@@ -20,6 +20,7 @@ pub struct DiffLine {
     pub old_line: Option<usize>,
     pub new_line: Option<usize>,
     pub content: String,
+    pub syntax: Vec<SyntaxSpan>,
 }
 
 #[derive(Debug, Clone)]
@@ -33,7 +34,27 @@ pub enum DiffLineKind {
     Context,
     Addition,
     Deletion,
+    Conflict,
     Note,
+}
+
+#[derive(Debug, Clone)]
+pub struct SyntaxSpan {
+    pub start: usize,
+    pub end: usize,
+    pub kind: SyntaxKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyntaxKind {
+    Comment,
+    String,
+    Number,
+    Keyword,
+    Function,
+    Type,
+    Property,
+    Punctuation,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -42,6 +63,8 @@ pub struct Palette {
     pub text_muted: Color,
     pub addition_text: Color,
     pub deletion_text: Color,
+    pub modified_token: Color,
+    pub conflict_marker: Color,
     pub note_text: Color,
     pub panel: Color,
     pub hunk_header: Color,
@@ -73,6 +96,13 @@ struct RowRenderParams {
     content_clip_bounds: Rectangle,
     y: f32,
     horizontal_offset: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FragmentRenderParams {
+    position: Point,
+    color: Color,
+    clip_bounds: Rectangle,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -141,12 +171,8 @@ impl<'a> DiffView<'a> {
             .unwrap_or(0)
     }
 
-    fn draw_row<Renderer>(
-        &self,
-        renderer: &mut Renderer,
-        line: &DiffLine,
-        render: RowRenderParams,
-    ) where
+    fn draw_row<Renderer>(&self, renderer: &mut Renderer, line: &DiffLine, render: RowRenderParams)
+    where
         Renderer: text::Renderer<Font = Font>,
     {
         let text_color = self.line_text_color(line.kind);
@@ -173,17 +199,30 @@ impl<'a> DiffView<'a> {
             text_color,
             bounds,
         );
-        self.draw_text(
-            renderer,
-            &line.content,
-            text_width,
-            Point::new(
-                bounds.x + GUTTER_WIDTH + PREFIX_WIDTH + 8.0 - render.horizontal_offset,
-                y + 4.0,
-            ),
-            text_color,
-            render.content_clip_bounds,
+        let content_position = Point::new(
+            bounds.x + GUTTER_WIDTH + PREFIX_WIDTH + 8.0 - render.horizontal_offset,
+            y + 4.0,
         );
+
+        if line.syntax.is_empty() {
+            self.draw_text(
+                renderer,
+                &line.content,
+                text_width,
+                content_position,
+                text_color,
+                render.content_clip_bounds,
+            );
+        } else {
+            self.draw_syntax_text(
+                renderer,
+                &line.content,
+                &line.syntax,
+                content_position,
+                text_color,
+                render.content_clip_bounds,
+            );
+        }
     }
 }
 
@@ -418,6 +457,14 @@ where
                     1.0,
                     self.palette.hunk_header,
                 );
+                self.draw_background(
+                    renderer,
+                    bounds.x,
+                    header.y,
+                    CHANGE_MARK_WIDTH,
+                    HEADER_HEIGHT,
+                    self.palette.modified_token,
+                );
                 self.draw_text(
                     renderer,
                     &self.hunks[header.hunk_index].header,
@@ -522,10 +569,98 @@ impl DiffView<'_> {
         renderer.fill_text(self.make_text(content, width), position, color, clip_bounds);
     }
 
+    fn draw_syntax_text<Renderer>(
+        &self,
+        renderer: &mut Renderer,
+        content: &str,
+        spans: &[SyntaxSpan],
+        position: Point,
+        fallback: Color,
+        clip_bounds: Rectangle,
+    ) where
+        Renderer: text::Renderer<Font = Font>,
+    {
+        let mut cursor = 0;
+
+        for span in spans {
+            if span.start > cursor {
+                self.draw_text_fragment(
+                    renderer,
+                    content,
+                    cursor,
+                    span.start,
+                    FragmentRenderParams {
+                        position,
+                        color: fallback,
+                        clip_bounds,
+                    },
+                );
+            }
+
+            self.draw_text_fragment(
+                renderer,
+                content,
+                span.start,
+                span.end,
+                FragmentRenderParams {
+                    position,
+                    color: self.syntax_color(span.kind),
+                    clip_bounds,
+                },
+            );
+            cursor = span.end;
+        }
+
+        if cursor < content.len() {
+            self.draw_text_fragment(
+                renderer,
+                content,
+                cursor,
+                content.len(),
+                FragmentRenderParams {
+                    position,
+                    color: fallback,
+                    clip_bounds,
+                },
+            );
+        }
+    }
+
+    fn draw_text_fragment<Renderer>(
+        &self,
+        renderer: &mut Renderer,
+        content: &str,
+        start: usize,
+        end: usize,
+        render: FragmentRenderParams,
+    ) where
+        Renderer: text::Renderer<Font = Font>,
+    {
+        if start >= end {
+            return;
+        }
+
+        let Some(fragment) = content.get(start..end) else {
+            return;
+        };
+
+        let x = render.position.x + content[..start].chars().count() as f32 * self.char_width();
+        let width = self.text_width(fragment);
+        self.draw_text(
+            renderer,
+            fragment,
+            width,
+            Point::new(x, render.position.y),
+            render.color,
+            render.clip_bounds,
+        );
+    }
+
     fn line_text_color(&self, kind: DiffLineKind) -> Color {
         match kind {
             DiffLineKind::Addition => self.palette.addition_text,
             DiffLineKind::Deletion => self.palette.deletion_text,
+            DiffLineKind::Conflict => self.palette.conflict_marker,
             DiffLineKind::Context => self.palette.text,
             DiffLineKind::Note => self.palette.note_text,
         }
@@ -535,6 +670,7 @@ impl DiffView<'_> {
         match kind {
             DiffLineKind::Addition => Some(self.palette.addition_background),
             DiffLineKind::Deletion => Some(self.palette.deletion_background),
+            DiffLineKind::Conflict => Some(self.palette.note_background),
             DiffLineKind::Note => Some(self.palette.note_background),
             DiffLineKind::Context => None,
         }
@@ -544,8 +680,22 @@ impl DiffView<'_> {
         match kind {
             DiffLineKind::Addition => self.palette.addition_text,
             DiffLineKind::Deletion => self.palette.deletion_text,
+            DiffLineKind::Conflict => self.palette.conflict_marker,
             DiffLineKind::Note => self.palette.note_text,
             DiffLineKind::Context => self.palette.border,
+        }
+    }
+
+    fn syntax_color(&self, kind: SyntaxKind) -> Color {
+        match kind {
+            SyntaxKind::Comment => self.palette.text_muted,
+            SyntaxKind::String => self.palette.note_text,
+            SyntaxKind::Number => self.palette.modified_token,
+            SyntaxKind::Keyword => self.palette.modified_token,
+            SyntaxKind::Function => self.palette.addition_text,
+            SyntaxKind::Type => self.palette.deletion_text,
+            SyntaxKind::Property => self.palette.text,
+            SyntaxKind::Punctuation => self.palette.text_muted,
         }
     }
 }
@@ -577,6 +727,7 @@ fn prefix_for_kind(kind: DiffLineKind) -> &'static str {
     match kind {
         DiffLineKind::Addition => "+",
         DiffLineKind::Deletion => "-",
+        DiffLineKind::Conflict => "!",
         DiffLineKind::Context => " ",
         DiffLineKind::Note => "\\",
     }

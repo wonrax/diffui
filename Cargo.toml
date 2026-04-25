@@ -11,6 +11,8 @@ anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 iced = { git = "https://github.com/iced-rs/iced.git", features = ["advanced", "tokio", "debug"] }
 tokio = { version = "1.44", features = ["process", "time"] }
+tree-sitter = "0.26.8"
+tree-sitter-rust = "0.24.2"
 
 [profile.dev]
 debug = 1

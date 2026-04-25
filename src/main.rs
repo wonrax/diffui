@@ -9,32 +9,17 @@ mod diff_view;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use diff_view::{DiffHunkView, DiffLine, DiffLineKind, DiffView, Palette};
+use diff_view::{DiffHunkView, DiffLine, DiffLineKind, DiffView, Palette, SyntaxKind, SyntaxSpan};
 use iced::{
     Background, Border, Color, Element, Length, Shadow, Subscription, Task, Theme, keyboard,
     widget::{button, column, container, row, scrollable, text, text::Wrapping},
 };
 use tokio::process::Command;
+use tree_sitter::{Parser as SyntaxParser, Query, QueryCursor, StreamingIterator};
 
 const CODE_FONT: iced::Font = iced::Font::new("DejaVu Sans Mono");
 const CODE_TEXT_SIZE: f32 = 14.0;
 const CAPTION_TEXT_SIZE: f32 = 12.0;
-const PANEL_BORDER: Color = Color::from_rgb(0.16, 0.19, 0.25);
-const PAGE_BACKGROUND: Color = Color::from_rgb(0.04, 0.06, 0.10);
-const PANEL_BACKGROUND: Color = Color::from_rgb(0.08, 0.10, 0.15);
-const PANEL_BACKGROUND_ELEVATED: Color = Color::from_rgb(0.10, 0.12, 0.18);
-const PANEL_BACKGROUND_SELECTED: Color = Color::from_rgb(0.11, 0.15, 0.24);
-const TEXT_PRIMARY: Color = Color::from_rgb(0.90, 0.93, 0.98);
-const TEXT_MUTED: Color = Color::from_rgb(0.56, 0.63, 0.75);
-const TEXT_SUBTLE: Color = Color::from_rgb(0.42, 0.48, 0.58);
-const ACCENT: Color = Color::from_rgb(0.32, 0.63, 0.98);
-const ADDITION_TEXT: Color = Color::from_rgb(0.80, 0.95, 0.86);
-const DELETION_TEXT: Color = Color::from_rgb(0.98, 0.83, 0.86);
-const ADDITION_BACKGROUND: Color = Color::from_rgb(0.07, 0.18, 0.13);
-const DELETION_BACKGROUND: Color = Color::from_rgb(0.24, 0.10, 0.12);
-const HUNK_HEADER_BACKGROUND: Color = Color::from_rgb(0.08, 0.15, 0.25);
-const NOTE_BACKGROUND: Color = Color::from_rgb(0.18, 0.13, 0.06);
-const NOTE_TEXT: Color = Color::from_rgb(0.97, 0.86, 0.68);
 
 fn main() -> iced::Result {
     let cli = Cli::parse();
@@ -63,6 +48,9 @@ struct Diffui {
     repository: Option<Repository>,
     status: LoadStatus,
     document: DiffDocument,
+    commits: Vec<CommitSummary>,
+    selected_revision: RevisionSelection,
+    selected_theme: BuiltinTheme,
     selected_file: usize,
 }
 
@@ -86,6 +74,21 @@ enum LoadStatus {
     Failed(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RevisionSelection {
+    WorkingCopy,
+    Commit(String),
+}
+
+impl RevisionSelection {
+    fn label(&self) -> &str {
+        match self {
+            Self::WorkingCopy => "working copy",
+            Self::Commit(_) => "selected commit",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct DiffDocument {
     files: Vec<DiffFile>,
@@ -104,6 +107,14 @@ struct DiffFile {
     deletions: usize,
 }
 
+#[derive(Debug, Clone)]
+struct CommitSummary {
+    change_id: String,
+    commit_id: String,
+    description: String,
+    author: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiffFileStatus {
     Added,
@@ -116,6 +127,8 @@ enum DiffFileStatus {
 enum Message {
     BackendLoaded(Result<BackendOutput, String>),
     SelectFile(usize),
+    SelectRevision(RevisionSelection),
+    SelectTheme(BuiltinTheme),
     SelectNextFile,
     SelectPreviousFile,
 }
@@ -124,6 +137,7 @@ enum Message {
 struct BackendOutput {
     summary: String,
     document: DiffDocument,
+    commits: Vec<CommitSummary>,
 }
 
 #[derive(Debug, Clone)]
@@ -134,11 +148,132 @@ struct PendingHunk {
     next_new_line: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuiltinTheme {
+    Dark,
+    Light,
+    HighContrast,
+}
+
+impl BuiltinTheme {
+    const ALL: [Self; 3] = [Self::Dark, Self::Light, Self::HighContrast];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Dark => "dark",
+            Self::Light => "light",
+            Self::HighContrast => "contrast",
+        }
+    }
+
+    fn spec(self) -> ThemeSpec {
+        match self {
+            Self::Dark => ThemeSpec {
+                background: Color::from_rgb(0.020, 0.026, 0.040),
+                panel_background: Color::from_rgb(0.050, 0.060, 0.083),
+                panel_background_elevated: Color::from_rgb(0.072, 0.085, 0.118),
+                selected_file: Color::from_rgb(0.085, 0.145, 0.215),
+                text: Color::from_rgb(0.940, 0.965, 1.000),
+                muted_text: Color::from_rgb(0.700, 0.760, 0.840),
+                subtle_text: Color::from_rgb(0.520, 0.585, 0.680),
+                accent: Color::from_rgb(0.170, 0.760, 1.000),
+                added_line: Color::from_rgb(0.025, 0.205, 0.125),
+                removed_line: Color::from_rgb(0.285, 0.055, 0.095),
+                added_text: Color::from_rgb(0.440, 1.000, 0.650),
+                removed_text: Color::from_rgb(1.000, 0.465, 0.535),
+                modified_token: Color::from_rgb(1.000, 0.805, 0.275),
+                file_header: Color::from_rgb(0.075, 0.092, 0.130),
+                hunk_header: Color::from_rgb(0.055, 0.190, 0.295),
+                conflict_marker: Color::from_rgb(1.000, 0.235, 0.315),
+                border: Color::from_rgb(0.240, 0.295, 0.385),
+                note_background: Color::from_rgb(0.245, 0.160, 0.035),
+                note_text: Color::from_rgb(1.000, 0.890, 0.520),
+            },
+            Self::Light => ThemeSpec {
+                background: Color::from_rgb(0.948, 0.944, 0.928),
+                panel_background: Color::from_rgb(0.995, 0.992, 0.975),
+                panel_background_elevated: Color::from_rgb(0.965, 0.960, 0.935),
+                selected_file: Color::from_rgb(0.875, 0.918, 0.945),
+                text: Color::from_rgb(0.110, 0.130, 0.160),
+                muted_text: Color::from_rgb(0.380, 0.430, 0.485),
+                subtle_text: Color::from_rgb(0.555, 0.585, 0.620),
+                accent: Color::from_rgb(0.015, 0.415, 0.605),
+                added_line: Color::from_rgb(0.865, 0.950, 0.895),
+                removed_line: Color::from_rgb(0.985, 0.875, 0.875),
+                added_text: Color::from_rgb(0.070, 0.405, 0.205),
+                removed_text: Color::from_rgb(0.675, 0.115, 0.135),
+                modified_token: Color::from_rgb(0.690, 0.410, 0.020),
+                file_header: Color::from_rgb(0.930, 0.928, 0.900),
+                hunk_header: Color::from_rgb(0.820, 0.895, 0.935),
+                conflict_marker: Color::from_rgb(0.760, 0.090, 0.100),
+                border: Color::from_rgb(0.765, 0.775, 0.790),
+                note_background: Color::from_rgb(0.980, 0.930, 0.780),
+                note_text: Color::from_rgb(0.490, 0.310, 0.050),
+            },
+            Self::HighContrast => ThemeSpec {
+                background: Color::BLACK,
+                panel_background: Color::from_rgb(0.030, 0.030, 0.030),
+                panel_background_elevated: Color::from_rgb(0.070, 0.070, 0.070),
+                selected_file: Color::from_rgb(0.000, 0.180, 0.240),
+                text: Color::WHITE,
+                muted_text: Color::from_rgb(0.780, 0.820, 0.840),
+                subtle_text: Color::from_rgb(0.620, 0.660, 0.690),
+                accent: Color::from_rgb(0.000, 0.900, 1.000),
+                added_line: Color::from_rgb(0.000, 0.235, 0.080),
+                removed_line: Color::from_rgb(0.300, 0.000, 0.045),
+                added_text: Color::from_rgb(0.500, 1.000, 0.600),
+                removed_text: Color::from_rgb(1.000, 0.520, 0.560),
+                modified_token: Color::from_rgb(1.000, 0.920, 0.000),
+                file_header: Color::from_rgb(0.120, 0.120, 0.120),
+                hunk_header: Color::from_rgb(0.000, 0.220, 0.310),
+                conflict_marker: Color::from_rgb(1.000, 0.140, 0.140),
+                border: Color::from_rgb(0.570, 0.620, 0.660),
+                note_background: Color::from_rgb(0.260, 0.210, 0.000),
+                note_text: Color::from_rgb(1.000, 0.940, 0.500),
+            },
+        }
+    }
+
+    fn iced_theme(self) -> Theme {
+        match self {
+            Self::Dark => Theme::TokyoNight,
+            Self::Light => Theme::Light,
+            Self::HighContrast => Theme::Dark,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ThemeSpec {
+    background: Color,
+    panel_background: Color,
+    panel_background_elevated: Color,
+    selected_file: Color,
+    text: Color,
+    muted_text: Color,
+    subtle_text: Color,
+    accent: Color,
+    added_line: Color,
+    removed_line: Color,
+    added_text: Color,
+    removed_text: Color,
+    modified_token: Color,
+    file_header: Color,
+    hunk_header: Color,
+    conflict_marker: Color,
+    border: Color,
+    note_background: Color,
+    note_text: Color,
+}
+
 impl Diffui {
     fn new(cli: Cli) -> (Self, Task<Message>) {
         match prepare_repository(&cli.path) {
             Ok(repository) => {
-                let task = Task::perform(load_backend(repository.clone()), Message::BackendLoaded);
+                let task = Task::perform(
+                    load_backend(repository.clone(), RevisionSelection::WorkingCopy),
+                    Message::BackendLoaded,
+                );
 
                 (
                     Self {
@@ -146,6 +281,9 @@ impl Diffui {
                         repository: Some(repository),
                         status: LoadStatus::Loading,
                         document: loading_document(),
+                        commits: Vec::new(),
+                        selected_revision: RevisionSelection::WorkingCopy,
+                        selected_theme: BuiltinTheme::Dark,
                         selected_file: 0,
                     },
                     task,
@@ -157,6 +295,9 @@ impl Diffui {
                     repository: None,
                     status: LoadStatus::Failed(format!("{error:#}")),
                     document: DiffDocument::default(),
+                    commits: Vec::new(),
+                    selected_revision: RevisionSelection::WorkingCopy,
+                    selected_theme: BuiltinTheme::Dark,
                     selected_file: 0,
                 },
                 Task::none(),
@@ -169,6 +310,7 @@ impl Diffui {
             Message::BackendLoaded(Ok(output)) => {
                 self.status = LoadStatus::Loaded(output.summary);
                 self.document = output.document;
+                self.commits = output.commits;
                 self.selected_file = self
                     .selected_file
                     .min(self.document.files.len().saturating_sub(1));
@@ -180,6 +322,24 @@ impl Diffui {
                 if index < self.document.files.len() {
                     self.selected_file = index;
                 }
+            }
+            Message::SelectRevision(selection) => {
+                if self.selected_revision != selection {
+                    self.selected_revision = selection;
+                    self.status = LoadStatus::Loading;
+                    self.selected_file = 0;
+
+                    if let Some(repository) = self.repository.clone() {
+                        let revision = self.selected_revision.clone();
+                        return Task::perform(
+                            load_backend(repository, revision),
+                            Message::BackendLoaded,
+                        );
+                    }
+                }
+            }
+            Message::SelectTheme(theme) => {
+                self.selected_theme = theme;
             }
             Message::SelectNextFile => {
                 if !self.document.files.is_empty() {
@@ -199,6 +359,7 @@ impl Diffui {
     }
 
     fn view(&self) -> Element<'_, Message> {
+        let theme = self.selected_theme.spec();
         let status = match &self.status {
             LoadStatus::Loading => "loading backend output...".to_owned(),
             LoadStatus::Loaded(summary) => summary.clone(),
@@ -222,9 +383,10 @@ impl Diffui {
             self.document.files.len(),
             self.document.total_additions,
             self.document.total_deletions,
+            theme,
         );
 
-        let content = row![build_sidebar(self), build_diff_panel(self)]
+        let content = row![build_sidebar(self, theme), build_diff_panel(self, theme)]
             .spacing(20)
             .height(Length::Fill);
 
@@ -232,12 +394,12 @@ impl Diffui {
             .padding(20)
             .height(Length::Fill)
             .width(Length::Fill)
-            .style(|_| app_shell_style())
+            .style(move |_| app_shell_style(theme))
             .into()
     }
 
     fn theme(&self) -> Theme {
-        Theme::TokyoNight
+        self.selected_theme.iced_theme()
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -280,12 +442,12 @@ impl DiffFileStatus {
         }
     }
 
-    fn badge_color(self) -> Color {
+    fn badge_color(self, theme: ThemeSpec) -> Color {
         match self {
-            Self::Added => Color::from_rgb(0.12, 0.35, 0.22),
-            Self::Deleted => Color::from_rgb(0.40, 0.13, 0.18),
-            Self::Modified => Color::from_rgb(0.14, 0.22, 0.39),
-            Self::Renamed => Color::from_rgb(0.29, 0.21, 0.10),
+            Self::Added => theme.added_line,
+            Self::Deleted => theme.removed_line,
+            Self::Modified => theme.selected_file,
+            Self::Renamed => theme.note_background,
         }
     }
 }
@@ -344,36 +506,71 @@ fn discover_repository(start: &Path) -> Result<(PathBuf, Vcs)> {
     bail!("not inside a repository")
 }
 
-async fn load_backend(repository: Repository) -> Result<BackendOutput, String> {
-    run_backend(repository)
+async fn load_backend(
+    repository: Repository,
+    revision: RevisionSelection,
+) -> Result<BackendOutput, String> {
+    run_backend(repository, revision)
         .await
         .map_err(|error| format!("{error:#}"))
 }
 
-async fn run_backend(repository: Repository) -> Result<BackendOutput> {
-    let (program, args) = backend_command(&repository);
+async fn run_backend(repository: Repository, revision: RevisionSelection) -> Result<BackendOutput> {
+    let commits = load_commits(&repository).await?;
+    let (program, args) = backend_command(&repository, &revision);
     let output = run_command(&repository.root, program, args).await?;
     let document = parse_backend_output(&repository, &output);
 
     Ok(BackendOutput {
         summary: format!(
-            "loaded {} diff: {} file(s), {} additions, {} deletions",
+            "loaded {} {} diff: {} file(s), {} additions, {} deletions",
             repository.vcs.label(),
+            revision.label(),
             document.files.len(),
             document.total_additions,
             document.total_deletions,
         ),
         document,
+        commits,
     })
 }
 
-fn backend_command(repository: &Repository) -> (&'static str, Vec<OsString>) {
+fn backend_command(
+    repository: &Repository,
+    revision: &RevisionSelection,
+) -> (&'static str, Vec<OsString>) {
     let mut args: Vec<OsString> = match repository.vcs {
-        Vcs::Jj => ["diff", "--git", "--color", "never", "--"]
-            .into_iter()
-            .map(OsString::from)
-            .collect(),
-        Vcs::Git => ["diff", "--"].into_iter().map(OsString::from).collect(),
+        Vcs::Jj => {
+            let mut args = vec![
+                OsString::from("diff"),
+                OsString::from("--git"),
+                OsString::from("--color"),
+                OsString::from("never"),
+            ];
+
+            if let RevisionSelection::Commit(revision) = revision {
+                args.push(OsString::from("-r"));
+                args.push(OsString::from(revision));
+            }
+
+            args.push(OsString::from("--"));
+            args
+        }
+        Vcs::Git => match revision {
+            RevisionSelection::WorkingCopy => {
+                ["diff", "--"].into_iter().map(OsString::from).collect()
+            }
+            RevisionSelection::Commit(revision) => {
+                vec![
+                    OsString::from("show"),
+                    OsString::from("--format="),
+                    OsString::from("--no-ext-diff"),
+                    OsString::from("--no-color"),
+                    OsString::from(revision),
+                    OsString::from("--"),
+                ]
+            }
+        },
     };
 
     if !repository.scope.as_os_str().is_empty() {
@@ -398,6 +595,72 @@ async fn run_command(current_dir: &Path, program: &str, args: Vec<OsString>) -> 
     }
 
     String::from_utf8(output.stdout).with_context(|| format!("{program} emitted non-utf8 output"))
+}
+
+async fn load_commits(repository: &Repository) -> Result<Vec<CommitSummary>> {
+    match repository.vcs {
+        Vcs::Jj => {
+            let output = run_command(
+                &repository.root,
+                "jj",
+                vec![
+                    OsString::from("log"),
+                    OsString::from("--no-graph"),
+                    OsString::from("-r"),
+                    OsString::from("ancestors(@, 24)"),
+                    OsString::from("-T"),
+                    OsString::from(
+                        "change_id.short() ++ \"\\t\" ++ commit_id.short() ++ \"\\t\" ++ author.email() ++ \"\\t\" ++ description.first_line() ++ \"\\n\"",
+                    ),
+                ],
+            )
+            .await?;
+
+            Ok(parse_commit_log(&output))
+        }
+        Vcs::Git => {
+            let output = run_command(
+                &repository.root,
+                "git",
+                vec![
+                    OsString::from("log"),
+                    OsString::from("--max-count=24"),
+                    OsString::from("--pretty=format:%h%x09%H%x09%ae%x09%s"),
+                ],
+            )
+            .await?;
+
+            Ok(parse_commit_log(&output))
+        }
+    }
+}
+
+fn parse_commit_log(output: &str) -> Vec<CommitSummary> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(4, '\t');
+            let change_id = parts.next()?.trim();
+            let commit_id = parts.next()?.trim();
+            let author = parts.next()?.trim();
+            let description = parts.next().unwrap_or("").trim();
+
+            if change_id.is_empty() || commit_id.is_empty() {
+                return None;
+            }
+
+            Some(CommitSummary {
+                change_id: change_id.to_owned(),
+                commit_id: commit_id.to_owned(),
+                description: if description.is_empty() {
+                    "(no description set)".to_owned()
+                } else {
+                    description.to_owned()
+                },
+                author: author.to_owned(),
+            })
+        })
+        .collect()
 }
 
 fn parse_backend_output(repository: &Repository, output: &str) -> DiffDocument {
@@ -478,7 +741,8 @@ fn flush_current_file(
         flush_current_hunk(file, current_hunk);
     }
 
-    if let Some(file) = current_file.take() {
+    if let Some(mut file) = current_file.take() {
+        apply_syntax_highlighting(&mut file);
         files.push(file);
     }
 }
@@ -523,6 +787,7 @@ fn push_hunk_row(file: &mut DiffFile, hunk: &mut PendingHunk, line: &str) {
                 old_line: None,
                 new_line: Some(hunk.next_new_line),
                 content: line[1..].to_owned(),
+                syntax: Vec::new(),
             });
             hunk.next_new_line += 1;
         }
@@ -533,6 +798,7 @@ fn push_hunk_row(file: &mut DiffFile, hunk: &mut PendingHunk, line: &str) {
                 old_line: Some(hunk.next_old_line),
                 new_line: None,
                 content: line[1..].to_owned(),
+                syntax: Vec::new(),
             });
             hunk.next_old_line += 1;
         }
@@ -542,6 +808,7 @@ fn push_hunk_row(file: &mut DiffFile, hunk: &mut PendingHunk, line: &str) {
                 old_line: Some(hunk.next_old_line),
                 new_line: Some(hunk.next_new_line),
                 content: line[1..].to_owned(),
+                syntax: Vec::new(),
             });
             hunk.next_old_line += 1;
             hunk.next_new_line += 1;
@@ -552,17 +819,134 @@ fn push_hunk_row(file: &mut DiffFile, hunk: &mut PendingHunk, line: &str) {
                 old_line: None,
                 new_line: None,
                 content: line.to_owned(),
+                syntax: Vec::new(),
             });
         }
         _ => {
+            let kind = if is_conflict_marker(line) {
+                DiffLineKind::Conflict
+            } else {
+                DiffLineKind::Note
+            };
+
             hunk.rows.push(DiffLine {
-                kind: DiffLineKind::Note,
+                kind,
                 old_line: None,
                 new_line: None,
                 content: line.to_owned(),
+                syntax: Vec::new(),
             });
         }
     }
+}
+
+fn is_conflict_marker(line: &str) -> bool {
+    line.starts_with("<<<<<<<")
+        || line.starts_with("|||||||")
+        || line.starts_with("=======")
+        || line.starts_with(">>>>>>>")
+}
+
+fn apply_syntax_highlighting(file: &mut DiffFile) {
+    if !file.path.ends_with(".rs") {
+        return;
+    }
+
+    let language = tree_sitter_rust::LANGUAGE.into();
+    let Ok(query) = Query::new(&language, tree_sitter_rust::HIGHLIGHTS_QUERY) else {
+        return;
+    };
+
+    let mut parser = SyntaxParser::new();
+    if parser.set_language(&language).is_err() {
+        return;
+    }
+
+    for hunk in &mut file.hunks {
+        for line in &mut hunk.lines {
+            if matches!(line.kind, DiffLineKind::Note | DiffLineKind::Conflict) {
+                continue;
+            }
+
+            line.syntax = highlight_rust_line(&mut parser, &query, &line.content);
+        }
+    }
+}
+
+fn highlight_rust_line(parser: &mut SyntaxParser, query: &Query, content: &str) -> Vec<SyntaxSpan> {
+    if content.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let Some(tree) = parser.parse(content, None) else {
+        return Vec::new();
+    };
+
+    let mut cursor = QueryCursor::new();
+    let mut captures = cursor.captures(query, tree.root_node(), content.as_bytes());
+    let capture_names = query.capture_names();
+    let mut spans = Vec::new();
+
+    while let Some((query_match, capture_index)) = captures.next() {
+        let Some(capture) = query_match.captures.get(*capture_index) else {
+            continue;
+        };
+        let Some(capture_name) = capture_names.get(capture.index as usize) else {
+            continue;
+        };
+        let Some(kind) = syntax_kind_for_capture(capture_name) else {
+            continue;
+        };
+
+        let start = capture.node.start_byte();
+        let end = capture.node.end_byte();
+        if start < end && content.is_char_boundary(start) && content.is_char_boundary(end) {
+            spans.push(SyntaxSpan { start, end, kind });
+        }
+    }
+
+    normalize_syntax_spans(spans)
+}
+
+fn syntax_kind_for_capture(capture: &str) -> Option<SyntaxKind> {
+    if capture.starts_with("comment") {
+        Some(SyntaxKind::Comment)
+    } else if capture.starts_with("string") || capture == "character" {
+        Some(SyntaxKind::String)
+    } else if capture.starts_with("number") || capture == "constant.builtin" {
+        Some(SyntaxKind::Number)
+    } else if capture.starts_with("keyword") || capture == "operator" {
+        Some(SyntaxKind::Keyword)
+    } else if capture.starts_with("function") || capture == "constructor" {
+        Some(SyntaxKind::Function)
+    } else if capture.starts_with("type") || capture == "variable.builtin" {
+        Some(SyntaxKind::Type)
+    } else if capture.starts_with("property") || capture == "variable.parameter" {
+        Some(SyntaxKind::Property)
+    } else if capture == "punctuation.bracket" || capture == "punctuation.delimiter" {
+        Some(SyntaxKind::Punctuation)
+    } else {
+        None
+    }
+}
+
+fn normalize_syntax_spans(mut spans: Vec<SyntaxSpan>) -> Vec<SyntaxSpan> {
+    spans.sort_by_key(|span| (span.start, span.end));
+
+    let mut normalized: Vec<SyntaxSpan> = Vec::with_capacity(spans.len());
+    for mut span in spans {
+        if let Some(previous) = normalized.last()
+            && span.start < previous.end
+        {
+            span.start = previous.end;
+        }
+
+        if span.start < span.end {
+            normalized.push(span);
+        }
+    }
+
+    normalized
 }
 
 fn parse_diff_git_paths(paths: &str) -> (Option<String>, String) {
@@ -609,27 +993,28 @@ fn build_header<'a>(
     file_count: usize,
     additions: usize,
     deletions: usize,
+    theme: ThemeSpec,
 ) -> Element<'a, Message> {
     let file_count = file_count.to_string();
     let additions = format!("+{additions}");
     let deletions = format!("-{deletions}");
 
     let metrics = row![
-        build_metric_card("files", file_count, ACCENT),
-        build_metric_card("additions", additions, ADDITION_TEXT),
-        build_metric_card("deletions", deletions, DELETION_TEXT),
+        build_metric_card("files", file_count, theme.accent, theme),
+        build_metric_card("additions", additions, theme.added_text, theme),
+        build_metric_card("deletions", deletions, theme.removed_text, theme),
     ]
     .spacing(12);
 
     container(
         row![
             column![
-                text("diffui").size(34).color(TEXT_PRIMARY),
+                text("diffui").size(34).color(theme.text),
                 text(format!("target: {}", target.display()))
                     .size(15)
-                    .color(TEXT_MUTED),
-                text(status).size(14).color(TEXT_PRIMARY),
-                text(repo).size(CAPTION_TEXT_SIZE).color(TEXT_SUBTLE),
+                    .color(theme.muted_text),
+                text(status).size(14).color(theme.text),
+                text(repo).size(CAPTION_TEXT_SIZE).color(theme.subtle_text),
             ]
             .spacing(6)
             .width(Length::Fill),
@@ -638,7 +1023,7 @@ fn build_header<'a>(
         .spacing(20),
     )
     .padding(20)
-    .style(|_| hero_panel_style())
+    .style(move |_| hero_panel_style(theme))
     .into()
 }
 
@@ -646,20 +1031,21 @@ fn build_metric_card<'a>(
     label: &'a str,
     value: String,
     value_color: Color,
+    theme: ThemeSpec,
 ) -> Element<'a, Message> {
     container(
         column![
-            text(label).size(CAPTION_TEXT_SIZE).color(TEXT_SUBTLE),
+            text(label).size(CAPTION_TEXT_SIZE).color(theme.subtle_text),
             text(value).size(22).color(value_color),
         ]
         .spacing(4),
     )
     .padding([12, 14])
-    .style(|_| secondary_panel_style())
+    .style(move |_| secondary_panel_style(theme))
     .into()
 }
 
-fn build_sidebar(ui: &Diffui) -> Element<'_, Message> {
+fn build_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     let repo_label = ui
         .repository
         .as_ref()
@@ -667,10 +1053,29 @@ fn build_sidebar(ui: &Diffui) -> Element<'_, Message> {
         .unwrap_or_else(|| "outside repository".to_owned());
 
     let mut files = column![
-        text("changed files").size(20).color(TEXT_PRIMARY),
-        text(repo_label).size(CAPTION_TEXT_SIZE).color(TEXT_SUBTLE),
+        text("theme").size(13).color(theme.subtle_text),
+        build_theme_switcher(ui.selected_theme, theme),
+        text("commits").size(18).color(theme.text),
+        build_revision_button(
+            "working copy",
+            "uncommitted diff",
+            RevisionSelection::WorkingCopy,
+            &ui.selected_revision,
+            theme
+        ),
     ]
-    .spacing(8);
+    .spacing(10);
+
+    for commit in &ui.commits {
+        files = files.push(build_commit_button(commit, &ui.selected_revision, theme));
+    }
+
+    files = files.push(text("changed files").size(18).color(theme.text));
+    files = files.push(
+        text(repo_label)
+            .size(CAPTION_TEXT_SIZE)
+            .color(theme.subtle_text),
+    );
 
     for (index, file) in ui.document.files.iter().enumerate() {
         let selected = index == ui.selected_file;
@@ -685,19 +1090,21 @@ fn build_sidebar(ui: &Diffui) -> Element<'_, Message> {
                     row![
                         text(file.path.as_str())
                             .size(14)
-                            .color(TEXT_PRIMARY)
+                            .color(theme.text)
                             .width(Length::Fill),
-                        build_badge(file.status.label(), file.status.badge_color()),
+                        build_badge(file.status.label(), file.status.badge_color(theme), theme),
                     ]
                     .spacing(10),
                     row![
-                        text(subtitle).size(CAPTION_TEXT_SIZE).color(TEXT_MUTED),
+                        text(subtitle)
+                            .size(CAPTION_TEXT_SIZE)
+                            .color(theme.muted_text),
                         text(format!("+{}", file.additions))
                             .size(CAPTION_TEXT_SIZE)
-                            .color(ADDITION_TEXT),
+                            .color(theme.added_text),
                         text(format!("-{}", file.deletions))
                             .size(CAPTION_TEXT_SIZE)
-                            .color(DELETION_TEXT),
+                            .color(theme.removed_text),
                     ]
                     .spacing(10),
                 ]
@@ -705,31 +1112,96 @@ fn build_sidebar(ui: &Diffui) -> Element<'_, Message> {
             )
             .width(Length::Fill)
             .padding([12, 14])
-            .style(move |_theme, status| sidebar_button_style(status, selected))
+            .style(move |_, status| sidebar_button_style(status, selected, theme))
             .on_press(Message::SelectFile(index)),
         );
     }
 
     container(
         scrollable(files.spacing(12))
-            .style(diff_scrollable_style)
+            .style(move |iced_theme, status| diff_scrollable_style(iced_theme, status, theme))
             .height(Length::Fill),
     )
     .width(Length::Fixed(320.0))
     .height(Length::Fill)
     .padding(16)
-    .style(|_| panel_style(PANEL_BACKGROUND))
+    .style(move |_| panel_style(theme.panel_background, theme))
     .into()
 }
 
-fn build_diff_panel(ui: &Diffui) -> Element<'_, Message> {
+fn build_theme_switcher(
+    selected_theme: BuiltinTheme,
+    theme: ThemeSpec,
+) -> Element<'static, Message> {
+    let mut controls = row![].spacing(8);
+
+    for candidate in BuiltinTheme::ALL {
+        let selected = candidate == selected_theme;
+        controls = controls.push(
+            button(text(candidate.label()).size(CAPTION_TEXT_SIZE))
+                .padding([7, 10])
+                .style(move |_, status| sidebar_button_style(status, selected, theme))
+                .on_press(Message::SelectTheme(candidate)),
+        );
+    }
+
+    controls.into()
+}
+
+fn build_commit_button<'a>(
+    commit: &'a CommitSummary,
+    selected_revision: &RevisionSelection,
+    theme: ThemeSpec,
+) -> Element<'a, Message> {
+    let title = format!("{} {}", commit.change_id, commit.description);
+    let subtitle = format!("{} | {}", commit.commit_id, commit.author);
+
+    build_revision_button(
+        title,
+        subtitle,
+        RevisionSelection::Commit(commit.change_id.clone()),
+        selected_revision,
+        theme,
+    )
+}
+
+fn build_revision_button<'a>(
+    title: impl Into<String>,
+    subtitle: impl Into<String>,
+    revision: RevisionSelection,
+    selected_revision: &RevisionSelection,
+    theme: ThemeSpec,
+) -> Element<'a, Message> {
+    let selected = &revision == selected_revision;
+
+    button(
+        column![
+            text(title.into())
+                .size(13)
+                .color(theme.text)
+                .width(Length::Fill),
+            text(subtitle.into())
+                .size(CAPTION_TEXT_SIZE)
+                .color(theme.muted_text)
+                .width(Length::Fill),
+        ]
+        .spacing(4),
+    )
+    .width(Length::Fill)
+    .padding([10, 12])
+    .style(move |_, status| sidebar_button_style(status, selected, theme))
+    .on_press(Message::SelectRevision(revision))
+    .into()
+}
+
+fn build_diff_panel(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     let Some(file) = ui.document.files.get(ui.selected_file) else {
-        return container(text("no diff loaded").size(16).color(TEXT_MUTED))
+        return container(text("no diff loaded").size(16).color(theme.muted_text))
             .width(Length::Fill)
             .height(Length::Fill)
             .center_x(Length::Fill)
             .center_y(Length::Fill)
-            .style(|_| panel_style(PANEL_BACKGROUND))
+            .style(move |_| panel_style(theme.panel_background, theme))
             .into();
     };
 
@@ -742,27 +1214,30 @@ fn build_diff_panel(ui: &Diffui) -> Element<'_, Message> {
         container(
             column![
                 row![
-                    text(title).size(24).color(TEXT_PRIMARY).width(Length::Fill),
-                    build_badge(file.status.label(), file.status.badge_color()),
+                    text(title).size(24).color(theme.text).width(Length::Fill),
+                    build_badge(file.status.label(), file.status.badge_color(theme), theme),
                 ]
                 .spacing(12),
                 row![
                     text(format!("{} hunk(s)", file.hunks.len()))
                         .size(CAPTION_TEXT_SIZE)
-                        .color(TEXT_MUTED),
+                        .color(theme.muted_text),
                     text(format!("+{} additions", file.additions))
                         .size(CAPTION_TEXT_SIZE)
-                        .color(ADDITION_TEXT),
+                        .color(theme.added_text),
                     text(format!("-{} deletions", file.deletions))
                         .size(CAPTION_TEXT_SIZE)
-                        .color(DELETION_TEXT),
+                        .color(theme.removed_text),
+                    text(format!("mode: {}", ui.selected_revision.label()))
+                        .size(CAPTION_TEXT_SIZE)
+                        .color(theme.subtle_text),
                 ]
                 .spacing(12),
             ]
             .spacing(10),
         )
         .padding(18)
-        .style(|_| secondary_panel_style()),
+        .style(move |_| secondary_panel_style(theme)),
     ]
     .spacing(16);
 
@@ -775,26 +1250,30 @@ fn build_diff_panel(ui: &Diffui) -> Element<'_, Message> {
                     .font(CODE_FONT)
                     .size(CAPTION_TEXT_SIZE)
                     .wrapping(Wrapping::None)
-                    .color(TEXT_MUTED),
+                    .color(theme.muted_text),
             );
         }
 
         content = content.push(
             container(metadata.spacing(6))
                 .padding(14)
-                .style(|_| panel_style(PANEL_BACKGROUND_ELEVATED)),
+                .style(move |_| panel_style(theme.panel_background_elevated, theme)),
         );
     }
 
     if file.hunks.is_empty() {
         content = content.push(
-            container(text("no hunks for this file").size(15).color(TEXT_MUTED))
-                .padding(18)
-                .style(|_| panel_style(PANEL_BACKGROUND_ELEVATED)),
+            container(
+                text("no hunks for this file")
+                    .size(15)
+                    .color(theme.muted_text),
+            )
+            .padding(18)
+            .style(move |_| panel_style(theme.panel_background_elevated, theme)),
         );
     } else {
         content = content.push(
-            container(render_diff(file, ui.selected_file))
+            container(render_diff(file, ui.selected_file, theme))
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .clip(true),
@@ -806,100 +1285,99 @@ fn build_diff_panel(ui: &Diffui) -> Element<'_, Message> {
         .height(Length::Fill)
         .padding(16)
         .clip(true)
-        .style(|_| panel_style(PANEL_BACKGROUND))
+        .style(move |_| panel_style(theme.panel_background, theme))
         .into()
 }
 
-fn render_diff<'a>(file: &'a DiffFile, file_key: usize) -> Element<'a, Message> {
+fn render_diff<'a>(file: &'a DiffFile, file_key: usize, theme: ThemeSpec) -> Element<'a, Message> {
     DiffView::new(
         &file.hunks,
         file_key,
-        diff_palette(),
+        diff_palette(theme),
         CODE_FONT,
         CODE_TEXT_SIZE,
     )
     .into()
 }
 
-fn build_badge<'a>(label: &'a str, background: Color) -> Element<'a, Message> {
-    container(text(label).size(CAPTION_TEXT_SIZE).color(TEXT_PRIMARY))
+fn build_badge<'a>(label: &'a str, background: Color, theme: ThemeSpec) -> Element<'a, Message> {
+    container(text(label).size(CAPTION_TEXT_SIZE).color(theme.text))
         .padding([4, 10])
-        .style(move |_| badge_style(background))
+        .style(move |_| badge_style(background, theme))
         .into()
 }
 
-fn diff_palette() -> Palette {
+fn diff_palette(theme: ThemeSpec) -> Palette {
     Palette {
-        text: TEXT_PRIMARY,
-        text_muted: TEXT_SUBTLE,
-        addition_text: ADDITION_TEXT,
-        deletion_text: DELETION_TEXT,
-        note_text: NOTE_TEXT,
-        panel: PANEL_BACKGROUND_ELEVATED,
-        hunk_header: HUNK_HEADER_BACKGROUND,
-        addition_background: ADDITION_BACKGROUND,
-        deletion_background: DELETION_BACKGROUND,
-        note_background: NOTE_BACKGROUND,
-        gutter_background: PANEL_BACKGROUND,
-        border: PANEL_BORDER,
+        text: theme.text,
+        text_muted: theme.subtle_text,
+        addition_text: theme.added_text,
+        deletion_text: theme.removed_text,
+        modified_token: theme.modified_token,
+        conflict_marker: theme.conflict_marker,
+        note_text: theme.note_text,
+        panel: theme.panel_background_elevated,
+        hunk_header: theme.hunk_header,
+        addition_background: theme.added_line,
+        deletion_background: theme.removed_line,
+        note_background: theme.note_background,
+        gutter_background: theme.panel_background,
+        border: theme.border,
     }
 }
 
-fn app_shell_style() -> container::Style {
+fn app_shell_style(theme: ThemeSpec) -> container::Style {
     container::Style::default()
-        .background(PAGE_BACKGROUND)
-        .color(TEXT_PRIMARY)
+        .background(theme.background)
+        .color(theme.text)
 }
 
-fn hero_panel_style() -> container::Style {
+fn hero_panel_style(theme: ThemeSpec) -> container::Style {
     container::Style::default()
-        .background(PANEL_BACKGROUND_ELEVATED)
-        .border(panel_border())
+        .background(theme.file_header)
+        .border(panel_border(theme))
 }
 
-fn panel_style(background: Color) -> container::Style {
+fn panel_style(background: Color, theme: ThemeSpec) -> container::Style {
     container::Style::default()
         .background(background)
-        .border(panel_border())
+        .border(panel_border(theme))
 }
 
-fn secondary_panel_style() -> container::Style {
+fn secondary_panel_style(theme: ThemeSpec) -> container::Style {
     container::Style::default()
-        .background(PANEL_BACKGROUND_SELECTED)
-        .border(panel_border())
+        .background(theme.selected_file)
+        .border(panel_border(theme))
 }
 
-fn badge_style(background: Color) -> container::Style {
+fn badge_style(background: Color, theme: ThemeSpec) -> container::Style {
     container::Style::default()
         .background(background)
         .border(Border {
             width: 1.0,
-            color: Color {
-                a: 1.0,
-                ..background
-            },
+            color: theme.border,
             ..Border::default()
         })
 }
 
-fn sidebar_button_style(status: button::Status, selected: bool) -> button::Style {
+fn sidebar_button_style(status: button::Status, selected: bool, theme: ThemeSpec) -> button::Style {
     let background = if selected {
-        PANEL_BACKGROUND_SELECTED
+        theme.selected_file
     } else {
-        PANEL_BACKGROUND_ELEVATED
+        theme.panel_background_elevated
     };
 
     let mut style = button::Style {
         background: Some(Background::Color(background)),
-        text_color: TEXT_PRIMARY,
+        text_color: theme.text,
         border: if selected {
             Border {
                 width: 1.0,
-                color: Color::from_rgb(0.30, 0.48, 0.72),
+                color: theme.accent,
                 ..Border::default()
             }
         } else {
-            panel_border()
+            panel_border(theme)
         },
         shadow: Shadow::default(),
         snap: true,
@@ -909,15 +1387,19 @@ fn sidebar_button_style(status: button::Status, selected: bool) -> button::Style
         button::Status::Hovered => {
             style.border = Border {
                 width: 1.0,
-                color: if selected { ACCENT } else { TEXT_SUBTLE },
+                color: if selected {
+                    theme.accent
+                } else {
+                    theme.subtle_text
+                },
                 ..Border::default()
             };
         }
         button::Status::Pressed => {
-            style.background = Some(Background::Color(PANEL_BACKGROUND_SELECTED));
+            style.background = Some(Background::Color(theme.selected_file));
         }
         button::Status::Disabled => {
-            style.text_color = TEXT_SUBTLE;
+            style.text_color = theme.subtle_text;
         }
         button::Status::Active => {}
     }
@@ -925,21 +1407,24 @@ fn sidebar_button_style(status: button::Status, selected: bool) -> button::Style
     style
 }
 
-fn diff_scrollable_style(theme: &Theme, status: scrollable::Status) -> scrollable::Style {
-    let mut style = scrollable::default(theme, status);
+fn diff_scrollable_style(
+    iced_theme: &Theme,
+    status: scrollable::Status,
+    theme: ThemeSpec,
+) -> scrollable::Style {
+    let mut style = scrollable::default(iced_theme, status);
     style.container = container::Style::default();
-    style.vertical_rail.background = Some(Background::Color(Color::from_rgb(0.11, 0.13, 0.18)));
-    style.horizontal_rail.background = Some(Background::Color(Color::from_rgb(0.11, 0.13, 0.18)));
-    style.vertical_rail.scroller.background = Background::Color(Color::from_rgb(0.24, 0.32, 0.44));
-    style.horizontal_rail.scroller.background =
-        Background::Color(Color::from_rgb(0.24, 0.32, 0.44));
+    style.vertical_rail.background = Some(Background::Color(theme.panel_background));
+    style.horizontal_rail.background = Some(Background::Color(theme.panel_background));
+    style.vertical_rail.scroller.background = Background::Color(theme.subtle_text);
+    style.horizontal_rail.scroller.background = Background::Color(theme.subtle_text);
     style
 }
 
-fn panel_border() -> Border {
+fn panel_border(theme: ThemeSpec) -> Border {
     Border {
         width: 1.0,
-        color: PANEL_BORDER,
+        color: theme.border,
         ..Border::default()
     }
 }
@@ -980,7 +1465,7 @@ mod tests {
             scope: PathBuf::new(),
         };
 
-        let (program, args) = backend_command(&repository);
+        let (program, args) = backend_command(&repository, &RevisionSelection::WorkingCopy);
 
         assert_eq!(program, "jj");
         assert_eq!(
@@ -1000,9 +1485,36 @@ mod tests {
             scope: PathBuf::from("src"),
         };
 
-        let (_program, args) = backend_command(&repository);
+        let (_program, args) = backend_command(&repository, &RevisionSelection::WorkingCopy);
 
         assert_eq!(args.last(), Some(&OsString::from("src")));
+    }
+
+    #[test]
+    fn jj_commit_diff_uses_selected_revision() {
+        let repository = Repository {
+            root: PathBuf::from("/repo"),
+            vcs: Vcs::Jj,
+            scope: PathBuf::new(),
+        };
+
+        let (_program, args) =
+            backend_command(&repository, &RevisionSelection::Commit("abc123".to_owned()));
+
+        assert!(args.contains(&OsString::from("-r")));
+        assert!(args.contains(&OsString::from("abc123")));
+        assert_eq!(args.last(), Some(&OsString::from("--")));
+    }
+
+    #[test]
+    fn parses_commit_log_rows() {
+        let commits = parse_commit_log("abc\tdef\tme@example.com\tadd commit sidebar\n");
+
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].change_id, "abc");
+        assert_eq!(commits[0].commit_id, "def");
+        assert_eq!(commits[0].author, "me@example.com");
+        assert_eq!(commits[0].description, "add commit sidebar");
     }
 
     #[test]
@@ -1015,7 +1527,7 @@ mod tests {
 
         let document = parse_backend_output(
             &repository,
-            "diff --git a/src/main.rs b/src/main.rs\nindex 123..456 100644\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -10,2 +10,3 @@ fn demo()\n old\n-old value\n+new value\n+second line\n",
+            "diff --git a/src/main.rs b/src/main.rs\nindex 123..456 100644\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -10,2 +10,3 @@ fn demo()\n let old_value = 0;\n-let old_value = 1;\n+let new_value = 1;\n+let second_line = 2;\n",
         );
 
         assert_eq!(document.files.len(), 1);
@@ -1033,6 +1545,26 @@ mod tests {
         assert_eq!(file.hunks[0].lines[2].kind, DiffLineKind::Addition);
         assert_eq!(file.hunks[0].lines[2].old_line, None);
         assert_eq!(file.hunks[0].lines[2].new_line, Some(11));
+        assert!(!file.hunks[0].lines[2].syntax.is_empty());
+    }
+
+    #[test]
+    fn parses_conflict_markers() {
+        let repository = Repository {
+            root: PathBuf::from("/repo"),
+            vcs: Vcs::Jj,
+            scope: PathBuf::new(),
+        };
+
+        let document = parse_backend_output(
+            &repository,
+            "diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,1 +1,1 @@\n<<<<<<< mine\n",
+        );
+
+        assert_eq!(
+            document.files[0].hunks[0].lines[0].kind,
+            DiffLineKind::Conflict
+        );
     }
 
     #[test]
