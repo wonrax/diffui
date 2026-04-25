@@ -15,9 +15,6 @@ tokio = { version = "1.44", features = ["process", "time"] }
 [profile.dev]
 debug = 1
 
-[profile.dev.package."*"]
-opt-level = 1
-
 [profile.profiling]
 inherits = "release"
 debug = true
