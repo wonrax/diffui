@@ -4,20 +4,16 @@ use iced::advanced::{
 };
 use iced::{
     Border, Color, Element, Event, Font, Length, Pixels, Point, Rectangle, Shadow, Size, Theme,
-    Vector, alignment, keyboard,
+    Vector, alignment,
 };
 
 const ROW_HEIGHT: f32 = 24.0;
-const FILE_HEADER_HEIGHT: f32 = 42.0;
-const HUNK_HEADER_HEIGHT: f32 = 28.0;
-const METADATA_ROW_HEIGHT: f32 = 20.0;
-const GUTTER_WIDTH: f32 = 112.0;
+const FILE_HEADER_HEIGHT: f32 = 38.0;
+const HUNK_HEADER_HEIGHT: f32 = 26.0;
+const METADATA_ROW_HEIGHT: f32 = 18.0;
+const GUTTER_WIDTH: f32 = 104.0;
 const PREFIX_WIDTH: f32 = 24.0;
-const HORIZONTAL_STEP: f32 = 48.0;
-const CHANGE_MARK_WIDTH: f32 = 3.0;
-const SCROLLBAR_THICKNESS: f32 = 12.0;
-const SCROLLBAR_MARGIN: f32 = 4.0;
-const SCROLLBAR_THUMB_THICKNESS: f32 = 7.0;
+const CHANGE_MARK_WIDTH: f32 = 2.0;
 
 #[derive(Debug, Clone)]
 pub struct DiffLine {
@@ -104,9 +100,6 @@ struct State {
     selected_file: usize,
     pending_file_jump: Option<usize>,
     vertical_offset: f32,
-    horizontal_offset: f32,
-    horizontal_drag: Option<f32>,
-    shift_pressed: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -249,11 +242,6 @@ impl<'a> DiffView<'a> {
             .sum()
     }
 
-    fn max_horizontal_offset(&self, viewport_width: f32) -> f32 {
-        let available_width = self.content_width(viewport_width);
-        (self.max_content_chars() as f32 * self.char_width() - available_width).max(0.0)
-    }
-
     fn content_width(&self, viewport_width: f32) -> f32 {
         (viewport_width - GUTTER_WIDTH - PREFIX_WIDTH - 16.0).max(self.char_width())
     }
@@ -267,21 +255,6 @@ impl<'a> DiffView<'a> {
         let wrapped_lines = line.content.chars().count().max(1).div_ceil(chars_per_line);
 
         wrapped_lines as f32 * ROW_HEIGHT
-    }
-
-    fn max_content_chars(&self) -> usize {
-        self.files
-            .iter()
-            .flat_map(|file| {
-                file.metadata
-                    .iter()
-                    .map(String::as_str)
-                    .chain(file.hunks.iter().map(|hunk| hunk.header.as_str()))
-            })
-            .map(str::chars)
-            .map(Iterator::count)
-            .max()
-            .unwrap_or(0)
     }
 
     fn draw_row<Renderer>(&self, renderer: &mut Renderer, line: &DiffLine, render: RowRenderParams)
@@ -362,9 +335,6 @@ where
             selected_file: self.selected_file,
             pending_file_jump: None,
             vertical_offset: 0.0,
-            horizontal_offset: 0.0,
-            horizontal_drag: None,
-            shift_pressed: false,
         })
     }
 
@@ -373,7 +343,6 @@ where
 
         if state.selected_file != self.selected_file {
             state.pending_file_jump = Some(self.selected_file);
-            state.horizontal_offset = 0.0;
         }
     }
 
@@ -416,93 +385,27 @@ where
                 .file_offset(file_index, bounds.width)
                 .clamp(0.0, max_vertical);
             state.selected_file = file_index;
-            state.horizontal_offset = 0.0;
             shell.request_redraw();
         }
 
-        match event {
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                let Some(cursor_position) = cursor.position_over(bounds) else {
-                    return;
-                };
-                let Some(scroller) = horizontal_scroller_bounds(
-                    bounds,
-                    state.horizontal_offset,
-                    self.max_horizontal_offset(bounds.width),
-                ) else {
-                    return;
-                };
+        if let Event::Mouse(mouse::Event::WheelScrolled { delta }) = event {
+            let Some(_cursor_position) = cursor.position_over(bounds) else {
+                return;
+            };
 
-                if scroller.contains(cursor_position) {
-                    state.horizontal_drag = Some(cursor_position.x - scroller.x);
-                } else if horizontal_scrollbar_bounds(bounds).contains(cursor_position) {
-                    let max_horizontal = self.max_horizontal_offset(bounds.width);
-                    state.horizontal_offset = horizontal_offset_from_cursor(
-                        bounds,
-                        max_horizontal,
-                        cursor_position.x,
-                        scroller.width / 2.0,
-                    );
-                } else {
-                    return;
-                }
+            let movement = match *delta {
+                mouse::ScrollDelta::Lines { x: _, y } => Vector::new(0.0, -y * ROW_HEIGHT * 3.0),
+                mouse::ScrollDelta::Pixels { x: _, y } => Vector::new(0.0, -y),
+            };
 
-                shell.capture_event();
-                shell.request_redraw();
+            if movement.y != 0.0 {
+                let max_vertical = (self.content_height(bounds.width) - bounds.height).max(0.0);
+                state.vertical_offset =
+                    (state.vertical_offset + movement.y).clamp(0.0, max_vertical);
             }
-            Event::Mouse(mouse::Event::CursorMoved { position }) => {
-                let Some(grab_offset) = state.horizontal_drag else {
-                    return;
-                };
 
-                let max_horizontal = self.max_horizontal_offset(bounds.width);
-                state.horizontal_offset =
-                    horizontal_offset_from_cursor(bounds, max_horizontal, position.x, grab_offset);
-                shell.capture_event();
-                shell.request_redraw();
-            }
-            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-                if state.horizontal_drag.take().is_some() {
-                    shell.capture_event();
-                    shell.request_redraw();
-                }
-            }
-            Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
-                let Some(_cursor_position) = cursor.position_over(bounds) else {
-                    return;
-                };
-
-                let mut movement = match *delta {
-                    mouse::ScrollDelta::Lines { x, y } => {
-                        Vector::new(-x * HORIZONTAL_STEP, -y * ROW_HEIGHT * 3.0)
-                    }
-                    mouse::ScrollDelta::Pixels { x, y } => Vector::new(-x, -y),
-                };
-
-                if state.shift_pressed && movement.x == 0.0 {
-                    movement.x = movement.y;
-                    movement.y = 0.0;
-                }
-
-                if movement.y != 0.0 {
-                    let max_vertical = (self.content_height(bounds.width) - bounds.height).max(0.0);
-                    state.vertical_offset =
-                        (state.vertical_offset + movement.y).clamp(0.0, max_vertical);
-                }
-
-                if movement.x != 0.0 {
-                    let max_horizontal = self.max_horizontal_offset(bounds.width);
-                    state.horizontal_offset =
-                        (state.horizontal_offset + movement.x).clamp(0.0, max_horizontal);
-                }
-
-                shell.capture_event();
-                shell.request_redraw();
-            }
-            Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
-                state.shift_pressed = modifiers.shift();
-            }
-            _ => {}
+            shell.capture_event();
+            shell.request_redraw();
         }
     }
 
@@ -661,13 +564,18 @@ where
 
             for header in &visible_file_headers {
                 let file = &self.files[header.file_index];
+                let hunk_label = if file.hunks.len() == 1 {
+                    "1 Hunk".to_owned()
+                } else {
+                    format!("{} Hunks", file.hunks.len())
+                };
                 let summary = format!(
-                    "{}  +{} -{}  {} hunk(s)",
-                    file.status,
-                    file.additions,
-                    file.deletions,
-                    file.hunks.len()
+                    "{}  +{} -{}  {}",
+                    file.status, file.additions, file.deletions, hunk_label
                 );
+                let summary_width = self
+                    .text_width(&summary)
+                    .min((bounds.width - 24.0).max(1.0));
 
                 self.draw_background(
                     renderer,
@@ -689,9 +597,9 @@ where
                     renderer,
                     &file.title,
                     TextRenderParams {
-                        width: (bounds.width - 200.0).max(1.0),
+                        width: (bounds.width - summary_width - 28.0).max(1.0),
                         height: ROW_HEIGHT,
-                        position: Point::new(bounds.x + 12.0, header.y + 5.0),
+                        position: Point::new(bounds.x + 12.0, header.y + 4.0),
                         color: self.palette.text,
                         clip_bounds: bounds,
                         wrapping: text::Wrapping::WordOrGlyph,
@@ -701,11 +609,11 @@ where
                     renderer,
                     &summary,
                     TextRenderParams {
-                        width: 180.0,
+                        width: summary_width,
                         height: ROW_HEIGHT,
                         position: Point::new(
-                            (bounds.x + bounds.width - 188.0).max(bounds.x + 12.0),
-                            header.y + 6.0,
+                            (bounds.x + bounds.width - summary_width - 8.0).max(bounds.x + 12.0),
+                            header.y + 5.0,
                         ),
                         color: self.palette.text_muted,
                         clip_bounds: bounds,
@@ -723,8 +631,8 @@ where
                         width: content_width,
                         height: METADATA_ROW_HEIGHT,
                         position: Point::new(
-                            bounds.x + GUTTER_WIDTH + PREFIX_WIDTH + 8.0 - state.horizontal_offset,
-                            metadata.y + 2.0,
+                            bounds.x + GUTTER_WIDTH + PREFIX_WIDTH + 8.0,
+                            metadata.y + 1.0,
                         ),
                         color: self.palette.text_muted,
                         clip_bounds: content_clip_bounds,
@@ -737,9 +645,9 @@ where
                 let hunk = &self.files[header.file_index].hunks[header.hunk_index];
                 self.draw_background(
                     renderer,
-                    bounds.x + GUTTER_WIDTH,
+                    bounds.x,
                     header.y + HUNK_HEADER_HEIGHT - 1.0,
-                    (bounds.width - GUTTER_WIDTH).max(1.0),
+                    bounds.width,
                     1.0,
                     self.palette.hunk_header,
                 );
@@ -758,11 +666,11 @@ where
                         width: self.text_width(&hunk.header),
                         height: HUNK_HEADER_HEIGHT,
                         position: Point::new(
-                            bounds.x + 14.0 - state.horizontal_offset,
-                            header.y + 5.0,
+                            bounds.x + GUTTER_WIDTH + PREFIX_WIDTH + 8.0,
+                            header.y + 4.0,
                         ),
-                        color: self.palette.text,
-                        clip_bounds: bounds,
+                        color: self.palette.text_muted,
+                        clip_bounds: content_clip_bounds,
                         wrapping: text::Wrapping::None,
                     },
                 );
@@ -782,30 +690,6 @@ where
                     },
                 );
             }
-
-            if let Some(scroller) = horizontal_scroller_bounds(
-                bounds,
-                state.horizontal_offset,
-                self.max_horizontal_offset(bounds.width),
-            ) {
-                let rail = horizontal_scrollbar_bounds(bounds);
-                self.draw_background(
-                    renderer,
-                    rail.x,
-                    rail.y,
-                    rail.width,
-                    rail.height,
-                    self.palette.panel,
-                );
-                self.draw_background(
-                    renderer,
-                    scroller.x,
-                    scroller.y + (scroller.height - SCROLLBAR_THUMB_THICKNESS) / 2.0,
-                    scroller.width,
-                    SCROLLBAR_THUMB_THICKNESS,
-                    self.palette.text_muted,
-                );
-            }
         });
     }
 
@@ -817,14 +701,7 @@ where
         _viewport: &Rectangle,
         _renderer: &Renderer,
     ) -> mouse::Interaction {
-        let bounds = layout.bounds();
-        let over_scrollbar = cursor
-            .position_over(bounds)
-            .is_some_and(|position| horizontal_scrollbar_bounds(bounds).contains(position));
-
-        if over_scrollbar {
-            mouse::Interaction::Pointer
-        } else if cursor.position_over(bounds).is_some() {
+        if cursor.position_over(layout.bounds()).is_some() {
             mouse::Interaction::AllScroll
         } else {
             mouse::Interaction::None
@@ -1096,50 +973,6 @@ fn byte_index_at_char(content: &str, char_index: usize) -> usize {
         .char_indices()
         .nth(char_index)
         .map_or(content.len(), |(index, _)| index)
-}
-
-fn horizontal_scrollbar_bounds(bounds: Rectangle) -> Rectangle {
-    Rectangle {
-        x: bounds.x + SCROLLBAR_MARGIN,
-        y: bounds.y + bounds.height - SCROLLBAR_THICKNESS - SCROLLBAR_MARGIN,
-        width: (bounds.width - SCROLLBAR_MARGIN * 2.0).max(1.0),
-        height: SCROLLBAR_THICKNESS,
-    }
-}
-
-fn horizontal_scroller_bounds(
-    bounds: Rectangle,
-    horizontal_offset: f32,
-    max_horizontal_offset: f32,
-) -> Option<Rectangle> {
-    if max_horizontal_offset <= 0.0 {
-        return None;
-    }
-
-    let rail = horizontal_scrollbar_bounds(bounds);
-    let content_width = bounds.width + max_horizontal_offset;
-    let width = (rail.width * bounds.width / content_width).clamp(32.0, rail.width);
-    let travel = (rail.width - width).max(1.0);
-    let x = rail.x + travel * (horizontal_offset / max_horizontal_offset).clamp(0.0, 1.0);
-
-    Some(Rectangle { x, width, ..rail })
-}
-
-fn horizontal_offset_from_cursor(
-    bounds: Rectangle,
-    max_horizontal_offset: f32,
-    cursor_x: f32,
-    grab_offset: f32,
-) -> f32 {
-    let Some(scroller) = horizontal_scroller_bounds(bounds, 0.0, max_horizontal_offset) else {
-        return 0.0;
-    };
-
-    let rail = horizontal_scrollbar_bounds(bounds);
-    let travel = (rail.width - scroller.width).max(1.0);
-    let scroller_x = (cursor_x - grab_offset).clamp(rail.x, rail.x + travel);
-
-    ((scroller_x - rail.x) / travel * max_horizontal_offset).clamp(0.0, max_horizontal_offset)
 }
 
 impl<'a, Message, Renderer> From<DiffView<'a>> for Element<'a, Message, Theme, Renderer>
