@@ -9,10 +9,13 @@ mod diff_view;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use diff_view::{DiffHunkView, DiffLine, DiffLineKind, DiffView, Palette, SyntaxKind, SyntaxSpan};
+use diff_view::{
+    DiffFileView, DiffHunkView, DiffLine, DiffLineKind, DiffView, Palette, SyntaxKind, SyntaxSpan,
+};
 use iced::{
-    Background, Border, Color, Element, Length, Shadow, Subscription, Task, Theme, keyboard,
-    widget::{button, column, container, row, scrollable, text, text::Wrapping},
+    Background, Border, Color, Element, Length, Padding, Shadow, Subscription, Task, Theme,
+    keyboard,
+    widget::{button, column, container, row, scrollable, text},
 };
 use tokio::process::Command;
 use tree_sitter::{Parser as SyntaxParser, Query, QueryCursor, StreamingIterator};
@@ -20,6 +23,9 @@ use tree_sitter::{Parser as SyntaxParser, Query, QueryCursor, StreamingIterator}
 const CODE_FONT: iced::Font = iced::Font::new("DejaVu Sans Mono");
 const CODE_TEXT_SIZE: f32 = 14.0;
 const CAPTION_TEXT_SIZE: f32 = 12.0;
+const SIDEBAR_SCROLLBAR_WIDTH: f32 = 10.0;
+const SIDEBAR_SCROLLBAR_SCROLLER_WIDTH: f32 = 7.0;
+const SIDEBAR_SCROLLBAR_SPACING: f32 = 10.0;
 
 fn main() -> iced::Result {
     let cli = Cli::parse();
@@ -607,7 +613,7 @@ async fn load_commits(repository: &Repository) -> Result<Vec<CommitSummary>> {
                     OsString::from("log"),
                     OsString::from("--no-graph"),
                     OsString::from("-r"),
-                    OsString::from("ancestors(@, 24)"),
+                    OsString::from("ancestors(@-, 24)"),
                     OsString::from("-T"),
                     OsString::from(
                         "change_id.short() ++ \"\\t\" ++ commit_id.short() ++ \"\\t\" ++ author.email() ++ \"\\t\" ++ description.first_line() ++ \"\\n\"",
@@ -1052,73 +1058,41 @@ fn build_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         .map(|repository| format!("{} / {}", repository.vcs.label(), display_scope(repository)))
         .unwrap_or_else(|| "outside repository".to_owned());
 
-    let mut files = column![
-        text("theme").size(13).color(theme.subtle_text),
-        build_theme_switcher(ui.selected_theme, theme),
-        text("commits").size(18).color(theme.text),
-        build_revision_button(
+    let mut items = column![
+        row![
+            text("history")
+                .size(18)
+                .color(theme.text)
+                .width(Length::Fill),
+            build_theme_switcher(ui.selected_theme, theme),
+        ]
+        .spacing(10),
+        text(repo_label)
+            .size(CAPTION_TEXT_SIZE)
+            .color(theme.subtle_text),
+        build_revision_item(
             "working copy",
             "uncommitted diff",
             RevisionSelection::WorkingCopy,
             &ui.selected_revision,
+            ui,
             theme
         ),
     ]
     .spacing(10);
 
     for commit in &ui.commits {
-        files = files.push(build_commit_button(commit, &ui.selected_revision, theme));
-    }
-
-    files = files.push(text("changed files").size(18).color(theme.text));
-    files = files.push(
-        text(repo_label)
-            .size(CAPTION_TEXT_SIZE)
-            .color(theme.subtle_text),
-    );
-
-    for (index, file) in ui.document.files.iter().enumerate() {
-        let selected = index == ui.selected_file;
-        let subtitle = match &file.old_path {
-            Some(old_path) if old_path != &file.path => format!("from {old_path}"),
-            _ => format!("{} hunk(s)", file.hunks.len()),
-        };
-
-        files = files.push(
-            button(
-                column![
-                    row![
-                        text(file.path.as_str())
-                            .size(14)
-                            .color(theme.text)
-                            .width(Length::Fill),
-                        build_badge(file.status.label(), file.status.badge_color(theme), theme),
-                    ]
-                    .spacing(10),
-                    row![
-                        text(subtitle)
-                            .size(CAPTION_TEXT_SIZE)
-                            .color(theme.muted_text),
-                        text(format!("+{}", file.additions))
-                            .size(CAPTION_TEXT_SIZE)
-                            .color(theme.added_text),
-                        text(format!("-{}", file.deletions))
-                            .size(CAPTION_TEXT_SIZE)
-                            .color(theme.removed_text),
-                    ]
-                    .spacing(10),
-                ]
-                .spacing(8),
-            )
-            .width(Length::Fill)
-            .padding([12, 14])
-            .style(move |_, status| sidebar_button_style(status, selected, theme))
-            .on_press(Message::SelectFile(index)),
-        );
+        items = items.push(build_commit_button(commit, ui, theme));
     }
 
     container(
-        scrollable(files.spacing(12))
+        scrollable(items.spacing(12))
+            .direction(scrollable::Direction::Vertical(
+                scrollable::Scrollbar::new()
+                    .width(SIDEBAR_SCROLLBAR_WIDTH)
+                    .scroller_width(SIDEBAR_SCROLLBAR_SCROLLER_WIDTH)
+                    .spacing(SIDEBAR_SCROLLBAR_SPACING),
+            ))
             .style(move |iced_theme, status| diff_scrollable_style(iced_theme, status, theme))
             .height(Length::Fill),
     )
@@ -1133,13 +1107,13 @@ fn build_theme_switcher(
     selected_theme: BuiltinTheme,
     theme: ThemeSpec,
 ) -> Element<'static, Message> {
-    let mut controls = row![].spacing(8);
+    let mut controls = row![].spacing(4);
 
     for candidate in BuiltinTheme::ALL {
         let selected = candidate == selected_theme;
         controls = controls.push(
             button(text(candidate.label()).size(CAPTION_TEXT_SIZE))
-                .padding([7, 10])
+                .padding([5, 8])
                 .style(move |_, status| sidebar_button_style(status, selected, theme))
                 .on_press(Message::SelectTheme(candidate)),
         );
@@ -1150,39 +1124,53 @@ fn build_theme_switcher(
 
 fn build_commit_button<'a>(
     commit: &'a CommitSummary,
-    selected_revision: &RevisionSelection,
+    ui: &'a Diffui,
     theme: ThemeSpec,
 ) -> Element<'a, Message> {
     let title = format!("{} {}", commit.change_id, commit.description);
     let subtitle = format!("{} | {}", commit.commit_id, commit.author);
 
-    build_revision_button(
+    build_revision_item(
         title,
         subtitle,
         RevisionSelection::Commit(commit.change_id.clone()),
-        selected_revision,
+        &ui.selected_revision,
+        ui,
         theme,
     )
 }
 
-fn build_revision_button<'a>(
+fn build_revision_item<'a>(
     title: impl Into<String>,
     subtitle: impl Into<String>,
     revision: RevisionSelection,
     selected_revision: &RevisionSelection,
+    ui: &'a Diffui,
     theme: ThemeSpec,
 ) -> Element<'a, Message> {
     let selected = &revision == selected_revision;
+    let title = title.into();
+    let subtitle = subtitle.into();
+    let file_count = ui.document.files.len();
 
-    button(
+    let revision_button = button(
         column![
-            text(title.into())
-                .size(13)
-                .color(theme.text)
-                .width(Length::Fill),
-            text(subtitle.into())
+            row![
+                text(title).size(13).color(theme.text).width(Length::Fill),
+                if selected {
+                    build_count_chip(file_count, theme)
+                } else {
+                    container(text("")).width(Length::Shrink).into()
+                },
+            ]
+            .spacing(8),
+            text(subtitle)
                 .size(CAPTION_TEXT_SIZE)
-                .color(theme.muted_text)
+                .color(if selected {
+                    theme.muted_text
+                } else {
+                    theme.subtle_text
+                })
                 .width(Length::Fill),
         ]
         .spacing(4),
@@ -1190,12 +1178,97 @@ fn build_revision_button<'a>(
     .width(Length::Fill)
     .padding([10, 12])
     .style(move |_, status| sidebar_button_style(status, selected, theme))
-    .on_press(Message::SelectRevision(revision))
+    .on_press(Message::SelectRevision(revision));
+
+    let mut item = column![revision_button].spacing(6);
+
+    if selected && !ui.document.files.is_empty() {
+        let mut files = column![].spacing(4);
+
+        for (index, file) in ui.document.files.iter().enumerate() {
+            files = files.push(build_nested_file_button(
+                index,
+                file,
+                index == ui.selected_file,
+                theme,
+            ));
+        }
+
+        item = item.push(
+            container(
+                row![
+                    container(text(""))
+                        .width(Length::Fixed(3.0))
+                        .height(Length::Fill)
+                        .style(move |_| sidebar_tree_rail_style(theme)),
+                    files.width(Length::Fill),
+                ]
+                .spacing(8),
+            )
+            .padding(Padding::ZERO.left(10.0)),
+        );
+    }
+
+    item.into()
+}
+
+fn build_count_chip(file_count: usize, theme: ThemeSpec) -> Element<'static, Message> {
+    let label = match file_count {
+        1 => "1 file".to_owned(),
+        count => format!("{count} files"),
+    };
+
+    container(text(label).size(CAPTION_TEXT_SIZE).color(theme.accent))
+        .padding([2, 7])
+        .style(move |_| count_chip_style(theme))
+        .into()
+}
+
+fn build_nested_file_button<'a>(
+    index: usize,
+    file: &'a DiffFile,
+    selected: bool,
+    theme: ThemeSpec,
+) -> Element<'a, Message> {
+    let subtitle = match &file.old_path {
+        Some(old_path) if old_path != &file.path => format!("from {old_path}"),
+        _ => format!("{} hunk(s)", file.hunks.len()),
+    };
+
+    button(
+        column![
+            row![
+                text(file.path.as_str())
+                    .size(CAPTION_TEXT_SIZE)
+                    .color(theme.text)
+                    .width(Length::Fill),
+                build_badge(file.status.label(), file.status.badge_color(theme), theme),
+            ]
+            .spacing(8),
+            row![
+                text(subtitle)
+                    .size(CAPTION_TEXT_SIZE)
+                    .color(theme.muted_text),
+                text(format!("+{}", file.additions))
+                    .size(CAPTION_TEXT_SIZE)
+                    .color(theme.added_text),
+                text(format!("-{}", file.deletions))
+                    .size(CAPTION_TEXT_SIZE)
+                    .color(theme.removed_text),
+            ]
+            .spacing(8),
+        ]
+        .spacing(6),
+    )
+    .width(Length::Fill)
+    .padding([7, 9])
+    .style(move |_, status| sidebar_child_button_style(status, selected, theme))
+    .on_press(Message::SelectFile(index))
     .into()
 }
 
 fn build_diff_panel(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
-    let Some(file) = ui.document.files.get(ui.selected_file) else {
+    if ui.document.files.is_empty() {
         return container(text("no diff loaded").size(16).color(theme.muted_text))
             .width(Length::Fill)
             .height(Length::Fill)
@@ -1203,82 +1276,26 @@ fn build_diff_panel(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             .center_y(Length::Fill)
             .style(move |_| panel_style(theme.panel_background, theme))
             .into();
-    };
-
-    let title = match &file.old_path {
-        Some(old_path) if old_path != &file.path => format!("{old_path} -> {}", file.path),
-        _ => file.path.clone(),
-    };
-
-    let mut content = column![
-        container(
-            column![
-                row![
-                    text(title).size(24).color(theme.text).width(Length::Fill),
-                    build_badge(file.status.label(), file.status.badge_color(theme), theme),
-                ]
-                .spacing(12),
-                row![
-                    text(format!("{} hunk(s)", file.hunks.len()))
-                        .size(CAPTION_TEXT_SIZE)
-                        .color(theme.muted_text),
-                    text(format!("+{} additions", file.additions))
-                        .size(CAPTION_TEXT_SIZE)
-                        .color(theme.added_text),
-                    text(format!("-{} deletions", file.deletions))
-                        .size(CAPTION_TEXT_SIZE)
-                        .color(theme.removed_text),
-                    text(format!("mode: {}", ui.selected_revision.label()))
-                        .size(CAPTION_TEXT_SIZE)
-                        .color(theme.subtle_text),
-                ]
-                .spacing(12),
-            ]
-            .spacing(10),
-        )
-        .padding(18)
-        .style(move |_| secondary_panel_style(theme)),
-    ]
-    .spacing(16);
-
-    if !file.metadata.is_empty() {
-        let mut metadata = column![];
-
-        for line in &file.metadata {
-            metadata = metadata.push(
-                text(line.as_str())
-                    .font(CODE_FONT)
-                    .size(CAPTION_TEXT_SIZE)
-                    .wrapping(Wrapping::None)
-                    .color(theme.muted_text),
-            );
-        }
-
-        content = content.push(
-            container(metadata.spacing(6))
-                .padding(14)
-                .style(move |_| panel_style(theme.panel_background_elevated, theme)),
-        );
     }
 
-    if file.hunks.is_empty() {
-        content = content.push(
-            container(
-                text("no hunks for this file")
-                    .size(15)
-                    .color(theme.muted_text),
-            )
-            .padding(18)
-            .style(move |_| panel_style(theme.panel_background_elevated, theme)),
-        );
-    } else {
-        content = content.push(
-            container(render_diff(file, ui.selected_file, theme))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .clip(true),
-        );
-    }
+    let files = ui
+        .document
+        .files
+        .iter()
+        .map(|file| DiffFileView {
+            title: match &file.old_path {
+                Some(old_path) if old_path != &file.path => format!("{old_path} -> {}", file.path),
+                _ => file.path.clone(),
+            },
+            status: file.status.label(),
+            metadata: &file.metadata,
+            hunks: &file.hunks,
+            additions: file.additions,
+            deletions: file.deletions,
+        })
+        .collect::<Vec<_>>();
+
+    let content = render_diff(files, ui.selected_file, theme);
 
     container(content)
         .width(Length::Fill)
@@ -1289,10 +1306,14 @@ fn build_diff_panel(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         .into()
 }
 
-fn render_diff<'a>(file: &'a DiffFile, file_key: usize, theme: ThemeSpec) -> Element<'a, Message> {
+fn render_diff<'a>(
+    files: Vec<DiffFileView<'a>>,
+    selected_file: usize,
+    theme: ThemeSpec,
+) -> Element<'a, Message> {
     DiffView::new(
-        &file.hunks,
-        file_key,
+        files,
+        selected_file,
         diff_palette(theme),
         CODE_FONT,
         CODE_TEXT_SIZE,
@@ -1317,6 +1338,7 @@ fn diff_palette(theme: ThemeSpec) -> Palette {
         conflict_marker: theme.conflict_marker,
         note_text: theme.note_text,
         panel: theme.panel_background_elevated,
+        file_header: theme.file_header,
         hunk_header: theme.hunk_header,
         addition_background: theme.added_line,
         deletion_background: theme.removed_line,
@@ -1358,6 +1380,20 @@ fn badge_style(background: Color, theme: ThemeSpec) -> container::Style {
             color: theme.border,
             ..Border::default()
         })
+}
+
+fn count_chip_style(theme: ThemeSpec) -> container::Style {
+    container::Style::default()
+        .background(theme.panel_background)
+        .border(Border {
+            width: 1.0,
+            color: theme.accent,
+            ..Border::default()
+        })
+}
+
+fn sidebar_tree_rail_style(theme: ThemeSpec) -> container::Style {
+    container::Style::default().background(theme.accent)
 }
 
 fn sidebar_button_style(status: button::Status, selected: bool, theme: ThemeSpec) -> button::Style {
@@ -1407,17 +1443,63 @@ fn sidebar_button_style(status: button::Status, selected: bool, theme: ThemeSpec
     style
 }
 
+fn sidebar_child_button_style(
+    status: button::Status,
+    selected: bool,
+    theme: ThemeSpec,
+) -> button::Style {
+    let mut style = sidebar_button_style(status, selected, theme);
+
+    if !selected {
+        style.background = Some(Background::Color(theme.panel_background));
+    }
+
+    style
+}
+
 fn diff_scrollable_style(
     iced_theme: &Theme,
     status: scrollable::Status,
     theme: ThemeSpec,
 ) -> scrollable::Style {
     let mut style = scrollable::default(iced_theme, status);
+    let hovered = matches!(
+        status,
+        scrollable::Status::Hovered {
+            is_vertical_scrollbar_hovered: true,
+            ..
+        }
+    );
+    let dragged = matches!(
+        status,
+        scrollable::Status::Dragged {
+            is_vertical_scrollbar_dragged: true,
+            ..
+        }
+    );
+    let thumb_color = if dragged {
+        theme.accent
+    } else if hovered {
+        theme.text
+    } else {
+        theme.muted_text
+    };
+
     style.container = container::Style::default();
-    style.vertical_rail.background = Some(Background::Color(theme.panel_background));
-    style.horizontal_rail.background = Some(Background::Color(theme.panel_background));
-    style.vertical_rail.scroller.background = Background::Color(theme.subtle_text);
-    style.horizontal_rail.scroller.background = Background::Color(theme.subtle_text);
+    style.vertical_rail.background = Some(Background::Color(theme.panel_background_elevated));
+    style.vertical_rail.border = Border {
+        width: 1.0,
+        color: theme.border,
+        ..Border::default()
+    };
+    style.vertical_rail.scroller.background = Background::Color(thumb_color);
+    style.vertical_rail.scroller.border = Border {
+        width: 1.0,
+        color: if dragged { theme.accent } else { theme.border },
+        ..Border::default()
+    };
+    style.horizontal_rail = style.vertical_rail;
+    style.gap = Some(Background::Color(theme.panel_background_elevated));
     style
 }
 
