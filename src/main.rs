@@ -20,7 +20,7 @@ use iced::{
 use tokio::process::Command;
 use tree_sitter::{Parser as SyntaxParser, Query, QueryCursor, StreamingIterator};
 
-const CODE_FONT: iced::Font = iced::Font::new("DejaVu Sans Mono");
+const CODE_FONT: iced::Font = iced::Font::new("Cascadia Code");
 const CODE_TEXT_SIZE: f32 = 14.0;
 const CAPTION_TEXT_SIZE: f32 = 12.0;
 const SMALL_TEXT_SIZE: f32 = 13.0;

@@ -16,25 +16,9 @@
       system:
       let
         pkgs = import nixpkgs { inherit system; };
+        inherit (pkgs) lib;
 
-        icedComet = pkgs.rustPlatform.buildRustPackage {
-          pname = "iced_comet";
-          version = "0.14.0-3f75f32";
-
-          src = pkgs.fetchFromGitHub {
-            owner = "iced-rs";
-            repo = "comet";
-            rev = "3f75f3240edc1719df584810337bc7df010327d8";
-            hash = "sha256-lwo0O8aivR4PqRZxFiiWEX7l6gNXsD0Oibn7s45XY+8=";
-          };
-
-          cargoHash = "sha256-UGCLJwCyLH5/QjvnI/HQtR04cEaenz167e78LtwSzsQ=";
-
-          nativeBuildInputs = [ pkgs.pkg-config ];
-          buildInputs = [ pkgs.openssl ];
-        };
-
-        runtimeLibs = with pkgs; [
+        linuxRuntimeLibs = with pkgs; [
           libx11
           libxcb
           libxcursor
@@ -44,11 +28,11 @@
         ];
 
         runtimeFonts = with pkgs; [
-          dejavu_fonts
           fontconfig
-          noto-fonts
-          noto-fonts-color-emoji
+          cascadia-code
         ];
+
+        darwinBuildInputs = [ pkgs.apple-sdk_15 ];
       in
       {
         devShells.default = pkgs.mkShell {
@@ -56,45 +40,51 @@
             with pkgs;
             [
               cargo
-              cargo-flamegraph
               clippy
-              icedComet
               nixfmt
-              perf
-              pkg-config
               rust-analyzer
               rustc
               rustfmt
             ]
-            ++ runtimeFonts
-            ++ runtimeLibs;
+            ++ lib.optionals stdenv.isLinux (
+              [
+                pkg-config
+              ]
+              ++ runtimeFonts
+              ++ linuxRuntimeLibs
+            );
+
+          buildInputs = lib.optionals pkgs.stdenv.isDarwin darwinBuildInputs;
 
           RUST_BACKTRACE = "1";
 
-          shellHook = ''
-            diffui_runtime_libs="${pkgs.lib.makeLibraryPath runtimeLibs}"
-            existing_ld_library_path="''${LD_LIBRARY_PATH#:}"
-            existing_xdg_data_dirs="''${XDG_DATA_DIRS#:}"
+          shellHook =
+            lib.optionalString pkgs.stdenv.isLinux ''
+              diffui_runtime_libs="${pkgs.lib.makeLibraryPath linuxRuntimeLibs}"
+              existing_ld_library_path="''${LD_LIBRARY_PATH#:}"
+              existing_xdg_data_dirs="''${XDG_DATA_DIRS#:}"
 
-            if [ -n "$existing_ld_library_path" ]; then
-              export LD_LIBRARY_PATH="$diffui_runtime_libs:$existing_ld_library_path"
-            else
-              export LD_LIBRARY_PATH="$diffui_runtime_libs"
-            fi
+              if [ -n "$existing_ld_library_path" ]; then
+                export LD_LIBRARY_PATH="$diffui_runtime_libs:$existing_ld_library_path"
+              else
+                export LD_LIBRARY_PATH="$diffui_runtime_libs"
+              fi
 
-            if [ -n "$existing_xdg_data_dirs" ]; then
-              export XDG_DATA_DIRS="${pkgs.lib.makeSearchPath "share" runtimeFonts}:$existing_xdg_data_dirs"
-            else
-              export XDG_DATA_DIRS="${pkgs.lib.makeSearchPath "share" runtimeFonts}"
-            fi
+              if [ -n "$existing_xdg_data_dirs" ]; then
+                export XDG_DATA_DIRS="${pkgs.lib.makeSearchPath "share" runtimeFonts}:$existing_xdg_data_dirs"
+              else
+                export XDG_DATA_DIRS="${pkgs.lib.makeSearchPath "share" runtimeFonts}"
+              fi
 
-            export FONTCONFIG_FILE="${pkgs.fontconfig.out}/etc/fonts/fonts.conf"
-            export FONTCONFIG_PATH="${pkgs.fontconfig.out}/etc/fonts"
-            export ICED_BACKEND="''${ICED_BACKEND:-wgpu}"
-            export WGPU_POWER_PREF="''${WGPU_POWER_PREF:-none}"
+              export FONTCONFIG_FILE="${pkgs.fontconfig.out}/etc/fonts/fonts.conf"
+              export FONTCONFIG_PATH="${pkgs.fontconfig.out}/etc/fonts"
 
-            unset diffui_runtime_libs existing_ld_library_path existing_xdg_data_dirs
-          '';
+              unset diffui_runtime_libs existing_ld_library_path existing_xdg_data_dirs
+            ''
+            + ''
+              export ICED_BACKEND="''${ICED_BACKEND:-wgpu}"
+              export WGPU_POWER_PREF="''${WGPU_POWER_PREF:-none}"
+            '';
         };
 
         formatter = pkgs.nixfmt;
