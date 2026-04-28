@@ -13,18 +13,21 @@ use diff_view::{
     DiffFileView, DiffHunkView, DiffLine, DiffLineKind, DiffView, Palette, SyntaxKind, SyntaxSpan,
 };
 use iced::{
-    Background, Border, Color, Element, Length, Shadow, Subscription, Task, Theme, alignment,
+    Background, Border, Color, Element, Font, Length, Shadow, Subscription, Task, Theme, alignment,
     keyboard, system, theme,
     widget::{button, column, container, row, scrollable, text},
 };
 use tokio::process::Command;
 use tree_sitter::{Parser as SyntaxParser, Query, QueryCursor, StreamingIterator};
 
-const CODE_FONT: iced::Font = iced::Font::new("Cascadia Code");
-const CODE_TEXT_SIZE: f32 = 14.0;
-const CAPTION_TEXT_SIZE: f32 = 12.0;
-const SMALL_TEXT_SIZE: f32 = 13.0;
-const TITLE_TEXT_SIZE: f32 = 17.0;
+#[cfg(target_os = "macos")]
+const CODE_FONT: Font = Font::new("Menlo");
+#[cfg(not(target_os = "macos"))]
+const CODE_FONT: Font = Font::new("Cascadia Code");
+const CODE_TEXT_SIZE: f32 = 13.0;
+const CAPTION_TEXT_SIZE: f32 = 13.0;
+const SMALL_TEXT_SIZE: f32 = 14.0;
+const TITLE_TEXT_SIZE: f32 = 18.0;
 const PANEL_RADIUS: f32 = 3.0;
 const CONTROL_RADIUS: f32 = 5.0;
 const SIDEBAR_WIDTH: f32 = 360.0;

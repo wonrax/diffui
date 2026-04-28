@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+
 use iced::advanced::{
     Layout, Shell, Widget, layout, mouse, renderer, text,
     widget::{Tree, tree},
@@ -14,6 +16,10 @@ const METADATA_ROW_HEIGHT: f32 = 18.0;
 const GUTTER_WIDTH: f32 = 104.0;
 const PREFIX_WIDTH: f32 = 24.0;
 const CHANGE_MARK_WIDTH: f32 = 2.0;
+const TEXT_X_PADDING: f32 = 8.0;
+const TEXT_Y_PADDING: f32 = 2.0;
+const LINE_SCROLL_ROWS: f32 = 1.5;
+const PIXEL_SCROLL_SCALE: f32 = 0.65;
 
 #[derive(Debug, Clone)]
 pub struct DiffLine {
@@ -95,11 +101,11 @@ pub struct DiffView<'a> {
     text_size: f32,
 }
 
-#[derive(Debug)]
-struct State {
+struct State<Paragraph> {
     selected_file: usize,
     pending_file_jump: Option<usize>,
     vertical_offset: f32,
+    paragraphs: RefCell<Vec<Paragraph>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -119,25 +125,6 @@ struct TextRenderParams {
     color: Color,
     clip_bounds: Rectangle,
     wrapping: text::Wrapping,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct SyntaxRenderParams {
-    fallback: Color,
-    content_width: f32,
-    position: Point,
-    clip_bounds: Rectangle,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct FragmentRenderParams {
-    line_start: usize,
-    start: usize,
-    end: usize,
-    color: Color,
-    position: Point,
-    y: f32,
-    clip_bounds: Rectangle,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -257,8 +244,13 @@ impl<'a> DiffView<'a> {
         wrapped_lines as f32 * ROW_HEIGHT
     }
 
-    fn draw_row<Renderer>(&self, renderer: &mut Renderer, line: &DiffLine, render: RowRenderParams)
-    where
+    fn draw_row<Renderer>(
+        &self,
+        renderer: &mut Renderer,
+        line: &DiffLine,
+        render: RowRenderParams,
+        paragraphs: &RefCell<Vec<Renderer::Paragraph>>,
+    ) where
         Renderer: text::Renderer<Font = Font>,
     {
         let text_color = self.line_text_color(line.kind);
@@ -272,7 +264,7 @@ impl<'a> DiffView<'a> {
             TextRenderParams {
                 width: GUTTER_WIDTH - 16.0,
                 height: ROW_HEIGHT,
-                position: Point::new(bounds.x + 8.0, render.y + 4.0),
+                position: Point::new(bounds.x + TEXT_X_PADDING, render.y + TEXT_Y_PADDING),
                 color: self.palette.text_muted,
                 clip_bounds: bounds,
                 wrapping: text::Wrapping::None,
@@ -284,41 +276,34 @@ impl<'a> DiffView<'a> {
             TextRenderParams {
                 width: PREFIX_WIDTH,
                 height: ROW_HEIGHT,
-                position: Point::new(bounds.x + GUTTER_WIDTH + 8.0, render.y + 4.0),
+                position: Point::new(
+                    bounds.x + GUTTER_WIDTH + TEXT_X_PADDING,
+                    render.y + TEXT_Y_PADDING,
+                ),
                 color: text_color,
                 clip_bounds: bounds,
                 wrapping: text::Wrapping::None,
             },
         );
 
-        let position = Point::new(bounds.x + GUTTER_WIDTH + PREFIX_WIDTH + 8.0, render.y + 4.0);
+        let position = Point::new(
+            bounds.x + GUTTER_WIDTH + PREFIX_WIDTH + TEXT_X_PADDING,
+            render.y + TEXT_Y_PADDING,
+        );
 
-        if line.syntax.is_empty() {
-            self.draw_text(
-                renderer,
-                &line.content,
-                TextRenderParams {
-                    width: render.content_width,
-                    height: render.height,
-                    position,
-                    color: text_color,
-                    clip_bounds: render.content_clip_bounds,
-                    wrapping: text::Wrapping::WordOrGlyph,
-                },
-            );
-        } else {
-            self.draw_syntax_text(
-                renderer,
-                &line.content,
-                &line.syntax,
-                SyntaxRenderParams {
-                    fallback: text_color,
-                    content_width: render.content_width,
-                    position,
-                    clip_bounds: render.content_clip_bounds,
-                },
-            );
-        }
+        self.draw_code_text(
+            renderer,
+            line,
+            TextRenderParams {
+                width: render.content_width,
+                height: render.height,
+                position,
+                color: text_color,
+                clip_bounds: render.content_clip_bounds,
+                wrapping: text::Wrapping::WordOrGlyph,
+            },
+            paragraphs,
+        );
     }
 }
 
@@ -327,19 +312,20 @@ where
     Renderer: text::Renderer<Font = Font>,
 {
     fn tag(&self) -> tree::Tag {
-        tree::Tag::of::<State>()
+        tree::Tag::of::<State<Renderer::Paragraph>>()
     }
 
     fn state(&self) -> tree::State {
-        tree::State::new(State {
+        tree::State::new(State::<Renderer::Paragraph> {
             selected_file: self.selected_file,
             pending_file_jump: None,
             vertical_offset: 0.0,
+            paragraphs: RefCell::new(Vec::new()),
         })
     }
 
     fn diff(&self, tree: &mut Tree) {
-        let state = tree.state.downcast_mut::<State>();
+        let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
 
         if state.selected_file != self.selected_file {
             state.pending_file_jump = Some(self.selected_file);
@@ -373,7 +359,7 @@ where
         _viewport: &Rectangle,
     ) {
         let bounds = layout.bounds();
-        let state = tree.state.downcast_mut::<State>();
+        let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
 
         if let Some(file_index) = state
             .pending_file_jump
@@ -394,8 +380,10 @@ where
             };
 
             let movement = match *delta {
-                mouse::ScrollDelta::Lines { x: _, y } => Vector::new(0.0, -y * ROW_HEIGHT * 3.0),
-                mouse::ScrollDelta::Pixels { x: _, y } => Vector::new(0.0, -y),
+                mouse::ScrollDelta::Lines { x: _, y } => {
+                    Vector::new(0.0, -y * ROW_HEIGHT * LINE_SCROLL_ROWS)
+                }
+                mouse::ScrollDelta::Pixels { x: _, y } => Vector::new(0.0, -y * PIXEL_SCROLL_SCALE),
             };
 
             if movement.y != 0.0 {
@@ -424,7 +412,8 @@ where
             return;
         };
 
-        let state = tree.state.downcast_ref::<State>();
+        let state = tree.state.downcast_ref::<State<Renderer::Paragraph>>();
+        state.paragraphs.borrow_mut().clear();
         let content_width = self.content_width(bounds.width);
         let content_clip_bounds = Rectangle {
             x: bounds.x + GUTTER_WIDTH + PREFIX_WIDTH,
@@ -599,7 +588,7 @@ where
                     TextRenderParams {
                         width: (bounds.width - summary_width - 28.0).max(1.0),
                         height: ROW_HEIGHT,
-                        position: Point::new(bounds.x + 12.0, header.y + 4.0),
+                        position: Point::new(bounds.x + 12.0, header.y + TEXT_Y_PADDING),
                         color: self.palette.text,
                         clip_bounds: bounds,
                         wrapping: text::Wrapping::WordOrGlyph,
@@ -613,7 +602,7 @@ where
                         height: ROW_HEIGHT,
                         position: Point::new(
                             (bounds.x + bounds.width - summary_width - 8.0).max(bounds.x + 12.0),
-                            header.y + 5.0,
+                            header.y + TEXT_Y_PADDING,
                         ),
                         color: self.palette.text_muted,
                         clip_bounds: bounds,
@@ -631,8 +620,8 @@ where
                         width: content_width,
                         height: METADATA_ROW_HEIGHT,
                         position: Point::new(
-                            bounds.x + GUTTER_WIDTH + PREFIX_WIDTH + 8.0,
-                            metadata.y + 1.0,
+                            bounds.x + GUTTER_WIDTH + PREFIX_WIDTH + TEXT_X_PADDING,
+                            metadata.y,
                         ),
                         color: self.palette.text_muted,
                         clip_bounds: content_clip_bounds,
@@ -666,8 +655,8 @@ where
                         width: self.text_width(&hunk.header),
                         height: HUNK_HEADER_HEIGHT,
                         position: Point::new(
-                            bounds.x + GUTTER_WIDTH + PREFIX_WIDTH + 8.0,
-                            header.y + 4.0,
+                            bounds.x + GUTTER_WIDTH + PREFIX_WIDTH + TEXT_X_PADDING,
+                            header.y + TEXT_Y_PADDING,
                         ),
                         color: self.palette.text_muted,
                         clip_bounds: content_clip_bounds,
@@ -688,6 +677,7 @@ where
                         height: row.height,
                         content_width,
                     },
+                    &state.paragraphs,
                 );
             }
         });
@@ -725,7 +715,7 @@ impl DiffView<'_> {
             content: content.to_owned(),
             bounds: Size::new(width.max(1.0), height.max(1.0)),
             size: Pixels(self.text_size),
-            line_height: text::LineHeight::Absolute(Pixels(ROW_HEIGHT)),
+            line_height: text::LineHeight::Absolute(Pixels(height.min(ROW_HEIGHT))),
             font: self.font,
             align_x: text::Alignment::Left,
             align_y: alignment::Vertical::Top,
@@ -775,111 +765,82 @@ impl DiffView<'_> {
         );
     }
 
-    fn draw_syntax_text<Renderer>(
+    fn draw_code_text<Renderer>(
         &self,
         renderer: &mut Renderer,
-        content: &str,
-        spans: &[SyntaxSpan],
-        render: SyntaxRenderParams,
+        line: &DiffLine,
+        render: TextRenderParams,
+        paragraphs: &RefCell<Vec<Renderer::Paragraph>>,
     ) where
         Renderer: text::Renderer<Font = Font>,
     {
-        let chars_per_line = (render.content_width / self.char_width()).floor().max(1.0) as usize;
-        let char_count = content.chars().count().max(1);
-
-        for line_start_char in (0..char_count).step_by(chars_per_line) {
-            let line_end_char = (line_start_char + chars_per_line).min(char_count);
-            let line_start_byte = byte_index_at_char(content, line_start_char);
-            let line_end_byte = byte_index_at_char(content, line_end_char);
-            let mut cursor = line_start_byte;
-            let y = render.position.y + (line_start_char / chars_per_line) as f32 * ROW_HEIGHT;
-
-            for span in spans {
-                let start = span.start.max(line_start_byte);
-                let end = span.end.min(line_end_byte);
-
-                if start >= end {
-                    continue;
-                }
-
-                if cursor < start {
-                    self.draw_text_fragment(
-                        renderer,
-                        content,
-                        FragmentRenderParams {
-                            line_start: line_start_byte,
-                            start: cursor,
-                            end: start,
-                            color: render.fallback,
-                            position: render.position,
-                            y,
-                            clip_bounds: render.clip_bounds,
-                        },
-                    );
-                }
-
-                self.draw_text_fragment(
-                    renderer,
-                    content,
-                    FragmentRenderParams {
-                        line_start: line_start_byte,
-                        start,
-                        end,
-                        color: self.syntax_color(span.kind),
-                        position: render.position,
-                        y,
-                        clip_bounds: render.clip_bounds,
-                    },
-                );
-                cursor = end;
-            }
-
-            if cursor < line_end_byte {
-                self.draw_text_fragment(
-                    renderer,
-                    content,
-                    FragmentRenderParams {
-                        line_start: line_start_byte,
-                        start: cursor,
-                        end: line_end_byte,
-                        color: render.fallback,
-                        position: render.position,
-                        y,
-                        clip_bounds: render.clip_bounds,
-                    },
-                );
-            }
+        if line.syntax.is_empty() {
+            self.draw_text(renderer, &line.content, render);
+            return;
         }
+
+        let spans = self.syntax_spans(&line.content, &line.syntax);
+        if spans.is_empty() {
+            self.draw_text(renderer, &line.content, render);
+            return;
+        }
+
+        let paragraph = <Renderer::Paragraph as text::Paragraph>::with_spans(text::Text {
+            content: spans.as_slice(),
+            bounds: Size::new(render.width.max(1.0), render.height.max(1.0)),
+            size: Pixels(self.text_size),
+            line_height: text::LineHeight::Absolute(Pixels(render.height.min(ROW_HEIGHT))),
+            font: self.font,
+            align_x: text::Alignment::Left,
+            align_y: alignment::Vertical::Top,
+            shaping: text::Shaping::Basic,
+            wrapping: render.wrapping,
+            ellipsis: text::Ellipsis::None,
+            hint_factor: None,
+        });
+
+        renderer.fill_paragraph(
+            &paragraph,
+            render.position,
+            render.color,
+            render.clip_bounds,
+        );
+        paragraphs.borrow_mut().push(paragraph);
     }
 
-    fn draw_text_fragment<Renderer>(
+    fn syntax_spans<'a>(
         &self,
-        renderer: &mut Renderer,
-        content: &str,
-        render: FragmentRenderParams,
-    ) where
-        Renderer: text::Renderer<Font = Font>,
-    {
-        let Some(fragment) = content.get(render.start..render.end) else {
-            return;
-        };
+        content: &'a str,
+        syntax: &'a [SyntaxSpan],
+    ) -> Vec<text::Span<'a, (), Font>> {
+        let mut spans = Vec::with_capacity(syntax.len().saturating_mul(2).saturating_add(1));
+        let mut cursor = 0;
 
-        let x = render.position.x
-            + content[render.line_start..render.start].chars().count() as f32 * self.char_width();
-        let width = self.text_width(fragment);
+        for span in syntax {
+            if span.start < cursor
+                || span.start >= span.end
+                || span.end > content.len()
+                || !content.is_char_boundary(span.start)
+                || !content.is_char_boundary(span.end)
+            {
+                continue;
+            }
 
-        self.draw_text(
-            renderer,
-            fragment,
-            TextRenderParams {
-                width,
-                height: ROW_HEIGHT,
-                position: Point::new(x, render.y),
-                color: render.color,
-                clip_bounds: render.clip_bounds,
-                wrapping: text::Wrapping::None,
-            },
-        );
+            if cursor < span.start {
+                spans.push(text::Span::new(&content[cursor..span.start]));
+            }
+
+            spans.push(
+                text::Span::new(&content[span.start..span.end]).color(self.syntax_color(span.kind)),
+            );
+            cursor = span.end;
+        }
+
+        if cursor < content.len() {
+            spans.push(text::Span::new(&content[cursor..]));
+        }
+
+        spans
     }
 
     fn line_text_color(&self, kind: DiffLineKind) -> Color {
@@ -915,12 +876,12 @@ impl DiffView<'_> {
     fn syntax_color(&self, kind: SyntaxKind) -> Color {
         match kind {
             SyntaxKind::Comment => self.palette.text_muted,
-            SyntaxKind::String => self.palette.note_text,
+            SyntaxKind::String => self.palette.modified_token,
             SyntaxKind::Number => self.palette.modified_token,
-            SyntaxKind::Keyword => self.palette.modified_token,
-            SyntaxKind::Function => self.palette.addition_text,
-            SyntaxKind::Type => self.palette.deletion_text,
-            SyntaxKind::Property => self.palette.text,
+            SyntaxKind::Keyword => self.palette.conflict_marker,
+            SyntaxKind::Function => self.palette.text,
+            SyntaxKind::Type => self.palette.addition_text,
+            SyntaxKind::Property => self.palette.modified_token,
             SyntaxKind::Punctuation => self.palette.text_muted,
         }
     }
@@ -966,13 +927,6 @@ fn prefix_for_kind(kind: DiffLineKind) -> &'static str {
         DiffLineKind::Context => " ",
         DiffLineKind::Note => "\\",
     }
-}
-
-fn byte_index_at_char(content: &str, char_index: usize) -> usize {
-    content
-        .char_indices()
-        .nth(char_index)
-        .map_or(content.len(), |(index, _)| index)
 }
 
 impl<'a, Message, Renderer> From<DiffView<'a>> for Element<'a, Message, Theme, Renderer>
