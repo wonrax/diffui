@@ -21,7 +21,11 @@ use diff_view::{
 use iced::{
     Background, Border, Color, Element, Font, Length, Shadow, Subscription, Task, Theme, alignment,
     keyboard, system, theme,
-    widget::{button, column, container, row, scrollable, text},
+    widget::{
+        button, column, container, row, scrollable, text,
+        text::{Ellipsis, Wrapping},
+        tooltip,
+    },
 };
 use tokio::process::Command;
 
@@ -44,6 +48,12 @@ const SIDEBAR_FILE_STAT_PADDING: f32 = 8.0;
 const SIDEBAR_SCROLLBAR_WIDTH: f32 = 10.0;
 const SIDEBAR_SCROLLBAR_SCROLLER_WIDTH: f32 = 7.0;
 const SIDEBAR_SCROLLBAR_SPACING: f32 = 10.0;
+const SIDEBAR_FILE_TEXT_CHAR_WIDTH: f32 = 7.0;
+const SIDEBAR_FILE_TEXT_RESERVED_WIDTH: f32 = SIDEBAR_FILE_RAIL_WIDTH
+    + SIDEBAR_FILE_BADGE_WIDTH
+    + SIDEBAR_FILE_STAT_MIN_WIDTH * 2.0
+    + 6.0 * 4.0
+    + 20.0;
 
 fn main() -> iced::Result {
     let cli = Cli::parse();
@@ -1239,6 +1249,8 @@ fn build_revision_item<'a>(
     if selected && loaded && !ui.document.files.is_empty() {
         let mut files = column![].spacing(0);
         let stat_width = sidebar_file_stat_widths(&ui.document.files);
+        let display_width = sidebar_file_display_width(stat_width);
+        let display_models = sidebar_file_display_models(&ui.document.files, display_width);
 
         for (index, file) in ui.document.files.iter().enumerate() {
             files = files.push(
@@ -1246,6 +1258,7 @@ fn build_revision_item<'a>(
                     build_nested_file_button(
                         index,
                         file,
+                        display_models[index].clone(),
                         index == ui.selected_file,
                         stat_width,
                         theme
@@ -1271,45 +1284,289 @@ fn build_count_chip(file_count: usize, theme: ThemeSpec) -> Element<'static, Mes
         .into()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SidebarFileDisplay {
+    primary: String,
+    secondary: String,
+    raw_path: String,
+}
+
+fn sidebar_file_display_models(
+    files: &[DiffFile],
+    available_width: f32,
+) -> Vec<SidebarFileDisplay> {
+    let mut basename_counts = HashMap::<&str, usize>::new();
+    let split_paths = files
+        .iter()
+        .map(|file| split_display_path(&file.path))
+        .inspect(|(_, basename)| {
+            *basename_counts.entry(*basename).or_default() += 1;
+        })
+        .collect::<Vec<_>>();
+
+    files
+        .iter()
+        .zip(split_paths.iter())
+        .map(|(file, (directories, basename))| {
+            let (primary, secondary) = if basename_counts.get(basename).copied() == Some(1) {
+                (
+                    (*basename).to_owned(),
+                    secondary_display_path(directories, available_width),
+                )
+            } else {
+                let group = split_paths
+                    .iter()
+                    .filter(|(_, other_basename)| other_basename == basename)
+                    .map(|(other_directories, _)| other_directories.as_slice())
+                    .collect::<Vec<_>>();
+                let suffix_len = collision_directory_suffix_len(directories, &group);
+                let split_at = directories.len().saturating_sub(suffix_len);
+                let primary_segments = directories[split_at..]
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(*basename))
+                    .collect::<Vec<_>>();
+
+                (
+                    primary_segments.join("/"),
+                    secondary_display_path(&common_directory_prefix(&group), available_width),
+                )
+            };
+
+            SidebarFileDisplay {
+                primary: truncate_primary_display(&primary, basename, available_width),
+                secondary,
+                raw_path: file.path.clone(),
+            }
+        })
+        .collect()
+}
+
+fn split_display_path(path: &str) -> (Vec<&str>, &str) {
+    let mut segments = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+
+    match segments.pop() {
+        Some(basename) => (segments, basename),
+        None => (Vec::new(), path),
+    }
+}
+
+fn collision_directory_suffix_len(directories: &[&str], group: &[&[&str]]) -> usize {
+    let max_depth = group
+        .iter()
+        .map(|other_directories| other_directories.len())
+        .max()
+        .unwrap_or(0);
+
+    for depth in 1..=max_depth {
+        let mut segments = group.iter().map(|other_directories| {
+            other_directories
+                .len()
+                .checked_sub(depth)
+                .and_then(|index| other_directories.get(index).copied())
+        });
+        let Some(first) = segments.next() else {
+            return 0;
+        };
+
+        if segments.any(|segment| segment != first) {
+            return directories.len().min(depth);
+        }
+    }
+
+    directories.len()
+}
+
+fn common_directory_prefix<'a>(group: &[&[&'a str]]) -> Vec<&'a str> {
+    let Some(first) = group.first() else {
+        return Vec::new();
+    };
+
+    first
+        .iter()
+        .enumerate()
+        .take_while(|(index, segment)| {
+            group
+                .iter()
+                .all(|directories| directories.get(*index) == Some(segment))
+        })
+        .map(|(_, segment)| *segment)
+        .collect()
+}
+
+fn secondary_display_path(segments: &[&str], available_width: f32) -> String {
+    let path = segments.join("/");
+    if path_fits_width(&path, available_width) {
+        path
+    } else {
+        abbreviate_secondary_path(segments)
+    }
+}
+
+fn path_fits_width(path: &str, available_width: f32) -> bool {
+    path.chars().count() <= max_sidebar_file_text_chars(available_width)
+}
+
+fn max_sidebar_file_text_chars(available_width: f32) -> usize {
+    (available_width / SIDEBAR_FILE_TEXT_CHAR_WIDTH)
+        .floor()
+        .max(0.0) as usize
+}
+
+fn abbreviate_secondary_path(segments: &[&str]) -> String {
+    match segments {
+        [] => String::new(),
+        [only] => (*only).to_owned(),
+        [first, rest @ .., last] => {
+            let mut abbreviated = Vec::with_capacity(segments.len());
+            abbreviated.push((*first).to_owned());
+            abbreviated.extend(
+                rest.iter()
+                    .filter_map(|segment| segment.chars().next())
+                    .map(|character| character.to_string()),
+            );
+            abbreviated.push((*last).to_owned());
+            abbreviated.join("/")
+        }
+    }
+}
+
+fn truncate_primary_display(primary: &str, basename: &str, available_width: f32) -> String {
+    let max_chars = max_sidebar_file_text_chars(available_width);
+
+    if primary.chars().count() <= max_chars || primary == basename {
+        return primary.to_owned();
+    }
+
+    let Some(prefix) = primary.strip_suffix(basename) else {
+        return primary.to_owned();
+    };
+    let prefix = prefix.trim_end_matches('/');
+    if prefix.is_empty() {
+        return primary.to_owned();
+    }
+
+    let basename_chars = basename.chars().count();
+    let separator_chars = 1;
+    let ellipsis_chars = 1;
+    if max_chars <= basename_chars + separator_chars + ellipsis_chars {
+        return basename.to_owned();
+    }
+
+    let prefix_budget = max_chars - basename_chars - separator_chars;
+    let truncated_prefix = middle_truncate(prefix, prefix_budget);
+
+    format!("{truncated_prefix}/{basename}")
+}
+
+fn middle_truncate(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_owned();
+    }
+    if max_chars <= 1 {
+        return "…".to_owned();
+    }
+
+    let keep = max_chars - 1;
+    let head_chars = keep.div_ceil(2);
+    let tail_chars = keep / 2;
+    let head = value.chars().take(head_chars).collect::<String>();
+    let tail = value
+        .chars()
+        .rev()
+        .take(tail_chars)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+
+    format!("{head}…{tail}")
+}
+
+fn sidebar_file_display_width(stat_width: SidebarFileStatWidth) -> f32 {
+    SIDEBAR_WIDTH
+        - SIDEBAR_FILE_TEXT_RESERVED_WIDTH
+        - stat_width.additions.max(SIDEBAR_FILE_STAT_MIN_WIDTH)
+        - stat_width.deletions.max(SIDEBAR_FILE_STAT_MIN_WIDTH)
+}
+
 fn build_nested_file_button<'a>(
     index: usize,
     file: &'a DiffFile,
+    display: SidebarFileDisplay,
     selected: bool,
     stat_width: SidebarFileStatWidth,
     theme: ThemeSpec,
 ) -> Element<'a, Message> {
-    button(
-        container(
-            row![
-                build_child_tree_rail(selected, theme),
-                container(build_file_status_badge(
-                    file.status.short_label(),
-                    file.status.short_badge_color(theme),
-                    theme,
-                ))
-                .width(Length::Fixed(SIDEBAR_FILE_BADGE_WIDTH)),
-                text(file.path.as_str())
-                    .size(CAPTION_TEXT_SIZE)
-                    .color(theme.text)
-                    .width(Length::Fill),
-                text(format!("+{}", file.additions))
-                    .size(CAPTION_TEXT_SIZE)
-                    .color(theme.added_text)
-                    .width(Length::Fixed(stat_width.additions)),
-                text(format!("-{}", file.deletions))
-                    .size(CAPTION_TEXT_SIZE)
-                    .color(theme.removed_text)
-                    .width(Length::Fixed(stat_width.deletions)),
-            ]
-            .spacing(6)
-            .align_y(alignment::Vertical::Center),
+    let primary = display.primary;
+    let secondary = display.secondary;
+    let raw_path = display.raw_path;
+    let path_label: Element<'a, Message> = if secondary.is_empty() {
+        text(primary)
+            .size(CAPTION_TEXT_SIZE)
+            .color(theme.text)
+            .wrapping(Wrapping::None)
+            .ellipsis(Ellipsis::End)
+            .width(Length::Fill)
+            .into()
+    } else {
+        column![
+            text(primary)
+                .size(CAPTION_TEXT_SIZE)
+                .color(theme.text)
+                .wrapping(Wrapping::None)
+                .ellipsis(Ellipsis::End)
+                .width(Length::Fill),
+            text(secondary)
+                .size(CAPTION_TEXT_SIZE - 2.0)
+                .color(theme.muted_text)
+                .wrapping(Wrapping::None)
+                .ellipsis(Ellipsis::End)
+                .width(Length::Fill),
+        ]
+        .spacing(1)
+        .width(Length::Fill)
+        .into()
+    };
+
+    tooltip(
+        button(
+            container(
+                row![
+                    build_child_tree_rail(selected, theme),
+                    container(build_file_status_badge(
+                        file.status.short_label(),
+                        file.status.short_badge_color(theme),
+                        theme,
+                    ))
+                    .width(Length::Fixed(SIDEBAR_FILE_BADGE_WIDTH)),
+                    container(path_label).width(Length::Fill),
+                    text(format!("+{}", file.additions))
+                        .size(CAPTION_TEXT_SIZE)
+                        .color(theme.added_text)
+                        .width(Length::Fixed(stat_width.additions)),
+                    text(format!("-{}", file.deletions))
+                        .size(CAPTION_TEXT_SIZE)
+                        .color(theme.removed_text)
+                        .width(Length::Fixed(stat_width.deletions)),
+                ]
+                .spacing(6)
+                .align_y(alignment::Vertical::Center),
+            )
+            .padding([5, 10]),
         )
-        .padding([5, 10]),
+        .width(Length::Fill)
+        .padding(0)
+        .style(move |_, status| sidebar_child_button_style(status, selected, theme))
+        .on_press(Message::SelectFile(index)),
+        container(text(raw_path).size(CAPTION_TEXT_SIZE).color(theme.text))
+            .padding([5, 8])
+            .style(move |_| tooltip_style(theme)),
+        tooltip::Position::Right,
     )
-    .width(Length::Fill)
-    .padding(0)
-    .style(move |_, status| sidebar_child_button_style(status, selected, theme))
-    .on_press(Message::SelectFile(index))
     .into()
 }
 
@@ -1548,6 +1805,17 @@ fn count_chip_style(theme: ThemeSpec) -> container::Style {
         })
 }
 
+fn tooltip_style(theme: ThemeSpec) -> container::Style {
+    container::Style::default()
+        .background(theme.panel_background_elevated)
+        .color(theme.text)
+        .border(Border {
+            width: 1.0,
+            color: theme.border,
+            radius: CONTROL_RADIUS.into(),
+        })
+}
+
 fn sidebar_button_style(status: button::Status, selected: bool, theme: ThemeSpec) -> button::Style {
     let background = if selected {
         theme.selected_file
@@ -1666,6 +1934,18 @@ fn display_scope(repository: &Repository) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn diff_file(path: &str) -> DiffFile {
+        DiffFile {
+            path: path.to_owned(),
+            old_path: None,
+            status: DiffFileStatus::Modified,
+            metadata: Vec::new(),
+            hunks: Vec::new(),
+            additions: 0,
+            deletions: 0,
+        }
+    }
 
     #[test]
     fn jj_root_scope_does_not_pass_empty_fileset() {
@@ -1807,5 +2087,121 @@ mod tests {
         let document = parse_backend_output(&repository, "");
 
         assert_eq!(document.files[0].path, ".");
+    }
+
+    #[test]
+    fn sidebar_display_keeps_unique_basename_primary_and_full_secondary_when_it_fits() {
+        let files = vec![diff_file("packages/frontend/src/components/Button.rs")];
+
+        let display = sidebar_file_display_models(&files, 400.0);
+
+        assert_eq!(
+            display,
+            [SidebarFileDisplay {
+                primary: "Button.rs".to_owned(),
+                secondary: "packages/frontend/src/components".to_owned(),
+                raw_path: "packages/frontend/src/components/Button.rs".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn sidebar_display_abbreviates_secondary_only_when_width_is_tight() {
+        let files = vec![diff_file("packages/frontend/src/components/Button.rs")];
+
+        let display = sidebar_file_display_models(&files, SIDEBAR_FILE_TEXT_CHAR_WIDTH * 16.0);
+
+        assert_eq!(display[0].primary, "Button.rs");
+        assert_eq!(display[0].secondary, "packages/f/s/components");
+    }
+
+    #[test]
+    fn sidebar_display_uses_shortest_unique_suffix_for_colliding_basenames() {
+        let files = vec![
+            diff_file("crates/ui/src/main.rs"),
+            diff_file("crates/cli/src/main.rs"),
+            diff_file("crates/worker/src/lib.rs"),
+        ];
+
+        let display = sidebar_file_display_models(&files, 400.0);
+
+        assert_eq!(display[0].primary, "ui/src/main.rs");
+        assert_eq!(display[0].secondary, "crates");
+        assert_eq!(display[1].primary, "cli/src/main.rs");
+        assert_eq!(display[1].secondary, "crates");
+        assert_eq!(display[2].primary, "lib.rs");
+        assert_eq!(display[2].secondary, "crates/worker/src");
+    }
+
+    #[test]
+    fn sidebar_display_collision_secondary_is_common_root_only() {
+        let files = vec![
+            diff_file("workspace/package-a/src/Button.rs"),
+            diff_file("workspace/package-b/test/Button.rs"),
+        ];
+
+        let display = sidebar_file_display_models(&files, 400.0);
+
+        assert_eq!(display[0].primary, "src/Button.rs");
+        assert_eq!(display[1].primary, "test/Button.rs");
+        assert_eq!(display[0].secondary, "workspace");
+        assert_eq!(display[1].secondary, "workspace");
+    }
+
+    #[test]
+    fn sidebar_display_handles_collision_at_repository_root() {
+        let files = vec![diff_file("src/main.rs"), diff_file("tests/main.rs")];
+
+        let display = sidebar_file_display_models(&files, 400.0);
+
+        assert_eq!(display[0].primary, "src/main.rs");
+        assert_eq!(display[0].secondary, "");
+        assert_eq!(display[1].primary, "tests/main.rs");
+        assert_eq!(display[1].secondary, "");
+    }
+
+    #[test]
+    fn sidebar_display_root_file_has_empty_secondary() {
+        let files = vec![diff_file("Cargo.lock")];
+
+        let display = sidebar_file_display_models(&files, 400.0);
+
+        assert_eq!(display[0].primary, "Cargo.lock");
+        assert_eq!(display[0].secondary, "");
+    }
+
+    #[test]
+    fn sidebar_display_preserves_root_and_leaf_secondary_segments() {
+        assert_eq!(
+            abbreviate_secondary_path(&["workspace", "packages", "frontend", "src"]),
+            "workspace/p/f/src"
+        );
+        assert_eq!(abbreviate_secondary_path(&["src"]), "src");
+        assert_eq!(abbreviate_secondary_path(&[]), "");
+    }
+
+    #[test]
+    fn sidebar_display_middle_truncates_only_prepended_primary_directories() {
+        let primary = truncate_primary_display(
+            "very/long/generated/module/path/component/Button.rs",
+            "Button.rs",
+            SIDEBAR_FILE_TEXT_CHAR_WIDTH * 24.0,
+        );
+
+        assert_eq!(primary, "very/lo…ponent/Button.rs");
+        assert_eq!(primary.chars().count(), 24);
+        assert!(primary.ends_with("/Button.rs"));
+    }
+
+    #[test]
+    fn sidebar_display_protects_basename_when_width_is_tiny() {
+        assert_eq!(
+            truncate_primary_display(
+                "deeply/nested/source/Button.rs",
+                "Button.rs",
+                SIDEBAR_FILE_TEXT_CHAR_WIDTH * 6.0,
+            ),
+            "Button.rs"
+        );
     }
 }
