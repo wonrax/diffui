@@ -96,6 +96,7 @@ pub struct Palette {
 pub struct DiffView<'a> {
     files: Vec<DiffFileView<'a>>,
     selected_file: usize,
+    revision_key: String,
     palette: Palette,
     font: Font,
     text_size: f32,
@@ -103,6 +104,7 @@ pub struct DiffView<'a> {
 
 struct State<Paragraph> {
     selected_file: usize,
+    revision_key: String,
     pending_file_jump: Option<usize>,
     vertical_offset: f32,
     paragraphs: RefCell<Vec<Paragraph>>,
@@ -167,6 +169,7 @@ impl<'a> DiffView<'a> {
     pub fn new(
         files: Vec<DiffFileView<'a>>,
         selected_file: usize,
+        revision_key: impl Into<String>,
         palette: Palette,
         font: Font,
         text_size: f32,
@@ -174,6 +177,7 @@ impl<'a> DiffView<'a> {
         Self {
             files,
             selected_file,
+            revision_key: revision_key.into(),
             palette,
             font,
             text_size,
@@ -318,6 +322,7 @@ where
     fn state(&self) -> tree::State {
         tree::State::new(State::<Renderer::Paragraph> {
             selected_file: self.selected_file,
+            revision_key: self.revision_key.clone(),
             pending_file_jump: None,
             vertical_offset: 0.0,
             paragraphs: RefCell::new(Vec::new()),
@@ -326,6 +331,14 @@ where
 
     fn diff(&self, tree: &mut Tree) {
         let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
+
+        if state.revision_key != self.revision_key {
+            state.revision_key = self.revision_key.clone();
+            state.vertical_offset = 0.0;
+            state.selected_file = self.selected_file;
+            state.pending_file_jump = Some(self.selected_file);
+            return;
+        }
 
         if state.selected_file != self.selected_file {
             state.pending_file_jump = Some(self.selected_file);
@@ -360,13 +373,18 @@ where
     ) {
         let bounds = layout.bounds();
         let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
+        let max_vertical = (self.content_height(bounds.width) - bounds.height).max(0.0);
+
+        if state.vertical_offset > max_vertical {
+            state.vertical_offset = max_vertical;
+            shell.request_redraw();
+        }
 
         if let Some(file_index) = state
             .pending_file_jump
             .take()
             .or_else(|| (state.selected_file != self.selected_file).then_some(self.selected_file))
         {
-            let max_vertical = (self.content_height(bounds.width) - bounds.height).max(0.0);
             state.vertical_offset = self
                 .file_offset(file_index, bounds.width)
                 .clamp(0.0, max_vertical);

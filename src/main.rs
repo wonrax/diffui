@@ -40,20 +40,17 @@ const TITLE_TEXT_SIZE: f32 = 18.0;
 const PANEL_RADIUS: f32 = 3.0;
 const CONTROL_RADIUS: f32 = 5.0;
 const SIDEBAR_WIDTH: f32 = 360.0;
-const SIDEBAR_FILE_RAIL_WIDTH: f32 = 5.0;
 const SIDEBAR_FILE_BADGE_WIDTH: f32 = 24.0;
 const SIDEBAR_FILE_STAT_MIN_WIDTH: f32 = 24.0;
 const SIDEBAR_FILE_STAT_CHAR_WIDTH: f32 = 7.0;
 const SIDEBAR_FILE_STAT_PADDING: f32 = 8.0;
+const REVISION_CHIP_HEIGHT: f32 = 20.0;
 const SIDEBAR_SCROLLBAR_WIDTH: f32 = 10.0;
 const SIDEBAR_SCROLLBAR_SCROLLER_WIDTH: f32 = 7.0;
 const SIDEBAR_SCROLLBAR_SPACING: f32 = 10.0;
 const SIDEBAR_FILE_TEXT_CHAR_WIDTH: f32 = 7.0;
-const SIDEBAR_FILE_TEXT_RESERVED_WIDTH: f32 = SIDEBAR_FILE_RAIL_WIDTH
-    + SIDEBAR_FILE_BADGE_WIDTH
-    + SIDEBAR_FILE_STAT_MIN_WIDTH * 2.0
-    + 6.0 * 4.0
-    + 20.0;
+const SIDEBAR_FILE_TEXT_RESERVED_WIDTH: f32 =
+    SIDEBAR_FILE_BADGE_WIDTH + SIDEBAR_FILE_STAT_MIN_WIDTH * 2.0 + 6.0 * 4.0 + 20.0;
 
 fn main() -> iced::Result {
     let cli = Cli::parse();
@@ -83,6 +80,7 @@ struct Diffui {
     document: DiffDocument,
     commits: Vec<CommitSummary>,
     selected_revision: RevisionSelection,
+    expanded_revision: RevisionSelection,
     pending_revision: Option<RevisionSelection>,
     selected_theme: ThemePreference,
     system_theme: theme::Mode,
@@ -105,7 +103,7 @@ enum Vcs {
 #[derive(Debug, Clone)]
 enum LoadStatus {
     Loading,
-    Loaded(String),
+    Loaded,
     Failed(String),
 }
 
@@ -116,10 +114,10 @@ enum RevisionSelection {
 }
 
 impl RevisionSelection {
-    fn label(&self) -> &'static str {
+    fn view_key(&self) -> String {
         match self {
-            Self::WorkingCopy => "Working Copy",
-            Self::Commit(_) => "Selected Commit",
+            Self::WorkingCopy => "working-copy".to_owned(),
+            Self::Commit(change_id) => format!("commit:{change_id}"),
         }
     }
 }
@@ -129,6 +127,14 @@ struct DiffDocument {
     files: Vec<DiffFile>,
     total_additions: usize,
     total_deletions: usize,
+}
+
+impl DiffDocument {
+    fn has_changes(&self) -> bool {
+        self.total_additions > 0
+            || self.total_deletions > 0
+            || self.files.iter().any(|file| !file.hunks.is_empty())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -148,6 +154,8 @@ struct CommitSummary {
     commit_id: String,
     description: String,
     author: String,
+    has_description: bool,
+    is_empty: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,7 +179,6 @@ enum Message {
 
 #[derive(Debug, Clone)]
 struct BackendOutput {
-    summary: String,
     document: DiffDocument,
     commits: Vec<CommitSummary>,
 }
@@ -343,6 +350,7 @@ impl Diffui {
                         document: DiffDocument::default(),
                         commits: Vec::new(),
                         selected_revision: RevisionSelection::WorkingCopy,
+                        expanded_revision: RevisionSelection::WorkingCopy,
                         pending_revision: Some(RevisionSelection::WorkingCopy),
                         selected_theme: ThemePreference::System,
                         system_theme: theme::Mode::None,
@@ -358,6 +366,7 @@ impl Diffui {
                     document: DiffDocument::default(),
                     commits: Vec::new(),
                     selected_revision: RevisionSelection::WorkingCopy,
+                    expanded_revision: RevisionSelection::WorkingCopy,
                     pending_revision: None,
                     selected_theme: ThemePreference::System,
                     system_theme: theme::Mode::None,
@@ -375,10 +384,11 @@ impl Diffui {
                     return Task::none();
                 }
 
-                let revision_changed = self.selected_revision != revision;
+                let revision_changed = self.expanded_revision != revision;
                 self.selected_revision = revision;
+                self.expanded_revision = self.selected_revision.clone();
                 self.pending_revision = None;
-                self.status = LoadStatus::Loaded(output.summary);
+                self.status = LoadStatus::Loaded;
                 self.document = output.document;
                 self.commits = output.commits;
                 self.selected_file = if revision_changed {
@@ -406,7 +416,9 @@ impl Diffui {
                     && self.pending_revision.as_ref() != Some(&selection)
                     && let Some(repository) = self.repository.clone()
                 {
+                    self.selected_revision = selection.clone();
                     self.pending_revision = Some(selection.clone());
+                    self.status = LoadStatus::Loading;
                     let revision = selection.clone();
                     return Task::perform(load_backend(repository, selection), move |result| {
                         Message::BackendLoaded(revision, result)
@@ -591,18 +603,7 @@ async fn run_backend(repository: Repository, revision: RevisionSelection) -> Res
     let output = run_command(&repository.root, program, args).await?;
     let document = parse_backend_output(&repository, &output);
 
-    Ok(BackendOutput {
-        summary: format!(
-            "Loaded {} {}: {} file(s), {} addition(s), {} deletion(s)",
-            repository.vcs.label(),
-            revision.label(),
-            document.files.len(),
-            document.total_additions,
-            document.total_deletions,
-        ),
-        document,
-        commits,
-    })
+    Ok(BackendOutput { document, commits })
 }
 
 fn backend_command(
@@ -680,7 +681,7 @@ async fn load_commits(repository: &Repository) -> Result<Vec<CommitSummary>> {
                     OsString::from("ancestors(@-, 24)"),
                     OsString::from("-T"),
                     OsString::from(
-                        "change_id.short() ++ \"\\t\" ++ commit_id.short() ++ \"\\t\" ++ author.email() ++ \"\\t\" ++ description.first_line() ++ \"\\n\"",
+                        "change_id.short() ++ \"\\t\" ++ commit_id.short() ++ \"\\t\" ++ author.email() ++ \"\\t\" ++ empty ++ \"\\t\" ++ description.first_line() ++ \"\\n\"",
                     ),
                 ],
             )
@@ -695,7 +696,7 @@ async fn load_commits(repository: &Repository) -> Result<Vec<CommitSummary>> {
                 vec![
                     OsString::from("log"),
                     OsString::from("--max-count=24"),
-                    OsString::from("--pretty=format:%h%x09%H%x09%ae%x09%s"),
+                    OsString::from("--pretty=format:%h%x09%H%x09%ae%x09%x09%s"),
                 ],
             )
             .await?;
@@ -713,12 +714,19 @@ fn parse_commit_log(output: &str) -> Vec<CommitSummary> {
             let change_id = parts.next()?.trim();
             let commit_id = parts.next()?.trim();
             let author = parts.next()?.trim();
-            let description = parts.next().unwrap_or("").trim();
+            let remainder = parts.next().unwrap_or("");
+            let (empty, description) =
+                if let Some((empty, description)) = remainder.split_once('\t') {
+                    (parse_optional_bool(empty.trim()), description.trim())
+                } else {
+                    (None, remainder.trim())
+                };
 
             if change_id.is_empty() || commit_id.is_empty() {
                 return None;
             }
 
+            let has_description = !description.is_empty();
             Some(CommitSummary {
                 change_id: change_id.to_owned(),
                 commit_id: commit_id.to_owned(),
@@ -728,9 +736,19 @@ fn parse_commit_log(output: &str) -> Vec<CommitSummary> {
                     description.to_owned()
                 },
                 author: author.to_owned(),
+                has_description,
+                is_empty: empty,
             })
         })
         .collect()
+}
+
+fn parse_optional_bool(value: &str) -> Option<bool> {
+    match value {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
 }
 
 fn parse_backend_output(repository: &Repository, output: &str) -> DiffDocument {
@@ -1074,11 +1092,6 @@ fn build_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         .as_ref()
         .map(|repository| format!("{} / {}", repository.vcs.label(), display_scope(repository)))
         .unwrap_or_else(|| "Outside Repository".to_owned());
-    let status = match &ui.status {
-        LoadStatus::Loading => "Loading Changes...".to_owned(),
-        LoadStatus::Loaded(summary) => summary.clone(),
-        LoadStatus::Failed(error) => format!("Failed: {error}"),
-    };
     let metrics = row![
         text(format_count(ui.document.files.len(), "File", "Files"))
             .size(CAPTION_TEXT_SIZE)
@@ -1093,47 +1106,38 @@ fn build_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     .spacing(10)
     .align_y(alignment::Vertical::Center);
 
-    let sidebar_header = container(
-        column![
-            row![
-                text("Changes")
-                    .size(TITLE_TEXT_SIZE)
-                    .color(theme.text)
-                    .width(Length::Fill),
-                build_theme_switcher(ui.selected_theme, theme),
-            ]
-            .spacing(10),
-            row![
-                build_badge(ui.selected_revision.label(), theme.selected_file, theme),
-                metrics,
-            ]
-            .spacing(8)
-            .align_y(alignment::Vertical::Center),
-            text(repo_label)
-                .size(CAPTION_TEXT_SIZE)
-                .color(theme.subtle_text),
-            text(status).size(CAPTION_TEXT_SIZE).color(theme.muted_text),
+    let mut header_content = column![
+        row![
+            text("Changes")
+                .size(TITLE_TEXT_SIZE)
+                .color(theme.text)
+                .width(Length::Fill),
+            build_theme_switcher(ui.selected_theme, theme),
         ]
-        .spacing(7),
-    )
-    .padding([12, 12])
-    .style(move |_| sidebar_header_style(theme));
-
-    let mut items = column![
-        sidebar_header,
-        build_revision_item(
-            "Working Copy",
-            "Uncommitted Changes",
-            RevisionSelection::WorkingCopy,
-            &ui.selected_revision,
-            ui,
-            theme
-        ),
+        .spacing(10),
+        metrics,
+        text(repo_label)
+            .size(CAPTION_TEXT_SIZE)
+            .color(theme.subtle_text),
     ]
-    .spacing(0);
+    .spacing(7);
+
+    if let LoadStatus::Failed(error) = &ui.status {
+        header_content = header_content.push(
+            text(format!("Failed: {error}"))
+                .size(CAPTION_TEXT_SIZE)
+                .color(theme.removed_text),
+        );
+    }
+
+    let sidebar_header = container(header_content)
+        .padding([12, 12])
+        .style(move |_| sidebar_header_style(theme));
+
+    let mut items = column![sidebar_header, build_working_copy_button(ui, theme),].spacing(0);
 
     for commit in &ui.commits {
-        items = items.push(build_commit_button(commit, ui, theme));
+        items = items.push(build_commit_button(commit, &ui.commits, ui, theme));
     }
 
     container(
@@ -1172,70 +1176,201 @@ fn build_theme_switcher(
     controls.into()
 }
 
-fn build_commit_button<'a>(
-    commit: &'a CommitSummary,
-    ui: &'a Diffui,
-    theme: ThemeSpec,
-) -> Element<'a, Message> {
-    let title = format!("{} {}", commit.change_id, commit.description);
-    let subtitle = format!("{} · {}", commit.commit_id, commit.author);
+fn build_working_copy_button(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
+    let mut indicators = vec![RevisionIndicator::WorkingCopy];
+    let revision = RevisionSelection::WorkingCopy;
 
-    build_revision_item(
-        title,
-        subtitle,
-        RevisionSelection::Commit(commit.change_id.clone()),
+    if revision == ui.expanded_revision
+        && matches!(ui.status, LoadStatus::Loaded)
+        && !ui.document.has_changes()
+    {
+        indicators.push(RevisionIndicator::Empty);
+    }
+
+    let title = row![
+        text("Working Copy")
+            .size(SMALL_TEXT_SIZE)
+            .color(theme.text)
+            .wrapping(Wrapping::Glyph),
+        build_revision_metadata(indicators, &revision, ui, theme),
+    ]
+    .spacing(8)
+    .align_y(alignment::Vertical::Center);
+
+    build_revision_item_with_content(
+        title.into(),
+        "Uncommitted Changes",
+        None,
+        revision,
         &ui.selected_revision,
         ui,
         theme,
     )
 }
 
-fn build_revision_item<'a>(
-    title: impl Into<String>,
-    subtitle: impl Into<String>,
+#[derive(Debug, Clone, Copy)]
+enum RevisionIndicator {
+    WorkingCopy,
+    Empty,
+    NoDescription,
+}
+
+impl RevisionIndicator {
+    fn label(self) -> &'static str {
+        match self {
+            Self::WorkingCopy => "wip",
+            Self::Empty => "empty",
+            Self::NoDescription => "no desc",
+        }
+    }
+
+    fn colors(self, theme: ThemeSpec) -> (Color, Color) {
+        match self {
+            Self::WorkingCopy => (theme.selected_file, theme.accent),
+            Self::Empty => (theme.panel_background, theme.subtle_text),
+            Self::NoDescription => (theme.note_background, theme.note_text),
+        }
+    }
+}
+
+fn build_commit_button<'a>(
+    commit: &'a CommitSummary,
+    commits: &'a [CommitSummary],
+    ui: &'a Diffui,
+    theme: ThemeSpec,
+) -> Element<'a, Message> {
+    let unique_len = shortest_unique_prefix_len(&commit.change_id, commits);
+    let id_prefix = commit
+        .change_id
+        .chars()
+        .take(unique_len)
+        .collect::<String>();
+    let id_suffix = commit
+        .change_id
+        .chars()
+        .skip(unique_len)
+        .collect::<String>();
+    let revision = RevisionSelection::Commit(commit.change_id.clone());
+    let detail = format!("{} · {}", commit.commit_id, commit.author);
+    let mut indicators = Vec::new();
+    if !commit.has_description {
+        indicators.push(RevisionIndicator::NoDescription);
+    }
+    if let Some(is_empty) = commit.is_empty
+        && is_empty
+    {
+        indicators.push(RevisionIndicator::Empty);
+    }
+
+    let title = row![
+        row![
+            text(id_prefix).size(SMALL_TEXT_SIZE).color(theme.accent),
+            text(id_suffix)
+                .size(SMALL_TEXT_SIZE)
+                .color(theme.subtle_text),
+        ]
+        .spacing(0),
+        build_revision_metadata(indicators, &revision, ui, theme),
+    ]
+    .spacing(8)
+    .align_y(alignment::Vertical::Center);
+
+    build_revision_item_with_content(
+        title.into(),
+        &commit.description,
+        Some(detail),
+        revision,
+        &ui.selected_revision,
+        ui,
+        theme,
+    )
+}
+
+fn build_revision_metadata<'a>(
+    indicators: impl IntoIterator<Item = RevisionIndicator>,
+    revision: &RevisionSelection,
+    ui: &Diffui,
+    theme: ThemeSpec,
+) -> Element<'a, Message> {
+    let mut row = row![].spacing(4).align_y(alignment::Vertical::Center);
+
+    for indicator in indicators {
+        let (background, text_color) = indicator.colors(theme);
+        row = row.push(build_revision_chip(
+            indicator.label(),
+            background,
+            text_color,
+            theme,
+        ));
+    }
+
+    if revision == &ui.expanded_revision && matches!(ui.status, LoadStatus::Loaded) {
+        row = row.push(build_revision_chip(
+            format_count(ui.document.files.len(), "file", "files"),
+            theme.panel_background,
+            theme.accent,
+            theme,
+        ));
+    }
+
+    row.into()
+}
+
+fn build_revision_chip<'a>(
+    label: impl Into<String>,
+    background: Color,
+    text_color: Color,
+    theme: ThemeSpec,
+) -> Element<'a, Message> {
+    container(
+        text(label.into())
+            .size(CAPTION_TEXT_SIZE)
+            .color(text_color)
+            .wrapping(Wrapping::None),
+    )
+    .height(Length::Fixed(REVISION_CHIP_HEIGHT))
+    .padding([1, 6])
+    .style(move |_| indicator_chip_style(background, theme))
+    .into()
+}
+
+fn build_revision_item_with_content<'a>(
+    title: Element<'a, Message>,
+    description: impl Into<String>,
+    detail: Option<String>,
     revision: RevisionSelection,
     selected_revision: &RevisionSelection,
     ui: &'a Diffui,
     theme: ThemeSpec,
 ) -> Element<'a, Message> {
     let selected = &revision == selected_revision;
-    let title = title.into();
-    let subtitle = subtitle.into();
-    let loaded = matches!(ui.status, LoadStatus::Loaded(_));
-    let file_count = if loaded { ui.document.files.len() } else { 0 };
+    let expanded = revision == ui.expanded_revision;
+    let description = description.into();
+    let loaded = matches!(ui.status, LoadStatus::Loaded);
+
+    let mut labels = column![
+        title,
+        text(description)
+            .size(SMALL_TEXT_SIZE)
+            .color(theme.text)
+            .width(Length::Fill)
+            .wrapping(Wrapping::Glyph),
+    ]
+    .spacing(4);
+
+    if let Some(detail) = detail {
+        labels = labels.push(
+            text(detail)
+                .size(CAPTION_TEXT_SIZE)
+                .color(theme.subtle_text)
+                .width(Length::Fill),
+        );
+    }
 
     let revision_button = button(container(
         row![
             build_selection_gutter(selected, theme),
-            container(
-                column![
-                    row![
-                        text(title)
-                            .size(SMALL_TEXT_SIZE)
-                            .color(theme.text)
-                            .width(Length::Fill),
-                        if selected {
-                            build_count_chip(file_count, theme)
-                        } else {
-                            container(text(""))
-                                .width(Length::Fixed(SIDEBAR_FILE_STAT_MIN_WIDTH))
-                                .into()
-                        },
-                    ]
-                    .spacing(8),
-                    text(subtitle)
-                        .size(CAPTION_TEXT_SIZE)
-                        .color(if selected {
-                            theme.muted_text
-                        } else {
-                            theme.subtle_text
-                        })
-                        .width(Length::Fill),
-                ]
-                .spacing(4),
-            )
-            .padding([9, 10])
-            .width(Length::Fill),
+            container(labels,).padding([9, 10]).width(Length::Fill),
         ]
         .spacing(0),
     ))
@@ -1246,7 +1381,7 @@ fn build_revision_item<'a>(
 
     let mut item = column![revision_button, build_sidebar_divider(theme)].spacing(0);
 
-    if selected && loaded && !ui.document.files.is_empty() {
+    if expanded && loaded && !ui.document.files.is_empty() {
         let mut files = column![].spacing(0);
         let stat_width = sidebar_file_stat_widths(&ui.document.files);
         let display_width = sidebar_file_display_width(stat_width);
@@ -1275,13 +1410,19 @@ fn build_revision_item<'a>(
     item.into()
 }
 
-fn build_count_chip(file_count: usize, theme: ThemeSpec) -> Element<'static, Message> {
-    let label = format_count(file_count, "File", "Files");
+fn shortest_unique_prefix_len(change_id: &str, commits: &[CommitSummary]) -> usize {
+    let total_len = change_id.chars().count();
 
-    container(text(label).size(CAPTION_TEXT_SIZE).color(theme.accent))
-        .padding([2, 7])
-        .style(move |_| count_chip_style(theme))
-        .into()
+    (1..=total_len)
+        .find(|prefix_len| {
+            let prefix = change_id.chars().take(*prefix_len).collect::<String>();
+            commits
+                .iter()
+                .filter(|commit| commit.change_id.starts_with(&prefix))
+                .count()
+                == 1
+        })
+        .unwrap_or(total_len)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1536,7 +1677,6 @@ fn build_nested_file_button<'a>(
         button(
             container(
                 row![
-                    build_child_tree_rail(selected, theme),
                     container(build_file_status_badge(
                         file.status.short_label(),
                         file.status.short_badge_color(theme),
@@ -1604,8 +1744,8 @@ fn prefixed_count_len(count: usize) -> usize {
 }
 
 fn build_diff_panel(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
-    if matches!(ui.status, LoadStatus::Loading) {
-        return container(text("Loading Changes...").size(16).color(theme.muted_text))
+    if matches!(ui.status, LoadStatus::Loading) && ui.document.files.is_empty() {
+        return container(text(""))
             .width(Length::Fill)
             .height(Length::Fill)
             .center_x(Length::Fill)
@@ -1641,7 +1781,12 @@ fn build_diff_panel(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         })
         .collect::<Vec<_>>();
 
-    let content = render_diff(files, ui.selected_file, theme);
+    let content = render_diff(
+        files,
+        ui.selected_file,
+        ui.selected_revision.view_key(),
+        theme,
+    );
 
     container(content)
         .width(Length::Fill)
@@ -1655,23 +1800,18 @@ fn build_diff_panel(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
 fn render_diff<'a>(
     files: Vec<DiffFileView<'a>>,
     selected_file: usize,
+    revision_key: String,
     theme: ThemeSpec,
 ) -> Element<'a, Message> {
     DiffView::new(
         files,
         selected_file,
+        revision_key,
         diff_palette(theme),
         CODE_FONT,
         CODE_TEXT_SIZE,
     )
     .into()
-}
-
-fn build_badge<'a>(label: &'a str, background: Color, theme: ThemeSpec) -> Element<'a, Message> {
-    container(text(label).size(CAPTION_TEXT_SIZE).color(theme.text))
-        .padding([4, 10])
-        .style(move |_| badge_style(background, theme))
-        .into()
 }
 
 fn build_selection_gutter(selected: bool, theme: ThemeSpec) -> Element<'static, Message> {
@@ -1690,19 +1830,6 @@ fn build_selection_stripe(theme: ThemeSpec) -> Element<'static, Message> {
         .width(Length::Fixed(3.0))
         .height(Length::Fill)
         .style(move |_| stripe_style(theme.accent, CONTROL_RADIUS))
-        .into()
-}
-
-fn build_child_tree_rail(selected: bool, theme: ThemeSpec) -> Element<'static, Message> {
-    container(text(""))
-        .width(Length::Fixed(SIDEBAR_FILE_RAIL_WIDTH))
-        .height(Length::Fill)
-        .style(move |_| {
-            stripe_style(
-                if selected { theme.accent } else { theme.border },
-                CONTROL_RADIUS,
-            )
-        })
         .into()
 }
 
@@ -1795,12 +1922,12 @@ fn sidebar_divider_style(theme: ThemeSpec) -> container::Style {
     container::Style::default().background(theme.border)
 }
 
-fn count_chip_style(theme: ThemeSpec) -> container::Style {
+fn indicator_chip_style(background: Color, theme: ThemeSpec) -> container::Style {
     container::Style::default()
-        .background(theme.panel_background)
+        .background(background)
         .border(Border {
             width: 1.0,
-            color: theme.accent,
+            color: theme.border,
             radius: CONTROL_RADIUS.into(),
         })
 }
@@ -1998,13 +2125,36 @@ mod tests {
 
     #[test]
     fn parses_commit_log_rows() {
-        let commits = parse_commit_log("abc\tdef\tme@example.com\tadd commit sidebar\n");
+        let commits = parse_commit_log("abc\tdef\tme@example.com\tfalse\tadd commit sidebar\n");
 
         assert_eq!(commits.len(), 1);
         assert_eq!(commits[0].change_id, "abc");
         assert_eq!(commits[0].commit_id, "def");
         assert_eq!(commits[0].author, "me@example.com");
         assert_eq!(commits[0].description, "add commit sidebar");
+        assert!(commits[0].has_description);
+        assert_eq!(commits[0].is_empty, Some(false));
+    }
+
+    #[test]
+    fn parses_commit_log_rows_without_description() {
+        let commits = parse_commit_log("abc\tdef\tme@example.com\ttrue\t\n");
+
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].description, "(no description set)");
+        assert!(!commits[0].has_description);
+        assert_eq!(commits[0].is_empty, Some(true));
+    }
+
+    #[test]
+    fn revision_id_prefix_uses_shortest_unique_change_id() {
+        let commits = parse_commit_log(
+            "abc\tone\tme@example.com\tfalse\tfirst\nabd\ttwo\tme@example.com\tfalse\tsecond\nz\three\tme@example.com\ttrue\tthird\n",
+        );
+
+        assert_eq!(shortest_unique_prefix_len("abc", &commits), 3);
+        assert_eq!(shortest_unique_prefix_len("abd", &commits), 3);
+        assert_eq!(shortest_unique_prefix_len("z", &commits), 1);
     }
 
     #[test]
