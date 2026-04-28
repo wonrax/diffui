@@ -1,13 +1,19 @@
 use std::{
+    collections::HashMap,
     env,
     ffi::OsString,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::{Arc, OnceLock},
 };
 
 mod diff_view;
 
 use anyhow::{Context, Result, bail};
+use arborium::{
+    GrammarStore,
+    advanced::{CompiledGrammar, ParseContext},
+};
 use clap::Parser;
 use diff_view::{
     DiffFileView, DiffHunkView, DiffLine, DiffLineKind, DiffView, Palette, SyntaxKind, SyntaxSpan,
@@ -18,7 +24,6 @@ use iced::{
     widget::{button, column, container, row, scrollable, text},
 };
 use tokio::process::Command;
-use tree_sitter::{Parser as SyntaxParser, Query, QueryCursor, StreamingIterator};
 
 #[cfg(target_os = "macos")]
 const CODE_FONT: Font = Font::new("Menlo");
@@ -903,19 +908,16 @@ fn is_conflict_marker(line: &str) -> bool {
 }
 
 fn apply_syntax_highlighting(file: &mut DiffFile) {
-    if !file.path.ends_with(".rs") {
-        return;
-    }
+    static GRAMMAR_STORE: OnceLock<GrammarStore> = OnceLock::new();
 
-    let language = tree_sitter_rust::LANGUAGE.into();
-    let Ok(query) = Query::new(&language, tree_sitter_rust::HIGHLIGHTS_QUERY) else {
+    let Some(language) = arborium::detect_language(&file.path) else {
         return;
     };
-
-    let mut parser = SyntaxParser::new();
-    if parser.set_language(&language).is_err() {
+    let store = GRAMMAR_STORE.get_or_init(GrammarStore::new);
+    let Some(grammar) = store.get(language) else {
         return;
-    }
+    };
+    let mut contexts = HashMap::new();
 
     for hunk in &mut file.hunks {
         for line in &mut hunk.lines {
@@ -923,38 +925,41 @@ fn apply_syntax_highlighting(file: &mut DiffFile) {
                 continue;
             }
 
-            line.syntax = highlight_rust_line(&mut parser, &query, &line.content);
+            line.syntax = highlight_line(language, grammar.clone(), &mut contexts, &line.content);
         }
     }
 }
 
-fn highlight_rust_line(parser: &mut SyntaxParser, query: &Query, content: &str) -> Vec<SyntaxSpan> {
+fn highlight_line(
+    language: &str,
+    grammar: Arc<CompiledGrammar>,
+    contexts: &mut HashMap<String, ParseContext>,
+    content: &str,
+) -> Vec<SyntaxSpan> {
     if content.trim().is_empty() {
         return Vec::new();
     }
 
-    let Some(tree) = parser.parse(content, None) else {
-        return Vec::new();
+    let context = match contexts.entry(language.to_owned()) {
+        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            let Ok(context) = ParseContext::for_grammar(&grammar) else {
+                return Vec::new();
+            };
+            entry.insert(context)
+        }
     };
-
-    let mut cursor = QueryCursor::new();
-    let mut captures = cursor.captures(query, tree.root_node(), content.as_bytes());
-    let capture_names = query.capture_names();
+    let result = grammar.parse(context, content);
     let mut spans = Vec::new();
 
-    while let Some((query_match, capture_index)) = captures.next() {
-        let Some(capture) = query_match.captures.get(*capture_index) else {
-            continue;
-        };
-        let Some(capture_name) = capture_names.get(capture.index as usize) else {
-            continue;
-        };
-        let Some(kind) = syntax_kind_for_capture(capture_name) else {
+    for span in result.spans {
+        let Some(kind) = syntax_kind_for_capture(&span.capture) else {
             continue;
         };
 
-        let start = capture.node.start_byte();
-        let end = capture.node.end_byte();
+        let (Ok(start), Ok(end)) = (usize::try_from(span.start), usize::try_from(span.end)) else {
+            continue;
+        };
         if start < end && content.is_char_boundary(start) && content.is_char_boundary(end) {
             spans.push(SyntaxSpan { start, end, kind });
         }
@@ -968,17 +973,29 @@ fn syntax_kind_for_capture(capture: &str) -> Option<SyntaxKind> {
         Some(SyntaxKind::Comment)
     } else if capture.starts_with("string") || capture == "character" {
         Some(SyntaxKind::String)
-    } else if capture.starts_with("number") || capture == "constant.builtin" {
+    } else if capture.starts_with("number")
+        || capture.starts_with("constant")
+        || capture == "boolean"
+    {
         Some(SyntaxKind::Number)
-    } else if capture.starts_with("keyword") || capture == "operator" {
+    } else if capture.starts_with("keyword")
+        || capture == "operator"
+        || capture == "include"
+        || capture == "storageclass"
+    {
         Some(SyntaxKind::Keyword)
-    } else if capture.starts_with("function") || capture == "constructor" {
+    } else if capture.starts_with("function") || capture == "constructor" || capture == "method" {
         Some(SyntaxKind::Function)
     } else if capture.starts_with("type") || capture == "variable.builtin" {
         Some(SyntaxKind::Type)
-    } else if capture.starts_with("property") || capture == "variable.parameter" {
+    } else if capture.starts_with("property")
+        || capture == "variable.parameter"
+        || capture == "field"
+        || capture == "attribute"
+        || capture == "tag"
+    {
         Some(SyntaxKind::Property)
-    } else if capture == "punctuation.bracket" || capture == "punctuation.delimiter" {
+    } else if capture.starts_with("punctuation") {
         Some(SyntaxKind::Punctuation)
     } else {
         None
