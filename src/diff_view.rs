@@ -91,13 +91,14 @@ pub struct Palette {
     pub border: Color,
 }
 
-pub struct DiffView<'a> {
+pub struct DiffView<'a, Message> {
     files: Vec<DiffFileView<'a>>,
     selected_file: usize,
     revision_key: String,
     palette: Palette,
     font: Font,
     text_size: f32,
+    on_selected_file_changed: fn(usize) -> Message,
 }
 
 struct State<Paragraph> {
@@ -156,7 +157,7 @@ struct VisibleBand {
     height: f32,
 }
 
-impl<'a> DiffView<'a> {
+impl<'a, Message> DiffView<'a, Message> {
     pub fn new(
         files: Vec<DiffFileView<'a>>,
         selected_file: usize,
@@ -164,6 +165,7 @@ impl<'a> DiffView<'a> {
         palette: Palette,
         font: Font,
         text_size: f32,
+        on_selected_file_changed: fn(usize) -> Message,
     ) -> Self {
         Self {
             files,
@@ -172,6 +174,7 @@ impl<'a> DiffView<'a> {
             palette,
             font,
             text_size,
+            on_selected_file_changed,
         }
     }
 
@@ -220,6 +223,35 @@ impl<'a> DiffView<'a> {
                         .sum::<f32>()
             })
             .sum()
+    }
+
+    fn file_at_offset(&self, offset: f32, width: f32) -> usize {
+        let content_width = self.content_width(width);
+        let mut content_y = 0.0;
+
+        for (file_index, file) in self.files.iter().enumerate() {
+            let file_height = FILE_HEADER_HEIGHT
+                + file
+                    .hunks
+                    .iter()
+                    .map(|hunk| {
+                        HUNK_HEADER_HEIGHT
+                            + hunk
+                                .lines
+                                .iter()
+                                .map(|line| self.row_height(line, content_width))
+                                .sum::<f32>()
+                    })
+                    .sum::<f32>();
+
+            if offset < content_y + file_height {
+                return file_index;
+            }
+
+            content_y += file_height;
+        }
+
+        self.files.len().saturating_sub(1)
     }
 
     fn content_width(&self, viewport_width: f32) -> f32 {
@@ -300,7 +332,7 @@ impl<'a> DiffView<'a> {
     }
 }
 
-impl<'a, Message, Renderer> Widget<Message, Theme, Renderer> for DiffView<'a>
+impl<'a, Message, Renderer> Widget<Message, Theme, Renderer> for DiffView<'a, Message>
 where
     Renderer: text::Renderer<Font = Font>,
 {
@@ -397,6 +429,11 @@ where
                 let max_vertical = (self.content_height(bounds.width) - bounds.height).max(0.0);
                 state.vertical_offset =
                     (state.vertical_offset + movement.y).clamp(0.0, max_vertical);
+                let selected_file = self.file_at_offset(state.vertical_offset, bounds.width);
+                if selected_file != state.selected_file {
+                    state.selected_file = selected_file;
+                    shell.publish((self.on_selected_file_changed)(selected_file));
+                }
             }
 
             shell.capture_event();
@@ -672,7 +709,7 @@ where
     }
 }
 
-impl DiffView<'_> {
+impl<Message> DiffView<'_, Message> {
     fn text_width(&self, content: &str) -> f32 {
         (content.chars().count() as f32 * self.char_width() + 16.0).max(1.0)
     }
@@ -906,12 +943,12 @@ fn prefix_for_kind(kind: DiffLineKind) -> &'static str {
     }
 }
 
-impl<'a, Message, Renderer> From<DiffView<'a>> for Element<'a, Message, Theme, Renderer>
+impl<'a, Message, Renderer> From<DiffView<'a, Message>> for Element<'a, Message, Theme, Renderer>
 where
     Message: 'a,
     Renderer: text::Renderer<Font = Font> + 'a,
 {
-    fn from(diff_view: DiffView<'a>) -> Self {
+    fn from(diff_view: DiffView<'a, Message>) -> Self {
         Element::new(diff_view)
     }
 }

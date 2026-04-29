@@ -5,6 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, OnceLock},
+    time::Duration,
 };
 
 mod diff_view;
@@ -21,13 +22,18 @@ use diff_view::{
 };
 use futures::StreamExt;
 use iced::{
-    Background, Border, Color, Element, Font, Length, Shadow, Subscription, Task, Theme, alignment,
-    keyboard, system, theme,
+    Background, Border, Color, Element, Font, Length, Rectangle, Shadow, Subscription, Task, Theme,
+    Vector,
+    advanced::widget::{self as advanced_widget, Id, Operation as WidgetOperation},
+    alignment,
+    event::{self, Event},
+    keyboard, system, theme, time,
     widget::{
         button, column, container, row, scrollable, text,
         text::{Ellipsis, Wrapping},
         tooltip,
     },
+    window,
 };
 use jj_lib::{
     backend::CommitId,
@@ -74,6 +80,12 @@ const SIDEBAR_SCROLLBAR_SPACING: f32 = 0.0;
 const SIDEBAR_FILE_TEXT_CHAR_WIDTH: f32 = 7.0;
 const SIDEBAR_FILE_TEXT_RESERVED_WIDTH: f32 =
     SIDEBAR_FILE_BADGE_WIDTH + SIDEBAR_FILE_STAT_MIN_WIDTH * 2.0 + 6.0 * 4.0 + 20.0;
+const REPOSITORY_REFRESH_INTERVAL: Duration = Duration::from_millis(1_000);
+const SIDEBAR_SCROLLABLE_ID: &str = "sidebar-scrollable";
+const SIDEBAR_HEADER_ESTIMATED_HEIGHT: f32 = 82.0;
+const SIDEBAR_REVISION_ESTIMATED_HEIGHT: f32 = 100.0;
+const SIDEBAR_FILE_ROW_ESTIMATED_HEIGHT: f32 = 39.0;
+const SIDEBAR_REVEAL_PADDING: f32 = 32.0;
 
 fn main() -> iced::Result {
     let cli = Cli::parse();
@@ -105,6 +117,9 @@ struct Diffui {
     selected_revision: RevisionSelection,
     expanded_revision: RevisionSelection,
     pending_revision: Option<RevisionSelection>,
+    repository_snapshot: Option<RepositorySnapshot>,
+    snapshot_pending: bool,
+    app_focused: bool,
     selected_theme: ThemePreference,
     system_theme: theme::Mode,
     selected_file: usize,
@@ -115,6 +130,11 @@ struct Repository {
     root: PathBuf,
     vcs: Vcs,
     scope: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepositorySnapshot {
+    fingerprint: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -193,10 +213,13 @@ enum DiffFileStatus {
 #[derive(Debug, Clone)]
 enum Message {
     BackendLoaded(RevisionSelection, Result<BackendOutput, String>),
+    RepositorySnapshotLoaded(Result<RepositorySnapshot, String>),
     SelectFile(usize),
     SelectRevision(RevisionSelection),
     SelectTheme(ThemePreference),
     SystemThemeChanged(theme::Mode),
+    WindowFocusChanged(bool),
+    RefreshRepository,
     SelectNextFile,
     SelectPreviousFile,
 }
@@ -205,6 +228,7 @@ enum Message {
 struct BackendOutput {
     document: DiffDocument,
     commits: Vec<CommitSummary>,
+    snapshot: RepositorySnapshot,
 }
 
 #[derive(Debug, Clone)]
@@ -376,6 +400,9 @@ impl Diffui {
                         selected_revision: RevisionSelection::WorkingCopy,
                         expanded_revision: RevisionSelection::WorkingCopy,
                         pending_revision: Some(RevisionSelection::WorkingCopy),
+                        repository_snapshot: None,
+                        snapshot_pending: false,
+                        app_focused: true,
                         selected_theme: ThemePreference::System,
                         system_theme: theme::Mode::None,
                         selected_file: 0,
@@ -392,6 +419,9 @@ impl Diffui {
                     selected_revision: RevisionSelection::WorkingCopy,
                     expanded_revision: RevisionSelection::WorkingCopy,
                     pending_revision: None,
+                    repository_snapshot: None,
+                    snapshot_pending: false,
+                    app_focused: true,
                     selected_theme: ThemePreference::System,
                     system_theme: theme::Mode::None,
                     selected_file: 0,
@@ -415,6 +445,7 @@ impl Diffui {
                 self.status = LoadStatus::Loaded;
                 self.document = output.document;
                 self.commits = output.commits;
+                self.repository_snapshot = Some(output.snapshot);
                 self.selected_file = if revision_changed {
                     0
                 } else {
@@ -430,9 +461,28 @@ impl Diffui {
                 self.pending_revision = None;
                 self.status = LoadStatus::Failed(error);
             }
+            Message::RepositorySnapshotLoaded(Ok(snapshot)) => {
+                self.snapshot_pending = false;
+                if self.repository_snapshot.as_ref() != Some(&snapshot)
+                    && self.pending_revision.is_none()
+                    && let Some(repository) = self.repository.clone()
+                {
+                    let revision = self.selected_revision.clone();
+                    self.pending_revision = Some(revision.clone());
+                    return Task::perform(
+                        load_backend(repository, revision.clone()),
+                        move |result| Message::BackendLoaded(revision, result),
+                    );
+                }
+            }
+            Message::RepositorySnapshotLoaded(Err(error)) => {
+                self.snapshot_pending = false;
+                self.status = LoadStatus::Failed(error);
+            }
             Message::SelectFile(index) => {
                 if index < self.document.files.len() {
                     self.selected_file = index;
+                    return scroll_sidebar_to_file(index, self);
                 }
             }
             Message::SelectRevision(selection) => {
@@ -453,21 +503,51 @@ impl Diffui {
             Message::SystemThemeChanged(theme) => {
                 self.system_theme = theme;
             }
+            Message::WindowFocusChanged(focused) => {
+                let gained_focus = focused && !self.app_focused;
+                self.app_focused = focused;
+
+                if gained_focus {
+                    return self.start_repository_snapshot();
+                }
+            }
+            Message::RefreshRepository => {
+                if self.app_focused {
+                    return self.start_repository_snapshot();
+                }
+            }
             Message::SelectNextFile => {
                 if !self.document.files.is_empty() {
                     self.selected_file =
                         (self.selected_file + 1).min(self.document.files.len().saturating_sub(1));
+                    return scroll_sidebar_to_file(self.selected_file, self);
                 }
             }
             Message::SelectPreviousFile => {
                 let previous = self.selected_file.saturating_sub(1);
                 if previous != self.selected_file {
                     self.selected_file = previous;
+                    return scroll_sidebar_to_file(self.selected_file, self);
                 }
             }
         }
 
         Task::none()
+    }
+
+    fn start_repository_snapshot(&mut self) -> Task<Message> {
+        if self.snapshot_pending {
+            return Task::none();
+        }
+
+        let Some(repository) = self.repository.clone() else {
+            return Task::none();
+        };
+
+        self.snapshot_pending = true;
+        Task::perform(load_repository_snapshot(repository), |result| {
+            Message::RepositorySnapshotLoaded(result.map_err(|error| format!("{error:#}")))
+        })
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -500,8 +580,21 @@ impl Diffui {
             _ => None,
         });
 
+        let focus = event::listen().filter_map(|event| match event {
+            Event::Window(window::Event::Focused) => Some(Message::WindowFocusChanged(true)),
+            Event::Window(window::Event::Unfocused) => Some(Message::WindowFocusChanged(false)),
+            _ => None,
+        });
+        let refresh = if self.app_focused {
+            time::every(REPOSITORY_REFRESH_INTERVAL).map(|_| Message::RefreshRepository)
+        } else {
+            Subscription::none()
+        };
+
         Subscription::batch([
             keyboard,
+            focus,
+            refresh,
             system::theme_changes().map(Message::SystemThemeChanged),
         ])
     }
@@ -628,8 +721,46 @@ async fn run_backend(repository: Repository, revision: RevisionSelection) -> Res
             parse_backend_output(&repository, &output)
         }
     };
+    let snapshot = run_repository_snapshot(repository).await?;
 
-    Ok(BackendOutput { document, commits })
+    Ok(BackendOutput {
+        document,
+        commits,
+        snapshot,
+    })
+}
+
+async fn load_repository_snapshot(repository: Repository) -> Result<RepositorySnapshot> {
+    run_repository_snapshot(repository).await
+}
+
+async fn run_repository_snapshot(repository: Repository) -> Result<RepositorySnapshot> {
+    match repository.vcs {
+        Vcs::Jj => {
+            let handle = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
+                handle.block_on(load_jj_repository_snapshot(repository))
+            })
+            .await
+            .context("jj repository snapshot task failed")?
+        }
+        Vcs::Git => {
+            let output = run_command(
+                &repository.root,
+                "git",
+                vec![
+                    OsString::from("status"),
+                    OsString::from("--porcelain=v1"),
+                    OsString::from("--branch"),
+                    OsString::from("--untracked-files=normal"),
+                ],
+            )
+            .await?;
+            Ok(RepositorySnapshot {
+                fingerprint: output,
+            })
+        }
+    }
 }
 
 fn git_backend_command(repository: &Repository, revision: &RevisionSelection) -> Vec<OsString> {
@@ -686,7 +817,6 @@ async fn load_commits(repository: &Repository) -> Result<Vec<CommitSummary>> {
                 "git",
                 vec![
                     OsString::from("log"),
-                    OsString::from("--max-count=24"),
                     OsString::from("--pretty=format:%h%x09%H%x09%ae%x09%x09%s"),
                 ],
             )
@@ -725,10 +855,11 @@ async fn load_jj_commits(repository_root: PathBuf) -> Result<Vec<CommitSummary>>
 
     let mut commits = Vec::new();
     let mut stack = wc_commit.parent_ids().to_vec();
+    let mut seen = std::collections::HashSet::new();
 
     while let Some(commit_id) = stack.pop() {
-        if commits.len() >= 24 {
-            break;
+        if !seen.insert(commit_id.clone()) {
+            continue;
         }
 
         let commit = repo
@@ -956,6 +1087,26 @@ async fn load_jj_diff(repository: Repository, revision: RevisionSelection) -> Re
         files,
         total_additions,
         total_deletions,
+    })
+}
+
+async fn load_jj_repository_snapshot(repository: Repository) -> Result<RepositorySnapshot> {
+    let settings = UserSettings::from_config(StackedConfig::with_defaults())
+        .context("failed to load jj settings")?;
+    let workspace = Workspace::load(
+        &settings,
+        &repository.root,
+        &StoreFactories::default(),
+        &default_working_copy_factories(),
+    )
+    .context("failed to load jj workspace")?;
+    let repo = workspace
+        .repo_loader()
+        .load_at_head()
+        .await
+        .context("failed to load jj repo")?;
+    Ok(RepositorySnapshot {
+        fingerprint: repo.operation().id().hex(),
     })
 }
 
@@ -1443,21 +1594,100 @@ fn build_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         items = items.push(build_commit_button(commit, &ui.commits, ui, theme));
     }
 
-    container(
-        scrollable(items.spacing(0))
-            .direction(scrollable::Direction::Vertical(
-                scrollable::Scrollbar::new()
-                    .width(SIDEBAR_SCROLLBAR_WIDTH)
-                    .scroller_width(SIDEBAR_SCROLLBAR_SCROLLER_WIDTH)
-                    .spacing(SIDEBAR_SCROLLBAR_SPACING),
-            ))
-            .style(move |iced_theme, status| diff_scrollable_style(iced_theme, status, theme))
-            .height(Length::Fill),
-    )
-    .width(Length::Fixed(SIDEBAR_WIDTH))
-    .height(Length::Fill)
-    .style(move |_| panel_style(theme.panel_background, theme))
-    .into()
+    let sidebar_content = scrollable(items.spacing(0))
+        .id(SIDEBAR_SCROLLABLE_ID)
+        .direction(scrollable::Direction::Vertical(
+            scrollable::Scrollbar::new()
+                .width(SIDEBAR_SCROLLBAR_WIDTH)
+                .scroller_width(SIDEBAR_SCROLLBAR_SCROLLER_WIDTH)
+                .spacing(SIDEBAR_SCROLLBAR_SPACING),
+        ))
+        .style(move |iced_theme, status| diff_scrollable_style(iced_theme, status, theme))
+        .height(Length::Fill);
+
+    container(sidebar_content)
+        .width(Length::Fixed(SIDEBAR_WIDTH))
+        .height(Length::Fill)
+        .style(move |_| panel_style(theme.panel_background, theme))
+        .into()
+}
+
+fn scroll_sidebar_to_file(file_index: usize, ui: &Diffui) -> Task<Message> {
+    advanced_widget::operate(SidebarRevealFileOperation {
+        target: Id::new(SIDEBAR_SCROLLABLE_ID),
+        file_top: sidebar_file_row_top(file_index, ui),
+        file_height: SIDEBAR_FILE_ROW_ESTIMATED_HEIGHT,
+        padding: SIDEBAR_REVEAL_PADDING,
+    })
+}
+
+struct SidebarRevealFileOperation {
+    target: Id,
+    file_top: f32,
+    file_height: f32,
+    padding: f32,
+}
+
+impl WidgetOperation<Message> for SidebarRevealFileOperation {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn WidgetOperation<Message>)) {
+        operate(self);
+    }
+
+    fn scrollable(
+        &mut self,
+        id: Option<&Id>,
+        bounds: Rectangle,
+        content_bounds: Rectangle,
+        translation: Vector,
+        state: &mut dyn advanced_widget::operation::Scrollable,
+    ) {
+        if id != Some(&self.target) {
+            return;
+        }
+
+        let max_scroll_y = (content_bounds.height - bounds.height).max(0.0);
+        let current_y = translation.y.clamp(0.0, max_scroll_y);
+        let file_bottom = self.file_top + self.file_height;
+        let visible_top = current_y + self.padding;
+        let visible_bottom = current_y + bounds.height - self.padding;
+
+        let target_y = if self.file_top < visible_top {
+            Some(self.file_top - self.padding * 2.)
+        } else if file_bottom > visible_bottom {
+            Some(file_bottom - bounds.height + self.padding / 2.)
+        } else {
+            None
+        };
+
+        if let Some(target_y) = target_y {
+            state.scroll_to(advanced_widget::operation::scrollable::AbsoluteOffset {
+                x: None,
+                y: Some(target_y.clamp(0.0, max_scroll_y)),
+            });
+        }
+    }
+}
+
+fn sidebar_file_row_top(file_index: usize, ui: &Diffui) -> f32 {
+    sidebar_revision_row_top(&ui.expanded_revision, ui)
+        + SIDEBAR_REVISION_ESTIMATED_HEIGHT
+        + file_index as f32 * SIDEBAR_FILE_ROW_ESTIMATED_HEIGHT
+}
+
+fn sidebar_revision_row_top(revision: &RevisionSelection, ui: &Diffui) -> f32 {
+    match revision {
+        RevisionSelection::WorkingCopy => SIDEBAR_HEADER_ESTIMATED_HEIGHT,
+        RevisionSelection::Commit(revision_id) => {
+            let commit_index = ui
+                .commits
+                .iter()
+                .position(|commit| &commit.revision_id == revision_id)
+                .unwrap_or(0);
+
+            SIDEBAR_HEADER_ESTIMATED_HEIGHT
+                + (commit_index + 1) as f32 * SIDEBAR_REVISION_ESTIMATED_HEIGHT
+        }
+    }
 }
 
 fn build_theme_switcher(
@@ -1502,12 +1732,12 @@ fn build_working_copy_button(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messa
 
     build_revision_item_with_content(
         title.into(),
-        "Uncommitted Changes",
+        RevisionDescription::new("Uncommitted Changes", theme.text),
         None,
         revision,
-        &ui.selected_revision,
         ui,
         theme,
+        true,
     )
 }
 
@@ -1515,7 +1745,6 @@ fn build_working_copy_button(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messa
 enum RevisionIndicator {
     WorkingCopy,
     Empty,
-    NoDescription,
 }
 
 impl RevisionIndicator {
@@ -1523,7 +1752,6 @@ impl RevisionIndicator {
         match self {
             Self::WorkingCopy => "wip",
             Self::Empty => "empty",
-            Self::NoDescription => "no desc",
         }
     }
 
@@ -1531,7 +1759,6 @@ impl RevisionIndicator {
         match self {
             Self::WorkingCopy => (theme.selected_file, theme.accent),
             Self::Empty => (theme.panel_background, theme.subtle_text),
-            Self::NoDescription => (theme.note_background, theme.note_text),
         }
     }
 }
@@ -1541,6 +1768,16 @@ fn build_commit_button<'a>(
     commits: &'a [CommitSummary],
     ui: &'a Diffui,
     theme: ThemeSpec,
+) -> Element<'a, Message> {
+    build_commit_button_with_options(commit, commits, ui, theme, true)
+}
+
+fn build_commit_button_with_options<'a>(
+    commit: &'a CommitSummary,
+    commits: &'a [CommitSummary],
+    ui: &'a Diffui,
+    theme: ThemeSpec,
+    show_files: bool,
 ) -> Element<'a, Message> {
     let unique_len = shortest_unique_prefix_len(&commit.change_id, commits);
     let label_len = revision_id_display_len(unique_len, &commit.change_id);
@@ -1559,9 +1796,6 @@ fn build_commit_button<'a>(
     let commit_id = truncate_end(&commit.commit_id, SIDEBAR_COMMIT_ID_CHARS);
     let detail = format!("{commit_id} · {}", commit.author);
     let mut indicators = Vec::new();
-    if !commit.has_description {
-        indicators.push(RevisionIndicator::NoDescription);
-    }
     if let Some(is_empty) = commit.is_empty
         && is_empty
     {
@@ -1583,12 +1817,12 @@ fn build_commit_button<'a>(
 
     build_revision_item_with_content(
         title.into(),
-        &commit.description,
+        RevisionDescription::new(&commit.description, commit_description_color(commit, theme)),
         Some(detail),
         revision,
-        &ui.selected_revision,
         ui,
         theme,
+        show_files,
     )
 }
 
@@ -1600,6 +1834,32 @@ fn revision_id_display_len(unique_len: usize, revision_id: &str) -> usize {
 
 fn truncate_end(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
+}
+
+fn commit_description_color(commit: &CommitSummary, theme: ThemeSpec) -> Color {
+    if commit.has_description {
+        return theme.text;
+    }
+
+    match commit.is_empty {
+        Some(true) => theme.added_text,
+        Some(false) => theme.note_text,
+        None => theme.note_text,
+    }
+}
+
+struct RevisionDescription {
+    text: String,
+    color: Color,
+}
+
+impl RevisionDescription {
+    fn new(text: impl Into<String>, color: Color) -> Self {
+        Self {
+            text: text.into(),
+            color,
+        }
+    }
 }
 
 fn build_revision_metadata<'a>(
@@ -1654,23 +1914,22 @@ fn build_revision_chip<'a>(
 
 fn build_revision_item_with_content<'a>(
     title: Element<'a, Message>,
-    description: impl Into<String>,
+    description: RevisionDescription,
     detail: Option<String>,
     revision: RevisionSelection,
-    selected_revision: &RevisionSelection,
     ui: &'a Diffui,
     theme: ThemeSpec,
+    show_files: bool,
 ) -> Element<'a, Message> {
-    let selected = &revision == selected_revision;
+    let selected = revision == ui.selected_revision;
     let expanded = revision == ui.expanded_revision;
-    let description = description.into();
     let loaded = matches!(ui.status, LoadStatus::Loaded);
 
     let mut labels = column![
         title,
-        text(description)
+        text(description.text)
             .size(SMALL_TEXT_SIZE)
-            .color(theme.text)
+            .color(description.color)
             .width(Length::Fill)
             .wrapping(Wrapping::Glyph),
     ]
@@ -1699,7 +1958,7 @@ fn build_revision_item_with_content<'a>(
 
     let mut item = column![revision_button, build_sidebar_divider(theme)].spacing(0);
 
-    if expanded && loaded && !ui.document.files.is_empty() {
+    if show_files && expanded && loaded && !ui.document.files.is_empty() {
         let mut files = column![].spacing(0);
         let stat_width = sidebar_file_stat_widths(&ui.document.files);
         let display_width = sidebar_file_display_width(stat_width);
@@ -2135,6 +2394,7 @@ fn render_diff<'a>(
         diff_palette(theme),
         CODE_FONT,
         CODE_TEXT_SIZE,
+        Message::SelectFile,
     )
     .into()
 }
@@ -2358,7 +2618,7 @@ fn diff_scrollable_style(
     style.vertical_rail.scroller.border = Border {
         width: 1.0,
         color: if dragged { theme.accent } else { theme.border },
-        radius: CONTROL_RADIUS.into(),
+        radius: 2.0.into(),
     };
     style.horizontal_rail = style.vertical_rail;
     style.gap = Some(Background::Color(theme.panel_background_elevated));
