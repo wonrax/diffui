@@ -12,7 +12,6 @@ use iced::{
 const ROW_HEIGHT: f32 = 24.0;
 const FILE_HEADER_HEIGHT: f32 = 38.0;
 const HUNK_HEADER_HEIGHT: f32 = 26.0;
-const METADATA_ROW_HEIGHT: f32 = 18.0;
 const GUTTER_WIDTH: f32 = 104.0;
 const PREFIX_WIDTH: f32 = 24.0;
 const CHANGE_MARK_WIDTH: f32 = 2.0;
@@ -49,7 +48,6 @@ pub enum DiffLineKind {
 pub struct DiffFileView<'a> {
     pub title: String,
     pub status: &'a str,
-    pub metadata: &'a [String],
     pub hunks: &'a [DiffHunkView],
     pub additions: usize,
     pub deletions: usize,
@@ -143,13 +141,6 @@ struct VisibleFileHeader {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct VisibleMetadata {
-    file_index: usize,
-    line_index: usize,
-    y: f32,
-}
-
-#[derive(Debug, Clone, Copy)]
 struct VisibleRow {
     file_index: usize,
     hunk_index: usize,
@@ -191,7 +182,6 @@ impl<'a> DiffView<'a> {
             .iter()
             .map(|file| {
                 FILE_HEADER_HEIGHT
-                    + file.metadata.len() as f32 * METADATA_ROW_HEIGHT
                     + file
                         .hunks
                         .iter()
@@ -216,7 +206,6 @@ impl<'a> DiffView<'a> {
             .take(file_index)
             .map(|file| {
                 FILE_HEADER_HEIGHT
-                    + file.metadata.len() as f32 * METADATA_ROW_HEIGHT
                     + file
                         .hunks
                         .iter()
@@ -455,7 +444,6 @@ where
             let mut content_y = 0.0;
             let visible_capacity = (bounds.height / ROW_HEIGHT).ceil() as usize + 8;
             let mut visible_file_headers = Vec::new();
-            let mut visible_metadata = Vec::new();
             let mut visible_hunk_headers = Vec::new();
             let mut visible_rows = Vec::with_capacity(visible_capacity);
             let mut visible_bands = Vec::new();
@@ -474,23 +462,6 @@ where
                     visible_bottom,
                 );
                 content_y += FILE_HEADER_HEIGHT;
-
-                for (line_index, _) in file.metadata.iter().enumerate() {
-                    let row_top = content_y;
-                    push_if_visible(
-                        &mut visible_metadata,
-                        VisibleMetadata {
-                            file_index,
-                            line_index,
-                            y: bounds.y + (row_top - visible_top),
-                        },
-                        row_top,
-                        METADATA_ROW_HEIGHT,
-                        visible_top,
-                        visible_bottom,
-                    );
-                    content_y += METADATA_ROW_HEIGHT;
-                }
 
                 for (hunk_index, hunk) in file.hunks.iter().enumerate() {
                     let hunk_top = content_y;
@@ -606,7 +577,10 @@ where
                     TextRenderParams {
                         width: (bounds.width - summary_width - 28.0).max(1.0),
                         height: ROW_HEIGHT,
-                        position: Point::new(bounds.x + 12.0, header.y + TEXT_Y_PADDING),
+                        position: Point::new(
+                            bounds.x + 12.0,
+                            centered_text_y(header.y, ROW_HEIGHT),
+                        ),
                         color: self.palette.text,
                         clip_bounds: bounds,
                         wrapping: text::Wrapping::WordOrGlyph,
@@ -620,29 +594,10 @@ where
                         height: ROW_HEIGHT,
                         position: Point::new(
                             (bounds.x + bounds.width - summary_width - 8.0).max(bounds.x + 12.0),
-                            header.y + TEXT_Y_PADDING,
+                            centered_text_y(header.y, ROW_HEIGHT),
                         ),
                         color: self.palette.text_muted,
                         clip_bounds: bounds,
-                        wrapping: text::Wrapping::None,
-                    },
-                );
-            }
-
-            for metadata in &visible_metadata {
-                let line = &self.files[metadata.file_index].metadata[metadata.line_index];
-                self.draw_text(
-                    renderer,
-                    line,
-                    TextRenderParams {
-                        width: content_width,
-                        height: METADATA_ROW_HEIGHT,
-                        position: Point::new(
-                            bounds.x + GUTTER_WIDTH + PREFIX_WIDTH + TEXT_X_PADDING,
-                            metadata.y,
-                        ),
-                        color: self.palette.text_muted,
-                        clip_bounds: content_clip_bounds,
                         wrapping: text::Wrapping::None,
                     },
                 );
@@ -935,6 +890,10 @@ fn format_gutter(old_line: Option<usize>, new_line: Option<usize>) -> String {
     let old = old_line.map(|line| line.to_string()).unwrap_or_default();
     let new = new_line.map(|line| line.to_string()).unwrap_or_default();
     format!("{old:>5} {new:>5}")
+}
+
+fn centered_text_y(container_y: f32, text_height: f32) -> f32 {
+    container_y + (FILE_HEADER_HEIGHT - text_height) / 2.0
 }
 
 fn prefix_for_kind(kind: DiffLineKind) -> &'static str {

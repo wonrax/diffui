@@ -14,10 +14,12 @@ use arborium::{
     GrammarStore,
     advanced::{CompiledGrammar, ParseContext},
 };
+use bstr::BStr;
 use clap::Parser;
 use diff_view::{
     DiffFileView, DiffHunkView, DiffLine, DiffLineKind, DiffView, Palette, SyntaxKind, SyntaxSpan,
 };
+use futures::StreamExt;
 use iced::{
     Background, Border, Color, Element, Font, Length, Shadow, Subscription, Task, Theme, alignment,
     keyboard, system, theme,
@@ -26,6 +28,25 @@ use iced::{
         text::{Ellipsis, Wrapping},
         tooltip,
     },
+};
+use jj_lib::{
+    backend::CommitId,
+    config::StackedConfig,
+    conflicts::{ConflictMarkerStyle, ConflictMaterializeOptions, materialized_diff_stream},
+    copies::CopyRecords,
+    diff_presentation::{
+        LineCompareMode,
+        unified::{DiffLineType, git_diff_part, unified_diff_hunks},
+    },
+    files::FileMergeHunkLevel,
+    matchers::{EverythingMatcher, Matcher, PrefixMatcher},
+    merge::{Diff, SameChange},
+    object_id::ObjectId,
+    repo::{Repo, StoreFactories},
+    repo_path::{RepoPath, RepoPathBuf},
+    settings::UserSettings,
+    tree_merge::MergeOptions,
+    workspace::{Workspace, default_working_copy_factories},
 };
 use tokio::process::Command;
 
@@ -37,6 +58,8 @@ const CODE_TEXT_SIZE: f32 = 13.0;
 const CAPTION_TEXT_SIZE: f32 = 13.0;
 const SMALL_TEXT_SIZE: f32 = 14.0;
 const TITLE_TEXT_SIZE: f32 = 18.0;
+const SIDEBAR_REVISION_ID_CHARS: usize = 12;
+const SIDEBAR_COMMIT_ID_CHARS: usize = 12;
 const PANEL_RADIUS: f32 = 3.0;
 const CONTROL_RADIUS: f32 = 5.0;
 const SIDEBAR_WIDTH: f32 = 360.0;
@@ -47,7 +70,7 @@ const SIDEBAR_FILE_STAT_PADDING: f32 = 8.0;
 const REVISION_CHIP_HEIGHT: f32 = 20.0;
 const SIDEBAR_SCROLLBAR_WIDTH: f32 = 10.0;
 const SIDEBAR_SCROLLBAR_SCROLLER_WIDTH: f32 = 7.0;
-const SIDEBAR_SCROLLBAR_SPACING: f32 = 10.0;
+const SIDEBAR_SCROLLBAR_SPACING: f32 = 0.0;
 const SIDEBAR_FILE_TEXT_CHAR_WIDTH: f32 = 7.0;
 const SIDEBAR_FILE_TEXT_RESERVED_WIDTH: f32 =
     SIDEBAR_FILE_BADGE_WIDTH + SIDEBAR_FILE_STAT_MIN_WIDTH * 2.0 + 6.0 * 4.0 + 20.0;
@@ -142,7 +165,6 @@ struct DiffFile {
     path: String,
     old_path: Option<String>,
     status: DiffFileStatus,
-    metadata: Vec<String>,
     hunks: Vec<DiffHunkView>,
     additions: usize,
     deletions: usize,
@@ -152,6 +174,8 @@ struct DiffFile {
 struct CommitSummary {
     change_id: String,
     commit_id: String,
+    revision_id: String,
+    shortest_change_id_len: Option<usize>,
     description: String,
     author: String,
     has_description: bool,
@@ -416,9 +440,7 @@ impl Diffui {
                     && self.pending_revision.as_ref() != Some(&selection)
                     && let Some(repository) = self.repository.clone()
                 {
-                    self.selected_revision = selection.clone();
                     self.pending_revision = Some(selection.clone());
-                    self.status = LoadStatus::Loading;
                     let revision = selection.clone();
                     return Task::perform(load_backend(repository, selection), move |result| {
                         Message::BackendLoaded(revision, result)
@@ -494,13 +516,6 @@ impl Vcs {
         match self {
             Self::Jj => "Jujutsu",
             Self::Git => "Git",
-        }
-    }
-
-    fn command(self) -> &'static str {
-        match self {
-            Self::Jj => "jj",
-            Self::Git => "git",
         }
     }
 }
@@ -599,56 +614,44 @@ async fn load_backend(
 
 async fn run_backend(repository: Repository, revision: RevisionSelection) -> Result<BackendOutput> {
     let commits = load_commits(&repository).await?;
-    let (program, args) = backend_command(&repository, &revision);
-    let output = run_command(&repository.root, program, args).await?;
-    let document = parse_backend_output(&repository, &output);
+    let document = match repository.vcs {
+        Vcs::Jj => {
+            let repository = repository.clone();
+            let handle = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || handle.block_on(load_jj_diff(repository, revision)))
+                .await
+                .context("jj diff loader task failed")??
+        }
+        Vcs::Git => {
+            let args = git_backend_command(&repository, &revision);
+            let output = run_command(&repository.root, "git", args).await?;
+            parse_backend_output(&repository, &output)
+        }
+    };
 
     Ok(BackendOutput { document, commits })
 }
 
-fn backend_command(
-    repository: &Repository,
-    revision: &RevisionSelection,
-) -> (&'static str, Vec<OsString>) {
-    let mut args: Vec<OsString> = match repository.vcs {
-        Vcs::Jj => {
-            let mut args = vec![
-                OsString::from("diff"),
-                OsString::from("--git"),
-                OsString::from("--color"),
-                OsString::from("never"),
-            ];
-
-            if let RevisionSelection::Commit(revision) = revision {
-                args.push(OsString::from("-r"));
-                args.push(OsString::from(revision));
-            }
-
-            args.push(OsString::from("--"));
-            args
+fn git_backend_command(repository: &Repository, revision: &RevisionSelection) -> Vec<OsString> {
+    let mut args: Vec<OsString> = match revision {
+        RevisionSelection::WorkingCopy => ["diff", "--"].into_iter().map(OsString::from).collect(),
+        RevisionSelection::Commit(revision) => {
+            vec![
+                OsString::from("show"),
+                OsString::from("--format="),
+                OsString::from("--no-ext-diff"),
+                OsString::from("--no-color"),
+                OsString::from(revision),
+                OsString::from("--"),
+            ]
         }
-        Vcs::Git => match revision {
-            RevisionSelection::WorkingCopy => {
-                ["diff", "--"].into_iter().map(OsString::from).collect()
-            }
-            RevisionSelection::Commit(revision) => {
-                vec![
-                    OsString::from("show"),
-                    OsString::from("--format="),
-                    OsString::from("--no-ext-diff"),
-                    OsString::from("--no-color"),
-                    OsString::from(revision),
-                    OsString::from("--"),
-                ]
-            }
-        },
     };
 
     if !repository.scope.as_os_str().is_empty() {
         args.push(repository.scope.as_os_str().to_owned());
     }
 
-    (repository.vcs.command(), args)
+    args
 }
 
 async fn run_command(current_dir: &Path, program: &str, args: Vec<OsString>) -> Result<String> {
@@ -671,23 +674,11 @@ async fn run_command(current_dir: &Path, program: &str, args: Vec<OsString>) -> 
 async fn load_commits(repository: &Repository) -> Result<Vec<CommitSummary>> {
     match repository.vcs {
         Vcs::Jj => {
-            let output = run_command(
-                &repository.root,
-                "jj",
-                vec![
-                    OsString::from("log"),
-                    OsString::from("--no-graph"),
-                    OsString::from("-r"),
-                    OsString::from("ancestors(@-, 24)"),
-                    OsString::from("-T"),
-                    OsString::from(
-                        "change_id.short() ++ \"\\t\" ++ commit_id.short() ++ \"\\t\" ++ author.email() ++ \"\\t\" ++ empty ++ \"\\t\" ++ description.first_line() ++ \"\\n\"",
-                    ),
-                ],
-            )
-            .await?;
-
-            Ok(parse_commit_log(&output))
+            let root = repository.root.clone();
+            let handle = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || handle.block_on(load_jj_commits(root)))
+                .await
+                .context("jj commit loader task failed")?
         }
         Vcs::Git => {
             let output = run_command(
@@ -703,6 +694,322 @@ async fn load_commits(repository: &Repository) -> Result<Vec<CommitSummary>> {
 
             Ok(parse_commit_log(&output))
         }
+    }
+}
+
+async fn load_jj_commits(repository_root: PathBuf) -> Result<Vec<CommitSummary>> {
+    let settings = UserSettings::from_config(StackedConfig::with_defaults())
+        .context("failed to load jj settings")?;
+    let workspace = Workspace::load(
+        &settings,
+        &repository_root,
+        &StoreFactories::default(),
+        &default_working_copy_factories(),
+    )
+    .context("failed to load jj workspace")?;
+    let workspace_name = workspace.workspace_name();
+    let repo = workspace
+        .repo_loader()
+        .load_at_head()
+        .await
+        .context("failed to load jj repo")?;
+    let wc_commit_id = repo
+        .view()
+        .get_wc_commit_id(workspace_name)
+        .context("jj workspace has no working-copy commit")?;
+    let wc_commit = repo
+        .store()
+        .get_commit_async(wc_commit_id)
+        .await
+        .context("failed to load jj working-copy commit")?;
+
+    let mut commits = Vec::new();
+    let mut stack = wc_commit.parent_ids().to_vec();
+
+    while let Some(commit_id) = stack.pop() {
+        if commits.len() >= 24 {
+            break;
+        }
+
+        let commit = repo
+            .store()
+            .get_commit_async(&commit_id)
+            .await
+            .with_context(|| format!("failed to load jj commit {}", commit_id.hex()))?;
+
+        let description = commit.description().lines().next().unwrap_or("").trim();
+        let is_empty = commit
+            .is_empty(repo.as_ref())
+            .await
+            .with_context(|| format!("failed to inspect jj commit {}", commit.id().hex()))?;
+        let shortest_change_id_len = repo
+            .shortest_unique_change_id_prefix_len(commit.change_id())
+            .with_context(|| {
+                format!(
+                    "failed to resolve shortest unique jj change id for {}",
+                    commit.change_id().hex()
+                )
+            })?;
+
+        commits.push(CommitSummary {
+            change_id: commit.change_id().to_string(),
+            commit_id: commit.id().hex(),
+            revision_id: commit.id().hex(),
+            shortest_change_id_len: Some(shortest_change_id_len),
+            description: if description.is_empty() {
+                "(no description set)".to_owned()
+            } else {
+                description.to_owned()
+            },
+            author: commit.author().email.clone(),
+            has_description: !description.is_empty(),
+            is_empty: Some(is_empty),
+        });
+
+        stack.extend(commit.parent_ids().iter().cloned());
+    }
+
+    Ok(commits)
+}
+
+async fn load_jj_diff(repository: Repository, revision: RevisionSelection) -> Result<DiffDocument> {
+    let settings = UserSettings::from_config(StackedConfig::with_defaults())
+        .context("failed to load jj settings")?;
+    let workspace = Workspace::load(
+        &settings,
+        &repository.root,
+        &StoreFactories::default(),
+        &default_working_copy_factories(),
+    )
+    .context("failed to load jj workspace")?;
+    let workspace_name = workspace.workspace_name();
+    let repo = workspace
+        .repo_loader()
+        .load_at_head()
+        .await
+        .context("failed to load jj repo")?;
+    let commit_id = match revision {
+        RevisionSelection::WorkingCopy => repo
+            .view()
+            .get_wc_commit_id(workspace_name)
+            .context("jj workspace has no working-copy commit")?
+            .clone(),
+        RevisionSelection::Commit(revision) => CommitId::try_from_hex(&revision)
+            .with_context(|| format!("invalid jj commit id {revision}"))?,
+    };
+    let commit = repo
+        .store()
+        .get_commit_async(&commit_id)
+        .await
+        .with_context(|| format!("failed to load jj commit {}", commit_id.hex()))?;
+    let old_tree = commit
+        .parent_tree(repo.as_ref())
+        .await
+        .with_context(|| format!("failed to load jj parent tree for {}", commit_id.hex()))?;
+    let new_tree = commit.tree();
+    let matcher = repo_scope_matcher(&repository)?;
+    let copy_records = CopyRecords::default();
+    let tree_diff = old_tree.diff_stream_with_copies(&new_tree, matcher.as_ref(), &copy_records);
+    let labels = Diff::new(old_tree.labels(), new_tree.labels());
+    let mut stream = materialized_diff_stream(repo.store(), tree_diff, labels);
+    let materialize_options = ConflictMaterializeOptions {
+        marker_style: ConflictMarkerStyle::Diff,
+        marker_len: None,
+        merge: MergeOptions {
+            hunk_level: FileMergeHunkLevel::Line,
+            same_change: SameChange::Accept,
+        },
+    };
+    let mut files = Vec::new();
+
+    while let Some(entry) = stream.next().await {
+        let values = entry.values.with_context(|| {
+            format!(
+                "failed to read jj diff for {}",
+                repo_path_label(entry.path.target())
+            )
+        })?;
+        let old_path = entry
+            .path
+            .to_diff()
+            .map(|paths| repo_path_label(paths.before));
+        let path = repo_path_label(entry.path.target());
+        let before_absent = values.before.is_absent();
+        let after_absent = values.after.is_absent();
+        let status = if before_absent {
+            DiffFileStatus::Added
+        } else if after_absent {
+            DiffFileStatus::Deleted
+        } else if old_path.is_some() {
+            DiffFileStatus::Renamed
+        } else {
+            DiffFileStatus::Modified
+        };
+        let before = git_diff_part(entry.path.source(), values.before, &materialize_options)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to read previous content for {}",
+                    repo_path_label(entry.path.source())
+                )
+            })?;
+        let after = git_diff_part(entry.path.target(), values.after, &materialize_options)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to read current content for {}",
+                    repo_path_label(entry.path.target())
+                )
+            })?;
+
+        let mut file = DiffFile {
+            path,
+            old_path,
+            status,
+            hunks: Vec::new(),
+            additions: 0,
+            deletions: 0,
+        };
+
+        if before.content.is_binary || after.content.is_binary {
+            file.hunks.push(DiffHunkView {
+                header: "binary files differ".to_owned(),
+                lines: Vec::new(),
+            });
+        } else {
+            let hunks = unified_diff_hunks(
+                Diff::new(
+                    BStr::new(before.content.contents.as_slice()),
+                    BStr::new(after.content.contents.as_slice()),
+                ),
+                3,
+                LineCompareMode::Exact,
+            );
+            for hunk in hunks {
+                let mut rows = Vec::new();
+                let mut old_line = hunk.left_line_range.start + 1;
+                let mut new_line = hunk.right_line_range.start + 1;
+                for (line_type, tokens) in hunk.lines {
+                    let content = diff_tokens_to_string(tokens);
+                    match line_type {
+                        DiffLineType::Context => {
+                            rows.push(DiffLine {
+                                kind: DiffLineKind::Context,
+                                old_line: Some(old_line),
+                                new_line: Some(new_line),
+                                content,
+                                syntax: Vec::new(),
+                            });
+                            old_line += 1;
+                            new_line += 1;
+                        }
+                        DiffLineType::Removed => {
+                            file.deletions += 1;
+                            rows.push(DiffLine {
+                                kind: DiffLineKind::Deletion,
+                                old_line: Some(old_line),
+                                new_line: None,
+                                content,
+                                syntax: Vec::new(),
+                            });
+                            old_line += 1;
+                        }
+                        DiffLineType::Added => {
+                            file.additions += 1;
+                            rows.push(DiffLine {
+                                kind: DiffLineKind::Addition,
+                                old_line: None,
+                                new_line: Some(new_line),
+                                content,
+                                syntax: Vec::new(),
+                            });
+                            new_line += 1;
+                        }
+                    }
+                }
+                file.hunks.push(DiffHunkView {
+                    header: format_hunk_header(&hunk.left_line_range, &hunk.right_line_range),
+                    lines: rows,
+                });
+            }
+        }
+
+        apply_syntax_highlighting(&mut file);
+        files.push(file);
+    }
+
+    if files.is_empty() {
+        files.push(DiffFile {
+            path: display_scope(&repository),
+            old_path: None,
+            status: DiffFileStatus::Modified,
+            hunks: Vec::new(),
+            additions: 0,
+            deletions: 0,
+        });
+    }
+
+    let total_additions = files.iter().map(|file| file.additions).sum();
+    let total_deletions = files.iter().map(|file| file.deletions).sum();
+
+    Ok(DiffDocument {
+        files,
+        total_additions,
+        total_deletions,
+    })
+}
+
+fn repo_scope_matcher(repository: &Repository) -> Result<Box<dyn Matcher>> {
+    if repository.scope.as_os_str().is_empty() {
+        return Ok(Box::new(EverythingMatcher));
+    }
+
+    let repo_path =
+        RepoPathBuf::parse_fs_path(&repository.root, &repository.root, &repository.scope)
+            .with_context(|| format!("failed to parse jj path {}", repository.scope.display()))?;
+    Ok(Box::new(PrefixMatcher::new([repo_path])))
+}
+
+fn repo_path_label(path: &RepoPath) -> String {
+    path.as_internal_file_string().to_owned()
+}
+
+fn diff_tokens_to_string(tokens: Vec<(jj_lib::diff_presentation::DiffTokenType, &[u8])>) -> String {
+    let mut bytes = Vec::new();
+    for (_, token) in tokens {
+        bytes.extend_from_slice(token);
+    }
+
+    while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+        bytes.pop();
+    }
+
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn format_hunk_header(
+    old_range: &std::ops::Range<usize>,
+    new_range: &std::ops::Range<usize>,
+) -> String {
+    format!(
+        "@@ -{} +{} @@",
+        format_hunk_range(old_range),
+        format_hunk_range(new_range)
+    )
+}
+
+fn format_hunk_range(range: &std::ops::Range<usize>) -> String {
+    let len = range.end.saturating_sub(range.start);
+    let start = if len == 0 {
+        range.start
+    } else {
+        range.start + 1
+    };
+
+    if len == 1 {
+        start.to_string()
+    } else {
+        format!("{start},{len}")
     }
 }
 
@@ -730,6 +1037,8 @@ fn parse_commit_log(output: &str) -> Vec<CommitSummary> {
             Some(CommitSummary {
                 change_id: change_id.to_owned(),
                 commit_id: commit_id.to_owned(),
+                revision_id: commit_id.to_owned(),
+                shortest_change_id_len: None,
                 description: if description.is_empty() {
                     "(no description set)".to_owned()
                 } else {
@@ -765,7 +1074,6 @@ fn parse_backend_output(repository: &Repository, output: &str) -> DiffDocument {
                 path,
                 old_path,
                 status: DiffFileStatus::Modified,
-                metadata: Vec::new(),
                 hunks: Vec::new(),
                 additions: 0,
                 deletions: 0,
@@ -803,7 +1111,6 @@ fn parse_backend_output(repository: &Repository, output: &str) -> DiffDocument {
             path: display_scope(repository),
             old_path: None,
             status: DiffFileStatus::Modified,
-            metadata: vec!["no changes detected for this scope".to_owned()],
             hunks: Vec::new(),
             additions: 0,
             deletions: 0,
@@ -859,10 +1166,6 @@ fn update_file_metadata(file: &mut DiffFile, line: &str) {
         file.old_path = Some(path.to_owned());
     } else if let Some(path) = line.strip_prefix("+++ b/") {
         file.path = path.to_owned();
-    }
-
-    if !matches!(line, "--- /dev/null" | "+++ /dev/null") {
-        file.metadata.push(line.to_owned());
     }
 }
 
@@ -1240,6 +1543,7 @@ fn build_commit_button<'a>(
     theme: ThemeSpec,
 ) -> Element<'a, Message> {
     let unique_len = shortest_unique_prefix_len(&commit.change_id, commits);
+    let label_len = revision_id_display_len(unique_len, &commit.change_id);
     let id_prefix = commit
         .change_id
         .chars()
@@ -1249,9 +1553,11 @@ fn build_commit_button<'a>(
         .change_id
         .chars()
         .skip(unique_len)
+        .take(label_len.saturating_sub(unique_len))
         .collect::<String>();
-    let revision = RevisionSelection::Commit(commit.change_id.clone());
-    let detail = format!("{} · {}", commit.commit_id, commit.author);
+    let revision = RevisionSelection::Commit(commit.revision_id.clone());
+    let commit_id = truncate_end(&commit.commit_id, SIDEBAR_COMMIT_ID_CHARS);
+    let detail = format!("{commit_id} · {}", commit.author);
     let mut indicators = Vec::new();
     if !commit.has_description {
         indicators.push(RevisionIndicator::NoDescription);
@@ -1286,6 +1592,16 @@ fn build_commit_button<'a>(
     )
 }
 
+fn revision_id_display_len(unique_len: usize, revision_id: &str) -> usize {
+    SIDEBAR_REVISION_ID_CHARS
+        .max(unique_len)
+        .min(revision_id.chars().count())
+}
+
+fn truncate_end(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
 fn build_revision_metadata<'a>(
     indicators: impl IntoIterator<Item = RevisionIndicator>,
     revision: &RevisionSelection,
@@ -1313,7 +1629,9 @@ fn build_revision_metadata<'a>(
         ));
     }
 
-    row.into()
+    container(row)
+        .height(Length::Fixed(REVISION_CHIP_HEIGHT))
+        .into()
 }
 
 fn build_revision_chip<'a>(
@@ -1411,6 +1729,14 @@ fn build_revision_item_with_content<'a>(
 }
 
 fn shortest_unique_prefix_len(change_id: &str, commits: &[CommitSummary]) -> usize {
+    if let Some(prefix_len) = commits
+        .iter()
+        .find(|commit| commit.change_id == change_id)
+        .and_then(|commit| commit.shortest_change_id_len)
+    {
+        return prefix_len.min(change_id.chars().count());
+    }
+
     let total_len = change_id.chars().count();
 
     (1..=total_len)
@@ -1774,7 +2100,6 @@ fn build_diff_panel(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
                 _ => file.path.clone(),
             },
             status: file.status.label(),
-            metadata: &file.metadata,
             hunks: &file.hunks,
             additions: file.additions,
             deletions: file.deletions,
@@ -1887,9 +2212,7 @@ fn app_shell_style(theme: ThemeSpec) -> container::Style {
 }
 
 fn sidebar_header_style(theme: ThemeSpec) -> container::Style {
-    container::Style::default()
-        .background(theme.panel_background)
-        .border(panel_border(theme))
+    container::Style::default().background(theme.panel_background)
 }
 
 fn panel_style(background: Color, theme: ThemeSpec) -> container::Style {
@@ -2067,7 +2390,6 @@ mod tests {
             path: path.to_owned(),
             old_path: None,
             status: DiffFileStatus::Modified,
-            metadata: Vec::new(),
             hunks: Vec::new(),
             additions: 0,
             deletions: 0,
@@ -2075,50 +2397,17 @@ mod tests {
     }
 
     #[test]
-    fn jj_root_scope_does_not_pass_empty_fileset() {
+    fn git_commit_diff_uses_selected_revision() {
         let repository = Repository {
             root: PathBuf::from("/repo"),
-            vcs: Vcs::Jj,
+            vcs: Vcs::Git,
             scope: PathBuf::new(),
         };
 
-        let (program, args) = backend_command(&repository, &RevisionSelection::WorkingCopy);
+        let args =
+            git_backend_command(&repository, &RevisionSelection::Commit("abc123".to_owned()));
 
-        assert_eq!(program, "jj");
-        assert_eq!(
-            args,
-            ["diff", "--git", "--color", "never", "--"]
-                .into_iter()
-                .map(OsString::from)
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn jj_subdir_scope_is_passed_as_fileset() {
-        let repository = Repository {
-            root: PathBuf::from("/repo"),
-            vcs: Vcs::Jj,
-            scope: PathBuf::from("src"),
-        };
-
-        let (_program, args) = backend_command(&repository, &RevisionSelection::WorkingCopy);
-
-        assert_eq!(args.last(), Some(&OsString::from("src")));
-    }
-
-    #[test]
-    fn jj_commit_diff_uses_selected_revision() {
-        let repository = Repository {
-            root: PathBuf::from("/repo"),
-            vcs: Vcs::Jj,
-            scope: PathBuf::new(),
-        };
-
-        let (_program, args) =
-            backend_command(&repository, &RevisionSelection::Commit("abc123".to_owned()));
-
-        assert!(args.contains(&OsString::from("-r")));
+        assert!(args.contains(&OsString::from("show")));
         assert!(args.contains(&OsString::from("abc123")));
         assert_eq!(args.last(), Some(&OsString::from("--")));
     }
@@ -2155,6 +2444,29 @@ mod tests {
         assert_eq!(shortest_unique_prefix_len("abc", &commits), 3);
         assert_eq!(shortest_unique_prefix_len("abd", &commits), 3);
         assert_eq!(shortest_unique_prefix_len("z", &commits), 1);
+    }
+
+    #[test]
+    fn commit_log_rows_select_full_revision_id() {
+        let commits = parse_commit_log(
+            "abc\tdef123456789abcdef\tme@example.com\tfalse\tadd commit sidebar\n",
+        );
+
+        assert_eq!(commits[0].change_id, "abc");
+        assert_eq!(commits[0].commit_id, "def123456789abcdef");
+        assert_eq!(commits[0].revision_id, "def123456789abcdef");
+    }
+
+    #[test]
+    fn revision_id_display_len_keeps_shortest_unique_prefix() {
+        let long_id = "abcdefghijklmnopqrstuvwxyz";
+
+        assert_eq!(
+            revision_id_display_len(3, long_id),
+            SIDEBAR_REVISION_ID_CHARS
+        );
+        assert_eq!(revision_id_display_len(16, long_id), 16);
+        assert_eq!(revision_id_display_len(99, long_id), long_id.len());
     }
 
     #[test]
