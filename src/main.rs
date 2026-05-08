@@ -9,6 +9,9 @@ use std::{
 };
 
 mod diff_view;
+mod graph;
+mod graph_view;
+mod revision_list;
 
 use anyhow::{Context, Result, bail};
 use arborium::{
@@ -21,18 +24,13 @@ use diff_view::{
     DiffFileView, DiffHunkView, DiffLine, DiffLineKind, DiffView, Palette, SyntaxKind, SyntaxSpan,
 };
 use futures::StreamExt;
+use graph::{LaneFrame, assign_lanes};
+use graph_view::RevisionGraphStyle;
 use iced::{
-    Background, Border, Color, Element, Font, Length, Rectangle, Shadow, Subscription, Task, Theme,
-    Vector,
-    advanced::widget::{self as advanced_widget, Id, Operation as WidgetOperation},
-    alignment,
+    Background, Border, Color, Element, Font, Length, Shadow, Subscription, Task, Theme, alignment,
     event::{self, Event},
     keyboard, system, theme, time,
-    widget::{
-        button, column, container, row, scrollable, text,
-        text::{Ellipsis, Wrapping},
-        tooltip,
-    },
+    widget::{button, column, container, row, text},
     window,
 };
 use jj_lib::{
@@ -45,14 +43,20 @@ use jj_lib::{
         unified::{DiffLineType, git_diff_part, unified_diff_hunks},
     },
     files::FileMergeHunkLevel,
+    graph::{GraphEdge, GraphNode, TopoGroupedGraphIterator},
     matchers::{EverythingMatcher, Matcher, PrefixMatcher},
     merge::{Diff, SameChange},
     object_id::ObjectId,
     repo::{Repo, StoreFactories},
     repo_path::{RepoPath, RepoPathBuf},
+    revset::{RevsetExpression, SymbolResolver},
     settings::UserSettings,
     tree_merge::MergeOptions,
     workspace::{Workspace, default_working_copy_factories},
+};
+use revision_list::{
+    FileRowView, IndicatorChip, Item as RevisionListItem, RevisionList, RevisionListStyle,
+    RevisionRowView, RowSelectionKey,
 };
 use tokio::process::Command;
 
@@ -66,26 +70,19 @@ const SMALL_TEXT_SIZE: f32 = 14.0;
 const TITLE_TEXT_SIZE: f32 = 18.0;
 const SIDEBAR_REVISION_ID_CHARS: usize = 12;
 const SIDEBAR_COMMIT_ID_CHARS: usize = 12;
-const PANEL_RADIUS: f32 = 3.0;
 const CONTROL_RADIUS: f32 = 5.0;
 const SIDEBAR_WIDTH: f32 = 360.0;
-const SIDEBAR_FILE_BADGE_WIDTH: f32 = 24.0;
+// Floor for the badge column. We measure the actual status labels to size the
+// column, but a single-character label like "M" can render thinner than the
+// chip looks tasteful at, so we keep a small visual minimum.
+const SIDEBAR_FILE_BADGE_MIN_WIDTH: f32 = 22.0;
+const SIDEBAR_FILE_BADGE_HORIZONTAL_PADDING: f32 = 6.0;
+// Horizontal padding flanking the `+N` / `-N` numeric columns.
+const SIDEBAR_FILE_STAT_HORIZONTAL_PADDING: f32 = 4.0;
 const SIDEBAR_FILE_STAT_MIN_WIDTH: f32 = 24.0;
-const SIDEBAR_FILE_STAT_CHAR_WIDTH: f32 = 7.0;
-const SIDEBAR_FILE_STAT_PADDING: f32 = 8.0;
-const REVISION_CHIP_HEIGHT: f32 = 20.0;
-const SIDEBAR_SCROLLBAR_WIDTH: f32 = 10.0;
-const SIDEBAR_SCROLLBAR_SCROLLER_WIDTH: f32 = 7.0;
-const SIDEBAR_SCROLLBAR_SPACING: f32 = 0.0;
-const SIDEBAR_FILE_TEXT_CHAR_WIDTH: f32 = 7.0;
-const SIDEBAR_FILE_TEXT_RESERVED_WIDTH: f32 =
-    SIDEBAR_FILE_BADGE_WIDTH + SIDEBAR_FILE_STAT_MIN_WIDTH * 2.0 + 6.0 * 4.0 + 20.0;
+const SIDEBAR_FILE_ROW_GAP: f32 = 6.0;
+const SIDEBAR_FILE_ROW_HORIZONTAL_PADDING: f32 = 20.0;
 const REPOSITORY_REFRESH_INTERVAL: Duration = Duration::from_millis(1_000);
-const SIDEBAR_SCROLLABLE_ID: &str = "sidebar-scrollable";
-const SIDEBAR_HEADER_ESTIMATED_HEIGHT: f32 = 82.0;
-const SIDEBAR_REVISION_ESTIMATED_HEIGHT: f32 = 100.0;
-const SIDEBAR_FILE_ROW_ESTIMATED_HEIGHT: f32 = 39.0;
-const SIDEBAR_REVEAL_PADDING: f32 = 32.0;
 
 fn main() -> iced::Result {
     let cli = Cli::parse();
@@ -172,14 +169,6 @@ struct DiffDocument {
     total_deletions: usize,
 }
 
-impl DiffDocument {
-    fn has_changes(&self) -> bool {
-        self.total_additions > 0
-            || self.total_deletions > 0
-            || self.files.iter().any(|file| !file.hunks.is_empty())
-    }
-}
-
 #[derive(Debug, Clone)]
 struct DiffFile {
     path: String,
@@ -200,6 +189,8 @@ struct CommitSummary {
     author: String,
     has_description: bool,
     is_empty: Option<bool>,
+    lane_frame: LaneFrame,
+    is_working_copy: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,13 +206,14 @@ enum Message {
     BackendLoaded(RevisionSelection, Result<BackendOutput, String>),
     RepositorySnapshotLoaded(Result<RepositorySnapshot, String>),
     SelectFile(usize),
-    SelectRevision(RevisionSelection),
+    SelectRowKey(revision_list::RowSelectionKey),
     SelectTheme(ThemePreference),
     SystemThemeChanged(theme::Mode),
     WindowFocusChanged(bool),
     RefreshRepository,
     SelectNextFile,
     SelectPreviousFile,
+    CopyToClipboard(String),
 }
 
 #[derive(Debug, Clone)]
@@ -485,7 +477,11 @@ impl Diffui {
                     return scroll_sidebar_to_file(index, self);
                 }
             }
-            Message::SelectRevision(selection) => {
+            Message::SelectRowKey(key) => {
+                let selection = match key {
+                    revision_list::RowSelectionKey::WorkingCopy => RevisionSelection::WorkingCopy,
+                    revision_list::RowSelectionKey::Commit(id) => RevisionSelection::Commit(id),
+                };
                 if self.selected_revision != selection
                     && self.pending_revision.as_ref() != Some(&selection)
                     && let Some(repository) = self.repository.clone()
@@ -530,6 +526,9 @@ impl Diffui {
                     return scroll_sidebar_to_file(self.selected_file, self);
                 }
             }
+            Message::CopyToClipboard(text) => {
+                return iced::clipboard::write(text).discard();
+            }
         }
 
         Task::none()
@@ -552,9 +551,13 @@ impl Diffui {
 
     fn view(&self) -> Element<'_, Message> {
         let theme = self.resolved_theme().spec();
-        let content = row![build_sidebar(self, theme), build_diff_panel(self, theme)]
-            .spacing(0)
-            .height(Length::Fill);
+        let content = row![
+            build_sidebar(self, theme),
+            vertical_divider(theme),
+            build_diff_panel(self, theme),
+        ]
+        .spacing(0)
+        .height(Length::Fill);
 
         container(content)
             .padding(0)
@@ -765,7 +768,16 @@ async fn run_repository_snapshot(repository: Repository) -> Result<RepositorySna
 
 fn git_backend_command(repository: &Repository, revision: &RevisionSelection) -> Vec<OsString> {
     let mut args: Vec<OsString> = match revision {
-        RevisionSelection::WorkingCopy => ["diff", "--"].into_iter().map(OsString::from).collect(),
+        RevisionSelection::WorkingCopy => {
+            // `git diff HEAD` covers both staged and unstaged changes
+            // against the last committed state — the closest analog to
+            // jj's @ working-copy diff. Untracked files are not included
+            // (git diff only walks tracked paths).
+            ["diff", "HEAD", "--no-ext-diff", "--no-color", "--"]
+                .into_iter()
+                .map(OsString::from)
+                .collect()
+        }
         RevisionSelection::Commit(revision) => {
             vec![
                 OsString::from("show"),
@@ -817,14 +829,47 @@ async fn load_commits(repository: &Repository) -> Result<Vec<CommitSummary>> {
                 "git",
                 vec![
                     OsString::from("log"),
-                    OsString::from("--pretty=format:%h%x09%H%x09%ae%x09%x09%s"),
+                    OsString::from("--topo-order"),
+                    OsString::from("--pretty=format:%h%x09%H%x09%P%x09%ae%x09%x09%s"),
                 ],
             )
             .await?;
 
-            Ok(parse_commit_log(&output))
+            let mut rows = parse_commit_log_rows(&output);
+            // Git has no native @ commit, so synthesize a working-copy row at
+            // the top whenever the tree differs from HEAD. The row's parent
+            // is HEAD so the graph keeps a continuous lane.
+            if !rows.is_empty() && git_has_uncommitted_changes(&repository.root).await? {
+                let head_id = rows[0].commit_id.clone();
+                rows.insert(
+                    0,
+                    ParsedCommitRow {
+                        change_id: GIT_WORKING_COPY_ID.to_owned(),
+                        commit_id: GIT_WORKING_COPY_ID.to_owned(),
+                        parents: vec![head_id],
+                        author: String::new(),
+                        is_empty: None,
+                        description: "Working copy".to_owned(),
+                        has_description: true,
+                        is_working_copy: true,
+                    },
+                );
+            }
+            Ok(build_commit_summaries(rows))
         }
     }
+}
+
+async fn git_has_uncommitted_changes(repository_root: &Path) -> Result<bool> {
+    // `git status --porcelain` prints one line per change (staged, unstaged,
+    // or untracked) and nothing on a clean tree.
+    let output = run_command(
+        repository_root,
+        "git",
+        vec![OsString::from("status"), OsString::from("--porcelain")],
+    )
+    .await?;
+    Ok(!output.trim().is_empty())
 }
 
 async fn load_jj_commits(repository_root: PathBuf) -> Result<Vec<CommitSummary>> {
@@ -846,27 +891,40 @@ async fn load_jj_commits(repository_root: PathBuf) -> Result<Vec<CommitSummary>>
     let wc_commit_id = repo
         .view()
         .get_wc_commit_id(workspace_name)
-        .context("jj workspace has no working-copy commit")?;
-    let wc_commit = repo
-        .store()
-        .get_commit_async(wc_commit_id)
-        .await
-        .context("failed to load jj working-copy commit")?;
+        .context("jj workspace has no working-copy commit")?
+        .clone();
 
-    let mut commits = Vec::new();
-    let mut stack = wc_commit.parent_ids().to_vec();
-    let mut seen = std::collections::HashSet::new();
+    // Default revset: all ancestors of the working copy (inclusive). Once the
+    // CLI grows a -r flag, parse it here instead.
+    let expr = RevsetExpression::commit(wc_commit_id.clone()).ancestors();
+    let symbol_resolver = SymbolResolver::new(
+        repo.as_ref(),
+        &[] as &[Box<dyn jj_lib::revset::SymbolResolverExtension>],
+    );
+    let resolved = expr
+        .resolve_user_expression(repo.as_ref(), &symbol_resolver)
+        .context("failed to resolve jj revset")?;
+    let revset = resolved
+        .evaluate(repo.as_ref())
+        .context("failed to evaluate jj revset")?;
 
-    while let Some(commit_id) = stack.pop() {
-        if !seen.insert(commit_id.clone()) {
-            continue;
-        }
+    let nodes: Vec<GraphNode<CommitId>> = {
+        let mut topo = TopoGroupedGraphIterator::new(revset.iter_graph(), |id: &CommitId| id);
+        topo.prioritize_branch(wc_commit_id.clone());
+        topo.collect::<Result<Vec<_>, _>>()
+            .context("failed to walk jj revset graph")?
+    };
+    drop(revset);
 
+    let lane_rows = assign_lanes(nodes.iter().map(|(id, edges)| (id.clone(), edges.clone())));
+
+    let mut commits = Vec::with_capacity(nodes.len());
+    for ((id, _edges), lane_row) in nodes.into_iter().zip(lane_rows) {
         let commit = repo
             .store()
-            .get_commit_async(&commit_id)
+            .get_commit_async(&id)
             .await
-            .with_context(|| format!("failed to load jj commit {}", commit_id.hex()))?;
+            .with_context(|| format!("failed to load jj commit {}", id.hex()))?;
 
         let description = commit.description().lines().next().unwrap_or("").trim();
         let is_empty = commit
@@ -882,10 +940,12 @@ async fn load_jj_commits(repository_root: PathBuf) -> Result<Vec<CommitSummary>>
                 )
             })?;
 
+        let commit_id_hex = commit.id().hex();
+        let is_working_copy = commit.id() == &wc_commit_id;
         commits.push(CommitSummary {
             change_id: commit.change_id().to_string(),
-            commit_id: commit.id().hex(),
-            revision_id: commit.id().hex(),
+            commit_id: commit_id_hex.clone(),
+            revision_id: commit_id_hex,
             shortest_change_id_len: Some(shortest_change_id_len),
             description: if description.is_empty() {
                 "(no description set)".to_owned()
@@ -895,9 +955,9 @@ async fn load_jj_commits(repository_root: PathBuf) -> Result<Vec<CommitSummary>>
             author: commit.author().email.clone(),
             has_description: !description.is_empty(),
             is_empty: Some(is_empty),
+            lane_frame: LaneFrame::from_lane_row(&lane_row),
+            is_working_copy,
         });
-
-        stack.extend(commit.parent_ids().iter().cloned());
     }
 
     Ok(commits)
@@ -1069,17 +1129,6 @@ async fn load_jj_diff(repository: Repository, revision: RevisionSelection) -> Re
         files.push(file);
     }
 
-    if files.is_empty() {
-        files.push(DiffFile {
-            path: display_scope(&repository),
-            old_path: None,
-            status: DiffFileStatus::Modified,
-            hunks: Vec::new(),
-            additions: 0,
-            deletions: 0,
-        });
-    }
-
     let total_additions = files.iter().map(|file| file.additions).sum();
     let total_deletions = files.iter().map(|file| file.deletions).sum();
 
@@ -1164,13 +1213,36 @@ fn format_hunk_range(range: &std::ops::Range<usize>) -> String {
     }
 }
 
+/// Sentinel commit_id used for the synthetic git working-copy row.
+/// Selection short-circuits on `is_working_copy` before this value is ever
+/// passed to git, so it just needs to be visually distinct and not collide
+/// with a real hex hash.
+const GIT_WORKING_COPY_ID: &str = "wc";
+
+struct ParsedCommitRow {
+    change_id: String,
+    commit_id: String,
+    parents: Vec<String>,
+    author: String,
+    is_empty: Option<bool>,
+    description: String,
+    has_description: bool,
+    is_working_copy: bool,
+}
+
+#[cfg(test)]
 fn parse_commit_log(output: &str) -> Vec<CommitSummary> {
+    build_commit_summaries(parse_commit_log_rows(output))
+}
+
+fn parse_commit_log_rows(output: &str) -> Vec<ParsedCommitRow> {
     output
         .lines()
         .filter_map(|line| {
-            let mut parts = line.splitn(4, '\t');
+            let mut parts = line.splitn(5, '\t');
             let change_id = parts.next()?.trim();
             let commit_id = parts.next()?.trim();
+            let parents_field = parts.next().unwrap_or("");
             let author = parts.next()?.trim();
             let remainder = parts.next().unwrap_or("");
             let (empty, description) =
@@ -1184,21 +1256,64 @@ fn parse_commit_log(output: &str) -> Vec<CommitSummary> {
                 return None;
             }
 
+            let parents: Vec<String> = parents_field
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect();
             let has_description = !description.is_empty();
-            Some(CommitSummary {
+            Some(ParsedCommitRow {
                 change_id: change_id.to_owned(),
                 commit_id: commit_id.to_owned(),
-                revision_id: commit_id.to_owned(),
-                shortest_change_id_len: None,
+                parents,
+                author: author.to_owned(),
+                is_empty: empty,
                 description: if description.is_empty() {
                     "(no description set)".to_owned()
                 } else {
                     description.to_owned()
                 },
-                author: author.to_owned(),
                 has_description,
-                is_empty: empty,
+                is_working_copy: false,
             })
+        })
+        .collect()
+}
+
+fn build_commit_summaries(rows: Vec<ParsedCommitRow>) -> Vec<CommitSummary> {
+    // Walk the rows in their existing topo order and assign lanes from
+    // parent edges. Parents not present in the listing (shallow clone, etc.)
+    // become Missing edges so the renderer can draw a stub.
+    let known: std::collections::HashSet<&str> =
+        rows.iter().map(|row| row.commit_id.as_str()).collect();
+    let lane_inputs = rows.iter().map(|row| {
+        let edges: Vec<GraphEdge<String>> = row
+            .parents
+            .iter()
+            .map(|parent| {
+                if known.contains(parent.as_str()) {
+                    GraphEdge::direct(parent.clone())
+                } else {
+                    GraphEdge::missing(parent.clone())
+                }
+            })
+            .collect();
+        (row.commit_id.clone(), edges)
+    });
+    let lane_rows = assign_lanes(lane_inputs);
+
+    rows.into_iter()
+        .zip(lane_rows)
+        .map(|(row, lane_row)| CommitSummary {
+            change_id: row.change_id,
+            commit_id: row.commit_id.clone(),
+            revision_id: row.commit_id,
+            shortest_change_id_len: None,
+            description: row.description,
+            author: row.author,
+            has_description: row.has_description,
+            is_empty: row.is_empty,
+            lane_frame: LaneFrame::from_lane_row(&lane_row),
+            is_working_copy: row.is_working_copy,
         })
         .collect()
 }
@@ -1211,7 +1326,7 @@ fn parse_optional_bool(value: &str) -> Option<bool> {
     }
 }
 
-fn parse_backend_output(repository: &Repository, output: &str) -> DiffDocument {
+fn parse_backend_output(_repository: &Repository, output: &str) -> DiffDocument {
     let mut files = Vec::new();
     let mut current_file: Option<DiffFile> = None;
     let mut current_hunk: Option<PendingHunk> = None;
@@ -1256,17 +1371,6 @@ fn parse_backend_output(repository: &Repository, output: &str) -> DiffDocument {
     }
 
     flush_current_file(&mut files, &mut current_file, &mut current_hunk);
-
-    if files.is_empty() {
-        files.push(DiffFile {
-            path: display_scope(repository),
-            old_path: None,
-            status: DiffFileStatus::Modified,
-            hunks: Vec::new(),
-            additions: 0,
-            deletions: 0,
-        });
-    }
 
     let total_additions = files.iter().map(|file| file.additions).sum();
     let total_deletions = files.iter().map(|file| file.deletions).sum();
@@ -1389,6 +1493,28 @@ fn is_conflict_marker(line: &str) -> bool {
         || line.starts_with(">>>>>>>")
 }
 
+/// Apply syntax highlighting to all visible diff lines for `file`.
+///
+/// We previously fed each line to tree-sitter individually, which was
+/// fundamentally wrong: tree-sitter expects a complete document, so a line
+/// like `fn foo(` parses as an error, `}` on its own gets no captures, and
+/// every multi-line construct (string literals, function bodies, doc
+/// comments, raw strings) is invisible to the parser. The result was that
+/// keywords mid-block went un-highlighted and noisy single-character lines
+/// would silently fall back to plain text.
+///
+/// The fix: reconstruct each "side" (old and new) of the file as a single
+/// contiguous document, parse it once, and map the resulting spans back to
+/// individual lines. Blank lines fill the gaps between hunks so each
+/// surviving line still sits at its original line number — the parser
+/// won't see the surrounding code, but tree-sitter is reasonably tolerant
+/// of missing top-level constructs and will still recover local syntax
+/// (literals, identifiers, comments, keywords) correctly within each hunk.
+///
+/// Context lines are highlighted from the new side (they're identical on
+/// both sides, but we only need to look them up once); deletions come from
+/// the old side; additions from the new side. Note/Conflict lines are
+/// rendered as plain text — they aren't real source content.
 fn apply_syntax_highlighting(file: &mut DiffFile) {
     static GRAMMAR_STORE: OnceLock<GrammarStore> = OnceLock::new();
 
@@ -1399,55 +1525,153 @@ fn apply_syntax_highlighting(file: &mut DiffFile) {
     let Some(grammar) = store.get(language) else {
         return;
     };
-    let mut contexts = HashMap::new();
 
-    for hunk in &mut file.hunks {
-        for line in &mut hunk.lines {
+    let new_spans = parse_side(&grammar, file, Side::New);
+    let old_spans = parse_side(&grammar, file, Side::Old);
+
+    for (hunk_index, hunk) in file.hunks.iter_mut().enumerate() {
+        for (line_index, line) in hunk.lines.iter_mut().enumerate() {
             if matches!(line.kind, DiffLineKind::Note | DiffLineKind::Conflict) {
                 continue;
             }
 
-            line.syntax = highlight_line(language, grammar.clone(), &mut contexts, &line.content);
+            let key = (hunk_index, line_index);
+            let spans = match line.kind {
+                DiffLineKind::Deletion => old_spans.get(&key),
+                DiffLineKind::Addition | DiffLineKind::Context => new_spans.get(&key),
+                DiffLineKind::Note | DiffLineKind::Conflict => None,
+            };
+
+            if let Some(spans) = spans {
+                line.syntax = spans.clone();
+            }
         }
     }
 }
 
-fn highlight_line(
-    language: &str,
-    grammar: Arc<CompiledGrammar>,
-    contexts: &mut HashMap<String, ParseContext>,
-    content: &str,
-) -> Vec<SyntaxSpan> {
-    if content.trim().is_empty() {
-        return Vec::new();
+#[derive(Clone, Copy)]
+enum Side {
+    Old,
+    New,
+}
+
+/// Reconstruct one side of `file` as a single document, parse it, and slice
+/// the resulting captures into per-line span lists keyed by
+/// `(hunk_index, line_index)`.
+fn parse_side(
+    grammar: &Arc<CompiledGrammar>,
+    file: &DiffFile,
+    side: Side,
+) -> HashMap<(usize, usize), Vec<SyntaxSpan>> {
+    // For each line we keep on this side, record its byte range in the
+    // reconstructed buffer so we can map captures back later.
+    struct LineRange {
+        hunk_index: usize,
+        line_index: usize,
+        start: usize,
+        end: usize,
     }
 
-    let context = match contexts.entry(language.to_owned()) {
-        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-        std::collections::hash_map::Entry::Vacant(entry) => {
-            let Ok(context) = ParseContext::for_grammar(&grammar) else {
-                return Vec::new();
+    let mut buf = String::new();
+    let mut ranges: Vec<LineRange> = Vec::new();
+    // 1-indexed cursor over the source-file line numbers we've reached so far.
+    let mut current_source_line: usize = 1;
+
+    for (hunk_index, hunk) in file.hunks.iter().enumerate() {
+        for (line_index, line) in hunk.lines.iter().enumerate() {
+            let included = matches!(
+                (side, line.kind),
+                (Side::Old, DiffLineKind::Context | DiffLineKind::Deletion)
+                    | (Side::New, DiffLineKind::Context | DiffLineKind::Addition)
+            );
+            if !included {
+                continue;
+            }
+
+            let source_line = match side {
+                Side::Old => line.old_line,
+                Side::New => line.new_line,
             };
-            entry.insert(context)
+            let Some(target) = source_line else {
+                continue;
+            };
+
+            // Pad blank lines so this content sits at its true line number.
+            // Tree-sitter will see structurally-meaningless gaps but its
+            // error-recovery handles that cleanly for most languages.
+            while current_source_line < target {
+                buf.push('\n');
+                current_source_line += 1;
+            }
+
+            let start = buf.len();
+            buf.push_str(&line.content);
+            let end = buf.len();
+            buf.push('\n');
+            current_source_line += 1;
+
+            ranges.push(LineRange {
+                hunk_index,
+                line_index,
+                start,
+                end,
+            });
         }
+    }
+
+    if buf.trim().is_empty() || ranges.is_empty() {
+        return HashMap::new();
+    }
+
+    let Ok(mut context) = ParseContext::for_grammar(grammar) else {
+        return HashMap::new();
     };
-    let result = grammar.parse(context, content);
-    let mut spans = Vec::new();
+    let result = grammar.parse(&mut context, &buf);
+
+    let mut per_line: HashMap<(usize, usize), Vec<SyntaxSpan>> = HashMap::new();
 
     for span in result.spans {
         let Some(kind) = syntax_kind_for_capture(&span.capture) else {
             continue;
         };
-
         let (Ok(start), Ok(end)) = (usize::try_from(span.start), usize::try_from(span.end)) else {
             continue;
         };
-        if start < end && content.is_char_boundary(start) && content.is_char_boundary(end) {
-            spans.push(SyntaxSpan { start, end, kind });
+        if start >= end || end > buf.len() {
+            continue;
+        }
+        if !buf.is_char_boundary(start) || !buf.is_char_boundary(end) {
+            continue;
+        }
+
+        // Walk every line that the span overlaps. Most spans live entirely
+        // within one line so this loop usually fires once, but multi-line
+        // constructs (block comments, raw strings) need to highlight every
+        // covered line.
+        for range in &ranges {
+            if range.end <= start || range.start >= end {
+                continue;
+            }
+            let local_start = start.saturating_sub(range.start);
+            let local_end = (end - range.start).min(range.end - range.start);
+            if local_start >= local_end {
+                continue;
+            }
+            per_line
+                .entry((range.hunk_index, range.line_index))
+                .or_default()
+                .push(SyntaxSpan {
+                    start: local_start,
+                    end: local_end,
+                    kind,
+                });
         }
     }
 
-    normalize_syntax_spans(spans)
+    for spans in per_line.values_mut() {
+        *spans = normalize_syntax_spans(std::mem::take(spans));
+    }
+    per_line
 }
 
 fn syntax_kind_for_capture(capture: &str) -> Option<SyntaxKind> {
@@ -1544,37 +1768,46 @@ fn build_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     let repo_label = ui
         .repository
         .as_ref()
-        .map(|repository| format!("{} / {}", repository.vcs.label(), display_scope(repository)))
+        .map(|repository| match scope_label(repository) {
+            Some(scope) => format!("{} · {scope}", repository.vcs.label()),
+            None => repository.vcs.label().to_owned(),
+        })
         .unwrap_or_else(|| "Outside Repository".to_owned());
-    let metrics = row![
-        text(format_count(ui.document.files.len(), "File", "Files"))
-            .size(CAPTION_TEXT_SIZE)
-            .color(theme.accent),
-        text(format!("+{}", ui.document.total_additions))
-            .size(CAPTION_TEXT_SIZE)
-            .color(theme.added_text),
-        text(format!("-{}", ui.document.total_deletions))
-            .size(CAPTION_TEXT_SIZE)
-            .color(theme.removed_text),
+
+    let title_row = row![
+        text("Changes")
+            .size(TITLE_TEXT_SIZE)
+            .color(theme.text)
+            .width(Length::Fill),
+        build_theme_switcher(ui.selected_theme, theme),
     ]
     .spacing(10)
     .align_y(alignment::Vertical::Center);
 
-    let mut header_content = column![
-        row![
-            text("Changes")
-                .size(TITLE_TEXT_SIZE)
-                .color(theme.text)
-                .width(Length::Fill),
-            build_theme_switcher(ui.selected_theme, theme),
+    let mut header_content = column![title_row].spacing(7);
+
+    if !ui.document.files.is_empty() {
+        let metrics = row![
+            text(format_count(ui.document.files.len(), "File", "Files"))
+                .size(CAPTION_TEXT_SIZE)
+                .color(theme.accent),
+            text(format!("+{}", ui.document.total_additions))
+                .size(CAPTION_TEXT_SIZE)
+                .color(theme.added_text),
+            text(format!("-{}", ui.document.total_deletions))
+                .size(CAPTION_TEXT_SIZE)
+                .color(theme.removed_text),
         ]
-        .spacing(10),
-        metrics,
+        .spacing(10)
+        .align_y(alignment::Vertical::Center);
+        header_content = header_content.push(metrics);
+    }
+
+    header_content = header_content.push(
         text(repo_label)
             .size(CAPTION_TEXT_SIZE)
             .color(theme.subtle_text),
-    ]
-    .spacing(7);
+    );
 
     if let LoadStatus::Failed(error) = &ui.status {
         header_content = header_content.push(
@@ -1588,106 +1821,247 @@ fn build_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         .padding([12, 12])
         .style(move |_| sidebar_header_style(theme));
 
-    let mut items = column![sidebar_header, build_working_copy_button(ui, theme),].spacing(0);
+    let revision_list = build_revision_list(ui, theme);
 
-    for commit in &ui.commits {
-        items = items.push(build_commit_button(commit, &ui.commits, ui, theme));
-    }
+    let body = column![sidebar_header, revision_list].spacing(0);
 
-    let sidebar_content = scrollable(items.spacing(0))
-        .id(SIDEBAR_SCROLLABLE_ID)
-        .direction(scrollable::Direction::Vertical(
-            scrollable::Scrollbar::new()
-                .width(SIDEBAR_SCROLLBAR_WIDTH)
-                .scroller_width(SIDEBAR_SCROLLBAR_SCROLLER_WIDTH)
-                .spacing(SIDEBAR_SCROLLBAR_SPACING),
-        ))
-        .style(move |iced_theme, status| diff_scrollable_style(iced_theme, status, theme))
-        .height(Length::Fill);
-
-    container(sidebar_content)
+    container(body)
         .width(Length::Fixed(SIDEBAR_WIDTH))
         .height(Length::Fill)
-        .style(move |_| panel_style(theme.panel_background, theme))
+        .style(move |_| sidebar_panel_style(theme))
         .into()
 }
 
-fn scroll_sidebar_to_file(file_index: usize, ui: &Diffui) -> Task<Message> {
-    advanced_widget::operate(SidebarRevealFileOperation {
-        target: Id::new(SIDEBAR_SCROLLABLE_ID),
-        file_top: sidebar_file_row_top(file_index, ui),
-        file_height: SIDEBAR_FILE_ROW_ESTIMATED_HEIGHT,
-        padding: SIDEBAR_REVEAL_PADDING,
-    })
-}
+fn build_revision_list(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
+    let mut items: Vec<RevisionListItem> = Vec::with_capacity(ui.commits.len());
+    let metrics = sidebar_text_metrics();
 
-struct SidebarRevealFileOperation {
-    target: Id,
-    file_top: f32,
-    file_height: f32,
-    padding: f32,
-}
+    let (file_widgets, file_badge_width): (Option<Vec<FileRowTemplate>>, f32) =
+        if matches!(ui.status, LoadStatus::Loaded) && !ui.document.files.is_empty() {
+            let widest_addition = ui
+                .document
+                .files
+                .iter()
+                .map(|file| format!("+{}", file.additions))
+                .max_by(|a, b| {
+                    metrics
+                        .measure(a)
+                        .partial_cmp(&metrics.measure(b))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap_or_else(|| "+0".to_owned());
+            let widest_deletion = ui
+                .document
+                .files
+                .iter()
+                .map(|file| format!("-{}", file.deletions))
+                .max_by(|a, b| {
+                    metrics
+                        .measure(a)
+                        .partial_cmp(&metrics.measure(b))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap_or_else(|| "-0".to_owned());
+            let additions_w = sidebar_file_stat_width(&widest_addition, &metrics);
+            let deletions_w = sidebar_file_stat_width(&widest_deletion, &metrics);
+            let badge_w = sidebar_file_badge_width(&ui.document.files, &metrics);
 
-impl WidgetOperation<Message> for SidebarRevealFileOperation {
-    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn WidgetOperation<Message>)) {
-        operate(self);
-    }
+            // Reserve room for everything that isn't the path, then hand the
+            // remainder to the truncation logic. Previously this expression
+            // double-counted the stat widths (subtracted both the per-column
+            // min and the actual measured widths), making abbreviation kick
+            // in earlier than necessary.
+            let reserved = badge_w
+                + additions_w
+                + deletions_w
+                + SIDEBAR_FILE_ROW_GAP * 4.0
+                + SIDEBAR_FILE_ROW_HORIZONTAL_PADDING;
+            let display_width = (SIDEBAR_WIDTH - reserved).max(0.0);
+            let display_models =
+                sidebar_file_display_models(&ui.document.files, display_width, &metrics);
+            (
+                Some(
+                    ui.document
+                        .files
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, file)| FileRowTemplate {
+                            primary: display_models[idx].primary.clone(),
+                            secondary: display_models[idx].secondary.clone(),
+                            raw_path: display_models[idx].raw_path.clone(),
+                            status_label: file.status.short_label().to_owned(),
+                            status_background: file.status.short_badge_color(theme),
+                            additions: file.additions,
+                            deletions: file.deletions,
+                            file_index: idx,
+                            additions_width: additions_w,
+                            deletions_width: deletions_w,
+                        })
+                        .collect(),
+                ),
+                badge_w,
+            )
+        } else {
+            (None, SIDEBAR_FILE_BADGE_MIN_WIDTH)
+        };
 
-    fn scrollable(
-        &mut self,
-        id: Option<&Id>,
-        bounds: Rectangle,
-        content_bounds: Rectangle,
-        translation: Vector,
-        state: &mut dyn advanced_widget::operation::Scrollable,
-    ) {
-        if id != Some(&self.target) {
-            return;
+    for commit in &ui.commits {
+        let unique_len = shortest_unique_prefix_len(&commit.change_id, &ui.commits);
+        let label_len = revision_id_display_len(unique_len, &commit.change_id);
+        let id_prefix: String = commit.change_id.chars().take(unique_len).collect();
+        let id_suffix: String = commit
+            .change_id
+            .chars()
+            .skip(unique_len)
+            .take(label_len.saturating_sub(unique_len))
+            .collect();
+        let commit_id_short = truncate_end(&commit.commit_id, SIDEBAR_COMMIT_ID_CHARS);
+        let detail = format!("{commit_id_short} · {}", commit.author);
+
+        let mut indicators = Vec::new();
+        if commit.is_working_copy {
+            indicators.push(IndicatorChip {
+                label: "@".to_owned(),
+                background: theme.selected_file,
+                text_color: theme.accent,
+            });
+        }
+        if commit.is_empty == Some(true) {
+            indicators.push(IndicatorChip {
+                label: "empty".to_owned(),
+                background: theme.panel_background,
+                text_color: theme.subtle_text,
+            });
         }
 
-        let max_scroll_y = (content_bounds.height - bounds.height).max(0.0);
-        let current_y = translation.y.clamp(0.0, max_scroll_y);
-        let file_bottom = self.file_top + self.file_height;
-        let visible_top = current_y + self.padding;
-        let visible_bottom = current_y + bounds.height - self.padding;
+        let selection_key = if commit.is_working_copy {
+            RowSelectionKey::WorkingCopy
+        } else {
+            RowSelectionKey::Commit(commit.revision_id.clone())
+        };
 
-        let target_y = if self.file_top < visible_top {
-            Some(self.file_top - self.padding * 2.)
-        } else if file_bottom > visible_bottom {
-            Some(file_bottom - bounds.height + self.padding / 2.)
+        let is_expanded = match (&ui.expanded_revision, commit.is_working_copy) {
+            (RevisionSelection::WorkingCopy, true) => true,
+            (RevisionSelection::Commit(id), false) => id == &commit.revision_id,
+            _ => false,
+        };
+
+        let file_count_chip = if is_expanded && file_widgets.is_some() {
+            Some(format_count(ui.document.files.len(), "file", "files"))
         } else {
             None
         };
 
-        if let Some(target_y) = target_y {
-            state.scroll_to(advanced_widget::operation::scrollable::AbsoluteOffset {
-                x: None,
-                y: Some(target_y.clamp(0.0, max_scroll_y)),
-            });
+        items.push(RevisionListItem::Revision(RevisionRowView {
+            selection_key,
+            change_id_prefix: id_prefix,
+            change_id_suffix: id_suffix,
+            description: commit.description.clone(),
+            description_color: commit_description_color(commit, theme),
+            detail,
+            indicators,
+            file_count_chip,
+            frame: commit.lane_frame.clone(),
+        }));
+
+        if is_expanded && let Some(files) = &file_widgets {
+            let continuation = commit.lane_frame.after.clone();
+            for file in files {
+                items.push(RevisionListItem::File(FileRowView {
+                    primary: file.primary.clone(),
+                    secondary: file.secondary.clone(),
+                    raw_path: file.raw_path.clone(),
+                    status_label: file.status_label.clone(),
+                    status_background: file.status_background,
+                    status_text: theme.background,
+                    additions: file.additions,
+                    deletions: file.deletions,
+                    additions_text: theme.added_text,
+                    deletions_text: theme.removed_text,
+                    continuation: continuation.clone(),
+                    additions_width: file.additions_width,
+                    deletions_width: file.deletions_width,
+                    primary_color: theme.text,
+                    secondary_color: theme.muted_text,
+                    file_index: file.file_index,
+                }));
+            }
         }
+    }
+
+    let selected_row = match &ui.selected_revision {
+        RevisionSelection::WorkingCopy => Some(RowSelectionKey::WorkingCopy),
+        RevisionSelection::Commit(id) => Some(RowSelectionKey::Commit(id.clone())),
+    };
+
+    RevisionList::new(
+        items,
+        selected_row,
+        Some(ui.selected_file),
+        revision_list_style(theme, file_badge_width),
+        Message::SelectRowKey,
+        Message::SelectFile,
+    )
+    .width(Length::Fill)
+    .into()
+}
+
+struct FileRowTemplate {
+    primary: String,
+    secondary: String,
+    raw_path: String,
+    status_label: String,
+    status_background: Color,
+    additions: usize,
+    deletions: usize,
+    file_index: usize,
+    additions_width: f32,
+    deletions_width: f32,
+}
+
+fn revision_list_style(theme: ThemeSpec, file_badge_width: f32) -> RevisionListStyle {
+    RevisionListStyle {
+        graph: RevisionGraphStyle {
+            lane_width: 10.0,
+            line_thickness: 1.5,
+            node_radius: 3.5,
+            // Lane 0 (the trunk) wears the theme accent; subsequent lanes
+            // and the node discs that sit on them derive their hue from
+            // this — see `RevisionGraphStyle::lane_color`.
+            lane_base_color: theme.accent,
+            missing_color: theme.subtle_text,
+        },
+        revision_row_height: 64.0,
+        file_row_height: 39.0,
+        gutter_padding: 8.0,
+        content_padding: 12.0,
+        background: theme.panel_background,
+        selected_background: theme.selected_file,
+        border: theme.border,
+        muted_text: theme.muted_text,
+        subtle_text: theme.subtle_text,
+        accent_text: theme.accent,
+        file_count_background: theme.panel_background,
+        indicator_radius: CONTROL_RADIUS,
+        small_text_size: SMALL_TEXT_SIZE,
+        caption_text_size: CAPTION_TEXT_SIZE,
+        primary_font: Font::DEFAULT,
+        file_badge_width,
+        file_row_gap: SIDEBAR_FILE_ROW_GAP,
+        file_row_right_pad: SIDEBAR_FILE_ROW_HORIZONTAL_PADDING / 2.0,
+        tooltip_background: theme.panel_background_elevated,
+        tooltip_text: theme.text,
+        tooltip_border: theme.border,
+        tooltip_radius: CONTROL_RADIUS,
+        tooltip_padding: 6.0,
+        tooltip_gap: 8.0,
     }
 }
 
-fn sidebar_file_row_top(file_index: usize, ui: &Diffui) -> f32 {
-    sidebar_revision_row_top(&ui.expanded_revision, ui)
-        + SIDEBAR_REVISION_ESTIMATED_HEIGHT
-        + file_index as f32 * SIDEBAR_FILE_ROW_ESTIMATED_HEIGHT
-}
-
-fn sidebar_revision_row_top(revision: &RevisionSelection, ui: &Diffui) -> f32 {
-    match revision {
-        RevisionSelection::WorkingCopy => SIDEBAR_HEADER_ESTIMATED_HEIGHT,
-        RevisionSelection::Commit(revision_id) => {
-            let commit_index = ui
-                .commits
-                .iter()
-                .position(|commit| &commit.revision_id == revision_id)
-                .unwrap_or(0);
-
-            SIDEBAR_HEADER_ESTIMATED_HEIGHT
-                + (commit_index + 1) as f32 * SIDEBAR_REVISION_ESTIMATED_HEIGHT
-        }
-    }
+fn scroll_sidebar_to_file(_file_index: usize, _ui: &Diffui) -> Task<Message> {
+    // TODO: re-implement scroll-to-reveal against `RevisionList`'s internal
+    // scroll state once the widget exposes a scrollable operation.
+    Task::none()
 }
 
 fn build_theme_switcher(
@@ -1701,129 +2075,12 @@ fn build_theme_switcher(
         controls = controls.push(
             button(text(candidate.label()).size(CAPTION_TEXT_SIZE))
                 .padding([5, 7])
-                .style(move |_, status| sidebar_button_style(status, selected, theme))
+                .style(move |_, status| theme_switcher_button_style(status, selected, theme))
                 .on_press(Message::SelectTheme(candidate)),
         );
     }
 
     controls.into()
-}
-
-fn build_working_copy_button(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
-    let mut indicators = vec![RevisionIndicator::WorkingCopy];
-    let revision = RevisionSelection::WorkingCopy;
-
-    if revision == ui.expanded_revision
-        && matches!(ui.status, LoadStatus::Loaded)
-        && !ui.document.has_changes()
-    {
-        indicators.push(RevisionIndicator::Empty);
-    }
-
-    let title = row![
-        text("Working Copy")
-            .size(SMALL_TEXT_SIZE)
-            .color(theme.text)
-            .wrapping(Wrapping::Glyph),
-        build_revision_metadata(indicators, &revision, ui, theme),
-    ]
-    .spacing(8)
-    .align_y(alignment::Vertical::Center);
-
-    build_revision_item_with_content(
-        title.into(),
-        RevisionDescription::new("Uncommitted Changes", theme.text),
-        None,
-        revision,
-        ui,
-        theme,
-        true,
-    )
-}
-
-#[derive(Debug, Clone, Copy)]
-enum RevisionIndicator {
-    WorkingCopy,
-    Empty,
-}
-
-impl RevisionIndicator {
-    fn label(self) -> &'static str {
-        match self {
-            Self::WorkingCopy => "wip",
-            Self::Empty => "empty",
-        }
-    }
-
-    fn colors(self, theme: ThemeSpec) -> (Color, Color) {
-        match self {
-            Self::WorkingCopy => (theme.selected_file, theme.accent),
-            Self::Empty => (theme.panel_background, theme.subtle_text),
-        }
-    }
-}
-
-fn build_commit_button<'a>(
-    commit: &'a CommitSummary,
-    commits: &'a [CommitSummary],
-    ui: &'a Diffui,
-    theme: ThemeSpec,
-) -> Element<'a, Message> {
-    build_commit_button_with_options(commit, commits, ui, theme, true)
-}
-
-fn build_commit_button_with_options<'a>(
-    commit: &'a CommitSummary,
-    commits: &'a [CommitSummary],
-    ui: &'a Diffui,
-    theme: ThemeSpec,
-    show_files: bool,
-) -> Element<'a, Message> {
-    let unique_len = shortest_unique_prefix_len(&commit.change_id, commits);
-    let label_len = revision_id_display_len(unique_len, &commit.change_id);
-    let id_prefix = commit
-        .change_id
-        .chars()
-        .take(unique_len)
-        .collect::<String>();
-    let id_suffix = commit
-        .change_id
-        .chars()
-        .skip(unique_len)
-        .take(label_len.saturating_sub(unique_len))
-        .collect::<String>();
-    let revision = RevisionSelection::Commit(commit.revision_id.clone());
-    let commit_id = truncate_end(&commit.commit_id, SIDEBAR_COMMIT_ID_CHARS);
-    let detail = format!("{commit_id} · {}", commit.author);
-    let mut indicators = Vec::new();
-    if let Some(is_empty) = commit.is_empty
-        && is_empty
-    {
-        indicators.push(RevisionIndicator::Empty);
-    }
-
-    let title = row![
-        row![
-            text(id_prefix).size(SMALL_TEXT_SIZE).color(theme.accent),
-            text(id_suffix)
-                .size(SMALL_TEXT_SIZE)
-                .color(theme.subtle_text),
-        ]
-        .spacing(0),
-        build_revision_metadata(indicators, &revision, ui, theme),
-    ]
-    .spacing(8)
-    .align_y(alignment::Vertical::Center);
-
-    build_revision_item_with_content(
-        title.into(),
-        RevisionDescription::new(&commit.description, commit_description_color(commit, theme)),
-        Some(detail),
-        revision,
-        ui,
-        theme,
-        show_files,
-    )
 }
 
 fn revision_id_display_len(unique_len: usize, revision_id: &str) -> usize {
@@ -1846,145 +2103,6 @@ fn commit_description_color(commit: &CommitSummary, theme: ThemeSpec) -> Color {
         Some(false) => theme.note_text,
         None => theme.note_text,
     }
-}
-
-struct RevisionDescription {
-    text: String,
-    color: Color,
-}
-
-impl RevisionDescription {
-    fn new(text: impl Into<String>, color: Color) -> Self {
-        Self {
-            text: text.into(),
-            color,
-        }
-    }
-}
-
-fn build_revision_metadata<'a>(
-    indicators: impl IntoIterator<Item = RevisionIndicator>,
-    revision: &RevisionSelection,
-    ui: &Diffui,
-    theme: ThemeSpec,
-) -> Element<'a, Message> {
-    let mut row = row![].spacing(4).align_y(alignment::Vertical::Center);
-
-    for indicator in indicators {
-        let (background, text_color) = indicator.colors(theme);
-        row = row.push(build_revision_chip(
-            indicator.label(),
-            background,
-            text_color,
-            theme,
-        ));
-    }
-
-    if revision == &ui.expanded_revision && matches!(ui.status, LoadStatus::Loaded) {
-        row = row.push(build_revision_chip(
-            format_count(ui.document.files.len(), "file", "files"),
-            theme.panel_background,
-            theme.accent,
-            theme,
-        ));
-    }
-
-    container(row)
-        .height(Length::Fixed(REVISION_CHIP_HEIGHT))
-        .into()
-}
-
-fn build_revision_chip<'a>(
-    label: impl Into<String>,
-    background: Color,
-    text_color: Color,
-    theme: ThemeSpec,
-) -> Element<'a, Message> {
-    container(
-        text(label.into())
-            .size(CAPTION_TEXT_SIZE)
-            .color(text_color)
-            .wrapping(Wrapping::None),
-    )
-    .height(Length::Fixed(REVISION_CHIP_HEIGHT))
-    .padding([1, 6])
-    .style(move |_| indicator_chip_style(background, theme))
-    .into()
-}
-
-fn build_revision_item_with_content<'a>(
-    title: Element<'a, Message>,
-    description: RevisionDescription,
-    detail: Option<String>,
-    revision: RevisionSelection,
-    ui: &'a Diffui,
-    theme: ThemeSpec,
-    show_files: bool,
-) -> Element<'a, Message> {
-    let selected = revision == ui.selected_revision;
-    let expanded = revision == ui.expanded_revision;
-    let loaded = matches!(ui.status, LoadStatus::Loaded);
-
-    let mut labels = column![
-        title,
-        text(description.text)
-            .size(SMALL_TEXT_SIZE)
-            .color(description.color)
-            .width(Length::Fill)
-            .wrapping(Wrapping::Glyph),
-    ]
-    .spacing(4);
-
-    if let Some(detail) = detail {
-        labels = labels.push(
-            text(detail)
-                .size(CAPTION_TEXT_SIZE)
-                .color(theme.subtle_text)
-                .width(Length::Fill),
-        );
-    }
-
-    let revision_button = button(container(
-        row![
-            build_selection_gutter(selected, theme),
-            container(labels,).padding([9, 10]).width(Length::Fill),
-        ]
-        .spacing(0),
-    ))
-    .width(Length::Fill)
-    .padding(0)
-    .style(move |_, status| sidebar_button_style(status, selected, theme))
-    .on_press(Message::SelectRevision(revision));
-
-    let mut item = column![revision_button, build_sidebar_divider(theme)].spacing(0);
-
-    if show_files && expanded && loaded && !ui.document.files.is_empty() {
-        let mut files = column![].spacing(0);
-        let stat_width = sidebar_file_stat_widths(&ui.document.files);
-        let display_width = sidebar_file_display_width(stat_width);
-        let display_models = sidebar_file_display_models(&ui.document.files, display_width);
-
-        for (index, file) in ui.document.files.iter().enumerate() {
-            files = files.push(
-                column![
-                    build_nested_file_button(
-                        index,
-                        file,
-                        display_models[index].clone(),
-                        index == ui.selected_file,
-                        stat_width,
-                        theme
-                    ),
-                    build_sidebar_divider(theme),
-                ]
-                .spacing(0),
-            );
-        }
-
-        item = item.push(files.width(Length::Fill));
-    }
-
-    item.into()
 }
 
 fn shortest_unique_prefix_len(change_id: &str, commits: &[CommitSummary]) -> usize {
@@ -2010,6 +2128,100 @@ fn shortest_unique_prefix_len(change_id: &str, commits: &[CommitSummary]) -> usi
         .unwrap_or(total_len)
 }
 
+/// Pixel-accurate text width measurement for layout decisions made outside
+/// the renderer (path truncation, badge column sizing, etc.).
+///
+/// We previously approximated text width with `chars * 7px` heuristics, which
+/// silently misbehaved for any glyph wider or narrower than the assumed
+/// average — `@` clipped into `…` in revision IDs, abbreviated paths over- or
+/// under-shot the available room, and badges would clip if the user ever
+/// switched to a larger font. Going through real `cosmic_text` shaping fixes
+/// the entire class of bug because we use the same engine the wgpu renderer
+/// uses, so the measurements match what gets drawn.
+///
+/// Why headless `iced::advanced::graphics::text::Paragraph` rather than the
+/// renderer's `R::Paragraph`:
+///
+/// - Path-truncation runs in `view()` (in `build_revision_list`), well before
+///   any `draw()` call, and we need exact widths to decide *which* string to
+///   hand to the widget. The renderer's `Paragraph` type isn't reachable from
+///   here without threading renderer generics through `main.rs`.
+/// - The wgpu renderer is built on top of `iced_graphics`, so the headless
+///   `Paragraph` shapes text identically — the answer matches the pixels.
+///
+/// Alternatives considered:
+///
+/// (a) Pass a `Fn(&str) -> R::Paragraph` closure down from the widget side.
+///     Most accurate per-renderer, but spreads renderer generics into
+///     `main.rs` for no real win — the underlying engine is the same.
+/// (b) Move all truncation into `RevisionList::layout()` so the widget owns
+///     it. Clean separation, but the same display models also feed the
+///     jump-to-file selection state in `main.rs`, so they'd have to leak
+///     back out of the widget anyway.
+/// (c) Keep the `chars * px` heuristic. Cheap but wrong for any non-default
+///     font and even wrong for the default font on wide glyphs (CJK,
+///     emoji, `@`, `_`). Source of multiple past bugs.
+///
+/// Tests use `Self::fixed_per_char` to stay deterministic regardless of which
+/// system fonts happen to be installed on the host.
+#[derive(Clone)]
+enum TextMetrics {
+    Iced {
+        font: Font,
+        size: f32,
+    },
+    #[cfg(test)]
+    FixedPerChar {
+        width: f32,
+    },
+}
+
+impl TextMetrics {
+    fn iced(font: Font, size: f32) -> Self {
+        Self::Iced { font, size }
+    }
+
+    #[cfg(test)]
+    fn fixed_per_char(width: f32) -> Self {
+        Self::FixedPerChar { width }
+    }
+
+    fn measure(&self, content: &str) -> f32 {
+        if content.is_empty() {
+            return 0.0;
+        }
+        match self {
+            Self::Iced { font, size } => {
+                use iced::advanced::graphics::text::Paragraph;
+                use iced::advanced::text::{LineHeight, Paragraph as _, Shaping, Text, Wrapping};
+                use iced::{Pixels, Size};
+
+                let line_height = (*size * 1.4).max(1.0);
+                let paragraph = Paragraph::with_text(Text {
+                    content,
+                    bounds: Size::new(f32::INFINITY, line_height),
+                    size: Pixels(*size),
+                    line_height: LineHeight::Absolute(Pixels(line_height)),
+                    font: *font,
+                    align_x: iced::advanced::text::Alignment::Left,
+                    align_y: alignment::Vertical::Top,
+                    shaping: Shaping::Advanced,
+                    wrapping: Wrapping::None,
+                    ellipsis: iced::advanced::text::Ellipsis::None,
+                    hint_factor: None,
+                });
+                paragraph.min_width()
+            }
+            #[cfg(test)]
+            Self::FixedPerChar { width } => content.chars().count() as f32 * width,
+        }
+    }
+}
+
+fn sidebar_text_metrics() -> TextMetrics {
+    TextMetrics::iced(Font::DEFAULT, CAPTION_TEXT_SIZE)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SidebarFileDisplay {
     primary: String,
@@ -2020,6 +2232,7 @@ struct SidebarFileDisplay {
 fn sidebar_file_display_models(
     files: &[DiffFile],
     available_width: f32,
+    metrics: &TextMetrics,
 ) -> Vec<SidebarFileDisplay> {
     let mut basename_counts = HashMap::<&str, usize>::new();
     let split_paths = files
@@ -2037,7 +2250,7 @@ fn sidebar_file_display_models(
             let (primary, secondary) = if basename_counts.get(basename).copied() == Some(1) {
                 (
                     (*basename).to_owned(),
-                    secondary_display_path(directories, available_width),
+                    secondary_display_path(directories, available_width, metrics),
                 )
             } else {
                 let group = split_paths
@@ -2055,12 +2268,16 @@ fn sidebar_file_display_models(
 
                 (
                     primary_segments.join("/"),
-                    secondary_display_path(&common_directory_prefix(&group), available_width),
+                    secondary_display_path(
+                        &common_directory_prefix(&group),
+                        available_width,
+                        metrics,
+                    ),
                 )
             };
 
             SidebarFileDisplay {
-                primary: truncate_primary_display(&primary, basename, available_width),
+                primary: truncate_primary_display(&primary, basename, available_width, metrics),
                 secondary,
                 raw_path: file.path.clone(),
             }
@@ -2123,23 +2340,17 @@ fn common_directory_prefix<'a>(group: &[&[&'a str]]) -> Vec<&'a str> {
         .collect()
 }
 
-fn secondary_display_path(segments: &[&str], available_width: f32) -> String {
+fn secondary_display_path(
+    segments: &[&str],
+    available_width: f32,
+    metrics: &TextMetrics,
+) -> String {
     let path = segments.join("/");
-    if path_fits_width(&path, available_width) {
+    if metrics.measure(&path) <= available_width {
         path
     } else {
         abbreviate_secondary_path(segments)
     }
-}
-
-fn path_fits_width(path: &str, available_width: f32) -> bool {
-    path.chars().count() <= max_sidebar_file_text_chars(available_width)
-}
-
-fn max_sidebar_file_text_chars(available_width: f32) -> usize {
-    (available_width / SIDEBAR_FILE_TEXT_CHAR_WIDTH)
-        .floor()
-        .max(0.0) as usize
 }
 
 fn abbreviate_secondary_path(segments: &[&str]) -> String {
@@ -2160,10 +2371,13 @@ fn abbreviate_secondary_path(segments: &[&str]) -> String {
     }
 }
 
-fn truncate_primary_display(primary: &str, basename: &str, available_width: f32) -> String {
-    let max_chars = max_sidebar_file_text_chars(available_width);
-
-    if primary.chars().count() <= max_chars || primary == basename {
+fn truncate_primary_display(
+    primary: &str,
+    basename: &str,
+    available_width: f32,
+    metrics: &TextMetrics,
+) -> String {
+    if metrics.measure(primary) <= available_width || primary == basename {
         return primary.to_owned();
     }
 
@@ -2175,157 +2389,99 @@ fn truncate_primary_display(primary: &str, basename: &str, available_width: f32)
         return primary.to_owned();
     }
 
-    let basename_chars = basename.chars().count();
-    let separator_chars = 1;
-    let ellipsis_chars = 1;
-    if max_chars <= basename_chars + separator_chars + ellipsis_chars {
+    // Always preserve the basename — the user needs to know what file this is.
+    // The prefix is what gets squeezed.
+    let suffix = format!("/{basename}");
+    let suffix_w = metrics.measure(&suffix);
+    if suffix_w >= available_width {
         return basename.to_owned();
     }
+    let prefix_budget = available_width - suffix_w;
 
-    let prefix_budget = max_chars - basename_chars - separator_chars;
-    let truncated_prefix = middle_truncate(prefix, prefix_budget);
-
-    format!("{truncated_prefix}/{basename}")
+    let truncated_prefix = middle_truncate_to_width(prefix, prefix_budget, metrics);
+    if truncated_prefix.is_empty() {
+        return basename.to_owned();
+    }
+    format!("{truncated_prefix}{suffix}")
 }
 
-fn middle_truncate(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
+/// Middle-truncate `value` so it fits in `max_width` pixels under `metrics`.
+///
+/// Reads char-by-char from each side and stops as soon as the rendered width
+/// of `head + "…" + tail` exceeds the budget. Linear in chars; fine since
+/// these strings are short path segments and we run this once per file.
+fn middle_truncate_to_width(value: &str, max_width: f32, metrics: &TextMetrics) -> String {
+    if metrics.measure(value) <= max_width {
         return value.to_owned();
     }
-    if max_chars <= 1 {
-        return "…".to_owned();
+    let ellipsis_w = metrics.measure("…");
+    if ellipsis_w > max_width {
+        return String::new();
     }
 
-    let keep = max_chars - 1;
-    let head_chars = keep.div_ceil(2);
-    let tail_chars = keep / 2;
-    let head = value.chars().take(head_chars).collect::<String>();
-    let tail = value
-        .chars()
-        .rev()
-        .take(tail_chars)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<String>();
+    let chars: Vec<char> = value.chars().collect();
+    if chars.is_empty() {
+        return String::new();
+    }
 
+    let mut head = String::new();
+    let mut tail = String::new();
+    let mut head_len = 0;
+    let mut tail_len = 0;
+    // Bias: take from head first when budget allows odd counts.
+    let mut take_head = true;
+
+    while head_len + tail_len < chars.len() {
+        let next_char = if take_head {
+            chars[head_len]
+        } else {
+            chars[chars.len() - 1 - tail_len]
+        };
+
+        let mut candidate_head = head.clone();
+        let mut candidate_tail = tail.clone();
+        if take_head {
+            candidate_head.push(next_char);
+        } else {
+            candidate_tail.insert(0, next_char);
+        }
+
+        let candidate = format!("{candidate_head}…{candidate_tail}");
+        if metrics.measure(&candidate) > max_width {
+            break;
+        }
+
+        head = candidate_head;
+        tail = candidate_tail;
+        if take_head {
+            head_len += 1;
+        } else {
+            tail_len += 1;
+        }
+        take_head = !take_head;
+    }
+
+    if head_len == 0 && tail_len == 0 {
+        // We can fit the ellipsis but not even one neighbouring character.
+        return "…".to_owned();
+    }
     format!("{head}…{tail}")
 }
 
-fn sidebar_file_display_width(stat_width: SidebarFileStatWidth) -> f32 {
-    SIDEBAR_WIDTH
-        - SIDEBAR_FILE_TEXT_RESERVED_WIDTH
-        - stat_width.additions.max(SIDEBAR_FILE_STAT_MIN_WIDTH)
-        - stat_width.deletions.max(SIDEBAR_FILE_STAT_MIN_WIDTH)
-}
-
-fn build_nested_file_button<'a>(
-    index: usize,
-    file: &'a DiffFile,
-    display: SidebarFileDisplay,
-    selected: bool,
-    stat_width: SidebarFileStatWidth,
-    theme: ThemeSpec,
-) -> Element<'a, Message> {
-    let primary = display.primary;
-    let secondary = display.secondary;
-    let raw_path = display.raw_path;
-    let path_label: Element<'a, Message> = if secondary.is_empty() {
-        text(primary)
-            .size(CAPTION_TEXT_SIZE)
-            .color(theme.text)
-            .wrapping(Wrapping::None)
-            .ellipsis(Ellipsis::End)
-            .width(Length::Fill)
-            .into()
-    } else {
-        column![
-            text(primary)
-                .size(CAPTION_TEXT_SIZE)
-                .color(theme.text)
-                .wrapping(Wrapping::None)
-                .ellipsis(Ellipsis::End)
-                .width(Length::Fill),
-            text(secondary)
-                .size(CAPTION_TEXT_SIZE - 2.0)
-                .color(theme.muted_text)
-                .wrapping(Wrapping::None)
-                .ellipsis(Ellipsis::End)
-                .width(Length::Fill),
-        ]
-        .spacing(1)
-        .width(Length::Fill)
-        .into()
-    };
-
-    tooltip(
-        button(
-            container(
-                row![
-                    container(build_file_status_badge(
-                        file.status.short_label(),
-                        file.status.short_badge_color(theme),
-                        theme,
-                    ))
-                    .width(Length::Fixed(SIDEBAR_FILE_BADGE_WIDTH)),
-                    container(path_label).width(Length::Fill),
-                    text(format!("+{}", file.additions))
-                        .size(CAPTION_TEXT_SIZE)
-                        .color(theme.added_text)
-                        .width(Length::Fixed(stat_width.additions)),
-                    text(format!("-{}", file.deletions))
-                        .size(CAPTION_TEXT_SIZE)
-                        .color(theme.removed_text)
-                        .width(Length::Fixed(stat_width.deletions)),
-                ]
-                .spacing(6)
-                .align_y(alignment::Vertical::Center),
-            )
-            .padding([5, 10]),
-        )
-        .width(Length::Fill)
-        .padding(0)
-        .style(move |_, status| sidebar_child_button_style(status, selected, theme))
-        .on_press(Message::SelectFile(index)),
-        container(text(raw_path).size(CAPTION_TEXT_SIZE).color(theme.text))
-            .padding([5, 8])
-            .style(move |_| tooltip_style(theme)),
-        tooltip::Position::Right,
-    )
-    .into()
-}
-
-#[derive(Debug, Clone, Copy)]
-struct SidebarFileStatWidth {
-    additions: f32,
-    deletions: f32,
-}
-
-fn sidebar_file_stat_widths(files: &[DiffFile]) -> SidebarFileStatWidth {
-    let max_addition_chars = files
-        .iter()
-        .map(|file| prefixed_count_len(file.additions))
-        .max()
-        .unwrap_or(2);
-    let max_deletion_chars = files
-        .iter()
-        .map(|file| prefixed_count_len(file.deletions))
-        .max()
-        .unwrap_or(2);
-
-    SidebarFileStatWidth {
-        additions: sidebar_file_stat_width(max_addition_chars),
-        deletions: sidebar_file_stat_width(max_deletion_chars),
-    }
-}
-
-fn sidebar_file_stat_width(chars: usize) -> f32 {
-    (chars as f32 * SIDEBAR_FILE_STAT_CHAR_WIDTH + SIDEBAR_FILE_STAT_PADDING)
+fn sidebar_file_stat_width(text: &str, metrics: &TextMetrics) -> f32 {
+    (metrics.measure(text) + SIDEBAR_FILE_STAT_HORIZONTAL_PADDING * 2.0)
         .max(SIDEBAR_FILE_STAT_MIN_WIDTH)
 }
 
-fn prefixed_count_len(count: usize) -> usize {
-    count.to_string().len() + 1
+/// Width of the status badge column ("M", "A", "D", "R", …). We measure the
+/// widest label in the document and add padding so two-letter labels like
+/// "MM" still fit comfortably.
+fn sidebar_file_badge_width(files: &[DiffFile], metrics: &TextMetrics) -> f32 {
+    let widest = files
+        .iter()
+        .map(|file| metrics.measure(file.status.short_label()))
+        .fold(0.0_f32, f32::max);
+    (widest + SIDEBAR_FILE_BADGE_HORIZONTAL_PADDING * 2.0).max(SIDEBAR_FILE_BADGE_MIN_WIDTH)
 }
 
 fn build_diff_panel(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
@@ -2335,17 +2491,21 @@ fn build_diff_panel(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             .height(Length::Fill)
             .center_x(Length::Fill)
             .center_y(Length::Fill)
-            .style(move |_| panel_style(theme.panel_background, theme))
+            .style(move |_| diff_panel_style(theme))
             .into();
     }
 
     if ui.document.files.is_empty() {
-        return container(text("No Changes Loaded").size(16).color(theme.muted_text))
+        let message = match &ui.status {
+            LoadStatus::Failed(_) => "Failed to load changes",
+            _ => "No file changes in this revision",
+        };
+        return container(text(message).size(15).color(theme.subtle_text))
             .width(Length::Fill)
             .height(Length::Fill)
             .center_x(Length::Fill)
             .center_y(Length::Fill)
-            .style(move |_| panel_style(theme.panel_background, theme))
+            .style(move |_| diff_panel_style(theme))
             .into();
     }
 
@@ -2377,7 +2537,7 @@ fn build_diff_panel(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         .height(Length::Fill)
         .padding(0)
         .clip(true)
-        .style(move |_| panel_style(theme.panel_background, theme))
+        .style(move |_| diff_panel_style(theme))
         .into()
 }
 
@@ -2396,45 +2556,8 @@ fn render_diff<'a>(
         CODE_TEXT_SIZE,
         Message::SelectFile,
     )
+    .on_copy(Message::CopyToClipboard)
     .into()
-}
-
-fn build_selection_gutter(selected: bool, theme: ThemeSpec) -> Element<'static, Message> {
-    if selected {
-        build_selection_stripe(theme)
-    } else {
-        container(text(""))
-            .width(Length::Fixed(3.0))
-            .height(Length::Fixed(28.0))
-            .into()
-    }
-}
-
-fn build_selection_stripe(theme: ThemeSpec) -> Element<'static, Message> {
-    container(text(""))
-        .width(Length::Fixed(3.0))
-        .height(Length::Fill)
-        .style(move |_| stripe_style(theme.accent, CONTROL_RADIUS))
-        .into()
-}
-
-fn build_file_status_badge<'a>(
-    label: &'a str,
-    background: Color,
-    theme: ThemeSpec,
-) -> Element<'a, Message> {
-    container(text(label).size(CAPTION_TEXT_SIZE).color(theme.background))
-        .padding([2, 6])
-        .style(move |_| badge_style(background, theme))
-        .into()
-}
-
-fn build_sidebar_divider(theme: ThemeSpec) -> Element<'static, Message> {
-    container(text(""))
-        .height(Length::Fixed(1.0))
-        .width(Length::Fill)
-        .style(move |_| sidebar_divider_style(theme))
-        .into()
 }
 
 fn format_count(count: usize, singular: &str, plural: &str) -> String {
@@ -2462,6 +2585,12 @@ fn diff_palette(theme: ThemeSpec) -> Palette {
         note_background: theme.note_background,
         gutter_background: theme.panel_background,
         border: theme.border,
+        // Translucent accent so the underlying syntax-highlighted text and
+        // line-change tints stay readable under the selection.
+        selection: Color {
+            a: 0.30,
+            ..theme.accent
+        },
     }
 }
 
@@ -2471,69 +2600,51 @@ fn app_shell_style(theme: ThemeSpec) -> container::Style {
         .color(theme.text)
 }
 
+fn vertical_divider(theme: ThemeSpec) -> Element<'static, Message> {
+    container(text(""))
+        .width(Length::Fixed(1.0))
+        .height(Length::Fill)
+        .style(move |_| {
+            container::Style::default()
+                .background(theme.border)
+                .border(Border {
+                    width: 0.0,
+                    color: Color::TRANSPARENT,
+                    radius: 0.0.into(),
+                })
+        })
+        .into()
+}
+
 fn sidebar_header_style(theme: ThemeSpec) -> container::Style {
     container::Style::default().background(theme.panel_background)
 }
 
-fn panel_style(background: Color, theme: ThemeSpec) -> container::Style {
-    container::Style::default()
-        .background(background)
-        .border(panel_border(theme))
+fn sidebar_panel_style(theme: ThemeSpec) -> container::Style {
+    container::Style::default().background(theme.panel_background)
 }
 
-fn badge_style(background: Color, theme: ThemeSpec) -> container::Style {
+fn diff_panel_style(theme: ThemeSpec) -> container::Style {
     container::Style::default()
-        .background(background)
-        .border(Border {
-            width: 1.0,
-            color: theme.border,
-            radius: CONTROL_RADIUS.into(),
-        })
-}
-
-fn stripe_style(background: Color, radius: f32) -> container::Style {
-    container::Style::default()
-        .background(background)
+        .background(theme.panel_background)
         .border(Border {
             width: 0.0,
             color: Color::TRANSPARENT,
-            radius: radius.into(),
+            radius: 0.0.into(),
         })
 }
 
-fn sidebar_divider_style(theme: ThemeSpec) -> container::Style {
-    container::Style::default().background(theme.border)
-}
-
-fn indicator_chip_style(background: Color, theme: ThemeSpec) -> container::Style {
-    container::Style::default()
-        .background(background)
-        .border(Border {
-            width: 1.0,
-            color: theme.border,
-            radius: CONTROL_RADIUS.into(),
-        })
-}
-
-fn tooltip_style(theme: ThemeSpec) -> container::Style {
-    container::Style::default()
-        .background(theme.panel_background_elevated)
-        .color(theme.text)
-        .border(Border {
-            width: 1.0,
-            color: theme.border,
-            radius: CONTROL_RADIUS.into(),
-        })
-}
-
-fn sidebar_button_style(status: button::Status, selected: bool, theme: ThemeSpec) -> button::Style {
-    let background = if selected {
-        theme.selected_file
-    } else {
-        theme.panel_background_elevated
+fn theme_switcher_button_style(
+    status: button::Status,
+    selected: bool,
+    theme: ThemeSpec,
+) -> button::Style {
+    let background = match (selected, status) {
+        (true, _) => theme.selected_file,
+        (false, button::Status::Hovered | button::Status::Pressed) => theme.selected_file,
+        (false, _) => theme.panel_background_elevated,
     };
-
-    let mut style = button::Style {
+    button::Style {
         background: Some(Background::Color(background)),
         text_color: theme.text,
         border: Border {
@@ -2543,101 +2654,14 @@ fn sidebar_button_style(status: button::Status, selected: bool, theme: ThemeSpec
         },
         shadow: Shadow::default(),
         snap: true,
-    };
-
-    match status {
-        button::Status::Hovered => {
-            style.background = Some(Background::Color(theme.selected_file));
-        }
-        button::Status::Pressed => {
-            style.background = Some(Background::Color(theme.selected_file));
-        }
-        button::Status::Disabled => {
-            style.text_color = theme.subtle_text;
-        }
-        button::Status::Active => {}
-    }
-
-    style
-}
-
-fn sidebar_child_button_style(
-    status: button::Status,
-    selected: bool,
-    theme: ThemeSpec,
-) -> button::Style {
-    let background = match (selected, status) {
-        (true, _) => theme.selected_file,
-        (false, button::Status::Hovered) => theme.file_header,
-        (false, button::Status::Pressed) => theme.selected_file,
-        (false, _) => theme.panel_background,
-    };
-
-    let mut style = sidebar_button_style(status, selected, theme);
-    style.background = Some(Background::Color(background));
-
-    style
-}
-
-fn diff_scrollable_style(
-    iced_theme: &Theme,
-    status: scrollable::Status,
-    theme: ThemeSpec,
-) -> scrollable::Style {
-    let mut style = scrollable::default(iced_theme, status);
-    let hovered = matches!(
-        status,
-        scrollable::Status::Hovered {
-            is_vertical_scrollbar_hovered: true,
-            ..
-        }
-    );
-    let dragged = matches!(
-        status,
-        scrollable::Status::Dragged {
-            is_vertical_scrollbar_dragged: true,
-            ..
-        }
-    );
-    let thumb_color = if dragged {
-        theme.accent
-    } else if hovered {
-        theme.text
-    } else {
-        theme.muted_text
-    };
-
-    style.container = container::Style::default();
-    style.vertical_rail.background = Some(Background::Color(theme.panel_background_elevated));
-    style.vertical_rail.border = Border {
-        width: 1.0,
-        color: theme.border,
-        radius: 0.0.into(),
-    };
-    style.vertical_rail.scroller.background = Background::Color(thumb_color);
-    style.vertical_rail.scroller.border = Border {
-        width: 1.0,
-        color: if dragged { theme.accent } else { theme.border },
-        radius: 2.0.into(),
-    };
-    style.horizontal_rail = style.vertical_rail;
-    style.gap = Some(Background::Color(theme.panel_background_elevated));
-    style
-}
-
-fn panel_border(theme: ThemeSpec) -> Border {
-    Border {
-        width: 1.0,
-        color: theme.border,
-        radius: PANEL_RADIUS.into(),
     }
 }
 
-fn display_scope(repository: &Repository) -> String {
+fn scope_label(repository: &Repository) -> Option<String> {
     if repository.scope.as_os_str().is_empty() {
-        ".".to_owned()
+        None
     } else {
-        repository.scope.display().to_string()
+        Some(repository.scope.display().to_string())
     }
 }
 
@@ -2674,7 +2698,7 @@ mod tests {
 
     #[test]
     fn parses_commit_log_rows() {
-        let commits = parse_commit_log("abc\tdef\tme@example.com\tfalse\tadd commit sidebar\n");
+        let commits = parse_commit_log("abc\tdef\t\tme@example.com\tfalse\tadd commit sidebar\n");
 
         assert_eq!(commits.len(), 1);
         assert_eq!(commits[0].change_id, "abc");
@@ -2687,7 +2711,7 @@ mod tests {
 
     #[test]
     fn parses_commit_log_rows_without_description() {
-        let commits = parse_commit_log("abc\tdef\tme@example.com\ttrue\t\n");
+        let commits = parse_commit_log("abc\tdef\t\tme@example.com\ttrue\t\n");
 
         assert_eq!(commits.len(), 1);
         assert_eq!(commits[0].description, "(no description set)");
@@ -2698,7 +2722,7 @@ mod tests {
     #[test]
     fn revision_id_prefix_uses_shortest_unique_change_id() {
         let commits = parse_commit_log(
-            "abc\tone\tme@example.com\tfalse\tfirst\nabd\ttwo\tme@example.com\tfalse\tsecond\nz\three\tme@example.com\ttrue\tthird\n",
+            "abc\tone\t\tme@example.com\tfalse\tfirst\nabd\ttwo\t\tme@example.com\tfalse\tsecond\nz\three\t\tme@example.com\ttrue\tthird\n",
         );
 
         assert_eq!(shortest_unique_prefix_len("abc", &commits), 3);
@@ -2709,12 +2733,46 @@ mod tests {
     #[test]
     fn commit_log_rows_select_full_revision_id() {
         let commits = parse_commit_log(
-            "abc\tdef123456789abcdef\tme@example.com\tfalse\tadd commit sidebar\n",
+            "abc\tdef123456789abcdef\t\tme@example.com\tfalse\tadd commit sidebar\n",
         );
 
         assert_eq!(commits[0].change_id, "abc");
         assert_eq!(commits[0].commit_id, "def123456789abcdef");
         assert_eq!(commits[0].revision_id, "def123456789abcdef");
+    }
+
+    #[test]
+    fn git_log_merge_assigns_distinct_lanes_for_second_parent() {
+        // Topo order, descendants first:
+        //   M (merge of T and W) - parents: T W
+        //   T - parent: A
+        //   W - parent: A
+        //   A - root, no parents
+        let commits = parse_commit_log(
+            "M\tM\tT W\tme@example.com\tfalse\tmerge\n\
+             T\tT\tA\tme@example.com\tfalse\ttrunk\n\
+             W\tW\tA\tme@example.com\tfalse\tside\n\
+             A\tA\t\tme@example.com\tfalse\troot\n",
+        );
+
+        assert_eq!(commits.len(), 4);
+        assert_eq!(commits[0].lane_frame.node_lane, 0);
+        assert_eq!(commits[1].lane_frame.node_lane, 0);
+        // Second parent of the merge spawns a new lane to the right.
+        assert_eq!(commits[2].lane_frame.node_lane, 1);
+        // Both lanes converge back at A.
+        assert_eq!(commits[3].lane_frame.node_lane, 0);
+        assert_eq!(commits[3].lane_frame.merging_lanes, vec![0, 1]);
+    }
+
+    #[test]
+    fn git_log_marks_unknown_parents_as_missing() {
+        // Single commit whose parent isn't in the listing — e.g. a shallow clone.
+        let commits = parse_commit_log("abc\tabc\tdeadbeef\tme@example.com\tfalse\thead\n");
+
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].lane_frame.missing_parents, 1);
+        assert!(commits[0].lane_frame.after.is_empty());
     }
 
     #[test]
@@ -2799,7 +2857,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_diff_uses_root_scope_label() {
+    fn empty_diff_yields_no_files() {
         let repository = Repository {
             root: PathBuf::from("/repo"),
             vcs: Vcs::Jj,
@@ -2808,14 +2866,16 @@ mod tests {
 
         let document = parse_backend_output(&repository, "");
 
-        assert_eq!(document.files[0].path, ".");
+        assert!(document.files.is_empty());
+        assert_eq!(document.total_additions, 0);
+        assert_eq!(document.total_deletions, 0);
     }
 
     #[test]
     fn sidebar_display_keeps_unique_basename_primary_and_full_secondary_when_it_fits() {
         let files = vec![diff_file("packages/frontend/src/components/Button.rs")];
 
-        let display = sidebar_file_display_models(&files, 400.0);
+        let display = sidebar_file_display_models(&files, 400.0, &test_metrics());
 
         assert_eq!(
             display,
@@ -2831,7 +2891,10 @@ mod tests {
     fn sidebar_display_abbreviates_secondary_only_when_width_is_tight() {
         let files = vec![diff_file("packages/frontend/src/components/Button.rs")];
 
-        let display = sidebar_file_display_models(&files, SIDEBAR_FILE_TEXT_CHAR_WIDTH * 16.0);
+        // Width tight enough that "packages/frontend/src/components" (32 chars
+        // at 7px under the test metrics → 224px) doesn't fit, forcing the
+        // abbreviation path.
+        let display = sidebar_file_display_models(&files, 7.0 * 16.0, &test_metrics());
 
         assert_eq!(display[0].primary, "Button.rs");
         assert_eq!(display[0].secondary, "packages/f/s/components");
@@ -2845,7 +2908,7 @@ mod tests {
             diff_file("crates/worker/src/lib.rs"),
         ];
 
-        let display = sidebar_file_display_models(&files, 400.0);
+        let display = sidebar_file_display_models(&files, 400.0, &test_metrics());
 
         assert_eq!(display[0].primary, "ui/src/main.rs");
         assert_eq!(display[0].secondary, "crates");
@@ -2862,7 +2925,7 @@ mod tests {
             diff_file("workspace/package-b/test/Button.rs"),
         ];
 
-        let display = sidebar_file_display_models(&files, 400.0);
+        let display = sidebar_file_display_models(&files, 400.0, &test_metrics());
 
         assert_eq!(display[0].primary, "src/Button.rs");
         assert_eq!(display[1].primary, "test/Button.rs");
@@ -2874,7 +2937,7 @@ mod tests {
     fn sidebar_display_handles_collision_at_repository_root() {
         let files = vec![diff_file("src/main.rs"), diff_file("tests/main.rs")];
 
-        let display = sidebar_file_display_models(&files, 400.0);
+        let display = sidebar_file_display_models(&files, 400.0, &test_metrics());
 
         assert_eq!(display[0].primary, "src/main.rs");
         assert_eq!(display[0].secondary, "");
@@ -2886,7 +2949,7 @@ mod tests {
     fn sidebar_display_root_file_has_empty_secondary() {
         let files = vec![diff_file("Cargo.lock")];
 
-        let display = sidebar_file_display_models(&files, 400.0);
+        let display = sidebar_file_display_models(&files, 400.0, &test_metrics());
 
         assert_eq!(display[0].primary, "Cargo.lock");
         assert_eq!(display[0].secondary, "");
@@ -2904,10 +2967,12 @@ mod tests {
 
     #[test]
     fn sidebar_display_middle_truncates_only_prepended_primary_directories() {
+        // Budget = 24 chars × 7px under test metrics = 168px.
         let primary = truncate_primary_display(
             "very/long/generated/module/path/component/Button.rs",
             "Button.rs",
-            SIDEBAR_FILE_TEXT_CHAR_WIDTH * 24.0,
+            7.0 * 24.0,
+            &test_metrics(),
         );
 
         assert_eq!(primary, "very/lo…ponent/Button.rs");
@@ -2917,13 +2982,26 @@ mod tests {
 
     #[test]
     fn sidebar_display_protects_basename_when_width_is_tiny() {
+        // Even 6 chars of budget is too tight for "/Button.rs" (10 chars), so
+        // the truncator should bail out and just hand back the basename.
         assert_eq!(
             truncate_primary_display(
                 "deeply/nested/source/Button.rs",
                 "Button.rs",
-                SIDEBAR_FILE_TEXT_CHAR_WIDTH * 6.0,
+                7.0 * 6.0,
+                &test_metrics(),
             ),
             "Button.rs"
         );
+    }
+
+    /// Deterministic metrics for tests: each character is 7px wide, matching
+    /// the old `SIDEBAR_FILE_TEXT_CHAR_WIDTH` heuristic so the existing
+    /// fixture widths still trigger truncation at the same boundaries. We
+    /// don't go through real cosmic_text in tests because system font
+    /// availability differs across hosts and would make the assertions
+    /// flaky in CI.
+    fn test_metrics() -> TextMetrics {
+        TextMetrics::fixed_per_char(7.0)
     }
 }

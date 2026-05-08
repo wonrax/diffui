@@ -6,19 +6,22 @@ use iced::advanced::{
 };
 use iced::{
     Border, Color, Element, Event, Font, Length, Pixels, Point, Rectangle, Shadow, Size, Theme,
-    Vector, alignment,
+    Vector, alignment, keyboard,
 };
 
 const ROW_HEIGHT: f32 = 24.0;
 const FILE_HEADER_HEIGHT: f32 = 38.0;
 const HUNK_HEADER_HEIGHT: f32 = 26.0;
-const GUTTER_WIDTH: f32 = 104.0;
 const PREFIX_WIDTH: f32 = 24.0;
 const CHANGE_MARK_WIDTH: f32 = 2.0;
 const TEXT_X_PADDING: f32 = 8.0;
 const TEXT_Y_PADDING: f32 = 2.0;
 const LINE_SCROLL_ROWS: f32 = 1.5;
 const PIXEL_SCROLL_SCALE: f32 = 0.65;
+// Floor for the gutter so two single-digit columns still look intentional.
+const GUTTER_MIN_WIDTH: f32 = 56.0;
+// Padding flanking the gutter text on both sides.
+const GUTTER_HORIZONTAL_PADDING: f32 = 8.0;
 
 #[derive(Debug, Clone)]
 pub struct DiffLine {
@@ -89,6 +92,8 @@ pub struct Palette {
     pub note_background: Color,
     pub gutter_background: Color,
     pub border: Color,
+    /// Background tint drawn under selected text.
+    pub selection: Color,
 }
 
 pub struct DiffView<'a, Message> {
@@ -98,7 +103,10 @@ pub struct DiffView<'a, Message> {
     palette: Palette,
     font: Font,
     text_size: f32,
+    gutter_width: f32,
+    gutter_digit_count: usize,
     on_selected_file_changed: fn(usize) -> Message,
+    on_copy: Option<fn(String) -> Message>,
 }
 
 struct State<Paragraph> {
@@ -107,6 +115,25 @@ struct State<Paragraph> {
     pending_file_jump: Option<usize>,
     vertical_offset: f32,
     paragraphs: RefCell<Vec<Paragraph>>,
+    /// Anchor (mouse-down position) of the in-progress or completed selection.
+    selection_anchor: Option<TextPosition>,
+    /// Focus (current/release position) of the selection.
+    selection_focus: Option<TextPosition>,
+    /// True while the user is mid-drag.
+    is_selecting: bool,
+}
+
+/// Stable cursor position inside the diff document. We index by
+/// `(file, hunk, line)` instead of by screen y so the position stays valid
+/// across scrolling, file selection, and re-renders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct TextPosition {
+    file_index: usize,
+    hunk_index: usize,
+    line_index: usize,
+    /// Byte offset within `line.content`. Bytes (not chars) so we can slice
+    /// the source string directly when copying.
+    byte: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -167,6 +194,15 @@ impl<'a, Message> DiffView<'a, Message> {
         text_size: f32,
         on_selected_file_changed: fn(usize) -> Message,
     ) -> Self {
+        let gutter_digit_count = compute_gutter_digit_count(&files);
+        // Width of the rendered gutter text "{old:>D} {new:>D}" plus padding.
+        // Computed once at construction so layout, hit-testing and rendering
+        // all agree on the column width without each having to remeasure.
+        let char_width = text_size * 0.62;
+        let gutter_text_chars = gutter_digit_count * 2 + 1; // two columns + one separating space
+        let gutter_width = (gutter_text_chars as f32 * char_width
+            + GUTTER_HORIZONTAL_PADDING * 2.0)
+            .max(GUTTER_MIN_WIDTH);
         Self {
             files,
             selected_file,
@@ -174,8 +210,16 @@ impl<'a, Message> DiffView<'a, Message> {
             palette,
             font,
             text_size,
+            gutter_width,
+            gutter_digit_count,
             on_selected_file_changed,
+            on_copy: None,
         }
+    }
+
+    pub fn on_copy(mut self, on_copy: fn(String) -> Message) -> Self {
+        self.on_copy = Some(on_copy);
+        self
     }
 
     fn content_height(&self, width: f32) -> f32 {
@@ -255,7 +299,7 @@ impl<'a, Message> DiffView<'a, Message> {
     }
 
     fn content_width(&self, viewport_width: f32) -> f32 {
-        (viewport_width - GUTTER_WIDTH - PREFIX_WIDTH - 16.0).max(self.char_width())
+        (viewport_width - self.gutter_width - PREFIX_WIDTH - 16.0).max(self.char_width())
     }
 
     fn char_width(&self) -> f32 {
@@ -269,6 +313,112 @@ impl<'a, Message> DiffView<'a, Message> {
         wrapped_lines as f32 * ROW_HEIGHT
     }
 
+    /// Convert a screen point into a `TextPosition` if it falls on a row's
+    /// text area. Returns `None` for clicks on the gutter, file/hunk
+    /// headers, or empty space below the last row.
+    ///
+    /// Hit-testing assumes a monospace font (see `char_width`); this is
+    /// fine for code text in Menlo/Cascadia Code, but tab characters and
+    /// wide glyphs (CJK, emoji) will land slightly off. We accept that
+    /// trade-off because real glyph hit-testing would require keeping a
+    /// `Paragraph` per visible row alive across the event loop, which iced
+    /// doesn't make easy from a custom widget.
+    fn position_at_point(
+        &self,
+        point: Point,
+        bounds: Rectangle,
+        vertical_offset: f32,
+    ) -> Option<TextPosition> {
+        if !bounds.contains(point) {
+            return None;
+        }
+        let content_width = self.content_width(bounds.width);
+        let text_x = bounds.x + self.gutter_width + PREFIX_WIDTH + TEXT_X_PADDING;
+        let mut content_y = 0.0;
+
+        for (file_index, file) in self.files.iter().enumerate() {
+            content_y += FILE_HEADER_HEIGHT;
+            for (hunk_index, hunk) in file.hunks.iter().enumerate() {
+                content_y += HUNK_HEADER_HEIGHT;
+                for (line_index, line) in hunk.lines.iter().enumerate() {
+                    let height = self.row_height(line, content_width);
+                    let row_y = bounds.y + (content_y - vertical_offset);
+                    let row_bottom = row_y + height;
+
+                    if point.y >= row_y && point.y < row_bottom {
+                        let relative_x = (point.x - text_x).max(0.0);
+                        let cw = self.char_width().max(1.0);
+                        let char_offset = (relative_x / cw).round() as usize;
+                        let byte = byte_offset_for_char(&line.content, char_offset);
+                        return Some(TextPosition {
+                            file_index,
+                            hunk_index,
+                            line_index,
+                            byte,
+                        });
+                    }
+                    content_y += height;
+                }
+            }
+        }
+        None
+    }
+
+    /// Build the substring inside the inclusive selection range
+    /// `[start, end)`, walking files/hunks/lines in document order so the
+    /// pasted text reads naturally regardless of which direction the user
+    /// dragged.
+    fn collect_selected_text(&self, start: TextPosition, end: TextPosition) -> String {
+        if start == end {
+            return String::new();
+        }
+        let mut output = String::new();
+        let mut first = true;
+
+        for (file_index, file) in self.files.iter().enumerate() {
+            for (hunk_index, hunk) in file.hunks.iter().enumerate() {
+                for (line_index, line) in hunk.lines.iter().enumerate() {
+                    let pos_start = TextPosition {
+                        file_index,
+                        hunk_index,
+                        line_index,
+                        byte: 0,
+                    };
+                    let pos_end = TextPosition {
+                        file_index,
+                        hunk_index,
+                        line_index,
+                        byte: line.content.len(),
+                    };
+                    if pos_end < start || pos_start >= end {
+                        continue;
+                    }
+
+                    let line_start = if pos_start < start { start.byte } else { 0 };
+                    let line_end = if pos_end > end {
+                        end.byte
+                    } else {
+                        line.content.len()
+                    };
+                    let line_start = line_start.min(line.content.len());
+                    let line_end = line_end.min(line.content.len()).max(line_start);
+
+                    if !first {
+                        output.push('\n');
+                    }
+                    first = false;
+
+                    if line.content.is_char_boundary(line_start)
+                        && line.content.is_char_boundary(line_end)
+                    {
+                        output.push_str(&line.content[line_start..line_end]);
+                    }
+                }
+            }
+        }
+        output
+    }
+
     fn draw_row<Renderer>(
         &self,
         renderer: &mut Renderer,
@@ -279,7 +429,7 @@ impl<'a, Message> DiffView<'a, Message> {
         Renderer: text::Renderer<Font = Font>,
     {
         let text_color = self.line_text_color(line.kind);
-        let gutter = format_gutter(line.old_line, line.new_line);
+        let gutter = format_gutter(line.old_line, line.new_line, self.gutter_digit_count);
         let prefix = prefix_for_kind(line.kind);
         let bounds = render.bounds;
 
@@ -287,9 +437,12 @@ impl<'a, Message> DiffView<'a, Message> {
             renderer,
             &gutter,
             TextRenderParams {
-                width: GUTTER_WIDTH - 16.0,
+                width: (self.gutter_width - GUTTER_HORIZONTAL_PADDING * 2.0).max(1.0),
                 height: ROW_HEIGHT,
-                position: Point::new(bounds.x + TEXT_X_PADDING, render.y + TEXT_Y_PADDING),
+                position: Point::new(
+                    bounds.x + GUTTER_HORIZONTAL_PADDING,
+                    render.y + TEXT_Y_PADDING,
+                ),
                 color: self.palette.text_muted,
                 clip_bounds: bounds,
                 wrapping: text::Wrapping::None,
@@ -302,7 +455,7 @@ impl<'a, Message> DiffView<'a, Message> {
                 width: PREFIX_WIDTH,
                 height: ROW_HEIGHT,
                 position: Point::new(
-                    bounds.x + GUTTER_WIDTH + TEXT_X_PADDING,
+                    bounds.x + self.gutter_width + TEXT_X_PADDING,
                     render.y + TEXT_Y_PADDING,
                 ),
                 color: text_color,
@@ -312,7 +465,7 @@ impl<'a, Message> DiffView<'a, Message> {
         );
 
         let position = Point::new(
-            bounds.x + GUTTER_WIDTH + PREFIX_WIDTH + TEXT_X_PADDING,
+            bounds.x + self.gutter_width + PREFIX_WIDTH + TEXT_X_PADDING,
             render.y + TEXT_Y_PADDING,
         );
 
@@ -347,6 +500,9 @@ where
             pending_file_jump: None,
             vertical_offset: 0.0,
             paragraphs: RefCell::new(Vec::new()),
+            selection_anchor: None,
+            selection_focus: None,
+            is_selecting: false,
         })
     }
 
@@ -358,6 +514,12 @@ where
             state.vertical_offset = 0.0;
             state.selected_file = self.selected_file;
             state.pending_file_jump = Some(self.selected_file);
+            // A revision change means the underlying line indices no longer
+            // refer to the same text — drop the selection rather than risk
+            // copying stale content.
+            state.selection_anchor = None;
+            state.selection_focus = None;
+            state.is_selecting = false;
             return;
         }
 
@@ -413,31 +575,100 @@ where
             shell.request_redraw();
         }
 
-        if let Event::Mouse(mouse::Event::WheelScrolled { delta }) = event {
-            let Some(_cursor_position) = cursor.position_over(bounds) else {
-                return;
-            };
+        match event {
+            Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
+                let Some(_cursor_position) = cursor.position_over(bounds) else {
+                    return;
+                };
 
-            let movement = match *delta {
-                mouse::ScrollDelta::Lines { x: _, y } => {
-                    Vector::new(0.0, -y * ROW_HEIGHT * LINE_SCROLL_ROWS)
+                let movement = match *delta {
+                    mouse::ScrollDelta::Lines { x: _, y } => {
+                        Vector::new(0.0, -y * ROW_HEIGHT * LINE_SCROLL_ROWS)
+                    }
+                    mouse::ScrollDelta::Pixels { x: _, y } => {
+                        Vector::new(0.0, -y * PIXEL_SCROLL_SCALE)
+                    }
+                };
+
+                if movement.y != 0.0 {
+                    let max_vertical = (self.content_height(bounds.width) - bounds.height).max(0.0);
+                    state.vertical_offset =
+                        (state.vertical_offset + movement.y).clamp(0.0, max_vertical);
+                    let selected_file = self.file_at_offset(state.vertical_offset, bounds.width);
+                    if selected_file != state.selected_file {
+                        state.selected_file = selected_file;
+                        shell.publish((self.on_selected_file_changed)(selected_file));
+                    }
                 }
-                mouse::ScrollDelta::Pixels { x: _, y } => Vector::new(0.0, -y * PIXEL_SCROLL_SCALE),
-            };
 
-            if movement.y != 0.0 {
-                let max_vertical = (self.content_height(bounds.width) - bounds.height).max(0.0);
-                state.vertical_offset =
-                    (state.vertical_offset + movement.y).clamp(0.0, max_vertical);
-                let selected_file = self.file_at_offset(state.vertical_offset, bounds.width);
-                if selected_file != state.selected_file {
-                    state.selected_file = selected_file;
-                    shell.publish((self.on_selected_file_changed)(selected_file));
+                shell.capture_event();
+                shell.request_redraw();
+            }
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                let Some(point) = cursor.position_over(bounds) else {
+                    // Click outside our bounds — drop any existing selection
+                    // so it doesn't visually persist after the user moves on.
+                    if state.selection_anchor.is_some() {
+                        state.selection_anchor = None;
+                        state.selection_focus = None;
+                        shell.request_redraw();
+                    }
+                    return;
+                };
+                if let Some(position) = self.position_at_point(point, bounds, state.vertical_offset)
+                {
+                    state.selection_anchor = Some(position);
+                    state.selection_focus = Some(position);
+                    state.is_selecting = true;
+                    shell.capture_event();
+                    shell.request_redraw();
                 }
             }
-
-            shell.capture_event();
-            shell.request_redraw();
+            Event::Mouse(mouse::Event::CursorMoved { .. }) if state.is_selecting => {
+                let Some(point) = cursor.position() else {
+                    return;
+                };
+                if let Some(position) = self.position_at_point(point, bounds, state.vertical_offset)
+                    && state.selection_focus != Some(position)
+                {
+                    state.selection_focus = Some(position);
+                    shell.request_redraw();
+                }
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+                if state.is_selecting =>
+            {
+                state.is_selecting = false;
+                // If the user clicked without dragging, anchor == focus —
+                // clear so we don't leave a phantom zero-width selection.
+                if state.selection_anchor == state.selection_focus {
+                    state.selection_anchor = None;
+                    state.selection_focus = None;
+                }
+                shell.request_redraw();
+            }
+            Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+                if !is_copy_shortcut(key, *modifiers) {
+                    return;
+                }
+                let (Some(anchor), Some(focus)) = (state.selection_anchor, state.selection_focus)
+                else {
+                    return;
+                };
+                let (start, end) = ordered(anchor, focus);
+                if start == end {
+                    return;
+                }
+                let Some(on_copy) = self.on_copy else {
+                    return;
+                };
+                let text = self.collect_selected_text(start, end);
+                if !text.is_empty() {
+                    shell.publish(on_copy(text));
+                    shell.capture_event();
+                }
+            }
+            _ => {}
         }
     }
 
@@ -460,9 +691,9 @@ where
         state.paragraphs.borrow_mut().clear();
         let content_width = self.content_width(bounds.width);
         let content_clip_bounds = Rectangle {
-            x: bounds.x + GUTTER_WIDTH + PREFIX_WIDTH,
+            x: bounds.x + self.gutter_width + PREFIX_WIDTH,
             y: bounds.y,
-            width: (bounds.width - GUTTER_WIDTH - PREFIX_WIDTH).max(1.0),
+            width: (bounds.width - self.gutter_width - PREFIX_WIDTH).max(1.0),
             height: bounds.height,
         };
 
@@ -541,13 +772,13 @@ where
                 renderer,
                 bounds.x,
                 bounds.y,
-                GUTTER_WIDTH,
+                self.gutter_width,
                 bounds.height,
                 self.palette.gutter_background,
             );
             self.draw_background(
                 renderer,
-                bounds.x + GUTTER_WIDTH,
+                bounds.x + self.gutter_width,
                 bounds.y,
                 1.0,
                 bounds.height,
@@ -665,7 +896,7 @@ where
                         width: self.text_width(&hunk.header),
                         height: HUNK_HEADER_HEIGHT,
                         position: Point::new(
-                            bounds.x + GUTTER_WIDTH + PREFIX_WIDTH + TEXT_X_PADDING,
+                            bounds.x + self.gutter_width + PREFIX_WIDTH + TEXT_X_PADDING,
                             header.y + TEXT_Y_PADDING,
                         ),
                         color: self.palette.text_muted,
@@ -673,6 +904,87 @@ where
                         wrapping: text::Wrapping::None,
                     },
                 );
+            }
+
+            // Draw selection backgrounds *before* the text so glyphs render
+            // on top. Painting after would either occlude the text or
+            // require alpha blending tricks; before-and-translucent is the
+            // common pattern (matches how text editors render selection).
+            if let (Some(anchor), Some(focus)) = (state.selection_anchor, state.selection_focus) {
+                let (sel_start, sel_end) = ordered(anchor, focus);
+                if sel_start != sel_end {
+                    let cw = self.char_width().max(1.0);
+                    let text_x = bounds.x + self.gutter_width + PREFIX_WIDTH + TEXT_X_PADDING;
+                    for row in &visible_rows {
+                        let line =
+                            &self.files[row.file_index].hunks[row.hunk_index].lines[row.line_index];
+                        let row_pos_start = TextPosition {
+                            file_index: row.file_index,
+                            hunk_index: row.hunk_index,
+                            line_index: row.line_index,
+                            byte: 0,
+                        };
+                        let row_pos_end = TextPosition {
+                            file_index: row.file_index,
+                            hunk_index: row.hunk_index,
+                            line_index: row.line_index,
+                            byte: line.content.len(),
+                        };
+                        if row_pos_end < sel_start || row_pos_start >= sel_end {
+                            continue;
+                        }
+
+                        let line_start_byte = if row_pos_start < sel_start {
+                            sel_start.byte
+                        } else {
+                            0
+                        };
+                        let line_end_byte = if row_pos_end > sel_end {
+                            sel_end.byte
+                        } else {
+                            line.content.len()
+                        };
+                        let start_chars = char_count_at_byte(&line.content, line_start_byte);
+                        let end_chars = char_count_at_byte(&line.content, line_end_byte);
+                        let is_full_line = sel_start <= row_pos_start && row_pos_end < sel_end;
+                        let mut x = text_x + start_chars as f32 * cw;
+                        let mut width =
+                            (end_chars.saturating_sub(start_chars) as f32 * cw).max(0.0);
+                        // Pad full-line selections so they read as a "select
+                        // through end-of-line" highlight, mimicking what
+                        // editors do on shift+down.
+                        if is_full_line {
+                            width += cw * 0.6;
+                        }
+                        if width <= 0.0 {
+                            // Empty selection on this row (e.g. cursor sits
+                            // at column 0 on the trailing line).
+                            continue;
+                        }
+                        // Constrain to the content region so a long
+                        // selection on a wide row doesn't bleed into the
+                        // gutter on horizontal overflow.
+                        let max_right = content_clip_bounds.x + content_clip_bounds.width;
+                        if x < content_clip_bounds.x {
+                            let trim = content_clip_bounds.x - x;
+                            x = content_clip_bounds.x;
+                            width = (width - trim).max(0.0);
+                        }
+                        if x + width > max_right {
+                            width = (max_right - x).max(0.0);
+                        }
+                        if width > 0.0 {
+                            self.draw_background(
+                                renderer,
+                                x,
+                                row.y,
+                                width,
+                                row.height,
+                                self.palette.selection,
+                            );
+                        }
+                    }
+                }
             }
 
             for row in &visible_rows {
@@ -701,10 +1013,16 @@ where
         _viewport: &Rectangle,
         _renderer: &Renderer,
     ) -> mouse::Interaction {
-        if cursor.position_over(layout.bounds()).is_some() {
-            mouse::Interaction::AllScroll
+        // Match the convention of every code editor: text cursor over the
+        // text area, default arrow over the gutter / chrome. (Avoid
+        // `AllScroll` — implies drag-to-pan, which we don't support.)
+        let Some(point) = cursor.position_over(layout.bounds()) else {
+            return mouse::Interaction::None;
+        };
+        if point.x >= layout.bounds().x + self.gutter_width + PREFIX_WIDTH {
+            mouse::Interaction::Text
         } else {
-            mouse::Interaction::None
+            mouse::Interaction::Idle
         }
     }
 }
@@ -923,10 +1241,85 @@ fn push_visible_band(bands: &mut Vec<VisibleBand>, kind: DiffLineKind, y: f32, h
     }
 }
 
-fn format_gutter(old_line: Option<usize>, new_line: Option<usize>) -> String {
+fn format_gutter(old_line: Option<usize>, new_line: Option<usize>, digit_count: usize) -> String {
     let old = old_line.map(|line| line.to_string()).unwrap_or_default();
     let new = new_line.map(|line| line.to_string()).unwrap_or_default();
-    format!("{old:>5} {new:>5}")
+    format!("{old:>digit_count$} {new:>digit_count$}")
+}
+
+/// Maximum line-number digit count across all visible files. Used to size
+/// the gutter just wide enough for the largest line number plus a small
+/// padding, so a 30k-line file isn't truncated and a 50-line file doesn't
+/// waste a third of the viewport on whitespace.
+fn compute_gutter_digit_count(files: &[DiffFileView<'_>]) -> usize {
+    let mut max_line = 0usize;
+    for file in files {
+        for hunk in file.hunks {
+            for line in &hunk.lines {
+                if let Some(n) = line.old_line {
+                    max_line = max_line.max(n);
+                }
+                if let Some(n) = line.new_line {
+                    max_line = max_line.max(n);
+                }
+            }
+        }
+    }
+    // Floor at 3 so the gutter still feels like a column for tiny files.
+    digits(max_line).max(3)
+}
+
+fn char_count_at_byte(content: &str, byte: usize) -> usize {
+    let cap = byte.min(content.len());
+    content
+        .char_indices()
+        .take_while(|(idx, _)| *idx < cap)
+        .count()
+}
+
+fn ordered(a: TextPosition, b: TextPosition) -> (TextPosition, TextPosition) {
+    if a <= b { (a, b) } else { (b, a) }
+}
+
+/// Translate a character index inside `content` to a byte offset, clamped
+/// to the string length. Used so the click-to-position logic can store
+/// byte offsets (cheap to slice) while the hit-test math operates in chars
+/// (which is what monospace `x / char_width` gives us).
+fn byte_offset_for_char(content: &str, char_index: usize) -> usize {
+    if char_index == 0 {
+        return 0;
+    }
+    let mut bytes = 0;
+    for (i, ch) in content.chars().enumerate() {
+        if i == char_index {
+            return bytes;
+        }
+        bytes += ch.len_utf8();
+    }
+    bytes.min(content.len())
+}
+
+fn is_copy_shortcut(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> bool {
+    if !modifiers.command() {
+        return false;
+    }
+    matches!(
+        key.as_ref(),
+        keyboard::Key::Character("c") | keyboard::Key::Character("C")
+    )
+}
+
+fn digits(n: usize) -> usize {
+    if n == 0 {
+        return 1;
+    }
+    let mut count = 0;
+    let mut value = n;
+    while value > 0 {
+        count += 1;
+        value /= 10;
+    }
+    count
 }
 
 fn centered_text_y(container_y: f32, text_height: f32) -> f32 {
