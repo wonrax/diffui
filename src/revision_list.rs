@@ -37,6 +37,7 @@ pub struct RevisionListStyle {
     pub graph: RevisionGraphStyle,
     pub revision_row_height: f32,
     pub file_row_height: f32,
+    pub gutter_left_padding: f32,
     pub gutter_padding: f32,
     pub content_padding: f32,
     pub background: Color,
@@ -166,7 +167,9 @@ impl<Message> RevisionList<Message> {
             Item::Revision(row) => row.frame.lane_count(),
             Item::File(row) => row.continuation.len(),
         };
-        lane_strip_width(lanes, &self.style.graph) + self.style.gutter_padding
+        self.style.gutter_left_padding
+            + lane_strip_width(lanes, &self.style.graph)
+            + self.style.gutter_padding
     }
 
     fn row_at_offset(&self, offset: f32) -> Option<usize> {
@@ -593,9 +596,9 @@ impl<Message> RevisionList<Message> {
 
         // Graph painted last so node + lines sit on top of any row chrome.
         let gutter_bounds = Rectangle {
-            x: row_bounds.x,
+            x: row_bounds.x + self.style.gutter_left_padding,
             y: row_bounds.y,
-            width: gutter_total - self.style.gutter_padding,
+            width: gutter_total - self.style.gutter_left_padding - self.style.gutter_padding,
             height: row_bounds.height,
         };
         draw_revision_row(renderer, gutter_bounds, &rev.frame, &self.style.graph);
@@ -672,8 +675,14 @@ impl<Message> RevisionList<Message> {
         let path_x = content_x + badge_w + row_gap;
         let path_w = (plus_x - path_x - row_gap).max(1.0);
 
+        // `fill_text_truncated` applies an end-ellipsis at the renderer level.
+        // The display models from main.rs already pick a smart truncation
+        // (preserves the basename, middle-ellipses the prefix); the renderer
+        // ellipsis is a safety net for the cases that logic can't squeeze —
+        // e.g. a basename that itself is wider than `path_w` — so the text
+        // doesn't bleed visually into the +N / -N columns to the right.
         if f.secondary.is_empty() {
-            fill_text_centered_y(
+            fill_text_truncated(
                 renderer,
                 &f.primary,
                 path_x,
@@ -683,14 +692,13 @@ impl<Message> RevisionList<Message> {
                 f.primary_color,
                 self.style.primary_font,
                 row_clip,
-                text::Alignment::Left,
             );
         } else {
             let secondary_size = (self.style.caption_text_size - 2.0).max(9.0);
             // Stack two text rows visually centered on the row mid-line.
             let primary_mid = row_mid_y - secondary_size * 0.55;
             let secondary_mid = row_mid_y + self.style.caption_text_size * 0.55;
-            fill_text_centered_y(
+            fill_text_truncated(
                 renderer,
                 &f.primary,
                 path_x,
@@ -700,9 +708,8 @@ impl<Message> RevisionList<Message> {
                 f.primary_color,
                 self.style.primary_font,
                 row_clip,
-                text::Alignment::Left,
             );
-            fill_text_centered_y(
+            fill_text_truncated(
                 renderer,
                 &f.secondary,
                 path_x,
@@ -712,7 +719,6 @@ impl<Message> RevisionList<Message> {
                 f.secondary_color,
                 self.style.primary_font,
                 row_clip,
-                text::Alignment::Left,
             );
         }
 
@@ -745,9 +751,9 @@ impl<Message> RevisionList<Message> {
 
         // Graph last — same z-order rationale as draw_revision.
         let gutter_bounds = Rectangle {
-            x: row_bounds.x,
+            x: row_bounds.x + self.style.gutter_left_padding,
             y: row_bounds.y,
-            width: gutter_total - self.style.gutter_padding,
+            width: gutter_total - self.style.gutter_left_padding - self.style.gutter_padding,
             height: row_bounds.height,
         };
         draw_continuation_row(renderer, gutter_bounds, &f.continuation, &self.style.graph);

@@ -11,6 +11,7 @@ use std::{
 mod diff_view;
 mod graph;
 mod graph_view;
+mod resize_handle;
 mod revision_list;
 
 use anyhow::{Context, Result, bail};
@@ -30,7 +31,7 @@ use iced::{
     Background, Border, Color, Element, Font, Length, Shadow, Subscription, Task, Theme, alignment,
     event::{self, Event},
     keyboard, system, theme, time,
-    widget::{button, column, container, row, text},
+    widget::{button, column, container, row, stack, text},
     window,
 };
 use jj_lib::{
@@ -54,6 +55,7 @@ use jj_lib::{
     tree_merge::MergeOptions,
     workspace::{Workspace, default_working_copy_factories},
 };
+use resize_handle::ResizeHandle;
 use revision_list::{
     FileRowView, IndicatorChip, Item as RevisionListItem, RevisionList, RevisionListStyle,
     RevisionRowView, RowSelectionKey,
@@ -71,7 +73,10 @@ const TITLE_TEXT_SIZE: f32 = 18.0;
 const SIDEBAR_REVISION_ID_CHARS: usize = 12;
 const SIDEBAR_COMMIT_ID_CHARS: usize = 12;
 const CONTROL_RADIUS: f32 = 5.0;
-const SIDEBAR_WIDTH: f32 = 360.0;
+const SIDEBAR_DEFAULT_WIDTH: f32 = 360.0;
+const SIDEBAR_MIN_WIDTH: f32 = 220.0;
+const SIDEBAR_MAX_WIDTH: f32 = 800.0;
+const SIDEBAR_RESIZE_HIT_PADDING: f32 = 4.0;
 // Floor for the badge column. We measure the actual status labels to size the
 // column, but a single-character label like "M" can render thinner than the
 // chip looks tasteful at, so we keep a small visual minimum.
@@ -82,6 +87,9 @@ const SIDEBAR_FILE_STAT_HORIZONTAL_PADDING: f32 = 4.0;
 const SIDEBAR_FILE_STAT_MIN_WIDTH: f32 = 24.0;
 const SIDEBAR_FILE_ROW_GAP: f32 = 6.0;
 const SIDEBAR_FILE_ROW_HORIZONTAL_PADDING: f32 = 20.0;
+const SIDEBAR_GRAPH_LANE_WIDTH: f32 = 10.0;
+const SIDEBAR_GRAPH_GUTTER_PADDING: f32 = 8.0;
+const SIDEBAR_GRAPH_LEFT_PADDING: f32 = 8.0;
 const REPOSITORY_REFRESH_INTERVAL: Duration = Duration::from_millis(1_000);
 
 fn main() -> iced::Result {
@@ -120,6 +128,7 @@ struct Diffui {
     selected_theme: ThemePreference,
     system_theme: theme::Mode,
     selected_file: usize,
+    sidebar_width: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -214,6 +223,7 @@ enum Message {
     SelectNextFile,
     SelectPreviousFile,
     CopyToClipboard(String),
+    SidebarWidthChanged(f32),
 }
 
 #[derive(Debug, Clone)]
@@ -398,6 +408,7 @@ impl Diffui {
                         selected_theme: ThemePreference::System,
                         system_theme: theme::Mode::None,
                         selected_file: 0,
+                        sidebar_width: SIDEBAR_DEFAULT_WIDTH,
                     },
                     Task::batch([backend_task, theme_task]),
                 )
@@ -417,6 +428,7 @@ impl Diffui {
                     selected_theme: ThemePreference::System,
                     system_theme: theme::Mode::None,
                     selected_file: 0,
+                    sidebar_width: SIDEBAR_DEFAULT_WIDTH,
                 },
                 system::theme().map(Message::SystemThemeChanged),
             ),
@@ -529,6 +541,9 @@ impl Diffui {
             Message::CopyToClipboard(text) => {
                 return iced::clipboard::write(text).discard();
             }
+            Message::SidebarWidthChanged(width) => {
+                self.sidebar_width = width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+            }
         }
 
         Task::none()
@@ -551,13 +566,23 @@ impl Diffui {
 
     fn view(&self) -> Element<'_, Message> {
         let theme = self.resolved_theme().spec();
-        let content = row![
+        let panels = row![
             build_sidebar(self, theme),
             vertical_divider(theme),
             build_diff_panel(self, theme),
         ]
         .spacing(0)
         .height(Length::Fill);
+        let resize_overlay = ResizeHandle::new(
+            self.sidebar_width,
+            SIDEBAR_MIN_WIDTH,
+            SIDEBAR_MAX_WIDTH,
+            SIDEBAR_RESIZE_HIT_PADDING,
+            Message::SidebarWidthChanged,
+        );
+        let content = stack![panels, resize_overlay]
+            .width(Length::Fill)
+            .height(Length::Fill);
 
         container(content)
             .padding(0)
@@ -1826,7 +1851,7 @@ fn build_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     let body = column![sidebar_header, revision_list].spacing(0);
 
     container(body)
-        .width(Length::Fixed(SIDEBAR_WIDTH))
+        .width(Length::Fixed(ui.sidebar_width))
         .height(Length::Fill)
         .style(move |_| sidebar_panel_style(theme))
         .into()
@@ -1866,17 +1891,35 @@ fn build_revision_list(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             let deletions_w = sidebar_file_stat_width(&widest_deletion, &metrics);
             let badge_w = sidebar_file_badge_width(&ui.document.files, &metrics);
 
-            // Reserve room for everything that isn't the path, then hand the
-            // remainder to the truncation logic. Previously this expression
-            // double-counted the stat widths (subtracted both the per-column
-            // min and the actual measured widths), making abbreviation kick
-            // in earlier than necessary.
-            let reserved = badge_w
+            // Mirror `draw_file`'s layout exactly so truncation kicks in at
+            // the same threshold the renderer clips at:
+            //   [gutter] [badge] gap [path] gap [+N] gap [-N] right_pad
+            // Previously this used 4 gaps and the full horizontal padding,
+            // and ignored the graph gutter entirely — so paths bled past
+            // the +N/-N columns whenever the expanded commit had any lanes.
+            let expanded_lane_count = ui
+                .commits
+                .iter()
+                .find(
+                    |commit| match (&ui.expanded_revision, commit.is_working_copy) {
+                        (RevisionSelection::WorkingCopy, true) => true,
+                        (RevisionSelection::Commit(id), false) => id == &commit.revision_id,
+                        _ => false,
+                    },
+                )
+                .map(|commit| commit.lane_frame.after.len())
+                .unwrap_or(0);
+            let gutter_total = SIDEBAR_GRAPH_LEFT_PADDING
+                + expanded_lane_count as f32 * SIDEBAR_GRAPH_LANE_WIDTH
+                + SIDEBAR_GRAPH_GUTTER_PADDING;
+            let right_pad = SIDEBAR_FILE_ROW_HORIZONTAL_PADDING / 2.0;
+            let reserved = gutter_total
+                + badge_w
                 + additions_w
                 + deletions_w
-                + SIDEBAR_FILE_ROW_GAP * 4.0
-                + SIDEBAR_FILE_ROW_HORIZONTAL_PADDING;
-            let display_width = (SIDEBAR_WIDTH - reserved).max(0.0);
+                + SIDEBAR_FILE_ROW_GAP * 3.0
+                + right_pad;
+            let display_width = (ui.sidebar_width - reserved).max(0.0);
             let display_models =
                 sidebar_file_display_models(&ui.document.files, display_width, &metrics);
             (
@@ -2022,7 +2065,7 @@ struct FileRowTemplate {
 fn revision_list_style(theme: ThemeSpec, file_badge_width: f32) -> RevisionListStyle {
     RevisionListStyle {
         graph: RevisionGraphStyle {
-            lane_width: 10.0,
+            lane_width: SIDEBAR_GRAPH_LANE_WIDTH,
             line_thickness: 1.5,
             node_radius: 3.5,
             // Lane 0 (the trunk) wears the theme accent; subsequent lanes
@@ -2033,7 +2076,8 @@ fn revision_list_style(theme: ThemeSpec, file_badge_width: f32) -> RevisionListS
         },
         revision_row_height: 64.0,
         file_row_height: 39.0,
-        gutter_padding: 8.0,
+        gutter_left_padding: SIDEBAR_GRAPH_LEFT_PADDING,
+        gutter_padding: SIDEBAR_GRAPH_GUTTER_PADDING,
         content_padding: 12.0,
         background: theme.panel_background,
         selected_background: theme.selected_file,
