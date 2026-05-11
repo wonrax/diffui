@@ -1435,14 +1435,26 @@ async fn load_jj_repository_snapshot(repository: Repository) -> Result<Repositor
     )
     .context("failed to load jj workspace")?;
     let workspace_name = workspace.workspace_name().to_owned();
-    let base_repo = workspace
-        .repo_loader()
+
+    let auto_track = snapshot_auto_track_matcher(&settings, &repository.root)?;
+    let base_ignores = snapshot_base_ignores(&repository.root)?;
+    let max_new_file_size = snapshot_max_new_file_size(&settings)?;
+
+    // Take the working-copy lock *before* reading the repo head. Otherwise a
+    // jj-cli command running between `load_at_head` and the lock can rewrite
+    // the wc commit out from under us, and our snapshot tx — still parented on
+    // the stale op — lands as a sibling of the cli's op. Both ops touch the
+    // same change_id with different commit_ids, which jj's concurrent-op
+    // resolver presents as a divergent change.
+    let repo_loader = workspace.repo_loader().clone();
+    let mut locked_ws = workspace
+        .start_working_copy_mutation()
+        .context("failed to lock jj working copy")?;
+
+    let base_repo = repo_loader
         .load_at_head()
         .await
         .context("failed to load jj repo")?;
-
-    // Capture the working-copy commit before locking, so we can compare the
-    // freshly-snapshotted tree against the tree currently recorded for it.
     let wc_commit_id = base_repo
         .view()
         .get_wc_commit_id(&workspace_name)
@@ -1460,13 +1472,6 @@ async fn load_jj_repository_snapshot(repository: Repository) -> Result<Repositor
         })?;
     let old_tree = wc_commit.tree();
 
-    let auto_track = snapshot_auto_track_matcher(&settings, &repository.root)?;
-    let base_ignores = snapshot_base_ignores(&repository.root)?;
-    let max_new_file_size = snapshot_max_new_file_size(&settings)?;
-
-    let mut locked_ws = workspace
-        .start_working_copy_mutation()
-        .context("failed to lock jj working copy")?;
     let snapshot_options = SnapshotOptions {
         base_ignores,
         progress: None,

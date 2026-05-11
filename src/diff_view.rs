@@ -857,9 +857,16 @@ where
             .take()
             .or_else(|| (state.selected_file != self.selected_file).then_some(self.selected_file))
         {
-            state.vertical_offset = self
-                .file_offset(file_index, bounds.width)
-                .clamp(0.0, max_vertical);
+            // For file 0, scroll to the very top so the revision header stays
+            // visible — `file_offset(0)` equals `header_height()`, which would
+            // park the file's content header right at the top and hide the
+            // revision metadata above it.
+            let target = if file_index == 0 {
+                0.0
+            } else {
+                self.file_offset(file_index, bounds.width)
+            };
+            state.vertical_offset = target.clamp(0.0, max_vertical);
             state.selected_file = file_index;
             shell.request_redraw();
         }
