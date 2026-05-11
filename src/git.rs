@@ -1,0 +1,401 @@
+use std::{ffi::OsString, path::Path, process::Stdio};
+
+use anyhow::{Context, Result, bail};
+use jj_lib::graph::GraphEdge;
+use tokio::process::Command;
+
+use crate::backend::{
+    CommitSummary, DiffDocument, RevisionDetails, RevisionSelection, SignatureInfo,
+    parse_unified_diff,
+};
+use crate::graph::assign_lanes;
+use crate::repository::{Repository, RepositorySnapshot};
+
+/// Sentinel commit_id used for the synthetic git working-copy row.
+/// Selection short-circuits on `is_working_copy` before this value is ever
+/// passed to git, so it just needs to be visually distinct and not collide
+/// with a real hex hash.
+pub const GIT_WORKING_COPY_ID: &str = "wc";
+
+pub async fn load_git_diff(
+    repository: &Repository,
+    revision: &RevisionSelection,
+) -> Result<(DiffDocument, Option<RevisionDetails>)> {
+    let args = git_backend_command(repository, revision);
+    let output = run_command(&repository.root, "git", args).await?;
+    let document = parse_unified_diff(&output);
+    let details = load_git_revision_details(repository, revision).await.ok();
+    Ok((document, details))
+}
+
+pub async fn load_git_commits(repository: &Repository) -> Result<Vec<CommitSummary>> {
+    let output = run_command(
+        &repository.root,
+        "git",
+        vec![
+            OsString::from("log"),
+            OsString::from("--topo-order"),
+            OsString::from("--pretty=format:%h%x09%H%x09%P%x09%an%x09%x09%s"),
+        ],
+    )
+    .await?;
+
+    let mut rows = parse_commit_log_rows(&output);
+    // Git has no native @ commit, so synthesize a working-copy row at
+    // the top whenever the tree differs from HEAD. The row's parent
+    // is HEAD so the graph keeps a continuous lane.
+    if !rows.is_empty() && git_has_uncommitted_changes(&repository.root).await? {
+        let head_id = rows[0].commit_id.clone();
+        rows.insert(
+            0,
+            ParsedCommitRow {
+                change_id: GIT_WORKING_COPY_ID.to_owned(),
+                commit_id: GIT_WORKING_COPY_ID.to_owned(),
+                parents: vec![head_id],
+                author: String::new(),
+                is_empty: None,
+                description: "Working copy".to_owned(),
+                has_description: true,
+                is_working_copy: true,
+            },
+        );
+    }
+    Ok(build_commit_summaries(rows))
+}
+
+pub async fn load_git_repository_snapshot(repository_root: &Path) -> Result<RepositorySnapshot> {
+    let output = run_command(
+        repository_root,
+        "git",
+        vec![
+            OsString::from("status"),
+            OsString::from("--porcelain=v1"),
+            OsString::from("--branch"),
+            OsString::from("--untracked-files=normal"),
+        ],
+    )
+    .await?;
+    Ok(RepositorySnapshot {
+        fingerprint: output,
+    })
+}
+
+fn git_backend_command(repository: &Repository, revision: &RevisionSelection) -> Vec<OsString> {
+    let mut args: Vec<OsString> = match revision {
+        RevisionSelection::WorkingCopy => {
+            // `git diff HEAD` covers both staged and unstaged changes
+            // against the last committed state — the closest analog to
+            // jj's @ working-copy diff. Untracked files are not included
+            // (git diff only walks tracked paths).
+            ["diff", "HEAD", "--no-ext-diff", "--no-color", "--"]
+                .into_iter()
+                .map(OsString::from)
+                .collect()
+        }
+        RevisionSelection::Commit(revision) => {
+            vec![
+                OsString::from("show"),
+                OsString::from("--format="),
+                OsString::from("--no-ext-diff"),
+                OsString::from("--no-color"),
+                OsString::from(revision),
+                OsString::from("--"),
+            ]
+        }
+    };
+
+    if !repository.scope.as_os_str().is_empty() {
+        args.push(repository.scope.as_os_str().to_owned());
+    }
+
+    args
+}
+
+async fn run_command(current_dir: &Path, program: &str, args: Vec<OsString>) -> Result<String> {
+    let output = Command::new(program)
+        .args(args)
+        .current_dir(current_dir)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .with_context(|| format!("failed to execute {program}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("{program} exited with {}: {}", output.status, stderr.trim());
+    }
+
+    String::from_utf8(output.stdout).with_context(|| format!("{program} emitted non-utf8 output"))
+}
+
+async fn git_has_uncommitted_changes(repository_root: &Path) -> Result<bool> {
+    // `git status --porcelain` prints one line per change (staged, unstaged,
+    // or untracked) and nothing on a clean tree.
+    let output = run_command(
+        repository_root,
+        "git",
+        vec![OsString::from("status"), OsString::from("--porcelain")],
+    )
+    .await?;
+    Ok(!output.trim().is_empty())
+}
+
+async fn load_git_revision_details(
+    repository: &Repository,
+    revision: &RevisionSelection,
+) -> Result<RevisionDetails> {
+    // %x1f is a unit-separator byte chosen to be unlikely in commit metadata,
+    // so we can split the fields cleanly even when names or descriptions
+    // contain tabs/newlines.
+    const SEP: &str = "\x1f";
+    let target = match revision {
+        RevisionSelection::WorkingCopy => "HEAD".to_owned(),
+        RevisionSelection::Commit(id) => id.clone(),
+    };
+    let format = format!("%H{SEP}%an{SEP}%ae{SEP}%aI{SEP}%cn{SEP}%ce{SEP}%cI{SEP}%D{SEP}%B");
+    let output = run_command(
+        &repository.root,
+        "git",
+        vec![
+            OsString::from("show"),
+            OsString::from("--no-patch"),
+            OsString::from(format!("--format={format}")),
+            OsString::from(target),
+        ],
+    )
+    .await?;
+
+    let mut parts = output.splitn(9, '\x1f');
+    let commit_id = parts.next().unwrap_or("").trim().to_owned();
+    let author_name = parts.next().unwrap_or("").to_owned();
+    let author_email = parts.next().unwrap_or("").to_owned();
+    let author_date = parts.next().unwrap_or("").to_owned();
+    let committer_name = parts.next().unwrap_or("").to_owned();
+    let committer_email = parts.next().unwrap_or("").to_owned();
+    let committer_date = parts.next().unwrap_or("").to_owned();
+    let refs = parts.next().unwrap_or("").to_owned();
+    let description = parts.next().unwrap_or("").trim_end().to_owned();
+
+    let bookmarks: Vec<String> = refs
+        .split(',')
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    Ok(RevisionDetails {
+        commit_id,
+        change_id: None,
+        bookmarks,
+        author: SignatureInfo {
+            name: author_name,
+            email: author_email,
+            timestamp: Some(author_date).filter(|s| !s.is_empty()),
+        },
+        committer: Some(SignatureInfo {
+            name: committer_name,
+            email: committer_email,
+            timestamp: Some(committer_date).filter(|s| !s.is_empty()),
+        }),
+        signature: None,
+        description,
+    })
+}
+
+struct ParsedCommitRow {
+    change_id: String,
+    commit_id: String,
+    parents: Vec<String>,
+    author: String,
+    is_empty: Option<bool>,
+    description: String,
+    has_description: bool,
+    is_working_copy: bool,
+}
+
+fn parse_commit_log_rows(output: &str) -> Vec<ParsedCommitRow> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(5, '\t');
+            let change_id = parts.next()?.trim();
+            let commit_id = parts.next()?.trim();
+            let parents_field = parts.next().unwrap_or("");
+            let author = parts.next()?.trim();
+            let remainder = parts.next().unwrap_or("");
+            let (empty, description) =
+                if let Some((empty, description)) = remainder.split_once('\t') {
+                    (parse_optional_bool(empty.trim()), description.trim())
+                } else {
+                    (None, remainder.trim())
+                };
+
+            if change_id.is_empty() || commit_id.is_empty() {
+                return None;
+            }
+
+            let parents: Vec<String> = parents_field
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect();
+            let has_description = !description.is_empty();
+            Some(ParsedCommitRow {
+                change_id: change_id.to_owned(),
+                commit_id: commit_id.to_owned(),
+                parents,
+                author: author.to_owned(),
+                is_empty: empty,
+                description: if description.is_empty() {
+                    "(no description set)".to_owned()
+                } else {
+                    description.to_owned()
+                },
+                has_description,
+                is_working_copy: false,
+            })
+        })
+        .collect()
+}
+
+fn build_commit_summaries(rows: Vec<ParsedCommitRow>) -> Vec<CommitSummary> {
+    use crate::graph::LaneFrame;
+
+    // Walk the rows in their existing topo order and assign lanes from
+    // parent edges. Parents not present in the listing (shallow clone, etc.)
+    // become Missing edges so the renderer can draw a stub.
+    let known: std::collections::HashSet<&str> =
+        rows.iter().map(|row| row.commit_id.as_str()).collect();
+    let lane_inputs = rows.iter().map(|row| {
+        let edges: Vec<GraphEdge<String>> = row
+            .parents
+            .iter()
+            .map(|parent| {
+                if known.contains(parent.as_str()) {
+                    GraphEdge::direct(parent.clone())
+                } else {
+                    GraphEdge::missing(parent.clone())
+                }
+            })
+            .collect();
+        (row.commit_id.clone(), edges)
+    });
+    let lane_rows = assign_lanes(lane_inputs);
+
+    rows.into_iter()
+        .zip(lane_rows)
+        .map(|(row, lane_row)| CommitSummary {
+            change_id: row.change_id,
+            commit_id: row.commit_id.clone(),
+            revision_id: row.commit_id,
+            shortest_change_id_len: None,
+            description: row.description,
+            author: row.author,
+            has_description: row.has_description,
+            is_empty: row.is_empty,
+            lane_frame: LaneFrame::from_lane_row(&lane_row),
+            is_working_copy: row.is_working_copy,
+        })
+        .collect()
+}
+
+fn parse_optional_bool(value: &str) -> Option<bool> {
+    match value {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::repository::Vcs;
+    use std::path::PathBuf;
+
+    fn parse_commit_log(output: &str) -> Vec<CommitSummary> {
+        build_commit_summaries(parse_commit_log_rows(output))
+    }
+
+    #[test]
+    fn git_commit_diff_uses_selected_revision() {
+        let repository = Repository {
+            root: PathBuf::from("/repo"),
+            vcs: Vcs::Git,
+            scope: PathBuf::new(),
+        };
+
+        let args =
+            git_backend_command(&repository, &RevisionSelection::Commit("abc123".to_owned()));
+
+        assert!(args.contains(&OsString::from("show")));
+        assert!(args.contains(&OsString::from("abc123")));
+        assert_eq!(args.last(), Some(&OsString::from("--")));
+    }
+
+    #[test]
+    fn parses_commit_log_rows_basic() {
+        let commits = parse_commit_log("abc\tdef\t\tme@example.com\tfalse\tadd commit sidebar\n");
+
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].change_id, "abc");
+        assert_eq!(commits[0].commit_id, "def");
+        assert_eq!(commits[0].author, "me@example.com");
+        assert_eq!(commits[0].description, "add commit sidebar");
+        assert!(commits[0].has_description);
+        assert_eq!(commits[0].is_empty, Some(false));
+    }
+
+    #[test]
+    fn parses_commit_log_rows_without_description() {
+        let commits = parse_commit_log("abc\tdef\t\tme@example.com\ttrue\t\n");
+
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].description, "(no description set)");
+        assert!(!commits[0].has_description);
+        assert_eq!(commits[0].is_empty, Some(true));
+    }
+
+    #[test]
+    fn commit_log_rows_select_full_revision_id() {
+        let commits = parse_commit_log(
+            "abc\tdef123456789abcdef\t\tme@example.com\tfalse\tadd commit sidebar\n",
+        );
+
+        assert_eq!(commits[0].change_id, "abc");
+        assert_eq!(commits[0].commit_id, "def123456789abcdef");
+        assert_eq!(commits[0].revision_id, "def123456789abcdef");
+    }
+
+    #[test]
+    fn git_log_merge_assigns_distinct_lanes_for_second_parent() {
+        // Topo order, descendants first:
+        //   M (merge of T and W) - parents: T W
+        //   T - parent: A
+        //   W - parent: A
+        //   A - root, no parents
+        let commits = parse_commit_log(
+            "M\tM\tT W\tme@example.com\tfalse\tmerge\n\
+             T\tT\tA\tme@example.com\tfalse\ttrunk\n\
+             W\tW\tA\tme@example.com\tfalse\tside\n\
+             A\tA\t\tme@example.com\tfalse\troot\n",
+        );
+
+        assert_eq!(commits.len(), 4);
+        assert_eq!(commits[0].lane_frame.node_lane, 0);
+        assert_eq!(commits[1].lane_frame.node_lane, 0);
+        // Second parent of the merge spawns a new lane to the right.
+        assert_eq!(commits[2].lane_frame.node_lane, 1);
+        // Both lanes converge back at A.
+        assert_eq!(commits[3].lane_frame.node_lane, 0);
+        assert_eq!(commits[3].lane_frame.merging_lanes, vec![0, 1]);
+    }
+
+    #[test]
+    fn git_log_marks_unknown_parents_as_missing() {
+        // Single commit whose parent isn't in the listing — e.g. a shallow clone.
+        let commits = parse_commit_log("abc\tabc\tdeadbeef\tme@example.com\tfalse\thead\n");
+
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].lane_frame.missing_parents, 1);
+        assert!(commits[0].lane_frame.after.is_empty());
+    }
+}

@@ -20,11 +20,17 @@ use jj_lib::graph::GraphEdgeType;
 
 use crate::graph::LaneFrame;
 
+/// Horizontal width occupied by one lane in the gutter. `lane_x` centers
+/// the node disc in the middle of its lane, so adjacent lanes sit at
+/// `LANE_WIDTH` apart. Exposed because the revision list reserves
+/// `lanes * LANE_WIDTH` of horizontal space for the gutter, and sidebar
+/// layout math needs the same number to size the path column.
+pub const LANE_WIDTH: f32 = 10.0;
+const LINE_THICKNESS: f32 = 1.5;
+const NODE_RADIUS: f32 = 3.5;
+
 #[derive(Debug, Clone, Copy)]
 pub struct RevisionGraphStyle {
-    pub lane_width: f32,
-    pub line_thickness: f32,
-    pub node_radius: f32,
     /// Base color for lane 0 (the trunk). Other lanes — and the node
     /// discs that sit on them — are derived from this via a deterministic
     /// hue rotation; see [`Self::lane_color`]. We don't expose a separate
@@ -80,7 +86,7 @@ impl RevisionGraphStyle {
         };
         let mut stroke = Stroke::default()
             .with_color(color)
-            .with_width(self.line_thickness)
+            .with_width(LINE_THICKNESS)
             .with_line_cap(LineCap::Round)
             .with_line_join(LineJoin::Round);
         if matches!(kind, GraphEdgeType::Indirect) {
@@ -94,12 +100,12 @@ impl RevisionGraphStyle {
 }
 
 /// Width in pixels needed to render a row with `lane_count` lanes.
-pub fn lane_strip_width(lane_count: usize, style: &RevisionGraphStyle) -> f32 {
-    lane_count as f32 * style.lane_width
+pub fn lane_strip_width(lane_count: usize) -> f32 {
+    lane_count as f32 * LANE_WIDTH
 }
 
-fn lane_x(x_origin: f32, lane: usize, style: &RevisionGraphStyle) -> f32 {
-    x_origin + (lane as f32 + 0.5) * style.lane_width
+fn lane_x(x_origin: f32, lane: usize) -> f32 {
+    x_origin + (lane as f32 + 0.5) * LANE_WIDTH
 }
 
 /// Tilt of the branch-off segment, measured from horizontal. A pure
@@ -141,7 +147,6 @@ fn draw_outgoing(
     x_target: f32,
     y_mid: f32,
     y_bot: f32,
-    lane_width: f32,
 ) {
     if (x_target - x_node).abs() < 0.5 {
         builder.move_to(Point::new(x_node, y_mid));
@@ -159,7 +164,7 @@ fn draw_outgoing(
     // Cap against the remaining vertical drop so `arc_to` doesn't try to
     // fit an arc taller than the row — that degenerates into a plain
     // line and we lose the rounding entirely.
-    let radius = (lane_width * CORNER_RADIUS_FRAC).min((y_bot - corner_y) * 0.5);
+    let radius = (LANE_WIDTH * CORNER_RADIUS_FRAC).min((y_bot - corner_y) * 0.5);
 
     let corner = Point::new(x_target, corner_y);
     let end = Point::new(x_target, y_bot);
@@ -179,7 +184,6 @@ fn draw_incoming(
     x_node: f32,
     y_top: f32,
     y_mid: f32,
-    lane_width: f32,
 ) {
     if (x_node - x_source).abs() < 0.5 {
         builder.move_to(Point::new(x_node, y_top));
@@ -189,7 +193,7 @@ fn draw_incoming(
 
     let dx = (x_node - x_source).abs();
     let corner_y = y_mid - dx * NODE_TILT_DEG.to_radians().tan();
-    let radius = (lane_width * CORNER_RADIUS_FRAC).min((corner_y - y_top) * 0.5);
+    let radius = (LANE_WIDTH * CORNER_RADIUS_FRAC).min((corner_y - y_top) * 0.5);
 
     let corner = Point::new(x_source, corner_y);
     let node_point = Point::new(x_node, y_mid);
@@ -210,7 +214,7 @@ pub fn draw_revision_row<R>(
     let top = bounds.y;
     let bot = bounds.y + bounds.height;
     let mid = bounds.y + bounds.height / 2.0;
-    let x_node = lane_x(bounds.x, frame_data.node_lane, style);
+    let x_node = lane_x(bounds.x, frame_data.node_lane);
 
     // Indirect-edge dash pattern. Allocated once per row so the borrow
     // outlives the strokes; the pattern itself is just two `f32`s.
@@ -224,14 +228,14 @@ pub fn draw_revision_row<R>(
     // Incoming edges (top half).
     for (i, kind) in frame_data.before.iter().enumerate() {
         let Some(kind) = *kind else { continue };
-        let x_i = lane_x(bounds.x, i, style);
+        let x_i = lane_x(bounds.x, i);
 
         if frame_data.merging_lanes.contains(&i) {
             // This lane terminates at the node — vertical from top, then
             // either continues straight (if i == node_lane) or curves into
             // the node from the side.
             let path = Path::new(|builder| {
-                draw_incoming(builder, x_i, x_node, top, mid, style.lane_width);
+                draw_incoming(builder, x_i, x_node, top, mid);
             });
             frame.stroke(&path, style.edge_stroke(kind, i, &dash));
         } else if frame_data.is_pass_through(i) {
@@ -255,10 +259,10 @@ pub fn draw_revision_row<R>(
             // double-stroking.
             continue;
         }
-        let x_j = lane_x(bounds.x, j, style);
+        let x_j = lane_x(bounds.x, j);
 
         let path = Path::new(|builder| {
-            draw_outgoing(builder, x_node, x_j, mid, bot, style.lane_width);
+            draw_outgoing(builder, x_node, x_j, mid, bot);
         });
         // Color outgoing edges by the destination lane: a branch that
         // *opens* on lane 2 should already wear lane 2's color from the
@@ -275,13 +279,13 @@ pub fn draw_revision_row<R>(
     // so adding the stub before the disc lets the disc still cover any
     // overlap with it.
     if frame_data.missing_parents > 0 {
-        let stub_x = x_node + style.node_radius * 1.2;
-        let stub_top = mid + style.node_radius;
-        let stub_bot = (mid + style.node_radius + bounds.height * 0.3).min(bot);
+        let stub_x = x_node + NODE_RADIUS * 1.2;
+        let stub_top = mid + NODE_RADIUS;
+        let stub_bot = (mid + NODE_RADIUS + bounds.height * 0.3).min(bot);
         let stub_path = Path::line(Point::new(stub_x, stub_top), Point::new(stub_x, stub_bot));
         let stub_stroke = Stroke::default()
             .with_color(style.missing_color)
-            .with_width(style.line_thickness)
+            .with_width(LINE_THICKNESS)
             .with_line_cap(LineCap::Round);
         frame.stroke(&stub_path, stub_stroke);
     }
@@ -297,7 +301,7 @@ pub fn draw_revision_row<R>(
     //      rule means `node_lane` is also the first parent's lane, so
     //      this picks the closest possible match in hue.
     let disc_color = style.lane_color(frame_data.node_lane);
-    let disc_path = Path::new(|b| b.circle(Point::new(x_node, mid), style.node_radius));
+    let disc_path = Path::new(|b| b.circle(Point::new(x_node, mid), NODE_RADIUS));
     frame.fill(&disc_path, disc_color);
 
     renderer.draw_geometry(frame.into_geometry());
@@ -318,7 +322,7 @@ pub fn draw_continuation_row<R>(
     let mut frame = Frame::new(renderer, Size::new(bounds.x + bounds.width, bot));
     for (i, kind) in lanes.iter().enumerate() {
         let Some(kind) = *kind else { continue };
-        let x = lane_x(bounds.x, i, style);
+        let x = lane_x(bounds.x, i);
         let path = Path::line(Point::new(x, top), Point::new(x, bot));
         frame.stroke(&path, style.edge_stroke(kind, i, &dash));
     }

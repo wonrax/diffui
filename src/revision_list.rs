@@ -33,34 +33,35 @@ use crate::scrollbar::{self, ScrollbarState, ScrollbarStyle};
 const LINE_SCROLL_ROWS: f32 = 1.5;
 const PIXEL_SCROLL_SCALE: f32 = 0.65;
 
+const REVISION_ROW_HEIGHT: f32 = 46.0;
+const FILE_ROW_HEIGHT: f32 = 42.0;
+pub const GUTTER_LEFT_PADDING: f32 = 8.0;
+pub const GUTTER_PADDING: f32 = 8.0;
+const CONTENT_PADDING: f32 = 12.0;
+const INDICATOR_RADIUS: f32 = 5.0;
+const SMALL_TEXT_SIZE: f32 = 15.0;
+const CAPTION_TEXT_SIZE: f32 = 14.0;
+pub const FILE_ROW_GAP: f32 = 6.0;
+pub const FILE_ROW_RIGHT_PAD: f32 = 10.0;
+const TOOLTIP_RADIUS: f32 = 5.0;
+const TOOLTIP_PADDING: f32 = 6.0;
+const TOOLTIP_GAP: f32 = 8.0;
+
 #[derive(Debug, Clone, Copy)]
 pub struct RevisionListStyle {
     pub graph: RevisionGraphStyle,
-    pub revision_row_height: f32,
-    pub file_row_height: f32,
-    pub gutter_left_padding: f32,
-    pub gutter_padding: f32,
-    pub content_padding: f32,
     pub background: Color,
     pub selected_background: Color,
     pub border: Color,
     pub muted_text: Color,
     pub subtle_text: Color,
     pub accent_text: Color,
-    pub indicator_radius: f32,
-    pub small_text_size: f32,
-    pub caption_text_size: f32,
     pub primary_font: Font,
     pub mono_font: Font,
     pub file_badge_width: f32,
-    pub file_row_gap: f32,
-    pub file_row_right_pad: f32,
     pub tooltip_background: Color,
     pub tooltip_text: Color,
     pub tooltip_border: Color,
-    pub tooltip_radius: f32,
-    pub tooltip_padding: f32,
-    pub tooltip_gap: f32,
     pub scrollbar: ScrollbarStyle,
 }
 
@@ -155,8 +156,8 @@ impl<Message> RevisionList<Message> {
 
     fn row_height(&self, item: &Item) -> f32 {
         match item {
-            Item::Revision(_) => self.style.revision_row_height,
-            Item::File(_) => self.style.file_row_height,
+            Item::Revision(_) => REVISION_ROW_HEIGHT,
+            Item::File(_) => FILE_ROW_HEIGHT,
         }
     }
 
@@ -169,9 +170,7 @@ impl<Message> RevisionList<Message> {
             Item::Revision(row) => row.frame.lane_count(),
             Item::File(row) => row.continuation.len(),
         };
-        self.style.gutter_left_padding
-            + lane_strip_width(lanes, &self.style.graph)
-            + self.style.gutter_padding
+        GUTTER_LEFT_PADDING + lane_strip_width(lanes) + GUTTER_PADDING
     }
 
     fn row_at_offset(&self, offset: f32) -> Option<usize> {
@@ -291,7 +290,6 @@ where
                             *position,
                             bounds,
                             content_height,
-                            &self.style.scrollbar,
                         )
                     {
                         state.vertical_offset = new_offset.clamp(0.0, max_vertical);
@@ -327,7 +325,7 @@ where
                 }
                 let movement = match *delta {
                     mouse::ScrollDelta::Lines { x: _, y } => {
-                        Vector::new(0.0, -y * self.style.revision_row_height * LINE_SCROLL_ROWS)
+                        Vector::new(0.0, -y * REVISION_ROW_HEIGHT * LINE_SCROLL_ROWS)
                     }
                     mouse::ScrollDelta::Pixels { x: _, y } => {
                         Vector::new(0.0, -y * PIXEL_SCROLL_SCALE)
@@ -353,7 +351,6 @@ where
                     bounds,
                     content_height,
                     state.vertical_offset,
-                    &self.style.scrollbar,
                 ) {
                     scrollbar::ScrollbarEvent::OffsetChanged(new_offset) => {
                         state.vertical_offset = new_offset.clamp(0.0, max_vertical);
@@ -409,11 +406,11 @@ where
         let bounds = layout.bounds();
         let row_top = self.row_top(item_idx) - state.vertical_offset;
         let row_screen_y = bounds.y + row_top;
-        let row_height = self.style.file_row_height;
+        let row_height = FILE_ROW_HEIGHT;
 
         let measure_para = make_paragraph::<Renderer>(
             &file.raw_path,
-            self.style.caption_text_size,
+            CAPTION_TEXT_SIZE,
             self.style.primary_font,
         );
         let text_size = measure_para.min_bounds();
@@ -443,12 +440,7 @@ where
             return mouse::Interaction::None;
         };
         if scrollbar::is_dragging(&state.scrollbar)
-            || scrollbar::hits_container(
-                bounds,
-                point,
-                self.content_height(),
-                &self.style.scrollbar,
-            )
+            || scrollbar::hits_container(bounds, point, self.content_height())
         {
             return mouse::Interaction::Idle;
         }
@@ -512,12 +504,7 @@ where
                 }
             }
 
-            let geom = scrollbar::geometry(
-                bounds,
-                self.content_height(),
-                state.vertical_offset,
-                &self.style.scrollbar,
-            );
+            let geom = scrollbar::geometry(bounds, self.content_height(), state.vertical_offset);
             scrollbar::draw(renderer, &geom, &self.style.scrollbar);
         });
     }
@@ -558,15 +545,15 @@ impl<Message> RevisionList<Message> {
         );
 
         let content_left = row_bounds.x + gutter_total;
-        let content_right_pad = self.style.content_padding;
+        let content_right_pad = CONTENT_PADDING;
         let row_clip = row_bounds;
         let content_width = (row_bounds.width - gutter_total - content_right_pad).max(1.0);
 
         // Two-line stack: ids/author/chips on top, description below.
         // Sizes use cap-height for stack math rather than the rendered
         // line-box so the gap stays visually tight.
-        let id_size = self.style.caption_text_size;
-        let desc_size = self.style.small_text_size;
+        let id_size = CAPTION_TEXT_SIZE;
+        let desc_size = SMALL_TEXT_SIZE;
         let line_gap = 4.0;
         let stack_height = id_size + line_gap + desc_size;
         let stack_top = row_bounds.y + ((row_bounds.height - stack_height) / 2.0).max(0.0);
@@ -704,9 +691,9 @@ impl<Message> RevisionList<Message> {
 
         // Graph painted last so node + lines sit on top of any row chrome.
         let gutter_bounds = Rectangle {
-            x: row_bounds.x + self.style.gutter_left_padding,
+            x: row_bounds.x + GUTTER_LEFT_PADDING,
             y: row_bounds.y,
-            width: gutter_total - self.style.gutter_left_padding - self.style.gutter_padding,
+            width: gutter_total - GUTTER_LEFT_PADDING - GUTTER_PADDING,
             height: row_bounds.height,
         };
         draw_revision_row(renderer, gutter_bounds, &rev.frame, &self.style.graph);
@@ -758,7 +745,7 @@ impl<Message> RevisionList<Message> {
                 height: badge_h,
             },
             f.status_background,
-            self.style.indicator_radius,
+            INDICATOR_RADIUS,
         );
         fill_text_centered_y(
             renderer,
@@ -766,7 +753,7 @@ impl<Message> RevisionList<Message> {
             content_x + badge_w / 2.0,
             row_mid_y,
             badge_w,
-            self.style.caption_text_size,
+            CAPTION_TEXT_SIZE,
             f.status_text,
             self.style.primary_font,
             row_clip,
@@ -774,8 +761,8 @@ impl<Message> RevisionList<Message> {
         );
 
         // Layout: [badge] gap [path] gap [+N width=additions_width] gap [-N width=deletions_width] right_pad
-        let row_gap = self.style.file_row_gap;
-        let right_pad = self.style.file_row_right_pad;
+        let row_gap = FILE_ROW_GAP;
+        let right_pad = FILE_ROW_RIGHT_PAD;
         let minus_x = row_bounds.x + row_bounds.width - f.deletions_width - right_pad;
         let plus_x = minus_x - row_gap - f.additions_width;
 
@@ -796,23 +783,23 @@ impl<Message> RevisionList<Message> {
                 path_x,
                 row_mid_y,
                 path_w,
-                self.style.caption_text_size,
+                CAPTION_TEXT_SIZE,
                 f.primary_color,
                 self.style.primary_font,
                 row_clip,
             );
         } else {
-            let secondary_size = (self.style.caption_text_size - 2.0).max(9.0);
+            let secondary_size = (CAPTION_TEXT_SIZE - 2.0).max(9.0);
             // Stack two text rows visually centered on the row mid-line.
             let primary_mid = row_mid_y - secondary_size * 0.55;
-            let secondary_mid = row_mid_y + self.style.caption_text_size * 0.55;
+            let secondary_mid = row_mid_y + CAPTION_TEXT_SIZE * 0.55;
             fill_text_truncated(
                 renderer,
                 &f.primary,
                 path_x,
                 primary_mid,
                 path_w,
-                self.style.caption_text_size,
+                CAPTION_TEXT_SIZE,
                 f.primary_color,
                 self.style.primary_font,
                 row_clip,
@@ -838,7 +825,7 @@ impl<Message> RevisionList<Message> {
             plus_x,
             row_mid_y,
             f.additions_width,
-            self.style.caption_text_size,
+            CAPTION_TEXT_SIZE,
             f.additions_text,
             self.style.primary_font,
             row_clip,
@@ -850,7 +837,7 @@ impl<Message> RevisionList<Message> {
             minus_x,
             row_mid_y,
             f.deletions_width + right_pad,
-            self.style.caption_text_size,
+            CAPTION_TEXT_SIZE,
             f.deletions_text,
             self.style.primary_font,
             row_clip,
@@ -859,9 +846,9 @@ impl<Message> RevisionList<Message> {
 
         // Graph last — same z-order rationale as draw_revision.
         let gutter_bounds = Rectangle {
-            x: row_bounds.x + self.style.gutter_left_padding,
+            x: row_bounds.x + GUTTER_LEFT_PADDING,
             y: row_bounds.y,
-            width: gutter_total - self.style.gutter_left_padding - self.style.gutter_padding,
+            width: gutter_total - GUTTER_LEFT_PADDING - GUTTER_PADDING,
             height: row_bounds.height,
         };
         draw_continuation_row(renderer, gutter_bounds, &f.continuation, &self.style.graph);
@@ -872,7 +859,7 @@ impl<Message> RevisionList<Message> {
         label: &str,
         paragraphs: &RefCell<Vec<R::Paragraph>>,
     ) -> f32 {
-        let size = self.style.caption_text_size;
+        let size = CAPTION_TEXT_SIZE;
         let label_w = measure_text_width::<R>(label, size, self.style.primary_font, paragraphs);
         let pad_x = 5.0;
         label_w + pad_x * 2.0
@@ -890,7 +877,7 @@ impl<Message> RevisionList<Message> {
         text_color: Color,
         clip: Rectangle,
     ) -> f32 {
-        let size = self.style.caption_text_size;
+        let size = CAPTION_TEXT_SIZE;
         let label_w = measure_text_width::<R>(label, size, self.style.primary_font, paragraphs);
         let pad_x = 5.0;
         // Tight box: just enough vertical room for the cap-height plus a hair
@@ -907,7 +894,7 @@ impl<Message> RevisionList<Message> {
                 height: chip_h,
             },
             background,
-            self.style.indicator_radius,
+            INDICATOR_RADIUS,
         );
         // Let iced center the glyphs vertically within the chip via align_y.
         fill_text_centered_y(
@@ -1095,8 +1082,8 @@ struct TooltipOverlay {
 impl TooltipOverlay {
     fn box_size(&self) -> Size {
         Size::new(
-            self.text_size.width + self.style.tooltip_padding * 2.0,
-            self.text_size.height + self.style.tooltip_padding * 2.0,
+            self.text_size.width + TOOLTIP_PADDING * 2.0,
+            self.text_size.height + TOOLTIP_PADDING * 2.0,
         )
     }
 }
@@ -1109,11 +1096,11 @@ where
         let size = self.box_size();
         // Anchor to the right of the sidebar at the row's vertical center,
         // shifted by tooltip_gap. Snap into the viewport if it would clip.
-        let mut x = self.row_anchor_x + self.style.tooltip_gap;
+        let mut x = self.row_anchor_x + TOOLTIP_GAP;
         let mut y = self.row_anchor_y + (self.row_height - size.height) / 2.0;
         if x + size.width > viewport.width {
             // Fall back to following the cursor on the left.
-            x = (self.cursor.x - size.width - self.style.tooltip_gap).max(4.0);
+            x = (self.cursor.x - size.width - TOOLTIP_GAP).max(4.0);
         }
         if y + size.height > viewport.height {
             y = (viewport.height - size.height - 4.0).max(0.0);
@@ -1139,7 +1126,7 @@ where
                 border: Border {
                     color: self.style.tooltip_border,
                     width: 1.0,
-                    radius: iced::border::Radius::from(self.style.tooltip_radius),
+                    radius: iced::border::Radius::from(TOOLTIP_RADIUS),
                 },
                 shadow: Shadow::default(),
                 snap: true,
@@ -1152,10 +1139,10 @@ where
         fill_text_centered_y(
             renderer,
             &self.text,
-            bounds.x + self.style.tooltip_padding,
+            bounds.x + TOOLTIP_PADDING,
             bounds.y + bounds.height / 2.0,
-            bounds.width - self.style.tooltip_padding * 2.0,
-            self.style.caption_text_size,
+            bounds.width - TOOLTIP_PADDING * 2.0,
+            CAPTION_TEXT_SIZE,
             self.style.tooltip_text,
             self.style.primary_font,
             bounds,

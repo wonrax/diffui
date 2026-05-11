@@ -10,12 +10,13 @@
 use iced::advanced::renderer;
 use iced::{Background, Border, Color, Point, Rectangle, Shadow, border};
 
+/// Width of the outer (transparent) container holding the track.
+const WIDTH: f32 = 12.0;
+/// Padding from each side of the container to the inner pill track.
+const PADDING: f32 = 2.0;
+
 #[derive(Debug, Clone, Copy)]
 pub struct ScrollbarStyle {
-    /// Width of the outer (transparent) container holding the track.
-    pub width: f32,
-    /// Padding from each side of the container to the inner pill track.
-    pub padding: f32,
     /// Pill background color.
     pub track_color: Color,
     /// Draggable thumb color.
@@ -39,23 +40,18 @@ pub struct ScrollbarGeometry {
     pub thumb: Option<Rectangle>,
 }
 
-pub fn geometry(
-    bounds: Rectangle,
-    content_height: f32,
-    offset: f32,
-    style: &ScrollbarStyle,
-) -> ScrollbarGeometry {
+pub fn geometry(bounds: Rectangle, content_height: f32, offset: f32) -> ScrollbarGeometry {
     let container = Rectangle {
-        x: bounds.x + bounds.width - style.width,
+        x: bounds.x + bounds.width - WIDTH,
         y: bounds.y,
-        width: style.width,
+        width: WIDTH,
         height: bounds.height,
     };
     let track = Rectangle {
-        x: container.x + style.padding,
-        y: container.y + style.padding,
-        width: (container.width - 2.0 * style.padding).max(0.0),
-        height: (container.height - 2.0 * style.padding).max(0.0),
+        x: container.x + PADDING,
+        y: container.y + PADDING,
+        width: (container.width - 2.0 * PADDING).max(0.0),
+        height: (container.height - 2.0 * PADDING).max(0.0),
     };
     let thumb = if content_height <= bounds.height || track.height <= 0.0 || track.width <= 0.0 {
         None
@@ -142,9 +138,8 @@ pub fn on_button_pressed(
     bounds: Rectangle,
     content_height: f32,
     offset: f32,
-    style: &ScrollbarStyle,
 ) -> ScrollbarEvent {
-    let geom = geometry(bounds, content_height, offset, style);
+    let geom = geometry(bounds, content_height, offset);
     let Some(thumb) = geom.thumb else {
         return ScrollbarEvent::None;
     };
@@ -177,12 +172,11 @@ pub fn on_cursor_moved(
     cursor: Point,
     bounds: Rectangle,
     content_height: f32,
-    style: &ScrollbarStyle,
 ) -> ScrollbarEvent {
     let Some(drag) = state.drag else {
         return ScrollbarEvent::None;
     };
-    let geom = geometry(bounds, content_height, drag.start_offset, style);
+    let geom = geometry(bounds, content_height, drag.start_offset);
     let Some(thumb) = geom.thumb else {
         return ScrollbarEvent::None;
     };
@@ -209,19 +203,14 @@ pub fn is_dragging(state: &ScrollbarState) -> bool {
     state.drag.is_some()
 }
 
-pub fn hits_container(
-    bounds: Rectangle,
-    cursor: Point,
-    content_height: f32,
-    style: &ScrollbarStyle,
-) -> bool {
+pub fn hits_container(bounds: Rectangle, cursor: Point, content_height: f32) -> bool {
     if content_height <= bounds.height {
         return false;
     }
     let container = Rectangle {
-        x: bounds.x + bounds.width - style.width,
+        x: bounds.x + bounds.width - WIDTH,
         y: bounds.y,
-        width: style.width,
+        width: WIDTH,
         height: bounds.height,
     };
     container.contains(cursor)

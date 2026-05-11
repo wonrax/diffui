@@ -12,9 +12,16 @@ use iced::{
 
 use crate::scrollbar::{self, ScrollbarState, ScrollbarStyle};
 
-const ROW_HEIGHT: f32 = 24.0;
-const FILE_HEADER_HEIGHT: f32 = 40.0;
-const HUNK_HEADER_HEIGHT: f32 = 26.0;
+// Row height is `text_size * ROW_HEIGHT_RATIO` rounded to the nearest int,
+// so glyphs (which iced renders at `text_size * 1.4` line height) sit
+// inside the row with a few px of breathing room above and below. 1.85
+// gives 24px at the default 13pt code font, matching the historical fixed
+// row height, and scales linearly when the caller passes a larger size.
+const ROW_HEIGHT_RATIO: f32 = 1.85;
+// Padding above and below the centered title row inside the file-header strip.
+const FILE_HEADER_VPAD: f32 = 8.0;
+// Padding above and below the centered title row inside the hunk-header strip.
+const HUNK_HEADER_VPAD: f32 = 1.0;
 const PREFIX_WIDTH: f32 = 24.0;
 const CHANGE_MARK_WIDTH: f32 = 2.0;
 const TEXT_X_PADDING: f32 = 8.0;
@@ -163,11 +170,47 @@ pub struct DiffView<'a, Message> {
     font: Font,
     text_size: f32,
     multi_click_ms: u64,
-    gutter_width: f32,
-    gutter_digit_count: usize,
+    metrics: LayoutMetrics,
     header: Vec<HeaderLine>,
     on_selected_file_changed: fn(usize) -> Message,
     on_copy: Option<fn(String) -> Message>,
+}
+
+/// Sizes derived once at widget-construction time from the caller's
+/// `text_size`. Replaces the historical fixed `self.metrics.row_height` /
+/// `self.metrics.file_header_height` / `self.metrics.hunk_header_height` constants so the diff view
+/// stays visually proportional under a non-default code font size.
+#[derive(Debug, Clone, Copy)]
+struct LayoutMetrics {
+    row_height: f32,
+    file_header_height: f32,
+    hunk_header_height: f32,
+    gutter_width: f32,
+    gutter_digit_count: usize,
+}
+
+impl LayoutMetrics {
+    fn new(text_size: f32, gutter_digit_count: usize) -> Self {
+        let row_height = (text_size * ROW_HEIGHT_RATIO).round();
+        let file_header_height = row_height + 2.0 * FILE_HEADER_VPAD;
+        let hunk_header_height = row_height + 2.0 * HUNK_HEADER_VPAD;
+        // Width of the rendered gutter text "{old:>D} {new:>D}" plus padding.
+        // The `text_size * 0.62` char-width heuristic is the same one
+        // `DiffView::char_width` falls back to before the first draw — the
+        // gutter text is whitespace-padded so being a bit off is harmless.
+        let char_width = text_size * 0.62;
+        let gutter_text_chars = gutter_digit_count * 2 + 1; // two columns + one separating space
+        let gutter_width = (gutter_text_chars as f32 * char_width
+            + GUTTER_HORIZONTAL_PADDING * 2.0)
+            .max(GUTTER_MIN_WIDTH);
+        Self {
+            row_height,
+            file_header_height,
+            hunk_header_height,
+            gutter_width,
+            gutter_digit_count,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -288,16 +331,7 @@ impl<'a, Message> DiffView<'a, Message> {
         on_selected_file_changed: fn(usize) -> Message,
     ) -> Self {
         let gutter_digit_count = compute_gutter_digit_count(&files);
-        // Width of the rendered gutter text "{old:>D} {new:>D}" plus padding.
-        // Computed once at construction so layout, hit-testing and rendering
-        // all agree on the column width without each having to remeasure.
-        // Uses the same heuristic as the fallback char-advance — fine for
-        // sizing the column, since the gutter text is whitespace-padded.
-        let char_width = text_size * 0.62;
-        let gutter_text_chars = gutter_digit_count * 2 + 1; // two columns + one separating space
-        let gutter_width = (gutter_text_chars as f32 * char_width
-            + GUTTER_HORIZONTAL_PADDING * 2.0)
-            .max(GUTTER_MIN_WIDTH);
+        let metrics = LayoutMetrics::new(text_size, gutter_digit_count);
         Self {
             files,
             selected_file,
@@ -306,8 +340,7 @@ impl<'a, Message> DiffView<'a, Message> {
             font,
             text_size,
             multi_click_ms,
-            gutter_width,
-            gutter_digit_count,
+            metrics,
             header: Vec::new(),
             on_selected_file_changed,
             on_copy: None,
@@ -330,7 +363,7 @@ impl<'a, Message> DiffView<'a, Message> {
         if self.header.is_empty() {
             0.0
         } else {
-            self.header.len() as f32 * ROW_HEIGHT + HEADER_VERTICAL_PADDING * 2.0
+            self.header.len() as f32 * self.metrics.row_height + HEADER_VERTICAL_PADDING * 2.0
         }
     }
 
@@ -342,12 +375,12 @@ impl<'a, Message> DiffView<'a, Message> {
                 .files
                 .iter()
                 .map(|file| {
-                    FILE_HEADER_HEIGHT
+                    self.metrics.file_header_height
                         + file
                             .hunks
                             .iter()
                             .map(|hunk| {
-                                HUNK_HEADER_HEIGHT
+                                self.metrics.hunk_header_height
                                     + hunk
                                         .lines
                                         .iter()
@@ -368,12 +401,12 @@ impl<'a, Message> DiffView<'a, Message> {
                 .iter()
                 .take(file_index)
                 .map(|file| {
-                    FILE_HEADER_HEIGHT
+                    self.metrics.file_header_height
                         + file
                             .hunks
                             .iter()
                             .map(|hunk| {
-                                HUNK_HEADER_HEIGHT
+                                self.metrics.hunk_header_height
                                     + hunk
                                         .lines
                                         .iter()
@@ -390,12 +423,12 @@ impl<'a, Message> DiffView<'a, Message> {
         let mut content_y = self.header_height();
 
         for (file_index, file) in self.files.iter().enumerate() {
-            let file_height = FILE_HEADER_HEIGHT
+            let file_height = self.metrics.file_header_height
                 + file
                     .hunks
                     .iter()
                     .map(|hunk| {
-                        HUNK_HEADER_HEIGHT
+                        self.metrics.hunk_header_height
                             + hunk
                                 .lines
                                 .iter()
@@ -415,7 +448,7 @@ impl<'a, Message> DiffView<'a, Message> {
     }
 
     fn content_width(&self, viewport_width: f32) -> f32 {
-        (viewport_width - self.gutter_width - PREFIX_WIDTH - 16.0).max(self.char_width(None))
+        (viewport_width - self.metrics.gutter_width - PREFIX_WIDTH - 16.0).max(self.char_width(None))
     }
 
     /// Width of a single monospace glyph for this font/size. Hit-tests and
@@ -433,7 +466,7 @@ impl<'a, Message> DiffView<'a, Message> {
         let chars_per_line = (content_width / self.char_width(None)).floor().max(1.0) as usize;
         let wrapped_lines = line.content.chars().count().max(1).div_ceil(chars_per_line);
 
-        wrapped_lines as f32 * ROW_HEIGHT
+        wrapped_lines as f32 * self.metrics.row_height
     }
 
     /// Convert a screen point into a `TextPosition` if it falls on a row's
@@ -459,7 +492,7 @@ impl<'a, Message> DiffView<'a, Message> {
         measured_char_advance: Option<f32>,
     ) -> Option<TextPosition> {
         let content_width = self.content_width(bounds.width);
-        let text_x = bounds.x + self.gutter_width + PREFIX_WIDTH + TEXT_X_PADDING;
+        let text_x = bounds.x + self.metrics.gutter_width + PREFIX_WIDTH + TEXT_X_PADDING;
         let target_y = point.y - bounds.y + vertical_offset;
         // The header sits above all file content; skip past it before
         // walking files so a click on the header doesn't try to position
@@ -468,9 +501,9 @@ impl<'a, Message> DiffView<'a, Message> {
         let mut last_row: Option<(usize, usize, usize, f32, f32, usize)> = None;
 
         for (file_index, file) in self.files.iter().enumerate() {
-            content_y += FILE_HEADER_HEIGHT;
+            content_y += self.metrics.file_header_height;
             for (hunk_index, hunk) in file.hunks.iter().enumerate() {
-                content_y += HUNK_HEADER_HEIGHT;
+                content_y += self.metrics.hunk_header_height;
                 for (line_index, line) in hunk.lines.iter().enumerate() {
                     let height = self.row_height(line, content_width);
                     let row_top = content_y;
@@ -600,7 +633,7 @@ impl<'a, Message> DiffView<'a, Message> {
         Renderer: text::Renderer<Font = Font>,
     {
         let text_color = self.line_text_color(line.kind);
-        let gutter = format_gutter(line.old_line, line.new_line, self.gutter_digit_count);
+        let gutter = format_gutter(line.old_line, line.new_line, self.metrics.gutter_digit_count);
         let prefix = prefix_for_kind(line.kind);
         let bounds = render.bounds;
 
@@ -608,8 +641,8 @@ impl<'a, Message> DiffView<'a, Message> {
             renderer,
             &gutter,
             TextRenderParams {
-                width: (self.gutter_width - GUTTER_HORIZONTAL_PADDING * 2.0).max(1.0),
-                height: ROW_HEIGHT,
+                width: (self.metrics.gutter_width - GUTTER_HORIZONTAL_PADDING * 2.0).max(1.0),
+                height: self.metrics.row_height,
                 position: Point::new(
                     bounds.x + GUTTER_HORIZONTAL_PADDING,
                     render.y + TEXT_Y_PADDING,
@@ -624,9 +657,9 @@ impl<'a, Message> DiffView<'a, Message> {
             prefix,
             TextRenderParams {
                 width: PREFIX_WIDTH,
-                height: ROW_HEIGHT,
+                height: self.metrics.row_height,
                 position: Point::new(
-                    bounds.x + self.gutter_width + TEXT_X_PADDING,
+                    bounds.x + self.metrics.gutter_width + TEXT_X_PADDING,
                     render.y + TEXT_Y_PADDING,
                 ),
                 color: text_color,
@@ -636,7 +669,7 @@ impl<'a, Message> DiffView<'a, Message> {
         );
 
         let position = Point::new(
-            bounds.x + self.gutter_width + PREFIX_WIDTH + TEXT_X_PADDING,
+            bounds.x + self.metrics.gutter_width + PREFIX_WIDTH + TEXT_X_PADDING,
             render.y + TEXT_Y_PADDING,
         );
 
@@ -718,7 +751,7 @@ impl<'a, Message> DiffView<'a, Message> {
                         label,
                         TextRenderParams {
                             width: label_width.max(1.0),
-                            height: ROW_HEIGHT,
+                            height: self.metrics.row_height,
                             position: Point::new(left_x, y + TEXT_Y_PADDING),
                             color: label_color,
                             clip_bounds: clip,
@@ -730,7 +763,7 @@ impl<'a, Message> DiffView<'a, Message> {
                         value,
                         TextRenderParams {
                             width: value_width,
-                            height: ROW_HEIGHT,
+                            height: self.metrics.row_height,
                             position: Point::new(value_x, y + TEXT_Y_PADDING),
                             color: value_color,
                             clip_bounds: clip,
@@ -745,7 +778,7 @@ impl<'a, Message> DiffView<'a, Message> {
                         &indented,
                         TextRenderParams {
                             width: line_width,
-                            height: ROW_HEIGHT,
+                            height: self.metrics.row_height,
                             position: Point::new(left_x, y + TEXT_Y_PADDING),
                             color: value_color,
                             clip_bounds: clip,
@@ -755,7 +788,7 @@ impl<'a, Message> DiffView<'a, Message> {
                 }
                 HeaderLine::Blank => {}
             }
-            y += ROW_HEIGHT;
+            y += self.metrics.row_height;
         }
     }
 }
@@ -904,7 +937,7 @@ where
 
                 let movement = match *delta {
                     mouse::ScrollDelta::Lines { x: _, y } => {
-                        Vector::new(0.0, -y * ROW_HEIGHT * LINE_SCROLL_ROWS)
+                        Vector::new(0.0, -y * self.metrics.row_height * LINE_SCROLL_ROWS)
                     }
                     mouse::ScrollDelta::Pixels { x: _, y } => {
                         Vector::new(0.0, -y * PIXEL_SCROLL_SCALE)
@@ -944,7 +977,6 @@ where
                     bounds,
                     content_height,
                     state.vertical_offset,
-                    &self.palette.scrollbar,
                 ) {
                     scrollbar::ScrollbarEvent::OffsetChanged(new_offset) => {
                         state.vertical_offset = new_offset.clamp(0.0, max_vertical);
@@ -1014,7 +1046,6 @@ where
                             *position,
                             bounds,
                             content_height,
-                            &self.palette.scrollbar,
                         )
                     {
                         state.vertical_offset = new_offset.clamp(0.0, max_vertical);
@@ -1107,9 +1138,9 @@ where
         state.paragraphs.borrow_mut().clear();
         let content_width = self.content_width(bounds.width);
         let content_clip_bounds = Rectangle {
-            x: bounds.x + self.gutter_width + PREFIX_WIDTH,
+            x: bounds.x + self.metrics.gutter_width + PREFIX_WIDTH,
             y: bounds.y,
-            width: (bounds.width - self.gutter_width - PREFIX_WIDTH).max(1.0),
+            width: (bounds.width - self.metrics.gutter_width - PREFIX_WIDTH).max(1.0),
             height: bounds.height,
         };
 
@@ -1139,7 +1170,7 @@ where
             let visible_bottom = visible_top + bounds.height;
             let header_height = self.header_height();
             let mut content_y = header_height;
-            let visible_capacity = (bounds.height / ROW_HEIGHT).ceil() as usize + 8;
+            let visible_capacity = (bounds.height / self.metrics.row_height).ceil() as usize + 8;
             let mut visible_file_headers = Vec::new();
             let mut visible_hunk_headers = Vec::new();
             let mut visible_rows = Vec::with_capacity(visible_capacity);
@@ -1154,11 +1185,11 @@ where
                         y: bounds.y + (file_header_top - visible_top),
                     },
                     file_header_top,
-                    FILE_HEADER_HEIGHT,
+                    self.metrics.file_header_height,
                     visible_top,
                     visible_bottom,
                 );
-                content_y += FILE_HEADER_HEIGHT;
+                content_y += self.metrics.file_header_height;
 
                 for (hunk_index, hunk) in file.hunks.iter().enumerate() {
                     let hunk_top = content_y;
@@ -1170,11 +1201,11 @@ where
                             y: bounds.y + (hunk_top - visible_top),
                         },
                         hunk_top,
-                        HUNK_HEADER_HEIGHT,
+                        self.metrics.hunk_header_height,
                         visible_top,
                         visible_bottom,
                     );
-                    content_y += HUNK_HEADER_HEIGHT;
+                    content_y += self.metrics.hunk_header_height;
 
                     for (line_index, line) in hunk.lines.iter().enumerate() {
                         let height = self.row_height(line, content_width);
@@ -1201,13 +1232,13 @@ where
                 renderer,
                 bounds.x,
                 bounds.y,
-                self.gutter_width,
+                self.metrics.gutter_width,
                 bounds.height,
                 self.palette.gutter_background,
             );
             self.draw_background(
                 renderer,
-                bounds.x + self.gutter_width,
+                bounds.x + self.metrics.gutter_width,
                 bounds.y,
                 1.0,
                 bounds.height,
@@ -1261,13 +1292,13 @@ where
                     bounds.x,
                     header.y,
                     bounds.width,
-                    FILE_HEADER_HEIGHT,
+                    self.metrics.file_header_height,
                     self.palette.file_header,
                 );
                 self.draw_background(
                     renderer,
                     bounds.x,
-                    header.y + FILE_HEADER_HEIGHT - 1.0,
+                    header.y + self.metrics.file_header_height - 1.0,
                     bounds.width,
                     1.0,
                     self.palette.border,
@@ -1277,10 +1308,14 @@ where
                     &file.title,
                     TextRenderParams {
                         width: (bounds.width - summary_width - 28.0).max(1.0),
-                        height: ROW_HEIGHT,
+                        height: self.metrics.row_height,
                         position: Point::new(
                             bounds.x + 12.0,
-                            centered_text_y(header.y, ROW_HEIGHT),
+                            centered_text_y(
+                                header.y,
+                                self.metrics.file_header_height,
+                                self.metrics.row_height,
+                            ),
                         ),
                         color: self.palette.text,
                         clip_bounds: bounds,
@@ -1292,10 +1327,14 @@ where
                     &summary,
                     TextRenderParams {
                         width: summary_width,
-                        height: ROW_HEIGHT,
+                        height: self.metrics.row_height,
                         position: Point::new(
                             (bounds.x + bounds.width - summary_width - 8.0).max(bounds.x + 12.0),
-                            centered_text_y(header.y, ROW_HEIGHT),
+                            centered_text_y(
+                                header.y,
+                                self.metrics.file_header_height,
+                                self.metrics.row_height,
+                            ),
                         ),
                         color: self.palette.text_muted,
                         clip_bounds: bounds,
@@ -1309,7 +1348,7 @@ where
                 self.draw_background(
                     renderer,
                     bounds.x,
-                    header.y + HUNK_HEADER_HEIGHT - 1.0,
+                    header.y + self.metrics.hunk_header_height - 1.0,
                     bounds.width,
                     1.0,
                     self.palette.hunk_header,
@@ -1319,7 +1358,7 @@ where
                     bounds.x,
                     header.y,
                     CHANGE_MARK_WIDTH,
-                    HUNK_HEADER_HEIGHT,
+                    self.metrics.hunk_header_height,
                     self.palette.modified_token,
                 );
                 self.draw_text(
@@ -1327,9 +1366,9 @@ where
                     &hunk.header,
                     TextRenderParams {
                         width: self.text_width(&hunk.header),
-                        height: HUNK_HEADER_HEIGHT,
+                        height: self.metrics.hunk_header_height,
                         position: Point::new(
-                            bounds.x + self.gutter_width + PREFIX_WIDTH + TEXT_X_PADDING,
+                            bounds.x + self.metrics.gutter_width + PREFIX_WIDTH + TEXT_X_PADDING,
                             header.y + TEXT_Y_PADDING,
                         ),
                         color: self.palette.text_muted,
@@ -1347,7 +1386,7 @@ where
                 let (sel_start, sel_end) = ordered(anchor, focus);
                 if sel_start != sel_end {
                     let cw = self.char_width(measured_char_advance).max(1.0);
-                    let text_x = bounds.x + self.gutter_width + PREFIX_WIDTH + TEXT_X_PADDING;
+                    let text_x = bounds.x + self.metrics.gutter_width + PREFIX_WIDTH + TEXT_X_PADDING;
                     for row in &visible_rows {
                         let line =
                             &self.files[row.file_index].hunks[row.hunk_index].lines[row.line_index];
@@ -1440,7 +1479,6 @@ where
                 bounds,
                 self.content_height(bounds.width),
                 state.vertical_offset,
-                &self.palette.scrollbar,
             );
             scrollbar::draw(renderer, &geom, &self.palette.scrollbar);
         });
@@ -1463,16 +1501,11 @@ where
         };
         let state = tree.state.downcast_ref::<State<Renderer::Paragraph>>();
         if scrollbar::is_dragging(&state.scrollbar)
-            || scrollbar::hits_container(
-                bounds,
-                point,
-                self.content_height(bounds.width),
-                &self.palette.scrollbar,
-            )
+            || scrollbar::hits_container(bounds, point, self.content_height(bounds.width))
         {
             return mouse::Interaction::Idle;
         }
-        if point.x >= bounds.x + self.gutter_width + PREFIX_WIDTH {
+        if point.x >= bounds.x + self.metrics.gutter_width + PREFIX_WIDTH {
             mouse::Interaction::Text
         } else {
             mouse::Interaction::Idle
@@ -1549,7 +1582,7 @@ impl<Message> DiffView<'_, Message> {
             content: content.to_owned(),
             bounds: Size::new(width.max(1.0), height.max(1.0)),
             size: Pixels(self.text_size),
-            line_height: text::LineHeight::Absolute(Pixels(height.min(ROW_HEIGHT))),
+            line_height: text::LineHeight::Absolute(Pixels(height.min(self.metrics.row_height))),
             font: self.font,
             align_x: text::Alignment::Left,
             align_y: alignment::Vertical::Top,
@@ -1623,7 +1656,7 @@ impl<Message> DiffView<'_, Message> {
             content: spans.as_slice(),
             bounds: Size::new(render.width.max(1.0), render.height.max(1.0)),
             size: Pixels(self.text_size),
-            line_height: text::LineHeight::Absolute(Pixels(render.height.min(ROW_HEIGHT))),
+            line_height: text::LineHeight::Absolute(Pixels(render.height.min(self.metrics.row_height))),
             font: self.font,
             align_x: text::Alignment::Left,
             align_y: alignment::Vertical::Top,
@@ -1977,8 +2010,8 @@ fn digits(n: usize) -> usize {
     count
 }
 
-fn centered_text_y(container_y: f32, text_height: f32) -> f32 {
-    container_y + (FILE_HEADER_HEIGHT - text_height) / 2.0
+fn centered_text_y(container_y: f32, container_height: f32, text_height: f32) -> f32 {
+    container_y + (container_height - text_height) / 2.0
 }
 
 fn prefix_for_kind(kind: DiffLineKind) -> &'static str {
