@@ -37,7 +37,7 @@ use iced::{
 };
 use jj_lib::{
     backend::CommitId,
-    config::StackedConfig,
+    config::{ConfigSource, StackedConfig},
     conflicts::{ConflictMarkerStyle, ConflictMaterializeOptions, materialized_diff_stream},
     copies::CopyRecords,
     diff_presentation::{
@@ -45,15 +45,21 @@ use jj_lib::{
         unified::{DiffLineType, git_diff_part, unified_diff_hunks},
     },
     files::FileMergeHunkLevel,
+    fileset::{
+        FilesetAliasesMap, FilesetDiagnostics, FilesetExpression, FilesetParseContext,
+        parse as parse_fileset,
+    },
+    gitignore::GitIgnoreFile,
     graph::{GraphEdge, GraphNode, TopoGroupedGraphIterator},
-    matchers::{EverythingMatcher, Matcher, PrefixMatcher},
+    matchers::{EverythingMatcher, Matcher, NothingMatcher, PrefixMatcher},
     merge::{Diff, SameChange},
     object_id::ObjectId,
     repo::{Repo, StoreFactories},
-    repo_path::{RepoPath, RepoPathBuf},
+    repo_path::{RepoPath, RepoPathBuf, RepoPathUiConverter},
     revset::{RevsetExpression, SymbolResolver},
-    settings::UserSettings,
+    settings::{HumanByteSize, UserSettings},
     tree_merge::MergeOptions,
+    working_copy::SnapshotOptions,
     workspace::{Workspace, default_working_copy_factories},
 };
 use resize_handle::ResizeHandle;
@@ -992,8 +998,7 @@ async fn load_jj_commits(repository_root: PathBuf) -> Result<Vec<CommitSummary>>
 }
 
 async fn load_jj_diff(repository: Repository, revision: RevisionSelection) -> Result<DiffDocument> {
-    let settings = UserSettings::from_config(StackedConfig::with_defaults())
-        .context("failed to load jj settings")?;
+    let settings = jj_settings(&repository.root)?;
     let workspace = Workspace::load(
         &settings,
         &repository.root,
@@ -1167,23 +1172,230 @@ async fn load_jj_diff(repository: Repository, revision: RevisionSelection) -> Re
     })
 }
 
+// Fallback used only when the user has not configured `snapshot.max-new-file-size`.
+// Matches jj-cli's shipped default (1 MiB).
+const DEFAULT_SNAPSHOT_MAX_NEW_FILE_SIZE: u64 = 1024 * 1024;
+
+fn jj_settings(repo_root: &Path) -> Result<UserSettings> {
+    let mut config = StackedConfig::with_defaults();
+
+    for path in jj_user_config_paths() {
+        load_jj_user_config_path(&mut config, &path)?;
+    }
+
+    let repo_config = repo_root.join(".jj").join("repo").join("config.toml");
+    if repo_config.is_file() {
+        config
+            .load_file(ConfigSource::Repo, repo_config.clone())
+            .with_context(|| format!("failed to load jj repo config {}", repo_config.display()))?;
+    }
+
+    UserSettings::from_config(config).context("failed to build jj settings")
+}
+
+fn jj_user_config_paths() -> Vec<PathBuf> {
+    if let Ok(env_paths) = env::var("JJ_CONFIG")
+        && !env_paths.is_empty()
+    {
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        return env_paths
+            .split(sep)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .collect();
+    }
+
+    let mut paths = Vec::new();
+    if let Ok(xdg) = env::var("XDG_CONFIG_HOME")
+        && !xdg.is_empty()
+    {
+        paths.push(PathBuf::from(xdg).join("jj"));
+    }
+    if let Ok(home) = env::var("HOME") {
+        let home = PathBuf::from(home);
+        paths.push(home.join(".config").join("jj"));
+        if cfg!(target_os = "macos") {
+            paths.push(home.join("Library").join("Application Support").join("jj"));
+        }
+    }
+    paths
+}
+
+fn load_jj_user_config_path(config: &mut StackedConfig, path: &Path) -> Result<()> {
+    if path.is_file() {
+        config
+            .load_file(ConfigSource::User, path.to_path_buf())
+            .with_context(|| format!("failed to load jj config file {}", path.display()))?;
+    } else if path.is_dir() {
+        config
+            .load_dir(ConfigSource::User, path)
+            .with_context(|| format!("failed to load jj config dir {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn snapshot_max_new_file_size(settings: &UserSettings) -> Result<u64> {
+    use jj_lib::config::ConfigGetError;
+    match settings.get_value_with("snapshot.max-new-file-size", HumanByteSize::try_from) {
+        Ok(size) => Ok(size.0),
+        Err(ConfigGetError::NotFound { .. }) => Ok(DEFAULT_SNAPSHOT_MAX_NEW_FILE_SIZE),
+        Err(err) => Err(err).context("invalid snapshot.max-new-file-size"),
+    }
+}
+
+fn snapshot_auto_track_matcher(
+    settings: &UserSettings,
+    repo_root: &Path,
+) -> Result<Box<dyn Matcher>> {
+    use jj_lib::config::ConfigGetError;
+    let raw = match settings.get_string("snapshot.auto-track") {
+        Ok(value) => value,
+        Err(ConfigGetError::NotFound { .. }) => "all()".to_string(),
+        Err(err) => return Err(err).context("invalid snapshot.auto-track"),
+    };
+    let aliases = FilesetAliasesMap::new();
+    let path_converter = RepoPathUiConverter::Fs {
+        cwd: repo_root.to_path_buf(),
+        base: repo_root.to_path_buf(),
+    };
+    let context = FilesetParseContext {
+        aliases_map: &aliases,
+        path_converter: &path_converter,
+    };
+    let mut diagnostics = FilesetDiagnostics::new();
+    let expr: FilesetExpression = parse_fileset(&mut diagnostics, &raw, &context)
+        .with_context(|| format!("failed to parse snapshot.auto-track {raw:?}"))?;
+    Ok(expr.to_matcher())
+}
+
+// `LocalWorkingCopy` walks the repo tree and reads in-tree `.gitignore` files
+// itself, so we only need to provide the *out-of-tree* ignores: the user's
+// global git ignore and (for git-backed repos) `.git/info/exclude`.
+fn snapshot_base_ignores(repo_root: &Path) -> Result<Arc<GitIgnoreFile>> {
+    let mut ignores = GitIgnoreFile::empty();
+
+    if let Some(global) = user_global_git_ignore_path() {
+        ignores = ignores
+            .chain_with_file("", global.clone())
+            .with_context(|| format!("failed to read user gitignore {}", global.display()))?;
+    }
+
+    let info_exclude = repo_root.join(".git").join("info").join("exclude");
+    ignores = ignores
+        .chain_with_file("", info_exclude.clone())
+        .with_context(|| format!("failed to read {}", info_exclude.display()))?;
+
+    Ok(ignores)
+}
+
+fn user_global_git_ignore_path() -> Option<PathBuf> {
+    if let Ok(xdg) = env::var("XDG_CONFIG_HOME")
+        && !xdg.is_empty()
+    {
+        return Some(PathBuf::from(xdg).join("git").join("ignore"));
+    }
+    let home = env::var("HOME").ok()?;
+    Some(
+        PathBuf::from(home)
+            .join(".config")
+            .join("git")
+            .join("ignore"),
+    )
+}
+
 async fn load_jj_repository_snapshot(repository: Repository) -> Result<RepositorySnapshot> {
-    let settings = UserSettings::from_config(StackedConfig::with_defaults())
-        .context("failed to load jj settings")?;
-    let workspace = Workspace::load(
+    let settings = jj_settings(&repository.root)?;
+    let mut workspace = Workspace::load(
         &settings,
         &repository.root,
         &StoreFactories::default(),
         &default_working_copy_factories(),
     )
     .context("failed to load jj workspace")?;
-    let repo = workspace
+    let workspace_name = workspace.workspace_name().to_owned();
+    let base_repo = workspace
         .repo_loader()
         .load_at_head()
         .await
         .context("failed to load jj repo")?;
+
+    // Capture the working-copy commit before locking, so we can compare the
+    // freshly-snapshotted tree against the tree currently recorded for it.
+    let wc_commit_id = base_repo
+        .view()
+        .get_wc_commit_id(&workspace_name)
+        .context("jj workspace has no working-copy commit")?
+        .clone();
+    let wc_commit = base_repo
+        .store()
+        .get_commit_async(&wc_commit_id)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to load jj working-copy commit {}",
+                wc_commit_id.hex()
+            )
+        })?;
+    let old_tree = wc_commit.tree();
+
+    let auto_track = snapshot_auto_track_matcher(&settings, &repository.root)?;
+    let base_ignores = snapshot_base_ignores(&repository.root)?;
+    let max_new_file_size = snapshot_max_new_file_size(&settings)?;
+
+    let mut locked_ws = workspace
+        .start_working_copy_mutation()
+        .context("failed to lock jj working copy")?;
+    let snapshot_options = SnapshotOptions {
+        base_ignores,
+        progress: None,
+        start_tracking_matcher: auto_track.as_ref(),
+        force_tracking_matcher: &NothingMatcher,
+        max_new_file_size,
+    };
+    let (new_tree, _stats) = locked_ws
+        .locked_wc()
+        .snapshot(&snapshot_options)
+        .await
+        .context("failed to snapshot jj working copy")?;
+
+    if new_tree.tree_ids_and_labels() == old_tree.tree_ids_and_labels() {
+        // No file changes: drop the lock without writing an op. This is the
+        // common case on idle ticks and keeps `jj op log` clean.
+        return Ok(RepositorySnapshot {
+            fingerprint: base_repo.op_id().hex(),
+        });
+    }
+
+    let mut tx = base_repo.start_transaction();
+    tx.set_is_snapshot(true);
+    let new_commit = tx
+        .repo_mut()
+        .rewrite_commit(&wc_commit)
+        .set_tree(new_tree)
+        .write()
+        .await
+        .context("failed to rewrite jj working-copy commit with new tree")?;
+    tx.repo_mut()
+        .set_wc_commit(workspace_name, new_commit.id().clone())
+        .context("failed to update jj working-copy pointer")?;
+    // `rewrite_commit` records a rewrite that the transaction insists on
+    // resolving before commit, even when the wc commit has no descendants.
+    tx.repo_mut()
+        .rebase_descendants()
+        .await
+        .context("failed to rebase descendants after jj snapshot")?;
+    let new_repo = tx
+        .commit("snapshot working copy")
+        .await
+        .context("failed to commit jj snapshot transaction")?;
+    let new_op_id = new_repo.op_id().clone();
+    locked_ws
+        .finish(new_op_id.clone())
+        .await
+        .context("failed to finish jj working-copy mutation")?;
+
     Ok(RepositorySnapshot {
-        fingerprint: repo.operation().id().hex(),
+        fingerprint: new_op_id.hex(),
     })
 }
 

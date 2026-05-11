@@ -682,7 +682,8 @@ where
                 if !state.is_selecting {
                     return;
                 }
-                if let Some(position) = self.position_at_point(*position, bounds, state.vertical_offset)
+                if let Some(position) =
+                    self.position_at_point(*position, bounds, state.vertical_offset)
                     && state.selection_focus != Some(position)
                 {
                     state.selection_focus = Some(position);

@@ -443,7 +443,12 @@ where
             return mouse::Interaction::None;
         };
         if scrollbar::is_dragging(&state.scrollbar)
-            || scrollbar::hits_container(bounds, point, self.content_height(), &self.style.scrollbar)
+            || scrollbar::hits_container(
+                bounds,
+                point,
+                self.content_height(),
+                &self.style.scrollbar,
+            )
         {
             return mouse::Interaction::Idle;
         }
