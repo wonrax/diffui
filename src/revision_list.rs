@@ -47,11 +47,11 @@ pub struct RevisionListStyle {
     pub muted_text: Color,
     pub subtle_text: Color,
     pub accent_text: Color,
-    pub file_count_background: Color,
     pub indicator_radius: f32,
     pub small_text_size: f32,
     pub caption_text_size: f32,
     pub primary_font: Font,
+    pub mono_font: Font,
     pub file_badge_width: f32,
     pub file_row_gap: f32,
     pub file_row_right_pad: f32,
@@ -76,11 +76,11 @@ pub struct RevisionRowView {
     pub selection_key: RowSelectionKey,
     pub change_id_prefix: String,
     pub change_id_suffix: String,
+    pub commit_id_short: String,
+    pub author: String,
     pub description: String,
     pub description_color: Color,
-    pub detail: String,
     pub indicators: Vec<IndicatorChip>,
-    pub file_count_chip: Option<String>,
     pub frame: LaneFrame,
 }
 
@@ -562,28 +562,58 @@ impl<Message> RevisionList<Message> {
         let row_clip = row_bounds;
         let content_width = (row_bounds.width - gutter_total - content_right_pad).max(1.0);
 
-        // Three-line content stack (title / description / detail) centered
-        // vertically inside the row. Visual line height per row is just `size`
-        // (cap-to-baseline) — using full `size * 1.4` line_box would push the
-        // gaps wider than we want.
-        let title_size = self.style.small_text_size;
+        // Two-line stack: ids/author/chips on top, description below.
+        // Sizes use cap-height for stack math rather than the rendered
+        // line-box so the gap stays visually tight.
+        let id_size = self.style.caption_text_size;
         let desc_size = self.style.small_text_size;
-        let detail_size = self.style.caption_text_size;
-        let line_gap = 3.0;
-        let stack_height = title_size + line_gap + desc_size + line_gap + detail_size;
+        let line_gap = 4.0;
+        let stack_height = id_size + line_gap + desc_size;
         let stack_top = row_bounds.y + ((row_bounds.height - stack_height) / 2.0).max(0.0);
-        let title_mid_y = stack_top + title_size / 2.0;
-        let desc_mid_y = stack_top + title_size + line_gap + desc_size / 2.0;
-        let detail_mid_y =
-            stack_top + title_size + line_gap + desc_size + line_gap + detail_size / 2.0;
+        let title_mid_y = stack_top + id_size / 2.0;
+        let desc_mid_y = stack_top + id_size + line_gap + desc_size / 2.0;
 
-        let id_size = self.style.small_text_size;
         let prefix_w = measure_text_width::<R>(
             &rev.change_id_prefix,
             id_size,
-            self.style.primary_font,
+            self.style.mono_font,
             paragraphs,
         );
+        let suffix_w = measure_text_width::<R>(
+            &rev.change_id_suffix,
+            id_size,
+            self.style.mono_font,
+            paragraphs,
+        );
+        let commit_w = measure_text_width::<R>(
+            &rev.commit_id_short,
+            id_size,
+            self.style.mono_font,
+            paragraphs,
+        );
+
+        // Reserve the right edge for indicator chips so they don't collide
+        // with author text on narrow sidebars.
+        let chip_gap = 6.0;
+        let mut chip_widths: Vec<f32> = Vec::with_capacity(rev.indicators.len());
+        let mut chips_total = 0.0;
+        for (idx, chip) in rev.indicators.iter().enumerate() {
+            let w = self.measure_chip_width::<R>(&chip.label, paragraphs);
+            chip_widths.push(w);
+            chips_total += w;
+            if idx + 1 < rev.indicators.len() {
+                chips_total += chip_gap;
+            }
+        }
+
+        let right_edge = row_bounds.x + row_bounds.width - content_right_pad;
+        let chips_left = if rev.indicators.is_empty() {
+            right_edge
+        } else {
+            right_edge - chips_total
+        };
+
+        // Draw change_id (prefix + suffix in mono).
         fill_text_centered_y(
             renderer,
             &rev.change_id_prefix,
@@ -592,15 +622,9 @@ impl<Message> RevisionList<Message> {
             prefix_w.max(1.0),
             id_size,
             self.style.accent_text,
-            self.style.primary_font,
+            self.style.mono_font,
             row_clip,
             text::Alignment::Left,
-        );
-        let suffix_w = measure_text_width::<R>(
-            &rev.change_id_suffix,
-            id_size,
-            self.style.primary_font,
-            paragraphs,
         );
         fill_text_centered_y(
             renderer,
@@ -610,15 +634,50 @@ impl<Message> RevisionList<Message> {
             suffix_w.max(1.0),
             id_size,
             self.style.subtle_text,
-            self.style.primary_font,
+            self.style.mono_font,
             row_clip,
             text::Alignment::Left,
         );
 
-        let chip_gap = 6.0;
-        let mut chip_x = content_left + prefix_w + suffix_w + 8.0;
-        for chip in &rev.indicators {
-            let advance = self.draw_chip(
+        let id_gap = 8.0;
+        let mut x_cursor = content_left + prefix_w + suffix_w + id_gap;
+
+        // commit_id is mono, in the muted-text colour to distinguish it from
+        // the change_id which uses accent/subtle.
+        fill_text_centered_y(
+            renderer,
+            &rev.commit_id_short,
+            x_cursor,
+            title_mid_y,
+            commit_w.max(1.0),
+            id_size,
+            self.style.muted_text,
+            self.style.mono_font,
+            row_clip,
+            text::Alignment::Left,
+        );
+        x_cursor += commit_w + id_gap;
+
+        // Author name, in the proportional font.
+        let author_max_w = (chips_left - x_cursor - chip_gap).max(0.0);
+        if author_max_w > 0.0 {
+            fill_text_truncated(
+                renderer,
+                &rev.author,
+                x_cursor,
+                title_mid_y,
+                author_max_w,
+                id_size,
+                self.style.subtle_text,
+                self.style.primary_font,
+                row_clip,
+            );
+        }
+
+        // Chips anchored at the right edge.
+        let mut chip_x = chips_left;
+        for (chip, w) in rev.indicators.iter().zip(chip_widths.iter()) {
+            self.draw_chip(
                 renderer,
                 paragraphs,
                 chip_x,
@@ -628,19 +687,7 @@ impl<Message> RevisionList<Message> {
                 chip.text_color,
                 row_clip,
             );
-            chip_x += advance + chip_gap;
-        }
-        if let Some(label) = &rev.file_count_chip {
-            self.draw_chip(
-                renderer,
-                paragraphs,
-                chip_x,
-                title_mid_y,
-                label,
-                self.style.file_count_background,
-                self.style.accent_text,
-                row_clip,
-            );
+            chip_x += w + chip_gap;
         }
 
         fill_text_truncated(
@@ -651,17 +698,6 @@ impl<Message> RevisionList<Message> {
             content_width,
             desc_size,
             rev.description_color,
-            self.style.primary_font,
-            row_clip,
-        );
-        fill_text_truncated(
-            renderer,
-            &rev.detail,
-            content_left,
-            detail_mid_y,
-            content_width,
-            detail_size,
-            self.style.subtle_text,
             self.style.primary_font,
             row_clip,
         );
@@ -829,6 +865,17 @@ impl<Message> RevisionList<Message> {
             height: row_bounds.height,
         };
         draw_continuation_row(renderer, gutter_bounds, &f.continuation, &self.style.graph);
+    }
+
+    fn measure_chip_width<R: text::Renderer<Font = Font>>(
+        &self,
+        label: &str,
+        paragraphs: &RefCell<Vec<R::Paragraph>>,
+    ) -> f32 {
+        let size = self.style.caption_text_size;
+        let label_w = measure_text_width::<R>(label, size, self.style.primary_font, paragraphs);
+        let pad_x = 5.0;
+        label_w + pad_x * 2.0
     }
 
     #[allow(clippy::too_many_arguments)]

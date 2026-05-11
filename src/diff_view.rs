@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::time::Instant;
 
 use iced::advanced::{
     Layout, Shell, Widget, layout, mouse, renderer, text,
@@ -6,13 +7,13 @@ use iced::advanced::{
 };
 use iced::{
     Border, Color, Element, Event, Font, Length, Pixels, Point, Rectangle, Shadow, Size, Theme,
-    Vector, alignment, keyboard,
+    Vector, alignment, keyboard, window,
 };
 
 use crate::scrollbar::{self, ScrollbarState, ScrollbarStyle};
 
 const ROW_HEIGHT: f32 = 24.0;
-const FILE_HEADER_HEIGHT: f32 = 38.0;
+const FILE_HEADER_HEIGHT: f32 = 40.0;
 const HUNK_HEADER_HEIGHT: f32 = 26.0;
 const PREFIX_WIDTH: f32 = 24.0;
 const CHANGE_MARK_WIDTH: f32 = 2.0;
@@ -24,6 +25,24 @@ const PIXEL_SCROLL_SCALE: f32 = 0.65;
 const GUTTER_MIN_WIDTH: f32 = 56.0;
 // Padding flanking the gutter text on both sides.
 const GUTTER_HORIZONTAL_PADDING: f32 = 8.0;
+// Padding above and below the revision-header block when it's present.
+const HEADER_VERTICAL_PADDING: f32 = 10.0;
+// Left/right padding inside the header block (between the panel edge and
+// the first character of label/description text).
+const HEADER_HORIZONTAL_PADDING: f32 = 14.0;
+// Space drawn between the label column and the value column so the colon
+// sits a hair away from the value text.
+const HEADER_LABEL_GAP: f32 = 6.0;
+// Click within this distance of the previous click counts as a multi-click
+// rather than a fresh selection anchor.
+const MULTI_CLICK_RADIUS: f32 = 4.0;
+// Auto-scroll speed (px/sec) when the mouse is dragged just outside the
+// viewport. Scaled by how far past the edge the cursor sits.
+const AUTO_SCROLL_MAX_SPEED: f32 = 1200.0;
+// Width of the "edge zone" outside the viewport over which the auto-scroll
+// speed ramps up. The cursor sitting just past the edge scrolls slowly; a
+// cursor far outside the viewport scrolls at full speed.
+const AUTO_SCROLL_RAMP_PX: f32 = 80.0;
 
 #[derive(Debug, Clone)]
 pub struct DiffLine {
@@ -77,6 +96,43 @@ pub enum SyntaxKind {
     Punctuation,
 }
 
+/// One line of the `jj show`-style revision header rendered at the top of
+/// the diff scroll area. Kept as a plain enum so `main.rs` decides the text
+/// content without leaking `RevisionDetails` into this module.
+#[derive(Debug, Clone)]
+pub enum HeaderLine {
+    /// "Label: value" — label colored muted, value colored as text. The
+    /// `label` field is the rendered label including its trailing colon
+    /// (e.g. `"Commit ID:"`), padded to the column width by the caller.
+    Field { label: String, value: String },
+    /// A line of the description, rendered indented under the metadata
+    /// block. Stored without indentation; the renderer prepends four
+    /// spaces.
+    Description(String),
+    /// Blank separator between the metadata block and the description.
+    Blank,
+}
+
+impl HeaderLine {
+    /// Build a metadata row with the label padded to nine characters — the
+    /// width of "Commit ID" / "Committer" / "Signature", the longest labels
+    /// jj ships — so colons stack in a column across the block.
+    pub fn field(label: &str, value: &str) -> Self {
+        Self::Field {
+            label: format!("{label:<9}:"),
+            value: value.to_owned(),
+        }
+    }
+
+    pub fn description(line: &str) -> Self {
+        Self::Description(line.to_owned())
+    }
+
+    pub fn blank() -> Self {
+        Self::Blank
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Palette {
     pub text: Color,
@@ -106,10 +162,19 @@ pub struct DiffView<'a, Message> {
     palette: Palette,
     font: Font,
     text_size: f32,
+    multi_click_ms: u64,
     gutter_width: f32,
     gutter_digit_count: usize,
+    header: Vec<HeaderLine>,
     on_selected_file_changed: fn(usize) -> Message,
     on_copy: Option<fn(String) -> Message>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionUnit {
+    Character,
+    Word,
+    Line,
 }
 
 struct State<Paragraph> {
@@ -122,8 +187,30 @@ struct State<Paragraph> {
     selection_anchor: Option<TextPosition>,
     /// Focus (current/release position) of the selection.
     selection_focus: Option<TextPosition>,
+    /// When the user drags after a double/triple click, the selection grows
+    /// in word- or line-sized chunks instead of by character. We remember
+    /// where the anchor "click unit" started/ended so the resulting
+    /// selection always covers full units in both directions.
+    selection_anchor_unit_start: Option<TextPosition>,
+    selection_anchor_unit_end: Option<TextPosition>,
+    selection_unit: SelectionUnit,
     /// True while the user is mid-drag.
     is_selecting: bool,
+    /// Multi-click bookkeeping: timestamp + screen position + count of the
+    /// last left-button press, so a second/third press in quick succession
+    /// at the same spot upgrades the selection to word/line scope.
+    last_click_time: Option<Instant>,
+    last_click_screen: Option<Point>,
+    click_count: u32,
+    /// Last cursor position observed while dragging — used to drive
+    /// auto-scroll and to reproject the selection focus after the viewport
+    /// shifts under the cursor.
+    last_drag_cursor: Option<Point>,
+    /// Cached glyph advance for `self.font` at `self.text_size`. The diff
+    /// font is monospace, so one measured width is enough for hit-testing.
+    /// `None` until the first draw measures it. `Cell` so the immutable
+    /// `draw()` path can fill it without going through `RefCell` ceremony.
+    measured_char_advance: std::cell::Cell<Option<f32>>,
     scrollbar: ScrollbarState,
 }
 
@@ -189,6 +276,7 @@ struct VisibleBand {
 }
 
 impl<'a, Message> DiffView<'a, Message> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         files: Vec<DiffFileView<'a>>,
         selected_file: usize,
@@ -196,12 +284,15 @@ impl<'a, Message> DiffView<'a, Message> {
         palette: Palette,
         font: Font,
         text_size: f32,
+        multi_click_ms: u64,
         on_selected_file_changed: fn(usize) -> Message,
     ) -> Self {
         let gutter_digit_count = compute_gutter_digit_count(&files);
         // Width of the rendered gutter text "{old:>D} {new:>D}" plus padding.
         // Computed once at construction so layout, hit-testing and rendering
         // all agree on the column width without each having to remeasure.
+        // Uses the same heuristic as the fallback char-advance — fine for
+        // sizing the column, since the gutter text is whitespace-padded.
         let char_width = text_size * 0.62;
         let gutter_text_chars = gutter_digit_count * 2 + 1; // two columns + one separating space
         let gutter_width = (gutter_text_chars as f32 * char_width
@@ -214,11 +305,18 @@ impl<'a, Message> DiffView<'a, Message> {
             palette,
             font,
             text_size,
+            multi_click_ms,
             gutter_width,
             gutter_digit_count,
+            header: Vec::new(),
             on_selected_file_changed,
             on_copy: None,
         }
+    }
+
+    pub fn with_header(mut self, header: Vec<HeaderLine>) -> Self {
+        self.header = header;
+        self
     }
 
     pub fn on_copy(mut self, on_copy: fn(String) -> Message) -> Self {
@@ -226,56 +324,70 @@ impl<'a, Message> DiffView<'a, Message> {
         self
     }
 
+    /// Total height of the revision header block (metadata lines +
+    /// description + vertical padding). Zero when no header is set.
+    fn header_height(&self) -> f32 {
+        if self.header.is_empty() {
+            0.0
+        } else {
+            self.header.len() as f32 * ROW_HEIGHT + HEADER_VERTICAL_PADDING * 2.0
+        }
+    }
+
     fn content_height(&self, width: f32) -> f32 {
         let content_width = self.content_width(width);
 
-        self.files
-            .iter()
-            .map(|file| {
-                FILE_HEADER_HEIGHT
-                    + file
-                        .hunks
-                        .iter()
-                        .map(|hunk| {
-                            HUNK_HEADER_HEIGHT
-                                + hunk
-                                    .lines
-                                    .iter()
-                                    .map(|line| self.row_height(line, content_width))
-                                    .sum::<f32>()
-                        })
-                        .sum::<f32>()
-            })
-            .sum()
+        self.header_height()
+            + self
+                .files
+                .iter()
+                .map(|file| {
+                    FILE_HEADER_HEIGHT
+                        + file
+                            .hunks
+                            .iter()
+                            .map(|hunk| {
+                                HUNK_HEADER_HEIGHT
+                                    + hunk
+                                        .lines
+                                        .iter()
+                                        .map(|line| self.row_height(line, content_width))
+                                        .sum::<f32>()
+                            })
+                            .sum::<f32>()
+                })
+                .sum::<f32>()
     }
 
     fn file_offset(&self, file_index: usize, width: f32) -> f32 {
         let content_width = self.content_width(width);
 
-        self.files
-            .iter()
-            .take(file_index)
-            .map(|file| {
-                FILE_HEADER_HEIGHT
-                    + file
-                        .hunks
-                        .iter()
-                        .map(|hunk| {
-                            HUNK_HEADER_HEIGHT
-                                + hunk
-                                    .lines
-                                    .iter()
-                                    .map(|line| self.row_height(line, content_width))
-                                    .sum::<f32>()
-                        })
-                        .sum::<f32>()
-            })
-            .sum()
+        self.header_height()
+            + self
+                .files
+                .iter()
+                .take(file_index)
+                .map(|file| {
+                    FILE_HEADER_HEIGHT
+                        + file
+                            .hunks
+                            .iter()
+                            .map(|hunk| {
+                                HUNK_HEADER_HEIGHT
+                                    + hunk
+                                        .lines
+                                        .iter()
+                                        .map(|line| self.row_height(line, content_width))
+                                        .sum::<f32>()
+                            })
+                            .sum::<f32>()
+                })
+                .sum::<f32>()
     }
 
     fn file_at_offset(&self, offset: f32, width: f32) -> usize {
         let content_width = self.content_width(width);
-        let mut content_y = 0.0;
+        let mut content_y = self.header_height();
 
         for (file_index, file) in self.files.iter().enumerate() {
             let file_height = FILE_HEADER_HEIGHT
@@ -303,15 +415,22 @@ impl<'a, Message> DiffView<'a, Message> {
     }
 
     fn content_width(&self, viewport_width: f32) -> f32 {
-        (viewport_width - self.gutter_width - PREFIX_WIDTH - 16.0).max(self.char_width())
+        (viewport_width - self.gutter_width - PREFIX_WIDTH - 16.0).max(self.char_width(None))
     }
 
-    fn char_width(&self) -> f32 {
-        self.text_size * 0.62
+    /// Width of a single monospace glyph for this font/size. Hit-tests and
+    /// selection rendering reach for the value cached on the widget state
+    /// after the first draw (`measured`), falling back to a `text_size *
+    /// 0.62` heuristic until that runs. The heuristic over-counts for fonts
+    /// narrower than Menlo by ~0.5 char/line, which is what caused selection
+    /// rectangles to drift past the rightmost glyph and copies to drop the
+    /// trailing character.
+    fn char_width(&self, measured: Option<f32>) -> f32 {
+        measured.unwrap_or(self.text_size * 0.62)
     }
 
     fn row_height(&self, line: &DiffLine, content_width: f32) -> f32 {
-        let chars_per_line = (content_width / self.char_width()).floor().max(1.0) as usize;
+        let chars_per_line = (content_width / self.char_width(None)).floor().max(1.0) as usize;
         let wrapped_lines = line.content.chars().count().max(1).div_ceil(chars_per_line);
 
         wrapped_lines as f32 * ROW_HEIGHT
@@ -327,18 +446,26 @@ impl<'a, Message> DiffView<'a, Message> {
     /// trade-off because real glyph hit-testing would require keeping a
     /// `Paragraph` per visible row alive across the event loop, which iced
     /// doesn't make easy from a custom widget.
+    /// Locate the document position under `point`. Unlike a normal
+    /// "click to put cursor here" hit-test this clamps to the nearest valid
+    /// row even when the click is in the chrome / below the last row, so
+    /// dragging the mouse outside the viewport still produces a sensible
+    /// selection endpoint.
     fn position_at_point(
         &self,
         point: Point,
         bounds: Rectangle,
         vertical_offset: f32,
+        measured_char_advance: Option<f32>,
     ) -> Option<TextPosition> {
-        if !bounds.contains(point) {
-            return None;
-        }
         let content_width = self.content_width(bounds.width);
         let text_x = bounds.x + self.gutter_width + PREFIX_WIDTH + TEXT_X_PADDING;
-        let mut content_y = 0.0;
+        let target_y = point.y - bounds.y + vertical_offset;
+        // The header sits above all file content; skip past it before
+        // walking files so a click on the header doesn't try to position
+        // inside the diff body.
+        let mut content_y = self.header_height();
+        let mut last_row: Option<(usize, usize, usize, f32, f32, usize)> = None;
 
         for (file_index, file) in self.files.iter().enumerate() {
             content_y += FILE_HEADER_HEIGHT;
@@ -346,14 +473,20 @@ impl<'a, Message> DiffView<'a, Message> {
                 content_y += HUNK_HEADER_HEIGHT;
                 for (line_index, line) in hunk.lines.iter().enumerate() {
                     let height = self.row_height(line, content_width);
-                    let row_y = bounds.y + (content_y - vertical_offset);
-                    let row_bottom = row_y + height;
+                    let row_top = content_y;
+                    let row_bottom = row_top + height;
+                    let char_count = line.content.chars().count();
+                    last_row = Some((
+                        file_index, hunk_index, line_index, row_top, height, char_count,
+                    ));
 
-                    if point.y >= row_y && point.y < row_bottom {
-                        let relative_x = (point.x - text_x).max(0.0);
-                        let cw = self.char_width().max(1.0);
-                        let char_offset = (relative_x / cw).round() as usize;
-                        let byte = byte_offset_for_char(&line.content, char_offset);
+                    if target_y >= row_top && target_y < row_bottom {
+                        let byte = self.byte_offset_for_x(
+                            point.x,
+                            text_x,
+                            &line.content,
+                            measured_char_advance,
+                        );
                         return Some(TextPosition {
                             file_index,
                             hunk_index,
@@ -365,7 +498,41 @@ impl<'a, Message> DiffView<'a, Message> {
                 }
             }
         }
-        None
+
+        // Cursor is past the last row (e.g. user dragged below content). Snap
+        // to the end of the document so selection covers everything up to here.
+        last_row.map(
+            |(file_index, hunk_index, line_index, _row_top, _height, char_count)| {
+                let line = &self.files[file_index].hunks[hunk_index].lines[line_index];
+                let byte = byte_offset_for_char(&line.content, char_count);
+                TextPosition {
+                    file_index,
+                    hunk_index,
+                    line_index,
+                    byte,
+                }
+            },
+        )
+    }
+
+    /// Translate the screen-x of a click into a byte offset inside `content`.
+    /// Uses the measured char advance for accuracy and rounds half-cells up
+    /// so a click in the right half of a glyph lands after it (the editor
+    /// convention).
+    fn byte_offset_for_x(
+        &self,
+        x: f32,
+        text_x: f32,
+        content: &str,
+        measured_char_advance: Option<f32>,
+    ) -> usize {
+        let cw = self.char_width(measured_char_advance).max(1.0);
+        let relative_x = (x - text_x).max(0.0);
+        // Round to nearest cell boundary — clicks in the right half of a
+        // glyph snap after it, clicks in the left half snap before it.
+        let char_offset = (relative_x / cw + 0.5).floor() as usize;
+        let max_chars = content.chars().count();
+        byte_offset_for_char(content, char_offset.min(max_chars))
     }
 
     /// Build the substring inside the inclusive selection range
@@ -487,6 +654,110 @@ impl<'a, Message> DiffView<'a, Message> {
             paragraphs,
         );
     }
+
+    fn draw_revision_header<Renderer>(
+        &self,
+        renderer: &mut Renderer,
+        bounds: Rectangle,
+        visible_top: f32,
+        header_height: f32,
+    ) where
+        Renderer: text::Renderer<Font = Font>,
+    {
+        // Header occupies content_y in `[0, header_height)`. Translate to
+        // screen coords for the section that intersects the viewport.
+        let header_screen_y = bounds.y - visible_top;
+
+        // Tint the strip so the header reads as distinct chrome.
+        self.draw_background(
+            renderer,
+            bounds.x,
+            header_screen_y,
+            bounds.width,
+            header_height,
+            self.palette.file_header,
+        );
+
+        // Border across the bottom edge of the header strip, matching the
+        // visual treatment of file headers.
+        self.draw_background(
+            renderer,
+            bounds.x,
+            header_screen_y + header_height - 1.0,
+            bounds.width,
+            1.0,
+            self.palette.border,
+        );
+
+        let clip = bounds;
+        let label_color = self.palette.text_muted;
+        let value_color = self.palette.text;
+        // Measure the label column once. All field labels are padded to the
+        // same width in `HeaderLine::field`, so any non-empty one gives us
+        // the column extent.
+        let label_width = self
+            .header
+            .iter()
+            .find_map(|line| match line {
+                HeaderLine::Field { label, .. } => Some(self.text_width(label)),
+                _ => None,
+            })
+            .unwrap_or(0.0);
+
+        let mut y = header_screen_y + HEADER_VERTICAL_PADDING;
+        let left_x = bounds.x + HEADER_HORIZONTAL_PADDING;
+        let value_x = left_x + label_width + HEADER_LABEL_GAP;
+        let value_width = (bounds.x + bounds.width - HEADER_HORIZONTAL_PADDING - value_x).max(1.0);
+        let line_width = (bounds.x + bounds.width - HEADER_HORIZONTAL_PADDING - left_x).max(1.0);
+
+        for line in &self.header {
+            match line {
+                HeaderLine::Field { label, value } => {
+                    self.draw_text(
+                        renderer,
+                        label,
+                        TextRenderParams {
+                            width: label_width.max(1.0),
+                            height: ROW_HEIGHT,
+                            position: Point::new(left_x, y + TEXT_Y_PADDING),
+                            color: label_color,
+                            clip_bounds: clip,
+                            wrapping: text::Wrapping::None,
+                        },
+                    );
+                    self.draw_text(
+                        renderer,
+                        value,
+                        TextRenderParams {
+                            width: value_width,
+                            height: ROW_HEIGHT,
+                            position: Point::new(value_x, y + TEXT_Y_PADDING),
+                            color: value_color,
+                            clip_bounds: clip,
+                            wrapping: text::Wrapping::None,
+                        },
+                    );
+                }
+                HeaderLine::Description(line) => {
+                    let indented = format!("    {line}");
+                    self.draw_text(
+                        renderer,
+                        &indented,
+                        TextRenderParams {
+                            width: line_width,
+                            height: ROW_HEIGHT,
+                            position: Point::new(left_x, y + TEXT_Y_PADDING),
+                            color: value_color,
+                            clip_bounds: clip,
+                            wrapping: text::Wrapping::None,
+                        },
+                    );
+                }
+                HeaderLine::Blank => {}
+            }
+            y += ROW_HEIGHT;
+        }
+    }
 }
 
 impl<'a, Message, Renderer> Widget<Message, Theme, Renderer> for DiffView<'a, Message>
@@ -506,7 +777,15 @@ where
             paragraphs: RefCell::new(Vec::new()),
             selection_anchor: None,
             selection_focus: None,
+            selection_anchor_unit_start: None,
+            selection_anchor_unit_end: None,
+            selection_unit: SelectionUnit::Character,
             is_selecting: false,
+            last_click_time: None,
+            last_click_screen: None,
+            click_count: 0,
+            last_drag_cursor: None,
+            measured_char_advance: std::cell::Cell::new(None),
             scrollbar: ScrollbarState::default(),
         })
     }
@@ -524,7 +803,12 @@ where
             // copying stale content.
             state.selection_anchor = None;
             state.selection_focus = None;
+            state.selection_anchor_unit_start = None;
+            state.selection_anchor_unit_end = None;
+            state.selection_unit = SelectionUnit::Character;
             state.is_selecting = false;
+            state.last_drag_cursor = None;
+            state.click_count = 0;
             return;
         }
 
@@ -582,7 +866,30 @@ where
 
         let content_height = self.content_height(bounds.width);
 
+        let measured = state.measured_char_advance.get();
         match event {
+            Event::Window(window::Event::RedrawRequested(_)) => {
+                if state.is_selecting
+                    && let Some(cursor_pos) = state.last_drag_cursor
+                {
+                    let scroll_delta = auto_scroll_delta(cursor_pos.y, bounds);
+                    if scroll_delta != 0.0 {
+                        let new_offset =
+                            (state.vertical_offset + scroll_delta).clamp(0.0, max_vertical);
+                        if (new_offset - state.vertical_offset).abs() > f32::EPSILON {
+                            state.vertical_offset = new_offset;
+                            self.advance_drag_selection(state, cursor_pos, bounds, measured);
+                            let selected_file =
+                                self.file_at_offset(state.vertical_offset, bounds.width);
+                            if selected_file != state.selected_file {
+                                state.selected_file = selected_file;
+                                shell.publish((self.on_selected_file_changed)(selected_file));
+                            }
+                        }
+                        shell.request_redraw();
+                    }
+                }
+            }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
                 let Some(_cursor_position) = cursor.position_over(bounds) else {
                     return;
@@ -617,6 +924,9 @@ where
                     if state.selection_anchor.is_some() {
                         state.selection_anchor = None;
                         state.selection_focus = None;
+                        state.selection_anchor_unit_start = None;
+                        state.selection_anchor_unit_end = None;
+                        state.selection_unit = SelectionUnit::Character;
                         shell.request_redraw();
                     }
                     return;
@@ -647,14 +957,47 @@ where
                     }
                     scrollbar::ScrollbarEvent::None => {}
                 }
-                if let Some(position) = self.position_at_point(point, bounds, state.vertical_offset)
-                {
-                    state.selection_anchor = Some(position);
-                    state.selection_focus = Some(position);
-                    state.is_selecting = true;
-                    shell.capture_event();
-                    shell.request_redraw();
-                }
+                let Some(position) =
+                    self.position_at_point(point, bounds, state.vertical_offset, measured)
+                else {
+                    return;
+                };
+
+                let now = Instant::now();
+                let within_window = state
+                    .last_click_time
+                    .map(|t| now.duration_since(t).as_millis() as u64 <= self.multi_click_ms)
+                    .unwrap_or(false);
+                let same_spot = state
+                    .last_click_screen
+                    .map(|p| p.distance(point) <= MULTI_CLICK_RADIUS)
+                    .unwrap_or(false);
+                let next_count = if within_window && same_spot {
+                    state.click_count + 1
+                } else {
+                    1
+                };
+                state.click_count = next_count;
+                state.last_click_time = Some(now);
+                state.last_click_screen = Some(point);
+
+                // Cycle through Char → Word → Line on each successive click.
+                let unit = match ((next_count - 1) % 3, next_count) {
+                    (0, _) => SelectionUnit::Character,
+                    (1, _) => SelectionUnit::Word,
+                    _ => SelectionUnit::Line,
+                };
+                state.selection_unit = unit;
+
+                let (anchor_start, anchor_end) = expand_to_unit(&self.files, position, unit);
+                state.selection_anchor_unit_start = Some(anchor_start);
+                state.selection_anchor_unit_end = Some(anchor_end);
+                state.selection_anchor = Some(anchor_start);
+                state.selection_focus = Some(anchor_end);
+                state.is_selecting = true;
+                state.last_drag_cursor = Some(point);
+                shell.capture_event();
+                shell.request_redraw();
             }
             Event::Mouse(mouse::Event::CursorMoved { position }) => {
                 if scrollbar::is_dragging(&state.scrollbar) {
@@ -682,13 +1025,11 @@ where
                 if !state.is_selecting {
                     return;
                 }
-                if let Some(position) =
-                    self.position_at_point(*position, bounds, state.vertical_offset)
-                    && state.selection_focus != Some(position)
-                {
-                    state.selection_focus = Some(position);
-                    shell.request_redraw();
-                }
+                state.last_drag_cursor = Some(*position);
+                self.advance_drag_selection(state, *position, bounds, measured);
+                // Kick the redraw loop so the auto-scroll handler picks up
+                // where the cursor is even if the mouse stays still.
+                shell.request_redraw();
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                 if let scrollbar::ScrollbarEvent::Captured =
@@ -701,9 +1042,15 @@ where
                     return;
                 }
                 state.is_selecting = false;
-                // If the user clicked without dragging, anchor == focus —
-                // clear so we don't leave a phantom zero-width selection.
-                if state.selection_anchor == state.selection_focus {
+                state.last_drag_cursor = None;
+                // If the user clicked without dragging in character mode,
+                // anchor == focus — clear so we don't leave a phantom
+                // zero-width selection. Multi-click selections are kept
+                // even without drag, since the user expects them to stick
+                // (e.g. double-click a word, then Cmd+C).
+                if state.selection_unit == SelectionUnit::Character
+                    && state.selection_anchor == state.selection_focus
+                {
                     state.selection_anchor = None;
                     state.selection_focus = None;
                 }
@@ -759,6 +1106,18 @@ where
             height: bounds.height,
         };
 
+        // Measure the actual glyph advance for the code font on the first
+        // draw and cache it on `state`. The constructor's `text_size * 0.62`
+        // heuristic was off by ~0.5px/char for Menlo at 13pt, which made
+        // long selection rectangles drift past the rightmost glyph.
+        if state.measured_char_advance.get().is_none() {
+            let advance = measure_char_advance(self.font, self.text_size);
+            if advance.is_finite() && advance > 0.0 {
+                state.measured_char_advance.set(Some(advance));
+            }
+        }
+        let measured_char_advance = state.measured_char_advance.get();
+
         renderer.with_layer(bounds, |renderer| {
             self.draw_background(
                 renderer,
@@ -771,7 +1130,8 @@ where
 
             let visible_top = state.vertical_offset;
             let visible_bottom = visible_top + bounds.height;
-            let mut content_y = 0.0;
+            let header_height = self.header_height();
+            let mut content_y = header_height;
             let visible_capacity = (bounds.height / ROW_HEIGHT).ceil() as usize + 8;
             let mut visible_file_headers = Vec::new();
             let mut visible_hunk_headers = Vec::new();
@@ -868,6 +1228,10 @@ where
                     band.height,
                     self.changed_line_mark_color(band.kind),
                 );
+            }
+
+            if header_height > 0.0 {
+                self.draw_revision_header(renderer, bounds, visible_top, header_height);
             }
 
             for header in &visible_file_headers {
@@ -975,7 +1339,7 @@ where
             if let (Some(anchor), Some(focus)) = (state.selection_anchor, state.selection_focus) {
                 let (sel_start, sel_end) = ordered(anchor, focus);
                 if sel_start != sel_end {
-                    let cw = self.char_width().max(1.0);
+                    let cw = self.char_width(measured_char_advance).max(1.0);
                     let text_x = bounds.x + self.gutter_width + PREFIX_WIDTH + TEXT_X_PADDING;
                     for row in &visible_rows {
                         let line =
@@ -1111,7 +1475,60 @@ where
 
 impl<Message> DiffView<'_, Message> {
     fn text_width(&self, content: &str) -> f32 {
-        (content.chars().count() as f32 * self.char_width() + 16.0).max(1.0)
+        (content.chars().count() as f32 * self.char_width(None) + 16.0).max(1.0)
+    }
+
+    /// Update the selection focus based on the cursor's current screen
+    /// position. Handles word/line-mode expansion: in those modes the
+    /// selection always covers full units in both directions, so dragging
+    /// past the next word boundary jumps an entire word at once.
+    fn advance_drag_selection<P>(
+        &self,
+        state: &mut State<P>,
+        cursor_pos: Point,
+        bounds: Rectangle,
+        measured_char_advance: Option<f32>,
+    ) {
+        let Some(focus_pos) = self.position_at_point(
+            cursor_pos,
+            bounds,
+            state.vertical_offset,
+            measured_char_advance,
+        ) else {
+            return;
+        };
+
+        let (Some(anchor_start), Some(anchor_end)) = (
+            state.selection_anchor_unit_start,
+            state.selection_anchor_unit_end,
+        ) else {
+            return;
+        };
+
+        let unit = state.selection_unit;
+        let (focus_start, focus_end) = if unit == SelectionUnit::Character {
+            (focus_pos, focus_pos)
+        } else {
+            expand_to_unit(&self.files, focus_pos, unit)
+        };
+
+        let (new_anchor, new_focus) = if focus_end <= anchor_start {
+            // Drag has crossed to the left of the original click — selection
+            // grows from the *end* of the anchor unit backwards to the
+            // *start* of the focus unit.
+            (anchor_end, focus_start)
+        } else if focus_start >= anchor_end {
+            // Drag is to the right of the anchor unit.
+            (anchor_start, focus_end)
+        } else {
+            // Drag is still inside the original anchor unit.
+            (anchor_start, anchor_end)
+        };
+
+        if state.selection_anchor != Some(new_anchor) || state.selection_focus != Some(new_focus) {
+            state.selection_anchor = Some(new_anchor);
+            state.selection_focus = Some(new_focus);
+        }
     }
 
     fn make_text(
@@ -1389,6 +1806,155 @@ fn is_copy_shortcut(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> bool
         key.as_ref(),
         keyboard::Key::Character("c") | keyboard::Key::Character("C")
     )
+}
+
+/// Expand `pos` to cover the unit (word or line) that contains it. For
+/// character-mode selection this is a no-op — the caller never reaches
+/// this path with `unit == Character`.
+fn expand_to_unit(
+    files: &[DiffFileView<'_>],
+    pos: TextPosition,
+    unit: SelectionUnit,
+) -> (TextPosition, TextPosition) {
+    let Some(line) = files
+        .get(pos.file_index)
+        .and_then(|file| file.hunks.get(pos.hunk_index))
+        .and_then(|hunk| hunk.lines.get(pos.line_index))
+    else {
+        return (pos, pos);
+    };
+
+    match unit {
+        SelectionUnit::Character => (pos, pos),
+        SelectionUnit::Line => {
+            let start = TextPosition { byte: 0, ..pos };
+            let end = TextPosition {
+                byte: line.content.len(),
+                ..pos
+            };
+            (start, end)
+        }
+        SelectionUnit::Word => {
+            let (start_byte, end_byte) = word_bounds(&line.content, pos.byte);
+            (
+                TextPosition {
+                    byte: start_byte,
+                    ..pos
+                },
+                TextPosition {
+                    byte: end_byte,
+                    ..pos
+                },
+            )
+        }
+    }
+}
+
+/// Find the inclusive [start, end) byte range of the word the cursor is
+/// currently inside. "Word" is the run of characters with the same
+/// `word_class` as the character under the cursor, where word_class folds
+/// identifier chars (alphanumeric + `_`) into one bucket, whitespace into
+/// another, and everything else (punctuation, operators) into a third.
+/// Clicking on whitespace selects that whitespace run; clicking on
+/// punctuation selects that punctuation run; clicking on a letter selects
+/// the identifier — matching the convention every text editor uses.
+fn word_bounds(content: &str, byte_pos: usize) -> (usize, usize) {
+    if content.is_empty() {
+        return (0, 0);
+    }
+    let byte_pos = byte_pos.min(content.len());
+    let chars: Vec<(usize, char)> = content.char_indices().collect();
+    if chars.is_empty() {
+        return (0, 0);
+    }
+
+    // Find the char index closest to byte_pos (the click might land between
+    // two char boundaries when the user clicks on a wide glyph). Bias to
+    // the char to the *left* of the cursor when the click lands at a
+    // boundary, so double-clicking the gap between two words selects the
+    // word to the left rather than picking arbitrarily.
+    let mut anchor_index = chars
+        .iter()
+        .rposition(|(idx, _)| *idx <= byte_pos)
+        .unwrap_or(0);
+    if byte_pos == content.len() {
+        anchor_index = chars.len() - 1;
+    }
+
+    let target_class = word_class(chars[anchor_index].1);
+    let mut start = anchor_index;
+    while start > 0 && word_class(chars[start - 1].1) == target_class {
+        start -= 1;
+    }
+    let mut end = anchor_index;
+    while end + 1 < chars.len() && word_class(chars[end + 1].1) == target_class {
+        end += 1;
+    }
+
+    let start_byte = chars[start].0;
+    let end_byte = chars[end].0 + chars[end].1.len_utf8();
+    (start_byte, end_byte)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WordClass {
+    Word,
+    Whitespace,
+    Punctuation,
+}
+
+fn word_class(ch: char) -> WordClass {
+    if ch.is_whitespace() {
+        WordClass::Whitespace
+    } else if ch.is_alphanumeric() || ch == '_' {
+        WordClass::Word
+    } else {
+        WordClass::Punctuation
+    }
+}
+
+/// Returns the y-delta (in px) to apply to `vertical_offset` on this frame
+/// based on how far past the top/bottom edge the cursor sits. Zero when the
+/// cursor is inside the viewport. Frame-rate–independent: assumes ~60fps,
+/// which is fine for selection feel.
+fn auto_scroll_delta(cursor_y: f32, bounds: Rectangle) -> f32 {
+    let frame_seconds = 1.0 / 60.0;
+    let bottom = bounds.y + bounds.height;
+    let speed_for = |distance: f32| {
+        let ramp = (distance / AUTO_SCROLL_RAMP_PX).clamp(0.0, 1.0);
+        ramp * AUTO_SCROLL_MAX_SPEED * frame_seconds
+    };
+    if cursor_y < bounds.y {
+        -speed_for(bounds.y - cursor_y)
+    } else if cursor_y > bottom {
+        speed_for(cursor_y - bottom)
+    } else {
+        0.0
+    }
+}
+
+fn measure_char_advance(font: Font, text_size: f32) -> f32 {
+    use iced::advanced::graphics::text::Paragraph;
+    use iced::advanced::text::Paragraph as _;
+
+    // "M" is a stable choice for monospace measurement: it dominates hinting
+    // noise at small sizes. For monospace fonts the width of one char *is*
+    // the advance, which is what we cache here.
+    let line_height = (text_size * 1.4).max(1.0);
+    let paragraph = Paragraph::with_text(text::Text {
+        content: "M",
+        bounds: Size::new(f32::INFINITY, line_height),
+        size: Pixels(text_size),
+        line_height: text::LineHeight::Absolute(Pixels(line_height)),
+        font,
+        align_x: text::Alignment::Left,
+        align_y: alignment::Vertical::Top,
+        shaping: text::Shaping::Basic,
+        wrapping: text::Wrapping::None,
+        ellipsis: text::Ellipsis::None,
+        hint_factor: None,
+    });
+    paragraph.min_width()
 }
 
 fn digits(n: usize) -> usize {

@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+mod config;
 mod diff_view;
 mod graph;
 mod graph_view;
@@ -22,6 +23,7 @@ use arborium::{
 };
 use bstr::BStr;
 use clap::Parser;
+use config::AppConfig;
 use diff_view::{
     DiffFileView, DiffHunkView, DiffLine, DiffLineKind, DiffView, Palette, SyntaxKind, SyntaxSpan,
 };
@@ -69,14 +71,10 @@ use revision_list::{
 };
 use tokio::process::Command;
 
-#[cfg(target_os = "macos")]
-const CODE_FONT: Font = Font::new("Menlo");
-#[cfg(not(target_os = "macos"))]
-const CODE_FONT: Font = Font::new("Cascadia Code");
 const CODE_TEXT_SIZE: f32 = 13.0;
-const CAPTION_TEXT_SIZE: f32 = 13.0;
-const SMALL_TEXT_SIZE: f32 = 14.0;
-const TITLE_TEXT_SIZE: f32 = 18.0;
+const CAPTION_TEXT_SIZE: f32 = 14.0;
+const SMALL_TEXT_SIZE: f32 = 15.0;
+const TITLE_TEXT_SIZE: f32 = 20.0;
 const SIDEBAR_REVISION_ID_CHARS: usize = 12;
 const SIDEBAR_COMMIT_ID_CHARS: usize = 12;
 const CONTROL_RADIUS: f32 = 5.0;
@@ -138,6 +136,8 @@ struct Diffui {
     system_theme: theme::Mode,
     selected_file: usize,
     sidebar_width: f32,
+    config: AppConfig,
+    revision_details: Option<RevisionDetails>,
 }
 
 #[derive(Debug, Clone)]
@@ -221,7 +221,7 @@ enum DiffFileStatus {
 
 #[derive(Debug, Clone)]
 enum Message {
-    BackendLoaded(RevisionSelection, Result<BackendOutput, String>),
+    BackendLoaded(RevisionSelection, Box<Result<BackendOutput, String>>),
     RepositorySnapshotLoaded(Result<RepositorySnapshot, String>),
     SelectFile(usize),
     SelectRowKey(revision_list::RowSelectionKey),
@@ -240,6 +240,27 @@ struct BackendOutput {
     document: DiffDocument,
     commits: Vec<CommitSummary>,
     snapshot: RepositorySnapshot,
+    details: Option<RevisionDetails>,
+}
+
+/// `jj show`-style summary of a single revision, used to render the header
+/// strip above the diff view.
+#[derive(Debug, Clone, Default)]
+struct RevisionDetails {
+    commit_id: String,
+    change_id: Option<String>,
+    bookmarks: Vec<String>,
+    author: SignatureInfo,
+    committer: Option<SignatureInfo>,
+    signature: Option<String>,
+    description: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SignatureInfo {
+    name: String,
+    email: String,
+    timestamp: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -393,12 +414,13 @@ struct ThemeSpec {
 
 impl Diffui {
     fn new(cli: Cli) -> (Self, Task<Message>) {
+        let config = AppConfig::load();
         match prepare_repository(&cli.path) {
             Ok(repository) => {
                 let revision = RevisionSelection::WorkingCopy;
                 let backend_task = Task::perform(
                     load_backend(repository.clone(), revision.clone()),
-                    move |result| Message::BackendLoaded(revision, result),
+                    move |result| Message::BackendLoaded(revision, Box::new(result)),
                 );
                 let theme_task = system::theme().map(Message::SystemThemeChanged);
 
@@ -418,6 +440,8 @@ impl Diffui {
                         system_theme: theme::Mode::None,
                         selected_file: 0,
                         sidebar_width: SIDEBAR_DEFAULT_WIDTH,
+                        config,
+                        revision_details: None,
                     },
                     Task::batch([backend_task, theme_task]),
                 )
@@ -438,6 +462,8 @@ impl Diffui {
                     system_theme: theme::Mode::None,
                     selected_file: 0,
                     sidebar_width: SIDEBAR_DEFAULT_WIDTH,
+                    config,
+                    revision_details: None,
                 },
                 system::theme().map(Message::SystemThemeChanged),
             ),
@@ -446,34 +472,37 @@ impl Diffui {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::BackendLoaded(revision, Ok(output)) => {
-                if self.pending_revision.as_ref() != Some(&revision) {
-                    return Task::none();
-                }
+            Message::BackendLoaded(revision, result) => match *result {
+                Ok(output) => {
+                    if self.pending_revision.as_ref() != Some(&revision) {
+                        return Task::none();
+                    }
 
-                let revision_changed = self.expanded_revision != revision;
-                self.selected_revision = revision;
-                self.expanded_revision = self.selected_revision.clone();
-                self.pending_revision = None;
-                self.status = LoadStatus::Loaded;
-                self.document = output.document;
-                self.commits = output.commits;
-                self.repository_snapshot = Some(output.snapshot);
-                self.selected_file = if revision_changed {
-                    0
-                } else {
-                    self.selected_file
-                        .min(self.document.files.len().saturating_sub(1))
-                };
-            }
-            Message::BackendLoaded(revision, Err(error)) => {
-                if self.pending_revision.as_ref() != Some(&revision) {
-                    return Task::none();
+                    let revision_changed = self.expanded_revision != revision;
+                    self.selected_revision = revision;
+                    self.expanded_revision = self.selected_revision.clone();
+                    self.pending_revision = None;
+                    self.status = LoadStatus::Loaded;
+                    self.document = output.document;
+                    self.commits = output.commits;
+                    self.repository_snapshot = Some(output.snapshot);
+                    self.revision_details = output.details;
+                    self.selected_file = if revision_changed {
+                        0
+                    } else {
+                        self.selected_file
+                            .min(self.document.files.len().saturating_sub(1))
+                    };
                 }
+                Err(error) => {
+                    if self.pending_revision.as_ref() != Some(&revision) {
+                        return Task::none();
+                    }
 
-                self.pending_revision = None;
-                self.status = LoadStatus::Failed(error);
-            }
+                    self.pending_revision = None;
+                    self.status = LoadStatus::Failed(error);
+                }
+            },
             Message::RepositorySnapshotLoaded(Ok(snapshot)) => {
                 self.snapshot_pending = false;
                 if self.repository_snapshot.as_ref() != Some(&snapshot)
@@ -484,7 +513,7 @@ impl Diffui {
                     self.pending_revision = Some(revision.clone());
                     return Task::perform(
                         load_backend(repository, revision.clone()),
-                        move |result| Message::BackendLoaded(revision, result),
+                        move |result| Message::BackendLoaded(revision, Box::new(result)),
                     );
                 }
             }
@@ -510,7 +539,7 @@ impl Diffui {
                     self.pending_revision = Some(selection.clone());
                     let revision = selection.clone();
                     return Task::perform(load_backend(repository, selection), move |result| {
-                        Message::BackendLoaded(revision, result)
+                        Message::BackendLoaded(revision, Box::new(result))
                     });
                 }
             }
@@ -744,9 +773,10 @@ async fn load_backend(
 
 async fn run_backend(repository: Repository, revision: RevisionSelection) -> Result<BackendOutput> {
     let commits = load_commits(&repository).await?;
-    let document = match repository.vcs {
+    let (document, details) = match repository.vcs {
         Vcs::Jj => {
             let repository = repository.clone();
+            let revision = revision.clone();
             let handle = tokio::runtime::Handle::current();
             tokio::task::spawn_blocking(move || handle.block_on(load_jj_diff(repository, revision)))
                 .await
@@ -755,7 +785,9 @@ async fn run_backend(repository: Repository, revision: RevisionSelection) -> Res
         Vcs::Git => {
             let args = git_backend_command(&repository, &revision);
             let output = run_command(&repository.root, "git", args).await?;
-            parse_backend_output(&repository, &output)
+            let document = parse_backend_output(&repository, &output);
+            let details = load_git_revision_details(&repository, &revision).await.ok();
+            (document, details)
         }
     };
     let snapshot = run_repository_snapshot(repository).await?;
@@ -764,6 +796,7 @@ async fn run_backend(repository: Repository, revision: RevisionSelection) -> Res
         document,
         commits,
         snapshot,
+        details,
     })
 }
 
@@ -864,7 +897,7 @@ async fn load_commits(repository: &Repository) -> Result<Vec<CommitSummary>> {
                 vec![
                     OsString::from("log"),
                     OsString::from("--topo-order"),
-                    OsString::from("--pretty=format:%h%x09%H%x09%P%x09%ae%x09%x09%s"),
+                    OsString::from("--pretty=format:%h%x09%H%x09%P%x09%an%x09%x09%s"),
                 ],
             )
             .await?;
@@ -986,7 +1019,7 @@ async fn load_jj_commits(repository_root: PathBuf) -> Result<Vec<CommitSummary>>
             } else {
                 description.to_owned()
             },
-            author: commit.author().email.clone(),
+            author: commit.author().name.clone(),
             has_description: !description.is_empty(),
             is_empty: Some(is_empty),
             lane_frame: LaneFrame::from_lane_row(&lane_row),
@@ -997,7 +1030,10 @@ async fn load_jj_commits(repository_root: PathBuf) -> Result<Vec<CommitSummary>>
     Ok(commits)
 }
 
-async fn load_jj_diff(repository: Repository, revision: RevisionSelection) -> Result<DiffDocument> {
+async fn load_jj_diff(
+    repository: Repository,
+    revision: RevisionSelection,
+) -> Result<(DiffDocument, Option<RevisionDetails>)> {
     let settings = jj_settings(&repository.root)?;
     let workspace = Workspace::load(
         &settings,
@@ -1026,6 +1062,7 @@ async fn load_jj_diff(repository: Repository, revision: RevisionSelection) -> Re
         .get_commit_async(&commit_id)
         .await
         .with_context(|| format!("failed to load jj commit {}", commit_id.hex()))?;
+    let details = jj_revision_details(repo.as_ref(), &commit);
     let old_tree = commit
         .parent_tree(repo.as_ref())
         .await
@@ -1165,11 +1202,96 @@ async fn load_jj_diff(repository: Repository, revision: RevisionSelection) -> Re
     let total_additions = files.iter().map(|file| file.additions).sum();
     let total_deletions = files.iter().map(|file| file.deletions).sum();
 
-    Ok(DiffDocument {
-        files,
-        total_additions,
-        total_deletions,
-    })
+    Ok((
+        DiffDocument {
+            files,
+            total_additions,
+            total_deletions,
+        },
+        Some(details),
+    ))
+}
+
+fn jj_revision_details(repo: &dyn Repo, commit: &jj_lib::commit::Commit) -> RevisionDetails {
+    let commit_id = commit.id().clone();
+    let change_id = commit.change_id().to_string();
+
+    // Build a flat list mirroring `jj show`'s "Bookmarks:" line:
+    // local name first ("main"), then each remote tracking ref as
+    // `name@remote` ("main@git", "main@origin"). Skip names whose targets
+    // don't actually point at this commit.
+    let mut bookmarks: Vec<String> = Vec::new();
+    for (name, target) in repo.view().bookmarks() {
+        if target.local_target.added_ids().any(|id| id == &commit_id) {
+            bookmarks.push(name.as_str().to_owned());
+        }
+        for (remote, remote_ref) in &target.remote_refs {
+            if remote_ref.target.added_ids().any(|id| id == &commit_id) {
+                bookmarks.push(format!("{}@{}", name.as_str(), remote.as_str()));
+            }
+        }
+    }
+
+    let author = jj_signature_info(commit.author());
+    let committer = jj_signature_info(commit.committer());
+
+    RevisionDetails {
+        commit_id: commit.id().hex(),
+        change_id: Some(change_id),
+        bookmarks,
+        author,
+        committer: Some(committer),
+        signature: None,
+        description: commit.description().to_owned(),
+    }
+}
+
+fn jj_signature_info(signature: &jj_lib::backend::Signature) -> SignatureInfo {
+    SignatureInfo {
+        name: signature.name.clone(),
+        email: signature.email.clone(),
+        timestamp: Some(format_jj_timestamp(&signature.timestamp)),
+    }
+}
+
+fn format_jj_timestamp(ts: &jj_lib::backend::Timestamp) -> String {
+    // jj_lib::backend::Timestamp is a (millis_since_epoch, tz_offset_minutes)
+    // pair. We render it using the recorded offset so the timestamp matches
+    // what the author actually saw on their clock.
+    let total_minutes = ts.tz_offset;
+    let total_secs = ts.timestamp.0 / 1000 + total_minutes as i64 * 60;
+    let secs = total_secs.rem_euclid(86_400);
+    let day = total_secs.div_euclid(86_400);
+    let (year, month, mday) = civil_date_from_days(day);
+    let hour = (secs / 3600) as u32;
+    let minute = ((secs / 60) % 60) as u32;
+    let second = (secs % 60) as u32;
+    let sign = if total_minutes >= 0 { '+' } else { '-' };
+    let offset_hours = total_minutes.abs() / 60;
+    let offset_mins = total_minutes.abs() % 60;
+    format!(
+        "{year:04}-{month:02}-{mday:02} {hour:02}:{minute:02}:{second:02} {sign}{offset_hours:02}{offset_mins:02}"
+    )
+}
+
+/// Convert a count of days since the Unix epoch (1970-01-01) into a
+/// proleptic Gregorian (year, month, day) tuple. Used so we don't have to
+/// pull in `chrono`/`time` just to print timestamps in the revision header.
+fn civil_date_from_days(days: i64) -> (i32, u32, u32) {
+    // Algorithm from Howard Hinnant's "chrono-Compatible Low-Level Date
+    // Algorithms" — converts shifted-era days into year/month/day, then
+    // rotates back to a calendar starting in January.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    (year as i32, month, day)
 }
 
 // Fallback used only when the user has not configured `snapshot.max-new-file-size`.
@@ -2074,7 +2196,7 @@ fn build_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
 
 fn build_revision_list(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     let mut items: Vec<RevisionListItem> = Vec::with_capacity(ui.commits.len());
-    let metrics = sidebar_text_metrics();
+    let metrics = sidebar_text_metrics(ui.config);
 
     let (file_widgets, file_badge_width): (Option<Vec<FileRowTemplate>>, f32) =
         if matches!(ui.status, LoadStatus::Loaded) && !ui.document.files.is_empty() {
@@ -2174,20 +2296,19 @@ fn build_revision_list(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             .take(label_len.saturating_sub(unique_len))
             .collect();
         let commit_id_short = truncate_end(&commit.commit_id, SIDEBAR_COMMIT_ID_CHARS);
-        let detail = format!("{commit_id_short} · {}", commit.author);
 
         let mut indicators = Vec::new();
         if commit.is_working_copy {
             indicators.push(IndicatorChip {
                 label: "@".to_owned(),
-                background: theme.selected_file,
+                background: chip_background(theme.accent),
                 text_color: theme.accent,
             });
         }
         if commit.is_empty == Some(true) {
             indicators.push(IndicatorChip {
                 label: "empty".to_owned(),
-                background: theme.panel_background,
+                background: chip_background(theme.subtle_text),
                 text_color: theme.subtle_text,
             });
         }
@@ -2204,21 +2325,15 @@ fn build_revision_list(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             _ => false,
         };
 
-        let file_count_chip = if is_expanded && file_widgets.is_some() {
-            Some(format_count(ui.document.files.len(), "file", "files"))
-        } else {
-            None
-        };
-
         items.push(RevisionListItem::Revision(RevisionRowView {
             selection_key,
             change_id_prefix: id_prefix,
             change_id_suffix: id_suffix,
+            commit_id_short,
+            author: commit.author.clone(),
             description: commit.description.clone(),
             description_color: commit_description_color(commit, theme),
-            detail,
             indicators,
-            file_count_chip,
             frame: commit.lane_frame.clone(),
         }));
 
@@ -2256,7 +2371,7 @@ fn build_revision_list(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         items,
         selected_row,
         Some(ui.selected_file),
-        revision_list_style(theme, file_badge_width),
+        revision_list_style(theme, ui.config, file_badge_width),
         Message::SelectRowKey,
         Message::SelectFile,
     )
@@ -2277,7 +2392,11 @@ struct FileRowTemplate {
     deletions_width: f32,
 }
 
-fn revision_list_style(theme: ThemeSpec, file_badge_width: f32) -> RevisionListStyle {
+fn revision_list_style(
+    theme: ThemeSpec,
+    config: AppConfig,
+    file_badge_width: f32,
+) -> RevisionListStyle {
     RevisionListStyle {
         graph: RevisionGraphStyle {
             lane_width: SIDEBAR_GRAPH_LANE_WIDTH,
@@ -2289,8 +2408,8 @@ fn revision_list_style(theme: ThemeSpec, file_badge_width: f32) -> RevisionListS
             lane_base_color: theme.accent,
             missing_color: theme.subtle_text,
         },
-        revision_row_height: 64.0,
-        file_row_height: 39.0,
+        revision_row_height: 46.0,
+        file_row_height: 42.0,
         gutter_left_padding: SIDEBAR_GRAPH_LEFT_PADDING,
         gutter_padding: SIDEBAR_GRAPH_GUTTER_PADDING,
         content_padding: 12.0,
@@ -2300,11 +2419,11 @@ fn revision_list_style(theme: ThemeSpec, file_badge_width: f32) -> RevisionListS
         muted_text: theme.muted_text,
         subtle_text: theme.subtle_text,
         accent_text: theme.accent,
-        file_count_background: theme.panel_background,
         indicator_radius: CONTROL_RADIUS,
         small_text_size: SMALL_TEXT_SIZE,
         caption_text_size: CAPTION_TEXT_SIZE,
-        primary_font: Font::DEFAULT,
+        primary_font: config.ui_font,
+        mono_font: config.mono_font,
         file_badge_width,
         file_row_gap: SIDEBAR_FILE_ROW_GAP,
         file_row_right_pad: SIDEBAR_FILE_ROW_HORIZONTAL_PADDING / 2.0,
@@ -2316,6 +2435,13 @@ fn revision_list_style(theme: ThemeSpec, file_badge_width: f32) -> RevisionListS
         tooltip_gap: 8.0,
         scrollbar: scrollbar_style(theme),
     }
+}
+
+/// Translucent chip background derived from the chip's text color. This way
+/// the chip reads independently of whether the row is selected — its visual
+/// frame comes from the tint rather than from the row's solid background.
+fn chip_background(color: Color) -> Color {
+    Color { a: 0.20, ..color }
 }
 
 fn scroll_sidebar_to_file(_file_index: usize, _ui: &Diffui) -> Task<Message> {
@@ -2478,8 +2604,8 @@ impl TextMetrics {
     }
 }
 
-fn sidebar_text_metrics() -> TextMetrics {
-    TextMetrics::iced(Font::DEFAULT, CAPTION_TEXT_SIZE)
+fn sidebar_text_metrics(config: AppConfig) -> TextMetrics {
+    TextMetrics::iced(config.ui_font, CAPTION_TEXT_SIZE)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2745,54 +2871,61 @@ fn sidebar_file_badge_width(files: &[DiffFile], metrics: &TextMetrics) -> f32 {
 }
 
 fn build_diff_panel(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
-    if matches!(ui.status, LoadStatus::Loading) && ui.document.files.is_empty() {
-        return container(text(""))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill)
-            .style(move |_| diff_panel_style(theme))
-            .into();
-    }
+    let body: Element<'_, Message> =
+        if matches!(ui.status, LoadStatus::Loading) && ui.document.files.is_empty() {
+            container(text(""))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .into()
+        } else if ui.document.files.is_empty() && ui.revision_details.is_none() {
+            let message = match &ui.status {
+                LoadStatus::Failed(_) => "Failed to load changes",
+                _ => "No file changes in this revision",
+            };
+            container(text(message).size(15).color(theme.subtle_text))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .into()
+        } else {
+            let files = ui
+                .document
+                .files
+                .iter()
+                .map(|file| DiffFileView {
+                    title: match &file.old_path {
+                        Some(old_path) if old_path != &file.path => {
+                            format!("{old_path} -> {}", file.path)
+                        }
+                        _ => file.path.clone(),
+                    },
+                    status: file.status.label(),
+                    hunks: &file.hunks,
+                    additions: file.additions,
+                    deletions: file.deletions,
+                })
+                .collect::<Vec<_>>();
 
-    if ui.document.files.is_empty() {
-        let message = match &ui.status {
-            LoadStatus::Failed(_) => "Failed to load changes",
-            _ => "No file changes in this revision",
+            let header_lines = ui
+                .revision_details
+                .as_ref()
+                .map(build_header_lines)
+                .unwrap_or_default();
+
+            render_diff(
+                files,
+                ui.selected_file,
+                ui.selected_revision.view_key(),
+                header_lines,
+                theme,
+                ui.config,
+            )
         };
-        return container(text(message).size(15).color(theme.subtle_text))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill)
-            .style(move |_| diff_panel_style(theme))
-            .into();
-    }
 
-    let files = ui
-        .document
-        .files
-        .iter()
-        .map(|file| DiffFileView {
-            title: match &file.old_path {
-                Some(old_path) if old_path != &file.path => format!("{old_path} -> {}", file.path),
-                _ => file.path.clone(),
-            },
-            status: file.status.label(),
-            hunks: &file.hunks,
-            additions: file.additions,
-            deletions: file.deletions,
-        })
-        .collect::<Vec<_>>();
-
-    let content = render_diff(
-        files,
-        ui.selected_file,
-        ui.selected_revision.view_key(),
-        theme,
-    );
-
-    container(content)
+    container(body)
         .width(Length::Fill)
         .height(Length::Fill)
         .padding(0)
@@ -2805,19 +2938,85 @@ fn render_diff<'a>(
     files: Vec<DiffFileView<'a>>,
     selected_file: usize,
     revision_key: String,
+    header_lines: Vec<diff_view::HeaderLine>,
     theme: ThemeSpec,
+    config: AppConfig,
 ) -> Element<'a, Message> {
     DiffView::new(
         files,
         selected_file,
         revision_key,
         diff_palette(theme),
-        CODE_FONT,
+        config.mono_font,
         CODE_TEXT_SIZE,
+        config.multi_click_ms,
         Message::SelectFile,
     )
+    .with_header(header_lines)
     .on_copy(Message::CopyToClipboard)
     .into()
+}
+
+/// Format a `RevisionDetails` value into the line-by-line layout the diff
+/// view renders at the top of its scroll area. Mirrors `jj show`'s
+/// formatting: labels padded to 9 chars, blank line between the metadata
+/// block and the indented description.
+fn build_header_lines(details: &RevisionDetails) -> Vec<diff_view::HeaderLine> {
+    use diff_view::HeaderLine;
+    let mut lines: Vec<HeaderLine> = Vec::new();
+
+    lines.push(HeaderLine::field("Commit ID", &details.commit_id));
+    if let Some(change_id) = &details.change_id {
+        lines.push(HeaderLine::field("Change ID", change_id));
+    }
+    if !details.bookmarks.is_empty() {
+        lines.push(HeaderLine::field("Bookmarks", &details.bookmarks.join(" ")));
+    }
+    lines.push(HeaderLine::field(
+        "Author",
+        &format_signature_line(&details.author),
+    ));
+    if let Some(committer) = &details.committer {
+        lines.push(HeaderLine::field(
+            "Committer",
+            &format_signature_line(committer),
+        ));
+    }
+    if let Some(sig) = &details.signature {
+        lines.push(HeaderLine::field("Signature", sig));
+    }
+
+    if !details.description.is_empty() {
+        lines.push(HeaderLine::blank());
+        for line in details.description.lines() {
+            lines.push(HeaderLine::description(line));
+        }
+    }
+
+    lines
+}
+
+fn format_signature_line(sig: &SignatureInfo) -> String {
+    let mut parts = String::new();
+    if !sig.name.is_empty() {
+        parts.push_str(&sig.name);
+    }
+    if !sig.email.is_empty() {
+        if !parts.is_empty() {
+            parts.push(' ');
+        }
+        parts.push('<');
+        parts.push_str(&sig.email);
+        parts.push('>');
+    }
+    if let Some(ts) = &sig.timestamp
+        && !ts.is_empty()
+    {
+        parts.push_str(" (");
+        parts.push_str(ts);
+        parts.push(')');
+    }
+    parts
 }
 
 fn format_count(count: usize, singular: &str, plural: &str) -> String {
@@ -2941,6 +3140,67 @@ fn scope_label(repository: &Repository) -> Option<String> {
     } else {
         Some(repository.scope.display().to_string())
     }
+}
+
+async fn load_git_revision_details(
+    repository: &Repository,
+    revision: &RevisionSelection,
+) -> Result<RevisionDetails> {
+    // %x1f is a unit-separator byte chosen to be unlikely in commit metadata,
+    // so we can split the fields cleanly even when names or descriptions
+    // contain tabs/newlines.
+    const SEP: &str = "\x1f";
+    let target = match revision {
+        RevisionSelection::WorkingCopy => "HEAD".to_owned(),
+        RevisionSelection::Commit(id) => id.clone(),
+    };
+    let format = format!("%H{SEP}%an{SEP}%ae{SEP}%aI{SEP}%cn{SEP}%ce{SEP}%cI{SEP}%D{SEP}%B");
+    let output = run_command(
+        &repository.root,
+        "git",
+        vec![
+            OsString::from("show"),
+            OsString::from("--no-patch"),
+            OsString::from(format!("--format={format}")),
+            OsString::from(target),
+        ],
+    )
+    .await?;
+
+    let mut parts = output.splitn(9, '\x1f');
+    let commit_id = parts.next().unwrap_or("").trim().to_owned();
+    let author_name = parts.next().unwrap_or("").to_owned();
+    let author_email = parts.next().unwrap_or("").to_owned();
+    let author_date = parts.next().unwrap_or("").to_owned();
+    let committer_name = parts.next().unwrap_or("").to_owned();
+    let committer_email = parts.next().unwrap_or("").to_owned();
+    let committer_date = parts.next().unwrap_or("").to_owned();
+    let refs = parts.next().unwrap_or("").to_owned();
+    let description = parts.next().unwrap_or("").trim_end().to_owned();
+
+    let bookmarks: Vec<String> = refs
+        .split(',')
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    Ok(RevisionDetails {
+        commit_id,
+        change_id: None,
+        bookmarks,
+        author: SignatureInfo {
+            name: author_name,
+            email: author_email,
+            timestamp: Some(author_date).filter(|s| !s.is_empty()),
+        },
+        committer: Some(SignatureInfo {
+            name: committer_name,
+            email: committer_email,
+            timestamp: Some(committer_date).filter(|s| !s.is_empty()),
+        }),
+        signature: None,
+        description,
+    })
 }
 
 #[cfg(test)]
