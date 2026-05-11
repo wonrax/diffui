@@ -9,6 +9,8 @@ use iced::{
     Vector, alignment, keyboard,
 };
 
+use crate::scrollbar::{self, ScrollbarState, ScrollbarStyle};
+
 const ROW_HEIGHT: f32 = 24.0;
 const FILE_HEADER_HEIGHT: f32 = 38.0;
 const HUNK_HEADER_HEIGHT: f32 = 26.0;
@@ -94,6 +96,7 @@ pub struct Palette {
     pub border: Color,
     /// Background tint drawn under selected text.
     pub selection: Color,
+    pub scrollbar: ScrollbarStyle,
 }
 
 pub struct DiffView<'a, Message> {
@@ -121,6 +124,7 @@ struct State<Paragraph> {
     selection_focus: Option<TextPosition>,
     /// True while the user is mid-drag.
     is_selecting: bool,
+    scrollbar: ScrollbarState,
 }
 
 /// Stable cursor position inside the diff document. We index by
@@ -503,6 +507,7 @@ where
             selection_anchor: None,
             selection_focus: None,
             is_selecting: false,
+            scrollbar: ScrollbarState::default(),
         })
     }
 
@@ -575,6 +580,8 @@ where
             shell.request_redraw();
         }
 
+        let content_height = self.content_height(bounds.width);
+
         match event {
             Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
                 let Some(_cursor_position) = cursor.position_over(bounds) else {
@@ -591,7 +598,6 @@ where
                 };
 
                 if movement.y != 0.0 {
-                    let max_vertical = (self.content_height(bounds.width) - bounds.height).max(0.0);
                     state.vertical_offset =
                         (state.vertical_offset + movement.y).clamp(0.0, max_vertical);
                     let selected_file = self.file_at_offset(state.vertical_offset, bounds.width);
@@ -615,6 +621,32 @@ where
                     }
                     return;
                 };
+                match scrollbar::on_button_pressed(
+                    &mut state.scrollbar,
+                    point,
+                    bounds,
+                    content_height,
+                    state.vertical_offset,
+                    &self.palette.scrollbar,
+                ) {
+                    scrollbar::ScrollbarEvent::OffsetChanged(new_offset) => {
+                        state.vertical_offset = new_offset.clamp(0.0, max_vertical);
+                        let selected_file =
+                            self.file_at_offset(state.vertical_offset, bounds.width);
+                        if selected_file != state.selected_file {
+                            state.selected_file = selected_file;
+                            shell.publish((self.on_selected_file_changed)(selected_file));
+                        }
+                        shell.capture_event();
+                        shell.request_redraw();
+                        return;
+                    }
+                    scrollbar::ScrollbarEvent::Captured => {
+                        shell.capture_event();
+                        return;
+                    }
+                    scrollbar::ScrollbarEvent::None => {}
+                }
                 if let Some(position) = self.position_at_point(point, bounds, state.vertical_offset)
                 {
                     state.selection_anchor = Some(position);
@@ -624,20 +656,49 @@ where
                     shell.request_redraw();
                 }
             }
-            Event::Mouse(mouse::Event::CursorMoved { .. }) if state.is_selecting => {
-                let Some(point) = cursor.position() else {
+            Event::Mouse(mouse::Event::CursorMoved { position }) => {
+                if scrollbar::is_dragging(&state.scrollbar) {
+                    if let scrollbar::ScrollbarEvent::OffsetChanged(new_offset) =
+                        scrollbar::on_cursor_moved(
+                            &mut state.scrollbar,
+                            *position,
+                            bounds,
+                            content_height,
+                            &self.palette.scrollbar,
+                        )
+                    {
+                        state.vertical_offset = new_offset.clamp(0.0, max_vertical);
+                        let selected_file =
+                            self.file_at_offset(state.vertical_offset, bounds.width);
+                        if selected_file != state.selected_file {
+                            state.selected_file = selected_file;
+                            shell.publish((self.on_selected_file_changed)(selected_file));
+                        }
+                        shell.capture_event();
+                        shell.request_redraw();
+                    }
                     return;
-                };
-                if let Some(position) = self.position_at_point(point, bounds, state.vertical_offset)
+                }
+                if !state.is_selecting {
+                    return;
+                }
+                if let Some(position) = self.position_at_point(*position, bounds, state.vertical_offset)
                     && state.selection_focus != Some(position)
                 {
                     state.selection_focus = Some(position);
                     shell.request_redraw();
                 }
             }
-            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
-                if state.is_selecting =>
-            {
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                if let scrollbar::ScrollbarEvent::Captured =
+                    scrollbar::on_button_released(&mut state.scrollbar)
+                {
+                    shell.capture_event();
+                    return;
+                }
+                if !state.is_selecting {
+                    return;
+                }
                 state.is_selecting = false;
                 // If the user clicked without dragging, anchor == focus —
                 // clear so we don't leave a phantom zero-width selection.
@@ -1002,12 +1063,20 @@ where
                     &state.paragraphs,
                 );
             }
+
+            let geom = scrollbar::geometry(
+                bounds,
+                self.content_height(bounds.width),
+                state.vertical_offset,
+                &self.palette.scrollbar,
+            );
+            scrollbar::draw(renderer, &geom, &self.palette.scrollbar);
         });
     }
 
     fn mouse_interaction(
         &self,
-        _tree: &Tree,
+        tree: &Tree,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
         _viewport: &Rectangle,
@@ -1016,10 +1085,22 @@ where
         // Match the convention of every code editor: text cursor over the
         // text area, default arrow over the gutter / chrome. (Avoid
         // `AllScroll` — implies drag-to-pan, which we don't support.)
-        let Some(point) = cursor.position_over(layout.bounds()) else {
+        let bounds = layout.bounds();
+        let Some(point) = cursor.position_over(bounds) else {
             return mouse::Interaction::None;
         };
-        if point.x >= layout.bounds().x + self.gutter_width + PREFIX_WIDTH {
+        let state = tree.state.downcast_ref::<State<Renderer::Paragraph>>();
+        if scrollbar::is_dragging(&state.scrollbar)
+            || scrollbar::hits_container(
+                bounds,
+                point,
+                self.content_height(bounds.width),
+                &self.palette.scrollbar,
+            )
+        {
+            return mouse::Interaction::Idle;
+        }
+        if point.x >= bounds.x + self.gutter_width + PREFIX_WIDTH {
             mouse::Interaction::Text
         } else {
             mouse::Interaction::Idle

@@ -28,6 +28,7 @@ use crate::graph::LaneFrame;
 use crate::graph_view::{
     RevisionGraphStyle, draw_continuation_row, draw_revision_row, lane_strip_width,
 };
+use crate::scrollbar::{self, ScrollbarState, ScrollbarStyle};
 
 const LINE_SCROLL_ROWS: f32 = 1.5;
 const PIXEL_SCROLL_SCALE: f32 = 0.65;
@@ -60,6 +61,7 @@ pub struct RevisionListStyle {
     pub tooltip_radius: f32,
     pub tooltip_padding: f32,
     pub tooltip_gap: f32,
+    pub scrollbar: ScrollbarStyle,
 }
 
 #[derive(Debug, Clone)]
@@ -202,6 +204,7 @@ struct State<Paragraph> {
     /// coordinates. Used to anchor the tooltip.
     cursor_position: Option<Point>,
     paragraphs: RefCell<Vec<Paragraph>>,
+    scrollbar: ScrollbarState,
 }
 
 impl<Paragraph> State<Paragraph> {
@@ -211,6 +214,7 @@ impl<Paragraph> State<Paragraph> {
             hovered_file_item: None,
             cursor_position: None,
             paragraphs: RefCell::new(Vec::new()),
+            scrollbar: ScrollbarState::default(),
         }
     }
 }
@@ -276,8 +280,30 @@ where
                 .filter(|&idx| matches!(this.items.get(idx), Some(Item::File(_))));
         };
 
+        let content_height = self.content_height();
+
         match event {
             Event::Mouse(mouse::Event::CursorMoved { position }) => {
+                if scrollbar::is_dragging(&state.scrollbar) {
+                    if let scrollbar::ScrollbarEvent::OffsetChanged(new_offset) =
+                        scrollbar::on_cursor_moved(
+                            &mut state.scrollbar,
+                            *position,
+                            bounds,
+                            content_height,
+                            &self.style.scrollbar,
+                        )
+                    {
+                        state.vertical_offset = new_offset.clamp(0.0, max_vertical);
+                        shell.capture_event();
+                        shell.request_redraw();
+                    }
+                    state.cursor_position = None;
+                    if state.hovered_file_item.take().is_some() {
+                        shell.request_redraw();
+                    }
+                    return;
+                }
                 if bounds.contains(*position) {
                     state.cursor_position = Some(*position);
                 } else {
@@ -321,6 +347,26 @@ where
                 let Some(cursor_pos) = cursor.position_over(bounds) else {
                     return;
                 };
+                match scrollbar::on_button_pressed(
+                    &mut state.scrollbar,
+                    cursor_pos,
+                    bounds,
+                    content_height,
+                    state.vertical_offset,
+                    &self.style.scrollbar,
+                ) {
+                    scrollbar::ScrollbarEvent::OffsetChanged(new_offset) => {
+                        state.vertical_offset = new_offset.clamp(0.0, max_vertical);
+                        shell.capture_event();
+                        shell.request_redraw();
+                        return;
+                    }
+                    scrollbar::ScrollbarEvent::Captured => {
+                        shell.capture_event();
+                        return;
+                    }
+                    scrollbar::ScrollbarEvent::None => {}
+                }
                 let local_y = cursor_pos.y - bounds.y + state.vertical_offset;
                 if let Some(row_idx) = self.row_at_offset(local_y) {
                     match &self.items[row_idx] {
@@ -333,6 +379,13 @@ where
                             shell.capture_event();
                         }
                     }
+                }
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                if let scrollbar::ScrollbarEvent::Captured =
+                    scrollbar::on_button_released(&mut state.scrollbar)
+                {
+                    shell.capture_event();
                 }
             }
             _ => {}
@@ -378,17 +431,23 @@ where
 
     fn mouse_interaction(
         &self,
-        _tree: &Tree,
+        tree: &Tree,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
         _viewport: &Rectangle,
         _renderer: &Renderer,
     ) -> mouse::Interaction {
-        if cursor.position_over(layout.bounds()).is_some() {
-            mouse::Interaction::Pointer
-        } else {
-            mouse::Interaction::None
+        let state = tree.state.downcast_ref::<State<Renderer::Paragraph>>();
+        let bounds = layout.bounds();
+        let Some(point) = cursor.position_over(bounds) else {
+            return mouse::Interaction::None;
+        };
+        if scrollbar::is_dragging(&state.scrollbar)
+            || scrollbar::hits_container(bounds, point, self.content_height(), &self.style.scrollbar)
+        {
+            return mouse::Interaction::Idle;
         }
+        mouse::Interaction::Pointer
     }
 
     fn draw(
@@ -447,6 +506,14 @@ where
                     }
                 }
             }
+
+            let geom = scrollbar::geometry(
+                bounds,
+                self.content_height(),
+                state.vertical_offset,
+                &self.style.scrollbar,
+            );
+            scrollbar::draw(renderer, &geom, &self.style.scrollbar);
         });
     }
 }

@@ -13,6 +13,7 @@ mod graph;
 mod graph_view;
 mod resize_handle;
 mod revision_list;
+mod scrollbar;
 
 use anyhow::{Context, Result, bail};
 use arborium::{
@@ -76,7 +77,7 @@ const CONTROL_RADIUS: f32 = 5.0;
 const SIDEBAR_DEFAULT_WIDTH: f32 = 360.0;
 const SIDEBAR_MIN_WIDTH: f32 = 220.0;
 const SIDEBAR_MAX_WIDTH: f32 = 800.0;
-const SIDEBAR_RESIZE_HIT_PADDING: f32 = 4.0;
+const SIDEBAR_RESIZE_HIT_PADDING: f32 = 2.0;
 // Floor for the badge column. We measure the actual status labels to size the
 // column, but a single-character label like "M" can render thinner than the
 // chip looks tasteful at, so we keep a small visual minimum.
@@ -90,6 +91,8 @@ const SIDEBAR_FILE_ROW_HORIZONTAL_PADDING: f32 = 20.0;
 const SIDEBAR_GRAPH_LANE_WIDTH: f32 = 10.0;
 const SIDEBAR_GRAPH_GUTTER_PADDING: f32 = 8.0;
 const SIDEBAR_GRAPH_LEFT_PADDING: f32 = 8.0;
+const SCROLLBAR_WIDTH: f32 = 12.0;
+const SCROLLBAR_PADDING: f32 = 2.0;
 const REPOSITORY_REFRESH_INTERVAL: Duration = Duration::from_millis(1_000);
 
 fn main() -> iced::Result {
@@ -2099,6 +2102,7 @@ fn revision_list_style(theme: ThemeSpec, file_badge_width: f32) -> RevisionListS
         tooltip_radius: CONTROL_RADIUS,
         tooltip_padding: 6.0,
         tooltip_gap: 8.0,
+        scrollbar: scrollbar_style(theme),
     }
 }
 
@@ -2634,6 +2638,24 @@ fn diff_palette(theme: ThemeSpec) -> Palette {
         selection: Color {
             a: 0.30,
             ..theme.accent
+        },
+        scrollbar: scrollbar_style(theme),
+    }
+}
+
+fn scrollbar_style(theme: ThemeSpec) -> scrollbar::ScrollbarStyle {
+    scrollbar::ScrollbarStyle {
+        width: SCROLLBAR_WIDTH,
+        padding: SCROLLBAR_PADDING,
+        // Soft pill behind the thumb, lighter than the thumb so the two
+        // read as distinct without looking heavy on light themes.
+        track_color: Color {
+            a: 0.18,
+            ..theme.muted_text
+        },
+        thumb_color: Color {
+            a: 0.55,
+            ..theme.muted_text
         },
     }
 }
