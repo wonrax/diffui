@@ -12,16 +12,6 @@ pub struct Repository {
     pub scope: PathBuf,
 }
 
-impl Repository {
-    pub fn scope_label(&self) -> Option<String> {
-        if self.scope.as_os_str().is_empty() {
-            None
-        } else {
-            Some(self.scope.display().to_string())
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositorySnapshot {
     pub fingerprint: String,
@@ -31,15 +21,6 @@ pub struct RepositorySnapshot {
 pub enum Vcs {
     Jj,
     Git,
-}
-
-impl Vcs {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Jj => "Jujutsu",
-            Self::Git => "Git",
-        }
-    }
 }
 
 pub fn prepare_repository(input: &Path) -> Result<Repository> {

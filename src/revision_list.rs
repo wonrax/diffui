@@ -14,7 +14,9 @@
 use std::cell::RefCell;
 
 use iced::advanced::{
-    Layout, Shell, Widget, layout, mouse, overlay, renderer,
+    Layout, Shell, Widget,
+    graphics::geometry::{self, Frame, LineCap, LineJoin, Path, Stroke},
+    layout, mouse, overlay, renderer,
     text::{self, Paragraph, Text},
     widget::{Tree, tree},
 };
@@ -26,9 +28,10 @@ use jj_lib::graph::GraphEdgeType;
 
 use crate::graph::LaneFrame;
 use crate::graph_view::{
-    RevisionGraphStyle, draw_continuation_row, draw_revision_row, lane_strip_width,
+    LANE_WIDTH, RevisionGraphStyle, draw_continuation_row, draw_revision_row, lane_strip_width,
 };
 use crate::scrollbar::{self, ScrollbarState, ScrollbarStyle};
+use crate::theme::chip_background;
 
 const LINE_SCROLL_ROWS: f32 = 1.5;
 const PIXEL_SCROLL_SCALE: f32 = 0.65;
@@ -39,8 +42,8 @@ pub const GUTTER_LEFT_PADDING: f32 = 8.0;
 pub const GUTTER_PADDING: f32 = 8.0;
 const CONTENT_PADDING: f32 = 12.0;
 const INDICATOR_RADIUS: f32 = 5.0;
-const SMALL_TEXT_SIZE: f32 = 15.0;
-const CAPTION_TEXT_SIZE: f32 = 14.0;
+const SMALL_TEXT_SIZE: f32 = 14.0;
+const CAPTION_TEXT_SIZE: f32 = 13.0;
 pub const FILE_ROW_GAP: f32 = 6.0;
 pub const FILE_ROW_RIGHT_PAD: f32 = 10.0;
 const TOOLTIP_RADIUS: f32 = 5.0;
@@ -52,6 +55,13 @@ pub struct RevisionListStyle {
     pub graph: RevisionGraphStyle,
     pub background: Color,
     pub selected_background: Color,
+    /// Saturated accent — fills the working-copy row when it's the
+    /// loud "you are here" state, and tints it when selected. Also
+    /// recolors the working-copy node disc in the graph.
+    pub accent: Color,
+    /// Contrast color used for text/marks rendered on top of `accent`
+    /// (the loud working-copy row). See [`ThemeSpec::on_accent`].
+    pub on_accent: Color,
     pub border: Color,
     pub muted_text: Color,
     pub subtle_text: Color,
@@ -70,6 +80,12 @@ pub struct IndicatorChip {
     pub label: String,
     pub background: Color,
     pub text_color: Color,
+    /// Optional 1px chip border. When `border_dashed` is `true`, the
+    /// stroke is dashed (used by the `empty` chip in the design
+    /// system). When `false`, it's a solid 1px line (used by remote
+    /// bookmark chips — outlined, lane-colored).
+    pub border_color: Option<Color>,
+    pub border_dashed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -81,8 +97,28 @@ pub struct RevisionRowView {
     pub author: String,
     pub description: String,
     pub description_color: Color,
-    pub indicators: Vec<IndicatorChip>,
+    /// Bookmark chips, in display order. May be partially hidden behind
+    /// a synthetic `+N` overflow chip when there's not enough horizontal
+    /// room — see the layout logic in `draw_revision`. The lane color
+    /// these chips wear is also the color of the overflow chip.
+    pub bookmark_chips: Vec<IndicatorChip>,
+    /// Status chips (e.g. `empty`, `conflict`). Always shown — they're
+    /// load-bearing semantics and shouldn't compress.
+    pub status_chips: Vec<IndicatorChip>,
+    /// Color for the `+N` overflow chip (= the row's lane color).
+    pub lane_color: Color,
     pub frame: LaneFrame,
+    /// Bookmarks naming each lane visible at this row. Indexed by lane.
+    /// An empty inner vec means the lane segment is anonymous (no
+    /// bookmark up to this point in the walk). Used for the
+    /// graph-stroke hover tooltip.
+    pub lane_labels: Vec<Vec<String>>,
+    /// Per-lane segment id at this row. Two rows share an id on the
+    /// same lane iff they belong to the same continuous lane segment
+    /// (no termination in between). `None` means the lane is dead at
+    /// this row. Used to extend stroke emphasis from a single hovered
+    /// row out to the whole lane segment.
+    pub lane_segments: Vec<Option<usize>>,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +139,15 @@ pub struct FileRowView {
     pub primary_color: Color,
     pub secondary_color: Color,
     pub file_index: usize,
+    /// Lane → bookmark labels for the continuation strokes at this file
+    /// row. Equals the post-trim snapshot of the parent revision's
+    /// label state, so a lane that terminates at the parent isn't
+    /// labeled here.
+    pub lane_labels: Vec<Vec<String>>,
+    /// Per-lane segment id, matching the parent revision row for any
+    /// lane that survives into the continuation. See
+    /// [`RevisionRowView::lane_segments`].
+    pub lane_segments: Vec<Option<usize>>,
 }
 
 /// Key the widget reports back so the parent can map it to its own
@@ -199,6 +244,10 @@ struct State<Paragraph> {
     /// Item index of the file row currently hovered (only set for files,
     /// not revisions). Drives the tooltip overlay.
     hovered_file_item: Option<usize>,
+    /// Item index + lane index when the cursor is over a graph stroke
+    /// whose lane has bookmark labels at that row. Drives the
+    /// branch-name tooltip on the graph gutter.
+    hovered_lane: Option<(usize, usize)>,
     /// Last cursor position observed inside the widget bounds, in screen
     /// coordinates. Used to anchor the tooltip.
     cursor_position: Option<Point>,
@@ -211,6 +260,7 @@ impl<Paragraph> State<Paragraph> {
         Self {
             vertical_offset: 0.0,
             hovered_file_item: None,
+            hovered_lane: None,
             cursor_position: None,
             paragraphs: RefCell::new(Vec::new()),
             scrollbar: ScrollbarState::default(),
@@ -265,18 +315,37 @@ where
         }
 
         let recompute_hover = |state: &mut State<Renderer::Paragraph>, this: &Self| {
+            state.hovered_file_item = None;
+            state.hovered_lane = None;
             let Some(pos) = state.cursor_position else {
-                state.hovered_file_item = None;
                 return;
             };
             if !bounds.contains(pos) {
-                state.hovered_file_item = None;
                 return;
             }
+            let local_x = pos.x - bounds.x;
             let local_y = pos.y - bounds.y + state.vertical_offset;
-            state.hovered_file_item = this
-                .row_at_offset(local_y)
-                .filter(|&idx| matches!(this.items.get(idx), Some(Item::File(_))));
+            let Some(row_idx) = this.row_at_offset(local_y) else {
+                return;
+            };
+            let Some(item) = this.items.get(row_idx) else {
+                return;
+            };
+            let gutter_total = this.item_gutter_width(item);
+            // Lane hit-test first: a cursor in the lane strip with a
+            // labeled lane wins over the content-area file tooltip.
+            if local_x >= GUTTER_LEFT_PADDING && local_x < gutter_total - GUTTER_PADDING {
+                let strip_x = local_x - GUTTER_LEFT_PADDING;
+                let lane = (strip_x / LANE_WIDTH).floor() as usize;
+                let labels = item_lane_labels(item, lane);
+                if !labels.is_empty() {
+                    state.hovered_lane = Some((row_idx, lane));
+                    return;
+                }
+            }
+            if matches!(item, Item::File(_)) {
+                state.hovered_file_item = Some(row_idx);
+            }
         };
 
         let content_height = self.content_height();
@@ -297,7 +366,9 @@ where
                         shell.request_redraw();
                     }
                     state.cursor_position = None;
-                    if state.hovered_file_item.take().is_some() {
+                    let had_hover =
+                        state.hovered_file_item.take().is_some() || state.hovered_lane.take().is_some();
+                    if had_hover {
                         shell.request_redraw();
                     }
                     return;
@@ -307,15 +378,18 @@ where
                 } else {
                     state.cursor_position = None;
                 }
-                let prev = state.hovered_file_item;
+                let prev_file = state.hovered_file_item;
+                let prev_lane = state.hovered_lane;
                 recompute_hover(state, self);
-                if state.hovered_file_item != prev {
+                if state.hovered_file_item != prev_file || state.hovered_lane != prev_lane {
                     shell.request_redraw();
                 }
             }
             Event::Mouse(mouse::Event::CursorLeft) => {
                 state.cursor_position = None;
-                if state.hovered_file_item.take().is_some() {
+                let had_hover =
+                    state.hovered_file_item.take().is_some() || state.hovered_lane.take().is_some();
+                if had_hover {
                     shell.request_redraw();
                 }
             }
@@ -398,21 +472,49 @@ where
         translation: Vector,
     ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
         let state = tree.state.downcast_ref::<State<Renderer::Paragraph>>();
-        let item_idx = state.hovered_file_item?;
         let cursor_pos = state.cursor_position?;
+        let bounds = layout.bounds();
+
+        // Lane tooltip wins over the file path tooltip when both could
+        // fire at the same time — the cursor is in the gutter, which
+        // is mutually exclusive with the content area anyway.
+        if let Some((item_idx, lane)) = state.hovered_lane {
+            let item = self.items.get(item_idx)?;
+            let labels = item_lane_labels(item, lane);
+            if labels.is_empty() {
+                return None;
+            }
+            let text = labels.join(", ");
+            let row_top = self.row_top(item_idx) - state.vertical_offset;
+            let row_screen_y = bounds.y + row_top;
+            let row_height = self.row_height(item);
+            let gutter_total = self.item_gutter_width(item);
+            let measure_para =
+                make_paragraph::<Renderer>(&text, CAPTION_TEXT_SIZE, self.style.primary_font);
+            let text_size = measure_para.min_bounds();
+            return Some(overlay::Element::new(Box::new(TooltipOverlay {
+                text,
+                cursor: cursor_pos + translation,
+                // Anchor just past the gutter so the tip sits next to
+                // the stroke rather than at the far right edge.
+                row_anchor_x: bounds.x + gutter_total + translation.x,
+                row_anchor_y: row_screen_y + translation.y,
+                row_height,
+                style: self.style,
+                text_size,
+            })));
+        }
+
+        let item_idx = state.hovered_file_item?;
         let Some(Item::File(file)) = self.items.get(item_idx) else {
             return None;
         };
-        let bounds = layout.bounds();
         let row_top = self.row_top(item_idx) - state.vertical_offset;
         let row_screen_y = bounds.y + row_top;
         let row_height = FILE_ROW_HEIGHT;
 
-        let measure_para = make_paragraph::<Renderer>(
-            &file.raw_path,
-            CAPTION_TEXT_SIZE,
-            self.style.primary_font,
-        );
+        let measure_para =
+            make_paragraph::<Renderer>(&file.raw_path, CAPTION_TEXT_SIZE, self.style.primary_font);
         let text_size = measure_para.min_bounds();
 
         Some(overlay::Element::new(Box::new(TooltipOverlay {
@@ -470,8 +572,18 @@ where
         renderer.with_layer(bounds, |renderer| {
             fill_background(renderer, bounds, self.style.background);
 
+            // Resolve the hovered (row, lane) → (segment id, lane) once
+            // so each drawn row can do a single segment lookup instead of
+            // re-resolving the hover row's segment.
+            let emphasized_segment = state.hovered_lane.and_then(|(hov_idx, hov_lane)| {
+                self.items
+                    .get(hov_idx)
+                    .and_then(|item| item_lane_segment(item, hov_lane))
+                    .map(|seg| (seg, hov_lane))
+            });
+
             let mut y_cursor = 0.0;
-            for item in &self.items {
+            for item in self.items.iter() {
                 let row_h = self.row_height(item);
                 let row_top_local = y_cursor;
                 let row_bot_local = y_cursor + row_h;
@@ -487,6 +599,10 @@ where
                     height: row_h,
                 };
                 let gutter_total = self.item_gutter_width(item);
+                let emphasized_lane = emphasized_segment.and_then(|(seg, lane)| {
+                    let this_seg = item_lane_segment(item, lane)?;
+                    (this_seg == seg).then_some(lane)
+                });
 
                 match item {
                     Item::Revision(rev) => {
@@ -496,10 +612,18 @@ where
                             rev,
                             &state.paragraphs,
                             gutter_total,
+                            emphasized_lane,
                         );
                     }
                     Item::File(f) => {
-                        self.draw_file(renderer, row_bounds, f, &state.paragraphs, gutter_total);
+                        self.draw_file(
+                            renderer,
+                            row_bounds,
+                            f,
+                            &state.paragraphs,
+                            gutter_total,
+                            emphasized_lane,
+                        );
                     }
                 }
             }
@@ -518,6 +642,7 @@ impl<Message> RevisionList<Message> {
         rev: &RevisionRowView,
         paragraphs: &RefCell<Vec<R::Paragraph>>,
         gutter_total: f32,
+        emphasized_lane: Option<usize>,
     ) where
         R: text::Renderer<Font = Font> + iced::advanced::graphics::geometry::Renderer,
     {
@@ -526,11 +651,28 @@ impl<Message> RevisionList<Message> {
             .as_ref()
             .map(|key| key == &rev.selection_key)
             .unwrap_or(false);
+        let is_working_copy = matches!(rev.selection_key, RowSelectionKey::WorkingCopy);
+        // Working-copy uses an inverted hierarchy:
+        //   - unselected: solid accent fill, contrast text — loudly marks
+        //     "you are here" without competing with selection.
+        //   - selected:   soft accent tint, normal text — recedes so the
+        //     content reads like any other selected row.
+        let wc_loud = is_working_copy && !selected;
 
-        // Row chrome (selection highlight + bottom border) extends edge-to-edge.
-        // The graph is drawn last in this method so its lines & node still sit
-        // visually above any chrome painted underneath.
-        if selected {
+        // Row chrome extends edge-to-edge. The graph is drawn last in this
+        // method so its lines & node still sit visually above any chrome.
+        if wc_loud {
+            fill_background(renderer, row_bounds, self.style.accent);
+        } else if is_working_copy && selected {
+            fill_background(
+                renderer,
+                row_bounds,
+                Color {
+                    a: 0.20,
+                    ..self.style.accent
+                },
+            );
+        } else if selected {
             fill_background(renderer, row_bounds, self.style.selected_background);
         }
         fill_background(
@@ -579,91 +721,254 @@ impl<Message> RevisionList<Message> {
             paragraphs,
         );
 
-        // Reserve the right edge for indicator chips so they don't collide
-        // with author text on narrow sidebars.
+        // === Measurements ===
+        let id_gap = 8.0;
         let chip_gap = 6.0;
-        let mut chip_widths: Vec<f32> = Vec::with_capacity(rev.indicators.len());
-        let mut chips_total = 0.0;
-        for (idx, chip) in rev.indicators.iter().enumerate() {
-            let w = self.measure_chip_width::<R>(&chip.label, paragraphs);
-            chip_widths.push(w);
-            chips_total += w;
-            if idx + 1 < rev.indicators.len() {
-                chips_total += chip_gap;
-            }
+        let at_marker = matches!(rev.selection_key, RowSelectionKey::WorkingCopy);
+        let at_gap = 4.0;
+        let at_w = if at_marker {
+            measure_text_width::<R>("@", id_size, self.style.mono_font, paragraphs)
+        } else {
+            0.0
+        };
+        let author_full_w =
+            measure_text_width::<R>(&rev.author, id_size, self.style.primary_font, paragraphs);
+        let ellipsis_w =
+            measure_text_width::<R>("…", id_size, self.style.mono_font, paragraphs);
+
+        let bm_widths: Vec<f32> = rev
+            .bookmark_chips
+            .iter()
+            .map(|c| self.measure_chip_width::<R>(&c.label, paragraphs))
+            .collect();
+        let status_widths: Vec<f32> = rev
+            .status_chips
+            .iter()
+            .map(|c| self.measure_chip_width::<R>(&c.label, paragraphs))
+            .collect();
+        let status_total: f32 = status_widths.iter().sum::<f32>()
+            + chip_gap * status_widths.len().saturating_sub(1) as f32;
+
+        // === Layout budget ===
+        let content_right = row_bounds.x + row_bounds.width - content_right_pad;
+        let total_width = (content_right - content_left).max(0.0);
+
+        // Always-shown widths consume from the budget first.
+        let id_w = prefix_w + suffix_w;
+        let mandatory_left = at_w + (if at_marker { at_gap } else { 0.0 }) + id_w;
+        let mandatory_right_gap = if !status_widths.is_empty() { chip_gap } else { 0.0 };
+        let mandatory = mandatory_left + status_total + mandatory_right_gap;
+        let mut budget = (total_width - mandatory).max(0.0);
+
+        // === Priority: commit_id > bookmark chips > author ===
+        // 1. commit_id (with leading id_gap).
+        let show_commit_id = commit_w + id_gap <= budget;
+        if show_commit_id {
+            budget -= commit_w + id_gap;
         }
 
-        let right_edge = row_bounds.x + row_bounds.width - content_right_pad;
-        let chips_left = if rev.indicators.is_empty() {
-            right_edge
+        // 2. Bookmarks: fit greedily, reserving space for a `+N` overflow
+        //    chip when not all fit. The chip rail's leading gap separates
+        //    it from the left-side text.
+        let mut visible_bookmarks: usize = 0;
+        let mut overflow_count: usize = 0;
+        let mut overflow_w: f32 = 0.0;
+        if !rev.bookmark_chips.is_empty() {
+            let all_w: f32 = bm_widths.iter().sum::<f32>()
+                + chip_gap * bm_widths.len().saturating_sub(1) as f32;
+            let bm_block_w = if chip_gap + all_w <= budget {
+                visible_bookmarks = rev.bookmark_chips.len();
+                all_w
+            } else {
+                let mut acc = 0.0;
+                for (i, &w) in bm_widths.iter().enumerate() {
+                    let gap = if i == 0 { 0.0 } else { chip_gap };
+                    let candidate = acc + gap + w;
+                    let remaining = rev.bookmark_chips.len() - i - 1;
+                    let need_overflow = remaining > 0;
+                    let overflow_label = format!("+{}", remaining.max(1));
+                    let overflow_chip_w =
+                        self.measure_chip_width::<R>(&overflow_label, paragraphs);
+                    let plus_overflow = if need_overflow {
+                        chip_gap + overflow_chip_w
+                    } else {
+                        0.0
+                    };
+                    if chip_gap + candidate + plus_overflow <= budget {
+                        visible_bookmarks = i + 1;
+                        acc = candidate;
+                    } else {
+                        break;
+                    }
+                }
+                if visible_bookmarks < rev.bookmark_chips.len() {
+                    overflow_count = rev.bookmark_chips.len() - visible_bookmarks;
+                    let label = format!("+{overflow_count}");
+                    overflow_w = self.measure_chip_width::<R>(&label, paragraphs);
+                }
+                acc + if overflow_count > 0 {
+                    chip_gap + overflow_w
+                } else {
+                    0.0
+                }
+            };
+            // Subtract the chip rail's leading gap once, plus the block.
+            budget -= chip_gap + bm_block_w;
+        }
+
+        // 3. Author squeezes into whatever's left (with a leading id_gap).
+        let author_max_w = (budget - id_gap).max(0.0);
+        let (show_author, author_draw_w) = if !rev.author.is_empty() && author_max_w >= ellipsis_w {
+            (true, author_max_w.min(author_full_w))
         } else {
-            right_edge - chips_total
+            (false, 0.0)
         };
 
-        // Draw change_id (prefix + suffix in mono).
+        // Ellipsis indicator when commit_id or author got dropped entirely.
+        let need_ellipsis = (!show_commit_id) || (!show_author && !rev.author.is_empty());
+
+        // === Color selection ===
+        let (col_at, col_id_prefix, col_id_suffix, col_commit, col_author, col_ellipsis) =
+            if wc_loud {
+                let c = self.style.on_accent;
+                (c, c, c, c, c, c)
+            } else {
+                (
+                    self.style.accent,
+                    self.style.accent_text,
+                    self.style.subtle_text,
+                    self.style.muted_text,
+                    self.style.subtle_text,
+                    self.style.subtle_text,
+                )
+            };
+
+        // === Draw left-side flowing content ===
+        let mut x_cursor = content_left;
+        if at_marker {
+            fill_text_centered_y(
+                renderer,
+                "@",
+                x_cursor,
+                title_mid_y,
+                at_w.max(1.0),
+                id_size,
+                col_at,
+                self.style.mono_font,
+                row_clip,
+                text::Alignment::Left,
+            );
+            x_cursor += at_w + at_gap;
+        }
         fill_text_centered_y(
             renderer,
             &rev.change_id_prefix,
-            content_left,
+            x_cursor,
             title_mid_y,
             prefix_w.max(1.0),
             id_size,
-            self.style.accent_text,
+            col_id_prefix,
             self.style.mono_font,
             row_clip,
             text::Alignment::Left,
         );
+        x_cursor += prefix_w;
         fill_text_centered_y(
             renderer,
             &rev.change_id_suffix,
-            content_left + prefix_w,
+            x_cursor,
             title_mid_y,
             suffix_w.max(1.0),
             id_size,
-            self.style.subtle_text,
+            col_id_suffix,
             self.style.mono_font,
             row_clip,
             text::Alignment::Left,
         );
+        x_cursor += suffix_w;
 
-        let id_gap = 8.0;
-        let mut x_cursor = content_left + prefix_w + suffix_w + id_gap;
+        if show_commit_id {
+            x_cursor += id_gap;
+            fill_text_centered_y(
+                renderer,
+                &rev.commit_id_short,
+                x_cursor,
+                title_mid_y,
+                commit_w.max(1.0),
+                id_size,
+                col_commit,
+                self.style.mono_font,
+                row_clip,
+                text::Alignment::Left,
+            );
+            x_cursor += commit_w;
+        }
 
-        // commit_id is mono, in the muted-text colour to distinguish it from
-        // the change_id which uses accent/subtle.
-        fill_text_centered_y(
-            renderer,
-            &rev.commit_id_short,
-            x_cursor,
-            title_mid_y,
-            commit_w.max(1.0),
-            id_size,
-            self.style.muted_text,
-            self.style.mono_font,
-            row_clip,
-            text::Alignment::Left,
-        );
-        x_cursor += commit_w + id_gap;
-
-        // Author name, in the proportional font.
-        let author_max_w = (chips_left - x_cursor - chip_gap).max(0.0);
-        if author_max_w > 0.0 {
+        if show_author {
+            x_cursor += id_gap;
             fill_text_truncated(
                 renderer,
                 &rev.author,
                 x_cursor,
                 title_mid_y,
-                author_max_w,
+                author_draw_w,
                 id_size,
-                self.style.subtle_text,
+                col_author,
                 self.style.primary_font,
                 row_clip,
             );
+        } else if need_ellipsis {
+            // Single `…` after the last left-side glyph signals that
+            // commit_id and/or author got hidden for lack of room.
+            x_cursor += id_gap;
+            fill_text_centered_y(
+                renderer,
+                "…",
+                x_cursor,
+                title_mid_y,
+                ellipsis_w.max(1.0),
+                id_size,
+                col_ellipsis,
+                self.style.mono_font,
+                row_clip,
+                text::Alignment::Left,
+            );
         }
 
-        // Chips anchored at the right edge.
-        let mut chip_x = chips_left;
-        for (chip, w) in rev.indicators.iter().zip(chip_widths.iter()) {
+        // === Draw right-anchored chip rail ===
+        // Compose the rail left-to-right starting from its left edge: any
+        // bookmarks, then the `+N` overflow chip (if any), then status
+        // chips. The leading edge is computed from the cumulative width.
+        let rail_w: f32 = {
+            let mut w = 0.0;
+            for (i, &bw) in bm_widths.iter().enumerate().take(visible_bookmarks) {
+                if i > 0 {
+                    w += chip_gap;
+                }
+                w += bw;
+            }
+            if overflow_count > 0 {
+                if w > 0.0 {
+                    w += chip_gap;
+                }
+                w += overflow_w;
+            }
+            if !status_widths.is_empty() {
+                if w > 0.0 {
+                    w += chip_gap;
+                }
+                w += status_total;
+            }
+            w
+        };
+        let mut chip_x = content_right - rail_w;
+        let overflow_color = rev.lane_color;
+        for (chip, bw) in rev
+            .bookmark_chips
+            .iter()
+            .zip(bm_widths.iter())
+            .take(visible_bookmarks)
+        {
             self.draw_chip(
                 renderer,
                 paragraphs,
@@ -672,9 +977,42 @@ impl<Message> RevisionList<Message> {
                 &chip.label,
                 chip.background,
                 chip.text_color,
+                chip.border_color,
+                chip.border_dashed,
                 row_clip,
             );
-            chip_x += w + chip_gap;
+            chip_x += bw + chip_gap;
+        }
+        if overflow_count > 0 {
+            let label = format!("+{overflow_count}");
+            self.draw_chip(
+                renderer,
+                paragraphs,
+                chip_x,
+                title_mid_y,
+                &label,
+                chip_background(overflow_color),
+                overflow_color,
+                None,
+                false,
+                row_clip,
+            );
+            chip_x += overflow_w + chip_gap;
+        }
+        for (i, chip) in rev.status_chips.iter().enumerate() {
+            self.draw_chip(
+                renderer,
+                paragraphs,
+                chip_x,
+                title_mid_y,
+                &chip.label,
+                chip.background,
+                chip.text_color,
+                chip.border_color,
+                chip.border_dashed,
+                row_clip,
+            );
+            chip_x += status_widths[i] + chip_gap;
         }
 
         fill_text_truncated(
@@ -684,7 +1022,11 @@ impl<Message> RevisionList<Message> {
             desc_mid_y,
             content_width,
             desc_size,
-            rev.description_color,
+            if wc_loud {
+                self.style.on_accent
+            } else {
+                rev.description_color
+            },
             self.style.primary_font,
             row_clip,
         );
@@ -696,7 +1038,24 @@ impl<Message> RevisionList<Message> {
             width: gutter_total - GUTTER_LEFT_PADDING - GUTTER_PADDING,
             height: row_bounds.height,
         };
-        draw_revision_row(renderer, gutter_bounds, &rev.frame, &self.style.graph);
+        // Working-copy node: on the loud row the disc would be accent-on-
+        // accent (invisible), so swap it for the contrast color. On a
+        // selected (soft-tint) row the accent reads fine.
+        let node_override = if wc_loud {
+            Some(self.style.on_accent)
+        } else if is_working_copy {
+            Some(self.style.accent)
+        } else {
+            None
+        };
+        draw_revision_row(
+            renderer,
+            gutter_bounds,
+            &rev.frame,
+            &self.style.graph,
+            node_override,
+            emphasized_lane,
+        );
     }
 
     fn draw_file<R>(
@@ -706,6 +1065,7 @@ impl<Message> RevisionList<Message> {
         f: &FileRowView,
         _paragraphs: &RefCell<Vec<R::Paragraph>>,
         gutter_total: f32,
+        emphasized_lane: Option<usize>,
     ) where
         R: text::Renderer<Font = Font> + iced::advanced::graphics::geometry::Renderer,
     {
@@ -851,7 +1211,13 @@ impl<Message> RevisionList<Message> {
             width: gutter_total - GUTTER_LEFT_PADDING - GUTTER_PADDING,
             height: row_bounds.height,
         };
-        draw_continuation_row(renderer, gutter_bounds, &f.continuation, &self.style.graph);
+        draw_continuation_row(
+            renderer,
+            gutter_bounds,
+            &f.continuation,
+            &self.style.graph,
+            emphasized_lane,
+        );
     }
 
     fn measure_chip_width<R: text::Renderer<Font = Font>>(
@@ -866,7 +1232,7 @@ impl<Message> RevisionList<Message> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn draw_chip<R: text::Renderer<Font = Font>>(
+    fn draw_chip<R>(
         &self,
         renderer: &mut R,
         paragraphs: &RefCell<Vec<R::Paragraph>>,
@@ -875,8 +1241,13 @@ impl<Message> RevisionList<Message> {
         label: &str,
         background: Color,
         text_color: Color,
+        border_color: Option<Color>,
+        border_dashed: bool,
         clip: Rectangle,
-    ) -> f32 {
+    ) -> f32
+    where
+        R: text::Renderer<Font = Font> + geometry::Renderer,
+    {
         let size = CAPTION_TEXT_SIZE;
         let label_w = measure_text_width::<R>(label, size, self.style.primary_font, paragraphs);
         let pad_x = 5.0;
@@ -885,17 +1256,25 @@ impl<Message> RevisionList<Message> {
         let chip_h = (size + 3.0).round();
         let chip_w = label_w + pad_x * 2.0;
         let chip_top = (center_y - chip_h / 2.0).round();
-        fill_quad(
-            renderer,
-            Rectangle {
-                x,
-                y: chip_top,
-                width: chip_w,
-                height: chip_h,
-            },
-            background,
-            INDICATOR_RADIUS,
-        );
+        let rect = Rectangle {
+            x,
+            y: chip_top,
+            width: chip_w,
+            height: chip_h,
+        };
+        // Skip the fill when the chip is meant to read as outlined-only —
+        // a translucent fill with `a == 0` would still emit a quad but
+        // avoiding it keeps the layer count down and makes intent clear.
+        if background.a > f32::EPSILON {
+            fill_quad(renderer, rect, background, INDICATOR_RADIUS);
+        }
+        if let Some(border_color) = border_color {
+            if border_dashed {
+                stroke_dashed_rounded_rect(renderer, rect, border_color, INDICATOR_RADIUS);
+            } else {
+                stroke_solid_rounded_rect(renderer, rect, border_color, INDICATOR_RADIUS);
+            }
+        }
         // Let iced center the glyphs vertically within the chip via align_y.
         fill_text_centered_y(
             renderer,
@@ -911,6 +1290,27 @@ impl<Message> RevisionList<Message> {
         );
         chip_w
     }
+}
+
+/// Bookmark labels for `lane` at this item's row, or an empty slice
+/// when the lane has none. Both revision and file rows carry their own
+/// snapshot of the lane-label state — see [`RevisionRowView::lane_labels`]
+/// and [`FileRowView::lane_labels`].
+fn item_lane_labels(item: &Item, lane: usize) -> &[String] {
+    match item {
+        Item::Revision(row) => row.lane_labels.get(lane).map(|v| v.as_slice()).unwrap_or(&[]),
+        Item::File(row) => row.lane_labels.get(lane).map(|v| v.as_slice()).unwrap_or(&[]),
+    }
+}
+
+/// Segment id for `lane` at this item's row. `None` means the lane is
+/// dead at this row (no stroke drawn) or the column is out of range.
+fn item_lane_segment(item: &Item, lane: usize) -> Option<usize> {
+    let slot = match item {
+        Item::Revision(row) => row.lane_segments.get(lane),
+        Item::File(row) => row.lane_segments.get(lane),
+    };
+    slot.copied().flatten()
 }
 
 fn fill_background<R: renderer::Renderer>(renderer: &mut R, rect: Rectangle, color: Color) {
@@ -938,6 +1338,70 @@ fn fill_quad<R: renderer::Renderer>(renderer: &mut R, rect: Rectangle, color: Co
         },
         Background::Color(color),
     );
+}
+
+/// Solid 1px rounded-rect outline. Cheaper than the dashed variant —
+/// goes through iced's quad border instead of a geometry path. Used by
+/// remote-bookmark chips that want a crisp outlined look.
+fn stroke_solid_rounded_rect<R: renderer::Renderer>(
+    renderer: &mut R,
+    rect: Rectangle,
+    color: Color,
+    radius: f32,
+) {
+    renderer.fill_quad(
+        renderer::Quad {
+            bounds: rect,
+            border: Border {
+                color,
+                width: 1.0,
+                radius: iced::border::Radius::from(radius),
+            },
+            shadow: Shadow::default(),
+            snap: true,
+        },
+        Background::Color(Color::TRANSPARENT),
+    );
+}
+
+/// Dashed 1px rounded-rect outline. Used by outlined chips (e.g. the
+/// `empty` indicator). Iced's quad border can't be dashed, so we stroke
+/// a canvas path with a `LineDash` pattern.
+fn stroke_dashed_rounded_rect<R: geometry::Renderer>(
+    renderer: &mut R,
+    rect: Rectangle,
+    color: Color,
+    radius: f32,
+) {
+    // Inset by half a pixel so the 1px stroke sits on the rect's
+    // edge rather than straddling it (avoids fuzzy aliasing).
+    let inset_rect = Rectangle {
+        x: rect.x + 0.5,
+        y: rect.y + 0.5,
+        width: rect.width - 1.0,
+        height: rect.height - 1.0,
+    };
+    let path = Path::rounded_rectangle(
+        Point::new(inset_rect.x, inset_rect.y),
+        Size::new(inset_rect.width, inset_rect.height),
+        iced::border::Radius::from(radius),
+    );
+    let segments: [f32; 2] = [4.0, 2.2];
+    let mut stroke = Stroke::default()
+        .with_color(color)
+        .with_width(1.0)
+        .with_line_cap(LineCap::Butt)
+        .with_line_join(LineJoin::Miter);
+    stroke.line_dash = geometry::LineDash {
+        segments: &segments,
+        offset: 0,
+    };
+    let mut frame = Frame::new(
+        renderer,
+        Size::new(rect.x + rect.width + 1.0, rect.y + rect.height + 1.0),
+    );
+    frame.stroke(&path, stroke);
+    renderer.draw_geometry(frame.into_geometry());
 }
 
 /// Truncating text run, vertically centered on `center_y`. Used for

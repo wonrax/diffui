@@ -27,6 +27,7 @@ use crate::graph::LaneFrame;
 /// layout math needs the same number to size the path column.
 pub const LANE_WIDTH: f32 = 10.0;
 const LINE_THICKNESS: f32 = 1.5;
+const LINE_THICKNESS_EMPHASIZED: f32 = 2.75;
 const NODE_RADIUS: f32 = 3.5;
 
 #[derive(Debug, Clone, Copy)]
@@ -78,15 +79,27 @@ impl RevisionGraphStyle {
 
     /// Stroke style for an edge of a given kind in a given lane. Indirect
     /// edges are dashed so they remain distinguishable when they share a
-    /// lane color with a direct edge.
-    fn edge_stroke<'a>(&self, kind: GraphEdgeType, lane: usize, dash: &'a [f32]) -> Stroke<'a> {
+    /// lane color with a direct edge. When `emphasized` is true the
+    /// stroke renders thicker — used for the lane under the cursor.
+    fn edge_stroke<'a>(
+        &self,
+        kind: GraphEdgeType,
+        lane: usize,
+        dash: &'a [f32],
+        emphasized: bool,
+    ) -> Stroke<'a> {
         let color = match kind {
             GraphEdgeType::Missing => self.missing_color,
             _ => self.lane_color(lane),
         };
+        let width = if emphasized {
+            LINE_THICKNESS_EMPHASIZED
+        } else {
+            LINE_THICKNESS
+        };
         let mut stroke = Stroke::default()
             .with_color(color)
-            .with_width(LINE_THICKNESS)
+            .with_width(width)
             .with_line_cap(LineCap::Round)
             .with_line_join(LineJoin::Round);
         if matches!(kind, GraphEdgeType::Indirect) {
@@ -208,6 +221,16 @@ pub fn draw_revision_row<R>(
     bounds: Rectangle,
     frame_data: &LaneFrame,
     style: &RevisionGraphStyle,
+    // Forces the node disc to this color instead of the lane color.
+    // Used to paint the working-copy node in the accent (coral) so the
+    // current branching point is unmistakable in the graph, regardless
+    // of which lane it happens to live in. Edges still wear their lane
+    // colors — only the disc gets overridden.
+    node_color_override: Option<Color>,
+    // When `Some(lane)`, that lane's strokes render thicker — used by
+    // the revision list to highlight the lane under the cursor while
+    // its bookmark tooltip is showing.
+    emphasized_lane: Option<usize>,
 ) where
     R: renderer::Renderer + geometry::Renderer,
 {
@@ -237,17 +260,17 @@ pub fn draw_revision_row<R>(
             let path = Path::new(|builder| {
                 draw_incoming(builder, x_i, x_node, top, mid);
             });
-            frame.stroke(&path, style.edge_stroke(kind, i, &dash));
+            frame.stroke(&path, style.edge_stroke(kind, i, &dash, emphasized_lane == Some(i)));
         } else if frame_data.is_pass_through(i) {
             // Pure pass-through: draw a single straight vertical so we
             // benefit from the round line cap and dashed style if needed.
             let path = Path::line(Point::new(x_i, top), Point::new(x_i, bot));
-            frame.stroke(&path, style.edge_stroke(kind, i, &dash));
+            frame.stroke(&path, style.edge_stroke(kind, i, &dash, emphasized_lane == Some(i)));
         } else {
             // Lane terminates above the node without merging into it
             // (e.g., ended on the previous row). Just a half-line.
             let path = Path::line(Point::new(x_i, top), Point::new(x_i, mid));
-            frame.stroke(&path, style.edge_stroke(kind, i, &dash));
+            frame.stroke(&path, style.edge_stroke(kind, i, &dash, emphasized_lane == Some(i)));
         }
     }
 
@@ -268,7 +291,7 @@ pub fn draw_revision_row<R>(
         // *opens* on lane 2 should already wear lane 2's color from the
         // moment it leaves the node, so the eye picks it up consistently
         // wherever the branch travels.
-        frame.stroke(&path, style.edge_stroke(kind, j, &dash));
+        frame.stroke(&path, style.edge_stroke(kind, j, &dash, emphasized_lane == Some(j)));
     }
 
     // Missing-parent stub goes into the same geometry frame as the edges
@@ -300,7 +323,7 @@ pub fn draw_revision_row<R>(
     //      nodes (multiple parents) the lane-assignment first-parent
     //      rule means `node_lane` is also the first parent's lane, so
     //      this picks the closest possible match in hue.
-    let disc_color = style.lane_color(frame_data.node_lane);
+    let disc_color = node_color_override.unwrap_or_else(|| style.lane_color(frame_data.node_lane));
     let disc_path = Path::new(|b| b.circle(Point::new(x_node, mid), NODE_RADIUS));
     frame.fill(&disc_path, disc_color);
 
@@ -312,6 +335,7 @@ pub fn draw_continuation_row<R>(
     bounds: Rectangle,
     lanes: &[Option<GraphEdgeType>],
     style: &RevisionGraphStyle,
+    emphasized_lane: Option<usize>,
 ) where
     R: renderer::Renderer + geometry::Renderer,
 {
@@ -324,7 +348,10 @@ pub fn draw_continuation_row<R>(
         let Some(kind) = *kind else { continue };
         let x = lane_x(bounds.x, i);
         let path = Path::line(Point::new(x, top), Point::new(x, bot));
-        frame.stroke(&path, style.edge_stroke(kind, i, &dash));
+        frame.stroke(
+            &path,
+            style.edge_stroke(kind, i, &dash, emphasized_lane == Some(i)),
+        );
     }
     renderer.draw_geometry(frame.into_geometry());
 }

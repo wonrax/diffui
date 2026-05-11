@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     env,
     path::{Path, PathBuf},
     sync::Arc,
@@ -69,9 +70,11 @@ pub async fn load_jj_commits(repository_root: PathBuf) -> Result<Vec<CommitSumma
         .context("jj workspace has no working-copy commit")?
         .clone();
 
-    // Default revset: all ancestors of the working copy (inclusive). Once the
-    // CLI grows a -r flag, parse it here instead.
-    let expr = RevsetExpression::commit(wc_commit_id.clone()).ancestors();
+    // Default revset: `all()` — ancestors of every visible head plus any
+    // referenced commit. Covers the working copy, all local bookmarks,
+    // and tracked/untracked remote bookmarks, so branches that haven't
+    // been merged into the WC still show up in the graph.
+    let expr = RevsetExpression::all();
     let symbol_resolver = SymbolResolver::new(
         repo.as_ref(),
         &[] as &[Box<dyn jj_lib::revset::SymbolResolverExtension>],
@@ -92,6 +95,26 @@ pub async fn load_jj_commits(repository_root: PathBuf) -> Result<Vec<CommitSumma
     drop(revset);
 
     let lane_rows = assign_lanes(nodes.iter().map(|(id, edges)| (id.clone(), edges.clone())));
+
+    // Index bookmarks by commit id once so the per-commit loop below is a
+    // map lookup instead of an O(bookmarks) scan per revision.
+    let mut bookmarks_by_commit: HashMap<CommitId, Vec<String>> = HashMap::new();
+    for (name, target) in repo.view().bookmarks() {
+        for id in target.local_target.added_ids() {
+            bookmarks_by_commit
+                .entry(id.clone())
+                .or_default()
+                .push(name.as_str().to_owned());
+        }
+        for (remote, remote_ref) in &target.remote_refs {
+            for id in remote_ref.target.added_ids() {
+                bookmarks_by_commit
+                    .entry(id.clone())
+                    .or_default()
+                    .push(format!("{}@{}", name.as_str(), remote.as_str()));
+            }
+        }
+    }
 
     let mut commits = Vec::with_capacity(nodes.len());
     for ((id, _edges), lane_row) in nodes.into_iter().zip(lane_rows) {
@@ -117,6 +140,10 @@ pub async fn load_jj_commits(repository_root: PathBuf) -> Result<Vec<CommitSumma
 
         let commit_id_hex = commit.id().hex();
         let is_working_copy = commit.id() == &wc_commit_id;
+        let bookmarks = bookmarks_by_commit
+            .get(commit.id())
+            .cloned()
+            .unwrap_or_default();
         commits.push(CommitSummary {
             change_id: commit.change_id().to_string(),
             commit_id: commit_id_hex.clone(),
@@ -132,6 +159,7 @@ pub async fn load_jj_commits(repository_root: PathBuf) -> Result<Vec<CommitSumma
             is_empty: Some(is_empty),
             lane_frame: LaneFrame::from_lane_row(&lane_row),
             is_working_copy,
+            bookmarks,
         });
     }
 

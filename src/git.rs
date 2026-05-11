@@ -293,6 +293,7 @@ fn build_commit_summaries(rows: Vec<ParsedCommitRow>) -> Vec<CommitSummary> {
             is_empty: row.is_empty,
             lane_frame: LaneFrame::from_lane_row(&lane_row),
             is_working_copy: row.is_working_copy,
+            bookmarks: Vec::new(),
         })
         .collect()
 }

@@ -57,6 +57,10 @@ pub struct CommitSummary {
     pub is_empty: Option<bool>,
     pub lane_frame: LaneFrame,
     pub is_working_copy: bool,
+    /// Bookmarks pointing at this commit. Local bookmarks are bare
+    /// names; remote-tracking ones are `name@remote`. Order matches
+    /// `jj show`'s "Bookmarks:" line — local first, then remotes.
+    pub bookmarks: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

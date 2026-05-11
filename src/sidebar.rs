@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use iced::{
-    Color, Element, Font, Length, alignment,
+    Background, Border, Color, Element, Font, Length, alignment,
+    font::Weight,
     widget::{button, column, container, row, text},
 };
 
@@ -25,8 +26,13 @@ pub const MIN_WIDTH: f32 = 220.0;
 pub const MAX_WIDTH: f32 = 800.0;
 pub const RESIZE_HIT_PADDING: f32 = 2.0;
 
-const TITLE_TEXT_SIZE: f32 = 20.0;
-const CAPTION_TEXT_SIZE: f32 = 14.0;
+// `CHANGES` pane label — matches the design's `.pane-hd .ttl`: small,
+// uppercase, semibold, ink-300. The previous 20px sentence-case title
+// read as a top-level heading; the design uses a quieter pane-label
+// pattern so the commit list itself carries the visual weight.
+const TITLE_TEXT_SIZE: f32 = 11.0;
+const CAPTION_TEXT_SIZE: f32 = 13.0;
+const COUNT_CHIP_TEXT_SIZE: f32 = 11.0;
 const REVISION_ID_CHARS: usize = 12;
 const COMMIT_ID_CHARS: usize = 12;
 
@@ -40,49 +46,22 @@ const FILE_STAT_HORIZONTAL_PADDING: f32 = 4.0;
 const FILE_STAT_MIN_WIDTH: f32 = 24.0;
 
 pub fn build_sidebar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
-    let repo_label = ui
-        .repository
-        .as_ref()
-        .map(|repository| match repository.scope_label() {
-            Some(scope) => format!("{} · {scope}", repository.vcs.label()),
-            None => repository.vcs.label().to_owned(),
-        })
-        .unwrap_or_else(|| "Outside Repository".to_owned());
-
     let title_row = row![
-        text("Changes")
+        text("CHANGES")
             .size(TITLE_TEXT_SIZE)
-            .color(theme.text)
-            .width(Length::Fill),
-        build_theme_switcher(ui.selected_theme, theme),
+            .font(Font {
+                weight: Weight::Semibold,
+                ..ui.config.ui_font
+            })
+            .color(theme.subtle_text),
+        build_count_chip(ui.commits.len(), theme, ui.config.ui_font),
+        container(text("")).width(Length::Fill),
+        build_theme_switcher(ui.selected_theme, theme, ui.config.ui_font),
     ]
-    .spacing(10)
+    .spacing(8)
     .align_y(alignment::Vertical::Center);
 
     let mut header_content = column![title_row].spacing(7);
-
-    if !ui.document.files.is_empty() {
-        let metrics = row![
-            text(format_count(ui.document.files.len(), "File", "Files"))
-                .size(CAPTION_TEXT_SIZE)
-                .color(theme.accent),
-            text(format!("+{}", ui.document.total_additions))
-                .size(CAPTION_TEXT_SIZE)
-                .color(theme.added_text),
-            text(format!("-{}", ui.document.total_deletions))
-                .size(CAPTION_TEXT_SIZE)
-                .color(theme.removed_text),
-        ]
-        .spacing(10)
-        .align_y(alignment::Vertical::Center);
-        header_content = header_content.push(metrics);
-    }
-
-    header_content = header_content.push(
-        text(repo_label)
-            .size(CAPTION_TEXT_SIZE)
-            .color(theme.subtle_text),
-    );
 
     if let LoadStatus::Failed(error) = &ui.status {
         header_content = header_content.push(
@@ -110,6 +89,10 @@ pub fn build_sidebar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Messag
 fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
     let mut items: Vec<RevisionListItem> = Vec::with_capacity(ui.commits.len());
     let metrics = sidebar_text_metrics(ui.config);
+    let graph_style = RevisionGraphStyle {
+        lane_base_color: theme.lane_base,
+        missing_color: theme.subtle_text,
+    };
 
     let (file_widgets, file_badge_width): (Option<Vec<FileRowTemplate>>, f32) =
         if matches!(ui.status, LoadStatus::Loaded) && !ui.document.files.is_empty() {
@@ -181,7 +164,7 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
                             secondary: display_models[idx].secondary.clone(),
                             raw_path: display_models[idx].raw_path.clone(),
                             status_label: file.status.short_label().to_owned(),
-                            status_background: file_status_badge_color(file.status, theme),
+                            status_color: file_status_color(file.status, theme),
                             additions: file.additions,
                             deletions: file.deletions,
                             file_index: idx,
@@ -196,6 +179,20 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
             (None, FILE_BADGE_MIN_WIDTH)
         };
 
+    // Per-lane bookmark labels propagating top-down through the visible
+    // graph. When a commit carries bookmarks, they latch onto its
+    // node lane and stay until that lane terminates (drops out of
+    // `after`). The pre-trim snapshot is shown on the commit row
+    // itself; the post-trim snapshot is shown on any file rows below
+    // it, so terminated lanes don't keep a stale tooltip.
+    let mut current_labels: Vec<Vec<String>> = Vec::new();
+    // Per-lane segment id: a fresh id is allocated whenever a lane goes
+    // from dead → alive, and cleared when the lane drops out of `after`.
+    // Lets the revision list emphasize a whole lane segment when one of
+    // its rows is hovered, instead of only the strokes inside that row.
+    let mut current_segments: Vec<Option<usize>> = Vec::new();
+    let mut next_segment_id: usize = 0;
+
     for commit in &ui.commits {
         let unique_len = shortest_unique_prefix_len(&commit.change_id, &ui.commits);
         let label_len = revision_id_display_len(unique_len, &commit.change_id);
@@ -208,19 +205,45 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
             .collect();
         let commit_id_short = truncate_end(&commit.commit_id, COMMIT_ID_CHARS);
 
-        let mut indicators = Vec::new();
-        if commit.is_working_copy {
-            indicators.push(IndicatorChip {
-                label: "@".to_owned(),
-                background: chip_background(theme.accent),
-                text_color: theme.accent,
+        // Working-copy `@` is drawn inline before the change-id by the
+        // revision-list widget itself — the design system puts the
+        // marker *at* the change, not on the right-edge chip rail.
+        //
+        // Two chip groups: `bookmark_chips` can overflow into a `+N`
+        // chip when there's not enough room, and `status_chips` always
+        // shows.
+        let lane_color = graph_style.lane_color(commit.lane_frame.node_lane);
+        let mut bookmark_chips = Vec::with_capacity(commit.bookmarks.len());
+        for bookmark in &commit.bookmarks {
+            // Remote/untracked bookmarks contain `@` (e.g. `main@origin`).
+            // They render outlined (transparent fill + 1px lane-color
+            // border) so they read as "tracking" rather than "live"
+            // bookmarks, which use the filled-tint pattern.
+            let is_remote = bookmark.contains('@');
+            bookmark_chips.push(IndicatorChip {
+                label: bookmark.clone(),
+                background: if is_remote {
+                    Color::TRANSPARENT
+                } else {
+                    chip_background(lane_color)
+                },
+                text_color: lane_color,
+                border_color: if is_remote { Some(lane_color) } else { None },
+                border_dashed: false,
             });
         }
+
+        let mut status_chips = Vec::new();
         if commit.is_empty == Some(true) {
-            indicators.push(IndicatorChip {
+            // Outlined-transparent chip, mirroring the design's
+            // `.tag-empty` (dashed border, ink-400 text, transparent
+            // fill).
+            status_chips.push(IndicatorChip {
                 label: "empty".to_owned(),
-                background: chip_background(theme.subtle_text),
+                background: Color::TRANSPARENT,
                 text_color: theme.subtle_text,
+                border_color: Some(theme.subtle_text),
+                border_dashed: true,
             });
         }
 
@@ -236,6 +259,59 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
             _ => false,
         };
 
+        // Latch this commit's bookmarks onto its lane, allocate segment
+        // ids for any lane that just came alive, then snapshot pre-trim
+        // for the revision row.
+        let lane_count = commit.lane_frame.lane_count();
+        if current_labels.len() < lane_count {
+            current_labels.resize(lane_count, Vec::new());
+        }
+        if current_segments.len() < lane_count {
+            current_segments.resize(lane_count, None);
+        }
+        if !commit.bookmarks.is_empty() {
+            current_labels[commit.lane_frame.node_lane] = commit.bookmarks.clone();
+        }
+        for (lane, slot) in current_segments.iter_mut().enumerate().take(lane_count) {
+            let before = commit.lane_frame.before.get(lane).copied().flatten();
+            let after = commit.lane_frame.after.get(lane).copied().flatten();
+            let alive = before.is_some() || after.is_some() || lane == commit.lane_frame.node_lane;
+            if alive && slot.is_none() {
+                *slot = Some(next_segment_id);
+                next_segment_id += 1;
+            }
+        }
+        let revision_lane_labels = current_labels.clone();
+        let revision_lane_segments = current_segments.clone();
+        // Trim labels + segments for lanes that don't survive past this
+        // row. The post-trim snapshots are what file rows below inherit.
+        for (lane, slot) in current_labels.iter_mut().enumerate() {
+            let alive = commit
+                .lane_frame
+                .after
+                .get(lane)
+                .copied()
+                .flatten()
+                .is_some();
+            if !alive {
+                slot.clear();
+            }
+        }
+        for (lane, slot) in current_segments.iter_mut().enumerate() {
+            let alive = commit
+                .lane_frame
+                .after
+                .get(lane)
+                .copied()
+                .flatten()
+                .is_some();
+            if !alive {
+                *slot = None;
+            }
+        }
+        let continuation_lane_labels = current_labels.clone();
+        let continuation_lane_segments = current_segments.clone();
+
         items.push(RevisionListItem::Revision(RevisionRowView {
             selection_key,
             change_id_prefix: id_prefix,
@@ -244,8 +320,12 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
             author: commit.author.clone(),
             description: commit.description.clone(),
             description_color: commit_description_color(commit, theme),
-            indicators,
+            bookmark_chips,
+            status_chips,
+            lane_color,
             frame: commit.lane_frame.clone(),
+            lane_labels: revision_lane_labels,
+            lane_segments: revision_lane_segments,
         }));
 
         if is_expanded && let Some(files) = &file_widgets {
@@ -256,8 +336,12 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
                     secondary: file.secondary.clone(),
                     raw_path: file.raw_path.clone(),
                     status_label: file.status_label.clone(),
-                    status_background: file.status_background,
-                    status_text: theme.background,
+                    // Design system badge style: a soft tint of the
+                    // status color as the chip background, with the
+                    // saturated color used for the glyph. Replaces the
+                    // earlier "filled chip + bg-color text" pattern.
+                    status_background: chip_background(file.status_color),
+                    status_text: file.status_color,
                     additions: file.additions,
                     deletions: file.deletions,
                     additions_text: theme.added_text,
@@ -268,6 +352,8 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
                     primary_color: theme.text,
                     secondary_color: theme.muted_text,
                     file_index: file.file_index,
+                    lane_labels: continuation_lane_labels.clone(),
+                    lane_segments: continuation_lane_segments.clone(),
                 }));
             }
         }
@@ -295,7 +381,12 @@ struct FileRowTemplate {
     secondary: String,
     raw_path: String,
     status_label: String,
-    status_background: Color,
+    /// Saturated color for the file's status (e.g., green for Added).
+    /// The chip background is derived from this via `chip_background`
+    /// at draw-row construction time so the chip reads as a tint of
+    /// the same hue as its glyph — matching the design system's
+    /// "soft tint + colored text" badge pattern.
+    status_color: Color,
     additions: usize,
     deletions: usize,
     file_index: usize,
@@ -310,14 +401,19 @@ fn revision_list_style(
 ) -> RevisionListStyle {
     RevisionListStyle {
         graph: RevisionGraphStyle {
-            // Lane 0 (the trunk) wears the theme accent; subsequent lanes
-            // and the node discs that sit on them derive their hue from
-            // this — see `RevisionGraphStyle::lane_color`.
-            lane_base_color: theme.accent,
+            // Lane 0 (the trunk) wears `theme.lane_base` — violet by
+            // design — and subsequent lanes derive from it via HSL
+            // rotation in `RevisionGraphStyle::lane_color`. Kept
+            // separate from `theme.accent` so the coral accent stays
+            // reserved for working-copy / selection signalling and
+            // doesn't compete with the diff add/del greens and reds.
+            lane_base_color: theme.lane_base,
             missing_color: theme.subtle_text,
         },
         background: theme.panel_background,
         selected_background: theme.selected_file,
+        accent: theme.accent,
+        on_accent: theme.on_accent,
         border: theme.border,
         muted_text: theme.muted_text,
         subtle_text: theme.subtle_text,
@@ -332,31 +428,69 @@ fn revision_list_style(
     }
 }
 
+/// Small rounded badge showing the total number of revisions in view.
+/// Matches the design's `.pane-hd .ct` token: bg-elev background, line
+/// border, ink-400 mono numeral. Sits next to the `CHANGES` label.
+fn build_count_chip(count: usize, theme: ThemeSpec, font: Font) -> Element<'static, Message> {
+    container(
+        text(count.to_string())
+            .size(COUNT_CHIP_TEXT_SIZE)
+            .font(Font {
+                weight: Weight::Medium,
+                ..font
+            })
+            .color(theme.subtle_text),
+    )
+    .padding([1, 7])
+    .style(move |_| container::Style {
+        background: Some(Background::Color(theme.panel_background_elevated)),
+        text_color: Some(theme.subtle_text),
+        border: Border {
+            color: theme.border,
+            width: 1.0,
+            radius: 999.0.into(),
+        },
+        ..container::Style::default()
+    })
+    .into()
+}
+
 fn build_theme_switcher(
     selected_theme: ThemePreference,
     theme: ThemeSpec,
+    font: Font,
 ) -> Element<'static, Message> {
     let mut controls = row![].spacing(3);
 
     for candidate in ThemePreference::ALL {
         let selected = candidate == selected_theme;
         controls = controls.push(
-            button(text(candidate.label()).size(CAPTION_TEXT_SIZE))
-                .padding([5, 7])
-                .style(move |_, status| theme_switcher_button_style(status, selected, theme))
-                .on_press(Message::SelectTheme(candidate)),
+            button(
+                text(candidate.label())
+                    .size(CAPTION_TEXT_SIZE)
+                    .font(font),
+            )
+            .padding([5, 7])
+            .style(move |_, status| theme_switcher_button_style(status, selected, theme))
+            .on_press(Message::SelectTheme(candidate)),
         );
     }
 
     controls.into()
 }
 
-fn file_status_badge_color(status: DiffFileStatus, theme: ThemeSpec) -> Color {
+/// Saturated color associated with a file's diff status, used to tint
+/// the status chip in the revision list. Mapping follows the design
+/// system: A→green (added_text), M→blue (info), D→red (removed_text),
+/// R→amber (modified_token). The chip's background is derived from
+/// this color via `chip_background` so the glyph and the tint share
+/// a hue.
+fn file_status_color(status: DiffFileStatus, theme: ThemeSpec) -> Color {
     match status {
         DiffFileStatus::Added => theme.added_text,
         DiffFileStatus::Deleted => theme.removed_text,
-        DiffFileStatus::Modified => theme.modified_token,
-        DiffFileStatus::Renamed => theme.accent,
+        DiffFileStatus::Modified => theme.info,
+        DiffFileStatus::Renamed => theme.modified_token,
     }
 }
 
@@ -403,14 +537,6 @@ fn shortest_unique_prefix_len(change_id: &str, commits: &[CommitSummary]) -> usi
                 == 1
         })
         .unwrap_or(total_len)
-}
-
-fn format_count(count: usize, singular: &str, plural: &str) -> String {
-    if count == 1 {
-        format!("1 {singular}")
-    } else {
-        format!("{count} {plural}")
-    }
 }
 
 /// Pixel-accurate text width measurement for layout decisions made outside
@@ -788,6 +914,7 @@ mod tests {
                 missing_parents: 0,
             },
             is_working_copy: false,
+            bookmarks: Vec::new(),
         }
     }
 

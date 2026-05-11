@@ -50,47 +50,63 @@ pub enum ResolvedTheme {
 impl ResolvedTheme {
     pub fn spec(self) -> ThemeSpec {
         match self {
+            // Dark-first warm ink with a coral accent. Tokens mirror the
+            // Diffui v2 design system: `bg-canvas`, `bg-pane`, `bg-elev`,
+            // `bg-active`, `ink-100..300`, `accent #FF7A59`. The trunk lane
+            // is intentionally decoupled from the accent — the accent is
+            // reserved for the working copy, selection, and focus, while
+            // the graph rides on a violet base so coral doesn't fight the
+            // green/red diff signals.
             Self::Dark => ThemeSpec {
-                background: Color::from_rgb(0.035, 0.040, 0.052),
-                panel_background: Color::from_rgb(0.058, 0.066, 0.084),
-                panel_background_elevated: Color::from_rgb(0.083, 0.094, 0.120),
-                selected_file: Color::from_rgb(0.105, 0.150, 0.190),
-                text: Color::from_rgb(0.925, 0.940, 0.960),
-                muted_text: Color::from_rgb(0.665, 0.710, 0.760),
-                subtle_text: Color::from_rgb(0.500, 0.545, 0.600),
-                accent: Color::from_rgb(0.160, 0.640, 0.780),
-                added_line: Color::from_rgba(0.065, 0.500, 0.260, 0.18),
-                removed_line: Color::from_rgba(0.690, 0.145, 0.180, 0.19),
-                added_text: Color::from_rgb(0.450, 0.890, 0.590),
-                removed_text: Color::from_rgb(0.980, 0.470, 0.500),
-                modified_token: Color::from_rgb(0.920, 0.690, 0.265),
-                file_header: Color::from_rgb(0.070, 0.080, 0.102),
-                hunk_header: Color::from_rgb(0.105, 0.132, 0.155),
-                conflict_marker: Color::from_rgb(1.000, 0.310, 0.350),
-                border: Color::from_rgb(0.180, 0.205, 0.245),
-                note_background: Color::from_rgba(0.720, 0.490, 0.150, 0.18),
-                note_text: Color::from_rgb(0.940, 0.760, 0.390),
+                background: Color::from_rgb(0.043, 0.051, 0.071),
+                panel_background: Color::from_rgb(0.067, 0.078, 0.106),
+                panel_background_elevated: Color::from_rgb(0.094, 0.110, 0.145),
+                selected_file: Color::from_rgb(0.153, 0.176, 0.231),
+                text: Color::from_rgb(0.902, 0.910, 0.933),
+                muted_text: Color::from_rgb(0.690, 0.710, 0.761),
+                subtle_text: Color::from_rgb(0.486, 0.510, 0.580),
+                accent: Color::from_rgb(1.000, 0.478, 0.349),
+                added_line: Color::from_rgba(0.357, 0.773, 0.478, 0.07),
+                removed_line: Color::from_rgba(0.929, 0.431, 0.361, 0.07),
+                added_text: Color::from_rgb(0.357, 0.773, 0.478),
+                removed_text: Color::from_rgb(0.929, 0.431, 0.361),
+                modified_token: Color::from_rgb(0.961, 0.706, 0.345),
+                info: Color::from_rgb(0.416, 0.659, 1.000),
+                file_header: Color::from_rgb(0.067, 0.078, 0.106),
+                hunk_header: Color::from_rgba(0.416, 0.659, 1.000, 0.06),
+                conflict_marker: Color::from_rgb(0.949, 0.361, 0.361),
+                border: Color::from_rgb(0.137, 0.153, 0.196),
+                note_background: Color::from_rgba(0.961, 0.706, 0.345, 0.14),
+                note_text: Color::from_rgb(0.961, 0.706, 0.345),
+                lane_base: Color::from_rgb(0.655, 0.545, 0.980),
+                on_accent: Color::from_rgb(0.043, 0.051, 0.071),
             },
+            // Neutral whites — panes are pure white, canvas is a faint
+            // gray so the panes still read as elevated. Coral accent stays
+            // for selection / working-copy signalling.
             Self::Light => ThemeSpec {
-                background: Color::from_rgb(0.945, 0.946, 0.940),
-                panel_background: Color::from_rgb(0.988, 0.988, 0.982),
-                panel_background_elevated: Color::from_rgb(0.965, 0.966, 0.958),
-                selected_file: Color::from_rgb(0.860, 0.910, 0.925),
-                text: Color::from_rgb(0.120, 0.130, 0.145),
-                muted_text: Color::from_rgb(0.390, 0.430, 0.470),
-                subtle_text: Color::from_rgb(0.585, 0.610, 0.635),
-                accent: Color::from_rgb(0.045, 0.430, 0.545),
-                added_line: Color::from_rgba(0.120, 0.610, 0.330, 0.14),
-                removed_line: Color::from_rgba(0.760, 0.120, 0.145, 0.14),
-                added_text: Color::from_rgb(0.080, 0.430, 0.225),
-                removed_text: Color::from_rgb(0.660, 0.105, 0.125),
-                modified_token: Color::from_rgb(0.625, 0.410, 0.080),
-                file_header: Color::from_rgb(0.930, 0.932, 0.922),
-                hunk_header: Color::from_rgb(0.875, 0.905, 0.910),
-                conflict_marker: Color::from_rgb(0.760, 0.080, 0.100),
-                border: Color::from_rgb(0.760, 0.770, 0.780),
-                note_background: Color::from_rgba(0.820, 0.560, 0.110, 0.18),
+                background: Color::from_rgb(0.957, 0.957, 0.961),
+                panel_background: Color::from_rgb(1.000, 1.000, 1.000),
+                panel_background_elevated: Color::from_rgb(0.976, 0.976, 0.980),
+                selected_file: Color::from_rgb(0.910, 0.918, 0.933),
+                text: Color::from_rgb(0.106, 0.114, 0.133),
+                muted_text: Color::from_rgb(0.314, 0.337, 0.380),
+                subtle_text: Color::from_rgb(0.486, 0.506, 0.553),
+                accent: Color::from_rgb(0.851, 0.275, 0.122),
+                added_line: Color::from_rgba(0.184, 0.620, 0.365, 0.06),
+                removed_line: Color::from_rgba(0.800, 0.247, 0.184, 0.05),
+                added_text: Color::from_rgb(0.184, 0.620, 0.365),
+                removed_text: Color::from_rgb(0.800, 0.247, 0.184),
+                modified_token: Color::from_rgb(0.773, 0.518, 0.133),
+                info: Color::from_rgb(0.165, 0.435, 0.859),
+                file_header: Color::from_rgb(0.976, 0.976, 0.980),
+                hunk_header: Color::from_rgba(0.165, 0.435, 0.859, 0.06),
+                conflict_marker: Color::from_rgb(0.800, 0.247, 0.184),
+                border: Color::from_rgb(0.882, 0.886, 0.898),
+                note_background: Color::from_rgba(0.773, 0.518, 0.133, 0.14),
                 note_text: Color::from_rgb(0.500, 0.320, 0.045),
+                lane_base: Color::from_rgb(0.486, 0.357, 0.910),
+                on_accent: Color::WHITE,
             },
             Self::HighContrast => ThemeSpec {
                 background: Color::BLACK,
@@ -100,18 +116,21 @@ impl ResolvedTheme {
                 text: Color::WHITE,
                 muted_text: Color::from_rgb(0.780, 0.820, 0.840),
                 subtle_text: Color::from_rgb(0.620, 0.660, 0.690),
-                accent: Color::from_rgb(0.000, 0.900, 1.000),
+                accent: Color::from_rgb(1.000, 0.478, 0.349),
                 added_line: Color::from_rgb(0.000, 0.235, 0.080),
                 removed_line: Color::from_rgb(0.300, 0.000, 0.045),
                 added_text: Color::from_rgb(0.500, 1.000, 0.600),
                 removed_text: Color::from_rgb(1.000, 0.520, 0.560),
                 modified_token: Color::from_rgb(1.000, 0.920, 0.000),
+                info: Color::from_rgb(0.380, 0.770, 1.000),
                 file_header: Color::from_rgb(0.120, 0.120, 0.120),
                 hunk_header: Color::from_rgb(0.000, 0.220, 0.310),
                 conflict_marker: Color::from_rgb(1.000, 0.140, 0.140),
                 border: Color::from_rgb(0.570, 0.620, 0.660),
                 note_background: Color::from_rgb(0.260, 0.210, 0.000),
                 note_text: Color::from_rgb(1.000, 0.940, 0.500),
+                lane_base: Color::from_rgb(0.760, 0.620, 1.000),
+                on_accent: Color::BLACK,
             },
         }
     }
@@ -140,12 +159,29 @@ pub struct ThemeSpec {
     pub added_text: Color,
     pub removed_text: Color,
     pub modified_token: Color,
+    /// Informational blue. Used for the `M` (Modified) file-status chip
+    /// and the diff-view hunk header — wherever the design system uses
+    /// `--info`. Separate from `accent` so the accent (coral) stays
+    /// reserved for selection, working copy, and primary actions.
+    pub info: Color,
     pub file_header: Color,
     pub hunk_header: Color,
     pub conflict_marker: Color,
     pub border: Color,
     pub note_background: Color,
     pub note_text: Color,
+    /// Base color for lane 0 of the revision graph. Subsequent lanes
+    /// derive their hue from this via `RevisionGraphStyle::lane_color`'s
+    /// HSL rotation. Decoupled from `accent` so the trunk (violet in the
+    /// design) doesn't fight diff add/del greens and reds, and so the
+    /// coral accent stays reserved for the working copy and selection.
+    pub lane_base: Color,
+    /// High-contrast color for text/marks drawn *on top of* `accent`
+    /// (e.g. the working-copy row when it's the loud orange state).
+    /// White on the deep light-theme coral, near-black on the bright
+    /// dark-theme coral — coral's luminance is just below the middle
+    /// of the range so the contrast color flips between themes.
+    pub on_accent: Color,
 }
 
 pub fn diff_palette(theme: ThemeSpec) -> Palette {
@@ -166,9 +202,12 @@ pub fn diff_palette(theme: ThemeSpec) -> Palette {
         gutter_background: theme.panel_background,
         border: theme.border,
         // Translucent accent so the underlying syntax-highlighted text and
-        // line-change tints stay readable under the selection.
+        // line-change tints stay readable under the selection. Alpha tuned
+        // to match the design's `--accent-soft` token — strong enough to
+        // clearly mark the selection, soft enough to keep the diff colors
+        // legible behind it.
         selection: Color {
-            a: 0.30,
+            a: 0.18,
             ..theme.accent
         },
         scrollbar: scrollbar_style(theme),
@@ -246,7 +285,7 @@ pub fn theme_switcher_button_style(
         border: Border {
             width: 0.0,
             color: Color::TRANSPARENT,
-            radius: 0.0.into(),
+            radius: 5.0.into(),
         },
         shadow: Shadow::default(),
         snap: true,
@@ -256,6 +295,11 @@ pub fn theme_switcher_button_style(
 /// Translucent chip background derived from the chip's text color. This way
 /// the chip reads independently of whether the row is selected — its visual
 /// frame comes from the tint rather than from the row's solid background.
+///
+/// Alpha picked to match the design system's `--*-soft` tokens (e.g.
+/// `--accent-soft: rgba(..,..,..,.14)`, `--add-soft: rgba(..,..,..,.13)`).
+/// The previous 0.20 made the chip dominate the row; .14 keeps it as a
+/// quiet tint that lets the colored glyph carry the signal.
 pub fn chip_background(color: Color) -> Color {
-    Color { a: 0.20, ..color }
+    Color { a: 0.14, ..color }
 }

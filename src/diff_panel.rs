@@ -1,6 +1,6 @@
 use iced::{
-    Element, Length,
-    widget::{container, text},
+    Element, Length, alignment,
+    widget::{column, container, row, text},
 };
 
 use crate::backend::{RevisionDetails, SignatureInfo};
@@ -8,8 +8,9 @@ use crate::diff_view::{self, DiffFileView, DiffView};
 use crate::theme::{ThemeSpec, diff_palette, diff_panel_style};
 use crate::{Diffui, LoadStatus, Message};
 
-const CODE_TEXT_SIZE: f32 = 13.0;
-const EMPTY_STATE_TEXT_SIZE: f32 = 15.0;
+const CODE_TEXT_SIZE: f32 = 12.0;
+const EMPTY_STATE_TEXT_SIZE: f32 = 14.0;
+const STATS_TEXT_SIZE: f32 = 13.0;
 
 pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
     let body: Element<'a, Message> =
@@ -60,7 +61,9 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
                 .map(build_header_lines)
                 .unwrap_or_default();
 
-            DiffView::new(
+            let stats_bar = build_stats_bar(ui, theme);
+
+            let diff_view: Element<'a, Message> = DiffView::new(
                 files,
                 ui.selected_file,
                 ui.selected_revision.view_key(),
@@ -72,7 +75,9 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
             )
             .with_header(header_lines)
             .on_copy(Message::CopyToClipboard)
-            .into()
+            .into();
+
+            column![stats_bar, diff_view].spacing(0).into()
         };
 
     container(body)
@@ -82,6 +87,54 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
         .clip(true)
         .style(move |_| diff_panel_style(theme))
         .into()
+}
+
+/// Compact stats line shown above the diff scroll area: saturated
+/// `+N` / `−M` glyphs followed by a quiet `· N files` tail. Mirrors the
+/// pattern the sidebar header used to carry — moved here so the sidebar
+/// stays focused on the revision list and the totals sit next to the
+/// content they describe.
+fn build_stats_bar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
+    let bar = row![
+        text(format!("+{}", ui.document.total_additions))
+            .size(STATS_TEXT_SIZE)
+            .font(ui.config.mono_font)
+            .color(theme.added_text),
+        text(format!("−{}", ui.document.total_deletions))
+            .size(STATS_TEXT_SIZE)
+            .font(ui.config.mono_font)
+            .color(theme.removed_text),
+        text(format!(
+            "· {}",
+            format_file_count(ui.document.files.len())
+        ))
+        .size(STATS_TEXT_SIZE)
+        .color(theme.subtle_text),
+    ]
+    .spacing(8)
+    .align_y(alignment::Vertical::Center);
+
+    container(bar)
+        .width(Length::Fill)
+        .padding([8, 14])
+        .style(move |_| container::Style {
+            background: Some(iced::Background::Color(theme.panel_background)),
+            border: iced::Border {
+                color: theme.border,
+                width: 0.0,
+                radius: 0.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
+fn format_file_count(count: usize) -> String {
+    if count == 1 {
+        "1 file".to_owned()
+    } else {
+        format!("{count} files")
+    }
 }
 
 /// Format a `RevisionDetails` value into the line-by-line layout the diff
