@@ -21,8 +21,8 @@ use iced::advanced::{
     widget::{Tree, tree},
 };
 use iced::{
-    Background, Border, Color, Element, Event, Font, Length, Pixels, Point, Rectangle, Shadow,
-    Size, Theme, Vector, alignment,
+    Background, Border, Color, Element, Event, Font, Length, Pixels, Point, Radians, Rectangle,
+    Shadow, Size, Theme, Vector, alignment, gradient,
 };
 use jj_lib::graph::GraphEdgeType;
 
@@ -44,6 +44,10 @@ const CONTENT_PADDING: f32 = 12.0;
 const INDICATOR_RADIUS: f32 = 5.0;
 const SMALL_TEXT_SIZE: f32 = 14.0;
 const CAPTION_TEXT_SIZE: f32 = 13.0;
+/// Status-badge text size. Smaller than the row's caption text so the
+/// single-letter chip (M/A/D/R) reads as a compact tag rather than another
+/// full-weight column on the file row.
+const FILE_BADGE_TEXT_SIZE: f32 = 10.0;
 pub const FILE_ROW_GAP: f32 = 6.0;
 pub const FILE_ROW_RIGHT_PAD: f32 = 10.0;
 const TOOLTIP_RADIUS: f32 = 5.0;
@@ -55,13 +59,10 @@ pub struct RevisionListStyle {
     pub graph: RevisionGraphStyle,
     pub background: Color,
     pub selected_background: Color,
-    /// Saturated accent — fills the working-copy row when it's the
-    /// loud "you are here" state, and tints it when selected. Also
-    /// recolors the working-copy node disc in the graph.
+    /// Saturated accent — drives the left-edge tint of the working-copy
+    /// row's gradient and recolors the working-copy node disc in the
+    /// graph.
     pub accent: Color,
-    /// Contrast color used for text/marks rendered on top of `accent`
-    /// (the loud working-copy row). See [`ThemeSpec::on_accent`].
-    pub on_accent: Color,
     pub border: Color,
     pub muted_text: Color,
     pub subtle_text: Color,
@@ -119,6 +120,11 @@ pub struct RevisionRowView {
     /// this row. Used to extend stroke emphasis from a single hovered
     /// row out to the whole lane segment.
     pub lane_segments: Vec<Option<usize>>,
+    /// Whether to draw the inline collapse/expand chevron on the
+    /// description row. `None` skips the glyph entirely (non-selected
+    /// rows have no file list to toggle). `Some(true)` shows the
+    /// "expanded" chevron, `Some(false)` shows the "collapsed" one.
+    pub collapse_chevron: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -366,8 +372,8 @@ where
                         shell.request_redraw();
                     }
                     state.cursor_position = None;
-                    let had_hover =
-                        state.hovered_file_item.take().is_some() || state.hovered_lane.take().is_some();
+                    let had_hover = state.hovered_file_item.take().is_some()
+                        || state.hovered_lane.take().is_some();
                     if had_hover {
                         shell.request_redraw();
                     }
@@ -652,26 +658,25 @@ impl<Message> RevisionList<Message> {
             .map(|key| key == &rev.selection_key)
             .unwrap_or(false);
         let is_working_copy = matches!(rev.selection_key, RowSelectionKey::WorkingCopy);
-        // Working-copy uses an inverted hierarchy:
-        //   - unselected: solid accent fill, contrast text — loudly marks
-        //     "you are here" without competing with selection.
-        //   - selected:   soft accent tint, normal text — recedes so the
-        //     content reads like any other selected row.
-        let wc_loud = is_working_copy && !selected;
 
         // Row chrome extends edge-to-edge. The graph is drawn last in this
         // method so its lines & node still sit visually above any chrome.
-        if wc_loud {
-            fill_background(renderer, row_bounds, self.style.accent);
-        } else if is_working_copy && selected {
-            fill_background(
-                renderer,
-                row_bounds,
-                Color {
-                    a: 0.20,
-                    ..self.style.accent
-                },
-            );
+        // Working-copy rows get a left→right gradient with a fixed light
+        // accent on the left fading into the row's base color on the
+        // right (panel background normally, the selected gray when
+        // selected). The left tint is pre-mixed opaque so the orange
+        // reads identically whether or not the row is selected.
+        if is_working_copy {
+            let right = if selected {
+                self.style.selected_background
+            } else {
+                self.style.background
+            };
+            let left = mix_color(self.style.accent, self.style.background, 0.20);
+            let gradient = gradient::Linear::new(Radians(std::f32::consts::FRAC_PI_2))
+                .add_stop(0.0, left)
+                .add_stop(1.0, right);
+            fill_gradient(renderer, row_bounds, gradient);
         } else if selected {
             fill_background(renderer, row_bounds, self.style.selected_background);
         }
@@ -733,8 +738,7 @@ impl<Message> RevisionList<Message> {
         };
         let author_full_w =
             measure_text_width::<R>(&rev.author, id_size, self.style.primary_font, paragraphs);
-        let ellipsis_w =
-            measure_text_width::<R>("…", id_size, self.style.mono_font, paragraphs);
+        let ellipsis_w = measure_text_width::<R>("…", id_size, self.style.mono_font, paragraphs);
 
         let bm_widths: Vec<f32> = rev
             .bookmark_chips
@@ -756,7 +760,11 @@ impl<Message> RevisionList<Message> {
         // Always-shown widths consume from the budget first.
         let id_w = prefix_w + suffix_w;
         let mandatory_left = at_w + (if at_marker { at_gap } else { 0.0 }) + id_w;
-        let mandatory_right_gap = if !status_widths.is_empty() { chip_gap } else { 0.0 };
+        let mandatory_right_gap = if !status_widths.is_empty() {
+            chip_gap
+        } else {
+            0.0
+        };
         let mandatory = mandatory_left + status_total + mandatory_right_gap;
         let mut budget = (total_width - mandatory).max(0.0);
 
@@ -774,8 +782,8 @@ impl<Message> RevisionList<Message> {
         let mut overflow_count: usize = 0;
         let mut overflow_w: f32 = 0.0;
         if !rev.bookmark_chips.is_empty() {
-            let all_w: f32 = bm_widths.iter().sum::<f32>()
-                + chip_gap * bm_widths.len().saturating_sub(1) as f32;
+            let all_w: f32 =
+                bm_widths.iter().sum::<f32>() + chip_gap * bm_widths.len().saturating_sub(1) as f32;
             let bm_block_w = if chip_gap + all_w <= budget {
                 visible_bookmarks = rev.bookmark_chips.len();
                 all_w
@@ -787,8 +795,7 @@ impl<Message> RevisionList<Message> {
                     let remaining = rev.bookmark_chips.len() - i - 1;
                     let need_overflow = remaining > 0;
                     let overflow_label = format!("+{}", remaining.max(1));
-                    let overflow_chip_w =
-                        self.measure_chip_width::<R>(&overflow_label, paragraphs);
+                    let overflow_chip_w = self.measure_chip_width::<R>(&overflow_label, paragraphs);
                     let plus_overflow = if need_overflow {
                         chip_gap + overflow_chip_w
                     } else {
@@ -828,20 +835,14 @@ impl<Message> RevisionList<Message> {
         let need_ellipsis = (!show_commit_id) || (!show_author && !rev.author.is_empty());
 
         // === Color selection ===
-        let (col_at, col_id_prefix, col_id_suffix, col_commit, col_author, col_ellipsis) =
-            if wc_loud {
-                let c = self.style.on_accent;
-                (c, c, c, c, c, c)
-            } else {
-                (
-                    self.style.accent,
-                    self.style.accent_text,
-                    self.style.subtle_text,
-                    self.style.muted_text,
-                    self.style.subtle_text,
-                    self.style.subtle_text,
-                )
-            };
+        let (col_at, col_id_prefix, col_id_suffix, col_commit, col_author, col_ellipsis) = (
+            self.style.accent,
+            self.style.accent_text,
+            self.style.subtle_text,
+            self.style.muted_text,
+            self.style.subtle_text,
+            self.style.subtle_text,
+        );
 
         // === Draw left-side flowing content ===
         let mut x_cursor = content_left;
@@ -1015,21 +1016,50 @@ impl<Message> RevisionList<Message> {
             chip_x += status_widths[i] + chip_gap;
         }
 
+        // Reserve room on the right of the description for the collapse/
+        // expand chevron when this is the selected row. The chevron sizes
+        // up past the description so the affordance reads at a glance —
+        // at the description's own size it shrinks to ~5px on the y axis
+        // and disappears against the row chrome.
+        let chevron_glyph = rev
+            .collapse_chevron
+            .map(|expanded| if expanded { "\u{25BE}" } else { "\u{25B8}" });
+        let chevron_size = SMALL_TEXT_SIZE + 6.0;
+        let chevron_width = chevron_glyph
+            .map(|glyph| {
+                measure_text_width::<R>(glyph, chevron_size, self.style.primary_font, paragraphs)
+            })
+            .unwrap_or(0.0);
+        let chevron_gap = if chevron_glyph.is_some() { 6.0 } else { 0.0 };
+        let description_width = (content_width - chevron_width - chevron_gap).max(1.0);
+
         fill_text_truncated(
             renderer,
             &rev.description,
             content_left,
             desc_mid_y,
-            content_width,
+            description_width,
             desc_size,
-            if wc_loud {
-                self.style.on_accent
-            } else {
-                rev.description_color
-            },
+            rev.description_color,
             self.style.primary_font,
             row_clip,
         );
+
+        if let Some(glyph) = chevron_glyph {
+            let chevron_x = row_bounds.x + row_bounds.width - content_right_pad - chevron_width;
+            fill_text_centered_y(
+                renderer,
+                glyph,
+                chevron_x,
+                desc_mid_y,
+                chevron_width.max(1.0),
+                chevron_size,
+                self.style.subtle_text,
+                self.style.primary_font,
+                row_clip,
+                text::Alignment::Left,
+            );
+        }
 
         // Graph painted last so node + lines sit on top of any row chrome.
         let gutter_bounds = Rectangle {
@@ -1038,12 +1068,9 @@ impl<Message> RevisionList<Message> {
             width: gutter_total - GUTTER_LEFT_PADDING - GUTTER_PADDING,
             height: row_bounds.height,
         };
-        // Working-copy node: on the loud row the disc would be accent-on-
-        // accent (invisible), so swap it for the contrast color. On a
-        // selected (soft-tint) row the accent reads fine.
-        let node_override = if wc_loud {
-            Some(self.style.on_accent)
-        } else if is_working_copy {
+        // Working-copy node sits on the gradient's faded right side, so
+        // the saturated accent reads cleanly without a contrast swap.
+        let node_override = if is_working_copy {
             Some(self.style.accent)
         } else {
             None
@@ -1094,7 +1121,7 @@ impl<Message> RevisionList<Message> {
 
         // Status badge — vertically centered on the row mid-line.
         let badge_w = self.style.file_badge_width;
-        let badge_h = 18.0;
+        let badge_h = 14.0;
         let badge_y = row_mid_y - badge_h / 2.0;
         fill_quad(
             renderer,
@@ -1113,7 +1140,7 @@ impl<Message> RevisionList<Message> {
             content_x + badge_w / 2.0,
             row_mid_y,
             badge_w,
-            CAPTION_TEXT_SIZE,
+            FILE_BADGE_TEXT_SIZE,
             f.status_text,
             self.style.primary_font,
             row_clip,
@@ -1298,8 +1325,16 @@ impl<Message> RevisionList<Message> {
 /// and [`FileRowView::lane_labels`].
 fn item_lane_labels(item: &Item, lane: usize) -> &[String] {
     match item {
-        Item::Revision(row) => row.lane_labels.get(lane).map(|v| v.as_slice()).unwrap_or(&[]),
-        Item::File(row) => row.lane_labels.get(lane).map(|v| v.as_slice()).unwrap_or(&[]),
+        Item::Revision(row) => row
+            .lane_labels
+            .get(lane)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]),
+        Item::File(row) => row
+            .lane_labels
+            .get(lane)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]),
     }
 }
 
@@ -1322,6 +1357,34 @@ fn fill_background<R: renderer::Renderer>(renderer: &mut R, rect: Rectangle, col
             snap: true,
         },
         color,
+    );
+}
+
+/// Blend `fg` onto `bg` as if drawing `fg` (with its alpha replaced by
+/// `weight`) over an opaque `bg`. Returns an opaque color.
+fn mix_color(fg: Color, bg: Color, weight: f32) -> Color {
+    let w = weight.clamp(0.0, 1.0);
+    Color {
+        r: fg.r * w + bg.r * (1.0 - w),
+        g: fg.g * w + bg.g * (1.0 - w),
+        b: fg.b * w + bg.b * (1.0 - w),
+        a: 1.0,
+    }
+}
+
+fn fill_gradient<R: renderer::Renderer>(
+    renderer: &mut R,
+    rect: Rectangle,
+    gradient: gradient::Linear,
+) {
+    renderer.fill_quad(
+        renderer::Quad {
+            bounds: rect,
+            border: Border::default(),
+            shadow: Shadow::default(),
+            snap: true,
+        },
+        gradient,
     );
 }
 

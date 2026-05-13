@@ -23,7 +23,6 @@ const FILE_HEADER_VPAD: f32 = 8.0;
 // Padding above and below the centered title row inside the hunk-header strip.
 const HUNK_HEADER_VPAD: f32 = 1.0;
 const PREFIX_WIDTH: f32 = 24.0;
-const CHANGE_MARK_WIDTH: f32 = 2.0;
 const TEXT_X_PADDING: f32 = 8.0;
 const TEXT_Y_PADDING: f32 = 2.0;
 const LINE_SCROLL_ROWS: f32 = 1.5;
@@ -187,18 +186,27 @@ struct LayoutMetrics {
     hunk_header_height: f32,
     gutter_width: f32,
     gutter_digit_count: usize,
+    /// Real monospace glyph advance for the diff font + size, measured
+    /// once via cosmic_text at construction. Wrap-line counting (in
+    /// `row_height`) and selection geometry (in `draw()` /
+    /// `position_at_point`) both rely on this — agreeing on a single
+    /// value keeps row heights aligned with where iced actually breaks
+    /// long lines, so we don't reserve an empty wrap row before the
+    /// renderer actually wraps.
+    char_width: f32,
 }
 
 impl LayoutMetrics {
-    fn new(text_size: f32, gutter_digit_count: usize) -> Self {
+    fn new(text_size: f32, gutter_digit_count: usize, font: Font) -> Self {
         let row_height = (text_size * ROW_HEIGHT_RATIO).round();
         let file_header_height = row_height + 2.0 * FILE_HEADER_VPAD;
         let hunk_header_height = row_height + 2.0 * HUNK_HEADER_VPAD;
-        // Width of the rendered gutter text "{old:>D} {new:>D}" plus padding.
-        // The `text_size * 0.62` char-width heuristic is the same one
-        // `DiffView::char_width` falls back to before the first draw — the
-        // gutter text is whitespace-padded so being a bit off is harmless.
-        let char_width = text_size * 0.62;
+        // Headless cosmic_text shaping gives the actual glyph advance, so
+        // the row-height wrap math matches iced's renderer instead of the
+        // historical `text_size * 0.62` heuristic that consistently
+        // under-counted chars-per-line and produced phantom trailing
+        // wrap rows just before the renderer hit its real break point.
+        let char_width = measure_char_advance(font, text_size).max(1.0);
         let gutter_text_chars = gutter_digit_count * 2 + 1; // two columns + one separating space
         let gutter_width = (gutter_text_chars as f32 * char_width
             + GUTTER_HORIZONTAL_PADDING * 2.0)
@@ -209,6 +217,7 @@ impl LayoutMetrics {
             hunk_header_height,
             gutter_width,
             gutter_digit_count,
+            char_width,
         }
     }
 }
@@ -249,11 +258,6 @@ struct State<Paragraph> {
     /// auto-scroll and to reproject the selection focus after the viewport
     /// shifts under the cursor.
     last_drag_cursor: Option<Point>,
-    /// Cached glyph advance for `self.font` at `self.text_size`. The diff
-    /// font is monospace, so one measured width is enough for hit-testing.
-    /// `None` until the first draw measures it. `Cell` so the immutable
-    /// `draw()` path can fill it without going through `RefCell` ceremony.
-    measured_char_advance: std::cell::Cell<Option<f32>>,
     scrollbar: ScrollbarState,
 }
 
@@ -331,7 +335,7 @@ impl<'a, Message> DiffView<'a, Message> {
         on_selected_file_changed: fn(usize) -> Message,
     ) -> Self {
         let gutter_digit_count = compute_gutter_digit_count(&files);
-        let metrics = LayoutMetrics::new(text_size, gutter_digit_count);
+        let metrics = LayoutMetrics::new(text_size, gutter_digit_count, font);
         Self {
             files,
             selected_file,
@@ -448,22 +452,12 @@ impl<'a, Message> DiffView<'a, Message> {
     }
 
     fn content_width(&self, viewport_width: f32) -> f32 {
-        (viewport_width - self.metrics.gutter_width - PREFIX_WIDTH - 16.0).max(self.char_width(None))
-    }
-
-    /// Width of a single monospace glyph for this font/size. Hit-tests and
-    /// selection rendering reach for the value cached on the widget state
-    /// after the first draw (`measured`), falling back to a `text_size *
-    /// 0.62` heuristic until that runs. The heuristic over-counts for fonts
-    /// narrower than Menlo by ~0.5 char/line, which is what caused selection
-    /// rectangles to drift past the rightmost glyph and copies to drop the
-    /// trailing character.
-    fn char_width(&self, measured: Option<f32>) -> f32 {
-        measured.unwrap_or(self.text_size * 0.62)
+        (viewport_width - self.metrics.gutter_width - PREFIX_WIDTH - 16.0)
+            .max(self.metrics.char_width)
     }
 
     fn row_height(&self, line: &DiffLine, content_width: f32) -> f32 {
-        let chars_per_line = (content_width / self.char_width(None)).floor().max(1.0) as usize;
+        let chars_per_line = chars_per_visual_line(content_width, self.metrics.char_width);
         let wrapped_lines = line.content.chars().count().max(1).div_ceil(chars_per_line);
 
         wrapped_lines as f32 * self.metrics.row_height
@@ -489,7 +483,6 @@ impl<'a, Message> DiffView<'a, Message> {
         point: Point,
         bounds: Rectangle,
         vertical_offset: f32,
-        measured_char_advance: Option<f32>,
     ) -> Option<TextPosition> {
         let content_width = self.content_width(bounds.width);
         let text_x = bounds.x + self.metrics.gutter_width + PREFIX_WIDTH + TEXT_X_PADDING;
@@ -514,12 +507,20 @@ impl<'a, Message> DiffView<'a, Message> {
                     ));
 
                     if target_y >= row_top && target_y < row_bottom {
-                        let byte = self.byte_offset_for_x(
-                            point.x,
-                            text_x,
-                            &line.content,
-                            measured_char_advance,
-                        );
+                        // Each row may span multiple wrapped visual lines.
+                        // Figure out which visual line the click lands on,
+                        // then translate the horizontal click into a char
+                        // offset within that visual line's slice of the
+                        // source content.
+                        let cw = self.metrics.char_width;
+                        let chars_per_line = chars_per_visual_line(content_width, cw);
+                        let visual_idx =
+                            ((target_y - row_top) / self.metrics.row_height).floor() as usize;
+                        let line_char_start = visual_idx.saturating_mul(chars_per_line);
+                        let relative_x = (point.x - text_x).max(0.0);
+                        let local_char = (relative_x / cw + 0.5).floor() as usize;
+                        let char_offset = (line_char_start + local_char).min(char_count);
+                        let byte = byte_offset_for_char(&line.content, char_offset);
                         return Some(TextPosition {
                             file_index,
                             hunk_index,
@@ -546,26 +547,6 @@ impl<'a, Message> DiffView<'a, Message> {
                 }
             },
         )
-    }
-
-    /// Translate the screen-x of a click into a byte offset inside `content`.
-    /// Uses the measured char advance for accuracy and rounds half-cells up
-    /// so a click in the right half of a glyph lands after it (the editor
-    /// convention).
-    fn byte_offset_for_x(
-        &self,
-        x: f32,
-        text_x: f32,
-        content: &str,
-        measured_char_advance: Option<f32>,
-    ) -> usize {
-        let cw = self.char_width(measured_char_advance).max(1.0);
-        let relative_x = (x - text_x).max(0.0);
-        // Round to nearest cell boundary — clicks in the right half of a
-        // glyph snap after it, clicks in the left half snap before it.
-        let char_offset = (relative_x / cw + 0.5).floor() as usize;
-        let max_chars = content.chars().count();
-        byte_offset_for_char(content, char_offset.min(max_chars))
     }
 
     /// Build the substring inside the inclusive selection range
@@ -633,7 +614,11 @@ impl<'a, Message> DiffView<'a, Message> {
         Renderer: text::Renderer<Font = Font>,
     {
         let text_color = self.line_text_color(line.kind);
-        let gutter = format_gutter(line.old_line, line.new_line, self.metrics.gutter_digit_count);
+        let gutter = format_gutter(
+            line.old_line,
+            line.new_line,
+            self.metrics.gutter_digit_count,
+        );
         let prefix = prefix_for_kind(line.kind);
         let bounds = render.bounds;
 
@@ -673,6 +658,14 @@ impl<'a, Message> DiffView<'a, Message> {
             render.y + TEXT_Y_PADDING,
         );
 
+        // Glyph wrapping (hard column break) instead of `WordOrGlyph`
+        // so the renderer's wrap points match our chars-per-line column
+        // math exactly. Word-aware wrapping breaks at spaces, which means
+        // each visual line ends at a different column than the math
+        // predicts — and that's what made selection rectangles on wrapped
+        // code drift before/after the true text on the last visual line.
+        // For monospaced source code, glyph wrapping is also visually
+        // tighter (no ragged whitespace gaps on the right edge).
         self.draw_code_text(
             renderer,
             line,
@@ -682,7 +675,7 @@ impl<'a, Message> DiffView<'a, Message> {
                 position,
                 color: text_color,
                 clip_bounds: render.content_clip_bounds,
-                wrapping: text::Wrapping::WordOrGlyph,
+                wrapping: text::Wrapping::Glyph,
             },
             paragraphs,
         );
@@ -818,7 +811,6 @@ where
             last_click_screen: None,
             click_count: 0,
             last_drag_cursor: None,
-            measured_char_advance: std::cell::Cell::new(None),
             scrollbar: ScrollbarState::default(),
         })
     }
@@ -906,7 +898,6 @@ where
 
         let content_height = self.content_height(bounds.width);
 
-        let measured = state.measured_char_advance.get();
         match event {
             Event::Window(window::Event::RedrawRequested(_)) => {
                 if state.is_selecting
@@ -918,7 +909,7 @@ where
                             (state.vertical_offset + scroll_delta).clamp(0.0, max_vertical);
                         if (new_offset - state.vertical_offset).abs() > f32::EPSILON {
                             state.vertical_offset = new_offset;
-                            self.advance_drag_selection(state, cursor_pos, bounds, measured);
+                            self.advance_drag_selection(state, cursor_pos, bounds);
                             let selected_file =
                                 self.file_at_offset(state.vertical_offset, bounds.width);
                             if selected_file != state.selected_file {
@@ -996,8 +987,7 @@ where
                     }
                     scrollbar::ScrollbarEvent::None => {}
                 }
-                let Some(position) =
-                    self.position_at_point(point, bounds, state.vertical_offset, measured)
+                let Some(position) = self.position_at_point(point, bounds, state.vertical_offset)
                 else {
                     return;
                 };
@@ -1064,7 +1054,7 @@ where
                     return;
                 }
                 state.last_drag_cursor = Some(*position);
-                self.advance_drag_selection(state, *position, bounds, measured);
+                self.advance_drag_selection(state, *position, bounds);
                 // Kick the redraw loop so the auto-scroll handler picks up
                 // where the cursor is even if the mouse stays still.
                 shell.request_redraw();
@@ -1143,18 +1133,6 @@ where
             width: (bounds.width - self.metrics.gutter_width - PREFIX_WIDTH).max(1.0),
             height: bounds.height,
         };
-
-        // Measure the actual glyph advance for the code font on the first
-        // draw and cache it on `state`. The constructor's `text_size * 0.62`
-        // heuristic was off by ~0.5px/char for Menlo at 13pt, which made
-        // long selection rectangles drift past the rightmost glyph.
-        if state.measured_char_advance.get().is_none() {
-            let advance = measure_char_advance(self.font, self.text_size);
-            if advance.is_finite() && advance > 0.0 {
-                state.measured_char_advance.set(Some(advance));
-            }
-        }
-        let measured_char_advance = state.measured_char_advance.get();
 
         renderer.with_layer(bounds, |renderer| {
             self.draw_background(
@@ -1258,14 +1236,6 @@ where
                     band.height,
                     background,
                 );
-                self.draw_background(
-                    renderer,
-                    bounds.x,
-                    band.y,
-                    CHANGE_MARK_WIDTH,
-                    band.height,
-                    self.changed_line_mark_color(band.kind),
-                );
             }
 
             if header_height > 0.0 {
@@ -1353,14 +1323,6 @@ where
                     1.0,
                     self.palette.hunk_header,
                 );
-                self.draw_background(
-                    renderer,
-                    bounds.x,
-                    header.y,
-                    CHANGE_MARK_WIDTH,
-                    self.metrics.hunk_header_height,
-                    self.palette.modified_token,
-                );
                 self.draw_text(
                     renderer,
                     &hunk.header,
@@ -1385,8 +1347,12 @@ where
             if let (Some(anchor), Some(focus)) = (state.selection_anchor, state.selection_focus) {
                 let (sel_start, sel_end) = ordered(anchor, focus);
                 if sel_start != sel_end {
-                    let cw = self.char_width(measured_char_advance).max(1.0);
-                    let text_x = bounds.x + self.metrics.gutter_width + PREFIX_WIDTH + TEXT_X_PADDING;
+                    let cw = self.metrics.char_width;
+                    let chars_per_line = chars_per_visual_line(content_width, cw);
+                    let text_x =
+                        bounds.x + self.metrics.gutter_width + PREFIX_WIDTH + TEXT_X_PADDING;
+                    let visual_line_height = self.metrics.row_height;
+                    let max_right = content_clip_bounds.x + content_clip_bounds.width;
                     for row in &visible_rows {
                         let line =
                             &self.files[row.file_index].hunks[row.hunk_index].lines[row.line_index];
@@ -1418,40 +1384,50 @@ where
                         };
                         let start_chars = char_count_at_byte(&line.content, line_start_byte);
                         let end_chars = char_count_at_byte(&line.content, line_end_byte);
+                        let total_chars = line.content.chars().count();
                         let is_full_line = sel_start <= row_pos_start && row_pos_end < sel_end;
-                        let mut x = text_x + start_chars as f32 * cw;
-                        let mut width =
-                            (end_chars.saturating_sub(start_chars) as f32 * cw).max(0.0);
-                        // Pad full-line selections so they read as a "select
-                        // through end-of-line" highlight, mimicking what
-                        // editors do on shift+down.
-                        if is_full_line {
-                            width += cw * 0.6;
-                        }
-                        if width <= 0.0 {
-                            // Empty selection on this row (e.g. cursor sits
-                            // at column 0 on the trailing line).
-                            continue;
-                        }
-                        // Constrain to the content region so a long
-                        // selection on a wide row doesn't bleed into the
-                        // gutter on horizontal overflow.
-                        let max_right = content_clip_bounds.x + content_clip_bounds.width;
-                        if x < content_clip_bounds.x {
-                            let trim = content_clip_bounds.x - x;
-                            x = content_clip_bounds.x;
-                            width = (width - trim).max(0.0);
-                        }
-                        if x + width > max_right {
-                            width = (max_right - x).max(0.0);
-                        }
-                        if width > 0.0 {
+
+                        // Walk each visual sub-line the row contains and
+                        // intersect the selection char range with it. Without
+                        // this loop a wrapped row would render a single full-
+                        // width rectangle across every visual line, ignoring
+                        // where the selection actually starts and ends.
+                        let visual_lines = total_chars.max(1).div_ceil(chars_per_line);
+                        for visual_idx in 0..visual_lines {
+                            let vline_start = visual_idx * chars_per_line;
+                            let vline_end = ((visual_idx + 1) * chars_per_line).min(total_chars);
+                            let seg_start = start_chars.max(vline_start);
+                            let seg_end = end_chars.min(vline_end);
+                            if seg_start >= seg_end {
+                                continue;
+                            }
+                            let mut x = text_x + (seg_start - vline_start) as f32 * cw;
+                            let mut width = (seg_end - seg_start) as f32 * cw;
+                            // The "select through end-of-line" tail only
+                            // belongs on the trailing visual line of a full
+                            // logical row, not on every wrapped segment.
+                            let is_trailing_visual = visual_idx + 1 == visual_lines;
+                            if is_full_line && is_trailing_visual {
+                                width += cw * 0.6;
+                            }
+                            if x < content_clip_bounds.x {
+                                let trim = content_clip_bounds.x - x;
+                                x = content_clip_bounds.x;
+                                width = (width - trim).max(0.0);
+                            }
+                            if x + width > max_right {
+                                width = (max_right - x).max(0.0);
+                            }
+                            if width <= 0.0 {
+                                continue;
+                            }
+                            let y = row.y + visual_idx as f32 * visual_line_height;
                             self.draw_background(
                                 renderer,
                                 x,
-                                row.y,
+                                y,
                                 width,
-                                row.height,
+                                visual_line_height,
                                 self.palette.selection,
                             );
                         }
@@ -1505,6 +1481,13 @@ where
         {
             return mouse::Interaction::Idle;
         }
+        // The revision-header strip sits above the file content but isn't
+        // a selectable text region, so flipping back to the arrow cursor
+        // there avoids advertising an affordance we don't implement.
+        let target_y = point.y - bounds.y + state.vertical_offset;
+        if target_y < self.header_height() {
+            return mouse::Interaction::Idle;
+        }
         if point.x >= bounds.x + self.metrics.gutter_width + PREFIX_WIDTH {
             mouse::Interaction::Text
         } else {
@@ -1515,7 +1498,7 @@ where
 
 impl<Message> DiffView<'_, Message> {
     fn text_width(&self, content: &str) -> f32 {
-        (content.chars().count() as f32 * self.char_width(None) + 16.0).max(1.0)
+        (content.chars().count() as f32 * self.metrics.char_width + 16.0).max(1.0)
     }
 
     /// Update the selection focus based on the cursor's current screen
@@ -1527,14 +1510,9 @@ impl<Message> DiffView<'_, Message> {
         state: &mut State<P>,
         cursor_pos: Point,
         bounds: Rectangle,
-        measured_char_advance: Option<f32>,
     ) {
-        let Some(focus_pos) = self.position_at_point(
-            cursor_pos,
-            bounds,
-            state.vertical_offset,
-            measured_char_advance,
-        ) else {
+        let Some(focus_pos) = self.position_at_point(cursor_pos, bounds, state.vertical_offset)
+        else {
             return;
         };
 
@@ -1656,7 +1634,9 @@ impl<Message> DiffView<'_, Message> {
             content: spans.as_slice(),
             bounds: Size::new(render.width.max(1.0), render.height.max(1.0)),
             size: Pixels(self.text_size),
-            line_height: text::LineHeight::Absolute(Pixels(render.height.min(self.metrics.row_height))),
+            line_height: text::LineHeight::Absolute(Pixels(
+                render.height.min(self.metrics.row_height),
+            )),
             font: self.font,
             align_x: text::Alignment::Left,
             align_y: alignment::Vertical::Top,
@@ -1730,16 +1710,6 @@ impl<Message> DiffView<'_, Message> {
         }
     }
 
-    fn changed_line_mark_color(&self, kind: DiffLineKind) -> Color {
-        match kind {
-            DiffLineKind::Addition => self.palette.addition_text,
-            DiffLineKind::Deletion => self.palette.deletion_text,
-            DiffLineKind::Conflict => self.palette.conflict_marker,
-            DiffLineKind::Note => self.palette.note_text,
-            DiffLineKind::Context => self.palette.border,
-        }
-    }
-
     fn syntax_color(&self, kind: SyntaxKind) -> Color {
         match kind {
             SyntaxKind::Comment => self.palette.text_muted,
@@ -1752,6 +1722,13 @@ impl<Message> DiffView<'_, Message> {
             SyntaxKind::Punctuation => self.palette.text_muted,
         }
     }
+}
+
+/// How many characters fit on one visual line at the current monospace
+/// glyph advance. Mirrors `row_height`'s wrap-count math so hit-tests and
+/// selection geometry stay consistent with the way rows are laid out.
+fn chars_per_visual_line(content_width: f32, cw: f32) -> usize {
+    (content_width / cw.max(1.0)).floor().max(1.0) as usize
 }
 
 fn push_if_visible<T>(

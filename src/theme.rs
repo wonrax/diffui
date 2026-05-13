@@ -1,6 +1,5 @@
 use iced::{
-    Background, Border, Color, Element, Length, Shadow, Theme,
-    theme,
+    Background, Border, Color, Element, Length, Shadow, Theme, theme,
     widget::{button, container, text},
 };
 
@@ -72,14 +71,17 @@ impl ResolvedTheme {
                 removed_text: Color::from_rgb(0.929, 0.431, 0.361),
                 modified_token: Color::from_rgb(0.961, 0.706, 0.345),
                 info: Color::from_rgb(0.416, 0.659, 1.000),
-                file_header: Color::from_rgb(0.067, 0.078, 0.106),
+                // Pulled darker than `panel_background` so the file
+                // header strip reads as a clear divider when scrolling
+                // across files (the previous value matched the panel
+                // and made the header invisible against the diff body).
+                file_header: Color::from_rgb(0.043, 0.051, 0.071),
                 hunk_header: Color::from_rgba(0.416, 0.659, 1.000, 0.06),
                 conflict_marker: Color::from_rgb(0.949, 0.361, 0.361),
                 border: Color::from_rgb(0.137, 0.153, 0.196),
                 note_background: Color::from_rgba(0.961, 0.706, 0.345, 0.14),
                 note_text: Color::from_rgb(0.961, 0.706, 0.345),
                 lane_base: Color::from_rgb(0.655, 0.545, 0.980),
-                on_accent: Color::from_rgb(0.043, 0.051, 0.071),
             },
             // Neutral whites — panes are pure white, canvas is a faint
             // gray so the panes still read as elevated. Coral accent stays
@@ -99,14 +101,17 @@ impl ResolvedTheme {
                 removed_text: Color::from_rgb(0.800, 0.247, 0.184),
                 modified_token: Color::from_rgb(0.773, 0.518, 0.133),
                 info: Color::from_rgb(0.165, 0.435, 0.859),
-                file_header: Color::from_rgb(0.976, 0.976, 0.980),
+                // Same role as in the dark theme: visibly darker than the
+                // surrounding panel so file headers stand out as the
+                // scroll body slides past, but not so dark that it
+                // overpowers the body content.
+                file_header: Color::from_rgb(0.937, 0.941, 0.949),
                 hunk_header: Color::from_rgba(0.165, 0.435, 0.859, 0.06),
                 conflict_marker: Color::from_rgb(0.800, 0.247, 0.184),
                 border: Color::from_rgb(0.882, 0.886, 0.898),
                 note_background: Color::from_rgba(0.773, 0.518, 0.133, 0.14),
                 note_text: Color::from_rgb(0.500, 0.320, 0.045),
                 lane_base: Color::from_rgb(0.486, 0.357, 0.910),
-                on_accent: Color::WHITE,
             },
             Self::HighContrast => ThemeSpec {
                 background: Color::BLACK,
@@ -130,7 +135,6 @@ impl ResolvedTheme {
                 note_background: Color::from_rgb(0.260, 0.210, 0.000),
                 note_text: Color::from_rgb(1.000, 0.940, 0.500),
                 lane_base: Color::from_rgb(0.760, 0.620, 1.000),
-                on_accent: Color::BLACK,
             },
         }
     }
@@ -176,12 +180,6 @@ pub struct ThemeSpec {
     /// design) doesn't fight diff add/del greens and reds, and so the
     /// coral accent stays reserved for the working copy and selection.
     pub lane_base: Color,
-    /// High-contrast color for text/marks drawn *on top of* `accent`
-    /// (e.g. the working-copy row when it's the loud orange state).
-    /// White on the deep light-theme coral, near-black on the bright
-    /// dark-theme coral — coral's luminance is just below the middle
-    /// of the range so the contrast color flips between themes.
-    pub on_accent: Color,
 }
 
 pub fn diff_palette(theme: ThemeSpec) -> Palette {

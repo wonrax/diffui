@@ -157,6 +157,7 @@ pub async fn load_jj_commits(repository_root: PathBuf) -> Result<Vec<CommitSumma
             author: commit.author().name.clone(),
             has_description: !description.is_empty(),
             is_empty: Some(is_empty),
+            has_conflict: commit.has_conflict(),
             lane_frame: LaneFrame::from_lane_row(&lane_row),
             is_working_copy,
             bookmarks,

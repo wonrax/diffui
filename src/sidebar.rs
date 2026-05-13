@@ -19,18 +19,63 @@ use crate::theme::{
 };
 use crate::{Diffui, LoadStatus, Message};
 
-// Public sidebar layout knobs — used by main.rs to clamp the resize handle
-// to a sane range. Everything else lives module-private below.
-pub const DEFAULT_WIDTH: f32 = 360.0;
-pub const MIN_WIDTH: f32 = 220.0;
-pub const MAX_WIDTH: f32 = 800.0;
+// Public sidebar layout knobs — used by main.rs to clamp the resize handle.
+// `DEFAULT_WIDTH` is a starting point; the actual floor is derived from the
+// configured UI font at runtime by `min_width(...)` so it scales when the
+// user picks a larger font in the future. There's no upper cap — users can
+// drag the sidebar as wide as the window allows.
+pub const DEFAULT_WIDTH: f32 = 380.0;
 pub const RESIZE_HIT_PADDING: f32 = 2.0;
 
-// `CHANGES` pane label — matches the design's `.pane-hd .ttl`: small,
-// uppercase, semibold, ink-300. The previous 20px sentence-case title
-// read as a top-level heading; the design uses a quieter pane-label
-// pattern so the commit list itself carries the visual weight.
-const TITLE_TEXT_SIZE: f32 = 11.0;
+/// Minimum sidebar width for the current font config. Picked so the top
+/// row of a revision can always fit its load-bearing columns at this font:
+/// change-id (12 chars) + commit-id (12 chars) + an abbreviated author +
+/// the `+N` bookmark-overflow chip + the loudest status chip
+/// (`conflict`, 8 chars). Below this width the chip rail starts dropping
+/// rails, so the user loses the conflict signal.
+pub fn min_width(config: AppConfig) -> f32 {
+    let id_metrics = TextMetrics::iced(config.mono_font, CAPTION_TEXT_SIZE);
+    let ui_metrics = TextMetrics::iced(config.ui_font, CAPTION_TEXT_SIZE);
+
+    let change_id_w = id_metrics.measure(&"a".repeat(REVISION_ID_CHARS));
+    let commit_id_w = id_metrics.measure(&"a".repeat(COMMIT_ID_CHARS));
+    let at_w = id_metrics.measure("@");
+    let author_w = ui_metrics.measure("Author Name");
+    let plus_n_w = chip_width("+9", &ui_metrics);
+    let conflict_w = chip_width("conflict", &ui_metrics);
+
+    let at_gap = 4.0;
+    let id_gap = 8.0;
+    let chip_gap = 6.0;
+    // Gutter for a typical 1-lane row: `lane_strip_width(1) = LANE_WIDTH`.
+    let gutter =
+        revision_list::GUTTER_LEFT_PADDING + graph_view::LANE_WIDTH + revision_list::GUTTER_PADDING;
+
+    let row_content = at_w
+        + at_gap
+        + change_id_w
+        + id_gap
+        + commit_id_w
+        + id_gap
+        + author_w
+        + chip_gap
+        + plus_n_w
+        + chip_gap
+        + conflict_w;
+    gutter + row_content + REVISION_CONTENT_RIGHT_PAD
+}
+
+/// Width budget for a single chip (label + horizontal padding), matching
+/// `RevisionList::measure_chip_width`'s `pad_x = 5.0` on each side.
+fn chip_width(label: &str, metrics: &TextMetrics) -> f32 {
+    metrics.measure(label) + 10.0
+}
+
+/// Mirrors `revision_list::CONTENT_PADDING` — the right-edge padding
+/// inside a revision row. Kept here so `min_width` can budget the row
+/// without exposing the constant through `revision_list`.
+const REVISION_CONTENT_RIGHT_PAD: f32 = 12.0;
+
 const CAPTION_TEXT_SIZE: f32 = 13.0;
 const COUNT_CHIP_TEXT_SIZE: f32 = 11.0;
 const REVISION_ID_CHARS: usize = 12;
@@ -39,18 +84,22 @@ const COMMIT_ID_CHARS: usize = 12;
 // Floor for the badge column. We measure the actual status labels to size the
 // column, but a single-character label like "M" can render thinner than the
 // chip looks tasteful at, so we keep a small visual minimum.
-const FILE_BADGE_MIN_WIDTH: f32 = 22.0;
-const FILE_BADGE_HORIZONTAL_PADDING: f32 = 6.0;
+const FILE_BADGE_MIN_WIDTH: f32 = 13.0;
+const FILE_BADGE_HORIZONTAL_PADDING: f32 = 4.0;
+/// Mirrors `revision_list::FILE_BADGE_TEXT_SIZE`. The badge column width is
+/// computed in `view()`, so we measure label widths at the same point size
+/// the renderer actually paints them at.
+const FILE_BADGE_TEXT_SIZE: f32 = 10.0;
 // Horizontal padding flanking the `+N` / `-N` numeric columns.
 const FILE_STAT_HORIZONTAL_PADDING: f32 = 4.0;
 const FILE_STAT_MIN_WIDTH: f32 = 24.0;
 
 pub fn build_sidebar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
     let title_row = row![
-        text("CHANGES")
-            .size(TITLE_TEXT_SIZE)
+        text("Changes")
+            .size(15)
             .font(Font {
-                weight: Weight::Semibold,
+                weight: Weight::Normal,
                 ..ui.config.ui_font
             })
             .color(theme.subtle_text),
@@ -122,7 +171,8 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
                 .unwrap_or_else(|| "-0".to_owned());
             let additions_w = file_stat_width(&widest_addition, &metrics);
             let deletions_w = file_stat_width(&widest_deletion, &metrics);
-            let badge_w = file_badge_width(&ui.document.files, &metrics);
+            let badge_metrics = badge_text_metrics(ui.config);
+            let badge_w = file_badge_width(&ui.document.files, &badge_metrics);
 
             // Mirror `draw_file`'s layout exactly so truncation kicks in at
             // the same threshold the renderer clips at:
@@ -133,13 +183,9 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
             let expanded_lane_count = ui
                 .commits
                 .iter()
-                .find(
-                    |commit| match (&ui.expanded_revision, commit.is_working_copy) {
-                        (RevisionSelection::WorkingCopy, true) => true,
-                        (RevisionSelection::Commit(id), false) => id == &commit.revision_id,
-                        _ => false,
-                    },
-                )
+                .find(|commit| {
+                    is_expanded_commit(&ui.selected_revision, ui.file_list_expanded, commit)
+                })
                 .map(|commit| commit.lane_frame.after.len())
                 .unwrap_or(0);
             let gutter_total = revision_list::GUTTER_LEFT_PADDING
@@ -246,6 +292,18 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
                 border_dashed: true,
             });
         }
+        if commit.has_conflict {
+            // Filled-tint chip (mirrors the "soft" tag pattern used by
+            // file-status badges) using the design system's conflict red
+            // so it screams across the sidebar at a glance.
+            status_chips.push(IndicatorChip {
+                label: "conflict".to_owned(),
+                background: chip_background(theme.conflict_marker),
+                text_color: theme.conflict_marker,
+                border_color: None,
+                border_dashed: false,
+            });
+        }
 
         let selection_key = if commit.is_working_copy {
             RowSelectionKey::WorkingCopy
@@ -253,11 +311,7 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
             RowSelectionKey::Commit(commit.revision_id.clone())
         };
 
-        let is_expanded = match (&ui.expanded_revision, commit.is_working_copy) {
-            (RevisionSelection::WorkingCopy, true) => true,
-            (RevisionSelection::Commit(id), false) => id == &commit.revision_id,
-            _ => false,
-        };
+        let is_expanded = is_expanded_commit(&ui.selected_revision, ui.file_list_expanded, commit);
 
         // Latch this commit's bookmarks onto its lane, allocate segment
         // ids for any lane that just came alive, then snapshot pre-trim
@@ -312,6 +366,11 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
         let continuation_lane_labels = current_labels.clone();
         let continuation_lane_segments = current_segments.clone();
 
+        let is_selected = match &ui.selected_revision {
+            RevisionSelection::WorkingCopy => commit.is_working_copy,
+            RevisionSelection::Commit(id) => !commit.is_working_copy && id == &commit.revision_id,
+        };
+
         items.push(RevisionListItem::Revision(RevisionRowView {
             selection_key,
             change_id_prefix: id_prefix,
@@ -326,6 +385,9 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
             frame: commit.lane_frame.clone(),
             lane_labels: revision_lane_labels,
             lane_segments: revision_lane_segments,
+            // Show the collapse/expand chevron only on the selected row, so
+            // non-selected rows don't suggest they have a hidden file list.
+            collapse_chevron: is_selected.then_some(is_expanded),
         }));
 
         if is_expanded && let Some(files) = &file_widgets {
@@ -413,7 +475,6 @@ fn revision_list_style(
         background: theme.panel_background,
         selected_background: theme.selected_file,
         accent: theme.accent,
-        on_accent: theme.on_accent,
         border: theme.border,
         muted_text: theme.muted_text,
         subtle_text: theme.subtle_text,
@@ -435,10 +496,7 @@ fn build_count_chip(count: usize, theme: ThemeSpec, font: Font) -> Element<'stat
     container(
         text(count.to_string())
             .size(COUNT_CHIP_TEXT_SIZE)
-            .font(Font {
-                weight: Weight::Medium,
-                ..font
-            })
+            .font(font)
             .color(theme.subtle_text),
     )
     .padding([1, 7])
@@ -465,14 +523,10 @@ fn build_theme_switcher(
     for candidate in ThemePreference::ALL {
         let selected = candidate == selected_theme;
         controls = controls.push(
-            button(
-                text(candidate.label())
-                    .size(CAPTION_TEXT_SIZE)
-                    .font(font),
-            )
-            .padding([5, 7])
-            .style(move |_, status| theme_switcher_button_style(status, selected, theme))
-            .on_press(Message::SelectTheme(candidate)),
+            button(text(candidate.label()).size(CAPTION_TEXT_SIZE).font(font))
+                .padding([5, 7])
+                .style(move |_, status| theme_switcher_button_style(status, selected, theme))
+                .on_press(Message::SelectTheme(candidate)),
         );
     }
 
@@ -491,6 +545,25 @@ fn file_status_color(status: DiffFileStatus, theme: ThemeSpec) -> Color {
         DiffFileStatus::Deleted => theme.removed_text,
         DiffFileStatus::Modified => theme.info,
         DiffFileStatus::Renamed => theme.modified_token,
+    }
+}
+
+/// True when `commit` is the selected revision and the user hasn't
+/// collapsed the inline file list. The collapse/expand preference is
+/// global rather than per-revision (see `Diffui::file_list_expanded`),
+/// so flipping it once carries across whatever revision the user picks
+/// next.
+fn is_expanded_commit(
+    selected: &RevisionSelection,
+    expanded: bool,
+    commit: &CommitSummary,
+) -> bool {
+    if !expanded {
+        return false;
+    }
+    match selected {
+        RevisionSelection::WorkingCopy => commit.is_working_copy,
+        RevisionSelection::Commit(id) => !commit.is_working_copy && id == &commit.revision_id,
     }
 }
 
@@ -616,6 +689,10 @@ impl TextMetrics {
 
 fn sidebar_text_metrics(config: AppConfig) -> TextMetrics {
     TextMetrics::iced(config.ui_font, CAPTION_TEXT_SIZE)
+}
+
+fn badge_text_metrics(config: AppConfig) -> TextMetrics {
+    TextMetrics::iced(config.ui_font, FILE_BADGE_TEXT_SIZE)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -906,6 +983,7 @@ mod tests {
             author: String::new(),
             has_description: false,
             is_empty: None,
+            has_conflict: false,
             lane_frame: LaneFrame {
                 before: Vec::new(),
                 after: Vec::new(),

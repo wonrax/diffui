@@ -55,6 +55,10 @@ pub struct CommitSummary {
     pub author: String,
     pub has_description: bool,
     pub is_empty: Option<bool>,
+    /// Whether the commit's tree is in a conflicted state (jj only — git
+    /// commits can't carry an unresolved conflict, so this stays `false`
+    /// for the git backend).
+    pub has_conflict: bool,
     pub lane_frame: LaneFrame,
     pub is_working_copy: bool,
     /// Bookmarks pointing at this commit. Local bookmarks are bare

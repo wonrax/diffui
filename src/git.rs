@@ -291,6 +291,7 @@ fn build_commit_summaries(rows: Vec<ParsedCommitRow>) -> Vec<CommitSummary> {
             author: row.author,
             has_description: row.has_description,
             is_empty: row.is_empty,
+            has_conflict: false,
             lane_frame: LaneFrame::from_lane_row(&lane_row),
             is_working_copy: row.is_working_copy,
             bookmarks: Vec::new(),

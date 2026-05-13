@@ -260,17 +260,26 @@ pub fn draw_revision_row<R>(
             let path = Path::new(|builder| {
                 draw_incoming(builder, x_i, x_node, top, mid);
             });
-            frame.stroke(&path, style.edge_stroke(kind, i, &dash, emphasized_lane == Some(i)));
+            frame.stroke(
+                &path,
+                style.edge_stroke(kind, i, &dash, emphasized_lane == Some(i)),
+            );
         } else if frame_data.is_pass_through(i) {
             // Pure pass-through: draw a single straight vertical so we
             // benefit from the round line cap and dashed style if needed.
             let path = Path::line(Point::new(x_i, top), Point::new(x_i, bot));
-            frame.stroke(&path, style.edge_stroke(kind, i, &dash, emphasized_lane == Some(i)));
+            frame.stroke(
+                &path,
+                style.edge_stroke(kind, i, &dash, emphasized_lane == Some(i)),
+            );
         } else {
             // Lane terminates above the node without merging into it
             // (e.g., ended on the previous row). Just a half-line.
             let path = Path::line(Point::new(x_i, top), Point::new(x_i, mid));
-            frame.stroke(&path, style.edge_stroke(kind, i, &dash, emphasized_lane == Some(i)));
+            frame.stroke(
+                &path,
+                style.edge_stroke(kind, i, &dash, emphasized_lane == Some(i)),
+            );
         }
     }
 
@@ -291,7 +300,10 @@ pub fn draw_revision_row<R>(
         // *opens* on lane 2 should already wear lane 2's color from the
         // moment it leaves the node, so the eye picks it up consistently
         // wherever the branch travels.
-        frame.stroke(&path, style.edge_stroke(kind, j, &dash, emphasized_lane == Some(j)));
+        frame.stroke(
+            &path,
+            style.edge_stroke(kind, j, &dash, emphasized_lane == Some(j)),
+        );
     }
 
     // Missing-parent stub goes into the same geometry frame as the edges

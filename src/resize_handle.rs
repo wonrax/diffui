@@ -20,7 +20,6 @@ use iced::{Element, Event, Length, Rectangle, Size, Theme};
 pub struct ResizeHandle<Message> {
     handle_x: f32,
     min_width: f32,
-    max_width: f32,
     hit_padding: f32,
     on_resize: fn(f32) -> Message,
 }
@@ -29,14 +28,12 @@ impl<Message> ResizeHandle<Message> {
     pub fn new(
         handle_x: f32,
         min_width: f32,
-        max_width: f32,
         hit_padding: f32,
         on_resize: fn(f32) -> Message,
     ) -> Self {
         Self {
             handle_x,
             min_width,
-            max_width,
             hit_padding,
             on_resize,
         }
@@ -124,7 +121,7 @@ where
                     return;
                 };
                 let delta = position.x - drag.start_cursor_x;
-                let new_width = (drag.start_handle_x + delta).clamp(self.min_width, self.max_width);
+                let new_width = (drag.start_handle_x + delta).max(self.min_width);
                 if (new_width - self.handle_x).abs() > f32::EPSILON {
                     shell.publish((self.on_resize)(new_width));
                 }

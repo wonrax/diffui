@@ -63,7 +63,12 @@ pub(crate) struct Diffui {
     pub(crate) document: DiffDocument,
     pub(crate) commits: Vec<CommitSummary>,
     pub(crate) selected_revision: RevisionSelection,
-    pub(crate) expanded_revision: RevisionSelection,
+    /// Sticky inline-file-list preference. Always reflects whether the
+    /// *selected* revision's file list is shown; the user toggles it by
+    /// re-clicking the selected row, and the value persists across
+    /// revision switches so collapsing once stays collapsed for whatever
+    /// revision the user moves to next.
+    pub(crate) file_list_expanded: bool,
     pub(crate) pending_revision: Option<RevisionSelection>,
     pub(crate) repository_snapshot: Option<RepositorySnapshot>,
     pub(crate) snapshot_pending: bool,
@@ -118,7 +123,7 @@ impl Diffui {
                         document: DiffDocument::default(),
                         commits: Vec::new(),
                         selected_revision: RevisionSelection::WorkingCopy,
-                        expanded_revision: RevisionSelection::WorkingCopy,
+                        file_list_expanded: true,
                         pending_revision: Some(RevisionSelection::WorkingCopy),
                         repository_snapshot: None,
                         snapshot_pending: false,
@@ -126,7 +131,7 @@ impl Diffui {
                         selected_theme: ThemePreference::System,
                         system_theme: iced_theme::Mode::None,
                         selected_file: 0,
-                        sidebar_width: sidebar::DEFAULT_WIDTH,
+                        sidebar_width: sidebar::DEFAULT_WIDTH.max(sidebar::min_width(config)),
                         config,
                         revision_details: None,
                     },
@@ -140,7 +145,7 @@ impl Diffui {
                     document: DiffDocument::default(),
                     commits: Vec::new(),
                     selected_revision: RevisionSelection::WorkingCopy,
-                    expanded_revision: RevisionSelection::WorkingCopy,
+                    file_list_expanded: true,
                     pending_revision: None,
                     repository_snapshot: None,
                     snapshot_pending: false,
@@ -148,7 +153,7 @@ impl Diffui {
                     selected_theme: ThemePreference::System,
                     system_theme: iced_theme::Mode::None,
                     selected_file: 0,
-                    sidebar_width: sidebar::DEFAULT_WIDTH,
+                    sidebar_width: sidebar::DEFAULT_WIDTH.max(sidebar::min_width(config)),
                     config,
                     revision_details: None,
                 },
@@ -165,9 +170,8 @@ impl Diffui {
                         return Task::none();
                     }
 
-                    let revision_changed = self.expanded_revision != revision;
+                    let revision_changed = self.selected_revision != revision;
                     self.selected_revision = revision;
-                    self.expanded_revision = self.selected_revision.clone();
                     self.pending_revision = None;
                     self.status = LoadStatus::Loaded;
                     self.document = output.document;
@@ -219,8 +223,14 @@ impl Diffui {
                     revision_list::RowSelectionKey::WorkingCopy => RevisionSelection::WorkingCopy,
                     revision_list::RowSelectionKey::Commit(id) => RevisionSelection::Commit(id),
                 };
-                if self.selected_revision != selection
-                    && self.pending_revision.as_ref() != Some(&selection)
+                // Re-clicking the already-selected revision toggles its file
+                // list without re-running the backend or changing the diff.
+                // The toggled value persists across revision switches, so
+                // collapsing once stays collapsed wherever the user moves
+                // next.
+                if self.selected_revision == selection {
+                    self.file_list_expanded = !self.file_list_expanded;
+                } else if self.pending_revision.as_ref() != Some(&selection)
                     && let Some(repository) = self.repository.clone()
                 {
                     self.pending_revision = Some(selection.clone());
@@ -267,7 +277,7 @@ impl Diffui {
                 return iced::clipboard::write(text).discard();
             }
             Message::SidebarWidthChanged(width) => {
-                self.sidebar_width = width.clamp(sidebar::MIN_WIDTH, sidebar::MAX_WIDTH);
+                self.sidebar_width = width.max(sidebar::min_width(self.config));
             }
         }
 
@@ -300,8 +310,7 @@ impl Diffui {
         .height(Length::Fill);
         let resize_overlay = ResizeHandle::new(
             self.sidebar_width,
-            sidebar::MIN_WIDTH,
-            sidebar::MAX_WIDTH,
+            sidebar::min_width(self.config),
             sidebar::RESIZE_HIT_PADDING,
             Message::SidebarWidthChanged,
         );
@@ -356,7 +365,6 @@ impl Diffui {
         self.selected_theme.active(self.system_theme)
     }
 }
-
 
 fn scroll_sidebar_to_file(_file_index: usize, _ui: &Diffui) -> Task<Message> {
     // TODO: re-implement scroll-to-reveal against `RevisionList`'s internal

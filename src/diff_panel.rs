@@ -104,12 +104,9 @@ fn build_stats_bar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message>
             .size(STATS_TEXT_SIZE)
             .font(ui.config.mono_font)
             .color(theme.removed_text),
-        text(format!(
-            "· {}",
-            format_file_count(ui.document.files.len())
-        ))
-        .size(STATS_TEXT_SIZE)
-        .color(theme.subtle_text),
+        text(format!("· {}", format_file_count(ui.document.files.len())))
+            .size(STATS_TEXT_SIZE)
+            .color(theme.subtle_text),
     ]
     .spacing(8)
     .align_y(alignment::Vertical::Center);
