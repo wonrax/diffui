@@ -117,6 +117,8 @@ iced = { git = "https://github.com/iced-rs/iced.git", features = ["advanced", "t
 jj-lib = "0.40.0"
 bstr = "1.12"
 futures = "0.3"
+nucleo-matcher = "0.3"
+regex = "1"
 serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "1.44", features = ["process", "time"] }
 toml = "0.8"
