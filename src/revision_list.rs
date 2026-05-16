@@ -114,12 +114,21 @@ pub struct RevisionRowView {
     /// bookmark up to this point in the walk). Used for the
     /// graph-stroke hover tooltip.
     pub lane_labels: Vec<Vec<String>>,
-    /// Per-lane segment id at this row. Two rows share an id on the
-    /// same lane iff they belong to the same continuous lane segment
-    /// (no termination in between). `None` means the lane is dead at
-    /// this row. Used to extend stroke emphasis from a single hovered
-    /// row out to the whole lane segment.
-    pub lane_segments: Vec<Option<usize>>,
+    /// Per-lane segment ids at this row, split by row half. The
+    /// "incoming" half (`before`) covers strokes from the row's top edge
+    /// down to the disc midline; the "outgoing" half (`after`) covers
+    /// strokes from the disc midline down to the bottom edge. Two rows
+    /// share an id on the same lane iff they belong to the same
+    /// continuous lane segment.
+    ///
+    /// The two halves can disagree at a merge commit whose lane index
+    /// is reused by an outgoing branch (the merged-in branch terminates
+    /// in `before`, the new branch starts in `after`). Drawing emphasis
+    /// at that row only highlights the half whose segment id matches the
+    /// hovered branch — otherwise the merge stub of the dying branch
+    /// would also glow when hovering the new branch.
+    pub lane_segments_before: Vec<Option<usize>>,
+    pub lane_segments_after: Vec<Option<usize>>,
     /// Whether to draw the inline collapse/expand chevron on the
     /// description row. `None` skips the glyph entirely (non-selected
     /// rows have no file list to toggle). `Some(true)` shows the
@@ -245,15 +254,31 @@ impl<Message> RevisionList<Message> {
     }
 }
 
+/// Which half of a revision row the cursor is on, used to pick the
+/// right segment id when a lane is split (its incoming and outgoing
+/// halves carry different segment ids — see
+/// [`RevisionRowView::lane_segments_before`]).
+///
+/// File rows aren't split (their continuation is a single half), so
+/// this only matters for `Item::Revision`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaneHalf {
+    /// Top half of the row — the strokes drawn into the disc.
+    Before,
+    /// Bottom half of the row — the strokes drawn out of the disc.
+    After,
+}
+
 struct State<Paragraph> {
     vertical_offset: f32,
     /// Item index of the file row currently hovered (only set for files,
     /// not revisions). Drives the tooltip overlay.
     hovered_file_item: Option<usize>,
-    /// Item index + lane index when the cursor is over a graph stroke
-    /// whose lane has bookmark labels at that row. Drives the
-    /// branch-name tooltip on the graph gutter.
-    hovered_lane: Option<(usize, usize)>,
+    /// Item index + lane index + which half of the row the cursor is on,
+    /// when the cursor is over a graph stroke whose lane has bookmark
+    /// labels at that row. Drives the branch-name tooltip on the graph
+    /// gutter.
+    hovered_lane: Option<(usize, usize, LaneHalf)>,
     /// Last cursor position observed inside the widget bounds, in screen
     /// coordinates. Used to anchor the tooltip.
     cursor_position: Option<Point>,
@@ -345,7 +370,18 @@ where
                 let lane = (strip_x / LANE_WIDTH).floor() as usize;
                 let labels = item_lane_labels(item, lane);
                 if !labels.is_empty() {
-                    state.hovered_lane = Some((row_idx, lane));
+                    // Pick the half from the cursor's vertical position
+                    // within the row, so a click on the incoming stub of
+                    // a split lane resolves to that branch's segment
+                    // (not the unrelated new branch starting below).
+                    let row_top = this.row_top(row_idx);
+                    let row_h = this.row_height(item);
+                    let half = if local_y - row_top < row_h / 2.0 {
+                        LaneHalf::Before
+                    } else {
+                        LaneHalf::After
+                    };
+                    state.hovered_lane = Some((row_idx, lane, half));
                     return;
                 }
             }
@@ -484,7 +520,7 @@ where
         // Lane tooltip wins over the file path tooltip when both could
         // fire at the same time — the cursor is in the gutter, which
         // is mutually exclusive with the content area anyway.
-        if let Some((item_idx, lane)) = state.hovered_lane {
+        if let Some((item_idx, lane, _half)) = state.hovered_lane {
             let item = self.items.get(item_idx)?;
             let labels = item_lane_labels(item, lane);
             if labels.is_empty() {
@@ -578,15 +614,21 @@ where
         renderer.with_layer(bounds, |renderer| {
             fill_background(renderer, bounds, self.style.background);
 
-            // Resolve the hovered (row, lane) → (segment id, lane) once
-            // so each drawn row can do a single segment lookup instead of
-            // re-resolving the hover row's segment.
-            let emphasized_segment = state.hovered_lane.and_then(|(hov_idx, hov_lane)| {
-                self.items
-                    .get(hov_idx)
-                    .and_then(|item| item_lane_segment(item, hov_lane))
-                    .map(|seg| (seg, hov_lane))
-            });
+            // Resolve the hovered (row, lane, half) → (segment id, lane)
+            // once so each drawn row can do a single segment lookup
+            // instead of re-resolving the hover row's segment. The half
+            // matters at split lanes: the same lane index at the hover
+            // row may carry two different segment ids in its top vs
+            // bottom half.
+            let emphasized_segment =
+                state
+                    .hovered_lane
+                    .and_then(|(hov_idx, hov_lane, hov_half)| {
+                        self.items
+                            .get(hov_idx)
+                            .and_then(|item| item_lane_segment(item, hov_lane, hov_half))
+                            .map(|seg| (seg, hov_lane))
+                    });
 
             let mut y_cursor = 0.0;
             for item in self.items.iter() {
@@ -605,8 +647,12 @@ where
                     height: row_h,
                 };
                 let gutter_total = self.item_gutter_width(item);
-                let emphasized_lane = emphasized_segment.and_then(|(seg, lane)| {
-                    let this_seg = item_lane_segment(item, lane)?;
+                let emphasized_lane_before = emphasized_segment.and_then(|(seg, lane)| {
+                    let this_seg = item_lane_segment(item, lane, LaneHalf::Before)?;
+                    (this_seg == seg).then_some(lane)
+                });
+                let emphasized_lane_after = emphasized_segment.and_then(|(seg, lane)| {
+                    let this_seg = item_lane_segment(item, lane, LaneHalf::After)?;
                     (this_seg == seg).then_some(lane)
                 });
 
@@ -618,17 +664,21 @@ where
                             rev,
                             &state.paragraphs,
                             gutter_total,
-                            emphasized_lane,
+                            emphasized_lane_before,
+                            emphasized_lane_after,
                         );
                     }
                     Item::File(f) => {
+                        // File rows are continuation-only — they sit
+                        // under the parent revision's `after` snapshot,
+                        // so the after-half emphasis is what applies.
                         self.draw_file(
                             renderer,
                             row_bounds,
                             f,
                             &state.paragraphs,
                             gutter_total,
-                            emphasized_lane,
+                            emphasized_lane_after,
                         );
                     }
                 }
@@ -641,6 +691,7 @@ where
 }
 
 impl<Message> RevisionList<Message> {
+    #[allow(clippy::too_many_arguments)]
     fn draw_revision<R>(
         &self,
         renderer: &mut R,
@@ -648,7 +699,8 @@ impl<Message> RevisionList<Message> {
         rev: &RevisionRowView,
         paragraphs: &RefCell<Vec<R::Paragraph>>,
         gutter_total: f32,
-        emphasized_lane: Option<usize>,
+        emphasized_lane_before: Option<usize>,
+        emphasized_lane_after: Option<usize>,
     ) where
         R: text::Renderer<Font = Font> + iced::advanced::graphics::geometry::Renderer,
     {
@@ -1081,7 +1133,8 @@ impl<Message> RevisionList<Message> {
             &rev.frame,
             &self.style.graph,
             node_override,
-            emphasized_lane,
+            emphasized_lane_before,
+            emphasized_lane_after,
         );
     }
 
@@ -1338,11 +1391,16 @@ fn item_lane_labels(item: &Item, lane: usize) -> &[String] {
     }
 }
 
-/// Segment id for `lane` at this item's row. `None` means the lane is
-/// dead at this row (no stroke drawn) or the column is out of range.
-fn item_lane_segment(item: &Item, lane: usize) -> Option<usize> {
+/// Segment id for `lane` at this item's row in the given half. `None`
+/// means the lane is dead at this row in that half (no stroke drawn)
+/// or the column is out of range. File rows aren't split — both halves
+/// query the same `lane_segments`.
+fn item_lane_segment(item: &Item, lane: usize, half: LaneHalf) -> Option<usize> {
     let slot = match item {
-        Item::Revision(row) => row.lane_segments.get(lane),
+        Item::Revision(row) => match half {
+            LaneHalf::Before => row.lane_segments_before.get(lane),
+            LaneHalf::After => row.lane_segments_after.get(lane),
+        },
         Item::File(row) => row.lane_segments.get(lane),
     };
     slot.copied().flatten()

@@ -8,6 +8,7 @@ use iced::{
 
 use crate::backend::{CommitSummary, DiffFile, DiffFileStatus, RevisionSelection};
 use crate::config::AppConfig;
+use crate::graph::LaneFrame;
 use crate::graph_view::{self, RevisionGraphStyle};
 use crate::revision_list::{
     self, FileRowView, IndicatorChip, Item as RevisionListItem, RevisionList, RevisionListStyle,
@@ -326,43 +327,21 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
         if !commit.bookmarks.is_empty() {
             current_labels[commit.lane_frame.node_lane] = commit.bookmarks.clone();
         }
-        for (lane, slot) in current_segments.iter_mut().enumerate().take(lane_count) {
-            let before = commit.lane_frame.before.get(lane).copied().flatten();
-            let after = commit.lane_frame.after.get(lane).copied().flatten();
-            let alive = before.is_some() || after.is_some() || lane == commit.lane_frame.node_lane;
-            if alive && slot.is_none() {
-                *slot = Some(next_segment_id);
-                next_segment_id += 1;
-            }
-        }
+        // Capture the incoming-half segment ids BEFORE allocation, so a
+        // merged-in branch on a soon-to-be-reused lane keeps its old
+        // id in `before` while the outgoing half gets a fresh id in
+        // `after`. Hover emphasis then picks one half cleanly.
+        let revision_lane_segments_before = current_segments.clone();
+        advance_lane_segments(&mut current_segments, &mut next_segment_id, &commit.lane_frame);
+        // Snapshot labels BEFORE clearing split-lane labels — the merge
+        // row itself still needs the merged-in branch's tooltip to fire
+        // (hover detection gates on labels being non-empty), even
+        // though those labels shouldn't propagate to the new branch's
+        // strokes below.
         let revision_lane_labels = current_labels.clone();
-        let revision_lane_segments = current_segments.clone();
-        // Trim labels + segments for lanes that don't survive past this
-        // row. The post-trim snapshots are what file rows below inherit.
-        for (lane, slot) in current_labels.iter_mut().enumerate() {
-            let alive = commit
-                .lane_frame
-                .after
-                .get(lane)
-                .copied()
-                .flatten()
-                .is_some();
-            if !alive {
-                slot.clear();
-            }
-        }
-        for (lane, slot) in current_segments.iter_mut().enumerate() {
-            let alive = commit
-                .lane_frame
-                .after
-                .get(lane)
-                .copied()
-                .flatten()
-                .is_some();
-            if !alive {
-                *slot = None;
-            }
-        }
+        let revision_lane_segments_after = current_segments.clone();
+        clear_split_lane_labels(&mut current_labels, &commit.lane_frame);
+        trim_lane_state(&mut current_segments, &mut current_labels, &commit.lane_frame);
         let continuation_lane_labels = current_labels.clone();
         let continuation_lane_segments = current_segments.clone();
 
@@ -384,7 +363,8 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
             lane_color,
             frame: commit.lane_frame.clone(),
             lane_labels: revision_lane_labels,
-            lane_segments: revision_lane_segments,
+            lane_segments_before: revision_lane_segments_before,
+            lane_segments_after: revision_lane_segments_after,
             // Show the collapse/expand chevron only on the selected row, so
             // non-selected rows don't suggest they have a hidden file list.
             collapse_chevron: is_selected.then_some(is_expanded),
@@ -436,6 +416,99 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
     )
     .width(Length::Fill)
     .into()
+}
+
+/// Advance per-lane segment ids for one revision row, allocating fresh
+/// ids for newly-alive lanes and for lanes whose index is reused by a
+/// brand-new outgoing branch at this merge.
+///
+/// The second case (split lanes) is what stops the hover emphasis from
+/// leaking across two unrelated branches that share a lane index: at a
+/// merge commit `allocate_lane` will pick the leftmost-empty slot for any
+/// extra parent, which is often the slot just freed by the merged-in
+/// branch. Without resetting the id here, both the merged-in branch above
+/// and the brand-new branch below would share one segment id.
+///
+/// Labels are not touched here — callers separately clear split-lane
+/// labels *after* snapshotting the revision row, so the merged-in
+/// branch's tooltip still fires when the cursor is over the merge row
+/// itself (hover only triggers on lanes that have labels).
+fn advance_lane_segments(
+    current_segments: &mut Vec<Option<usize>>,
+    next_segment_id: &mut usize,
+    lane_frame: &LaneFrame,
+) {
+    let lane_count = lane_frame.lane_count();
+    if current_segments.len() < lane_count {
+        current_segments.resize(lane_count, None);
+    }
+    for (lane, slot) in current_segments.iter_mut().enumerate().take(lane_count) {
+        let before = lane_frame.before.get(lane).copied().flatten();
+        let after = lane_frame.after.get(lane).copied().flatten();
+        let alive = before.is_some() || after.is_some() || lane == lane_frame.node_lane;
+        if alive && slot.is_none() {
+            *slot = Some(*next_segment_id);
+            *next_segment_id += 1;
+        }
+    }
+    // Split-lane case: a non-node lane in `merging_lanes` terminates its
+    // incoming edge at the disc; if it also has an outgoing edge, that's
+    // a new branch reusing the freed slot. Allocate a fresh id for the
+    // outgoing half so emphasis at and below the merge follows the new
+    // branch, not the merged-in one.
+    for &lane in &lane_frame.merging_lanes {
+        if lane == lane_frame.node_lane {
+            continue;
+        }
+        if lane_frame.after.get(lane).copied().flatten().is_none() {
+            continue;
+        }
+        if let Some(slot) = current_segments.get_mut(lane) {
+            *slot = Some(*next_segment_id);
+            *next_segment_id += 1;
+        }
+    }
+}
+
+/// Clear the merged-in branch's labels on split lanes, so its name
+/// doesn't carry onto the new branch's strokes below the merge. Called
+/// *after* the revision row's label snapshot so the merge row itself
+/// still shows the merged-in branch's tooltip when the user hovers it.
+fn clear_split_lane_labels(current_labels: &mut [Vec<String>], lane_frame: &LaneFrame) {
+    for &lane in &lane_frame.merging_lanes {
+        if lane == lane_frame.node_lane {
+            continue;
+        }
+        if lane_frame.after.get(lane).copied().flatten().is_none() {
+            continue;
+        }
+        if let Some(labels) = current_labels.get_mut(lane) {
+            labels.clear();
+        }
+    }
+}
+
+/// Drop labels and segment ids for lanes that don't survive into the
+/// row's `after` snapshot. The trimmed state is what file rows below
+/// inherit so a terminated lane doesn't keep a stale tooltip or
+/// emphasis-id.
+fn trim_lane_state(
+    current_segments: &mut [Option<usize>],
+    current_labels: &mut [Vec<String>],
+    lane_frame: &LaneFrame,
+) {
+    for (lane, slot) in current_segments.iter_mut().enumerate() {
+        let alive = lane_frame.after.get(lane).copied().flatten().is_some();
+        if !alive {
+            *slot = None;
+        }
+    }
+    for (lane, labels) in current_labels.iter_mut().enumerate() {
+        let alive = lane_frame.after.get(lane).copied().flatten().is_some();
+        if !alive {
+            labels.clear();
+        }
+    }
 }
 
 struct FileRowTemplate {
@@ -961,6 +1034,7 @@ mod tests {
     use super::*;
     use crate::backend::DiffFileStatus;
     use crate::graph::LaneFrame;
+    use jj_lib::graph::GraphEdgeType;
 
     fn diff_file(path: &str) -> DiffFile {
         DiffFile {
@@ -1150,5 +1224,105 @@ mod tests {
             ),
             "Button.rs"
         );
+    }
+
+    #[test]
+    fn lane_reuse_at_merge_starts_a_new_segment() {
+        // Two children of a merge commit M share the lane, then M brings
+        // in a feature on a reused index. The merged-in branch (above M)
+        // and the brand-new feature branch (below M) must end up with
+        // different segment ids — otherwise hovering one would emphasize
+        // both.
+        //
+        // Layout (top is newest):
+        //
+        //   *  A0 (lane 0, child of M)
+        //   | * B0 (lane 1, child of M)
+        //   |/
+        //   *  M  (lane 0, parents [P (lane 0), F (lane 1)])
+        //   ...
+        let mut current_segments: Vec<Option<usize>> = Vec::new();
+        let mut current_labels: Vec<Vec<String>> = Vec::new();
+        let mut next_segment_id: usize = 0;
+
+        let direct = Some(GraphEdgeType::Direct);
+
+        // Row A0: lane 0 node, awaits M downward.
+        let frame_a0 = LaneFrame {
+            before: vec![],
+            after: vec![direct],
+            node_lane: 0,
+            merging_lanes: vec![],
+            missing_parents: 0,
+        };
+        advance_lane_segments(&mut current_segments, &mut next_segment_id, &frame_a0);
+        let a0_seg = current_segments[0];
+        trim_lane_state(&mut current_segments, &mut current_labels, &frame_a0);
+
+        // Row B0: lane 1 node, awaits M downward; lane 0 still pending M.
+        let frame_b0 = LaneFrame {
+            before: vec![direct, None],
+            after: vec![direct, direct],
+            node_lane: 1,
+            merging_lanes: vec![],
+            missing_parents: 0,
+        };
+        if current_labels.len() < frame_b0.lane_count() {
+            current_labels.resize(frame_b0.lane_count(), Vec::new());
+        }
+        advance_lane_segments(&mut current_segments, &mut next_segment_id, &frame_b0);
+        let b0_seg = current_segments[1];
+        trim_lane_state(&mut current_segments, &mut current_labels, &frame_b0);
+
+        // Row M: lanes 0 and 1 collapse into lane 0 (node), and lane 1
+        // is reused for the feature parent (F) opening a brand-new
+        // outgoing edge.
+        let frame_m = LaneFrame {
+            before: vec![direct, direct],
+            after: vec![direct, direct],
+            node_lane: 0,
+            merging_lanes: vec![0, 1],
+            missing_parents: 0,
+        };
+        // Snapshot before/after halves exactly the way `build_revision_list`
+        // does — drawing emphasis hinges on the split.
+        let m_before = current_segments.clone();
+        advance_lane_segments(&mut current_segments, &mut next_segment_id, &frame_m);
+        let m_after = current_segments.clone();
+        trim_lane_state(&mut current_segments, &mut current_labels, &frame_m);
+
+        // The before-half on the reused lane carries the merged-in
+        // branch (B0)'s segment, while the after-half is a fresh id —
+        // so hovering either branch only emphasizes its own half at M.
+        assert_eq!(m_before[1], b0_seg);
+        assert_ne!(m_after[1], b0_seg);
+        // Lane 0 continues across the merge — same id from A0 onward
+        // in both halves.
+        assert_eq!(m_before[0], a0_seg);
+        assert_eq!(m_after[0], a0_seg);
+    }
+
+    #[test]
+    fn pass_through_lane_keeps_its_segment_id() {
+        // Sanity check: an unrelated lane that just passes through a
+        // commit shouldn't get a new segment id.
+        let mut current_segments: Vec<Option<usize>> = Vec::new();
+        let mut current_labels: Vec<Vec<String>> = Vec::new();
+        let mut next_segment_id: usize = 0;
+
+        let direct = Some(GraphEdgeType::Direct);
+
+        let frame_a = LaneFrame {
+            before: vec![direct, direct],
+            after: vec![direct, direct],
+            node_lane: 0,
+            merging_lanes: vec![],
+            missing_parents: 0,
+        };
+        // Seed lane 1's segment via a previous row.
+        current_segments.extend([Some(10), Some(11)]);
+        let lane_1_before = current_segments[1];
+        advance_lane_segments(&mut current_segments, &mut next_segment_id, &frame_a);
+        assert_eq!(current_segments[1], lane_1_before);
     }
 }

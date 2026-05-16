@@ -227,10 +227,15 @@ pub fn draw_revision_row<R>(
     // of which lane it happens to live in. Edges still wear their lane
     // colors — only the disc gets overridden.
     node_color_override: Option<Color>,
-    // When `Some(lane)`, that lane's strokes render thicker — used by
-    // the revision list to highlight the lane under the cursor while
-    // its bookmark tooltip is showing.
-    emphasized_lane: Option<usize>,
+    // When `Some(lane)`, the incoming (top-half) strokes for that lane
+    // render thicker. Separate from `emphasized_lane_after` because a
+    // merge can reuse a lane index for an unrelated outgoing branch,
+    // and emphasizing both halves of such a lane would falsely highlight
+    // the merged-in branch when the user is hovering the new branch.
+    emphasized_lane_before: Option<usize>,
+    // When `Some(lane)`, the outgoing (bottom-half) strokes for that
+    // lane render thicker. See `emphasized_lane_before`.
+    emphasized_lane_after: Option<usize>,
 ) where
     R: renderer::Renderer + geometry::Renderer,
 {
@@ -262,15 +267,18 @@ pub fn draw_revision_row<R>(
             });
             frame.stroke(
                 &path,
-                style.edge_stroke(kind, i, &dash, emphasized_lane == Some(i)),
+                style.edge_stroke(kind, i, &dash, emphasized_lane_before == Some(i)),
             );
         } else if frame_data.is_pass_through(i) {
             // Pure pass-through: draw a single straight vertical so we
             // benefit from the round line cap and dashed style if needed.
+            // Pass-through means the lane isn't in `merging_lanes` and
+            // both halves are alive, so the before/after segments match
+            // — either emphasis flag is sufficient.
             let path = Path::line(Point::new(x_i, top), Point::new(x_i, bot));
             frame.stroke(
                 &path,
-                style.edge_stroke(kind, i, &dash, emphasized_lane == Some(i)),
+                style.edge_stroke(kind, i, &dash, emphasized_lane_before == Some(i)),
             );
         } else {
             // Lane terminates above the node without merging into it
@@ -278,7 +286,7 @@ pub fn draw_revision_row<R>(
             let path = Path::line(Point::new(x_i, top), Point::new(x_i, mid));
             frame.stroke(
                 &path,
-                style.edge_stroke(kind, i, &dash, emphasized_lane == Some(i)),
+                style.edge_stroke(kind, i, &dash, emphasized_lane_before == Some(i)),
             );
         }
     }
@@ -302,7 +310,7 @@ pub fn draw_revision_row<R>(
         // wherever the branch travels.
         frame.stroke(
             &path,
-            style.edge_stroke(kind, j, &dash, emphasized_lane == Some(j)),
+            style.edge_stroke(kind, j, &dash, emphasized_lane_after == Some(j)),
         );
     }
 
