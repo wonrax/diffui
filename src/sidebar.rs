@@ -332,7 +332,11 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
         // id in `before` while the outgoing half gets a fresh id in
         // `after`. Hover emphasis then picks one half cleanly.
         let revision_lane_segments_before = current_segments.clone();
-        advance_lane_segments(&mut current_segments, &mut next_segment_id, &commit.lane_frame);
+        advance_lane_segments(
+            &mut current_segments,
+            &mut next_segment_id,
+            &commit.lane_frame,
+        );
         // Snapshot labels BEFORE clearing split-lane labels — the merge
         // row itself still needs the merged-in branch's tooltip to fire
         // (hover detection gates on labels being non-empty), even
@@ -341,7 +345,11 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
         let revision_lane_labels = current_labels.clone();
         let revision_lane_segments_after = current_segments.clone();
         clear_split_lane_labels(&mut current_labels, &commit.lane_frame);
-        trim_lane_state(&mut current_segments, &mut current_labels, &commit.lane_frame);
+        trim_lane_state(
+            &mut current_segments,
+            &mut current_labels,
+            &commit.lane_frame,
+        );
         let continuation_lane_labels = current_labels.clone();
         let continuation_lane_segments = current_segments.clone();
 
@@ -415,6 +423,7 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
         Message::SelectFile,
     )
     .width(Length::Fill)
+    .reveal_selected(ui.revision_reveal_token)
     .into()
 }
 

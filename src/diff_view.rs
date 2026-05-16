@@ -173,6 +173,25 @@ pub struct DiffView<'a, Message> {
     header: Vec<HeaderLine>,
     on_selected_file_changed: fn(usize) -> Message,
     on_copy: Option<fn(String) -> Message>,
+    /// In-diff find highlights. `None` when the find bar is closed.
+    find: Option<FindOverlay<'a>>,
+}
+
+/// Per-render find-match data fed into `DiffView::with_find`. The widget
+/// renders one rectangle per match on the lines it overlaps and scrolls
+/// the active match into view when `scroll_token` changes between
+/// renders.
+#[derive(Debug, Clone)]
+pub struct FindOverlay<'a> {
+    pub matches: &'a [crate::find::FindMatch],
+    pub active: Option<usize>,
+    /// Bumped by the caller whenever the active match changes. The widget
+    /// keeps the previous token in its `State` and scrolls when the two
+    /// disagree — this is how we trigger scroll without tearing into the
+    /// widget's private state from outside.
+    pub scroll_token: u64,
+    pub highlight: Color,
+    pub active_highlight: Color,
 }
 
 /// Sizes derived once at widget-construction time from the caller's
@@ -233,6 +252,15 @@ struct State<Paragraph> {
     selected_file: usize,
     revision_key: String,
     pending_file_jump: Option<usize>,
+    /// (file, hunk, line, byte_in_line) of a match we should scroll into
+    /// view on the next pass. Set in `diff()` when the incoming find
+    /// scroll_token differs from `last_find_scroll_token`; consumed in
+    /// `update()` where layout bounds are available.
+    pending_find_scroll: Option<(usize, usize, usize, usize)>,
+    /// Last find scroll token we acted on. The widget compares this against
+    /// the incoming `FindOverlay::scroll_token` and, when they disagree,
+    /// schedules a scroll. Wrapping `u64` is fine — only equality matters.
+    last_find_scroll_token: Option<u64>,
     vertical_offset: f32,
     paragraphs: RefCell<Vec<Paragraph>>,
     /// Anchor (mouse-down position) of the in-progress or completed selection.
@@ -348,6 +376,7 @@ impl<'a, Message> DiffView<'a, Message> {
             header: Vec::new(),
             on_selected_file_changed,
             on_copy: None,
+            find: None,
         }
     }
 
@@ -358,6 +387,11 @@ impl<'a, Message> DiffView<'a, Message> {
 
     pub fn on_copy(mut self, on_copy: fn(String) -> Message) -> Self {
         self.on_copy = Some(on_copy);
+        self
+    }
+
+    pub fn with_find(mut self, find: FindOverlay<'a>) -> Self {
+        self.find = Some(find);
         self
     }
 
@@ -461,6 +495,64 @@ impl<'a, Message> DiffView<'a, Message> {
         let wrapped_lines = line.content.chars().count().max(1).div_ceil(chars_per_line);
 
         wrapped_lines as f32 * self.metrics.row_height
+    }
+
+    /// Y position (in content space, before viewport scroll) of the visual
+    /// line containing the byte at `byte_offset` within
+    /// `(file_idx, hunk_idx, line_idx)`. Returns `None` if any of the
+    /// indices are out of bounds.
+    fn match_target_y(
+        &self,
+        file_idx: usize,
+        hunk_idx: usize,
+        line_idx: usize,
+        byte_offset: usize,
+        bounds: Rectangle,
+    ) -> Option<f32> {
+        let file = self.files.get(file_idx)?;
+        let hunk = file.hunks.get(hunk_idx)?;
+        let line = hunk.lines.get(line_idx)?;
+
+        let content_width = self.content_width(bounds.width);
+        let mut y = self.header_height();
+        for (f_i, f) in self.files.iter().enumerate() {
+            if f_i == file_idx {
+                break;
+            }
+            y += self.metrics.file_header_height;
+            for h in f.hunks {
+                y += self.metrics.hunk_header_height;
+                for ln in &h.lines {
+                    y += self.row_height(ln, content_width);
+                }
+            }
+        }
+        y += self.metrics.file_header_height;
+        for (h_i, h) in file.hunks.iter().enumerate() {
+            if h_i == hunk_idx {
+                break;
+            }
+            y += self.metrics.hunk_header_height;
+            for ln in &h.lines {
+                y += self.row_height(ln, content_width);
+            }
+        }
+        y += self.metrics.hunk_header_height;
+        for (l_i, ln) in hunk.lines.iter().enumerate() {
+            if l_i == line_idx {
+                break;
+            }
+            y += self.row_height(ln, content_width);
+        }
+
+        // Offset within the wrapped row: figure out which visual line the
+        // byte sits on so a match on the 5th wrap row of a 200-char line
+        // doesn't scroll to the row top and leave the match off-screen.
+        let chars_per_line = chars_per_visual_line(content_width, self.metrics.char_width);
+        let char_offset = char_count_at_byte(&line.content, byte_offset);
+        let visual_idx = char_offset / chars_per_line;
+        y += visual_idx as f32 * self.metrics.row_height;
+        Some(y)
     }
 
     /// Convert a screen point into a `TextPosition` if it falls on a row's
@@ -681,6 +773,87 @@ impl<'a, Message> DiffView<'a, Message> {
         );
     }
 
+    /// Paint translucent rectangles behind every find match that intersects
+    /// the currently visible rows. The active match uses a stronger tint so
+    /// it stands out against the surrounding non-active hits.
+    fn draw_find_highlights<Renderer>(
+        &self,
+        renderer: &mut Renderer,
+        find: &FindOverlay<'_>,
+        visible_rows: &[VisibleRow],
+        content_clip_bounds: Rectangle,
+        bounds: Rectangle,
+        content_width: f32,
+    ) where
+        Renderer: renderer::Renderer,
+    {
+        if find.matches.is_empty() {
+            return;
+        }
+        let cw = self.metrics.char_width;
+        let chars_per_line = chars_per_visual_line(content_width, cw);
+        let text_x = bounds.x + self.metrics.gutter_width + PREFIX_WIDTH + TEXT_X_PADDING;
+        let max_right = content_clip_bounds.x + content_clip_bounds.width;
+
+        // Single pass over visible rows; for each, find matches landing on
+        // it. With small numbers of matches per row this is fine; for
+        // pathological cases (e.g. a `\w` regex with thousands of hits) we
+        // could pre-sort matches by row and binary-search, but typical
+        // queries match a few dozen times max.
+        for row in visible_rows {
+            let line = &self.files[row.file_index].hunks[row.hunk_index].lines[row.line_index];
+            for (match_idx, m) in find.matches.iter().enumerate() {
+                if m.file_index != row.file_index
+                    || m.hunk_index != row.hunk_index
+                    || m.line_index != row.line_index
+                {
+                    continue;
+                }
+                if !line.content.is_char_boundary(m.byte_start)
+                    || !line
+                        .content
+                        .is_char_boundary(m.byte_end.min(line.content.len()))
+                {
+                    continue;
+                }
+                let color = if find.active == Some(match_idx) {
+                    find.active_highlight
+                } else {
+                    find.highlight
+                };
+                let start_chars = char_count_at_byte(&line.content, m.byte_start);
+                let end_chars =
+                    char_count_at_byte(&line.content, m.byte_end.min(line.content.len()));
+                let total_chars = line.content.chars().count();
+                let visual_lines = total_chars.max(1).div_ceil(chars_per_line);
+                for visual_idx in 0..visual_lines {
+                    let vline_start = visual_idx * chars_per_line;
+                    let vline_end = ((visual_idx + 1) * chars_per_line).min(total_chars);
+                    let seg_start = start_chars.max(vline_start);
+                    let seg_end = end_chars.min(vline_end);
+                    if seg_start >= seg_end {
+                        continue;
+                    }
+                    let mut x = text_x + (seg_start - vline_start) as f32 * cw;
+                    let mut width = (seg_end - seg_start) as f32 * cw;
+                    if x < content_clip_bounds.x {
+                        let trim = content_clip_bounds.x - x;
+                        x = content_clip_bounds.x;
+                        width = (width - trim).max(0.0);
+                    }
+                    if x + width > max_right {
+                        width = (max_right - x).max(0.0);
+                    }
+                    if width <= 0.0 {
+                        continue;
+                    }
+                    let y = row.y + visual_idx as f32 * self.metrics.row_height;
+                    self.draw_background(renderer, x, y, width, self.metrics.row_height, color);
+                }
+            }
+        }
+    }
+
     fn draw_revision_header<Renderer>(
         &self,
         renderer: &mut Renderer,
@@ -799,6 +972,8 @@ where
             selected_file: self.selected_file,
             revision_key: self.revision_key.clone(),
             pending_file_jump: None,
+            pending_find_scroll: None,
+            last_find_scroll_token: None,
             vertical_offset: 0.0,
             paragraphs: RefCell::new(Vec::new()),
             selection_anchor: None,
@@ -839,6 +1014,18 @@ where
 
         if state.selected_file != self.selected_file {
             state.pending_file_jump = Some(self.selected_file);
+        }
+
+        if let Some(find) = &self.find
+            && state.last_find_scroll_token != Some(find.scroll_token)
+        {
+            state.last_find_scroll_token = Some(find.scroll_token);
+            if let Some(active_idx) = find.active
+                && let Some(m) = find.matches.get(active_idx)
+            {
+                state.pending_find_scroll =
+                    Some((m.file_index, m.hunk_index, m.line_index, m.byte_start));
+            }
         }
     }
 
@@ -893,6 +1080,23 @@ where
             };
             state.vertical_offset = target.clamp(0.0, max_vertical);
             state.selected_file = file_index;
+            shell.request_redraw();
+        }
+
+        if let Some((file_idx, hunk_idx, line_idx, byte_offset)) = state.pending_find_scroll.take()
+            && let Some(target) =
+                self.match_target_y(file_idx, hunk_idx, line_idx, byte_offset, bounds)
+        {
+            // Center the row in the viewport when there's room; clamp
+            // otherwise. Centering keeps the match's surrounding context
+            // visible instead of pinning it to the top edge.
+            let centered = target - (bounds.height - self.metrics.row_height) / 2.0;
+            state.vertical_offset = centered.clamp(0.0, max_vertical);
+            let selected_file = self.file_at_offset(state.vertical_offset, bounds.width);
+            if selected_file != state.selected_file {
+                state.selected_file = selected_file;
+                shell.publish((self.on_selected_file_changed)(selected_file));
+            }
             shell.request_redraw();
         }
 
@@ -1433,6 +1637,17 @@ where
                         }
                     }
                 }
+            }
+
+            if let Some(find) = &self.find {
+                self.draw_find_highlights(
+                    renderer,
+                    find,
+                    &visible_rows,
+                    content_clip_bounds,
+                    bounds,
+                    content_width,
+                );
             }
 
             for row in &visible_rows {

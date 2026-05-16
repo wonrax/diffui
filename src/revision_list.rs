@@ -185,6 +185,11 @@ pub struct RevisionList<Message> {
     selected_file: Option<usize>,
     style: RevisionListStyle,
     width: Length,
+    /// Bumped by the caller each time it wants the selected row scrolled
+    /// into view. The widget compares against `State::last_scroll_token`
+    /// and triggers a scroll on disagreement — analogous to the
+    /// `scroll_token` mechanism in `DiffView` for find matches.
+    reveal_token: Option<u64>,
     on_select_revision: fn(RowSelectionKey) -> Message,
     on_select_file: fn(usize) -> Message,
 }
@@ -204,6 +209,7 @@ impl<Message> RevisionList<Message> {
             selected_file,
             style,
             width: Length::Fill,
+            reveal_token: None,
             on_select_revision,
             on_select_file,
         }
@@ -212,6 +218,24 @@ impl<Message> RevisionList<Message> {
     pub fn width(mut self, width: Length) -> Self {
         self.width = width;
         self
+    }
+
+    /// Cause the widget to scroll the currently-selected row into view
+    /// the next time `token` changes. Calling with the same value twice
+    /// in a row is a no-op.
+    pub fn reveal_selected(mut self, token: u64) -> Self {
+        self.reveal_token = Some(token);
+        self
+    }
+
+    /// Index of the row matching `selected_row`, if any. Used by the
+    /// reveal-on-token-bump scroll.
+    fn selected_row_index(&self) -> Option<usize> {
+        let key = self.selected_row.as_ref()?;
+        self.items.iter().position(|item| match item {
+            Item::Revision(rev) => &rev.selection_key == key,
+            Item::File(_) => false,
+        })
     }
 
     fn row_height(&self, item: &Item) -> f32 {
@@ -284,6 +308,12 @@ struct State<Paragraph> {
     cursor_position: Option<Point>,
     paragraphs: RefCell<Vec<Paragraph>>,
     scrollbar: ScrollbarState,
+    /// Most recent `reveal_token` we acted on. `None` until first reveal.
+    last_reveal_token: Option<u64>,
+    /// Row to bring into view on the next `update()` pass — `None` when
+    /// no reveal is pending. Set in `diff()` (which sees prop changes
+    /// before layout); consumed in `update()` (which has bounds).
+    pending_reveal_row: Option<usize>,
 }
 
 impl<Paragraph> State<Paragraph> {
@@ -295,6 +325,8 @@ impl<Paragraph> State<Paragraph> {
             cursor_position: None,
             paragraphs: RefCell::new(Vec::new()),
             scrollbar: ScrollbarState::default(),
+            last_reveal_token: None,
+            pending_reveal_row: None,
         }
     }
 }
@@ -315,6 +347,17 @@ where
         Size {
             width: self.width,
             height: Length::Fill,
+        }
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
+        if self.reveal_token != state.last_reveal_token {
+            state.last_reveal_token = self.reveal_token;
+            // Defer the actual scroll to `update()` — that's where bounds
+            // (needed to clamp + center) are available. Storing the row
+            // index here saves us re-walking `items` later.
+            state.pending_reveal_row = self.selected_row_index();
         }
     }
 
@@ -343,6 +386,38 @@ where
         if state.vertical_offset > max_vertical {
             state.vertical_offset = max_vertical;
             shell.request_redraw();
+        }
+
+        if let Some(row_idx) = state.pending_reveal_row.take()
+            && let Some(item) = self.items.get(row_idx)
+        {
+            // Scroll so the selected row sits roughly a third of the way
+            // down the viewport — gives the user context above and below
+            // without pinning to the top edge. Falls back to "just bring
+            // it into view" when the viewport is too small to spare a
+            // third for offset.
+            let row_top = self.row_top(row_idx);
+            let row_h = self.row_height(item);
+            let preferred_top = (row_top - bounds.height * 0.33).max(0.0);
+            let must_top = (row_top + row_h - bounds.height).max(0.0);
+            let must_bottom = row_top;
+            let target = if (state.vertical_offset..state.vertical_offset + bounds.height)
+                .contains(&row_top)
+                && (state.vertical_offset..state.vertical_offset + bounds.height)
+                    .contains(&(row_top + row_h))
+            {
+                // Already visible — leave the offset alone.
+                state.vertical_offset
+            } else if state.vertical_offset > must_bottom {
+                preferred_top
+            } else {
+                must_top.max(preferred_top)
+            };
+            let target = target.clamp(0.0, max_vertical);
+            if (target - state.vertical_offset).abs() > f32::EPSILON {
+                state.vertical_offset = target;
+                shell.request_redraw();
+            }
         }
 
         let recompute_hover = |state: &mut State<Renderer::Paragraph>, this: &Self| {

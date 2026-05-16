@@ -1,10 +1,44 @@
 use iced::{
-    Background, Border, Color, Element, Length, Shadow, Theme, theme,
-    widget::{button, container, text},
+    Background, Border, Color, Element, Font, Length, Shadow, Theme, border,
+    font::{Family, Weight},
+    theme,
+    widget::{button, container, scrollable, text},
 };
 
 use crate::diff_view::Palette;
 use crate::scrollbar;
+
+/// Apply a `Medium` (or other emphasized) weight to a font *only* when
+/// the font is a specific named family the OS can actually look up.
+///
+/// On macOS, asking the platform font matcher for a generic family
+/// (`Family::SansSerif`, `Family::Monospace`) at a non-default weight
+/// frequently returns nothing — the matcher resolves the generic to the
+/// platform UI font but doesn't enumerate weights under it, so the
+/// renderer falls back to `.notdef` glyphs (the empty-box "tofu").
+/// Specific named families (`Family::Name("Cascadia Code")` etc.) round-
+/// trip through fontdb's family→weight index correctly, so weight
+/// overrides are safe there.
+///
+/// Use this for any label that wants to emphasize itself with a
+/// heavier weight; pass-through to the platform default when the family
+/// is generic and trust the OS's UI typography defaults.
+pub fn emphasis_font(base: Font, weight: Weight) -> Font {
+    match base.family {
+        Family::Name(_) => Font { weight, ..base },
+        // Generic families: don't override weight — the platform will
+        // pick a sensible default and we'd otherwise risk tofu.
+        _ => base,
+    }
+}
+
+/// Geometry knobs shared by every `iced::widget::scrollable` we style.
+/// Mirrors the values in `crate::scrollbar` (12px outer, 2px margin → 8px
+/// pill) so the iced-managed scrollbars in the palette / find overlays
+/// read as the same widget as the hand-drawn ones in `RevisionList` and
+/// `DiffView`.
+pub const SCROLLBAR_WIDTH: f32 = 8.0;
+pub const SCROLLBAR_MARGIN: f32 = 2.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThemePreference {
@@ -223,6 +257,36 @@ pub fn scrollbar_style(theme: ThemeSpec) -> scrollbar::ScrollbarStyle {
         thumb_color: Color {
             a: 0.55,
             ..theme.muted_text
+        },
+    }
+}
+
+/// Style closure for `iced::widget::scrollable`. Reuses the
+/// `scrollbar_style` colors and a fully-rounded pill border so the iced
+/// scrollbar visually matches the hand-drawn one in `RevisionList` /
+/// `DiffView`. Status is ignored — the custom widgets don't react to hover
+/// either, and matching that keeps the two indistinguishable side by side.
+pub fn iced_scrollable_style(theme: ThemeSpec, _status: scrollable::Status) -> scrollable::Style {
+    let colors = scrollbar_style(theme);
+    let pill = border::rounded(SCROLLBAR_WIDTH / 2.0);
+    let rail = scrollable::Rail {
+        background: Some(Background::Color(colors.track_color)),
+        border: pill,
+        scroller: scrollable::Scroller {
+            background: Background::Color(colors.thumb_color),
+            border: pill,
+        },
+    };
+    scrollable::Style {
+        container: container::Style::default(),
+        vertical_rail: rail,
+        horizontal_rail: rail,
+        gap: None,
+        auto_scroll: scrollable::AutoScroll {
+            background: Background::Color(Color::TRANSPARENT),
+            border: Border::default(),
+            shadow: Shadow::default(),
+            icon: theme.muted_text,
         },
     }
 }

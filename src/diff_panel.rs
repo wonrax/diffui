@@ -1,10 +1,11 @@
 use iced::{
-    Element, Length, alignment,
-    widget::{column, container, row, text},
+    Color, Element, Length, alignment,
+    widget::{column, container, row, stack, text},
 };
 
 use crate::backend::{RevisionDetails, SignatureInfo};
 use crate::diff_view::{self, DiffFileView, DiffView};
+use crate::find;
 use crate::theme::{ThemeSpec, diff_palette, diff_panel_style};
 use crate::{Diffui, LoadStatus, Message};
 
@@ -63,7 +64,7 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
 
             let stats_bar = build_stats_bar(ui, theme);
 
-            let diff_view: Element<'a, Message> = DiffView::new(
+            let mut dv = DiffView::new(
                 files,
                 ui.selected_file,
                 ui.selected_revision.view_key(),
@@ -74,10 +75,30 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
                 Message::SelectFile,
             )
             .with_header(header_lines)
-            .on_copy(Message::CopyToClipboard)
-            .into();
+            .on_copy(Message::CopyToClipboard);
 
-            column![stats_bar, diff_view].spacing(0).into()
+            if let Some(find_state) = &ui.find {
+                dv = dv.with_find(diff_view::FindOverlay {
+                    matches: &find_state.matches,
+                    active: find_state.active,
+                    scroll_token: find_state.scroll_token,
+                    highlight: theme.accent,
+                    active_highlight: Color {
+                        a: 0.45,
+                        ..theme.accent
+                    },
+                });
+            }
+
+            let diff_view: Element<'a, Message> = dv.into();
+
+            // The find bar sits on top of the diff view, pinned to the
+            // upper-right of the panel. `stack` overlays without taking
+            // the diff view out of the column flow.
+            let find_overlay = find::build_overlay(ui, theme);
+            let diff_with_find: Element<'a, Message> = stack![diff_view, find_overlay].into();
+
+            column![stats_bar, diff_with_find].spacing(0).into()
         };
 
     container(body)
