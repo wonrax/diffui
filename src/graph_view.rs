@@ -173,11 +173,18 @@ fn draw_outgoing(
     // ~17.6% of dx as the vertical drop, so a one-lane jump dips only a
     // couple of pixels before the corner, keeping the leg unmistakably
     // "horizontal".
-    let corner_y = y_mid + dx * NODE_TILT_DEG.to_radians().tan();
-    // Cap against the remaining vertical drop so `arc_to` doesn't try to
-    // fit an arc taller than the row — that degenerates into a plain
-    // line and we lose the rounding entirely.
-    let radius = (LANE_WIDTH * CORNER_RADIUS_FRAC).min((y_bot - corner_y) * 0.5);
+    let natural_corner_y = y_mid + dx * NODE_TILT_DEG.to_radians().tan();
+    // Keep the corner inside the row with room left for the arc. On wide
+    // graphs (many concurrent lanes) the natural 10° tilt would overshoot
+    // the row bottom — without this cap, the path either clips against
+    // the geometry frame or bleeds into the next revision. Clamping flattens
+    // the effective tilt so the line reads as a long diagonal into the
+    // target column instead.
+    let max_corner_y = (y_bot - LANE_WIDTH * CORNER_RADIUS_FRAC * 0.5).max(y_mid);
+    let corner_y = natural_corner_y.min(max_corner_y);
+    let radius = (LANE_WIDTH * CORNER_RADIUS_FRAC)
+        .min((y_bot - corner_y) * 0.5)
+        .max(0.0);
 
     let corner = Point::new(x_target, corner_y);
     let end = Point::new(x_target, y_bot);
@@ -205,8 +212,14 @@ fn draw_incoming(
     }
 
     let dx = (x_node - x_source).abs();
-    let corner_y = y_mid - dx * NODE_TILT_DEG.to_radians().tan();
-    let radius = (LANE_WIDTH * CORNER_RADIUS_FRAC).min((corner_y - y_top) * 0.5);
+    let natural_corner_y = y_mid - dx * NODE_TILT_DEG.to_radians().tan();
+    // Mirror of `draw_outgoing`: keep the corner inside the row with room
+    // for the arc, so wide graphs don't push the path above `y_top`.
+    let min_corner_y = (y_top + LANE_WIDTH * CORNER_RADIUS_FRAC * 0.5).min(y_mid);
+    let corner_y = natural_corner_y.max(min_corner_y);
+    let radius = (LANE_WIDTH * CORNER_RADIUS_FRAC)
+        .min((corner_y - y_top) * 0.5)
+        .max(0.0);
 
     let corner = Point::new(x_source, corner_y);
     let node_point = Point::new(x_node, y_mid);
