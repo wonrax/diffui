@@ -59,6 +59,91 @@ impl RevisionSelection {
     }
 }
 
+/// User-visible selection over the revision list.
+///
+/// `primary` is the diff target — switching it triggers a backend reload.
+/// `additional` holds the rest of the multi-select set (cmd-click toggle,
+/// shift-click range). The primary is never duplicated into `additional`;
+/// helpers below treat the two together as one logical set.
+///
+/// Working copy entries live alongside commits: a multi-select range that
+/// spans `@` keeps it as a `WorkingCopy` row token rather than resolving
+/// to a change-id, so the row's existing styling and tooling keep working.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Selection {
+    pub primary: RevisionSelection,
+    pub additional: Vec<RevisionSelection>,
+}
+
+impl Selection {
+    pub fn new(primary: RevisionSelection) -> Self {
+        Self {
+            primary,
+            additional: Vec::new(),
+        }
+    }
+
+    /// Total count including the primary. Will drive the palette's
+    /// arity gating once commands land.
+    #[allow(dead_code)]
+    pub fn count(&self) -> usize {
+        1 + self.additional.len()
+    }
+
+    /// Membership test across both primary and additional. Used by the
+    /// op-pad source-slot pre-fill.
+    #[allow(dead_code)]
+    pub fn contains(&self, candidate: &RevisionSelection) -> bool {
+        &self.primary == candidate || self.additional.iter().any(|r| r == candidate)
+    }
+
+    /// Replace the entire selection with a single primary (plain-click
+    /// gesture).
+    #[allow(dead_code)]
+    pub fn replace_primary(&mut self, primary: RevisionSelection) {
+        self.primary = primary;
+        self.additional.clear();
+    }
+
+    /// Toggle `candidate` in/out of `additional` (cmd/ctrl-click gesture).
+    /// Clicking the current primary is a no-op — we always keep one diff
+    /// target.
+    pub fn toggle(&mut self, candidate: RevisionSelection) {
+        if self.primary == candidate {
+            return;
+        }
+        if let Some(pos) = self.additional.iter().position(|r| r == &candidate) {
+            self.additional.remove(pos);
+        } else {
+            self.additional.push(candidate);
+        }
+    }
+
+    /// Fill `additional` with the inclusive range between the primary
+    /// (anchor) and `target` as laid out in `ordered`. Replaces any
+    /// previous additional set. Used by shift-click gestures.
+    pub fn extend_range(&mut self, target: RevisionSelection, ordered: &[RevisionSelection]) {
+        let Some(anchor_idx) = ordered.iter().position(|r| r == &self.primary) else {
+            return;
+        };
+        let Some(target_idx) = ordered.iter().position(|r| r == &target) else {
+            return;
+        };
+        let (lo, hi) = if anchor_idx <= target_idx {
+            (anchor_idx, target_idx)
+        } else {
+            (target_idx, anchor_idx)
+        };
+        self.additional.clear();
+        for r in &ordered[lo..=hi] {
+            if r == &self.primary {
+                continue;
+            }
+            self.additional.push(r.clone());
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DiffDocument {
     pub files: Vec<DiffFile>,
@@ -369,7 +454,11 @@ impl CommitStoreBuilder {
 /// even across a million commits. Shared by [`CommitStore::push`] (the lone
 /// caller); kept free-standing so it can borrow `authors` and `interner`
 /// disjointly from the rest of the store.
-fn intern_author(authors: &mut Vec<Arc<str>>, interner: &mut HashMap<String, u32>, author: &str) -> u32 {
+fn intern_author(
+    authors: &mut Vec<Arc<str>>,
+    interner: &mut HashMap<String, u32>,
+    author: &str,
+) -> u32 {
     if let Some(&idx) = interner.get(author) {
         return idx;
     }

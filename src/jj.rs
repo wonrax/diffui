@@ -283,8 +283,14 @@ pub async fn load_jj_cold(
         .map_err(|error| format!("{error:#}"));
     emit_diff(diff);
 
-    let empty_updates =
-        walk_jj_with_repo(repo.as_ref(), &wc_commit_id, progress, batch_size, emit_batch).await?;
+    let empty_updates = walk_jj_with_repo(
+        repo.as_ref(),
+        &wc_commit_id,
+        progress,
+        batch_size,
+        emit_batch,
+    )
+    .await?;
     Ok((snapshot, empty_updates))
 }
 
@@ -714,7 +720,7 @@ fn civil_date_from_days(days: i64) -> (i32, u32, u32) {
     (year as i32, month, day)
 }
 
-fn jj_settings(repo_root: &Path) -> Result<UserSettings> {
+pub fn jj_settings(repo_root: &Path) -> Result<UserSettings> {
     let mut config = StackedConfig::with_defaults();
 
     for path in jj_user_config_paths() {
@@ -914,7 +920,10 @@ mod mem_profile {
         eprintln!("repo            : {repo}");
         eprintln!("commits         : {}", store.len());
         eprintln!("transient peak  : {:>9.1} MB", mb(peak));
-        eprintln!("live after load : {:>9.1} MB  (allocator current)", mb(live));
+        eprintln!(
+            "live after load : {:>9.1} MB  (allocator current)",
+            mb(live)
+        );
         eprintln!("store.heap()    : {:>9.1} MB  (accounted)", mb(store_heap));
         eprintln!(
             "per commit      : store {:.0} B    peak {:.0} B",
@@ -946,8 +955,9 @@ mod lane_width_probe {
     #[test]
     #[ignore]
     fn profile_lane_width() {
-        let repo = std::env::var("DIFFUI_PROFILE_REPO")
-            .unwrap_or_else(|_| format!("{}/code/nixpkgs", std::env::var("HOME").expect("HOME set")));
+        let repo = std::env::var("DIFFUI_PROFILE_REPO").unwrap_or_else(|_| {
+            format!("{}/code/nixpkgs", std::env::var("HOME").expect("HOME set"))
+        });
         let root = std::path::PathBuf::from(&repo);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()

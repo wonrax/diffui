@@ -22,7 +22,7 @@ use iced::advanced::{
 };
 use iced::{
     Background, Border, Color, Element, Event, Font, Length, Pixels, Point, Radians, Rectangle,
-    Shadow, Size, Theme, Vector, alignment, gradient,
+    Shadow, Size, Theme, Vector, alignment, gradient, keyboard,
 };
 use jj_lib::graph::GraphEdgeType;
 
@@ -173,6 +173,20 @@ pub enum RowSelectionKey {
     Commit(String),
 }
 
+/// Modifier-derived intent attached to every `on_select_revision`
+/// publication, so the caller's selection model can apply the right
+/// gesture without re-reading the keyboard state separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionGesture {
+    /// Plain click — replace the selection with this row.
+    Replace,
+    /// Cmd/Ctrl-click — toggle this row in the additional set.
+    Toggle,
+    /// Shift-click — fill the additional set with the inclusive range
+    /// from the current primary to this row.
+    RangeExtend,
+}
+
 #[derive(Debug, Clone)]
 pub enum Item {
     Revision(RevisionRowView),
@@ -206,7 +220,12 @@ pub struct RevisionList<'a, Message> {
     expanded: Option<(usize, usize)>,
     build_revision: Box<dyn Fn(usize) -> RevisionRowView + 'a>,
     build_file: Box<dyn Fn(usize) -> FileRowView + 'a>,
+    /// Primary selection — drives the "fully selected" row styling and
+    /// the reveal-on-token scroll target.
     selected_row: Option<RowSelectionKey>,
+    /// Additional selections — drawn with a lighter highlight to show
+    /// they're part of the active selection but not the diff target.
+    additional_rows: Vec<RowSelectionKey>,
     selected_file: Option<usize>,
     /// Flat row index of the selected row, for the reveal-on-token scroll.
     selected_flat: Option<usize>,
@@ -217,7 +236,7 @@ pub struct RevisionList<'a, Message> {
     /// and triggers a scroll on disagreement — analogous to the
     /// `scroll_token` mechanism in `DiffView` for find matches.
     reveal_token: Option<u64>,
-    on_select_revision: fn(RowSelectionKey) -> Message,
+    on_select_revision: fn(RowSelectionKey, SelectionGesture) -> Message,
     on_select_file: fn(usize) -> Message,
 }
 
@@ -229,10 +248,11 @@ impl<'a, Message> RevisionList<'a, Message> {
         build_revision: Box<dyn Fn(usize) -> RevisionRowView + 'a>,
         build_file: Box<dyn Fn(usize) -> FileRowView + 'a>,
         selected_row: Option<RowSelectionKey>,
+        additional_rows: Vec<RowSelectionKey>,
         selected_file: Option<usize>,
         selected_flat: Option<usize>,
         style: RevisionListStyle,
-        on_select_revision: fn(RowSelectionKey) -> Message,
+        on_select_revision: fn(RowSelectionKey, SelectionGesture) -> Message,
         on_select_file: fn(usize) -> Message,
     ) -> Self {
         Self {
@@ -241,6 +261,7 @@ impl<'a, Message> RevisionList<'a, Message> {
             build_revision,
             build_file,
             selected_row,
+            additional_rows,
             selected_file,
             selected_flat,
             style,
@@ -408,6 +429,10 @@ struct State<Paragraph> {
     /// Last cursor position observed inside the widget bounds, in screen
     /// coordinates. Used to anchor the tooltip.
     cursor_position: Option<Point>,
+    /// Keyboard modifier state, kept up-to-date via `ModifiersChanged`
+    /// events. Read at click time to derive a `SelectionGesture`
+    /// (cmd/ctrl = Toggle, shift = RangeExtend, otherwise Replace).
+    modifiers: keyboard::Modifiers,
     paragraphs: RefCell<Vec<Paragraph>>,
     scrollbar: ScrollbarState,
     /// Most recent `reveal_token` we acted on. `None` until first reveal.
@@ -425,6 +450,7 @@ impl<Paragraph> State<Paragraph> {
             hovered_file_item: None,
             hovered_lane: None,
             cursor_position: None,
+            modifiers: keyboard::Modifiers::empty(),
             paragraphs: RefCell::new(Vec::new()),
             scrollbar: ScrollbarState::default(),
             last_reveal_token: None,
@@ -662,7 +688,8 @@ where
                 if let Some(row_idx) = self.row_at_offset(local_y) {
                     match self.item_at(row_idx) {
                         Item::Revision(rev) => {
-                            shell.publish((self.on_select_revision)(rev.selection_key));
+                            let gesture = gesture_from_modifiers(state.modifiers);
+                            shell.publish((self.on_select_revision)(rev.selection_key, gesture));
                             shell.capture_event();
                         }
                         Item::File(f) => {
@@ -671,6 +698,9 @@ where
                         }
                     }
                 }
+            }
+            Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
+                state.modifiers = *modifiers;
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                 if let scrollbar::ScrollbarEvent::Captured =
@@ -804,13 +834,16 @@ where
             // matters at split lanes: the same lane index at the hover
             // row may carry two different segment ids in its top vs
             // bottom half.
-            let emphasized_segment = state.hovered_lane.and_then(|(hov_idx, hov_lane, hov_half)| {
-                if hov_idx >= self.row_count() {
-                    return None;
-                }
-                let item = self.item_at(hov_idx);
-                item_lane_segment(&item, hov_lane, hov_half).map(|seg| (seg, hov_lane))
-            });
+            let emphasized_segment =
+                state
+                    .hovered_lane
+                    .and_then(|(hov_idx, hov_lane, hov_half)| {
+                        if hov_idx >= self.row_count() {
+                            return None;
+                        }
+                        let item = self.item_at(hov_idx);
+                        item_lane_segment(&item, hov_lane, hov_half).map(|seg| (seg, hov_lane))
+                    });
 
             // Walk only the rows that intersect the viewport, materializing
             // each one's view on demand — off-screen rows cost nothing.
@@ -901,7 +934,16 @@ impl<'a, Message> RevisionList<'a, Message> {
             .as_ref()
             .map(|key| key == &rev.selection_key)
             .unwrap_or(false);
+        let in_additional =
+            !selected && self.additional_rows.iter().any(|k| k == &rev.selection_key);
         let is_working_copy = matches!(rev.selection_key, RowSelectionKey::WorkingCopy);
+
+        // Additional-selection background sits between the panel base and
+        // the primary's `selected_background`, so multi-selected rows read
+        // as "part of the set" without competing visually with the diff
+        // target.
+        let additional_background =
+            mix_color(self.style.selected_background, self.style.background, 0.5);
 
         // Row chrome extends edge-to-edge. The graph is drawn last in this
         // method so its lines & node still sit visually above any chrome.
@@ -913,6 +955,8 @@ impl<'a, Message> RevisionList<'a, Message> {
         if is_working_copy {
             let right = if selected {
                 self.style.selected_background
+            } else if in_additional {
+                additional_background
             } else {
                 self.style.background
             };
@@ -923,6 +967,8 @@ impl<'a, Message> RevisionList<'a, Message> {
             fill_gradient(renderer, row_bounds, gradient);
         } else if selected {
             fill_background(renderer, row_bounds, self.style.selected_background);
+        } else if in_additional {
+            fill_background(renderer, row_bounds, additional_background);
         }
         fill_background(
             renderer,
@@ -1568,6 +1614,20 @@ impl<'a, Message> RevisionList<'a, Message> {
 /// when the lane has none. Both revision and file rows carry their own
 /// snapshot of the lane-label state — see [`RevisionRowView::lane_labels`]
 /// and [`FileRowView::lane_labels`].
+/// Pick a `SelectionGesture` from the modifier state at click time.
+/// macOS `Command` and Linux/Windows `Control` both toggle; `Shift`
+/// extends the range. If both are held, `Shift` wins (matches the
+/// Finder/Explorer convention for "extend from anchor").
+fn gesture_from_modifiers(modifiers: keyboard::Modifiers) -> SelectionGesture {
+    if modifiers.shift() {
+        SelectionGesture::RangeExtend
+    } else if modifiers.command() || modifiers.control() {
+        SelectionGesture::Toggle
+    } else {
+        SelectionGesture::Replace
+    }
+}
+
 fn item_lane_labels(item: &Item, lane: usize) -> &[String] {
     match item {
         Item::Revision(row) => row

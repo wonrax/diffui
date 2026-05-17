@@ -60,11 +60,19 @@ impl LaneFoldState {
             self.current_labels[lane_frame.node_lane] = bookmarks.to_vec();
         }
         let segments_before = self.current_segments.clone();
-        advance_lane_segments(&mut self.current_segments, &mut self.next_segment_id, lane_frame);
+        advance_lane_segments(
+            &mut self.current_segments,
+            &mut self.next_segment_id,
+            lane_frame,
+        );
         let labels = self.current_labels.clone();
         let segments_after = self.current_segments.clone();
         clear_split_lane_labels(&mut self.current_labels, lane_frame);
-        trim_lane_state(&mut self.current_segments, &mut self.current_labels, lane_frame);
+        trim_lane_state(
+            &mut self.current_segments,
+            &mut self.current_labels,
+            lane_frame,
+        );
         RowLaneData {
             labels,
             segments_before,
@@ -445,7 +453,11 @@ mod tests {
             let width = frame.lane_count();
             let got = layout.fold(i, usize::MAX);
             let want = &reference[i];
-            assert_eq!(truncate(&got.labels, width), truncate(&want.labels, width), "labels {i}");
+            assert_eq!(
+                truncate(&got.labels, width),
+                truncate(&want.labels, width),
+                "labels {i}"
+            );
             assert_eq!(
                 truncate(&got.segments_before, width),
                 truncate(&want.segments_before, width),

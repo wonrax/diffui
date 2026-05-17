@@ -15,6 +15,7 @@ mod graph;
 mod graph_layout;
 mod graph_view;
 mod jj;
+mod mutations;
 mod palette;
 mod repository;
 mod resize_handle;
@@ -95,22 +96,21 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use backend::{
     BackendOutput, CommitStore, CommitsTail, DiffDocument, LoadProgress, RevisionDetails,
-    RevisionSelection, RowView, StreamRow, compute_empty_status, load_backend, load_diff,
-    load_repository_snapshot,
+    RevisionSelection, RowView, Selection, StreamRow, compute_empty_status, load_backend,
+    load_diff, load_repository_snapshot,
 };
 use clap::Parser;
 use config::AppConfig;
 use find::FindState;
+use futures::{SinkExt, Stream, StreamExt};
 use iced::theme as iced_theme;
 use iced::{
-    Element, Length, Subscription, Task, Theme,
-    alignment,
+    Element, Length, Subscription, Task, Theme, alignment,
     event::{self, Event},
     keyboard, system, time,
-    widget::{self, column, container, progress_bar, row, stack, text},
+    widget::{self, column, container, progress_bar, row, stack, text, text_editor},
     window,
 };
-use futures::{SinkExt, Stream, StreamExt};
 use notify::Watcher;
 use palette::{
     ColumnSource, CommandId as PaletteCommand, PaletteState, Recents, ResultRef,
@@ -156,10 +156,14 @@ pub(crate) struct Diffui {
     pub(crate) status: LoadStatus,
     pub(crate) document: DiffDocument,
     pub(crate) commits: CommitStore,
-    pub(crate) selected_revision: RevisionSelection,
+    /// Multi-select aware revision selection. The `primary` field is what
+    /// drives the diff view and the backend reload; `additional` is the
+    /// rest of the multi-selection (cmd/shift-click) that destructive ops
+    /// act on. See `backend::Selection`.
+    pub(crate) selection: Selection,
     /// Sticky inline-file-list preference. Always reflects whether the
-    /// *selected* revision's file list is shown; the user toggles it by
-    /// re-clicking the selected row, and the value persists across
+    /// *primary* revision's file list is shown; the user toggles it by
+    /// re-clicking the primary row, and the value persists across
     /// revision switches so collapsing once stays collapsed for whatever
     /// revision the user moves to next.
     pub(crate) file_list_expanded: bool,
@@ -193,10 +197,10 @@ pub(crate) struct Diffui {
     pub(crate) revision_reveal_token: u64,
     /// True while a palette-initiated revision load is in flight. We
     /// can't bump `revision_reveal_token` at the moment the user accepts
-    /// the result — at that point `selected_revision` is still the old
+    /// the result — at that point `selection.primary` is still the old
     /// value, so the sidebar would scroll the wrong row into view. The
     /// `BackendLoaded` handler reads this flag once the new revision has
-    /// actually been written into `selected_revision`, *then* bumps the
+    /// actually been written into `selection.primary`, *then* bumps the
     /// token so the next render reveals the correct row.
     pub(crate) pending_revision_reveal: bool,
     /// Bumped when `commits` is replaced; tags background empty-status results
@@ -227,6 +231,13 @@ pub(crate) struct Diffui {
     /// whenever no stream is running (idle, or after a refresh that swaps the
     /// graph atomically instead).
     pub(crate) load: Option<LoadCursor>,
+    /// Current transient notification (e.g. "Reverted operation a1b2c3 —
+    /// ⌘Z to undo"). `None` when no toast is visible.
+    pub(crate) toast: Option<Toast>,
+    /// Monotonic counter handed out as each toast's `generation`. Stale
+    /// dismiss tasks (fired by an earlier toast's timer) compare against
+    /// this so they don't accidentally clear a later toast.
+    pub(crate) next_toast_generation: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -262,6 +273,36 @@ pub(crate) struct LoadCursor {
     fold: graph_layout::LaneFoldState,
 }
 
+/// Transient bottom-right notification banner. Shown after a mutation or
+/// any other op the user should be aware of. Auto-dismisses after a
+/// fixed delay; the `generation` token lets a stale dismiss task fired
+/// from an earlier toast no-op against the current one.
+#[derive(Debug, Clone)]
+pub(crate) struct Toast {
+    pub kind: ToastKind,
+    pub message: String,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ToastKind {
+    Success,
+    Error,
+}
+
+/// How Enter should be interpreted when the palette is open. Picker
+/// columns route Enter through their text_input's `on_submit`; op-pad
+/// columns route through this global handler. We use the same `⌘⏎`
+/// binding for every op pad (whether or not it has a message editor) so
+/// the keybinding is consistent across the surface — plain Enter inside
+/// the message editor stays free to insert a newline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum PaletteSubmitMode {
+    /// No palette open, or top column handles Enter itself.
+    None,
+    /// Top is an op pad — `⌘⏎` / `Ctrl+⏎` applies.
+    CmdEnter,
+}
 #[derive(Debug, Clone)]
 pub(crate) enum Message {
     BackendLoaded(RevisionSelection, Box<Result<BackendOutput, String>>),
@@ -293,7 +334,10 @@ pub(crate) enum Message {
     /// so results from a superseded load are dropped.
     EmptyStatusComputed(u64, Vec<(usize, bool)>),
     SelectFile(usize),
-    SelectRowKey(revision_list::RowSelectionKey),
+    SelectRowKey(
+        revision_list::RowSelectionKey,
+        revision_list::SelectionGesture,
+    ),
     SelectTheme(ThemePreference),
     SystemThemeChanged(iced_theme::Mode),
     WindowFocusChanged(bool),
@@ -336,6 +380,24 @@ pub(crate) enum Message {
     /// handler is a no-op — the goal is just to keep iced rendering each
     /// frame so the view can sample the animation's interpolated value.
     PaletteTick,
+    /// Forwarded from the op-pad's message text_editor. Applied to the
+    /// topmost column's `OpDraft.message` Content.
+    OpPadMessageAction(text_editor::Action),
+    /// Fired when a jj mutation task started by `apply_op_pad` (or by a
+    /// keyboard shortcut like ⌘Z) completes. Always followed by a
+    /// commits/diff reload via `BackendLoaded`.
+    MutationApplied(Box<Result<mutations::MutationOutcome, String>>),
+    /// ⌘Z global shortcut — fires `op undo` against the current head.
+    /// Skipped while the palette or find bar is open so the user's
+    /// in-flight text input keeps its own undo.
+    ApplyOpUndo,
+    /// Stale-token-aware toast dismissal. The handler ignores the
+    /// message unless `generation` matches the current toast.
+    DismissToast(u64),
+    /// Hotkey shortcut: open the palette and push an op-pad column for
+    /// the given mutation command pre-filled from the current selection.
+    /// Bypasses the palette's search step entirely.
+    OpenOpPadFor(palette::CommandId),
     /// Open the in-diff find bar (⌘F / Ctrl+F).
     FindOpen,
     FindClose,
@@ -400,7 +462,7 @@ impl Diffui {
                         status: LoadStatus::Loading,
                         document: DiffDocument::default(),
                         commits: CommitStore::default(),
-                        selected_revision: RevisionSelection::WorkingCopy,
+                        selection: Selection::new(RevisionSelection::WorkingCopy),
                         file_list_expanded: true,
                         pending_revision: Some(RevisionSelection::WorkingCopy),
                         repository_snapshot: None,
@@ -426,6 +488,8 @@ impl Diffui {
                         loading_since: Some(Instant::now()),
                         empty_cache: HashMap::new(),
                         load,
+                        toast: None,
+                        next_toast_generation: 0,
                     },
                     Task::batch([backend_task, theme_task]),
                 )
@@ -436,7 +500,7 @@ impl Diffui {
                     status: LoadStatus::Failed(format!("{error:#}")),
                     document: DiffDocument::default(),
                     commits: CommitStore::default(),
-                    selected_revision: RevisionSelection::WorkingCopy,
+                    selection: Selection::new(RevisionSelection::WorkingCopy),
                     file_list_expanded: true,
                     pending_revision: None,
                     repository_snapshot: None,
@@ -462,6 +526,8 @@ impl Diffui {
                     loading_since: None,
                     empty_cache: HashMap::new(),
                     load: None,
+                    toast: None,
+                    next_toast_generation: 0,
                 },
                 system::theme().map(Message::SystemThemeChanged),
             ),
@@ -476,8 +542,8 @@ impl Diffui {
                         return Task::none();
                     }
 
-                    let revision_changed = self.selected_revision != revision;
-                    self.selected_revision = revision;
+                    let revision_changed = self.selection.primary != revision;
+                    self.selection.primary = revision;
                     self.pending_revision = None;
                     self.loading_since = None;
                     self.status = LoadStatus::Loaded;
@@ -498,7 +564,7 @@ impl Diffui {
                             .min(self.document.files.len().saturating_sub(1))
                     };
                     // If this load was triggered by the palette, the
-                    // sidebar didn't yet know the new selected_revision
+                    // sidebar didn't yet know the new selection.primary
                     // when the user accepted; bump the reveal token now
                     // that it's been written so the *next* render scrolls
                     // the correct row into view.
@@ -531,7 +597,7 @@ impl Diffui {
                 let Some(mut cursor) = self.load.take().filter(|c| c.version == version) else {
                     return Task::none();
                 };
-                let selecting_wc = matches!(self.selected_revision, RevisionSelection::WorkingCopy);
+                let selecting_wc = matches!(self.selection.primary, RevisionSelection::WorkingCopy);
                 for row in rows {
                     let index = self.commits.len();
                     // The graph fold consumes the frame + the row's bookmarks
@@ -619,8 +685,8 @@ impl Diffui {
                     let wc_empty = matches!(revision, RevisionSelection::WorkingCopy)
                         .then(|| document.files.is_empty());
 
-                    let revision_changed = self.selected_revision != revision;
-                    self.selected_revision = revision;
+                    let revision_changed = self.selection.primary != revision;
+                    self.selection.primary = revision;
                     self.pending_revision = None;
                     self.loading_since = None;
                     self.status = LoadStatus::Loaded;
@@ -680,8 +746,8 @@ impl Diffui {
                             // fetch`/rebase that landed between edits would never
                             // appear. Leaving it stale lets the next focus (origin
                             // `Focus`) re-walk and reconcile topology.
-                            if matches!(self.selected_revision, RevisionSelection::WorkingCopy) {
-                                let revision = self.selected_revision.clone();
+                            if matches!(self.selection.primary, RevisionSelection::WorkingCopy) {
+                                let revision = self.selection.primary.clone();
                                 self.pending_revision = Some(revision.clone());
                                 self.loading_since = Some(Instant::now());
                                 return Task::perform(
@@ -694,7 +760,7 @@ impl Diffui {
                             // Focus regain / manual refresh can follow an external
                             // jj op that changed topology — full reload. The
                             // resulting `BackendLoaded` records the snapshot.
-                            let revision = self.selected_revision.clone();
+                            let revision = self.selection.primary.clone();
                             self.pending_revision = Some(revision.clone());
                             self.loading_since = Some(Instant::now());
                             let progress = LoadProgress::default();
@@ -730,27 +796,51 @@ impl Diffui {
                     return scroll_sidebar_to_file(index, self);
                 }
             }
-            Message::SelectRowKey(key) => {
-                let selection = match key {
-                    revision_list::RowSelectionKey::WorkingCopy => RevisionSelection::WorkingCopy,
-                    revision_list::RowSelectionKey::Commit(id) => RevisionSelection::Commit(id),
-                };
-                // Re-clicking the already-selected revision toggles its file
-                // list without re-running the backend or changing the diff.
-                // The toggled value persists across revision switches, so
-                // collapsing once stays collapsed wherever the user moves
-                // next.
-                if self.selected_revision == selection {
-                    self.file_list_expanded = !self.file_list_expanded;
-                } else if self.pending_revision.as_ref() != Some(&selection)
-                    && let Some(repository) = self.repository.clone()
-                {
-                    self.pending_revision = Some(selection.clone());
-                    self.loading_since = Some(Instant::now());
-                    let revision = selection.clone();
-                    return Task::perform(load_diff(repository, selection), move |result| {
-                        Message::DiffLoaded(revision, Box::new(result))
-                    });
+            Message::SelectRowKey(key, gesture) => {
+                let target = revision_from_row_key(key);
+                match gesture {
+                    revision_list::SelectionGesture::Replace => {
+                        // Re-clicking the current primary toggles its file
+                        // list without re-running the backend or changing
+                        // the diff. The toggled value persists across
+                        // revision switches.
+                        if self.selection.primary == target {
+                            self.file_list_expanded = !self.file_list_expanded;
+                            self.selection.additional.clear();
+                        } else {
+                            let load_needed = self.pending_revision.as_ref() != Some(&target);
+                            // A plain click drops any multi-select set —
+                            // user has "committed" to a single row.
+                            self.selection.additional.clear();
+                            if load_needed && let Some(repository) = self.repository.clone() {
+                                self.pending_revision = Some(target.clone());
+                                self.loading_since = Some(Instant::now());
+                                let revision = target.clone();
+                                // A revision switch leaves the commit graph
+                                // intact — only the diff changes — so load
+                                // just the diff instead of re-walking the
+                                // (up to ~1M-row) history.
+                                return Task::perform(
+                                    load_diff(repository, target),
+                                    move |result| Message::DiffLoaded(revision, Box::new(result)),
+                                );
+                            }
+                        }
+                    }
+                    revision_list::SelectionGesture::Toggle => {
+                        // Toggle on the primary is a no-op (we always need
+                        // a diff target). Toggle on any other row flips
+                        // its membership in `additional`. No reload.
+                        self.selection.toggle(target);
+                    }
+                    revision_list::SelectionGesture::RangeExtend => {
+                        // Build the visible ordering from the current
+                        // commits list and fill `additional` with the
+                        // contiguous span from primary to target.
+                        let ordered: Vec<RevisionSelection> =
+                            self.commits.iter().map(row_to_revision).collect();
+                        self.selection.extend_range(target, &ordered);
+                    }
                 }
             }
             Message::SelectTheme(theme) => {
@@ -912,6 +1002,70 @@ impl Diffui {
             }
             Message::PaletteNoOp => {}
             Message::PaletteTick => {}
+            Message::OpPadMessageAction(action) => {
+                if let Some(state) = self.palette.as_mut()
+                    && let Some(draft) = state.top_op_draft_mut()
+                {
+                    draft.message.perform(action);
+                }
+            }
+            Message::MutationApplied(result) => {
+                return self.handle_mutation_result(*result);
+            }
+            Message::ApplyOpUndo => {
+                if self.palette.is_some() || self.find.is_some() {
+                    // Defer to in-app text widgets' own undo when the
+                    // user has them open. ⌘Z otherwise routes to op undo.
+                    return Task::none();
+                }
+                let Some(repository) = self.repository.clone() else {
+                    return Task::none();
+                };
+                return Task::perform(
+                    mutations::run_mutation(repository, mutations::MutationOp::OpUndo),
+                    |result| Message::MutationApplied(Box::new(result)),
+                );
+            }
+            Message::DismissToast(generation) => {
+                if matches!(&self.toast, Some(t) if t.generation == generation) {
+                    self.toast = None;
+                }
+            }
+            Message::OpenOpPadFor(command) => {
+                // Arity check up front so a hotkey on the wrong shape of
+                // selection gives a clean error toast instead of opening
+                // an unfillable op pad.
+                let count = self.selection.count();
+                let shape = command.mutation_shape();
+                let arity_ok = shape
+                    .map(|s| match s.source_arity {
+                        palette::Arity::Zero => true,
+                        palette::Arity::One => count == 1,
+                        palette::Arity::OneOrMany => count >= 1,
+                    })
+                    .unwrap_or(true);
+                if !arity_ok {
+                    return self.show_toast(
+                        ToastKind::Error,
+                        format!(
+                            "{} needs {} — you have {} selected",
+                            command.label(),
+                            match shape.map(|s| s.source_arity) {
+                                Some(palette::Arity::One) => "exactly 1 revision",
+                                Some(palette::Arity::OneOrMany) => "at least 1 revision",
+                                _ => "no selection",
+                            },
+                            count,
+                        ),
+                    );
+                }
+                let mut state = palette::PaletteState::open(self);
+                state.push_op_pad(command, self);
+                self.palette = Some(state);
+                self.recents.push_command(command);
+                self.recents.save();
+                return op_pad_focus_task(command);
+            }
             Message::PalettePopColumn => {
                 if let Some(state) = self.palette.as_mut() {
                     if state.pop() {
@@ -1020,10 +1174,11 @@ impl Diffui {
         state.scroll_token = state.scroll_token.wrapping_add(1);
     }
 
-    /// Handle ⏎ in the palette. In `:` commit-search mode the all-commits scan
-    /// is deferred to here (too slow to run per keystroke on a 1M-commit repo):
-    /// the first ⏎ runs the scan and shows results; once searched, ⏎ accepts the
-    /// highlighted row like any other mode.
+    /// Handle ⏎ in the palette. In a Root `:` query the all-commits scan is
+    /// too slow to run per keystroke on a 1M-commit repo, so ⏎ opens it in a
+    /// dedicated commit-search column (the scan runs once as that column is
+    /// pushed). Inside that column ⏎ re-runs the scan after an edit, or — once
+    /// results are showing — accepts the highlighted row like any other mode.
     fn palette_submit(&mut self) -> Task<Message> {
         let Some(mut state) = self.palette.take() else {
             return Task::none();
@@ -1058,6 +1213,21 @@ impl Diffui {
         self.palette_accept_current()
     }
 
+    /// Read by the subscription to decide whether Enter should apply
+    /// the current op pad. See `PaletteSubmitMode` for the modes.
+    fn palette_submit_mode(&self) -> PaletteSubmitMode {
+        let Some(state) = &self.palette else {
+            return PaletteSubmitMode::None;
+        };
+        let Some(top) = state.top() else {
+            return PaletteSubmitMode::None;
+        };
+        match &top.source {
+            ColumnSource::OpPad(_) => PaletteSubmitMode::CmdEnter,
+            _ => PaletteSubmitMode::None,
+        }
+    }
+
     /// Execute the highlighted result in the rightmost column. Returns the
     /// `Task` chain that performs the corresponding action plus any
     /// followup state (closing the palette, focusing input, etc.).
@@ -1068,6 +1238,29 @@ impl Diffui {
         let Some(top) = state.top() else {
             return Task::none();
         };
+
+        // Op-pad columns short-circuit: Enter = apply (or arm the
+        // target slot if it's the next missing requirement).
+        if let ColumnSource::OpPad(draft) = &top.source {
+            return self.apply_op_pad(draft.clone());
+        }
+
+        // Target picker: Enter on a revision row fills the op-pad
+        // below's `placement_target` and pops back to it.
+        if matches!(top.source, ColumnSource::OpPadTargetPicker) {
+            let Some(selected) = top.matches.get(top.selected) else {
+                return Task::none();
+            };
+            let item = selected.item.clone();
+            let Some(rev) = palette::revision_selection(&item, self) else {
+                return Task::none();
+            };
+            if let Some(state) = self.palette.as_mut() {
+                state.fill_target_and_pop(rev);
+            }
+            return Task::none();
+        }
+
         let Some(selected) = top.matches.get(top.selected) else {
             return Task::none();
         };
@@ -1075,11 +1268,24 @@ impl Diffui {
         let target = match &top.source {
             ColumnSource::Root => None,
             ColumnSource::Actions(t) => Some(t.clone()),
+            ColumnSource::OpPad(_) | ColumnSource::OpPadTargetPicker => {
+                unreachable!("handled above")
+            }
         };
 
         match (&top.source, &item) {
-            // Top-level: command rows run directly; revision/file rows
+            // Top-level: a mutation command pushes an op pad column;
+            // built-in commands run inline; revision/file rows
             // primary-action without going through the Actions column.
+            (ColumnSource::Root, ResultRef::Command(cmd)) if cmd.is_mutation() => {
+                self.recents.push_command(*cmd);
+                self.recents.save();
+                if let Some(mut state) = self.palette.take() {
+                    state.push_op_pad(*cmd, self);
+                    self.palette = Some(state);
+                }
+                op_pad_focus_task(*cmd)
+            }
             (ColumnSource::Root, ResultRef::Command(cmd)) => {
                 self.recents.push_command(*cmd);
                 self.recents.save();
@@ -1110,8 +1316,118 @@ impl Diffui {
                 self.palette = None;
                 self.run_palette_command(*cmd, target)
             }
+            (ColumnSource::OpPad(_) | ColumnSource::OpPadTargetPicker, _) => {
+                unreachable!("handled above");
+            }
             _ => Task::none(),
         }
+    }
+
+    /// Apply an op-pad draft. If the op needs a destination and none
+    /// has been picked, push a destination-picker column instead and let
+    /// the user fill the slot first. Otherwise translate the draft into
+    /// a `MutationOp` and fire the async mutation task.
+    fn apply_op_pad(&mut self, draft: palette::OpDraft) -> Task<Message> {
+        let needs_target = match draft.command {
+            // `new` uses its source list directly as parents; there's no
+            // separate target slot for the `Onto` placement we support
+            // today.
+            palette::CommandId::New => false,
+            other => other
+                .mutation_shape()
+                .map(|s| !s.allowed_placements.is_empty())
+                .unwrap_or(false),
+        };
+
+        if needs_target && draft.placement_target.is_none() {
+            // Arm the slot — push a picker column on top of the op pad
+            // and let the user pick a destination. The picker's accept
+            // pops back to the op pad with the slot filled.
+            if let Some(mut state) = self.palette.take() {
+                state.push_target_picker(self);
+                self.palette = Some(state);
+            }
+            return Task::none();
+        }
+
+        self.palette = None;
+        let Some(op) = mutation_from_draft(&draft) else {
+            return self.show_toast(
+                ToastKind::Error,
+                format!("{}: not yet wired", draft.command.label()),
+            );
+        };
+        let Some(repository) = self.repository.clone() else {
+            return Task::none();
+        };
+        Task::perform(mutations::run_mutation(repository, op), |result| {
+            Message::MutationApplied(Box::new(result))
+        })
+    }
+
+    /// Display `message` as a toast of `kind`, returning a `Task` that
+    /// auto-dismisses it after a fixed delay. The dismiss is
+    /// generation-aware so a stale timer can't clear a later toast.
+    fn show_toast(&mut self, kind: ToastKind, message: String) -> Task<Message> {
+        let generation = self.next_toast_generation;
+        self.next_toast_generation = self.next_toast_generation.wrapping_add(1);
+        self.toast = Some(Toast {
+            kind,
+            message,
+            generation,
+        });
+        Task::perform(
+            async move {
+                tokio::time::sleep(Duration::from_millis(4000)).await;
+            },
+            move |_| Message::DismissToast(generation),
+        )
+    }
+
+    /// Shared handler for the `MutationApplied` message — show a toast +
+    /// kick off the post-mutation reload of commits/diff for the
+    /// currently-primary revision.
+    fn handle_mutation_result(
+        &mut self,
+        result: Result<mutations::MutationOutcome, String>,
+    ) -> Task<Message> {
+        match result {
+            Ok(outcome) => {
+                let toast = self.show_toast(
+                    ToastKind::Success,
+                    format!("{} — ⌘Z to undo", outcome.message),
+                );
+                // Mutations like abandon / squash / describe can change
+                // or remove the commit_id our primary points at. Reset
+                // to the working copy so the post-reload never lands on
+                // a stale id. A future polish: switch the primary key
+                // from commit_id to change_id so non-destructive
+                // rewrites (describe, rebase) preserve focus.
+                self.selection.primary = RevisionSelection::WorkingCopy;
+                self.selection.additional.clear();
+                let reload = self.start_post_mutation_reload();
+                Task::batch([toast, reload])
+            }
+            Err(error) => self.show_toast(ToastKind::Error, error),
+        }
+    }
+
+    /// Re-run the backend against the current `selection.primary`. Used
+    /// after a successful mutation so the commit list / diff reflect the
+    /// new state. Mirrors the pattern in `RepositorySnapshotLoaded`.
+    fn start_post_mutation_reload(&mut self) -> Task<Message> {
+        let Some(repository) = self.repository.clone() else {
+            return Task::none();
+        };
+        let revision = self.selection.primary.clone();
+        self.pending_revision = Some(revision.clone());
+        self.loading_since = Some(Instant::now());
+        let progress = LoadProgress::default();
+        self.commit_progress = progress.clone();
+        Task::perform(
+            load_backend(repository, revision.clone(), progress),
+            move |result| Message::BackendLoaded(revision, Box::new(result)),
+        )
     }
 
     fn run_palette_command(
@@ -1201,6 +1517,23 @@ impl Diffui {
                     Task::none()
                 }
             }
+            // Mutation commands are intercepted in `palette_accept_current`
+            // and routed through `apply_op_pad` after the user fills the
+            // op-pad form. They should never reach this path — if they
+            // do, it's a bug (e.g. an action menu surfacing a mutation
+            // without going through `push_op_pad`).
+            PaletteCommand::New
+            | PaletteCommand::Edit
+            | PaletteCommand::Abandon
+            | PaletteCommand::Describe
+            | PaletteCommand::Squash
+            | PaletteCommand::Rebase
+            | PaletteCommand::OpUndo
+            | PaletteCommand::BookmarkSet
+            | PaletteCommand::BookmarkDelete => {
+                debug_assert!(false, "mutation command reached run_palette_command");
+                Task::none()
+            }
         }
     }
 
@@ -1211,7 +1544,7 @@ impl Diffui {
 
         // Already current — no load, no async wait, bump the token now so
         // the next render scrolls the sidebar row into view.
-        if self.selected_revision == selection {
+        if self.selection.primary == selection {
             self.revision_reveal_token = self.revision_reveal_token.wrapping_add(1);
             return Task::none();
         }
@@ -1322,7 +1655,7 @@ impl Diffui {
     }
 
     fn find_selected_commit_index(&self) -> Option<usize> {
-        match &self.selected_revision {
+        match &self.selection.primary {
             RevisionSelection::WorkingCopy => {
                 self.commits.iter().position(|row| row.is_working_copy())
             }
@@ -1386,7 +1719,8 @@ impl Diffui {
             Message::SidebarWidthChanged,
         );
         let palette_overlay = palette::build_overlay(self, theme);
-        let content = stack![panels, resize_overlay, palette_overlay]
+        let toast_overlay = build_toast_overlay(self, theme);
+        let content = stack![panels, resize_overlay, palette_overlay, toast_overlay]
             .width(Length::Fill)
             .height(Length::Fill);
 
@@ -1422,7 +1756,11 @@ impl Diffui {
         // open/closed flags in through `Subscription::with`, which
         // becomes part of the subscription identity and arrives as a
         // tuple alongside each event.
-        let flags = (self.palette.is_some(), self.find.is_some());
+        let flags = (
+            self.palette.is_some(),
+            self.find.is_some(),
+            self.palette_submit_mode(),
+        );
 
         let keyboard = event::listen_with(|event, _status, _window| match event {
             Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
@@ -1431,82 +1769,141 @@ impl Diffui {
             _ => None,
         })
         .with(flags)
-        .filter_map(|((palette_open, find_open), (key, modifiers))| {
-            // Cmd/Ctrl+K opens (or toggles closed) the palette.
-            if modifiers.command()
-                && matches!(
-                    key.as_ref(),
-                    keyboard::Key::Character("k") | keyboard::Key::Character("K")
-                )
-            {
-                return Some(if palette_open {
-                    Message::PaletteClose
-                } else {
-                    Message::PaletteOpen
-                });
-            }
+        .filter_map(
+            |((palette_open, find_open, submit_mode), (key, modifiers))| {
+                // Cmd/Ctrl+K opens (or toggles closed) the palette.
+                if modifiers.command()
+                    && matches!(
+                        key.as_ref(),
+                        keyboard::Key::Character("k") | keyboard::Key::Character("K")
+                    )
+                {
+                    return Some(if palette_open {
+                        Message::PaletteClose
+                    } else {
+                        Message::PaletteOpen
+                    });
+                }
 
-            // Cmd/Ctrl+F opens the in-diff find bar. No toggle; Esc
-            // closes.
-            if modifiers.command()
-                && matches!(
-                    key.as_ref(),
-                    keyboard::Key::Character("f") | keyboard::Key::Character("F")
-                )
-            {
-                return Some(Message::FindOpen);
-            }
+                // Cmd/Ctrl+F opens the in-diff find bar. No toggle; Esc
+                // closes.
+                if modifiers.command()
+                    && matches!(
+                        key.as_ref(),
+                        keyboard::Key::Character("f") | keyboard::Key::Character("F")
+                    )
+                {
+                    return Some(Message::FindOpen);
+                }
 
-            if palette_open {
-                return match key.as_ref() {
-                    keyboard::Key::Named(keyboard::key::Named::Escape) => {
-                        Some(Message::PalettePopColumn)
+                // Cmd/Ctrl+Z routes to `op undo` whenever there isn't an in-
+                // app text widget that owns its own undo. The handler in
+                // `update` re-checks palette/find state defensively so a
+                // keypress that races with an overlay close still does the
+                // right thing.
+                if (modifiers.command() || modifiers.control())
+                    && !modifiers.shift()
+                    && !palette_open
+                    && !find_open
+                    && matches!(
+                        key.as_ref(),
+                        keyboard::Key::Character("z") | keyboard::Key::Character("Z")
+                    )
+                {
+                    return Some(Message::ApplyOpUndo);
+                }
+
+                if palette_open {
+                    // Op-pad Enter handling. Picker columns route Enter
+                    // through their text_input's `on_submit`, but op pads
+                    // render a `text_editor` (no on_submit), so we fire
+                    // PaletteAccept from here. Cmd/Ctrl+Enter when a message
+                    // editor exists; plain Enter when it doesn't (Enter
+                    // belongs to the editor for newlines otherwise).
+                    if matches!(
+                        key.as_ref(),
+                        keyboard::Key::Named(keyboard::key::Named::Enter)
+                    ) && matches!(submit_mode, PaletteSubmitMode::CmdEnter)
+                        && (modifiers.command() || modifiers.control())
+                        && !modifiers.shift()
+                    {
+                        return Some(Message::PaletteAccept);
                     }
-                    keyboard::Key::Named(keyboard::key::Named::ArrowDown) => {
-                        Some(Message::PaletteMoveSelection(1))
+
+                    return match key.as_ref() {
+                        keyboard::Key::Named(keyboard::key::Named::Escape) => {
+                            Some(Message::PalettePopColumn)
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::ArrowDown) => {
+                            Some(Message::PaletteMoveSelection(1))
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
+                            Some(Message::PaletteMoveSelection(-1))
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::Tab) => {
+                            Some(Message::PalettePushActions)
+                        }
+                        _ => None,
+                    };
+                }
+
+                if find_open {
+                    return match key.as_ref() {
+                        keyboard::Key::Named(keyboard::key::Named::Escape) => {
+                            Some(Message::FindClose)
+                        }
+                        // Enter / Shift+Enter — handle both here since
+                        // text_input intentionally has no on_submit (it
+                        // would route every Enter to FindNext and swallow
+                        // Shift+Enter on the way).
+                        keyboard::Key::Named(keyboard::key::Named::Enter) => {
+                            Some(if modifiers.shift() {
+                                Message::FindPrev
+                            } else {
+                                Message::FindNext
+                            })
+                        }
+                        _ => None,
+                    };
+                }
+
+                // No overlay — global j/k/arrow file shortcuts apply. Only
+                // fire when no modifier is held, otherwise ⌘J / ⌘K combos
+                // would also trigger file nav.
+                if modifiers.command() || modifiers.alt() || modifiers.control() {
+                    return None;
+                }
+                match key.as_ref() {
+                    keyboard::Key::Named(keyboard::key::Named::ArrowDown)
+                    | keyboard::Key::Character("j") => Some(Message::SelectNextFile),
+                    keyboard::Key::Named(keyboard::key::Named::ArrowUp)
+                    | keyboard::Key::Character("k") => Some(Message::SelectPreviousFile),
+                    // Mutation hotkeys. All open an op pad pre-filled from
+                    // the current selection; the handler in `update` does
+                    // the arity check and shows an error toast if the
+                    // selection is the wrong shape.
+                    keyboard::Key::Character("n") => {
+                        Some(Message::OpenOpPadFor(palette::CommandId::New))
                     }
-                    keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
-                        Some(Message::PaletteMoveSelection(-1))
+                    keyboard::Key::Character("e") => {
+                        Some(Message::OpenOpPadFor(palette::CommandId::Edit))
                     }
-                    keyboard::Key::Named(keyboard::key::Named::Tab) => {
-                        Some(Message::PalettePushActions)
+                    keyboard::Key::Character("x") => {
+                        Some(Message::OpenOpPadFor(palette::CommandId::Abandon))
+                    }
+                    keyboard::Key::Character("d") => {
+                        Some(Message::OpenOpPadFor(palette::CommandId::Describe))
+                    }
+                    keyboard::Key::Character("s") => {
+                        Some(Message::OpenOpPadFor(palette::CommandId::Squash))
+                    }
+                    keyboard::Key::Character("r") => {
+                        Some(Message::OpenOpPadFor(palette::CommandId::Rebase))
                     }
                     _ => None,
-                };
-            }
-
-            if find_open {
-                return match key.as_ref() {
-                    keyboard::Key::Named(keyboard::key::Named::Escape) => Some(Message::FindClose),
-                    // Enter / Shift+Enter — handle both here since
-                    // text_input intentionally has no on_submit (it
-                    // would route every Enter to FindNext and swallow
-                    // Shift+Enter on the way).
-                    keyboard::Key::Named(keyboard::key::Named::Enter) => {
-                        Some(if modifiers.shift() {
-                            Message::FindPrev
-                        } else {
-                            Message::FindNext
-                        })
-                    }
-                    _ => None,
-                };
-            }
-
-            // No overlay — global j/k/arrow file shortcuts apply. Only
-            // fire when no modifier is held, otherwise ⌘J / ⌘K combos
-            // would also trigger file nav.
-            if modifiers.command() || modifiers.alt() || modifiers.control() {
-                return None;
-            }
-            match key.as_ref() {
-                keyboard::Key::Named(keyboard::key::Named::ArrowDown)
-                | keyboard::Key::Character("j") => Some(Message::SelectNextFile),
-                keyboard::Key::Named(keyboard::key::Named::ArrowUp)
-                | keyboard::Key::Character("k") => Some(Message::SelectPreviousFile),
-                _ => None,
-            }
-        });
+                }
+            },
+        );
 
         let focus = event::listen().filter_map(|event| match event {
             Event::Window(window::Event::Focused) => Some(Message::WindowFocusChanged(true)),
@@ -1518,9 +1915,7 @@ impl Diffui {
         // starts once and persists; `RefreshRepository` itself is gated on
         // focus, so edits made while unfocused are picked up on focus-regain.
         let refresh = match &self.repository {
-            Some(repository) => {
-                Subscription::run_with(repository.root.clone(), watch_repository)
-            }
+            Some(repository) => Subscription::run_with(repository.root.clone(), watch_repository),
             None => Subscription::none(),
         };
 
@@ -1568,6 +1963,166 @@ fn scroll_sidebar_to_file(_file_index: usize, _ui: &Diffui) -> Task<Message> {
     // TODO: re-implement scroll-to-reveal against `RevisionList`'s internal
     // scroll state once the widget exposes a scrollable operation.
     Task::none()
+}
+
+/// Task that focuses the op-pad's message editor if the chosen command
+/// has one. For ops without an editor (edit / abandon / rebase / etc.)
+/// nothing is focused — keyboard input there is just `⌘⏎` to apply.
+fn op_pad_focus_task(command: palette::CommandId) -> Task<Message> {
+    let needs_message = command.mutation_shape().is_some_and(|s| s.needs_message);
+    if needs_message {
+        widget::operation::focus(palette::OP_PAD_MESSAGE_ID)
+    } else {
+        Task::none()
+    }
+}
+
+/// Translate an `OpDraft` into a concrete `MutationOp` the mutations
+/// module knows how to run. Returns `None` for ops that haven't been
+/// wired yet (the user sees a stub toast in that case).
+fn mutation_from_draft(draft: &palette::OpDraft) -> Option<mutations::MutationOp> {
+    use palette::CommandId;
+    match draft.command {
+        CommandId::OpUndo => Some(mutations::MutationOp::OpUndo),
+        CommandId::Describe => {
+            let target = draft.source.first().cloned()?;
+            Some(mutations::MutationOp::Describe {
+                target,
+                message: draft.message.text(),
+            })
+        }
+        CommandId::Edit => {
+            let target = draft.source.first().cloned()?;
+            Some(mutations::MutationOp::Edit { target })
+        }
+        CommandId::Abandon => {
+            if draft.source.is_empty() {
+                return None;
+            }
+            Some(mutations::MutationOp::Abandon {
+                targets: draft.source.clone(),
+            })
+        }
+        CommandId::Squash => {
+            if draft.source.is_empty() {
+                return None;
+            }
+            let destination = draft.placement_target.clone()?;
+            Some(mutations::MutationOp::Squash {
+                sources: draft.source.clone(),
+                destination,
+            })
+        }
+        CommandId::Rebase => {
+            if draft.source.is_empty() {
+                return None;
+            }
+            let destination = draft.placement_target.clone()?;
+            let placement = draft.placement_kind?;
+            Some(mutations::MutationOp::Rebase {
+                sources: draft.source.clone(),
+                destination,
+                placement,
+            })
+        }
+        CommandId::New => {
+            if draft.source.is_empty() {
+                return None;
+            }
+            Some(mutations::MutationOp::New {
+                parents: draft.source.clone(),
+                message: draft.message.text(),
+            })
+        }
+        CommandId::BookmarkSet => {
+            let target = draft.source.first().cloned()?;
+            Some(mutations::MutationOp::BookmarkSet {
+                name: draft.message.text(),
+                target,
+            })
+        }
+        CommandId::BookmarkDelete => Some(mutations::MutationOp::BookmarkDelete {
+            name: draft.message.text(),
+        }),
+        _ => None,
+    }
+}
+
+/// Map a row-selection token from the sidebar widget back to the
+/// app-level `RevisionSelection`. Working-copy rows carry no id; commit
+/// rows carry the change-id string that `RowView::change_id` produces.
+fn revision_from_row_key(key: revision_list::RowSelectionKey) -> RevisionSelection {
+    match key {
+        revision_list::RowSelectionKey::WorkingCopy => RevisionSelection::WorkingCopy,
+        revision_list::RowSelectionKey::Commit(id) => RevisionSelection::Commit(id),
+    }
+}
+
+/// Mirror of `revision_from_row_key`, but for a `RowView` out of the
+/// commit store. Keeps the working-copy row identified as `WorkingCopy`
+/// rather than a `Commit(commit_id)` so it round-trips against the
+/// sidebar's own keys (which carry the commit id, see `build_revision_row`).
+fn row_to_revision(row: RowView<'_>) -> RevisionSelection {
+    if row.is_working_copy() {
+        RevisionSelection::WorkingCopy
+    } else {
+        RevisionSelection::Commit(row.commit_id().to_owned())
+    }
+}
+
+/// Build the bottom-right toast overlay. Returns an empty space when no
+/// toast is showing — the parent `stack![...]` is cheap to over-build.
+fn build_toast_overlay<'a>(ui: &'a Diffui, theme: theme::ThemeSpec) -> Element<'a, Message> {
+    use iced::widget::{Space, container, mouse_area, text};
+    let Some(toast) = ui.toast.as_ref() else {
+        return Space::new().into();
+    };
+    let (background, foreground) = match toast.kind {
+        ToastKind::Success => (theme.accent, theme.background),
+        ToastKind::Error => (theme.conflict_marker, theme.background),
+    };
+    let card = container(
+        text(toast.message.clone())
+            .size(13)
+            .font(ui.config.ui_font)
+            .color(foreground),
+    )
+    .padding(iced::Padding::from([10, 16]))
+    .style(move |_| container::Style {
+        background: Some(iced::Background::Color(background)),
+        border: iced::Border {
+            width: 0.0,
+            color: iced::Color::TRANSPARENT,
+            radius: 8.0.into(),
+        },
+        shadow: iced::Shadow {
+            color: iced::Color {
+                a: 0.30,
+                ..iced::Color::BLACK
+            },
+            offset: iced::Vector::new(0.0, 6.0),
+            blur_radius: 16.0,
+        },
+        ..container::Style::default()
+    });
+
+    // Click-to-dismiss: the toast captures clicks itself, the rest of the
+    // overlay passes through so the user can keep working underneath.
+    let generation = toast.generation;
+    let clickable = mouse_area(card).on_press(Message::DismissToast(generation));
+
+    container(clickable)
+        .padding(iced::Padding {
+            top: 0.0,
+            right: 16.0,
+            bottom: 24.0,
+            left: 0.0,
+        })
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(iced::alignment::Horizontal::Right)
+        .align_y(iced::alignment::Vertical::Bottom)
+        .into()
 }
 
 fn commit_for_ref<'a>(ui: &'a Diffui, item: &ResultRef) -> Option<RowView<'a>> {
@@ -1702,18 +2257,21 @@ fn watch_repository(root: &PathBuf) -> Pin<Box<dyn Stream<Item = Message> + Send
             // notify's handler runs on its own thread; bridge it to this async
             // task over an unbounded channel so the handler never blocks.
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-            let watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
-                if let Ok(event) = result
-                    && !matches!(event.kind, notify::EventKind::Access(_))
-                    && event_touches_worktree(&event)
-                {
-                    let _ = tx.send(());
-                }
-            });
+            let watcher =
+                notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
+                    if let Ok(event) = result
+                        && !matches!(event.kind, notify::EventKind::Access(_))
+                        && event_touches_worktree(&event)
+                    {
+                        let _ = tx.send(());
+                    }
+                });
             let mut watcher = match watcher {
                 Ok(watcher) => watcher,
                 Err(error) => {
-                    eprintln!("diffui: filesystem watcher unavailable, auto-refresh disabled: {error}");
+                    eprintln!(
+                        "diffui: filesystem watcher unavailable, auto-refresh disabled: {error}"
+                    );
                     return;
                 }
             };

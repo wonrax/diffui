@@ -26,7 +26,7 @@ use iced::{
     widget::{
         Space, column, container, mouse_area, pin, responsive, row, scrollable,
         scrollable::{Direction, Scrollbar},
-        stack, text, text_input,
+        stack, text, text_editor, text_input,
     },
 };
 use nucleo_matcher::{Config, Matcher, Utf32String};
@@ -39,6 +39,11 @@ use crate::{Diffui, Message};
 /// rightmost column changes (open, push, pop) so keystrokes always land in
 /// the column the user is steering.
 pub const PALETTE_INPUT_ID: &str = "palette-input";
+
+/// `Id` for the op-pad's multi-line message editor. Focused when the op
+/// pad is pushed so the user can start typing immediately without
+/// clicking the editor first.
+pub const OP_PAD_MESSAGE_ID: &str = "op-pad-message";
 
 /// Build the scrollable id for column at `depth`. Each column gets its
 /// own id so `scroll_to(...)` only operates on the targeted one — iced
@@ -161,6 +166,100 @@ pub enum ColumnSource {
     /// Action menu for a specific result. Renders a fixed catalog instead
     /// of fuzzy-matching against repo data.
     Actions(ResultRef),
+    /// Op pad — a structured form for a destructive jj operation. Doesn't
+    /// fuzzy-match anything; the column's `query` / `matches` / `selected`
+    /// stay at their defaults and the form renders from `op_draft`.
+    OpPad(OpDraft),
+    /// Revision picker dedicated to filling the op pad below. Behaves
+    /// like a `Root` column but accepts only revisions (commits +
+    /// bookmarks + working copy) and routes its accept through the op
+    /// pad's `placement_target` slot instead of jumping the diff view.
+    OpPadTargetPicker,
+}
+
+/// A user-edited draft of a mutating jj operation. Populated from the
+/// current selection + the command's `MutationShape` defaults; mutated by
+/// the op pad ui slot interactions; consumed by the mutations module when
+/// the user hits Apply.
+///
+/// `message` is a `text_editor::Content` rather than a plain `String` so
+/// the multi-line message slot keeps cursor/selection state across view
+/// rebuilds. Read the text with `message.text()` at apply time.
+#[derive(Debug, Clone)]
+pub struct OpDraft {
+    pub command: CommandId,
+    /// Revisions in user-visible order (primary first, then additional).
+    pub source: Vec<RevisionSelection>,
+    pub source_mode: SourceMode,
+    pub placement_kind: Option<PlacementKind>,
+    /// Target rev for placements that need one. `None` means the slot is
+    /// armed (waiting for a click in the revision list, or a typed
+    /// revset).
+    pub placement_target: Option<RevisionSelection>,
+    /// Multi-line commit message editor state (used by `describe` /
+    /// `new`). Empty when the command's shape doesn't include a message
+    /// slot.
+    pub message: text_editor::Content,
+}
+
+impl OpDraft {
+    /// Build a fresh draft for `command`, prefilling source from the
+    /// current selection and choosing the default source-mode/placement
+    /// from the command's shape. The message field is loaded from the
+    /// primary commit's existing description when the op edits an
+    /// existing message (currently: `describe`).
+    pub fn from_selection(command: CommandId, ui: &Diffui) -> Self {
+        let shape = command
+            .mutation_shape()
+            .expect("OpDraft::from_selection called with non-mutation command");
+
+        let mut source = Vec::with_capacity(1 + ui.selection.additional.len());
+        if !matches!(shape.source_arity, Arity::Zero) {
+            source.push(ui.selection.primary.clone());
+            source.extend(ui.selection.additional.iter().cloned());
+        }
+
+        let source_mode = shape
+            .allowed_source_modes
+            .first()
+            .copied()
+            .unwrap_or(SourceMode::Just);
+        let placement_kind = shape.allowed_placements.first().copied();
+
+        let message = if shape.needs_message && command == CommandId::Describe {
+            // Preload the primary commit's existing message so the user
+            // is editing in place rather than starting from blank.
+            text_editor::Content::with_text(&describe_initial_message(ui).unwrap_or_default())
+        } else {
+            text_editor::Content::new()
+        };
+
+        Self {
+            command,
+            source,
+            source_mode,
+            placement_kind,
+            placement_target: None,
+            message,
+        }
+    }
+}
+
+fn describe_initial_message(ui: &Diffui) -> Option<String> {
+    let primary_commit_id = match &ui.selection.primary {
+        RevisionSelection::Commit(id) => id.clone(),
+        RevisionSelection::WorkingCopy => ui
+            .commits
+            .iter()
+            .find(|c| c.is_working_copy())?
+            .commit_id()
+            .to_owned(),
+    };
+    ui.commits
+        .iter()
+        .find(|c| c.commit_id() == primary_commit_id.as_str())
+        .filter(|c| c.has_description())
+        .map(|c| c.description().to_owned())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -187,6 +286,7 @@ pub struct PaletteMatch {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CommandId {
+    // Built-in commands (top-level, non-mutating)
     RefreshRepository,
     SelectNextFile,
     SelectPreviousFile,
@@ -196,58 +296,398 @@ pub enum CommandId {
     ThemeHighContrast,
     CopyFileDiff,
     OpenFind,
-    // Tab-action targets (filled per result type by `push_action_candidates`):
+    // Tab-action commands (filled per result type by `push_action_candidates`)
     JumpToRevision,
     CopyChangeId,
     CopyCommitMessage,
     CopyAuthor,
     OpenFile,
     CopyFilePath,
+    // Mutating jj operations — accept opens an op pad column.
+    New,
+    Edit,
+    Abandon,
+    Describe,
+    Squash,
+    Rebase,
+    OpUndo,
+    /// Create or move a local bookmark to point at the selected commit.
+    BookmarkSet,
+    /// Delete a local bookmark (name supplied in the message slot).
+    BookmarkDelete,
 }
 
+/// Required source-revset arity for a mutation. Drives palette filtering
+/// against the current `Selection`. Non-mutation commands ignore this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arity {
+    /// No source needed (e.g. `op undo`).
+    Zero,
+    /// Exactly one source revision (e.g. `edit`).
+    One,
+    /// One or more source revisions (e.g. `rebase`, `abandon`).
+    OneOrMany,
+}
+
+/// How a source revset is interpreted relative to its descendants — the
+/// rebase `-r` / `-s` / `-b` axis. For every op other than rebase this is
+/// always `Just`, but we model it uniformly so the op-pad ui can render a
+/// mode selector whenever `allowed_source_modes` has more than one entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceMode {
+    /// `-r`: only the named revisions; their descendants are re-parented
+    /// in place.
+    Just,
+    /// `-s`: revisions plus all their descendants come along.
+    WithDescendants,
+    /// `-b`: the whole "branch" containing the revisions (everything from
+    /// their nearest trunk-side ancestor up to them and their descendants).
+    Branch,
+}
+
+/// Where the source lands relative to the destination. `Onto` (rebase /
+/// duplicate / new) makes the destination the new parent; `Into` (squash)
+/// folds the changes into the destination; `InsertAfter` / `InsertBefore`
+/// splice into a chain on either side of the destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlacementKind {
+    Onto,
+    Into,
+    InsertAfter,
+    InsertBefore,
+}
+
+/// Risk level for the warning ui. `Safe` = no rewrite (copies, navigation,
+/// theme changes); `Rewrite` = standard destructive but recoverable via
+/// `jj op undo`; `Irreversible` = a rewrite that can't be undone (rare, not
+/// in p0 — placeholder for future ops like `git push --force`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum Danger {
+    Safe,
+    Rewrite,
+    Irreversible,
+}
+
+/// Shape of the op pad rendered when a mutation command is accepted.
+/// Drives slot visibility, validation, and dispatch.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub struct MutationShape {
+    pub source_arity: Arity,
+    pub allowed_source_modes: &'static [SourceMode],
+    pub allowed_placements: &'static [PlacementKind],
+    /// True when the op pad shows a message editor slot — i.e. `describe`
+    /// and `new`. The op uses the message both for input (display the
+    /// existing message for describe) and for output (write it on apply).
+    pub needs_message: bool,
+    pub danger: Danger,
+}
+
+/// What a command actually does when accepted. `Builtin` and `Action`
+/// match the existing read-only command paths; `Mutation(_)` opens an op
+/// pad column.
+#[derive(Debug, Clone, Copy)]
+pub enum CommandKind {
+    Builtin,
+    Action,
+    Mutation(MutationShape),
+}
+
+/// Single source of truth for a command's metadata. Replaces the
+/// scattered `.label()` / `.hint()` / `.persist_name()` impls so adding a
+/// new command is one entry in the `COMMAND_SPECS` table.
+#[derive(Debug, Clone, Copy)]
+pub struct CommandSpec {
+    pub id: CommandId,
+    pub label: &'static str,
+    pub hint: &'static str,
+    /// Stable string used in the on-disk recents file. Renaming `label`
+    /// doesn't invalidate persisted MRU entries — only this does.
+    pub persist_name: &'static str,
+    pub kind: CommandKind,
+}
+
+const COMMAND_SPECS: &[CommandSpec] = &[
+    CommandSpec {
+        id: CommandId::RefreshRepository,
+        label: "Refresh repository",
+        hint: "Re-read the repository state",
+        persist_name: "refresh-repository",
+        kind: CommandKind::Builtin,
+    },
+    CommandSpec {
+        id: CommandId::SelectNextFile,
+        label: "Select next file",
+        hint: "Move between files in current diff",
+        persist_name: "select-next-file",
+        kind: CommandKind::Builtin,
+    },
+    CommandSpec {
+        id: CommandId::SelectPreviousFile,
+        label: "Select previous file",
+        hint: "Move between files in current diff",
+        persist_name: "select-previous-file",
+        kind: CommandKind::Builtin,
+    },
+    CommandSpec {
+        id: CommandId::ThemeSystem,
+        label: "Theme: System",
+        hint: "Follow OS appearance",
+        persist_name: "theme-system",
+        kind: CommandKind::Builtin,
+    },
+    CommandSpec {
+        id: CommandId::ThemeLight,
+        label: "Theme: Light",
+        hint: "Set palette theme",
+        persist_name: "theme-light",
+        kind: CommandKind::Builtin,
+    },
+    CommandSpec {
+        id: CommandId::ThemeDark,
+        label: "Theme: Dark",
+        hint: "Set palette theme",
+        persist_name: "theme-dark",
+        kind: CommandKind::Builtin,
+    },
+    CommandSpec {
+        id: CommandId::ThemeHighContrast,
+        label: "Theme: High contrast",
+        hint: "Set palette theme",
+        persist_name: "theme-high-contrast",
+        kind: CommandKind::Builtin,
+    },
+    CommandSpec {
+        id: CommandId::CopyFileDiff,
+        label: "Copy current file diff",
+        hint: "Copy the selected file's diff text",
+        persist_name: "copy-file-diff",
+        kind: CommandKind::Builtin,
+    },
+    CommandSpec {
+        id: CommandId::OpenFind,
+        label: "Find in current diff",
+        hint: "⌘F-style in-diff search across all files",
+        persist_name: "open-find",
+        kind: CommandKind::Builtin,
+    },
+    CommandSpec {
+        id: CommandId::JumpToRevision,
+        label: "Jump to revision",
+        hint: "Show this revision in the diff view",
+        persist_name: "jump-to-revision",
+        kind: CommandKind::Action,
+    },
+    CommandSpec {
+        id: CommandId::CopyChangeId,
+        label: "Copy change-id",
+        hint: "Copy the revision's change-id",
+        persist_name: "copy-change-id",
+        kind: CommandKind::Action,
+    },
+    CommandSpec {
+        id: CommandId::CopyCommitMessage,
+        label: "Copy commit message",
+        hint: "Copy the commit message",
+        persist_name: "copy-commit-message",
+        kind: CommandKind::Action,
+    },
+    CommandSpec {
+        id: CommandId::CopyAuthor,
+        label: "Copy author",
+        hint: "Copy author name and email",
+        persist_name: "copy-author",
+        kind: CommandKind::Action,
+    },
+    CommandSpec {
+        id: CommandId::OpenFile,
+        label: "Open file",
+        hint: "Scroll the diff to this file",
+        persist_name: "open-file",
+        kind: CommandKind::Action,
+    },
+    CommandSpec {
+        id: CommandId::CopyFilePath,
+        label: "Copy file path",
+        hint: "Copy the file's path",
+        persist_name: "copy-file-path",
+        kind: CommandKind::Action,
+    },
+    CommandSpec {
+        id: CommandId::New,
+        label: "New",
+        hint: "Create a new commit (with the selected revisions as parents)",
+        persist_name: "new",
+        kind: CommandKind::Mutation(MutationShape {
+            source_arity: Arity::OneOrMany,
+            allowed_source_modes: &[SourceMode::Just],
+            allowed_placements: &[
+                PlacementKind::Onto,
+                PlacementKind::InsertAfter,
+                PlacementKind::InsertBefore,
+            ],
+            needs_message: true,
+            danger: Danger::Rewrite,
+        }),
+    },
+    CommandSpec {
+        id: CommandId::Edit,
+        label: "Edit",
+        hint: "Move the working copy to the selected revision",
+        persist_name: "edit",
+        kind: CommandKind::Mutation(MutationShape {
+            source_arity: Arity::One,
+            allowed_source_modes: &[SourceMode::Just],
+            allowed_placements: &[],
+            needs_message: false,
+            danger: Danger::Rewrite,
+        }),
+    },
+    CommandSpec {
+        id: CommandId::Abandon,
+        label: "Abandon",
+        hint: "Discard the selected revision(s); descendants get re-parented",
+        persist_name: "abandon",
+        kind: CommandKind::Mutation(MutationShape {
+            source_arity: Arity::OneOrMany,
+            allowed_source_modes: &[SourceMode::Just],
+            allowed_placements: &[],
+            needs_message: false,
+            danger: Danger::Rewrite,
+        }),
+    },
+    CommandSpec {
+        id: CommandId::Describe,
+        label: "Describe",
+        hint: "Edit the commit message of the selected revision",
+        persist_name: "describe",
+        kind: CommandKind::Mutation(MutationShape {
+            source_arity: Arity::One,
+            allowed_source_modes: &[SourceMode::Just],
+            allowed_placements: &[],
+            needs_message: true,
+            danger: Danger::Rewrite,
+        }),
+    },
+    CommandSpec {
+        id: CommandId::Squash,
+        label: "Squash",
+        hint: "Fold the selected revision(s) into a destination",
+        persist_name: "squash",
+        kind: CommandKind::Mutation(MutationShape {
+            source_arity: Arity::OneOrMany,
+            allowed_source_modes: &[SourceMode::Just],
+            allowed_placements: &[PlacementKind::Into],
+            needs_message: false,
+            danger: Danger::Rewrite,
+        }),
+    },
+    CommandSpec {
+        id: CommandId::Rebase,
+        label: "Rebase",
+        hint: "Move the selected revision(s) onto / after / before another commit",
+        persist_name: "rebase",
+        kind: CommandKind::Mutation(MutationShape {
+            source_arity: Arity::OneOrMany,
+            allowed_source_modes: &[
+                SourceMode::Just,
+                SourceMode::WithDescendants,
+                SourceMode::Branch,
+            ],
+            allowed_placements: &[
+                PlacementKind::Onto,
+                PlacementKind::InsertAfter,
+                PlacementKind::InsertBefore,
+            ],
+            needs_message: false,
+            danger: Danger::Rewrite,
+        }),
+    },
+    CommandSpec {
+        id: CommandId::OpUndo,
+        label: "Undo last op",
+        hint: "Revert the most recent destructive operation",
+        persist_name: "op-undo",
+        kind: CommandKind::Mutation(MutationShape {
+            source_arity: Arity::Zero,
+            allowed_source_modes: &[],
+            allowed_placements: &[],
+            needs_message: false,
+            danger: Danger::Rewrite,
+        }),
+    },
+    CommandSpec {
+        id: CommandId::BookmarkSet,
+        label: "Bookmark set",
+        hint: "Create or move a local bookmark to the selected commit",
+        persist_name: "bookmark-set",
+        kind: CommandKind::Mutation(MutationShape {
+            source_arity: Arity::One,
+            allowed_source_modes: &[SourceMode::Just],
+            allowed_placements: &[],
+            // The message field stands in as the bookmark name slot —
+            // single-line content typed by the user.
+            needs_message: true,
+            danger: Danger::Rewrite,
+        }),
+    },
+    CommandSpec {
+        id: CommandId::BookmarkDelete,
+        label: "Bookmark delete",
+        hint: "Delete a local bookmark by name",
+        persist_name: "bookmark-delete",
+        kind: CommandKind::Mutation(MutationShape {
+            source_arity: Arity::Zero,
+            allowed_source_modes: &[],
+            allowed_placements: &[],
+            needs_message: true,
+            danger: Danger::Rewrite,
+        }),
+    },
+];
+
 impl CommandId {
+    /// Lookup the spec for this variant. Panics if the table is missing
+    /// an entry — that's a programming error, not a runtime one.
+    pub fn spec(self) -> &'static CommandSpec {
+        COMMAND_SPECS
+            .iter()
+            .find(|s| s.id == self)
+            .expect("CommandSpec missing for variant")
+    }
+
     pub fn label(self) -> &'static str {
-        match self {
-            Self::RefreshRepository => "Refresh repository",
-            Self::SelectNextFile => "Select next file",
-            Self::SelectPreviousFile => "Select previous file",
-            Self::ThemeSystem => "Theme: System",
-            Self::ThemeLight => "Theme: Light",
-            Self::ThemeDark => "Theme: Dark",
-            Self::ThemeHighContrast => "Theme: High contrast",
-            Self::CopyFileDiff => "Copy current file diff",
-            Self::OpenFind => "Find in current diff",
-            Self::JumpToRevision => "Jump to revision",
-            Self::CopyChangeId => "Copy change-id",
-            Self::CopyCommitMessage => "Copy commit message",
-            Self::CopyAuthor => "Copy author",
-            Self::OpenFile => "Open file",
-            Self::CopyFilePath => "Copy file path",
-        }
+        self.spec().label
     }
 
     pub fn hint(self) -> &'static str {
-        match self {
-            Self::RefreshRepository => "Re-read the repository state",
-            Self::SelectNextFile | Self::SelectPreviousFile => "Move between files in current diff",
-            Self::ThemeSystem => "Follow OS appearance",
-            Self::ThemeLight | Self::ThemeDark | Self::ThemeHighContrast => "Set palette theme",
-            Self::CopyFileDiff => "Copy the selected file's diff text",
-            Self::OpenFind => "⌘F-style in-diff search across all files",
-            Self::JumpToRevision => "Show this revision in the diff view",
-            Self::CopyChangeId => "Copy the revision's change-id",
-            Self::CopyCommitMessage => "Copy the commit message",
-            Self::CopyAuthor => "Copy author name and email",
-            Self::OpenFile => "Scroll the diff to this file",
-            Self::CopyFilePath => "Copy the file's path",
+        self.spec().hint
+    }
+
+    /// True when this command opens an op pad on accept (vs running
+    /// inline).
+    #[allow(dead_code)]
+    pub fn is_mutation(self) -> bool {
+        matches!(self.spec().kind, CommandKind::Mutation(_))
+    }
+
+    /// `MutationShape` for this command, if it's a mutation.
+    pub fn mutation_shape(self) -> Option<&'static MutationShape> {
+        match &self.spec().kind {
+            CommandKind::Mutation(shape) => Some(shape),
+            _ => None,
         }
     }
 }
 
 /// Top-level commands shown when the user enters the palette with no
 /// context. Tab-action commands are appended only inside `Actions(_)`
-/// columns by `push_action_candidates`.
+/// columns by `push_action_candidates`. Mutation commands are also
+/// surfaced here but filtered against the current selection's arity by
+/// `push_command_candidates`.
 const ROOT_COMMANDS: &[CommandId] = &[
+    // Built-ins
     CommandId::RefreshRepository,
     CommandId::OpenFind,
     CommandId::SelectNextFile,
@@ -257,6 +697,16 @@ const ROOT_COMMANDS: &[CommandId] = &[
     CommandId::ThemeLight,
     CommandId::ThemeHighContrast,
     CommandId::CopyFileDiff,
+    // Mutations
+    CommandId::New,
+    CommandId::Edit,
+    CommandId::Describe,
+    CommandId::Abandon,
+    CommandId::Squash,
+    CommandId::Rebase,
+    CommandId::OpUndo,
+    CommandId::BookmarkSet,
+    CommandId::BookmarkDelete,
 ];
 
 /// In-memory MRU bookkeeping. Two tracks: recently-jumped revisions and
@@ -374,48 +824,15 @@ impl From<&Recents> for PersistedRecents {
 }
 
 impl CommandId {
-    /// Stable string used in the on-disk recents file. Keep this separate
-    /// from the user-visible `label()` so renaming a label doesn't
-    /// invalidate persisted MRU entries.
     fn persist_name(self) -> &'static str {
-        match self {
-            Self::RefreshRepository => "refresh-repository",
-            Self::SelectNextFile => "select-next-file",
-            Self::SelectPreviousFile => "select-previous-file",
-            Self::ThemeSystem => "theme-system",
-            Self::ThemeLight => "theme-light",
-            Self::ThemeDark => "theme-dark",
-            Self::ThemeHighContrast => "theme-high-contrast",
-            Self::CopyFileDiff => "copy-file-diff",
-            Self::OpenFind => "open-find",
-            Self::JumpToRevision => "jump-to-revision",
-            Self::CopyChangeId => "copy-change-id",
-            Self::CopyCommitMessage => "copy-commit-message",
-            Self::CopyAuthor => "copy-author",
-            Self::OpenFile => "open-file",
-            Self::CopyFilePath => "copy-file-path",
-        }
+        self.spec().persist_name
     }
 
     fn from_persist_name(name: &str) -> Option<Self> {
-        Some(match name {
-            "refresh-repository" => Self::RefreshRepository,
-            "select-next-file" => Self::SelectNextFile,
-            "select-previous-file" => Self::SelectPreviousFile,
-            "theme-system" => Self::ThemeSystem,
-            "theme-light" => Self::ThemeLight,
-            "theme-dark" => Self::ThemeDark,
-            "theme-high-contrast" => Self::ThemeHighContrast,
-            "copy-file-diff" => Self::CopyFileDiff,
-            "open-find" => Self::OpenFind,
-            "jump-to-revision" => Self::JumpToRevision,
-            "copy-change-id" => Self::CopyChangeId,
-            "copy-commit-message" => Self::CopyCommitMessage,
-            "copy-author" => Self::CopyAuthor,
-            "open-file" => Self::OpenFile,
-            "copy-file-path" => Self::CopyFilePath,
-            _ => return None,
-        })
+        COMMAND_SPECS
+            .iter()
+            .find(|s| s.persist_name == name)
+            .map(|s| s.id)
     }
 }
 
@@ -542,6 +959,93 @@ impl PaletteState {
         self.stack.last_mut()
     }
 
+    /// Push an op-pad column for `command`, pre-filled from the current
+    /// selection. The form's mutations live entirely inside the
+    /// `ColumnSource::OpPad(draft)` payload so the existing column-stack
+    /// animation / focus management works unchanged.
+    pub fn push_op_pad(&mut self, command: CommandId, ui: &Diffui) {
+        let draft = OpDraft::from_selection(command, ui);
+        let column = PaletteColumn {
+            query: String::new(),
+            source: ColumnSource::OpPad(draft),
+            matches: Vec::new(),
+            selected: 0,
+            scroll_y: 0.0,
+            query_version: 0,
+            dirty: false,
+            searched: false,
+        };
+        self.stack.push(column);
+        self.shift_anim = build_shift_anim(COLUMN_WIDTH + COLUMN_HORIZONTAL_GAP);
+        self.shift_anim.go_mut(0.0, Instant::now());
+    }
+
+    /// Mutable access to the current op-pad draft, if the topmost column
+    /// is one. Used by message-changed / radio-changed / target-set
+    /// handlers in `main.rs` to update the draft in place.
+    pub fn top_op_draft_mut(&mut self) -> Option<&mut OpDraft> {
+        match &mut self.stack.last_mut()?.source {
+            ColumnSource::OpPad(draft) => Some(draft),
+            _ => None,
+        }
+    }
+
+    /// Push a target-picker column on top of an op-pad column. No-op
+    /// unless the current top is an op pad — callers must check that
+    /// the placement makes sense (a picker on top of Root or Actions
+    /// would have nowhere to write its result back to).
+    pub fn push_target_picker(&mut self, ui: &Diffui) -> bool {
+        let Some(top) = self.stack.last() else {
+            return false;
+        };
+        if !matches!(top.source, ColumnSource::OpPad(_)) {
+            return false;
+        }
+        let mut column = PaletteColumn {
+            query: String::new(),
+            source: ColumnSource::OpPadTargetPicker,
+            matches: Vec::new(),
+            selected: 0,
+            scroll_y: 0.0,
+            query_version: 0,
+            dirty: false,
+            searched: false,
+        };
+        recompute_matches(&mut column, ui, false);
+        self.stack.push(column);
+        self.shift_anim = build_shift_anim(COLUMN_WIDTH + COLUMN_HORIZONTAL_GAP);
+        self.shift_anim.go_mut(0.0, Instant::now());
+        true
+    }
+
+    /// Pop the target-picker column and write `selection` into the
+    /// op-pad column underneath. No-op when the stack isn't in that
+    /// configuration. Returns the popped column's animation kicked
+    /// off — drives the slide-back transition.
+    pub fn fill_target_and_pop(&mut self, selection: RevisionSelection) -> bool {
+        // Validate stack shape: [..., OpPad, OpPadTargetPicker].
+        let len = self.stack.len();
+        if len < 2 {
+            return false;
+        }
+        if !matches!(self.stack[len - 1].source, ColumnSource::OpPadTargetPicker) {
+            return false;
+        }
+        if !matches!(self.stack[len - 2].source, ColumnSource::OpPad(_)) {
+            return false;
+        }
+
+        self.stack.pop();
+        if let Some(top) = self.stack.last_mut()
+            && let ColumnSource::OpPad(draft) = &mut top.source
+        {
+            draft.placement_target = Some(selection);
+        }
+        self.shift_anim = build_shift_anim(-(COLUMN_WIDTH + COLUMN_HORIZONTAL_GAP));
+        self.shift_anim.go_mut(0.0, Instant::now());
+        true
+    }
+
     /// Push an Actions column for the currently highlighted target. Returns
     /// `false` (and no-ops) when there's nothing to push — either no matches
     /// in the top column or the highlighted item is a Command (which is its
@@ -619,7 +1123,7 @@ pub fn recompute_matches(column: &mut PaletteColumn, ui: &Diffui, search_revisio
     match &column.source {
         ColumnSource::Root => {
             if mode == Mode::Mixed || mode == Mode::Commands {
-                push_command_candidates(&mut candidates);
+                push_command_candidates(&mut candidates, ui);
             }
             if mode == Mode::Mixed {
                 // Commits are NOT searched here — that's `:` mode (below), kept
@@ -634,6 +1138,17 @@ pub fn recompute_matches(column: &mut PaletteColumn, ui: &Diffui, search_revisio
         }
         ColumnSource::Actions(target) => {
             push_action_candidates(&mut candidates, target);
+        }
+        ColumnSource::OpPad(_) => {
+            // Op pad columns don't fuzzy-match anything — the form renders
+            // straight from the draft.
+        }
+        ColumnSource::OpPadTargetPicker => {
+            // Same surface as the Root column's revision search but
+            // without commands or files — the user is choosing a
+            // destination rev for the op pad behind this column.
+            push_revision_candidates(&mut candidates, ui);
+            push_bookmark_candidates(&mut candidates, ui);
         }
     }
 
@@ -753,12 +1268,33 @@ fn push_file_candidates(out: &mut Vec<Candidate>, ui: &Diffui) {
     }
 }
 
-fn push_command_candidates(out: &mut Vec<Candidate>) {
+fn push_command_candidates(out: &mut Vec<Candidate>, ui: &Diffui) {
+    let selection_count = ui.selection.count();
     for cmd in ROOT_COMMANDS {
+        // Mutation commands gate on the current selection's size; the
+        // op-pad ui then operates on that selection as its source. Non-
+        // mutation commands always show — they don't consume selection.
+        if let Some(shape) = cmd.mutation_shape()
+            && !arity_accepts(shape.source_arity, selection_count)
+        {
+            continue;
+        }
         out.push(Candidate {
             item: ResultRef::Command(*cmd),
             haystack: format!("{} {}", cmd.label(), cmd.hint()),
         });
+    }
+}
+
+/// Decide whether a command with `arity` should be visible given the
+/// current selection size. Selections always have at least 1 (the
+/// primary), so `Zero` and `OneOrMany` always show; `One` is only
+/// reachable when the user hasn't multi-selected.
+fn arity_accepts(arity: Arity, selection_count: usize) -> bool {
+    match arity {
+        Arity::Zero => true,
+        Arity::One => selection_count == 1,
+        Arity::OneOrMany => selection_count >= 1,
     }
 }
 
@@ -791,6 +1327,10 @@ pub fn build_overlay<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Messag
         return Space::new().into();
     };
 
+    // Modal scrim: clicking closes the palette, but every other mouse
+    // event in the screen area outside the palette card must be
+    // *absorbed* — without `on_move` / `on_release`, hovers fall through
+    // to the sidebar and trigger row tooltips behind the modal.
     let scrim = mouse_area(
         container(Space::new().width(Length::Fill).height(Length::Fill))
             .width(Length::Fill)
@@ -803,7 +1343,9 @@ pub fn build_overlay<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Messag
                 ..container::Style::default()
             }),
     )
-    .on_press(Message::PaletteClose);
+    .on_press(Message::PaletteClose)
+    .on_release(Message::PaletteNoOp)
+    .on_move(|_| Message::PaletteNoOp);
 
     // Layout strategy: every column is pinned at an absolute X inside a
     // clipping `Stack`. We can't use a row-of-columns inside a container —
@@ -863,10 +1405,18 @@ fn build_column<'a>(
     is_focused: bool,
 ) -> Element<'a, Message> {
     let header = column_header(ui, theme, column_state);
-    let input = build_input(ui, theme, column_state, is_focused);
-    let results = build_results(ui, theme, column_state, depth);
 
-    let body = column![header, input, results].spacing(0);
+    let body = match &column_state.source {
+        ColumnSource::OpPad(draft) => {
+            let form = build_op_pad_body(ui, theme, draft, is_focused);
+            column![header, form].spacing(0)
+        }
+        ColumnSource::Root | ColumnSource::Actions(_) | ColumnSource::OpPadTargetPicker => {
+            let input = build_input(ui, theme, column_state, is_focused);
+            let results = build_results(ui, theme, column_state, depth);
+            column![header, input, results].spacing(0)
+        }
+    };
 
     let panel_color = theme.panel_background_elevated;
     let border_color = if is_focused {
@@ -874,7 +1424,7 @@ fn build_column<'a>(
     } else {
         theme.border
     };
-    container(body)
+    let card = container(body)
         .width(Length::Fixed(COLUMN_WIDTH))
         .height(Length::Fixed(COLUMN_HEIGHT))
         .style(move |_| container::Style {
@@ -896,7 +1446,18 @@ fn build_column<'a>(
                 blur_radius: 12.0,
             },
             ..container::Style::default()
-        })
+        });
+
+    // Mouse-event absorber around the card: clicks on empty parts of the
+    // column (between rows, on the header) would otherwise fall through
+    // to the scrim and close the palette. The interactive widgets inside
+    // (text_input, result rows, text_editor) capture their own events
+    // first, so this wrapper only fires when the click lands on dead
+    // space.
+    mouse_area(card)
+        .on_press(Message::PaletteNoOp)
+        .on_release(Message::PaletteNoOp)
+        .on_move(|_| Message::PaletteNoOp)
         .into()
 }
 
@@ -908,6 +1469,8 @@ fn column_header<'a>(
     let label = match &column_state.source {
         ColumnSource::Root => "Search".to_owned(),
         ColumnSource::Actions(target) => format!("Actions · {}", target_label(target, ui)),
+        ColumnSource::OpPad(draft) => format!("Op · {}", draft.command.label()),
+        ColumnSource::OpPadTargetPicker => "Pick destination".to_owned(),
     };
     container(
         text(label)
@@ -942,6 +1505,10 @@ fn build_input<'a>(
     let placeholder = match &column_state.source {
         ColumnSource::Root => "Search bookmarks, files, commands  (>cmd  @file  :commit)",
         ColumnSource::Actions(_) => "Filter actions",
+        // Op-pad columns short-circuit before this function runs; the
+        // placeholder here is unreachable but kept for match exhaustivity.
+        ColumnSource::OpPad(_) => "",
+        ColumnSource::OpPadTargetPicker => "Search for a destination revision",
     };
 
     let mut input = text_input(placeholder, &column_state.query)
@@ -995,9 +1562,10 @@ fn build_results<'a>(
     column_state: &'a PaletteColumn,
     depth: usize,
 ) -> Element<'a, Message> {
-    // `:` commit-search defers the all-commits scan to ⏎ — show a prompt until
-    // it runs, instead of an empty "No matches".
-    let revision_prompt = revision_mode_needle(&column_state.query)
+    // Commit search defers the all-commits scan to ⏎ — show a prompt until it
+    // runs, instead of an empty "No matches".
+    let deferred_needle = revision_mode_needle(&column_state.query);
+    let revision_prompt = deferred_needle
         .filter(|_| !column_state.searched)
         .map(|needle| {
             let needle = needle.trim();
@@ -1078,6 +1646,324 @@ fn build_results<'a>(
             ..container::Style::default()
         })
         .into()
+}
+
+fn build_op_pad_body<'a>(
+    ui: &'a Diffui,
+    theme: ThemeSpec,
+    draft: &'a OpDraft,
+    is_focused: bool,
+) -> Element<'a, Message> {
+    let shape = draft
+        .command
+        .mutation_shape()
+        .expect("op pad rendered for non-mutation command");
+
+    let mut sections: Vec<Element<'a, Message>> = Vec::new();
+
+    // Source section — hidden when the op takes no source (e.g. OpUndo).
+    if !matches!(shape.source_arity, Arity::Zero) {
+        sections.push(op_pad_section_label(ui, theme, "Source"));
+        sections.push(source_chip_row(ui, theme, &draft.source));
+    }
+
+    // Mode section — shown only when the command allows more than one
+    // mode (currently rebase). Rendered read-only for chunk B; the radio
+    // wiring lands in a later chunk.
+    if shape.allowed_source_modes.len() > 1 {
+        sections.push(op_pad_section_label(ui, theme, "Mode"));
+        sections.push(read_only_value(
+            ui,
+            theme,
+            source_mode_label(draft.source_mode),
+        ));
+    }
+
+    // Placement + target — shown only when the command has placements.
+    if !shape.allowed_placements.is_empty() {
+        sections.push(op_pad_section_label(ui, theme, "Placement"));
+        let placement_text = draft
+            .placement_kind
+            .map(placement_kind_label)
+            .unwrap_or("—");
+        sections.push(read_only_value(ui, theme, placement_text));
+
+        sections.push(op_pad_section_label(ui, theme, "Target"));
+        let target_text = draft
+            .placement_target
+            .as_ref()
+            .map(|t| revision_chip_label(ui, t))
+            .unwrap_or_else(|| "(click a row to set destination)".to_owned());
+        sections.push(read_only_value(ui, theme, &target_text));
+    }
+
+    // Message editor — interactive multi-line text editor. Fills the
+    // remaining vertical space in the column.
+    if shape.needs_message {
+        sections.push(op_pad_section_label(ui, theme, "Message"));
+        let editor_padding = Padding::from([8, 12]);
+        let mut editor = text_editor(&draft.message)
+            .id(OP_PAD_MESSAGE_ID)
+            .padding(editor_padding)
+            .size(14)
+            .font(ui.config.ui_font)
+            .height(Length::Fill)
+            // Match the rest of the palette aesthetic: panel-elevated
+            // background, subtle 1px border, accent border on focus,
+            // panel-text foreground, accent selection.
+            .style(move |_, status| text_editor::Style {
+                background: Background::Color(theme.panel_background),
+                border: Border {
+                    width: 1.0,
+                    color: if matches!(status, text_editor::Status::Focused { .. }) {
+                        theme.accent
+                    } else {
+                        theme.border
+                    },
+                    radius: 6.0.into(),
+                },
+                placeholder: theme.subtle_text,
+                value: theme.text,
+                selection: Color {
+                    a: 0.25,
+                    ..theme.accent
+                },
+            })
+            // Custom key-binding: drop `⌘⏎` / `Ctrl+⏎` so it doesn't
+            // insert a newline — that combo is reserved for "apply",
+            // routed by the global subscription. Every other key falls
+            // back to iced's default text_editor bindings.
+            .key_binding(|kp| {
+                if matches!(
+                    kp.key.as_ref(),
+                    iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter)
+                ) && (kp.modifiers.command() || kp.modifiers.control())
+                {
+                    return None;
+                }
+                text_editor::Binding::from_key_press(kp)
+            });
+        if is_focused {
+            editor = editor.on_action(Message::OpPadMessageAction);
+        }
+        let editor_box = container(editor)
+            .padding(Padding::from([0, 16]))
+            .width(Length::Fill)
+            .height(Length::Fill);
+        sections.push(editor_box.into());
+    }
+
+    sections.push(op_pad_preview(ui, theme, draft));
+    sections.push(op_pad_footer(ui, theme, draft));
+
+    let body = column(sections).spacing(8);
+    container(body)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(Padding::from([12, 0]))
+        .style(move |_| container::Style {
+            background: Some(Background::Color(theme.panel_background_elevated)),
+            border: Border {
+                width: 0.0,
+                color: Color::TRANSPARENT,
+                radius: border::Radius::default().bottom(10.0),
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
+fn op_pad_section_label<'a>(
+    ui: &'a Diffui,
+    theme: ThemeSpec,
+    label: &'static str,
+) -> Element<'a, Message> {
+    container(
+        text(label)
+            .size(10)
+            .font(theme::emphasis_font(ui.config.ui_font, Weight::Medium))
+            .color(theme.subtle_text),
+    )
+    .padding(Padding::from([0, 16]))
+    .into()
+}
+
+fn read_only_value<'a>(ui: &'a Diffui, theme: ThemeSpec, value: &str) -> Element<'a, Message> {
+    container(
+        text(value.to_owned())
+            .size(13)
+            .font(ui.config.ui_font)
+            .color(theme.text),
+    )
+    .padding(Padding::from([2, 16]))
+    .into()
+}
+
+fn source_chip_row<'a>(
+    ui: &'a Diffui,
+    theme: ThemeSpec,
+    source: &[RevisionSelection],
+) -> Element<'a, Message> {
+    let mut chip_row = row![].spacing(6);
+    for rev in source {
+        chip_row = chip_row.push(op_pad_chip(
+            theme,
+            ui.config.mono_font,
+            revision_chip_label(ui, rev),
+        ));
+    }
+    if source.is_empty() {
+        chip_row = chip_row.push(
+            text("(none)")
+                .size(12)
+                .color(theme.subtle_text)
+                .font(ui.config.ui_font),
+        );
+    }
+    container(chip_row).padding(Padding::from([0, 16])).into()
+}
+
+fn op_pad_chip<'a>(theme: ThemeSpec, font: iced::Font, label: String) -> Element<'a, Message> {
+    container(text(label).size(11).font(font).color(theme.text))
+        .padding(Padding::from([2, 8]))
+        .style(move |_| container::Style {
+            background: Some(Background::Color(theme.panel_background)),
+            border: Border {
+                width: 1.0,
+                color: theme.border,
+                radius: 6.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
+fn revision_chip_label(ui: &Diffui, rev: &RevisionSelection) -> String {
+    match rev {
+        RevisionSelection::WorkingCopy => ui
+            .commits
+            .iter()
+            .find(|c| c.is_working_copy())
+            .map(|c| {
+                let short: String = c.change_id().chars().take(8).collect();
+                format!("@ {short}")
+            })
+            .unwrap_or_else(|| "@".to_owned()),
+        RevisionSelection::Commit(id) => ui
+            .commits
+            .iter()
+            .find(|c| c.commit_id() == id.as_str())
+            .map(|c| c.change_id().chars().take(8).collect::<String>())
+            .unwrap_or_else(|| id.chars().take(8).collect::<String>()),
+    }
+}
+
+fn source_mode_label(mode: SourceMode) -> &'static str {
+    match mode {
+        SourceMode::Just => "Just these revisions",
+        SourceMode::WithDescendants => "+ descendants",
+        SourceMode::Branch => "Whole branch",
+    }
+}
+
+fn placement_kind_label(kind: PlacementKind) -> &'static str {
+    match kind {
+        PlacementKind::Onto => "Onto",
+        PlacementKind::Into => "Into",
+        PlacementKind::InsertAfter => "Insert after",
+        PlacementKind::InsertBefore => "Insert before",
+    }
+}
+
+fn op_pad_footer<'a>(ui: &'a Diffui, theme: ThemeSpec, _draft: &OpDraft) -> Element<'a, Message> {
+    // `⌘⏎` applies for every op pad — consistent across the surface so
+    // there's a single muscle-memory keybinding regardless of whether
+    // the op has a message editor.
+    container(
+        text("⌘⏎ Apply  ·  Esc Cancel")
+            .size(11)
+            .color(theme.subtle_text)
+            .font(ui.config.ui_font),
+    )
+    .padding(Padding::from([8, 16]))
+    .into()
+}
+
+/// One-line preview text describing what the op will do, given the
+/// current draft. A text-only stand-in for the ghost graph — beefier
+/// than a raw "rewrites N commits" because it names the affected
+/// change-ids, but cheaper than rendering a projected graph overlay.
+/// The real graph overlay slips to p2 polish.
+fn op_pad_preview<'a>(ui: &'a Diffui, theme: ThemeSpec, draft: &OpDraft) -> Element<'a, Message> {
+    let text_value = preview_text(ui, draft);
+    container(
+        text(text_value)
+            .size(12)
+            .color(theme.muted_text)
+            .font(ui.config.ui_font),
+    )
+    .padding(Padding::from([0, 16]))
+    .into()
+}
+
+fn preview_text(ui: &Diffui, draft: &OpDraft) -> String {
+    let sources = draft
+        .source
+        .iter()
+        .map(|r| revision_chip_label(ui, r))
+        .collect::<Vec<_>>();
+    let target = draft
+        .placement_target
+        .as_ref()
+        .map(|r| revision_chip_label(ui, r));
+    let source_phrase = if sources.is_empty() {
+        "<none>".to_owned()
+    } else if sources.len() <= 3 {
+        sources.join(", ")
+    } else {
+        format!("{} (+ {} more)", sources[..2].join(", "), sources.len() - 2)
+    };
+
+    match draft.command {
+        CommandId::OpUndo => "Reverts the most recent operation".to_owned(),
+        CommandId::Edit => format!("Moves working copy to {source_phrase}"),
+        CommandId::Describe => format!("Rewrites message of {source_phrase}"),
+        CommandId::Abandon => {
+            let n = draft.source.len();
+            format!(
+                "Discards {n} commit{plural}: {source_phrase}",
+                plural = if n == 1 { "" } else { "s" }
+            )
+        }
+        CommandId::New => format!("New commit with parent(s): {source_phrase}"),
+        CommandId::Squash => match &target {
+            Some(t) => format!("Folds {source_phrase} into {t}"),
+            None => format!("Folds {source_phrase} into … (destination required)"),
+        },
+        CommandId::Rebase => match &target {
+            Some(t) => format!("Moves {source_phrase} onto {t}"),
+            None => format!("Moves {source_phrase} onto … (destination required)"),
+        },
+        CommandId::BookmarkSet => {
+            let raw = draft.message.text();
+            let name = raw.trim();
+            if name.is_empty() {
+                format!("Sets bookmark <name> at {source_phrase}")
+            } else {
+                format!("Sets bookmark `{name}` at {source_phrase}")
+            }
+        }
+        CommandId::BookmarkDelete => {
+            let raw = draft.message.text();
+            let name = raw.trim();
+            if name.is_empty() {
+                "Deletes bookmark <name>".to_owned()
+            } else {
+                format!("Deletes bookmark `{name}`")
+            }
+        }
+        _ => String::new(),
+    }
 }
 
 fn build_result_row<'a>(
@@ -1336,10 +2222,7 @@ pub fn change_id_for_recents(item: &ResultRef, ui: &Diffui) -> Option<String> {
             .iter()
             .find(|c| c.bookmarks().iter().any(|b| b == name))
             .map(|c| c.change_id().to_owned()),
-        ResultRef::WorkingCopy => ui
-            .commits
-            .working_copy()
-            .map(|c| c.change_id().to_owned()),
+        ResultRef::WorkingCopy => ui.commits.working_copy().map(|c| c.change_id().to_owned()),
         _ => None,
     }
 }

@@ -1921,12 +1921,7 @@ impl<Message> DiffView<'_, Message> {
             })
         });
 
-        renderer.fill_paragraph(
-            paragraph,
-            render.position,
-            render.color,
-            render.clip_bounds,
-        );
+        renderer.fill_paragraph(paragraph, render.position, render.color, render.clip_bounds);
     }
 
     fn syntax_spans<'a>(

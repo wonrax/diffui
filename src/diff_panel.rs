@@ -67,7 +67,7 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
             let mut dv = DiffView::new(
                 files,
                 ui.selected_file,
-                ui.selected_revision.view_key(),
+                ui.selection.primary.view_key(),
                 diff_palette(theme),
                 ui.config.mono_font,
                 CODE_TEXT_SIZE,

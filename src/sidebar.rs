@@ -14,12 +14,12 @@ use crate::revision_list::{
     self, FileRowView, IndicatorChip, RevisionList, RevisionListStyle, RevisionRowView,
     RowSelectionKey,
 };
-use jj_lib::graph::GraphEdgeType;
 use crate::theme::{
     self, ThemePreference, ThemeSpec, chip_background, sidebar_header_style, sidebar_panel_style,
     theme_switcher_button_style,
 };
 use crate::{Diffui, LoadStatus, Message};
+use jj_lib::graph::GraphEdgeType;
 
 // Public sidebar layout knobs — used by main.rs to clamp the resize handle.
 // `DEFAULT_WIDTH` is a starting point; the actual floor is derived from the
@@ -230,7 +230,7 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
     let graph = &ui.graph;
     let prefix_lens = &ui.sidebar_prefix_lens;
     let commits = &ui.commits;
-    let selected = ui.selected_revision.clone();
+    let selected = ui.selection.primary.clone();
     let file_list_expanded = ui.file_list_expanded;
     let build_revision = Box::new(move |index: usize| {
         build_revision_row(
@@ -266,17 +266,21 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
         )
     });
 
-    let selected_row = match &ui.selected_revision {
-        RevisionSelection::WorkingCopy => Some(RowSelectionKey::WorkingCopy),
-        RevisionSelection::Commit(id) => Some(RowSelectionKey::Commit(id.clone())),
-    };
+    let selected_row = revision_to_row_key(&ui.selection.primary);
+    let additional_rows: Vec<RowSelectionKey> = ui
+        .selection
+        .additional
+        .iter()
+        .map(revision_to_row_key)
+        .collect();
 
     RevisionList::new(
         ui.commits.len(),
         expanded,
         build_revision,
         build_file,
-        selected_row,
+        Some(selected_row),
+        additional_rows,
         Some(ui.selected_file),
         ui.selected_commit_index,
         revision_list_style(theme, ui.config, file_badge_width),
@@ -414,6 +418,16 @@ fn build_file_row(
         file_index: template.file_index,
         lane_labels: continuation_labels.to_vec(),
         lane_segments: continuation_segments.to_vec(),
+    }
+}
+
+/// Map an app-level `RevisionSelection` to the widget's row-selection key.
+/// The commit id rides through unchanged so the key round-trips against
+/// the per-row `selection_key` built in `build_revision_row`.
+fn revision_to_row_key(revision: &RevisionSelection) -> RowSelectionKey {
+    match revision {
+        RevisionSelection::WorkingCopy => RowSelectionKey::WorkingCopy,
+        RevisionSelection::Commit(id) => RowSelectionKey::Commit(id.clone()),
     }
 }
 
@@ -614,10 +628,7 @@ pub fn shortest_unique_prefix_lens(commits: &CommitStore) -> Vec<usize> {
 
 /// Number of leading characters two strings share.
 fn common_prefix_len(a: &str, b: &str) -> usize {
-    a.chars()
-        .zip(b.chars())
-        .take_while(|(x, y)| x == y)
-        .count()
+    a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
 }
 
 /// Pixel-accurate text width measurement for layout decisions made outside
@@ -1170,5 +1181,4 @@ mod tests {
             "Button.rs"
         );
     }
-
 }

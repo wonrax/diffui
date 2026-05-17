@@ -131,6 +131,16 @@ toml = "0.8"
 [profile.dev]
 debug = 1
 
+# Cosmic-text shaping and iced's text/wgpu paths dominate per-frame cost
+# in the diff view (~40 paragraph shapes per scroll frame). At dev's
+# default opt-level=0 each shape is ~10× slower than release, which
+# makes scrolling dense diffs in a debug build feel like a slideshow.
+# Building deps at opt-level=3 keeps our code unoptimized (fast
+# incremental rebuilds, full debuggability) while the upstream hot path
+# runs at release speed.
+[profile.dev.package."*"]
+opt-level = 3
+
 [profile.profiling]
 inherits = "release"
 debug = true
