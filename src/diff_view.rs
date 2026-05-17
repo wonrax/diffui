@@ -225,7 +225,10 @@ impl LayoutMetrics {
         // historical `text_size * 0.62` heuristic that consistently
         // under-counted chars-per-line and produced phantom trailing
         // wrap rows just before the renderer hit its real break point.
-        let char_width = measure_char_advance(font, text_size).max(1.0);
+        // Cached per (font, size) — iced rebuilds the widget on every
+        // `view()` cycle, and uncached this re-shapes "M" each time
+        // (~40µs release / ~450µs debug per rebuild).
+        let char_width = measure_char_advance_cached(font, text_size).max(1.0);
         let gutter_text_chars = gutter_digit_count * 2 + 1; // two columns + one separating space
         let gutter_width = (gutter_text_chars as f32 * char_width
             + GUTTER_HORIZONTAL_PADDING * 2.0)
@@ -239,6 +242,19 @@ impl LayoutMetrics {
             char_width,
         }
     }
+}
+
+/// Cache key for per-line shaped `Paragraph`s. The `(file, hunk, line)`
+/// triple maps to stable line content under a fixed `revision_key`
+/// (`diff()` clears the cache when that changes). `content_width_bits`
+/// invalidates entries when the panel is resized — wrap points move and
+/// the old layout would no longer match the renderer's geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ParagraphKey {
+    file_index: u32,
+    hunk_index: u32,
+    line_index: u32,
+    content_width_bits: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,7 +278,14 @@ struct State<Paragraph> {
     /// schedules a scroll. Wrapping `u64` is fine — only equality matters.
     last_find_scroll_token: Option<u64>,
     vertical_offset: f32,
-    paragraphs: RefCell<Vec<Paragraph>>,
+    /// Shaped `Paragraph`s for syntax-highlighted code lines, keyed by
+    /// `(file, hunk, line, content_width)`. Reused across frames during
+    /// scrolling — `with_spans` shaping is ~280µs/row in release and
+    /// dominates the per-frame draw cost on dense diffs. Cleared in
+    /// `diff()` whenever `revision_key` changes (line indices stop
+    /// pointing at the same text) and unused entries are evicted at the
+    /// end of each `draw()`.
+    paragraph_cache: RefCell<std::collections::HashMap<ParagraphKey, Paragraph>>,
     /// Anchor (mouse-down position) of the in-progress or completed selection.
     selection_anchor: Option<TextPosition>,
     /// Focus (current/release position) of the selection.
@@ -696,12 +719,15 @@ impl<'a, Message> DiffView<'a, Message> {
         output
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_row<Renderer>(
         &self,
         renderer: &mut Renderer,
         line: &DiffLine,
         render: RowRenderParams,
-        paragraphs: &RefCell<Vec<Renderer::Paragraph>>,
+        cache_key: ParagraphKey,
+        paragraph_cache: &RefCell<std::collections::HashMap<ParagraphKey, Renderer::Paragraph>>,
+        paragraph_seen: &mut std::collections::HashSet<ParagraphKey>,
     ) where
         Renderer: text::Renderer<Font = Font>,
     {
@@ -769,7 +795,9 @@ impl<'a, Message> DiffView<'a, Message> {
                 clip_bounds: render.content_clip_bounds,
                 wrapping: text::Wrapping::Glyph,
             },
-            paragraphs,
+            cache_key,
+            paragraph_cache,
+            paragraph_seen,
         );
     }
 
@@ -975,7 +1003,7 @@ where
             pending_find_scroll: None,
             last_find_scroll_token: None,
             vertical_offset: 0.0,
-            paragraphs: RefCell::new(Vec::new()),
+            paragraph_cache: RefCell::new(std::collections::HashMap::new()),
             selection_anchor: None,
             selection_focus: None,
             selection_anchor_unit_start: None,
@@ -1009,6 +1037,9 @@ where
             state.is_selecting = false;
             state.last_drag_cursor = None;
             state.click_count = 0;
+            // Cache entries are keyed by (file, hunk, line) which now
+            // points at different content.
+            state.paragraph_cache.borrow_mut().clear();
             return;
         }
 
@@ -1329,8 +1360,14 @@ where
         };
 
         let state = tree.state.downcast_ref::<State<Renderer::Paragraph>>();
-        state.paragraphs.borrow_mut().clear();
         let content_width = self.content_width(bounds.width);
+        // Keys touched this frame; entries not in this set get evicted
+        // at the end so the cache doesn't grow unbounded as the user
+        // scrolls past new rows. Eviction-at-end is safe because the
+        // renderer only holds `Weak` refs to paragraphs we *did* draw
+        // (i.e. ones we add to `seen` here).
+        let mut paragraph_seen: std::collections::HashSet<ParagraphKey> =
+            std::collections::HashSet::new();
         let content_clip_bounds = Rectangle {
             x: bounds.x + self.metrics.gutter_width + PREFIX_WIDTH,
             y: bounds.y,
@@ -1650,8 +1687,15 @@ where
                 );
             }
 
+            let content_width_bits = content_width.to_bits();
             for row in &visible_rows {
                 let line = &self.files[row.file_index].hunks[row.hunk_index].lines[row.line_index];
+                let key = ParagraphKey {
+                    file_index: row.file_index as u32,
+                    hunk_index: row.hunk_index as u32,
+                    line_index: row.line_index as u32,
+                    content_width_bits,
+                };
                 self.draw_row(
                     renderer,
                     line,
@@ -1662,7 +1706,9 @@ where
                         height: row.height,
                         content_width,
                     },
-                    &state.paragraphs,
+                    key,
+                    &state.paragraph_cache,
+                    &mut paragraph_seen,
                 );
             }
 
@@ -1673,6 +1719,14 @@ where
             );
             scrollbar::draw(renderer, &geom, &self.palette.scrollbar);
         });
+
+        // Evict entries that weren't used this frame. Their last
+        // `fill_paragraph` was at least one frame ago, so the renderer's
+        // present queue no longer references them.
+        state
+            .paragraph_cache
+            .borrow_mut()
+            .retain(|k, _| paragraph_seen.contains(k));
     }
 
     fn mouse_interaction(
@@ -1830,7 +1884,9 @@ impl<Message> DiffView<'_, Message> {
         renderer: &mut Renderer,
         line: &DiffLine,
         render: TextRenderParams,
-        paragraphs: &RefCell<Vec<Renderer::Paragraph>>,
+        cache_key: ParagraphKey,
+        paragraph_cache: &RefCell<std::collections::HashMap<ParagraphKey, Renderer::Paragraph>>,
+        paragraph_seen: &mut std::collections::HashSet<ParagraphKey>,
     ) where
         Renderer: text::Renderer<Font = Font>,
     {
@@ -1845,29 +1901,32 @@ impl<Message> DiffView<'_, Message> {
             return;
         }
 
-        let paragraph = <Renderer::Paragraph as text::Paragraph>::with_spans(text::Text {
-            content: spans.as_slice(),
-            bounds: Size::new(render.width.max(1.0), render.height.max(1.0)),
-            size: Pixels(self.text_size),
-            line_height: text::LineHeight::Absolute(Pixels(
-                render.height.min(self.metrics.row_height),
-            )),
-            font: self.font,
-            align_x: text::Alignment::Left,
-            align_y: alignment::Vertical::Top,
-            shaping: text::Shaping::Basic,
-            wrapping: render.wrapping,
-            ellipsis: text::Ellipsis::None,
-            hint_factor: None,
+        paragraph_seen.insert(cache_key);
+        let mut cache = paragraph_cache.borrow_mut();
+        let paragraph = cache.entry(cache_key).or_insert_with(|| {
+            <Renderer::Paragraph as text::Paragraph>::with_spans(text::Text {
+                content: spans.as_slice(),
+                bounds: Size::new(render.width.max(1.0), render.height.max(1.0)),
+                size: Pixels(self.text_size),
+                line_height: text::LineHeight::Absolute(Pixels(
+                    render.height.min(self.metrics.row_height),
+                )),
+                font: self.font,
+                align_x: text::Alignment::Left,
+                align_y: alignment::Vertical::Top,
+                shaping: text::Shaping::Basic,
+                wrapping: render.wrapping,
+                ellipsis: text::Ellipsis::None,
+                hint_factor: None,
+            })
         });
 
         renderer.fill_paragraph(
-            &paragraph,
+            paragraph,
             render.position,
             render.color,
             render.clip_bounds,
         );
-        paragraphs.borrow_mut().push(paragraph);
     }
 
     fn syntax_spans<'a>(
@@ -2163,6 +2222,20 @@ fn auto_scroll_delta(cursor_y: f32, bounds: Rectangle) -> f32 {
     } else {
         0.0
     }
+}
+
+fn measure_char_advance_cached(font: Font, text_size: f32) -> f32 {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<(Font, u32), f32>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (font, text_size.to_bits());
+    if let Some(&v) = cache.lock().unwrap().get(&key) {
+        return v;
+    }
+    let v = measure_char_advance(font, text_size);
+    cache.lock().unwrap().insert(key, v);
+    v
 }
 
 fn measure_char_advance(font: Font, text_size: f32) -> f32 {

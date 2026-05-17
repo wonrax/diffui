@@ -84,6 +84,12 @@ pub(crate) struct Diffui {
     pub(crate) system_theme: iced_theme::Mode,
     pub(crate) selected_file: usize,
     pub(crate) sidebar_width: f32,
+    /// Cached result of `sidebar::min_width(config)`. The min width is
+    /// purely a function of `config.ui_font` + `config.mono_font` glyph
+    /// advances at `CAPTION_TEXT_SIZE`, which are stable for the life of
+    /// the app — caching avoids re-shaping six strings on every `view()`
+    /// rebuild and on every drag tick of the resize handle.
+    pub(crate) sidebar_min_width: f32,
     pub(crate) config: AppConfig,
     pub(crate) revision_details: Option<RevisionDetails>,
     /// `None` when closed; a non-empty column stack when open.
@@ -174,6 +180,7 @@ pub(crate) enum Message {
 impl Diffui {
     fn new(cli: Cli) -> (Self, Task<Message>) {
         let config = AppConfig::load();
+        let sidebar_min_width = sidebar::min_width(config);
         match prepare_repository(&cli.path) {
             Ok(repository) => {
                 let revision = RevisionSelection::WorkingCopy;
@@ -198,7 +205,8 @@ impl Diffui {
                         selected_theme: ThemePreference::System,
                         system_theme: iced_theme::Mode::None,
                         selected_file: 0,
-                        sidebar_width: sidebar::DEFAULT_WIDTH.max(sidebar::min_width(config)),
+                        sidebar_width: sidebar::DEFAULT_WIDTH.max(sidebar_min_width),
+                        sidebar_min_width,
                         config,
                         revision_details: None,
                         palette: None,
@@ -225,7 +233,8 @@ impl Diffui {
                     selected_theme: ThemePreference::System,
                     system_theme: iced_theme::Mode::None,
                     selected_file: 0,
-                    sidebar_width: sidebar::DEFAULT_WIDTH.max(sidebar::min_width(config)),
+                    sidebar_width: sidebar::DEFAULT_WIDTH.max(sidebar_min_width),
+                    sidebar_min_width,
                     config,
                     revision_details: None,
                     palette: None,
@@ -363,7 +372,7 @@ impl Diffui {
                 return iced::clipboard::write(text).discard();
             }
             Message::SidebarWidthChanged(width) => {
-                self.sidebar_width = width.max(sidebar::min_width(self.config));
+                self.sidebar_width = width.max(self.sidebar_min_width);
             }
             Message::PaletteOpen => {
                 if self.palette.is_none() {
@@ -772,7 +781,7 @@ impl Diffui {
         .height(Length::Fill);
         let resize_overlay = ResizeHandle::new(
             self.sidebar_width,
-            sidebar::min_width(self.config),
+            self.sidebar_min_width,
             sidebar::RESIZE_HIT_PADDING,
             Message::SidebarWidthChanged,
         );
