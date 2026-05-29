@@ -18,27 +18,7 @@
 //! * `Missing` edges do not reserve a lane; they are reported per-row so
 //!   the renderer can draw a stub if it wants.
 
-use std::hash::Hash;
-
 use jj_lib::graph::{GraphEdge, GraphEdgeType};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LaneRow<Id> {
-    pub id: Id,
-    pub node_lane: usize,
-    /// Lane state immediately before this row's node is processed.
-    /// Equal to the previous row's `lanes_after`. Empty for the first row.
-    pub lanes_before: Vec<Slot<Id>>,
-    /// Lane state immediately after this row's node is processed.
-    pub lanes_after: Vec<Slot<Id>>,
-    /// Indices into `lanes_before` of lanes that targeted this row's node
-    /// and therefore terminate at it. Always contains `node_lane` plus any
-    /// extra lanes that collapse into it.
-    pub merging_lanes: Vec<usize>,
-    /// Parent edges classified as `Missing` — they have no lane and the
-    /// renderer may draw a stub at the row.
-    pub missing_parents: usize,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Slot<Id> {
@@ -62,9 +42,12 @@ impl<Id> Slot<Id> {
     }
 }
 
-/// Renderer-friendly subset of [`LaneRow`]: drops the per-slot target id and
-/// keeps only what's needed to draw one row of the gutter. Cheap to clone and
-/// safe to attach to per-revision summaries.
+/// Renderer-friendly per-row lane snapshot produced by [`LaneAssigner`]: the
+/// edge kind occupying each lane just before and after this row's node, the
+/// node's own lane, which incoming lanes merge into it, and how many parents
+/// were missing. It drops the per-slot target id the assigner tracks
+/// internally, so it's compact (one byte per lane, not a 32-byte commit id)
+/// and cheap to store for every commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaneFrame {
     pub before: Vec<Option<GraphEdgeType>>,
@@ -75,16 +58,6 @@ pub struct LaneFrame {
 }
 
 impl LaneFrame {
-    pub fn from_lane_row<Id>(row: &LaneRow<Id>) -> Self {
-        Self {
-            before: row.lanes_before.iter().map(Slot::kind).collect(),
-            after: row.lanes_after.iter().map(Slot::kind).collect(),
-            node_lane: row.node_lane,
-            merging_lanes: row.merging_lanes.clone(),
-            missing_parents: row.missing_parents,
-        }
-    }
-
     /// Width in lanes for layout: covers all occupied lane indices plus
     /// the node lane.
     pub fn lane_count(&self) -> usize {
@@ -119,37 +92,75 @@ impl LaneFrame {
     }
 }
 
-pub fn assign_lanes<Id, I>(nodes: I) -> Vec<LaneRow<Id>>
-where
-    Id: Clone + Eq + Hash,
-    I: IntoIterator<Item = (Id, Vec<GraphEdge<Id>>)>,
-{
-    let mut rows = Vec::new();
-    let mut lanes: Vec<Slot<Id>> = Vec::new();
+/// Incremental lane assigner. Feed nodes in topo order (descendants first) one
+/// at a time via [`LaneAssigner::push`]; it keeps the running lane state and
+/// returns one compact [`LaneFrame`] per node. Because the state persists
+/// across calls, it composes with a streaming loader — assign a batch, ship it,
+/// keep going — instead of needing the whole graph up front.
+///
+/// This kills the old per-row `LaneRow<CommitId>` intermediate, which cloned a
+/// 32-byte commit id into every lane of every row (~75GB across nixpkgs before
+/// it even reached the store). It emits only compact frames; the sole id-bearing
+/// copy is the single running `lanes` vec. Width is still capped in
+/// [`allocate_lane`] — see there — because the stored frames and the sidebar
+/// fold remain O(rows × width) even without the intermediate.
+pub struct LaneAssigner<Id> {
+    lanes: Vec<Slot<Id>>,
+    /// Width cap; see [`MAX_LANES`]. Held per-assigner (not read from the const
+    /// directly) so the profiler can run the identical algorithm uncapped to
+    /// measure a graph's true width.
+    max_lanes: usize,
+}
 
-    for (id, edges) in nodes {
-        let lanes_before = lanes.clone();
+impl<Id> Default for LaneAssigner<Id> {
+    fn default() -> Self {
+        Self {
+            lanes: Vec::new(),
+            max_lanes: MAX_LANES,
+        }
+    }
+}
 
-        let merging_lanes: Vec<usize> = lanes
+impl<Id: Clone + Eq> LaneAssigner<Id> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Uncapped assigner for width profiling — lets the lane count grow to the
+    /// graph's true width instead of clamping at [`MAX_LANES`].
+    #[cfg(feature = "track-alloc")]
+    pub fn uncapped() -> Self {
+        Self {
+            lanes: Vec::new(),
+            max_lanes: usize::MAX,
+        }
+    }
+
+    /// Process one node and return its lane frame, advancing the running state.
+    pub fn push(&mut self, id: &Id, edges: &[GraphEdge<Id>]) -> LaneFrame {
+        let before = self.lanes.iter().map(Slot::kind).collect();
+
+        let merging_lanes: Vec<usize> = self
+            .lanes
             .iter()
             .enumerate()
-            .filter_map(|(i, slot)| slot.awaits(&id).then_some(i))
+            .filter_map(|(i, slot)| slot.awaits(id).then_some(i))
             .collect();
 
         let node_lane = if let Some(&first) = merging_lanes.first() {
             for &lane in &merging_lanes[1..] {
-                lanes[lane] = Slot::Empty;
+                self.lanes[lane] = Slot::Empty;
             }
             first
         } else {
-            allocate_lane(&mut lanes)
+            allocate_lane(&mut self.lanes, self.max_lanes)
         };
 
-        lanes[node_lane] = Slot::Empty;
+        self.lanes[node_lane] = Slot::Empty;
 
         let mut continued = false;
         let mut missing_parents = 0;
-        for edge in &edges {
+        for edge in edges {
             match edge.edge_type {
                 GraphEdgeType::Missing => {
                     missing_parents += 1;
@@ -160,39 +171,69 @@ where
                         kind,
                     };
                     if !continued {
-                        lanes[node_lane] = slot;
+                        self.lanes[node_lane] = slot;
                         continued = true;
                     } else {
-                        let lane = allocate_lane(&mut lanes);
-                        lanes[lane] = slot;
+                        let lane = allocate_lane(&mut self.lanes, self.max_lanes);
+                        self.lanes[lane] = slot;
                     }
                 }
             }
         }
 
-        while matches!(lanes.last(), Some(Slot::Empty)) {
-            lanes.pop();
+        while matches!(self.lanes.last(), Some(Slot::Empty)) {
+            self.lanes.pop();
         }
 
-        rows.push(LaneRow {
-            id,
+        let after = self.lanes.iter().map(Slot::kind).collect();
+
+        LaneFrame {
+            before,
+            after,
             node_lane,
-            lanes_before,
-            lanes_after: lanes.clone(),
             merging_lanes,
             missing_parents,
-        });
+        }
     }
-
-    rows
 }
 
-fn allocate_lane<Id>(lanes: &mut Vec<Slot<Id>>) -> usize {
+/// Batch convenience over [`LaneAssigner`]: assign lanes for a whole sequence
+/// at once, one [`LaneFrame`] per node in input order. Used by loaders that
+/// already hold the full node list (e.g. the git backend); the jj backend
+/// drives the assigner directly in its load loop to avoid the intermediate.
+pub fn assign_lanes<Id, I>(nodes: I) -> Vec<LaneFrame>
+where
+    Id: Clone + Eq,
+    I: IntoIterator<Item = (Id, Vec<GraphEdge<Id>>)>,
+{
+    let mut assigner = LaneAssigner::new();
+    nodes
+        .into_iter()
+        .map(|(id, edges)| assigner.push(&id, &edges))
+        .collect()
+}
+
+/// Render-time cap on concurrent lanes. Per-row lane state is stored for every
+/// commit — the compact `LaneFrame`s and (far heavier) the sidebar fold's
+/// `RowLaneData`: ~5 width-wide Vecs per row, ~96 B per lane per row — so the
+/// graph costs O(rows × width). Measured, nixpkgs runs a *median* of ~1200
+/// concurrent lanes across its 1.1M rows (max 1714), so uncapped storage is
+/// ~100GB. 128 is chosen so ordinary repos can show a wide graph when the
+/// sidebar is dragged out (32 felt cramped); note that on nixpkgs-scale this
+/// fold is still ~13GB and will OOM on load. The real fix is the segment-based
+/// lane model — store each lane once as a start→end span, O(edges) ≈ ~30MB —
+/// which turns this into a pure render-time concern. Beyond the cap, extra
+/// branches share the last lane.
+const MAX_LANES: usize = 128;
+
+fn allocate_lane<Id>(lanes: &mut Vec<Slot<Id>>, max_lanes: usize) -> usize {
     if let Some(idx) = lanes.iter().position(|slot| matches!(slot, Slot::Empty)) {
         idx
-    } else {
+    } else if lanes.len() < max_lanes {
         lanes.push(Slot::Empty);
         lanes.len() - 1
+    } else {
+        max_lanes - 1
     }
 }
 
@@ -212,42 +253,44 @@ mod tests {
         GraphEdge::missing(c)
     }
 
-    fn lanes(rows: &[LaneRow<char>]) -> Vec<(char, usize)> {
-        rows.iter().map(|row| (row.id, row.node_lane)).collect()
+    /// Drive the assigner over a node list, pairing each input id with the
+    /// frame it produced (frames themselves drop the id). Goes through the
+    /// public `assign_lanes` so the batch wrapper is covered too.
+    fn run(nodes: impl IntoIterator<Item = (char, Vec<GraphEdge<char>>)>) -> Vec<(char, LaneFrame)> {
+        let nodes: Vec<_> = nodes.into_iter().collect();
+        let ids: Vec<char> = nodes.iter().map(|(id, _)| *id).collect();
+        ids.into_iter().zip(assign_lanes(nodes)).collect()
+    }
+
+    fn lanes(rows: &[(char, LaneFrame)]) -> Vec<(char, usize)> {
+        rows.iter()
+            .map(|(id, frame)| (*id, frame.node_lane))
+            .collect()
     }
 
     /// Render the lane state of every row as a textual sketch:
-    /// `<node_lane>: <lanes_after>` where each lane is `.` (empty),
-    /// `D`/`I`/`M` for the awaiting edge type, and the row's own column
-    /// has the node id in uppercase.
-    fn sketch(rows: &[LaneRow<char>]) -> String {
+    /// `<lanes_after>  (<node_lane>)` where each lane is `.` (empty),
+    /// `|`/`:`/`~` for the awaiting edge kind, and the row's own column
+    /// holds the node id.
+    fn sketch(rows: &[(char, LaneFrame)]) -> String {
         let mut out = String::new();
-        for row in rows {
-            let width = row.lanes_after.len().max(row.node_lane + 1);
+        for (id, frame) in rows {
+            let width = frame.after.len().max(frame.node_lane + 1);
             let mut line = vec!['.'; width];
-            for (i, slot) in row.lanes_after.iter().enumerate() {
+            for (i, slot) in frame.after.iter().enumerate() {
                 line[i] = match slot {
-                    Slot::Empty => '.',
-                    Slot::Awaiting {
-                        kind: GraphEdgeType::Direct,
-                        ..
-                    } => '|',
-                    Slot::Awaiting {
-                        kind: GraphEdgeType::Indirect,
-                        ..
-                    } => ':',
-                    Slot::Awaiting {
-                        kind: GraphEdgeType::Missing,
-                        ..
-                    } => '~',
+                    None => '.',
+                    Some(GraphEdgeType::Direct) => '|',
+                    Some(GraphEdgeType::Indirect) => ':',
+                    Some(GraphEdgeType::Missing) => '~',
                 };
             }
             // Mark the node position by replacing whatever sits in node_lane.
-            line[row.node_lane] = row.id;
+            line[frame.node_lane] = *id;
             out.push_str(&format!(
                 "{}  ({})\n",
                 line.iter().collect::<String>(),
-                row.node_lane
+                frame.node_lane
             ));
         }
         out
@@ -256,7 +299,7 @@ mod tests {
     #[test]
     fn linear_history_stays_in_lane_zero() {
         // C -> B -> A
-        let rows = assign_lanes([
+        let rows = run([
             ('C', vec![direct('B')]),
             ('B', vec![direct('A')]),
             ('A', vec![]),
@@ -268,7 +311,7 @@ mod tests {
     fn merge_keeps_first_parent_on_node_lane() {
         // E merges C (first) and D. After E we expect lane 0 = C, lane 1 = D.
         // Topo order picks the second parent's branch first.
-        let rows = assign_lanes([
+        let rows = run([
             ('F', vec![direct('E')]),
             ('E', vec![direct('C'), direct('D')]),
             ('D', vec![direct('B')]),
@@ -280,16 +323,13 @@ mod tests {
             lanes(&rows),
             vec![('F', 0), ('E', 0), ('D', 1), ('B', 1), ('C', 0), ('A', 0),],
         );
-        // After E: lane 0 awaits C, lane 1 awaits D.
-        assert_eq!(rows[1].lanes_after.len(), 2);
-        assert!(matches!(
-            rows[1].lanes_after[0],
-            Slot::Awaiting { target: 'C', .. }
-        ));
-        assert!(matches!(
-            rows[1].lanes_after[1],
-            Slot::Awaiting { target: 'D', .. }
-        ));
+        // After E two lanes stay open. The frame drops which commit each
+        // awaits (that's the memory win); the targets are pinned anyway by C
+        // and D landing on lanes 0 and 1 in the `lanes` assertion above.
+        assert_eq!(
+            rows[1].1.after,
+            vec![Some(GraphEdgeType::Direct), Some(GraphEdgeType::Direct)]
+        );
     }
 
     #[test]
@@ -304,7 +344,7 @@ mod tests {
         //   │ @
         //   │ │
         //   A     <- shared root, where @ joins back
-        let rows = assign_lanes([
+        let rows = run([
             ('M', vec![direct('T'), direct('W')]), // M = mega merge, W = @
             ('T', vec![direct('A')]),
             ('W', vec![direct('A')]),
@@ -312,9 +352,9 @@ mod tests {
         ]);
         assert_eq!(lanes(&rows), vec![('M', 0), ('T', 0), ('W', 1), ('A', 0)],);
         // After A is processed lane 1 should have collapsed.
-        assert!(rows[3].lanes_after.is_empty());
+        assert!(rows[3].1.after.is_empty());
         // A merges two lanes (0 and 1) into 0.
-        assert_eq!(rows[3].merging_lanes, vec![0, 1]);
+        assert_eq!(rows[3].1.merging_lanes, vec![0, 1]);
     }
 
     #[test]
@@ -322,42 +362,38 @@ mod tests {
         // D --> B
         //  \--> C --> A
         //  B's parent A is the same as C's eventual parent.
-        let rows = assign_lanes([
+        let rows = run([
             ('D', vec![direct('B'), direct('C')]),
             ('C', vec![direct('A')]),
             ('B', vec![direct('A')]),
             ('A', vec![]),
         ]);
         assert_eq!(lanes(&rows), vec![('D', 0), ('C', 1), ('B', 0), ('A', 0)],);
-        assert!(rows[3].lanes_after.is_empty());
+        assert!(rows[3].1.after.is_empty());
     }
 
     #[test]
     fn missing_parent_does_not_reserve_a_lane() {
-        let rows = assign_lanes([('B', vec![missing('X')]), ('A', vec![])]);
-        assert_eq!(rows[0].node_lane, 0);
-        assert_eq!(rows[0].missing_parents, 1);
-        assert!(rows[0].lanes_after.is_empty());
+        let rows = run([('B', vec![missing('X')]), ('A', vec![])]);
+        assert_eq!(rows[0].1.node_lane, 0);
+        assert_eq!(rows[0].1.missing_parents, 1);
+        assert!(rows[0].1.after.is_empty());
         // A is treated as a fresh head and takes lane 0 again.
-        assert_eq!(rows[1].node_lane, 0);
+        assert_eq!(rows[1].1.node_lane, 0);
     }
 
     #[test]
     fn indirect_edge_is_distinguishable_from_direct_in_slot() {
-        let rows = assign_lanes([('C', vec![indirect('A')]), ('A', vec![])]);
-        assert!(matches!(
-            rows[0].lanes_after[0],
-            Slot::Awaiting {
-                target: 'A',
-                kind: GraphEdgeType::Indirect
-            },
-        ));
+        let rows = run([('C', vec![indirect('A')]), ('A', vec![])]);
+        // The frame keeps the edge KIND (so indirect strokes still render
+        // dashed) even though it drops the 'A' target the assigner matched on.
+        assert_eq!(rows[0].1.after[0], Some(GraphEdgeType::Indirect));
     }
 
     #[test]
     fn sketch_renders_a_simple_dag_for_eyeballing() {
         // Same setup as `mega_merge_pushes_working_copy_to_lane_one`.
-        let rows = assign_lanes([
+        let rows = run([
             ('M', vec![direct('T'), direct('W')]),
             ('T', vec![direct('A')]),
             ('W', vec![direct('A')]),

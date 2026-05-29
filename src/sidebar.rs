@@ -6,14 +6,15 @@ use iced::{
     widget::{button, column, container, row, text},
 };
 
-use crate::backend::{CommitSummary, DiffFile, DiffFileStatus, RevisionSelection};
+use crate::backend::{CommitStore, DiffFile, DiffFileStatus, RevisionSelection, RowView};
 use crate::config::AppConfig;
 use crate::graph::LaneFrame;
 use crate::graph_view::{self, RevisionGraphStyle};
 use crate::revision_list::{
-    self, FileRowView, IndicatorChip, Item as RevisionListItem, RevisionList, RevisionListStyle,
-    RevisionRowView, RowSelectionKey,
+    self, FileRowView, IndicatorChip, RevisionList, RevisionListStyle, RevisionRowView,
+    RowSelectionKey,
 };
+use jj_lib::graph::GraphEdgeType;
 use crate::theme::{
     self, ThemePreference, ThemeSpec, chip_background, sidebar_header_style, sidebar_panel_style,
     theme_switcher_button_style,
@@ -95,7 +96,7 @@ const FILE_BADGE_TEXT_SIZE: f32 = 10.0;
 const FILE_STAT_HORIZONTAL_PADDING: f32 = 4.0;
 const FILE_STAT_MIN_WIDTH: f32 = 24.0;
 
-pub fn build_sidebar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
+pub fn build_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     let title_row = row![
         text("Changes")
             .size(15)
@@ -137,277 +138,136 @@ pub fn build_sidebar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Messag
 }
 
 fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
-    let mut items: Vec<RevisionListItem> = Vec::with_capacity(ui.commits.len());
     let metrics = sidebar_text_metrics(ui.config);
     let graph_style = RevisionGraphStyle {
         lane_base_color: theme.lane_base,
         missing_color: theme.subtle_text,
     };
 
-    let (file_widgets, file_badge_width): (Option<Vec<FileRowTemplate>>, f32) =
-        if matches!(ui.status, LoadStatus::Loaded) && !ui.document.files.is_empty() {
-            let widest_addition = ui
-                .document
-                .files
-                .iter()
-                .map(|file| format!("+{}", file.additions))
-                .max_by(|a, b| {
-                    metrics
-                        .measure(a)
-                        .partial_cmp(&metrics.measure(b))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .unwrap_or_else(|| "+0".to_owned());
-            let widest_deletion = ui
-                .document
-                .files
-                .iter()
-                .map(|file| format!("-{}", file.deletions))
-                .max_by(|a, b| {
-                    metrics
-                        .measure(a)
-                        .partial_cmp(&metrics.measure(b))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .unwrap_or_else(|| "-0".to_owned());
-            let additions_w = file_stat_width(&widest_addition, &metrics);
-            let deletions_w = file_stat_width(&widest_deletion, &metrics);
-            let badge_metrics = badge_text_metrics(ui.config);
-            let badge_w = file_badge_width(&ui.document.files, &badge_metrics);
+    // Files show under the selected commit, only while its inline list is open.
+    let expanded_index = ui.selected_commit_index.filter(|_| ui.file_list_expanded);
 
-            // Mirror `draw_file`'s layout exactly so truncation kicks in at
-            // the same threshold the renderer clips at:
-            //   [gutter] [badge] gap [path] gap [+N] gap [-N] right_pad
-            // Previously this used 4 gaps and the full horizontal padding,
-            // and ignored the graph gutter entirely — so paths bled past
-            // the +N/-N columns whenever the expanded commit had any lanes.
-            let expanded_lane_count = ui
-                .commits
-                .iter()
-                .find(|commit| {
-                    is_expanded_commit(&ui.selected_revision, ui.file_list_expanded, commit)
-                })
-                .map(|commit| commit.lane_frame.after.len())
-                .unwrap_or(0);
-            let gutter_total = revision_list::GUTTER_LEFT_PADDING
-                + expanded_lane_count as f32 * graph_view::LANE_WIDTH
-                + revision_list::GUTTER_PADDING;
-            let reserved = gutter_total
-                + badge_w
-                + additions_w
-                + deletions_w
-                + revision_list::FILE_ROW_GAP * 3.0
-                + revision_list::FILE_ROW_RIGHT_PAD;
-            let display_width = (ui.sidebar_width - reserved).max(0.0);
-            let display_models = file_display_models(&ui.document.files, display_width, &metrics);
-            (
-                Some(
-                    ui.document
-                        .files
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, file)| FileRowTemplate {
-                            primary: display_models[idx].primary.clone(),
-                            secondary: display_models[idx].secondary.clone(),
-                            raw_path: display_models[idx].raw_path.clone(),
-                            status_label: file.status.short_label().to_owned(),
-                            status_color: file_status_color(file.status, theme),
-                            additions: file.additions,
-                            deletions: file.deletions,
-                            file_index: idx,
-                            additions_width: additions_w,
-                            deletions_width: deletions_w,
-                        })
-                        .collect(),
-                ),
-                badge_w,
-            )
-        } else {
-            (None, FILE_BADGE_MIN_WIDTH)
-        };
+    let (file_widgets, file_badge_width): (Vec<FileRowTemplate>, f32) = if let Some(expanded) =
+        expanded_index
+        && matches!(ui.status, LoadStatus::Loaded)
+        && !ui.document.files.is_empty()
+    {
+        let widest_addition = ui
+            .document
+            .files
+            .iter()
+            .map(|file| format!("+{}", file.additions))
+            .max_by(|a, b| {
+                metrics
+                    .measure(a)
+                    .partial_cmp(&metrics.measure(b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .unwrap_or_else(|| "+0".to_owned());
+        let widest_deletion = ui
+            .document
+            .files
+            .iter()
+            .map(|file| format!("-{}", file.deletions))
+            .max_by(|a, b| {
+                metrics
+                    .measure(a)
+                    .partial_cmp(&metrics.measure(b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .unwrap_or_else(|| "-0".to_owned());
+        let additions_w = file_stat_width(&widest_addition, &metrics);
+        let deletions_w = file_stat_width(&widest_deletion, &metrics);
+        let badge_metrics = badge_text_metrics(ui.config);
+        let badge_w = file_badge_width(&ui.document.files, &badge_metrics);
 
-    // Per-lane bookmark labels propagating top-down through the visible
-    // graph. When a commit carries bookmarks, they latch onto its
-    // node lane and stay until that lane terminates (drops out of
-    // `after`). The pre-trim snapshot is shown on the commit row
-    // itself; the post-trim snapshot is shown on any file rows below
-    // it, so terminated lanes don't keep a stale tooltip.
-    let mut current_labels: Vec<Vec<String>> = Vec::new();
-    // Per-lane segment id: a fresh id is allocated whenever a lane goes
-    // from dead → alive, and cleared when the lane drops out of `after`.
-    // Lets the revision list emphasize a whole lane segment when one of
-    // its rows is hovered, instead of only the strokes inside that row.
-    let mut current_segments: Vec<Option<usize>> = Vec::new();
-    let mut next_segment_id: usize = 0;
-
-    for commit in &ui.commits {
-        let unique_len = shortest_unique_prefix_len(&commit.change_id, &ui.commits);
-        let label_len = revision_id_display_len(unique_len, &commit.change_id);
-        let id_prefix: String = commit.change_id.chars().take(unique_len).collect();
-        let id_suffix: String = commit
-            .change_id
-            .chars()
-            .skip(unique_len)
-            .take(label_len.saturating_sub(unique_len))
+        // Mirror `draw_file`'s layout exactly so truncation kicks in at the
+        // same threshold the renderer clips at:
+        //   [gutter] [badge] gap [path] gap [+N] gap [-N] right_pad
+        let expanded_lane_count = ui.commits.row(expanded).lane_frame().after.len();
+        let gutter_total = revision_list::GUTTER_LEFT_PADDING
+            + expanded_lane_count as f32 * graph_view::LANE_WIDTH
+            + revision_list::GUTTER_PADDING;
+        let reserved = gutter_total
+            + badge_w
+            + additions_w
+            + deletions_w
+            + revision_list::FILE_ROW_GAP * 3.0
+            + revision_list::FILE_ROW_RIGHT_PAD;
+        let display_width = (ui.sidebar_width - reserved).max(0.0);
+        let display_models = file_display_models(&ui.document.files, display_width, &metrics);
+        let templates = ui
+            .document
+            .files
+            .iter()
+            .enumerate()
+            .map(|(idx, file)| FileRowTemplate {
+                primary: display_models[idx].primary.clone(),
+                secondary: display_models[idx].secondary.clone(),
+                raw_path: display_models[idx].raw_path.clone(),
+                status_label: file.status.short_label().to_owned(),
+                status_color: file_status_color(file.status, theme),
+                additions: file.additions,
+                deletions: file.deletions,
+                file_index: idx,
+                additions_width: additions_w,
+                deletions_width: deletions_w,
+            })
             .collect();
-        let commit_id_short = truncate_end(&commit.commit_id, COMMIT_ID_CHARS);
+        (templates, badge_w)
+    } else {
+        (Vec::new(), FILE_BADGE_MIN_WIDTH)
+    };
 
-        // Working-copy `@` is drawn inline before the change-id by the
-        // revision-list widget itself — the design system puts the
-        // marker *at* the change, not on the right-edge chip rail.
-        //
-        // Two chip groups: `bookmark_chips` can overflow into a `+N`
-        // chip when there's not enough room, and `status_chips` always
-        // shows.
-        let lane_color = graph_style.lane_color(commit.lane_frame.node_lane);
-        let mut bookmark_chips = Vec::with_capacity(commit.bookmarks.len());
-        for bookmark in &commit.bookmarks {
-            // Remote/untracked bookmarks contain `@` (e.g. `main@origin`).
-            // They render outlined (transparent fill + 1px lane-color
-            // border) so they read as "tracking" rather than "live"
-            // bookmarks, which use the filled-tint pattern.
-            let is_remote = bookmark.contains('@');
-            bookmark_chips.push(IndicatorChip {
-                label: bookmark.clone(),
-                background: if is_remote {
-                    Color::TRANSPARENT
-                } else {
-                    chip_background(lane_color)
-                },
-                text_color: lane_color,
-                border_color: if is_remote { Some(lane_color) } else { None },
-                border_dashed: false,
-            });
-        }
+    let file_count = file_widgets.len();
+    let expanded = expanded_index
+        .filter(|_| file_count > 0)
+        .map(|index| (index, file_count));
 
-        let mut status_chips = Vec::new();
-        if commit.is_empty == Some(true) {
-            // Outlined-transparent chip, mirroring the design's
-            // `.tag-empty` (dashed border, ink-400 text, transparent
-            // fill).
-            status_chips.push(IndicatorChip {
-                label: "empty".to_owned(),
-                background: Color::TRANSPARENT,
-                text_color: theme.subtle_text,
-                border_color: Some(theme.subtle_text),
-                border_dashed: true,
-            });
-        }
-        if commit.has_conflict {
-            // Filled-tint chip (mirrors the "soft" tag pattern used by
-            // file-status badges) using the design system's conflict red
-            // so it screams across the sidebar at a glance.
-            status_chips.push(IndicatorChip {
-                label: "conflict".to_owned(),
-                background: chip_background(theme.conflict_marker),
-                text_color: theme.conflict_marker,
-                border_color: None,
-                border_dashed: false,
-            });
-        }
+    // The per-row lane fold + prefix lengths are precomputed once and held in
+    // `Diffui`; the closures below build a single visible row's view from them
+    // on demand, so the widget never materializes all ~N rows.
+    let fold = ui.sidebar_lane_data.clone();
+    let prefix_lens = ui.sidebar_prefix_lens.clone();
+    let commits = &ui.commits;
+    let selected = ui.selected_revision.clone();
+    let file_list_expanded = ui.file_list_expanded;
+    let build_revision = Box::new(move |index: usize| {
+        build_revision_row(
+            commits,
+            &fold,
+            &prefix_lens,
+            theme,
+            &graph_style,
+            &selected,
+            file_list_expanded,
+            index,
+        )
+    });
 
-        let selection_key = if commit.is_working_copy {
-            RowSelectionKey::WorkingCopy
-        } else {
-            RowSelectionKey::Commit(commit.revision_id.clone())
-        };
-
-        let is_expanded = is_expanded_commit(&ui.selected_revision, ui.file_list_expanded, commit);
-
-        // Latch this commit's bookmarks onto its lane, allocate segment
-        // ids for any lane that just came alive, then snapshot pre-trim
-        // for the revision row.
-        let lane_count = commit.lane_frame.lane_count();
-        if current_labels.len() < lane_count {
-            current_labels.resize(lane_count, Vec::new());
-        }
-        if current_segments.len() < lane_count {
-            current_segments.resize(lane_count, None);
-        }
-        if !commit.bookmarks.is_empty() {
-            current_labels[commit.lane_frame.node_lane] = commit.bookmarks.clone();
-        }
-        // Capture the incoming-half segment ids BEFORE allocation, so a
-        // merged-in branch on a soon-to-be-reused lane keeps its old
-        // id in `before` while the outgoing half gets a fresh id in
-        // `after`. Hover emphasis then picks one half cleanly.
-        let revision_lane_segments_before = current_segments.clone();
-        advance_lane_segments(
-            &mut current_segments,
-            &mut next_segment_id,
-            &commit.lane_frame,
-        );
-        // Snapshot labels BEFORE clearing split-lane labels — the merge
-        // row itself still needs the merged-in branch's tooltip to fire
-        // (hover detection gates on labels being non-empty), even
-        // though those labels shouldn't propagate to the new branch's
-        // strokes below.
-        let revision_lane_labels = current_labels.clone();
-        let revision_lane_segments_after = current_segments.clone();
-        clear_split_lane_labels(&mut current_labels, &commit.lane_frame);
-        trim_lane_state(
-            &mut current_segments,
-            &mut current_labels,
-            &commit.lane_frame,
-        );
-        let continuation_lane_labels = current_labels.clone();
-        let continuation_lane_segments = current_segments.clone();
-
-        let is_selected = match &ui.selected_revision {
-            RevisionSelection::WorkingCopy => commit.is_working_copy,
-            RevisionSelection::Commit(id) => !commit.is_working_copy && id == &commit.revision_id,
-        };
-
-        items.push(RevisionListItem::Revision(RevisionRowView {
-            selection_key,
-            change_id_prefix: id_prefix,
-            change_id_suffix: id_suffix,
-            commit_id_short,
-            author: commit.author.clone(),
-            description: commit.description.clone(),
-            description_color: commit_description_color(commit, theme),
-            bookmark_chips,
-            status_chips,
-            lane_color,
-            frame: commit.lane_frame.clone(),
-            lane_labels: revision_lane_labels,
-            lane_segments_before: revision_lane_segments_before,
-            lane_segments_after: revision_lane_segments_after,
-            // Show the collapse/expand chevron only on the selected row, so
-            // non-selected rows don't suggest they have a hidden file list.
-            collapse_chevron: is_selected.then_some(is_expanded),
-        }));
-
-        if is_expanded && let Some(files) = &file_widgets {
-            let continuation = commit.lane_frame.after.clone();
-            for file in files {
-                items.push(RevisionListItem::File(FileRowView {
-                    primary: file.primary.clone(),
-                    secondary: file.secondary.clone(),
-                    raw_path: file.raw_path.clone(),
-                    status_label: file.status_label.clone(),
-                    // Design system badge style: a soft tint of the
-                    // status color as the chip background, with the
-                    // saturated color used for the glyph. Replaces the
-                    // earlier "filled chip + bg-color text" pattern.
-                    status_background: chip_background(file.status_color),
-                    status_text: file.status_color,
-                    additions: file.additions,
-                    deletions: file.deletions,
-                    additions_text: theme.added_text,
-                    deletions_text: theme.removed_text,
-                    continuation: continuation.clone(),
-                    additions_width: file.additions_width,
-                    deletions_width: file.deletions_width,
-                    primary_color: theme.text,
-                    secondary_color: theme.muted_text,
-                    file_index: file.file_index,
-                    lane_labels: continuation_lane_labels.clone(),
-                    lane_segments: continuation_lane_segments.clone(),
-                }));
-            }
-        }
-    }
+    // File rows render under the expanded commit, so they share its
+    // continuation lane state (the post-trim snapshot of that row's fold).
+    let continuation = expanded_index
+        .map(|index| ui.commits.row(index).lane_frame().after.clone())
+        .unwrap_or_default();
+    let (continuation_labels, continuation_segments) = expanded_index
+        .and_then(|index| ui.sidebar_lane_data.get(index))
+        .map(|lane| {
+            (
+                lane.continuation_labels.clone(),
+                lane.continuation_segments.clone(),
+            )
+        })
+        .unwrap_or_default();
+    let build_file = Box::new(move |file_index: usize| {
+        build_file_row(
+            &file_widgets[file_index],
+            &continuation,
+            &continuation_labels,
+            &continuation_segments,
+            theme,
+        )
+    });
 
     let selected_row = match &ui.selected_revision {
         RevisionSelection::WorkingCopy => Some(RowSelectionKey::WorkingCopy),
@@ -415,9 +275,13 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
     };
 
     RevisionList::new(
-        items,
+        ui.commits.len(),
+        expanded,
+        build_revision,
+        build_file,
         selected_row,
         Some(ui.selected_file),
+        ui.selected_commit_index,
         revision_list_style(theme, ui.config, file_badge_width),
         Message::SelectRowKey,
         Message::SelectFile,
@@ -425,6 +289,191 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
     .width(Length::Fill)
     .reveal_selected(ui.revision_reveal_token)
     .into()
+}
+
+/// Per-commit lane state for the graph gutter, computed once over the whole
+/// graph (a top-down fold) and stored so visible rows can be rebuilt on demand
+/// without re-walking. See [`build_revision_row`] / [`build_file_row`].
+#[derive(Debug, Clone, Default)]
+pub struct RowLaneData {
+    pub labels: Vec<Vec<String>>,
+    pub segments_before: Vec<Option<usize>>,
+    pub segments_after: Vec<Option<usize>>,
+    pub continuation_labels: Vec<Vec<String>>,
+    pub continuation_segments: Vec<Option<usize>>,
+}
+
+/// Walk the graph once, propagating bookmark labels and lane segment ids
+/// top-down, capturing each row's pre/post-trim snapshots. Runs when the
+/// commit graph changes, not per frame.
+pub fn compute_lane_fold(commits: &CommitStore) -> Vec<RowLaneData> {
+    let mut fold = Vec::with_capacity(commits.len());
+    // When a commit carries bookmarks they latch onto its node lane and stay
+    // until that lane terminates. A fresh segment id is allocated whenever a
+    // lane goes dead → alive, letting the renderer emphasize a whole lane
+    // segment on hover rather than just the strokes inside one row.
+    let mut current_labels: Vec<Vec<String>> = Vec::new();
+    let mut current_segments: Vec<Option<usize>> = Vec::new();
+    let mut next_segment_id: usize = 0;
+
+    for commit in commits.iter() {
+        let lane_frame = commit.lane_frame();
+        let bookmarks = commit.bookmarks();
+        let lane_count = lane_frame.lane_count();
+        if current_labels.len() < lane_count {
+            current_labels.resize(lane_count, Vec::new());
+        }
+        if current_segments.len() < lane_count {
+            current_segments.resize(lane_count, None);
+        }
+        if !bookmarks.is_empty() {
+            current_labels[lane_frame.node_lane] = bookmarks.to_vec();
+        }
+        let segments_before = current_segments.clone();
+        advance_lane_segments(&mut current_segments, &mut next_segment_id, lane_frame);
+        let labels = current_labels.clone();
+        let segments_after = current_segments.clone();
+        clear_split_lane_labels(&mut current_labels, lane_frame);
+        trim_lane_state(&mut current_segments, &mut current_labels, lane_frame);
+        fold.push(RowLaneData {
+            labels,
+            segments_before,
+            segments_after,
+            continuation_labels: current_labels.clone(),
+            continuation_segments: current_segments.clone(),
+        });
+    }
+
+    fold
+}
+
+/// Build the display view for one revision row from the precomputed fold +
+/// store. Called only for on-screen rows.
+#[allow(clippy::too_many_arguments)]
+fn build_revision_row(
+    commits: &CommitStore,
+    fold: &[RowLaneData],
+    prefix_lens: &[usize],
+    theme: ThemeSpec,
+    graph_style: &RevisionGraphStyle,
+    selected: &RevisionSelection,
+    file_list_expanded: bool,
+    index: usize,
+) -> RevisionRowView {
+    let commit = commits.row(index);
+    let change_id = commit.change_id();
+    let lane_frame = commit.lane_frame();
+    let bookmarks = commit.bookmarks();
+    let unique_len = prefix_lens.get(index).copied().unwrap_or(REVISION_ID_CHARS);
+    let label_len = revision_id_display_len(unique_len, change_id);
+    let id_prefix: String = change_id.chars().take(unique_len).collect();
+    let id_suffix: String = change_id
+        .chars()
+        .skip(unique_len)
+        .take(label_len.saturating_sub(unique_len))
+        .collect();
+    let commit_id_short = truncate_end(commit.commit_id(), COMMIT_ID_CHARS);
+
+    let lane_color = graph_style.lane_color(lane_frame.node_lane);
+    let mut bookmark_chips = Vec::with_capacity(bookmarks.len());
+    for bookmark in bookmarks {
+        // Remote/untracked bookmarks contain `@` (e.g. `main@origin`) and
+        // render outlined (transparent fill + 1px lane-color border) so they
+        // read as "tracking" rather than "live" bookmarks.
+        let is_remote = bookmark.contains('@');
+        bookmark_chips.push(IndicatorChip {
+            label: bookmark.clone(),
+            background: if is_remote {
+                Color::TRANSPARENT
+            } else {
+                chip_background(lane_color)
+            },
+            text_color: lane_color,
+            border_color: if is_remote { Some(lane_color) } else { None },
+            border_dashed: false,
+        });
+    }
+
+    let mut status_chips = Vec::new();
+    if commit.is_empty() == Some(true) {
+        status_chips.push(IndicatorChip {
+            label: "empty".to_owned(),
+            background: Color::TRANSPARENT,
+            text_color: theme.subtle_text,
+            border_color: Some(theme.subtle_text),
+            border_dashed: true,
+        });
+    }
+    if commit.has_conflict() {
+        status_chips.push(IndicatorChip {
+            label: "conflict".to_owned(),
+            background: chip_background(theme.conflict_marker),
+            text_color: theme.conflict_marker,
+            border_color: None,
+            border_dashed: false,
+        });
+    }
+
+    let selection_key = if commit.is_working_copy() {
+        RowSelectionKey::WorkingCopy
+    } else {
+        RowSelectionKey::Commit(commit.commit_id().to_owned())
+    };
+    let is_expanded = is_expanded_commit(selected, file_list_expanded, commit);
+    let is_selected = match selected {
+        RevisionSelection::WorkingCopy => commit.is_working_copy(),
+        RevisionSelection::Commit(id) => !commit.is_working_copy() && id == commit.commit_id(),
+    };
+
+    let lane = fold.get(index).cloned().unwrap_or_default();
+    RevisionRowView {
+        selection_key,
+        change_id_prefix: id_prefix,
+        change_id_suffix: id_suffix,
+        commit_id_short,
+        author: commit.author().to_owned(),
+        description: commit.description().to_owned(),
+        description_color: commit_description_color(commit, theme),
+        bookmark_chips,
+        status_chips,
+        lane_color,
+        frame: lane_frame.clone(),
+        lane_labels: lane.labels,
+        lane_segments_before: lane.segments_before,
+        lane_segments_after: lane.segments_after,
+        // The collapse/expand chevron shows only on the selected row.
+        collapse_chevron: is_selected.then_some(is_expanded),
+    }
+}
+
+/// Build the display view for one file row under the expanded commit.
+fn build_file_row(
+    template: &FileRowTemplate,
+    continuation: &[Option<GraphEdgeType>],
+    continuation_labels: &[Vec<String>],
+    continuation_segments: &[Option<usize>],
+    theme: ThemeSpec,
+) -> FileRowView {
+    FileRowView {
+        primary: template.primary.clone(),
+        secondary: template.secondary.clone(),
+        raw_path: template.raw_path.clone(),
+        status_label: template.status_label.clone(),
+        status_background: chip_background(template.status_color),
+        status_text: template.status_color,
+        additions: template.additions,
+        deletions: template.deletions,
+        additions_text: theme.added_text,
+        deletions_text: theme.removed_text,
+        continuation: continuation.to_vec(),
+        additions_width: template.additions_width,
+        deletions_width: template.deletions_width,
+        primary_color: theme.text,
+        secondary_color: theme.muted_text,
+        file_index: template.file_index,
+        lane_labels: continuation_labels.to_vec(),
+        lane_segments: continuation_segments.to_vec(),
+    }
 }
 
 /// Advance per-lane segment ids for one revision row, allocating fresh
@@ -635,17 +684,13 @@ fn file_status_color(status: DiffFileStatus, theme: ThemeSpec) -> Color {
 /// global rather than per-revision (see `Diffui::file_list_expanded`),
 /// so flipping it once carries across whatever revision the user picks
 /// next.
-fn is_expanded_commit(
-    selected: &RevisionSelection,
-    expanded: bool,
-    commit: &CommitSummary,
-) -> bool {
+fn is_expanded_commit(selected: &RevisionSelection, expanded: bool, commit: RowView) -> bool {
     if !expanded {
         return false;
     }
     match selected {
-        RevisionSelection::WorkingCopy => commit.is_working_copy,
-        RevisionSelection::Commit(id) => !commit.is_working_copy && id == &commit.revision_id,
+        RevisionSelection::WorkingCopy => commit.is_working_copy(),
+        RevisionSelection::Commit(id) => !commit.is_working_copy() && id == commit.commit_id(),
     }
 }
 
@@ -659,39 +704,72 @@ fn truncate_end(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 
-fn commit_description_color(commit: &CommitSummary, theme: ThemeSpec) -> Color {
-    if commit.has_description {
+fn commit_description_color(commit: RowView, theme: ThemeSpec) -> Color {
+    if commit.has_description() {
         return theme.text;
     }
 
-    match commit.is_empty {
+    match commit.is_empty() {
         Some(true) => theme.added_text,
         Some(false) => theme.note_text,
         None => theme.note_text,
     }
 }
 
-fn shortest_unique_prefix_len(change_id: &str, commits: &[CommitSummary]) -> usize {
-    if let Some(prefix_len) = commits
-        .iter()
-        .find(|commit| commit.change_id == change_id)
-        .and_then(|commit| commit.shortest_change_id_len)
-    {
-        return prefix_len.min(change_id.chars().count());
+/// Shortest unique change-id prefix length for every commit, returned in
+/// `commits` order.
+///
+/// The jj backend precomputes this per commit (`shortest_change_id_len`)
+/// against the repo index, so when every row carries it we map straight
+/// through. The git backend leaves it `None`; there we derive each prefix
+/// from sorted neighbors — a prefix is unique once it's one character longer
+/// than the longest prefix the id shares with either lexicographic neighbor.
+///
+/// This used to be a per-row helper that rescanned all commits on every
+/// call, so building the sidebar was O(n²) in the commit count and dropped
+/// large repos (e.g. bun's ~43k commits) to seconds-per-frame.
+pub fn shortest_unique_prefix_lens(commits: &CommitStore) -> Vec<usize> {
+    if (0..commits.len()).all(|i| commits.row(i).shortest_change_id_len().is_some()) {
+        return (0..commits.len())
+            .map(|i| {
+                let row = commits.row(i);
+                row.shortest_change_id_len()
+                    .unwrap_or(1)
+                    .min(row.change_id().chars().count())
+            })
+            .collect();
     }
 
-    let total_len = change_id.chars().count();
+    let mut order: Vec<usize> = (0..commits.len()).collect();
+    order.sort_by(|&a, &b| commits.row(a).change_id().cmp(commits.row(b).change_id()));
 
-    (1..=total_len)
-        .find(|prefix_len| {
-            let prefix = change_id.chars().take(*prefix_len).collect::<String>();
-            commits
-                .iter()
-                .filter(|commit| commit.change_id.starts_with(&prefix))
-                .count()
-                == 1
-        })
-        .unwrap_or(total_len)
+    let mut lens = vec![0usize; commits.len()];
+    for (rank, &idx) in order.iter().enumerate() {
+        let change_id = commits.row(idx).change_id();
+        let total = change_id.chars().count();
+        lens[idx] = if let Some(precomputed) = commits.row(idx).shortest_change_id_len() {
+            precomputed.min(total)
+        } else {
+            let prev = rank
+                .checked_sub(1)
+                .map(|r| common_prefix_len(change_id, commits.row(order[r]).change_id()))
+                .unwrap_or(0);
+            let next = order
+                .get(rank + 1)
+                .map(|&n| common_prefix_len(change_id, commits.row(n).change_id()))
+                .unwrap_or(0);
+            (prev.max(next) + 1).min(total)
+        };
+    }
+    lens
+}
+
+/// Number of leading characters two strings share.
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    a.chars()
+        .zip(b.chars())
+        .take_while(|(x, y)| x == y)
+        .count()
 }
 
 /// Pixel-accurate text width measurement for layout decisions made outside
@@ -1041,7 +1119,7 @@ fn file_badge_width(files: &[DiffFile], metrics: &TextMetrics) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::DiffFileStatus;
+    use crate::backend::{CommitStoreBuilder, CommitSummary, DiffFileStatus};
     use crate::graph::LaneFrame;
     use jj_lib::graph::GraphEdgeType;
 
@@ -1060,7 +1138,6 @@ mod tests {
         CommitSummary {
             change_id: change_id.to_owned(),
             commit_id: change_id.to_owned(),
-            revision_id: change_id.to_owned(),
             shortest_change_id_len: None,
             description: String::new(),
             author: String::new(),
@@ -1079,6 +1156,14 @@ mod tests {
         }
     }
 
+    fn store(commits: Vec<CommitSummary>) -> CommitStore {
+        let mut builder = CommitStoreBuilder::with_capacity(commits.len());
+        for commit in commits {
+            builder.push(commit);
+        }
+        builder.finish()
+    }
+
     /// Deterministic metrics for tests: each character is 7px wide, matching
     /// the old `SIDEBAR_FILE_TEXT_CHAR_WIDTH` heuristic so the existing
     /// fixture widths still trigger truncation at the same boundaries. We
@@ -1091,15 +1176,27 @@ mod tests {
 
     #[test]
     fn revision_id_prefix_uses_shortest_unique_change_id() {
+        // No precomputed lengths (the git backend leaves them `None`), so this
+        // exercises the sorted-neighbor derivation. "abc"/"abd" collide on
+        // "ab" and need 3 chars to disambiguate; "z" is unique at 1.
         let commits = vec![
             commit_summary("abc"),
             commit_summary("abd"),
             commit_summary("z"),
         ];
 
-        assert_eq!(shortest_unique_prefix_len("abc", &commits), 3);
-        assert_eq!(shortest_unique_prefix_len("abd", &commits), 3);
-        assert_eq!(shortest_unique_prefix_len("z", &commits), 1);
+        assert_eq!(shortest_unique_prefix_lens(&store(commits)), vec![3, 3, 1]);
+    }
+
+    #[test]
+    fn revision_id_prefix_prefers_precomputed_len() {
+        // When jj supplies `shortest_change_id_len` we trust it over the
+        // neighbor derivation, clamped to the id's own length.
+        let mut commits = vec![commit_summary("abcdef"), commit_summary("abcxyz")];
+        commits[0].shortest_change_id_len = Some(4);
+        commits[1].shortest_change_id_len = Some(99);
+
+        assert_eq!(shortest_unique_prefix_lens(&store(commits)), vec![4, 6]);
     }
 
     #[test]
@@ -1316,7 +1413,6 @@ mod tests {
         // Sanity check: an unrelated lane that just passes through a
         // commit shouldn't get a new segment id.
         let mut current_segments: Vec<Option<usize>> = Vec::new();
-        let mut current_labels: Vec<Vec<String>> = Vec::new();
         let mut next_segment_id: usize = 0;
 
         let direct = Some(GraphEdgeType::Direct);

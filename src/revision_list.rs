@@ -179,10 +179,37 @@ pub enum Item {
     File(FileRowView),
 }
 
-pub struct RevisionList<Message> {
-    items: Vec<Item>,
+/// What a flat row index maps to: a commit (by index) or a file row under the
+/// expanded commit (by file index).
+#[derive(Clone, Copy)]
+enum RowKind {
+    Revision(usize),
+    File(usize),
+}
+
+fn row_height_of(kind: RowKind) -> f32 {
+    match kind {
+        RowKind::Revision(_) => REVISION_ROW_HEIGHT,
+        RowKind::File(_) => FILE_ROW_HEIGHT,
+    }
+}
+
+/// Virtualized at the *data* level: instead of holding an `Item` per commit
+/// (~600MB on a million-commit repo), the widget holds the commit count, the
+/// expanded-files span, and closures that materialize a single row's display
+/// view on demand. Layout/hit-test use arithmetic; draw builds only the rows
+/// that are actually on screen.
+pub struct RevisionList<'a, Message> {
+    commit_count: usize,
+    /// `(commit index of the expanded row, file count)`. File rows render
+    /// immediately after that commit. `None` when nothing is expanded.
+    expanded: Option<(usize, usize)>,
+    build_revision: Box<dyn Fn(usize) -> RevisionRowView + 'a>,
+    build_file: Box<dyn Fn(usize) -> FileRowView + 'a>,
     selected_row: Option<RowSelectionKey>,
     selected_file: Option<usize>,
+    /// Flat row index of the selected row, for the reveal-on-token scroll.
+    selected_flat: Option<usize>,
     style: RevisionListStyle,
     width: Length,
     /// Bumped by the caller each time it wants the selected row scrolled
@@ -194,19 +221,28 @@ pub struct RevisionList<Message> {
     on_select_file: fn(usize) -> Message,
 }
 
-impl<Message> RevisionList<Message> {
+impl<'a, Message> RevisionList<'a, Message> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        items: Vec<Item>,
+        commit_count: usize,
+        expanded: Option<(usize, usize)>,
+        build_revision: Box<dyn Fn(usize) -> RevisionRowView + 'a>,
+        build_file: Box<dyn Fn(usize) -> FileRowView + 'a>,
         selected_row: Option<RowSelectionKey>,
         selected_file: Option<usize>,
+        selected_flat: Option<usize>,
         style: RevisionListStyle,
         on_select_revision: fn(RowSelectionKey) -> Message,
         on_select_file: fn(usize) -> Message,
     ) -> Self {
         Self {
-            items,
+            commit_count,
+            expanded,
+            build_revision,
+            build_file,
             selected_row,
             selected_file,
+            selected_flat,
             style,
             width: Length::Fill,
             reveal_token: None,
@@ -228,14 +264,21 @@ impl<Message> RevisionList<Message> {
         self
     }
 
-    /// Index of the row matching `selected_row`, if any. Used by the
-    /// reveal-on-token-bump scroll.
-    fn selected_row_index(&self) -> Option<usize> {
-        let key = self.selected_row.as_ref()?;
-        self.items.iter().position(|item| match item {
-            Item::Revision(rev) => &rev.selection_key == key,
-            Item::File(_) => false,
-        })
+    fn row_count(&self) -> usize {
+        rows_total(self.commit_count, self.expanded)
+    }
+
+    fn row_kind(&self, flat: usize) -> RowKind {
+        row_kind_at(self.expanded, flat)
+    }
+
+    /// Materialize the display view for a single row. Builds only what the
+    /// caller asked for, so draw/hit-test pay only for on-screen rows.
+    fn item_at(&self, flat: usize) -> Item {
+        match self.row_kind(flat) {
+            RowKind::Revision(commit) => Item::Revision((self.build_revision)(commit)),
+            RowKind::File(file) => Item::File((self.build_file)(file)),
+        }
     }
 
     fn row_height(&self, item: &Item) -> f32 {
@@ -245,8 +288,8 @@ impl<Message> RevisionList<Message> {
         }
     }
 
-    fn content_height(&self) -> f32 {
-        self.items.iter().map(|item| self.row_height(item)).sum()
+    fn content_height(&self) -> f64 {
+        rows_content_height(self.commit_count, self.expanded)
     }
 
     fn item_gutter_width(&self, item: &Item) -> f32 {
@@ -257,25 +300,81 @@ impl<Message> RevisionList<Message> {
         GUTTER_LEFT_PADDING + lane_strip_width(lanes) + GUTTER_PADDING
     }
 
-    fn row_at_offset(&self, offset: f32) -> Option<usize> {
-        let mut y = 0.0;
-        for (idx, item) in self.items.iter().enumerate() {
-            let h = self.row_height(item);
-            if offset < y + h {
-                return Some(idx);
-            }
-            y += h;
-        }
-        None
+    fn row_at_offset(&self, offset: f64) -> Option<usize> {
+        row_at_offset_in(self.commit_count, self.expanded, offset)
     }
 
-    fn row_top(&self, item_index: usize) -> f32 {
-        self.items
-            .iter()
-            .take(item_index)
-            .map(|item| self.row_height(item))
-            .sum()
+    fn row_top(&self, flat: usize) -> f64 {
+        row_top_at(self.expanded, flat)
     }
+}
+
+// Pure row-geometry helpers, split out so they can be unit-tested without
+// constructing a full widget. `expanded` is `(commit index of the expanded
+// row, file count)`; file rows sit immediately after that commit.
+
+fn rows_total(commit_count: usize, expanded: Option<(usize, usize)>) -> usize {
+    commit_count + expanded.map_or(0, |(_, files)| files)
+}
+
+fn row_kind_at(expanded: Option<(usize, usize)>, flat: usize) -> RowKind {
+    match expanded {
+        Some((commit, files)) if flat > commit && flat <= commit + files => {
+            RowKind::File(flat - commit - 1)
+        }
+        Some((commit, files)) if flat > commit + files => RowKind::Revision(flat - files),
+        _ => RowKind::Revision(flat),
+    }
+}
+
+// These work in `f64` content-space pixels deliberately. A ~1M-commit list is
+// ~50M px tall, which is past `f32`'s exact-integer ceiling (2^24 ≈ 16.7M), so
+// in `f32` the draw path's `flat * H` and the hit-test path's `y / H` rounded
+// to different multiples — a click near the bottom selected the neighbouring
+// row. `f64` is exact for integers to 2^53 (~9e15), far beyond any real repo,
+// so the two paths agree again. Row heights stay `f32` constants (whole px).
+fn rows_content_height(commit_count: usize, expanded: Option<(usize, usize)>) -> f64 {
+    commit_count as f64 * REVISION_ROW_HEIGHT as f64
+        + expanded.map_or(0, |(_, files)| files) as f64 * FILE_ROW_HEIGHT as f64
+}
+
+fn row_top_at(expanded: Option<(usize, usize)>, flat: usize) -> f64 {
+    let (revisions_before, files_before) = match expanded {
+        Some((commit, files)) if flat > commit => {
+            let files_before = (flat - commit - 1).min(files);
+            (flat - files_before, files_before)
+        }
+        _ => (flat, 0),
+    };
+    revisions_before as f64 * REVISION_ROW_HEIGHT as f64
+        + files_before as f64 * FILE_ROW_HEIGHT as f64
+}
+
+fn row_at_offset_in(
+    commit_count: usize,
+    expanded: Option<(usize, usize)>,
+    offset: f64,
+) -> Option<usize> {
+    if offset < 0.0 {
+        return None;
+    }
+    let rev_h = REVISION_ROW_HEIGHT as f64;
+    let file_h = FILE_ROW_HEIGHT as f64;
+    let flat = match expanded {
+        Some((commit, files)) => {
+            let files_top = (commit + 1) as f64 * rev_h;
+            let files_bottom = files_top + files as f64 * file_h;
+            if offset < files_top {
+                (offset / rev_h) as usize
+            } else if offset < files_bottom {
+                commit + 1 + ((offset - files_top) / file_h) as usize
+            } else {
+                commit + 1 + files + ((offset - files_bottom) / rev_h) as usize
+            }
+        }
+        None => (offset / rev_h) as usize,
+    };
+    (flat < rows_total(commit_count, expanded)).then_some(flat)
 }
 
 /// Which half of a revision row the cursor is on, used to pick the
@@ -294,7 +393,10 @@ enum LaneHalf {
 }
 
 struct State<Paragraph> {
-    vertical_offset: f32,
+    /// Scroll position in `f64` content-space px (see the row-geometry helpers
+    /// for why `f64`). Cast to `f32` only at the scrollbar/render boundary,
+    /// where values are viewport-small and `f32` is exact.
+    vertical_offset: f64,
     /// Item index of the file row currently hovered (only set for files,
     /// not revisions). Drives the tooltip overlay.
     hovered_file_item: Option<usize>,
@@ -331,7 +433,7 @@ impl<Paragraph> State<Paragraph> {
     }
 }
 
-impl<Message, Renderer> Widget<Message, Theme, Renderer> for RevisionList<Message>
+impl<'a, Message, Renderer> Widget<Message, Theme, Renderer> for RevisionList<'a, Message>
 where
     Renderer: text::Renderer<Font = Font> + iced::advanced::graphics::geometry::Renderer,
 {
@@ -355,9 +457,8 @@ where
         if self.reveal_token != state.last_reveal_token {
             state.last_reveal_token = self.reveal_token;
             // Defer the actual scroll to `update()` — that's where bounds
-            // (needed to clamp + center) are available. Storing the row
-            // index here saves us re-walking `items` later.
-            state.pending_reveal_row = self.selected_row_index();
+            // (needed to clamp + center) are available.
+            state.pending_reveal_row = self.selected_flat;
         }
     }
 
@@ -382,14 +483,14 @@ where
     ) {
         let bounds = layout.bounds();
         let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
-        let max_vertical = (self.content_height() - bounds.height).max(0.0);
+        let max_vertical = (self.content_height() - bounds.height as f64).max(0.0);
         if state.vertical_offset > max_vertical {
             state.vertical_offset = max_vertical;
             shell.request_redraw();
         }
 
         if let Some(row_idx) = state.pending_reveal_row.take()
-            && let Some(item) = self.items.get(row_idx)
+            && row_idx < self.row_count()
         {
             // Scroll so the selected row sits roughly a third of the way
             // down the viewport — gives the user context above and below
@@ -397,13 +498,14 @@ where
             // it into view" when the viewport is too small to spare a
             // third for offset.
             let row_top = self.row_top(row_idx);
-            let row_h = self.row_height(item);
-            let preferred_top = (row_top - bounds.height * 0.33).max(0.0);
-            let must_top = (row_top + row_h - bounds.height).max(0.0);
+            let row_h = row_height_of(self.row_kind(row_idx)) as f64;
+            let view_h = bounds.height as f64;
+            let preferred_top = (row_top - view_h * 0.33).max(0.0);
+            let must_top = (row_top + row_h - view_h).max(0.0);
             let must_bottom = row_top;
-            let target = if (state.vertical_offset..state.vertical_offset + bounds.height)
+            let target = if (state.vertical_offset..state.vertical_offset + view_h)
                 .contains(&row_top)
-                && (state.vertical_offset..state.vertical_offset + bounds.height)
+                && (state.vertical_offset..state.vertical_offset + view_h)
                     .contains(&(row_top + row_h))
             {
                 // Already visible — leave the offset alone.
@@ -414,7 +516,7 @@ where
                 must_top.max(preferred_top)
             };
             let target = target.clamp(0.0, max_vertical);
-            if (target - state.vertical_offset).abs() > f32::EPSILON {
+            if (target - state.vertical_offset).abs() > f64::EPSILON {
                 state.vertical_offset = target;
                 shell.request_redraw();
             }
@@ -430,28 +532,26 @@ where
                 return;
             }
             let local_x = pos.x - bounds.x;
-            let local_y = pos.y - bounds.y + state.vertical_offset;
+            let local_y = (pos.y - bounds.y) as f64 + state.vertical_offset;
             let Some(row_idx) = this.row_at_offset(local_y) else {
                 return;
             };
-            let Some(item) = this.items.get(row_idx) else {
-                return;
-            };
-            let gutter_total = this.item_gutter_width(item);
+            let item = this.item_at(row_idx);
+            let gutter_total = this.item_gutter_width(&item);
             // Lane hit-test first: a cursor in the lane strip with a
             // labeled lane wins over the content-area file tooltip.
             if local_x >= GUTTER_LEFT_PADDING && local_x < gutter_total - GUTTER_PADDING {
                 let strip_x = local_x - GUTTER_LEFT_PADDING;
                 let lane = (strip_x / LANE_WIDTH).floor() as usize;
-                let labels = item_lane_labels(item, lane);
+                let labels = item_lane_labels(&item, lane);
                 if !labels.is_empty() {
                     // Pick the half from the cursor's vertical position
                     // within the row, so a click on the incoming stub of
                     // a split lane resolves to that branch's segment
                     // (not the unrelated new branch starting below).
                     let row_top = this.row_top(row_idx);
-                    let row_h = this.row_height(item);
-                    let half = if local_y - row_top < row_h / 2.0 {
+                    let row_h = this.row_height(&item);
+                    let half = if local_y - row_top < f64::from(row_h) / 2.0 {
                         LaneHalf::Before
                     } else {
                         LaneHalf::After
@@ -465,7 +565,10 @@ where
             }
         };
 
-        let content_height = self.content_height();
+        // The scrollbar is purely visual (thumb position/size), so it stays in
+        // `f32`; a few px of thumb imprecision on a 50M-tall list is invisible,
+        // and any offset it produces is widened back to `f64` before storage.
+        let content_height = self.content_height() as f32;
 
         match event {
             Event::Mouse(mouse::Event::CursorMoved { position }) => {
@@ -478,7 +581,7 @@ where
                             content_height,
                         )
                     {
-                        state.vertical_offset = new_offset.clamp(0.0, max_vertical);
+                        state.vertical_offset = (new_offset as f64).clamp(0.0, max_vertical);
                         shell.capture_event();
                         shell.request_redraw();
                     }
@@ -524,7 +627,7 @@ where
                 };
                 if movement.y != 0.0 {
                     state.vertical_offset =
-                        (state.vertical_offset + movement.y).clamp(0.0, max_vertical);
+                        (state.vertical_offset + movement.y as f64).clamp(0.0, max_vertical);
                     let prev = state.hovered_file_item;
                     recompute_hover(state, self);
                     shell.capture_event();
@@ -541,10 +644,10 @@ where
                     cursor_pos,
                     bounds,
                     content_height,
-                    state.vertical_offset,
+                    state.vertical_offset as f32,
                 ) {
                     scrollbar::ScrollbarEvent::OffsetChanged(new_offset) => {
-                        state.vertical_offset = new_offset.clamp(0.0, max_vertical);
+                        state.vertical_offset = (new_offset as f64).clamp(0.0, max_vertical);
                         shell.capture_event();
                         shell.request_redraw();
                         return;
@@ -555,11 +658,11 @@ where
                     }
                     scrollbar::ScrollbarEvent::None => {}
                 }
-                let local_y = cursor_pos.y - bounds.y + state.vertical_offset;
+                let local_y = (cursor_pos.y - bounds.y) as f64 + state.vertical_offset;
                 if let Some(row_idx) = self.row_at_offset(local_y) {
-                    match &self.items[row_idx] {
+                    match self.item_at(row_idx) {
                         Item::Revision(rev) => {
-                            shell.publish((self.on_select_revision)(rev.selection_key.clone()));
+                            shell.publish((self.on_select_revision)(rev.selection_key));
                             shell.capture_event();
                         }
                         Item::File(f) => {
@@ -596,16 +699,19 @@ where
         // fire at the same time — the cursor is in the gutter, which
         // is mutually exclusive with the content area anyway.
         if let Some((item_idx, lane, _half)) = state.hovered_lane {
-            let item = self.items.get(item_idx)?;
-            let labels = item_lane_labels(item, lane);
+            if item_idx >= self.row_count() {
+                return None;
+            }
+            let item = self.item_at(item_idx);
+            let labels = item_lane_labels(&item, lane);
             if labels.is_empty() {
                 return None;
             }
             let text = labels.join(", ");
             let row_top = self.row_top(item_idx) - state.vertical_offset;
-            let row_screen_y = bounds.y + row_top;
-            let row_height = self.row_height(item);
-            let gutter_total = self.item_gutter_width(item);
+            let row_screen_y = bounds.y + row_top as f32;
+            let row_height = self.row_height(&item);
+            let gutter_total = self.item_gutter_width(&item);
             let measure_para =
                 make_paragraph::<Renderer>(&text, CAPTION_TEXT_SIZE, self.style.primary_font);
             let text_size = measure_para.min_bounds();
@@ -623,11 +729,14 @@ where
         }
 
         let item_idx = state.hovered_file_item?;
-        let Some(Item::File(file)) = self.items.get(item_idx) else {
+        if item_idx >= self.row_count() {
+            return None;
+        }
+        let Item::File(file) = self.item_at(item_idx) else {
             return None;
         };
         let row_top = self.row_top(item_idx) - state.vertical_offset;
-        let row_screen_y = bounds.y + row_top;
+        let row_screen_y = bounds.y + row_top as f32;
         let row_height = FILE_ROW_HEIGHT;
 
         let measure_para =
@@ -659,7 +768,7 @@ where
             return mouse::Interaction::None;
         };
         if scrollbar::is_dragging(&state.scrollbar)
-            || scrollbar::hits_container(bounds, point, self.content_height())
+            || scrollbar::hits_container(bounds, point, self.content_height() as f32)
         {
             return mouse::Interaction::Idle;
         }
@@ -684,7 +793,7 @@ where
         state.paragraphs.borrow_mut().clear();
 
         let visible_top = state.vertical_offset;
-        let visible_bottom = visible_top + bounds.height;
+        let visible_bottom = visible_top + bounds.height as f64;
 
         renderer.with_layer(bounds, |renderer| {
             fill_background(renderer, bounds, self.style.background);
@@ -695,39 +804,40 @@ where
             // matters at split lanes: the same lane index at the hover
             // row may carry two different segment ids in its top vs
             // bottom half.
-            let emphasized_segment =
-                state
-                    .hovered_lane
-                    .and_then(|(hov_idx, hov_lane, hov_half)| {
-                        self.items
-                            .get(hov_idx)
-                            .and_then(|item| item_lane_segment(item, hov_lane, hov_half))
-                            .map(|seg| (seg, hov_lane))
-                    });
-
-            let mut y_cursor = 0.0;
-            for item in self.items.iter() {
-                let row_h = self.row_height(item);
-                let row_top_local = y_cursor;
-                let row_bot_local = y_cursor + row_h;
-                y_cursor = row_bot_local;
-                if row_bot_local < visible_top || row_top_local > visible_bottom {
-                    continue;
+            let emphasized_segment = state.hovered_lane.and_then(|(hov_idx, hov_lane, hov_half)| {
+                if hov_idx >= self.row_count() {
+                    return None;
                 }
-                let screen_y = bounds.y + (row_top_local - visible_top);
+                let item = self.item_at(hov_idx);
+                item_lane_segment(&item, hov_lane, hov_half).map(|seg| (seg, hov_lane))
+            });
+
+            // Walk only the rows that intersect the viewport, materializing
+            // each one's view on demand — off-screen rows cost nothing.
+            let count = self.row_count();
+            let first = self.row_at_offset(visible_top).unwrap_or(0);
+            let mut flat = first;
+            let mut row_top_local = self.row_top(first);
+            while flat < count && row_top_local < visible_bottom {
+                let row_h = row_height_of(self.row_kind(flat));
+                // `row_top_local - visible_top` is viewport-relative (small) and
+                // exact in `f64`; only here, after the subtraction cancels the
+                // large magnitude, is it safe to narrow to `f32` for rendering.
+                let screen_y = bounds.y + (row_top_local - visible_top) as f32;
                 let row_bounds = Rectangle {
                     x: bounds.x,
                     y: screen_y,
                     width: bounds.width,
                     height: row_h,
                 };
-                let gutter_total = self.item_gutter_width(item);
+                let item = self.item_at(flat);
+                let gutter_total = self.item_gutter_width(&item);
                 let emphasized_lane_before = emphasized_segment.and_then(|(seg, lane)| {
-                    let this_seg = item_lane_segment(item, lane, LaneHalf::Before)?;
+                    let this_seg = item_lane_segment(&item, lane, LaneHalf::Before)?;
                     (this_seg == seg).then_some(lane)
                 });
                 let emphasized_lane_after = emphasized_segment.and_then(|(seg, lane)| {
-                    let this_seg = item_lane_segment(item, lane, LaneHalf::After)?;
+                    let this_seg = item_lane_segment(&item, lane, LaneHalf::After)?;
                     (this_seg == seg).then_some(lane)
                 });
 
@@ -736,7 +846,7 @@ where
                         self.draw_revision(
                             renderer,
                             row_bounds,
-                            rev,
+                            &rev,
                             &state.paragraphs,
                             gutter_total,
                             emphasized_lane_before,
@@ -750,22 +860,29 @@ where
                         self.draw_file(
                             renderer,
                             row_bounds,
-                            f,
+                            &f,
                             &state.paragraphs,
                             gutter_total,
                             emphasized_lane_after,
                         );
                     }
                 }
+
+                row_top_local += row_h as f64;
+                flat += 1;
             }
 
-            let geom = scrollbar::geometry(bounds, self.content_height(), state.vertical_offset);
+            let geom = scrollbar::geometry(
+                bounds,
+                self.content_height() as f32,
+                state.vertical_offset as f32,
+            );
             scrollbar::draw(renderer, &geom, &self.style.scrollbar);
         });
     }
 }
 
-impl<Message> RevisionList<Message> {
+impl<'a, Message> RevisionList<'a, Message> {
     #[allow(clippy::too_many_arguments)]
     fn draw_revision<R>(
         &self,
@@ -1811,12 +1928,104 @@ where
     }
 }
 
-impl<Message: 'static, Renderer> From<RevisionList<Message>>
-    for Element<'_, Message, Theme, Renderer>
+impl<'a, Message: 'a, Renderer> From<RevisionList<'a, Message>>
+    for Element<'a, Message, Theme, Renderer>
 where
-    Renderer: text::Renderer<Font = Font> + iced::advanced::graphics::geometry::Renderer + 'static,
+    Renderer: text::Renderer<Font = Font> + iced::advanced::graphics::geometry::Renderer + 'a,
 {
-    fn from(widget: RevisionList<Message>) -> Self {
+    fn from(widget: RevisionList<'a, Message>) -> Self {
         Element::new(widget)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Three commits with the middle one (index 1) expanded over 2 file rows.
+    // Flat layout: [rev0, rev1, file0, file1, rev2].
+    const EXP: Option<(usize, usize)> = Some((1, 2));
+
+    #[test]
+    fn row_count_includes_expanded_files() {
+        assert_eq!(rows_total(3, None), 3);
+        assert_eq!(rows_total(3, EXP), 5);
+    }
+
+    #[test]
+    fn row_kind_maps_flat_indices() {
+        let kinds: Vec<_> = (0..5).map(|f| row_kind_at(EXP, f)).collect();
+        assert!(matches!(kinds[0], RowKind::Revision(0)));
+        assert!(matches!(kinds[1], RowKind::Revision(1)));
+        assert!(matches!(kinds[2], RowKind::File(0)));
+        assert!(matches!(kinds[3], RowKind::File(1)));
+        assert!(matches!(kinds[4], RowKind::Revision(2)));
+    }
+
+    #[test]
+    fn row_top_accumulates_mixed_heights() {
+        let rev = f64::from(REVISION_ROW_HEIGHT);
+        let file = f64::from(FILE_ROW_HEIGHT);
+        assert_eq!(row_top_at(EXP, 0), 0.0);
+        assert_eq!(row_top_at(EXP, 1), rev);
+        assert_eq!(row_top_at(EXP, 2), 2.0 * rev);
+        assert_eq!(row_top_at(EXP, 3), 2.0 * rev + file);
+        assert_eq!(row_top_at(EXP, 4), 2.0 * rev + 2.0 * file);
+        // content_height equals the top of the one-past-the-last row.
+        assert_eq!(rows_content_height(3, EXP), row_top_at(EXP, 5));
+    }
+
+    #[test]
+    fn row_at_offset_inverts_row_top() {
+        for flat in 0..5 {
+            let top = row_top_at(EXP, flat);
+            let height = f64::from(row_height_of(row_kind_at(EXP, flat)));
+            assert_eq!(row_at_offset_in(3, EXP, top), Some(flat), "top of {flat}");
+            assert_eq!(
+                row_at_offset_in(3, EXP, top + height / 2.0),
+                Some(flat),
+                "mid of {flat}"
+            );
+        }
+        assert_eq!(
+            row_at_offset_in(3, EXP, rows_content_height(3, EXP) + 1.0),
+            None
+        );
+        assert_eq!(row_at_offset_in(3, EXP, -1.0), None);
+    }
+
+    #[test]
+    fn unexpanded_layout_is_uniform() {
+        let rev = f64::from(REVISION_ROW_HEIGHT);
+        assert_eq!(rows_total(10, None), 10);
+        assert_eq!(row_top_at(None, 5), 5.0 * rev);
+        assert_eq!(row_at_offset_in(10, None, 5.0 * rev + 1.0), Some(5));
+        assert_eq!(row_at_offset_in(10, None, 1000.0 * rev), None);
+    }
+
+    #[test]
+    fn row_geometry_exact_at_large_indices() {
+        // Regression: in `f32`, integers stop being exact past 2^24 ≈ 16.7M,
+        // and a ~1M-commit list is ~50M px tall. There, draw's `flat * H` and
+        // hit-test's `y / H` rounded to different rows, so a click near the
+        // bottom selected the neighbour. `f64` keeps both exact, so the
+        // round-trip `row_at_offset(row_top(flat)) == flat` holds everywhere.
+        let n = 1_100_000usize;
+        let rev = f64::from(REVISION_ROW_HEIGHT);
+        for &flat in &[1_000_000usize, 1_086_956, n - 1] {
+            let top = row_top_at(None, flat);
+            assert_eq!(row_at_offset_in(n, None, top), Some(flat), "top of {flat}");
+            assert_eq!(
+                row_at_offset_in(n, None, top + rev / 2.0),
+                Some(flat),
+                "mid of {flat}"
+            );
+            // Last sub-pixel before the next row still maps to `flat`.
+            assert_eq!(
+                row_at_offset_in(n, None, top + rev - 0.001),
+                Some(flat),
+                "end of {flat}"
+            );
+        }
     }
 }

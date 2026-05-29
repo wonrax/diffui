@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use bstr::BStr;
 use futures::StreamExt;
 use jj_lib::{
-    backend::CommitId,
+    backend::{CommitId, TreeId},
     config::{ConfigSource, StackedConfig},
     conflicts::{ConflictMarkerStyle, ConflictMaterializeOptions, materialized_diff_stream},
     copies::CopyRecords,
@@ -25,7 +25,7 @@ use jj_lib::{
     gitignore::GitIgnoreFile,
     graph::{GraphNode, TopoGroupedGraphIterator},
     matchers::{EverythingMatcher, Matcher, NothingMatcher, PrefixMatcher},
-    merge::{Diff, SameChange},
+    merge::{Diff, Merge, SameChange},
     object_id::ObjectId,
     repo::{Repo, StoreFactories},
     repo_path::{RepoPath, RepoPathBuf, RepoPathUiConverter},
@@ -37,18 +37,21 @@ use jj_lib::{
 };
 
 use crate::backend::{
-    CommitSummary, DiffDocument, DiffFile, DiffFileStatus, DiffHunkView, DiffLine, DiffLineKind,
-    RevisionDetails, RevisionSelection, SignatureInfo, apply_syntax_highlighting,
-    format_hunk_header,
+    CommitStore, CommitStoreBuilder, CommitSummary, DiffDocument, DiffFile, DiffFileStatus,
+    DiffHunkView, DiffLine, DiffLineKind, LoadProgress, RevisionDetails, RevisionSelection,
+    SignatureInfo, apply_syntax_highlighting, format_hunk_header,
 };
-use crate::graph::{LaneFrame, assign_lanes};
+use crate::graph::LaneAssigner;
 use crate::repository::{Repository, RepositorySnapshot};
 
 // Fallback used only when the user has not configured `snapshot.max-new-file-size`.
 // Matches jj-cli's shipped default (1 MiB).
 const DEFAULT_SNAPSHOT_MAX_NEW_FILE_SIZE: u64 = 1024 * 1024;
 
-pub async fn load_jj_commits(repository_root: PathBuf) -> Result<Vec<CommitSummary>> {
+pub async fn load_jj_commits(
+    repository_root: PathBuf,
+    progress: LoadProgress,
+) -> Result<CommitStore> {
     let settings = UserSettings::from_config(StackedConfig::with_defaults())
         .context("failed to load jj settings")?;
     let workspace = Workspace::load(
@@ -93,8 +96,7 @@ pub async fn load_jj_commits(repository_root: PathBuf) -> Result<Vec<CommitSumma
             .context("failed to walk jj revset graph")?
     };
     drop(revset);
-
-    let lane_rows = assign_lanes(nodes.iter().map(|(id, edges)| (id.clone(), edges.clone())));
+    progress.set_total(nodes.len());
 
     // Index bookmarks by commit id once so the per-commit loop below is a
     // map lookup instead of an O(bookmarks) scan per revision.
@@ -116,19 +118,33 @@ pub async fn load_jj_commits(repository_root: PathBuf) -> Result<Vec<CommitSumma
         }
     }
 
-    let mut commits = Vec::with_capacity(nodes.len());
-    for ((id, _edges), lane_row) in nodes.into_iter().zip(lane_rows) {
+    // Build the store in a single pass, dropping each jj `Commit` as soon as
+    // its data is extracted rather than holding all of them at once — that Vec
+    // is ~400MB on a million-commit repo. Single-parent emptiness needs a
+    // parent's tree-id, which (in descendants-first order) hasn't been loaded
+    // yet, so we keep just the tree-id map + each commit's lone parent and
+    // resolve it cheaply in a second pass. Merges/roots stay unknown and are
+    // resolved off the load path (see `compute_jj_empty_status`).
+    let mut builder = CommitStoreBuilder::with_capacity(nodes.len());
+    let mut tree_ids: HashMap<CommitId, Merge<TreeId>> = HashMap::with_capacity(nodes.len());
+    let mut single_parents: Vec<Option<CommitId>> = Vec::with_capacity(nodes.len());
+    let mut lane_assigner = LaneAssigner::new();
+    for (id, edges) in nodes.iter() {
+        // Advance the lane state for every node in topo order. The assigner is
+        // stateful, so this must run once per node — keep it first in the loop.
+        let lane_frame = lane_assigner.push(id, edges);
         let commit = repo
             .store()
-            .get_commit_async(&id)
+            .get_commit_async(id)
             .await
             .with_context(|| format!("failed to load jj commit {}", id.hex()))?;
+        tree_ids.insert(id.clone(), commit.tree_ids().clone());
+        single_parents.push(match commit.parent_ids() {
+            [parent] => Some(parent.clone()),
+            _ => None,
+        });
 
         let description = commit.description().lines().next().unwrap_or("").trim();
-        let is_empty = commit
-            .is_empty(repo.as_ref())
-            .await
-            .with_context(|| format!("failed to inspect jj commit {}", commit.id().hex()))?;
         let shortest_change_id_len = repo
             .shortest_unique_change_id_prefix_len(commit.change_id())
             .with_context(|| {
@@ -137,17 +153,10 @@ pub async fn load_jj_commits(repository_root: PathBuf) -> Result<Vec<CommitSumma
                     commit.change_id().hex()
                 )
             })?;
-
-        let commit_id_hex = commit.id().hex();
-        let is_working_copy = commit.id() == &wc_commit_id;
-        let bookmarks = bookmarks_by_commit
-            .get(commit.id())
-            .cloned()
-            .unwrap_or_default();
-        commits.push(CommitSummary {
+        let bookmarks = bookmarks_by_commit.get(id).cloned().unwrap_or_default();
+        builder.push(CommitSummary {
             change_id: commit.change_id().to_string(),
-            commit_id: commit_id_hex.clone(),
-            revision_id: commit_id_hex,
+            commit_id: id.hex(),
             shortest_change_id_len: Some(shortest_change_id_len),
             description: if description.is_empty() {
                 "(no description set)".to_owned()
@@ -156,15 +165,70 @@ pub async fn load_jj_commits(repository_root: PathBuf) -> Result<Vec<CommitSumma
             },
             author: commit.author().name.clone(),
             has_description: !description.is_empty(),
-            is_empty: Some(is_empty),
+            is_empty: None,
             has_conflict: commit.has_conflict(),
-            lane_frame: LaneFrame::from_lane_row(&lane_row),
-            is_working_copy,
+            lane_frame,
+            is_working_copy: id == &wc_commit_id,
             bookmarks,
         });
+        progress.increment();
+        // `commit` dropped here — we never hold more than one at a time.
     }
 
-    Ok(commits)
+    // Resolve single-parent emptiness now that every tree-id is known: a
+    // commit is empty iff its tree matches its parent's (a cheap id compare).
+    let mut store = builder.finish();
+    for index in 0..store.len() {
+        let Some(parent) = &single_parents[index] else {
+            continue;
+        };
+        if let (Some(own), Some(parent_tree)) =
+            (tree_ids.get(&nodes[index].0), tree_ids.get(parent))
+        {
+            store.set_is_empty(index, own == parent_tree);
+        }
+    }
+
+    Ok(store)
+}
+
+/// Resolve the empty status of specific commits (the merges/roots the loader
+/// left unknown) off the load path. `targets` carries the
+/// caller's row index alongside the hex commit-id so results can be applied
+/// back without a second lookup. Per-commit failures are skipped rather than
+/// failing the whole batch.
+pub async fn compute_jj_empty_status(
+    repository_root: PathBuf,
+    targets: Vec<(usize, String)>,
+) -> Result<Vec<(usize, bool)>> {
+    let settings = UserSettings::from_config(StackedConfig::with_defaults())
+        .context("failed to load jj settings")?;
+    let workspace = Workspace::load(
+        &settings,
+        &repository_root,
+        &StoreFactories::default(),
+        &default_working_copy_factories(),
+    )
+    .context("failed to load jj workspace")?;
+    let repo = workspace
+        .repo_loader()
+        .load_at_head()
+        .await
+        .context("failed to load jj repo")?;
+
+    let mut out = Vec::with_capacity(targets.len());
+    for (index, commit_id_hex) in targets {
+        let Some(id) = CommitId::try_from_hex(&commit_id_hex) else {
+            continue;
+        };
+        let Ok(commit) = repo.store().get_commit_async(&id).await else {
+            continue;
+        };
+        if let Ok(empty) = commit.is_empty(repo.as_ref()).await {
+            out.push((index, empty));
+        }
+    }
+    Ok(out)
 }
 
 pub async fn load_jj_diff(
@@ -685,4 +749,163 @@ fn diff_tokens_to_string(tokens: Vec<(jj_lib::diff_presentation::DiffTokenType, 
     }
 
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[cfg(all(test, feature = "track-alloc"))]
+mod mem_profile {
+    use crate::backend::LoadProgress;
+    use crate::track_alloc::{CURRENT, PEAK};
+    use std::sync::atomic::Ordering::Relaxed;
+
+    /// Loads a real jj repo and prints the retained store size against the
+    /// transient allocation peak during the load — the breakdown behind "why
+    /// does RSS dwarf the live data". Point it at a repo with:
+    ///   DIFFUI_PROFILE_REPO=/path \
+    ///   cargo test --features track-alloc profile_load_memory -- --ignored --nocapture
+    /// Defaults to the bun benchmark clone. `#[ignore]`d since it needs a repo
+    /// on disk; counts are logical bytes (no allocator rounding), so true RSS
+    /// runs higher — the peak/live ratio is the signal.
+    #[test]
+    #[ignore]
+    fn profile_load_memory() {
+        let repo = std::env::var("DIFFUI_PROFILE_REPO")
+            .unwrap_or_else(|_| format!("{}/code/bun", std::env::var("HOME").expect("HOME set")));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+
+        let progress = LoadProgress::default();
+        let baseline = CURRENT.load(Relaxed);
+        PEAK.store(baseline, Relaxed);
+
+        let store = runtime
+            .block_on(super::load_jj_commits(repo.clone().into(), progress))
+            .expect("load commits");
+
+        let peak = PEAK.load(Relaxed).saturating_sub(baseline);
+        let live = CURRENT.load(Relaxed).saturating_sub(baseline);
+        let store_heap = store.heap_bytes();
+        let n = store.len().max(1);
+        let mb = |bytes: usize| bytes as f64 / 1.0e6;
+
+        eprintln!("\n=== diffui memory profile (logical bytes) ===");
+        eprintln!("repo            : {repo}");
+        eprintln!("commits         : {}", store.len());
+        eprintln!("transient peak  : {:>9.1} MB", mb(peak));
+        eprintln!("live after load : {:>9.1} MB  (allocator current)", mb(live));
+        eprintln!("store.heap()    : {:>9.1} MB  (accounted)", mb(store_heap));
+        eprintln!(
+            "per commit      : store {:.0} B    peak {:.0} B",
+            store_heap as f64 / n as f64,
+            peak as f64 / n as f64
+        );
+        eprintln!(
+            "peak / live     : {:.2}x  (how much of the high-water mark is transient)",
+            peak as f64 / store_heap.max(1) as f64
+        );
+        eprintln!("=============================================\n");
+
+        drop(store);
+    }
+}
+
+#[cfg(all(test, feature = "track-alloc"))]
+mod lane_width_probe {
+    use super::*;
+    use crate::graph::LaneAssigner;
+
+    // Settles "how wide is the graph really" by running the lane assigner
+    // UNCAPPED over a repo's topology and histogramming the per-row lane count.
+    // Walks the revset only (no `get_commit_async`), so it's fast and
+    // memory-light (never stores the per-row fold), and it can't OOM. Run:
+    //   DIFFUI_PROFILE_REPO=/path \
+    //   cargo test --features track-alloc profile_lane_width -- --ignored --nocapture
+    // Defaults to the nixpkgs clone.
+    #[test]
+    #[ignore]
+    fn profile_lane_width() {
+        let repo = std::env::var("DIFFUI_PROFILE_REPO")
+            .unwrap_or_else(|_| format!("{}/code/nixpkgs", std::env::var("HOME").expect("HOME set")));
+        let root = std::path::PathBuf::from(&repo);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+
+        let widths: Vec<u32> = runtime.block_on(async {
+            let settings =
+                UserSettings::from_config(StackedConfig::with_defaults()).expect("jj settings");
+            let workspace = Workspace::load(
+                &settings,
+                &root,
+                &StoreFactories::default(),
+                &default_working_copy_factories(),
+            )
+            .expect("jj workspace");
+            let workspace_name = workspace.workspace_name();
+            let repo = workspace
+                .repo_loader()
+                .load_at_head()
+                .await
+                .expect("jj repo");
+            let wc = repo
+                .view()
+                .get_wc_commit_id(workspace_name)
+                .expect("wc commit")
+                .clone();
+            let expr = RevsetExpression::all();
+            let resolver = SymbolResolver::new(
+                repo.as_ref(),
+                &[] as &[Box<dyn jj_lib::revset::SymbolResolverExtension>],
+            );
+            let resolved = expr
+                .resolve_user_expression(repo.as_ref(), &resolver)
+                .expect("resolve revset");
+            let revset = resolved.evaluate(repo.as_ref()).expect("evaluate revset");
+            let nodes: Vec<GraphNode<CommitId>> = {
+                let mut topo =
+                    TopoGroupedGraphIterator::new(revset.iter_graph(), |id: &CommitId| id);
+                topo.prioritize_branch(wc.clone());
+                topo.collect::<Result<Vec<_>, _>>().expect("walk graph")
+            };
+            drop(revset);
+
+            let mut assigner = LaneAssigner::uncapped();
+            nodes
+                .iter()
+                .map(|(id, edges)| assigner.push(id, edges).lane_count() as u32)
+                .collect()
+        });
+
+        let mut widths = widths;
+        widths.sort_unstable();
+        let n = widths.len().max(1);
+        let pct = |p: f64| {
+            widths
+                .get(((n as f64 * p) as usize).min(n - 1))
+                .copied()
+                .unwrap_or(0)
+        };
+        let over = |t: u32| widths.iter().filter(|&&w| w > t).count();
+        let mean = widths.iter().map(|&w| u64::from(w)).sum::<u64>() as f64 / n as f64;
+
+        eprintln!("\n=== diffui lane-width profile (UNCAPPED) ===");
+        eprintln!("repo : {repo}");
+        eprintln!("rows : {n}");
+        eprintln!("max  : {}", widths.last().copied().unwrap_or(0));
+        eprintln!("mean : {mean:.1}");
+        eprintln!("p50  : {}", pct(0.50));
+        eprintln!("p90  : {}", pct(0.90));
+        eprintln!("p99  : {}", pct(0.99));
+        eprintln!("p999 : {}", pct(0.999));
+        for threshold in [32u32, 64, 96, 128, 192, 256, 384, 512, 768, 1024] {
+            let count = over(threshold);
+            eprintln!(
+                "rows > {threshold:>4} lanes : {count:>9}  ({:.3}%)",
+                count as f64 / n as f64 * 100.0
+            );
+        }
+        eprintln!("============================================\n");
+    }
 }

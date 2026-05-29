@@ -257,8 +257,6 @@ fn parse_commit_log_rows(output: &str) -> Vec<ParsedCommitRow> {
 }
 
 fn build_commit_summaries(rows: Vec<ParsedCommitRow>) -> Vec<CommitSummary> {
-    use crate::graph::LaneFrame;
-
     // Walk the rows in their existing topo order and assign lanes from
     // parent edges. Parents not present in the listing (shallow clone, etc.)
     // become Missing edges so the renderer can draw a stub.
@@ -278,21 +276,20 @@ fn build_commit_summaries(rows: Vec<ParsedCommitRow>) -> Vec<CommitSummary> {
             .collect();
         (row.commit_id.clone(), edges)
     });
-    let lane_rows = assign_lanes(lane_inputs);
+    let lane_frames = assign_lanes(lane_inputs);
 
     rows.into_iter()
-        .zip(lane_rows)
-        .map(|(row, lane_row)| CommitSummary {
+        .zip(lane_frames)
+        .map(|(row, lane_frame)| CommitSummary {
             change_id: row.change_id,
-            commit_id: row.commit_id.clone(),
-            revision_id: row.commit_id,
+            commit_id: row.commit_id,
             shortest_change_id_len: None,
             description: row.description,
             author: row.author,
             has_description: row.has_description,
             is_empty: row.is_empty,
             has_conflict: false,
-            lane_frame: LaneFrame::from_lane_row(&lane_row),
+            lane_frame,
             is_working_copy: row.is_working_copy,
             bookmarks: Vec::new(),
         })
@@ -364,7 +361,6 @@ mod tests {
 
         assert_eq!(commits[0].change_id, "abc");
         assert_eq!(commits[0].commit_id, "def123456789abcdef");
-        assert_eq!(commits[0].revision_id, "def123456789abcdef");
     }
 
     #[test]

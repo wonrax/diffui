@@ -141,6 +141,12 @@ pub struct PaletteColumn {
     /// whenever a keyboard move pushes the selected row out of the
     /// visible window.
     pub scroll_y: f32,
+    /// Bumped on every query edit; the debounced recompute carries the value
+    /// it was scheduled for and is dropped if the user has typed past it.
+    pub query_version: u64,
+    /// True while a query edit is awaiting its debounced recompute — drives
+    /// the palette's "searching…" hint.
+    pub dirty: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -491,6 +497,8 @@ impl PaletteState {
             matches: Vec::new(),
             selected: 0,
             scroll_y: 0.0,
+            query_version: 0,
+            dirty: false,
         };
         recompute_matches(&mut column, ui);
         // The first column doesn't animate — it just appears. Push/pop
@@ -531,6 +539,8 @@ impl PaletteState {
             matches: Vec::new(),
             selected: 0,
             scroll_y: 0.0,
+            query_version: 0,
+            dirty: false,
         };
         recompute_matches(&mut column, ui);
         self.stack.push(column);
@@ -648,25 +658,25 @@ fn push_revision_candidates(out: &mut Vec<Candidate>, ui: &Diffui) {
         item: ResultRef::WorkingCopy,
         haystack: "working copy @".to_owned(),
     });
-    for commit in &ui.commits {
+    for commit in ui.commits.iter() {
         let mut haystack = String::with_capacity(
-            commit.change_id.len() + commit.description.len() + commit.author.len() + 32,
+            commit.change_id().len() + commit.description().len() + commit.author().len() + 32,
         );
-        haystack.push_str(&commit.change_id);
+        haystack.push_str(commit.change_id());
         haystack.push(' ');
-        haystack.push_str(&commit.commit_id);
+        haystack.push_str(commit.commit_id());
         haystack.push(' ');
-        if commit.has_description {
-            haystack.push_str(&commit.description);
+        if commit.has_description() {
+            haystack.push_str(commit.description());
             haystack.push(' ');
         }
-        haystack.push_str(&commit.author);
-        for bookmark in &commit.bookmarks {
+        haystack.push_str(commit.author());
+        for bookmark in commit.bookmarks() {
             haystack.push(' ');
             haystack.push_str(bookmark);
         }
         out.push(Candidate {
-            item: ResultRef::Commit(commit.change_id.clone()),
+            item: ResultRef::Commit(commit.change_id().to_owned()),
             haystack,
         });
     }
@@ -678,13 +688,14 @@ fn push_bookmark_candidates(out: &mut Vec<Candidate>, ui: &Diffui) {
     // haystack — they get a category boost over the revision so an exact
     // bookmark-name match floats to the top, which is what the user
     // typically wants when typing "main" or a feature branch name.
-    for commit in &ui.commits {
-        for bookmark in &commit.bookmarks {
-            let mut haystack = String::with_capacity(bookmark.len() + commit.description.len() + 8);
+    for commit in ui.commits.iter() {
+        for bookmark in commit.bookmarks() {
+            let mut haystack =
+                String::with_capacity(bookmark.len() + commit.description().len() + 8);
             haystack.push_str(bookmark);
             haystack.push(' ');
-            if commit.has_description {
-                haystack.push_str(&commit.description);
+            if commit.has_description() {
+                haystack.push_str(commit.description());
             }
             out.push(Candidate {
                 item: ResultRef::Bookmark(bookmark.clone()),
@@ -946,8 +957,13 @@ fn build_results<'a>(
     depth: usize,
 ) -> Element<'a, Message> {
     if column_state.matches.is_empty() {
+        let label = if column_state.dirty {
+            "Searching…"
+        } else {
+            "No matches"
+        };
         let empty = container(
-            text("No matches")
+            text(label)
                 .size(13)
                 .color(theme.subtle_text)
                 .font(ui.config.ui_font),
@@ -1083,23 +1099,23 @@ fn result_row_body<'a>(
         .align_y(alignment::Vertical::Center)
         .into(),
         ResultRef::Commit(change_id) => {
-            let commit = ui.commits.iter().find(|c| &c.change_id == change_id);
+            let commit = ui.commits.find_by_change_id(change_id);
             let prefix = commit
                 .map(|c| {
-                    let len = c.shortest_change_id_len.unwrap_or(8).max(8);
-                    c.change_id.chars().take(len).collect::<String>()
+                    let len = c.shortest_change_id_len().unwrap_or(8).max(8);
+                    c.change_id().chars().take(len).collect::<String>()
                 })
                 .unwrap_or_else(|| change_id.chars().take(8).collect::<String>());
             let description = commit
                 .map(|c| {
-                    if c.has_description {
-                        c.description.lines().next().unwrap_or("").to_owned()
+                    if c.has_description() {
+                        c.description().lines().next().unwrap_or("").to_owned()
                     } else {
                         "(no description)".to_owned()
                     }
                 })
                 .unwrap_or_default();
-            let author = commit.map(|c| c.author.clone()).unwrap_or_default();
+            let author = commit.map(|c| c.author().to_owned()).unwrap_or_default();
             row![
                 text(prefix)
                     .size(13)
@@ -1122,13 +1138,13 @@ fn result_row_body<'a>(
             let commit = ui
                 .commits
                 .iter()
-                .find(|c| c.bookmarks.iter().any(|b| b == name));
+                .find(|c| c.bookmarks().iter().any(|b| b == name));
             let tail = commit
                 .map(|c| {
-                    if c.has_description {
-                        c.description.lines().next().unwrap_or("").to_owned()
+                    if c.has_description() {
+                        c.description().lines().next().unwrap_or("").to_owned()
                     } else {
-                        c.change_id.chars().take(8).collect::<String>()
+                        c.change_id().chars().take(8).collect::<String>()
                     }
                 })
                 .unwrap_or_default();
@@ -1216,11 +1232,10 @@ fn target_label(target: &ResultRef, ui: &Diffui) -> String {
         ResultRef::WorkingCopy => "Working copy".to_owned(),
         ResultRef::Commit(change_id) => ui
             .commits
-            .iter()
-            .find(|c| &c.change_id == change_id)
+            .find_by_change_id(change_id)
             .map(|c| {
-                let len = c.shortest_change_id_len.unwrap_or(8).max(8);
-                c.change_id.chars().take(len).collect()
+                let len = c.shortest_change_id_len().unwrap_or(8).max(8);
+                c.change_id().chars().take(len).collect()
             })
             .unwrap_or_else(|| change_id.chars().take(8).collect()),
         ResultRef::Bookmark(name) => name.clone(),
@@ -1244,14 +1259,13 @@ pub fn revision_selection(item: &ResultRef, ui: &Diffui) -> Option<RevisionSelec
         ResultRef::WorkingCopy => Some(RevisionSelection::WorkingCopy),
         ResultRef::Commit(change_id) => ui
             .commits
-            .iter()
-            .find(|c| &c.change_id == change_id)
-            .map(|c| RevisionSelection::Commit(c.revision_id.clone())),
+            .find_by_change_id(change_id)
+            .map(|c| RevisionSelection::Commit(c.commit_id().to_owned())),
         ResultRef::Bookmark(name) => ui
             .commits
             .iter()
-            .find(|c| c.bookmarks.iter().any(|b| b == name))
-            .map(|c| RevisionSelection::Commit(c.revision_id.clone())),
+            .find(|c| c.bookmarks().iter().any(|b| b == name))
+            .map(|c| RevisionSelection::Commit(c.commit_id().to_owned())),
         _ => None,
     }
 }
@@ -1266,13 +1280,12 @@ pub fn change_id_for_recents(item: &ResultRef, ui: &Diffui) -> Option<String> {
         ResultRef::Bookmark(name) => ui
             .commits
             .iter()
-            .find(|c| c.bookmarks.iter().any(|b| b == name))
-            .map(|c| c.change_id.clone()),
+            .find(|c| c.bookmarks().iter().any(|b| b == name))
+            .map(|c| c.change_id().to_owned()),
         ResultRef::WorkingCopy => ui
             .commits
-            .iter()
-            .find(|c| c.is_working_copy)
-            .map(|c| c.change_id.clone()),
+            .working_copy()
+            .map(|c| c.change_id().to_owned()),
         _ => None,
     }
 }

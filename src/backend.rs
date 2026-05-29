@@ -1,6 +1,9 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use anyhow::{Context, Result};
@@ -12,6 +15,33 @@ use arborium::{
 pub use crate::diff_view::{DiffHunkView, DiffLine, DiffLineKind, SyntaxKind, SyntaxSpan};
 use crate::graph::LaneFrame;
 use crate::repository::{Repository, RepositorySnapshot, Vcs};
+
+/// Shared, lock-free progress for a commit-graph load. The loader bumps these
+/// from its worker thread; the UI reads them each frame to render a progress
+/// indicator. `total` is 0 until the revset has been walked.
+#[derive(Debug, Clone, Default)]
+pub struct LoadProgress {
+    loaded: Arc<AtomicUsize>,
+    total: Arc<AtomicUsize>,
+}
+
+impl LoadProgress {
+    pub fn set_total(&self, total: usize) {
+        self.total.store(total, Ordering::Relaxed);
+    }
+
+    pub fn increment(&self) {
+        self.loaded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `(loaded, total)` so far. `total == 0` means the count isn't known yet.
+    pub fn snapshot(&self) -> (usize, usize) {
+        (
+            self.loaded.load(Ordering::Relaxed),
+            self.total.load(Ordering::Relaxed),
+        )
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RevisionSelection {
@@ -45,11 +75,14 @@ pub struct DiffFile {
     pub deletions: usize,
 }
 
+/// One commit's data as produced by a backend loader. This is a transient
+/// builder input — it's pushed into a [`CommitStore`], which keeps the data
+/// compactly (interned authors, an arena for ids/descriptions, packed flags)
+/// so a million-commit history fits in memory. Read it back via [`RowView`].
 #[derive(Debug, Clone)]
 pub struct CommitSummary {
     pub change_id: String,
     pub commit_id: String,
-    pub revision_id: String,
     pub shortest_change_id_len: Option<usize>,
     pub description: String,
     pub author: String,
@@ -65,6 +98,277 @@ pub struct CommitSummary {
     /// names; remote-tracking ones are `name@remote`. Order matches
     /// `jj show`'s "Bookmarks:" line — local first, then remotes.
     pub bookmarks: Vec<String>,
+}
+
+mod commit_flags {
+    pub const HAS_DESCRIPTION: u8 = 1;
+    pub const IS_EMPTY_KNOWN: u8 = 1 << 1;
+    pub const IS_EMPTY: u8 = 1 << 2;
+    pub const HAS_CONFLICT: u8 = 1 << 3;
+    pub const IS_WORKING_COPY: u8 = 1 << 4;
+}
+
+/// Byte range `[start, start+len)` into a [`CommitStore`]'s text arena.
+#[derive(Debug, Clone, Copy)]
+struct Span {
+    start: u32,
+    len: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CommitSpans {
+    change_id: Span,
+    commit_id: Span,
+    description: Span,
+}
+
+/// Compact, indexable storage for a commit graph. Strings live in one shared
+/// arena (no per-commit `String` headers/allocations); authors are interned
+/// (a repo has far fewer authors than commits); flags are packed into a byte;
+/// bookmarks are stored sparsely since most commits have none. Read rows with
+/// [`CommitStore::row`] / [`CommitStore::iter`].
+#[derive(Debug, Clone, Default)]
+pub struct CommitStore {
+    text: String,
+    spans: Vec<CommitSpans>,
+    authors: Vec<Arc<str>>,
+    author_idx: Vec<u32>,
+    shortest_change_id_len: Vec<u32>,
+    flags: Vec<u8>,
+    lanes: Vec<LaneFrame>,
+    bookmarks: HashMap<usize, Vec<String>>,
+}
+
+impl CommitStore {
+    pub fn len(&self) -> usize {
+        self.spans.len()
+    }
+
+    // The `len`'s companion (kept for the clippy lint and API completeness);
+    // no caller needs it yet.
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
+    pub fn row(&self, index: usize) -> RowView<'_> {
+        RowView { store: self, index }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = RowView<'_>> {
+        (0..self.len()).map(move |index| RowView { store: self, index })
+    }
+
+    pub fn find_by_change_id(&self, change_id: &str) -> Option<RowView<'_>> {
+        self.iter().find(|row| row.change_id() == change_id)
+    }
+
+    pub fn working_copy(&self) -> Option<RowView<'_>> {
+        self.iter().find(|row| row.is_working_copy())
+    }
+
+    /// Set a row's empty status, used to fill in the merge/root commits left
+    /// "unknown" by the loader once they've been computed in the background.
+    pub fn set_is_empty(&mut self, index: usize, empty: bool) {
+        if let Some(flags) = self.flags.get_mut(index) {
+            *flags |= commit_flags::IS_EMPTY_KNOWN;
+            if empty {
+                *flags |= commit_flags::IS_EMPTY;
+            } else {
+                *flags &= !commit_flags::IS_EMPTY;
+            }
+        }
+    }
+
+    fn slice(&self, span: Span) -> &str {
+        &self.text[span.start as usize..(span.start + span.len) as usize]
+    }
+
+    /// Approximate retained heap of the store in bytes, for the `track-alloc`
+    /// memory profiler. Sums the backing capacity of every arena/vec plus each
+    /// row's lane allocations, so it can be compared against the allocator's
+    /// live/peak counters to see how much of RSS is live data vs transient.
+    #[cfg(feature = "track-alloc")]
+    pub fn heap_bytes(&self) -> usize {
+        use std::mem::size_of;
+        let edge = size_of::<Option<jj_lib::graph::GraphEdgeType>>();
+        let mut total = self.text.capacity();
+        total += self.spans.capacity() * size_of::<CommitSpans>();
+        total += self.authors.capacity() * size_of::<Arc<str>>();
+        total += self.authors.iter().map(|name| name.len()).sum::<usize>();
+        total += self.author_idx.capacity() * size_of::<u32>();
+        total += self.shortest_change_id_len.capacity() * size_of::<u32>();
+        total += self.flags.capacity();
+        total += self.lanes.capacity() * size_of::<LaneFrame>();
+        for frame in &self.lanes {
+            total += frame.before.capacity() * edge;
+            total += frame.after.capacity() * edge;
+            total += frame.merging_lanes.capacity() * size_of::<usize>();
+        }
+        for names in self.bookmarks.values() {
+            total += names.capacity() * size_of::<String>();
+            total += names.iter().map(|name| name.capacity()).sum::<usize>();
+        }
+        total += self.bookmarks.capacity() * (size_of::<usize>() + size_of::<Vec<String>>());
+        total
+    }
+}
+
+/// Borrowed view of a single commit in a [`CommitStore`]. Field accessors
+/// mirror the old `&CommitSummary` field reads.
+#[derive(Clone, Copy)]
+pub struct RowView<'a> {
+    store: &'a CommitStore,
+    index: usize,
+}
+
+impl<'a> RowView<'a> {
+    pub fn change_id(&self) -> &'a str {
+        self.store.slice(self.store.spans[self.index].change_id)
+    }
+
+    pub fn commit_id(&self) -> &'a str {
+        self.store.slice(self.store.spans[self.index].commit_id)
+    }
+
+    pub fn description(&self) -> &'a str {
+        self.store.slice(self.store.spans[self.index].description)
+    }
+
+    pub fn author(&self) -> &'a str {
+        &self.store.authors[self.store.author_idx[self.index] as usize]
+    }
+
+    pub fn shortest_change_id_len(&self) -> Option<usize> {
+        match self.store.shortest_change_id_len[self.index] {
+            0 => None,
+            n => Some(n as usize),
+        }
+    }
+
+    fn flags(&self) -> u8 {
+        self.store.flags[self.index]
+    }
+
+    pub fn has_description(&self) -> bool {
+        self.flags() & commit_flags::HAS_DESCRIPTION != 0
+    }
+
+    pub fn is_empty(&self) -> Option<bool> {
+        if self.flags() & commit_flags::IS_EMPTY_KNOWN == 0 {
+            None
+        } else {
+            Some(self.flags() & commit_flags::IS_EMPTY != 0)
+        }
+    }
+
+    pub fn has_conflict(&self) -> bool {
+        self.flags() & commit_flags::HAS_CONFLICT != 0
+    }
+
+    pub fn is_working_copy(&self) -> bool {
+        self.flags() & commit_flags::IS_WORKING_COPY != 0
+    }
+
+    pub fn lane_frame(&self) -> &'a LaneFrame {
+        &self.store.lanes[self.index]
+    }
+
+    pub fn bookmarks(&self) -> &'a [String] {
+        self.store
+            .bookmarks
+            .get(&self.index)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+}
+
+/// Accumulates [`CommitSummary`]s into a [`CommitStore`], interning as it goes.
+#[derive(Default)]
+pub struct CommitStoreBuilder {
+    store: CommitStore,
+    author_interner: HashMap<String, u32>,
+}
+
+impl CommitStoreBuilder {
+    pub fn with_capacity(commits: usize) -> Self {
+        let mut store = CommitStore::default();
+        store.spans.reserve(commits);
+        store.author_idx.reserve(commits);
+        store.shortest_change_id_len.reserve(commits);
+        store.flags.reserve(commits);
+        store.lanes.reserve(commits);
+        Self {
+            store,
+            author_interner: HashMap::new(),
+        }
+    }
+
+    pub fn push(&mut self, commit: CommitSummary) {
+        let index = self.store.spans.len();
+        let change_id = self.intern_text(&commit.change_id);
+        let commit_id = self.intern_text(&commit.commit_id);
+        let description = self.intern_text(&commit.description);
+        self.store.spans.push(CommitSpans {
+            change_id,
+            commit_id,
+            description,
+        });
+
+        let author = self.intern_author(&commit.author);
+        self.store.author_idx.push(author);
+
+        self.store
+            .shortest_change_id_len
+            .push(commit.shortest_change_id_len.unwrap_or(0) as u32);
+
+        let mut flags = 0u8;
+        if commit.has_description {
+            flags |= commit_flags::HAS_DESCRIPTION;
+        }
+        if let Some(empty) = commit.is_empty {
+            flags |= commit_flags::IS_EMPTY_KNOWN;
+            if empty {
+                flags |= commit_flags::IS_EMPTY;
+            }
+        }
+        if commit.has_conflict {
+            flags |= commit_flags::HAS_CONFLICT;
+        }
+        if commit.is_working_copy {
+            flags |= commit_flags::IS_WORKING_COPY;
+        }
+        self.store.flags.push(flags);
+
+        self.store.lanes.push(commit.lane_frame);
+
+        if !commit.bookmarks.is_empty() {
+            self.store.bookmarks.insert(index, commit.bookmarks);
+        }
+    }
+
+    fn intern_text(&mut self, text: &str) -> Span {
+        let start = self.store.text.len() as u32;
+        self.store.text.push_str(text);
+        Span {
+            start,
+            len: text.len() as u32,
+        }
+    }
+
+    fn intern_author(&mut self, author: &str) -> u32 {
+        if let Some(&idx) = self.author_interner.get(author) {
+            return idx;
+        }
+        let idx = self.store.authors.len() as u32;
+        self.store.authors.push(Arc::from(author));
+        self.author_interner.insert(author.to_owned(), idx);
+        idx
+    }
+
+    pub fn finish(self) -> CommitStore {
+        self.store
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,7 +402,7 @@ impl DiffFileStatus {
 #[derive(Debug, Clone)]
 pub struct BackendOutput {
     pub document: DiffDocument,
-    pub commits: Vec<CommitSummary>,
+    pub commits: CommitStore,
     pub snapshot: RepositorySnapshot,
     pub details: Option<RevisionDetails>,
 }
@@ -126,28 +430,25 @@ pub struct SignatureInfo {
 pub async fn load_backend(
     repository: Repository,
     revision: RevisionSelection,
+    progress: LoadProgress,
 ) -> Result<BackendOutput, String> {
-    run_backend(repository, revision)
+    run_backend(repository, revision, progress)
         .await
         .map_err(|error| format!("{error:#}"))
 }
 
-async fn run_backend(repository: Repository, revision: RevisionSelection) -> Result<BackendOutput> {
-    let commits = load_commits(&repository).await?;
-    let (document, details) = match repository.vcs {
-        Vcs::Jj => {
-            let repository = repository.clone();
-            let revision = revision.clone();
-            let handle = tokio::runtime::Handle::current();
-            tokio::task::spawn_blocking(move || {
-                handle.block_on(crate::jj::load_jj_diff(repository, revision))
-            })
-            .await
-            .context("jj diff loader task failed")??
-        }
-        Vcs::Git => crate::git::load_git_diff(&repository, &revision).await?,
-    };
-    let snapshot = run_repository_snapshot(repository).await?;
+async fn run_backend(
+    repository: Repository,
+    revision: RevisionSelection,
+    progress: LoadProgress,
+) -> Result<BackendOutput> {
+    // Snapshot the working copy *before* reading the graph and diff, so both
+    // reflect the on-disk state. Loading first showed a stale, pre-snapshot
+    // working-copy commit — e.g. `@` flagged "empty" while its diff actually
+    // had changes — until the next refresh re-read it.
+    let snapshot = run_repository_snapshot(repository.clone()).await?;
+    let commits = load_commits(&repository, &progress).await?;
+    let (document, details) = run_diff(&repository, &revision).await?;
 
     Ok(BackendOutput {
         document,
@@ -157,8 +458,70 @@ async fn run_backend(repository: Repository, revision: RevisionSelection) -> Res
     })
 }
 
+/// Load just the diff (and revision-header details) for `revision`, without
+/// re-walking the commit graph or snapshotting the working copy.
+///
+/// Switching which revision's diff is shown leaves the graph and repo state
+/// untouched, so the full `load_backend` would waste ~all of its time
+/// re-running `load_commits` (whose per-commit `is_empty` check dominates
+/// load time on large repos — tens of seconds on a 40k-commit repo).
+pub async fn load_diff(
+    repository: Repository,
+    revision: RevisionSelection,
+) -> Result<(DiffDocument, Option<RevisionDetails>), String> {
+    run_diff(&repository, &revision)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+async fn run_diff(
+    repository: &Repository,
+    revision: &RevisionSelection,
+) -> Result<(DiffDocument, Option<RevisionDetails>)> {
+    match repository.vcs {
+        Vcs::Jj => {
+            let repository = repository.clone();
+            let revision = revision.clone();
+            let handle = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
+                handle.block_on(crate::jj::load_jj_diff(repository, revision))
+            })
+            .await
+            .context("jj diff loader task failed")?
+        }
+        Vcs::Git => crate::git::load_git_diff(repository, revision).await,
+    }
+}
+
 pub async fn load_repository_snapshot(repository: Repository) -> Result<RepositorySnapshot> {
     run_repository_snapshot(repository).await
+}
+
+/// Resolve the empty status of `targets` (row index + hex commit-id) off the
+/// load path. Best-effort: any failure yields no update for that commit, since
+/// the "empty" marker is purely cosmetic. Git has no equivalent here (its
+/// loader doesn't populate empty status), so it returns nothing.
+pub async fn compute_empty_status(
+    repository: Repository,
+    targets: Vec<(usize, String)>,
+) -> Vec<(usize, bool)> {
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    match repository.vcs {
+        Vcs::Jj => {
+            let root = repository.root.clone();
+            let handle = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
+                handle.block_on(crate::jj::compute_jj_empty_status(root, targets))
+            })
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default()
+        }
+        Vcs::Git => Vec::new(),
+    }
 }
 
 async fn run_repository_snapshot(repository: Repository) -> Result<RepositorySnapshot> {
@@ -175,16 +538,30 @@ async fn run_repository_snapshot(repository: Repository) -> Result<RepositorySna
     }
 }
 
-async fn load_commits(repository: &Repository) -> Result<Vec<CommitSummary>> {
+async fn load_commits(repository: &Repository, progress: &LoadProgress) -> Result<CommitStore> {
     match repository.vcs {
         Vcs::Jj => {
             let root = repository.root.clone();
+            let progress = progress.clone();
             let handle = tokio::runtime::Handle::current();
-            tokio::task::spawn_blocking(move || handle.block_on(crate::jj::load_jj_commits(root)))
-                .await
-                .context("jj commit loader task failed")?
+            tokio::task::spawn_blocking(move || {
+                handle.block_on(crate::jj::load_jj_commits(root, progress))
+            })
+            .await
+            .context("jj commit loader task failed")?
         }
-        Vcs::Git => crate::git::load_git_commits(repository).await,
+        Vcs::Git => {
+            // The git loader parses `git log` in one shot rather than
+            // per-commit, so surface the count once it's known, then fold the
+            // summaries into the compact store.
+            let commits = crate::git::load_git_commits(repository).await?;
+            progress.set_total(commits.len());
+            let mut builder = CommitStoreBuilder::with_capacity(commits.len());
+            for commit in commits {
+                builder.push(commit);
+            }
+            Ok(builder.finish())
+        }
     }
 }
 

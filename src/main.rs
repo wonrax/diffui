@@ -1,4 +1,10 @@
-use std::{path::PathBuf, time::Duration};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    pin::Pin,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 mod backend;
 mod config;
@@ -17,9 +23,79 @@ mod scrollbar;
 mod sidebar;
 mod theme;
 
+/// Profiling-only global allocator (enabled by the `track-alloc` feature). It
+/// forwards every request to the system allocator while tracking the live byte
+/// count and its high-water mark, so a measurement harness can compare the
+/// retained working set against the transient peak during a load. The atomics
+/// add real per-alloc cost — this is never compiled into a normal build.
+#[cfg(feature = "track-alloc")]
+pub(crate) mod track_alloc {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    pub static CURRENT: AtomicUsize = AtomicUsize::new(0);
+    pub static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+    fn add(size: usize) {
+        let now = CURRENT.fetch_add(size, Relaxed) + size;
+        PEAK.fetch_max(now, Relaxed);
+    }
+
+    pub struct Tracking;
+
+    // SAFETY: every method delegates to the system allocator with the same
+    // layout/pointer it was handed; the only extra work is updating counters.
+    unsafe impl GlobalAlloc for Tracking {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let ptr = unsafe { System.alloc(layout) };
+            if !ptr.is_null() {
+                add(layout.size());
+            }
+            ptr
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let ptr = unsafe { System.alloc_zeroed(layout) };
+            if !ptr.is_null() {
+                add(layout.size());
+            }
+            ptr
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            CURRENT.fetch_sub(layout.size(), Relaxed);
+            unsafe { System.dealloc(ptr, layout) };
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
+            if !new_ptr.is_null() {
+                if new_size >= layout.size() {
+                    add(new_size - layout.size());
+                } else {
+                    CURRENT.fetch_sub(layout.size() - new_size, Relaxed);
+                }
+            }
+            new_ptr
+        }
+    }
+}
+
+#[cfg(feature = "track-alloc")]
+#[global_allocator]
+static GLOBAL: track_alloc::Tracking = track_alloc::Tracking;
+
+// mimalloc returns freed memory to the OS far more eagerly than macOS's system
+// allocator, which otherwise parks a load's transient high-water mark and keeps
+// RSS pinned near the peak long after the working set shrinks. The profiler
+// (`track-alloc`) overrides this with its own counting allocator.
+#[cfg(not(feature = "track-alloc"))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use backend::{
-    BackendOutput, CommitSummary, DiffDocument, RevisionDetails, RevisionSelection, load_backend,
-    load_repository_snapshot,
+    BackendOutput, CommitStore, DiffDocument, LoadProgress, RevisionDetails, RevisionSelection,
+    RowView, compute_empty_status, load_backend, load_diff, load_repository_snapshot,
 };
 use clap::Parser;
 use config::AppConfig;
@@ -27,20 +103,30 @@ use find::FindState;
 use iced::theme as iced_theme;
 use iced::{
     Element, Length, Subscription, Task, Theme,
+    alignment,
     event::{self, Event},
     keyboard, system, time,
-    widget::{self, container, row, stack},
+    widget::{self, column, container, progress_bar, row, stack, text},
     window,
 };
+use futures::{SinkExt, Stream, StreamExt};
+use notify::Watcher;
 use palette::{
     ColumnSource, CommandId as PaletteCommand, PaletteState, Recents, ResultRef,
     change_id_for_recents, revision_selection,
 };
 use repository::{Repository, RepositorySnapshot, prepare_repository};
 use resize_handle::ResizeHandle;
-use theme::{ResolvedTheme, ThemePreference, app_shell_style, vertical_divider};
+use theme::{ResolvedTheme, ThemePreference, ThemeSpec, app_shell_style, vertical_divider};
 
-const REPOSITORY_REFRESH_INTERVAL: Duration = Duration::from_millis(1_000);
+/// Quiet period after the last filesystem event before we refresh. A single
+/// editor save typically emits a burst of events; coalescing them avoids
+/// snapshotting several times for one logical change.
+const WATCH_DEBOUNCE: Duration = Duration::from_millis(400);
+
+/// Debounce before re-running the palette matcher. It scans every commit, so
+/// coalescing fast typing keeps the input responsive on large repos.
+const PALETTE_QUERY_DEBOUNCE: Duration = Duration::from_millis(120);
 
 fn main() -> iced::Result {
     let cli = Cli::parse();
@@ -68,7 +154,7 @@ pub(crate) struct Diffui {
     pub(crate) repository: Option<Repository>,
     pub(crate) status: LoadStatus,
     pub(crate) document: DiffDocument,
-    pub(crate) commits: Vec<CommitSummary>,
+    pub(crate) commits: CommitStore,
     pub(crate) selected_revision: RevisionSelection,
     /// Sticky inline-file-list preference. Always reflects whether the
     /// *selected* revision's file list is shown; the user toggles it by
@@ -112,6 +198,29 @@ pub(crate) struct Diffui {
     /// actually been written into `selected_revision`, *then* bumps the
     /// token so the next render reveals the correct row.
     pub(crate) pending_revision_reveal: bool,
+    /// Bumped when `commits` is replaced; tags background empty-status results
+    /// so a result from a superseded load is dropped.
+    pub(crate) commits_version: u64,
+    /// Per-row lane fold + shortest-unique-prefix lengths, recomputed only
+    /// when the commit graph changes. The sidebar renders rows on demand from
+    /// these, so it never materializes the whole (up to ~1M-row) list.
+    pub(crate) sidebar_lane_data: Rc<Vec<sidebar::RowLaneData>>,
+    pub(crate) sidebar_prefix_lens: Rc<Vec<usize>>,
+    /// Index of the selected commit in `commits` (drives the reveal-on-jump
+    /// scroll and the expanded file-list span), recomputed on selection change
+    /// so `view()` stays O(visible rows).
+    pub(crate) selected_commit_index: Option<usize>,
+    /// Live progress of the in-flight commit-graph load, read by `view()` to
+    /// render the startup progress indicator.
+    pub(crate) commit_progress: LoadProgress,
+    /// When the current load began, or `None` when idle. Drives the ~500ms
+    /// grace period before a loading indicator is shown (so fast loads don't
+    /// flash one).
+    pub(crate) loading_since: Option<Instant>,
+    /// Session cache of resolved empty status keyed by commit-id. A commit's
+    /// emptiness never changes, so background results computed once survive
+    /// reloads — only newly-seen merges are recomputed.
+    pub(crate) empty_cache: HashMap<String, bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -124,13 +233,27 @@ pub(crate) enum LoadStatus {
 #[derive(Debug, Clone)]
 pub(crate) enum Message {
     BackendLoaded(RevisionSelection, Box<Result<BackendOutput, String>>),
+    /// Diff-only load for a revision switch — carries just the document and
+    /// header details, leaving the commit graph and snapshot untouched.
+    DiffLoaded(
+        RevisionSelection,
+        Box<Result<(DiffDocument, Option<RevisionDetails>), String>>,
+    ),
     RepositorySnapshotLoaded(Result<RepositorySnapshot, String>),
+    /// Background-resolved empty status for the merge/root commits the loader
+    /// left unknown, tagged with the `commits_version` it was computed against
+    /// so results from a superseded load are dropped.
+    EmptyStatusComputed(u64, Vec<(usize, bool)>),
     SelectFile(usize),
     SelectRowKey(revision_list::RowSelectionKey),
     SelectTheme(ThemePreference),
     SystemThemeChanged(iced_theme::Mode),
     WindowFocusChanged(bool),
     RefreshRepository,
+    /// Periodic tick while a load is in flight. No-op handler — it exists only
+    /// to keep `view()` re-running so the loading indicator can appear after
+    /// its grace period and animate.
+    LoadingTick,
     SelectNextFile,
     SelectPreviousFile,
     CopyToClipboard(String),
@@ -138,6 +261,9 @@ pub(crate) enum Message {
     PaletteOpen,
     PaletteClose,
     PaletteQueryChanged(String),
+    /// Fired after the query debounce. Carries `(column depth, query version)`
+    /// so a recompute is dropped if the user has typed past it.
+    PaletteRecompute(usize, u64),
     /// Move the highlighted result by `±1`. `-1` for up, `+1` for down.
     PaletteMoveSelection(i32),
     /// Set the highlighted index to a specific row (used by hover).
@@ -184,8 +310,9 @@ impl Diffui {
         match prepare_repository(&cli.path) {
             Ok(repository) => {
                 let revision = RevisionSelection::WorkingCopy;
+                let commit_progress = LoadProgress::default();
                 let backend_task = Task::perform(
-                    load_backend(repository.clone(), revision.clone()),
+                    load_backend(repository.clone(), revision.clone(), commit_progress.clone()),
                     move |result| Message::BackendLoaded(revision, Box::new(result)),
                 );
                 let theme_task = system::theme().map(Message::SystemThemeChanged);
@@ -195,7 +322,7 @@ impl Diffui {
                         repository: Some(repository),
                         status: LoadStatus::Loading,
                         document: DiffDocument::default(),
-                        commits: Vec::new(),
+                        commits: CommitStore::default(),
                         selected_revision: RevisionSelection::WorkingCopy,
                         file_list_expanded: true,
                         pending_revision: Some(RevisionSelection::WorkingCopy),
@@ -214,6 +341,13 @@ impl Diffui {
                         find: None,
                         revision_reveal_token: 0,
                         pending_revision_reveal: false,
+                        commits_version: 0,
+                        sidebar_lane_data: Rc::new(Vec::new()),
+                        sidebar_prefix_lens: Rc::new(Vec::new()),
+                        selected_commit_index: None,
+                        commit_progress,
+                        loading_since: Some(Instant::now()),
+                        empty_cache: HashMap::new(),
                     },
                     Task::batch([backend_task, theme_task]),
                 )
@@ -223,7 +357,7 @@ impl Diffui {
                     repository: None,
                     status: LoadStatus::Failed(format!("{error:#}")),
                     document: DiffDocument::default(),
-                    commits: Vec::new(),
+                    commits: CommitStore::default(),
                     selected_revision: RevisionSelection::WorkingCopy,
                     file_list_expanded: true,
                     pending_revision: None,
@@ -242,6 +376,13 @@ impl Diffui {
                     find: None,
                     revision_reveal_token: 0,
                     pending_revision_reveal: false,
+                    commits_version: 0,
+                    sidebar_lane_data: Rc::new(Vec::new()),
+                    sidebar_prefix_lens: Rc::new(Vec::new()),
+                    selected_commit_index: None,
+                    commit_progress: LoadProgress::default(),
+                    loading_since: None,
+                    empty_cache: HashMap::new(),
                 },
                 system::theme().map(Message::SystemThemeChanged),
             ),
@@ -259,9 +400,11 @@ impl Diffui {
                     let revision_changed = self.selected_revision != revision;
                     self.selected_revision = revision;
                     self.pending_revision = None;
+                    self.loading_since = None;
                     self.status = LoadStatus::Loaded;
                     self.document = output.document;
                     self.commits = output.commits;
+                    self.commits_version = self.commits_version.wrapping_add(1);
                     self.repository_snapshot = Some(output.snapshot);
                     self.revision_details = output.details;
                     self.selected_file = if revision_changed {
@@ -279,6 +422,13 @@ impl Diffui {
                         self.pending_revision_reveal = false;
                         self.revision_reveal_token = self.revision_reveal_token.wrapping_add(1);
                     }
+                    // Recompute the on-demand sidebar index (lane fold, prefix
+                    // lengths, selected-row index) for the new graph.
+                    self.rebuild_sidebar_index();
+                    // Fill in merge/root empty status (left unknown by the
+                    // loader) from cache, and kick off a background task for
+                    // any not seen before.
+                    return self.resolve_empty_status();
                 }
                 Err(error) => {
                     if self.pending_revision.as_ref() != Some(&revision) {
@@ -286,6 +436,44 @@ impl Diffui {
                     }
 
                     self.pending_revision = None;
+                    self.loading_since = None;
+                    self.status = LoadStatus::Failed(error);
+                }
+            },
+            Message::DiffLoaded(revision, result) => match *result {
+                Ok((document, details)) => {
+                    if self.pending_revision.as_ref() != Some(&revision) {
+                        return Task::none();
+                    }
+
+                    let revision_changed = self.selected_revision != revision;
+                    self.selected_revision = revision;
+                    self.pending_revision = None;
+                    self.loading_since = None;
+                    self.status = LoadStatus::Loaded;
+                    self.document = document;
+                    self.revision_details = details;
+                    // The graph is unchanged on a diff-only load; just relocate
+                    // the selected row.
+                    self.selected_commit_index = self.find_selected_commit_index();
+                    self.selected_file = if revision_changed {
+                        0
+                    } else {
+                        self.selected_file
+                            .min(self.document.files.len().saturating_sub(1))
+                    };
+                    if self.pending_revision_reveal {
+                        self.pending_revision_reveal = false;
+                        self.revision_reveal_token = self.revision_reveal_token.wrapping_add(1);
+                    }
+                }
+                Err(error) => {
+                    if self.pending_revision.as_ref() != Some(&revision) {
+                        return Task::none();
+                    }
+
+                    self.pending_revision = None;
+                    self.loading_since = None;
                     self.status = LoadStatus::Failed(error);
                 }
             },
@@ -297,8 +485,11 @@ impl Diffui {
                 {
                     let revision = self.selected_revision.clone();
                     self.pending_revision = Some(revision.clone());
+                    self.loading_since = Some(Instant::now());
+                    let progress = LoadProgress::default();
+                    self.commit_progress = progress.clone();
                     return Task::perform(
-                        load_backend(repository, revision.clone()),
+                        load_backend(repository, revision.clone(), progress),
                         move |result| Message::BackendLoaded(revision, Box::new(result)),
                     );
                 }
@@ -306,6 +497,19 @@ impl Diffui {
             Message::RepositorySnapshotLoaded(Err(error)) => {
                 self.snapshot_pending = false;
                 self.status = LoadStatus::Failed(error);
+            }
+            Message::EmptyStatusComputed(version, updates) => {
+                // Drop results computed against a graph that's since been
+                // replaced — their row indices would no longer line up.
+                if version != self.commits_version || updates.is_empty() {
+                    return Task::none();
+                }
+                for &(index, empty) in &updates {
+                    let commit_id = self.commits.row(index).commit_id().to_owned();
+                    self.empty_cache.insert(commit_id, empty);
+                    self.commits.set_is_empty(index, empty);
+                }
+                self.commits_version = self.commits_version.wrapping_add(1);
             }
             Message::SelectFile(index) => {
                 if index < self.document.files.len() {
@@ -329,9 +533,10 @@ impl Diffui {
                     && let Some(repository) = self.repository.clone()
                 {
                     self.pending_revision = Some(selection.clone());
+                    self.loading_since = Some(Instant::now());
                     let revision = selection.clone();
-                    return Task::perform(load_backend(repository, selection), move |result| {
-                        Message::BackendLoaded(revision, Box::new(result))
+                    return Task::perform(load_diff(repository, selection), move |result| {
+                        Message::DiffLoaded(revision, Box::new(result))
                     });
                 }
             }
@@ -354,6 +559,7 @@ impl Diffui {
                     return self.start_repository_snapshot();
                 }
             }
+            Message::LoadingTick => {}
             Message::SelectNextFile => {
                 if !self.document.files.is_empty() {
                     self.selected_file =
@@ -388,23 +594,54 @@ impl Diffui {
                 self.palette = None;
             }
             Message::PaletteQueryChanged(query) => {
-                let snapshot = self.clone_for_palette();
-                if let Some(state) = self.palette.as_mut()
-                    && let Some(column) = state.top_mut()
-                {
+                // Take the palette out of `self` so the matcher can borrow
+                // `&self` (commits / files / recents) directly. Previously
+                // this cloned the entire app per keystroke; on a 40k-commit
+                // repo that deep clone was the bulk of the typing latency.
+                let Some(mut state) = self.palette.take() else {
+                    return Task::none();
+                };
+                let depth = state.stack.len().saturating_sub(1);
+                let mut task = Task::none();
+                if let Some(column) = state.top_mut() {
                     column.query = query;
+                    column.dirty = true;
+                    column.query_version = column.query_version.wrapping_add(1);
+                    let version = column.query_version;
+                    // Debounce: the matcher scans every commit, so coalesce
+                    // fast typing rather than re-matching on each keystroke.
+                    task = Task::perform(
+                        async move {
+                            tokio::time::sleep(PALETTE_QUERY_DEBOUNCE).await;
+                            (depth, version)
+                        },
+                        |(depth, version)| Message::PaletteRecompute(depth, version),
+                    );
+                }
+                self.palette = Some(state);
+                return task;
+            }
+            Message::PaletteRecompute(depth, version) => {
+                let Some(mut state) = self.palette.take() else {
+                    return Task::none();
+                };
+                let mut task = Task::none();
+                if let Some(column) = state.stack.get_mut(depth)
+                    && column.query_version == version
+                {
                     column.selected = 0;
                     // Re-running the matcher invalidates row positions; jump
-                    // the scroll back to the top so the (newly selected)
-                    // first row is visible.
+                    // the scroll back to the top so the first row is visible.
                     column.scroll_y = 0.0;
-                    palette::recompute_matches(column, &snapshot);
-                    let depth = state.stack.len().saturating_sub(1);
-                    return widget::operation::scroll_to(
+                    column.dirty = false;
+                    palette::recompute_matches(column, self);
+                    task = widget::operation::scroll_to(
                         palette::results_scrollable_id(depth),
                         iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
                     );
                 }
+                self.palette = Some(state);
+                return task;
             }
             Message::PaletteMoveSelection(delta) => {
                 if let Some(state) = self.palette.as_mut()
@@ -448,10 +685,12 @@ impl Diffui {
                 return self.palette_accept_current();
             }
             Message::PalettePushActions => {
-                let snapshot = self.clone_for_palette();
-                if let Some(state) = self.palette.as_mut()
-                    && state.push_actions(&snapshot)
-                {
+                let Some(mut state) = self.palette.take() else {
+                    return Task::none();
+                };
+                let pushed = state.push_actions(self);
+                self.palette = Some(state);
+                if pushed {
                     return widget::operation::focus(palette::PALETTE_INPUT_ID);
                 }
             }
@@ -565,15 +804,6 @@ impl Diffui {
         state.scroll_token = state.scroll_token.wrapping_add(1);
     }
 
-    /// `recompute_matches` and `push_actions` need a `&Diffui` to read
-    /// `commits`, `document`, and `recents`. Cloning the whole app for that
-    /// is wasteful but it's bounded (commits + diff are already in memory)
-    /// and avoids splitting borrows across the palette state and the rest
-    /// of the struct.
-    fn clone_for_palette(&self) -> Diffui {
-        self.clone()
-    }
-
     /// Execute the highlighted result in the rightmost column. Returns the
     /// `Task` chain that performs the corresponding action plus any
     /// followup state (closing the palette, focusing input, etc.).
@@ -682,8 +912,8 @@ impl Diffui {
             }
             PaletteCommand::CopyCommitMessage => {
                 let payload = target.and_then(|t| commit_for_ref(self, &t)).map(|c| {
-                    if c.has_description {
-                        c.description.clone()
+                    if c.has_description() {
+                        c.description().to_owned()
                     } else {
                         String::new()
                     }
@@ -696,7 +926,7 @@ impl Diffui {
             PaletteCommand::CopyAuthor => {
                 let payload = target
                     .and_then(|t| commit_for_ref(self, &t))
-                    .map(|c| c.author.clone());
+                    .map(|c| c.author().to_owned());
                 payload
                     .filter(|s| !s.is_empty())
                     .map(|t| Task::done(Message::CopyToClipboard(t)))
@@ -741,11 +971,12 @@ impl Diffui {
             return Task::none();
         };
         self.pending_revision = Some(selection.clone());
+        self.loading_since = Some(Instant::now());
         // Deferred bump — see comment on `pending_revision_reveal`.
         self.pending_revision_reveal = true;
         let revision = selection.clone();
-        Task::perform(load_backend(repository, selection), move |result| {
-            Message::BackendLoaded(revision.clone(), Box::new(result))
+        Task::perform(load_diff(repository, selection), move |result| {
+            Message::DiffLoaded(revision.clone(), Box::new(result))
         })
     }
 
@@ -770,15 +1001,122 @@ impl Diffui {
         })
     }
 
+    /// Resolve the merge/root commits the loader left with unknown empty
+    /// status: apply any cached results immediately, and spawn a background
+    /// task for the rest (single-parent commits were already decided cheaply
+    /// during load).
+    fn resolve_empty_status(&mut self) -> Task<Message> {
+        let Some(repository) = self.repository.clone() else {
+            return Task::none();
+        };
+
+        // Each background resolution is an ~8ms parent-tree merge, so on a
+        // repo with hundreds of thousands of merge commits (nixpkgs) computing
+        // them all would burn tens of minutes of CPU. Cap how many we resolve
+        // per load; beyond that, merges simply keep no "empty" chip. Cached
+        // results still apply to every row, so this only bounds *new* work.
+        const EMPTY_STATUS_LIMIT: usize = 5_000;
+
+        let mut cached_updates = Vec::new();
+        let mut targets = Vec::new();
+        for (index, row) in self.commits.iter().enumerate() {
+            if row.is_empty().is_some() {
+                continue;
+            }
+            match self.empty_cache.get(row.commit_id()) {
+                Some(&empty) => cached_updates.push((index, empty)),
+                None if targets.len() < EMPTY_STATUS_LIMIT => {
+                    targets.push((index, row.commit_id().to_owned()))
+                }
+                None => {}
+            }
+        }
+
+        let had_cached = !cached_updates.is_empty();
+        for (index, empty) in cached_updates {
+            self.commits.set_is_empty(index, empty);
+        }
+        if had_cached {
+            self.commits_version = self.commits_version.wrapping_add(1);
+        }
+
+        if targets.is_empty() {
+            return Task::none();
+        }
+
+        let version = self.commits_version;
+        Task::perform(compute_empty_status(repository, targets), move |updates| {
+            Message::EmptyStatusComputed(version, updates)
+        })
+    }
+
+    /// Recompute the per-row sidebar index (lane fold, shortest-unique-prefix
+    /// lengths, selected-row index) after the commit graph changes. O(n) once
+    /// per graph load, so the per-frame `view()` stays O(visible rows).
+    fn rebuild_sidebar_index(&mut self) {
+        self.sidebar_lane_data = Rc::new(sidebar::compute_lane_fold(&self.commits));
+        self.sidebar_prefix_lens = Rc::new(sidebar::shortest_unique_prefix_lens(&self.commits));
+        self.selected_commit_index = self.find_selected_commit_index();
+    }
+
+    fn find_selected_commit_index(&self) -> Option<usize> {
+        match &self.selected_revision {
+            RevisionSelection::WorkingCopy => {
+                self.commits.iter().position(|row| row.is_working_copy())
+            }
+            RevisionSelection::Commit(id) => self
+                .commits
+                .iter()
+                .position(|row| !row.is_working_copy() && id == row.commit_id()),
+        }
+    }
+
     fn view(&self) -> Element<'_, Message> {
         let theme = self.resolved_theme().spec();
-        let panels = row![
-            sidebar::build_sidebar(self, theme),
-            vertical_divider(theme),
-            diff_panel::build_diff_panel(self, theme),
-        ]
-        .spacing(0)
-        .height(Length::Fill);
+
+        // A loading indicator appears only after a short grace period, so
+        // quick loads don't flash one. `dots` animates a simple ellipsis.
+        let loading_visible = self
+            .loading_since
+            .is_some_and(|since| since.elapsed() >= Duration::from_millis(500));
+        let dots = self
+            .loading_since
+            .map_or(0, |since| (since.elapsed().as_millis() / 350 % 4) as usize);
+
+        // Startup: nothing to render behind a spinner yet, so the progress
+        // indicator takes over the whole window.
+        if loading_visible && matches!(self.status, LoadStatus::Loading) {
+            let body = loading_indicator(
+                format!("Loading repository{}", ".".repeat(dots)),
+                Some(self.commit_progress.snapshot()),
+                theme,
+            );
+            return container(body)
+                .height(Length::Fill)
+                .width(Length::Fill)
+                .style(move |_| app_shell_style(theme))
+                .into();
+        }
+
+        // The sidebar builds rows on demand from the precomputed per-row index
+        // (lane fold + prefix lengths), so constructing it each frame is
+        // O(visible rows) — no memoization needed.
+        let sidebar = sidebar::build_sidebar(self, theme);
+
+        // A revision's diff is loading: swap just the diff pane for an
+        // indicator, leaving the commit graph and selection in place.
+        let diff_pane: Element<'_, Message> = if loading_visible
+            && self.pending_revision.is_some()
+            && matches!(self.status, LoadStatus::Loaded)
+        {
+            loading_indicator(format!("Loading diff{}", ".".repeat(dots)), None, theme)
+        } else {
+            diff_panel::build_diff_panel(self, theme)
+        };
+
+        let panels = row![sidebar, vertical_divider(theme), diff_pane]
+            .spacing(0)
+            .height(Length::Fill);
         let resize_overlay = ResizeHandle::new(
             self.sidebar_width,
             self.sidebar_min_width,
@@ -913,10 +1251,15 @@ impl Diffui {
             Event::Window(window::Event::Unfocused) => Some(Message::WindowFocusChanged(false)),
             _ => None,
         });
-        let refresh = if self.app_focused {
-            time::every(REPOSITORY_REFRESH_INTERVAL).map(|_| Message::RefreshRepository)
-        } else {
-            Subscription::none()
+        // Watch the working tree for changes instead of polling. The
+        // subscription identity is keyed on the repo root, so the watcher
+        // starts once and persists; `RefreshRepository` itself is gated on
+        // focus, so edits made while unfocused are picked up on focus-regain.
+        let refresh = match &self.repository {
+            Some(repository) => {
+                Subscription::run_with(repository.root.clone(), watch_repository)
+            }
+            None => Subscription::none(),
         };
 
         // Per-frame ticks during a palette push/pop animation. iced's
@@ -936,11 +1279,20 @@ impl Diffui {
             Subscription::none()
         };
 
+        // While a load is in flight, tick so the loading indicator can cross
+        // its grace period, animate, and reflect live commit-load progress.
+        let loading_tick = if self.loading_since.is_some() {
+            time::every(Duration::from_millis(120)).map(|_| Message::LoadingTick)
+        } else {
+            Subscription::none()
+        };
+
         Subscription::batch([
             keyboard,
             focus,
             refresh,
             palette_tick,
+            loading_tick,
             system::theme_changes().map(Message::SystemThemeChanged),
         ])
     }
@@ -956,14 +1308,14 @@ fn scroll_sidebar_to_file(_file_index: usize, _ui: &Diffui) -> Task<Message> {
     Task::none()
 }
 
-fn commit_for_ref<'a>(ui: &'a Diffui, item: &ResultRef) -> Option<&'a CommitSummary> {
+fn commit_for_ref<'a>(ui: &'a Diffui, item: &ResultRef) -> Option<RowView<'a>> {
     match item {
-        ResultRef::Commit(id) => ui.commits.iter().find(|c| &c.change_id == id),
+        ResultRef::Commit(id) => ui.commits.find_by_change_id(id),
         ResultRef::Bookmark(name) => ui
             .commits
             .iter()
-            .find(|c| c.bookmarks.iter().any(|b| b == name)),
-        ResultRef::WorkingCopy => ui.commits.iter().find(|c| c.is_working_copy),
+            .find(|c| c.bookmarks().iter().any(|b| b == name)),
+        ResultRef::WorkingCopy => ui.commits.working_copy(),
         _ => None,
     }
 }
@@ -997,4 +1349,118 @@ fn current_file_diff_text(ui: &Diffui) -> Option<String> {
         }
     }
     Some(out)
+}
+
+/// Filesystem-watch subscription: emits `RefreshRepository` (debounced) when
+/// the working tree changes. Replaces the old fixed-interval poll — between
+/// edits there is zero work, and the off-thread snapshot only runs when files
+/// actually change.
+///
+/// `.git` / `.jj` are deliberately not treated as relevant: watching them
+/// would feed our own snapshot's writes back as events (a refresh loop) and
+/// bury real edits under VCS-internal churn. External VCS operations surface
+/// through window focus-regain instead.
+// `&PathBuf` (not `&Path`) is required: `Subscription::run_with` keys on
+// `D = PathBuf` and hands the builder a `fn(&D)`.
+#[allow(clippy::ptr_arg)]
+fn watch_repository(root: &PathBuf) -> Pin<Box<dyn Stream<Item = Message> + Send>> {
+    let root = root.clone();
+    iced::stream::channel(
+        8,
+        async move |mut output: futures::channel::mpsc::Sender<Message>| {
+            // notify's handler runs on its own thread; bridge it to this async
+            // task over an unbounded channel so the handler never blocks.
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+            let watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
+                if let Ok(event) = result
+                    && !matches!(event.kind, notify::EventKind::Access(_))
+                    && event_touches_worktree(&event)
+                {
+                    let _ = tx.send(());
+                }
+            });
+            let mut watcher = match watcher {
+                Ok(watcher) => watcher,
+                Err(error) => {
+                    eprintln!("diffui: filesystem watcher unavailable, auto-refresh disabled: {error}");
+                    return;
+                }
+            };
+            if let Err(error) = watcher.watch(&root, notify::RecursiveMode::Recursive) {
+                eprintln!(
+                    "diffui: failed to watch {}, auto-refresh disabled: {error}",
+                    root.display()
+                );
+                return;
+            }
+
+            // Coalesce bursts: wait for an event, then keep draining until the
+            // tree goes quiet for `WATCH_DEBOUNCE`, then emit a single refresh.
+            while rx.recv().await.is_some() {
+                while tokio::time::timeout(WATCH_DEBOUNCE, rx.recv())
+                    .await
+                    .is_ok()
+                {}
+                if output.send(Message::RefreshRepository).await.is_err() {
+                    break;
+                }
+            }
+
+            // Hold the watcher for the lifetime of the stream.
+            drop(watcher);
+        },
+    )
+    .boxed()
+}
+
+/// Whether any path in `event` lies outside `.git` / `.jj` — i.e. it's a
+/// working-tree change we should refresh on, rather than VCS-internal churn.
+fn event_touches_worktree(event: &notify::Event) -> bool {
+    event.paths.iter().any(|path| {
+        !path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::Normal(name) if name == ".git" || name == ".jj"
+            )
+        })
+    })
+}
+
+/// Centered loading indicator. With a known total it renders a determinate
+/// bar plus a commit count; otherwise just the (caller-animated) label.
+fn loading_indicator(
+    label: String,
+    progress: Option<(usize, usize)>,
+    theme: ThemeSpec,
+) -> Element<'static, Message> {
+    let mut body = column![text(label).size(16).color(theme.text)]
+        .spacing(12)
+        .align_x(alignment::Horizontal::Center);
+
+    if let Some((loaded, total)) = progress {
+        if total > 0 {
+            body = body
+                .push(
+                    progress_bar(0.0..=total as f32, loaded as f32)
+                        .length(Length::Fixed(240.0))
+                        .girth(Length::Fixed(6.0)),
+                )
+                .push(
+                    text(format!("{loaded} / {total} commits"))
+                        .size(12)
+                        .color(theme.muted_text),
+                );
+        } else if loaded > 0 {
+            body = body.push(
+                text(format!("{loaded} commits"))
+                    .size(12)
+                    .color(theme.muted_text),
+            );
+        }
+    }
+
+    container(body)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .into()
 }
