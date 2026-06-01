@@ -664,15 +664,22 @@ impl Diffui {
                 {
                     match origin {
                         RefreshOrigin::Watcher => {
-                            // A working-tree edit only moved @'s tree — the graph
-                            // is unchanged, so skip the (up to ~1M-commit)
-                            // re-walk. Record the new fingerprint, and reload @'s
-                            // diff only if it's on screen (the wc snapshot already
-                            // ran in `load_repository_snapshot`, so `load_diff`
-                            // sees the edit; the `DiffLoaded` handler also
-                            // re-syncs @'s empty chip). Viewing another commit ⇒
-                            // its diff is unchanged, nothing to reload.
-                            self.repository_snapshot = Some(snapshot);
+                            // A working-tree edit moved @'s tree but not the
+                            // graph, so skip the (up to ~1M-commit) re-walk and
+                            // just reload @'s diff if it's on screen (the wc
+                            // snapshot already ran in `load_repository_snapshot`,
+                            // so `load_diff` sees the edit; `DiffLoaded` re-syncs
+                            // @'s empty chip). Viewing another commit ⇒ its diff
+                            // is unchanged, nothing to reload.
+                            //
+                            // We deliberately do NOT advance `repository_snapshot`
+                            // here: it tracks the op the *graph* reflects, and a
+                            // lightweight reload didn't re-walk. Recording the new
+                            // op would make a later focus-regain compare equal and
+                            // skip its full reload — so an external `jj git
+                            // fetch`/rebase that landed between edits would never
+                            // appear. Leaving it stale lets the next focus (origin
+                            // `Focus`) re-walk and reconcile topology.
                             if matches!(self.selected_revision, RevisionSelection::WorkingCopy) {
                                 let revision = self.selected_revision.clone();
                                 self.pending_revision = Some(revision.clone());
