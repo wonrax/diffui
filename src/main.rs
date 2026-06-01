@@ -1633,44 +1633,29 @@ fn stream_jj_initial_load(
             let worker = tokio::task::spawn_blocking(move || {
                 let handle = tokio::runtime::Handle::current();
                 handle.block_on(async move {
-                    // Snapshot first so the graph + diff reflect on-disk state —
-                    // a jj-cli edit landing between load and here would
-                    // otherwise show a stale working copy.
-                    let snapshot =
-                        match crate::jj::load_jj_repository_snapshot(repository.clone()).await {
-                            Ok(snapshot) => snapshot,
-                            Err(error) => {
-                                let _ = tx.send(Message::CommitsFinished(
-                                    version,
-                                    Box::new(Err(format!("{error:#}"))),
-                                ));
-                                return;
-                            }
-                        };
-
-                    // The working-copy diff is fast; load it up front so it's
-                    // ready to show the moment the first commit batch lifts the
-                    // loading screen (this message doesn't lift it itself).
-                    let diff = crate::jj::load_jj_diff(
-                        repository.clone(),
-                        RevisionSelection::WorkingCopy,
-                    )
-                    .await
-                    .map_err(|error| format!("{error:#}"));
-                    let _ = tx.send(Message::InitialDiff(version, Box::new(diff)));
-
+                    // `load_jj_cold` snapshots the working copy first (so the
+                    // graph + diff reflect on-disk state), then reuses that one
+                    // loaded repo for the diff + walk. `emit_diff` fires the
+                    // working-copy diff (this doesn't lift the loading screen —
+                    // the first `CommitsBatch` does); `emit_batch` fires per
+                    // commit batch.
+                    let tx_diff = tx.clone();
+                    let mut emit_diff = move |diff| {
+                        let _ = tx_diff.send(Message::InitialDiff(version, Box::new(diff)));
+                    };
                     let tx_batches = tx.clone();
-                    let mut emit = move |batch: Vec<StreamRow>| {
+                    let mut emit_batch = move |batch: Vec<StreamRow>| {
                         let _ = tx_batches.send(Message::CommitsBatch(version, batch));
                     };
-                    let finished = crate::jj::walk_jj_commits(
-                        repository.root.clone(),
+                    let finished = crate::jj::load_jj_cold(
+                        repository,
                         progress,
                         COMMIT_BATCH_SIZE,
-                        &mut emit,
+                        &mut emit_diff,
+                        &mut emit_batch,
                     )
                     .await
-                    .map(|empty_updates| CommitsTail {
+                    .map(|(snapshot, empty_updates)| CommitsTail {
                         snapshot,
                         empty_updates,
                     })

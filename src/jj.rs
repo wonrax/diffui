@@ -27,7 +27,7 @@ use jj_lib::{
     matchers::{EverythingMatcher, Matcher, NothingMatcher, PrefixMatcher},
     merge::{Diff, Merge, SameChange},
     object_id::ObjectId,
-    repo::{Repo, StoreFactories},
+    repo::{ReadonlyRepo, Repo, StoreFactories},
     repo_path::{RepoPath, RepoPathBuf, RepoPathUiConverter},
     revset::{RevsetExpression, SymbolResolver},
     settings::{HumanByteSize, UserSettings},
@@ -93,21 +93,34 @@ pub async fn walk_jj_commits(
         .get_wc_commit_id(workspace_name)
         .context("jj workspace has no working-copy commit")?
         .clone();
+    walk_jj_with_repo(repo.as_ref(), &wc_commit_id, progress, batch_size, emit).await
+}
 
+/// The graph-walk half of [`walk_jj_commits`], given an already-loaded repo and
+/// its working-copy commit id. Split out so the cold streaming load
+/// ([`load_jj_cold`]) reuses the repo it loaded for the snapshot instead of
+/// reading the (large) commit index a second time.
+pub async fn walk_jj_with_repo(
+    repo: &ReadonlyRepo,
+    wc_commit_id: &CommitId,
+    progress: LoadProgress,
+    batch_size: usize,
+    emit: &mut dyn FnMut(Vec<StreamRow>),
+) -> Result<Vec<(usize, bool)>> {
     // Default revset: `all()` — ancestors of every visible head plus any
     // referenced commit. Covers the working copy, all local bookmarks,
     // and tracked/untracked remote bookmarks, so branches that haven't
     // been merged into the WC still show up in the graph.
     let expr = RevsetExpression::all();
     let symbol_resolver = SymbolResolver::new(
-        repo.as_ref(),
+        repo,
         &[] as &[Box<dyn jj_lib::revset::SymbolResolverExtension>],
     );
     let resolved = expr
-        .resolve_user_expression(repo.as_ref(), &symbol_resolver)
+        .resolve_user_expression(repo, &symbol_resolver)
         .context("failed to resolve jj revset")?;
     let revset = resolved
-        .evaluate(repo.as_ref())
+        .evaluate(repo)
         .context("failed to evaluate jj revset")?;
 
     // Index bookmarks by commit id once so the per-commit loop below is a
@@ -181,7 +194,7 @@ pub async fn walk_jj_commits(
                 has_description: !description.is_empty(),
                 is_empty: None,
                 has_conflict: commit.has_conflict(),
-                is_working_copy: id == wc_commit_id,
+                is_working_copy: id == *wc_commit_id,
                 bookmarks,
             };
             ids.push(id);
@@ -240,6 +253,39 @@ pub async fn load_jj_commits(
         store.set_is_empty(index, empty);
     }
     Ok((store, graph))
+}
+
+/// The working-copy diff (or a stringified error) handed to `load_jj_cold`'s
+/// `emit_diff` callback — i.e. what becomes a `Message::InitialDiff`.
+pub type ColdDiffResult = Result<(DiffDocument, Option<RevisionDetails>), String>;
+
+/// Cold streaming load for a jj repo: snapshot the working copy, then run the
+/// working-copy diff and the graph walk **reusing the snapshot's repo**, so the
+/// (large) commit index is read once instead of three times — that triple
+/// `load_at_head` was the dominant floor before first paint on a 1M-commit repo.
+///
+/// `emit_diff` fires once with the working-copy diff (cheap now that the repo is
+/// already loaded); `emit_batch` fires per commit batch. Returns the snapshot
+/// fingerprint + single-parent emptiness for the load's tail.
+pub async fn load_jj_cold(
+    repository: Repository,
+    progress: LoadProgress,
+    batch_size: usize,
+    emit_diff: &mut dyn FnMut(ColdDiffResult),
+    emit_batch: &mut dyn FnMut(Vec<StreamRow>),
+) -> Result<(RepositorySnapshot, Vec<(usize, bool)>)> {
+    let (snapshot, repo, wc_commit_id) = load_jj_repository_snapshot(repository.clone()).await?;
+
+    // Emit the working-copy diff up front so the diff pane is ready the moment
+    // the first commit batch lifts the loading screen.
+    let diff = diff_jj_with_repo(repo.as_ref(), &wc_commit_id, &repository)
+        .await
+        .map_err(|error| format!("{error:#}"));
+    emit_diff(diff);
+
+    let empty_updates =
+        walk_jj_with_repo(repo.as_ref(), &wc_commit_id, progress, batch_size, emit_batch).await?;
+    Ok((snapshot, empty_updates))
 }
 
 /// Resolve the empty status of specific commits (the merges/roots the loader
@@ -308,18 +354,29 @@ pub async fn load_jj_diff(
         RevisionSelection::Commit(revision) => CommitId::try_from_hex(&revision)
             .with_context(|| format!("invalid jj commit id {revision}"))?,
     };
+    diff_jj_with_repo(repo.as_ref(), &commit_id, &repository).await
+}
+
+/// The diff half of [`load_jj_diff`], given an already-loaded repo. Split out so
+/// the cold streaming load ([`load_jj_cold`]) reuses the snapshot's repo for the
+/// working-copy diff instead of reading the index again.
+async fn diff_jj_with_repo(
+    repo: &ReadonlyRepo,
+    commit_id: &CommitId,
+    repository: &Repository,
+) -> Result<(DiffDocument, Option<RevisionDetails>)> {
     let commit = repo
         .store()
-        .get_commit_async(&commit_id)
+        .get_commit_async(commit_id)
         .await
         .with_context(|| format!("failed to load jj commit {}", commit_id.hex()))?;
-    let details = jj_revision_details(repo.as_ref(), &commit);
+    let details = jj_revision_details(repo, &commit);
     let old_tree = commit
-        .parent_tree(repo.as_ref())
+        .parent_tree(repo)
         .await
         .with_context(|| format!("failed to load jj parent tree for {}", commit_id.hex()))?;
     let new_tree = commit.tree();
-    let matcher = repo_scope_matcher(&repository)?;
+    let matcher = repo_scope_matcher(repository)?;
     let copy_records = CopyRecords::default();
     let tree_diff = old_tree.diff_stream_with_copies(&new_tree, matcher.as_ref(), &copy_records);
     let labels = Diff::new(old_tree.labels(), new_tree.labels());
@@ -463,7 +520,14 @@ pub async fn load_jj_diff(
     ))
 }
 
-pub async fn load_jj_repository_snapshot(repository: Repository) -> Result<RepositorySnapshot> {
+/// Snapshot the working copy, returning the fingerprint plus the post-snapshot
+/// repo and working-copy commit id. The cold streaming load ([`load_jj_cold`])
+/// reuses that repo for the diff + graph walk so it reads the commit index once
+/// instead of three times; the refresh path ([`run_repository_snapshot`]) drops
+/// the repo and keeps only the fingerprint.
+pub async fn load_jj_repository_snapshot(
+    repository: Repository,
+) -> Result<(RepositorySnapshot, Arc<ReadonlyRepo>, CommitId)> {
     let settings = jj_settings(&repository.root)?;
     let mut workspace = Workspace::load(
         &settings,
@@ -525,10 +589,12 @@ pub async fn load_jj_repository_snapshot(repository: Repository) -> Result<Repos
 
     if new_tree.tree_ids_and_labels() == old_tree.tree_ids_and_labels() {
         // No file changes: drop the lock without writing an op. This is the
-        // common case on idle ticks and keeps `jj op log` clean.
-        return Ok(RepositorySnapshot {
+        // common case on idle ticks and keeps `jj op log` clean. `base_repo` is
+        // already at the post-snapshot head, so hand it back for reuse.
+        let snapshot = RepositorySnapshot {
             fingerprint: base_repo.op_id().hex(),
-        });
+        };
+        return Ok((snapshot, base_repo, wc_commit_id));
     }
 
     let mut tx = base_repo.start_transaction();
@@ -549,6 +615,7 @@ pub async fn load_jj_repository_snapshot(repository: Repository) -> Result<Repos
         .rebase_descendants()
         .await
         .context("failed to rebase descendants after jj snapshot")?;
+    let new_wc_commit_id = new_commit.id().clone();
     let new_repo = tx
         .commit("snapshot working copy")
         .await
@@ -559,9 +626,10 @@ pub async fn load_jj_repository_snapshot(repository: Repository) -> Result<Repos
         .await
         .context("failed to finish jj working-copy mutation")?;
 
-    Ok(RepositorySnapshot {
+    let snapshot = RepositorySnapshot {
         fingerprint: new_op_id.hex(),
-    })
+    };
+    Ok((snapshot, new_repo, new_wc_commit_id))
 }
 
 fn jj_revision_details(repo: &dyn Repo, commit: &jj_lib::commit::Commit) -> RevisionDetails {

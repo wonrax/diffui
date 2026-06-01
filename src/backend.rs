@@ -561,7 +561,11 @@ async fn run_repository_snapshot(repository: Repository) -> Result<RepositorySna
         Vcs::Jj => {
             let handle = tokio::runtime::Handle::current();
             tokio::task::spawn_blocking(move || {
-                handle.block_on(crate::jj::load_jj_repository_snapshot(repository))
+                // Drop the returned repo + wc id; the refresh path only needs
+                // the fingerprint (the cold path keeps the repo for reuse).
+                handle
+                    .block_on(crate::jj::load_jj_repository_snapshot(repository))
+                    .map(|(snapshot, _repo, _wc_commit_id)| snapshot)
             })
             .await
             .context("jj repository snapshot task failed")?
