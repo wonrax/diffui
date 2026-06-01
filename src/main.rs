@@ -236,6 +236,19 @@ pub(crate) enum LoadStatus {
     Failed(String),
 }
 
+/// What triggered a repository refresh — decides how much we reload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefreshOrigin {
+    /// The filesystem watcher (a working-tree file edit). It ignores `.jj`/
+    /// `.git`, so the change is always a working-copy tree edit — topology is
+    /// unchanged, so we skip the full graph re-walk and just reload the diff.
+    Watcher,
+    /// Focus regain or a manual "Refresh repository" command. These can follow
+    /// an external jj op (rebase, new, bookmark move) that *did* change
+    /// topology, so they do the full reload.
+    Focus,
+}
+
 /// Carries the transient builder state of a streaming cold load across the
 /// `CommitsBatch` messages: the author interner and the lane fold, which both
 /// must persist between batches as rows append to `commits` / `graph`. The
@@ -274,7 +287,7 @@ pub(crate) enum Message {
         RevisionSelection,
         Box<Result<(DiffDocument, Option<RevisionDetails>), String>>,
     ),
-    RepositorySnapshotLoaded(Result<RepositorySnapshot, String>),
+    RepositorySnapshotLoaded(RefreshOrigin, Result<RepositorySnapshot, String>),
     /// Background-resolved empty status for the merge/root commits the loader
     /// left unknown, tagged with the `commits_version` it was computed against
     /// so results from a superseded load are dropped.
@@ -599,6 +612,13 @@ impl Diffui {
                         return Task::none();
                     }
 
+                    // A working-copy diff is the definitive emptiness signal for
+                    // @ (files present ⇒ not empty) — capture it before
+                    // `document` moves so a watcher-refresh edit toggles the @
+                    // "empty" chip without a graph re-walk.
+                    let wc_empty = matches!(revision, RevisionSelection::WorkingCopy)
+                        .then(|| document.files.is_empty());
+
                     let revision_changed = self.selected_revision != revision;
                     self.selected_revision = revision;
                     self.pending_revision = None;
@@ -609,6 +629,12 @@ impl Diffui {
                     // The graph is unchanged on a diff-only load; just relocate
                     // the selected row.
                     self.selected_commit_index = self.find_selected_commit_index();
+                    if let Some(empty) = wc_empty
+                        && let Some(index) = self.selected_commit_index
+                    {
+                        self.commits.set_is_empty(index, empty);
+                        self.commits_version = self.commits_version.wrapping_add(1);
+                    }
                     self.selected_file = if revision_changed {
                         0
                     } else {
@@ -630,24 +656,51 @@ impl Diffui {
                     self.status = LoadStatus::Failed(error);
                 }
             },
-            Message::RepositorySnapshotLoaded(Ok(snapshot)) => {
+            Message::RepositorySnapshotLoaded(origin, Ok(snapshot)) => {
                 self.snapshot_pending = false;
                 if self.repository_snapshot.as_ref() != Some(&snapshot)
                     && self.pending_revision.is_none()
                     && let Some(repository) = self.repository.clone()
                 {
-                    let revision = self.selected_revision.clone();
-                    self.pending_revision = Some(revision.clone());
-                    self.loading_since = Some(Instant::now());
-                    let progress = LoadProgress::default();
-                    self.commit_progress = progress.clone();
-                    return Task::perform(
-                        load_backend(repository, revision.clone(), progress),
-                        move |result| Message::BackendLoaded(revision, Box::new(result)),
-                    );
+                    match origin {
+                        RefreshOrigin::Watcher => {
+                            // A working-tree edit only moved @'s tree — the graph
+                            // is unchanged, so skip the (up to ~1M-commit)
+                            // re-walk. Record the new fingerprint, and reload @'s
+                            // diff only if it's on screen (the wc snapshot already
+                            // ran in `load_repository_snapshot`, so `load_diff`
+                            // sees the edit; the `DiffLoaded` handler also
+                            // re-syncs @'s empty chip). Viewing another commit ⇒
+                            // its diff is unchanged, nothing to reload.
+                            self.repository_snapshot = Some(snapshot);
+                            if matches!(self.selected_revision, RevisionSelection::WorkingCopy) {
+                                let revision = self.selected_revision.clone();
+                                self.pending_revision = Some(revision.clone());
+                                self.loading_since = Some(Instant::now());
+                                return Task::perform(
+                                    load_diff(repository, revision.clone()),
+                                    move |result| Message::DiffLoaded(revision, Box::new(result)),
+                                );
+                            }
+                        }
+                        RefreshOrigin::Focus => {
+                            // Focus regain / manual refresh can follow an external
+                            // jj op that changed topology — full reload. The
+                            // resulting `BackendLoaded` records the snapshot.
+                            let revision = self.selected_revision.clone();
+                            self.pending_revision = Some(revision.clone());
+                            self.loading_since = Some(Instant::now());
+                            let progress = LoadProgress::default();
+                            self.commit_progress = progress.clone();
+                            return Task::perform(
+                                load_backend(repository, revision.clone(), progress),
+                                move |result| Message::BackendLoaded(revision, Box::new(result)),
+                            );
+                        }
+                    }
                 }
             }
-            Message::RepositorySnapshotLoaded(Err(error)) => {
+            Message::RepositorySnapshotLoaded(_, Err(error)) => {
                 self.snapshot_pending = false;
                 self.status = LoadStatus::Failed(error);
             }
@@ -704,12 +757,12 @@ impl Diffui {
                 self.app_focused = focused;
 
                 if gained_focus {
-                    return self.start_repository_snapshot();
+                    return self.start_repository_snapshot(RefreshOrigin::Focus);
                 }
             }
             Message::RefreshRepository => {
                 if self.app_focused {
-                    return self.start_repository_snapshot();
+                    return self.start_repository_snapshot(RefreshOrigin::Watcher);
                 }
             }
             Message::LoadingTick => {}
@@ -1062,7 +1115,9 @@ impl Diffui {
         match cmd {
             PaletteCommand::RefreshRepository => {
                 if self.app_focused {
-                    return self.start_repository_snapshot();
+                    // Manual refresh = full reload (the user may have run an
+                    // external jj op since the last load).
+                    return self.start_repository_snapshot(RefreshOrigin::Focus);
                 }
                 Task::none()
             }
@@ -1180,7 +1235,7 @@ impl Diffui {
         }
     }
 
-    fn start_repository_snapshot(&mut self) -> Task<Message> {
+    fn start_repository_snapshot(&mut self, origin: RefreshOrigin) -> Task<Message> {
         // Don't refresh while a cold stream is still appending — a refresh
         // re-walks and swaps the graph wholesale, which would race the
         // in-flight batches. The stream finishes in seconds; refresh resumes
@@ -1194,8 +1249,8 @@ impl Diffui {
         };
 
         self.snapshot_pending = true;
-        Task::perform(load_repository_snapshot(repository), |result| {
-            Message::RepositorySnapshotLoaded(result.map_err(|error| format!("{error:#}")))
+        Task::perform(load_repository_snapshot(repository), move |result| {
+            Message::RepositorySnapshotLoaded(origin, result.map_err(|error| format!("{error:#}")))
         })
     }
 
