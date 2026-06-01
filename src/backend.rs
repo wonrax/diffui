@@ -158,6 +158,16 @@ impl CommitStore {
         (0..self.len()).map(move |index| RowView { store: self, index })
     }
 
+    /// Iterate only the rows that carry bookmarks, as `(row index, names)`.
+    /// Bookmarks are stored sparsely, so this is `O(#bookmarks)` — the palette
+    /// uses it to list branch candidates without scanning all ~1M commits per
+    /// keystroke. Order is unspecified (the caller sorts when it needs one).
+    pub fn bookmarked_rows(&self) -> impl Iterator<Item = (usize, &[String])> {
+        self.bookmarks
+            .iter()
+            .map(|(&index, names)| (index, names.as_slice()))
+    }
+
     pub fn find_by_change_id(&self, change_id: &str) -> Option<RowView<'_>> {
         self.iter().find(|row| row.change_id() == change_id)
     }

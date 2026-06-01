@@ -759,6 +759,9 @@ impl Diffui {
                 if let Some(column) = state.top_mut() {
                     column.query = query;
                     column.dirty = true;
+                    // Editing resets `:` commit-search back to its "press ⏎"
+                    // prompt (the prior results are for a stale query).
+                    column.searched = false;
                     column.query_version = column.query_version.wrapping_add(1);
                     let version = column.query_version;
                     // Debounce: the matcher scans every commit, so coalesce
@@ -787,7 +790,7 @@ impl Diffui {
                     // the scroll back to the top so the first row is visible.
                     column.scroll_y = 0.0;
                     column.dirty = false;
-                    palette::recompute_matches(column, self);
+                    palette::recompute_matches(column, self, false);
                     task = widget::operation::scroll_to(
                         palette::results_scrollable_id(depth),
                         iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
@@ -826,7 +829,7 @@ impl Diffui {
                 }
             }
             Message::PaletteAccept => {
-                return self.palette_accept_current();
+                return self.palette_submit();
             }
             Message::PaletteAcceptIndex(index) => {
                 if let Some(state) = self.palette.as_mut()
@@ -955,6 +958,44 @@ impl Diffui {
         let next = (current + delta).rem_euclid(len);
         state.active = Some(next as usize);
         state.scroll_token = state.scroll_token.wrapping_add(1);
+    }
+
+    /// Handle ⏎ in the palette. In `:` commit-search mode the all-commits scan
+    /// is deferred to here (too slow to run per keystroke on a 1M-commit repo):
+    /// the first ⏎ runs the scan and shows results; once searched, ⏎ accepts the
+    /// highlighted row like any other mode.
+    fn palette_submit(&mut self) -> Task<Message> {
+        let Some(mut state) = self.palette.take() else {
+            return Task::none();
+        };
+        let trigger_search = state.top().is_some_and(|column| {
+            matches!(column.source, ColumnSource::Root)
+                && !column.searched
+                && palette::revision_mode_needle(&column.query)
+                    .is_some_and(|needle| !needle.trim().is_empty())
+        });
+        if trigger_search {
+            let depth = state.stack.len().saturating_sub(1);
+            if let Some(column) = state.top_mut() {
+                column.searched = true;
+                column.dirty = false;
+                column.selected = 0;
+                column.scroll_y = 0.0;
+                // Invalidate the pending debounced recompute so it can't wipe
+                // the results we're about to compute.
+                column.query_version = column.query_version.wrapping_add(1);
+                // `self.palette` is `None` here (taken above), so this borrows
+                // `self` cleanly while mutating the detached column.
+                palette::recompute_matches(column, self, true);
+            }
+            self.palette = Some(state);
+            return widget::operation::scroll_to(
+                palette::results_scrollable_id(depth),
+                iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
+            );
+        }
+        self.palette = Some(state);
+        self.palette_accept_current()
     }
 
     /// Execute the highlighted result in the rightmost column. Returns the

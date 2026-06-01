@@ -147,6 +147,11 @@ pub struct PaletteColumn {
     /// True while a query edit is awaiting its debounced recompute — drives
     /// the palette's "searching…" hint.
     pub dirty: bool,
+    /// `:` commit-search only: whether the (deferred) commit scan has run for
+    /// the current query. The first ⏎ runs the scan and sets this; editing the
+    /// query resets it so the "press ⏎ to search" prompt comes back. Ignored in
+    /// other modes (they search live).
+    pub searched: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -446,6 +451,10 @@ enum Mode {
     Mixed,
     Commands,
     Files,
+    /// Commit search (`:` prefix). Scanning all commits is `O(#commits)` and
+    /// too slow to run per keystroke on a 1M-commit repo, so this mode defers
+    /// the scan to ⏎ (see `recompute_matches` / `Diffui::palette_submit`).
+    Revisions,
 }
 
 fn parse_query(raw: &str) -> (Mode, &str) {
@@ -453,8 +462,21 @@ fn parse_query(raw: &str) -> (Mode, &str) {
         (Mode::Commands, rest.trim_start())
     } else if let Some(rest) = raw.strip_prefix('@') {
         (Mode::Files, rest.trim_start())
+    } else if let Some(rest) = raw.strip_prefix(':') {
+        (Mode::Revisions, rest.trim_start())
     } else {
         (Mode::Mixed, raw)
+    }
+}
+
+/// The needle of a `:`-prefixed commit-search query, or `None` when the query
+/// isn't in commit-search mode. `Some("")` means the user typed `:` with no
+/// term yet. Lets `main.rs` and the results view branch on commit-search mode
+/// without exposing the private `Mode`.
+pub fn revision_mode_needle(query: &str) -> Option<&str> {
+    match parse_query(query) {
+        (Mode::Revisions, needle) => Some(needle),
+        _ => None,
     }
 }
 
@@ -499,8 +521,9 @@ impl PaletteState {
             scroll_y: 0.0,
             query_version: 0,
             dirty: false,
+            searched: false,
         };
-        recompute_matches(&mut column, ui);
+        recompute_matches(&mut column, ui, false);
         // The first column doesn't animate — it just appears. Push/pop
         // *between* columns is what justifies a transition; the
         // open-from-nothing case has no "from" state to slide out of, so
@@ -541,8 +564,9 @@ impl PaletteState {
             scroll_y: 0.0,
             query_version: 0,
             dirty: false,
+            searched: false,
         };
-        recompute_matches(&mut column, ui);
+        recompute_matches(&mut column, ui, false);
         self.stack.push(column);
         // Slide-in from the right: kick the offset out by one column
         // worth (so the new rightmost is initially off-center to the
@@ -580,7 +604,13 @@ impl PaletteState {
 }
 
 /// Re-run the fuzzy match against the column's current query.
-pub fn recompute_matches(column: &mut PaletteColumn, ui: &Diffui) {
+///
+/// `search_revisions` gates the expensive all-commits scan: the live
+/// (debounced) keystroke path passes `false` so commit search never runs per
+/// keystroke; the ⏎-triggered path (`Diffui::palette_submit`) passes `true`.
+/// In `:` (commit) mode with `false`, candidates stay empty and the results
+/// view shows the "press ⏎ to search" prompt. Other modes ignore the flag.
+pub fn recompute_matches(column: &mut PaletteColumn, ui: &Diffui, search_revisions: bool) {
     let (mode, needle) = parse_query(&column.query);
     let mut matcher = Matcher::new(Config::DEFAULT);
     let needle_utf32 = Utf32String::from(needle);
@@ -592,11 +622,14 @@ pub fn recompute_matches(column: &mut PaletteColumn, ui: &Diffui) {
                 push_command_candidates(&mut candidates);
             }
             if mode == Mode::Mixed {
-                push_revision_candidates(&mut candidates, ui);
+                // Commits are NOT searched here — that's `:` mode (below), kept
+                // off the keystroke path. Bookmarks/files stay live and cheap.
                 push_bookmark_candidates(&mut candidates, ui);
                 push_file_candidates(&mut candidates, ui);
             } else if mode == Mode::Files {
                 push_file_candidates(&mut candidates, ui);
+            } else if mode == Mode::Revisions && search_revisions {
+                push_revision_candidates(&mut candidates, ui);
             }
         }
         ColumnSource::Actions(target) => {
@@ -683,13 +716,19 @@ fn push_revision_candidates(out: &mut Vec<Candidate>, ui: &Diffui) {
 }
 
 fn push_bookmark_candidates(out: &mut Vec<Candidate>, ui: &Diffui) {
-    // Walk commits and emit one entry per bookmark. We deliberately
-    // include even bookmarks that are duplicates of the revision row's
-    // haystack — they get a category boost over the revision so an exact
-    // bookmark-name match floats to the top, which is what the user
-    // typically wants when typing "main" or a feature branch name.
-    for commit in ui.commits.iter() {
-        for bookmark in commit.bookmarks() {
+    // Emit one entry per bookmark. Bookmarks are sparse, so iterate the
+    // bookmark index directly (`O(#bookmarks)`) rather than scanning all ~1M
+    // commits — the latter is what made keystroke search 5fps. We deliberately
+    // include even bookmarks that duplicate a revision row's haystack: they get
+    // a category boost over the revision so an exact bookmark-name match floats
+    // to the top, which is what the user wants when typing "main" or a feature
+    // branch. Sorted by row so the empty-query order is stable (the index is a
+    // HashMap).
+    let mut rows: Vec<(usize, &[String])> = ui.commits.bookmarked_rows().collect();
+    rows.sort_by_key(|(index, _)| *index);
+    for (index, bookmarks) in rows {
+        let commit = ui.commits.row(index);
+        for bookmark in bookmarks {
             let mut haystack =
                 String::with_capacity(bookmark.len() + commit.description().len() + 8);
             haystack.push_str(bookmark);
@@ -901,7 +940,7 @@ fn build_input<'a>(
     is_focused: bool,
 ) -> Element<'a, Message> {
     let placeholder = match &column_state.source {
-        ColumnSource::Root => "Search revisions, files, commands  (>  @  prefixes)",
+        ColumnSource::Root => "Search bookmarks, files, commands  (>cmd  @file  :commit)",
         ColumnSource::Actions(_) => "Filter actions",
     };
 
@@ -956,12 +995,27 @@ fn build_results<'a>(
     column_state: &'a PaletteColumn,
     depth: usize,
 ) -> Element<'a, Message> {
-    if column_state.matches.is_empty() {
-        let label = if column_state.dirty {
-            "Searching…"
-        } else {
-            "No matches"
-        };
+    // `:` commit-search defers the all-commits scan to ⏎ — show a prompt until
+    // it runs, instead of an empty "No matches".
+    let revision_prompt = revision_mode_needle(&column_state.query)
+        .filter(|_| !column_state.searched)
+        .map(|needle| {
+            let needle = needle.trim();
+            if needle.is_empty() {
+                "Type a query, then press ⏎ to search commits".to_owned()
+            } else {
+                format!("Press ⏎ to search commits for “{needle}”")
+            }
+        });
+
+    if revision_prompt.is_some() || column_state.matches.is_empty() {
+        let label = revision_prompt.unwrap_or_else(|| {
+            if column_state.dirty {
+                "Searching…".to_owned()
+            } else {
+                "No matches".to_owned()
+            }
+        });
         let empty = container(
             text(label)
                 .size(13)
@@ -1287,5 +1341,31 @@ pub fn change_id_for_recents(item: &ResultRef, ui: &Diffui) -> Option<String> {
             .working_copy()
             .map(|c| c.change_id().to_owned()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_prefixes_select_modes() {
+        assert_eq!(parse_query("fix bug"), (Mode::Mixed, "fix bug"));
+        assert_eq!(parse_query(">refresh"), (Mode::Commands, "refresh"));
+        assert_eq!(parse_query("@main.rs"), (Mode::Files, "main.rs"));
+        assert_eq!(parse_query(":abc"), (Mode::Revisions, "abc"));
+        // The term after a prefix is left-trimmed.
+        assert_eq!(parse_query(":  spaced"), (Mode::Revisions, "spaced"));
+    }
+
+    #[test]
+    fn revision_mode_needle_only_fires_for_colon_prefix() {
+        assert_eq!(revision_mode_needle(":abc"), Some("abc"));
+        // Bare `:` is commit-search mode with an empty term (shows the prompt,
+        // doesn't trigger a scan).
+        assert_eq!(revision_mode_needle(":"), Some(""));
+        assert_eq!(revision_mode_needle("abc"), None);
+        assert_eq!(revision_mode_needle(">cmd"), None);
+        assert_eq!(revision_mode_needle("@file"), None);
     }
 }
