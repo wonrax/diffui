@@ -13,7 +13,7 @@ use arborium::{
 };
 
 pub use crate::diff_view::{DiffHunkView, DiffLine, DiffLineKind, SyntaxKind, SyntaxSpan};
-use crate::graph::LaneFrame;
+use crate::graph_layout::GraphLayout;
 use crate::repository::{Repository, RepositorySnapshot, Vcs};
 
 /// Shared, lock-free progress for a commit-graph load. The loader bumps these
@@ -92,7 +92,6 @@ pub struct CommitSummary {
     /// commits can't carry an unresolved conflict, so this stays `false`
     /// for the git backend).
     pub has_conflict: bool,
-    pub lane_frame: LaneFrame,
     pub is_working_copy: bool,
     /// Bookmarks pointing at this commit. Local bookmarks are bare
     /// names; remote-tracking ones are `name@remote`. Order matches
@@ -135,7 +134,6 @@ pub struct CommitStore {
     author_idx: Vec<u32>,
     shortest_change_id_len: Vec<u32>,
     flags: Vec<u8>,
-    lanes: Vec<LaneFrame>,
     bookmarks: HashMap<usize, Vec<String>>,
 }
 
@@ -191,7 +189,6 @@ impl CommitStore {
     #[cfg(feature = "track-alloc")]
     pub fn heap_bytes(&self) -> usize {
         use std::mem::size_of;
-        let edge = size_of::<Option<jj_lib::graph::GraphEdgeType>>();
         let mut total = self.text.capacity();
         total += self.spans.capacity() * size_of::<CommitSpans>();
         total += self.authors.capacity() * size_of::<Arc<str>>();
@@ -199,12 +196,6 @@ impl CommitStore {
         total += self.author_idx.capacity() * size_of::<u32>();
         total += self.shortest_change_id_len.capacity() * size_of::<u32>();
         total += self.flags.capacity();
-        total += self.lanes.capacity() * size_of::<LaneFrame>();
-        for frame in &self.lanes {
-            total += frame.before.capacity() * edge;
-            total += frame.after.capacity() * edge;
-            total += frame.merging_lanes.capacity() * size_of::<usize>();
-        }
         for names in self.bookmarks.values() {
             total += names.capacity() * size_of::<String>();
             total += names.iter().map(|name| name.capacity()).sum::<usize>();
@@ -270,10 +261,6 @@ impl<'a> RowView<'a> {
         self.flags() & commit_flags::IS_WORKING_COPY != 0
     }
 
-    pub fn lane_frame(&self) -> &'a LaneFrame {
-        &self.store.lanes[self.index]
-    }
-
     pub fn bookmarks(&self) -> &'a [String] {
         self.store
             .bookmarks
@@ -297,7 +284,6 @@ impl CommitStoreBuilder {
         store.author_idx.reserve(commits);
         store.shortest_change_id_len.reserve(commits);
         store.flags.reserve(commits);
-        store.lanes.reserve(commits);
         Self {
             store,
             author_interner: HashMap::new(),
@@ -339,8 +325,6 @@ impl CommitStoreBuilder {
             flags |= commit_flags::IS_WORKING_COPY;
         }
         self.store.flags.push(flags);
-
-        self.store.lanes.push(commit.lane_frame);
 
         if !commit.bookmarks.is_empty() {
             self.store.bookmarks.insert(index, commit.bookmarks);
@@ -403,6 +387,7 @@ impl DiffFileStatus {
 pub struct BackendOutput {
     pub document: DiffDocument,
     pub commits: CommitStore,
+    pub graph: GraphLayout,
     pub snapshot: RepositorySnapshot,
     pub details: Option<RevisionDetails>,
 }
@@ -447,12 +432,13 @@ async fn run_backend(
     // working-copy commit — e.g. `@` flagged "empty" while its diff actually
     // had changes — until the next refresh re-read it.
     let snapshot = run_repository_snapshot(repository.clone()).await?;
-    let commits = load_commits(&repository, &progress).await?;
+    let (commits, graph) = load_commits(&repository, &progress).await?;
     let (document, details) = run_diff(&repository, &revision).await?;
 
     Ok(BackendOutput {
         document,
         commits,
+        graph,
         snapshot,
         details,
     })
@@ -538,7 +524,10 @@ async fn run_repository_snapshot(repository: Repository) -> Result<RepositorySna
     }
 }
 
-async fn load_commits(repository: &Repository, progress: &LoadProgress) -> Result<CommitStore> {
+async fn load_commits(
+    repository: &Repository,
+    progress: &LoadProgress,
+) -> Result<(CommitStore, GraphLayout)> {
     match repository.vcs {
         Vcs::Jj => {
             let root = repository.root.clone();
@@ -554,13 +543,13 @@ async fn load_commits(repository: &Repository, progress: &LoadProgress) -> Resul
             // The git loader parses `git log` in one shot rather than
             // per-commit, so surface the count once it's known, then fold the
             // summaries into the compact store.
-            let commits = crate::git::load_git_commits(repository).await?;
+            let (commits, graph) = crate::git::load_git_commits(repository).await?;
             progress.set_total(commits.len());
             let mut builder = CommitStoreBuilder::with_capacity(commits.len());
             for commit in commits {
                 builder.push(commit);
             }
-            Ok(builder.finish())
+            Ok((builder.finish(), graph))
         }
     }
 }

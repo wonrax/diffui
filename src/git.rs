@@ -9,6 +9,7 @@ use crate::backend::{
     parse_unified_diff,
 };
 use crate::graph::assign_lanes;
+use crate::graph_layout::{GraphLayout, GraphLayoutBuilder};
 use crate::repository::{Repository, RepositorySnapshot};
 
 /// Sentinel commit_id used for the synthetic git working-copy row.
@@ -28,7 +29,9 @@ pub async fn load_git_diff(
     Ok((document, details))
 }
 
-pub async fn load_git_commits(repository: &Repository) -> Result<Vec<CommitSummary>> {
+pub async fn load_git_commits(
+    repository: &Repository,
+) -> Result<(Vec<CommitSummary>, GraphLayout)> {
     let output = run_command(
         &repository.root,
         "git",
@@ -256,7 +259,7 @@ fn parse_commit_log_rows(output: &str) -> Vec<ParsedCommitRow> {
         .collect()
 }
 
-fn build_commit_summaries(rows: Vec<ParsedCommitRow>) -> Vec<CommitSummary> {
+fn build_commit_summaries(rows: Vec<ParsedCommitRow>) -> (Vec<CommitSummary>, GraphLayout) {
     // Walk the rows in their existing topo order and assign lanes from
     // parent edges. Parents not present in the listing (shallow clone, etc.)
     // become Missing edges so the renderer can draw a stub.
@@ -278,9 +281,16 @@ fn build_commit_summaries(rows: Vec<ParsedCommitRow>) -> Vec<CommitSummary> {
     });
     let lane_frames = assign_lanes(lane_inputs);
 
-    rows.into_iter()
+    // Git carries no bookmarks, so the lane fold sees empty labels everywhere.
+    let mut graph_builder = GraphLayoutBuilder::new();
+    for frame in &lane_frames {
+        graph_builder.push(frame, &[]);
+    }
+
+    let summaries = rows
+        .into_iter()
         .zip(lane_frames)
-        .map(|(row, lane_frame)| CommitSummary {
+        .map(|(row, _frame)| CommitSummary {
             change_id: row.change_id,
             commit_id: row.commit_id,
             shortest_change_id_len: None,
@@ -289,11 +299,11 @@ fn build_commit_summaries(rows: Vec<ParsedCommitRow>) -> Vec<CommitSummary> {
             has_description: row.has_description,
             is_empty: row.is_empty,
             has_conflict: false,
-            lane_frame,
             is_working_copy: row.is_working_copy,
             bookmarks: Vec::new(),
         })
-        .collect()
+        .collect();
+    (summaries, graph_builder.finish())
 }
 
 fn parse_optional_bool(value: &str) -> Option<bool> {
@@ -311,7 +321,11 @@ mod tests {
     use std::path::PathBuf;
 
     fn parse_commit_log(output: &str) -> Vec<CommitSummary> {
-        build_commit_summaries(parse_commit_log_rows(output))
+        build_commit_summaries(parse_commit_log_rows(output)).0
+    }
+
+    fn parse_commit_log_graph(output: &str) -> GraphLayout {
+        build_commit_summaries(parse_commit_log_rows(output)).1
     }
 
     #[test]
@@ -370,30 +384,30 @@ mod tests {
         //   T - parent: A
         //   W - parent: A
         //   A - root, no parents
-        let commits = parse_commit_log(
+        let graph = parse_commit_log_graph(
             "M\tM\tT W\tme@example.com\tfalse\tmerge\n\
              T\tT\tA\tme@example.com\tfalse\ttrunk\n\
              W\tW\tA\tme@example.com\tfalse\tside\n\
              A\tA\t\tme@example.com\tfalse\troot\n",
         );
 
-        assert_eq!(commits.len(), 4);
-        assert_eq!(commits[0].lane_frame.node_lane, 0);
-        assert_eq!(commits[1].lane_frame.node_lane, 0);
+        assert_eq!(graph.len(), 4);
+        assert_eq!(graph.frame(0, usize::MAX).node_lane, 0);
+        assert_eq!(graph.frame(1, usize::MAX).node_lane, 0);
         // Second parent of the merge spawns a new lane to the right.
-        assert_eq!(commits[2].lane_frame.node_lane, 1);
+        assert_eq!(graph.frame(2, usize::MAX).node_lane, 1);
         // Both lanes converge back at A.
-        assert_eq!(commits[3].lane_frame.node_lane, 0);
-        assert_eq!(commits[3].lane_frame.merging_lanes, vec![0, 1]);
+        assert_eq!(graph.frame(3, usize::MAX).node_lane, 0);
+        assert_eq!(graph.frame(3, usize::MAX).merging_lanes, vec![0, 1]);
     }
 
     #[test]
     fn git_log_marks_unknown_parents_as_missing() {
         // Single commit whose parent isn't in the listing — e.g. a shallow clone.
-        let commits = parse_commit_log("abc\tabc\tdeadbeef\tme@example.com\tfalse\thead\n");
+        let graph = parse_commit_log_graph("abc\tabc\tdeadbeef\tme@example.com\tfalse\thead\n");
 
-        assert_eq!(commits.len(), 1);
-        assert_eq!(commits[0].lane_frame.missing_parents, 1);
-        assert!(commits[0].lane_frame.after.is_empty());
+        assert_eq!(graph.len(), 1);
+        assert_eq!(graph.frame(0, usize::MAX).missing_parents, 1);
+        assert!(graph.frame(0, usize::MAX).after.is_empty());
     }
 }

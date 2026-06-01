@@ -42,6 +42,7 @@ use crate::backend::{
     SignatureInfo, apply_syntax_highlighting, format_hunk_header,
 };
 use crate::graph::LaneAssigner;
+use crate::graph_layout::{GraphLayout, GraphLayoutBuilder};
 use crate::repository::{Repository, RepositorySnapshot};
 
 // Fallback used only when the user has not configured `snapshot.max-new-file-size`.
@@ -51,7 +52,7 @@ const DEFAULT_SNAPSHOT_MAX_NEW_FILE_SIZE: u64 = 1024 * 1024;
 pub async fn load_jj_commits(
     repository_root: PathBuf,
     progress: LoadProgress,
-) -> Result<CommitStore> {
+) -> Result<(CommitStore, GraphLayout)> {
     let settings = UserSettings::from_config(StackedConfig::with_defaults())
         .context("failed to load jj settings")?;
     let workspace = Workspace::load(
@@ -129,6 +130,7 @@ pub async fn load_jj_commits(
     let mut tree_ids: HashMap<CommitId, Merge<TreeId>> = HashMap::with_capacity(nodes.len());
     let mut single_parents: Vec<Option<CommitId>> = Vec::with_capacity(nodes.len());
     let mut lane_assigner = LaneAssigner::new();
+    let mut graph_builder = GraphLayoutBuilder::new();
     for (id, edges) in nodes.iter() {
         // Advance the lane state for every node in topo order. The assigner is
         // stateful, so this must run once per node — keep it first in the loop.
@@ -154,6 +156,7 @@ pub async fn load_jj_commits(
                 )
             })?;
         let bookmarks = bookmarks_by_commit.get(id).cloned().unwrap_or_default();
+        graph_builder.push(&lane_frame, &bookmarks);
         builder.push(CommitSummary {
             change_id: commit.change_id().to_string(),
             commit_id: id.hex(),
@@ -167,7 +170,6 @@ pub async fn load_jj_commits(
             has_description: !description.is_empty(),
             is_empty: None,
             has_conflict: commit.has_conflict(),
-            lane_frame,
             is_working_copy: id == &wc_commit_id,
             bookmarks,
         });
@@ -189,7 +191,7 @@ pub async fn load_jj_commits(
         }
     }
 
-    Ok(store)
+    Ok((store, graph_builder.finish()))
 }
 
 /// Resolve the empty status of specific commits (the merges/roots the loader
@@ -779,12 +781,15 @@ mod mem_profile {
         let baseline = CURRENT.load(Relaxed);
         PEAK.store(baseline, Relaxed);
 
-        let store = runtime
+        let (store, graph) = runtime
             .block_on(super::load_jj_commits(repo.clone().into(), progress))
             .expect("load commits");
 
         let peak = PEAK.load(Relaxed).saturating_sub(baseline);
         let live = CURRENT.load(Relaxed).saturating_sub(baseline);
+        // `store.heap_bytes()` no longer includes lanes (they moved to the
+        // `GraphLayout`); `live` (allocator current) still counts everything,
+        // including `graph`, so keep it alive until after we read the counters.
         let store_heap = store.heap_bytes();
         let n = store.len().max(1);
         let mb = |bytes: usize| bytes as f64 / 1.0e6;
@@ -806,7 +811,7 @@ mod mem_profile {
         );
         eprintln!("=============================================\n");
 
-        drop(store);
+        drop((store, graph));
     }
 }
 

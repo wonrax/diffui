@@ -13,6 +13,7 @@ mod diff_view;
 mod find;
 mod git;
 mod graph;
+mod graph_layout;
 mod graph_view;
 mod jj;
 mod palette;
@@ -204,7 +205,7 @@ pub(crate) struct Diffui {
     /// Per-row lane fold + shortest-unique-prefix lengths, recomputed only
     /// when the commit graph changes. The sidebar renders rows on demand from
     /// these, so it never materializes the whole (up to ~1M-row) list.
-    pub(crate) sidebar_lane_data: Rc<Vec<sidebar::RowLaneData>>,
+    pub(crate) graph: Rc<graph_layout::GraphLayout>,
     pub(crate) sidebar_prefix_lens: Rc<Vec<usize>>,
     /// Index of the selected commit in `commits` (drives the reveal-on-jump
     /// scroll and the expanded file-list span), recomputed on selection change
@@ -342,7 +343,7 @@ impl Diffui {
                         revision_reveal_token: 0,
                         pending_revision_reveal: false,
                         commits_version: 0,
-                        sidebar_lane_data: Rc::new(Vec::new()),
+                        graph: Rc::new(graph_layout::GraphLayout::default()),
                         sidebar_prefix_lens: Rc::new(Vec::new()),
                         selected_commit_index: None,
                         commit_progress,
@@ -377,7 +378,7 @@ impl Diffui {
                     revision_reveal_token: 0,
                     pending_revision_reveal: false,
                     commits_version: 0,
-                    sidebar_lane_data: Rc::new(Vec::new()),
+                    graph: Rc::new(graph_layout::GraphLayout::default()),
                     sidebar_prefix_lens: Rc::new(Vec::new()),
                     selected_commit_index: None,
                     commit_progress: LoadProgress::default(),
@@ -404,6 +405,7 @@ impl Diffui {
                     self.status = LoadStatus::Loaded;
                     self.document = output.document;
                     self.commits = output.commits;
+                    self.graph = Rc::new(output.graph);
                     self.commits_version = self.commits_version.wrapping_add(1);
                     self.repository_snapshot = Some(output.snapshot);
                     self.revision_details = output.details;
@@ -1054,7 +1056,9 @@ impl Diffui {
     /// lengths, selected-row index) after the commit graph changes. O(n) once
     /// per graph load, so the per-frame `view()` stays O(visible rows).
     fn rebuild_sidebar_index(&mut self) {
-        self.sidebar_lane_data = Rc::new(sidebar::compute_lane_fold(&self.commits));
+        // The compact lane store (`graph`) is built by the loader and assigned
+        // from `BackendOutput` in the `BackendLoaded` handler; here we only
+        // refresh the cheap per-row indices that depend on the commit list.
         self.sidebar_prefix_lens = Rc::new(sidebar::shortest_unique_prefix_lens(&self.commits));
         self.selected_commit_index = self.find_selected_commit_index();
     }
