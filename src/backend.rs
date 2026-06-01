@@ -13,6 +13,7 @@ use arborium::{
 };
 
 pub use crate::diff_view::{DiffHunkView, DiffLine, DiffLineKind, SyntaxKind, SyntaxSpan};
+use crate::graph::LaneFrame;
 use crate::graph_layout::GraphLayout;
 use crate::repository::{Repository, RepositorySnapshot, Vcs};
 
@@ -178,6 +179,60 @@ impl CommitStore {
         }
     }
 
+    /// Append one commit, interning its author through `author_interner` (kept
+    /// by the caller so it persists across a streaming load's batches and is
+    /// freed when the load ends). Strings land in the shared arena; flags pack
+    /// into a byte; bookmarks are stored sparsely. The batch
+    /// [`CommitStoreBuilder`] is a thin wrapper over this.
+    pub fn push(&mut self, commit: CommitSummary, author_interner: &mut HashMap<String, u32>) {
+        let index = self.spans.len();
+        let change_id = self.intern_text(&commit.change_id);
+        let commit_id = self.intern_text(&commit.commit_id);
+        let description = self.intern_text(&commit.description);
+        self.spans.push(CommitSpans {
+            change_id,
+            commit_id,
+            description,
+        });
+
+        let author = intern_author(&mut self.authors, author_interner, &commit.author);
+        self.author_idx.push(author);
+
+        self.shortest_change_id_len
+            .push(commit.shortest_change_id_len.unwrap_or(0) as u32);
+
+        let mut flags = 0u8;
+        if commit.has_description {
+            flags |= commit_flags::HAS_DESCRIPTION;
+        }
+        if let Some(empty) = commit.is_empty {
+            flags |= commit_flags::IS_EMPTY_KNOWN;
+            if empty {
+                flags |= commit_flags::IS_EMPTY;
+            }
+        }
+        if commit.has_conflict {
+            flags |= commit_flags::HAS_CONFLICT;
+        }
+        if commit.is_working_copy {
+            flags |= commit_flags::IS_WORKING_COPY;
+        }
+        self.flags.push(flags);
+
+        if !commit.bookmarks.is_empty() {
+            self.bookmarks.insert(index, commit.bookmarks);
+        }
+    }
+
+    fn intern_text(&mut self, text: &str) -> Span {
+        let start = self.text.len() as u32;
+        self.text.push_str(text);
+        Span {
+            start,
+            len: text.len() as u32,
+        }
+    }
+
     fn slice(&self, span: Span) -> &str {
         &self.text[span.start as usize..(span.start + span.len) as usize]
     }
@@ -291,68 +346,27 @@ impl CommitStoreBuilder {
     }
 
     pub fn push(&mut self, commit: CommitSummary) {
-        let index = self.store.spans.len();
-        let change_id = self.intern_text(&commit.change_id);
-        let commit_id = self.intern_text(&commit.commit_id);
-        let description = self.intern_text(&commit.description);
-        self.store.spans.push(CommitSpans {
-            change_id,
-            commit_id,
-            description,
-        });
-
-        let author = self.intern_author(&commit.author);
-        self.store.author_idx.push(author);
-
-        self.store
-            .shortest_change_id_len
-            .push(commit.shortest_change_id_len.unwrap_or(0) as u32);
-
-        let mut flags = 0u8;
-        if commit.has_description {
-            flags |= commit_flags::HAS_DESCRIPTION;
-        }
-        if let Some(empty) = commit.is_empty {
-            flags |= commit_flags::IS_EMPTY_KNOWN;
-            if empty {
-                flags |= commit_flags::IS_EMPTY;
-            }
-        }
-        if commit.has_conflict {
-            flags |= commit_flags::HAS_CONFLICT;
-        }
-        if commit.is_working_copy {
-            flags |= commit_flags::IS_WORKING_COPY;
-        }
-        self.store.flags.push(flags);
-
-        if !commit.bookmarks.is_empty() {
-            self.store.bookmarks.insert(index, commit.bookmarks);
-        }
-    }
-
-    fn intern_text(&mut self, text: &str) -> Span {
-        let start = self.store.text.len() as u32;
-        self.store.text.push_str(text);
-        Span {
-            start,
-            len: text.len() as u32,
-        }
-    }
-
-    fn intern_author(&mut self, author: &str) -> u32 {
-        if let Some(&idx) = self.author_interner.get(author) {
-            return idx;
-        }
-        let idx = self.store.authors.len() as u32;
-        self.store.authors.push(Arc::from(author));
-        self.author_interner.insert(author.to_owned(), idx);
-        idx
+        self.store.push(commit, &mut self.author_interner);
     }
 
     pub fn finish(self) -> CommitStore {
         self.store
     }
+}
+
+/// Intern `author` into `authors`, returning its index. The `interner` maps a
+/// name to its slot so a repo's handful of distinct authors are stored once
+/// even across a million commits. Shared by [`CommitStore::push`] (the lone
+/// caller); kept free-standing so it can borrow `authors` and `interner`
+/// disjointly from the rest of the store.
+fn intern_author(authors: &mut Vec<Arc<str>>, interner: &mut HashMap<String, u32>, author: &str) -> u32 {
+    if let Some(&idx) = interner.get(author) {
+        return idx;
+    }
+    let idx = authors.len() as u32;
+    authors.push(Arc::from(author));
+    interner.insert(author.to_owned(), idx);
+    idx
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -390,6 +404,28 @@ pub struct BackendOutput {
     pub graph: GraphLayout,
     pub snapshot: RepositorySnapshot,
     pub details: Option<RevisionDetails>,
+}
+
+/// One commit emitted by the streaming loader: the data for the compact store
+/// plus the row's lane frame for the graph fold. The UI appends a batch of
+/// these into its live `CommitStore` + `GraphLayout` per `CommitsBatch`
+/// message, so the sidebar paints after the first batch instead of waiting for
+/// the whole (up to ~1M-row) history to load.
+#[derive(Debug, Clone)]
+pub struct StreamRow {
+    pub summary: CommitSummary,
+    pub frame: LaneFrame,
+}
+
+/// Tail of a streaming load, delivered once the walk completes: the
+/// working-copy snapshot fingerprint (held for refresh comparison) and the
+/// `(row index, is_empty)` results for single-parent commits — resolved in one
+/// final pass now that every tree-id is known (merges/roots are still left to
+/// the background `compute_empty_status` path).
+#[derive(Debug, Clone)]
+pub struct CommitsTail {
+    pub snapshot: RepositorySnapshot,
+    pub empty_updates: Vec<(usize, bool)>,
 }
 
 /// `jj show`-style summary of a single revision, used to render the header

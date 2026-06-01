@@ -37,9 +37,10 @@ pub struct RowLaneData {
 /// Running state of the top-down lane fold. `advance` consumes one row's
 /// [`LaneFrame`] + bookmarks and returns that row's [`RowLaneData`], mutating
 /// the carried label/segment state for the next row. This is the single source
-/// of truth for the fold; both [`compute_lane_fold`] and the
-/// [`GraphLayoutBuilder`] drive it, so they can never diverge.
-#[derive(Default)]
+/// of truth for the fold; both the batch [`GraphLayoutBuilder`] and the
+/// streaming loader (carrying one across `CommitsBatch` messages) drive it
+/// through [`GraphLayout::push`], so they can never diverge.
+#[derive(Default, Clone, Debug)]
 pub struct LaneFoldState {
     current_labels: Vec<Vec<String>>,
     current_segments: Vec<Option<usize>>,
@@ -294,6 +295,62 @@ impl GraphLayout {
             continuation_segments,
         }
     }
+
+    /// Append one row in graph order: drive the carried `fold` for this row's
+    /// `frame` + `bookmarks`, then run-length encode the result. Holds no more
+    /// than one row plus the fold state, so it composes with the streaming
+    /// loader (each `CommitsBatch` appends) and never materializes the dense
+    /// per-row arrays. The batch [`GraphLayoutBuilder`] is a thin wrapper over
+    /// this so the two paths can't diverge.
+    pub fn push(&mut self, frame: &LaneFrame, bookmarks: &[String], fold: &mut LaneFoldState) {
+        let row = self.row_count as u32;
+        let data = fold.advance(frame, bookmarks);
+        self.ensure_columns(frame.lane_count());
+
+        // Push every existing column (including ones that just went dead, so
+        // their run closes with a `None`). `RunList::push` no-ops on no change,
+        // so a quiet lane costs one comparison.
+        let cols = self.before_kind.len();
+        for col in 0..cols {
+            self.before_kind[col].push(row, frame.before.get(col).copied().flatten());
+            self.after_kind[col].push(row, frame.after.get(col).copied().flatten());
+            self.seg_before[col].push(
+                row,
+                data.segments_before.get(col).copied().flatten().map(seg_id),
+            );
+            self.seg_after[col].push(
+                row,
+                data.segments_after.get(col).copied().flatten().map(seg_id),
+            );
+            self.labels[col].push(row, data.labels.get(col).cloned().unwrap_or_default());
+        }
+
+        // `merging_off` needs a leading 0 so row 0's slice is
+        // `merging_flat[0..merging_off[1]]`; seed it on the first row so the
+        // offsets stay valid for reconstruction *during* a streaming load, not
+        // just after a final `finish`.
+        if self.merging_off.is_empty() {
+            self.merging_off.push(0);
+        }
+        self.node_lane.push(frame.node_lane as u32);
+        self.missing_parents
+            .push(frame.missing_parents.min(u8::MAX as usize) as u8);
+        for &lane in &frame.merging_lanes {
+            self.merging_flat.push(lane as u32);
+        }
+        self.merging_off.push(self.merging_flat.len() as u32);
+        self.row_count += 1;
+    }
+
+    fn ensure_columns(&mut self, count: usize) {
+        while self.before_kind.len() < count {
+            self.before_kind.push(RunList::default());
+            self.after_kind.push(RunList::default());
+            self.seg_before.push(RunList::default());
+            self.seg_after.push(RunList::default());
+            self.labels.push(RunList::default());
+        }
+    }
 }
 
 fn seg_at(columns: &[RunList<Option<u32>>], col: usize, row: u32) -> Option<usize> {
@@ -328,51 +385,10 @@ impl GraphLayoutBuilder {
     }
 
     pub fn push(&mut self, frame: &LaneFrame, bookmarks: &[String]) {
-        let row = self.layout.row_count as u32;
-        let data = self.fold.advance(frame, bookmarks);
-        self.ensure_columns(frame.lane_count());
-
-        // Push every existing column (including ones that just went dead, so
-        // their run closes with a `None`). `RunList::push` no-ops on no change,
-        // so a quiet lane costs one comparison.
-        let cols = self.layout.before_kind.len();
-        for col in 0..cols {
-            self.layout.before_kind[col].push(row, frame.before.get(col).copied().flatten());
-            self.layout.after_kind[col].push(row, frame.after.get(col).copied().flatten());
-            self.layout.seg_before[col]
-                .push(row, data.segments_before.get(col).copied().flatten().map(seg_id));
-            self.layout.seg_after[col]
-                .push(row, data.segments_after.get(col).copied().flatten().map(seg_id));
-            self.layout.labels[col].push(row, data.labels.get(col).cloned().unwrap_or_default());
-        }
-
-        self.layout.node_lane.push(frame.node_lane as u32);
-        self.layout
-            .missing_parents
-            .push(frame.missing_parents.min(u8::MAX as usize) as u8);
-        for &lane in &frame.merging_lanes {
-            self.layout.merging_flat.push(lane as u32);
-        }
-        self.layout
-            .merging_off
-            .push(self.layout.merging_flat.len() as u32);
-        self.layout.row_count += 1;
+        self.layout.push(frame, bookmarks, &mut self.fold);
     }
 
-    fn ensure_columns(&mut self, count: usize) {
-        while self.layout.before_kind.len() < count {
-            self.layout.before_kind.push(RunList::default());
-            self.layout.after_kind.push(RunList::default());
-            self.layout.seg_before.push(RunList::default());
-            self.layout.seg_after.push(RunList::default());
-            self.layout.labels.push(RunList::default());
-        }
-    }
-
-    pub fn finish(mut self) -> GraphLayout {
-        // `merging_off` needs a leading 0 so row 0's slice is
-        // `merging_flat[0..merging_off[0]]`; build it with a sentinel front.
-        self.layout.merging_off.insert(0, 0);
+    pub fn finish(self) -> GraphLayout {
         self.layout
     }
 }
@@ -557,6 +573,49 @@ mod tests {
         assert!(capped.before.len() <= 1);
         assert!(capped.after.len() <= 1);
         assert!(capped.merging_lanes.iter().all(|&l| l < 1));
+    }
+
+    #[test]
+    fn partial_layout_reconstructs_rows_pushed_so_far() {
+        // Streaming paints rows before the walk finishes, so `frame`/`fold`
+        // must reconstruct a row the moment it's pushed — not only after a
+        // final `finish`. This is what seeding the `merging_off` leading-0 on
+        // the first push (vs the old finish-time insert) buys. Drive the
+        // merge/split topology with bookmarks so the label/segment run-lists
+        // are exercised mid-stream too.
+        let frames = assign_lanes([
+            ('M', vec![direct('T'), direct('W')]),
+            ('T', vec![direct('A')]),
+            ('W', vec![direct('A')]),
+            ('A', vec![]),
+        ]);
+        let bookmarks = vec![
+            vec!["main".to_owned()],
+            vec![],
+            vec!["feature".to_owned()],
+            vec![],
+        ];
+        let full = build(&frames, &bookmarks);
+
+        let mut layout = GraphLayout::default();
+        let mut fold = LaneFoldState::default();
+        for (k, (frame, bm)) in frames.iter().zip(&bookmarks).enumerate() {
+            layout.push(frame, bm, &mut fold);
+            // Every row pushed so far must already match the finished build.
+            for i in 0..=k {
+                assert_eq!(
+                    layout.frame(i, usize::MAX),
+                    full.frame(i, usize::MAX),
+                    "frame {i} after pushing through row {k}"
+                );
+                assert_eq!(
+                    layout.fold(i, usize::MAX),
+                    full.fold(i, usize::MAX),
+                    "fold {i} after pushing through row {k}"
+                );
+            }
+        }
+        assert_eq!(layout.len(), frames.len());
     }
 
     #[test]

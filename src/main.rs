@@ -2,7 +2,6 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     pin::Pin,
-    rc::Rc,
     time::{Duration, Instant},
 };
 
@@ -95,8 +94,9 @@ static GLOBAL: track_alloc::Tracking = track_alloc::Tracking;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use backend::{
-    BackendOutput, CommitStore, DiffDocument, LoadProgress, RevisionDetails, RevisionSelection,
-    RowView, compute_empty_status, load_backend, load_diff, load_repository_snapshot,
+    BackendOutput, CommitStore, CommitsTail, DiffDocument, LoadProgress, RevisionDetails,
+    RevisionSelection, RowView, StreamRow, compute_empty_status, load_backend, load_diff,
+    load_repository_snapshot,
 };
 use clap::Parser;
 use config::AppConfig;
@@ -116,7 +116,7 @@ use palette::{
     ColumnSource, CommandId as PaletteCommand, PaletteState, Recents, ResultRef,
     change_id_for_recents, revision_selection,
 };
-use repository::{Repository, RepositorySnapshot, prepare_repository};
+use repository::{Repository, RepositorySnapshot, Vcs, prepare_repository};
 use resize_handle::ResizeHandle;
 use theme::{ResolvedTheme, ThemePreference, ThemeSpec, app_shell_style, vertical_divider};
 
@@ -202,11 +202,12 @@ pub(crate) struct Diffui {
     /// Bumped when `commits` is replaced; tags background empty-status results
     /// so a result from a superseded load is dropped.
     pub(crate) commits_version: u64,
-    /// Per-row lane fold + shortest-unique-prefix lengths, recomputed only
-    /// when the commit graph changes. The sidebar renders rows on demand from
-    /// these, so it never materializes the whole (up to ~1M-row) list.
-    pub(crate) graph: Rc<graph_layout::GraphLayout>,
-    pub(crate) sidebar_prefix_lens: Rc<Vec<usize>>,
+    /// Compact run-length lane store + shortest-unique-prefix lengths. The
+    /// sidebar renders rows on demand from these, so it never materializes the
+    /// whole (up to ~1M-row) list. A streaming cold load appends to both in
+    /// place per `CommitsBatch`; a refresh swaps them wholesale.
+    pub(crate) graph: graph_layout::GraphLayout,
+    pub(crate) sidebar_prefix_lens: Vec<usize>,
     /// Index of the selected commit in `commits` (drives the reveal-on-jump
     /// scroll and the expanded file-list span), recomputed on selection change
     /// so `view()` stays O(visible rows).
@@ -222,6 +223,10 @@ pub(crate) struct Diffui {
     /// emptiness never changes, so background results computed once survive
     /// reloads — only newly-seen merges are recomputed.
     pub(crate) empty_cache: HashMap<String, bool>,
+    /// Append state for an in-flight *streaming* cold load (jj only). `None`
+    /// whenever no stream is running (idle, or after a refresh that swaps the
+    /// graph atomically instead).
+    pub(crate) load: Option<LoadCursor>,
 }
 
 #[derive(Debug, Clone)]
@@ -231,9 +236,38 @@ pub(crate) enum LoadStatus {
     Failed(String),
 }
 
+/// Carries the transient builder state of a streaming cold load across the
+/// `CommitsBatch` messages: the author interner and the lane fold, which both
+/// must persist between batches as rows append to `commits` / `graph`. The
+/// `version` is the `commits_version` the stream was started under — batches
+/// tagged with a stale version (e.g. a refresh superseded the stream) are
+/// dropped. Freed when the stream finishes, so none of it sticks around.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LoadCursor {
+    version: u64,
+    interner: HashMap<String, u32>,
+    fold: graph_layout::LaneFoldState,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum Message {
     BackendLoaded(RevisionSelection, Box<Result<BackendOutput, String>>),
+    /// One batch of commits from a streaming cold load, tagged with the
+    /// `commits_version` the stream was started under. Appended into the live
+    /// `commits` / `graph` so the sidebar grows as the walk progresses.
+    CommitsBatch(u64, Vec<StreamRow>),
+    /// End of a streaming cold load: the snapshot fingerprint + single-parent
+    /// emptiness updates, or an error. Finalizes the stream (clears the load
+    /// cursor, kicks off background empty-status resolution for merges).
+    CommitsFinished(u64, Box<Result<CommitsTail, String>>),
+    /// Working-copy diff for a streaming cold load, tagged with the stream's
+    /// `commits_version`. Sets the diff pane *without* flipping `status` to
+    /// `Loaded` — that's the first `CommitsBatch`'s job, so the sidebar never
+    /// flashes empty while the graph walk loads the index.
+    InitialDiff(
+        u64,
+        Box<Result<(DiffDocument, Option<RevisionDetails>), String>>,
+    ),
     /// Diff-only load for a revision switch — carries just the document and
     /// header details, leaving the commit graph and snapshot untouched.
     DiffLoaded(
@@ -310,12 +344,41 @@ impl Diffui {
         let sidebar_min_width = sidebar::min_width(config);
         match prepare_repository(&cli.path) {
             Ok(repository) => {
-                let revision = RevisionSelection::WorkingCopy;
                 let commit_progress = LoadProgress::default();
-                let backend_task = Task::perform(
-                    load_backend(repository.clone(), revision.clone(), commit_progress.clone()),
-                    move |result| Message::BackendLoaded(revision, Box::new(result)),
-                );
+                // jj streams the cold load for a progressive first paint; git
+                // loads in one shot (its `git log` parse isn't incremental).
+                let (backend_task, load, commits_version) = match repository.vcs {
+                    Vcs::Jj => {
+                        let version = 1;
+                        (
+                            stream_jj_initial_load(
+                                repository.clone(),
+                                commit_progress.clone(),
+                                version,
+                            ),
+                            Some(LoadCursor {
+                                version,
+                                ..Default::default()
+                            }),
+                            version,
+                        )
+                    }
+                    Vcs::Git => {
+                        let revision = RevisionSelection::WorkingCopy;
+                        (
+                            Task::perform(
+                                load_backend(
+                                    repository.clone(),
+                                    revision.clone(),
+                                    commit_progress.clone(),
+                                ),
+                                move |result| Message::BackendLoaded(revision, Box::new(result)),
+                            ),
+                            None,
+                            0,
+                        )
+                    }
+                };
                 let theme_task = system::theme().map(Message::SystemThemeChanged);
 
                 (
@@ -342,13 +405,14 @@ impl Diffui {
                         find: None,
                         revision_reveal_token: 0,
                         pending_revision_reveal: false,
-                        commits_version: 0,
-                        graph: Rc::new(graph_layout::GraphLayout::default()),
-                        sidebar_prefix_lens: Rc::new(Vec::new()),
+                        commits_version,
+                        graph: graph_layout::GraphLayout::default(),
+                        sidebar_prefix_lens: Vec::new(),
                         selected_commit_index: None,
                         commit_progress,
                         loading_since: Some(Instant::now()),
                         empty_cache: HashMap::new(),
+                        load,
                     },
                     Task::batch([backend_task, theme_task]),
                 )
@@ -378,12 +442,13 @@ impl Diffui {
                     revision_reveal_token: 0,
                     pending_revision_reveal: false,
                     commits_version: 0,
-                    graph: Rc::new(graph_layout::GraphLayout::default()),
-                    sidebar_prefix_lens: Rc::new(Vec::new()),
+                    graph: graph_layout::GraphLayout::default(),
+                    sidebar_prefix_lens: Vec::new(),
                     selected_commit_index: None,
                     commit_progress: LoadProgress::default(),
                     loading_since: None,
                     empty_cache: HashMap::new(),
+                    load: None,
                 },
                 system::theme().map(Message::SystemThemeChanged),
             ),
@@ -405,7 +470,11 @@ impl Diffui {
                     self.status = LoadStatus::Loaded;
                     self.document = output.document;
                     self.commits = output.commits;
-                    self.graph = Rc::new(output.graph);
+                    self.graph = output.graph;
+                    // A refresh swaps the graph atomically; if a cold stream was
+                    // somehow still in flight, supersede it so its late batches
+                    // (which assume the now-replaced row indices) are dropped.
+                    self.load = None;
                     self.commits_version = self.commits_version.wrapping_add(1);
                     self.repository_snapshot = Some(output.snapshot);
                     self.revision_details = output.details;
@@ -442,6 +511,88 @@ impl Diffui {
                     self.status = LoadStatus::Failed(error);
                 }
             },
+            Message::CommitsBatch(version, rows) => {
+                // Take the cursor out so the appends below borrow `self` fields
+                // freely (same idiom the palette uses). Drop batches from a
+                // superseded load — their row indices no longer line up.
+                let Some(mut cursor) = self.load.take().filter(|c| c.version == version) else {
+                    return Task::none();
+                };
+                let selecting_wc = matches!(self.selected_revision, RevisionSelection::WorkingCopy);
+                for row in rows {
+                    let index = self.commits.len();
+                    // The graph fold consumes the frame + the row's bookmarks
+                    // (still owned by the summary), so push it before the
+                    // summary moves into the store.
+                    self.graph
+                        .push(&row.frame, &row.summary.bookmarks, &mut cursor.fold);
+                    // jj precomputes the shortest-unique-prefix length per row,
+                    // so the sidebar index grows by one O(1) push instead of an
+                    // O(n) rescan per batch.
+                    let total = row.summary.change_id.chars().count();
+                    let prefix = row.summary.shortest_change_id_len.unwrap_or(1).min(total);
+                    self.sidebar_prefix_lens.push(prefix);
+                    if selecting_wc && row.summary.is_working_copy {
+                        self.selected_commit_index = Some(index);
+                    }
+                    self.commits.push(row.summary, &mut cursor.interner);
+                }
+                self.load = Some(cursor);
+                // First batch on screen: lift the full-window loading indicator
+                // and reveal the (still-growing) sidebar.
+                if matches!(self.status, LoadStatus::Loading) {
+                    self.status = LoadStatus::Loaded;
+                    self.loading_since = None;
+                }
+            }
+            Message::CommitsFinished(version, result) => {
+                if self.load.as_ref().map(|c| c.version) != Some(version) {
+                    return Task::none();
+                }
+                self.load = None;
+                match *result {
+                    Ok(tail) => {
+                        self.repository_snapshot = Some(tail.snapshot);
+                        // Apply the single-parent emptiness resolved in the
+                        // loader's final pass, caching each so reloads skip it.
+                        for (index, empty) in tail.empty_updates {
+                            let commit_id = self.commits.row(index).commit_id().to_owned();
+                            self.empty_cache.insert(commit_id, empty);
+                            self.commits.set_is_empty(index, empty);
+                        }
+                        self.commits_version = self.commits_version.wrapping_add(1);
+                        self.selected_commit_index = self.find_selected_commit_index();
+                        // Fill in the merges/roots the loader left unknown.
+                        return self.resolve_empty_status();
+                    }
+                    Err(error) => {
+                        self.status = LoadStatus::Failed(error);
+                        self.loading_since = None;
+                    }
+                }
+            }
+            Message::InitialDiff(version, result) => {
+                // Apply only while this stream is the active load and the user
+                // hasn't navigated off the working copy (e.g. via the palette
+                // during load). Leaves `status` as `Loading` so the full-window
+                // indicator stays up until the first commit batch.
+                let active = self.load.as_ref().map(|c| c.version) == Some(version)
+                    && self.pending_revision.as_ref() == Some(&RevisionSelection::WorkingCopy);
+                if !active {
+                    return Task::none();
+                }
+                self.pending_revision = None;
+                match *result {
+                    Ok((document, details)) => {
+                        self.document = document;
+                        self.revision_details = details;
+                        self.selected_file = 0;
+                    }
+                    Err(error) => {
+                        eprintln!("diffui: working-copy diff failed during load: {error}");
+                    }
+                }
+            }
             Message::DiffLoaded(revision, result) => match *result {
                 Ok((document, details)) => {
                     if self.pending_revision.as_ref() != Some(&revision) {
@@ -989,7 +1140,11 @@ impl Diffui {
     }
 
     fn start_repository_snapshot(&mut self) -> Task<Message> {
-        if self.snapshot_pending {
+        // Don't refresh while a cold stream is still appending — a refresh
+        // re-walks and swaps the graph wholesale, which would race the
+        // in-flight batches. The stream finishes in seconds; refresh resumes
+        // normally once it clears the load cursor.
+        if self.snapshot_pending || self.load.is_some() {
             return Task::none();
         }
 
@@ -1059,7 +1214,7 @@ impl Diffui {
         // The compact lane store (`graph`) is built by the loader and assigned
         // from `BackendOutput` in the `BackendLoaded` handler; here we only
         // refresh the cheap per-row indices that depend on the commit list.
-        self.sidebar_prefix_lens = Rc::new(sidebar::shortest_unique_prefix_lens(&self.commits));
+        self.sidebar_prefix_lens = sidebar::shortest_unique_prefix_lens(&self.commits);
         self.selected_commit_index = self.find_selected_commit_index();
     }
 
@@ -1353,6 +1508,90 @@ fn current_file_diff_text(ui: &Diffui) -> Option<String> {
         }
     }
     Some(out)
+}
+
+/// Streaming cold load for a jj repo: snapshot the working copy, emit the
+/// working-copy diff, then walk the graph emitting `CommitsBatch` messages so
+/// the sidebar paints after the first batch instead of after the whole (up to
+/// ~1M-row) history.
+///
+/// Mirrors `watch_repository`'s bridge: the heavy walk runs on a blocking task
+/// and emits through an unbounded tokio channel; a forwarder relays to iced
+/// with backpressure. Every message carries `version` so a superseded load's
+/// batches are dropped (see `LoadCursor`).
+fn stream_jj_initial_load(
+    repository: Repository,
+    progress: LoadProgress,
+    version: u64,
+) -> Task<Message> {
+    // First batch ships after this many commits — small enough that the first
+    // screenful paints quickly, large enough that ~1M commits don't flood the
+    // update loop with batch messages.
+    const COMMIT_BATCH_SIZE: usize = 256;
+
+    Task::stream(iced::stream::channel(
+        16,
+        async move |mut output: futures::channel::mpsc::Sender<Message>| {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+
+            let worker = tokio::task::spawn_blocking(move || {
+                let handle = tokio::runtime::Handle::current();
+                handle.block_on(async move {
+                    // Snapshot first so the graph + diff reflect on-disk state —
+                    // a jj-cli edit landing between load and here would
+                    // otherwise show a stale working copy.
+                    let snapshot =
+                        match crate::jj::load_jj_repository_snapshot(repository.clone()).await {
+                            Ok(snapshot) => snapshot,
+                            Err(error) => {
+                                let _ = tx.send(Message::CommitsFinished(
+                                    version,
+                                    Box::new(Err(format!("{error:#}"))),
+                                ));
+                                return;
+                            }
+                        };
+
+                    // The working-copy diff is fast; load it up front so it's
+                    // ready to show the moment the first commit batch lifts the
+                    // loading screen (this message doesn't lift it itself).
+                    let diff = crate::jj::load_jj_diff(
+                        repository.clone(),
+                        RevisionSelection::WorkingCopy,
+                    )
+                    .await
+                    .map_err(|error| format!("{error:#}"));
+                    let _ = tx.send(Message::InitialDiff(version, Box::new(diff)));
+
+                    let tx_batches = tx.clone();
+                    let mut emit = move |batch: Vec<StreamRow>| {
+                        let _ = tx_batches.send(Message::CommitsBatch(version, batch));
+                    };
+                    let finished = crate::jj::walk_jj_commits(
+                        repository.root.clone(),
+                        progress,
+                        COMMIT_BATCH_SIZE,
+                        &mut emit,
+                    )
+                    .await
+                    .map(|empty_updates| CommitsTail {
+                        snapshot,
+                        empty_updates,
+                    })
+                    .map_err(|error| format!("{error:#}"));
+                    let _ = tx.send(Message::CommitsFinished(version, Box::new(finished)));
+                });
+            });
+
+            // Relay worker messages to iced, honoring its backpressure.
+            while let Some(message) = rx.recv().await {
+                if output.send(message).await.is_err() {
+                    break;
+                }
+            }
+            let _ = worker.await;
+        },
+    ))
 }
 
 /// Filesystem-watch subscription: emits `RefreshRepository` (debounced) when

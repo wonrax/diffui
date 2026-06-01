@@ -227,16 +227,16 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
     // The per-row lane fold + prefix lengths are precomputed once and held in
     // `Diffui`; the closures below build a single visible row's view from them
     // on demand, so the widget never materializes all ~N rows.
-    let graph = ui.graph.clone();
-    let prefix_lens = ui.sidebar_prefix_lens.clone();
+    let graph = &ui.graph;
+    let prefix_lens = &ui.sidebar_prefix_lens;
     let commits = &ui.commits;
     let selected = ui.selected_revision.clone();
     let file_list_expanded = ui.file_list_expanded;
     let build_revision = Box::new(move |index: usize| {
         build_revision_row(
             commits,
-            &graph,
-            &prefix_lens,
+            graph,
+            prefix_lens,
             theme,
             &graph_style,
             &selected,

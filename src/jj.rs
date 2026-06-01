@@ -23,7 +23,7 @@ use jj_lib::{
         parse as parse_fileset,
     },
     gitignore::GitIgnoreFile,
-    graph::{GraphNode, TopoGroupedGraphIterator},
+    graph::TopoGroupedGraphIterator,
     matchers::{EverythingMatcher, Matcher, NothingMatcher, PrefixMatcher},
     merge::{Diff, Merge, SameChange},
     object_id::ObjectId,
@@ -37,22 +37,42 @@ use jj_lib::{
 };
 
 use crate::backend::{
-    CommitStore, CommitStoreBuilder, CommitSummary, DiffDocument, DiffFile, DiffFileStatus,
-    DiffHunkView, DiffLine, DiffLineKind, LoadProgress, RevisionDetails, RevisionSelection,
-    SignatureInfo, apply_syntax_highlighting, format_hunk_header,
+    CommitStore, CommitSummary, DiffDocument, DiffFile, DiffFileStatus, DiffHunkView, DiffLine,
+    DiffLineKind, LoadProgress, RevisionDetails, RevisionSelection, SignatureInfo, StreamRow,
+    apply_syntax_highlighting, format_hunk_header,
 };
 use crate::graph::LaneAssigner;
-use crate::graph_layout::{GraphLayout, GraphLayoutBuilder};
+use crate::graph_layout::{GraphLayout, LaneFoldState};
 use crate::repository::{Repository, RepositorySnapshot};
 
 // Fallback used only when the user has not configured `snapshot.max-new-file-size`.
 // Matches jj-cli's shipped default (1 MiB).
 const DEFAULT_SNAPSHOT_MAX_NEW_FILE_SIZE: u64 = 1024 * 1024;
 
-pub async fn load_jj_commits(
+/// Walk the jj revset graph, emitting commits in batches as they're built, and
+/// return the single-parent emptiness updates once every tree-id is known.
+///
+/// Unlike a collect-then-loop, this pulls the topo iterator *lazily* and ships
+/// each `batch_size` chunk through `emit` the moment it fills — so a streaming
+/// consumer can paint the first screen after the first batch instead of waiting
+/// for the whole (up to ~1M-row) history. The batch [`load_jj_commits`] passes
+/// an `emit` that accumulates into a store+graph; the UI's streaming loader
+/// passes one that ships each batch as a `CommitsBatch` message. Both append
+/// through the same `GraphLayout::push` / `CommitStore::push`, so they can't
+/// diverge.
+///
+/// Each jj `Commit` is dropped as soon as its data is extracted rather than
+/// holding all of them at once (~400MB on a million-commit repo). Single-parent
+/// emptiness needs a parent's tree-id, which in descendants-first order hasn't
+/// been loaded yet, so we keep the tree-id map + each commit's lone parent and
+/// resolve it in a final pass; merges/roots stay unknown and are resolved off
+/// the load path (see `compute_jj_empty_status`).
+pub async fn walk_jj_commits(
     repository_root: PathBuf,
     progress: LoadProgress,
-) -> Result<(CommitStore, GraphLayout)> {
+    batch_size: usize,
+    emit: &mut dyn FnMut(Vec<StreamRow>),
+) -> Result<Vec<(usize, bool)>> {
     let settings = UserSettings::from_config(StackedConfig::with_defaults())
         .context("failed to load jj settings")?;
     let workspace = Workspace::load(
@@ -90,15 +110,6 @@ pub async fn load_jj_commits(
         .evaluate(repo.as_ref())
         .context("failed to evaluate jj revset")?;
 
-    let nodes: Vec<GraphNode<CommitId>> = {
-        let mut topo = TopoGroupedGraphIterator::new(revset.iter_graph(), |id: &CommitId| id);
-        topo.prioritize_branch(wc_commit_id.clone());
-        topo.collect::<Result<Vec<_>, _>>()
-            .context("failed to walk jj revset graph")?
-    };
-    drop(revset);
-    progress.set_total(nodes.len());
-
     // Index bookmarks by commit id once so the per-commit loop below is a
     // map lookup instead of an O(bookmarks) scan per revision.
     let mut bookmarks_by_commit: HashMap<CommitId, Vec<String>> = HashMap::new();
@@ -119,79 +130,116 @@ pub async fn load_jj_commits(
         }
     }
 
-    // Build the store in a single pass, dropping each jj `Commit` as soon as
-    // its data is extracted rather than holding all of them at once — that Vec
-    // is ~400MB on a million-commit repo. Single-parent emptiness needs a
-    // parent's tree-id, which (in descendants-first order) hasn't been loaded
-    // yet, so we keep just the tree-id map + each commit's lone parent and
-    // resolve it cheaply in a second pass. Merges/roots stay unknown and are
-    // resolved off the load path (see `compute_jj_empty_status`).
-    let mut builder = CommitStoreBuilder::with_capacity(nodes.len());
-    let mut tree_ids: HashMap<CommitId, Merge<TreeId>> = HashMap::with_capacity(nodes.len());
-    let mut single_parents: Vec<Option<CommitId>> = Vec::with_capacity(nodes.len());
     let mut lane_assigner = LaneAssigner::new();
-    let mut graph_builder = GraphLayoutBuilder::new();
-    for (id, edges) in nodes.iter() {
-        // Advance the lane state for every node in topo order. The assigner is
-        // stateful, so this must run once per node — keep it first in the loop.
-        let lane_frame = lane_assigner.push(id, edges);
-        let commit = repo
-            .store()
-            .get_commit_async(id)
-            .await
-            .with_context(|| format!("failed to load jj commit {}", id.hex()))?;
-        tree_ids.insert(id.clone(), commit.tree_ids().clone());
-        single_parents.push(match commit.parent_ids() {
-            [parent] => Some(parent.clone()),
-            _ => None,
-        });
+    let mut tree_ids: HashMap<CommitId, Merge<TreeId>> = HashMap::new();
+    let mut ids: Vec<CommitId> = Vec::new();
+    let mut single_parents: Vec<Option<CommitId>> = Vec::new();
+    let mut batch: Vec<StreamRow> = Vec::with_capacity(batch_size);
 
-        let description = commit.description().lines().next().unwrap_or("").trim();
-        let shortest_change_id_len = repo
-            .shortest_unique_change_id_prefix_len(commit.change_id())
-            .with_context(|| {
-                format!(
-                    "failed to resolve shortest unique jj change id for {}",
-                    commit.change_id().hex()
-                )
-            })?;
-        let bookmarks = bookmarks_by_commit.get(id).cloned().unwrap_or_default();
-        graph_builder.push(&lane_frame, &bookmarks);
-        builder.push(CommitSummary {
-            change_id: commit.change_id().to_string(),
-            commit_id: id.hex(),
-            shortest_change_id_len: Some(shortest_change_id_len),
-            description: if description.is_empty() {
-                "(no description set)".to_owned()
-            } else {
-                description.to_owned()
-            },
-            author: commit.author().name.clone(),
-            has_description: !description.is_empty(),
-            is_empty: None,
-            has_conflict: commit.has_conflict(),
-            is_working_copy: id == &wc_commit_id,
-            bookmarks,
-        });
-        progress.increment();
-        // `commit` dropped here — we never hold more than one at a time.
-    }
+    // Scope the topo iterator so its borrow of `revset` ends before the empty
+    // pass; the iterator is pulled lazily (no up-front `collect`), so the first
+    // batch ships after only `batch_size` commits are walked.
+    {
+        let mut topo = TopoGroupedGraphIterator::new(revset.iter_graph(), |id: &CommitId| id);
+        topo.prioritize_branch(wc_commit_id.clone());
+        for node in topo {
+            // Advance the lane state for every node in topo order. The assigner
+            // is stateful, so this must run once per node — keep it first.
+            let (id, edges) = node.context("failed to walk jj revset graph")?;
+            let frame = lane_assigner.push(&id, &edges);
+            let commit = repo
+                .store()
+                .get_commit_async(&id)
+                .await
+                .with_context(|| format!("failed to load jj commit {}", id.hex()))?;
+            tree_ids.insert(id.clone(), commit.tree_ids().clone());
+            single_parents.push(match commit.parent_ids() {
+                [parent] => Some(parent.clone()),
+                _ => None,
+            });
 
-    // Resolve single-parent emptiness now that every tree-id is known: a
-    // commit is empty iff its tree matches its parent's (a cheap id compare).
-    let mut store = builder.finish();
-    for index in 0..store.len() {
-        let Some(parent) = &single_parents[index] else {
-            continue;
-        };
-        if let (Some(own), Some(parent_tree)) =
-            (tree_ids.get(&nodes[index].0), tree_ids.get(parent))
-        {
-            store.set_is_empty(index, own == parent_tree);
+            let description = commit.description().lines().next().unwrap_or("").trim();
+            let shortest_change_id_len = repo
+                .shortest_unique_change_id_prefix_len(commit.change_id())
+                .with_context(|| {
+                    format!(
+                        "failed to resolve shortest unique jj change id for {}",
+                        commit.change_id().hex()
+                    )
+                })?;
+            let bookmarks = bookmarks_by_commit.get(&id).cloned().unwrap_or_default();
+            let summary = CommitSummary {
+                change_id: commit.change_id().to_string(),
+                commit_id: id.hex(),
+                shortest_change_id_len: Some(shortest_change_id_len),
+                description: if description.is_empty() {
+                    "(no description set)".to_owned()
+                } else {
+                    description.to_owned()
+                },
+                author: commit.author().name.clone(),
+                has_description: !description.is_empty(),
+                is_empty: None,
+                has_conflict: commit.has_conflict(),
+                is_working_copy: id == wc_commit_id,
+                bookmarks,
+            };
+            ids.push(id);
+            batch.push(StreamRow { summary, frame });
+            progress.increment();
+            if batch.len() >= batch_size {
+                emit(std::mem::take(&mut batch));
+                batch.reserve(batch_size);
+            }
+            // `commit` dropped here — we never hold more than one at a time.
         }
     }
+    drop(revset);
+    if !batch.is_empty() {
+        emit(batch);
+    }
 
-    Ok((store, graph_builder.finish()))
+    // Resolve single-parent emptiness now that every tree-id is known: a commit
+    // is empty iff its tree matches its lone parent's (a cheap id compare).
+    let mut empty_updates = Vec::new();
+    for (index, parent) in single_parents.iter().enumerate() {
+        let Some(parent) = parent else {
+            continue;
+        };
+        if let (Some(own), Some(parent_tree)) = (tree_ids.get(&ids[index]), tree_ids.get(parent)) {
+            empty_updates.push((index, own == parent_tree));
+        }
+    }
+    Ok(empty_updates)
+}
+
+/// Batch loader for refreshes: walk the whole graph and fold it into a compact
+/// store + layout in one shot (no progressive paint — a refresh swaps the
+/// result in atomically so the old graph stays on screen until it's ready). The
+/// cold initial load uses [`walk_jj_commits`] directly to stream instead.
+pub async fn load_jj_commits(
+    repository_root: PathBuf,
+    progress: LoadProgress,
+) -> Result<(CommitStore, GraphLayout)> {
+    let mut store = CommitStore::default();
+    let mut graph = GraphLayout::default();
+    let mut interner: HashMap<String, u32> = HashMap::new();
+    let mut fold = LaneFoldState::default();
+
+    let empty_updates = {
+        let mut emit = |batch: Vec<StreamRow>| {
+            for row in batch {
+                graph.push(&row.frame, &row.summary.bookmarks, &mut fold);
+                store.push(row.summary, &mut interner);
+            }
+        };
+        walk_jj_commits(repository_root, progress, 4096, &mut emit).await?
+    };
+
+    for (index, empty) in empty_updates {
+        store.set_is_empty(index, empty);
+    }
+    Ok((store, graph))
 }
 
 /// Resolve the empty status of specific commits (the merges/roots the loader
@@ -868,7 +916,7 @@ mod lane_width_probe {
                 .resolve_user_expression(repo.as_ref(), &resolver)
                 .expect("resolve revset");
             let revset = resolved.evaluate(repo.as_ref()).expect("evaluate revset");
-            let nodes: Vec<GraphNode<CommitId>> = {
+            let nodes: Vec<jj_lib::graph::GraphNode<CommitId>> = {
                 let mut topo =
                     TopoGroupedGraphIterator::new(revset.iter_graph(), |id: &CommitId| id);
                 topo.prioritize_branch(wc.clone());
