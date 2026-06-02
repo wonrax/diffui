@@ -11,6 +11,10 @@ track-alloc = []
 
 [dependencies]
 anyhow = "1.0"
+# Only used to construct a `DatePatternContext` for jj-lib's revset parser when
+# resolving the short change-id prefix disambiguation set. jj-lib already
+# depends on chrono, so this pins no new transitive tree.
+chrono = "0.4"
 arborium = { version = "2.16.0", features = [
     "lang-ada",
     "lang-agda",

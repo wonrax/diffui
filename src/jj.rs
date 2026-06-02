@@ -10,7 +10,7 @@ use bstr::BStr;
 use futures::StreamExt;
 use jj_lib::{
     backend::{CommitId, TreeId},
-    config::{ConfigSource, StackedConfig},
+    config::{ConfigLayer, ConfigSource, StackedConfig},
     conflicts::{ConflictMarkerStyle, ConflictMaterializeOptions, materialized_diff_stream},
     copies::CopyRecords,
     diff_presentation::{
@@ -24,12 +24,18 @@ use jj_lib::{
     },
     gitignore::GitIgnoreFile,
     graph::TopoGroupedGraphIterator,
+    id_prefix::IdPrefixContext,
     matchers::{EverythingMatcher, Matcher, NothingMatcher, PrefixMatcher},
     merge::{Diff, Merge, SameChange},
     object_id::ObjectId,
+    ref_name::{WorkspaceName, WorkspaceNameBuf},
     repo::{ReadonlyRepo, Repo, StoreFactories},
     repo_path::{RepoPath, RepoPathBuf, RepoPathUiConverter},
-    revset::{RevsetExpression, SymbolResolver},
+    revset::{
+        RevsetAliasesMap, RevsetDiagnostics, RevsetExpression, RevsetExtensions,
+        RevsetParseContext, RevsetWorkspaceContext, SymbolResolver, UserRevsetExpression,
+        parse as parse_revset,
+    },
     settings::{HumanByteSize, UserSettings},
     tree_merge::MergeOptions,
     working_copy::SnapshotOptions,
@@ -93,7 +99,15 @@ pub async fn walk_jj_commits(
         .get_wc_commit_id(workspace_name)
         .context("jj workspace has no working-copy commit")?
         .clone();
-    walk_jj_with_repo(repo.as_ref(), &wc_commit_id, progress, batch_size, emit).await
+    walk_jj_with_repo(
+        repo.as_ref(),
+        &repository_root,
+        &wc_commit_id,
+        progress,
+        batch_size,
+        emit,
+    )
+    .await
 }
 
 /// The graph-walk half of [`walk_jj_commits`], given an already-loaded repo and
@@ -102,6 +116,7 @@ pub async fn walk_jj_commits(
 /// reading the (large) commit index a second time.
 pub async fn walk_jj_with_repo(
     repo: &ReadonlyRepo,
+    repo_root: &Path,
     wc_commit_id: &CommitId,
     progress: LoadProgress,
     batch_size: usize,
@@ -143,6 +158,21 @@ pub async fn walk_jj_with_repo(
         }
     }
 
+    // Match the jj CLI's short change-id prefixes. jj shortens an id only as
+    // far as it stays unique within its `revsets.short-prefixes` disambiguation
+    // set (defaulting to `revsets.log` — the working copy, its near ancestors,
+    // and trunk), and falls back to full-index uniqueness for everything else.
+    // Disambiguating against all ~1M commits (what
+    // `Repo::shortest_unique_change_id_prefix_len` does) makes @ and its parent
+    // render with a far longer prefix than `jj log` shows. We resolve the
+    // user's actual config so this tracks their jj exactly; commits outside the
+    // set keep the full-index prefix, also exactly as jj renders them.
+    let prefix_context = IdPrefixContext::new(Arc::new(RevsetExtensions::default()))
+        .disambiguate_within(short_prefixes_disambiguation(repo_root, repo, wc_commit_id));
+    let prefix_index = prefix_context
+        .populate(repo)
+        .context("failed to build jj change-id prefix index")?;
+
     let mut lane_assigner = LaneAssigner::new();
     let mut tree_ids: HashMap<CommitId, Merge<TreeId>> = HashMap::new();
     let mut ids: Vec<CommitId> = Vec::new();
@@ -172,8 +202,8 @@ pub async fn walk_jj_with_repo(
             });
 
             let description = commit.description().lines().next().unwrap_or("").trim();
-            let shortest_change_id_len = repo
-                .shortest_unique_change_id_prefix_len(commit.change_id())
+            let shortest_change_id_len = prefix_index
+                .shortest_change_prefix_len(repo, commit.change_id())
                 .with_context(|| {
                     format!(
                         "failed to resolve shortest unique jj change id for {}",
@@ -285,6 +315,7 @@ pub async fn load_jj_cold(
 
     let empty_updates = walk_jj_with_repo(
         repo.as_ref(),
+        &repository.root,
         &wc_commit_id,
         progress,
         batch_size,
@@ -720,8 +751,142 @@ fn civil_date_from_days(days: i64) -> (i32, u32, u32) {
     (year as i32, month, day)
 }
 
+/// jj's revset config defaults — `revsets.log`, `revsets.short-prefixes`, and
+/// the `trunk()` / `immutable_heads()` family of aliases — ship in the jj **CLI**
+/// crate, not in jj-lib. A jj-lib consumer like diffui therefore inherits none
+/// of them, and a user's own config file only contains the keys they explicitly
+/// overrode. We embed the subset that the default `revsets.log` resolves through
+/// as the lowest config layer (`ConfigSource::Default`), so it is overridden by
+/// every higher layer — the user's `~/.config/jj`, the repo's
+/// `.jj/repo/config.toml`, `$JJ_CONFIG`, etc. (`trunk()` on most clones is a
+/// repo override, e.g. `master@origin`, and wins over the value here.)
+///
+/// ⚠️ DRIFT CAVEAT — keep this in sync with jj's defaults. These strings are
+/// copied verbatim from jj 0.35's defaults:
+///
+/// ```text
+/// jj config get revsets.log
+/// jj config get 'revset-aliases."trunk()"'          # + immutable_heads(),
+/// jj config get 'revset-aliases."immutable_heads()"'  #   builtin_immutable_heads(),
+/// jj config get 'revset-aliases."mutable()"'          #   immutable()
+/// ```
+///
+/// They take effect ONLY for a user who has not set the corresponding key
+/// themselves (any layer they define wins). The failure mode if a future jj
+/// changes a default and this block is not re-synced is purely cosmetic: such a
+/// user sees diffui shorten change-ids against jj's *old* default set, i.e. a
+/// slightly different prefix *length*. It is never a wrong or ambiguous id — a
+/// commit outside the disambiguation set still falls back to full-index
+/// uniqueness (`IdPrefixIndex::shortest_change_prefix_len`). And if a future jj
+/// default uses a revset/alias syntax our jj-lib can't parse,
+/// `short_prefixes_disambiguation` catches the parse error and falls back to
+/// `ancestors(@, 2)`. `embedded_default_revsets_log_parses` guards parseability
+/// at test time. Re-verify after every jj-lib bump.
+const JJ_DEFAULT_SHORT_PREFIX_CONFIG: &str = r#"
+[revsets]
+log = "present(@) | ancestors(immutable_heads().., 2) | present(trunk())"
+
+[revset-aliases]
+"trunk()" = 'latest(remote_bookmarks(exact:"main", exact:"origin") | remote_bookmarks(exact:"master", exact:"origin") | remote_bookmarks(exact:"trunk", exact:"origin") | remote_bookmarks(exact:"main", exact:"upstream") | remote_bookmarks(exact:"master", exact:"upstream") | remote_bookmarks(exact:"trunk", exact:"upstream") | root())'
+"builtin_immutable_heads()" = "present(trunk()) | tags() | untracked_remote_bookmarks()"
+"immutable_heads()" = "builtin_immutable_heads()"
+"immutable()" = "::(immutable_heads() | root())"
+"mutable()" = "~immutable()"
+"#;
+
+/// Disambiguation revset for short change-id prefixes, matching the jj CLI.
+///
+/// jj shortens a change-id only as far as it stays unique within
+/// `revsets.short-prefixes` (which falls back to `revsets.log`); ids outside
+/// that set fall back to full-index uniqueness. We resolve the user's actual
+/// config (see [`JJ_DEFAULT_SHORT_PREFIX_CONFIG`] for how the jj defaults are
+/// supplied), so the displayed prefixes track whatever their jj would show.
+/// Any failure — missing config, an alias we don't embed, a parse error — is
+/// non-fatal: we degrade to `ancestors(@, 2)`, jj's default working set, rather
+/// than abort a load over a cosmetic id-length detail.
+fn short_prefixes_disambiguation(
+    repo_root: &Path,
+    repo: &ReadonlyRepo,
+    wc_commit_id: &CommitId,
+) -> Arc<UserRevsetExpression> {
+    let workspace_name: WorkspaceNameBuf = repo
+        .view()
+        .wc_commit_ids()
+        .iter()
+        .find(|(_, id)| *id == wc_commit_id)
+        .map(|(name, _)| name.clone())
+        .unwrap_or_else(|| WorkspaceName::DEFAULT.to_owned());
+    match resolve_short_prefixes_revset(repo_root, &workspace_name) {
+        Ok(expr) => expr,
+        Err(err) => {
+            eprintln!("diffui: short change-id prefixes fall back to @ ancestors ({err:#})");
+            RevsetExpression::working_copy(workspace_name).ancestors_range(0..2)
+        }
+    }
+}
+
+/// Parse `revsets.short-prefixes` (falling back to `revsets.log`) from the
+/// user's merged jj config into a revset expression, the way the jj CLI does.
+fn resolve_short_prefixes_revset(
+    repo_root: &Path,
+    workspace_name: &WorkspaceName,
+) -> Result<Arc<UserRevsetExpression>> {
+    let settings = jj_settings(repo_root)?;
+
+    let revset_str = match settings.get_string("revsets.short-prefixes") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => settings
+            .get_string("revsets.log")
+            .context("no revsets.log to derive short change-id prefixes from")?,
+    };
+
+    let mut aliases = RevsetAliasesMap::new();
+    if let Ok(table) = settings.get_table("revset-aliases") {
+        for (decl, value) in table.iter() {
+            let Some(defn) = value.as_str() else { continue };
+            aliases
+                .insert(decl, defn)
+                .map_err(|err| anyhow::anyhow!("invalid revset alias {decl}: {err}"))?;
+        }
+    }
+
+    let path_converter = RepoPathUiConverter::Fs {
+        cwd: repo_root.to_path_buf(),
+        base: repo_root.to_path_buf(),
+    };
+    let extensions = RevsetExtensions::default();
+    let fileset_aliases = FilesetAliasesMap::new();
+    let context = RevsetParseContext {
+        aliases_map: &aliases,
+        local_variables: HashMap::new(),
+        user_email: settings.user_email(),
+        // No date patterns appear in short-prefix revsets, so the reference
+        // instant is irrelevant — the parser just requires one.
+        date_pattern_context: chrono::Utc::now().fixed_offset().into(),
+        default_ignored_remote: Some("git".as_ref()),
+        fileset_aliases_map: &fileset_aliases,
+        use_glob_by_default: false,
+        extensions: &extensions,
+        workspace: Some(RevsetWorkspaceContext {
+            path_converter: &path_converter,
+            workspace_name,
+        }),
+    };
+    let mut diagnostics = RevsetDiagnostics::new();
+    parse_revset(&mut diagnostics, &revset_str, &context)
+        .with_context(|| format!("failed to parse short-prefixes revset {revset_str:?}"))
+}
+
 pub fn jj_settings(repo_root: &Path) -> Result<UserSettings> {
     let mut config = StackedConfig::with_defaults();
+
+    // jj's own default `revsets.*` + revset-aliases ship in jj-CLI, not jj-lib,
+    // so we seed them as a low-priority layer. User/repo config loaded below
+    // overrides any of them. See [`JJ_DEFAULT_SHORT_PREFIX_CONFIG`].
+    config.add_layer(
+        ConfigLayer::parse(ConfigSource::Default, JJ_DEFAULT_SHORT_PREFIX_CONFIG)
+            .context("failed to parse embedded jj revset defaults")?,
+    );
 
     for path in jj_user_config_paths() {
         load_jj_user_config_path(&mut config, &path)?;
@@ -1038,5 +1203,133 @@ mod lane_width_probe {
             );
         }
         eprintln!("============================================\n");
+    }
+}
+
+#[cfg(test)]
+mod short_prefix_tests {
+    use super::*;
+
+    /// Drift guard for [`JJ_DEFAULT_SHORT_PREFIX_CONFIG`]: the embedded default
+    /// `revsets.log` and the aliases it expands through must parse under our
+    /// jj-lib. If a jj-lib bump changes the revset/alias syntax, this fails
+    /// instead of silently degrading every default-config user to the
+    /// `ancestors(@, 2)` fallback — see the constant's doc comment for the fix.
+    #[test]
+    fn embedded_default_revsets_log_parses() {
+        let mut config = StackedConfig::with_defaults();
+        config.add_layer(
+            ConfigLayer::parse(ConfigSource::Default, JJ_DEFAULT_SHORT_PREFIX_CONFIG)
+                .expect("embedded default config is valid TOML"),
+        );
+        let settings = UserSettings::from_config(config).expect("settings build");
+
+        let log = settings
+            .get_string("revsets.log")
+            .expect("embedded revsets.log present");
+        let mut aliases = RevsetAliasesMap::new();
+        for (decl, value) in settings
+            .get_table("revset-aliases")
+            .expect("embedded revset-aliases present")
+            .iter()
+        {
+            aliases
+                .insert(decl, value.as_str().expect("alias defn is a string"))
+                .expect("embedded alias parses");
+        }
+
+        let path_converter = RepoPathUiConverter::Fs {
+            cwd: PathBuf::from("."),
+            base: PathBuf::from("."),
+        };
+        let extensions = RevsetExtensions::default();
+        let fileset_aliases = FilesetAliasesMap::new();
+        let context = RevsetParseContext {
+            aliases_map: &aliases,
+            local_variables: HashMap::new(),
+            user_email: "test@example.com",
+            date_pattern_context: chrono::Utc::now().fixed_offset().into(),
+            default_ignored_remote: Some("git".as_ref()),
+            fileset_aliases_map: &fileset_aliases,
+            use_glob_by_default: false,
+            extensions: &extensions,
+            workspace: Some(RevsetWorkspaceContext {
+                path_converter: &path_converter,
+                workspace_name: WorkspaceName::DEFAULT,
+            }),
+        };
+        let mut diagnostics = RevsetDiagnostics::new();
+        parse_revset(&mut diagnostics, &log, &context).expect(
+            "embedded default revsets.log must parse — update JJ_DEFAULT_SHORT_PREFIX_CONFIG",
+        );
+    }
+
+    /// End-to-end check on a real repo: `@` must shorten to the same prefix the
+    /// jj CLI shows (1 char on a default-config clone), proving we disambiguate
+    /// within the user's `revsets.log` set rather than the full ~1M-commit
+    /// index. Loads only the repo index + the small disambiguation revset — no
+    /// full graph walk — so it's safe on huge repos that would OOM the GUI.
+    /// Run with `DIFFUI_PROFILE_REPO=/path cargo test --bin diffui short_prefixes_match_jj -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "loads a real repo; set DIFFUI_PROFILE_REPO"]
+    fn short_prefixes_match_jj_on_real_repo() {
+        let repo_root = PathBuf::from(std::env::var("DIFFUI_PROFILE_REPO").unwrap_or_else(|_| {
+            format!("{}/code/nixpkgs", std::env::var("HOME").expect("HOME set"))
+        }));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+
+        let settings =
+            UserSettings::from_config(StackedConfig::with_defaults()).expect("base settings");
+        let workspace = Workspace::load(
+            &settings,
+            &repo_root,
+            &StoreFactories::default(),
+            &default_working_copy_factories(),
+        )
+        .expect("load workspace");
+        let workspace_name = workspace.workspace_name().to_owned();
+        let repo = runtime
+            .block_on(workspace.repo_loader().load_at_head())
+            .expect("load repo at head");
+        let wc_commit_id = repo
+            .view()
+            .get_wc_commit_id(&workspace_name)
+            .expect("workspace has a working-copy commit")
+            .clone();
+
+        let expr = short_prefixes_disambiguation(&repo_root, repo.as_ref(), &wc_commit_id);
+        let index = IdPrefixContext::new(Arc::new(RevsetExtensions::default()))
+            .disambiguate_within(expr);
+        let index = index.populate(repo.as_ref()).expect("populate prefix index");
+
+        let prefix_len = |id: &CommitId| -> (String, usize) {
+            let commit = runtime
+                .block_on(repo.store().get_commit_async(id))
+                .expect("load commit");
+            let len = index
+                .shortest_change_prefix_len(repo.as_ref(), commit.change_id())
+                .expect("shortest prefix len");
+            (commit.change_id().to_string(), len)
+        };
+
+        let (wc_change, wc_len) = prefix_len(&wc_commit_id);
+        let wc_commit = runtime
+            .block_on(repo.store().get_commit_async(&wc_commit_id))
+            .expect("load wc commit");
+        eprintln!("\n=== short change-id prefixes (disambiguation = resolved revsets.log) ===");
+        eprintln!("@   {wc_change}  ->  {wc_len} char(s)");
+        if let Some(parent) = wc_commit.parent_ids().first() {
+            let (p_change, p_len) = prefix_len(parent);
+            eprintln!("@-  {p_change}  ->  {p_len} char(s)");
+        }
+        eprintln!("=====================================================================\n");
+
+        assert_eq!(
+            wc_len, 1,
+            "@ should get jj's short 1-char prefix, not the full-index length"
+        );
     }
 }
