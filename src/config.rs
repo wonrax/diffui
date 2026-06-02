@@ -9,17 +9,23 @@
 //!                        elsewhere.
 //!   multi_click_ms     — max ms between clicks to count as a multi-click in
 //!                        the diff view. Defaults to 350.
+//!   theme              — color theme: System | Light | Dark | Contrast.
+//!                        `System` follows the OS appearance. Defaults to
+//!                        System.
 
 use std::{env, path::PathBuf};
 
 use iced::Font;
 use serde::Deserialize;
 
+use crate::theme::ThemePreference;
+
 #[derive(Debug, Clone, Copy)]
 pub struct AppConfig {
     pub ui_font: Font,
     pub mono_font: Font,
     pub multi_click_ms: u64,
+    pub theme: ThemePreference,
 }
 
 impl AppConfig {
@@ -37,6 +43,11 @@ impl AppConfig {
                 .map(font_from_name)
                 .unwrap_or_else(default_mono_font),
             multi_click_ms: raw.multi_click_ms.unwrap_or(350),
+            theme: raw
+                .theme
+                .as_deref()
+                .and_then(theme_from_name)
+                .unwrap_or(ThemePreference::System),
         }
     }
 }
@@ -46,6 +57,20 @@ struct RawConfig {
     ui_font: Option<String>,
     mono_font: Option<String>,
     multi_click_ms: Option<u64>,
+    theme: Option<String>,
+}
+
+/// Parse a config `theme` value. Case-insensitive; `Contrast` maps to the
+/// high-contrast theme. Unknown values fall back to `System` (via the
+/// `None` the caller unwraps).
+fn theme_from_name(name: &str) -> Option<ThemePreference> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "system" => Some(ThemePreference::System),
+        "light" => Some(ThemePreference::Light),
+        "dark" => Some(ThemePreference::Dark),
+        "contrast" | "highcontrast" | "high-contrast" => Some(ThemePreference::HighContrast),
+        _ => None,
+    }
 }
 
 fn read_config_file() -> Option<RawConfig> {

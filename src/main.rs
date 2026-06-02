@@ -648,7 +648,7 @@ impl Diffui {
             repository_snapshot: None,
             snapshot_pending: false,
             app_focused: true,
-            selected_theme: ThemePreference::System,
+            selected_theme: config.theme,
             system_theme: iced_theme::Mode::None,
             selected_file: 0,
             sidebar_width,

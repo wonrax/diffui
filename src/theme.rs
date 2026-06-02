@@ -2,7 +2,7 @@ use iced::{
     Background, Border, Color, Element, Font, Length, Shadow, Theme, border,
     font::{Family, Weight},
     theme,
-    widget::{button, container, scrollable, text},
+    widget::{container, scrollable, text},
 };
 
 use crate::diff_view::Palette;
@@ -49,17 +49,6 @@ pub enum ThemePreference {
 }
 
 impl ThemePreference {
-    pub const ALL: [Self; 4] = [Self::System, Self::Dark, Self::Light, Self::HighContrast];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::System => "System",
-            Self::Dark => "Dark",
-            Self::Light => "Light",
-            Self::HighContrast => "Contrast",
-        }
-    }
-
     pub fn active(self, system_theme: theme::Mode) -> ResolvedTheme {
         match self {
             Self::System => match system_theme {
@@ -329,10 +318,6 @@ pub fn horizontal_divider<Message: 'static>(theme: ThemeSpec) -> Element<'static
         .into()
 }
 
-pub fn sidebar_header_style(theme: ThemeSpec) -> container::Style {
-    container::Style::default().background(theme.panel_background)
-}
-
 pub fn sidebar_panel_style(theme: ThemeSpec) -> container::Style {
     container::Style::default().background(theme.panel_background)
 }
@@ -345,29 +330,6 @@ pub fn diff_panel_style(theme: ThemeSpec) -> container::Style {
             color: Color::TRANSPARENT,
             radius: 0.0.into(),
         })
-}
-
-pub fn theme_switcher_button_style(
-    status: button::Status,
-    selected: bool,
-    theme: ThemeSpec,
-) -> button::Style {
-    let background = match (selected, status) {
-        (true, _) => theme.selected_file,
-        (false, button::Status::Hovered | button::Status::Pressed) => theme.selected_file,
-        (false, _) => theme.panel_background_elevated,
-    };
-    button::Style {
-        background: Some(Background::Color(background)),
-        text_color: theme.text,
-        border: Border {
-            width: 0.0,
-            color: Color::TRANSPARENT,
-            radius: 5.0.into(),
-        },
-        shadow: Shadow::default(),
-        snap: true,
-    }
 }
 
 /// Translucent chip background derived from the chip's text color. This way

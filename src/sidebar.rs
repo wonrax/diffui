@@ -1,9 +1,8 @@
 use std::collections::HashMap;
 
 use iced::{
-    Background, Border, Color, Element, Font, Length, alignment,
-    font::Weight,
-    widget::{button, column, container, row, text},
+    Color, Element, Font, Length, alignment,
+    widget::{column, container, text},
 };
 
 use crate::backend::{CommitStore, DiffFile, DiffFileStatus, RevisionSelection, RowView};
@@ -15,10 +14,7 @@ use crate::revision_list::{
     RowSelectionKey,
 };
 use jj_lib::graph::GraphEdgeType;
-use crate::theme::{
-    self, ThemePreference, ThemeSpec, chip_background, sidebar_header_style, sidebar_panel_style,
-    theme_switcher_button_style,
-};
+use crate::theme::{self, ThemeSpec, chip_background, sidebar_panel_style};
 use crate::{Diffui, LoadStatus, Message};
 
 // Public sidebar layout knobs — used by main.rs to clamp the resize handle.
@@ -79,7 +75,6 @@ fn chip_width(label: &str, metrics: &TextMetrics) -> f32 {
 const REVISION_CONTENT_RIGHT_PAD: f32 = 12.0;
 
 const CAPTION_TEXT_SIZE: f32 = 13.0;
-const COUNT_CHIP_TEXT_SIZE: f32 = 11.0;
 const REVISION_ID_CHARS: usize = 12;
 const COMMIT_ID_CHARS: usize = 12;
 
@@ -97,38 +92,35 @@ const FILE_STAT_HORIZONTAL_PADDING: f32 = 4.0;
 const FILE_STAT_MIN_WIDTH: f32 = 24.0;
 
 pub fn build_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
-    let title_row = row![
-        text("Changes")
-            .size(15)
-            .font(Font {
-                weight: Weight::Normal,
-                ..ui.config.ui_font
-            })
-            .color(theme.subtle_text),
-        build_count_chip(ui.commits.len(), theme, ui.config.ui_font),
-        container(text("")).width(Length::Fill),
-        build_theme_switcher(ui.selected_theme, theme, ui.config.ui_font),
-    ]
-    .spacing(8)
-    .align_y(alignment::Vertical::Center);
-
-    let mut header_content = column![title_row].spacing(7);
-
-    if let LoadStatus::Failed(error) = &ui.status {
-        header_content = header_content.push(
-            text(format!("Failed: {error}"))
-                .size(CAPTION_TEXT_SIZE)
-                .color(theme.removed_text),
-        );
-    }
-
-    let sidebar_header = container(header_content)
-        .padding([12, 12])
-        .style(move |_| sidebar_header_style(theme));
-
     let revision_list = build_revision_list(ui, theme);
 
-    let body = column![sidebar_header, revision_list].spacing(0);
+    // The "Changes" header is gone; give the first row a few px of breathing
+    // room so it doesn't sit flush against the top edge of the pane.
+    let list = container(revision_list).height(Length::Fill).padding(
+        iced::Padding {
+            top: 6.0,
+            right: 0.0,
+            bottom: 0.0,
+            left: 0.0,
+        },
+    );
+
+    let mut body = column![].spacing(0);
+    // Load failures no longer have a header to live under — surface them as a
+    // slim banner above the list.
+    if let LoadStatus::Failed(error) = &ui.status {
+        body = body.push(
+            container(
+                text(format!("Failed: {error}"))
+                    .size(CAPTION_TEXT_SIZE)
+                    .font(ui.config.ui_font)
+                    .color(theme.removed_text),
+            )
+            .width(Length::Fill)
+            .padding([8, 12]),
+        );
+    }
+    let body = body.push(list);
 
     container(body)
         .width(Length::Fixed(ui.sidebar_width))
@@ -466,50 +458,6 @@ fn revision_list_style(
         tooltip_border: theme.border,
         scrollbar: theme::scrollbar_style(theme),
     }
-}
-
-/// Small rounded badge showing the total number of revisions in view.
-/// Matches the design's `.pane-hd .ct` token: bg-elev background, line
-/// border, ink-400 mono numeral. Sits next to the `CHANGES` label.
-fn build_count_chip(count: usize, theme: ThemeSpec, font: Font) -> Element<'static, Message> {
-    container(
-        text(count.to_string())
-            .size(COUNT_CHIP_TEXT_SIZE)
-            .font(font)
-            .color(theme.subtle_text),
-    )
-    .padding([1, 7])
-    .style(move |_| container::Style {
-        background: Some(Background::Color(theme.panel_background_elevated)),
-        text_color: Some(theme.subtle_text),
-        border: Border {
-            color: theme.border,
-            width: 1.0,
-            radius: 999.0.into(),
-        },
-        ..container::Style::default()
-    })
-    .into()
-}
-
-fn build_theme_switcher(
-    selected_theme: ThemePreference,
-    theme: ThemeSpec,
-    font: Font,
-) -> Element<'static, Message> {
-    let mut controls = row![].spacing(3);
-
-    for candidate in ThemePreference::ALL {
-        let selected = candidate == selected_theme;
-        controls = controls.push(
-            button(text(candidate.label()).size(CAPTION_TEXT_SIZE).font(font))
-                .padding([5, 7])
-                .style(move |_, status| theme_switcher_button_style(status, selected, theme))
-                .on_press(Message::SelectTheme(candidate)),
-        );
-    }
-
-    controls.into()
 }
 
 /// Saturated color associated with a file's diff status, used to tint
