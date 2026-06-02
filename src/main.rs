@@ -22,6 +22,7 @@ mod revision_list;
 mod scrollbar;
 mod sidebar;
 mod theme;
+mod window_state;
 
 /// Profiling-only global allocator (enabled by the `track-alloc` feature). It
 /// forwards every request to the system allocator while tracking the live byte
@@ -103,7 +104,7 @@ use config::AppConfig;
 use find::FindState;
 use iced::theme as iced_theme;
 use iced::{
-    Element, Length, Subscription, Task, Theme,
+    Element, Length, Point, Size, Subscription, Task, Theme,
     alignment,
     event::{self, Event},
     keyboard, system, time,
@@ -119,6 +120,7 @@ use palette::{
 use repository::{Repository, RepositorySnapshot, Vcs, prepare_repository};
 use resize_handle::ResizeHandle;
 use theme::{ResolvedTheme, ThemePreference, ThemeSpec, app_shell_style, vertical_divider};
+use window_state::WindowState;
 
 /// Quiet period after the last filesystem event before we refresh. A single
 /// editor save typically emits a burst of events; coalescing them avoids
@@ -129,15 +131,33 @@ const WATCH_DEBOUNCE: Duration = Duration::from_millis(400);
 /// coalescing fast typing keeps the input responsive on large repos.
 const PALETTE_QUERY_DEBOUNCE: Duration = Duration::from_millis(120);
 
+/// Quiet period after the last window move/resize (or sidebar drag) before the
+/// geometry is written to disk. A single drag emits a burst of events;
+/// coalescing them into one write avoids hammering the disk every frame.
+const WINDOW_STATE_DEBOUNCE: Duration = Duration::from_millis(400);
+
 fn main() -> iced::Result {
     let cli = Cli::parse();
 
+    // Restore the last window geometry before the window is created. The
+    // sidebar split lives in app state, so it's restored later in
+    // `Diffui::new`; `saved` is handed to the boot closure for that.
+    let saved = WindowState::load();
+    let mut window_settings = window::Settings::default();
+    if let Some((width, height)) = saved.size() {
+        window_settings.size = Size::new(width, height);
+    }
+    if let Some((x, y)) = saved.position() {
+        window_settings.position = window::Position::Specific(Point::new(x, y));
+    }
+
     iced::application(
-        move || Diffui::new(cli.clone()),
+        move || Diffui::new(cli.clone(), saved),
         Diffui::update,
         Diffui::view,
     )
     .title("diffui")
+    .window(window_settings)
     .subscription(Diffui::subscription)
     .theme(Diffui::theme)
     .run()
@@ -177,6 +197,18 @@ pub(crate) struct Diffui {
     /// the app — caching avoids re-shaping six strings on every `view()`
     /// rebuild and on every drag tick of the resize handle.
     pub(crate) sidebar_min_width: f32,
+    /// Last window geometry seen from the compositor: inner (client) size and
+    /// outer top-left position. Updated on `Opened`/`Resized`/`Moved` and
+    /// written back — debounced — so the next launch restores it. Position is
+    /// `None` until the window reports one (and stays `None` on Wayland, which
+    /// doesn't report window positions).
+    pub(crate) window_size: Size,
+    pub(crate) window_position: Option<Point>,
+    /// Set when the window geometry or sidebar width changes; cleared once the
+    /// new value is persisted. While it's `Some`, the subscription runs a
+    /// debounce timer whose tick flushes the geometry to disk after the
+    /// changes settle. `None` when nothing is pending.
+    pub(crate) geometry_dirty_since: Option<Instant>,
     pub(crate) config: AppConfig,
     pub(crate) revision_details: Option<RevisionDetails>,
     /// `None` when closed; a non-empty column stack when open.
@@ -306,6 +338,19 @@ pub(crate) enum Message {
     SelectPreviousFile,
     CopyToClipboard(String),
     SidebarWidthChanged(f32),
+    /// The window finished opening: carries its initial outer position (absent
+    /// on Wayland) and inner size. Seeds geometry tracking without marking it
+    /// dirty — the restored state is already on disk.
+    WindowOpened(Option<Point>, Size),
+    /// The window was resized by the user. Updates tracking and schedules a
+    /// debounced save.
+    WindowResized(Size),
+    /// The window was moved by the user. Updates tracking and schedules a
+    /// debounced save.
+    WindowMoved(Point),
+    /// Debounce tick: persist the window geometry + sidebar width once the
+    /// changes have settled. Subscribed only while a change is pending.
+    PersistWindowState,
     PaletteOpen,
     PaletteClose,
     PaletteQueryChanged(String),
@@ -352,9 +397,24 @@ pub(crate) enum Message {
 }
 
 impl Diffui {
-    fn new(cli: Cli) -> (Self, Task<Message>) {
+    fn new(cli: Cli, saved: WindowState) -> (Self, Task<Message>) {
         let config = AppConfig::load();
         let sidebar_min_width = sidebar::min_width(config);
+        // Restore the persisted sidebar split and window geometry. The sidebar
+        // is clamped to its min so a stale width from a narrower font config
+        // can't leave it unusable. The window size/position seed the in-memory
+        // tracking; the compositor's `Opened` event overwrites them with the
+        // real values a frame later, but seeding keeps them correct in between.
+        let sidebar_width = saved
+            .sidebar_width
+            .filter(|w| w.is_finite() && *w > 0.0)
+            .unwrap_or(sidebar::DEFAULT_WIDTH)
+            .max(sidebar_min_width);
+        let window_size = saved
+            .size()
+            .map(|(w, h)| Size::new(w, h))
+            .unwrap_or_else(|| window::Settings::default().size);
+        let window_position = saved.position().map(|(x, y)| Point::new(x, y));
         match prepare_repository(&cli.path) {
             Ok(repository) => {
                 let commit_progress = LoadProgress::default();
@@ -409,8 +469,11 @@ impl Diffui {
                         selected_theme: ThemePreference::System,
                         system_theme: iced_theme::Mode::None,
                         selected_file: 0,
-                        sidebar_width: sidebar::DEFAULT_WIDTH.max(sidebar_min_width),
+                        sidebar_width,
                         sidebar_min_width,
+                        window_size,
+                        window_position,
+                        geometry_dirty_since: None,
                         config,
                         revision_details: None,
                         palette: None,
@@ -445,8 +508,11 @@ impl Diffui {
                     selected_theme: ThemePreference::System,
                     system_theme: iced_theme::Mode::None,
                     selected_file: 0,
-                    sidebar_width: sidebar::DEFAULT_WIDTH.max(sidebar_min_width),
+                    sidebar_width,
                     sidebar_min_width,
+                    window_size,
+                    window_position,
+                    geometry_dirty_since: None,
                     config,
                     revision_details: None,
                     palette: None,
@@ -761,7 +827,16 @@ impl Diffui {
             }
             Message::WindowFocusChanged(focused) => {
                 let gained_focus = focused && !self.app_focused;
+                let lost_focus = !focused && self.app_focused;
                 self.app_focused = focused;
+
+                // Flush pending geometry immediately on focus loss. App-switch
+                // and quit almost always blur the window first, so this closes
+                // the gap between a resize and the debounce timer firing.
+                if lost_focus && self.geometry_dirty_since.is_some() {
+                    self.geometry_dirty_since = None;
+                    self.current_window_state().save();
+                }
 
                 if gained_focus {
                     return self.start_repository_snapshot(RefreshOrigin::Focus);
@@ -791,7 +866,42 @@ impl Diffui {
                 return iced::clipboard::write(text).discard();
             }
             Message::SidebarWidthChanged(width) => {
-                self.sidebar_width = width.max(self.sidebar_min_width);
+                let clamped = width.max(self.sidebar_min_width);
+                if clamped != self.sidebar_width {
+                    self.sidebar_width = clamped;
+                    self.mark_geometry_dirty();
+                }
+            }
+            Message::WindowOpened(position, size) => {
+                // Seed tracking from the real window without marking dirty: the
+                // geometry we'd persist already matches what's on disk.
+                self.window_size = size;
+                if position.is_some() {
+                    self.window_position = position;
+                }
+            }
+            Message::WindowResized(size) => {
+                if self.window_size != size {
+                    self.window_size = size;
+                    self.mark_geometry_dirty();
+                }
+            }
+            Message::WindowMoved(position) => {
+                if self.window_position != Some(position) {
+                    self.window_position = Some(position);
+                    self.mark_geometry_dirty();
+                }
+            }
+            Message::PersistWindowState => {
+                // Only write once the changes have settled — a drag keeps
+                // bumping `geometry_dirty_since`, so the elapsed check holds the
+                // write back until the burst stops.
+                if let Some(since) = self.geometry_dirty_since
+                    && since.elapsed() >= WINDOW_STATE_DEBOUNCE
+                {
+                    self.geometry_dirty_since = None;
+                    self.current_window_state().save();
+                }
             }
             Message::PaletteOpen => {
                 if self.palette.is_none() {
@@ -1508,9 +1618,14 @@ impl Diffui {
             }
         });
 
-        let focus = event::listen().filter_map(|event| match event {
+        let window_events = event::listen().filter_map(|event| match event {
             Event::Window(window::Event::Focused) => Some(Message::WindowFocusChanged(true)),
             Event::Window(window::Event::Unfocused) => Some(Message::WindowFocusChanged(false)),
+            Event::Window(window::Event::Opened { position, size, .. }) => {
+                Some(Message::WindowOpened(position, size))
+            }
+            Event::Window(window::Event::Resized(size)) => Some(Message::WindowResized(size)),
+            Event::Window(window::Event::Moved(position)) => Some(Message::WindowMoved(position)),
             _ => None,
         });
         // Watch the working tree for changes instead of polling. The
@@ -1549,14 +1664,41 @@ impl Diffui {
             Subscription::none()
         };
 
+        // Drives the debounced geometry save. Active only while a change is
+        // pending; the handler writes once the changes settle, then clears the
+        // dirty flag, which tears this subscription back down.
+        let window_state_tick = if self.geometry_dirty_since.is_some() {
+            time::every(WINDOW_STATE_DEBOUNCE).map(|_| Message::PersistWindowState)
+        } else {
+            Subscription::none()
+        };
+
         Subscription::batch([
             keyboard,
-            focus,
+            window_events,
             refresh,
             palette_tick,
             loading_tick,
+            window_state_tick,
             system::theme_changes().map(Message::SystemThemeChanged),
         ])
+    }
+
+    /// Mark the window geometry / sidebar width as changed, arming the
+    /// debounce timer the subscription runs while a save is pending.
+    fn mark_geometry_dirty(&mut self) {
+        self.geometry_dirty_since = Some(Instant::now());
+    }
+
+    /// Snapshot the current geometry + sidebar width into the persisted form.
+    fn current_window_state(&self) -> WindowState {
+        WindowState {
+            width: Some(self.window_size.width),
+            height: Some(self.window_size.height),
+            x: self.window_position.map(|p| p.x),
+            y: self.window_position.map(|p| p.y),
+            sidebar_width: Some(self.sidebar_width),
+        }
     }
 
     fn resolved_theme(&self) -> ResolvedTheme {
