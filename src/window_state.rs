@@ -21,12 +21,12 @@ use serde::{Deserialize, Serialize};
 /// an unusable sliver of a window.
 const MIN_RESTORE_DIMENSION: f32 = 100.0;
 
-/// Window geometry + sidebar split persisted between sessions. Every field is
-/// optional so a partial or older file still loads — a missing field just
-/// falls back to the in-app default. All values are logical pixels. The type
-/// is intentionally iced-free (plain `f32`) so persistence stays decoupled
-/// from the UI layer; callers convert to `iced::Size` / `iced::Point`.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+/// Window geometry, sidebar split, and the open-repo session persisted between
+/// runs. Every field is optional / defaulted so a partial or older file still
+/// loads — a missing field just falls back to the in-app default. Geometry is
+/// logical pixels; the type is intentionally iced-free (plain `f32` / `String`)
+/// so persistence stays decoupled from the UI layer.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WindowState {
     #[serde(default)]
     pub width: Option<f32>,
@@ -41,6 +41,14 @@ pub struct WindowState {
     pub y: Option<f32>,
     #[serde(default)]
     pub sidebar_width: Option<f32>,
+    /// Repository roots that were open as tabs, in tab order. Restored on the
+    /// next launch when no repositories are given on the command line.
+    #[serde(default)]
+    pub open_repos: Vec<String>,
+    /// Root of the tab that was active, so it's re-focused on restore. `None`
+    /// (or an unresolvable path) falls back to the first tab.
+    #[serde(default)]
+    pub active_repo: Option<String>,
 }
 
 impl WindowState {
@@ -195,12 +203,19 @@ mod tests {
             x: Some(100.0),
             y: Some(50.0),
             sidebar_width: Some(280.0),
+            open_repos: vec!["/a/repo".to_owned(), "/b/repo".to_owned()],
+            active_repo: Some("/b/repo".to_owned()),
         };
         let raw = toml::to_string(&state).expect("serialize");
         let parsed: WindowState = toml::from_str(&raw).expect("deserialize");
         assert_eq!(parsed.size(), Some((1200.0, 800.0)));
         assert_eq!(parsed.position(), Some((100.0, 50.0)));
         assert_eq!(parsed.sidebar_width, Some(280.0));
+        assert_eq!(
+            parsed.open_repos,
+            vec!["/a/repo".to_owned(), "/b/repo".to_owned()]
+        );
+        assert_eq!(parsed.active_repo.as_deref(), Some("/b/repo"));
     }
 
     #[test]

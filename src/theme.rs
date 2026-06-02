@@ -313,6 +313,22 @@ pub fn vertical_divider<Message: 'static>(theme: ThemeSpec) -> Element<'static, 
         .into()
 }
 
+pub fn horizontal_divider<Message: 'static>(theme: ThemeSpec) -> Element<'static, Message> {
+    container(text(""))
+        .width(Length::Fill)
+        .height(Length::Fixed(1.0))
+        .style(move |_| {
+            container::Style::default()
+                .background(theme.border)
+                .border(Border {
+                    width: 0.0,
+                    color: Color::TRANSPARENT,
+                    radius: 0.0.into(),
+                })
+        })
+        .into()
+}
+
 pub fn sidebar_header_style(theme: ThemeSpec) -> container::Style {
     container::Style::default().background(theme.panel_background)
 }

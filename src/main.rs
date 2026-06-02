@@ -1,11 +1,12 @@
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     time::{Duration, Instant},
 };
 
 mod backend;
+mod chrome;
 mod config;
 mod diff_panel;
 mod diff_view;
@@ -21,6 +22,7 @@ mod resize_handle;
 mod revision_list;
 mod scrollbar;
 mod sidebar;
+mod tab_bar;
 mod theme;
 mod window_state;
 
@@ -119,7 +121,10 @@ use palette::{
 };
 use repository::{Repository, RepositorySnapshot, Vcs, prepare_repository};
 use resize_handle::ResizeHandle;
-use theme::{ResolvedTheme, ThemePreference, ThemeSpec, app_shell_style, vertical_divider};
+use theme::{
+    ResolvedTheme, ThemePreference, ThemeSpec, app_shell_style, horizontal_divider,
+    vertical_divider,
+};
 use window_state::WindowState;
 
 /// Quiet period after the last filesystem event before we refresh. A single
@@ -150,9 +155,12 @@ fn main() -> iced::Result {
     if let Some((x, y)) = saved.position() {
         window_settings.position = window::Position::Specific(Point::new(x, y));
     }
+    // Platform window chrome (e.g. macOS transparent title bar so the tab strip
+    // sits inline with the traffic lights). See `chrome`.
+    chrome::apply_window_settings(&mut window_settings);
 
     iced::application(
-        move || Diffui::new(cli.clone(), saved),
+        move || Diffui::new(cli.clone(), saved.clone()),
         Diffui::update,
         Diffui::view,
     )
@@ -166,8 +174,10 @@ fn main() -> iced::Result {
 #[derive(Debug, Clone, Parser)]
 #[command(version, about = "Native GUI diff viewer for jj and git")]
 struct Cli {
-    #[arg(default_value = ".")]
-    path: PathBuf,
+    /// One or more repository paths to open as tabs. Defaults to the current
+    /// directory when none are given.
+    #[arg(value_name = "PATH")]
+    paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -259,6 +269,127 @@ pub(crate) struct Diffui {
     /// whenever no stream is running (idle, or after a refresh that swaps the
     /// graph atomically instead).
     pub(crate) load: Option<LoadCursor>,
+
+    // ── Multi-repo ──────────────────────────────────────────────────────
+    /// Every open repository, in tab order. The *active* tab's heavy view
+    /// state lives in the inline fields above; every other tab keeps its in
+    /// `Tab::stash`. Switching tabs swaps the two. Empty ⇒ the empty-state
+    /// view owns the window.
+    pub(crate) tabs: Vec<Tab>,
+    /// Index into `tabs` of the active tab. Meaningless when `tabs` is empty.
+    pub(crate) active_tab: usize,
+    /// Monotonic source of `TabId`s, so a tab keeps a stable identity even as
+    /// its index shifts when other tabs open/close.
+    pub(crate) next_tab_id: u64,
+    /// Monotonic source of streaming-load `version`s. Each (re)load gets a
+    /// fresh value so late batches from a superseded or backgrounded load are
+    /// dropped by the version guard rather than corrupting the active tab.
+    pub(crate) next_load_version: u64,
+    /// `Some` while the "open repository" path dialog is showing.
+    pub(crate) open_repo_dialog: Option<OpenRepoDialog>,
+}
+
+/// Per-repository view state. The active tab's copy is spread across the
+/// `Diffui` inline fields (so the view/update code reads it as flat fields);
+/// inactive tabs keep theirs here, stashed in `Tab::stash`. The field set is
+/// the exact per-repo subset of `Diffui` — `stash_active_state` /
+/// `restore_active_state` move every field between the two, so the two lists
+/// MUST stay in sync.
+#[derive(Debug, Clone)]
+pub(crate) struct RepoState {
+    pub(crate) repository: Option<Repository>,
+    pub(crate) status: LoadStatus,
+    pub(crate) document: DiffDocument,
+    pub(crate) commits: CommitStore,
+    pub(crate) selected_revision: RevisionSelection,
+    pub(crate) file_list_expanded: bool,
+    pub(crate) pending_revision: Option<RevisionSelection>,
+    pub(crate) repository_snapshot: Option<RepositorySnapshot>,
+    pub(crate) snapshot_pending: bool,
+    pub(crate) selected_file: usize,
+    pub(crate) revision_details: Option<RevisionDetails>,
+    pub(crate) revision_reveal_token: u64,
+    pub(crate) pending_revision_reveal: bool,
+    pub(crate) commits_version: u64,
+    pub(crate) graph: graph_layout::GraphLayout,
+    pub(crate) sidebar_prefix_lens: Vec<usize>,
+    pub(crate) selected_commit_index: Option<usize>,
+    pub(crate) commit_progress: LoadProgress,
+    pub(crate) loading_since: Option<Instant>,
+    pub(crate) empty_cache: HashMap<String, bool>,
+    pub(crate) load: Option<LoadCursor>,
+}
+
+impl RepoState {
+    /// A never-loaded tab for `repository`: empty graph, `Loading` status, no
+    /// task in flight. `ensure_active_loaded` kicks the real load when this
+    /// becomes the active tab (`status != Loaded`).
+    fn unloaded(repository: Option<Repository>) -> Self {
+        Self {
+            repository,
+            status: LoadStatus::Loading,
+            document: DiffDocument::default(),
+            commits: CommitStore::default(),
+            selected_revision: RevisionSelection::WorkingCopy,
+            file_list_expanded: true,
+            pending_revision: None,
+            repository_snapshot: None,
+            snapshot_pending: false,
+            selected_file: 0,
+            revision_details: None,
+            revision_reveal_token: 0,
+            pending_revision_reveal: false,
+            commits_version: 0,
+            graph: graph_layout::GraphLayout::default(),
+            sidebar_prefix_lens: Vec::new(),
+            selected_commit_index: None,
+            commit_progress: LoadProgress::default(),
+            loading_since: None,
+            empty_cache: HashMap::new(),
+            load: None,
+        }
+    }
+
+    /// The inline state when no repository is open at all (closed the last
+    /// tab). `Loaded` so `view()` doesn't try to show a loading indicator
+    /// behind the empty state.
+    fn empty() -> Self {
+        Self {
+            status: LoadStatus::Loaded,
+            ..Self::unloaded(None)
+        }
+    }
+}
+
+/// A stable identity for an open tab, independent of its position in `tabs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct TabId(pub(crate) u64);
+
+/// One open repository: its identity + display metadata, plus the stashed
+/// per-repo state while it's inactive. The active tab's `stash` is `None` —
+/// its state is checked out into the `Diffui` inline fields.
+#[derive(Debug, Clone)]
+pub(crate) struct Tab {
+    pub(crate) id: TabId,
+    /// Dimmed prefix in the tab label — the repo root's parent directory.
+    pub(crate) owner: String,
+    /// Emphasized repo name — the repo root's directory name.
+    pub(crate) name: String,
+    pub(crate) vcs: Vcs,
+    /// Repository root, used to de-duplicate opens and key the watcher.
+    pub(crate) root: PathBuf,
+    /// `None` for the active tab (state is inline); `Some` for an inactive
+    /// tab (loaded, or a fresh `RepoState::unloaded`).
+    pub(crate) stash: Option<RepoState>,
+}
+
+/// Transient state of the open-repository path dialog.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OpenRepoDialog {
+    pub(crate) path: String,
+    /// Populated when the last submit failed to resolve a repository, so the
+    /// dialog stays open with the reason shown.
+    pub(crate) error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -351,6 +482,26 @@ pub(crate) enum Message {
     /// Debounce tick: persist the window geometry + sidebar width once the
     /// changes have settled. Subscribed only while a change is pending.
     PersistWindowState,
+    // ── Multi-repo ──────────────────────────────────────────────────────
+    /// Activate the tab with this id (clicking a tab).
+    SelectTab(TabId),
+    /// Activate the tab at this position (⌘1–9). Out-of-range is a no-op.
+    SelectTabIndex(usize),
+    /// Close the tab with this id (clicking its ×).
+    CloseTab(TabId),
+    /// Close the active tab (⌘W).
+    CloseActiveTab,
+    /// Open the "open repository" path dialog (+ button / ⌘O).
+    OpenRepoDialogOpen,
+    OpenRepoDialogClose,
+    OpenRepoPathChanged(String),
+    /// Resolve the dialog's path and open it as a tab (Enter / "Open").
+    OpenRepoSubmit,
+    /// Swallow clicks on the dialog card so they don't dismiss it.
+    OpenRepoNoOp,
+    /// Begin an interactive window drag — fired when the user presses an empty
+    /// area of the tab strip on platforms where it stands in for the title bar.
+    TitleBarDrag,
     PaletteOpen,
     PaletteClose,
     PaletteQueryChanged(String),
@@ -415,123 +566,125 @@ impl Diffui {
             .map(|(w, h)| Size::new(w, h))
             .unwrap_or_else(|| window::Settings::default().size);
         let window_position = saved.position().map(|(x, y)| Point::new(x, y));
-        match prepare_repository(&cli.path) {
-            Ok(repository) => {
-                let commit_progress = LoadProgress::default();
-                // jj streams the cold load for a progressive first paint; git
-                // loads in one shot (its `git log` parse isn't incremental).
-                let (backend_task, load, commits_version) = match repository.vcs {
-                    Vcs::Jj => {
-                        let version = 1;
-                        (
-                            stream_jj_initial_load(
-                                repository.clone(),
-                                commit_progress.clone(),
-                                version,
-                            ),
-                            Some(LoadCursor {
-                                version,
-                                ..Default::default()
-                            }),
-                            version,
-                        )
-                    }
-                    Vcs::Git => {
-                        let revision = RevisionSelection::WorkingCopy;
-                        (
-                            Task::perform(
-                                load_backend(
-                                    repository.clone(),
-                                    revision.clone(),
-                                    commit_progress.clone(),
-                                ),
-                                move |result| Message::BackendLoaded(revision, Box::new(result)),
-                            ),
-                            None,
-                            0,
-                        )
-                    }
-                };
-                let theme_task = system::theme().map(Message::SystemThemeChanged);
 
-                (
-                    Self {
-                        repository: Some(repository),
-                        status: LoadStatus::Loading,
-                        document: DiffDocument::default(),
-                        commits: CommitStore::default(),
-                        selected_revision: RevisionSelection::WorkingCopy,
-                        file_list_expanded: true,
-                        pending_revision: Some(RevisionSelection::WorkingCopy),
-                        repository_snapshot: None,
-                        snapshot_pending: false,
-                        app_focused: true,
-                        selected_theme: ThemePreference::System,
-                        system_theme: iced_theme::Mode::None,
-                        selected_file: 0,
-                        sidebar_width,
-                        sidebar_min_width,
-                        window_size,
-                        window_position,
-                        geometry_dirty_since: None,
-                        config,
-                        revision_details: None,
-                        palette: None,
-                        recents: Recents::load(),
-                        find: None,
-                        revision_reveal_token: 0,
-                        pending_revision_reveal: false,
-                        commits_version,
-                        graph: graph_layout::GraphLayout::default(),
-                        sidebar_prefix_lens: Vec::new(),
-                        selected_commit_index: None,
-                        commit_progress,
-                        loading_since: Some(Instant::now()),
-                        empty_cache: HashMap::new(),
-                        load,
-                    },
-                    Task::batch([backend_task, theme_task]),
-                )
+        // Repositories to open: explicit CLI paths win; otherwise restore last
+        // session's open repos; otherwise the current directory. Unresolvable
+        // paths are skipped (keeping the first error so a single bad path still
+        // surfaces a message); the survivors each become a tab.
+        let requested: Vec<PathBuf> = if !cli.paths.is_empty() {
+            cli.paths
+        } else if !saved.open_repos.is_empty() {
+            saved.open_repos.iter().map(PathBuf::from).collect()
+        } else {
+            vec![PathBuf::from(".")]
+        };
+        let mut repositories = Vec::new();
+        let mut first_error = None;
+        for path in &requested {
+            match prepare_repository(path) {
+                Ok(repository) => repositories.push(repository),
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(format!("{error:#}"));
+                    }
+                }
             }
-            Err(error) => (
-                Self {
-                    repository: None,
-                    status: LoadStatus::Failed(format!("{error:#}")),
-                    document: DiffDocument::default(),
-                    commits: CommitStore::default(),
-                    selected_revision: RevisionSelection::WorkingCopy,
-                    file_list_expanded: true,
-                    pending_revision: None,
-                    repository_snapshot: None,
-                    snapshot_pending: false,
-                    app_focused: true,
-                    selected_theme: ThemePreference::System,
-                    system_theme: iced_theme::Mode::None,
-                    selected_file: 0,
-                    sidebar_width,
-                    sidebar_min_width,
-                    window_size,
-                    window_position,
-                    geometry_dirty_since: None,
-                    config,
-                    revision_details: None,
-                    palette: None,
-                    recents: Recents::load(),
-                    find: None,
-                    revision_reveal_token: 0,
-                    pending_revision_reveal: false,
-                    commits_version: 0,
-                    graph: graph_layout::GraphLayout::default(),
-                    sidebar_prefix_lens: Vec::new(),
-                    selected_commit_index: None,
-                    commit_progress: LoadProgress::default(),
-                    loading_since: None,
-                    empty_cache: HashMap::new(),
-                    load: None,
-                },
-                system::theme().map(Message::SystemThemeChanged),
-            ),
         }
+
+        // Re-focus the tab that was active last session (matched by repo root),
+        // falling back to the first.
+        let active_index = saved
+            .active_repo
+            .as_deref()
+            .and_then(|active| {
+                repositories
+                    .iter()
+                    .position(|repository| repository.root.to_string_lossy() == active)
+            })
+            .unwrap_or(0);
+
+        let mut next_tab_id = 0u64;
+        let mut tabs = Vec::with_capacity(repositories.len());
+        for (index, repository) in repositories.iter().enumerate() {
+            let (owner, name) = repo_label(&repository.root);
+            let id = TabId(next_tab_id);
+            next_tab_id += 1;
+            // The active tab's state lives inline (no stash); the rest start
+            // unloaded and load lazily on first activation.
+            let stash = if index == active_index {
+                None
+            } else {
+                Some(RepoState::unloaded(Some(repository.clone())))
+            };
+            tabs.push(Tab {
+                id,
+                owner,
+                name,
+                vcs: repository.vcs,
+                root: repository.root.clone(),
+                stash,
+            });
+        }
+
+        let active_repository = repositories.get(active_index).cloned();
+        let active_tab = if repositories.is_empty() { 0 } else { active_index };
+        let status = match (&active_repository, &first_error) {
+            (Some(_), _) => LoadStatus::Loading,
+            (None, Some(error)) => LoadStatus::Failed(error.clone()),
+            (None, None) => LoadStatus::Loaded,
+        };
+
+        // The active tab starts as a blank `unloaded` shell; `kick_initial_load`
+        // below fills it in (and streams the rest). Inactive tabs load on
+        // first activation.
+        let mut app = Self {
+            repository: active_repository.clone(),
+            status,
+            document: DiffDocument::default(),
+            commits: CommitStore::default(),
+            selected_revision: RevisionSelection::WorkingCopy,
+            file_list_expanded: true,
+            pending_revision: None,
+            repository_snapshot: None,
+            snapshot_pending: false,
+            app_focused: true,
+            selected_theme: ThemePreference::System,
+            system_theme: iced_theme::Mode::None,
+            selected_file: 0,
+            sidebar_width,
+            sidebar_min_width,
+            window_size,
+            window_position,
+            geometry_dirty_since: None,
+            config,
+            revision_details: None,
+            palette: None,
+            recents: Recents::load(),
+            find: None,
+            revision_reveal_token: 0,
+            pending_revision_reveal: false,
+            commits_version: 0,
+            graph: graph_layout::GraphLayout::default(),
+            sidebar_prefix_lens: Vec::new(),
+            selected_commit_index: None,
+            commit_progress: LoadProgress::default(),
+            loading_since: None,
+            empty_cache: HashMap::new(),
+            load: None,
+            tabs,
+            active_tab,
+            next_tab_id,
+            next_load_version: 0,
+            open_repo_dialog: None,
+        };
+
+        let theme_task = system::theme().map(Message::SystemThemeChanged);
+        let load_task = if active_repository.is_some() {
+            app.kick_initial_load()
+        } else {
+            Task::none()
+        };
+        (app, Task::batch([load_task, theme_task]))
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -879,12 +1032,16 @@ impl Diffui {
                 if position.is_some() {
                     self.window_position = position;
                 }
+                // Center the native window controls on the tab strip.
+                return self.reposition_window_controls();
             }
             Message::WindowResized(size) => {
                 if self.window_size != size {
                     self.window_size = size;
                     self.mark_geometry_dirty();
                 }
+                // AppKit resets the traffic-light position on resize — re-apply.
+                return self.reposition_window_controls();
             }
             Message::WindowMoved(position) => {
                 if self.window_position != Some(position) {
@@ -903,12 +1060,62 @@ impl Diffui {
                     self.current_window_state().save();
                 }
             }
+            Message::SelectTab(id) => {
+                return self.activate_tab(id);
+            }
+            Message::SelectTabIndex(index) => {
+                if let Some(tab) = self.tabs.get(index) {
+                    let id = tab.id;
+                    return self.activate_tab(id);
+                }
+            }
+            Message::CloseTab(id) => {
+                return self.close_tab(id);
+            }
+            Message::CloseActiveTab => {
+                if let Some(tab) = self.tabs.get(self.active_tab) {
+                    let id = tab.id;
+                    return self.close_tab(id);
+                }
+            }
+            Message::OpenRepoDialogOpen => {
+                // Mutually exclusive with the other overlays.
+                self.palette = None;
+                self.find = None;
+                self.open_repo_dialog = Some(OpenRepoDialog::default());
+                return widget::operation::focus(tab_bar::OPEN_REPO_INPUT_ID);
+            }
+            Message::OpenRepoDialogClose => {
+                self.open_repo_dialog = None;
+            }
+            Message::OpenRepoPathChanged(path) => {
+                if let Some(dialog) = self.open_repo_dialog.as_mut() {
+                    dialog.path = path;
+                    // Clear a stale error as soon as the user edits the path.
+                    dialog.error = None;
+                }
+            }
+            Message::OpenRepoSubmit => {
+                let path = self
+                    .open_repo_dialog
+                    .as_ref()
+                    .map(|dialog| dialog.path.clone())
+                    .unwrap_or_default();
+                return self.open_repository(&path);
+            }
+            Message::OpenRepoNoOp => {}
+            Message::TitleBarDrag => {
+                // Resolve the (single) window and begin an interactive drag.
+                // No-op if the window id isn't available yet.
+                return window::latest().then(|id| id.map_or_else(Task::none, window::drag));
+            }
             Message::PaletteOpen => {
                 if self.palette.is_none() {
-                    // Mutually exclusive with the find bar: opening the
-                    // palette pulls keyboard focus and the find bar would
-                    // sit behind the modal anyway.
+                    // Mutually exclusive with the find bar / open-repo dialog:
+                    // opening the palette pulls keyboard focus and the others
+                    // would sit behind the modal anyway.
                     self.find = None;
+                    self.open_repo_dialog = None;
                     self.palette = Some(PaletteState::open(self));
                     return widget::operation::focus(palette::PALETTE_INPUT_ID);
                 }
@@ -1032,10 +1239,11 @@ impl Diffui {
                 }
             }
             Message::FindOpen => {
-                // Mutually exclusive with the palette: same keyboard focus
-                // arbiter, and stacking the palette over a find bar makes
-                // the find bar look broken.
+                // Mutually exclusive with the palette / open-repo dialog: same
+                // keyboard focus arbiter, and stacking overlays makes the find
+                // bar look broken.
                 self.palette = None;
+                self.open_repo_dialog = None;
                 if self.find.is_none() {
                     self.find = Some(FindState::default());
                 }
@@ -1443,8 +1651,265 @@ impl Diffui {
         }
     }
 
+    /// (Re)start the initial load for the active tab's repository — a streaming
+    /// cold load for jj, a one-shot load for git. Resets the per-repo view
+    /// fields first, so a re-kick (after returning to a tab whose load was
+    /// abandoned while it sat in the background) starts from a clean slate.
+    fn kick_initial_load(&mut self) -> Task<Message> {
+        let Some(repository) = self.repository.clone() else {
+            return Task::none();
+        };
+        self.status = LoadStatus::Loading;
+        self.loading_since = Some(Instant::now());
+        self.selected_revision = RevisionSelection::WorkingCopy;
+        self.pending_revision = Some(RevisionSelection::WorkingCopy);
+        self.pending_revision_reveal = false;
+        self.selected_file = 0;
+        self.document = DiffDocument::default();
+        self.commits = CommitStore::default();
+        self.graph = graph_layout::GraphLayout::default();
+        self.sidebar_prefix_lens.clear();
+        self.selected_commit_index = None;
+        self.repository_snapshot = None;
+        self.snapshot_pending = false;
+        let progress = LoadProgress::default();
+        self.commit_progress = progress.clone();
+        // Fresh version so a backgrounded load's late batches are dropped.
+        let version = self.allocate_load_version();
+        self.commits_version = version;
+        match repository.vcs {
+            Vcs::Jj => {
+                self.load = Some(LoadCursor {
+                    version,
+                    ..Default::default()
+                });
+                stream_jj_initial_load(repository, progress, version)
+            }
+            Vcs::Git => {
+                self.load = None;
+                let revision = RevisionSelection::WorkingCopy;
+                Task::perform(
+                    load_backend(repository, revision.clone(), progress),
+                    move |result| Message::BackendLoaded(revision, Box::new(result)),
+                )
+            }
+        }
+    }
+
+    /// Hand out the next streaming-load version. Monotonic across every tab
+    /// and reload, so a backgrounded load's late batches never collide with
+    /// the active tab's cursor.
+    fn allocate_load_version(&mut self) -> u64 {
+        self.next_load_version = self.next_load_version.wrapping_add(1);
+        self.next_load_version
+    }
+
+    /// Move the active tab's inline view state out into a `RepoState`, leaving
+    /// the inline fields at cheap placeholders. Always paired with an
+    /// immediate `restore_active_state` of the incoming tab. Keep the field
+    /// list in sync with `RepoState`.
+    fn stash_active_state(&mut self) -> RepoState {
+        RepoState {
+            repository: self.repository.take(),
+            status: std::mem::replace(&mut self.status, LoadStatus::Loading),
+            document: std::mem::take(&mut self.document),
+            commits: std::mem::take(&mut self.commits),
+            selected_revision: std::mem::replace(
+                &mut self.selected_revision,
+                RevisionSelection::WorkingCopy,
+            ),
+            file_list_expanded: self.file_list_expanded,
+            pending_revision: self.pending_revision.take(),
+            repository_snapshot: self.repository_snapshot.take(),
+            snapshot_pending: self.snapshot_pending,
+            selected_file: self.selected_file,
+            revision_details: self.revision_details.take(),
+            revision_reveal_token: self.revision_reveal_token,
+            pending_revision_reveal: self.pending_revision_reveal,
+            commits_version: self.commits_version,
+            graph: std::mem::take(&mut self.graph),
+            sidebar_prefix_lens: std::mem::take(&mut self.sidebar_prefix_lens),
+            selected_commit_index: self.selected_commit_index.take(),
+            commit_progress: std::mem::take(&mut self.commit_progress),
+            loading_since: self.loading_since.take(),
+            empty_cache: std::mem::take(&mut self.empty_cache),
+            load: self.load.take(),
+        }
+    }
+
+    /// Move a stashed `RepoState` into the inline fields, making it the active
+    /// view. The previous inline state is overwritten (its caller has already
+    /// stashed it, or is intentionally discarding it).
+    fn restore_active_state(&mut self, state: RepoState) {
+        self.repository = state.repository;
+        self.status = state.status;
+        self.document = state.document;
+        self.commits = state.commits;
+        self.selected_revision = state.selected_revision;
+        self.file_list_expanded = state.file_list_expanded;
+        self.pending_revision = state.pending_revision;
+        self.repository_snapshot = state.repository_snapshot;
+        self.snapshot_pending = state.snapshot_pending;
+        self.selected_file = state.selected_file;
+        self.revision_details = state.revision_details;
+        self.revision_reveal_token = state.revision_reveal_token;
+        self.pending_revision_reveal = state.pending_revision_reveal;
+        self.commits_version = state.commits_version;
+        self.graph = state.graph;
+        self.sidebar_prefix_lens = state.sidebar_prefix_lens;
+        self.selected_commit_index = state.selected_commit_index;
+        self.commit_progress = state.commit_progress;
+        self.loading_since = state.loading_since;
+        self.empty_cache = state.empty_cache;
+        self.load = state.load;
+    }
+
+    /// Switch to the tab `id`: stash the current active tab, restore the
+    /// target's state, scroll its selection back into view, and kick a load if
+    /// it hasn't loaded yet (or its load was abandoned while backgrounded). A
+    /// fully-loaded tab is restored instantly and losslessly.
+    fn activate_tab(&mut self, id: TabId) -> Task<Message> {
+        let Some(target) = self.tabs.iter().position(|tab| tab.id == id) else {
+            return Task::none();
+        };
+        if target == self.active_tab {
+            return Task::none();
+        }
+        // Persist the new active tab so it's re-focused next launch.
+        self.mark_geometry_dirty();
+
+        let current = self.stash_active_state();
+        self.tabs[self.active_tab].stash = Some(current);
+        self.active_tab = target;
+        // Inactive tabs always carry a stash; the fallback only guards against
+        // an impossible invariant break.
+        let restored = self.tabs[target]
+            .stash
+            .take()
+            .unwrap_or_else(RepoState::empty);
+        self.restore_active_state(restored);
+        // The sidebar widget's scroll offset is shared across tabs, so nudge it
+        // to reveal this repo's restored selection.
+        self.revision_reveal_token = self.revision_reveal_token.wrapping_add(1);
+        self.ensure_active_loaded()
+    }
+
+    /// Kick a load for the active tab unless it's already loaded. A tab that
+    /// has never loaded — or whose load was abandoned while backgrounded — has
+    /// `status != Loaded`, so activating it (re)starts the load.
+    fn ensure_active_loaded(&mut self) -> Task<Message> {
+        if self.repository.is_some() && !matches!(self.status, LoadStatus::Loaded) {
+            self.kick_initial_load()
+        } else {
+            Task::none()
+        }
+    }
+
+    /// Close the tab `id`. Closing an inactive tab just drops it; closing the
+    /// active tab activates a neighbour (previous, else next), or falls back to
+    /// the empty state when it was the last tab.
+    fn close_tab(&mut self, id: TabId) -> Task<Message> {
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
+            return Task::none();
+        };
+        // The open-tab set is changing — re-persist the session.
+        self.mark_geometry_dirty();
+
+        if index != self.active_tab {
+            self.tabs.remove(index);
+            if index < self.active_tab {
+                self.active_tab -= 1;
+            }
+            return Task::none();
+        }
+
+        if self.tabs.len() == 1 {
+            self.tabs.clear();
+            self.active_tab = 0;
+            self.restore_active_state(RepoState::empty());
+            return Task::none();
+        }
+
+        // Prefer the previous neighbour, matching the design's close behaviour.
+        let neighbour = if index > 0 { index - 1 } else { 1 };
+        let neighbour_id = self.tabs[neighbour].id;
+        self.tabs.remove(index);
+        self.active_tab = self
+            .tabs
+            .iter()
+            .position(|tab| tab.id == neighbour_id)
+            .unwrap_or(0);
+        // Overwriting the inline fields here discards the closed tab's state.
+        let restored = self.tabs[self.active_tab]
+            .stash
+            .take()
+            .unwrap_or_else(RepoState::empty);
+        self.restore_active_state(restored);
+        self.revision_reveal_token = self.revision_reveal_token.wrapping_add(1);
+        self.ensure_active_loaded()
+    }
+
+    /// Resolve `raw` to a repository and open it as a tab (or focus it if it's
+    /// already open). On failure the dialog stays open with the reason shown.
+    fn open_repository(&mut self, raw: &str) -> Task<Message> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Task::none();
+        }
+        match prepare_repository(&expand_user_path(trimmed)) {
+            Ok(repository) => {
+                self.open_repo_dialog = None;
+                // Re-persist the session with the newly-opened repo.
+                self.mark_geometry_dirty();
+                if let Some(existing) = self.tabs.iter().find(|tab| tab.root == repository.root) {
+                    let id = existing.id;
+                    return self.activate_tab(id);
+                }
+                let (owner, name) = repo_label(&repository.root);
+                let id = TabId(self.next_tab_id);
+                self.next_tab_id += 1;
+                let was_empty = self.tabs.is_empty();
+                self.tabs.push(Tab {
+                    id,
+                    owner,
+                    name,
+                    vcs: repository.vcs,
+                    root: repository.root.clone(),
+                    stash: Some(RepoState::unloaded(Some(repository))),
+                });
+                if was_empty {
+                    // No active tab to switch from — check the new one out
+                    // directly.
+                    self.active_tab = 0;
+                    if let Some(state) = self.tabs[0].stash.take() {
+                        self.restore_active_state(state);
+                    }
+                    self.ensure_active_loaded()
+                } else {
+                    self.activate_tab(id)
+                }
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                if let Some(dialog) = self.open_repo_dialog.as_mut() {
+                    dialog.error = Some(message);
+                }
+                Task::none()
+            }
+        }
+    }
+
     fn view(&self) -> Element<'_, Message> {
         let theme = self.resolved_theme().spec();
+
+        // No repositories open: the empty state owns the whole window.
+        if self.tabs.is_empty() {
+            return container(empty_state(self, theme))
+                .height(Length::Fill)
+                .width(Length::Fill)
+                .style(move |_| app_shell_style(theme))
+                .into();
+        }
 
         // A loading indicator appears only after a short grace period, so
         // quick loads don't flash one. `dots` animates a simple ellipsis.
@@ -1455,50 +1920,64 @@ impl Diffui {
             .loading_since
             .map_or(0, |since| (since.elapsed().as_millis() / 350 % 4) as usize);
 
-        // Startup: nothing to render behind a spinner yet, so the progress
-        // indicator takes over the whole window.
-        if loading_visible && matches!(self.status, LoadStatus::Loading) {
-            let body = loading_indicator(
-                format!("Loading repository{}", ".".repeat(dots)),
-                Some(self.commit_progress.snapshot()),
-                theme,
-            );
-            return container(body)
-                .height(Length::Fill)
-                .width(Length::Fill)
-                .style(move |_| app_shell_style(theme))
-                .into();
-        }
+        let tab_bar = tab_bar::build_tab_bar(self, theme);
 
-        // The sidebar builds rows on demand from the precomputed per-row index
-        // (lane fold + prefix lengths), so constructing it each frame is
-        // O(visible rows) — no memoization needed.
-        let sidebar = sidebar::build_sidebar(self, theme);
+        // Body: the full-window progress indicator during a cold load (the tab
+        // strip still shows above it so the user can switch away mid-load),
+        // otherwise the sidebar + diff panes with their overlays.
+        let body: Element<'_, Message> =
+            if loading_visible && matches!(self.status, LoadStatus::Loading) {
+                loading_indicator(
+                    format!("Loading repository{}", ".".repeat(dots)),
+                    Some(self.commit_progress.snapshot()),
+                    theme,
+                )
+            } else {
+                // The sidebar builds rows on demand from the precomputed per-row
+                // index (lane fold + prefix lengths), so constructing it each
+                // frame is O(visible rows) — no memoization needed.
+                let sidebar = sidebar::build_sidebar(self, theme);
 
-        // A revision's diff is loading: swap just the diff pane for an
-        // indicator, leaving the commit graph and selection in place.
-        let diff_pane: Element<'_, Message> = if loading_visible
-            && self.pending_revision.is_some()
-            && matches!(self.status, LoadStatus::Loaded)
-        {
-            loading_indicator(format!("Loading diff{}", ".".repeat(dots)), None, theme)
-        } else {
-            diff_panel::build_diff_panel(self, theme)
-        };
+                // A revision's diff is loading: swap just the diff pane for an
+                // indicator, leaving the commit graph and selection in place.
+                let diff_pane: Element<'_, Message> = if loading_visible
+                    && self.pending_revision.is_some()
+                    && matches!(self.status, LoadStatus::Loaded)
+                {
+                    loading_indicator(format!("Loading diff{}", ".".repeat(dots)), None, theme)
+                } else {
+                    diff_panel::build_diff_panel(self, theme)
+                };
 
-        let panels = row![sidebar, vertical_divider(theme), diff_pane]
-            .spacing(0)
-            .height(Length::Fill);
-        let resize_overlay = ResizeHandle::new(
-            self.sidebar_width,
-            self.sidebar_min_width,
-            sidebar::RESIZE_HIT_PADDING,
-            Message::SidebarWidthChanged,
-        );
-        let palette_overlay = palette::build_overlay(self, theme);
-        let content = stack![panels, resize_overlay, palette_overlay]
+                let panels = row![sidebar, vertical_divider(theme), diff_pane]
+                    .spacing(0)
+                    .height(Length::Fill);
+                let resize_overlay = ResizeHandle::new(
+                    self.sidebar_width,
+                    self.sidebar_min_width,
+                    sidebar::RESIZE_HIT_PADDING,
+                    Message::SidebarWidthChanged,
+                );
+                let palette_overlay = palette::build_overlay(self, theme);
+                stack![panels, resize_overlay, palette_overlay]
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into()
+            };
+
+        let shell = column![tab_bar, horizontal_divider(theme), body]
             .width(Length::Fill)
             .height(Length::Fill);
+
+        // The open-repo dialog floats above the whole shell, tab strip included.
+        let content: Element<'_, Message> = if self.open_repo_dialog.is_some() {
+            stack![shell, tab_bar::build_open_repo_dialog(self, theme)]
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else {
+            shell.into()
+        };
 
         container(content)
             .padding(0)
@@ -1532,7 +2011,11 @@ impl Diffui {
         // open/closed flags in through `Subscription::with`, which
         // becomes part of the subscription identity and arrives as a
         // tuple alongside each event.
-        let flags = (self.palette.is_some(), self.find.is_some());
+        let flags = (
+            self.palette.is_some(),
+            self.find.is_some(),
+            self.open_repo_dialog.is_some(),
+        );
 
         let keyboard = event::listen_with(|event, _status, _window| match event {
             Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
@@ -1541,7 +2024,7 @@ impl Diffui {
             _ => None,
         })
         .with(flags)
-        .filter_map(|((palette_open, find_open), (key, modifiers))| {
+        .filter_map(|((palette_open, find_open, dialog_open), (key, modifiers))| {
             // Cmd/Ctrl+K opens (or toggles closed) the palette.
             if modifiers.command()
                 && matches!(
@@ -1565,6 +2048,18 @@ impl Diffui {
                 )
             {
                 return Some(Message::FindOpen);
+            }
+
+            // Open-repo dialog owns the keyboard: Esc dismisses, everything
+            // else falls through to its text input. (Enter is handled by the
+            // input's `on_submit`.)
+            if dialog_open {
+                return match key.as_ref() {
+                    keyboard::Key::Named(keyboard::key::Named::Escape) => {
+                        Some(Message::OpenRepoDialogClose)
+                    }
+                    _ => None,
+                };
             }
 
             if palette_open {
@@ -1601,6 +2096,29 @@ impl Diffui {
                     }
                     _ => None,
                 };
+            }
+
+            // Tab management — only with no overlay holding the keyboard, so
+            // these never steal keystrokes from a focused text input. ⌘W
+            // closes the active tab, ⌘O opens the path dialog, ⌘1–9 jump to a
+            // tab by position.
+            if modifiers.command() && !modifiers.shift() && !modifiers.alt() {
+                match key.as_ref() {
+                    keyboard::Key::Character("w") | keyboard::Key::Character("W") => {
+                        return Some(Message::CloseActiveTab);
+                    }
+                    keyboard::Key::Character("o") | keyboard::Key::Character("O") => {
+                        return Some(Message::OpenRepoDialogOpen);
+                    }
+                    keyboard::Key::Character(c) => {
+                        if let Some(digit) = c.chars().next().and_then(|c| c.to_digit(10))
+                            && (1..=9).contains(&digit)
+                        {
+                            return Some(Message::SelectTabIndex((digit - 1) as usize));
+                        }
+                    }
+                    _ => {}
+                }
             }
 
             // No overlay — global j/k/arrow file shortcuts apply. Only
@@ -1684,8 +2202,30 @@ impl Diffui {
         ])
     }
 
-    /// Mark the window geometry / sidebar width as changed, arming the
-    /// debounce timer the subscription runs while a save is pending.
+    /// Re-center the native OS window controls (macOS traffic lights) on the tab
+    /// strip. macOS pins them to the native title bar, so we reach the window on
+    /// the main thread via `window::run` and nudge them through `chrome`. A
+    /// no-op where the strip doesn't stand in for the title bar.
+    fn reposition_window_controls(&self) -> Task<Message> {
+        let Some(bar_height) = chrome::title_bar_height() else {
+            return Task::none();
+        };
+        window::latest()
+            .then(move |maybe_id| {
+                maybe_id.map_or_else(Task::none, move |id| {
+                    window::run(id, move |window| {
+                        if let Ok(handle) = window.window_handle() {
+                            chrome::position_window_controls(handle.as_raw(), bar_height);
+                        }
+                    })
+                })
+            })
+            .discard()
+    }
+
+    /// Mark the persisted session (window geometry, sidebar width, open tabs)
+    /// as changed, arming the debounce timer the subscription runs while a save
+    /// is pending.
     fn mark_geometry_dirty(&mut self) {
         self.geometry_dirty_since = Some(Instant::now());
     }
@@ -1698,6 +2238,15 @@ impl Diffui {
             x: self.window_position.map(|p| p.x),
             y: self.window_position.map(|p| p.y),
             sidebar_width: Some(self.sidebar_width),
+            open_repos: self
+                .tabs
+                .iter()
+                .map(|tab| tab.root.to_string_lossy().into_owned())
+                .collect(),
+            active_repo: self
+                .tabs
+                .get(self.active_tab)
+                .map(|tab| tab.root.to_string_lossy().into_owned()),
         }
     }
 
@@ -1710,6 +2259,65 @@ fn scroll_sidebar_to_file(_file_index: usize, _ui: &Diffui) -> Task<Message> {
     // TODO: re-implement scroll-to-reveal against `RevisionList`'s internal
     // scroll state once the widget exposes a scrollable operation.
     Task::none()
+}
+
+/// Centered empty state shown when no repositories are open (e.g. after
+/// closing the last tab, or when the launch path wasn't a repository).
+fn empty_state<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
+    let heading = match &ui.status {
+        LoadStatus::Failed(error) => format!("Couldn't open repository: {error}"),
+        _ => "No repositories open".to_owned(),
+    };
+    let body = column![
+        text(heading)
+            .size(15)
+            .color(theme.text)
+            .font(ui.config.ui_font),
+        text("Press \u{2318}O or + to open a repository.")
+            .size(12)
+            .color(theme.muted_text)
+            .font(ui.config.ui_font),
+    ]
+    .spacing(8)
+    .align_x(alignment::Horizontal::Center);
+
+    container(body)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .into()
+}
+
+/// Split a repository root into a dimmed `owner` (the parent directory name)
+/// and an emphasized `name` (the directory name) for the tab label, e.g.
+/// `/Users/me/code/diffui` → (`code`, `diffui`). The owner is empty when the
+/// root has no usable parent.
+fn repo_label(root: &Path) -> (String, String) {
+    let name = root
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root.to_string_lossy().into_owned());
+    let owner = root
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    (owner, name)
+}
+
+/// Expand a leading `~` / `~/` to `$HOME` so the open-repo dialog accepts the
+/// shell-style paths users type. Everything else is passed through verbatim;
+/// `prepare_repository` canonicalizes from there.
+fn expand_user_path(input: &str) -> PathBuf {
+    if input == "~" {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home);
+        }
+    } else if let Some(rest) = input.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(rest);
+    }
+    PathBuf::from(input)
 }
 
 fn commit_for_ref<'a>(ui: &'a Diffui, item: &ResultRef) -> Option<RowView<'a>> {
@@ -1936,4 +2544,53 @@ fn loading_indicator(
         .center_x(Length::Fill)
         .center_y(Length::Fill)
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{expand_user_path, repo_label};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn repo_label_splits_owner_and_name() {
+        assert_eq!(
+            repo_label(Path::new("/Users/me/code/diffui")),
+            ("code".to_owned(), "diffui".to_owned())
+        );
+        // A root-level repo has no usable parent name → empty owner.
+        assert_eq!(
+            repo_label(Path::new("/diffui")),
+            (String::new(), "diffui".to_owned())
+        );
+        // A bare relative name likewise yields no owner.
+        assert_eq!(
+            repo_label(Path::new("repo")),
+            (String::new(), "repo".to_owned())
+        );
+    }
+
+    #[test]
+    fn expand_user_path_passes_through_non_tilde() {
+        assert_eq!(
+            expand_user_path("/abs/path/repo"),
+            PathBuf::from("/abs/path/repo")
+        );
+        assert_eq!(
+            expand_user_path("relative/repo"),
+            PathBuf::from("relative/repo")
+        );
+        // A tilde mid-path is not a home shortcut and must be left intact.
+        assert_eq!(expand_user_path("/etc/we~rd"), PathBuf::from("/etc/we~rd"));
+    }
+
+    #[test]
+    fn expand_user_path_expands_leading_tilde() {
+        // Only assert when HOME is available (it is in normal test runs);
+        // skip otherwise rather than mutate process-global env.
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = PathBuf::from(home);
+            assert_eq!(expand_user_path("~"), home);
+            assert_eq!(expand_user_path("~/code/repo"), home.join("code/repo"));
+        }
+    }
 }

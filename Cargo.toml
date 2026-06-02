@@ -123,10 +123,18 @@ bstr = "1.12"
 futures = "0.3"
 notify = "8"
 nucleo-matcher = "0.3"
+raw-window-handle = "0.6"
 regex = "1"
 serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "1.44", features = ["process", "time"] }
 toml = "0.8"
+
+# macOS-only: reposition the native traffic lights to the center of our tab
+# strip (which stands in for the title bar). These versions match what winit
+# already pulls in, so they add no new compilation. See `chrome`.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"
+objc2-foundation = "0.2"
 
 [profile.dev]
 debug = 1
