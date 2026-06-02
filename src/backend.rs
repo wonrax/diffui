@@ -257,6 +257,18 @@ impl CommitStore {
         self.iter().find(|row| row.change_id() == change_id)
     }
 
+    /// Resolve the commit a bookmark points at. `O(#bookmarked commits)` via
+    /// the sparse bookmark index, never an all-commits scan — the palette
+    /// renders a bookmark row's destination per frame, so an `O(commits)`
+    /// lookup here drops a million-commit repo to single-digit fps while
+    /// typing.
+    pub fn find_by_bookmark(&self, name: &str) -> Option<RowView<'_>> {
+        self.bookmarks
+            .iter()
+            .find(|(_, names)| names.iter().any(|b| b == name))
+            .map(|(&index, _)| RowView { store: self, index })
+    }
+
     pub fn working_copy(&self) -> Option<RowView<'_>> {
         self.iter().find(|row| row.is_working_copy())
     }

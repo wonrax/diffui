@@ -31,9 +31,10 @@ use iced::{
 };
 use nucleo_matcher::{Config, Matcher, Utf32String};
 
-use crate::backend::RevisionSelection;
+use crate::backend::{RevisionSelection, RowView};
 use crate::theme::{self, ThemeSpec};
 use crate::{Diffui, Message};
+use std::collections::HashMap;
 
 /// `Id` for the active palette text input. Refocused whenever the
 /// rightmost column changes (open, push, pop) so keystrokes always land in
@@ -1609,9 +1610,36 @@ fn build_results<'a>(
             .into();
     }
 
+    // Resolve every commit-result row's owning commit in ONE pass. The Commit
+    // arm of `result_row_body` shows the commit's prefix/description/author in
+    // the row tail; a `find_by_change_id` (an all-commits scan) per row would
+    // re-walk the whole ~1M-row store for each of up to 200 rows, every frame —
+    // i.e. the same trap the bookmark rows hit. Keyed by the matched
+    // change-ids, this is a single scan shared across the rows.
+    let commit_rows: HashMap<&str, RowView<'_>> = {
+        let mut wanted: Vec<&str> = column_state
+            .matches
+            .iter()
+            .filter_map(|m| match &m.item {
+                ResultRef::Commit(id) => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        if wanted.is_empty() {
+            HashMap::new()
+        } else {
+            wanted.sort_unstable();
+            ui.commits
+                .iter()
+                .filter(|row| wanted.binary_search(&row.change_id()).is_ok())
+                .map(|row| (row.change_id(), row))
+                .collect()
+        }
+    };
+
     let mut list = column![].spacing(0);
     for (index, m) in column_state.matches.iter().enumerate() {
-        list = list.push(build_result_row(ui, theme, column_state, index, m));
+        list = list.push(build_result_row(ui, theme, column_state, index, m, &commit_rows));
     }
 
     let scrollable_list = scrollable(list)
@@ -1972,6 +2000,7 @@ fn build_result_row<'a>(
     column_state: &'a PaletteColumn,
     index: usize,
     m: &'a PaletteMatch,
+    commit_rows: &HashMap<&'a str, RowView<'a>>,
 ) -> Element<'a, Message> {
     let selected = index == column_state.selected;
     let row_bg = if selected {
@@ -1980,7 +2009,7 @@ fn build_result_row<'a>(
         Color::TRANSPARENT
     };
 
-    let body = result_row_body(ui, theme, &m.item);
+    let body = result_row_body(ui, theme, &m.item, commit_rows);
 
     let row_el = container(body)
         .padding([6, 12])
@@ -2012,6 +2041,7 @@ fn result_row_body<'a>(
     ui: &'a Diffui,
     theme: ThemeSpec,
     item: &'a ResultRef,
+    commit_rows: &HashMap<&'a str, RowView<'a>>,
 ) -> Element<'a, Message> {
     let primary = theme.text;
     let muted = theme.subtle_text;
@@ -2039,7 +2069,7 @@ fn result_row_body<'a>(
         .align_y(alignment::Vertical::Center)
         .into(),
         ResultRef::Commit(change_id) => {
-            let commit = ui.commits.find_by_change_id(change_id);
+            let commit = commit_rows.get(change_id.as_str()).copied();
             let prefix = commit
                 .map(|c| {
                     let len = c.shortest_change_id_len().unwrap_or(8).max(8);
@@ -2072,13 +2102,13 @@ fn result_row_body<'a>(
         }
         ResultRef::Bookmark(name) => {
             // Find the owning commit so we can show the destination in
-            // the tail. Bookmarks without a matching commit (stale data
-            // races between snapshots) still render — the tail just goes
-            // empty.
-            let commit = ui
-                .commits
-                .iter()
-                .find(|c| c.bookmarks().iter().any(|b| b == name));
+            // the tail. Resolve through the sparse bookmark index
+            // (`O(#bookmarks)`), not an all-commits scan — this runs per
+            // bookmark row, every frame, so a linear scan here is what
+            // dropped keystroke search to ~10fps on a 1M-commit repo.
+            // Bookmarks without a matching commit (stale data races between
+            // snapshots) still render — the tail just goes empty.
+            let commit = ui.commits.find_by_bookmark(name);
             let tail = commit
                 .map(|c| {
                     if c.has_description() {
