@@ -136,14 +136,31 @@ toml = "0.8"
 # version is independent of whatever winit pulls in.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSString", "NSGeometry", "NSObjCRuntime"] }
+objc2-foundation = { version = "0.3", features = ["NSString", "NSGeometry", "NSObjCRuntime", "NSValue"] }
 objc2-app-kit = { version = "0.3", features = [
     "NSMenu",
     "NSMenuItem",
     "NSEvent",
     "NSResponder",
     "NSApplication",
+    "NSView",
+    "NSWindow",
 ] }
+# Core Animation for the right-clicked-row glow: a CALayer animates on the
+# window server (a separate process), so its pulse keeps running even while the
+# modal NSMenu blocks our main thread. CGColor/CGRect come from the core-graphics
+# / core-foundation bindings the quartz-core layer APIs are typed against.
+objc2-quartz-core = { version = "0.3", features = [
+    "CALayer",
+    "CAAnimation",
+    "CAMediaTiming",
+    "CAMediaTimingFunction",
+    "CATransaction",
+    "objc2-core-foundation",
+    "objc2-core-graphics",
+] }
+objc2-core-foundation = { version = "0.3", features = ["CFCGTypes"] }
+objc2-core-graphics = { version = "0.3", features = ["CGColor"] }
 
 [profile.dev]
 debug = 1

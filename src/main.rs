@@ -100,9 +100,9 @@ static GLOBAL: track_alloc::Tracking = track_alloc::Tracking;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use backend::{
-    BackendOutput, BranchStatus, CommitStore, CommitsTail, DiffDocument, LoadProgress,
-    RevisionDetails, RevisionSelection, RowView, StreamRow, compute_empty_status, load_backend,
-    load_diff, load_repository_snapshot,
+    BackendOutput, BookmarksInfo, BranchStatus, CommitStore, CommitsTail, DiffDocument,
+    LoadProgress, RevisionDetails, RevisionSelection, RowView, StreamRow, compute_empty_status,
+    load_backend, load_diff, load_repository_snapshot,
 };
 use clap::Parser;
 use config::AppConfig;
@@ -228,6 +228,10 @@ pub(crate) struct Diffui {
     /// its tracked upstream) for the sidebar footer. `None` until a load
     /// resolves it, or when `@` has no local bookmark in its ancestry.
     pub(crate) branch_status: Option<BranchStatus>,
+    /// Repo-wide bookmark table (local targets + per-remote tracking state),
+    /// loaded alongside the graph. Drives the revision context menu's
+    /// move/track/delete/push actions. Empty for git repos.
+    pub(crate) bookmarks: BookmarksInfo,
     /// `None` when closed; a non-empty column stack when open.
     pub(crate) palette: Option<PaletteState>,
     /// In-session recents (revisions + commands) used to score palette
@@ -316,6 +320,7 @@ pub(crate) struct RepoState {
     pub(crate) selected_file: usize,
     pub(crate) revision_details: Option<RevisionDetails>,
     pub(crate) branch_status: Option<BranchStatus>,
+    pub(crate) bookmarks: BookmarksInfo,
     pub(crate) revision_reveal_token: u64,
     pub(crate) pending_revision_reveal: bool,
     pub(crate) commits_version: u64,
@@ -346,6 +351,7 @@ impl RepoState {
             selected_file: 0,
             revision_details: None,
             branch_status: None,
+            bookmarks: BookmarksInfo::default(),
             revision_reveal_token: 0,
             pending_revision_reveal: false,
             commits_version: 0,
@@ -466,9 +472,11 @@ pub(crate) enum Message {
     EmptyStatusComputed(u64, Vec<(usize, bool)>),
     SelectFile(usize),
     SelectRowKey(revision_list::RowSelectionKey),
-    /// Right-click on a revision row — opens the native context menu.
-    RevisionContextMenu(revision_list::RowSelectionKey),
-    /// A context-menu mutation (new/edit/abandon) finished.
+    /// Right-click on a revision row — opens the native context menu. Carries
+    /// the row's on-screen rect (window-content points) so the native glow can
+    /// be anchored over it while the menu is open.
+    RevisionContextMenu(revision_list::RowSelectionKey, iced::Rectangle),
+    /// A context-menu mutation (new/edit/abandon/bookmark) finished.
     MutationCompleted(Box<Result<mutations::MutationOutcome, String>>),
     SelectTheme(ThemePreference),
     SystemThemeChanged(iced_theme::Mode),
@@ -672,6 +680,7 @@ impl Diffui {
             config,
             revision_details: None,
             branch_status: None,
+            bookmarks: BookmarksInfo::default(),
             palette: None,
             recents: Recents::load(),
             find: None,
@@ -724,6 +733,7 @@ impl Diffui {
                     self.commits_version = self.commits_version.wrapping_add(1);
                     self.repository_snapshot = Some(output.snapshot);
                     self.branch_status = output.branch_status;
+                    self.bookmarks = output.bookmarks;
                     self.revision_details = output.details;
                     self.selected_file = if revision_changed {
                         0
@@ -801,6 +811,7 @@ impl Diffui {
                     Ok(tail) => {
                         self.repository_snapshot = Some(tail.snapshot);
                         self.branch_status = tail.branch_status;
+                        self.bookmarks = tail.bookmarks;
                         // Apply the single-parent emptiness resolved in the
                         // loader's final pass, caching each so reloads skip it.
                         for (index, empty) in tail.empty_updates {
@@ -994,11 +1005,7 @@ impl Diffui {
             Message::SystemThemeChanged(theme) => {
                 self.system_theme = theme;
             }
-            Message::RevisionContextMenu(key) => {
-                let selection = match key {
-                    revision_list::RowSelectionKey::WorkingCopy => RevisionSelection::WorkingCopy,
-                    revision_list::RowSelectionKey::Commit(id) => RevisionSelection::Commit(id),
-                };
+            Message::RevisionContextMenu(key, row_rect) => {
                 let Some(repository) = self.repository.clone() else {
                     return Task::none();
                 };
@@ -1006,15 +1013,23 @@ impl Diffui {
                 if !matches!(repository.vcs, Vcs::Jj) {
                     return Task::none();
                 }
-                return self.open_revision_context_menu(repository, selection);
+                // Opens the native menu (blocking) with a pulsing glow anchored
+                // over `row_rect`; returns the chosen mutation as a task.
+                return self.open_revision_context_menu(
+                    repository,
+                    selection_from_key(&key),
+                    row_rect,
+                );
             }
             Message::MutationCompleted(result) => match *result {
                 Ok(outcome) => {
                     eprintln!("diffui: {}", outcome.message);
-                    // The mutation moved/rewrote commits — reload the graph.
-                    // Reset to the working copy: edit/new move `@`, and abandon
-                    // may remove the previously-selected commit.
-                    self.selected_revision = RevisionSelection::WorkingCopy;
+                    // Reload the graph to reflect the mutation. Only snap the
+                    // selection back to `@` when the op actually moved it
+                    // (new/edit/abandon); bookmark ops leave it put.
+                    if outcome.moved_working_copy {
+                        self.selected_revision = RevisionSelection::WorkingCopy;
+                    }
                     return self.start_repository_snapshot(RefreshOrigin::Focus);
                 }
                 Err(error) => {
@@ -1626,17 +1641,145 @@ impl Diffui {
     /// the chosen mutation. `popup_menu` blocks (a nested `NSMenu` loop) on the
     /// main thread until the user picks — fine for a modal menu — then the
     /// mutation itself runs off-thread.
+    ///
+    /// The menu is built from `self.bookmarks` (loaded with the graph), so it
+    /// can offer per-bookmark actions for the bookmarks sitting on this revision
+    /// without any synchronous repo read.
     #[cfg(target_os = "macos")]
     fn open_revision_context_menu(
         &self,
         repository: Repository,
         selection: RevisionSelection,
+        row_rect: iced::Rectangle,
     ) -> Task<Message> {
-        let op = match macos_native::popup_menu(&["New", "Edit", "Abandon"]) {
-            Some(0) => mutations::MutationOp::New { parent: selection },
-            Some(1) => mutations::MutationOp::Edit { target: selection },
-            Some(2) => mutations::MutationOp::Abandon { target: selection },
-            _ => return Task::none(),
+        use macos_native::MenuItem;
+        use mutations::MutationOp;
+
+        // Each leaf carries an index into `actions`; the popup returns that
+        // index. `register` keeps the menu tree and the action list in lockstep.
+        fn register(actions: &mut Vec<MutationOp>, op: MutationOp) -> u32 {
+            let id = actions.len() as u32;
+            actions.push(op);
+            id
+        }
+
+        let mut actions: Vec<MutationOp> = Vec::new();
+
+        // ── Commit-level actions ────────────────────────────────────────────
+        let mut top = vec![
+            MenuItem::entry(
+                "New child",
+                register(
+                    &mut actions,
+                    MutationOp::New {
+                        parent: selection.clone(),
+                    },
+                ),
+            ),
+            MenuItem::entry(
+                "Edit",
+                register(
+                    &mut actions,
+                    MutationOp::Edit {
+                        target: selection.clone(),
+                    },
+                ),
+            ),
+            MenuItem::entry(
+                "Abandon",
+                register(
+                    &mut actions,
+                    MutationOp::Abandon {
+                        target: selection.clone(),
+                    },
+                ),
+            ),
+        ];
+
+        // ── Move a bookmark onto this revision ──────────────────────────────
+        // Collect names first so the `self.bookmarks` borrow ends before we
+        // start mutating `actions`. An empty submenu renders as a disabled row.
+        let move_names: Vec<String> = self.bookmarks.local_names().map(str::to_owned).collect();
+        let move_items: Vec<MenuItem> = move_names
+            .into_iter()
+            .map(|name| {
+                let id = register(
+                    &mut actions,
+                    MutationOp::MoveBookmark {
+                        name: name.clone(),
+                        to: selection.clone(),
+                    },
+                );
+                MenuItem::entry(name, id)
+            })
+            .collect();
+        top.push(MenuItem::Separator);
+        top.push(MenuItem::submenu("Move bookmark here", move_items));
+
+        // ── Per-bookmark actions for bookmarks on this revision ─────────────
+        let target_hex: Option<&str> = match &selection {
+            RevisionSelection::Commit(hex) => Some(hex.as_str()),
+            RevisionSelection::WorkingCopy => self.bookmarks.working_copy_commit.as_deref(),
+        };
+        let mut bookmark_items: Vec<MenuItem> = Vec::new();
+        if let Some(hex) = target_hex {
+            for entry in &self.bookmarks.bookmarks {
+                // A local bookmark sitting here → push (if tracked) + delete.
+                if entry.local_target.as_deref() == Some(hex) {
+                    let mut sub = Vec::new();
+                    if let Some(remote) = entry.tracked_remote() {
+                        let id = register(
+                            &mut actions,
+                            MutationOp::PushBookmark {
+                                name: entry.name.clone(),
+                                remote: remote.to_owned(),
+                            },
+                        );
+                        sub.push(MenuItem::entry(format!("Push to {remote}"), id));
+                    }
+                    let id = register(
+                        &mut actions,
+                        MutationOp::DeleteBookmark {
+                            name: entry.name.clone(),
+                        },
+                    );
+                    sub.push(MenuItem::entry("Delete", id));
+                    bookmark_items.push(MenuItem::submenu(entry.name.clone(), sub));
+                }
+                // An untracked remote ref sitting here → offer to track it.
+                for remote_ref in &entry.remotes {
+                    if remote_ref.target.as_str() == hex && !remote_ref.tracked {
+                        let id = register(
+                            &mut actions,
+                            MutationOp::TrackBookmark {
+                                name: entry.name.clone(),
+                                remote: remote_ref.remote.clone(),
+                            },
+                        );
+                        bookmark_items.push(MenuItem::submenu(
+                            format!("{}@{}", entry.name, remote_ref.remote),
+                            vec![MenuItem::entry("Track", id)],
+                        ));
+                    }
+                }
+            }
+        }
+        if !bookmark_items.is_empty() {
+            top.push(MenuItem::Separator);
+            top.append(&mut bookmark_items);
+        }
+
+        let glow = macos_native::GlowRect {
+            x: row_rect.x,
+            y: row_rect.y,
+            width: row_rect.width,
+            height: row_rect.height,
+        };
+        let Some(id) = macos_native::popup_menu(&top, Some(glow)) else {
+            return Task::none();
+        };
+        let Some(op) = actions.get(id as usize).cloned() else {
+            return Task::none();
         };
         Task::perform(mutations::run_mutation(repository, op), |result| {
             Message::MutationCompleted(Box::new(result))
@@ -1650,6 +1793,7 @@ impl Diffui {
         &self,
         _repository: Repository,
         _selection: RevisionSelection,
+        _row_rect: iced::Rectangle,
     ) -> Task<Message> {
         Task::none()
     }
@@ -1800,6 +1944,7 @@ impl Diffui {
             selected_file: self.selected_file,
             revision_details: self.revision_details.take(),
             branch_status: self.branch_status.take(),
+            bookmarks: std::mem::take(&mut self.bookmarks),
             revision_reveal_token: self.revision_reveal_token,
             pending_revision_reveal: self.pending_revision_reveal,
             commits_version: self.commits_version,
@@ -1829,6 +1974,7 @@ impl Diffui {
         self.selected_file = state.selected_file;
         self.revision_details = state.revision_details;
         self.branch_status = state.branch_status;
+        self.bookmarks = state.bookmarks;
         self.revision_reveal_token = state.revision_reveal_token;
         self.pending_revision_reveal = state.pending_revision_reveal;
         self.commits_version = state.commits_version;
@@ -2338,6 +2484,14 @@ fn scroll_sidebar_to_file(_file_index: usize, _ui: &Diffui) -> Task<Message> {
     Task::none()
 }
 
+/// Map a sidebar row key back to the app's revision selection enum.
+fn selection_from_key(key: &revision_list::RowSelectionKey) -> RevisionSelection {
+    match key {
+        revision_list::RowSelectionKey::WorkingCopy => RevisionSelection::WorkingCopy,
+        revision_list::RowSelectionKey::Commit(id) => RevisionSelection::Commit(id.clone()),
+    }
+}
+
 /// Centered empty state shown when no repositories are open (e.g. after
 /// closing the last tab, or when the launch path wasn't a repository).
 fn empty_state<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
@@ -2489,11 +2643,14 @@ fn stream_jj_initial_load(
                         &mut emit_batch,
                     )
                     .await
-                    .map(|(snapshot, branch_status, empty_updates)| CommitsTail {
-                        snapshot,
-                        empty_updates,
-                        branch_status,
-                    })
+                    .map(
+                        |(snapshot, branch_status, empty_updates, bookmarks)| CommitsTail {
+                            snapshot,
+                            empty_updates,
+                            branch_status,
+                            bookmarks,
+                        },
+                    )
                     .map_err(|error| format!("{error:#}"));
                     let _ = tx.send(Message::CommitsFinished(version, Box::new(finished)));
                 });

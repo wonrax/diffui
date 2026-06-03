@@ -219,8 +219,10 @@ pub struct RevisionList<'a, Message> {
     reveal_token: Option<u64>,
     on_select_revision: fn(RowSelectionKey) -> Message,
     on_select_file: fn(usize) -> Message,
-    /// Optional right-click handler for a revision row — opens the context menu.
-    on_context_menu: Option<fn(RowSelectionKey) -> Message>,
+    /// Optional right-click handler for a revision row — opens the context
+    /// menu. Receives the row's selection key and its on-screen rectangle (in
+    /// window-content points), the latter used to anchor a native highlight.
+    on_context_menu: Option<fn(RowSelectionKey, Rectangle) -> Message>,
 }
 
 impl<'a, Message> RevisionList<'a, Message> {
@@ -259,8 +261,9 @@ impl<'a, Message> RevisionList<'a, Message> {
         self
     }
 
-    /// Register a right-click handler for revision rows (the context menu).
-    pub fn on_context_menu(mut self, callback: fn(RowSelectionKey) -> Message) -> Self {
+    /// Register a right-click handler for revision rows (the context menu). The
+    /// callback gets the row key and its on-screen rect (window-content points).
+    pub fn on_context_menu(mut self, callback: fn(RowSelectionKey, Rectangle) -> Message) -> Self {
         self.on_context_menu = Some(callback);
         self
     }
@@ -700,7 +703,17 @@ where
                 if let Some(row_idx) = self.row_at_offset(local_y)
                     && let Item::Revision(rev) = self.item_at(row_idx)
                 {
-                    shell.publish(callback(rev.selection_key));
+                    // The row's on-screen rect (window-content points) anchors
+                    // the native highlight drawn while the menu is open.
+                    let row_h = row_height_of(self.row_kind(row_idx));
+                    let screen_y = bounds.y + (self.row_top(row_idx) - state.vertical_offset) as f32;
+                    let row_rect = Rectangle {
+                        x: bounds.x,
+                        y: screen_y,
+                        width: bounds.width,
+                        height: row_h,
+                    };
+                    shell.publish(callback(rev.selection_key, row_rect));
                     shell.capture_event();
                 }
             }

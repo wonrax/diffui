@@ -19,12 +19,26 @@ pub enum MutationOp {
     /// Discard `target`, re-parenting its descendants onto its parents
     /// (`jj abandon`).
     Abandon { target: RevisionSelection },
+    /// Point local bookmark `name` at `to`, creating it if needed
+    /// (`jj bookmark set -r <to> <name>`).
+    MoveBookmark { name: String, to: RevisionSelection },
+    /// Delete local bookmark `name` (`jj bookmark delete <name>`).
+    DeleteBookmark { name: String },
+    /// Start tracking remote bookmark `name@remote`
+    /// (`jj bookmark track <name>@<remote>`).
+    TrackBookmark { name: String, remote: String },
+    /// Push local bookmark `name` to `remote` (`jj git push -b <name>`).
+    PushBookmark { name: String, remote: String },
 }
 
 /// User-facing summary of a successful mutation — becomes the status message.
 #[derive(Debug, Clone)]
 pub struct MutationOutcome {
     pub message: String,
+    /// Whether the mutation moved `@` (new/edit/abandon). Bookmark ops leave the
+    /// working copy where it is, so the UI keeps the user's current selection
+    /// instead of snapping back to the working copy.
+    pub moved_working_copy: bool,
 }
 
 /// Run `op` off the iced runtime. jj-lib holds `!Send` state, so the work runs

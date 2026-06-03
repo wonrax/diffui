@@ -415,6 +415,7 @@ pub struct BackendOutput {
     pub snapshot: RepositorySnapshot,
     pub details: Option<RevisionDetails>,
     pub branch_status: Option<BranchStatus>,
+    pub bookmarks: BookmarksInfo,
 }
 
 /// One commit emitted by the streaming loader: the data for the compact store
@@ -438,6 +439,7 @@ pub struct CommitsTail {
     pub snapshot: RepositorySnapshot,
     pub empty_updates: Vec<(usize, bool)>,
     pub branch_status: Option<BranchStatus>,
+    pub bookmarks: BookmarksInfo,
 }
 
 /// Working-copy branch summary for the sidebar footer: the nearest local
@@ -455,6 +457,56 @@ pub struct BranchStatus {
     pub ahead: usize,
     /// Commits reachable from the upstream but not `@`.
     pub behind: usize,
+}
+
+/// Every bookmark in the repo, with the state the revision context menu needs:
+/// which commit each points at (to know which bookmarks sit on a right-clicked
+/// revision) and per-remote tracking state (to offer push vs. track). Computed
+/// once per load alongside [`BranchStatus`]; empty for git repos.
+#[derive(Debug, Clone, Default)]
+pub struct BookmarksInfo {
+    pub bookmarks: Vec<BookmarkEntry>,
+    /// `@`'s commit id (hex), so a working-copy right-click can resolve the
+    /// bookmarks sitting on it.
+    pub working_copy_commit: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BookmarkEntry {
+    pub name: String,
+    /// Commit id (hex) the local bookmark points at, if it has a local target.
+    pub local_target: Option<String>,
+    /// Remote-tracking copies of this bookmark.
+    pub remotes: Vec<RemoteBookmarkRef>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteBookmarkRef {
+    pub remote: String,
+    /// Commit id (hex) this remote ref points at.
+    pub target: String,
+    pub tracked: bool,
+}
+
+impl BookmarkEntry {
+    /// The remote this local bookmark tracks, if any (first tracked remote).
+    pub fn tracked_remote(&self) -> Option<&str> {
+        self.remotes
+            .iter()
+            .find(|r| r.tracked)
+            .map(|r| r.remote.as_str())
+    }
+}
+
+impl BookmarksInfo {
+    /// Names of all bookmarks with a local target — the candidates for
+    /// "move bookmark here".
+    pub fn local_names(&self) -> impl Iterator<Item = &str> {
+        self.bookmarks
+            .iter()
+            .filter(|b| b.local_target.is_some())
+            .map(|b| b.name.as_str())
+    }
 }
 
 /// `jj show`-style summary of a single revision, used to render the header
@@ -497,7 +549,7 @@ async fn run_backend(
     // working-copy commit — e.g. `@` flagged "empty" while its diff actually
     // had changes — until the next refresh re-read it.
     let snapshot = run_repository_snapshot(repository.clone()).await?;
-    let (commits, graph, branch_status) = load_commits(&repository, &progress).await?;
+    let (commits, graph, branch_status, bookmarks) = load_commits(&repository, &progress).await?;
     let (document, details) = run_diff(&repository, &revision).await?;
 
     Ok(BackendOutput {
@@ -507,6 +559,7 @@ async fn run_backend(
         snapshot,
         details,
         branch_status,
+        bookmarks,
     })
 }
 
@@ -597,7 +650,7 @@ async fn run_repository_snapshot(repository: Repository) -> Result<RepositorySna
 async fn load_commits(
     repository: &Repository,
     progress: &LoadProgress,
-) -> Result<(CommitStore, GraphLayout, Option<BranchStatus>)> {
+) -> Result<(CommitStore, GraphLayout, Option<BranchStatus>, BookmarksInfo)> {
     match repository.vcs {
         Vcs::Jj => {
             let root = repository.root.clone();
@@ -620,8 +673,9 @@ async fn load_commits(
                 builder.push(commit);
             }
             // Git ahead/behind isn't wired yet — the footer falls back to the
-            // change count for git repos.
-            Ok((builder.finish(), graph, None))
+            // change count for git repos, and the context menu's bookmark
+            // actions are jj-only.
+            Ok((builder.finish(), graph, None, BookmarksInfo::default()))
         }
     }
 }

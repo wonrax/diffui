@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use bstr::BStr;
 use futures::StreamExt;
 use jj_lib::{
@@ -23,11 +23,17 @@ use jj_lib::{
         FilesetAliasesMap, FilesetDiagnostics, FilesetExpression, FilesetParseContext,
         parse as parse_fileset,
     },
+    git::{
+        GitProgress, GitPushOptions, GitPushRefTargets, GitSidebandLineTerminator,
+        GitSubprocessCallback, GitSubprocessOptions, REMOTE_NAME_FOR_LOCAL_GIT_REPO, push_refs,
+    },
     gitignore::GitIgnoreFile,
     graph::TopoGroupedGraphIterator,
     matchers::{EverythingMatcher, Matcher, NothingMatcher, PrefixMatcher},
     merge::{Diff, Merge, SameChange},
     object_id::ObjectId,
+    op_store::RefTarget,
+    ref_name::{RefName, RefNameBuf, RemoteName},
     repo::{MutableRepo, ReadonlyRepo, Repo, StoreFactories},
     repo_path::{RepoPath, RepoPathBuf, RepoPathUiConverter},
     revset::{RevsetExpression, SymbolResolver, UserRevsetExpression},
@@ -39,9 +45,10 @@ use jj_lib::{
 };
 
 use crate::backend::{
-    BranchStatus, CommitStore, CommitSummary, DiffDocument, DiffFile, DiffFileStatus, DiffHunkView,
-    DiffLine, DiffLineKind, LoadProgress, RevisionDetails, RevisionSelection, SignatureInfo,
-    StreamRow, apply_syntax_highlighting, format_hunk_header,
+    BookmarkEntry, BookmarksInfo, BranchStatus, CommitStore, CommitSummary, DiffDocument, DiffFile,
+    DiffFileStatus, DiffHunkView, DiffLine, DiffLineKind, LoadProgress, RemoteBookmarkRef,
+    RevisionDetails, RevisionSelection, SignatureInfo, StreamRow, apply_syntax_highlighting,
+    format_hunk_header,
 };
 use crate::graph::LaneAssigner;
 use crate::graph_layout::{GraphLayout, LaneFoldState};
@@ -75,7 +82,7 @@ pub async fn walk_jj_commits(
     progress: LoadProgress,
     batch_size: usize,
     emit: &mut dyn FnMut(Vec<StreamRow>),
-) -> Result<(Vec<(usize, bool)>, Option<BranchStatus>)> {
+) -> Result<(Vec<(usize, bool)>, Option<BranchStatus>, BookmarksInfo)> {
     let settings = UserSettings::from_config(StackedConfig::with_defaults())
         .context("failed to load jj settings")?;
     let workspace = Workspace::load(
@@ -109,7 +116,7 @@ pub async fn walk_jj_with_repo(
     progress: LoadProgress,
     batch_size: usize,
     emit: &mut dyn FnMut(Vec<StreamRow>),
-) -> Result<(Vec<(usize, bool)>, Option<BranchStatus>)> {
+) -> Result<(Vec<(usize, bool)>, Option<BranchStatus>, BookmarksInfo)> {
     // Default revset: `all()` — ancestors of every visible head plus any
     // referenced commit. Covers the working copy, all local bookmarks,
     // and tracked/untracked remote bookmarks, so branches that haven't
@@ -230,7 +237,52 @@ pub async fn walk_jj_with_repo(
     // Branch summary for the sidebar footer — reuses the already-loaded repo so
     // it costs a few small revset evals, not another index load.
     let branch_status = compute_branch_status(repo, wc_commit_id);
-    Ok((empty_updates, branch_status))
+    // Repo-wide bookmark table for the revision context menu (move/track/
+    // delete/push) — a single bookmarks() walk on the same repo.
+    let bookmarks = compute_bookmarks_info(repo, wc_commit_id);
+    Ok((empty_updates, branch_status, bookmarks))
+}
+
+/// Snapshot every bookmark in the repo with the state the revision context menu
+/// needs: each bookmark's local target commit, and each remote ref's target +
+/// tracking state. `@`'s commit id is recorded so a working-copy right-click can
+/// resolve the bookmarks sitting on it.
+fn compute_bookmarks_info(repo: &ReadonlyRepo, wc_commit_id: &CommitId) -> BookmarksInfo {
+    let mut bookmarks = Vec::new();
+    for (name, target) in repo.view().bookmarks() {
+        // `added_ids().next()` (not `as_normal`) so a conflicted bookmark still
+        // resolves to one side rather than vanishing from the menu.
+        let local_target = target.local_target.added_ids().next().map(|id| id.hex());
+        let mut remotes = Vec::new();
+        for (remote, remote_ref) in &target.remote_refs {
+            // Skip jj's colocated-git pseudo-remote ("git"): it mirrors the
+            // local Git repo's branches, isn't a real push/track target, and
+            // jj rejects pushing to it ("reserved for local Git repository").
+            if remote.as_str() == REMOTE_NAME_FOR_LOCAL_GIT_REPO.as_str() {
+                continue;
+            }
+            if let Some(id) = remote_ref.target.added_ids().next() {
+                remotes.push(RemoteBookmarkRef {
+                    remote: remote.as_str().to_owned(),
+                    target: id.hex(),
+                    tracked: remote_ref.is_tracked(),
+                });
+            }
+        }
+        if local_target.is_none() && remotes.is_empty() {
+            continue;
+        }
+        bookmarks.push(BookmarkEntry {
+            name: name.as_str().to_owned(),
+            local_target,
+            remotes,
+        });
+    }
+    bookmarks.sort_by(|a, b| a.name.cmp(&b.name));
+    BookmarksInfo {
+        bookmarks,
+        working_copy_commit: Some(wc_commit_id.hex()),
+    }
 }
 
 /// Compute the working-copy's branch summary: the nearest local bookmark at or
@@ -268,6 +320,12 @@ fn branch_status_inner(
                 .push(name_str.clone());
         }
         for (remote, remote_ref) in &target.remote_refs {
+            // Skip jj's colocated-git pseudo-remote — it mirrors the local Git
+            // branches, so treating it as the upstream would always read as
+            // "in sync" instead of comparing against the real remote.
+            if remote.as_str() == REMOTE_NAME_FOR_LOCAL_GIT_REPO.as_str() {
+                continue;
+            }
             if remote_ref.is_tracked()
                 && let Some(id) = remote_ref.target.added_ids().next()
             {
@@ -369,13 +427,13 @@ fn count_revset(
 pub async fn load_jj_commits(
     repository_root: PathBuf,
     progress: LoadProgress,
-) -> Result<(CommitStore, GraphLayout, Option<BranchStatus>)> {
+) -> Result<(CommitStore, GraphLayout, Option<BranchStatus>, BookmarksInfo)> {
     let mut store = CommitStore::default();
     let mut graph = GraphLayout::default();
     let mut interner: HashMap<String, u32> = HashMap::new();
     let mut fold = LaneFoldState::default();
 
-    let (empty_updates, branch_status) = {
+    let (empty_updates, branch_status, bookmarks) = {
         let mut emit = |batch: Vec<StreamRow>| {
             for row in batch {
                 graph.push(&row.frame, &row.summary.bookmarks, &mut fold);
@@ -388,7 +446,7 @@ pub async fn load_jj_commits(
     for (index, empty) in empty_updates {
         store.set_is_empty(index, empty);
     }
-    Ok((store, graph, branch_status))
+    Ok((store, graph, branch_status, bookmarks))
 }
 
 /// The working-copy diff (or a stringified error) handed to `load_jj_cold`'s
@@ -409,7 +467,12 @@ pub async fn load_jj_cold(
     batch_size: usize,
     emit_diff: &mut dyn FnMut(ColdDiffResult),
     emit_batch: &mut dyn FnMut(Vec<StreamRow>),
-) -> Result<(RepositorySnapshot, Option<BranchStatus>, Vec<(usize, bool)>)> {
+) -> Result<(
+    RepositorySnapshot,
+    Option<BranchStatus>,
+    Vec<(usize, bool)>,
+    BookmarksInfo,
+)> {
     let (snapshot, repo, wc_commit_id) = load_jj_repository_snapshot(repository.clone()).await?;
 
     // Emit the working-copy diff up front so the diff pane is ready the moment
@@ -419,9 +482,9 @@ pub async fn load_jj_cold(
         .map_err(|error| format!("{error:#}"));
     emit_diff(diff);
 
-    let (empty_updates, branch_status) =
+    let (empty_updates, branch_status, bookmarks) =
         walk_jj_with_repo(repo.as_ref(), &wc_commit_id, progress, batch_size, emit_batch).await?;
-    Ok((snapshot, branch_status, empty_updates))
+    Ok((snapshot, branch_status, empty_updates, bookmarks))
 }
 
 /// Resolve the empty status of specific commits (the merges/roots the loader
@@ -893,6 +956,28 @@ pub(crate) async fn apply_mutation(
             tx.repo_mut().record_abandoned_commit(&commit);
             format!("Abandoned {short}")
         }
+        MutationOp::MoveBookmark { name, to } => {
+            let commit = resolve_mutation_target(tx.repo(), &current_wc_id, to).await?;
+            let short = short_change_id(&commit);
+            tx.repo_mut()
+                .set_local_bookmark_target(RefName::new(name), RefTarget::normal(commit.id().clone()));
+            format!("Moved bookmark {name} to {short}")
+        }
+        MutationOp::DeleteBookmark { name } => {
+            tx.repo_mut()
+                .set_local_bookmark_target(RefName::new(name), RefTarget::absent());
+            format!("Deleted bookmark {name}")
+        }
+        MutationOp::TrackBookmark { name, remote } => {
+            let symbol = RefName::new(name).to_remote_symbol(RemoteName::new(remote));
+            tx.repo_mut()
+                .track_remote_bookmark(symbol)
+                .with_context(|| format!("failed to track {name}@{remote}"))?;
+            format!("Tracking {name}@{remote}")
+        }
+        MutationOp::PushBookmark { name, remote } => {
+            push_bookmark(&settings, tx.repo_mut(), name, remote)?
+        }
     };
 
     tx.repo_mut()
@@ -926,7 +1011,14 @@ pub(crate) async fn apply_mutation(
         .await
         .context("failed to finish working-copy mutation")?;
 
-    Ok(MutationOutcome { message })
+    let moved_working_copy = matches!(
+        op,
+        MutationOp::New { .. } | MutationOp::Edit { .. } | MutationOp::Abandon { .. }
+    );
+    Ok(MutationOutcome {
+        message,
+        moved_working_copy,
+    })
 }
 
 /// Resolve a `RevisionSelection` to a `Commit`. The working-copy case uses
@@ -950,6 +1042,111 @@ async fn resolve_mutation_target(
 
 fn short_change_id(commit: &Commit) -> String {
     commit.change_id().hex().chars().take(8).collect()
+}
+
+/// Push a single local bookmark to `remote` inside the caller's transaction.
+/// jj-lib's [`push_refs`] spawns `git push` under the hood, so authentication
+/// uses the user's existing git credential setup (SSH agent, credential
+/// helper). It also updates the local remote-tracking ref, keeping the
+/// sidebar's ahead/behind correct after the push.
+fn push_bookmark(
+    settings: &UserSettings,
+    repo: &mut MutableRepo,
+    name: &str,
+    remote: &str,
+) -> Result<String> {
+    let ref_name = RefName::new(name);
+    let remote_name = RemoteName::new(remote);
+
+    // `after` = where the local bookmark now points; `before` = where we last
+    // recorded the remote (its tracking ref). jj uses `before` as the expected
+    // on-remote position for its push lease check.
+    let after = repo
+        .view()
+        .get_local_bookmark(ref_name)
+        .added_ids()
+        .next()
+        .cloned();
+    if after.is_none() {
+        bail!("bookmark {name} has no local target to push");
+    }
+    let before = repo
+        .view()
+        .get_remote_bookmark(ref_name.to_remote_symbol(remote_name))
+        .target
+        .added_ids()
+        .next()
+        .cloned();
+    if before == after {
+        return Ok(format!("{name} already up to date on {remote}"));
+    }
+
+    let subprocess_options = GitSubprocessOptions::from_settings(settings)
+        .context("failed to read git subprocess options")?;
+    let targets = GitPushRefTargets {
+        bookmarks: vec![(RefNameBuf::from(name), Diff { before, after })],
+    };
+    let mut callback = SilentPushCallback;
+    let stats = push_refs(
+        repo,
+        subprocess_options,
+        remote_name,
+        &targets,
+        &mut callback,
+        &GitPushOptions::default(),
+    )
+    .with_context(|| format!("failed to push {name} to {remote}"))?;
+
+    if !stats.all_ok() {
+        let mut problems = Vec::new();
+        for (git_ref, reason) in stats.rejected.iter().chain(stats.remote_rejected.iter()) {
+            let reason = reason.as_deref().unwrap_or("rejected");
+            problems.push(format!("{}: {reason}", git_ref.as_str()));
+        }
+        if problems.is_empty() {
+            bail!("push of {name} to {remote} did not complete");
+        }
+        bail!("push rejected — {}", problems.join("; "));
+    }
+
+    Ok(format!("Pushed {name} to {remote}"))
+}
+
+/// Quiet [`GitSubprocessCallback`] for pushes: no progress, sideband lines
+/// (which include credential-helper prompts and the remote's PR hints) are
+/// echoed to stderr for debugging but not surfaced in the UI.
+struct SilentPushCallback;
+
+impl GitSubprocessCallback for SilentPushCallback {
+    fn needs_progress(&self) -> bool {
+        false
+    }
+
+    fn progress(&mut self, _progress: &GitProgress) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn local_sideband(
+        &mut self,
+        message: &[u8],
+        _term: Option<GitSidebandLineTerminator>,
+    ) -> std::io::Result<()> {
+        if !message.is_empty() {
+            eprint!("diffui push: {}", String::from_utf8_lossy(message));
+        }
+        Ok(())
+    }
+
+    fn remote_sideband(
+        &mut self,
+        message: &[u8],
+        _term: Option<GitSidebandLineTerminator>,
+    ) -> std::io::Result<()> {
+        if !message.is_empty() {
+            eprint!("diffui push (remote): {}", String::from_utf8_lossy(message));
+        }
+        Ok(())
+    }
 }
 
 fn jj_revision_details(repo: &dyn Repo, commit: &jj_lib::commit::Commit) -> RevisionDetails {
@@ -1217,7 +1414,7 @@ mod mem_profile {
         let baseline = CURRENT.load(Relaxed);
         PEAK.store(baseline, Relaxed);
 
-        let (store, graph, _branch_status) = runtime
+        let (store, graph, _branch_status, _bookmarks) = runtime
             .block_on(super::load_jj_commits(repo.clone().into(), progress))
             .expect("load commits");
 
