@@ -18,6 +18,9 @@
 //! * `Missing` edges do not reserve a lane; they are reported per-row so
 //!   the renderer can draw a stub if it wants.
 
+use std::collections::HashSet;
+use std::hash::Hash;
+
 use jj_lib::graph::{GraphEdge, GraphEdgeType};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +113,15 @@ pub struct LaneAssigner<Id> {
     /// directly) so the profiler can run the identical algorithm uncapped to
     /// measure a graph's true width.
     max_lanes: usize,
+    /// Missing-edge targets already accounted for. jj reports the revset's
+    /// external **boundary** commits as `Missing` edges on *every* node that
+    /// descends from them — pervasive under a filter like `mine()`, where
+    /// almost every commit's ancestry leaves the visible set. Counting those
+    /// per node drew a missing-parent stub on nearly every row (a stray
+    /// vertical line); instead we count each missing target once, at its first
+    /// occurrence, the way a true root reads. Bounded by the number of distinct
+    /// boundary commits (a handful), not by graph size.
+    seen_missing: HashSet<Id>,
 }
 
 impl<Id> Default for LaneAssigner<Id> {
@@ -117,11 +129,12 @@ impl<Id> Default for LaneAssigner<Id> {
         Self {
             lanes: Vec::new(),
             max_lanes: MAX_LANES,
+            seen_missing: HashSet::new(),
         }
     }
 }
 
-impl<Id: Clone + Eq> LaneAssigner<Id> {
+impl<Id: Clone + Eq + Hash> LaneAssigner<Id> {
     pub fn new() -> Self {
         Self::default()
     }
@@ -133,6 +146,7 @@ impl<Id: Clone + Eq> LaneAssigner<Id> {
         Self {
             lanes: Vec::new(),
             max_lanes: usize::MAX,
+            seen_missing: HashSet::new(),
         }
     }
 
@@ -163,7 +177,12 @@ impl<Id: Clone + Eq> LaneAssigner<Id> {
         for edge in edges {
             match edge.edge_type {
                 GraphEdgeType::Missing => {
-                    missing_parents += 1;
+                    // Count a missing parent only the first time we see its
+                    // target, so the revset's boundary commits (re-reported on
+                    // every descendant) don't stub every row. See `seen_missing`.
+                    if self.seen_missing.insert(edge.target.clone()) {
+                        missing_parents += 1;
+                    }
                 }
                 kind @ (GraphEdgeType::Direct | GraphEdgeType::Indirect) => {
                     let slot = Slot::Awaiting {
@@ -203,7 +222,7 @@ impl<Id: Clone + Eq> LaneAssigner<Id> {
 /// drives the assigner directly in its load loop to avoid the intermediate.
 pub fn assign_lanes<Id, I>(nodes: I) -> Vec<LaneFrame>
 where
-    Id: Clone + Eq,
+    Id: Clone + Eq + Hash,
     I: IntoIterator<Item = (Id, Vec<GraphEdge<Id>>)>,
 {
     let mut assigner = LaneAssigner::new();
@@ -382,6 +401,33 @@ mod tests {
         assert!(rows[0].1.after.is_empty());
         // A is treated as a fresh head and takes lane 0 again.
         assert_eq!(rows[1].1.node_lane, 0);
+    }
+
+    #[test]
+    fn shared_missing_boundary_is_counted_once() {
+        // jj re-reports the revset's external boundary as a `Missing` edge on
+        // every descendant (pervasive under a filter like `mine()`). Only the
+        // first node to reach a given missing target counts it, so the
+        // missing-parent stub isn't redrawn on every row.
+        let rows = run([
+            ('C', vec![direct('B'), missing('X')]),
+            ('B', vec![direct('A'), missing('X')]),
+            ('A', vec![missing('X')]),
+        ]);
+        assert_eq!(rows[0].1.missing_parents, 1); // X first seen here
+        assert_eq!(rows[1].1.missing_parents, 0); // same boundary — not recounted
+        assert_eq!(rows[2].1.missing_parents, 0);
+    }
+
+    #[test]
+    fn distinct_missing_targets_each_count_once() {
+        // Genuinely different missing parents still each get marked.
+        let rows = run([
+            ('B', vec![direct('A'), missing('X')]),
+            ('A', vec![missing('Y')]),
+        ]);
+        assert_eq!(rows[0].1.missing_parents, 1); // X
+        assert_eq!(rows[1].1.missing_parents, 1); // Y is a different boundary
     }
 
     #[test]

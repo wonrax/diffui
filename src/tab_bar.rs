@@ -34,7 +34,10 @@ pub fn build_tab_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         return Space::new().into();
     }
 
-    let mut tabs_row = row![].spacing(4).align_y(alignment::Vertical::Center);
+    // 6px between tabs (and the trailing `+`) — the same rhythm the strip uses
+    // between its top-level groups and the toolbar uses between its actions, so
+    // every gap across the two title-bar bands is one consistent value.
+    let mut tabs_row = row![].spacing(6).align_y(alignment::Vertical::Center);
     for (index, tab) in ui.tabs.iter().enumerate() {
         let active = index == ui.active_tab;
         tabs_row = tabs_row.push(tab_widget(ui, theme, tab, active));
@@ -329,6 +332,58 @@ fn tab_is_dirty(ui: &Diffui, tab: &crate::Tab, active: bool) -> bool {
         == Some(false)
 }
 
+/// One quick-pick row in the open dialog's recent list: `owner/name` over the
+/// home-contracted path, clicking it reopens that repo.
+fn recent_repo_row<'a>(ui: &'a Diffui, theme: ThemeSpec, root: &'a str) -> Element<'a, Message> {
+    let (owner, name) = crate::repo_label(std::path::Path::new(root));
+    let mut label = row![].spacing(0).align_y(alignment::Vertical::Center);
+    if !owner.is_empty() {
+        label = label.push(
+            text(format!("{owner}/"))
+                .size(12.5)
+                .color(theme.subtle_text)
+                .font(ui.config.ui_font),
+        );
+    }
+    label = label.push(
+        text(name)
+            .size(12.5)
+            .color(theme.text)
+            .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
+    );
+
+    let content = column![
+        label,
+        text(crate::contract_user_path(root))
+            .size(11)
+            .color(theme.subtle_text)
+            .font(ui.config.mono_font),
+    ]
+    .spacing(1);
+
+    button(content)
+        .width(Length::Fill)
+        .padding(Padding::from([6, 8]))
+        .on_press(Message::OpenRecentRepo(root.to_owned()))
+        .style(move |_, status| button::Style {
+            background: match status {
+                button::Status::Hovered | button::Status::Pressed => {
+                    Some(Background::Color(theme.selected_file))
+                }
+                _ => None,
+            },
+            text_color: theme.text,
+            border: Border {
+                width: 0.0,
+                color: Color::TRANSPARENT,
+                radius: 6.0.into(),
+            },
+            shadow: Default::default(),
+            snap: true,
+        })
+        .into()
+}
+
 /// Modal overlay for opening a repository from a path. Returns an empty
 /// `Space` when the dialog is closed. Mirrors the palette's scrim + card
 /// construction so click-outside dismisses and the card itself doesn't.
@@ -394,6 +449,33 @@ pub fn build_open_repo_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Mess
                 .color(theme.removed_text)
                 .font(ui.config.ui_font),
         );
+    }
+
+    // Recent repositories quick-pick: anything in the MRU that isn't already
+    // open. One click reopens it (no need to retype the path).
+    let open_roots: Vec<&str> = ui
+        .tabs
+        .iter()
+        .map(|tab| tab.root.to_str().unwrap_or_default())
+        .collect();
+    let recents: Vec<&String> = ui
+        .recent_repos
+        .iter()
+        .filter(|root| !open_roots.contains(&root.as_str()))
+        .take(6)
+        .collect();
+    if !recents.is_empty() {
+        body = body.push(
+            text("Recent")
+                .size(11)
+                .color(theme.subtle_text)
+                .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
+        );
+        let mut list = column![].spacing(2);
+        for root in recents {
+            list = list.push(recent_repo_row(ui, theme, root));
+        }
+        body = body.push(list);
     }
 
     let cancel = button(

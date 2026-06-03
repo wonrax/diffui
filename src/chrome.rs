@@ -91,6 +91,130 @@ pub fn position_window_controls(handle: raw_window_handle::RawWindowHandle, bar_
     }
 }
 
+/// Install a native observer that re-centers the traffic lights on every window
+/// resize, **synchronously within AppKit's own resize handling**. Reacting to
+/// winit's `Resized` through the iced message loop (see
+/// `position_window_controls`) runs a frame *after* AppKit has already snapped
+/// the buttons back to their default top position — that one stale frame, drawn
+/// repeatedly while dragging an edge, is the up/down "jump". Re-centering inside
+/// `windowDidResize:` happens before the frame is flushed, so the buttons never
+/// visibly land at the default position. Install once; the observer lives for
+/// the app's lifetime. No-op off macOS / non-AppKit handles.
+#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+pub fn install_window_resize_observer(
+    handle: raw_window_handle::RawWindowHandle,
+    bar_height: f32,
+) {
+    #[cfg(target_os = "macos")]
+    {
+        let raw_window_handle::RawWindowHandle::AppKit(appkit) = handle else {
+            return;
+        };
+        resize_observer::install(appkit.ns_view.as_ptr(), bar_height);
+    }
+}
+
+/// The `NSWindowDidResizeNotification` observer backing
+/// [`install_window_resize_observer`]. A tiny `NSObject` subclass whose
+/// `windowDidResize:` re-runs the same traffic-light centring as the iced path,
+/// but on AppKit's timeline.
+#[cfg(target_os = "macos")]
+mod resize_observer {
+    use std::ffi::c_void;
+
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2::{DefinedClass, MainThreadOnly, class, define_class, msg_send, sel};
+    use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSString};
+
+    pub(super) struct Ivars {
+        bar_height: f32,
+    }
+
+    define_class!(
+        // SAFETY:
+        // - The superclass NSObject has no subclassing requirements.
+        // - `ResizeObserver` does not implement `Drop`.
+        #[unsafe(super = NSObject)]
+        #[thread_kind = MainThreadOnly]
+        #[ivars = Ivars]
+        struct ResizeObserver;
+
+        // SAFETY: `NSObjectProtocol` has no safety requirements.
+        unsafe impl NSObjectProtocol for ResizeObserver {}
+
+        impl ResizeObserver {
+            // Fired by AppKit (on the main thread, synchronously during the
+            // resize) for each `NSWindowDidResizeNotification` on our window.
+            //
+            // SAFETY: the selector takes one object argument — the notification,
+            // whose `object` is the resized `NSWindow`.
+            #[unsafe(method(windowDidResize:))]
+            fn window_did_resize(&self, notification: &NSObject) {
+                let window: *mut AnyObject = unsafe { msg_send![notification, object] };
+                if window.is_null() {
+                    return;
+                }
+                let content_view: *mut AnyObject = unsafe { msg_send![window, contentView] };
+                if content_view.is_null() {
+                    return;
+                }
+                // SAFETY: `content_view` is a live `NSView*`; we're on the main
+                // thread and only send well-known AppKit messages.
+                unsafe {
+                    super::position_traffic_lights(
+                        content_view as *mut c_void,
+                        self.ivars().bar_height,
+                    );
+                }
+            }
+        }
+    );
+
+    impl ResizeObserver {
+        fn new(mtm: MainThreadMarker, bar_height: f32) -> Retained<Self> {
+            let this = Self::alloc(mtm).set_ivars(Ivars { bar_height });
+            // SAFETY: `NSObject`'s `init` is a correct designated initializer.
+            unsafe { msg_send![super(this), init] }
+        }
+    }
+
+    pub(super) fn install(ns_view: *mut c_void, bar_height: f32) {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let ns_view = ns_view as *mut AnyObject;
+        if ns_view.is_null() {
+            return;
+        }
+        // SAFETY: `ns_view` is a live `NSView*`; `-window` returns its window.
+        let window: *mut AnyObject = unsafe { msg_send![ns_view, window] };
+        if window.is_null() {
+            return;
+        }
+
+        let observer = ResizeObserver::new(mtm, bar_height);
+        let name = NSString::from_str("NSWindowDidResizeNotification");
+        let observer_ref: &AnyObject = &observer;
+        // SAFETY: registering a well-formed observer + selector with the default
+        // notification center; `name` and `window` are valid for the call.
+        unsafe {
+            let center: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
+            let _: () = msg_send![
+                center,
+                addObserver: observer_ref,
+                selector: sel!(windowDidResize:),
+                name: &*name,
+                object: window,
+            ];
+        }
+        // The observer must outlive this call. There's exactly one window and it
+        // lives until the process exits, so leak the observer rather than track
+        // ownership we'd never reclaim.
+        std::mem::forget(observer);
+    }
+}
+
 /// macOS traffic-light repositioning. We resize the private
 /// `NSTitlebarContainerView` (the buttons' grandparent) to span the bar and pin
 /// it to the window top — the Tauri/Electron technique — then *measure* where

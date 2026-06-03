@@ -195,6 +195,14 @@ pub async fn walk_jj_with_repo(
         .evaluate(repo)
         .context("failed to evaluate jj revset")?;
 
+    // Determinate progress: count the revset's commits up front so the toolbar
+    // shows N / total during a big cold load. This is a position-only walk (no
+    // commit/tree loading) — ~20ms for 43k commits, so a fraction of the
+    // streaming load it precedes; best-effort, we stay indeterminate on error.
+    if let Ok((lower, upper)) = revset.count_estimate() {
+        progress.set_total(upper.unwrap_or(lower));
+    }
+
     // Index bookmarks by commit id once so the per-commit loop below is a
     // map lookup instead of an O(bookmarks) scan per revision.
     let mut bookmarks_by_commit: HashMap<CommitId, Vec<String>> = HashMap::new();
@@ -639,6 +647,46 @@ pub async fn load_jj_diff(
             .with_context(|| format!("invalid jj commit id {revision}"))?,
     };
     diff_jj_with_repo(repo.as_ref(), &commit_id, &repository).await
+}
+
+/// Load just the `jj show`-style header for `revision` (no diff): ids,
+/// bookmarks, author/committer signatures, description. Used by the revision
+/// context menu's copy actions, which need the author/committer dates the
+/// in-memory graph doesn't carry. Mirrors [`load_jj_diff`]'s workspace + commit
+/// resolution but stops at [`jj_revision_details`].
+pub async fn load_jj_revision_details(
+    repository: Repository,
+    revision: RevisionSelection,
+) -> Result<RevisionDetails> {
+    let settings = jj_settings(&repository.root)?;
+    let workspace = Workspace::load(
+        &settings,
+        &repository.root,
+        &StoreFactories::default(),
+        &default_working_copy_factories(),
+    )
+    .context("failed to load jj workspace")?;
+    let workspace_name = workspace.workspace_name();
+    let repo = workspace
+        .repo_loader()
+        .load_at_head()
+        .await
+        .context("failed to load jj repo")?;
+    let commit_id = match revision {
+        RevisionSelection::WorkingCopy => repo
+            .view()
+            .get_wc_commit_id(workspace_name)
+            .context("jj workspace has no working-copy commit")?
+            .clone(),
+        RevisionSelection::Commit(revision) => CommitId::try_from_hex(&revision)
+            .with_context(|| format!("invalid jj commit id {revision}"))?,
+    };
+    let commit = repo
+        .store()
+        .get_commit_async(&commit_id)
+        .await
+        .with_context(|| format!("failed to load jj commit {}", commit_id.hex()))?;
+    Ok(jj_revision_details(repo.as_ref(), &commit))
 }
 
 /// The diff half of [`load_jj_diff`], given an already-loaded repo. Split out so

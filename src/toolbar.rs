@@ -5,16 +5,66 @@
 //! render as iced overlays anchored near their trigger.
 
 use iced::{
-    Background, Border, Color, Element, Length, Padding, alignment,
+    Background, Border, Color, Element, Length, Padding, Point, Rectangle, alignment,
     font::Weight,
     mouse,
-    widget::{Space, button, column, container, mouse_area, row, stack, text},
+    widget::{Space, button, canvas, column, container, mouse_area, row, stack, text},
 };
 
 use crate::activity;
 use crate::repository::Vcs;
 use crate::theme::{ThemeSpec, chip_background, emphasis_font};
 use crate::{Diffui, FetchTarget, HoverTarget, Message, ToolbarMenu};
+
+/// A down-pointing caret (▾) drawn as a filled triangle rather than a text
+/// glyph. The `U+25BE` glyph sits off-center within the line box in many UI
+/// fonts (notably the macOS system font), which left the fetch / revset carets
+/// looking vertically misaligned no matter how the text box was centered. A
+/// geometric triangle centers exactly on its bounds, so both carets line up
+/// regardless of the configured font. Reused by the revset caret in `sidebar`.
+struct Caret {
+    color: Color,
+}
+
+impl canvas::Program<Message> for Caret {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &iced::Renderer,
+        _theme: &iced::Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        let half_w = 4.0; // 8px wide
+        let half_h = 2.0; // 4px tall — flat, matching ▾'s proportions
+        let cx = bounds.width / 2.0;
+        let cy = bounds.height / 2.0;
+        let triangle = canvas::Path::new(|b| {
+            b.move_to(Point::new(cx - half_w, cy - half_h));
+            b.line_to(Point::new(cx + half_w, cy - half_h));
+            b.line_to(Point::new(cx, cy + half_h));
+            b.close();
+        });
+        frame.fill(&triangle, self.color);
+        vec![frame.into_geometry()]
+    }
+}
+
+/// The shared caret glyph: a fixed-width canvas drawing a centered triangle in
+/// `color`. `box_height` should be the neighbour's text **line box** (iced's
+/// `Relative(1.3)` line-height ⇒ `1.3 × text_size`, which is font-independent),
+/// so that with matching vertical padding the caret's hover fill is exactly as
+/// tall as the button / input beside it. `Fill` can't be used here: nothing up
+/// the toolbar tree bounds the height, so it would stretch to the whole window.
+pub(crate) fn caret_glyph(color: Color, box_height: f32) -> Element<'static, Message> {
+    canvas(Caret { color })
+        .width(Length::Fixed(9.0))
+        .height(Length::Fixed(box_height))
+        .into()
+}
 
 /// Build the actions toolbar. Returns an empty `Space` when no repo is open
 /// (the empty-state view owns the window then).
@@ -26,11 +76,13 @@ pub fn build_toolbar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     let is_jj = matches!(ui.repository.as_ref().map(|r| r.vcs), Some(Vcs::Jj));
 
     let caret_hovered = ui.hovered == Some(HoverTarget::FetchCaret);
+    // 6px between actions — the same rhythm the tab strip uses between tabs, so
+    // both title-bar bands share one consistent item spacing.
     let mut actions = row![
         toolbar_button("\u{21BB}", "Refresh", Message::ToolbarRefresh, theme, font),
         fetch_split_button(theme, font, caret_hovered),
     ]
-    .spacing(4)
+    .spacing(6)
     .align_y(alignment::Vertical::Center);
     // jj-only: git has no operation log to undo.
     if is_jj {
@@ -143,19 +195,13 @@ fn fetch_split_button(
     // selection (iced `button` only fires on release). Hover + cursor are set
     // manually since mouse_area has neither.
     let caret = mouse_area(
-        container(
-            text("\u{25BE}")
-                .size(crate::revision_list::CHEVRON_TEXT_SIZE)
-                // Match the revision-row chevron's glyph size, but keep the
-                // widget's box tight (line-height 1.0) so the larger size
-                // doesn't inflate the toolbar height.
-                .line_height(text::LineHeight::Relative(1.0))
-                .color(theme.muted_text)
-                .font(font),
-        )
-        .padding(Padding::from([2, 7]))
-        .align_y(alignment::Vertical::Center)
-        .style(move |_| caret_hover_style(theme, caret_hovered)),
+        // Box height = the main half's size-13 text line box, and the same
+        // vertical padding (4) — so the caret's hover fill is exactly as tall as
+        // the "Fetch" half rather than hugging the small glyph.
+        container(caret_glyph(theme.muted_text, 13.0 * 1.3))
+            .padding(Padding::from([4, 7]))
+            .align_y(alignment::Vertical::Center)
+            .style(move |_| caret_hover_style(theme, caret_hovered)),
     )
     .on_press(Message::OpenToolbarMenu(ToolbarMenu::FetchBranches))
     .on_enter(Message::SetHover(Some(HoverTarget::FetchCaret)))
@@ -175,9 +221,12 @@ fn fetch_split_button(
             .spacing(0)
             .align_y(alignment::Vertical::Center),
     )
-    // 1px padding keeps the halves' hover fills off the border so it doesn't
-    // darken (the border + fill never overlap).
-    .padding(1)
+    // Horizontal-only 1px inset keeps the halves' hover fills off the rounded
+    // left/right corners. Vertical padding is 0 so the split button is exactly
+    // as tall as the plain Refresh / Undo buttons (whose fills already meet
+    // their top/bottom borders the same way) — the extra vertical ring is what
+    // made Fetch read as taller than the rest.
+    .padding(Padding::from([0, 1]))
     .style(move |_| container::Style {
         border: Border {
             width: 1.0,

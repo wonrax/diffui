@@ -11,12 +11,12 @@
 //! Entries are **persistent**: running and finished alike stay until the user
 //! clears them or the app restarts — nothing auto-dismisses.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use iced::{
     Background, Border, Color, Element, Length, Padding, alignment,
     font::Weight,
-    widget::{Space, button, column, container, mouse_area, row, scrollable, stack, text},
+    widget::{Space, button, column, container, mouse_area, row, scrollable, stack, text, text_input},
 };
 
 use crate::backend::LoadProgress;
@@ -27,6 +27,13 @@ use crate::{Diffui, Message};
 /// font; advanced at ~12fps off the activity's elapsed time (the toolbar tick
 /// keeps `view()` re-running while anything is in flight).
 const SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
+
+/// How long an operation must run before its spinner / progress line is painted.
+/// Anything that finishes faster than this never shows a visual, so a quick
+/// refresh / revset eval / mutation / diff load doesn't flash the orange
+/// indicator. The op is still tracked the whole time (and lands in the popover
+/// log on finish) — only the in-flight toolbar visual is held back.
+pub const ACTIVITY_DISPLAY_DELAY: Duration = Duration::from_millis(150);
 
 /// Stable identity for a log entry, handed back by [`ActivityLog::start`] so the
 /// operation's later `append_output`/`finish` calls (and the row's expand
@@ -165,6 +172,15 @@ impl ActivityLog {
             .find(|a| matches!(a.status, ActivityStatus::Running))
     }
 
+    /// Like [`first_running`](Self::first_running), but only once the op has run
+    /// past [`ACTIVITY_DISPLAY_DELAY`] — so a short op never flashes the toolbar
+    /// spinner / progress line. `first_running` is the *oldest* still-running
+    /// entry, so if it isn't old enough to show, none are.
+    pub fn first_running_visible(&self) -> Option<&Activity> {
+        self.first_running()
+            .filter(|a| a.started.elapsed() >= ACTIVITY_DISPLAY_DELAY)
+    }
+
     fn get_mut(&mut self, id: ActivityId) -> Option<&mut Activity> {
         self.activities.iter_mut().find(|a| a.id == id)
     }
@@ -183,7 +199,7 @@ pub fn activity_indicator(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message>
     let mono = ui.config.mono_font;
     let running = ui.activities.running_count();
 
-    let body: Element<'_, Message> = if let Some(active) = ui.activities.first_running() {
+    let body: Element<'_, Message> = if let Some(active) = ui.activities.first_running_visible() {
         let mut chips = row![
             text(spinner_glyph(active.started))
                 .size(12)
@@ -259,8 +275,13 @@ pub fn activity_indicator(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message>
 pub fn activity_progress_line(ui: &Diffui, theme: ThemeSpec) -> Element<'static, Message> {
     const HEIGHT: f32 = 2.0;
 
-    let active = ui.activities.first_running();
-    let diff_loading = ui.pending_revision.is_some();
+    // Both visuals are held back until the work has run past the display delay,
+    // so short ops don't flash. `loading_since` times the (un-logged)
+    // revision-switch diff load the same way an activity's `started` does.
+    let active = ui.activities.first_running_visible();
+    let diff_loading = ui
+        .loading_since
+        .is_some_and(|since| since.elapsed() >= ACTIVITY_DISPLAY_DELAY);
 
     // Determinate fill — only when the running op reports a real total.
     if let Some(activity) = active {
@@ -358,14 +379,14 @@ pub fn activity_popover(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
                 .height(Length::Shrink)
                 .style(move |_, s| iced_scrollable_style(theme, s)),
         )
-        .max_height(440.0),
+        .max_height(520.0),
     ]
     .spacing(10);
 
     let card = mouse_area(
         container(body)
-            .width(Length::Fixed(360.0))
-            .padding(Padding::from([14, 16]))
+            .width(Length::Fixed(420.0))
+            .padding(Padding::from([16, 18]))
             .style(move |_| card_style(theme)),
     )
     .on_press(Message::ActivityNoOp);
@@ -438,8 +459,10 @@ fn activity_row<'a>(
         head = head.push(text(chevron).size(11).font(mono).color(theme.subtle_text));
     }
 
-    // The determinate progress bar sits under the header while running.
-    let mut block = column![head].spacing(4);
+    // Header (status + label + the determinate bar). This is the click target
+    // that toggles the detail; the detail itself sits *outside* it, so dragging
+    // to select text there doesn't collapse the row.
+    let mut header = column![head].spacing(4);
     if matches!(activity.status, ActivityStatus::Running) && determinate {
         let accent = theme.accent;
         let fill = ((loaded as f32 / total as f32).clamp(0.0, 1.0) * 1000.0) as u16;
@@ -461,37 +484,73 @@ fn activity_row<'a>(
                     .style(move |_| rounded(chip_background(theme.muted_text))),
             );
         }
-        block = block.push(bar);
-    }
-
-    if activity.expanded {
-        for line in &activity.detail {
-            block = block.push(detail_line(line, mono, theme));
-        }
+        header = header.push(bar);
     }
 
     let id = activity.id;
-    let interactive = mouse_area(
-        container(block)
+    let header_area = mouse_area(
+        container(header)
             .width(Length::Fill)
             .padding(Padding::from([6, 8])),
     );
-    // Only the rows with output toggle on click.
-    if activity.detail.is_empty() {
-        interactive.into()
+    // Only rows with captured output expand on click.
+    let header_area: Element<'a, Message> = if activity.detail.is_empty() {
+        header_area.into()
     } else {
-        interactive.on_press(Message::ActivityExpand(id)).into()
+        header_area.on_press(Message::ActivityExpand(id)).into()
+    };
+
+    if !activity.expanded || activity.detail.is_empty() {
+        return header_area;
     }
+
+    // Expanded: the captured output, indented under the header. Each line is
+    // selectable (a read-only text field) so it can be copied; lines carrying a
+    // URL keep their one-click link instead.
+    let mut detail = column![].spacing(1);
+    for line in &activity.detail {
+        detail = detail.push(detail_line(line, mono, theme));
+    }
+    column![
+        header_area,
+        container(detail).width(Length::Fill).padding(Padding {
+            top: 0.0,
+            right: 8.0,
+            bottom: 6.0,
+            left: 8.0,
+        }),
+    ]
+    .into()
 }
 
 /// Render one output line, turning whitespace-delimited `http(s)://…` tokens
 /// into clickable links. Preserves the rest as monospace text.
 fn detail_line<'a>(line: &'a str, mono: iced::Font, theme: ThemeSpec) -> Element<'a, Message> {
     if !line.contains("http://") && !line.contains("https://") {
-        return text(line.to_owned())
-            .size(11)
+        // Read-only but selectable: a no-op `on_input` keeps the value pinned to
+        // `line` while still letting the user drag-select and ⌘C it — a plain
+        // `text` widget can't be selected at all. Styled to read as plain mono
+        // text (transparent, borderless, no internal padding).
+        return text_input("", line)
             .font(mono)
-            .color(theme.muted_text)
+            .size(11)
+            .padding(0)
+            .on_input(|_| Message::ActivityNoOp)
+            .style(move |_, _| text_input::Style {
+                background: Background::Color(Color::TRANSPARENT),
+                border: Border {
+                    width: 0.0,
+                    color: Color::TRANSPARENT,
+                    radius: 0.0.into(),
+                },
+                icon: theme.subtle_text,
+                placeholder: theme.subtle_text,
+                value: theme.muted_text,
+                selection: Color {
+                    a: 0.25,
+                    ..theme.accent
+                },
+            })
             .into();
     }
 
@@ -608,8 +667,10 @@ fn card_style(theme: ThemeSpec) -> container::Style {
             radius: 12.0.into(),
         },
         shadow: iced::Shadow {
+            // Half the previous opacity (0.12 → 0.06) — a softer, more
+            // translucent drop shadow under the popover.
             color: Color {
-                a: 0.12,
+                a: 0.06,
                 ..Color::BLACK
             },
             offset: iced::Vector::new(0.0, 3.0),

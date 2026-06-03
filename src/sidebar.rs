@@ -167,18 +167,14 @@ fn build_revset_filter(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     // Hover is tracked manually (mouse_area has no built-in hover style).
     let caret_hovered = ui.hovered == Some(HoverTarget::RevsetCaret);
     let caret = mouse_area(
-        container(
-            text("\u{25BE}")
-                .size(revision_list::CHEVRON_TEXT_SIZE)
-                // Same glyph size as the revision-row chevron; tight line-height
-                // so it doesn't inflate the input row's height.
-                .line_height(iced::widget::text::LineHeight::Relative(1.0))
-                .font(ui.config.ui_font)
-                .color(theme.muted_text),
-        )
-        .padding(Padding::from([3, 7]))
-        .align_y(alignment::Vertical::Center)
-        .style(move |_| crate::toolbar::caret_hover_style(theme, caret_hovered)),
+        // Drawn triangle (see `toolbar::caret_glyph`) so it centers exactly.
+        // Box height = the input's size-12 line box and the same vertical
+        // padding (5), so the hover fill lines up with the input box top-to-
+        // bottom instead of hugging the small glyph.
+        container(crate::toolbar::caret_glyph(theme.muted_text, 12.0 * 1.3))
+            .padding(Padding::from([5, 7]))
+            .align_y(alignment::Vertical::Center)
+            .style(move |_| crate::toolbar::caret_hover_style(theme, caret_hovered)),
     )
     .on_press(Message::OpenToolbarMenu(ToolbarMenu::RevsetPresets))
     .on_enter(Message::SetHover(Some(HoverTarget::RevsetCaret)))

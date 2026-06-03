@@ -54,6 +54,12 @@ pub struct WindowState {
     /// Restored so each repo reopens with the filter the user last set.
     #[serde(default)]
     pub revsets: BTreeMap<String, String>,
+    /// Most-recently-opened repository roots, newest first. Offered as
+    /// quick-pick rows in the "Open repository" dialog so a closed repo is one
+    /// click to reopen. Distinct from `open_repos` (which is only what's open
+    /// *right now*); this remembers history across closes.
+    #[serde(default)]
+    pub recent_repos: Vec<String>,
 }
 
 impl WindowState {
@@ -214,6 +220,7 @@ mod tests {
                 ("/a/repo".to_owned(), "all()".to_owned()),
                 ("/b/repo".to_owned(), "mine()".to_owned()),
             ]),
+            recent_repos: vec!["/b/repo".to_owned(), "/a/repo".to_owned()],
         };
         let raw = toml::to_string(&state).expect("serialize");
         let parsed: WindowState = toml::from_str(&raw).expect("deserialize");
@@ -228,6 +235,10 @@ mod tests {
         assert_eq!(
             parsed.revsets.get("/b/repo").map(String::as_str),
             Some("mine()")
+        );
+        assert_eq!(
+            parsed.recent_repos,
+            vec!["/b/repo".to_owned(), "/a/repo".to_owned()]
         );
     }
 

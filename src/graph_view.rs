@@ -30,6 +30,14 @@ const LINE_THICKNESS: f32 = 1.5;
 const LINE_THICKNESS_EMPHASIZED: f32 = 2.75;
 const NODE_RADIUS: f32 = 3.5;
 
+/// Whether to draw the little stub below a node that has a parent outside the
+/// visible set (a `Missing` edge — e.g. the top/bottom boundary of a filtered
+/// `mine()` view). It's a real boundary indicator, but as a bare gray nub it
+/// reads more like a rendering glitch than a signal, so it's parked off until
+/// we design a clearer affordance. The counting/dedup logic and the drawing
+/// code below are kept intact so flipping this back on is a one-line change.
+const SHOW_MISSING_PARENT_STUB: bool = false;
+
 #[derive(Debug, Clone, Copy)]
 pub struct RevisionGraphStyle {
     /// Base color for lane 0 (the trunk). Other lanes — and the node
@@ -334,7 +342,7 @@ pub fn draw_revision_row<R>(
     // Within a single frame the order *does* matter (later draws on top),
     // so adding the stub before the disc lets the disc still cover any
     // overlap with it.
-    if frame_data.missing_parents > 0 {
+    if SHOW_MISSING_PARENT_STUB && frame_data.missing_parents > 0 {
         let stub_x = x_node + NODE_RADIUS * 1.2;
         let stub_top = mid + NODE_RADIUS;
         let stub_bot = (mid + NODE_RADIUS + bounds.height * 0.3).min(bot);

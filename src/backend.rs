@@ -179,6 +179,10 @@ impl CommitStore {
         self.iter().find(|row| row.change_id() == change_id)
     }
 
+    pub fn find_by_commit_id(&self, commit_id: &str) -> Option<RowView<'_>> {
+        self.iter().find(|row| row.commit_id() == commit_id)
+    }
+
     pub fn working_copy(&self) -> Option<RowView<'_>> {
         self.iter().find(|row| row.is_working_copy())
     }
@@ -603,6 +607,31 @@ async fn run_diff(
 
 pub async fn load_repository_snapshot(repository: Repository) -> Result<RepositorySnapshot> {
     run_repository_snapshot(repository).await
+}
+
+/// Load just the `jj show`-style header (ids, bookmarks, author/committer
+/// signatures, description) for a single revision — no diff. Used by the
+/// revision context menu's "Copy → Author / Committer", which needs the dates
+/// the in-memory graph doesn't keep. jj-only (the context menu itself is
+/// jj-only); the off-thread `block_on` mirrors [`run_diff`]'s jj path.
+pub async fn load_revision_details(
+    repository: Repository,
+    revision: RevisionSelection,
+) -> Result<RevisionDetails, String> {
+    match repository.vcs {
+        Vcs::Jj => {
+            let handle = tokio::runtime::Handle::current();
+            let joined = tokio::task::spawn_blocking(move || {
+                handle.block_on(crate::jj::load_jj_revision_details(repository, revision))
+            })
+            .await;
+            match joined {
+                Ok(result) => result.map_err(|error| format!("{error:#}")),
+                Err(error) => Err(format!("jj details loader task failed: {error}")),
+            }
+        }
+        Vcs::Git => Err("revision details are jj-only".to_owned()),
+    }
 }
 
 /// Resolve the empty status of `targets` (row index + hex commit-id) off the

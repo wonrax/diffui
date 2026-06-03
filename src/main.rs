@@ -103,8 +103,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use backend::{
     BackendOutput, BookmarksInfo, BranchStatus, CommitStore, CommitsTail, DiffDocument,
-    LoadProgress, RevisionDetails, RevisionSelection, RowView, StreamRow, compute_empty_status,
-    load_backend, load_diff, load_repository_snapshot,
+    LoadProgress, RevisionDetails, RevisionSelection, RowView, SignatureInfo, StreamRow,
+    compute_empty_status, load_backend, load_diff, load_repository_snapshot,
 };
 use clap::Parser;
 use config::AppConfig;
@@ -144,6 +144,10 @@ const PALETTE_QUERY_DEBOUNCE: Duration = Duration::from_millis(120);
 /// geometry is written to disk. A single drag emits a burst of events;
 /// coalescing them into one write avoids hammering the disk every frame.
 const WINDOW_STATE_DEBOUNCE: Duration = Duration::from_millis(400);
+
+/// How many recently-opened repo roots to remember for the open dialog's
+/// quick-pick list. Bounded so the persisted state file stays small.
+const RECENT_REPOS_MAX: usize = 12;
 
 fn main() -> iced::Result {
     let cli = Cli::parse();
@@ -299,6 +303,9 @@ pub(crate) struct Diffui {
     pub(crate) next_load_version: u64,
     /// `Some` while the "open repository" path dialog is showing.
     pub(crate) open_repo_dialog: Option<OpenRepoDialog>,
+    /// Most-recently-opened repo roots (newest first), surfaced as quick-pick
+    /// rows in the open dialog. Seeded from / persisted to `WindowState`.
+    pub(crate) recent_repos: Vec<String>,
 
     // ── Toolbar / activity / revset (per-tab where noted) ───────────────
     /// The revset (jj) / revision-range (git) controlling which commits the
@@ -613,6 +620,8 @@ pub(crate) enum Message {
     OpenRepoPathChanged(String),
     /// Resolve the dialog's path and open it as a tab (Enter / "Open").
     OpenRepoSubmit,
+    /// Open a repo picked from the dialog's recent-repositories list.
+    OpenRecentRepo(String),
     /// Swallow clicks on the dialog card so they don't dismiss it.
     OpenRepoNoOp,
     /// Begin an interactive window drag — fired when the user presses an empty
@@ -814,6 +823,17 @@ impl Diffui {
             (None, None) => LoadStatus::Loaded,
         };
 
+        // Recent-repos MRU: prior history from disk, with the repos opening this
+        // session promoted to the front (newest first) so they're remembered
+        // even after they're later closed.
+        let mut recent_repos = saved.recent_repos.clone();
+        for repository in repositories.iter().rev() {
+            let key = repository.root.to_string_lossy().into_owned();
+            recent_repos.retain(|root| root != &key);
+            recent_repos.insert(0, key);
+        }
+        recent_repos.truncate(RECENT_REPOS_MAX);
+
         // The active tab starts as a blank `unloaded` shell; `kick_initial_load`
         // below fills it in (and streams the rest). Inactive tabs load on
         // first activation.
@@ -858,6 +878,7 @@ impl Diffui {
             next_tab_id,
             next_load_version: 0,
             open_repo_dialog: None,
+            recent_repos,
             revset: active_revset,
             activities: activity::ActivityLog::default(),
             pending_load_activity: None,
@@ -940,7 +961,12 @@ impl Diffui {
                 // Take the cursor out so the appends below borrow `self` fields
                 // freely (same idiom the palette uses). Drop batches from a
                 // superseded load — their row indices no longer line up.
-                let Some(mut cursor) = self.load.take().filter(|c| c.version == version) else {
+                // `take_if` (not `take().filter()`) leaves the cursor in place
+                // when a *stale* batch arrives mid-stream: taking it out and
+                // dropping it would orphan the live load, so its later batches
+                // would be lost and the store would end up shorter than the
+                // loader's `empty_updates` indices (an out-of-bounds panic).
+                let Some(mut cursor) = self.load.take_if(|c| c.version == version) else {
                     return Task::none();
                 };
                 let selecting_wc = matches!(self.selected_revision, RevisionSelection::WorkingCopy);
@@ -983,6 +1009,12 @@ impl Diffui {
                         // Apply the single-parent emptiness resolved in the
                         // loader's final pass, caching each so reloads skip it.
                         for (index, empty) in tail.empty_updates {
+                            // Defensive: a superseded/shorter store must never
+                            // index past its end (`set_is_empty` already guards
+                            // with `get_mut`; the row read did not).
+                            if index >= self.commits.len() {
+                                continue;
+                            }
                             let commit_id = self.commits.row(index).commit_id().to_owned();
                             self.empty_cache.insert(commit_id, empty);
                             self.commits.set_is_empty(index, empty);
@@ -1285,15 +1317,25 @@ impl Diffui {
                 if position.is_some() {
                     self.window_position = position;
                 }
-                // Center the native window controls on the tab strip.
-                return self.reposition_window_controls();
+                // Center the native window controls on the tab strip, and arm
+                // the native resize observer that keeps them centered without a
+                // frame of lag while the window is dragged (see
+                // `chrome::install_window_resize_observer`).
+                return Task::batch([
+                    self.reposition_window_controls(),
+                    self.install_resize_observer(),
+                ]);
             }
             Message::WindowResized(size) => {
                 if self.window_size != size {
                     self.window_size = size;
                     self.mark_geometry_dirty();
                 }
-                // AppKit resets the traffic-light position on resize — re-apply.
+                // The native resize observer (armed on open) re-centers the
+                // traffic lights in step with AppKit's layout. This message-loop
+                // reposition stays as a harmless fallback — it runs a frame
+                // later and just re-applies the same position the observer
+                // already set, so it can't reintroduce the jump.
                 return self.reposition_window_controls();
             }
             Message::WindowMoved(position) => {
@@ -1354,6 +1396,9 @@ impl Diffui {
                     .as_ref()
                     .map(|dialog| dialog.path.clone())
                     .unwrap_or_default();
+                return self.open_repository(&path);
+            }
+            Message::OpenRecentRepo(path) => {
                 return self.open_repository(&path);
             }
             Message::OpenRepoNoOp => {}
@@ -1904,13 +1949,13 @@ impl Diffui {
 
         // Each leaf carries an index into `actions`; the popup returns that
         // index. `register` keeps the menu tree and the action list in lockstep.
-        fn register(actions: &mut Vec<MutationOp>, op: MutationOp) -> u32 {
+        fn register(actions: &mut Vec<MenuAction>, action: MenuAction) -> u32 {
             let id = actions.len() as u32;
-            actions.push(op);
+            actions.push(action);
             id
         }
 
-        let mut actions: Vec<MutationOp> = Vec::new();
+        let mut actions: Vec<MenuAction> = Vec::new();
 
         // ── Commit-level actions ────────────────────────────────────────────
         let mut top = vec![
@@ -1918,30 +1963,117 @@ impl Diffui {
                 "New child",
                 register(
                     &mut actions,
-                    MutationOp::New {
+                    MenuAction::Mutate(MutationOp::New {
                         parent: selection.clone(),
-                    },
+                    }),
                 ),
             ),
             MenuItem::entry(
                 "Edit",
                 register(
                     &mut actions,
-                    MutationOp::Edit {
+                    MenuAction::Mutate(MutationOp::Edit {
                         target: selection.clone(),
-                    },
+                    }),
                 ),
             ),
             MenuItem::entry(
                 "Abandon",
                 register(
                     &mut actions,
-                    MutationOp::Abandon {
+                    MenuAction::Mutate(MutationOp::Abandon {
                         target: selection.clone(),
-                    },
+                    }),
                 ),
             ),
         ];
+
+        // ── Copy revision metadata ──────────────────────────────────────────
+        // Values read from the already-loaded graph row (so the menu stays
+        // instant); author/committer copies, which need a date the graph
+        // doesn't keep, are read on demand when picked.
+        let copy_fields = {
+            let row = match &selection {
+                RevisionSelection::WorkingCopy => self.commits.working_copy(),
+                RevisionSelection::Commit(hex) => self.commits.find_by_commit_id(hex),
+            };
+            row.map(|row| {
+                (
+                    row.change_id().to_owned(),
+                    row.commit_id().to_owned(),
+                    row.description().to_owned(),
+                    row.author().to_owned(),
+                    row.bookmarks().to_vec(),
+                )
+            })
+        };
+        if let Some((change_id, commit_id, description, author, bookmarks)) = copy_fields {
+            let mut copy_items = vec![
+                MenuItem::entry(
+                    "Revision ID",
+                    register(&mut actions, MenuAction::CopyText(change_id)),
+                ),
+                MenuItem::entry(
+                    "Commit hash",
+                    register(&mut actions, MenuAction::CopyText(commit_id)),
+                ),
+            ];
+            match bookmarks.len() {
+                0 => {}
+                1 => copy_items.push(MenuItem::entry(
+                    "Bookmark",
+                    register(&mut actions, MenuAction::CopyText(bookmarks[0].clone())),
+                )),
+                _ => {
+                    let subs = bookmarks
+                        .iter()
+                        .map(|name| {
+                            MenuItem::entry(
+                                name.clone(),
+                                register(&mut actions, MenuAction::CopyText(name.clone())),
+                            )
+                        })
+                        .collect();
+                    copy_items.push(MenuItem::submenu("Bookmark", subs));
+                }
+            }
+            if !description.is_empty() {
+                copy_items.push(MenuItem::entry(
+                    "Description",
+                    register(
+                        &mut actions,
+                        MenuAction::CopyDetail {
+                            field: DetailField::Description,
+                            // The in-memory subject line, in case the full read
+                            // fails — better than copying nothing.
+                            fallback: description,
+                        },
+                    ),
+                ));
+            }
+            copy_items.push(MenuItem::entry(
+                "Author",
+                register(
+                    &mut actions,
+                    MenuAction::CopyDetail {
+                        field: DetailField::Author,
+                        fallback: author.clone(),
+                    },
+                ),
+            ));
+            copy_items.push(MenuItem::entry(
+                "Committer",
+                register(
+                    &mut actions,
+                    MenuAction::CopyDetail {
+                        field: DetailField::Committer,
+                        fallback: author,
+                    },
+                ),
+            ));
+            top.push(MenuItem::Separator);
+            top.push(MenuItem::submenu("Copy", copy_items));
+        }
 
         // ── Move a bookmark onto this revision ──────────────────────────────
         // Candidate local bookmarks (name + target commit). Collected first so
@@ -1965,10 +2097,10 @@ impl Diffui {
             .map(|(name, _target)| {
                 let id = register(
                     &mut actions,
-                    MutationOp::MoveBookmark {
+                    MenuAction::Mutate(MutationOp::MoveBookmark {
                         name: name.clone(),
                         to: selection.clone(),
-                    },
+                    }),
                 );
                 MenuItem::entry(name, id)
             })
@@ -1990,18 +2122,18 @@ impl Diffui {
                     if let Some(remote) = entry.tracked_remote() {
                         let id = register(
                             &mut actions,
-                            MutationOp::PushBookmark {
+                            MenuAction::Mutate(MutationOp::PushBookmark {
                                 name: entry.name.clone(),
                                 remote: remote.to_owned(),
-                            },
+                            }),
                         );
                         sub.push(MenuItem::entry(format!("Push to {remote}"), id));
                     }
                     let id = register(
                         &mut actions,
-                        MutationOp::DeleteBookmark {
+                        MenuAction::Mutate(MutationOp::DeleteBookmark {
                             name: entry.name.clone(),
-                        },
+                        }),
                     );
                     sub.push(MenuItem::entry("Delete", id));
                     bookmark_items.push(MenuItem::submenu(entry.name.clone(), sub));
@@ -2011,10 +2143,10 @@ impl Diffui {
                     if remote_ref.target.as_str() == hex && !remote_ref.tracked {
                         let id = register(
                             &mut actions,
-                            MutationOp::TrackBookmark {
+                            MenuAction::Mutate(MutationOp::TrackBookmark {
                                 name: entry.name.clone(),
                                 remote: remote_ref.remote.clone(),
-                            },
+                            }),
                         );
                         bookmark_items.push(MenuItem::submenu(
                             format!("{}@{}", entry.name, remote_ref.remote),
@@ -2038,8 +2170,28 @@ impl Diffui {
         let Some(chosen) = macos_native::popup_menu(&top, Some(glow)) else {
             return Task::none();
         };
-        let Some(op) = actions.get(chosen as usize).cloned() else {
+        let Some(action) = actions.get(chosen as usize).cloned() else {
             return Task::none();
+        };
+        let op = match action {
+            MenuAction::Mutate(op) => op,
+            // Ready-to-paste values write to the clipboard immediately.
+            MenuAction::CopyText(text) => return iced::clipboard::write(text).discard(),
+            // Author / committer / full description aren't kept in the graph, so
+            // read the revision off-thread, format the field, and copy —
+            // falling back to the in-memory value on failure.
+            MenuAction::CopyDetail { field, fallback } => {
+                return Task::perform(
+                    backend::load_revision_details(repository, selection),
+                    move |result| {
+                        let text = result
+                            .ok()
+                            .and_then(|details| format_detail(&details, field))
+                            .unwrap_or(fallback);
+                        Message::CopyToClipboard(text)
+                    },
+                );
+            }
         };
         let Some(tab_id) = self.active_tab_id() else {
             return Task::none();
@@ -2678,6 +2830,7 @@ impl Diffui {
         match prepare_repository(&expand_user_path(trimmed)) {
             Ok(repository) => {
                 self.open_repo_dialog = None;
+                self.push_recent_repo(&repository.root);
                 // Re-persist the session with the newly-opened repo.
                 self.mark_geometry_dirty();
                 if let Some(existing) = self.tabs.iter().find(|tab| tab.root == repository.root) {
@@ -3048,11 +3201,40 @@ impl Diffui {
             .discard()
     }
 
+    /// Arm the native resize observer once the window exists, so the traffic
+    /// lights track resizes on AppKit's timeline rather than a frame behind via
+    /// the message loop. Called once on `WindowOpened`.
+    fn install_resize_observer(&self) -> Task<Message> {
+        let Some(bar_height) = chrome::title_bar_height() else {
+            return Task::none();
+        };
+        window::latest()
+            .then(move |maybe_id| {
+                maybe_id.map_or_else(Task::none, move |id| {
+                    window::run(id, move |window| {
+                        if let Ok(handle) = window.window_handle() {
+                            chrome::install_window_resize_observer(handle.as_raw(), bar_height);
+                        }
+                    })
+                })
+            })
+            .discard()
+    }
+
     /// Mark the persisted session (window geometry, sidebar width, open tabs)
     /// as changed, arming the debounce timer the subscription runs while a save
     /// is pending.
     fn mark_geometry_dirty(&mut self) {
         self.geometry_dirty_since = Some(Instant::now());
+    }
+
+    /// Record `root` as the most-recently-opened repository (deduped, newest
+    /// first, capped). Surfaced by the open dialog's quick-pick list.
+    fn push_recent_repo(&mut self, root: &std::path::Path) {
+        let key = root.to_string_lossy().into_owned();
+        self.recent_repos.retain(|existing| existing != &key);
+        self.recent_repos.insert(0, key);
+        self.recent_repos.truncate(RECENT_REPOS_MAX);
     }
 
     /// Snapshot the current geometry + sidebar width into the persisted form.
@@ -3073,6 +3255,7 @@ impl Diffui {
                 .get(self.active_tab)
                 .map(|tab| tab.root.to_string_lossy().into_owned()),
             revsets: self.collect_revsets(),
+            recent_repos: self.recent_repos.clone(),
         }
     }
 
@@ -3145,7 +3328,60 @@ fn empty_state<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
 /// and an emphasized `name` (the directory name) for the tab label, e.g.
 /// `/Users/me/code/diffui` → (`code`, `diffui`). The owner is empty when the
 /// root has no usable parent.
-fn repo_label(root: &Path) -> (String, String) {
+/// One entry in the revision context menu's action table. The native popup
+/// returns the chosen leaf's index into a `Vec<MenuAction>`; this records what
+/// to do with that choice.
+#[derive(Debug, Clone)]
+enum MenuAction {
+    /// A jj mutation (new / edit / abandon / bookmark op).
+    Mutate(mutations::MutationOp),
+    /// Copy a value already in hand (revision id, commit hash, a bookmark name).
+    CopyText(String),
+    /// Copy author / committer / the full description — read on demand. The
+    /// in-memory graph keeps only the description's first line and no dates, so
+    /// these need a fresh read; `fallback` is copied if that read fails.
+    CopyDetail {
+        field: DetailField,
+        fallback: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DetailField {
+    Author,
+    Committer,
+    Description,
+}
+
+/// Format a `Copy → {Author,Committer,Description}` value from a freshly-read
+/// revision. Signatures render as `Name <email>  <timestamp>` (absent parts
+/// skipped); the description is the full message. Returns `None` when the field
+/// is absent (no committer, empty description), so the caller can fall back.
+fn format_detail(details: &RevisionDetails, field: DetailField) -> Option<String> {
+    fn signature(sig: &SignatureInfo) -> Option<String> {
+        let mut out = sig.name.clone();
+        if !sig.email.is_empty() {
+            out.push_str(&format!(" <{}>", sig.email));
+        }
+        if let Some(timestamp) = &sig.timestamp {
+            if !out.is_empty() {
+                out.push_str("  ");
+            }
+            out.push_str(timestamp);
+        }
+        (!out.is_empty()).then_some(out)
+    }
+    match field {
+        DetailField::Author => signature(&details.author),
+        DetailField::Committer => details.committer.as_ref().and_then(signature),
+        DetailField::Description => {
+            let description = details.description.trim_end();
+            (!description.is_empty()).then(|| description.to_owned())
+        }
+    }
+}
+
+pub(crate) fn repo_label(root: &Path) -> (String, String) {
     let name = root
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -3156,6 +3392,19 @@ fn repo_label(root: &Path) -> (String, String) {
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
     (owner, name)
+}
+
+/// Contract a leading `$HOME` back to `~` for display — the inverse of
+/// `expand_user_path`, used so recent-repo rows show the short `~/code/foo`
+/// form rather than the absolute path.
+pub(crate) fn contract_user_path(path: &str) -> String {
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = home.to_string_lossy();
+        if let Some(rest) = path.strip_prefix(home.as_ref()) {
+            return format!("~{rest}");
+        }
+    }
+    path.to_owned()
 }
 
 /// Expand a leading `~` / `~/` to `$HOME` so the open-repo dialog accepts the
