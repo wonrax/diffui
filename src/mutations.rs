@@ -5,7 +5,7 @@
 //! snapshot/checkout machinery in `jj.rs` so a mutation that moves `@` also
 //! updates the files on disk (and doesn't lose uncommitted work).
 
-use crate::backend::RevisionSelection;
+use crate::backend::{LoadProgress, RevisionSelection};
 use crate::repository::Repository;
 
 /// A revision-context-menu mutation. The target is a `RevisionSelection` so the
@@ -39,6 +39,10 @@ pub struct MutationOutcome {
     /// working copy where it is, so the UI keeps the user's current selection
     /// instead of snapping back to the working copy.
     pub moved_working_copy: bool,
+    /// Captured remote/sideband output (push only) — e.g. GitHub's "create a
+    /// pull request" hint + URL. Shown in the activity's expanded row. Empty for
+    /// local mutations.
+    pub output: Vec<String>,
 }
 
 /// Run `op` off the iced runtime. jj-lib holds `!Send` state, so the work runs
@@ -46,10 +50,13 @@ pub struct MutationOutcome {
 pub async fn run_mutation(
     repository: Repository,
     op: MutationOp,
+    progress: LoadProgress,
 ) -> Result<MutationOutcome, String> {
     let handle = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || handle.block_on(crate::jj::apply_mutation(repository, op)))
-        .await
-        .map_err(|e| format!("mutation task panicked: {e}"))?
-        .map_err(|e| format!("{e:#}"))
+    tokio::task::spawn_blocking(move || {
+        handle.block_on(crate::jj::apply_mutation(repository, op, progress))
+    })
+    .await
+    .map_err(|e| format!("mutation task panicked: {e}"))?
+    .map_err(|e| format!("{e:#}"))
 }

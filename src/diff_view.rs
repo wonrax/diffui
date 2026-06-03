@@ -381,7 +381,12 @@ fn header_position(line_index: usize, byte: usize) -> TextPosition {
     }
 }
 
-fn body_position(file_index: usize, hunk_index: usize, line_index: usize, byte: usize) -> TextPosition {
+fn body_position(
+    file_index: usize,
+    hunk_index: usize,
+    line_index: usize,
+    byte: usize,
+) -> TextPosition {
     TextPosition {
         region: Region::Body,
         file_index,
@@ -555,8 +560,16 @@ impl<'a, Message> DiffView<'a, Message> {
         if pos_end < sel_start || pos_start >= sel_end {
             return;
         }
-        let start_byte = if pos_start < sel_start { sel_start.byte } else { 0 };
-        let end_byte = if pos_end > sel_end { sel_end.byte } else { text.len() };
+        let start_byte = if pos_start < sel_start {
+            sel_start.byte
+        } else {
+            0
+        };
+        let end_byte = if pos_end > sel_end {
+            sel_end.byte
+        } else {
+            text.len()
+        };
         let start_chars = char_count_at_byte(text, start_byte);
         let end_chars = char_count_at_byte(text, end_byte);
         if end_chars > start_chars {
@@ -574,7 +587,11 @@ impl<'a, Message> DiffView<'a, Message> {
 
     /// Expand `pos` to cover the unit (word or line) that contains it, in
     /// either the header or the body. Character mode is a no-op.
-    fn expand_to_unit(&self, pos: TextPosition, unit: SelectionUnit) -> (TextPosition, TextPosition) {
+    fn expand_to_unit(
+        &self,
+        pos: TextPosition,
+        unit: SelectionUnit,
+    ) -> (TextPosition, TextPosition) {
         let text: &str = match pos.region {
             Region::Header => match self.header_selectable_text(pos.line_index) {
                 Some(text) => text,
@@ -2300,12 +2317,7 @@ impl<Message> DiffView<'_, Message> {
             })
         });
 
-        renderer.fill_paragraph(
-            paragraph,
-            render.position,
-            render.color,
-            render.clip_bounds,
-        );
+        renderer.fill_paragraph(paragraph, render.position, render.color, render.clip_bounds);
     }
 
     fn syntax_spans<'a>(

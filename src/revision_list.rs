@@ -44,6 +44,10 @@ const CONTENT_PADDING: f32 = 12.0;
 const INDICATOR_RADIUS: f32 = 5.0;
 const SMALL_TEXT_SIZE: f32 = 14.0;
 const CAPTION_TEXT_SIZE: f32 = 13.0;
+/// Text size for the `▾`/`▸` collapse chevron on the selected revision row.
+/// Exposed so the toolbar / revset carets can match it (one consistent caret
+/// size across the app).
+pub const CHEVRON_TEXT_SIZE: f32 = SMALL_TEXT_SIZE + 6.0;
 /// Status-badge text size. Smaller than the row's caption text so the
 /// single-letter chip (M/A/D/R) reads as a compact tag rather than another
 /// full-weight column on the file row.
@@ -706,7 +710,8 @@ where
                     // The row's on-screen rect (window-content points) anchors
                     // the native highlight drawn while the menu is open.
                     let row_h = row_height_of(self.row_kind(row_idx));
-                    let screen_y = bounds.y + (self.row_top(row_idx) - state.vertical_offset) as f32;
+                    let screen_y =
+                        bounds.y + (self.row_top(row_idx) - state.vertical_offset) as f32;
                     let row_rect = Rectangle {
                         x: bounds.x,
                         y: screen_y,
@@ -842,13 +847,16 @@ where
             // matters at split lanes: the same lane index at the hover
             // row may carry two different segment ids in its top vs
             // bottom half.
-            let emphasized_segment = state.hovered_lane.and_then(|(hov_idx, hov_lane, hov_half)| {
-                if hov_idx >= self.row_count() {
-                    return None;
-                }
-                let item = self.item_at(hov_idx);
-                item_lane_segment(&item, hov_lane, hov_half).map(|seg| (seg, hov_lane))
-            });
+            let emphasized_segment =
+                state
+                    .hovered_lane
+                    .and_then(|(hov_idx, hov_lane, hov_half)| {
+                        if hov_idx >= self.row_count() {
+                            return None;
+                        }
+                        let item = self.item_at(hov_idx);
+                        item_lane_segment(&item, hov_lane, hov_half).map(|seg| (seg, hov_lane))
+                    });
 
             // Walk only the rows that intersect the viewport, materializing
             // each one's view on demand — off-screen rows cost nothing.
@@ -1306,7 +1314,7 @@ impl<'a, Message> RevisionList<'a, Message> {
         let chevron_glyph = rev
             .collapse_chevron
             .map(|expanded| if expanded { "\u{25BE}" } else { "\u{25B8}" });
-        let chevron_size = SMALL_TEXT_SIZE + 6.0;
+        let chevron_size = CHEVRON_TEXT_SIZE;
         let chevron_width = chevron_glyph
             .map(|glyph| {
                 measure_text_width::<R>(glyph, chevron_size, self.style.primary_font, paragraphs)

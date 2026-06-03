@@ -1,10 +1,11 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     pin::Pin,
     time::{Duration, Instant},
 };
 
+mod activity;
 mod backend;
 mod chrome;
 mod config;
@@ -27,6 +28,7 @@ mod scrollbar;
 mod sidebar;
 mod tab_bar;
 mod theme;
+mod toolbar;
 mod window_state;
 
 /// Profiling-only global allocator (enabled by the `track-alloc` feature). It
@@ -107,16 +109,15 @@ use backend::{
 use clap::Parser;
 use config::AppConfig;
 use find::FindState;
+use futures::{SinkExt, Stream, StreamExt};
 use iced::theme as iced_theme;
 use iced::{
-    Element, Length, Point, Size, Subscription, Task, Theme,
-    alignment,
+    Element, Length, Point, Size, Subscription, Task, Theme, alignment,
     event::{self, Event},
     keyboard, system, time,
-    widget::{self, column, container, progress_bar, row, stack, text},
+    widget::{self, column, container, row, stack, text},
     window,
 };
-use futures::{SinkExt, Stream, StreamExt};
 use notify::Watcher;
 use palette::{
     ColumnSource, CommandId as PaletteCommand, PaletteState, Recents, ResultRef,
@@ -298,6 +299,61 @@ pub(crate) struct Diffui {
     pub(crate) next_load_version: u64,
     /// `Some` while the "open repository" path dialog is showing.
     pub(crate) open_repo_dialog: Option<OpenRepoDialog>,
+
+    // ── Toolbar / activity / revset (per-tab where noted) ───────────────
+    /// The revset (jj) / revision-range (git) controlling which commits the
+    /// log shows. Per-tab; persisted per repo root. Empty or `all()` is the
+    /// default (every visible head's ancestry).
+    pub(crate) revset: String,
+    /// The active tab's activity log (long-running ops: load, refresh, revset
+    /// eval, fetch, undo, push). Per-tab; inactive tabs keep theirs in
+    /// `RepoState::activities`.
+    pub(crate) activities: activity::ActivityLog,
+    /// The activity wrapping the in-flight graph (re)load, finished when the
+    /// terminal load message arrives. Per-tab so a backgrounded load's entry is
+    /// resolved against the right log.
+    pub(crate) pending_load_activity: Option<activity::ActivityId>,
+    /// Monotonic source of `ActivityId`s across every tab.
+    pub(crate) next_activity_id: u64,
+    /// Open toolbar dropdown (fetch-branches / revset-presets), if any.
+    pub(crate) toolbar_menu: Option<ToolbarMenu>,
+    /// Whether the activity popover is showing.
+    pub(crate) activity_popover_open: bool,
+    /// The caret control the cursor is currently over, if any — drives the
+    /// hover highlight that `mouse_area` (unlike `button`) doesn't provide.
+    pub(crate) hovered: Option<HoverTarget>,
+}
+
+/// Which toolbar dropdown is open. Both render as iced overlays anchored near
+/// their trigger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolbarMenu {
+    /// The fetch split-button's caret: one row per known remote branch.
+    FetchBranches,
+    /// The revset input's caret: built-in preset revsets.
+    RevsetPresets,
+}
+
+/// A `mouse_area`-based control whose hover state we track manually (the caret
+/// triggers can't be `button`s — they must open their menu on mouse-down for
+/// the native menu's press-drag-release — so they don't get button hover for
+/// free). At most one is hovered at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HoverTarget {
+    /// The Fetch split button's caret half (the main half uses `button`'s own
+    /// hover state; only the `mouse_area` caret needs manual tracking).
+    FetchCaret,
+    RevsetCaret,
+}
+
+/// What a fetch should pull.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FetchTarget {
+    /// Every remote, all branches (`jj git fetch --all-remotes` /
+    /// `git fetch --all`).
+    AllRemotes,
+    /// One branch on one remote (`name@remote`).
+    RemoteBranch { remote: String, branch: String },
 }
 
 /// Per-repository view state. The active tab's copy is spread across the
@@ -331,13 +387,17 @@ pub(crate) struct RepoState {
     pub(crate) loading_since: Option<Instant>,
     pub(crate) empty_cache: HashMap<String, bool>,
     pub(crate) load: Option<LoadCursor>,
+    pub(crate) revset: String,
+    pub(crate) activities: activity::ActivityLog,
+    pub(crate) pending_load_activity: Option<activity::ActivityId>,
 }
 
 impl RepoState {
     /// A never-loaded tab for `repository`: empty graph, `Loading` status, no
     /// task in flight. `ensure_active_loaded` kicks the real load when this
-    /// becomes the active tab (`status != Loaded`).
-    fn unloaded(repository: Option<Repository>) -> Self {
+    /// becomes the active tab (`status != Loaded`). `revset` is the persisted
+    /// (or default) filter for this repo.
+    fn unloaded(repository: Option<Repository>, revset: String) -> Self {
         Self {
             repository,
             status: LoadStatus::Loading,
@@ -362,6 +422,9 @@ impl RepoState {
             loading_since: None,
             empty_cache: HashMap::new(),
             load: None,
+            revset,
+            activities: activity::ActivityLog::default(),
+            pending_load_activity: None,
         }
     }
 
@@ -371,8 +434,34 @@ impl RepoState {
     fn empty() -> Self {
         Self {
             status: LoadStatus::Loaded,
-            ..Self::unloaded(None)
+            ..Self::unloaded(None, String::new())
         }
+    }
+}
+
+/// The default revset for a freshly-opened repo of `vcs`, before any persisted
+/// value is applied: jj shows `all()` (every visible head's ancestry — the
+/// current hardcoded behavior); git falls back to its `git log` default (the
+/// current branch's history), expressed as an empty range.
+fn default_revset(vcs: Vcs) -> String {
+    match vcs {
+        Vcs::Jj => "all()".to_owned(),
+        Vcs::Git => String::new(),
+    }
+}
+
+/// Built-in revset presets for the caret menu, as `(label, expression)`. jj
+/// uses revset functions; git uses `git log` revision-range shortcuts. Shared
+/// by the native macOS menu and the iced fallback so they stay in sync.
+pub(crate) fn revset_presets(vcs: Option<Vcs>) -> &'static [(&'static str, &'static str)] {
+    match vcs {
+        Some(Vcs::Git) => &[("All branches", "--all"), ("Current", "HEAD")],
+        _ => &[
+            ("Everything", "all()"),
+            ("Mine", "mine()"),
+            ("Current line", "ancestors(@)"),
+            ("Conflicts", "conflicts()"),
+        ],
     }
 }
 
@@ -476,8 +565,14 @@ pub(crate) enum Message {
     /// the row's on-screen rect (window-content points) so the native glow can
     /// be anchored over it while the menu is open.
     RevisionContextMenu(revision_list::RowSelectionKey, iced::Rectangle),
-    /// A context-menu mutation (new/edit/abandon/bookmark) finished.
-    MutationCompleted(Box<Result<mutations::MutationOutcome, String>>),
+    /// A context-menu mutation (new/edit/abandon/bookmark/push) finished,
+    /// tab-addressed with its activity id so push remote output lands in the
+    /// right log.
+    MutationCompleted(
+        TabId,
+        activity::ActivityId,
+        Box<Result<mutations::MutationOutcome, String>>,
+    ),
     SelectTheme(ThemePreference),
     SystemThemeChanged(iced_theme::Mode),
     WindowFocusChanged(bool),
@@ -566,6 +661,49 @@ pub(crate) enum Message {
     FindNext,
     /// Shift+Enter: advance to the previous match.
     FindPrev,
+
+    // ── Toolbar / activity / revset ─────────────────────────────────────
+    /// Toolbar "Refresh": force a working-copy snapshot + full graph reload.
+    ToolbarRefresh,
+    /// Toolbar "Fetch" (main button or a caret-menu item).
+    Fetch(FetchTarget),
+    /// A fetch finished: captured output lines, or an error. Tab-addressed so a
+    /// fetch that completes after a tab switch resolves against the right log.
+    FetchCompleted(
+        TabId,
+        activity::ActivityId,
+        Box<Result<Vec<String>, String>>,
+    ),
+    /// Toolbar "Undo": revert the latest jj operation.
+    Undo,
+    /// An undo finished.
+    UndoCompleted(
+        TabId,
+        activity::ActivityId,
+        Box<Result<Vec<String>, String>>,
+    ),
+    /// Revset input edited.
+    RevsetChanged(String),
+    /// Revset submitted (Enter) — re-evaluate the log.
+    RevsetSubmit,
+    /// A revset preset was picked from the caret menu.
+    RevsetPreset(String),
+    /// Open a toolbar dropdown (fetch branches / revset presets).
+    OpenToolbarMenu(ToolbarMenu),
+    /// Close any open toolbar dropdown.
+    CloseToolbarMenu,
+    /// Open/close the activity popover.
+    ActivityToggle,
+    /// Expand/collapse one activity row's captured output.
+    ActivityExpand(activity::ActivityId),
+    /// Clear finished activities from the active tab's log.
+    ActivityClear,
+    /// Swallow clicks on the activity card / dropdown so they don't dismiss it.
+    ActivityNoOp,
+    /// Open a URL (from an activity's remote output) in the default browser.
+    OpenUrl(String),
+    /// Cursor entered/left a caret control — drives its hover highlight.
+    SetHover(Option<HoverTarget>),
 }
 
 impl Diffui {
@@ -624,6 +762,16 @@ impl Diffui {
             })
             .unwrap_or(0);
 
+        // Resolve a repo's persisted revset (keyed by root), else its default.
+        let revset_for = |repository: &Repository| -> String {
+            saved
+                .revsets
+                .get(&repository.root.to_string_lossy().into_owned())
+                .filter(|value| !value.is_empty())
+                .cloned()
+                .unwrap_or_else(|| default_revset(repository.vcs))
+        };
+
         let mut next_tab_id = 0u64;
         let mut tabs = Vec::with_capacity(repositories.len());
         for (index, repository) in repositories.iter().enumerate() {
@@ -635,7 +783,10 @@ impl Diffui {
             let stash = if index == active_index {
                 None
             } else {
-                Some(RepoState::unloaded(Some(repository.clone())))
+                Some(RepoState::unloaded(
+                    Some(repository.clone()),
+                    revset_for(repository),
+                ))
             };
             tabs.push(Tab {
                 id,
@@ -648,7 +799,15 @@ impl Diffui {
         }
 
         let active_repository = repositories.get(active_index).cloned();
-        let active_tab = if repositories.is_empty() { 0 } else { active_index };
+        let active_revset = active_repository
+            .as_ref()
+            .map(revset_for)
+            .unwrap_or_default();
+        let active_tab = if repositories.is_empty() {
+            0
+        } else {
+            active_index
+        };
         let status = match (&active_repository, &first_error) {
             (Some(_), _) => LoadStatus::Loading,
             (None, Some(error)) => LoadStatus::Failed(error.clone()),
@@ -699,6 +858,13 @@ impl Diffui {
             next_tab_id,
             next_load_version: 0,
             open_repo_dialog: None,
+            revset: active_revset,
+            activities: activity::ActivityLog::default(),
+            pending_load_activity: None,
+            next_activity_id: 0,
+            toolbar_menu: None,
+            activity_popover_open: false,
+            hovered: None,
         };
 
         let theme_task = system::theme().map(Message::SystemThemeChanged);
@@ -753,6 +919,7 @@ impl Diffui {
                     // Recompute the on-demand sidebar index (lane fold, prefix
                     // lengths, selected-row index) for the new graph.
                     self.rebuild_sidebar_index();
+                    self.finish_load_activity(activity::ActivityStatus::Done, None);
                     // Fill in merge/root empty status (left unknown by the
                     // loader) from cache, and kick off a background task for
                     // any not seen before.
@@ -765,7 +932,8 @@ impl Diffui {
 
                     self.pending_revision = None;
                     self.loading_since = None;
-                    self.status = LoadStatus::Failed(error);
+                    self.status = LoadStatus::Failed(error.clone());
+                    self.finish_load_activity(activity::ActivityStatus::Error, Some(error));
                 }
             },
             Message::CommitsBatch(version, rows) => {
@@ -821,20 +989,23 @@ impl Diffui {
                         }
                         self.commits_version = self.commits_version.wrapping_add(1);
                         self.selected_commit_index = self.find_selected_commit_index();
+                        self.finish_load_activity(activity::ActivityStatus::Done, None);
                         // Fill in the merges/roots the loader left unknown.
                         return self.resolve_empty_status();
                     }
                     Err(error) => {
-                        self.status = LoadStatus::Failed(error);
+                        self.status = LoadStatus::Failed(error.clone());
                         self.loading_since = None;
+                        self.finish_load_activity(activity::ActivityStatus::Error, Some(error));
                     }
                 }
             }
             Message::InitialDiff(version, result) => {
                 // Apply only while this stream is the active load and the user
                 // hasn't navigated off the working copy (e.g. via the palette
-                // during load). Leaves `status` as `Loading` so the full-window
-                // indicator stays up until the first commit batch.
+                // during load). Leaves `status` as `Loading` so the sidebar
+                // stays empty (rather than flashing a stale graph) until the
+                // first commit batch; loading feedback is in the toolbar.
                 let active = self.load.as_ref().map(|c| c.version) == Some(version)
                     && self.pending_revision.as_ref() == Some(&RevisionSelection::WorkingCopy);
                 if !active {
@@ -945,16 +1116,26 @@ impl Diffui {
                             self.loading_since = Some(Instant::now());
                             let progress = LoadProgress::default();
                             self.commit_progress = progress.clone();
+                            let revset = self.revset.clone();
                             return Task::perform(
-                                load_backend(repository, revision.clone(), progress),
+                                load_backend(repository, revision.clone(), revset, progress),
                                 move |result| Message::BackendLoaded(revision, Box::new(result)),
                             );
                         }
                     }
                 }
+                // We reach here only when no reload was kicked (snapshot
+                // unchanged, or viewing a non-@ revision on a watcher tick). A
+                // toolbar Refresh still wants its activity resolved — there was
+                // simply nothing to reload.
+                self.finish_load_activity(
+                    activity::ActivityStatus::Done,
+                    Some("Already up to date".to_owned()),
+                );
             }
             Message::RepositorySnapshotLoaded(_, Err(error)) => {
                 self.snapshot_pending = false;
+                self.finish_load_activity(activity::ActivityStatus::Error, Some(error.clone()));
                 self.status = LoadStatus::Failed(error);
             }
             Message::EmptyStatusComputed(version, updates) => {
@@ -1021,9 +1202,18 @@ impl Diffui {
                     row_rect,
                 );
             }
-            Message::MutationCompleted(result) => match *result {
+            Message::MutationCompleted(tab_id, id, result) => match *result {
                 Ok(outcome) => {
-                    eprintln!("diffui: {}", outcome.message);
+                    if let Some(log) = self.activity_log_for(tab_id) {
+                        if !outcome.output.is_empty() {
+                            log.extend_output(id, outcome.output);
+                        }
+                        log.finish(
+                            id,
+                            activity::ActivityStatus::Done,
+                            Some(outcome.message.clone()),
+                        );
+                    }
                     // Reload the graph to reflect the mutation. Only snap the
                     // selection back to `@` when the op actually moved it
                     // (new/edit/abandon); bookmark ops leave it put.
@@ -1033,7 +1223,12 @@ impl Diffui {
                     return self.start_repository_snapshot(RefreshOrigin::Focus);
                 }
                 Err(error) => {
-                    self.status = LoadStatus::Failed(error);
+                    // Surface the failure in the activity log rather than failing
+                    // the whole view — a rejected push shouldn't blank the panes.
+                    if let Some(log) = self.activity_log_for(tab_id) {
+                        log.append_output(id, error.clone());
+                        log.finish(id, activity::ActivityStatus::Error, Some(error));
+                    }
                 }
             },
             Message::WindowFocusChanged(focused) => {
@@ -1358,6 +1553,58 @@ impl Diffui {
             Message::FindPrev => {
                 self.find_advance(-1);
             }
+
+            // ── Toolbar / activity / revset ─────────────────────────────
+            Message::ToolbarRefresh => {
+                return self.toolbar_refresh();
+            }
+            Message::Fetch(target) => {
+                return self.start_fetch(target);
+            }
+            Message::FetchCompleted(tab_id, id, result) => {
+                return self.finish_remote_op(tab_id, id, *result);
+            }
+            Message::Undo => {
+                return self.start_undo();
+            }
+            Message::UndoCompleted(tab_id, id, result) => {
+                return self.finish_remote_op(tab_id, id, *result);
+            }
+            Message::RevsetChanged(value) => {
+                self.revset = value;
+            }
+            Message::RevsetSubmit => {
+                return self.evaluate_revset();
+            }
+            Message::RevsetPreset(value) => {
+                self.revset = value;
+                self.toolbar_menu = None;
+                return self.evaluate_revset();
+            }
+            Message::OpenToolbarMenu(menu) => {
+                self.activity_popover_open = false;
+                return self.open_toolbar_menu(menu);
+            }
+            Message::CloseToolbarMenu => {
+                self.toolbar_menu = None;
+            }
+            Message::ActivityToggle => {
+                self.activity_popover_open = !self.activity_popover_open;
+                self.toolbar_menu = None;
+            }
+            Message::ActivityExpand(id) => {
+                self.activities.toggle_expand(id);
+            }
+            Message::ActivityClear => {
+                self.activities.clear_finished();
+            }
+            Message::ActivityNoOp => {}
+            Message::OpenUrl(url) => {
+                open_url(&url);
+            }
+            Message::SetHover(target) => {
+                self.hovered = target;
+            }
         }
 
         Task::none()
@@ -1647,7 +1894,7 @@ impl Diffui {
     /// without any synchronous repo read.
     #[cfg(target_os = "macos")]
     fn open_revision_context_menu(
-        &self,
+        &mut self,
         repository: Repository,
         selection: RevisionSelection,
         row_rect: iced::Rectangle,
@@ -1697,12 +1944,25 @@ impl Diffui {
         ];
 
         // ── Move a bookmark onto this revision ──────────────────────────────
-        // Collect names first so the `self.bookmarks` borrow ends before we
-        // start mutating `actions`. An empty submenu renders as a disabled row.
-        let move_names: Vec<String> = self.bookmarks.local_names().map(str::to_owned).collect();
-        let move_items: Vec<MenuItem> = move_names
+        // Candidate local bookmarks (name + target commit). Collected first so
+        // the `self.bookmarks` borrow ends before we mutate `actions`, then
+        // ordered nearest-first to the right-clicked revision. An empty submenu
+        // renders as a disabled row.
+        let mut moves: Vec<(String, String)> = self
+            .bookmarks
+            .bookmarks
+            .iter()
+            .filter_map(|b| b.local_target.as_ref().map(|t| (b.name.clone(), t.clone())))
+            .collect();
+        moves.sort(); // alphabetical baseline (stable tiebreak below)
+        let move_reference = match &selection {
+            RevisionSelection::Commit(hex) => Some(hex.clone()),
+            RevisionSelection::WorkingCopy => self.bookmarks.working_copy_commit.clone(),
+        };
+        self.sort_by_proximity(&mut moves, move_reference.as_deref(), |(_, t)| t.as_str());
+        let move_items: Vec<MenuItem> = moves
             .into_iter()
-            .map(|name| {
+            .map(|(name, _target)| {
                 let id = register(
                     &mut actions,
                     MutationOp::MoveBookmark {
@@ -1775,15 +2035,33 @@ impl Diffui {
             width: row_rect.width,
             height: row_rect.height,
         };
-        let Some(id) = macos_native::popup_menu(&top, Some(glow)) else {
+        let Some(chosen) = macos_native::popup_menu(&top, Some(glow)) else {
             return Task::none();
         };
-        let Some(op) = actions.get(id as usize).cloned() else {
+        let Some(op) = actions.get(chosen as usize).cloned() else {
             return Task::none();
         };
-        Task::perform(mutations::run_mutation(repository, op), |result| {
-            Message::MutationCompleted(Box::new(result))
-        })
+        let Some(tab_id) = self.active_tab_id() else {
+            return Task::none();
+        };
+        // Surface the mutation as an activity (push captures its remote output).
+        let label = match &op {
+            MutationOp::New { .. } => "New change".to_owned(),
+            MutationOp::Edit { .. } => "Edit".to_owned(),
+            MutationOp::Abandon { .. } => "Abandon".to_owned(),
+            MutationOp::MoveBookmark { name, .. } => format!("Move bookmark {name}"),
+            MutationOp::DeleteBookmark { name } => format!("Delete bookmark {name}"),
+            MutationOp::TrackBookmark { name, remote } => format!("Track {name}@{remote}"),
+            MutationOp::PushBookmark { name, remote } => format!("Push {name} to {remote}"),
+        };
+        // Only push reports real progress (git transfer); the rest are quick
+        // local ops, so they stay indeterminate.
+        let determinate = matches!(op, MutationOp::PushBookmark { .. });
+        let (activity_id, progress) = self.begin_activity(label, determinate);
+        Task::perform(
+            mutations::run_mutation(repository, op, progress),
+            move |result| Message::MutationCompleted(tab_id, activity_id, Box::new(result)),
+        )
     }
 
     /// Non-macOS stub: the native popup isn't available, so right-click is a
@@ -1795,6 +2073,66 @@ impl Diffui {
         _selection: RevisionSelection,
         _row_rect: iced::Rectangle,
     ) -> Task<Message> {
+        Task::none()
+    }
+
+    /// Open a toolbar dropdown (fetch branches / revset presets) as a native
+    /// `NSMenu` at the cursor — it auto-sizes to the longest label and never
+    /// word-wraps, unlike the iced overlay (kept as the non-macOS fallback).
+    /// The menu is modal/blocking like the revision context menu, so the chosen
+    /// action is dispatched directly on return.
+    #[cfg(target_os = "macos")]
+    fn open_toolbar_menu(&mut self, menu: ToolbarMenu) -> Task<Message> {
+        use macos_native::MenuItem;
+
+        match menu {
+            ToolbarMenu::FetchBranches => {
+                // id 0 = all remotes; each known `name@remote` follows, ordered
+                // by proximity to the working copy.
+                let mut targets = vec![FetchTarget::AllRemotes];
+                let mut items = vec![MenuItem::entry("Fetch all remotes", 0)];
+                let branches = self.remote_branches_by_proximity();
+                if !branches.is_empty() {
+                    items.push(MenuItem::Separator);
+                    for (branch, remote) in branches {
+                        let id = targets.len() as u32;
+                        items.push(MenuItem::entry(format!("{branch}@{remote}"), id));
+                        targets.push(FetchTarget::RemoteBranch { remote, branch });
+                    }
+                }
+                let Some(chosen) = macos_native::popup_menu(&items, None) else {
+                    return Task::none();
+                };
+                let Some(target) = targets.get(chosen as usize).cloned() else {
+                    return Task::none();
+                };
+                self.start_fetch(target)
+            }
+            ToolbarMenu::RevsetPresets => {
+                let presets = revset_presets(self.repository.as_ref().map(|r| r.vcs));
+                let items: Vec<MenuItem> = presets
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (label, expr))| {
+                        MenuItem::entry(format!("{label}  ·  {expr}"), index as u32)
+                    })
+                    .collect();
+                let Some(chosen) = macos_native::popup_menu(&items, None) else {
+                    return Task::none();
+                };
+                let Some((_, expr)) = presets.get(chosen as usize) else {
+                    return Task::none();
+                };
+                self.revset = (*expr).to_owned();
+                self.evaluate_revset()
+            }
+        }
+    }
+
+    /// Non-macOS: fall back to the iced overlay dropdown.
+    #[cfg(not(target_os = "macos"))]
+    fn open_toolbar_menu(&mut self, menu: ToolbarMenu) -> Task<Message> {
+        self.toolbar_menu = Some(menu);
         Task::none()
     }
 
@@ -1870,14 +2208,92 @@ impl Diffui {
         }
     }
 
+    /// One-pass `commit-id hex → index` lookup in the loaded log for the wanted
+    /// hexes (early-exit once all are found). Used to order the bookmark menus by
+    /// proximity to a reference revision — far cheaper than a graph-distance
+    /// revset, and the index distance matches the sidebar's visual order.
+    fn commit_indices<'a>(
+        &self,
+        wanted: impl IntoIterator<Item = &'a str>,
+    ) -> HashMap<String, usize> {
+        let want: std::collections::HashSet<&str> = wanted.into_iter().collect();
+        let mut out: HashMap<String, usize> = HashMap::new();
+        if want.is_empty() {
+            return out;
+        }
+        for (index, row) in self.commits.iter().enumerate() {
+            let id = row.commit_id();
+            if want.contains(id) {
+                out.entry(id.to_owned()).or_insert(index);
+                if out.len() == want.len() {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// Stable-sort `items` in place so each item's target commit (via
+    /// `target_of`) sits nearest-first to `reference` in the loaded log. Items
+    /// whose target — or the reference — isn't loaded sink to the bottom, where
+    /// the caller's prior ordering (e.g. an alphabetical pre-sort) breaks ties.
+    fn sort_by_proximity<T>(
+        &self,
+        items: &mut [T],
+        reference: Option<&str>,
+        target_of: impl Fn(&T) -> &str,
+    ) {
+        let index_of = self.commit_indices(items.iter().map(&target_of).chain(reference));
+        let reference_index = reference.and_then(|r| index_of.get(r).copied());
+        items.sort_by_key(|item| proximity_key(&index_of, reference_index, target_of(item)));
+    }
+
+    /// Every known remote-tracking bookmark as `(branch, remote)`, ordered
+    /// nearest-first to the working copy (alphabetical tiebreak). Shared by the
+    /// native fetch menu and the iced fallback so they list identically.
+    pub(crate) fn remote_branches_by_proximity(&self) -> Vec<(String, String)> {
+        // (branch, remote, target-commit-hex) per known remote bookmark.
+        let mut branches: Vec<(String, String, String)> = self
+            .bookmarks
+            .bookmarks
+            .iter()
+            .flat_map(|entry| {
+                entry
+                    .remotes
+                    .iter()
+                    .map(move |r| (entry.name.clone(), r.remote.clone(), r.target.clone()))
+            })
+            .collect();
+        branches.sort(); // alphabetical baseline (stable tiebreak below)
+        branches.dedup();
+        let reference = self.bookmarks.working_copy_commit.clone();
+        self.sort_by_proximity(&mut branches, reference.as_deref(), |(_, _, t)| t.as_str());
+        branches
+            .into_iter()
+            .map(|(branch, remote, _)| (branch, remote))
+            .collect()
+    }
+
     /// (Re)start the initial load for the active tab's repository — a streaming
     /// cold load for jj, a one-shot load for git. Resets the per-repo view
     /// fields first, so a re-kick (after returning to a tab whose load was
     /// abandoned while it sat in the background) starts from a clean slate.
     fn kick_initial_load(&mut self) -> Task<Message> {
+        self.kick_load(None)
+    }
+
+    /// As [`kick_initial_load`], with an optional activity label (defaults to
+    /// "Load <repo>"). This is the **streaming cold load** — it clears the graph
+    /// and regrows it as batches arrive, for the initial open / tab activation
+    /// where there's nothing on screen to preserve. A revset switch instead uses
+    /// the atomic-swap load in [`evaluate_revset`] to avoid flashing.
+    fn kick_load(&mut self, activity_label: Option<String>) -> Task<Message> {
         let Some(repository) = self.repository.clone() else {
             return Task::none();
         };
+        // A previous load's activity is being superseded by this (re)load —
+        // resolve it so it doesn't spin forever.
+        self.finish_load_activity(activity::ActivityStatus::Done, None);
         self.status = LoadStatus::Loading;
         self.loading_since = Some(Instant::now());
         self.selected_revision = RevisionSelection::WorkingCopy;
@@ -1891,24 +2307,30 @@ impl Diffui {
         self.selected_commit_index = None;
         self.repository_snapshot = None;
         self.snapshot_pending = false;
-        let progress = LoadProgress::default();
+        // Wrap the load in a determinate activity; its progress handle is what
+        // the loader bumps, so the toolbar progress line + popover track it.
+        let label =
+            activity_label.unwrap_or_else(|| format!("Load {}", repo_label(&repository.root).1));
+        let (activity_id, progress) = self.begin_activity(label, true);
+        self.pending_load_activity = Some(activity_id);
         self.commit_progress = progress.clone();
         // Fresh version so a backgrounded load's late batches are dropped.
         let version = self.allocate_load_version();
         self.commits_version = version;
+        let revset = self.revset.clone();
         match repository.vcs {
             Vcs::Jj => {
                 self.load = Some(LoadCursor {
                     version,
                     ..Default::default()
                 });
-                stream_jj_initial_load(repository, progress, version)
+                stream_jj_initial_load(repository, revset, progress, version)
             }
             Vcs::Git => {
                 self.load = None;
                 let revision = RevisionSelection::WorkingCopy;
                 Task::perform(
-                    load_backend(repository, revision.clone(), progress),
+                    load_backend(repository, revision.clone(), revset, progress),
                     move |result| Message::BackendLoaded(revision, Box::new(result)),
                 )
             }
@@ -1921,6 +2343,174 @@ impl Diffui {
     fn allocate_load_version(&mut self) -> u64 {
         self.next_load_version = self.next_load_version.wrapping_add(1);
         self.next_load_version
+    }
+
+    /// Hand out the next activity id (monotonic across every tab).
+    fn allocate_activity_id(&mut self) -> activity::ActivityId {
+        let id = activity::ActivityId(self.next_activity_id);
+        self.next_activity_id = self.next_activity_id.wrapping_add(1);
+        id
+    }
+
+    /// Start an activity on the active tab's log, returning its id and the
+    /// progress handle the worker reports through.
+    fn begin_activity(
+        &mut self,
+        label: impl Into<String>,
+        determinate: bool,
+    ) -> (activity::ActivityId, LoadProgress) {
+        let id = self.allocate_activity_id();
+        let progress = self.activities.start(id, label, determinate);
+        (id, progress)
+    }
+
+    /// The active tab's stable id, if any tab is open.
+    fn active_tab_id(&self) -> Option<TabId> {
+        self.tabs.get(self.active_tab).map(|tab| tab.id)
+    }
+
+    /// The activity log for `tab_id`: the inline one when it's the active tab,
+    /// else the matching stash. `None` if the tab has since closed.
+    fn activity_log_for(&mut self, tab_id: TabId) -> Option<&mut activity::ActivityLog> {
+        if self.active_tab_id() == Some(tab_id) {
+            return Some(&mut self.activities);
+        }
+        self.tabs
+            .iter_mut()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.stash.as_mut())
+            .map(|state| &mut state.activities)
+    }
+
+    /// Finish a remote op's activity (fetch / undo) on its tab, recording the
+    /// captured output or error, then — on success, if it's still the active
+    /// tab — reload so the new commits/state appear.
+    fn finish_remote_op(
+        &mut self,
+        tab_id: TabId,
+        id: activity::ActivityId,
+        result: Result<Vec<String>, String>,
+    ) -> Task<Message> {
+        let ok = result.is_ok();
+        if let Some(log) = self.activity_log_for(tab_id) {
+            match result {
+                Ok(lines) => {
+                    log.extend_output(id, lines);
+                    log.finish(id, activity::ActivityStatus::Done, None);
+                }
+                Err(error) => {
+                    log.append_output(id, error.clone());
+                    log.finish(id, activity::ActivityStatus::Error, Some(error));
+                }
+            }
+        }
+        if ok && self.active_tab_id() == Some(tab_id) {
+            self.start_repository_snapshot(RefreshOrigin::Focus)
+        } else {
+            Task::none()
+        }
+    }
+
+    /// Finish the activity that wraps the in-flight graph (re)load, if one is
+    /// tracked for this tab. Called from the terminal load handlers.
+    fn finish_load_activity(&mut self, status: activity::ActivityStatus, result: Option<String>) {
+        if let Some(id) = self.pending_load_activity.take() {
+            self.activities.finish(id, status, result);
+        }
+    }
+
+    /// Toolbar "Refresh": a full reload (working-copy snapshot + graph re-walk),
+    /// surfaced as an activity. No-op while a load is already in flight.
+    fn toolbar_refresh(&mut self) -> Task<Message> {
+        if self.repository.is_none() || self.snapshot_pending || self.load.is_some() {
+            return Task::none();
+        }
+        let (id, _progress) = self.begin_activity("Refresh", false);
+        self.pending_load_activity = Some(id);
+        self.start_repository_snapshot(RefreshOrigin::Focus)
+    }
+
+    /// Toolbar "Fetch": fetch the given target (all remotes / one branch),
+    /// surfaced as an activity whose expanded output shows the remote messages.
+    /// On success `finish_remote_op` reloads so new commits appear.
+    fn start_fetch(&mut self, target: FetchTarget) -> Task<Message> {
+        let Some(repository) = self.repository.clone() else {
+            return Task::none();
+        };
+        let Some(tab_id) = self.active_tab_id() else {
+            return Task::none();
+        };
+        self.toolbar_menu = None;
+        let label = match &target {
+            FetchTarget::AllRemotes => "Fetch all remotes".to_owned(),
+            FetchTarget::RemoteBranch { remote, branch } => format!("Fetch {branch}@{remote}"),
+        };
+        let (id, progress) = self.begin_activity(label, true);
+        Task::perform(
+            backend::fetch(repository, target, progress),
+            move |result| Message::FetchCompleted(tab_id, id, Box::new(result)),
+        )
+    }
+
+    /// Toolbar "Undo": revert the latest jj operation, surfaced as an activity.
+    /// jj-only; `finish_remote_op` reloads on success.
+    fn start_undo(&mut self) -> Task<Message> {
+        let Some(repository) = self.repository.clone() else {
+            return Task::none();
+        };
+        if !matches!(repository.vcs, Vcs::Jj) {
+            return Task::none();
+        }
+        let Some(tab_id) = self.active_tab_id() else {
+            return Task::none();
+        };
+        let (id, _progress) = self.begin_activity("Undo", false);
+        Task::perform(backend::undo(repository), move |result| {
+            Message::UndoCompleted(tab_id, id, Box::new(result))
+        })
+    }
+
+    /// Re-evaluate the log against the current `self.revset` (Enter in the
+    /// revset input, or a preset pick), surfaced as an activity, persisting the
+    /// filter for this repo.
+    ///
+    /// Uses the **atomic-swap** load (`load_backend` → `BackendLoaded`) rather
+    /// than the streaming cold load: the current graph/diff stay on screen the
+    /// whole time and are replaced in one shot when the new walk is ready, so
+    /// switching revsets doesn't flash an empty sidebar. The selection is kept
+    /// (it just won't be highlighted if it falls outside the new set).
+    fn evaluate_revset(&mut self) -> Task<Message> {
+        let Some(repository) = self.repository.clone() else {
+            return Task::none();
+        };
+        self.toolbar_menu = None;
+        // Persist the new filter (debounced) for this repo.
+        self.mark_geometry_dirty();
+        // Supersede any prior in-flight load (cold stream or a previous eval) so
+        // its results/activity don't linger.
+        self.finish_load_activity(activity::ActivityStatus::Done, None);
+        self.load = None;
+
+        let shown = self.revset.trim();
+        let label = if shown.is_empty() {
+            "Evaluate revset: all()".to_owned()
+        } else {
+            format!("Evaluate revset: {shown}")
+        };
+        let (id, progress) = self.begin_activity(label, true);
+        self.pending_load_activity = Some(id);
+        self.commit_progress = progress.clone();
+
+        // Keep the current view; only `pending_revision` is set, which lights
+        // the toolbar progress line. `BackendLoaded` swaps the graph atomically.
+        let revision = self.selected_revision.clone();
+        self.pending_revision = Some(revision.clone());
+        self.loading_since = Some(Instant::now());
+        let revset = self.revset.clone();
+        Task::perform(
+            load_backend(repository, revision.clone(), revset, progress),
+            move |result| Message::BackendLoaded(revision, Box::new(result)),
+        )
     }
 
     /// Move the active tab's inline view state out into a `RepoState`, leaving
@@ -1955,6 +2545,9 @@ impl Diffui {
             loading_since: self.loading_since.take(),
             empty_cache: std::mem::take(&mut self.empty_cache),
             load: self.load.take(),
+            revset: std::mem::take(&mut self.revset),
+            activities: std::mem::take(&mut self.activities),
+            pending_load_activity: self.pending_load_activity.take(),
         }
     }
 
@@ -1985,6 +2578,9 @@ impl Diffui {
         self.loading_since = state.loading_since;
         self.empty_cache = state.empty_cache;
         self.load = state.load;
+        self.revset = state.revset;
+        self.activities = state.activities;
+        self.pending_load_activity = state.pending_load_activity;
     }
 
     /// Switch to the tab `id`: stash the current active tab, restore the
@@ -2092,13 +2688,14 @@ impl Diffui {
                 let id = TabId(self.next_tab_id);
                 self.next_tab_id += 1;
                 let was_empty = self.tabs.is_empty();
+                let revset = default_revset(repository.vcs);
                 self.tabs.push(Tab {
                     id,
                     owner,
                     name,
                     vcs: repository.vcs,
                     root: repository.root.clone(),
-                    stash: Some(RepoState::unloaded(Some(repository))),
+                    stash: Some(RepoState::unloaded(Some(repository), revset)),
                 });
                 if was_empty {
                     // No active tab to switch from — check the new one out
@@ -2134,73 +2731,46 @@ impl Diffui {
                 .into();
         }
 
-        // A loading indicator appears only after a short grace period, so
-        // quick loads don't flash one. `dots` animates a simple ellipsis.
-        let loading_visible = self
-            .loading_since
-            .is_some_and(|since| since.elapsed() >= Duration::from_millis(500));
-        let dots = self
-            .loading_since
-            .map_or(0, |since| (since.elapsed().as_millis() / 350 % 4) as usize);
-
         let tab_bar = tab_bar::build_tab_bar(self, theme);
+        let toolbar = toolbar::build_toolbar(self, theme);
 
-        // Body: the full-window progress indicator during a cold load (the tab
-        // strip still shows above it so the user can switch away mid-load),
-        // otherwise the sidebar + diff panes with their overlays.
-        let body: Element<'_, Message> =
-            if loading_visible && matches!(self.status, LoadStatus::Loading) {
-                loading_indicator(
-                    format!("Loading repository{}", ".".repeat(dots)),
-                    Some(self.commit_progress.snapshot()),
-                    theme,
-                )
-            } else {
-                // The sidebar builds rows on demand from the precomputed per-row
-                // index (lane fold + prefix lengths), so constructing it each
-                // frame is O(visible rows) — no memoization needed.
-                let sidebar = sidebar::build_sidebar(self, theme);
+        // Body is always the sidebar + diff panes. All loading feedback lives in
+        // the toolbar now (progress line + activity indicator) — there's no
+        // full-window cold-load takeover and no diff-pane spinner. On a cold
+        // load the sidebar simply grows from empty as batches arrive; a revision
+        // switch keeps the prior diff until `DiffLoaded` replaces it.
+        let sidebar = sidebar::build_sidebar(self, theme);
+        let diff_pane = diff_panel::build_diff_panel(self, theme);
+        let panels = row![sidebar, vertical_divider(theme), diff_pane]
+            .spacing(0)
+            .height(Length::Fill);
+        let resize_overlay = ResizeHandle::new(
+            self.sidebar_width,
+            self.sidebar_min_width,
+            sidebar::RESIZE_HIT_PADDING,
+            Message::SidebarWidthChanged,
+        );
+        let palette_overlay = palette::build_overlay(self, theme);
+        let body: Element<'_, Message> = stack![panels, resize_overlay, palette_overlay]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
 
-                // A revision's diff is loading: swap just the diff pane for an
-                // indicator, leaving the commit graph and selection in place.
-                let diff_pane: Element<'_, Message> = if loading_visible
-                    && self.pending_revision.is_some()
-                    && matches!(self.status, LoadStatus::Loaded)
-                {
-                    loading_indicator(format!("Loading diff{}", ".".repeat(dots)), None, theme)
-                } else {
-                    diff_panel::build_diff_panel(self, theme)
-                };
-
-                let panels = row![sidebar, vertical_divider(theme), diff_pane]
-                    .spacing(0)
-                    .height(Length::Fill);
-                let resize_overlay = ResizeHandle::new(
-                    self.sidebar_width,
-                    self.sidebar_min_width,
-                    sidebar::RESIZE_HIT_PADDING,
-                    Message::SidebarWidthChanged,
-                );
-                let palette_overlay = palette::build_overlay(self, theme);
-                stack![panels, resize_overlay, palette_overlay]
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .into()
-            };
-
-        let shell = column![tab_bar, horizontal_divider(theme), body]
+        let shell = column![tab_bar, toolbar, horizontal_divider(theme), body]
             .width(Length::Fill)
             .height(Length::Fill);
 
-        // The open-repo dialog floats above the whole shell, tab strip included.
-        let content: Element<'_, Message> = if self.open_repo_dialog.is_some() {
-            stack![shell, tab_bar::build_open_repo_dialog(self, theme)]
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
-        } else {
-            shell.into()
-        };
+        // Overlays float above the whole shell. Each returns an empty `Space`
+        // when inactive, so they can always be stacked.
+        let content: Element<'_, Message> = stack![
+            shell,
+            activity::activity_popover(self, theme),
+            toolbar::build_menu_overlay(self, theme),
+            tab_bar::build_open_repo_dialog(self, theme),
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into();
 
         container(content)
             .padding(0)
@@ -2238,126 +2808,156 @@ impl Diffui {
             self.palette.is_some(),
             self.find.is_some(),
             self.open_repo_dialog.is_some(),
+            self.toolbar_menu.is_some(),
+            self.activity_popover_open,
         );
 
-        let keyboard = event::listen_with(|event, _status, _window| match event {
+        let keyboard = event::listen_with(|event, status, _window| match event {
             Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
-                Some((key, modifiers))
+                // `ignored` = no focused widget consumed it. The revset input is
+                // inline (not behind an overlay flag), so we use this to keep its
+                // keystrokes from leaking into the global j/k file nav.
+                Some((key, modifiers, matches!(status, event::Status::Ignored)))
             }
             _ => None,
         })
         .with(flags)
-        .filter_map(|((palette_open, find_open, dialog_open), (key, modifiers))| {
-            // Cmd/Ctrl+K opens (or toggles closed) the palette.
-            if modifiers.command()
-                && matches!(
-                    key.as_ref(),
-                    keyboard::Key::Character("k") | keyboard::Key::Character("K")
-                )
-            {
-                return Some(if palette_open {
-                    Message::PaletteClose
-                } else {
-                    Message::PaletteOpen
-                });
-            }
-
-            // Cmd/Ctrl+F opens the in-diff find bar. No toggle; Esc
-            // closes.
-            if modifiers.command()
-                && matches!(
-                    key.as_ref(),
-                    keyboard::Key::Character("f") | keyboard::Key::Character("F")
-                )
-            {
-                return Some(Message::FindOpen);
-            }
-
-            // Open-repo dialog owns the keyboard: Esc dismisses, everything
-            // else falls through to its text input. (Enter is handled by the
-            // input's `on_submit`.)
-            if dialog_open {
-                return match key.as_ref() {
-                    keyboard::Key::Named(keyboard::key::Named::Escape) => {
-                        Some(Message::OpenRepoDialogClose)
-                    }
-                    _ => None,
-                };
-            }
-
-            if palette_open {
-                return match key.as_ref() {
-                    keyboard::Key::Named(keyboard::key::Named::Escape) => {
-                        Some(Message::PalettePopColumn)
-                    }
-                    keyboard::Key::Named(keyboard::key::Named::ArrowDown) => {
-                        Some(Message::PaletteMoveSelection(1))
-                    }
-                    keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
-                        Some(Message::PaletteMoveSelection(-1))
-                    }
-                    keyboard::Key::Named(keyboard::key::Named::Tab) => {
-                        Some(Message::PalettePushActions)
-                    }
-                    _ => None,
-                };
-            }
-
-            if find_open {
-                return match key.as_ref() {
-                    keyboard::Key::Named(keyboard::key::Named::Escape) => Some(Message::FindClose),
-                    // Enter / Shift+Enter — handle both here since
-                    // text_input intentionally has no on_submit (it
-                    // would route every Enter to FindNext and swallow
-                    // Shift+Enter on the way).
-                    keyboard::Key::Named(keyboard::key::Named::Enter) => {
-                        Some(if modifiers.shift() {
-                            Message::FindPrev
+        .filter_map(
+            |(
+                (palette_open, find_open, dialog_open, menu_open, popover_open),
+                (key, modifiers, ignored),
+            )| {
+                // A toolbar dropdown / activity popover is open: Esc dismisses it
+                // and other keys are swallowed so they don't reach file nav.
+                if menu_open || popover_open {
+                    return match key.as_ref() {
+                        keyboard::Key::Named(keyboard::key::Named::Escape) => Some(if menu_open {
+                            Message::CloseToolbarMenu
                         } else {
-                            Message::FindNext
-                        })
-                    }
-                    _ => None,
-                };
-            }
-
-            // Tab management — only with no overlay holding the keyboard, so
-            // these never steal keystrokes from a focused text input. ⌘W
-            // closes the active tab, ⌘O opens the path dialog, ⌘1–9 jump to a
-            // tab by position.
-            if modifiers.command() && !modifiers.shift() && !modifiers.alt() {
-                match key.as_ref() {
-                    keyboard::Key::Character("w") | keyboard::Key::Character("W") => {
-                        return Some(Message::CloseActiveTab);
-                    }
-                    keyboard::Key::Character("o") | keyboard::Key::Character("O") => {
-                        return Some(Message::OpenRepoDialogOpen);
-                    }
-                    keyboard::Key::Character(c) => {
-                        if let Some(digit) = c.chars().next().and_then(|c| c.to_digit(10))
-                            && (1..=9).contains(&digit)
-                        {
-                            return Some(Message::SelectTabIndex((digit - 1) as usize));
-                        }
-                    }
-                    _ => {}
+                            Message::ActivityToggle
+                        }),
+                        _ => None,
+                    };
                 }
-            }
 
-            // No overlay — global j/k/arrow file shortcuts apply. Only
-            // fire when no modifier is held, otherwise ⌘J / ⌘K combos
-            // would also trigger file nav.
-            if modifiers.command() || modifiers.alt() || modifiers.control() {
-                return None;
-            }
-            match key.as_ref() {
-                keyboard::Key::Named(keyboard::key::Named::ArrowDown)
-                | keyboard::Key::Character("j") => Some(Message::SelectNextFile),
-                keyboard::Key::Named(keyboard::key::Named::ArrowUp)
-                | keyboard::Key::Character("k") => Some(Message::SelectPreviousFile),
-                _ => None,
-            }
-        });
+                // Cmd/Ctrl+K opens (or toggles closed) the palette.
+                if modifiers.command()
+                    && matches!(
+                        key.as_ref(),
+                        keyboard::Key::Character("k") | keyboard::Key::Character("K")
+                    )
+                {
+                    return Some(if palette_open {
+                        Message::PaletteClose
+                    } else {
+                        Message::PaletteOpen
+                    });
+                }
+
+                // Cmd/Ctrl+F opens the in-diff find bar. No toggle; Esc
+                // closes.
+                if modifiers.command()
+                    && matches!(
+                        key.as_ref(),
+                        keyboard::Key::Character("f") | keyboard::Key::Character("F")
+                    )
+                {
+                    return Some(Message::FindOpen);
+                }
+
+                // Open-repo dialog owns the keyboard: Esc dismisses, everything
+                // else falls through to its text input. (Enter is handled by the
+                // input's `on_submit`.)
+                if dialog_open {
+                    return match key.as_ref() {
+                        keyboard::Key::Named(keyboard::key::Named::Escape) => {
+                            Some(Message::OpenRepoDialogClose)
+                        }
+                        _ => None,
+                    };
+                }
+
+                if palette_open {
+                    return match key.as_ref() {
+                        keyboard::Key::Named(keyboard::key::Named::Escape) => {
+                            Some(Message::PalettePopColumn)
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::ArrowDown) => {
+                            Some(Message::PaletteMoveSelection(1))
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
+                            Some(Message::PaletteMoveSelection(-1))
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::Tab) => {
+                            Some(Message::PalettePushActions)
+                        }
+                        _ => None,
+                    };
+                }
+
+                if find_open {
+                    return match key.as_ref() {
+                        keyboard::Key::Named(keyboard::key::Named::Escape) => {
+                            Some(Message::FindClose)
+                        }
+                        // Enter / Shift+Enter — handle both here since
+                        // text_input intentionally has no on_submit (it
+                        // would route every Enter to FindNext and swallow
+                        // Shift+Enter on the way).
+                        keyboard::Key::Named(keyboard::key::Named::Enter) => {
+                            Some(if modifiers.shift() {
+                                Message::FindPrev
+                            } else {
+                                Message::FindNext
+                            })
+                        }
+                        _ => None,
+                    };
+                }
+
+                // Tab management — only with no overlay holding the keyboard, so
+                // these never steal keystrokes from a focused text input. ⌘W
+                // closes the active tab, ⌘O opens the path dialog, ⌘1–9 jump to a
+                // tab by position.
+                if modifiers.command() && !modifiers.shift() && !modifiers.alt() {
+                    match key.as_ref() {
+                        keyboard::Key::Character("w") | keyboard::Key::Character("W") => {
+                            return Some(Message::CloseActiveTab);
+                        }
+                        keyboard::Key::Character("o") | keyboard::Key::Character("O") => {
+                            return Some(Message::OpenRepoDialogOpen);
+                        }
+                        keyboard::Key::Character(c) => {
+                            if let Some(digit) = c.chars().next().and_then(|c| c.to_digit(10))
+                                && (1..=9).contains(&digit)
+                            {
+                                return Some(Message::SelectTabIndex((digit - 1) as usize));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                // No overlay — global j/k/arrow file shortcuts apply. Only
+                // fire when no modifier is held, otherwise ⌘J / ⌘K combos
+                // would also trigger file nav.
+                if modifiers.command() || modifiers.alt() || modifiers.control() {
+                    return None;
+                }
+                // A focused widget (the revset input) consumed this key — don't also
+                // route it to file nav.
+                if !ignored {
+                    return None;
+                }
+                match key.as_ref() {
+                    keyboard::Key::Named(keyboard::key::Named::ArrowDown)
+                    | keyboard::Key::Character("j") => Some(Message::SelectNextFile),
+                    keyboard::Key::Named(keyboard::key::Named::ArrowUp)
+                    | keyboard::Key::Character("k") => Some(Message::SelectPreviousFile),
+                    _ => None,
+                }
+            },
+        );
 
         let window_events = event::listen().filter_map(|event| match event {
             Event::Window(window::Event::Focused) => Some(Message::WindowFocusChanged(true)),
@@ -2374,9 +2974,7 @@ impl Diffui {
         // starts once and persists; `RefreshRepository` itself is gated on
         // focus, so edits made while unfocused are picked up on focus-regain.
         let refresh = match &self.repository {
-            Some(repository) => {
-                Subscription::run_with(repository.root.clone(), watch_repository)
-            }
+            Some(repository) => Subscription::run_with(repository.root.clone(), watch_repository),
             None => Subscription::none(),
         };
 
@@ -2397,9 +2995,13 @@ impl Diffui {
             Subscription::none()
         };
 
-        // While a load is in flight, tick so the loading indicator can cross
-        // its grace period, animate, and reflect live commit-load progress.
-        let loading_tick = if self.loading_since.is_some() {
+        // While anything is in flight — a load, a diff switch, or any running
+        // activity (fetch/undo/push) — tick so the toolbar progress line +
+        // spinner animate and reflect live progress.
+        let work_in_flight = self.loading_since.is_some()
+            || self.pending_revision.is_some()
+            || self.activities.any_running();
+        let loading_tick = if work_in_flight {
             time::every(Duration::from_millis(120)).map(|_| Message::LoadingTick)
         } else {
             Subscription::none()
@@ -2470,7 +3072,28 @@ impl Diffui {
                 .tabs
                 .get(self.active_tab)
                 .map(|tab| tab.root.to_string_lossy().into_owned()),
+            revsets: self.collect_revsets(),
         }
+    }
+
+    /// Gather each open tab's revset (active inline + stashed), keyed by repo
+    /// root, dropping empties so the persisted map stays tidy.
+    fn collect_revsets(&self) -> BTreeMap<String, String> {
+        let mut revsets = BTreeMap::new();
+        for (index, tab) in self.tabs.iter().enumerate() {
+            let revset = if index == self.active_tab {
+                self.revset.clone()
+            } else {
+                tab.stash
+                    .as_ref()
+                    .map(|state| state.revset.clone())
+                    .unwrap_or_default()
+            };
+            if !revset.is_empty() {
+                revsets.insert(tab.root.to_string_lossy().into_owned(), revset);
+            }
+        }
+        revsets
     }
 
     fn resolved_theme(&self) -> ResolvedTheme {
@@ -2551,6 +3174,47 @@ fn expand_user_path(input: &str) -> PathBuf {
     PathBuf::from(input)
 }
 
+/// Open `url` in the user's default browser via the platform opener. Used by
+/// clickable links in an activity's captured remote output (e.g. a GitHub
+/// "create a pull request" URL). Fire-and-forget — a failure to launch is
+/// non-fatal and silently ignored.
+fn open_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut c = std::process::Command::new("open");
+        c.arg(url);
+        c
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "start", "", url]);
+        c
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut command = {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    let _ = command.spawn();
+}
+
+/// Sort key for ordering a bookmark by how close its `target` commit sits to a
+/// reference revision in the loaded log: the absolute index distance, or
+/// `usize::MAX` when either commit isn't loaded (so unknowns sink to the bottom
+/// and a stable sort keeps the prior alphabetical order among them).
+fn proximity_key(
+    index_of: &HashMap<String, usize>,
+    reference_index: Option<usize>,
+    target: &str,
+) -> usize {
+    match (index_of.get(target), reference_index) {
+        (Some(&target_index), Some(reference_index)) => target_index.abs_diff(reference_index),
+        _ => usize::MAX,
+    }
+}
+
 fn commit_for_ref<'a>(ui: &'a Diffui, item: &ResultRef) -> Option<RowView<'a>> {
     match item {
         ResultRef::Commit(id) => ui.commits.find_by_change_id(id),
@@ -2605,6 +3269,7 @@ fn current_file_diff_text(ui: &Diffui) -> Option<String> {
 /// batches are dropped (see `LoadCursor`).
 fn stream_jj_initial_load(
     repository: Repository,
+    revset: String,
     progress: LoadProgress,
     version: u64,
 ) -> Task<Message> {
@@ -2637,6 +3302,7 @@ fn stream_jj_initial_load(
                     };
                     let finished = crate::jj::load_jj_cold(
                         repository,
+                        revset,
                         progress,
                         COMMIT_BATCH_SIZE,
                         &mut emit_diff,
@@ -2687,18 +3353,21 @@ fn watch_repository(root: &PathBuf) -> Pin<Box<dyn Stream<Item = Message> + Send
             // notify's handler runs on its own thread; bridge it to this async
             // task over an unbounded channel so the handler never blocks.
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-            let watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
-                if let Ok(event) = result
-                    && !matches!(event.kind, notify::EventKind::Access(_))
-                    && event_touches_worktree(&event)
-                {
-                    let _ = tx.send(());
-                }
-            });
+            let watcher =
+                notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
+                    if let Ok(event) = result
+                        && !matches!(event.kind, notify::EventKind::Access(_))
+                        && event_touches_worktree(&event)
+                    {
+                        let _ = tx.send(());
+                    }
+                });
             let mut watcher = match watcher {
                 Ok(watcher) => watcher,
                 Err(error) => {
-                    eprintln!("diffui: filesystem watcher unavailable, auto-refresh disabled: {error}");
+                    eprintln!(
+                        "diffui: filesystem watcher unavailable, auto-refresh disabled: {error}"
+                    );
                     return;
                 }
             };
@@ -2740,45 +3409,6 @@ fn event_touches_worktree(event: &notify::Event) -> bool {
             )
         })
     })
-}
-
-/// Centered loading indicator. With a known total it renders a determinate
-/// bar plus a commit count; otherwise just the (caller-animated) label.
-fn loading_indicator(
-    label: String,
-    progress: Option<(usize, usize)>,
-    theme: ThemeSpec,
-) -> Element<'static, Message> {
-    let mut body = column![text(label).size(16).color(theme.text)]
-        .spacing(12)
-        .align_x(alignment::Horizontal::Center);
-
-    if let Some((loaded, total)) = progress {
-        if total > 0 {
-            body = body
-                .push(
-                    progress_bar(0.0..=total as f32, loaded as f32)
-                        .length(Length::Fixed(240.0))
-                        .girth(Length::Fixed(6.0)),
-                )
-                .push(
-                    text(format!("{loaded} / {total} commits"))
-                        .size(12)
-                        .color(theme.muted_text),
-                );
-        } else if loaded > 0 {
-            body = body.push(
-                text(format!("{loaded} commits"))
-                    .size(12)
-                    .color(theme.muted_text),
-            );
-        }
-    }
-
-    container(body)
-        .center_x(Length::Fill)
-        .center_y(Length::Fill)
-        .into()
 }
 
 #[cfg(test)]

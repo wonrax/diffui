@@ -1336,10 +1336,7 @@ pub fn change_id_for_recents(item: &ResultRef, ui: &Diffui) -> Option<String> {
             .iter()
             .find(|c| c.bookmarks().iter().any(|b| b == name))
             .map(|c| c.change_id().to_owned()),
-        ResultRef::WorkingCopy => ui
-            .commits
-            .working_copy()
-            .map(|c| c.change_id().to_owned()),
+        ResultRef::WorkingCopy => ui.commits.working_copy().map(|c| c.change_id().to_owned()),
         _ => None,
     }
 }

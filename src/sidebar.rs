@@ -1,21 +1,22 @@
 use std::collections::HashMap;
 
 use iced::{
-    Background, Border, Color, Element, Font, Length, alignment,
-    widget::{column, container, row, text, tooltip},
+    Background, Border, Color, Element, Font, Length, Padding, alignment, mouse,
+    widget::{Space, column, container, mouse_area, row, text, text_input, tooltip},
 };
 
 use crate::backend::{CommitStore, DiffFile, DiffFileStatus, RevisionSelection, RowView};
 use crate::config::AppConfig;
 use crate::graph_layout::GraphLayout;
 use crate::graph_view::{self, RevisionGraphStyle};
+use crate::repository::Vcs;
 use crate::revision_list::{
     self, FileRowView, IndicatorChip, RevisionList, RevisionListStyle, RevisionRowView,
     RowSelectionKey,
 };
-use jj_lib::graph::GraphEdgeType;
 use crate::theme::{self, ThemeSpec, chip_background, sidebar_panel_style};
-use crate::{Diffui, LoadStatus, Message};
+use crate::{Diffui, HoverTarget, LoadStatus, Message, ToolbarMenu};
+use jj_lib::graph::GraphEdgeType;
 
 // Public sidebar layout knobs — used by main.rs to clamp the resize handle.
 // `DEFAULT_WIDTH` is a starting point; the actual floor is derived from the
@@ -99,6 +100,8 @@ pub fn build_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     let revision_list = build_revision_list(ui, theme);
 
     let mut body = column![].spacing(0);
+    // The revset / revision-range filter sits at the very top of the pane.
+    body = body.push(build_revset_filter(ui, theme));
     // Load failures no longer have a header to live under — surface them as a
     // slim banner above the list.
     if let LoadStatus::Failed(error) = &ui.status {
@@ -123,6 +126,86 @@ pub fn build_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         .into()
 }
 
+/// Focus target id for the revset input.
+pub const REVSET_INPUT_ID: &str = "revset-input";
+
+/// The monospace revset (jj) / revision-range (git) input at the top of the
+/// sidebar, with a caret that opens the presets menu. Submitting (Enter) or
+/// picking a preset re-evaluates the log.
+fn build_revset_filter(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
+    let placeholder = match ui.repository.as_ref().map(|r| r.vcs) {
+        Some(Vcs::Git) => "revision range — e.g. --all, main..@",
+        _ => "revset — e.g. all(), mine()",
+    };
+
+    let input = text_input(placeholder, &ui.revset)
+        .id(REVSET_INPUT_ID)
+        .padding(Padding::from([5, 8]))
+        .size(12)
+        .font(ui.config.mono_font)
+        .width(Length::Fill)
+        .on_input(Message::RevsetChanged)
+        .on_submit(Message::RevsetSubmit)
+        .style(move |_, _| text_input::Style {
+            background: Background::Color(theme.background),
+            border: Border {
+                width: 1.0,
+                color: theme.border,
+                radius: 6.0.into(),
+            },
+            icon: theme.muted_text,
+            placeholder: theme.subtle_text,
+            value: theme.text,
+            selection: Color {
+                a: 0.25,
+                ..theme.accent
+            },
+        });
+
+    // `mouse_area` (not `button`) so the presets menu opens on mouse-*down*
+    // while held — required for the native NSMenu's press-drag-release select.
+    // Hover is tracked manually (mouse_area has no built-in hover style).
+    let caret_hovered = ui.hovered == Some(HoverTarget::RevsetCaret);
+    let caret = mouse_area(
+        container(
+            text("\u{25BE}")
+                .size(revision_list::CHEVRON_TEXT_SIZE)
+                // Same glyph size as the revision-row chevron; tight line-height
+                // so it doesn't inflate the input row's height.
+                .line_height(iced::widget::text::LineHeight::Relative(1.0))
+                .font(ui.config.ui_font)
+                .color(theme.muted_text),
+        )
+        .padding(Padding::from([3, 7]))
+        .align_y(alignment::Vertical::Center)
+        .style(move |_| crate::toolbar::caret_hover_style(theme, caret_hovered)),
+    )
+    .on_press(Message::OpenToolbarMenu(ToolbarMenu::RevsetPresets))
+    .on_enter(Message::SetHover(Some(HoverTarget::RevsetCaret)))
+    .on_exit(Message::SetHover(None))
+    .interaction(mouse::Interaction::Pointer);
+
+    let bar = row![input, caret]
+        .spacing(4)
+        .align_y(alignment::Vertical::Center);
+
+    let hairline = container(Space::new())
+        .width(Length::Fill)
+        .height(Length::Fixed(1.0))
+        .style(move |_| container::Style {
+            background: Some(Background::Color(theme.border)),
+            ..container::Style::default()
+        });
+
+    column![
+        container(bar)
+            .width(Length::Fill)
+            .padding(Padding::from([6, 8])),
+        hairline,
+    ]
+    .into()
+}
+
 const FOOTER_TEXT_SIZE: f32 = 12.0;
 
 /// Thin status bar pinned to the bottom of the commit-log pane: the working
@@ -138,7 +221,10 @@ fn build_footer(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         Some(status) => {
             // Branch glyph + name; the tracked upstream rides along as a tooltip.
             let name = row![
-                text("\u{2387}").size(FOOTER_TEXT_SIZE).font(font).color(dim),
+                text("\u{2387}")
+                    .size(FOOTER_TEXT_SIZE)
+                    .font(font)
+                    .color(dim),
                 text(status.branch.clone())
                     .size(FOOTER_TEXT_SIZE)
                     .font(font)
@@ -684,10 +770,7 @@ pub fn shortest_unique_prefix_lens(commits: &CommitStore) -> Vec<usize> {
 
 /// Number of leading characters two strings share.
 fn common_prefix_len(a: &str, b: &str) -> usize {
-    a.chars()
-        .zip(b.chars())
-        .take_while(|(x, y)| x == y)
-        .count()
+    a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
 }
 
 /// Pixel-accurate text width measurement for layout decisions made outside
@@ -1240,5 +1323,4 @@ mod tests {
             "Button.rs"
         );
     }
-
 }

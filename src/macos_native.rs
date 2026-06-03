@@ -20,10 +20,10 @@ use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{NSApplication, NSEvent, NSMenu, NSMenuItem};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_core_graphics::CGColor;
-use objc2_foundation::{MainThreadMarker, NSNumber, NSObject, NSObjectProtocol, NSString, ns_string};
-use objc2_quartz_core::{
-    CABasicAnimation, CALayer, CAMediaTiming, CATransaction,
+use objc2_foundation::{
+    MainThreadMarker, NSNumber, NSObject, NSObjectProtocol, NSString, ns_string,
 };
+use objc2_quartz_core::{CABasicAnimation, CALayer, CAMediaTiming, CATransaction};
 
 /// A node in a native popup menu. Leaves carry a caller-chosen `id` that
 /// `popup_menu` returns when that leaf is picked (across any submenu depth).
@@ -122,11 +122,7 @@ fn build_menu(mtm: MainThreadMarker, target: &AnyObject, items: &[MenuItem]) -> 
             MenuItem::Separator => {
                 menu.addItem(&NSMenuItem::separatorItem(mtm));
             }
-            MenuItem::Entry {
-                label,
-                id,
-                enabled,
-            } => {
+            MenuItem::Entry { label, id, enabled } => {
                 let menu_item = NSMenuItem::new(mtm);
                 menu_item.setTitle(&NSString::from_str(label));
                 menu_item.setEnabled(*enabled);

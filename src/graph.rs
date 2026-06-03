@@ -256,7 +256,9 @@ mod tests {
     /// Drive the assigner over a node list, pairing each input id with the
     /// frame it produced (frames themselves drop the id). Goes through the
     /// public `assign_lanes` so the batch wrapper is covered too.
-    fn run(nodes: impl IntoIterator<Item = (char, Vec<GraphEdge<char>>)>) -> Vec<(char, LaneFrame)> {
+    fn run(
+        nodes: impl IntoIterator<Item = (char, Vec<GraphEdge<char>>)>,
+    ) -> Vec<(char, LaneFrame)> {
         let nodes: Vec<_> = nodes.into_iter().collect();
         let ids: Vec<char> = nodes.iter().map(|(id, _)| *id).collect();
         ids.into_iter().zip(assign_lanes(nodes)).collect()

@@ -174,7 +174,10 @@ fn selected_lane_color(ui: &Diffui, theme: ThemeSpec) -> Color {
 /// view renders at the top of its scroll area. Mirrors `jj show`'s
 /// formatting: labels padded to 9 chars, blank line between the metadata
 /// block and the indented description.
-fn build_header_lines(details: &RevisionDetails, bookmark_color: Color) -> Vec<diff_view::HeaderLine> {
+fn build_header_lines(
+    details: &RevisionDetails,
+    bookmark_color: Color,
+) -> Vec<diff_view::HeaderLine> {
     use diff_view::{HeaderChip, HeaderLine};
     let mut lines: Vec<HeaderLine> = Vec::new();
 

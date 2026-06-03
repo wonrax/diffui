@@ -12,8 +12,7 @@
 //! keep in sync.
 
 use iced::{
-    Background, Border, Color, Element, Length, Padding,
-    alignment,
+    Background, Border, Color, Element, Length, Padding, alignment,
     font::Weight,
     widget::{Space, button, column, container, mouse_area, row, stack, text, text_input},
 };
@@ -114,11 +113,7 @@ fn tab_widget<'a>(
 ) -> Element<'a, Message> {
     let badge = vcs_badge(tab.vcs, theme, ui.config.mono_font);
 
-    let name_color = if active {
-        theme.text
-    } else {
-        theme.muted_text
-    };
+    let name_color = if active { theme.text } else { theme.muted_text };
     // owner + name as a tight unit (no gap), matching the design's RepoLabel —
     // "code/diffui" reads as one path. The badge and dirty dot get the 6px
     // rhythm from the outer row instead.
@@ -141,9 +136,17 @@ fn tab_widget<'a>(
     let mut label = row![badge, repo_label]
         .spacing(6)
         .align_y(alignment::Vertical::Center);
-    if tab_is_dirty(ui, tab, active) {
-        label = label.push(dirty_dot(theme));
-    }
+    // Always reserve the dot's slot (a transparent placeholder when clean) so a
+    // tab's width doesn't jump as its dirty status changes — e.g. when a revset
+    // that excludes `@` makes the working copy drop out of the loaded set.
+    label = label.push(if tab_is_dirty(ui, tab, active) {
+        dirty_dot(theme)
+    } else {
+        Space::new()
+            .width(Length::Fixed(6.0))
+            .height(Length::Fixed(6.0))
+            .into()
+    });
 
     let id = tab.id;
     let select = mouse_area(label).on_press(Message::SelectTab(id));
@@ -277,17 +280,22 @@ fn add_button(theme: ThemeSpec, font: iced::Font) -> Element<'static, Message> {
 /// The right-hand `⌘K` control. The design put a repo-search `⌘P` here; per
 /// the spec it instead opens our existing command palette.
 fn palette_hint(theme: ThemeSpec, mono: iced::Font) -> Element<'static, Message> {
-    let chip = container(text("\u{2318}K").size(10.5).color(theme.muted_text).font(mono))
-        .padding(Padding::from([1, 5]))
-        .style(move |_| container::Style {
-            background: Some(Background::Color(chip_background(theme.muted_text))),
-            border: Border {
-                width: 0.0,
-                color: Color::TRANSPARENT,
-                radius: 4.0.into(),
-            },
-            ..container::Style::default()
-        });
+    let chip = container(
+        text("\u{2318}K")
+            .size(10.5)
+            .color(theme.muted_text)
+            .font(mono),
+    )
+    .padding(Padding::from([1, 5]))
+    .style(move |_| container::Style {
+        background: Some(Background::Color(chip_background(theme.muted_text))),
+        border: Border {
+            width: 0.0,
+            color: Color::TRANSPARENT,
+            radius: 4.0.into(),
+        },
+        ..container::Style::default()
+    });
 
     button(chip)
         .padding(Padding::from([2, 4]))

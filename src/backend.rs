@@ -35,6 +35,13 @@ impl LoadProgress {
         self.loaded.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Set the absolute loaded count. For sources that report a running total
+    /// rather than per-item ticks (e.g. git's transfer progress), as opposed to
+    /// [`increment`](Self::increment).
+    pub fn set_loaded(&self, loaded: usize) {
+        self.loaded.store(loaded, Ordering::Relaxed);
+    }
+
     /// `(loaded, total)` so far. `total == 0` means the count isn't known yet.
     pub fn snapshot(&self) -> (usize, usize) {
         (
@@ -369,7 +376,11 @@ impl CommitStoreBuilder {
 /// even across a million commits. Shared by [`CommitStore::push`] (the lone
 /// caller); kept free-standing so it can borrow `authors` and `interner`
 /// disjointly from the rest of the store.
-fn intern_author(authors: &mut Vec<Arc<str>>, interner: &mut HashMap<String, u32>, author: &str) -> u32 {
+fn intern_author(
+    authors: &mut Vec<Arc<str>>,
+    interner: &mut HashMap<String, u32>,
+    author: &str,
+) -> u32 {
     if let Some(&idx) = interner.get(author) {
         return idx;
     }
@@ -498,17 +509,6 @@ impl BookmarkEntry {
     }
 }
 
-impl BookmarksInfo {
-    /// Names of all bookmarks with a local target — the candidates for
-    /// "move bookmark here".
-    pub fn local_names(&self) -> impl Iterator<Item = &str> {
-        self.bookmarks
-            .iter()
-            .filter(|b| b.local_target.is_some())
-            .map(|b| b.name.as_str())
-    }
-}
-
 /// `jj show`-style summary of a single revision, used to render the header
 /// strip above the diff view.
 #[derive(Debug, Clone, Default)]
@@ -532,9 +532,10 @@ pub struct SignatureInfo {
 pub async fn load_backend(
     repository: Repository,
     revision: RevisionSelection,
+    revset: String,
     progress: LoadProgress,
 ) -> Result<BackendOutput, String> {
-    run_backend(repository, revision, progress)
+    run_backend(repository, revision, revset, progress)
         .await
         .map_err(|error| format!("{error:#}"))
 }
@@ -542,6 +543,7 @@ pub async fn load_backend(
 async fn run_backend(
     repository: Repository,
     revision: RevisionSelection,
+    revset: String,
     progress: LoadProgress,
 ) -> Result<BackendOutput> {
     // Snapshot the working copy *before* reading the graph and diff, so both
@@ -549,7 +551,8 @@ async fn run_backend(
     // working-copy commit — e.g. `@` flagged "empty" while its diff actually
     // had changes — until the next refresh re-read it.
     let snapshot = run_repository_snapshot(repository.clone()).await?;
-    let (commits, graph, branch_status, bookmarks) = load_commits(&repository, &progress).await?;
+    let (commits, graph, branch_status, bookmarks) =
+        load_commits(&repository, &revset, &progress).await?;
     let (document, details) = run_diff(&repository, &revision).await?;
 
     Ok(BackendOutput {
@@ -629,6 +632,45 @@ pub async fn compute_empty_status(
     }
 }
 
+/// Fetch from the remote(s) and return the captured remote/sideband output for
+/// the activity log. jj runs in-process (jj-lib spawns git internally) on a
+/// blocking thread since jj-lib state is `!Send`; git shells out.
+pub async fn fetch(
+    repository: Repository,
+    target: crate::FetchTarget,
+    progress: LoadProgress,
+) -> Result<Vec<String>, String> {
+    match repository.vcs {
+        Vcs::Jj => {
+            let handle = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
+                handle.block_on(crate::jj::fetch_jj(repository, target, progress))
+            })
+            .await
+            .map_err(|error| format!("fetch task panicked: {error}"))?
+            .map_err(|error| format!("{error:#}"))
+        }
+        Vcs::Git => crate::git::fetch_git(&repository, &target)
+            .await
+            .map_err(|error| format!("{error:#}")),
+    }
+}
+
+/// Undo the latest jj operation, returning a one-line summary for the activity
+/// log. jj-only — git has no operation log.
+pub async fn undo(repository: Repository) -> Result<Vec<String>, String> {
+    match repository.vcs {
+        Vcs::Jj => {
+            let handle = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || handle.block_on(crate::jj::undo_jj(repository)))
+                .await
+                .map_err(|error| format!("undo task panicked: {error}"))?
+                .map_err(|error| format!("{error:#}"))
+        }
+        Vcs::Git => Err("Undo is only available for jj repositories".to_owned()),
+    }
+}
+
 async fn run_repository_snapshot(repository: Repository) -> Result<RepositorySnapshot> {
     match repository.vcs {
         Vcs::Jj => {
@@ -649,15 +691,22 @@ async fn run_repository_snapshot(repository: Repository) -> Result<RepositorySna
 
 async fn load_commits(
     repository: &Repository,
+    revset: &str,
     progress: &LoadProgress,
-) -> Result<(CommitStore, GraphLayout, Option<BranchStatus>, BookmarksInfo)> {
+) -> Result<(
+    CommitStore,
+    GraphLayout,
+    Option<BranchStatus>,
+    BookmarksInfo,
+)> {
     match repository.vcs {
         Vcs::Jj => {
             let root = repository.root.clone();
+            let revset = revset.to_owned();
             let progress = progress.clone();
             let handle = tokio::runtime::Handle::current();
             tokio::task::spawn_blocking(move || {
-                handle.block_on(crate::jj::load_jj_commits(root, progress))
+                handle.block_on(crate::jj::load_jj_commits(root, revset, progress))
             })
             .await
             .context("jj commit loader task failed")?
@@ -666,7 +715,7 @@ async fn load_commits(
             // The git loader parses `git log` in one shot rather than
             // per-commit, so surface the count once it's known, then fold the
             // summaries into the compact store.
-            let (commits, graph) = crate::git::load_git_commits(repository).await?;
+            let (commits, graph) = crate::git::load_git_commits(repository, revset).await?;
             progress.set_total(commits.len());
             let mut builder = CommitStoreBuilder::with_capacity(commits.len());
             for commit in commits {

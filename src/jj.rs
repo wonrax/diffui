@@ -24,26 +24,34 @@ use jj_lib::{
         parse as parse_fileset,
     },
     git::{
-        GitProgress, GitPushOptions, GitPushRefTargets, GitSidebandLineTerminator,
-        GitSubprocessCallback, GitSubprocessOptions, REMOTE_NAME_FOR_LOCAL_GIT_REPO, push_refs,
+        GitFetch, GitFetchRefExpression, GitImportOptions, GitProgress, GitPushOptions,
+        GitPushRefTargets, GitSettings, GitSidebandLineTerminator, GitSubprocessCallback,
+        GitSubprocessOptions, REMOTE_NAME_FOR_LOCAL_GIT_REPO, expand_fetch_refspecs,
+        get_all_remote_names, push_refs,
     },
     gitignore::GitIgnoreFile,
     graph::TopoGroupedGraphIterator,
     matchers::{EverythingMatcher, Matcher, NothingMatcher, PrefixMatcher},
     merge::{Diff, Merge, SameChange},
     object_id::ObjectId,
-    op_store::RefTarget,
-    ref_name::{RefName, RefNameBuf, RemoteName},
+    op_store::{RefTarget, View},
+    ref_name::{RefName, RefNameBuf, RemoteName, RemoteNameBuf, WorkspaceName},
     repo::{MutableRepo, ReadonlyRepo, Repo, StoreFactories},
     repo_path::{RepoPath, RepoPathBuf, RepoPathUiConverter},
-    revset::{RevsetExpression, SymbolResolver, UserRevsetExpression},
+    revset::{
+        RevsetAliasesMap, RevsetDiagnostics, RevsetExpression, RevsetExtensions,
+        RevsetParseContext, RevsetWorkspaceContext, SymbolResolver, UserRevsetExpression,
+        parse as parse_revset,
+    },
     rewrite::merge_commit_trees,
     settings::{HumanByteSize, UserSettings},
+    str_util::{StringExpression, StringPattern},
     tree_merge::MergeOptions,
     working_copy::SnapshotOptions,
     workspace::{Workspace, default_working_copy_factories},
 };
 
+use crate::FetchTarget;
 use crate::backend::{
     BookmarkEntry, BookmarksInfo, BranchStatus, CommitStore, CommitSummary, DiffDocument, DiffFile,
     DiffFileStatus, DiffHunkView, DiffLine, DiffLineKind, LoadProgress, RemoteBookmarkRef,
@@ -58,6 +66,46 @@ use crate::repository::{Repository, RepositorySnapshot};
 // Fallback used only when the user has not configured `snapshot.max-new-file-size`.
 // Matches jj-cli's shipped default (1 MiB).
 const DEFAULT_SNAPSHOT_MAX_NEW_FILE_SIZE: u64 = 1024 * 1024;
+
+/// Parse a user-entered revset string into a jj expression for the graph
+/// loaders. Empty or `all()` short-circuits to [`RevsetExpression::all`] (the
+/// app default — and avoids any parse risk on the common path). Symbols like
+/// `@`, `mine()`, `conflicts()` resolve against the default workspace; a parse
+/// error is surfaced so the revset activity can report it. `default_ignored_remote`
+/// is jj's colocated-git pseudo-remote, matching jj's own parsing.
+fn parse_user_revset(
+    repo_root: &Path,
+    settings: &UserSettings,
+    src: &str,
+) -> Result<Arc<UserRevsetExpression>> {
+    let trimmed = src.trim();
+    if trimmed.is_empty() || trimmed == "all()" {
+        return Ok(RevsetExpression::all());
+    }
+    let aliases = RevsetAliasesMap::new();
+    let fileset_aliases = FilesetAliasesMap::new();
+    let extensions = RevsetExtensions::default();
+    let path_converter = RepoPathUiConverter::Fs {
+        cwd: repo_root.to_path_buf(),
+        base: repo_root.to_path_buf(),
+    };
+    let workspace_ctx = RevsetWorkspaceContext {
+        path_converter: &path_converter,
+        workspace_name: WorkspaceName::DEFAULT,
+    };
+    let context = RevsetParseContext {
+        aliases_map: &aliases,
+        local_variables: HashMap::new(),
+        user_email: settings.user_email(),
+        date_pattern_context: chrono::Local::now().into(),
+        default_ignored_remote: Some(REMOTE_NAME_FOR_LOCAL_GIT_REPO),
+        fileset_aliases_map: &fileset_aliases,
+        use_glob_by_default: true,
+        extensions: &extensions,
+        workspace: Some(workspace_ctx),
+    };
+    parse_revset(&mut RevsetDiagnostics::new(), trimmed, &context).context("failed to parse revset")
+}
 
 /// Walk the jj revset graph, emitting commits in batches as they're built, and
 /// return the single-parent emptiness updates once every tree-id is known.
@@ -79,12 +127,16 @@ const DEFAULT_SNAPSHOT_MAX_NEW_FILE_SIZE: u64 = 1024 * 1024;
 /// the load path (see `compute_jj_empty_status`).
 pub async fn walk_jj_commits(
     repository_root: PathBuf,
+    revset: String,
     progress: LoadProgress,
     batch_size: usize,
     emit: &mut dyn FnMut(Vec<StreamRow>),
 ) -> Result<(Vec<(usize, bool)>, Option<BranchStatus>, BookmarksInfo)> {
-    let settings = UserSettings::from_config(StackedConfig::with_defaults())
-        .context("failed to load jj settings")?;
+    // Load the *user's* jj config (not just defaults) so config-dependent
+    // revsets resolve correctly — `mine()` lowers to `author(your-email)`, which
+    // is empty unless `user.email` is read from the user/repo config. The cold
+    // load already does this via `jj_settings`; this is the refresh path.
+    let settings = jj_settings(&repository_root)?;
     let workspace = Workspace::load(
         &settings,
         &repository_root,
@@ -103,7 +155,16 @@ pub async fn walk_jj_commits(
         .get_wc_commit_id(workspace_name)
         .context("jj workspace has no working-copy commit")?
         .clone();
-    walk_jj_with_repo(repo.as_ref(), &wc_commit_id, progress, batch_size, emit).await
+    walk_jj_with_repo(
+        repo.as_ref(),
+        &wc_commit_id,
+        &repository_root,
+        &revset,
+        progress,
+        batch_size,
+        emit,
+    )
+    .await
 }
 
 /// The graph-walk half of [`walk_jj_commits`], given an already-loaded repo and
@@ -113,15 +174,16 @@ pub async fn walk_jj_commits(
 pub async fn walk_jj_with_repo(
     repo: &ReadonlyRepo,
     wc_commit_id: &CommitId,
+    repo_root: &Path,
+    revset: &str,
     progress: LoadProgress,
     batch_size: usize,
     emit: &mut dyn FnMut(Vec<StreamRow>),
 ) -> Result<(Vec<(usize, bool)>, Option<BranchStatus>, BookmarksInfo)> {
-    // Default revset: `all()` — ancestors of every visible head plus any
-    // referenced commit. Covers the working copy, all local bookmarks,
-    // and tracked/untracked remote bookmarks, so branches that haven't
-    // been merged into the WC still show up in the graph.
-    let expr = RevsetExpression::all();
+    // The user's revset controls which revisions load. The default (`all()`)
+    // covers the working copy, every local bookmark, and tracked/untracked
+    // remote bookmarks, so unmerged branches still appear in the graph.
+    let expr = parse_user_revset(repo_root, repo.settings(), revset)?;
     let symbol_resolver = SymbolResolver::new(
         repo,
         &[] as &[Box<dyn jj_lib::revset::SymbolResolverExtension>],
@@ -164,7 +226,15 @@ pub async fn walk_jj_with_repo(
     // batch ships after only `batch_size` commits are walked.
     {
         let mut topo = TopoGroupedGraphIterator::new(revset.iter_graph(), |id: &CommitId| id);
-        topo.prioritize_branch(wc_commit_id.clone());
+        // Prioritize `@` only when the revset actually contains it. A revset that
+        // excludes the working copy (e.g. `mine()` when `@` isn't yours,
+        // `conflicts()`, a narrow range) has no such node, and the topo iterator
+        // panics ("parent or prioritized node should exist") on a prioritized
+        // node missing from its input. jj-cli guards `jj log` the same way.
+        let has_commit = revset.containing_fn();
+        if has_commit(wc_commit_id).unwrap_or(false) {
+            topo.prioritize_branch(wc_commit_id.clone());
+        }
         for node in topo {
             // Advance the lane state for every node in topo order. The assigner
             // is stateful, so this must run once per node — keep it first.
@@ -329,9 +399,9 @@ fn branch_status_inner(
             if remote_ref.is_tracked()
                 && let Some(id) = remote_ref.target.added_ids().next()
             {
-                tracked_upstream.entry(name_str.clone()).or_insert_with(|| {
-                    (format!("{name_str}@{}", remote.as_str()), id.clone())
-                });
+                tracked_upstream
+                    .entry(name_str.clone())
+                    .or_insert_with(|| (format!("{name_str}@{}", remote.as_str()), id.clone()));
             }
         }
     }
@@ -426,8 +496,14 @@ fn count_revset(
 /// cold initial load uses [`walk_jj_commits`] directly to stream instead.
 pub async fn load_jj_commits(
     repository_root: PathBuf,
+    revset: String,
     progress: LoadProgress,
-) -> Result<(CommitStore, GraphLayout, Option<BranchStatus>, BookmarksInfo)> {
+) -> Result<(
+    CommitStore,
+    GraphLayout,
+    Option<BranchStatus>,
+    BookmarksInfo,
+)> {
     let mut store = CommitStore::default();
     let mut graph = GraphLayout::default();
     let mut interner: HashMap<String, u32> = HashMap::new();
@@ -440,7 +516,7 @@ pub async fn load_jj_commits(
                 store.push(row.summary, &mut interner);
             }
         };
-        walk_jj_commits(repository_root, progress, 4096, &mut emit).await?
+        walk_jj_commits(repository_root, revset, progress, 4096, &mut emit).await?
     };
 
     for (index, empty) in empty_updates {
@@ -463,6 +539,7 @@ pub type ColdDiffResult = Result<(DiffDocument, Option<RevisionDetails>), String
 /// fingerprint + single-parent emptiness for the load's tail.
 pub async fn load_jj_cold(
     repository: Repository,
+    revset: String,
     progress: LoadProgress,
     batch_size: usize,
     emit_diff: &mut dyn FnMut(ColdDiffResult),
@@ -482,8 +559,16 @@ pub async fn load_jj_cold(
         .map_err(|error| format!("{error:#}"));
     emit_diff(diff);
 
-    let (empty_updates, branch_status, bookmarks) =
-        walk_jj_with_repo(repo.as_ref(), &wc_commit_id, progress, batch_size, emit_batch).await?;
+    let (empty_updates, branch_status, bookmarks) = walk_jj_with_repo(
+        repo.as_ref(),
+        &wc_commit_id,
+        &repository.root,
+        &revset,
+        progress,
+        batch_size,
+        emit_batch,
+    )
+    .await?;
     Ok((snapshot, branch_status, empty_updates, bookmarks))
 }
 
@@ -843,6 +928,7 @@ pub async fn load_jj_repository_snapshot(
 pub(crate) async fn apply_mutation(
     repository: Repository,
     op: MutationOp,
+    progress: LoadProgress,
 ) -> Result<MutationOutcome> {
     let settings = jj_settings(&repository.root)?;
     let mut workspace = Workspace::load(
@@ -876,7 +962,12 @@ pub(crate) async fn apply_mutation(
         .store()
         .get_commit_async(&wc_commit_id)
         .await
-        .with_context(|| format!("failed to load jj working-copy commit {}", wc_commit_id.hex()))?;
+        .with_context(|| {
+            format!(
+                "failed to load jj working-copy commit {}",
+                wc_commit_id.hex()
+            )
+        })?;
 
     let snapshot_options = SnapshotOptions {
         base_ignores,
@@ -921,6 +1012,8 @@ pub(crate) async fn apply_mutation(
         .context("jj workspace has no working-copy commit")?
         .clone();
 
+    // Captured remote output (push only); empty for local mutations.
+    let mut push_output: Vec<String> = Vec::new();
     let message = match &op {
         MutationOp::New { parent } => {
             let parent_commit = resolve_mutation_target(tx.repo(), &current_wc_id, parent).await?;
@@ -959,8 +1052,10 @@ pub(crate) async fn apply_mutation(
         MutationOp::MoveBookmark { name, to } => {
             let commit = resolve_mutation_target(tx.repo(), &current_wc_id, to).await?;
             let short = short_change_id(&commit);
-            tx.repo_mut()
-                .set_local_bookmark_target(RefName::new(name), RefTarget::normal(commit.id().clone()));
+            tx.repo_mut().set_local_bookmark_target(
+                RefName::new(name),
+                RefTarget::normal(commit.id().clone()),
+            );
             format!("Moved bookmark {name} to {short}")
         }
         MutationOp::DeleteBookmark { name } => {
@@ -976,7 +1071,10 @@ pub(crate) async fn apply_mutation(
             format!("Tracking {name}@{remote}")
         }
         MutationOp::PushBookmark { name, remote } => {
-            push_bookmark(&settings, tx.repo_mut(), name, remote)?
+            let (message, output) =
+                push_bookmark(&settings, tx.repo_mut(), name, remote, &progress)?;
+            push_output = output;
+            message
         }
     };
 
@@ -1018,6 +1116,7 @@ pub(crate) async fn apply_mutation(
     Ok(MutationOutcome {
         message,
         moved_working_copy,
+        output: push_output,
     })
 }
 
@@ -1054,7 +1153,8 @@ fn push_bookmark(
     repo: &mut MutableRepo,
     name: &str,
     remote: &str,
-) -> Result<String> {
+    progress: &LoadProgress,
+) -> Result<(String, Vec<String>)> {
     let ref_name = RefName::new(name);
     let remote_name = RemoteName::new(remote);
 
@@ -1078,7 +1178,7 @@ fn push_bookmark(
         .next()
         .cloned();
     if before == after {
-        return Ok(format!("{name} already up to date on {remote}"));
+        return Ok((format!("{name} already up to date on {remote}"), Vec::new()));
     }
 
     let subprocess_options = GitSubprocessOptions::from_settings(settings)
@@ -1086,7 +1186,9 @@ fn push_bookmark(
     let targets = GitPushRefTargets {
         bookmarks: vec![(RefNameBuf::from(name), Diff { before, after })],
     };
-    let mut callback = SilentPushCallback;
+    // Collect the remote sideband (GitHub's "create a pull request" hint + URL)
+    // for the activity log, and forward git's transfer progress to the bar.
+    let mut callback = CollectingCallback::new(progress.clone());
     let stats = push_refs(
         repo,
         subprocess_options,
@@ -1109,20 +1211,48 @@ fn push_bookmark(
         bail!("push rejected — {}", problems.join("; "));
     }
 
-    Ok(format!("Pushed {name} to {remote}"))
+    Ok((format!("Pushed {name} to {remote}"), callback.lines))
 }
 
-/// Quiet [`GitSubprocessCallback`] for pushes: no progress, sideband lines
-/// (which include credential-helper prompts and the remote's PR hints) are
-/// echoed to stderr for debugging but not surfaced in the UI.
-struct SilentPushCallback;
+/// Scale for mapping git's normalized [`GitProgress::overall`] (0..1) onto the
+/// integer `(loaded, total)` the activity bar reads. Arbitrary granularity.
+const GIT_PROGRESS_SCALE: usize = 1000;
 
-impl GitSubprocessCallback for SilentPushCallback {
+/// [`GitSubprocessCallback`] for push/fetch: captures the remote/local sideband
+/// lines git emits — shown in the activity's expanded row (a fetch's progress
+/// summary, or a push's GitHub "create a pull request" hint + URL) — and mirrors
+/// git's transfer progress onto the activity's [`LoadProgress`] so the toolbar
+/// shows a determinate bar while the transfer runs.
+struct CollectingCallback {
+    lines: Vec<String>,
+    progress: LoadProgress,
+}
+
+impl CollectingCallback {
+    fn new(progress: LoadProgress) -> Self {
+        Self {
+            lines: Vec::new(),
+            progress,
+        }
+    }
+}
+
+impl GitSubprocessCallback for CollectingCallback {
     fn needs_progress(&self) -> bool {
-        false
+        true
     }
 
-    fn progress(&mut self, _progress: &GitProgress) -> std::io::Result<()> {
+    fn progress(&mut self, progress: &GitProgress) -> std::io::Result<()> {
+        // git reports a running fraction; mirror it onto the activity's integer
+        // (loaded, total). Only set the total once there's real progress so the
+        // bar stays indeterminate (pulsing) until the transfer starts, rather
+        // than flashing a 0/0 determinate bar (see `Activity::determinate`).
+        let overall = progress.overall();
+        if overall > 0.0 {
+            self.progress.set_total(GIT_PROGRESS_SCALE);
+            let loaded = (overall * GIT_PROGRESS_SCALE as f32) as usize;
+            self.progress.set_loaded(loaded.min(GIT_PROGRESS_SCALE));
+        }
         Ok(())
     }
 
@@ -1131,9 +1261,7 @@ impl GitSubprocessCallback for SilentPushCallback {
         message: &[u8],
         _term: Option<GitSidebandLineTerminator>,
     ) -> std::io::Result<()> {
-        if !message.is_empty() {
-            eprint!("diffui push: {}", String::from_utf8_lossy(message));
-        }
+        collect_sideband_lines(&mut self.lines, message);
         Ok(())
     }
 
@@ -1142,10 +1270,243 @@ impl GitSubprocessCallback for SilentPushCallback {
         message: &[u8],
         _term: Option<GitSidebandLineTerminator>,
     ) -> std::io::Result<()> {
-        if !message.is_empty() {
-            eprint!("diffui push (remote): {}", String::from_utf8_lossy(message));
-        }
+        collect_sideband_lines(&mut self.lines, message);
         Ok(())
+    }
+}
+
+/// Split git sideband output into individual lines (git interleaves `\r` for
+/// progress redraws and `\n` for real lines), dropping blanks, so each entry is
+/// one display line in the activity's expanded output.
+fn collect_sideband_lines(lines: &mut Vec<String>, message: &[u8]) {
+    let text = String::from_utf8_lossy(message);
+    for piece in text.split(['\n', '\r']) {
+        let piece = piece.trim_end();
+        if !piece.is_empty() {
+            lines.push(piece.to_owned());
+        }
+    }
+}
+
+/// In-process `git fetch` via jj-lib: fetch the requested remote(s) / branch,
+/// import the new remote-tracking refs into the jj repo, and commit the
+/// resulting operation. Returns the captured sideband output.
+///
+/// jj-lib's [`GitFetch`] spawns `git fetch` under the hood, so authentication
+/// reuses the user's git credential setup (SSH agent, credential helper) —
+/// the same path the context-menu push takes.
+pub(crate) async fn fetch_jj(
+    repository: Repository,
+    target: FetchTarget,
+    progress: LoadProgress,
+) -> Result<Vec<String>> {
+    let settings = jj_settings(&repository.root)?;
+    let workspace = Workspace::load(
+        &settings,
+        &repository.root,
+        &StoreFactories::default(),
+        &default_working_copy_factories(),
+    )
+    .context("failed to load jj workspace")?;
+    let repo = workspace
+        .repo_loader()
+        .load_at_head()
+        .await
+        .context("failed to load jj repo")?;
+
+    let git_settings =
+        GitSettings::from_settings(&settings).context("failed to read git settings")?;
+    let import_options = GitImportOptions {
+        auto_local_bookmark: git_settings.auto_local_bookmark,
+        abandon_unreachable_commits: git_settings.abandon_unreachable_commits,
+        remote_auto_track_bookmarks: HashMap::new(),
+    };
+
+    // Resolve which remotes to fetch from.
+    let remotes: Vec<RemoteNameBuf> = match &target {
+        FetchTarget::AllRemotes => {
+            get_all_remote_names(repo.store()).context("failed to list git remotes")?
+        }
+        FetchTarget::RemoteBranch { remote, .. } => vec![RemoteName::new(remote).to_owned()],
+    };
+    if remotes.is_empty() {
+        bail!("no git remotes are configured");
+    }
+
+    let mut tx = repo.start_transaction();
+    let lines;
+    {
+        let mut fetcher = GitFetch::new(
+            tx.repo_mut(),
+            git_settings.to_subprocess_options(),
+            &import_options,
+        )
+        .context("failed to start git fetch")?;
+        let mut callback = CollectingCallback::new(progress.clone());
+        for remote in &remotes {
+            // All branches for a whole-remote fetch; the single branch for a
+            // targeted `name@remote` fetch.
+            let bookmark = match &target {
+                FetchTarget::AllRemotes => StringExpression::all(),
+                FetchTarget::RemoteBranch { branch, .. } => {
+                    StringExpression::pattern(StringPattern::exact(branch))
+                }
+            };
+            let ref_expr = GitFetchRefExpression {
+                bookmark,
+                tag: StringExpression::none(),
+            };
+            let refspecs = expand_fetch_refspecs(remote, ref_expr)
+                .context("failed to expand fetch refspecs")?;
+            fetcher
+                .fetch(remote, refspecs, &mut callback, None, None)
+                .with_context(|| format!("failed to fetch from {}", remote.as_str()))?;
+        }
+        fetcher
+            .import_refs()
+            .await
+            .context("failed to import fetched refs")?;
+        lines = callback.lines;
+    }
+    // import_refs can abandon now-unreachable commits; reconcile descendants
+    // before recording the op (a no-op when nothing changed).
+    tx.repo_mut()
+        .rebase_descendants()
+        .await
+        .context("failed to rebase descendants after fetch")?;
+    tx.commit("diffui: fetch")
+        .await
+        .context("failed to commit fetch")?;
+
+    if lines.is_empty() {
+        Ok(vec!["Fetch complete.".to_owned()])
+    } else {
+        Ok(lines)
+    }
+}
+
+/// In-process `jj undo`: restore the working state to the parent of the last
+/// meaningful operation, then check out the restored `@` so on-disk files
+/// match. Mirrors jj-cli's `cmd_undo` (restore-to-parent of the *view*, not a
+/// merge-revert), with two diffui-specific adaptations:
+///
+///   * **Skip diffui's own background snapshot ops.** diffui auto-snapshots the
+///     working copy on focus/refresh, so the head op is often a "pure snapshot".
+///     jj-cli's interactive undo rarely hits that; here we walk past snapshot
+///     ops (`metadata().is_snapshot`) so Undo targets the user's last real
+///     operation rather than a no-op snapshot.
+///   * We don't replicate the undo/redo *stack-walking* — repeated Undo simply
+///     toggles (undo, then undo-the-undo = redo). The op description uses jj's
+///     own `undo: restore to operation <id>` prefix, so the result still
+///     composes with the jj CLI's undo/redo.
+pub(crate) async fn undo_jj(repository: Repository) -> Result<Vec<String>> {
+    let settings = jj_settings(&repository.root)?;
+    let mut workspace = Workspace::load(
+        &settings,
+        &repository.root,
+        &StoreFactories::default(),
+        &default_working_copy_factories(),
+    )
+    .context("failed to load jj workspace")?;
+    let workspace_name = workspace.workspace_name().to_owned();
+
+    let repo_loader = workspace.repo_loader().clone();
+    let mut locked_ws = workspace
+        .start_working_copy_mutation()
+        .context("failed to lock jj working copy")?;
+    let base_repo = repo_loader
+        .load_at_head()
+        .await
+        .context("failed to load jj repo")?;
+
+    // Walk past diffui's background snapshot ops to the last meaningful op.
+    let mut op_to_undo = base_repo.operation().clone();
+    while op_to_undo.metadata().is_snapshot {
+        let parents = op_to_undo
+            .parents()
+            .await
+            .context("failed to read operation parents")?;
+        match parents.as_slice() {
+            [parent] => op_to_undo = parent.clone(),
+            _ => break,
+        }
+    }
+
+    let parents = op_to_undo
+        .parents()
+        .await
+        .context("failed to read operation parents")?;
+    let op_to_restore = match parents.as_slice() {
+        [parent] => parent.clone(),
+        [] => bail!("nothing to undo"),
+        _ => bail!("can't undo a merge operation"),
+    };
+
+    let undone_description = op_to_undo.metadata().description.clone();
+
+    // Restore the parent op's view (repo state + remote-tracking bookmarks),
+    // keeping the current git refs/head — exactly jj's DEFAULT_REVERT_WHAT.
+    let restored_view = op_to_restore
+        .view()
+        .await
+        .context("failed to load operation view")?;
+    let current_view = base_repo.view().store_view();
+    let new_view = restore_repo_and_remote_tracking(restored_view.store_view(), current_view);
+
+    let mut tx = base_repo.start_transaction();
+    tx.repo_mut().set_view(new_view);
+    let description = format!("undo: restore to operation {}", op_to_restore.id().hex());
+    let new_repo = tx
+        .commit(description)
+        .await
+        .context("failed to commit undo")?;
+
+    // Check out the restored `@` so the working-copy files match it.
+    let new_wc_id = new_repo
+        .view()
+        .get_wc_commit_id(&workspace_name)
+        .context("jj workspace has no working-copy commit after undo")?
+        .clone();
+    let new_wc_commit = new_repo
+        .store()
+        .get_commit_async(&new_wc_id)
+        .await
+        .with_context(|| format!("failed to load working-copy commit {}", new_wc_id.hex()))?;
+    locked_ws
+        .locked_wc()
+        .check_out(&new_wc_commit)
+        .await
+        .context("failed to check out working copy after undo")?;
+    locked_ws
+        .finish(new_repo.op_id().clone())
+        .await
+        .context("failed to finish working-copy mutation after undo")?;
+
+    let undone = if undone_description.is_empty() {
+        "operation".to_owned()
+    } else {
+        undone_description
+            .lines()
+            .next()
+            .unwrap_or("operation")
+            .to_owned()
+    };
+    Ok(vec![format!("Undid: {undone}")])
+}
+
+/// jj's `view_with_desired_portions_restored` for the default `undo` set
+/// (`Repo` + `RemoteTracking`): take heads, local bookmarks/tags, the
+/// working-copy pointer, and remote-tracking views from the op being restored,
+/// but keep the current git refs/head. Inlined so we don't depend on jj-cli.
+fn restore_repo_and_remote_tracking(restored: &View, current: &View) -> View {
+    View {
+        head_ids: restored.head_ids.clone(),
+        local_bookmarks: restored.local_bookmarks.clone(),
+        local_tags: restored.local_tags.clone(),
+        remote_views: restored.remote_views.clone(),
+        git_refs: current.git_refs.clone(),
+        git_head: current.git_head.clone(),
+        wc_commit_ids: restored.wc_commit_ids.clone(),
     }
 }
 
@@ -1386,6 +1747,88 @@ fn diff_tokens_to_string(tokens: Vec<(jj_lib::diff_presentation::DiffTokenType, 
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+#[cfg(test)]
+mod revset_tests {
+    use super::*;
+
+    fn settings() -> UserSettings {
+        UserSettings::from_config(StackedConfig::with_defaults()).expect("default settings")
+    }
+
+    #[test]
+    fn empty_and_all_are_accepted() {
+        let s = settings();
+        let root = Path::new("/tmp");
+        assert!(parse_user_revset(root, &s, "").is_ok());
+        assert!(parse_user_revset(root, &s, "   ").is_ok());
+        assert!(parse_user_revset(root, &s, "all()").is_ok());
+        assert!(parse_user_revset(root, &s, "  all()  ").is_ok());
+    }
+
+    #[test]
+    fn built_in_functions_and_working_copy_parse() {
+        let s = settings();
+        let root = Path::new("/tmp");
+        // `@` needs the workspace context; the preset functions are built-ins.
+        assert!(parse_user_revset(root, &s, "@").is_ok());
+        assert!(parse_user_revset(root, &s, "ancestors(@)").is_ok());
+        assert!(parse_user_revset(root, &s, "mine()").is_ok());
+        assert!(parse_user_revset(root, &s, "conflicts()").is_ok());
+    }
+
+    #[test]
+    fn malformed_revset_is_rejected() {
+        let s = settings();
+        let root = Path::new("/tmp");
+        assert!(parse_user_revset(root, &s, "(((").is_err());
+    }
+
+    /// Regression: a revset that excludes the working-copy commit must not panic
+    /// the graph walk (`prioritize_branch` on a missing node). `none()` excludes
+    /// everything, including `@`. Needs the diffui jj repo on disk, so it's
+    /// `#[ignore]`d — run with `cargo test -- --ignored excluding_revset`.
+    #[test]
+    #[ignore = "needs the diffui jj repo on disk"]
+    fn excluding_revset_loads_without_panicking() {
+        use crate::backend::LoadProgress;
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let result = runtime.block_on(super::load_jj_commits(
+            root,
+            "none()".to_owned(),
+            LoadProgress::default(),
+        ));
+        let (store, _graph, _branch, _bookmarks) = result.expect("none() should load, not panic");
+        assert_eq!(store.len(), 0, "none() should yield an empty graph");
+    }
+
+    /// Regression: the refresh path must load the user's jj config, not just
+    /// defaults — otherwise config-dependent revsets like `mine()` resolve
+    /// against an empty `user.email` and return nothing. Proves `jj_settings`
+    /// reads a real email distinct from the bare-defaults one.
+    #[test]
+    #[ignore = "needs the diffui jj repo + a configured user.email"]
+    fn refresh_path_loads_user_email() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let default_email = UserSettings::from_config(StackedConfig::with_defaults())
+            .expect("default settings")
+            .user_email()
+            .to_owned();
+        let loaded_email = super::jj_settings(&root)
+            .expect("jj settings")
+            .user_email()
+            .to_owned();
+        assert!(!loaded_email.is_empty(), "user.email should be configured");
+        assert_ne!(
+            loaded_email, default_email,
+            "jj_settings must load the user's email, not the bare default"
+        );
+    }
+}
+
 #[cfg(all(test, feature = "track-alloc"))]
 mod mem_profile {
     use crate::backend::LoadProgress;
@@ -1415,7 +1858,11 @@ mod mem_profile {
         PEAK.store(baseline, Relaxed);
 
         let (store, graph, _branch_status, _bookmarks) = runtime
-            .block_on(super::load_jj_commits(repo.clone().into(), progress))
+            .block_on(super::load_jj_commits(
+                repo.clone().into(),
+                "all()".to_owned(),
+                progress,
+            ))
             .expect("load commits");
 
         let peak = PEAK.load(Relaxed).saturating_sub(baseline);
@@ -1431,7 +1878,10 @@ mod mem_profile {
         eprintln!("repo            : {repo}");
         eprintln!("commits         : {}", store.len());
         eprintln!("transient peak  : {:>9.1} MB", mb(peak));
-        eprintln!("live after load : {:>9.1} MB  (allocator current)", mb(live));
+        eprintln!(
+            "live after load : {:>9.1} MB  (allocator current)",
+            mb(live)
+        );
         eprintln!("store.heap()    : {:>9.1} MB  (accounted)", mb(store_heap));
         eprintln!(
             "per commit      : store {:.0} B    peak {:.0} B",
@@ -1463,8 +1913,9 @@ mod lane_width_probe {
     #[test]
     #[ignore]
     fn profile_lane_width() {
-        let repo = std::env::var("DIFFUI_PROFILE_REPO")
-            .unwrap_or_else(|_| format!("{}/code/nixpkgs", std::env::var("HOME").expect("HOME set")));
+        let repo = std::env::var("DIFFUI_PROFILE_REPO").unwrap_or_else(|_| {
+            format!("{}/code/nixpkgs", std::env::var("HOME").expect("HOME set"))
+        });
         let root = std::path::PathBuf::from(&repo);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()

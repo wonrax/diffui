@@ -12,6 +12,7 @@
 //! silently degrades to defaults. Geometry is convenience state, never
 //! load-bearing, so we never surface an error or block the UI on it.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -49,6 +50,10 @@ pub struct WindowState {
     /// (or an unresolvable path) falls back to the first tab.
     #[serde(default)]
     pub active_repo: Option<String>,
+    /// Per-repository revset (jj) / revision-range (git), keyed by repo root.
+    /// Restored so each repo reopens with the filter the user last set.
+    #[serde(default)]
+    pub revsets: BTreeMap<String, String>,
 }
 
 impl WindowState {
@@ -205,6 +210,10 @@ mod tests {
             sidebar_width: Some(280.0),
             open_repos: vec!["/a/repo".to_owned(), "/b/repo".to_owned()],
             active_repo: Some("/b/repo".to_owned()),
+            revsets: BTreeMap::from([
+                ("/a/repo".to_owned(), "all()".to_owned()),
+                ("/b/repo".to_owned(), "mine()".to_owned()),
+            ]),
         };
         let raw = toml::to_string(&state).expect("serialize");
         let parsed: WindowState = toml::from_str(&raw).expect("deserialize");
@@ -216,6 +225,10 @@ mod tests {
             vec!["/a/repo".to_owned(), "/b/repo".to_owned()]
         );
         assert_eq!(parsed.active_repo.as_deref(), Some("/b/repo"));
+        assert_eq!(
+            parsed.revsets.get("/b/repo").map(String::as_str),
+            Some("mine()")
+        );
     }
 
     #[test]

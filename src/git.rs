@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail};
 use jj_lib::graph::GraphEdge;
 use tokio::process::Command;
 
+use crate::FetchTarget;
 use crate::backend::{
     CommitSummary, DiffDocument, RevisionDetails, RevisionSelection, SignatureInfo,
     parse_unified_diff,
@@ -31,17 +32,17 @@ pub async fn load_git_diff(
 
 pub async fn load_git_commits(
     repository: &Repository,
+    revision_range: &str,
 ) -> Result<(Vec<CommitSummary>, GraphLayout)> {
-    let output = run_command(
-        &repository.root,
-        "git",
-        vec![
-            OsString::from("log"),
-            OsString::from("--topo-order"),
-            OsString::from("--pretty=format:%h%x09%H%x09%P%x09%an%x09%x09%s"),
-        ],
-    )
-    .await?;
+    // The revision range is the git analog of the jj revset: extra `git log`
+    // arguments (e.g. `--all`, `main..HEAD`). Empty keeps the default (the
+    // current branch's history).
+    let mut args = vec![OsString::from("log"), OsString::from("--topo-order")];
+    args.extend(revision_range.split_whitespace().map(OsString::from));
+    args.push(OsString::from(
+        "--pretty=format:%h%x09%H%x09%P%x09%an%x09%x09%s",
+    ));
+    let output = run_command(&repository.root, "git", args).await?;
 
     let mut rows = parse_commit_log_rows(&output);
     // Git has no native @ commit, so synthesize a working-copy row at
@@ -112,6 +113,65 @@ fn git_backend_command(repository: &Repository, revision: &RevisionSelection) ->
     }
 
     args
+}
+
+/// `git fetch` (all remotes, or a single remote/branch). Captures both stdout
+/// and stderr as lines for the activity log — git writes progress and remote
+/// messages to stderr even on success.
+pub async fn fetch_git(repository: &Repository, target: &FetchTarget) -> Result<Vec<String>> {
+    let args: Vec<OsString> = match target {
+        FetchTarget::AllRemotes => {
+            vec![OsString::from("fetch"), OsString::from("--all")]
+        }
+        FetchTarget::RemoteBranch { remote, branch } => vec![
+            OsString::from("fetch"),
+            OsString::from(remote),
+            OsString::from(branch),
+        ],
+    };
+    let lines = run_command_lines(&repository.root, "git", args).await?;
+    if lines.is_empty() {
+        Ok(vec!["Fetch complete.".to_owned()])
+    } else {
+        Ok(lines)
+    }
+}
+
+/// Run a command and return its combined stdout+stderr split into non-empty
+/// lines, regardless of exit status — used where the interesting output (git's
+/// progress / remote sideband) lands on stderr even on success. Still errors on
+/// a non-zero exit, surfacing the captured lines.
+async fn run_command_lines(
+    current_dir: &Path,
+    program: &str,
+    args: Vec<OsString>,
+) -> Result<Vec<String>> {
+    let output = Command::new(program)
+        .args(args)
+        .current_dir(current_dir)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .with_context(|| format!("failed to execute {program}"))?;
+
+    let mut lines = Vec::new();
+    for chunk in [&output.stdout, &output.stderr] {
+        for line in String::from_utf8_lossy(chunk).split(['\n', '\r']) {
+            let line = line.trim_end();
+            if !line.is_empty() {
+                lines.push(line.to_owned());
+            }
+        }
+    }
+
+    if !output.status.success() {
+        bail!(
+            "{program} exited with {}: {}",
+            output.status,
+            lines.join("; ")
+        );
+    }
+    Ok(lines)
 }
 
 async fn run_command(current_dir: &Path, program: &str, args: Vec<OsString>) -> Result<String> {
