@@ -219,6 +219,8 @@ pub struct RevisionList<'a, Message> {
     reveal_token: Option<u64>,
     on_select_revision: fn(RowSelectionKey) -> Message,
     on_select_file: fn(usize) -> Message,
+    /// Optional right-click handler for a revision row — opens the context menu.
+    on_context_menu: Option<fn(RowSelectionKey) -> Message>,
 }
 
 impl<'a, Message> RevisionList<'a, Message> {
@@ -248,11 +250,18 @@ impl<'a, Message> RevisionList<'a, Message> {
             reveal_token: None,
             on_select_revision,
             on_select_file,
+            on_context_menu: None,
         }
     }
 
     pub fn width(mut self, width: Length) -> Self {
         self.width = width;
+        self
+    }
+
+    /// Register a right-click handler for revision rows (the context menu).
+    pub fn on_context_menu(mut self, callback: fn(RowSelectionKey) -> Message) -> Self {
+        self.on_context_menu = Some(callback);
         self
     }
 
@@ -676,6 +685,22 @@ where
                 if let scrollbar::ScrollbarEvent::Captured =
                     scrollbar::on_button_released(&mut state.scrollbar)
                 {
+                    shell.capture_event();
+                }
+            }
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
+                let Some(callback) = self.on_context_menu else {
+                    return;
+                };
+                let Some(cursor_pos) = cursor.position_over(bounds) else {
+                    return;
+                };
+                let local_y = (cursor_pos.y - bounds.y) as f64 + state.vertical_offset;
+                // Only revision rows get a context menu — file rows don't.
+                if let Some(row_idx) = self.row_at_offset(local_y)
+                    && let Item::Revision(rev) = self.item_at(row_idx)
+                {
+                    shell.publish(callback(rev.selection_key));
                     shell.capture_event();
                 }
             }

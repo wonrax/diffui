@@ -16,6 +16,9 @@ mod graph;
 mod graph_layout;
 mod graph_view;
 mod jj;
+#[cfg(target_os = "macos")]
+mod macos_native;
+mod mutations;
 mod palette;
 mod repository;
 mod resize_handle;
@@ -463,6 +466,10 @@ pub(crate) enum Message {
     EmptyStatusComputed(u64, Vec<(usize, bool)>),
     SelectFile(usize),
     SelectRowKey(revision_list::RowSelectionKey),
+    /// Right-click on a revision row — opens the native context menu.
+    RevisionContextMenu(revision_list::RowSelectionKey),
+    /// A context-menu mutation (new/edit/abandon) finished.
+    MutationCompleted(Box<Result<mutations::MutationOutcome, String>>),
     SelectTheme(ThemePreference),
     SystemThemeChanged(iced_theme::Mode),
     WindowFocusChanged(bool),
@@ -987,6 +994,33 @@ impl Diffui {
             Message::SystemThemeChanged(theme) => {
                 self.system_theme = theme;
             }
+            Message::RevisionContextMenu(key) => {
+                let selection = match key {
+                    revision_list::RowSelectionKey::WorkingCopy => RevisionSelection::WorkingCopy,
+                    revision_list::RowSelectionKey::Commit(id) => RevisionSelection::Commit(id),
+                };
+                let Some(repository) = self.repository.clone() else {
+                    return Task::none();
+                };
+                // jj-only for now — the mutations are jj-lib transactions.
+                if !matches!(repository.vcs, Vcs::Jj) {
+                    return Task::none();
+                }
+                return self.open_revision_context_menu(repository, selection);
+            }
+            Message::MutationCompleted(result) => match *result {
+                Ok(outcome) => {
+                    eprintln!("diffui: {}", outcome.message);
+                    // The mutation moved/rewrote commits — reload the graph.
+                    // Reset to the working copy: edit/new move `@`, and abandon
+                    // may remove the previously-selected commit.
+                    self.selected_revision = RevisionSelection::WorkingCopy;
+                    return self.start_repository_snapshot(RefreshOrigin::Focus);
+                }
+                Err(error) => {
+                    self.status = LoadStatus::Failed(error);
+                }
+            },
             Message::WindowFocusChanged(focused) => {
                 let gained_focus = focused && !self.app_focused;
                 let lost_focus = !focused && self.app_focused;
@@ -1586,6 +1620,38 @@ impl Diffui {
         Task::perform(load_repository_snapshot(repository), move |result| {
             Message::RepositorySnapshotLoaded(origin, result.map_err(|error| format!("{error:#}")))
         })
+    }
+
+    /// Show the native context menu for a right-clicked revision and dispatch
+    /// the chosen mutation. `popup_menu` blocks (a nested `NSMenu` loop) on the
+    /// main thread until the user picks — fine for a modal menu — then the
+    /// mutation itself runs off-thread.
+    #[cfg(target_os = "macos")]
+    fn open_revision_context_menu(
+        &self,
+        repository: Repository,
+        selection: RevisionSelection,
+    ) -> Task<Message> {
+        let op = match macos_native::popup_menu(&["New", "Edit", "Abandon"]) {
+            Some(0) => mutations::MutationOp::New { parent: selection },
+            Some(1) => mutations::MutationOp::Edit { target: selection },
+            Some(2) => mutations::MutationOp::Abandon { target: selection },
+            _ => return Task::none(),
+        };
+        Task::perform(mutations::run_mutation(repository, op), |result| {
+            Message::MutationCompleted(Box::new(result))
+        })
+    }
+
+    /// Non-macOS stub: the native popup isn't available, so right-click is a
+    /// no-op for now (the mutations themselves are portable).
+    #[cfg(not(target_os = "macos"))]
+    fn open_revision_context_menu(
+        &self,
+        _repository: Repository,
+        _selection: RevisionSelection,
+    ) -> Task<Message> {
+        Task::none()
     }
 
     /// Resolve the merge/root commits the loader left with unknown empty

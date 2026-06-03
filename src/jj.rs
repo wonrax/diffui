@@ -10,6 +10,7 @@ use bstr::BStr;
 use futures::StreamExt;
 use jj_lib::{
     backend::{CommitId, TreeId},
+    commit::Commit,
     config::{ConfigSource, StackedConfig},
     conflicts::{ConflictMarkerStyle, ConflictMaterializeOptions, materialized_diff_stream},
     copies::CopyRecords,
@@ -27,9 +28,10 @@ use jj_lib::{
     matchers::{EverythingMatcher, Matcher, NothingMatcher, PrefixMatcher},
     merge::{Diff, Merge, SameChange},
     object_id::ObjectId,
-    repo::{ReadonlyRepo, Repo, StoreFactories},
+    repo::{MutableRepo, ReadonlyRepo, Repo, StoreFactories},
     repo_path::{RepoPath, RepoPathBuf, RepoPathUiConverter},
     revset::{RevsetExpression, SymbolResolver, UserRevsetExpression},
+    rewrite::merge_commit_trees,
     settings::{HumanByteSize, UserSettings},
     tree_merge::MergeOptions,
     working_copy::SnapshotOptions,
@@ -43,6 +45,7 @@ use crate::backend::{
 };
 use crate::graph::LaneAssigner;
 use crate::graph_layout::{GraphLayout, LaneFoldState};
+use crate::mutations::{MutationOp, MutationOutcome};
 use crate::repository::{Repository, RepositorySnapshot};
 
 // Fallback used only when the user has not configured `snapshot.max-new-file-size`.
@@ -765,6 +768,190 @@ pub async fn load_jj_repository_snapshot(
     Ok((snapshot, new_repo, new_wc_commit_id))
 }
 
+/// Apply a revision-context-menu mutation (`new` / `edit` / `abandon`) and
+/// reconcile the working copy on disk.
+///
+/// One locked working-copy session does the whole thing, mirroring what `jj`
+/// itself runs: snapshot the current on-disk state into `@` (so uncommitted
+/// work survives `@` moving), apply the mutation in a transaction, then check
+/// out the resulting `@` so the files on disk match it. Skipping the checkout
+/// would leave the old files in place, and the next snapshot would record them
+/// into the moved-to commit.
+pub(crate) async fn apply_mutation(
+    repository: Repository,
+    op: MutationOp,
+) -> Result<MutationOutcome> {
+    let settings = jj_settings(&repository.root)?;
+    let mut workspace = Workspace::load(
+        &settings,
+        &repository.root,
+        &StoreFactories::default(),
+        &default_working_copy_factories(),
+    )
+    .context("failed to load jj workspace")?;
+    let workspace_name = workspace.workspace_name().to_owned();
+
+    let auto_track = snapshot_auto_track_matcher(&settings, &repository.root)?;
+    let base_ignores = snapshot_base_ignores(&repository.root)?;
+    let max_new_file_size = snapshot_max_new_file_size(&settings)?;
+
+    let repo_loader = workspace.repo_loader().clone();
+    let mut locked_ws = workspace
+        .start_working_copy_mutation()
+        .context("failed to lock jj working copy")?;
+    let base_repo = repo_loader
+        .load_at_head()
+        .await
+        .context("failed to load jj repo")?;
+
+    let wc_commit_id = base_repo
+        .view()
+        .get_wc_commit_id(&workspace_name)
+        .context("jj workspace has no working-copy commit")?
+        .clone();
+    let wc_commit = base_repo
+        .store()
+        .get_commit_async(&wc_commit_id)
+        .await
+        .with_context(|| format!("failed to load jj working-copy commit {}", wc_commit_id.hex()))?;
+
+    let snapshot_options = SnapshotOptions {
+        base_ignores,
+        progress: None,
+        start_tracking_matcher: auto_track.as_ref(),
+        force_tracking_matcher: &NothingMatcher,
+        max_new_file_size,
+    };
+    let (new_tree, _stats) = locked_ws
+        .locked_wc()
+        .snapshot(&snapshot_options)
+        .await
+        .context("failed to snapshot jj working copy")?;
+
+    let mut tx = base_repo.start_transaction();
+
+    // Fold any uncommitted on-disk changes into `@` first so moving off it
+    // doesn't lose them.
+    if new_tree.tree_ids_and_labels() != wc_commit.tree().tree_ids_and_labels() {
+        let rewritten = tx
+            .repo_mut()
+            .rewrite_commit(&wc_commit)
+            .set_tree(new_tree)
+            .write()
+            .await
+            .context("failed to fold working-copy changes before mutation")?;
+        tx.repo_mut()
+            .set_wc_commit(workspace_name.clone(), rewritten.id().clone())
+            .context("failed to update working-copy pointer before mutation")?;
+        tx.repo_mut()
+            .rebase_descendants()
+            .await
+            .context("failed to rebase descendants after working-copy fold")?;
+    }
+
+    // The post-fold `@`, used to resolve a `WorkingCopy` target after the fold
+    // may have rewritten it.
+    let current_wc_id = tx
+        .repo()
+        .view()
+        .get_wc_commit_id(&workspace_name)
+        .context("jj workspace has no working-copy commit")?
+        .clone();
+
+    let message = match &op {
+        MutationOp::New { parent } => {
+            let parent_commit = resolve_mutation_target(tx.repo(), &current_wc_id, parent).await?;
+            let short = short_change_id(&parent_commit);
+            // Single parent: `merge_commit_trees` returns the parent's tree.
+            let tree = merge_commit_trees(tx.repo(), std::slice::from_ref(&parent_commit))
+                .await
+                .context("failed to build tree for new commit")?;
+            let new_commit = tx
+                .repo_mut()
+                .new_commit(vec![parent_commit.id().clone()], tree)
+                .write()
+                .await
+                .context("failed to write new commit")?;
+            tx.repo_mut()
+                .edit(workspace_name.clone(), &new_commit)
+                .await
+                .context("failed to point working copy at new commit")?;
+            format!("New change on {short}")
+        }
+        MutationOp::Edit { target } => {
+            let commit = resolve_mutation_target(tx.repo(), &current_wc_id, target).await?;
+            let short = short_change_id(&commit);
+            tx.repo_mut()
+                .edit(workspace_name.clone(), &commit)
+                .await
+                .context("failed to set working copy to target commit")?;
+            format!("Working copy now at {short}")
+        }
+        MutationOp::Abandon { target } => {
+            let commit = resolve_mutation_target(tx.repo(), &current_wc_id, target).await?;
+            let short = short_change_id(&commit);
+            tx.repo_mut().record_abandoned_commit(&commit);
+            format!("Abandoned {short}")
+        }
+    };
+
+    tx.repo_mut()
+        .rebase_descendants()
+        .await
+        .context("failed to rebase descendants after mutation")?;
+
+    let new_repo = tx
+        .commit(format!("diffui: {message}"))
+        .await
+        .context("failed to commit mutation transaction")?;
+
+    // Check out the resulting `@` so the on-disk files match it.
+    let new_wc_id = new_repo
+        .view()
+        .get_wc_commit_id(&workspace_name)
+        .context("jj workspace has no working-copy commit after mutation")?
+        .clone();
+    let new_wc_commit = new_repo
+        .store()
+        .get_commit_async(&new_wc_id)
+        .await
+        .with_context(|| format!("failed to load new working-copy commit {}", new_wc_id.hex()))?;
+    locked_ws
+        .locked_wc()
+        .check_out(&new_wc_commit)
+        .await
+        .context("failed to check out new working copy")?;
+    locked_ws
+        .finish(new_repo.op_id().clone())
+        .await
+        .context("failed to finish working-copy mutation")?;
+
+    Ok(MutationOutcome { message })
+}
+
+/// Resolve a `RevisionSelection` to a `Commit`. The working-copy case uses
+/// `current_wc_id` (the post-snapshot `@`).
+async fn resolve_mutation_target(
+    repo: &MutableRepo,
+    current_wc_id: &CommitId,
+    target: &RevisionSelection,
+) -> Result<Commit> {
+    let commit_id = match target {
+        RevisionSelection::WorkingCopy => current_wc_id.clone(),
+        RevisionSelection::Commit(hex) => {
+            CommitId::try_from_hex(hex).with_context(|| format!("invalid jj commit id {hex}"))?
+        }
+    };
+    repo.store()
+        .get_commit_async(&commit_id)
+        .await
+        .with_context(|| format!("failed to load jj commit {}", commit_id.hex()))
+}
+
+fn short_change_id(commit: &Commit) -> String {
+    commit.change_id().hex().chars().take(8).collect()
+}
+
 fn jj_revision_details(repo: &dyn Repo, commit: &jj_lib::commit::Commit) -> RevisionDetails {
     let commit_id = commit.id().clone();
     let change_id = commit.change_id().to_string();
@@ -847,7 +1034,7 @@ fn civil_date_from_days(days: i64) -> (i32, u32, u32) {
     (year as i32, month, day)
 }
 
-fn jj_settings(repo_root: &Path) -> Result<UserSettings> {
+pub(crate) fn jj_settings(repo_root: &Path) -> Result<UserSettings> {
     let mut config = StackedConfig::with_defaults();
 
     for path in jj_user_config_paths() {
