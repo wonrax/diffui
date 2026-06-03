@@ -6,7 +6,7 @@ use iced::{
 use crate::backend::{RevisionDetails, SignatureInfo};
 use crate::diff_view::{self, DiffFileView, DiffView};
 use crate::find;
-use crate::theme::{ThemeSpec, diff_palette, diff_panel_style};
+use crate::theme::{ThemeSpec, chip_background, diff_palette, diff_panel_style};
 use crate::{Diffui, LoadStatus, Message};
 
 const CODE_TEXT_SIZE: f32 = 12.0;
@@ -56,10 +56,11 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
                 })
                 .collect::<Vec<_>>();
 
+            let bookmark_color = selected_lane_color(ui, theme);
             let header_lines = ui
                 .revision_details
                 .as_ref()
-                .map(build_header_lines)
+                .map(|details| build_header_lines(details, bookmark_color))
                 .unwrap_or_default();
 
             let stats_bar = build_stats_bar(ui, theme);
@@ -155,12 +156,26 @@ fn format_file_count(count: usize) -> String {
     }
 }
 
+/// The lane color of the currently-selected commit — the same color the
+/// sidebar paints that commit's bookmark chips, so the diff-view chips match.
+/// Falls back to the accent when there's no selected row yet.
+fn selected_lane_color(ui: &Diffui, theme: ThemeSpec) -> Color {
+    let style = crate::graph_view::RevisionGraphStyle {
+        lane_base_color: theme.lane_base,
+        missing_color: theme.subtle_text,
+    };
+    ui.selected_commit_index
+        .filter(|&index| index < ui.commits.len())
+        .map(|index| style.lane_color(ui.graph.frame(index, usize::MAX).node_lane))
+        .unwrap_or(theme.accent)
+}
+
 /// Format a `RevisionDetails` value into the line-by-line layout the diff
 /// view renders at the top of its scroll area. Mirrors `jj show`'s
 /// formatting: labels padded to 9 chars, blank line between the metadata
 /// block and the indented description.
-fn build_header_lines(details: &RevisionDetails) -> Vec<diff_view::HeaderLine> {
-    use diff_view::HeaderLine;
+fn build_header_lines(details: &RevisionDetails, bookmark_color: Color) -> Vec<diff_view::HeaderLine> {
+    use diff_view::{HeaderChip, HeaderLine};
     let mut lines: Vec<HeaderLine> = Vec::new();
 
     lines.push(HeaderLine::field("Commit ID", &details.commit_id));
@@ -168,7 +183,26 @@ fn build_header_lines(details: &RevisionDetails) -> Vec<diff_view::HeaderLine> {
         lines.push(HeaderLine::field("Change ID", change_id));
     }
     if !details.bookmarks.is_empty() {
-        lines.push(HeaderLine::field("Bookmarks", &details.bookmarks.join(" ")));
+        // Chips match the sidebar: a tint of the commit's lane color for local
+        // bookmarks, outlined for remote (`name@remote`) ones.
+        let chips = details
+            .bookmarks
+            .iter()
+            .map(|bookmark| {
+                let is_remote = bookmark.contains('@');
+                HeaderChip {
+                    label: bookmark.clone(),
+                    fill: if is_remote {
+                        Color::TRANSPARENT
+                    } else {
+                        chip_background(bookmark_color)
+                    },
+                    text: bookmark_color,
+                    border: is_remote.then_some(bookmark_color),
+                }
+            })
+            .collect();
+        lines.push(HeaderLine::bookmarks("Bookmarks", chips));
     }
     lines.push(HeaderLine::field(
         "Author",

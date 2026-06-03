@@ -39,6 +39,9 @@ const HEADER_HORIZONTAL_PADDING: f32 = 14.0;
 // Space drawn between the label column and the value column so the colon
 // sits a hair away from the value text.
 const HEADER_LABEL_GAP: f32 = 6.0;
+// Description lines are indented by this many monospace columns under the
+// metadata block (matches the four-space indent jj uses).
+const HEADER_DESCRIPTION_INDENT: f32 = 4.0;
 // Click within this distance of the previous click counts as a multi-click
 // rather than a fresh selection anchor.
 const MULTI_CLICK_RADIUS: f32 = 4.0;
@@ -111,12 +114,30 @@ pub enum HeaderLine {
     /// `label` field is the rendered label including its trailing colon
     /// (e.g. `"Commit ID:"`), padded to the column width by the caller.
     Field { label: String, value: String },
+    /// Bookmarks rendered as colored chips that match the sidebar. The chips'
+    /// colors are resolved by the caller (the selected commit's lane color);
+    /// remote `name@remote` bookmarks render outlined.
+    Bookmarks {
+        label: String,
+        chips: Vec<HeaderChip>,
+    },
     /// A line of the description, rendered indented under the metadata
     /// block. Stored without indentation; the renderer prepends four
     /// spaces.
     Description(String),
     /// Blank separator between the metadata block and the description.
     Blank,
+}
+
+/// One bookmark chip in the revision header, with its styling pre-resolved so
+/// the renderer just paints it. Mirrors the sidebar's `IndicatorChip`.
+#[derive(Debug, Clone)]
+pub struct HeaderChip {
+    pub label: String,
+    pub fill: Color,
+    pub text: Color,
+    /// `Some` for outlined (remote) chips; `None` for filled (local) ones.
+    pub border: Option<Color>,
 }
 
 impl HeaderLine {
@@ -127,6 +148,15 @@ impl HeaderLine {
         Self::Field {
             label: format!("{label:<9}:"),
             value: value.to_owned(),
+        }
+    }
+
+    /// Bookmarks row — `label` padded like `field` so it aligns with the
+    /// metadata column.
+    pub fn bookmarks(label: &str, chips: Vec<HeaderChip>) -> Self {
+        Self::Bookmarks {
+            label: format!("{label:<9}:"),
+            chips,
         }
     }
 
@@ -317,12 +347,48 @@ struct State<Paragraph> {
 /// across scrolling, file selection, and re-renders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct TextPosition {
+    /// Which part of the document the position is in. Ordered first so every
+    /// header position sorts before every body position — the revision header
+    /// sits above the diff body.
+    region: Region,
+    /// `Body`: the file index. Unused (`0`) for `Header`.
     file_index: usize,
+    /// `Body`: the hunk index. Unused (`0`) for `Header`.
     hunk_index: usize,
+    /// `Body`: the line within the hunk. `Header`: the header-line index.
     line_index: usize,
-    /// Byte offset within `line.content`. Bytes (not chars) so we can slice
-    /// the source string directly when copying.
+    /// Byte offset within the line's selectable text. Bytes (not chars) so we
+    /// can slice the source string directly when copying.
     byte: usize,
+}
+
+/// Which selectable region of the diff document a `TextPosition` lives in.
+/// `Header` (the `jj show`-style revision metadata) sorts before `Body` (the
+/// file diffs), matching their visual stacking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Region {
+    Header,
+    Body,
+}
+
+fn header_position(line_index: usize, byte: usize) -> TextPosition {
+    TextPosition {
+        region: Region::Header,
+        file_index: 0,
+        hunk_index: 0,
+        line_index,
+        byte,
+    }
+}
+
+fn body_position(file_index: usize, hunk_index: usize, line_index: usize, byte: usize) -> TextPosition {
+    TextPosition {
+        region: Region::Body,
+        file_index,
+        hunk_index,
+        line_index,
+        byte,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -425,6 +491,128 @@ impl<'a, Message> DiffView<'a, Message> {
             0.0
         } else {
             self.header.len() as f32 * self.metrics.row_height + HEADER_VERTICAL_PADDING * 2.0
+        }
+    }
+
+    /// The selectable text of header line `index`, if any — field *values* and
+    /// description lines. Labels, bookmark chips, and blank lines are not.
+    fn header_selectable_text(&self, index: usize) -> Option<&str> {
+        match self.header.get(index)? {
+            HeaderLine::Field { value, .. } => Some(value),
+            HeaderLine::Description(line) => Some(line),
+            _ => None,
+        }
+    }
+
+    /// The x where header field values begin — left edge + the (padded) label
+    /// column + gap. Mirrors `draw_revision_header`'s layout so hit-testing and
+    /// selection rendering land on the same glyphs the renderer drew.
+    fn header_value_x(&self, bounds: Rectangle) -> f32 {
+        let left_x = bounds.x + HEADER_HORIZONTAL_PADDING;
+        let label_width = self
+            .header
+            .iter()
+            .find_map(|line| match line {
+                HeaderLine::Field { label, .. } => Some(self.text_width(label)),
+                _ => None,
+            })
+            .unwrap_or(0.0);
+        left_x + label_width + HEADER_LABEL_GAP
+    }
+
+    /// Screen-x where header line `index`'s selectable text starts: the value
+    /// column for fields, or the indented column for description lines.
+    fn header_text_origin_x(&self, index: usize, bounds: Rectangle) -> f32 {
+        match self.header.get(index) {
+            Some(HeaderLine::Description(_)) => {
+                bounds.x
+                    + HEADER_HORIZONTAL_PADDING
+                    + HEADER_DESCRIPTION_INDENT * self.metrics.char_width
+            }
+            _ => self.header_value_x(bounds),
+        }
+    }
+
+    /// Paint the selection tint behind a header line's selectable `text` at
+    /// `origin_x` / `y`. Drawn before the text so the glyphs sit on top, like
+    /// the diff body. No-op when nothing is selected on this line.
+    fn draw_header_value_selection<Renderer>(
+        &self,
+        renderer: &mut Renderer,
+        line_index: usize,
+        text: &str,
+        origin_x: f32,
+        y: f32,
+        selection: Option<(TextPosition, TextPosition)>,
+    ) where
+        Renderer: renderer::Renderer,
+    {
+        let Some((sel_start, sel_end)) = selection else {
+            return;
+        };
+        let pos_start = header_position(line_index, 0);
+        let pos_end = header_position(line_index, text.len());
+        if pos_end < sel_start || pos_start >= sel_end {
+            return;
+        }
+        let start_byte = if pos_start < sel_start { sel_start.byte } else { 0 };
+        let end_byte = if pos_end > sel_end { sel_end.byte } else { text.len() };
+        let start_chars = char_count_at_byte(text, start_byte);
+        let end_chars = char_count_at_byte(text, end_byte);
+        if end_chars > start_chars {
+            let cw = self.metrics.char_width;
+            self.draw_background(
+                renderer,
+                origin_x + start_chars as f32 * cw,
+                y,
+                (end_chars - start_chars) as f32 * cw,
+                self.metrics.row_height,
+                self.palette.selection,
+            );
+        }
+    }
+
+    /// Expand `pos` to cover the unit (word or line) that contains it, in
+    /// either the header or the body. Character mode is a no-op.
+    fn expand_to_unit(&self, pos: TextPosition, unit: SelectionUnit) -> (TextPosition, TextPosition) {
+        let text: &str = match pos.region {
+            Region::Header => match self.header_selectable_text(pos.line_index) {
+                Some(text) => text,
+                None => return (pos, pos),
+            },
+            Region::Body => match self
+                .files
+                .get(pos.file_index)
+                .and_then(|file| file.hunks.get(pos.hunk_index))
+                .and_then(|hunk| hunk.lines.get(pos.line_index))
+            {
+                Some(line) => &line.content,
+                None => return (pos, pos),
+            },
+        };
+
+        match unit {
+            SelectionUnit::Character => (pos, pos),
+            SelectionUnit::Line => (
+                TextPosition { byte: 0, ..pos },
+                TextPosition {
+                    byte: text.len(),
+                    ..pos
+                },
+            ),
+            SelectionUnit::Word => {
+                let (start_byte, end_byte) = word_bounds(text, pos.byte);
+                (
+                    TextPosition {
+                        byte: start_byte,
+                        ..pos
+                    },
+                    TextPosition {
+                        byte: end_byte,
+                        ..pos
+                    },
+                )
+            }
         }
     }
 
@@ -602,10 +790,33 @@ impl<'a, Message> DiffView<'a, Message> {
         let content_width = self.content_width(bounds.width);
         let text_x = bounds.x + self.metrics.gutter_width + PREFIX_WIDTH + TEXT_X_PADDING;
         let target_y = point.y - bounds.y + vertical_offset;
-        // The header sits above all file content; skip past it before
-        // walking files so a click on the header doesn't try to position
-        // inside the diff body.
-        let mut content_y = self.header_height();
+        let header_height = self.header_height();
+
+        // The header sits above all file content. Field values (Commit ID,
+        // Author, …) are selectable; clicks on labels, bookmark chips, or blank
+        // lines return `None`.
+        if header_height > 0.0 && target_y < header_height {
+            let line_offset = (target_y - HEADER_VERTICAL_PADDING) / self.metrics.row_height;
+            if line_offset < 0.0 {
+                return None;
+            }
+            let line_index = line_offset.floor() as usize;
+            let text = self.header_selectable_text(line_index)?;
+            let origin_x = self.header_text_origin_x(line_index, bounds);
+            let char_count = text.chars().count();
+            let relative_x = (point.x - origin_x).max(0.0);
+            let char_offset =
+                ((relative_x / self.metrics.char_width + 0.5).floor() as usize).min(char_count);
+            return Some(TextPosition {
+                region: Region::Header,
+                file_index: 0,
+                hunk_index: 0,
+                line_index,
+                byte: byte_offset_for_char(text, char_offset),
+            });
+        }
+
+        let mut content_y = header_height;
         let mut last_row: Option<(usize, usize, usize, f32, f32, usize)> = None;
 
         for (file_index, file) in self.files.iter().enumerate() {
@@ -637,6 +848,7 @@ impl<'a, Message> DiffView<'a, Message> {
                         let char_offset = (line_char_start + local_char).min(char_count);
                         let byte = byte_offset_for_char(&line.content, char_offset);
                         return Some(TextPosition {
+                            region: Region::Body,
                             file_index,
                             hunk_index,
                             line_index,
@@ -655,6 +867,7 @@ impl<'a, Message> DiffView<'a, Message> {
                 let line = &self.files[file_index].hunks[hunk_index].lines[line_index];
                 let byte = byte_offset_for_char(&line.content, char_count);
                 TextPosition {
+                    region: Region::Body,
                     file_index,
                     hunk_index,
                     line_index,
@@ -675,44 +888,44 @@ impl<'a, Message> DiffView<'a, Message> {
         let mut output = String::new();
         let mut first = true;
 
+        // Slice one logical line's selectable `text` against the selection and
+        // append the covered part. Shared by the header and body passes.
+        let mut emit = |text: &str, pos_start: TextPosition, pos_end: TextPosition| {
+            if pos_end < start || pos_start >= end {
+                return;
+            }
+            let line_start = if pos_start < start { start.byte } else { 0 };
+            let line_end = if pos_end > end { end.byte } else { text.len() };
+            let line_start = line_start.min(text.len());
+            let line_end = line_end.min(text.len()).max(line_start);
+
+            if !first {
+                output.push('\n');
+            }
+            first = false;
+
+            if text.is_char_boundary(line_start) && text.is_char_boundary(line_end) {
+                output.push_str(&text[line_start..line_end]);
+            }
+        };
+
+        // Header field values sort before the body (Region::Header < Body).
+        for line_index in 0..self.header.len() {
+            if let Some(text) = self.header_selectable_text(line_index) {
+                let pos_start = header_position(line_index, 0);
+                let pos_end = header_position(line_index, text.len());
+                emit(text, pos_start, pos_end);
+            }
+        }
+
+        // Then the diff body, in document order.
         for (file_index, file) in self.files.iter().enumerate() {
             for (hunk_index, hunk) in file.hunks.iter().enumerate() {
                 for (line_index, line) in hunk.lines.iter().enumerate() {
-                    let pos_start = TextPosition {
-                        file_index,
-                        hunk_index,
-                        line_index,
-                        byte: 0,
-                    };
-                    let pos_end = TextPosition {
-                        file_index,
-                        hunk_index,
-                        line_index,
-                        byte: line.content.len(),
-                    };
-                    if pos_end < start || pos_start >= end {
-                        continue;
-                    }
-
-                    let line_start = if pos_start < start { start.byte } else { 0 };
-                    let line_end = if pos_end > end {
-                        end.byte
-                    } else {
-                        line.content.len()
-                    };
-                    let line_start = line_start.min(line.content.len());
-                    let line_end = line_end.min(line.content.len()).max(line_start);
-
-                    if !first {
-                        output.push('\n');
-                    }
-                    first = false;
-
-                    if line.content.is_char_boundary(line_start)
-                        && line.content.is_char_boundary(line_end)
-                    {
-                        output.push_str(&line.content[line_start..line_end]);
-                    }
+                    let pos_start = body_position(file_index, hunk_index, line_index, 0);
+                    let pos_end =
+                        body_position(file_index, hunk_index, line_index, line.content.len());
+                    emit(&line.content, pos_start, pos_end);
                 }
             }
         }
@@ -888,6 +1101,7 @@ impl<'a, Message> DiffView<'a, Message> {
         bounds: Rectangle,
         visible_top: f32,
         header_height: f32,
+        selection: Option<(TextPosition, TextPosition)>,
     ) where
         Renderer: text::Renderer<Font = Font>,
     {
@@ -935,9 +1149,8 @@ impl<'a, Message> DiffView<'a, Message> {
         let left_x = bounds.x + HEADER_HORIZONTAL_PADDING;
         let value_x = left_x + label_width + HEADER_LABEL_GAP;
         let value_width = (bounds.x + bounds.width - HEADER_HORIZONTAL_PADDING - value_x).max(1.0);
-        let line_width = (bounds.x + bounds.width - HEADER_HORIZONTAL_PADDING - left_x).max(1.0);
 
-        for line in &self.header {
+        for (line_index, line) in self.header.iter().enumerate() {
             match line {
                 HeaderLine::Field { label, value } => {
                     self.draw_text(
@@ -952,6 +1165,9 @@ impl<'a, Message> DiffView<'a, Message> {
                             wrapping: text::Wrapping::None,
                         },
                     );
+                    self.draw_header_value_selection(
+                        renderer, line_index, value, value_x, y, selection,
+                    );
                     self.draw_text(
                         renderer,
                         value,
@@ -965,15 +1181,78 @@ impl<'a, Message> DiffView<'a, Message> {
                         },
                     );
                 }
-                HeaderLine::Description(line) => {
-                    let indented = format!("    {line}");
+                HeaderLine::Bookmarks { label, chips } => {
                     self.draw_text(
                         renderer,
-                        &indented,
+                        label,
                         TextRenderParams {
-                            width: line_width,
+                            width: label_width.max(1.0),
                             height: self.metrics.row_height,
                             position: Point::new(left_x, y + TEXT_Y_PADDING),
+                            color: label_color,
+                            clip_bounds: clip,
+                            wrapping: text::Wrapping::None,
+                        },
+                    );
+                    let chip_h = (self.metrics.row_height - 4.0).max(1.0);
+                    let chip_y = y + 2.0;
+                    let pad_x = 5.0;
+                    let gap = 6.0;
+                    let right_edge = bounds.x + bounds.width - HEADER_HORIZONTAL_PADDING;
+                    let mut chip_x = value_x;
+                    for chip in chips {
+                        // Tight monospace width — `text_width` adds breathing
+                        // room meant for wrapped text, which would bloat the
+                        // chip's right side.
+                        let label_w = chip.label.chars().count() as f32 * self.metrics.char_width;
+                        let chip_w = label_w + pad_x * 2.0;
+                        // Drop chips that would overflow the panel rather than
+                        // clip them mid-glyph.
+                        if chip_x + chip_w > right_edge {
+                            break;
+                        }
+                        self.draw_chip(
+                            renderer,
+                            Rectangle {
+                                x: chip_x,
+                                y: chip_y,
+                                width: chip_w,
+                                height: chip_h,
+                            },
+                            chip.fill,
+                            chip.border,
+                        );
+                        self.draw_text(
+                            renderer,
+                            &chip.label,
+                            TextRenderParams {
+                                width: label_w,
+                                height: self.metrics.row_height,
+                                position: Point::new(chip_x + pad_x, y + TEXT_Y_PADDING),
+                                color: chip.text,
+                                clip_bounds: clip,
+                                wrapping: text::Wrapping::None,
+                            },
+                        );
+                        chip_x += chip_w + gap;
+                    }
+                }
+                HeaderLine::Description(line) => {
+                    // Draw the raw text at an indented origin (rather than a
+                    // four-space-prefixed string) so the selectable text and
+                    // the hit-test/selection origin line up.
+                    let desc_x = left_x + HEADER_DESCRIPTION_INDENT * self.metrics.char_width;
+                    self.draw_header_value_selection(
+                        renderer, line_index, line, desc_x, y, selection,
+                    );
+                    self.draw_text(
+                        renderer,
+                        line,
+                        TextRenderParams {
+                            width: (bounds.x + bounds.width - HEADER_HORIZONTAL_PADDING - desc_x)
+                                .max(1.0),
+                            height: self.metrics.row_height,
+                            position: Point::new(desc_x, y + TEXT_Y_PADDING),
                             color: value_color,
                             clip_bounds: clip,
                             wrapping: text::Wrapping::None,
@@ -1253,7 +1532,7 @@ where
                 };
                 state.selection_unit = unit;
 
-                let (anchor_start, anchor_end) = expand_to_unit(&self.files, position, unit);
+                let (anchor_start, anchor_end) = self.expand_to_unit(position, unit);
                 state.selection_anchor_unit_start = Some(anchor_start);
                 state.selection_anchor_unit_end = Some(anchor_end);
                 state.selection_anchor = Some(anchor_start);
@@ -1394,9 +1673,12 @@ where
             let mut visible_hunk_headers = Vec::new();
             let mut visible_rows = Vec::with_capacity(visible_capacity);
             let mut visible_bands = Vec::new();
+            // Content-space top of each file's header, for the sticky header.
+            let mut file_tops: Vec<f32> = Vec::with_capacity(self.files.len());
 
             for (file_index, file) in self.files.iter().enumerate() {
                 let file_header_top = content_y;
+                file_tops.push(file_header_top);
                 push_if_visible(
                     &mut visible_file_headers,
                     VisibleFileHeader {
@@ -1447,6 +1729,22 @@ where
                 }
             }
 
+            // Sticky file header: the file occupying the top of the viewport
+            // keeps its name pinned while its hunks scroll under it, until the
+            // next file's header slides up to push it off. Only kicks in once
+            // that file's header has scrolled above the viewport top — which is
+            // always below the revision header, so the two never overlap.
+            let content_end = content_y;
+            let sticky_file = file_tops
+                .iter()
+                .rposition(|&top| top <= visible_top)
+                .filter(|&i| file_tops[i] < visible_top);
+            let sticky_pin_y = sticky_file.map(|i| {
+                let next_top = file_tops.get(i + 1).copied().unwrap_or(content_end);
+                let pinned_content_y = visible_top.min(next_top - self.metrics.file_header_height);
+                bounds.y + (pinned_content_y - visible_top)
+            });
+
             self.draw_background(
                 renderer,
                 bounds.x,
@@ -1479,79 +1777,28 @@ where
                 );
             }
 
+            let selection_range = match (state.selection_anchor, state.selection_focus) {
+                (Some(anchor), Some(focus)) if anchor != focus => Some(ordered(anchor, focus)),
+                _ => None,
+            };
+
             if header_height > 0.0 {
-                self.draw_revision_header(renderer, bounds, visible_top, header_height);
+                self.draw_revision_header(
+                    renderer,
+                    bounds,
+                    visible_top,
+                    header_height,
+                    selection_range,
+                );
             }
 
             for header in &visible_file_headers {
-                let file = &self.files[header.file_index];
-                let hunk_label = if file.hunks.len() == 1 {
-                    "1 Hunk".to_owned()
-                } else {
-                    format!("{} Hunks", file.hunks.len())
-                };
-                let summary = format!(
-                    "{}  +{} -{}  {}",
-                    file.status, file.additions, file.deletions, hunk_label
-                );
-                let summary_width = self
-                    .text_width(&summary)
-                    .min((bounds.width - 24.0).max(1.0));
-
-                self.draw_background(
-                    renderer,
-                    bounds.x,
-                    header.y,
-                    bounds.width,
-                    self.metrics.file_header_height,
-                    self.palette.file_header,
-                );
-                self.draw_background(
-                    renderer,
-                    bounds.x,
-                    header.y + self.metrics.file_header_height - 1.0,
-                    bounds.width,
-                    1.0,
-                    self.palette.border,
-                );
-                self.draw_text(
-                    renderer,
-                    &file.title,
-                    TextRenderParams {
-                        width: (bounds.width - summary_width - 28.0).max(1.0),
-                        height: self.metrics.row_height,
-                        position: Point::new(
-                            bounds.x + 12.0,
-                            centered_text_y(
-                                header.y,
-                                self.metrics.file_header_height,
-                                self.metrics.row_height,
-                            ),
-                        ),
-                        color: self.palette.text,
-                        clip_bounds: bounds,
-                        wrapping: text::Wrapping::WordOrGlyph,
-                    },
-                );
-                self.draw_text(
-                    renderer,
-                    &summary,
-                    TextRenderParams {
-                        width: summary_width,
-                        height: self.metrics.row_height,
-                        position: Point::new(
-                            (bounds.x + bounds.width - summary_width - 8.0).max(bounds.x + 12.0),
-                            centered_text_y(
-                                header.y,
-                                self.metrics.file_header_height,
-                                self.metrics.row_height,
-                            ),
-                        ),
-                        color: self.palette.text_muted,
-                        clip_bounds: bounds,
-                        wrapping: text::Wrapping::None,
-                    },
-                );
+                // The sticky file's header is drawn pinned, on top, after the
+                // rows — skip its natural (scrolling) draw here.
+                if Some(header.file_index) == sticky_file {
+                    continue;
+                }
+                self.draw_file_header(renderer, header.file_index, header.y, bounds);
             }
 
             for header in &visible_hunk_headers {
@@ -1597,18 +1844,14 @@ where
                     for row in &visible_rows {
                         let line =
                             &self.files[row.file_index].hunks[row.hunk_index].lines[row.line_index];
-                        let row_pos_start = TextPosition {
-                            file_index: row.file_index,
-                            hunk_index: row.hunk_index,
-                            line_index: row.line_index,
-                            byte: 0,
-                        };
-                        let row_pos_end = TextPosition {
-                            file_index: row.file_index,
-                            hunk_index: row.hunk_index,
-                            line_index: row.line_index,
-                            byte: line.content.len(),
-                        };
+                        let row_pos_start =
+                            body_position(row.file_index, row.hunk_index, row.line_index, 0);
+                        let row_pos_end = body_position(
+                            row.file_index,
+                            row.hunk_index,
+                            row.line_index,
+                            line.content.len(),
+                        );
                         if row_pos_end < sel_start || row_pos_start >= sel_end {
                             continue;
                         }
@@ -1712,12 +1955,29 @@ where
                 );
             }
 
+            // Pinned sticky file header. Drawn in its own layer so the opaque
+            // strip composites *over* the code beneath it: within a single
+            // layer `fill_quad` always renders behind `fill_text`, so the
+            // header background alone can't hide the diff text scrolling under
+            // it — only a new layer does.
+            if let (Some(file_index), Some(y)) = (sticky_file, sticky_pin_y) {
+                renderer.with_layer(bounds, |renderer| {
+                    self.draw_file_header(renderer, file_index, y, bounds);
+                });
+            }
+
             let geom = scrollbar::geometry(
                 bounds,
                 self.content_height(bounds.width),
                 state.vertical_offset,
             );
-            scrollbar::draw(renderer, &geom, &self.palette.scrollbar);
+            // Draw the scrollbar in its own layer, created *after* the sticky
+            // header's, so it composites above it — sub-layers stack in creation
+            // order, so otherwise the full-width sticky strip would hide the
+            // scrollbar's top.
+            renderer.with_layer(bounds, |renderer| {
+                scrollbar::draw(renderer, &geom, &self.palette.scrollbar);
+            });
         });
 
         // Evict entries that weren't used this frame. Their last
@@ -1750,12 +2010,22 @@ where
         {
             return mouse::Interaction::Idle;
         }
-        // The revision-header strip sits above the file content but isn't
-        // a selectable text region, so flipping back to the arrow cursor
-        // there avoids advertising an affordance we don't implement.
+        // In the revision-header strip, show the text cursor only over the
+        // selectable values (field values + description), and the arrow over
+        // labels, bookmark chips, and blank space.
         let target_y = point.y - bounds.y + state.vertical_offset;
         if target_y < self.header_height() {
-            return mouse::Interaction::Idle;
+            let line_offset = (target_y - HEADER_VERTICAL_PADDING) / self.metrics.row_height;
+            let over_value = line_offset >= 0.0 && {
+                let line_index = line_offset.floor() as usize;
+                self.header_selectable_text(line_index).is_some()
+                    && point.x >= self.header_text_origin_x(line_index, bounds)
+            };
+            return if over_value {
+                mouse::Interaction::Text
+            } else {
+                mouse::Interaction::Idle
+            };
         }
         if point.x >= bounds.x + self.metrics.gutter_width + PREFIX_WIDTH {
             mouse::Interaction::Text
@@ -1796,7 +2066,7 @@ impl<Message> DiffView<'_, Message> {
         let (focus_start, focus_end) = if unit == SelectionUnit::Character {
             (focus_pos, focus_pos)
         } else {
-            expand_to_unit(&self.files, focus_pos, unit)
+            self.expand_to_unit(focus_pos, unit)
         };
 
         let (new_anchor, new_focus) = if focus_end <= anchor_start {
@@ -1864,6 +2134,115 @@ impl<Message> DiffView<'_, Message> {
                 snap: true,
             },
             color,
+        );
+    }
+
+    /// Draw a pill-shaped chip (filled, or outlined when `border` is `Some`).
+    /// Used for bookmark chips in the revision header.
+    fn draw_chip<Renderer>(
+        &self,
+        renderer: &mut Renderer,
+        bounds: Rectangle,
+        fill: Color,
+        border: Option<Color>,
+    ) where
+        Renderer: renderer::Renderer,
+    {
+        let radius = (bounds.height / 2.0).into();
+        let border = match border {
+            Some(color) => Border {
+                color,
+                width: 1.0,
+                radius,
+            },
+            None => Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius,
+            },
+        };
+        renderer.fill_quad(
+            renderer::Quad {
+                bounds,
+                border,
+                shadow: Shadow::default(),
+                snap: true,
+            },
+            fill,
+        );
+    }
+
+    /// Draw one file's header strip (background + bottom border + title +
+    /// stats) at screen-y `y`. Shared by the normal scrolling draw and the
+    /// pinned sticky draw.
+    fn draw_file_header<Renderer>(
+        &self,
+        renderer: &mut Renderer,
+        file_index: usize,
+        y: f32,
+        bounds: Rectangle,
+    ) where
+        Renderer: text::Renderer<Font = Font>,
+    {
+        let file = &self.files[file_index];
+        let hunk_label = if file.hunks.len() == 1 {
+            "1 Hunk".to_owned()
+        } else {
+            format!("{} Hunks", file.hunks.len())
+        };
+        let summary = format!(
+            "{}  +{} -{}  {}",
+            file.status, file.additions, file.deletions, hunk_label
+        );
+        let summary_width = self
+            .text_width(&summary)
+            .min((bounds.width - 24.0).max(1.0));
+
+        self.draw_background(
+            renderer,
+            bounds.x,
+            y,
+            bounds.width,
+            self.metrics.file_header_height,
+            self.palette.file_header,
+        );
+        self.draw_background(
+            renderer,
+            bounds.x,
+            y + self.metrics.file_header_height - 1.0,
+            bounds.width,
+            1.0,
+            self.palette.border,
+        );
+        self.draw_text(
+            renderer,
+            &file.title,
+            TextRenderParams {
+                width: (bounds.width - summary_width - 28.0).max(1.0),
+                height: self.metrics.row_height,
+                position: Point::new(
+                    bounds.x + 12.0,
+                    centered_text_y(y, self.metrics.file_header_height, self.metrics.row_height),
+                ),
+                color: self.palette.text,
+                clip_bounds: bounds,
+                wrapping: text::Wrapping::WordOrGlyph,
+            },
+        );
+        self.draw_text(
+            renderer,
+            &summary,
+            TextRenderParams {
+                width: summary_width,
+                height: self.metrics.row_height,
+                position: Point::new(
+                    (bounds.x + bounds.width - summary_width - 8.0).max(bounds.x + 12.0),
+                    centered_text_y(y, self.metrics.file_header_height, self.metrics.row_height),
+                ),
+                color: self.palette.text_muted,
+                clip_bounds: bounds,
+                wrapping: text::Wrapping::None,
+            },
         );
     }
 
@@ -2097,48 +2476,6 @@ fn is_copy_shortcut(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> bool
         key.as_ref(),
         keyboard::Key::Character("c") | keyboard::Key::Character("C")
     )
-}
-
-/// Expand `pos` to cover the unit (word or line) that contains it. For
-/// character-mode selection this is a no-op — the caller never reaches
-/// this path with `unit == Character`.
-fn expand_to_unit(
-    files: &[DiffFileView<'_>],
-    pos: TextPosition,
-    unit: SelectionUnit,
-) -> (TextPosition, TextPosition) {
-    let Some(line) = files
-        .get(pos.file_index)
-        .and_then(|file| file.hunks.get(pos.hunk_index))
-        .and_then(|hunk| hunk.lines.get(pos.line_index))
-    else {
-        return (pos, pos);
-    };
-
-    match unit {
-        SelectionUnit::Character => (pos, pos),
-        SelectionUnit::Line => {
-            let start = TextPosition { byte: 0, ..pos };
-            let end = TextPosition {
-                byte: line.content.len(),
-                ..pos
-            };
-            (start, end)
-        }
-        SelectionUnit::Word => {
-            let (start_byte, end_byte) = word_bounds(&line.content, pos.byte);
-            (
-                TextPosition {
-                    byte: start_byte,
-                    ..pos
-                },
-                TextPosition {
-                    byte: end_byte,
-                    ..pos
-                },
-            )
-        }
-    }
 }
 
 /// Find the inclusive [start, end) byte range of the word the cursor is
