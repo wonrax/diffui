@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use iced::{
-    Color, Element, Font, Length, alignment,
-    widget::{column, container, text},
+    Background, Border, Color, Element, Font, Length, alignment,
+    widget::{column, container, row, text, tooltip},
 };
 
 use crate::backend::{CommitStore, DiffFile, DiffFileStatus, RevisionSelection, RowView};
@@ -92,18 +92,11 @@ const FILE_STAT_HORIZONTAL_PADDING: f32 = 4.0;
 const FILE_STAT_MIN_WIDTH: f32 = 24.0;
 
 pub fn build_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
+    // The "Changes" header is gone; the list starts flush at the top of the
+    // pane. Each row carries its own internal vertical padding, so the first
+    // row's content isn't cramped against the top edge — adding a panel-colored
+    // gap above it instead just reads as a stray strip above the selected row.
     let revision_list = build_revision_list(ui, theme);
-
-    // The "Changes" header is gone; give the first row a few px of breathing
-    // room so it doesn't sit flush against the top edge of the pane.
-    let list = container(revision_list).height(Length::Fill).padding(
-        iced::Padding {
-            top: 6.0,
-            right: 0.0,
-            bottom: 0.0,
-            left: 0.0,
-        },
-    );
 
     let mut body = column![].spacing(0);
     // Load failures no longer have a header to live under — surface them as a
@@ -120,13 +113,141 @@ pub fn build_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             .padding([8, 12]),
         );
     }
-    let body = body.push(list);
+    body = body.push(revision_list);
+    body = body.push(build_footer(ui, theme));
 
     container(body)
         .width(Length::Fixed(ui.sidebar_width))
         .height(Length::Fill)
         .style(move |_| sidebar_panel_style(theme))
         .into()
+}
+
+const FOOTER_TEXT_SIZE: f32 = 12.0;
+
+/// Thin status bar pinned to the bottom of the commit-log pane: the working
+/// copy's branch + ahead/behind on the left, the total change count on the
+/// right. Monospace, dim, with a hairline top border. The "uncommitted files"
+/// count common to git tools is deliberately omitted — jj's `@` is always a
+/// commit, so it would be semantically wrong here.
+fn build_footer(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
+    let font = ui.config.mono_font;
+    let dim = theme.subtle_text;
+
+    let left: Element<'_, Message> = match &ui.branch_status {
+        Some(status) => {
+            // Branch glyph + name; the tracked upstream rides along as a tooltip.
+            let name = row![
+                text("\u{2387}").size(FOOTER_TEXT_SIZE).font(font).color(dim),
+                text(status.branch.clone())
+                    .size(FOOTER_TEXT_SIZE)
+                    .font(font)
+                    .color(dim),
+            ]
+            .spacing(5)
+            .align_y(alignment::Vertical::Center);
+            let name: Element<'_, Message> = match &status.upstream {
+                Some(upstream) => tooltip(
+                    name,
+                    container(
+                        text(upstream.clone())
+                            .size(FOOTER_TEXT_SIZE)
+                            .font(font)
+                            .color(theme.text),
+                    )
+                    .padding([3, 7])
+                    .style(move |_| footer_tooltip_style(theme)),
+                    tooltip::Position::Top,
+                )
+                .gap(4)
+                .into(),
+                None => name.into(),
+            };
+
+            let mut group = row![name].spacing(8).align_y(alignment::Vertical::Center);
+            // Ahead/behind only mean something against a tracked upstream.
+            if status.upstream.is_some() {
+                if status.ahead == 0 && status.behind == 0 {
+                    group =
+                        group.push(text("in sync").size(FOOTER_TEXT_SIZE).font(font).color(dim));
+                } else {
+                    if status.ahead > 0 {
+                        group = group.push(
+                            text(format!("\u{2191}{}", status.ahead))
+                                .size(FOOTER_TEXT_SIZE)
+                                .font(font)
+                                .color(theme.added_text),
+                        );
+                    }
+                    if status.behind > 0 {
+                        group = group.push(
+                            text(format!("\u{2193}{}", status.behind))
+                                .size(FOOTER_TEXT_SIZE)
+                                .font(font)
+                                .color(theme.removed_text),
+                        );
+                    }
+                }
+            }
+            group.into()
+        }
+        None => row![].into(),
+    };
+
+    let right = text(format!("{} changes", thousands(ui.commits.len())))
+        .size(FOOTER_TEXT_SIZE)
+        .font(font)
+        .color(dim);
+
+    let bar = row![left, container(text("")).width(Length::Fill), right]
+        .align_y(alignment::Vertical::Center)
+        .spacing(8);
+
+    // iced's `Border` paints all four edges; draw the hairline top rule as a
+    // 1px line above the bar instead.
+    let hairline = container(text(""))
+        .width(Length::Fill)
+        .height(Length::Fixed(1.0))
+        .style(move |_| container::Style {
+            background: Some(Background::Color(theme.border)),
+            ..container::Style::default()
+        });
+
+    column![
+        hairline,
+        container(bar)
+            .width(Length::Fill)
+            .padding([6, 12])
+            .style(move |_| container::Style::default().background(theme.panel_background)),
+    ]
+    .into()
+}
+
+fn footer_tooltip_style(theme: ThemeSpec) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(theme.panel_background_elevated)),
+        text_color: Some(theme.text),
+        border: Border {
+            color: theme.border,
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
+/// Group an integer with `,` thousands separators, e.g. 1410 -> "1,410".
+fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let len = digits.len();
+    let mut out = String::with_capacity(len + len / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (len - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {

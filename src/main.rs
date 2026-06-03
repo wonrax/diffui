@@ -97,9 +97,9 @@ static GLOBAL: track_alloc::Tracking = track_alloc::Tracking;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use backend::{
-    BackendOutput, CommitStore, CommitsTail, DiffDocument, LoadProgress, RevisionDetails,
-    RevisionSelection, RowView, StreamRow, compute_empty_status, load_backend, load_diff,
-    load_repository_snapshot,
+    BackendOutput, BranchStatus, CommitStore, CommitsTail, DiffDocument, LoadProgress,
+    RevisionDetails, RevisionSelection, RowView, StreamRow, compute_empty_status, load_backend,
+    load_diff, load_repository_snapshot,
 };
 use clap::Parser;
 use config::AppConfig;
@@ -221,6 +221,10 @@ pub(crate) struct Diffui {
     pub(crate) geometry_dirty_since: Option<Instant>,
     pub(crate) config: AppConfig,
     pub(crate) revision_details: Option<RevisionDetails>,
+    /// Working-copy branch summary (nearest local bookmark + ahead/behind vs
+    /// its tracked upstream) for the sidebar footer. `None` until a load
+    /// resolves it, or when `@` has no local bookmark in its ancestry.
+    pub(crate) branch_status: Option<BranchStatus>,
     /// `None` when closed; a non-empty column stack when open.
     pub(crate) palette: Option<PaletteState>,
     /// In-session recents (revisions + commands) used to score palette
@@ -308,6 +312,7 @@ pub(crate) struct RepoState {
     pub(crate) snapshot_pending: bool,
     pub(crate) selected_file: usize,
     pub(crate) revision_details: Option<RevisionDetails>,
+    pub(crate) branch_status: Option<BranchStatus>,
     pub(crate) revision_reveal_token: u64,
     pub(crate) pending_revision_reveal: bool,
     pub(crate) commits_version: u64,
@@ -337,6 +342,7 @@ impl RepoState {
             snapshot_pending: false,
             selected_file: 0,
             revision_details: None,
+            branch_status: None,
             revision_reveal_token: 0,
             pending_revision_reveal: false,
             commits_version: 0,
@@ -658,6 +664,7 @@ impl Diffui {
             geometry_dirty_since: None,
             config,
             revision_details: None,
+            branch_status: None,
             palette: None,
             recents: Recents::load(),
             find: None,
@@ -709,6 +716,7 @@ impl Diffui {
                     self.load = None;
                     self.commits_version = self.commits_version.wrapping_add(1);
                     self.repository_snapshot = Some(output.snapshot);
+                    self.branch_status = output.branch_status;
                     self.revision_details = output.details;
                     self.selected_file = if revision_changed {
                         0
@@ -785,6 +793,7 @@ impl Diffui {
                 match *result {
                     Ok(tail) => {
                         self.repository_snapshot = Some(tail.snapshot);
+                        self.branch_status = tail.branch_status;
                         // Apply the single-parent emptiness resolved in the
                         // loader's final pass, caching each so reloads skip it.
                         for (index, empty) in tail.empty_updates {
@@ -1724,6 +1733,7 @@ impl Diffui {
             snapshot_pending: self.snapshot_pending,
             selected_file: self.selected_file,
             revision_details: self.revision_details.take(),
+            branch_status: self.branch_status.take(),
             revision_reveal_token: self.revision_reveal_token,
             pending_revision_reveal: self.pending_revision_reveal,
             commits_version: self.commits_version,
@@ -1752,6 +1762,7 @@ impl Diffui {
         self.snapshot_pending = state.snapshot_pending;
         self.selected_file = state.selected_file;
         self.revision_details = state.revision_details;
+        self.branch_status = state.branch_status;
         self.revision_reveal_token = state.revision_reveal_token;
         self.pending_revision_reveal = state.pending_revision_reveal;
         self.commits_version = state.commits_version;
@@ -2412,9 +2423,10 @@ fn stream_jj_initial_load(
                         &mut emit_batch,
                     )
                     .await
-                    .map(|(snapshot, empty_updates)| CommitsTail {
+                    .map(|(snapshot, branch_status, empty_updates)| CommitsTail {
                         snapshot,
                         empty_updates,
+                        branch_status,
                     })
                     .map_err(|error| format!("{error:#}"));
                     let _ = tx.send(Message::CommitsFinished(version, Box::new(finished)));

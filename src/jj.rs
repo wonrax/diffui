@@ -29,7 +29,7 @@ use jj_lib::{
     object_id::ObjectId,
     repo::{ReadonlyRepo, Repo, StoreFactories},
     repo_path::{RepoPath, RepoPathBuf, RepoPathUiConverter},
-    revset::{RevsetExpression, SymbolResolver},
+    revset::{RevsetExpression, SymbolResolver, UserRevsetExpression},
     settings::{HumanByteSize, UserSettings},
     tree_merge::MergeOptions,
     working_copy::SnapshotOptions,
@@ -37,9 +37,9 @@ use jj_lib::{
 };
 
 use crate::backend::{
-    CommitStore, CommitSummary, DiffDocument, DiffFile, DiffFileStatus, DiffHunkView, DiffLine,
-    DiffLineKind, LoadProgress, RevisionDetails, RevisionSelection, SignatureInfo, StreamRow,
-    apply_syntax_highlighting, format_hunk_header,
+    BranchStatus, CommitStore, CommitSummary, DiffDocument, DiffFile, DiffFileStatus, DiffHunkView,
+    DiffLine, DiffLineKind, LoadProgress, RevisionDetails, RevisionSelection, SignatureInfo,
+    StreamRow, apply_syntax_highlighting, format_hunk_header,
 };
 use crate::graph::LaneAssigner;
 use crate::graph_layout::{GraphLayout, LaneFoldState};
@@ -72,7 +72,7 @@ pub async fn walk_jj_commits(
     progress: LoadProgress,
     batch_size: usize,
     emit: &mut dyn FnMut(Vec<StreamRow>),
-) -> Result<Vec<(usize, bool)>> {
+) -> Result<(Vec<(usize, bool)>, Option<BranchStatus>)> {
     let settings = UserSettings::from_config(StackedConfig::with_defaults())
         .context("failed to load jj settings")?;
     let workspace = Workspace::load(
@@ -106,7 +106,7 @@ pub async fn walk_jj_with_repo(
     progress: LoadProgress,
     batch_size: usize,
     emit: &mut dyn FnMut(Vec<StreamRow>),
-) -> Result<Vec<(usize, bool)>> {
+) -> Result<(Vec<(usize, bool)>, Option<BranchStatus>)> {
     // Default revset: `all()` — ancestors of every visible head plus any
     // referenced commit. Covers the working copy, all local bookmarks,
     // and tracked/untracked remote bookmarks, so branches that haven't
@@ -223,7 +223,140 @@ pub async fn walk_jj_with_repo(
             empty_updates.push((index, own == parent_tree));
         }
     }
-    Ok(empty_updates)
+
+    // Branch summary for the sidebar footer — reuses the already-loaded repo so
+    // it costs a few small revset evals, not another index load.
+    let branch_status = compute_branch_status(repo, wc_commit_id);
+    Ok((empty_updates, branch_status))
+}
+
+/// Compute the working-copy's branch summary: the nearest local bookmark at or
+/// behind `@`, its tracked upstream, and `@`'s ahead/behind counts vs that
+/// upstream. Best-effort — any failure (or no local bookmark in `@`'s
+/// ancestry) yields `None`, so the footer falls back to the change count.
+fn compute_branch_status(repo: &ReadonlyRepo, wc_commit_id: &CommitId) -> Option<BranchStatus> {
+    match branch_status_inner(repo, wc_commit_id) {
+        Ok(status) => status,
+        Err(error) => {
+            eprintln!("diffui: failed to compute branch status: {error:#}");
+            None
+        }
+    }
+}
+
+fn branch_status_inner(
+    repo: &ReadonlyRepo,
+    wc_commit_id: &CommitId,
+) -> Result<Option<BranchStatus>> {
+    let view = repo.view();
+
+    // Local bookmark targets, and — per local-bookmark name — its tracked
+    // remote (display + target id).
+    let mut local_targets: Vec<CommitId> = Vec::new();
+    let mut local_by_commit: HashMap<CommitId, Vec<String>> = HashMap::new();
+    let mut tracked_upstream: HashMap<String, (String, CommitId)> = HashMap::new();
+    for (name, target) in view.bookmarks() {
+        let name_str = name.as_str().to_owned();
+        for id in target.local_target.added_ids() {
+            local_targets.push(id.clone());
+            local_by_commit
+                .entry(id.clone())
+                .or_default()
+                .push(name_str.clone());
+        }
+        for (remote, remote_ref) in &target.remote_refs {
+            if remote_ref.is_tracked()
+                && let Some(id) = remote_ref.target.added_ids().next()
+            {
+                tracked_upstream.entry(name_str.clone()).or_insert_with(|| {
+                    (format!("{name_str}@{}", remote.as_str()), id.clone())
+                });
+            }
+        }
+    }
+    if local_targets.is_empty() {
+        return Ok(None);
+    }
+
+    let symbol_resolver = SymbolResolver::new(
+        repo,
+        &[] as &[Box<dyn jj_lib::revset::SymbolResolverExtension>],
+    );
+
+    // Nearest local bookmark at/behind `@` = (bookmark commits) ∩ ancestors(@),
+    // taking the first in topo order (children before parents → closest to `@`).
+    let nearest_expr = RevsetExpression::commits(local_targets)
+        .intersection(&RevsetExpression::commit(wc_commit_id.clone()).ancestors());
+    let nearest = {
+        let resolved = nearest_expr
+            .resolve_user_expression(repo, &symbol_resolver)
+            .context("failed to resolve nearest-bookmark revset")?;
+        let revset = resolved
+            .evaluate(repo)
+            .context("failed to evaluate nearest-bookmark revset")?;
+        match revset.iter().next() {
+            Some(result) => result.context("failed to read nearest bookmark commit")?,
+            None => return Ok(None),
+        }
+    };
+
+    let names = local_by_commit.get(&nearest).cloned().unwrap_or_default();
+    // Prefer a name that tracks a remote so ahead/behind is meaningful;
+    // otherwise fall back to the first bookmark on the commit.
+    let branch = match names
+        .iter()
+        .find(|n| tracked_upstream.contains_key(*n))
+        .or_else(|| names.first())
+        .cloned()
+    {
+        Some(branch) => branch,
+        None => return Ok(None),
+    };
+
+    let Some((upstream_display, remote_id)) = tracked_upstream.get(&branch).cloned() else {
+        // Bookmark with no tracking remote — show the name only.
+        return Ok(Some(BranchStatus {
+            branch,
+            upstream: None,
+            ahead: 0,
+            behind: 0,
+        }));
+    };
+
+    let at = RevsetExpression::commit(wc_commit_id.clone());
+    let remote = RevsetExpression::commit(remote_id);
+    // ahead = remote..@ (reachable from @, not the remote); behind = @..remote.
+    let ahead = count_revset(repo, &symbol_resolver, &remote.range(&at))
+        .context("failed to count ahead commits")?;
+    let behind = count_revset(repo, &symbol_resolver, &at.range(&remote))
+        .context("failed to count behind commits")?;
+
+    Ok(Some(BranchStatus {
+        branch,
+        upstream: Some(upstream_display),
+        ahead,
+        behind,
+    }))
+}
+
+/// Evaluate `expr` and count the commits it yields.
+fn count_revset(
+    repo: &ReadonlyRepo,
+    symbol_resolver: &SymbolResolver,
+    expr: &Arc<UserRevsetExpression>,
+) -> Result<usize> {
+    let resolved = expr
+        .resolve_user_expression(repo, symbol_resolver)
+        .context("failed to resolve count revset")?;
+    let revset = resolved
+        .evaluate(repo)
+        .context("failed to evaluate count revset")?;
+    let mut count = 0usize;
+    for result in revset.iter() {
+        result.context("failed to read commit while counting revset")?;
+        count += 1;
+    }
+    Ok(count)
 }
 
 /// Batch loader for refreshes: walk the whole graph and fold it into a compact
@@ -233,13 +366,13 @@ pub async fn walk_jj_with_repo(
 pub async fn load_jj_commits(
     repository_root: PathBuf,
     progress: LoadProgress,
-) -> Result<(CommitStore, GraphLayout)> {
+) -> Result<(CommitStore, GraphLayout, Option<BranchStatus>)> {
     let mut store = CommitStore::default();
     let mut graph = GraphLayout::default();
     let mut interner: HashMap<String, u32> = HashMap::new();
     let mut fold = LaneFoldState::default();
 
-    let empty_updates = {
+    let (empty_updates, branch_status) = {
         let mut emit = |batch: Vec<StreamRow>| {
             for row in batch {
                 graph.push(&row.frame, &row.summary.bookmarks, &mut fold);
@@ -252,7 +385,7 @@ pub async fn load_jj_commits(
     for (index, empty) in empty_updates {
         store.set_is_empty(index, empty);
     }
-    Ok((store, graph))
+    Ok((store, graph, branch_status))
 }
 
 /// The working-copy diff (or a stringified error) handed to `load_jj_cold`'s
@@ -273,7 +406,7 @@ pub async fn load_jj_cold(
     batch_size: usize,
     emit_diff: &mut dyn FnMut(ColdDiffResult),
     emit_batch: &mut dyn FnMut(Vec<StreamRow>),
-) -> Result<(RepositorySnapshot, Vec<(usize, bool)>)> {
+) -> Result<(RepositorySnapshot, Option<BranchStatus>, Vec<(usize, bool)>)> {
     let (snapshot, repo, wc_commit_id) = load_jj_repository_snapshot(repository.clone()).await?;
 
     // Emit the working-copy diff up front so the diff pane is ready the moment
@@ -283,9 +416,9 @@ pub async fn load_jj_cold(
         .map_err(|error| format!("{error:#}"));
     emit_diff(diff);
 
-    let empty_updates =
+    let (empty_updates, branch_status) =
         walk_jj_with_repo(repo.as_ref(), &wc_commit_id, progress, batch_size, emit_batch).await?;
-    Ok((snapshot, empty_updates))
+    Ok((snapshot, branch_status, empty_updates))
 }
 
 /// Resolve the empty status of specific commits (the merges/roots the loader
@@ -897,7 +1030,7 @@ mod mem_profile {
         let baseline = CURRENT.load(Relaxed);
         PEAK.store(baseline, Relaxed);
 
-        let (store, graph) = runtime
+        let (store, graph, _branch_status) = runtime
             .block_on(super::load_jj_commits(repo.clone().into(), progress))
             .expect("load commits");
 

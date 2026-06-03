@@ -414,6 +414,7 @@ pub struct BackendOutput {
     pub graph: GraphLayout,
     pub snapshot: RepositorySnapshot,
     pub details: Option<RevisionDetails>,
+    pub branch_status: Option<BranchStatus>,
 }
 
 /// One commit emitted by the streaming loader: the data for the compact store
@@ -436,6 +437,24 @@ pub struct StreamRow {
 pub struct CommitsTail {
     pub snapshot: RepositorySnapshot,
     pub empty_updates: Vec<(usize, bool)>,
+    pub branch_status: Option<BranchStatus>,
+}
+
+/// Working-copy branch summary for the sidebar footer: the nearest local
+/// bookmark at or behind `@`, its tracked upstream (if any), and how far `@`
+/// sits ahead/behind that upstream. `None` when the working copy has no local
+/// bookmark in its ancestry, or for backends without branch tracking (git).
+#[derive(Debug, Clone)]
+pub struct BranchStatus {
+    /// The nearest local bookmark at or behind `@`.
+    pub branch: String,
+    /// Tracked remote bookmark, e.g. `main@origin`. `None` when the branch has
+    /// no tracking remote — the footer then shows just the name.
+    pub upstream: Option<String>,
+    /// Commits reachable from `@` but not the upstream (your unpushed work).
+    pub ahead: usize,
+    /// Commits reachable from the upstream but not `@`.
+    pub behind: usize,
 }
 
 /// `jj show`-style summary of a single revision, used to render the header
@@ -478,7 +497,7 @@ async fn run_backend(
     // working-copy commit — e.g. `@` flagged "empty" while its diff actually
     // had changes — until the next refresh re-read it.
     let snapshot = run_repository_snapshot(repository.clone()).await?;
-    let (commits, graph) = load_commits(&repository, &progress).await?;
+    let (commits, graph, branch_status) = load_commits(&repository, &progress).await?;
     let (document, details) = run_diff(&repository, &revision).await?;
 
     Ok(BackendOutput {
@@ -487,6 +506,7 @@ async fn run_backend(
         graph,
         snapshot,
         details,
+        branch_status,
     })
 }
 
@@ -577,7 +597,7 @@ async fn run_repository_snapshot(repository: Repository) -> Result<RepositorySna
 async fn load_commits(
     repository: &Repository,
     progress: &LoadProgress,
-) -> Result<(CommitStore, GraphLayout)> {
+) -> Result<(CommitStore, GraphLayout, Option<BranchStatus>)> {
     match repository.vcs {
         Vcs::Jj => {
             let root = repository.root.clone();
@@ -599,7 +619,9 @@ async fn load_commits(
             for commit in commits {
                 builder.push(commit);
             }
-            Ok((builder.finish(), graph))
+            // Git ahead/behind isn't wired yet — the footer falls back to the
+            // change count for git repos.
+            Ok((builder.finish(), graph, None))
         }
     }
 }
