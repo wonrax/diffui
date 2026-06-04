@@ -609,6 +609,27 @@ pub async fn load_repository_snapshot(repository: Repository) -> Result<Reposito
     run_repository_snapshot(repository).await
 }
 
+/// Read the jj op-log head fingerprint (cheap, lock-free) for the fs-watcher's
+/// op-id dedup. Git has no operation log, so it yields `Ok(None)` and the caller
+/// treats the op-log signal as a no-op. Mirrors the off-thread `block_on` idiom
+/// the other jj backend calls use.
+pub async fn read_op_head(repository: Repository) -> Result<Option<String>, String> {
+    match repository.vcs {
+        Vcs::Jj => {
+            let handle = tokio::runtime::Handle::current();
+            let joined = tokio::task::spawn_blocking(move || {
+                handle.block_on(crate::jj::read_jj_op_head(repository))
+            })
+            .await;
+            match joined {
+                Ok(result) => result.map(Some).map_err(|error| format!("{error:#}")),
+                Err(error) => Err(format!("jj op-head read task failed: {error}")),
+            }
+        }
+        Vcs::Git => Ok(None),
+    }
+}
+
 /// Load just the `jj show`-style header (ids, bookmarks, author/committer
 /// signatures, description) for a single revision — no diff. Used by the
 /// revision context menu's "Copy → Author / Committer", which needs the dates

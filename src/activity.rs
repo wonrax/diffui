@@ -16,7 +16,9 @@ use std::time::{Duration, Instant};
 use iced::{
     Background, Border, Color, Element, Length, Padding, alignment,
     font::Weight,
-    widget::{Space, button, column, container, mouse_area, row, scrollable, stack, text, text_input},
+    widget::{
+        Space, button, column, container, mouse_area, row, scrollable, stack, text, text_input,
+    },
 };
 
 use crate::backend::LoadProgress;
@@ -43,6 +45,10 @@ pub struct ActivityId(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivityStatus {
+    /// Accepted but not started — waiting behind an op that holds the same
+    /// resource (e.g. a mutation queued behind one already running). Counts as
+    /// unfinished (survives "Clear"), but doesn't drive the toolbar spinner.
+    Queued,
     Running,
     Done,
     Error,
@@ -133,17 +139,29 @@ impl ActivityLog {
         }
     }
 
+    /// Flip an entry's status without recording a result — used to move a
+    /// mutation between `Queued` and `Running` as the serial queue drains.
+    pub fn set_status(&mut self, id: ActivityId, status: ActivityStatus) {
+        if let Some(activity) = self.get_mut(id) {
+            activity.status = status;
+        }
+    }
+
     pub fn toggle_expand(&mut self, id: ActivityId) {
         if let Some(activity) = self.get_mut(id) {
             activity.expanded = !activity.expanded;
         }
     }
 
-    /// Drop finished entries, keeping anything still running (so the log never
-    /// hides in-flight work). Bound to the popover's "Clear".
+    /// Drop finished entries, keeping anything still running or queued (so the
+    /// log never hides pending work). Bound to the popover's "Clear".
     pub fn clear_finished(&mut self) {
-        self.activities
-            .retain(|activity| matches!(activity.status, ActivityStatus::Running));
+        self.activities.retain(|activity| {
+            matches!(
+                activity.status,
+                ActivityStatus::Running | ActivityStatus::Queued
+            )
+        });
     }
 
     pub fn is_empty(&self) -> bool {
@@ -160,6 +178,13 @@ impl ActivityLog {
         self.activities
             .iter()
             .filter(|a| matches!(a.status, ActivityStatus::Running))
+            .count()
+    }
+
+    pub fn queued_count(&self) -> usize {
+        self.activities
+            .iter()
+            .filter(|a| matches!(a.status, ActivityStatus::Queued))
             .count()
     }
 
@@ -198,6 +223,7 @@ fn spinner_glyph(started: Instant) -> &'static str {
 pub fn activity_indicator(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     let mono = ui.config.mono_font;
     let running = ui.activities.running_count();
+    let queued = ui.activities.queued_count();
 
     let body: Element<'_, Message> = if let Some(active) = ui.activities.first_running_visible() {
         let mut chips = row![
@@ -222,6 +248,18 @@ pub fn activity_indicator(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message>
                 )
                 .padding(Padding::from([1, 5]))
                 .style(move |_| chip_style(chip_background(theme.muted_text))),
+            );
+        }
+        if queued > 0 {
+            chips = chips.push(
+                container(
+                    text(format!("{queued} queued"))
+                        .size(10)
+                        .font(mono)
+                        .color(theme.subtle_text),
+                )
+                .padding(Padding::from([1, 5]))
+                .style(move |_| chip_style(chip_background(theme.subtle_text))),
             );
         }
         chips.into()
@@ -415,6 +453,7 @@ fn activity_row<'a>(
     let (loaded, total, determinate) = activity.progress_snapshot();
 
     let (icon, icon_color) = match activity.status {
+        ActivityStatus::Queued => ("\u{2026}".to_owned(), theme.subtle_text), // … waiting
         ActivityStatus::Running => (spinner_glyph(activity.started).to_owned(), theme.accent),
         ActivityStatus::Done => ("\u{2713}".to_owned(), theme.added_text),
         ActivityStatus::Error => ("\u{2715}".to_owned(), theme.removed_text),
@@ -594,7 +633,7 @@ fn clear_button(ui: &Diffui, theme: ThemeSpec) -> Element<'static, Message> {
         .activities
         .activities
         .iter()
-        .any(|a| !matches!(a.status, ActivityStatus::Running));
+        .any(|a| matches!(a.status, ActivityStatus::Done | ActivityStatus::Error));
     let label = text("Clear")
         .size(11.5)
         .font(ui.config.ui_font)
@@ -727,6 +766,35 @@ mod tests {
         assert_eq!(
             log.first_running().map(|a| a.label.as_str()),
             Some("still-running")
+        );
+    }
+
+    #[test]
+    fn queued_entry_does_not_run_but_survives_clear() {
+        let mut log = ActivityLog::default();
+        log.start(ActivityId(1), "running", false);
+        log.start(ActivityId(2), "queued", false);
+        log.set_status(ActivityId(2), ActivityStatus::Queued);
+
+        // Queued doesn't count as running and never drives the spinner.
+        assert_eq!(log.running_count(), 1);
+        assert_eq!(
+            log.first_running().map(|a| a.label.as_str()),
+            Some("running")
+        );
+
+        // Clearing keeps both the running and the queued entry.
+        log.finish(ActivityId(1), ActivityStatus::Done, None);
+        log.clear_finished();
+        assert_eq!(log.activities.len(), 1);
+        assert_eq!(log.activities[0].label, "queued");
+
+        // When the queue drains it starts running for real.
+        log.set_status(ActivityId(2), ActivityStatus::Running);
+        assert_eq!(log.running_count(), 1);
+        assert_eq!(
+            log.first_running().map(|a| a.label.as_str()),
+            Some("queued")
         );
     }
 }

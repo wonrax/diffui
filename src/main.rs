@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     path::{Path, PathBuf},
     pin::Pin,
     time::{Duration, Instant},
@@ -104,7 +104,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use backend::{
     BackendOutput, BookmarksInfo, BranchStatus, CommitStore, CommitsTail, DiffDocument,
     LoadProgress, RevisionDetails, RevisionSelection, RowView, SignatureInfo, StreamRow,
-    compute_empty_status, load_backend, load_diff, load_repository_snapshot,
+    compute_empty_status, load_backend, load_diff, load_repository_snapshot, read_op_head,
 };
 use clap::Parser;
 use config::AppConfig;
@@ -186,6 +186,20 @@ struct Cli {
     /// directory when none are given.
     #[arg(value_name = "PATH")]
     paths: Vec<PathBuf>,
+}
+
+/// A revision-context-menu mutation captured for serial execution. Mutations
+/// take jj's working-copy lock, so we run at most one of our own at a time and
+/// queue the rest (see [`Diffui::enqueue_or_run_mutation`]). `progress` is the
+/// handle the worker reports through, allocated alongside the activity up front
+/// so a queued entry is fully wired before it ever starts.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingMutation {
+    repository: Repository,
+    op: mutations::MutationOp,
+    tab_id: TabId,
+    activity_id: activity::ActivityId,
+    progress: LoadProgress,
 }
 
 #[derive(Debug, Clone)]
@@ -312,6 +326,12 @@ pub(crate) struct Diffui {
     /// log shows. Per-tab; persisted per repo root. Empty or `all()` is the
     /// default (every visible head's ancestry).
     pub(crate) revset: String,
+    /// The active repo's default revset (its `revsets.log`, or jj's default) —
+    /// what the "Default" preset in the revset menu applies. A derived cache of
+    /// `default_revset(active repo)`, recomputed on every active-repo change
+    /// (`restore_active_state`) rather than per render, so the menu never does
+    /// config-file I/O while painting. Not stashed: it's re-derivable per repo.
+    pub(crate) default_revset: String,
     /// The active tab's activity log (long-running ops: load, refresh, revset
     /// eval, fetch, undo, push). Per-tab; inactive tabs keep theirs in
     /// `RepoState::activities`.
@@ -322,6 +342,20 @@ pub(crate) struct Diffui {
     pub(crate) pending_load_activity: Option<activity::ActivityId>,
     /// Monotonic source of `ActivityId`s across every tab.
     pub(crate) next_activity_id: u64,
+    /// Serial mutation execution. At most one revision-menu mutation runs at a
+    /// time (they contend on jj's working-copy lock); the rest wait in
+    /// `mutation_queue` and drain in order. Global rather than per-tab: a
+    /// `PendingMutation` carries its own repo/tab/activity, so cross-tab
+    /// serialization costs nothing and avoids stash/restore churn.
+    pub(crate) mutation_in_flight: bool,
+    pub(crate) mutation_queue: VecDeque<PendingMutation>,
+    /// A refresh requested while a snapshot/reload was already in flight, held
+    /// so it runs once the current one finishes instead of racing it (two
+    /// snapshots thrash the wc lock) or being dropped (and missing a change that
+    /// landed mid-reload). Coalesced: many triggers collapse to one, keeping the
+    /// stronger origin (`Focus` walk over `Watcher` diff). Kicked by
+    /// `take_pending_refresh` once the app goes idle.
+    pub(crate) pending_refresh: Option<RefreshOrigin>,
     /// Open toolbar dropdown (fetch-branches / revset-presets), if any.
     pub(crate) toolbar_menu: Option<ToolbarMenu>,
     /// Whether the activity popover is showing.
@@ -450,9 +484,12 @@ impl RepoState {
 /// value is applied: jj shows `all()` (every visible head's ancestry — the
 /// current hardcoded behavior); git falls back to its `git log` default (the
 /// current branch's history), expressed as an empty range.
-fn default_revset(vcs: Vcs) -> String {
-    match vcs {
-        Vcs::Jj => "all()".to_owned(),
+/// The revset a freshly-opened repo starts on when nothing is persisted for it.
+/// jj mirrors `jj log` (the user's `revsets.log`, or jj's default); git keeps
+/// its empty default (the backend's own "current branch" view).
+fn default_revset(repository: &Repository) -> String {
+    match repository.vcs {
+        Vcs::Jj => crate::jj::jj_log_revset(&repository.root),
         Vcs::Git => String::new(),
     }
 }
@@ -523,6 +560,16 @@ pub(crate) enum RefreshOrigin {
     Focus,
 }
 
+/// Merge a newly-requested refresh origin with one already coalesced: a `Focus`
+/// full walk subsumes a `Watcher` lightweight @-diff reload.
+fn coalesce_refresh(pending: Option<RefreshOrigin>, incoming: RefreshOrigin) -> RefreshOrigin {
+    if matches!(pending, Some(RefreshOrigin::Focus)) || matches!(incoming, RefreshOrigin::Focus) {
+        RefreshOrigin::Focus
+    } else {
+        RefreshOrigin::Watcher
+    }
+}
+
 /// Carries the transient builder state of a streaming cold load across the
 /// `CommitsBatch` messages: the author interner and the lane fold, which both
 /// must persist between batches as rows append to `commits` / `graph`. The
@@ -584,6 +631,14 @@ pub(crate) enum Message {
     SystemThemeChanged(iced_theme::Mode),
     WindowFocusChanged(bool),
     RefreshRepository,
+    /// The fs watcher saw a write under `.jj/repo/op_heads` — an operation
+    /// landed (ours: a wc snapshot / mutation, or external: a CLI `jj` command).
+    /// Triggers a cheap op-head read to decide whether it's worth reloading.
+    OpLogChanged,
+    /// Result of the op-head read kicked by [`Message::OpLogChanged`]. `None` for
+    /// git (no op log). Reloads only if the head differs from the one the graph
+    /// already reflects (so our own writes don't cause a redundant walk).
+    OpHeadChecked(Box<Result<Option<String>, String>>),
     /// Periodic tick while a load is in flight. No-op handler — it exists only
     /// to keep `view()` re-running so the loading indicator can appear after
     /// its grace period and animate.
@@ -778,7 +833,7 @@ impl Diffui {
                 .get(&repository.root.to_string_lossy().into_owned())
                 .filter(|value| !value.is_empty())
                 .cloned()
-                .unwrap_or_else(|| default_revset(repository.vcs))
+                .unwrap_or_else(|| default_revset(repository))
         };
 
         let mut next_tab_id = 0u64;
@@ -880,9 +935,16 @@ impl Diffui {
             open_repo_dialog: None,
             recent_repos,
             revset: active_revset,
+            default_revset: active_repository
+                .as_ref()
+                .map(default_revset)
+                .unwrap_or_default(),
             activities: activity::ActivityLog::default(),
             pending_load_activity: None,
             next_activity_id: 0,
+            mutation_in_flight: false,
+            mutation_queue: VecDeque::new(),
+            pending_refresh: None,
             toolbar_menu: None,
             activity_popover_open: false,
             hovered: None,
@@ -943,8 +1005,11 @@ impl Diffui {
                     self.finish_load_activity(activity::ActivityStatus::Done, None);
                     // Fill in merge/root empty status (left unknown by the
                     // loader) from cache, and kick off a background task for
-                    // any not seen before.
-                    return self.resolve_empty_status();
+                    // any not seen before. Then run any refresh coalesced while
+                    // this walk was in flight (e.g. an external op the op-log
+                    // watcher saw land mid-walk).
+                    let empty = self.resolve_empty_status();
+                    return Task::batch([empty, self.take_pending_refresh()]);
                 }
                 Err(error) => {
                     if self.pending_revision.as_ref() != Some(&revision) {
@@ -1022,8 +1087,10 @@ impl Diffui {
                         self.commits_version = self.commits_version.wrapping_add(1);
                         self.selected_commit_index = self.find_selected_commit_index();
                         self.finish_load_activity(activity::ActivityStatus::Done, None);
-                        // Fill in the merges/roots the loader left unknown.
-                        return self.resolve_empty_status();
+                        // Fill in the merges/roots the loader left unknown, then
+                        // run any refresh coalesced during the cold load.
+                        let empty = self.resolve_empty_status();
+                        return Task::batch([empty, self.take_pending_refresh()]);
                     }
                     Err(error) => {
                         self.status = LoadStatus::Failed(error.clone());
@@ -1114,21 +1181,22 @@ impl Diffui {
                     match origin {
                         RefreshOrigin::Watcher => {
                             // A working-tree edit moved @'s tree but not the
-                            // graph, so skip the (up to ~1M-commit) re-walk and
-                            // just reload @'s diff if it's on screen (the wc
-                            // snapshot already ran in `load_repository_snapshot`,
-                            // so `load_diff` sees the edit; `DiffLoaded` re-syncs
-                            // @'s empty chip). Viewing another commit ⇒ its diff
-                            // is unchanged, nothing to reload.
+                            // graph topology, so skip the (up to ~1M-commit)
+                            // re-walk and just reload @'s diff if it's on screen
+                            // (the wc snapshot already ran in
+                            // `load_repository_snapshot`, so `load_diff` sees the
+                            // edit; `DiffLoaded` re-syncs @'s empty chip).
+                            // Viewing another commit ⇒ its diff is unchanged.
                             //
-                            // We deliberately do NOT advance `repository_snapshot`
-                            // here: it tracks the op the *graph* reflects, and a
-                            // lightweight reload didn't re-walk. Recording the new
-                            // op would make a later focus-regain compare equal and
-                            // skip its full reload — so an external `jj git
-                            // fetch`/rebase that landed between edits would never
-                            // appear. Leaving it stale lets the next focus (origin
-                            // `Focus`) re-walk and reconcile topology.
+                            // Advance `repository_snapshot` to this op: external
+                            // ops are now caught live by the op-log watcher, so a
+                            // later focus-regain no longer has to conservatively
+                            // re-walk just because our own snapshot moved the op
+                            // — that's what kept focus expensive on big repos.
+                            // (The narrow race where an external op lands in the
+                            // same instant as an edit and is absorbed into this
+                            // snapshot self-heals on the next op change.)
+                            self.repository_snapshot = Some(snapshot.clone());
                             if matches!(self.selected_revision, RevisionSelection::WorkingCopy) {
                                 let revision = self.selected_revision.clone();
                                 self.pending_revision = Some(revision.clone());
@@ -1140,13 +1208,22 @@ impl Diffui {
                             }
                         }
                         RefreshOrigin::Focus => {
-                            // Focus regain / manual refresh can follow an external
-                            // jj op that changed topology — full reload. The
-                            // resulting `BackendLoaded` records the snapshot.
+                            // A real topology change (an external op caught by the
+                            // op-log watcher, a mutation, a fetch): full reload.
+                            // Surface the walk as an activity so a multi-second
+                            // graph walk on a big repo doesn't look like a freeze;
+                            // `BackendLoaded` records the snapshot and finishes it.
                             let revision = self.selected_revision.clone();
                             self.pending_revision = Some(revision.clone());
                             self.loading_since = Some(Instant::now());
-                            let progress = LoadProgress::default();
+                            let progress = if self.pending_load_activity.is_none() {
+                                let (id, progress) =
+                                    self.begin_activity("Refresh repository", true);
+                                self.pending_load_activity = Some(id);
+                                progress
+                            } else {
+                                LoadProgress::default()
+                            };
                             self.commit_progress = progress.clone();
                             let revset = self.revset.clone();
                             return Task::perform(
@@ -1234,35 +1311,41 @@ impl Diffui {
                     row_rect,
                 );
             }
-            Message::MutationCompleted(tab_id, id, result) => match *result {
-                Ok(outcome) => {
-                    if let Some(log) = self.activity_log_for(tab_id) {
-                        if !outcome.output.is_empty() {
-                            log.extend_output(id, outcome.output);
+            Message::MutationCompleted(tab_id, id, result) => {
+                match *result {
+                    Ok(outcome) => {
+                        if let Some(log) = self.activity_log_for(tab_id) {
+                            if !outcome.output.is_empty() {
+                                log.extend_output(id, outcome.output);
+                            }
+                            log.finish(
+                                id,
+                                activity::ActivityStatus::Done,
+                                Some(outcome.message.clone()),
+                            );
                         }
-                        log.finish(
-                            id,
-                            activity::ActivityStatus::Done,
-                            Some(outcome.message.clone()),
-                        );
+                        // Only snap the selection back to `@` when the op
+                        // actually moved it (new/edit/abandon); bookmark ops
+                        // leave it put. The reload itself happens once the queue
+                        // drains, in `advance_mutation_queue`.
+                        if outcome.moved_working_copy {
+                            self.selected_revision = RevisionSelection::WorkingCopy;
+                        }
                     }
-                    // Reload the graph to reflect the mutation. Only snap the
-                    // selection back to `@` when the op actually moved it
-                    // (new/edit/abandon); bookmark ops leave it put.
-                    if outcome.moved_working_copy {
-                        self.selected_revision = RevisionSelection::WorkingCopy;
-                    }
-                    return self.start_repository_snapshot(RefreshOrigin::Focus);
-                }
-                Err(error) => {
-                    // Surface the failure in the activity log rather than failing
-                    // the whole view — a rejected push shouldn't blank the panes.
-                    if let Some(log) = self.activity_log_for(tab_id) {
-                        log.append_output(id, error.clone());
-                        log.finish(id, activity::ActivityStatus::Error, Some(error));
+                    Err(error) => {
+                        // Surface the failure in the activity log rather than
+                        // failing the whole view — a rejected push shouldn't
+                        // blank the panes.
+                        if let Some(log) = self.activity_log_for(tab_id) {
+                            log.append_output(id, error.clone());
+                            log.finish(id, activity::ActivityStatus::Error, Some(error));
+                        }
                     }
                 }
-            },
+                // Run the next queued mutation, or reload once the batch is
+                // done. Unconditional so a failure can't strand the queue.
+                return self.advance_mutation_queue();
+            }
             Message::WindowFocusChanged(focused) => {
                 let gained_focus = focused && !self.app_focused;
                 let lost_focus = !focused && self.app_focused;
@@ -1281,8 +1364,45 @@ impl Diffui {
                 }
             }
             Message::RefreshRepository => {
-                if self.app_focused {
+                // Hold off the (frequent, uncontrolled) watcher snapshot while a
+                // mutation is running or queued — both take jj's wc lock, and
+                // the post-batch reload re-snapshots, so nothing is lost.
+                if self.app_focused && !self.mutation_busy() {
                     return self.start_repository_snapshot(RefreshOrigin::Watcher);
+                }
+            }
+            Message::OpLogChanged => {
+                // An op landed. Read the head cheaply (off-thread, no wc lock)
+                // and let `OpHeadChecked` decide; skip while busy (a reload in
+                // flight will reconcile) or mid-mutation (the post-batch reload
+                // covers it). Gated on focus like the watcher refresh — ops that
+                // land while unfocused are caught by the focus-regain reload.
+                if self.app_focused
+                    && !self.mutation_busy()
+                    && !self.snapshot_pending
+                    && self.load.is_none()
+                    && let Some(repository) = self.repository.clone()
+                {
+                    return Task::perform(read_op_head(repository), |result| {
+                        Message::OpHeadChecked(Box::new(result))
+                    });
+                }
+            }
+            Message::OpHeadChecked(result) => {
+                // Reload only when the on-disk op differs from the one the graph
+                // reflects — i.e. it was an *external* op, not our own wc
+                // snapshot / mutation (whose op is already recorded in
+                // `repository_snapshot`). That dedup is what keeps our own writes
+                // from each triggering a full re-walk. Errors are swallowed: a
+                // failed cheap read just means we wait for the next signal.
+                if let Ok(Some(on_disk)) = *result {
+                    let reflects = self
+                        .repository_snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.fingerprint.as_str());
+                    if reflects != Some(on_disk.as_str()) {
+                        return self.start_repository_snapshot(RefreshOrigin::Focus);
+                    }
                 }
             }
             Message::LoadingTick => {}
@@ -1652,7 +1772,10 @@ impl Diffui {
             }
         }
 
-        Task::none()
+        // Fall-through chokepoint for every arm that didn't return its own task:
+        // if a refresh was coalesced while busy and we're now idle, run it. A
+        // no-op when nothing's pending (the common case).
+        self.take_pending_refresh()
     }
 
     /// Recompute find matches immediately (no debounce). Used by toggle
@@ -1911,11 +2034,14 @@ impl Diffui {
     }
 
     fn start_repository_snapshot(&mut self, origin: RefreshOrigin) -> Task<Message> {
-        // Don't refresh while a cold stream is still appending — a refresh
-        // re-walks and swaps the graph wholesale, which would race the
-        // in-flight batches. The stream finishes in seconds; refresh resumes
-        // normally once it clears the load cursor.
-        if self.snapshot_pending || self.load.is_some() {
+        // A snapshot or reload is already in flight (the snapshot phase, a cold
+        // stream still appending, or a graph walk holding `pending_revision`).
+        // Coalesce rather than race it: a second snapshot thrashes the wc lock,
+        // and a snapshot landing mid-walk is dropped by `RepositorySnapshotLoaded`
+        // anyway. The in-flight load's terminal kicks the coalesced refresh via
+        // `take_pending_refresh`, so a change that lands mid-reload isn't lost.
+        if self.snapshot_pending || self.load.is_some() || self.pending_revision.is_some() {
+            self.pending_refresh = Some(coalesce_refresh(self.pending_refresh, origin));
             return Task::none();
         }
 
@@ -1927,6 +2053,20 @@ impl Diffui {
         Task::perform(load_repository_snapshot(repository), move |result| {
             Message::RepositorySnapshotLoaded(origin, result.map_err(|error| format!("{error:#}")))
         })
+    }
+
+    /// Run a refresh coalesced while the app was busy, now that it's idle. The
+    /// idle check mirrors `start_repository_snapshot`'s coalesce condition, and
+    /// taking the origin before dispatching keeps a no-op snapshot (op
+    /// unchanged) from re-arming itself into a loop.
+    fn take_pending_refresh(&mut self) -> Task<Message> {
+        if self.snapshot_pending || self.load.is_some() || self.pending_revision.is_some() {
+            return Task::none();
+        }
+        match self.pending_refresh.take() {
+            Some(origin) => self.start_repository_snapshot(origin),
+            None => Task::none(),
+        }
     }
 
     /// Show the native context menu for a right-clicked revision and dispatch
@@ -2210,10 +2350,13 @@ impl Diffui {
         // local ops, so they stay indeterminate.
         let determinate = matches!(op, MutationOp::PushBookmark { .. });
         let (activity_id, progress) = self.begin_activity(label, determinate);
-        Task::perform(
-            mutations::run_mutation(repository, op, progress),
-            move |result| Message::MutationCompleted(tab_id, activity_id, Box::new(result)),
-        )
+        self.enqueue_or_run_mutation(PendingMutation {
+            repository,
+            op,
+            tab_id,
+            activity_id,
+            progress,
+        })
     }
 
     /// Non-macOS stub: the native popup isn't available, so right-click is a
@@ -2261,8 +2404,8 @@ impl Diffui {
                 self.start_fetch(target)
             }
             ToolbarMenu::RevsetPresets => {
-                let presets = revset_presets(self.repository.as_ref().map(|r| r.vcs));
-                let items: Vec<MenuItem> = presets
+                let entries = self.revset_menu_entries();
+                let items: Vec<MenuItem> = entries
                     .iter()
                     .enumerate()
                     .map(|(index, (label, expr))| {
@@ -2272,10 +2415,10 @@ impl Diffui {
                 let Some(chosen) = macos_native::popup_menu(&items, None) else {
                     return Task::none();
                 };
-                let Some((_, expr)) = presets.get(chosen as usize) else {
+                let Some((_, expr)) = entries.get(chosen as usize) else {
                     return Task::none();
                 };
-                self.revset = (*expr).to_owned();
+                self.revset = expr.clone();
                 self.evaluate_revset()
             }
         }
@@ -2459,6 +2602,8 @@ impl Diffui {
         self.selected_commit_index = None;
         self.repository_snapshot = None;
         self.snapshot_pending = false;
+        // A full cold reload supersedes any coalesced refresh for the old state.
+        self.pending_refresh = None;
         // Wrap the load in a determinate activity; its progress handle is what
         // the loader bumps, so the toolbar progress line + popover track it.
         let label =
@@ -2516,6 +2661,66 @@ impl Diffui {
         (id, progress)
     }
 
+    /// Whether one of our own mutations is running or waiting to. Background
+    /// snapshots check this so the watcher doesn't fire a working-copy snapshot
+    /// into the middle of a mutation (both take jj's wc lock); the post-batch
+    /// reload in [`advance_mutation_queue`] catches anything missed meanwhile.
+    fn mutation_busy(&self) -> bool {
+        self.mutation_in_flight || !self.mutation_queue.is_empty()
+    }
+
+    /// Run a mutation now, or queue it behind one already in flight. Two of our
+    /// mutations running at once would contend on jj's working-copy lock and
+    /// serialize opaquely; queuing keeps them in order and visible (the queued
+    /// entry shows in the activity log until it starts).
+    fn enqueue_or_run_mutation(&mut self, pending: PendingMutation) -> Task<Message> {
+        if self.mutation_in_flight {
+            if let Some(log) = self.activity_log_for(pending.tab_id) {
+                log.set_status(pending.activity_id, activity::ActivityStatus::Queued);
+            }
+            self.mutation_queue.push_back(pending);
+            Task::none()
+        } else {
+            self.run_mutation_now(pending)
+        }
+    }
+
+    /// Dispatch `pending` off the runtime and mark a mutation in flight. The
+    /// status flip to `Running` is idempotent — harmless for the first run,
+    /// and what un-queues an entry pulled off the queue by
+    /// [`advance_mutation_queue`].
+    fn run_mutation_now(&mut self, pending: PendingMutation) -> Task<Message> {
+        self.mutation_in_flight = true;
+        if let Some(log) = self.activity_log_for(pending.tab_id) {
+            log.set_status(pending.activity_id, activity::ActivityStatus::Running);
+        }
+        let PendingMutation {
+            repository,
+            op,
+            tab_id,
+            activity_id,
+            progress,
+        } = pending;
+        Task::perform(
+            mutations::run_mutation(repository, op, progress),
+            move |result| Message::MutationCompleted(tab_id, activity_id, Box::new(result)),
+        )
+    }
+
+    /// A mutation finished: start the next queued one, or — when the queue is
+    /// empty — clear the in-flight flag and reload once so the graph reflects
+    /// the whole batch. Called on success *and* failure, so a failed mutation
+    /// never strands the ones queued behind it. (A reload when nothing actually
+    /// changed is a no-op: the snapshot fingerprint compares equal.)
+    fn advance_mutation_queue(&mut self) -> Task<Message> {
+        if let Some(next) = self.mutation_queue.pop_front() {
+            self.run_mutation_now(next)
+        } else {
+            self.mutation_in_flight = false;
+            self.start_repository_snapshot(RefreshOrigin::Focus)
+        }
+    }
+
     /// The active tab's stable id, if any tab is open.
     fn active_tab_id(&self) -> Option<TabId> {
         self.tabs.get(self.active_tab).map(|tab| tab.id)
@@ -2571,14 +2776,14 @@ impl Diffui {
         }
     }
 
-    /// Toolbar "Refresh": a full reload (working-copy snapshot + graph re-walk),
-    /// surfaced as an activity. No-op while a load is already in flight.
+    /// Toolbar "Refresh": a full reload (working-copy snapshot + graph re-walk).
+    /// No-op while a load is already in flight. The walk itself is surfaced as an
+    /// activity by the `Focus` reload path (so every reload trigger logs it the
+    /// same way); an up-to-date refresh that finds nothing changed is silent.
     fn toolbar_refresh(&mut self) -> Task<Message> {
         if self.repository.is_none() || self.snapshot_pending || self.load.is_some() {
             return Task::none();
         }
-        let (id, _progress) = self.begin_activity("Refresh", false);
-        self.pending_load_activity = Some(id);
         self.start_repository_snapshot(RefreshOrigin::Focus)
     }
 
@@ -2631,6 +2836,26 @@ impl Diffui {
     /// whole time and are replaced in one shot when the new walk is ready, so
     /// switching revsets doesn't flash an empty sidebar. The selection is kept
     /// (it just won't be highlighted if it falls outside the new set).
+    /// The revset preset menu entries as `(label, expression)`: the active
+    /// repo's "Default" (its `revsets.log`) first when there is one, then the
+    /// built-in presets. Owned so the dynamic default can sit alongside the
+    /// `'static` presets, and shared by the iced and native menus so they stay
+    /// in sync. The default is read from the [`Self::default_revset`] cache, so
+    /// building the menu never touches the config files.
+    pub(crate) fn revset_menu_entries(&self) -> Vec<(String, String)> {
+        let presets = revset_presets(self.repository.as_ref().map(|r| r.vcs));
+        let mut entries = Vec::with_capacity(presets.len() + 1);
+        if !self.default_revset.is_empty() {
+            entries.push(("Default".to_owned(), self.default_revset.clone()));
+        }
+        entries.extend(
+            presets
+                .iter()
+                .map(|(label, expr)| ((*label).to_owned(), (*expr).to_owned())),
+        );
+        entries
+    }
+
     fn evaluate_revset(&mut self) -> Task<Message> {
         let Some(repository) = self.repository.clone() else {
             return Task::none();
@@ -2708,6 +2933,11 @@ impl Diffui {
     /// stashed it, or is intentionally discarding it).
     fn restore_active_state(&mut self, state: RepoState) {
         self.repository = state.repository;
+        self.default_revset = self
+            .repository
+            .as_ref()
+            .map(default_revset)
+            .unwrap_or_default();
         self.status = state.status;
         self.document = state.document;
         self.commits = state.commits;
@@ -2841,7 +3071,7 @@ impl Diffui {
                 let id = TabId(self.next_tab_id);
                 self.next_tab_id += 1;
                 let was_empty = self.tabs.is_empty();
-                let revset = default_revset(repository.vcs);
+                let revset = default_revset(&repository);
                 self.tabs.push(Tab {
                     id,
                     owner,
@@ -3582,15 +3812,19 @@ fn stream_jj_initial_load(
     ))
 }
 
-/// Filesystem-watch subscription: emits `RefreshRepository` (debounced) when
-/// the working tree changes. Replaces the old fixed-interval poll — between
-/// edits there is zero work, and the off-thread snapshot only runs when files
-/// actually change.
+/// Filesystem-watch subscription. Replaces the old fixed-interval poll — between
+/// events there is zero work, and the off-thread snapshot only runs when
+/// something actually changes. Two kinds of change are classified per debounce
+/// window and emitted separately:
 ///
-/// `.git` / `.jj` are deliberately not treated as relevant: watching them
-/// would feed our own snapshot's writes back as events (a refresh loop) and
-/// bury real edits under VCS-internal churn. External VCS operations surface
-/// through window focus-regain instead.
+/// - a **working-tree** edit (anything outside `.git`/`.jj`) → `RefreshRepository`
+///   (snapshot + reload @'s diff).
+/// - a write under **`.jj/repo/op_heads`** (an operation landed) → `OpLogChanged`,
+///   which an op-id dedup turns into a reload only when the op was *external*.
+///
+/// The rest of `.git`/`.jj` is still ignored: watching it would feed our own
+/// snapshot writes back as a refresh loop and bury real edits under VCS churn.
+/// `op_heads` is the one exception, and the dedup is what keeps it loop-free.
 // `&PathBuf` (not `&Path`) is required: `Subscription::run_with` keys on
 // `D = PathBuf` and hands the builder a `fn(&D)`.
 #[allow(clippy::ptr_arg)]
@@ -3601,14 +3835,19 @@ fn watch_repository(root: &PathBuf) -> Pin<Box<dyn Stream<Item = Message> + Send
         async move |mut output: futures::channel::mpsc::Sender<Message>| {
             // notify's handler runs on its own thread; bridge it to this async
             // task over an unbounded channel so the handler never blocks.
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WatchSignal>();
             let watcher =
                 notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
                     if let Ok(event) = result
                         && !matches!(event.kind, notify::EventKind::Access(_))
-                        && event_touches_worktree(&event)
                     {
-                        let _ = tx.send(());
+                        // A single event is one or the other: an op-head write is
+                        // entirely under `.jj`, so it never touches the worktree.
+                        if event_touches_worktree(&event) {
+                            let _ = tx.send(WatchSignal::Worktree);
+                        } else if event_touches_op_log(&event) {
+                            let _ = tx.send(WatchSignal::OpLog);
+                        }
                     }
                 });
             let mut watcher = match watcher {
@@ -3629,13 +3868,23 @@ fn watch_repository(root: &PathBuf) -> Pin<Box<dyn Stream<Item = Message> + Send
             }
 
             // Coalesce bursts: wait for an event, then keep draining until the
-            // tree goes quiet for `WATCH_DEBOUNCE`, then emit a single refresh.
-            while rx.recv().await.is_some() {
-                while tokio::time::timeout(WATCH_DEBOUNCE, rx.recv())
-                    .await
-                    .is_ok()
-                {}
-                if output.send(Message::RefreshRepository).await.is_err() {
+            // tree goes quiet for `WATCH_DEBOUNCE`, tracking which kind(s) of
+            // change arrived, then emit one message per kind. The op-head's
+            // create+remove pair from a single op thus collapses to one signal.
+            while let Some(first) = rx.recv().await {
+                let mut worktree = matches!(first, WatchSignal::Worktree);
+                let mut op_log = matches!(first, WatchSignal::OpLog);
+                while let Ok(signal) = tokio::time::timeout(WATCH_DEBOUNCE, rx.recv()).await {
+                    match signal {
+                        Some(WatchSignal::Worktree) => worktree = true,
+                        Some(WatchSignal::OpLog) => op_log = true,
+                        None => break,
+                    }
+                }
+                if worktree && output.send(Message::RefreshRepository).await.is_err() {
+                    break;
+                }
+                if op_log && output.send(Message::OpLogChanged).await.is_err() {
                     break;
                 }
             }
@@ -3657,6 +3906,32 @@ fn event_touches_worktree(event: &notify::Event) -> bool {
                 std::path::Component::Normal(name) if name == ".git" || name == ".jj"
             )
         })
+    })
+}
+
+/// What the fs watcher saw in a debounce window — kept distinct so a worktree
+/// edit and an op-log write drive their own (deduped) refresh paths.
+#[derive(Clone, Copy)]
+enum WatchSignal {
+    Worktree,
+    OpLog,
+}
+
+/// Whether any path in `event` is under `.jj/repo/op_heads` — i.e. an operation
+/// landed (a head file was added/removed). Matches the three dir names as a
+/// consecutive run so a stray `op_heads` component elsewhere can't trip it.
+fn event_touches_op_log(event: &notify::Event) -> bool {
+    event.paths.iter().any(|path| {
+        let names: Vec<_> = path
+            .components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(name) => Some(name),
+                _ => None,
+            })
+            .collect();
+        names
+            .windows(3)
+            .any(|w| w[0] == ".jj" && w[1] == "repo" && w[2] == "op_heads")
     })
 }
 

@@ -101,10 +101,7 @@ pub fn position_window_controls(handle: raw_window_handle::RawWindowHandle, bar_
 /// visibly land at the default position. Install once; the observer lives for
 /// the app's lifetime. No-op off macOS / non-AppKit handles.
 #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
-pub fn install_window_resize_observer(
-    handle: raw_window_handle::RawWindowHandle,
-    bar_height: f32,
-) {
+pub fn install_window_resize_observer(handle: raw_window_handle::RawWindowHandle, bar_height: f32) {
     #[cfg(target_os = "macos")]
     {
         let raw_window_handle::RawWindowHandle::AppKit(appkit) = handle else {

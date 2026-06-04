@@ -349,17 +349,13 @@ fn fetch_menu_items(ui: &Diffui, theme: ThemeSpec) -> Vec<Element<'_, Message>> 
 fn revset_preset_items(ui: &Diffui, theme: ThemeSpec) -> Vec<Element<'_, Message>> {
     let font = ui.config.ui_font;
     let mono = ui.config.mono_font;
-    let presets = crate::revset_presets(ui.repository.as_ref().map(|r| r.vcs));
-    presets
-        .iter()
+    ui.revset_menu_entries()
+        .into_iter()
         .map(|(label, expr)| {
             let row = row![
-                text((*label).to_owned())
-                    .size(12)
-                    .color(theme.text)
-                    .font(font),
+                text(label).size(12).color(theme.text).font(font),
                 Space::new().width(Length::Fill),
-                text((*expr).to_owned())
+                text(expr.clone())
                     .size(11)
                     .color(theme.subtle_text)
                     .font(mono),
@@ -369,7 +365,7 @@ fn revset_preset_items(ui: &Diffui, theme: ThemeSpec) -> Vec<Element<'_, Message
             button(row)
                 .width(Length::Fill)
                 .padding(Padding::from([5, 8]))
-                .on_press(Message::RevsetPreset((*expr).to_owned()))
+                .on_press(Message::RevsetPreset(expr))
                 .style(move |_, status| ghost_button_style(theme, status))
                 .into()
         })
