@@ -26,7 +26,7 @@ use jj_lib::{
     git::{
         GitFetch, GitFetchRefExpression, GitImportOptions, GitProgress, GitPushOptions,
         GitPushRefTargets, GitSettings, GitSidebandLineTerminator, GitSubprocessCallback,
-        GitSubprocessOptions, REMOTE_NAME_FOR_LOCAL_GIT_REPO, expand_fetch_refspecs,
+        GitSubprocessOptions, REMOTE_NAME_FOR_LOCAL_GIT_REPO, expand_fetch_refspecs, export_refs,
         get_all_remote_names, push_refs,
     },
     gitignore::GitIgnoreFile,
@@ -34,7 +34,7 @@ use jj_lib::{
     matchers::{EverythingMatcher, Matcher, NothingMatcher, PrefixMatcher},
     merge::{Diff, Merge, SameChange},
     object_id::ObjectId,
-    op_store::{RefTarget, View},
+    op_store::{LocalRemoteRefTarget, RefTarget, View},
     ref_name::{RefName, RefNameBuf, RemoteName, RemoteNameBuf, WorkspaceName},
     repo::{MutableRepo, ReadonlyRepo, Repo, RepoLoader, StoreFactories},
     repo_path::{RepoPath, RepoPathBuf, RepoPathUiConverter},
@@ -284,20 +284,12 @@ pub async fn walk_jj_with_repo(
     // map lookup instead of an O(bookmarks) scan per revision.
     let mut bookmarks_by_commit: HashMap<CommitId, Vec<String>> = HashMap::new();
     for (name, target) in repo.view().bookmarks() {
-        for id in target.local_target.added_ids() {
+        collect_bookmark_labels(name.as_str(), &target, |id, label| {
             bookmarks_by_commit
                 .entry(id.clone())
                 .or_default()
-                .push(name.as_str().to_owned());
-        }
-        for (remote, remote_ref) in &target.remote_refs {
-            for id in remote_ref.target.added_ids() {
-                bookmarks_by_commit
-                    .entry(id.clone())
-                    .or_default()
-                    .push(format!("{}@{}", name.as_str(), remote.as_str()));
-            }
-        }
+                .push(label);
+        });
     }
 
     let mut lane_assigner = LaneAssigner::new();
@@ -396,6 +388,53 @@ pub async fn walk_jj_with_repo(
     // delete/push) — a single bookmarks() walk on the same repo.
     let bookmarks = compute_bookmarks_info(repo, wc_commit_id);
     Ok((empty_updates, branch_status, bookmarks))
+}
+
+/// Emit the bookmark chip label(s) for one bookmark onto the commit(s) they sit
+/// on, following jj's `bookmarks` template semantics:
+/// - the local bookmark renders as `name`, or `name*` when it diverges from any
+///   of its tracked remotes (i.e. there are unpushed/unpulled changes);
+/// - a tracked remote pointing at the same commit as the local bookmark is
+///   redundant and dropped, while a diverged or untracked remote renders as
+///   `name@remote`;
+/// - jj's colocated-git pseudo-remote (`name@git`) is never shown — it just
+///   mirrors the local bookmark and is an implementation detail, so it also
+///   never contributes to the `*` divergence check.
+///
+/// `emit` receives `(commit_id, label)` per chip, so the per-commit graph index
+/// and the single-revision diff header can share one rule.
+fn collect_bookmark_labels(
+    name: &str,
+    target: &LocalRemoteRefTarget<'_>,
+    mut emit: impl FnMut(&CommitId, String),
+) {
+    let local_id = target.local_target.added_ids().next();
+    let diverged = target.remote_refs.iter().any(|(remote, remote_ref)| {
+        remote.as_str() != REMOTE_NAME_FOR_LOCAL_GIT_REPO.as_str()
+            && remote_ref.is_tracked()
+            && remote_ref.target.added_ids().next() != local_id
+    });
+    let local_label = if diverged {
+        format!("{name}*")
+    } else {
+        name.to_owned()
+    };
+    for id in target.local_target.added_ids() {
+        emit(id, local_label.clone());
+    }
+    for (remote, remote_ref) in &target.remote_refs {
+        if remote.as_str() == REMOTE_NAME_FOR_LOCAL_GIT_REPO.as_str() {
+            continue;
+        }
+        let tracked = remote_ref.is_tracked();
+        for id in remote_ref.target.added_ids() {
+            // A tracked remote in sync with the local bookmark is redundant.
+            if tracked && Some(id) == local_id {
+                continue;
+            }
+            emit(id, format!("{}@{}", name, remote.as_str()));
+        }
+    }
 }
 
 /// Snapshot every bookmark in the repo with the state the revision context menu
@@ -1235,6 +1274,15 @@ pub(crate) async fn apply_mutation(
         .await
         .context("failed to rebase descendants after mutation")?;
 
+    // Mirror jj's own post-operation behavior: export the updated bookmarks to
+    // the colocated git repo so the real git branches (which jj surfaces as
+    // `name@git`) follow the move. Without this the jj bookmark moves but the
+    // git branch stays put, unlike the `jj` CLI. Bookmarks that can't be
+    // represented as a single git ref (e.g. conflicted) come back in
+    // `failed_bookmarks`; that's expected and non-fatal, exactly as jj treats
+    // it, so only a hard backend error is propagated.
+    export_refs(tx.repo_mut()).context("failed to export bookmarks to the git backend")?;
+
     let new_repo = tx
         .commit(format!("diffui: {message}"))
         .await
@@ -1666,20 +1714,17 @@ fn jj_revision_details(repo: &dyn Repo, commit: &jj_lib::commit::Commit) -> Revi
     let commit_id = commit.id().clone();
     let change_id = commit.change_id().to_string();
 
-    // Build a flat list mirroring `jj show`'s "Bookmarks:" line:
-    // local name first ("main"), then each remote tracking ref as
-    // `name@remote` ("main@git", "main@origin"). Skip names whose targets
-    // don't actually point at this commit.
+    // The bookmark chips sitting on this commit, matching jj's `bookmarks`
+    // template: the local name (suffixed `*` when it diverges from a tracked
+    // remote), plus any diverged/untracked `name@remote`, with jj's
+    // colocated-git pseudo-remote (`name@git`) hidden.
     let mut bookmarks: Vec<String> = Vec::new();
     for (name, target) in repo.view().bookmarks() {
-        if target.local_target.added_ids().any(|id| id == &commit_id) {
-            bookmarks.push(name.as_str().to_owned());
-        }
-        for (remote, remote_ref) in &target.remote_refs {
-            if remote_ref.target.added_ids().any(|id| id == &commit_id) {
-                bookmarks.push(format!("{}@{}", name.as_str(), remote.as_str()));
+        collect_bookmark_labels(name.as_str(), &target, |id, label| {
+            if id == &commit_id {
+                bookmarks.push(label);
             }
-        }
+        });
     }
 
     let author = jj_signature_info(commit.author());
@@ -2184,5 +2229,108 @@ mod lane_width_probe {
             );
         }
         eprintln!("============================================\n");
+    }
+}
+
+#[cfg(test)]
+mod bookmark_label_tests {
+    use super::*;
+    use jj_lib::op_store::{RemoteRef, RemoteRefState};
+
+    fn cid(hex: &str) -> CommitId {
+        CommitId::try_from_hex(hex).expect("valid hex commit id")
+    }
+
+    fn remote(target: &str, tracked: bool) -> RemoteRef {
+        RemoteRef {
+            target: RefTarget::normal(cid(target)),
+            state: if tracked {
+                RemoteRefState::Tracked
+            } else {
+                RemoteRefState::New
+            },
+        }
+    }
+
+    /// `(commit_hex, label)` chips `collect_bookmark_labels` emits for "main".
+    fn labels(target: &LocalRemoteRefTarget<'_>) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        collect_bookmark_labels("main", target, |id, label| out.push((id.hex(), label)));
+        out
+    }
+
+    #[test]
+    fn local_only_bookmark_has_no_asterisk() {
+        let local = RefTarget::normal(cid("aa"));
+        let target = LocalRemoteRefTarget {
+            local_target: &local,
+            remote_refs: vec![],
+        };
+        assert_eq!(labels(&target), vec![("aa".into(), "main".into())]);
+    }
+
+    #[test]
+    fn tracked_remote_in_sync_is_omitted() {
+        let local = RefTarget::normal(cid("aa"));
+        let origin = remote("aa", true);
+        let target = LocalRemoteRefTarget {
+            local_target: &local,
+            remote_refs: vec![(RemoteName::new("origin"), &origin)],
+        };
+        // Just the local chip — no redundant `main@origin`, no `*`.
+        assert_eq!(labels(&target), vec![("aa".into(), "main".into())]);
+    }
+
+    #[test]
+    fn diverged_tracked_remote_adds_asterisk_and_chip() {
+        let local = RefTarget::normal(cid("aa"));
+        let origin = remote("bb", true);
+        let target = LocalRemoteRefTarget {
+            local_target: &local,
+            remote_refs: vec![(RemoteName::new("origin"), &origin)],
+        };
+        assert_eq!(
+            labels(&target),
+            vec![
+                ("aa".into(), "main*".into()),
+                ("bb".into(), "main@origin".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn untracked_remote_shows_chip_but_no_asterisk() {
+        let local = RefTarget::normal(cid("aa"));
+        let origin = remote("bb", false);
+        let target = LocalRemoteRefTarget {
+            local_target: &local,
+            remote_refs: vec![(RemoteName::new("origin"), &origin)],
+        };
+        assert_eq!(
+            labels(&target),
+            vec![
+                ("aa".into(), "main".into()),
+                ("bb".into(), "main@origin".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn git_pseudo_remote_is_hidden_and_excluded_from_asterisk() {
+        // `@git` diverges from the local target, but it must neither render a
+        // chip nor flip the local bookmark to `main*`; only the in-sync origin
+        // matters, and it's redundant — so just `main` is shown.
+        let local = RefTarget::normal(cid("aa"));
+        let git = remote("bb", true);
+        let origin = remote("aa", true);
+        let target = LocalRemoteRefTarget {
+            local_target: &local,
+            // jj yields remotes lexicographically: "git" before "origin".
+            remote_refs: vec![
+                (RemoteName::new("git"), &git),
+                (RemoteName::new("origin"), &origin),
+            ],
+        };
+        assert_eq!(labels(&target), vec![("aa".into(), "main".into())]);
     }
 }
