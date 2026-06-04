@@ -166,6 +166,9 @@ fn build_revset_filter(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     // while held — required for the native NSMenu's press-drag-release select.
     // Hover is tracked manually (mouse_area has no built-in hover style).
     let caret_hovered = ui.hovered == Some(HoverTarget::RevsetCaret);
+    // No press handler — the press falls through to the wrapping `AnchorArea`
+    // (the `text_input` captures its own), which reports the whole bar's rect so
+    // the presets menu anchors edge-to-edge below it.
     let caret = mouse_area(
         // Drawn triangle (see `toolbar::caret_glyph`) so it centers exactly.
         // Box height = the input's size-12 line box and the same vertical
@@ -176,14 +179,16 @@ fn build_revset_filter(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             .align_y(alignment::Vertical::Center)
             .style(move |_| crate::toolbar::caret_hover_style(theme, caret_hovered)),
     )
-    .on_press(Message::OpenToolbarMenu(ToolbarMenu::RevsetPresets))
     .on_enter(Message::SetHover(Some(HoverTarget::RevsetCaret)))
     .on_exit(Message::SetHover(None))
     .interaction(mouse::Interaction::Pointer);
 
-    let bar = row![input, caret]
-        .spacing(4)
-        .align_y(alignment::Vertical::Center);
+    let bar = crate::menu::anchor_area(
+        row![input, caret]
+            .spacing(4)
+            .align_y(alignment::Vertical::Center),
+        |rect| Message::OpenToolbarMenu(ToolbarMenu::RevsetPresets, rect),
+    );
 
     let hairline = container(Space::new())
         .width(Length::Fill)

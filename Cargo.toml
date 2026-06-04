@@ -8,6 +8,9 @@ iced-debug = ["iced/debug"]
 # Profiling-only: swaps in a global allocator that tracks current/peak bytes.
 # Adds atomic bookkeeping to every alloc, so never enable it for normal builds.
 track-alloc = []
+# Draws the submenu trajectory-guard triangle (apex + flyout edge + live cursor)
+# over open menus. Off by default; enable when tuning the guard.
+trajectory-debug = []
 
 [dependencies]
 anyhow = "1.0"

@@ -19,6 +19,7 @@ mod graph_view;
 mod jj;
 #[cfg(target_os = "macos")]
 mod macos_native;
+mod menu;
 mod mutations;
 mod palette;
 mod repository;
@@ -378,8 +379,9 @@ pub(crate) struct Diffui {
     /// stronger origin (`Focus` walk over `Watcher` diff). Kicked by
     /// `take_pending_refresh` once the app goes idle.
     pub(crate) pending_refresh: Option<RefreshOrigin>,
-    /// Open toolbar dropdown (fetch-branches / revset-presets), if any.
-    pub(crate) toolbar_menu: Option<ToolbarMenu>,
+    /// Open popup menu (toolbar fetch/revset dropdown or revision right-click),
+    /// if any. macOS uses native `NSMenu`s instead and leaves this `None`.
+    pub(crate) menu: Option<menu::OverlayMenu>,
     /// Whether the activity popover is showing.
     pub(crate) activity_popover_open: bool,
     /// The caret control the cursor is currently over, if any — drives the
@@ -645,10 +647,10 @@ pub(crate) enum Message {
     /// active tab's state so it can be stashed and restored on tab switch.
     SidebarScrolled(f64),
     DiffScrolled(f32),
-    /// Right-click on a revision row — opens the native context menu. Carries
-    /// the row's on-screen rect (window-content points) so the native glow can
-    /// be anchored over it while the menu is open.
-    RevisionContextMenu(revision_list::RowSelectionKey, iced::Rectangle),
+    /// Right-click on a revision row — opens the context menu. Carries the row's
+    /// on-screen rect (window-content points) so the glow can be anchored over
+    /// it, plus the cursor point the menu opens at.
+    RevisionContextMenu(revision_list::RowSelectionKey, iced::Rectangle, iced::Point),
     /// A context-menu mutation (new/edit/abandon/bookmark/push) finished,
     /// tab-addressed with its activity id so push remote output lands in the
     /// right log.
@@ -780,12 +782,26 @@ pub(crate) enum Message {
     RevsetChanged(String),
     /// Revset submitted (Enter) — re-evaluate the log.
     RevsetSubmit,
-    /// A revset preset was picked from the caret menu.
-    RevsetPreset(String),
-    /// Open a toolbar dropdown (fetch branches / revset presets).
-    OpenToolbarMenu(ToolbarMenu),
-    /// Close any open toolbar dropdown.
-    CloseToolbarMenu,
+    /// Open a toolbar dropdown (fetch branches / revset presets), anchored
+    /// edge-to-edge below the carried trigger rect.
+    OpenToolbarMenu(ToolbarMenu, iced::Rectangle),
+    /// Hovered a popup-menu row (path of indices through submenus): highlight it
+    /// and open its flyout if it's a submenu.
+    MenuHover(Vec<usize>),
+    /// Cursor moved while a popup menu is open (window coords). Drives the
+    /// submenu trajectory guard and keeps the app underneath inert.
+    MenuMouseMoved(iced::Point),
+    /// Released the mouse over a popup-menu row: pick it (if a leaf).
+    MenuSelect(Vec<usize>),
+    /// A press landed inside a menu card — swallowed so it doesn't dismiss.
+    MenuCapturePress,
+    /// Dismiss the open popup menu (press outside, or Esc).
+    MenuDismiss,
+    /// A release landed on the dismiss scrim — arms outside-dismiss after the
+    /// opening click, or dismisses once armed / after the cursor entered.
+    MenuScrimRelease,
+    /// No-op tick that keeps `view` re-running so the right-click glow pulses.
+    MenuTick,
     /// Open/close the activity popover.
     ActivityToggle,
     /// Expand/collapse one activity row's captured output.
@@ -979,7 +995,7 @@ impl Diffui {
             mutation_in_flight: false,
             mutation_queue: VecDeque::new(),
             pending_refresh: None,
-            toolbar_menu: None,
+            menu: None,
             activity_popover_open: false,
             hovered: None,
         };
@@ -1369,7 +1385,7 @@ impl Diffui {
             Message::SystemThemeChanged(theme) => {
                 self.system_theme = theme;
             }
-            Message::RevisionContextMenu(key, row_rect) => {
+            Message::RevisionContextMenu(key, row_rect, cursor) => {
                 let Some(repository) = self.repository.clone() else {
                     return Task::none();
                 };
@@ -1377,12 +1393,14 @@ impl Diffui {
                 if !matches!(repository.vcs, Vcs::Jj) {
                     return Task::none();
                 }
-                // Opens the native menu (blocking) with a pulsing glow anchored
-                // over `row_rect`; returns the chosen mutation as a task.
+                // macOS pops the native menu (blocking) with a pulsing glow over
+                // `row_rect`; every other platform opens the iced overlay at the
+                // cursor. Either way the chosen action dispatches the same way.
                 return self.open_revision_context_menu(
                     repository,
                     selection_from_key(&key),
                     row_rect,
+                    cursor,
                 );
             }
             Message::MutationCompleted(tab_id, id, result) => {
@@ -1815,21 +1833,101 @@ impl Diffui {
             Message::RevsetSubmit => {
                 return self.evaluate_revset();
             }
-            Message::RevsetPreset(value) => {
-                self.revset = value;
-                self.toolbar_menu = None;
-                return self.evaluate_revset();
-            }
-            Message::OpenToolbarMenu(menu) => {
+            Message::OpenToolbarMenu(which, anchor) => {
                 self.activity_popover_open = false;
-                return self.open_toolbar_menu(menu);
+                return self.open_toolbar_menu(which, anchor);
             }
-            Message::CloseToolbarMenu => {
-                self.toolbar_menu = None;
+            Message::MenuHover(path) => {
+                // Hover is `on_enter`-driven (geometry-free, can't mis-hit). On
+                // the open branch (or with no flyout open) it commits at once.
+                // An off-branch row while a flyout is open is held as *pending*;
+                // MenuMouseMoved commits it once the cursor veers out of the
+                // trajectory wedge, so the row only opens when the sweep ends.
+                let Some(m) = self.menu.as_mut() else {
+                    return Task::none();
+                };
+                m.entered = true;
+                if m.open_path.is_empty() || m.on_open_branch(&path) {
+                    m.activate(path);
+                } else {
+                    m.pending_row = Some(path);
+                }
+            }
+            Message::MenuMouseMoved(pos) => {
+                if self.menu.is_none() {
+                    return Task::none();
+                }
+                // Off-branch sweep pending: commit the row the moment the cursor
+                // leaves the triangle aimed at the flyout (a veer). The apex
+                // itself is eased toward the cursor on the menu tick (see
+                // `MenuTick`), frozen while a row is pending — so it sits upstream
+                // and the wedge has room during a sweep. No timeouts: a big menu
+                // can take as long as it likes. A not-yet-set apex (submenu only
+                // just opened) holds the row pending rather than stealing it.
+                let commit = {
+                    let m = self.menu.as_ref().unwrap();
+                    m.pending_row.as_ref().map(|_| {
+                        match (m.flyout_origin, menu::flyout_rect(self, m)) {
+                            (Some(apex), Some(fly)) => !menu::heading_to_flyout(apex, pos, fly),
+                            _ => false,
+                        }
+                    })
+                };
+                let m = self.menu.as_mut().unwrap();
+                m.cursor = Some(pos);
+                m.entered = true;
+                if commit == Some(true)
+                    && let Some(path) = m.pending_row.take()
+                {
+                    m.activate(path);
+                }
+            }
+            Message::MenuSelect(path) => {
+                let Some(open) = self.menu.as_ref() else {
+                    return Task::none();
+                };
+                // Only a leaf picks; a release on a submenu/disabled/separator
+                // row leaves the (already hover-opened) menu as it is.
+                if let Some(menu::MenuEntry::Item { action, .. }) = open.entry_at(&path) {
+                    let action = action.clone();
+                    let selection = open.selection.clone();
+                    self.menu = None;
+                    return self.dispatch_menu_action(action, selection);
+                }
+            }
+            Message::MenuCapturePress => {}
+            Message::MenuDismiss => {
+                self.menu = None;
+            }
+            Message::MenuScrimRelease => {
+                if let Some(menu) = self.menu.as_mut() {
+                    // The opening left-click's release lands here first; swallow
+                    // it (arm) and keep the menu open. A later release — or one
+                    // after the cursor has dragged into the menu — dismisses.
+                    if menu.armed || menu.entered {
+                        self.menu = None;
+                    } else {
+                        menu.armed = true;
+                    }
+                }
+            }
+            // Drives two time-based effects while a menu is open: the right-click
+            // glow pulse (re-running `view`), and easing the trajectory apex
+            // toward the cursor. Easing on this fixed clock — not on raw moves —
+            // is what makes the apex lag by a velocity-proportional amount during
+            // a sweep yet catch up when the cursor idles. Frozen while a row is
+            // pending so the wedge keeps a stable upstream origin mid-sweep.
+            Message::MenuTick => {
+                if let Some(m) = self.menu.as_mut()
+                    && m.pending_row.is_none()
+                    && let Some(cursor) = m.cursor
+                {
+                    m.flyout_origin = Some(menu::ease_apex(m.flyout_origin, cursor));
+                }
             }
             Message::ActivityToggle => {
                 self.activity_popover_open = !self.activity_popover_open;
-                self.toolbar_menu = None;
+                self.menu = None;
             }
             Message::ActivityExpand(id) => {
                 self.activities.toggle_expand(id);
@@ -2143,71 +2241,39 @@ impl Diffui {
         }
     }
 
-    /// Show the native context menu for a right-clicked revision and dispatch
-    /// the chosen mutation. `popup_menu` blocks (a nested `NSMenu` loop) on the
-    /// main thread until the user picks — fine for a modal menu — then the
-    /// mutation itself runs off-thread.
-    ///
-    /// The menu is built from `self.bookmarks` (loaded with the graph), so it
-    /// can offer per-bookmark actions for the bookmarks sitting on this revision
-    /// without any synchronous repo read.
-    #[cfg(target_os = "macos")]
-    fn open_revision_context_menu(
-        &mut self,
-        repository: Repository,
-        selection: RevisionSelection,
-        row_rect: iced::Rectangle,
-    ) -> Task<Message> {
-        use macos_native::MenuItem;
+    /// Build the revision context menu's entry tree from the already-loaded
+    /// `self.bookmarks` / `self.commits` (so it opens instantly, no repo read).
+    /// Shared by the macOS native popup and the iced overlay; author/committer/
+    /// description copies carry only an in-memory fallback, with the live value
+    /// read on demand when picked.
+    fn revision_menu_tree(&self, selection: &RevisionSelection) -> Vec<menu::MenuEntry> {
+        use menu::MenuEntry;
         use mutations::MutationOp;
 
-        // Each leaf carries an index into `actions`; the popup returns that
-        // index. `register` keeps the menu tree and the action list in lockstep.
-        fn register(actions: &mut Vec<MenuAction>, action: MenuAction) -> u32 {
-            let id = actions.len() as u32;
-            actions.push(action);
-            id
-        }
-
-        let mut actions: Vec<MenuAction> = Vec::new();
-
-        // ── Commit-level actions ────────────────────────────────────────────
         let mut top = vec![
-            MenuItem::entry(
+            MenuEntry::item(
                 "New child",
-                register(
-                    &mut actions,
-                    MenuAction::Mutate(MutationOp::New {
-                        parent: selection.clone(),
-                    }),
-                ),
+                MenuAction::Mutate(MutationOp::New {
+                    parent: selection.clone(),
+                }),
             ),
-            MenuItem::entry(
+            MenuEntry::item(
                 "Edit",
-                register(
-                    &mut actions,
-                    MenuAction::Mutate(MutationOp::Edit {
-                        target: selection.clone(),
-                    }),
-                ),
+                MenuAction::Mutate(MutationOp::Edit {
+                    target: selection.clone(),
+                }),
             ),
-            MenuItem::entry(
+            MenuEntry::item(
                 "Abandon",
-                register(
-                    &mut actions,
-                    MenuAction::Mutate(MutationOp::Abandon {
-                        target: selection.clone(),
-                    }),
-                ),
+                MenuAction::Mutate(MutationOp::Abandon {
+                    target: selection.clone(),
+                }),
             ),
         ];
 
-        // ── Copy revision metadata ──────────────────────────────────────────
-        // Values read from the already-loaded graph row (so the menu stays
-        // instant); author/committer copies, which need a date the graph
-        // doesn't keep, are read on demand when picked.
+        // Copy revision metadata — values come from the loaded graph row.
         let copy_fields = {
-            let row = match &selection {
+            let row = match selection {
                 RevisionSelection::WorkingCopy => self.commits.working_copy(),
                 RevisionSelection::Commit(hex) => self.commits.find_by_commit_id(hex),
             };
@@ -2223,178 +2289,212 @@ impl Diffui {
         };
         if let Some((change_id, commit_id, description, author, bookmarks)) = copy_fields {
             let mut copy_items = vec![
-                MenuItem::entry(
-                    "Revision ID",
-                    register(&mut actions, MenuAction::CopyText(change_id)),
-                ),
-                MenuItem::entry(
-                    "Commit hash",
-                    register(&mut actions, MenuAction::CopyText(commit_id)),
-                ),
+                MenuEntry::item("Revision ID", MenuAction::CopyText(change_id)),
+                MenuEntry::item("Commit hash", MenuAction::CopyText(commit_id)),
             ];
             match bookmarks.len() {
                 0 => {}
-                1 => copy_items.push(MenuItem::entry(
+                1 => copy_items.push(MenuEntry::item(
                     "Bookmark",
-                    register(&mut actions, MenuAction::CopyText(bookmarks[0].clone())),
+                    MenuAction::CopyText(bookmarks[0].clone()),
                 )),
                 _ => {
                     let subs = bookmarks
                         .iter()
                         .map(|name| {
-                            MenuItem::entry(
-                                name.clone(),
-                                register(&mut actions, MenuAction::CopyText(name.clone())),
-                            )
+                            MenuEntry::item(name.clone(), MenuAction::CopyText(name.clone()))
                         })
                         .collect();
-                    copy_items.push(MenuItem::submenu("Bookmark", subs));
+                    copy_items.push(MenuEntry::Submenu {
+                        label: "Bookmark".to_owned(),
+                        items: subs,
+                    });
                 }
             }
             if !description.is_empty() {
-                copy_items.push(MenuItem::entry(
+                copy_items.push(MenuEntry::item(
                     "Description",
-                    register(
-                        &mut actions,
-                        MenuAction::CopyDetail {
-                            field: DetailField::Description,
-                            // The in-memory subject line, in case the full read
-                            // fails — better than copying nothing.
-                            fallback: description,
-                        },
-                    ),
+                    MenuAction::CopyDetail {
+                        field: DetailField::Description,
+                        fallback: description,
+                    },
                 ));
             }
-            copy_items.push(MenuItem::entry(
+            copy_items.push(MenuEntry::item(
                 "Author",
-                register(
-                    &mut actions,
-                    MenuAction::CopyDetail {
-                        field: DetailField::Author,
-                        fallback: author.clone(),
-                    },
-                ),
+                MenuAction::CopyDetail {
+                    field: DetailField::Author,
+                    fallback: author.clone(),
+                },
             ));
-            copy_items.push(MenuItem::entry(
+            copy_items.push(MenuEntry::item(
                 "Committer",
-                register(
-                    &mut actions,
-                    MenuAction::CopyDetail {
-                        field: DetailField::Committer,
-                        fallback: author,
-                    },
-                ),
+                MenuAction::CopyDetail {
+                    field: DetailField::Committer,
+                    fallback: author,
+                },
             ));
-            top.push(MenuItem::Separator);
-            top.push(MenuItem::submenu("Copy", copy_items));
+            top.push(MenuEntry::Separator);
+            top.push(MenuEntry::Submenu {
+                label: "Copy".to_owned(),
+                items: copy_items,
+            });
         }
 
-        // ── Move a bookmark onto this revision ──────────────────────────────
-        // Candidate local bookmarks (name + target commit). Collected first so
-        // the `self.bookmarks` borrow ends before we mutate `actions`, then
-        // ordered nearest-first to the right-clicked revision. An empty submenu
-        // renders as a disabled row.
+        // Move a local bookmark onto this revision, nearest-first.
         let mut moves: Vec<(String, String)> = self
             .bookmarks
             .bookmarks
             .iter()
             .filter_map(|b| b.local_target.as_ref().map(|t| (b.name.clone(), t.clone())))
             .collect();
-        moves.sort(); // alphabetical baseline (stable tiebreak below)
-        let move_reference = match &selection {
+        moves.sort();
+        let move_reference = match selection {
             RevisionSelection::Commit(hex) => Some(hex.clone()),
             RevisionSelection::WorkingCopy => self.bookmarks.working_copy_commit.clone(),
         };
         self.sort_by_proximity(&mut moves, move_reference.as_deref(), |(_, t)| t.as_str());
-        let move_items: Vec<MenuItem> = moves
+        let move_items: Vec<MenuEntry> = moves
             .into_iter()
             .map(|(name, _target)| {
-                let id = register(
-                    &mut actions,
+                MenuEntry::item(
+                    name.clone(),
                     MenuAction::Mutate(MutationOp::MoveBookmark {
-                        name: name.clone(),
+                        name,
                         to: selection.clone(),
                     }),
-                );
-                MenuItem::entry(name, id)
+                )
             })
             .collect();
-        top.push(MenuItem::Separator);
-        top.push(MenuItem::submenu("Move bookmark here", move_items));
+        top.push(MenuEntry::Separator);
+        top.push(if move_items.is_empty() {
+            MenuEntry::Disabled {
+                label: "Move bookmark here".to_owned(),
+            }
+        } else {
+            MenuEntry::Submenu {
+                label: "Move bookmark here".to_owned(),
+                items: move_items,
+            }
+        });
 
-        // ── Per-bookmark actions for bookmarks on this revision ─────────────
-        let target_hex: Option<&str> = match &selection {
+        // Per-bookmark actions for bookmarks sitting on this revision.
+        let target_hex: Option<&str> = match selection {
             RevisionSelection::Commit(hex) => Some(hex.as_str()),
             RevisionSelection::WorkingCopy => self.bookmarks.working_copy_commit.as_deref(),
         };
-        let mut bookmark_items: Vec<MenuItem> = Vec::new();
+        let mut bookmark_items: Vec<MenuEntry> = Vec::new();
         if let Some(hex) = target_hex {
             for entry in &self.bookmarks.bookmarks {
-                // A local bookmark sitting here → push (if tracked) + delete.
                 if entry.local_target.as_deref() == Some(hex) {
                     let mut sub = Vec::new();
                     if let Some(remote) = entry.tracked_remote() {
-                        let id = register(
-                            &mut actions,
+                        sub.push(MenuEntry::item(
+                            format!("Push to {remote}"),
                             MenuAction::Mutate(MutationOp::PushBookmark {
                                 name: entry.name.clone(),
                                 remote: remote.to_owned(),
                             }),
-                        );
-                        sub.push(MenuItem::entry(format!("Push to {remote}"), id));
+                        ));
                     }
-                    let id = register(
-                        &mut actions,
+                    sub.push(MenuEntry::item(
+                        "Delete",
                         MenuAction::Mutate(MutationOp::DeleteBookmark {
                             name: entry.name.clone(),
                         }),
-                    );
-                    sub.push(MenuItem::entry("Delete", id));
-                    bookmark_items.push(MenuItem::submenu(entry.name.clone(), sub));
+                    ));
+                    bookmark_items.push(MenuEntry::Submenu {
+                        label: entry.name.clone(),
+                        items: sub,
+                    });
                 }
-                // An untracked remote ref sitting here → offer to track it.
                 for remote_ref in &entry.remotes {
                     if remote_ref.target.as_str() == hex && !remote_ref.tracked {
-                        let id = register(
-                            &mut actions,
-                            MenuAction::Mutate(MutationOp::TrackBookmark {
-                                name: entry.name.clone(),
-                                remote: remote_ref.remote.clone(),
-                            }),
-                        );
-                        bookmark_items.push(MenuItem::submenu(
-                            format!("{}@{}", entry.name, remote_ref.remote),
-                            vec![MenuItem::entry("Track", id)],
-                        ));
+                        bookmark_items.push(MenuEntry::Submenu {
+                            label: format!("{}@{}", entry.name, remote_ref.remote),
+                            items: vec![MenuEntry::item(
+                                "Track",
+                                MenuAction::Mutate(MutationOp::TrackBookmark {
+                                    name: entry.name.clone(),
+                                    remote: remote_ref.remote.clone(),
+                                }),
+                            )],
+                        });
                     }
                 }
             }
         }
         if !bookmark_items.is_empty() {
-            top.push(MenuItem::Separator);
+            top.push(MenuEntry::Separator);
             top.append(&mut bookmark_items);
         }
 
-        let glow = macos_native::GlowRect {
-            x: row_rect.x,
-            y: row_rect.y,
-            width: row_rect.width,
-            height: row_rect.height,
-        };
-        let Some(chosen) = macos_native::popup_menu(&top, Some(glow)) else {
-            return Task::none();
-        };
-        let Some(action) = actions.get(chosen as usize).cloned() else {
-            return Task::none();
-        };
+        top
+    }
+
+    /// The toolbar fetch menu's entries: "Fetch all remotes" + one row per known
+    /// remote branch (`name@remote`), nearest-first.
+    fn fetch_menu_entries(&self) -> Vec<menu::MenuEntry> {
+        use menu::MenuEntry;
+        let mut items = vec![MenuEntry::Item {
+            label: "Fetch all remotes".to_owned(),
+            detail: None,
+            emphasized: true,
+            action: MenuAction::Fetch(FetchTarget::AllRemotes),
+        }];
+        let branches = self.remote_branches_by_proximity();
+        if !branches.is_empty() {
+            items.push(MenuEntry::Separator);
+            for (branch, remote) in branches {
+                items.push(MenuEntry::item(
+                    format!("{branch}@{remote}"),
+                    MenuAction::Fetch(FetchTarget::RemoteBranch { remote, branch }),
+                ));
+            }
+        }
+        items
+    }
+
+    /// The toolbar revset menu's entries: each `label` with its `expr` shown as
+    /// the right-aligned detail.
+    fn revset_menu_entry_tree(&self) -> Vec<menu::MenuEntry> {
+        self.revset_menu_entries()
+            .into_iter()
+            .map(|(label, expr)| menu::MenuEntry::Item {
+                label,
+                detail: Some(expr.clone()),
+                emphasized: false,
+                action: MenuAction::SetRevset(expr),
+            })
+            .collect()
+    }
+
+    /// Run a picked menu action. `selection` is the right-clicked revision (for
+    /// the on-demand author/committer/description reads), `None` for the toolbar
+    /// menus. Shared by the native and iced menus.
+    fn dispatch_menu_action(
+        &mut self,
+        action: MenuAction,
+        selection: Option<RevisionSelection>,
+    ) -> Task<Message> {
+        use mutations::MutationOp;
+
         let op = match action {
-            MenuAction::Mutate(op) => op,
+            MenuAction::Fetch(target) => return self.start_fetch(target),
+            MenuAction::SetRevset(expr) => {
+                self.revset = expr;
+                return self.evaluate_revset();
+            }
             // Ready-to-paste values write to the clipboard immediately.
             MenuAction::CopyText(text) => return iced::clipboard::write(text).discard(),
             // Author / committer / full description aren't kept in the graph, so
-            // read the revision off-thread, format the field, and copy —
-            // falling back to the in-memory value on failure.
+            // read the revision off-thread, format the field, and copy — falling
+            // back to the in-memory value on failure.
             MenuAction::CopyDetail { field, fallback } => {
+                let (Some(repository), Some(selection)) = (self.repository.clone(), selection)
+                else {
+                    return Task::none();
+                };
                 return Task::perform(
                     backend::load_revision_details(repository, selection),
                     move |result| {
@@ -2406,6 +2506,11 @@ impl Diffui {
                     },
                 );
             }
+            MenuAction::Mutate(op) => op,
+        };
+
+        let Some(repository) = self.repository.clone() else {
+            return Task::none();
         };
         let Some(tab_id) = self.active_tab_id() else {
             return Task::none();
@@ -2433,15 +2538,52 @@ impl Diffui {
         })
     }
 
-    /// Non-macOS stub: the native popup isn't available, so right-click is a
-    /// no-op for now (the mutations themselves are portable).
+    /// macOS: lower the shared tree to a native `NSMenu`, pop it (blocking, with
+    /// a pulsing glow over `row_rect`), and dispatch the chosen action.
+    #[cfg(target_os = "macos")]
+    fn open_revision_context_menu(
+        &mut self,
+        _repository: Repository,
+        selection: RevisionSelection,
+        row_rect: iced::Rectangle,
+        _cursor: iced::Point,
+    ) -> Task<Message> {
+        let tree = self.revision_menu_tree(&selection);
+        let mut actions: Vec<MenuAction> = Vec::new();
+        let items = lower_menu_to_native(&tree, &mut actions);
+        let glow = macos_native::GlowRect {
+            x: row_rect.x,
+            y: row_rect.y,
+            width: row_rect.width,
+            height: row_rect.height,
+        };
+        let Some(chosen) = macos_native::popup_menu(&items, Some(glow)) else {
+            return Task::none();
+        };
+        let Some(action) = actions.get(chosen as usize).cloned() else {
+            return Task::none();
+        };
+        self.dispatch_menu_action(action, Some(selection))
+    }
+
+    /// Non-macOS: open the iced overlay menu at the cursor, pulsing `row_rect`.
     #[cfg(not(target_os = "macos"))]
     fn open_revision_context_menu(
-        &self,
+        &mut self,
         _repository: Repository,
-        _selection: RevisionSelection,
-        _row_rect: iced::Rectangle,
+        selection: RevisionSelection,
+        row_rect: iced::Rectangle,
+        cursor: iced::Point,
     ) -> Task<Message> {
+        let tree = self.revision_menu_tree(&selection);
+        // `armed: false` so the right-button release that opened the menu is
+        // swallowed (kept open) rather than treated as a pick/dismiss — the
+        // cursor sits in the card's corner padding, not on a row, at open.
+        let mut overlay = menu::OverlayMenu::new(tree, menu::AnchorSpec::At(cursor), false);
+        overlay.selection = Some(selection);
+        overlay.glow = Some(row_rect);
+        self.activity_popover_open = false;
+        self.menu = Some(overlay);
         Task::none()
     }
 
@@ -2451,10 +2593,10 @@ impl Diffui {
     /// The menu is modal/blocking like the revision context menu, so the chosen
     /// action is dispatched directly on return.
     #[cfg(target_os = "macos")]
-    fn open_toolbar_menu(&mut self, menu: ToolbarMenu) -> Task<Message> {
+    fn open_toolbar_menu(&mut self, which: ToolbarMenu, _anchor: iced::Rectangle) -> Task<Message> {
         use macos_native::MenuItem;
 
-        match menu {
+        match which {
             ToolbarMenu::FetchBranches => {
                 // id 0 = all remotes; each known `name@remote` follows, ordered
                 // by proximity to the working copy.
@@ -2498,10 +2640,19 @@ impl Diffui {
         }
     }
 
-    /// Non-macOS: fall back to the iced overlay dropdown.
+    /// Non-macOS: open the iced overlay dropdown, anchored edge-to-edge below
+    /// the trigger's reported rect.
     #[cfg(not(target_os = "macos"))]
-    fn open_toolbar_menu(&mut self, menu: ToolbarMenu) -> Task<Message> {
-        self.toolbar_menu = Some(menu);
+    fn open_toolbar_menu(&mut self, which: ToolbarMenu, anchor: iced::Rectangle) -> Task<Message> {
+        let root = match which {
+            ToolbarMenu::FetchBranches => self.fetch_menu_entries(),
+            ToolbarMenu::RevsetPresets => self.revset_menu_entry_tree(),
+        };
+        self.menu = Some(menu::OverlayMenu::new(
+            root,
+            menu::AnchorSpec::Below(anchor),
+            false,
+        ));
         Task::none()
     }
 
@@ -2885,7 +3036,7 @@ impl Diffui {
         let Some(tab_id) = self.active_tab_id() else {
             return Task::none();
         };
-        self.toolbar_menu = None;
+        self.menu = None;
         let label = match &target {
             FetchTarget::AllRemotes => "Fetch all remotes".to_owned(),
             FetchTarget::RemoteBranch { remote, branch } => format!("Fetch {branch}@{remote}"),
@@ -2948,7 +3099,7 @@ impl Diffui {
         let Some(repository) = self.repository.clone() else {
             return Task::none();
         };
-        self.toolbar_menu = None;
+        self.menu = None;
         // Persist the new filter (debounced) for this repo.
         self.mark_geometry_dirty();
         // Supersede any prior in-flight load (cold stream or a previous eval) so
@@ -3253,7 +3404,7 @@ impl Diffui {
         let content: Element<'_, Message> = stack![
             shell,
             activity::activity_popover(self, theme),
-            toolbar::build_menu_overlay(self, theme),
+            menu::build_overlay(self, theme),
             tab_bar::build_open_repo_dialog(self, theme),
         ]
         .width(Length::Fill)
@@ -3296,7 +3447,7 @@ impl Diffui {
             self.palette.is_some(),
             self.find.is_some(),
             self.open_repo_dialog.is_some(),
-            self.toolbar_menu.is_some(),
+            self.menu.is_some(),
             self.activity_popover_open,
         );
 
@@ -3320,7 +3471,7 @@ impl Diffui {
                 if menu_open || popover_open {
                     return match key.as_ref() {
                         keyboard::Key::Named(keyboard::key::Named::Escape) => Some(if menu_open {
-                            Message::CloseToolbarMenu
+                            Message::MenuDismiss
                         } else {
                             Message::ActivityToggle
                         }),
@@ -3504,12 +3655,27 @@ impl Diffui {
             Subscription::none()
         };
 
+        // Per-frame ticks while a right-click menu's row glow is up (so its pulse
+        // animates — the render is the effect; only the iced overlay glows, macOS
+        // animates natively) or while a submenu is open (so the trajectory apex
+        // eases toward the cursor / catches up when it idles).
+        let menu_ticking = self
+            .menu
+            .as_ref()
+            .is_some_and(|m| m.glow.is_some() || !m.open_path.is_empty());
+        let menu_tick = if menu_ticking {
+            time::every(Duration::from_millis(16)).map(|_| Message::MenuTick)
+        } else {
+            Subscription::none()
+        };
+
         Subscription::batch([
             keyboard,
             window_events,
             refresh,
             palette_tick,
             loading_tick,
+            menu_tick,
             window_state_tick,
             system::theme_changes().map(Message::SystemThemeChanged),
         ])
@@ -3667,7 +3833,7 @@ fn empty_state<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
 /// returns the chosen leaf's index into a `Vec<MenuAction>`; this records what
 /// to do with that choice.
 #[derive(Debug, Clone)]
-enum MenuAction {
+pub(crate) enum MenuAction {
     /// A jj mutation (new / edit / abandon / bookmark op).
     Mutate(mutations::MutationOp),
     /// Copy a value already in hand (revision id, commit hash, a bookmark name).
@@ -3679,13 +3845,59 @@ enum MenuAction {
         field: DetailField,
         fallback: String,
     },
+    /// Run a fetch (toolbar fetch menu).
+    Fetch(FetchTarget),
+    /// Replace the revset and re-evaluate (toolbar revset menu).
+    SetRevset(String),
 }
 
 #[derive(Debug, Clone, Copy)]
-enum DetailField {
+pub(crate) enum DetailField {
     Author,
     Committer,
     Description,
+}
+
+/// Lower a shared [`menu::MenuEntry`] tree to a native `NSMenu` tree, assigning
+/// each actionable leaf the next index into `actions` (what `popup_menu` returns
+/// when it's picked). A revset row folds its expression into the label; an empty
+/// submenu becomes a disabled row.
+#[cfg(target_os = "macos")]
+fn lower_menu_to_native(
+    entries: &[menu::MenuEntry],
+    actions: &mut Vec<MenuAction>,
+) -> Vec<macos_native::MenuItem> {
+    use macos_native::MenuItem;
+    use menu::MenuEntry;
+
+    entries
+        .iter()
+        .map(|entry| match entry {
+            MenuEntry::Separator => MenuItem::Separator,
+            MenuEntry::Disabled { label } => MenuItem::Entry {
+                label: label.clone(),
+                id: 0,
+                enabled: false,
+            },
+            MenuEntry::Item {
+                label,
+                detail,
+                action,
+                ..
+            } => {
+                let id = actions.len() as u32;
+                actions.push(action.clone());
+                let label = match detail {
+                    Some(detail) => format!("{label}  ·  {detail}"),
+                    None => label.clone(),
+                };
+                MenuItem::entry(label, id)
+            }
+            MenuEntry::Submenu { label, items } => {
+                MenuItem::submenu(label.clone(), lower_menu_to_native(items, actions))
+            }
+        })
+        .collect()
 }
 
 /// Format a `Copy → {Author,Committer,Description}` value from a freshly-read

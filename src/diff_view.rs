@@ -25,7 +25,10 @@ const HUNK_HEADER_VPAD: f32 = 1.0;
 const PREFIX_WIDTH: f32 = 24.0;
 const TEXT_X_PADDING: f32 = 8.0;
 const TEXT_Y_PADDING: f32 = 2.0;
-const LINE_SCROLL_ROWS: f32 = 1.5;
+// Rows advanced per wheel-notch line on Linux/Windows (macOS trackpads take the
+// pixel path below). Above the ~3-line OS default — browsing a long diff with a
+// wheel felt sluggish otherwise.
+const LINE_SCROLL_ROWS: f32 = 5.0;
 const PIXEL_SCROLL_SCALE: f32 = 0.65;
 // Floor for the gutter so two single-digit columns still look intentional.
 const GUTTER_MIN_WIDTH: f32 = 56.0;

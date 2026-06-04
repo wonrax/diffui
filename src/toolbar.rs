@@ -5,15 +5,13 @@
 //! render as iced overlays anchored near their trigger.
 
 use iced::{
-    Background, Border, Color, Element, Length, Padding, Point, Rectangle, alignment,
-    font::Weight,
-    mouse,
-    widget::{Space, button, canvas, column, container, mouse_area, row, stack, text},
+    Background, Border, Color, Element, Length, Padding, Point, Rectangle, alignment, mouse,
+    widget::{Space, button, canvas, column, container, mouse_area, row, text},
 };
 
 use crate::activity;
 use crate::repository::Vcs;
-use crate::theme::{ThemeSpec, chip_background, emphasis_font};
+use crate::theme::{ThemeSpec, chip_background};
 use crate::{Diffui, FetchTarget, HoverTarget, Message, ToolbarMenu};
 
 /// A down-pointing caret (▾) drawn as a filled triangle rather than a text
@@ -190,10 +188,11 @@ fn fetch_split_button(
     .on_press(Message::Fetch(FetchTarget::AllRemotes))
     .style(move |_, status| ghost_button_style(theme, status));
 
-    // A `mouse_area` (not a `button`) so the menu opens on mouse-*down* while
-    // held — that's what lets the native NSMenu track a press-drag-release
-    // selection (iced `button` only fires on release). Hover + cursor are set
-    // manually since mouse_area has neither.
+    // A `mouse_area` (not a `button`) with no press handler: the press falls
+    // through to the wrapping `AnchorArea` (the main "Fetch" `button` captures
+    // its own, so only a press on this caret half opens the menu), which reports
+    // the whole split button's rect so the dropdown anchors edge-to-edge below
+    // it. Hover + cursor are set manually since mouse_area has neither.
     let caret = mouse_area(
         // Box height = the main half's size-13 text line box, and the same
         // vertical padding (4) — so the caret's hover fill is exactly as tall as
@@ -203,7 +202,6 @@ fn fetch_split_button(
             .align_y(alignment::Vertical::Center)
             .style(move |_| caret_hover_style(theme, caret_hovered)),
     )
-    .on_press(Message::OpenToolbarMenu(ToolbarMenu::FetchBranches))
     .on_enter(Message::SetHover(Some(HoverTarget::FetchCaret)))
     .on_exit(Message::SetHover(None))
     .interaction(mouse::Interaction::Pointer);
@@ -216,7 +214,7 @@ fn fetch_split_button(
             ..container::Style::default()
         });
 
-    container(
+    let split = container(
         row![main, divider, caret]
             .spacing(0)
             .align_y(alignment::Vertical::Center),
@@ -234,6 +232,10 @@ fn fetch_split_button(
             radius: 6.0.into(),
         },
         ..container::Style::default()
+    });
+
+    crate::menu::anchor_area(split, |rect| {
+        Message::OpenToolbarMenu(ToolbarMenu::FetchBranches, rect)
     })
     .into()
 }
@@ -269,162 +271,5 @@ fn ghost_button_style(theme: ThemeSpec, status: button::Status) -> button::Style
         },
         shadow: Default::default(),
         snap: true,
-    }
-}
-
-/// Overlay for whichever toolbar dropdown is open (fetch branches / revset
-/// presets). Empty `Space` when none is open. Anchored near its trigger.
-pub fn build_menu_overlay(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
-    let Some(menu) = ui.toolbar_menu else {
-        return Space::new().into();
-    };
-
-    let scrim = mouse_area(
-        container(Space::new().width(Length::Fill).height(Length::Fill))
-            .width(Length::Fill)
-            .height(Length::Fill),
-    )
-    .on_press(Message::CloseToolbarMenu);
-
-    let (items, pad_top, pad_left) = match menu {
-        ToolbarMenu::FetchBranches => (fetch_menu_items(ui, theme), 78.0, 90.0),
-        ToolbarMenu::RevsetPresets => (revset_preset_items(ui, theme), 118.0, 12.0),
-    };
-
-    let card = mouse_area(
-        container(column(items).spacing(1))
-            .width(Length::Fixed(240.0))
-            .padding(Padding::from([6, 6]))
-            .style(move |_| menu_card_style(theme)),
-    )
-    .on_press(Message::ActivityNoOp);
-
-    let anchored = container(card)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .align_x(alignment::Horizontal::Left)
-        .padding(Padding {
-            top: pad_top,
-            right: 0.0,
-            bottom: 0.0,
-            left: pad_left,
-        });
-
-    stack![scrim, anchored].into()
-}
-
-/// Fetch dropdown: "Fetch all remotes" + one row per known remote branch
-/// (`name@remote`, from the already-loaded bookmark table). git repos have no
-/// bookmark table, so they show only the "all remotes" row.
-fn fetch_menu_items(ui: &Diffui, theme: ThemeSpec) -> Vec<Element<'_, Message>> {
-    let font = ui.config.ui_font;
-    let mono = ui.config.mono_font;
-    let mut items: Vec<Element<'_, Message>> = vec![menu_item(
-        "Fetch all remotes",
-        Message::Fetch(FetchTarget::AllRemotes),
-        font,
-        theme,
-        true,
-    )];
-
-    // Ordered the same as the native menu (see `remote_branches_by_proximity`).
-    let branches = ui.remote_branches_by_proximity();
-    if !branches.is_empty() {
-        items.push(menu_separator(theme));
-        for (branch, remote) in branches {
-            let label = format!("{branch}@{remote}");
-            items.push(menu_item(
-                &label,
-                Message::Fetch(FetchTarget::RemoteBranch { remote, branch }),
-                mono,
-                theme,
-                false,
-            ));
-        }
-    }
-    items
-}
-
-/// Revset presets: jj built-in functions, or git rev-range shortcuts.
-fn revset_preset_items(ui: &Diffui, theme: ThemeSpec) -> Vec<Element<'_, Message>> {
-    let font = ui.config.ui_font;
-    let mono = ui.config.mono_font;
-    ui.revset_menu_entries()
-        .into_iter()
-        .map(|(label, expr)| {
-            let row = row![
-                text(label).size(12).color(theme.text).font(font),
-                Space::new().width(Length::Fill),
-                text(expr.clone())
-                    .size(11)
-                    .color(theme.subtle_text)
-                    .font(mono),
-            ]
-            .spacing(8)
-            .align_y(alignment::Vertical::Center);
-            button(row)
-                .width(Length::Fill)
-                .padding(Padding::from([5, 8]))
-                .on_press(Message::RevsetPreset(expr))
-                .style(move |_, status| ghost_button_style(theme, status))
-                .into()
-        })
-        .collect()
-}
-
-fn menu_item<'a>(
-    label: &str,
-    message: Message,
-    font: iced::Font,
-    theme: ThemeSpec,
-    emphasized: bool,
-) -> Element<'a, Message> {
-    let label_font = if emphasized {
-        emphasis_font(font, Weight::Medium)
-    } else {
-        font
-    };
-    button(
-        text(label.to_owned())
-            .size(12)
-            .color(theme.text)
-            .font(label_font),
-    )
-    .width(Length::Fill)
-    .padding(Padding::from([5, 8]))
-    .on_press(message)
-    .style(move |_, status| ghost_button_style(theme, status))
-    .into()
-}
-
-fn menu_separator<'a>(theme: ThemeSpec) -> Element<'a, Message> {
-    container(Space::new())
-        .width(Length::Fill)
-        .height(Length::Fixed(1.0))
-        .padding(Padding::from([0, 4]))
-        .style(move |_| container::Style {
-            background: Some(Background::Color(theme.border)),
-            ..container::Style::default()
-        })
-        .into()
-}
-
-fn menu_card_style(theme: ThemeSpec) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(theme.panel_background_elevated)),
-        border: Border {
-            width: 1.0,
-            color: theme.border,
-            radius: 10.0.into(),
-        },
-        shadow: iced::Shadow {
-            color: Color {
-                a: 0.30,
-                ..Color::BLACK
-            },
-            offset: iced::Vector::new(0.0, 8.0),
-            blur_radius: 24.0,
-        },
-        ..container::Style::default()
     }
 }

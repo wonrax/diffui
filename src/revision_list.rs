@@ -226,7 +226,7 @@ pub struct RevisionList<'a, Message> {
     /// Optional right-click handler for a revision row — opens the context
     /// menu. Receives the row's selection key and its on-screen rectangle (in
     /// window-content points), the latter used to anchor a native highlight.
-    on_context_menu: Option<fn(RowSelectionKey, Rectangle) -> Message>,
+    on_context_menu: Option<fn(RowSelectionKey, Rectangle, Point) -> Message>,
     /// Reports the scroll offset (content-space px) whenever it changes, so the
     /// app can persist it per-tab. `None` ⇒ scroll position isn't tracked.
     on_scroll: Option<fn(f64) -> Message>,
@@ -280,7 +280,10 @@ impl<'a, Message> RevisionList<'a, Message> {
 
     /// Register a right-click handler for revision rows (the context menu). The
     /// callback gets the row key and its on-screen rect (window-content points).
-    pub fn on_context_menu(mut self, callback: fn(RowSelectionKey, Rectangle) -> Message) -> Self {
+    pub fn on_context_menu(
+        mut self,
+        callback: fn(RowSelectionKey, Rectangle, Point) -> Message,
+    ) -> Self {
         self.on_context_menu = Some(callback);
         self
     }
@@ -790,7 +793,7 @@ where
                         width: bounds.width,
                         height: row_h,
                     };
-                    shell.publish(callback(rev.selection_key, row_rect));
+                    shell.publish(callback(rev.selection_key, row_rect, cursor_pos));
                     shell.capture_event();
                 }
             }
@@ -1906,6 +1909,18 @@ fn make_paragraph<R: text::Renderer<Font = Font>>(
         ellipsis: text::Ellipsis::None,
         hint_factor: None,
     })
+}
+
+/// One-line rendered width of `content`, for sizing a layout to fit its text
+/// at view-build time (e.g. a dropdown that grows to its widest row). Unlike
+/// [`measure_text_width`], the paragraph isn't retained — the caller reads the
+/// width and drops it, which is fine here because this paragraph never reaches
+/// the renderer (nothing upgrades its `Weak` buffer later).
+pub(crate) fn line_width(content: &str, size: f32, font: Font) -> f32 {
+    if content.is_empty() {
+        return 0.0;
+    }
+    make_paragraph::<iced::Renderer>(content, size, font).min_width()
 }
 
 /// Measure the rendered width of `content` using a real `Paragraph`. The
