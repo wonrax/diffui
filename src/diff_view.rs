@@ -205,6 +205,22 @@ pub struct DiffView<'a, Message> {
     on_copy: Option<fn(String) -> Message>,
     /// In-diff find highlights. `None` when the find bar is closed.
     find: Option<FindOverlay<'a>>,
+    /// Reports the scroll offset whenever it changes, so the app can persist it
+    /// per-tab. `None` ⇒ scroll position isn't tracked.
+    on_scroll: Option<fn(f32) -> Message>,
+    /// One-shot scroll restore: when `restore_token` differs from the value the
+    /// widget last saw, the offset jumps to `restore_offset` (clamped),
+    /// overriding the reset-to-top a `revision_key` change would otherwise do.
+    /// Used to re-apply a tab's saved scroll on activation.
+    restore_offset: f32,
+    restore_token: u64,
+    /// Monotonic version of the diff content, bumped by the app on every
+    /// document swap. The per-line paragraph cache is keyed by
+    /// `(file, hunk, line)`, which point at *different* text after a reload,
+    /// a working-copy edit, or a tab switch (the widget `State` — cache included
+    /// — is shared across tabs). `revision_key` alone can't catch those: it's a
+    /// constant `"working-copy"` for any `@`. A version bump drops the cache.
+    content_version: u64,
 }
 
 /// Per-render find-match data fed into `DiffView::with_find`. The widget
@@ -340,6 +356,18 @@ struct State<Paragraph> {
     /// shifts under the cursor.
     last_drag_cursor: Option<Point>,
     scrollbar: ScrollbarState,
+    /// Most recent `restore_token` acted on; a change schedules a one-shot jump
+    /// to the caller's `restore_offset`, consumed in `update()` where bounds
+    /// clamp. Starts at 0 to match the caller's initial token.
+    last_restore_token: u64,
+    /// Offset to jump to on the next `update()` pass, set when `restore_token`
+    /// changed. Overrides the `revision_key`-change reset and file jump;
+    /// clamped once bounds are known.
+    pending_set_offset: Option<f32>,
+    /// Most recent `content_version` acted on. A change drops the paragraph
+    /// cache (whose keys would otherwise map to stale text). Starts at 0 to
+    /// match the app's initial version.
+    last_content_version: u64,
 }
 
 /// Stable cursor position inside the diff document. We index by
@@ -471,11 +499,40 @@ impl<'a, Message> DiffView<'a, Message> {
             on_selected_file_changed,
             on_copy: None,
             find: None,
+            on_scroll: None,
+            restore_offset: 0.0,
+            restore_token: 0,
+            content_version: 0,
         }
     }
 
     pub fn with_header(mut self, header: Vec<HeaderLine>) -> Self {
         self.header = header;
+        self
+    }
+
+    /// Report scroll-offset changes so the caller can persist the position.
+    /// See [`Self::restore_scroll`] for the inverse.
+    pub fn on_scroll(mut self, callback: fn(f32) -> Message) -> Self {
+        self.on_scroll = Some(callback);
+        self
+    }
+
+    /// Jump the scroll offset to `offset` the next time `token` changes. Calling
+    /// with the same `token` twice is a no-op, so live scrolling is preserved.
+    /// Wins over the `revision_key`-change reset in the same render — a tab
+    /// restore wants the exact saved offset, not the top.
+    pub fn restore_scroll(mut self, offset: f32, token: u64) -> Self {
+        self.restore_offset = offset;
+        self.restore_token = token;
+        self
+    }
+
+    /// Set the diff content's version. A change since the widget last saw it
+    /// drops the per-line paragraph cache (see the field docs). The app bumps
+    /// this whenever it swaps the displayed document.
+    pub fn content_version(mut self, version: u64) -> Self {
+        self.content_version = version;
         self
     }
 
@@ -1311,11 +1368,34 @@ where
             click_count: 0,
             last_drag_cursor: None,
             scrollbar: ScrollbarState::default(),
+            last_restore_token: 0,
+            pending_set_offset: None,
+            last_content_version: 0,
         })
     }
 
     fn diff(&self, tree: &mut Tree) {
         let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
+
+        // Checked before the revision-key reset below (which early-returns), so
+        // a tab restore is never skipped. Applied last in `update()`, so it
+        // overrides the reset-to-top + file jump that reset schedules.
+        if self.restore_token != state.last_restore_token {
+            state.last_restore_token = self.restore_token;
+            state.pending_set_offset = Some(self.restore_offset);
+        }
+
+        // The content changed under us (a reload, a working-copy edit, or a tab
+        // switch — the cache lives in shared widget `State`). Drop the per-line
+        // paragraph cache, whose `(file, hunk, line)` keys now map to different
+        // text. Done before the revision-key reset (which early-returns) so
+        // `last_content_version` always advances — otherwise it would re-clear
+        // every frame after a revision change. Cache-only: a working-copy edit
+        // must refresh the rendered text without resetting scroll or selection.
+        if self.content_version != state.last_content_version {
+            state.last_content_version = self.content_version;
+            state.paragraph_cache.borrow_mut().clear();
+        }
 
         if state.revision_key != self.revision_key {
             state.revision_key = self.revision_key.clone();
@@ -1383,7 +1463,12 @@ where
         _viewport: &Rectangle,
     ) {
         let bounds = layout.bounds();
+        let on_scroll = self.on_scroll;
         let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
+        // Offset on entry; compared on the way out so any change this pass
+        // (wheel, scrollbar, file jump, find, restore, clamp) is reported once
+        // via `on_scroll`. `fn` pointers are `Copy`, so this borrows nothing.
+        let prev_offset = state.vertical_offset;
         let max_vertical = (self.content_height(bounds.width) - bounds.height).max(0.0);
 
         if state.vertical_offset > max_vertical {
@@ -1425,6 +1510,21 @@ where
                 shell.publish((self.on_selected_file_changed)(selected_file));
             }
             shell.request_redraw();
+        }
+
+        // Tab restore: jump straight to the saved offset, overriding the
+        // reset-to-top a revision change scheduled above. Only the offset is
+        // restored — `selected_file` was already set by the file-jump block
+        // above (to the tab's saved file), and republishing it here would fire
+        // `SelectFile` → `scroll_sidebar_to_file`, fighting the sidebar's own
+        // restore. The saved offset and saved file were captured together, so
+        // they stay consistent without recomputing one from the other.
+        if let Some(offset) = state.pending_set_offset.take() {
+            let target = offset.clamp(0.0, max_vertical);
+            if (target - state.vertical_offset).abs() > f32::EPSILON {
+                state.vertical_offset = target;
+                shell.request_redraw();
+            }
         }
 
         let content_height = self.content_height(bounds.width);
@@ -1510,6 +1610,11 @@ where
                         }
                         shell.capture_event();
                         shell.request_redraw();
+                        if state.vertical_offset != prev_offset
+                            && let Some(cb) = on_scroll
+                        {
+                            shell.publish(cb(state.vertical_offset));
+                        }
                         return;
                     }
                     scrollbar::ScrollbarEvent::Captured => {
@@ -1579,6 +1684,11 @@ where
                         shell.capture_event();
                         shell.request_redraw();
                     }
+                    if state.vertical_offset != prev_offset
+                        && let Some(cb) = on_scroll
+                    {
+                        shell.publish(cb(state.vertical_offset));
+                    }
                     return;
                 }
                 if !state.is_selecting {
@@ -1637,6 +1747,15 @@ where
                 }
             }
             _ => {}
+        }
+
+        // Report any offset change from this pass (wheel, auto-scroll, file
+        // jump, find, restore, clamp) once. The scrollbar early-returns above
+        // publish on their own.
+        if state.vertical_offset != prev_offset
+            && let Some(cb) = on_scroll
+        {
+            shell.publish(cb(state.vertical_offset));
         }
     }
 

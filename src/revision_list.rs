@@ -227,6 +227,16 @@ pub struct RevisionList<'a, Message> {
     /// menu. Receives the row's selection key and its on-screen rectangle (in
     /// window-content points), the latter used to anchor a native highlight.
     on_context_menu: Option<fn(RowSelectionKey, Rectangle) -> Message>,
+    /// Reports the scroll offset (content-space px) whenever it changes, so the
+    /// app can persist it per-tab. `None` ⇒ scroll position isn't tracked.
+    on_scroll: Option<fn(f64) -> Message>,
+    /// One-shot scroll restore: when `restore_token` differs from the value the
+    /// widget last saw, the offset jumps to `restore_offset` (clamped). Used to
+    /// re-apply a tab's saved scroll on activation — the widget's `State` is
+    /// shared across tabs and would otherwise leak the prior tab's position.
+    /// Mirrors the `reveal_token` trigger pattern.
+    restore_offset: f64,
+    restore_token: u64,
 }
 
 impl<'a, Message> RevisionList<'a, Message> {
@@ -257,6 +267,9 @@ impl<'a, Message> RevisionList<'a, Message> {
             on_select_revision,
             on_select_file,
             on_context_menu: None,
+            on_scroll: None,
+            restore_offset: 0.0,
+            restore_token: 0,
         }
     }
 
@@ -277,6 +290,24 @@ impl<'a, Message> RevisionList<'a, Message> {
     /// in a row is a no-op.
     pub fn reveal_selected(mut self, token: u64) -> Self {
         self.reveal_token = Some(token);
+        self
+    }
+
+    /// Report scroll-offset changes (content-space px) so the caller can persist
+    /// the position. See [`Self::restore_scroll`] for the inverse.
+    pub fn on_scroll(mut self, callback: fn(f64) -> Message) -> Self {
+        self.on_scroll = Some(callback);
+        self
+    }
+
+    /// Jump the scroll offset to `offset` the next time `token` changes. Calling
+    /// with the same `token` twice is a no-op, so live scrolling is preserved
+    /// between restores. Takes precedence over a `reveal_selected` scheduled in
+    /// the same render (a tab restore wants the exact saved offset, not a
+    /// re-centred selection).
+    pub fn restore_scroll(mut self, offset: f64, token: u64) -> Self {
+        self.restore_offset = offset;
+        self.restore_token = token;
         self
     }
 
@@ -432,6 +463,14 @@ struct State<Paragraph> {
     /// no reveal is pending. Set in `diff()` (which sees prop changes
     /// before layout); consumed in `update()` (which has bounds).
     pending_reveal_row: Option<usize>,
+    /// Most recent `restore_token` we acted on. A change schedules a one-shot
+    /// jump to the caller's `restore_offset`, consumed in `update()` (bounds
+    /// clamp). Starts at 0 to match the caller's initial token, so a cold load
+    /// doesn't trigger a spurious restore.
+    last_restore_token: u64,
+    /// Offset to jump to on the next `update()` pass, set when `restore_token`
+    /// changed. Consumed (and clamped) once bounds are known.
+    pending_set_offset: Option<f64>,
 }
 
 impl<Paragraph> State<Paragraph> {
@@ -445,6 +484,8 @@ impl<Paragraph> State<Paragraph> {
             scrollbar: ScrollbarState::default(),
             last_reveal_token: None,
             pending_reveal_row: None,
+            last_restore_token: 0,
+            pending_set_offset: None,
         }
     }
 }
@@ -476,6 +517,12 @@ where
             // (needed to clamp + center) are available.
             state.pending_reveal_row = self.selected_flat;
         }
+        if self.restore_token != state.last_restore_token {
+            state.last_restore_token = self.restore_token;
+            // Applied after the reveal in `update()`, so an exact restore wins
+            // over a re-centred selection when both land in the same render.
+            state.pending_set_offset = Some(self.restore_offset);
+        }
     }
 
     fn layout(
@@ -498,7 +545,12 @@ where
         _viewport: &Rectangle,
     ) {
         let bounds = layout.bounds();
+        let on_scroll = self.on_scroll;
         let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
+        // Offset on entry; compared on the way out so any change this pass
+        // (wheel, scrollbar, reveal, restore, clamp) is reported once via
+        // `on_scroll`. `fn` pointers are `Copy`, so this borrows nothing.
+        let prev_offset = state.vertical_offset;
         let max_vertical = (self.content_height() - bounds.height as f64).max(0.0);
         if state.vertical_offset > max_vertical {
             state.vertical_offset = max_vertical;
@@ -532,6 +584,16 @@ where
                 must_top.max(preferred_top)
             };
             let target = target.clamp(0.0, max_vertical);
+            if (target - state.vertical_offset).abs() > f64::EPSILON {
+                state.vertical_offset = target;
+                shell.request_redraw();
+            }
+        }
+
+        // Tab restore: jump straight to the saved offset, overriding any reveal
+        // scheduled above.
+        if let Some(offset) = state.pending_set_offset.take() {
+            let target = offset.clamp(0.0, max_vertical);
             if (target - state.vertical_offset).abs() > f64::EPSILON {
                 state.vertical_offset = target;
                 shell.request_redraw();
@@ -607,6 +669,11 @@ where
                     if had_hover {
                         shell.request_redraw();
                     }
+                    if state.vertical_offset != prev_offset
+                        && let Some(cb) = on_scroll
+                    {
+                        shell.publish(cb(state.vertical_offset));
+                    }
                     return;
                 }
                 if bounds.contains(*position) {
@@ -666,6 +733,11 @@ where
                         state.vertical_offset = (new_offset as f64).clamp(0.0, max_vertical);
                         shell.capture_event();
                         shell.request_redraw();
+                        if state.vertical_offset != prev_offset
+                            && let Some(cb) = on_scroll
+                        {
+                            shell.publish(cb(state.vertical_offset));
+                        }
                         return;
                     }
                     scrollbar::ScrollbarEvent::Captured => {
@@ -723,6 +795,14 @@ where
                 }
             }
             _ => {}
+        }
+
+        // Report any offset change from this pass (wheel, reveal, restore,
+        // clamp) once. The scrollbar early-returns above publish on their own.
+        if state.vertical_offset != prev_offset
+            && let Some(cb) = on_scroll
+        {
+            shell.publish(cb(state.vertical_offset));
         }
     }
 

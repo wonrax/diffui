@@ -271,6 +271,28 @@ pub(crate) struct Diffui {
     /// actually been written into `selected_revision`, *then* bumps the
     /// token so the next render reveals the correct row.
     pub(crate) pending_revision_reveal: bool,
+    /// Last-known scroll offsets of the sidebar (content-space px) and diff
+    /// view, kept current by the widgets' `on_scroll` callbacks. The widgets
+    /// own their live offset in tree `State`, but that state is shared across
+    /// tabs; mirroring it here lets [`stash_active_state`] save a per-tab
+    /// position and [`restore_active_state`] push it back via
+    /// `scroll_restore_token`.
+    pub(crate) sidebar_scroll_offset: f64,
+    pub(crate) diff_scroll_offset: f32,
+    /// Bumped whenever a tab is (re)activated. The sidebar/diff widgets watch
+    /// it and, on a change, jump to `sidebar_scroll_offset` / `diff_scroll_offset`
+    /// — re-applying the restored tab's saved scroll over whatever the shared
+    /// widget state leaked from the previous tab.
+    pub(crate) scroll_restore_token: u64,
+    /// Bumped whenever `document` is replaced (a diff reload, working-copy edit,
+    /// or tab switch). The diff view watches it to drop its per-line shaped-
+    /// paragraph cache, whose `(file, hunk, line)` keys would otherwise render
+    /// stale text — most visibly between two tabs both on `@`, which share the
+    /// constant `"working-copy"` revision key. Global/monotonic, not per-tab:
+    /// since a tab restore reassigns `document` (and bumps this), returning to a
+    /// tab correctly re-clears the cache the other tab populated. Set only via
+    /// [`set_document`].
+    pub(crate) document_version: u64,
     /// Bumped when `commits` is replaced; tags background empty-status results
     /// so a result from a superseded load is dropped.
     pub(crate) commits_version: u64,
@@ -420,6 +442,8 @@ pub(crate) struct RepoState {
     pub(crate) bookmarks: BookmarksInfo,
     pub(crate) revision_reveal_token: u64,
     pub(crate) pending_revision_reveal: bool,
+    pub(crate) sidebar_scroll_offset: f64,
+    pub(crate) diff_scroll_offset: f32,
     pub(crate) commits_version: u64,
     pub(crate) graph: graph_layout::GraphLayout,
     pub(crate) sidebar_prefix_lens: Vec<usize>,
@@ -455,6 +479,8 @@ impl RepoState {
             bookmarks: BookmarksInfo::default(),
             revision_reveal_token: 0,
             pending_revision_reveal: false,
+            sidebar_scroll_offset: 0.0,
+            diff_scroll_offset: 0.0,
             commits_version: 0,
             graph: graph_layout::GraphLayout::default(),
             sidebar_prefix_lens: Vec::new(),
@@ -615,6 +641,10 @@ pub(crate) enum Message {
     EmptyStatusComputed(u64, Vec<(usize, bool)>),
     SelectFile(usize),
     SelectRowKey(revision_list::RowSelectionKey),
+    /// The sidebar / diff view reported a new scroll offset. Mirrored into the
+    /// active tab's state so it can be stashed and restored on tab switch.
+    SidebarScrolled(f64),
+    DiffScrolled(f32),
     /// Right-click on a revision row — opens the native context menu. Carries
     /// the row's on-screen rect (window-content points) so the native glow can
     /// be anchored over it while the menu is open.
@@ -920,6 +950,10 @@ impl Diffui {
             find: None,
             revision_reveal_token: 0,
             pending_revision_reveal: false,
+            sidebar_scroll_offset: 0.0,
+            diff_scroll_offset: 0.0,
+            scroll_restore_token: 0,
+            document_version: 0,
             commits_version: 0,
             graph: graph_layout::GraphLayout::default(),
             sidebar_prefix_lens: Vec::new(),
@@ -972,7 +1006,7 @@ impl Diffui {
                     self.pending_revision = None;
                     self.loading_since = None;
                     self.status = LoadStatus::Loaded;
-                    self.document = output.document;
+                    self.set_document(output.document);
                     self.commits = output.commits;
                     self.graph = output.graph;
                     // A refresh swaps the graph atomically; if a cold stream was
@@ -1000,7 +1034,14 @@ impl Diffui {
                         self.revision_reveal_token = self.revision_reveal_token.wrapping_add(1);
                     }
                     // Recompute the on-demand sidebar index (lane fold, prefix
-                    // lengths, selected-row index) for the new graph.
+                    // lengths, selected-row index) for the new graph. If the
+                    // selected commit isn't in the new graph, `selected_commit_index`
+                    // is `None` — but that's *not* a fall-back trigger: the diff
+                    // loaded, so the commit still exists, it's just outside the
+                    // current revset (e.g. a palette jump to an off-view commit,
+                    // or an abandoned-but-not-yet-GC'd commit). We keep showing
+                    // it rather than yanking the user to `@`. Only a *failed*
+                    // resolve (the `Err` arm) means the commit is truly gone.
                     self.rebuild_sidebar_index();
                     self.finish_load_activity(activity::ActivityStatus::Done, None);
                     // Fill in merge/root empty status (left unknown by the
@@ -1018,6 +1059,33 @@ impl Diffui {
 
                     self.pending_revision = None;
                     self.loading_since = None;
+                    // A reload targeting a specific commit that's since vanished
+                    // (abandoned *and* GC'd) can't resolve it, failing the whole
+                    // walk. Retry once against the working copy rather than
+                    // stranding the tab on an error screen. Guarded on the
+                    // revision being a commit, so a genuine `@` failure (or a
+                    // failure of this very retry) still surfaces.
+                    if !matches!(revision, RevisionSelection::WorkingCopy)
+                        && let Some(repository) = self.repository.clone()
+                    {
+                        eprintln!(
+                            "diffui: reload of {revision:?} failed ({error}); \
+                             falling back to the working copy"
+                        );
+                        let fallback = RevisionSelection::WorkingCopy;
+                        self.selected_revision = fallback.clone();
+                        self.selected_file = 0;
+                        self.diff_scroll_offset = 0.0;
+                        self.pending_revision = Some(fallback.clone());
+                        self.pending_revision_reveal = true;
+                        self.loading_since = Some(Instant::now());
+                        let revset = self.revset.clone();
+                        let progress = self.commit_progress.clone();
+                        return Task::perform(
+                            load_backend(repository, fallback.clone(), revset, progress),
+                            move |result| Message::BackendLoaded(fallback, Box::new(result)),
+                        );
+                    }
                     self.status = LoadStatus::Failed(error.clone());
                     self.finish_load_activity(activity::ActivityStatus::Error, Some(error));
                 }
@@ -1113,7 +1181,7 @@ impl Diffui {
                 self.pending_revision = None;
                 match *result {
                     Ok((document, details)) => {
-                        self.document = document;
+                        self.set_document(document);
                         self.revision_details = details;
                         self.selected_file = 0;
                     }
@@ -1140,7 +1208,7 @@ impl Diffui {
                     self.pending_revision = None;
                     self.loading_since = None;
                     self.status = LoadStatus::Loaded;
-                    self.document = document;
+                    self.set_document(document);
                     self.revision_details = details;
                     // The graph is unchanged on a diff-only load; just relocate
                     // the selected row.
@@ -1265,6 +1333,12 @@ impl Diffui {
                     self.selected_file = index;
                     return scroll_sidebar_to_file(index, self);
                 }
+            }
+            Message::SidebarScrolled(offset) => {
+                self.sidebar_scroll_offset = offset;
+            }
+            Message::DiffScrolled(offset) => {
+                self.diff_scroll_offset = offset;
             }
             Message::SelectRowKey(key) => {
                 let selection = match key {
@@ -2577,6 +2651,15 @@ impl Diffui {
         self.kick_load(None)
     }
 
+    /// Replace the displayed diff, bumping [`document_version`](Self::document_version)
+    /// so the diff view drops its per-line shaped-paragraph cache. Every write
+    /// to `self.document` must go through here — a missed one leaves the diff
+    /// view rendering another revision's (or repo's) stale highlighted text.
+    fn set_document(&mut self, document: DiffDocument) {
+        self.document = document;
+        self.document_version = self.document_version.wrapping_add(1);
+    }
+
     /// As [`kick_initial_load`], with an optional activity label (defaults to
     /// "Load <repo>"). This is the **streaming cold load** — it clears the graph
     /// and regrows it as batches arrive, for the initial open / tab activation
@@ -2595,7 +2678,12 @@ impl Diffui {
         self.pending_revision = Some(RevisionSelection::WorkingCopy);
         self.pending_revision_reveal = false;
         self.selected_file = 0;
-        self.document = DiffDocument::default();
+        // The cold load clears the graph + diff, so both views belong at the
+        // top. Keep the mirrors in step with the cleared content; the widgets
+        // restore from these on the next activation.
+        self.sidebar_scroll_offset = 0.0;
+        self.diff_scroll_offset = 0.0;
+        self.set_document(DiffDocument::default());
         self.commits = CommitStore::default();
         self.graph = graph_layout::GraphLayout::default();
         self.sidebar_prefix_lens.clear();
@@ -2914,6 +3002,8 @@ impl Diffui {
             bookmarks: std::mem::take(&mut self.bookmarks),
             revision_reveal_token: self.revision_reveal_token,
             pending_revision_reveal: self.pending_revision_reveal,
+            sidebar_scroll_offset: self.sidebar_scroll_offset,
+            diff_scroll_offset: self.diff_scroll_offset,
             commits_version: self.commits_version,
             graph: std::mem::take(&mut self.graph),
             sidebar_prefix_lens: std::mem::take(&mut self.sidebar_prefix_lens),
@@ -2939,7 +3029,10 @@ impl Diffui {
             .map(default_revset)
             .unwrap_or_default();
         self.status = state.status;
-        self.document = state.document;
+        // Bumps `document_version` so the diff view drops the cache the
+        // previously-active tab populated — its `(file, hunk, line)` keys map to
+        // that tab's text, not this one's.
+        self.set_document(state.document);
         self.commits = state.commits;
         self.selected_revision = state.selected_revision;
         self.file_list_expanded = state.file_list_expanded;
@@ -2952,6 +3045,8 @@ impl Diffui {
         self.bookmarks = state.bookmarks;
         self.revision_reveal_token = state.revision_reveal_token;
         self.pending_revision_reveal = state.pending_revision_reveal;
+        self.sidebar_scroll_offset = state.sidebar_scroll_offset;
+        self.diff_scroll_offset = state.diff_scroll_offset;
         self.commits_version = state.commits_version;
         self.graph = state.graph;
         self.sidebar_prefix_lens = state.sidebar_prefix_lens;
@@ -2989,20 +3084,30 @@ impl Diffui {
             .take()
             .unwrap_or_else(RepoState::empty);
         self.restore_active_state(restored);
-        // The sidebar widget's scroll offset is shared across tabs, so nudge it
-        // to reveal this repo's restored selection.
-        self.revision_reveal_token = self.revision_reveal_token.wrapping_add(1);
+        // The sidebar/diff widgets' scroll offsets are shared across tabs, so
+        // push this tab's saved positions back in (the restored fields above
+        // hold them) over whatever the previous tab left in the widget state.
+        self.scroll_restore_token = self.scroll_restore_token.wrapping_add(1);
         self.ensure_active_loaded()
     }
 
-    /// Kick a load for the active tab unless it's already loaded. A tab that
-    /// has never loaded — or whose load was abandoned while backgrounded — has
-    /// `status != Loaded`, so activating it (re)starts the load.
+    /// Kick a load for the active tab when activating it. A tab that has never
+    /// loaded — or whose load was abandoned while backgrounded — has
+    /// `status != Loaded`, so activating it (re)starts the streaming load. An
+    /// already-loaded tab instead gets a cheap freshness re-check: the fs/op-log
+    /// watcher follows only the *active* repo, so external ops/edits to a
+    /// backgrounded tab go unseen until we return to it. A `Focus` snapshot
+    /// reconciles that — its op-fingerprint dedup in `RepositorySnapshotLoaded`
+    /// makes it a no-op (no graph re-walk) when nothing changed, and a full
+    /// reload only when an external op actually landed.
     fn ensure_active_loaded(&mut self) -> Task<Message> {
-        if self.repository.is_some() && !matches!(self.status, LoadStatus::Loaded) {
-            self.kick_initial_load()
+        if self.repository.is_none() {
+            return Task::none();
+        }
+        if matches!(self.status, LoadStatus::Loaded) {
+            self.start_repository_snapshot(RefreshOrigin::Focus)
         } else {
-            Task::none()
+            self.kick_initial_load()
         }
     }
 
@@ -3046,7 +3151,7 @@ impl Diffui {
             .take()
             .unwrap_or_else(RepoState::empty);
         self.restore_active_state(restored);
-        self.revision_reveal_token = self.revision_reveal_token.wrapping_add(1);
+        self.scroll_restore_token = self.scroll_restore_token.wrapping_add(1);
         self.ensure_active_loaded()
     }
 

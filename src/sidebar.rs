@@ -480,6 +480,8 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
     )
     .width(Length::Fill)
     .reveal_selected(ui.revision_reveal_token)
+    .on_scroll(Message::SidebarScrolled)
+    .restore_scroll(ui.sidebar_scroll_offset, ui.scroll_restore_token)
     .on_context_menu(Message::RevisionContextMenu)
     .into()
 }
