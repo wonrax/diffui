@@ -71,7 +71,7 @@ pub fn build_toolbar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         return Space::new().into();
     }
     let font = ui.config.ui_font;
-    let is_jj = matches!(ui.repository.as_ref().map(|r| r.vcs), Some(Vcs::Jj));
+    let is_jj = matches!(ui.session.repository.as_ref().map(|r| r.vcs), Some(Vcs::Jj));
 
     let caret_hovered = ui.hovered == Some(HoverTarget::FetchCaret);
     // 6px between actions — the same rhythm the tab strip uses between tabs, so

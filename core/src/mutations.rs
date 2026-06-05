@@ -5,7 +5,7 @@
 //! snapshot/checkout machinery in `jj.rs` so a mutation that moves `@` also
 //! updates the files on disk (and doesn't lose uncommitted work).
 
-use crate::backend::{LoadProgress, RevisionSelection};
+use crate::model::{LoadProgress, RevisionSelection};
 use crate::repository::Repository;
 
 /// A revision-context-menu mutation. The target is a `RevisionSelection` so the

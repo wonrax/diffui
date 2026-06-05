@@ -5,7 +5,6 @@ use iced::{
     widget::{Space, column, container, mouse_area, row, text, text_input, tooltip},
 };
 
-use crate::backend::{CommitStore, DiffFile, DiffFileStatus, RevisionSelection, RowView};
 use crate::config::AppConfig;
 use crate::graph_layout::GraphLayout;
 use crate::graph_view::{self, RevisionGraphStyle};
@@ -16,6 +15,7 @@ use crate::revision_list::{
 };
 use crate::theme::{self, ThemeSpec, chip_background, sidebar_panel_style};
 use crate::{Diffui, HoverTarget, LoadStatus, Message, ToolbarMenu};
+use diffui_core::{CommitStore, DiffFile, DiffFileStatus, RevisionSelection, RowView};
 use jj_lib::graph::GraphEdgeType;
 
 // Public sidebar layout knobs — used by main.rs to clamp the resize handle.
@@ -104,7 +104,7 @@ pub fn build_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     body = body.push(build_revset_filter(ui, theme));
     // Load failures no longer have a header to live under — surface them as a
     // slim banner above the list.
-    if let LoadStatus::Failed(error) = &ui.status {
+    if let LoadStatus::Failed(error) = &ui.session.status {
         body = body.push(
             container(
                 text(format!("Failed: {error}"))
@@ -133,12 +133,12 @@ pub const REVSET_INPUT_ID: &str = "revset-input";
 /// sidebar, with a caret that opens the presets menu. Submitting (Enter) or
 /// picking a preset re-evaluates the log.
 fn build_revset_filter(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
-    let placeholder = match ui.repository.as_ref().map(|r| r.vcs) {
+    let placeholder = match ui.session.repository.as_ref().map(|r| r.vcs) {
         Some(Vcs::Git) => "revision range — e.g. --all, main..@",
         _ => "revset — e.g. all(), mine()",
     };
 
-    let input = text_input(placeholder, &ui.revset)
+    let input = text_input(placeholder, &ui.session.revset)
         .id(REVSET_INPUT_ID)
         .padding(Padding::from([5, 8]))
         .size(12)
@@ -218,7 +218,7 @@ fn build_footer(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     let font = ui.config.mono_font;
     let dim = theme.subtle_text;
 
-    let left: Element<'_, Message> = match &ui.branch_status {
+    let left: Element<'_, Message> = match &ui.session.branch_status {
         Some(status) => {
             // Branch glyph + name; the tracked upstream rides along as a tooltip.
             let name = row![
@@ -281,7 +281,7 @@ fn build_footer(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         None => row![].into(),
     };
 
-    let right = text(format!("{} changes", thousands(ui.commits.len())))
+    let right = text(format!("{} changes", thousands(ui.session.commits.len())))
         .size(FOOTER_TEXT_SIZE)
         .font(font)
         .color(dim);
@@ -345,14 +345,18 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
     };
 
     // Files show under the selected commit, only while its inline list is open.
-    let expanded_index = ui.selected_commit_index.filter(|_| ui.file_list_expanded);
+    let expanded_index = ui
+        .session
+        .selected_commit_index
+        .filter(|_| ui.file_list_expanded);
 
     let (file_widgets, file_badge_width): (Vec<FileRowTemplate>, f32) = if let Some(expanded) =
         expanded_index
-        && matches!(ui.status, LoadStatus::Loaded)
-        && !ui.document.files.is_empty()
+        && matches!(ui.session.status, LoadStatus::Loaded)
+        && !ui.session.document.files.is_empty()
     {
         let widest_addition = ui
+            .session
             .document
             .files
             .iter()
@@ -365,6 +369,7 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
             })
             .unwrap_or_else(|| "+0".to_owned());
         let widest_deletion = ui
+            .session
             .document
             .files
             .iter()
@@ -379,12 +384,12 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
         let additions_w = file_stat_width(&widest_addition, &metrics);
         let deletions_w = file_stat_width(&widest_deletion, &metrics);
         let badge_metrics = badge_text_metrics(ui.config);
-        let badge_w = file_badge_width(&ui.document.files, &badge_metrics);
+        let badge_w = file_badge_width(&ui.session.document.files, &badge_metrics);
 
         // Mirror `draw_file`'s layout exactly so truncation kicks in at the
         // same threshold the renderer clips at:
         //   [gutter] [badge] gap [path] gap [+N] gap [-N] right_pad
-        let expanded_lane_count = ui.graph.frame(expanded, usize::MAX).after.len();
+        let expanded_lane_count = ui.session.graph.frame(expanded, usize::MAX).after.len();
         let gutter_total = revision_list::GUTTER_LEFT_PADDING
             + expanded_lane_count as f32 * graph_view::LANE_WIDTH
             + revision_list::GUTTER_PADDING;
@@ -395,8 +400,10 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
             + revision_list::FILE_ROW_GAP * 3.0
             + revision_list::FILE_ROW_RIGHT_PAD;
         let display_width = (ui.sidebar_width - reserved).max(0.0);
-        let display_models = file_display_models(&ui.document.files, display_width, &metrics);
+        let display_models =
+            file_display_models(&ui.session.document.files, display_width, &metrics);
         let templates = ui
+            .session
             .document
             .files
             .iter()
@@ -427,10 +434,10 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
     // The per-row lane fold + prefix lengths are precomputed once and held in
     // `Diffui`; the closures below build a single visible row's view from them
     // on demand, so the widget never materializes all ~N rows.
-    let graph = &ui.graph;
-    let prefix_lens = &ui.sidebar_prefix_lens;
-    let commits = &ui.commits;
-    let selected = ui.selected_revision.clone();
+    let graph = &ui.session.graph;
+    let prefix_lens = &ui.session.sidebar_prefix_lens;
+    let commits = &ui.session.commits;
+    let selected = ui.session.selected_revision.clone();
     let file_list_expanded = ui.file_list_expanded;
     let build_revision = Box::new(move |index: usize| {
         build_revision_row(
@@ -448,11 +455,11 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
     // File rows render under the expanded commit, so they share its
     // continuation lane state (the post-trim snapshot of that row's fold).
     let continuation = expanded_index
-        .map(|index| ui.graph.frame(index, usize::MAX).after)
+        .map(|index| ui.session.graph.frame(index, usize::MAX).after)
         .unwrap_or_default();
     let (continuation_labels, continuation_segments) = expanded_index
         .map(|index| {
-            let lane = ui.graph.fold(index, usize::MAX);
+            let lane = ui.session.graph.fold(index, usize::MAX);
             (lane.continuation_labels, lane.continuation_segments)
         })
         .unwrap_or_default();
@@ -466,19 +473,19 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
         )
     });
 
-    let selected_row = match &ui.selected_revision {
+    let selected_row = match &ui.session.selected_revision {
         RevisionSelection::WorkingCopy => Some(RowSelectionKey::WorkingCopy),
         RevisionSelection::Commit(id) => Some(RowSelectionKey::Commit(id.clone())),
     };
 
     RevisionList::new(
-        ui.commits.len(),
+        ui.session.commits.len(),
         expanded,
         build_revision,
         build_file,
         selected_row,
         Some(ui.selected_file),
-        ui.selected_commit_index,
+        ui.session.selected_commit_index,
         revision_list_style(theme, ui.config, file_badge_width),
         Message::SelectRowKey,
         Message::SelectFile,
@@ -721,59 +728,6 @@ fn commit_description_color(commit: RowView, theme: ThemeSpec) -> Color {
         Some(false) => theme.note_text,
         None => theme.note_text,
     }
-}
-
-/// Shortest unique change-id prefix length for every commit, returned in
-/// `commits` order.
-///
-/// The jj backend precomputes this per commit (`shortest_change_id_len`)
-/// against the repo index, so when every row carries it we map straight
-/// through. The git backend leaves it `None`; there we derive each prefix
-/// from sorted neighbors — a prefix is unique once it's one character longer
-/// than the longest prefix the id shares with either lexicographic neighbor.
-///
-/// This used to be a per-row helper that rescanned all commits on every
-/// call, so building the sidebar was O(n²) in the commit count and dropped
-/// large repos (e.g. bun's ~43k commits) to seconds-per-frame.
-pub fn shortest_unique_prefix_lens(commits: &CommitStore) -> Vec<usize> {
-    if (0..commits.len()).all(|i| commits.row(i).shortest_change_id_len().is_some()) {
-        return (0..commits.len())
-            .map(|i| {
-                let row = commits.row(i);
-                row.shortest_change_id_len()
-                    .unwrap_or(1)
-                    .min(row.change_id().chars().count())
-            })
-            .collect();
-    }
-
-    let mut order: Vec<usize> = (0..commits.len()).collect();
-    order.sort_by(|&a, &b| commits.row(a).change_id().cmp(commits.row(b).change_id()));
-
-    let mut lens = vec![0usize; commits.len()];
-    for (rank, &idx) in order.iter().enumerate() {
-        let change_id = commits.row(idx).change_id();
-        let total = change_id.chars().count();
-        lens[idx] = if let Some(precomputed) = commits.row(idx).shortest_change_id_len() {
-            precomputed.min(total)
-        } else {
-            let prev = rank
-                .checked_sub(1)
-                .map(|r| common_prefix_len(change_id, commits.row(order[r]).change_id()))
-                .unwrap_or(0);
-            let next = order
-                .get(rank + 1)
-                .map(|&n| common_prefix_len(change_id, commits.row(n).change_id()))
-                .unwrap_or(0);
-            (prev.max(next) + 1).min(total)
-        };
-    }
-    lens
-}
-
-/// Number of leading characters two strings share.
-fn common_prefix_len(a: &str, b: &str) -> usize {
-    a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
 }
 
 /// Pixel-accurate text width measurement for layout decisions made outside
@@ -1123,7 +1077,7 @@ fn file_badge_width(files: &[DiffFile], metrics: &TextMetrics) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{CommitStoreBuilder, CommitSummary, DiffFileStatus};
+    use diffui_core::{CommitStoreBuilder, CommitSummary, DiffFileStatus};
 
     fn diff_file(path: &str) -> DiffFile {
         DiffFile {
@@ -1180,7 +1134,7 @@ mod tests {
             commit_summary("z"),
         ];
 
-        assert_eq!(shortest_unique_prefix_lens(&store(commits)), vec![3, 3, 1]);
+        assert_eq!(store(commits).shortest_unique_prefix_lens(), vec![3, 3, 1]);
     }
 
     #[test]
@@ -1191,7 +1145,7 @@ mod tests {
         commits[0].shortest_change_id_len = Some(4);
         commits[1].shortest_change_id_len = Some(99);
 
-        assert_eq!(shortest_unique_prefix_lens(&store(commits)), vec![4, 6]);
+        assert_eq!(store(commits).shortest_unique_prefix_lens(), vec![4, 6]);
     }
 
     #[test]

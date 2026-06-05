@@ -2177,15 +2177,12 @@ name = "diffui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "arborium",
- "bstr",
- "chrono",
  "clap",
+ "diffui-core",
  "futures",
  "iced",
  "jj-lib",
  "mimalloc",
- "notify",
  "nucleo-matcher",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
@@ -2198,6 +2195,21 @@ dependencies = [
  "serde",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "diffui-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arborium",
+ "async-trait",
+ "bstr",
+ "chrono",
+ "futures",
+ "jj-lib",
+ "notify",
+ "tokio",
 ]
 
 [[package]]

@@ -31,9 +31,35 @@ use iced::{
 };
 use nucleo_matcher::{Config, Matcher, Utf32String};
 
-use crate::backend::RevisionSelection;
 use crate::theme::{self, ThemeSpec};
 use crate::{Diffui, Message};
+use diffui_core::RevisionSelection;
+
+/// Messages from the command palette, nested under [`Message::Palette`].
+#[derive(Debug, Clone)]
+pub enum PaletteMessage {
+    Open,
+    Close,
+    QueryChanged(String),
+    /// `(column depth, query version)` — drops a recompute the user typed past.
+    Recompute(usize, u64),
+    /// Move the highlighted result by `±1`.
+    MoveSelection(i32),
+    /// Set the highlighted index (used by hover).
+    SelectIndex(usize),
+    /// Enter / on_submit: act on the highlighted row.
+    Accept,
+    /// Click a specific row — explicit index against re-render races.
+    AcceptIndex(usize),
+    /// Tab: push an actions column for the highlighted result.
+    PushActions,
+    /// Esc / Backspace at empty: pop the rightmost column.
+    PopColumn,
+    /// Captured-but-inert (e.g. scroll ticks on the palette scrim).
+    NoOp,
+    /// Per-frame tick driving the column push/pop slide animation.
+    Tick,
+}
 
 /// `Id` for the active palette text input. Refocused whenever the
 /// rightmost column changes (open, push, pop) so keystrokes always land in
@@ -691,7 +717,7 @@ fn push_revision_candidates(out: &mut Vec<Candidate>, ui: &Diffui) {
         item: ResultRef::WorkingCopy,
         haystack: "working copy @".to_owned(),
     });
-    for commit in ui.commits.iter() {
+    for commit in ui.session.commits.iter() {
         let mut haystack = String::with_capacity(
             commit.change_id().len() + commit.description().len() + commit.author().len() + 32,
         );
@@ -724,10 +750,10 @@ fn push_bookmark_candidates(out: &mut Vec<Candidate>, ui: &Diffui) {
     // to the top, which is what the user wants when typing "main" or a feature
     // branch. Sorted by row so the empty-query order is stable (the index is a
     // HashMap).
-    let mut rows: Vec<(usize, &[String])> = ui.commits.bookmarked_rows().collect();
+    let mut rows: Vec<(usize, &[String])> = ui.session.commits.bookmarked_rows().collect();
     rows.sort_by_key(|(index, _)| *index);
     for (index, bookmarks) in rows {
-        let commit = ui.commits.row(index);
+        let commit = ui.session.commits.row(index);
         for bookmark in bookmarks {
             let mut haystack =
                 String::with_capacity(bookmark.len() + commit.description().len() + 8);
@@ -745,7 +771,7 @@ fn push_bookmark_candidates(out: &mut Vec<Candidate>, ui: &Diffui) {
 }
 
 fn push_file_candidates(out: &mut Vec<Candidate>, ui: &Diffui) {
-    for file in &ui.document.files {
+    for file in &ui.session.document.files {
         out.push(Candidate {
             item: ResultRef::File(file.path.clone()),
             haystack: file.path.clone(),
@@ -803,7 +829,7 @@ pub fn build_overlay<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Messag
                 ..container::Style::default()
             }),
     )
-    .on_press(Message::PaletteClose);
+    .on_press(Message::Palette(PaletteMessage::Close));
 
     // Layout strategy: every column is pinned at an absolute X inside a
     // clipping `Stack`. We can't use a row-of-columns inside a container —
@@ -851,7 +877,7 @@ pub fn build_overlay<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Messag
     // limit, unhandled delta bubbles up and this outer mouse_area
     // captures it so the diff view behind doesn't move.
     mouse_area(stack![scrim, palette_block])
-        .on_scroll(|_| Message::PaletteNoOp)
+        .on_scroll(|_| Message::Palette(PaletteMessage::NoOp))
         .into()
 }
 
@@ -969,8 +995,8 @@ fn build_input<'a>(
         // Older (left-of-center) columns are read-only previews. The
         // rightmost column receives input + submit.
         input = input
-            .on_input(Message::PaletteQueryChanged)
-            .on_submit(Message::PaletteAccept);
+            .on_input(|q| Message::Palette(PaletteMessage::QueryChanged(q)))
+            .on_submit(Message::Palette(PaletteMessage::Accept));
     }
 
     container(input)
@@ -1117,8 +1143,8 @@ fn build_result_row<'a>(
         });
 
     mouse_area(row_el)
-        .on_press(Message::PaletteAcceptIndex(index))
-        .on_enter(Message::PaletteSelectIndex(index))
+        .on_press(Message::Palette(PaletteMessage::AcceptIndex(index)))
+        .on_enter(Message::Palette(PaletteMessage::SelectIndex(index)))
         .into()
 }
 
@@ -1153,7 +1179,7 @@ fn result_row_body<'a>(
         .align_y(alignment::Vertical::Center)
         .into(),
         ResultRef::Commit(change_id) => {
-            let commit = ui.commits.find_by_change_id(change_id);
+            let commit = ui.session.commits.find_by_change_id(change_id);
             let prefix = commit
                 .map(|c| {
                     let len = c.shortest_change_id_len().unwrap_or(8).max(8);
@@ -1190,6 +1216,7 @@ fn result_row_body<'a>(
             // races between snapshots) still render — the tail just goes
             // empty.
             let commit = ui
+                .session
                 .commits
                 .iter()
                 .find(|c| c.bookmarks().iter().any(|b| b == name));
@@ -1285,6 +1312,7 @@ fn target_label(target: &ResultRef, ui: &Diffui) -> String {
     match target {
         ResultRef::WorkingCopy => "Working copy".to_owned(),
         ResultRef::Commit(change_id) => ui
+            .session
             .commits
             .find_by_change_id(change_id)
             .map(|c| {
@@ -1312,10 +1340,12 @@ pub fn revision_selection(item: &ResultRef, ui: &Diffui) -> Option<RevisionSelec
     match item {
         ResultRef::WorkingCopy => Some(RevisionSelection::WorkingCopy),
         ResultRef::Commit(change_id) => ui
+            .session
             .commits
             .find_by_change_id(change_id)
             .map(|c| RevisionSelection::Commit(c.commit_id().to_owned())),
         ResultRef::Bookmark(name) => ui
+            .session
             .commits
             .iter()
             .find(|c| c.bookmarks().iter().any(|b| b == name))
@@ -1332,11 +1362,16 @@ pub fn change_id_for_recents(item: &ResultRef, ui: &Diffui) -> Option<String> {
     match item {
         ResultRef::Commit(change_id) => Some(change_id.clone()),
         ResultRef::Bookmark(name) => ui
+            .session
             .commits
             .iter()
             .find(|c| c.bookmarks().iter().any(|b| b == name))
             .map(|c| c.change_id().to_owned()),
-        ResultRef::WorkingCopy => ui.commits.working_copy().map(|c| c.change_id().to_owned()),
+        ResultRef::WorkingCopy => ui
+            .session
+            .commits
+            .working_copy()
+            .map(|c| c.change_id().to_owned()),
         _ => None,
     }
 }

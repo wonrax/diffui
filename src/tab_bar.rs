@@ -18,6 +18,7 @@ use iced::{
 };
 
 use crate::chrome;
+use crate::palette::PaletteMessage;
 use crate::repository::Vcs;
 use crate::theme::{ThemeSpec, chip_background, emphasis_font};
 use crate::{Diffui, Message};
@@ -302,7 +303,7 @@ fn palette_hint(theme: ThemeSpec, mono: iced::Font) -> Element<'static, Message>
 
     button(chip)
         .padding(Padding::from([2, 4]))
-        .on_press(Message::PaletteOpen)
+        .on_press(Message::Palette(PaletteMessage::Open))
         .style(move |_, _| button::Style {
             background: None,
             text_color: theme.muted_text,
@@ -322,9 +323,9 @@ fn palette_hint(theme: ThemeSpec, mono: iced::Font) -> Element<'static, Message>
 /// in which case we draw no dot rather than guess.
 fn tab_is_dirty(ui: &Diffui, tab: &crate::Tab, active: bool) -> bool {
     let commits = if active {
-        Some(&ui.commits)
+        Some(&ui.session.commits)
     } else {
-        tab.stash.as_ref().map(|s| &s.commits)
+        tab.stash.as_ref().map(|s| &s.session.commits)
     };
     commits
         .and_then(|c| c.working_copy())

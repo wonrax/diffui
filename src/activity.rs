@@ -21,9 +21,9 @@ use iced::{
     },
 };
 
-use crate::backend::LoadProgress;
 use crate::theme::{ThemeSpec, chip_background, emphasis_font, iced_scrollable_style};
 use crate::{Diffui, Message};
+use diffui_core::LoadProgress;
 
 /// Frames for the running spinner. ASCII so it renders under any configured
 /// font; advanced at ~12fps off the activity's elapsed time (the toolbar tick
@@ -318,6 +318,7 @@ pub fn activity_progress_line(ui: &Diffui, theme: ThemeSpec) -> Element<'static,
     // revision-switch diff load the same way an activity's `started` does.
     let active = ui.activities.first_running_visible();
     let diff_loading = ui
+        .session
         .loading_since
         .is_some_and(|since| since.elapsed() >= ACTIVITY_DISPLAY_DELAY);
 

@@ -56,29 +56,9 @@ const AUTO_SCROLL_MAX_SPEED: f32 = 1200.0;
 // cursor far outside the viewport scrolls at full speed.
 const AUTO_SCROLL_RAMP_PX: f32 = 80.0;
 
-#[derive(Debug, Clone)]
-pub struct DiffLine {
-    pub kind: DiffLineKind,
-    pub old_line: Option<usize>,
-    pub new_line: Option<usize>,
-    pub content: String,
-    pub syntax: Vec<SyntaxSpan>,
-}
-
-#[derive(Debug, Clone)]
-pub struct DiffHunkView {
-    pub header: String,
-    pub lines: Vec<DiffLine>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DiffLineKind {
-    Context,
-    Addition,
-    Deletion,
-    Conflict,
-    Note,
-}
+// The diff data model lives in `diffui_core`; re-export the types this widget
+// renders so `crate::diff_view::DiffLine` etc. still resolve for callers.
+pub use diffui_core::{DiffHunkView, DiffLine, DiffLineKind, SyntaxKind, SyntaxSpan};
 
 #[derive(Debug, Clone)]
 pub struct DiffFileView<'a> {
@@ -87,25 +67,6 @@ pub struct DiffFileView<'a> {
     pub hunks: &'a [DiffHunkView],
     pub additions: usize,
     pub deletions: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct SyntaxSpan {
-    pub start: usize,
-    pub end: usize,
-    pub kind: SyntaxKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SyntaxKind {
-    Comment,
-    String,
-    Number,
-    Keyword,
-    Function,
-    Type,
-    Property,
-    Punctuation,
 }
 
 /// One line of the `jj show`-style revision header rendered at the top of

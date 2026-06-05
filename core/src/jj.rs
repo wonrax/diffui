@@ -52,16 +52,17 @@ use jj_lib::{
 };
 
 use crate::FetchTarget;
-use crate::backend::{
-    BookmarkEntry, BookmarksInfo, BranchStatus, CommitStore, CommitSummary, DiffDocument, DiffFile,
-    DiffFileStatus, DiffHunkView, DiffLine, DiffLineKind, LoadProgress, RemoteBookmarkRef,
-    RevisionDetails, RevisionSelection, SignatureInfo, StreamRow, apply_syntax_highlighting,
-    format_hunk_header,
-};
+use crate::diff_parse::format_hunk_header;
 use crate::graph::LaneAssigner;
 use crate::graph_layout::{GraphLayout, LaneFoldState};
+use crate::model::{
+    BookmarkEntry, BookmarksInfo, BranchStatus, CommitStore, CommitSummary, DiffDocument, DiffFile,
+    DiffFileStatus, DiffHunkView, DiffLine, DiffLineKind, LoadProgress, RemoteBookmarkRef,
+    RevisionDetails, RevisionSelection, SignatureInfo, StreamRow,
+};
 use crate::mutations::{MutationOp, MutationOutcome};
 use crate::repository::{Repository, RepositorySnapshot};
+use crate::syntax::apply_syntax_highlighting;
 
 // Fallback used only when the user has not configured `snapshot.max-new-file-size`.
 // Matches jj-cli's shipped default (1 MiB).
@@ -137,7 +138,7 @@ const DEFAULT_LOG_REVSET: &str = "present(@) | ancestors(immutable_heads().., 2)
 /// saved: their configured `revsets.log` if set, else jj's default (so the
 /// initial view matches `jj log`). Falls back to the default if the repo's
 /// settings can't be loaded.
-pub(crate) fn jj_log_revset(repo_root: &Path) -> String {
+pub fn jj_log_revset(repo_root: &Path) -> String {
     jj_settings(repo_root)
         .ok()
         .and_then(|settings| settings.get_string("revsets.log").ok())
@@ -1039,8 +1040,10 @@ pub async fn load_jj_repository_snapshot(
         // No file changes: drop the lock without writing an op. This is the
         // common case on idle ticks and keeps `jj op log` clean. `base_repo` is
         // already at the post-snapshot head, so hand it back for reuse.
+        let working_copy_empty = wc_commit.is_empty(base_repo.as_ref()).await.ok();
         let snapshot = RepositorySnapshot {
             fingerprint: base_repo.op_id().hex(),
+            working_copy_empty,
         };
         return Ok((snapshot, base_repo, wc_commit_id));
     }
@@ -1074,8 +1077,10 @@ pub async fn load_jj_repository_snapshot(
         .await
         .context("failed to finish jj working-copy mutation")?;
 
+    let working_copy_empty = new_commit.is_empty(new_repo.as_ref()).await.ok();
     let snapshot = RepositorySnapshot {
         fingerprint: new_op_id.hex(),
+        working_copy_empty,
     };
     Ok((snapshot, new_repo, new_wc_commit_id))
 }
@@ -1987,7 +1992,7 @@ mod revset_tests {
     #[test]
     #[ignore = "needs the diffui jj repo on disk"]
     fn excluding_revset_loads_without_panicking() {
-        use crate::backend::LoadProgress;
+        use crate::model::LoadProgress;
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2059,75 +2064,6 @@ mod revset_tests {
                 "read_jj_op_head part {part} must be a head on disk: {on_disk:?}"
             );
         }
-    }
-}
-
-#[cfg(all(test, feature = "track-alloc"))]
-mod mem_profile {
-    use crate::backend::LoadProgress;
-    use crate::track_alloc::{CURRENT, PEAK};
-    use std::sync::atomic::Ordering::Relaxed;
-
-    /// Loads a real jj repo and prints the retained store size against the
-    /// transient allocation peak during the load — the breakdown behind "why
-    /// does RSS dwarf the live data". Point it at a repo with:
-    ///   DIFFUI_PROFILE_REPO=/path \
-    ///   cargo test --features track-alloc profile_load_memory -- --ignored --nocapture
-    /// Defaults to the bun benchmark clone. `#[ignore]`d since it needs a repo
-    /// on disk; counts are logical bytes (no allocator rounding), so true RSS
-    /// runs higher — the peak/live ratio is the signal.
-    #[test]
-    #[ignore]
-    fn profile_load_memory() {
-        let repo = std::env::var("DIFFUI_PROFILE_REPO")
-            .unwrap_or_else(|_| format!("{}/code/bun", std::env::var("HOME").expect("HOME set")));
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build tokio runtime");
-
-        let progress = LoadProgress::default();
-        let baseline = CURRENT.load(Relaxed);
-        PEAK.store(baseline, Relaxed);
-
-        let (store, graph, _branch_status, _bookmarks) = runtime
-            .block_on(super::load_jj_commits(
-                repo.clone().into(),
-                "all()".to_owned(),
-                progress,
-            ))
-            .expect("load commits");
-
-        let peak = PEAK.load(Relaxed).saturating_sub(baseline);
-        let live = CURRENT.load(Relaxed).saturating_sub(baseline);
-        // `store.heap_bytes()` no longer includes lanes (they moved to the
-        // `GraphLayout`); `live` (allocator current) still counts everything,
-        // including `graph`, so keep it alive until after we read the counters.
-        let store_heap = store.heap_bytes();
-        let n = store.len().max(1);
-        let mb = |bytes: usize| bytes as f64 / 1.0e6;
-
-        eprintln!("\n=== diffui memory profile (logical bytes) ===");
-        eprintln!("repo            : {repo}");
-        eprintln!("commits         : {}", store.len());
-        eprintln!("transient peak  : {:>9.1} MB", mb(peak));
-        eprintln!(
-            "live after load : {:>9.1} MB  (allocator current)",
-            mb(live)
-        );
-        eprintln!("store.heap()    : {:>9.1} MB  (accounted)", mb(store_heap));
-        eprintln!(
-            "per commit      : store {:.0} B    peak {:.0} B",
-            store_heap as f64 / n as f64,
-            peak as f64 / n as f64
-        );
-        eprintln!(
-            "peak / live     : {:.2}x  (how much of the high-water mark is transient)",
-            peak as f64 / store_heap.max(1) as f64
-        );
-        eprintln!("=============================================\n");
-
-        drop((store, graph));
     }
 }
 

@@ -5,12 +5,12 @@ use jj_lib::graph::GraphEdge;
 use tokio::process::Command;
 
 use crate::FetchTarget;
-use crate::backend::{
-    CommitSummary, DiffDocument, RevisionDetails, RevisionSelection, SignatureInfo,
-    parse_unified_diff,
-};
+use crate::diff_parse::parse_unified_diff;
 use crate::graph::assign_lanes;
 use crate::graph_layout::{GraphLayout, GraphLayoutBuilder};
+use crate::model::{
+    CommitSummary, DiffDocument, RevisionDetails, RevisionSelection, SignatureInfo,
+};
 use crate::repository::{Repository, RepositorySnapshot};
 
 /// Sentinel commit_id used for the synthetic git working-copy row.
@@ -81,6 +81,7 @@ pub async fn load_git_repository_snapshot(repository_root: &Path) -> Result<Repo
     .await?;
     Ok(RepositorySnapshot {
         fingerprint: output,
+        working_copy_empty: None,
     })
 }
 

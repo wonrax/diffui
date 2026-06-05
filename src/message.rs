@@ -1,0 +1,164 @@
+//! The application `Message` enum — every event the iced runtime delivers to
+//! `Diffui::update`. Pulled into its own module to tame `main.rs`; variants are
+//! still flat (the self-contained overlay groups get nested in a later pass).
+
+use iced::{Point, Size, theme as iced_theme};
+
+use diffui_core::{
+    BackendOutput, CommitsTail, DiffDocument, FetchTarget, RepositorySnapshot, RevisionDetails,
+    RevisionSelection, StreamRow,
+};
+
+use crate::theme::ThemePreference;
+use crate::{HoverTarget, RefreshOrigin, TabId, ToolbarMenu, activity, mutations, revision_list};
+
+#[derive(Debug, Clone)]
+pub(crate) enum Message {
+    BackendLoaded(RevisionSelection, Box<Result<BackendOutput, String>>),
+    /// One batch of commits from a streaming cold load, tagged with the
+    /// `commits_version` the stream was started under. Appended into the live
+    /// `commits` / `graph` so the sidebar grows as the walk progresses.
+    CommitsBatch(u64, Vec<StreamRow>),
+    /// End of a streaming cold load: the snapshot fingerprint + single-parent
+    /// emptiness updates, or an error. Finalizes the stream (clears the load
+    /// cursor, kicks off background empty-status resolution for merges).
+    CommitsFinished(u64, Box<Result<CommitsTail, String>>),
+    /// Working-copy diff for a streaming cold load, tagged with the stream's
+    /// `commits_version`. Sets the diff pane *without* flipping `status` to
+    /// `Loaded` — that's the first `CommitsBatch`'s job, so the sidebar never
+    /// flashes empty while the graph walk loads the index.
+    InitialDiff(
+        u64,
+        Box<Result<(DiffDocument, Option<RevisionDetails>), String>>,
+    ),
+    /// Diff-only load for a revision switch — carries just the document and
+    /// header details, leaving the commit graph and snapshot untouched.
+    DiffLoaded(
+        RevisionSelection,
+        Box<Result<(DiffDocument, Option<RevisionDetails>), String>>,
+    ),
+    RepositorySnapshotLoaded(RefreshOrigin, Result<RepositorySnapshot, String>),
+    /// Background-resolved empty status for the merge/root commits the loader
+    /// left unknown, tagged with the `commits_version` it was computed against
+    /// so results from a superseded load are dropped.
+    EmptyStatusComputed(u64, Vec<(usize, bool)>),
+    SelectFile(usize),
+    SelectRowKey(revision_list::RowSelectionKey),
+    /// The sidebar / diff view reported a new scroll offset. Mirrored into the
+    /// active tab's state so it can be stashed and restored on tab switch.
+    SidebarScrolled(f64),
+    DiffScrolled(f32),
+    /// Right-click on a revision row — opens the context menu. Carries the row's
+    /// on-screen rect (window-content points) so the glow can be anchored over
+    /// it, plus the cursor point the menu opens at.
+    RevisionContextMenu(revision_list::RowSelectionKey, iced::Rectangle, iced::Point),
+    /// A context-menu mutation (new/edit/abandon/bookmark/push) finished,
+    /// tab-addressed with its activity id so push remote output lands in the
+    /// right log.
+    MutationCompleted(
+        TabId,
+        activity::ActivityId,
+        Box<Result<mutations::MutationOutcome, String>>,
+    ),
+    SelectTheme(ThemePreference),
+    SystemThemeChanged(iced_theme::Mode),
+    WindowFocusChanged(bool),
+    RefreshRepository,
+    /// The fs watcher saw a write under `.jj/repo/op_heads` — an operation
+    /// landed (ours: a wc snapshot / mutation, or external: a CLI `jj` command).
+    /// Triggers a cheap op-head read to decide whether it's worth reloading.
+    OpLogChanged,
+    /// Result of the op-head read kicked by [`Message::OpLogChanged`]. `None` for
+    /// git (no op log). Reloads only if the head differs from the one the graph
+    /// already reflects (so our own writes don't cause a redundant walk).
+    OpHeadChecked(Box<Result<Option<String>, String>>),
+    /// Periodic tick while a load is in flight. No-op handler — it exists only
+    /// to keep `view()` re-running so the loading indicator can appear after
+    /// its grace period and animate.
+    LoadingTick,
+    SelectNextFile,
+    SelectPreviousFile,
+    CopyToClipboard(String),
+    SidebarWidthChanged(f32),
+    /// The window finished opening: carries its initial outer position (absent
+    /// on Wayland) and inner size. Seeds geometry tracking without marking it
+    /// dirty — the restored state is already on disk.
+    WindowOpened(Option<Point>, Size),
+    /// The window was resized by the user. Updates tracking and schedules a
+    /// debounced save.
+    WindowResized(Size),
+    /// The window was moved by the user. Updates tracking and schedules a
+    /// debounced save.
+    WindowMoved(Point),
+    /// Debounce tick: persist the window geometry + sidebar width once the
+    /// changes have settled. Subscribed only while a change is pending.
+    PersistWindowState,
+    // ── Multi-repo ──────────────────────────────────────────────────────
+    /// Activate the tab with this id (clicking a tab).
+    SelectTab(TabId),
+    /// Activate the tab at this position (⌘1–9). Out-of-range is a no-op.
+    SelectTabIndex(usize),
+    /// Close the tab with this id (clicking its ×).
+    CloseTab(TabId),
+    /// Close the active tab (⌘W).
+    CloseActiveTab,
+    /// Open the "open repository" path dialog (+ button / ⌘O).
+    OpenRepoDialogOpen,
+    OpenRepoDialogClose,
+    OpenRepoPathChanged(String),
+    /// Resolve the dialog's path and open it as a tab (Enter / "Open").
+    OpenRepoSubmit,
+    /// Open a repo picked from the dialog's recent-repositories list.
+    OpenRecentRepo(String),
+    /// Swallow clicks on the dialog card so they don't dismiss it.
+    OpenRepoNoOp,
+    /// Begin an interactive window drag — fired when the user presses an empty
+    /// area of the tab strip on platforms where it stands in for the title bar.
+    TitleBarDrag,
+    /// Command-palette messages — see [`crate::palette::PaletteMessage`].
+    Palette(crate::palette::PaletteMessage),
+    /// In-diff find bar messages (⌘F) — see [`crate::find::FindMessage`].
+    Find(crate::find::FindMessage),
+
+    // ── Toolbar / activity / revset ─────────────────────────────────────
+    /// Toolbar "Refresh": force a working-copy snapshot + full graph reload.
+    ToolbarRefresh,
+    /// Toolbar "Fetch" (main button or a caret-menu item).
+    Fetch(FetchTarget),
+    /// A fetch finished: captured output lines, or an error. Tab-addressed so a
+    /// fetch that completes after a tab switch resolves against the right log.
+    FetchCompleted(
+        TabId,
+        activity::ActivityId,
+        Box<Result<Vec<String>, String>>,
+    ),
+    /// Toolbar "Undo": revert the latest jj operation.
+    Undo,
+    /// An undo finished.
+    UndoCompleted(
+        TabId,
+        activity::ActivityId,
+        Box<Result<Vec<String>, String>>,
+    ),
+    /// Revset input edited.
+    RevsetChanged(String),
+    /// Revset submitted (Enter) — re-evaluate the log.
+    RevsetSubmit,
+    /// Open a toolbar dropdown (fetch branches / revset presets), anchored
+    /// edge-to-edge below the carried trigger rect.
+    OpenToolbarMenu(ToolbarMenu, iced::Rectangle),
+    /// Popup-menu messages — see [`crate::menu::MenuMessage`].
+    Menu(crate::menu::MenuMessage),
+    /// Open/close the activity popover.
+    ActivityToggle,
+    /// Expand/collapse one activity row's captured output.
+    ActivityExpand(activity::ActivityId),
+    /// Clear finished activities from the active tab's log.
+    ActivityClear,
+    /// Swallow clicks on the activity card / dropdown so they don't dismiss it.
+    ActivityNoOp,
+    /// Open a URL (from an activity's remote output) in the default browser.
+    OpenUrl(String),
+    /// Cursor entered/left a caret control — drives its hover highlight.
+    SetHover(Option<HoverTarget>),
+}

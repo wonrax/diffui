@@ -3,107 +3,110 @@ use iced::{
     widget::{column, container, row, stack, text},
 };
 
-use crate::backend::{RevisionDetails, SignatureInfo};
 use crate::diff_view::{self, DiffFileView, DiffView};
 use crate::find;
 use crate::theme::{ThemeSpec, chip_background, diff_palette, diff_panel_style};
 use crate::{Diffui, LoadStatus, Message};
+use diffui_core::{RevisionDetails, SignatureInfo};
 
 const CODE_TEXT_SIZE: f32 = 12.0;
 const EMPTY_STATE_TEXT_SIZE: f32 = 14.0;
 const STATS_TEXT_SIZE: f32 = 13.0;
 
 pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
-    let body: Element<'a, Message> =
-        if matches!(ui.status, LoadStatus::Loading) && ui.document.files.is_empty() {
-            container(text(""))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .center_x(Length::Fill)
-                .center_y(Length::Fill)
-                .into()
-        } else if ui.document.files.is_empty() && ui.revision_details.is_none() {
-            let message = match &ui.status {
-                LoadStatus::Failed(_) => "Failed to load changes",
-                _ => "No file changes in this revision",
-            };
-            container(
-                text(message)
-                    .size(EMPTY_STATE_TEXT_SIZE)
-                    .color(theme.subtle_text),
-            )
+    let body: Element<'a, Message> = if matches!(ui.session.status, LoadStatus::Loading)
+        && ui.session.document.files.is_empty()
+    {
+        container(text(""))
             .width(Length::Fill)
             .height(Length::Fill)
             .center_x(Length::Fill)
             .center_y(Length::Fill)
             .into()
-        } else {
-            let files = ui
-                .document
-                .files
-                .iter()
-                .map(|file| DiffFileView {
-                    title: match &file.old_path {
-                        Some(old_path) if old_path != &file.path => {
-                            format!("{old_path} -> {}", file.path)
-                        }
-                        _ => file.path.clone(),
-                    },
-                    status: file.status.label(),
-                    hunks: &file.hunks,
-                    additions: file.additions,
-                    deletions: file.deletions,
-                })
-                .collect::<Vec<_>>();
-
-            let bookmark_color = selected_lane_color(ui, theme);
-            let header_lines = ui
-                .revision_details
-                .as_ref()
-                .map(|details| build_header_lines(details, bookmark_color))
-                .unwrap_or_default();
-
-            let stats_bar = build_stats_bar(ui, theme);
-
-            let mut dv = DiffView::new(
-                files,
-                ui.selected_file,
-                ui.selected_revision.view_key(),
-                diff_palette(theme),
-                ui.config.mono_font,
-                CODE_TEXT_SIZE,
-                ui.config.multi_click_ms,
-                Message::SelectFile,
-            )
-            .with_header(header_lines)
-            .on_copy(Message::CopyToClipboard)
-            .on_scroll(Message::DiffScrolled)
-            .restore_scroll(ui.diff_scroll_offset, ui.scroll_restore_token)
-            .content_version(ui.document_version);
-
-            if let Some(find_state) = &ui.find {
-                dv = dv.with_find(diff_view::FindOverlay {
-                    matches: &find_state.matches,
-                    active: find_state.active,
-                    scroll_token: find_state.scroll_token,
-                    highlight: theme.accent,
-                    active_highlight: Color {
-                        a: 0.45,
-                        ..theme.accent
-                    },
-                });
-            }
-
-            let diff_view: Element<'a, Message> = dv.into();
-
-            // The find bar sits on top of the diff view, pinned to the
-            // upper-right of the panel. `stack` overlays without taking
-            // the diff view out of the column flow.
-            let find_overlay = find::build_overlay(ui, theme);
-            let diff_with_find: Element<'a, Message> = stack![diff_view, find_overlay].into();
-
-            column![stats_bar, diff_with_find].spacing(0).into()
+    } else if ui.session.document.files.is_empty() && ui.session.revision_details.is_none() {
+        let message = match &ui.session.status {
+            LoadStatus::Failed(_) => "Failed to load changes",
+            _ => "No file changes in this revision",
         };
+        container(
+            text(message)
+                .size(EMPTY_STATE_TEXT_SIZE)
+                .color(theme.subtle_text),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .into()
+    } else {
+        let files = ui
+            .session
+            .document
+            .files
+            .iter()
+            .map(|file| DiffFileView {
+                title: match &file.old_path {
+                    Some(old_path) if old_path != &file.path => {
+                        format!("{old_path} -> {}", file.path)
+                    }
+                    _ => file.path.clone(),
+                },
+                status: file.status.label(),
+                hunks: &file.hunks,
+                additions: file.additions,
+                deletions: file.deletions,
+            })
+            .collect::<Vec<_>>();
+
+        let bookmark_color = selected_lane_color(ui, theme);
+        let header_lines = ui
+            .session
+            .revision_details
+            .as_ref()
+            .map(|details| build_header_lines(details, bookmark_color))
+            .unwrap_or_default();
+
+        let stats_bar = build_stats_bar(ui, theme);
+
+        let mut dv = DiffView::new(
+            files,
+            ui.selected_file,
+            ui.session.selected_revision.view_key(),
+            diff_palette(theme),
+            ui.config.mono_font,
+            CODE_TEXT_SIZE,
+            ui.config.multi_click_ms,
+            Message::SelectFile,
+        )
+        .with_header(header_lines)
+        .on_copy(Message::CopyToClipboard)
+        .on_scroll(Message::DiffScrolled)
+        .restore_scroll(ui.diff_scroll_offset, ui.scroll_restore_token)
+        .content_version(ui.document_version);
+
+        if let Some(find_state) = &ui.find {
+            dv = dv.with_find(diff_view::FindOverlay {
+                matches: &find_state.matches,
+                active: find_state.active,
+                scroll_token: find_state.scroll_token,
+                highlight: theme.accent,
+                active_highlight: Color {
+                    a: 0.45,
+                    ..theme.accent
+                },
+            });
+        }
+
+        let diff_view: Element<'a, Message> = dv.into();
+
+        // The find bar sits on top of the diff view, pinned to the
+        // upper-right of the panel. `stack` overlays without taking
+        // the diff view out of the column flow.
+        let find_overlay = find::build_overlay(ui, theme);
+        let diff_with_find: Element<'a, Message> = stack![diff_view, find_overlay].into();
+
+        column![stats_bar, diff_with_find].spacing(0).into()
+    };
 
     container(body)
         .width(Length::Fill)
@@ -121,17 +124,20 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
 /// content they describe.
 fn build_stats_bar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
     let bar = row![
-        text(format!("+{}", ui.document.total_additions))
+        text(format!("+{}", ui.session.document.total_additions))
             .size(STATS_TEXT_SIZE)
             .font(ui.config.mono_font)
             .color(theme.added_text),
-        text(format!("−{}", ui.document.total_deletions))
+        text(format!("−{}", ui.session.document.total_deletions))
             .size(STATS_TEXT_SIZE)
             .font(ui.config.mono_font)
             .color(theme.removed_text),
-        text(format!("· {}", format_file_count(ui.document.files.len())))
-            .size(STATS_TEXT_SIZE)
-            .color(theme.subtle_text),
+        text(format!(
+            "· {}",
+            format_file_count(ui.session.document.files.len())
+        ))
+        .size(STATS_TEXT_SIZE)
+        .color(theme.subtle_text),
     ]
     .spacing(8)
     .align_y(alignment::Vertical::Center);
@@ -167,9 +173,10 @@ fn selected_lane_color(ui: &Diffui, theme: ThemeSpec) -> Color {
         lane_base_color: theme.lane_base,
         missing_color: theme.subtle_text,
     };
-    ui.selected_commit_index
-        .filter(|&index| index < ui.commits.len())
-        .map(|index| style.lane_color(ui.graph.frame(index, usize::MAX).node_lane))
+    ui.session
+        .selected_commit_index
+        .filter(|&index| index < ui.session.commits.len())
+        .map(|index| style.lane_color(ui.session.graph.frame(index, usize::MAX).node_lane))
         .unwrap_or(theme.accent)
 }
 

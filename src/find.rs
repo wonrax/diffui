@@ -20,9 +20,9 @@ use iced::{
 };
 use regex::{Regex, RegexBuilder};
 
-use crate::backend::DiffDocument;
 use crate::theme::ThemeSpec;
 use crate::{Diffui, Message};
+use diffui_core::DiffDocument;
 
 pub const FIND_INPUT_ID: &str = "find-input";
 
@@ -30,6 +30,23 @@ pub const FIND_INPUT_ID: &str = "find-input";
 /// instant, long enough that regex re-runs don't pile up while the user is
 /// burst-typing.
 pub const DEBOUNCE: Duration = Duration::from_millis(50);
+
+/// Messages from the in-diff find bar, nested under [`Message::Find`].
+#[derive(Debug, Clone)]
+pub enum FindMessage {
+    /// Open the find bar (⌘F / Ctrl+F).
+    Open,
+    Close,
+    QueryChanged(String),
+    /// Fired after the debounce delay; the version cookie drops stale results.
+    Recompute(u64),
+    ToggleCase,
+    ToggleRegex,
+    /// Enter: advance to the next match (wraps around).
+    Next,
+    /// Shift+Enter: advance to the previous match.
+    Prev,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct FindState {
@@ -239,7 +256,7 @@ pub fn build_overlay<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Messag
         .padding(Padding::from([4, 8]))
         .size(13)
         .font(ui.config.ui_font)
-        .on_input(Message::FindQueryChanged)
+        .on_input(|q| Message::Find(FindMessage::QueryChanged(q)))
         // Intentionally no `on_submit` — that would route Enter to FindNext
         // unconditionally and steal Shift+Enter from the keyboard
         // subscription, which is what handles forward/backward.
@@ -261,13 +278,16 @@ pub fn build_overlay<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Messag
         });
 
     let case_button = toggle_button("Aa", state.case_sensitive, theme, ui.config.ui_font)
-        .on_press(Message::FindToggleCase);
+        .on_press(Message::Find(FindMessage::ToggleCase));
     let regex_button = toggle_button(".*", state.regex, theme, ui.config.mono_font)
-        .on_press(Message::FindToggleRegex);
+        .on_press(Message::Find(FindMessage::ToggleRegex));
 
-    let prev_button = nav_button("‹", theme, ui.config.ui_font).on_press(Message::FindPrev);
-    let next_button = nav_button("›", theme, ui.config.ui_font).on_press(Message::FindNext);
-    let close_button = nav_button("✕", theme, ui.config.ui_font).on_press(Message::FindClose);
+    let prev_button =
+        nav_button("‹", theme, ui.config.ui_font).on_press(Message::Find(FindMessage::Prev));
+    let next_button =
+        nav_button("›", theme, ui.config.ui_font).on_press(Message::Find(FindMessage::Next));
+    let close_button =
+        nav_button("✕", theme, ui.config.ui_font).on_press(Message::Find(FindMessage::Close));
 
     // Each row item is wrapped in a container that asks for
     // `Length::Shrink` height + centered Y. iced's `Row::align_y` only

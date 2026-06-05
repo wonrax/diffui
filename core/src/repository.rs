@@ -15,12 +15,28 @@ pub struct Repository {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositorySnapshot {
     pub fingerprint: String,
+    /// Whether the post-snapshot working-copy commit is empty (no diff from its
+    /// parent), or `None` when unknown (git — no cheap per-commit emptiness).
+    /// Lets the sidebar keep @'s "empty" chip live on a watcher refresh even
+    /// when the diff pane is showing a *different* revision (so the row can flip
+    /// empty→non-empty without a graph re-walk); jj always fills it.
+    pub working_copy_empty: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum Vcs {
     Jj,
     Git,
+}
+
+/// What a fetch should pull.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchTarget {
+    /// Every remote, all branches (`jj git fetch --all-remotes` /
+    /// `git fetch --all`).
+    AllRemotes,
+    /// One branch on one remote (`name@remote`).
+    RemoteBranch { remote: String, branch: String },
 }
 
 pub fn prepare_repository(input: &Path) -> Result<Repository> {

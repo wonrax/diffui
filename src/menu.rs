@@ -31,9 +31,30 @@ use iced::{
     },
 };
 
-use crate::backend::RevisionSelection;
 use crate::theme::{self, ThemeSpec, chip_background, emphasis_font};
 use crate::{Diffui, MenuAction, Message};
+use diffui_core::RevisionSelection;
+
+/// Messages from an open popup menu, nested under [`Message::Menu`].
+#[derive(Debug, Clone)]
+pub enum MenuMessage {
+    /// Hovered a row (path of indices through submenus): highlight it and open
+    /// its flyout if it's a submenu.
+    Hover(Vec<usize>),
+    /// Cursor moved while a menu is open (window coords) — drives the submenu
+    /// trajectory guard and keeps the app underneath inert.
+    MouseMoved(iced::Point),
+    /// Released over a row: pick it (if a leaf).
+    Select(Vec<usize>),
+    /// A press inside the card — swallowed so it doesn't dismiss.
+    CapturePress,
+    /// Dismiss the open menu (press outside, or Esc).
+    Dismiss,
+    /// A release on the dismiss scrim — arms/dismisses outside-dismiss.
+    ScrimRelease,
+    /// No-op tick that keeps `view` re-running so the right-click glow pulses.
+    Tick,
+}
 
 // ── Card geometry ───────────────────────────────────────────────────────────
 const MENU_MIN_WIDTH: f32 = 200.0;
@@ -104,8 +125,12 @@ impl MenuEntry {
     }
 }
 
-/// Where a menu opens from.
+/// Where a menu opens from. Only constructed by the non-macOS iced overlay menu
+/// (macOS uses a native `NSMenu`); the enum and the `anchor_origin` match are
+/// still compiled on both platforms, so suppress the macOS "never constructed"
+/// lint rather than cfg-gate the whole overlay subsystem out.
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) enum AnchorSpec {
     /// Drop edge-to-edge below this trigger rect, left-aligned (toolbar carets).
     Below(Rectangle),
@@ -153,6 +178,9 @@ pub(crate) struct OverlayMenu {
 }
 
 impl OverlayMenu {
+    // Constructed only for the non-macOS iced overlay menu; macOS uses a native
+    // `NSMenu` and never builds an `OverlayMenu`.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn new(root: Vec<MenuEntry>, anchor: AnchorSpec, armed: bool) -> Self {
         OverlayMenu {
             root,
@@ -237,9 +265,9 @@ pub(crate) fn build_overlay(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
     // they see events first; only what they ignore reaches here.
     let mut layers: Vec<Element<'_, Message>> = vec![
         Backdrop {
-            on_press: Message::MenuDismiss,
-            on_release: Message::MenuScrimRelease,
-            on_move: Message::MenuMouseMoved,
+            on_press: Message::Menu(MenuMessage::Dismiss),
+            on_release: Message::Menu(MenuMessage::ScrimRelease),
+            on_move: |p| Message::Menu(MenuMessage::MouseMoved(p)),
         }
         .into(),
     ];
@@ -599,8 +627,8 @@ fn build_card<'a>(
             .padding(Padding::from([MENU_CARD_PAD, MENU_CARD_PAD]))
             .style(move |_| menu_card_style(theme)),
     )
-    .on_press(Message::MenuCapturePress)
-    .on_right_press(Message::MenuCapturePress)
+    .on_press(Message::Menu(MenuMessage::CapturePress))
+    .on_right_press(Message::Menu(MenuMessage::CapturePress))
     .into()
 }
 
@@ -712,9 +740,9 @@ fn build_row<'a>(
     // card's capture so they don't reach the dismiss backdrop, while a
     // press-started-on-the-trigger drag still releases onto the row.
     mouse_area(styled)
-        .on_enter(Message::MenuHover(path.clone()))
-        .on_release(Message::MenuSelect(path.clone()))
-        .on_right_release(Message::MenuSelect(path))
+        .on_enter(Message::Menu(MenuMessage::Hover(path.clone())))
+        .on_release(Message::Menu(MenuMessage::Select(path.clone())))
+        .on_right_release(Message::Menu(MenuMessage::Select(path)))
         .interaction(mouse::Interaction::Pointer)
         .into()
 }
