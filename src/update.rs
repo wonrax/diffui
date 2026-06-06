@@ -721,6 +721,11 @@ impl Diffui {
                 if position.is_some() {
                     self.window_position = position;
                 }
+                // Make sure the dock shows our icon even for an unbundled run
+                // (`cargo run`); the nix `.app` bundle already covers packaged
+                // launches. Window's open now, so AppKit is fully up.
+                #[cfg(target_os = "macos")]
+                chrome::set_dock_icon();
                 // Center the native window controls on the tab strip, and arm
                 // the native resize observer that keeps them centered without a
                 // frame of lag while the window is dragged (see

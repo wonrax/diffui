@@ -78,9 +78,9 @@
                 cp ${infoPlist} "$app/Contents/Info.plist"
                 mv "$out/bin/diffui" "$app/Contents/MacOS/diffui"
                 ln -s "../Applications/Diffui.app/Contents/MacOS/diffui" "$out/bin/diffui"
-                ${lib.optionalString (builtins.pathExists ./macos/diffui.icns) ''
-                  cp ${./macos/diffui.icns} "$app/Contents/Resources/diffui.icns"
-                ''}
+                # Dynamic Tahoe icon: the actool-compiled asset catalog
+                # (Assets.car + the .icns fallback). See `appIconAssets`.
+                cp -R ${appIconAssets}/. "$app/Contents/Resources/"
               '';
 
             meta = {
@@ -91,11 +91,45 @@
             };
           };
 
+          # The Tahoe app icon. `actool` (ships only with full Xcode) compiles
+          # the Icon Composer `macos/diffui.icon` into the layered asset catalog
+          # (`Assets.car`) the system needs for the dynamic light/dark/tinted +
+          # Liquid Glass treatment — a flat `.icns` can't express it. actool
+          # isn't in nixpkgs and reads from `/Applications/Xcode.app`, so this
+          # step is deliberately impure (`__noChroot`) and fails loudly if actool
+          # is missing. Kept in its own derivation so the Rust build above stays
+          # hermetic and cached, and so only this icon step is non-sandboxed.
+          #
+          # NOTE: the exact asset-catalog layout actool wants for a standalone
+          # `.icon` is the one piece that needs confirming on a machine that has
+          # Xcode — see `macos/README.md` for what to verify if it errors.
+          appIconAssets = pkgs.runCommandLocal "diffui-app-icon" { __noChroot = true; } ''
+            if ! /usr/bin/xcrun --find actool >/dev/null 2>&1; then
+              echo "diffui: actool not found — the macOS app icon needs full Xcode." >&2
+              echo "        Install Xcode, then: sudo xcode-select -s /Applications/Xcode.app" >&2
+              exit 1
+            fi
+
+            catalog="$PWD/Assets.xcassets"
+            mkdir -p "$catalog/AppIcon.icon"
+            cp -R ${./macos/diffui.icon}/. "$catalog/AppIcon.icon/"
+            printf '{ "info": { "author": "xcode", "version": 1 } }\n' > "$catalog/Contents.json"
+
+            mkdir -p "$out"
+            /usr/bin/xcrun actool "$catalog" \
+              --compile "$out" \
+              --app-icon AppIcon \
+              --platform macosx \
+              --minimum-deployment-target 11.0 \
+              --output-partial-info-plist "$TMPDIR/icon-info.plist" \
+              --errors --warnings --notices
+          '';
+
           # macOS bundle metadata. `CFBundleIdentifier` is the stable identity
           # the OS keys permissions/preferences off of — change it if you fork.
-          # `CFBundleIconFile` points at Resources/diffui.icns, which is copied
-          # in only if you drop a `macos/diffui.icns` into the repo (the bundle
-          # builds fine without one — macOS just shows a generic icon).
+          # `CFBundleIconName` names the `AppIcon` entry in the compiled
+          # `Assets.car` (see `appIconAssets`); `CFBundleIconFile` is the legacy
+          # `.icns` fallback actool also emits for pre-catalog macOS.
           infoPlist = pkgs.writeText "diffui-Info.plist" ''
             <?xml version="1.0" encoding="UTF-8"?>
             <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -108,7 +142,9 @@
               <key>CFBundleExecutable</key>
               <string>diffui</string>
               <key>CFBundleIconFile</key>
-              <string>diffui</string>
+              <string>AppIcon</string>
+              <key>CFBundleIconName</key>
+              <string>AppIcon</string>
               <key>CFBundleIdentifier</key>
               <string>com.haiha.diffui</string>
               <key>CFBundleInfoDictionaryVersion</key>

@@ -70,6 +70,68 @@ pub fn apply_window_settings(settings: &mut window::Settings) {
     }
 }
 
+/// Set the macOS dock / app-switcher icon for an **unbundled** run only.
+///
+/// The nix package wraps the binary in a real `Diffui.app` whose compiled
+/// asset catalog (from `actool`) drives the icon — including the Tahoe dynamic
+/// light/dark/tinted + Liquid Glass treatment — so a *packaged* launch (and the
+/// `bin/diffui` symlink into the bundle) gets the right icon from the OS with no
+/// code involved. We must NOT touch it there: `setApplicationIconImage:` takes a
+/// *static* `NSImage` and would flatten that dynamic icon. So this only fires
+/// for an unbundled binary (`cargo run`, a bare `target/debug/diffui`), where
+/// the dock would otherwise show the generic terminal icon — winit/iced's window
+/// icon is a no-op on macOS, so AppKit is the only lever. We detect "bundled" by
+/// asking whether the main bundle has an identifier (only true with a real
+/// `Info.plist`). No-op off macOS; must run on the main thread (the iced update
+/// loop, which calls this, is main-thread).
+#[cfg(target_os = "macos")]
+pub fn set_dock_icon() {
+    use std::ffi::c_void;
+
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+
+    // SAFETY: runs on the main thread (via the iced update loop). We only send
+    // well-known AppKit messages, copy the bytes into an autoreleased `NSData`,
+    // and null-check each result before using it.
+    unsafe {
+        // Inside a real `.app`, the main bundle has a `CFBundleIdentifier`; a
+        // bare CLI binary's main bundle returns nil. Bail when bundled so the
+        // OS-rendered (dynamic) icon stands.
+        let bundle: *mut AnyObject = msg_send![class!(NSBundle), mainBundle];
+        if !bundle.is_null() {
+            let identifier: *mut AnyObject = msg_send![bundle, bundleIdentifier];
+            if !identifier.is_null() {
+                return;
+            }
+        }
+
+        // A 512px padded render of the macOS icon (the dock shows it as-is, so
+        // it carries the ~80% gutter a packaged icon would otherwise get from
+        // the OS). Kept small so the unbundled binary doesn't balloon.
+        const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
+
+        let data: *mut AnyObject = msg_send![
+            class!(NSData),
+            dataWithBytes: ICON_PNG.as_ptr() as *const c_void,
+            length: ICON_PNG.len(),
+        ];
+        if data.is_null() {
+            return;
+        }
+        let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+        let image: *mut AnyObject = msg_send![image, initWithData: data];
+        if image.is_null() {
+            return;
+        }
+        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        if app.is_null() {
+            return;
+        }
+        let _: () = msg_send![app, setApplicationIconImage: image];
+    }
+}
+
 /// Reposition the OS-drawn window controls to the vertical center of a
 /// `bar_height`-tall title bar, so they line up with the centered tabs. macOS
 /// pins the traffic lights to the center of the *native* ~28pt title bar and
