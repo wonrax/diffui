@@ -82,7 +82,8 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
         .on_copy(Message::CopyToClipboard)
         .on_scroll(Message::DiffScrolled)
         .restore_scroll(ui.diff_scroll_offset, ui.scroll_restore_token)
-        .content_version(ui.document_version);
+        .content_version(ui.document_version)
+        .layout_version(ui.session.document_id);
 
         if let Some(find_state) = &ui.find {
             dv = dv.with_find(diff_view::FindOverlay {

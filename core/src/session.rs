@@ -285,6 +285,17 @@ pub struct Session {
     /// whole-PR diff ↔ per-commit diffs). The *displayed* document is never
     /// in here — switching moves it in and the target out. Cleared on reload.
     pub pr_diffs: HashMap<String, CachedDiff>,
+    /// Identity of the displayed document, stamped from the frontend's global
+    /// counter on every replacement. Background per-file results (syntax
+    /// highlights) carry it so they route to the session still showing that
+    /// document — or are dropped once it's gone. Appends (a PR stream) keep
+    /// the id: existing files are unchanged, results stay valid.
+    pub document_id: u64,
+    /// File indices of `document` still waiting for background highlighting,
+    /// drained a few at a time by the frontend.
+    pub highlight_pending: VecDeque<usize>,
+    /// Highlight jobs currently running for `document`.
+    pub highlight_in_flight: usize,
     /// A refresh requested while a load/snapshot was already in flight, held
     /// (coalesced — `Focus` subsumes `Watcher`) so it runs once the current work
     /// finishes rather than racing it (a second wc snapshot thrashes jj's lock).
@@ -366,6 +377,36 @@ impl Session {
             }
         }
         out
+    }
+
+    /// The displayed document was replaced: stamp its new identity and restart
+    /// highlight bookkeeping — queue every file of the new document whose
+    /// lines carry no spans yet (a parked PR document keeps the spans it
+    /// already earned), and forget in-flight jobs (their results carry the old
+    /// id and will be dropped on arrival).
+    pub fn reset_highlights(&mut self, document_id: u64) {
+        self.document_id = document_id;
+        self.highlight_in_flight = 0;
+        self.highlight_pending.clear();
+        self.enqueue_unhighlighted(0);
+    }
+
+    /// Queue files from `start` onward that have no syntax spans at all —
+    /// used by [`reset_highlights`] for a fresh document and by streaming
+    /// appends for the newly arrived tail.
+    pub fn enqueue_unhighlighted(&mut self, start: usize) {
+        for (offset, file) in self.document.files[start.min(self.document.files.len())..]
+            .iter()
+            .enumerate()
+        {
+            let unhighlighted = file
+                .hunks
+                .iter()
+                .all(|hunk| hunk.lines.iter().all(|line| line.syntax.is_empty()));
+            if unhighlighted && !file.hunks.is_empty() {
+                self.highlight_pending.push_back(start + offset);
+            }
+        }
     }
 
     /// Apply any cached empty-status to the loaded commits in place, and return

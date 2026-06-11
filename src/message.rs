@@ -6,7 +6,7 @@ use iced::{Point, Size, theme as iced_theme};
 
 use diffui_core::{
     BackendOutput, CommitsTail, DiffDocument, DiffFile, FetchTarget, RepositorySnapshot,
-    RevisionDetails, RevisionSelection, StreamRow, github,
+    RevisionDetails, RevisionSelection, StreamRow, SyntaxSpan, github,
 };
 
 use crate::theme::ThemePreference;
@@ -195,4 +195,10 @@ pub(crate) enum Message {
     PrCommitsLoaded(u64, Box<Result<Vec<github::PrCommit>, String>>),
     /// The PR diff stream ended — every file was emitted, or it failed.
     PrFinished(u64, Box<Result<(), String>>),
+
+    /// Background syntax highlighting finished for one file: sparse
+    /// `(hunk, line, spans)` for the document identified by the leading
+    /// `document_id` (routed to whichever session still shows it — active or
+    /// stashed — and dropped once that document is gone).
+    FileHighlighted(u64, usize, Vec<(usize, usize, Vec<SyntaxSpan>)>),
 }

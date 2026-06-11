@@ -296,6 +296,10 @@ pub(crate) struct Diffui {
     /// fresh value so late batches from a superseded or backgrounded load are
     /// dropped by the version guard rather than corrupting the active tab.
     pub(crate) next_load_version: u64,
+    /// Monotonic source of document identities (`Session::document_id`),
+    /// stamped on every document replacement across every tab. Background
+    /// per-file work (syntax highlighting) routes its results by this id.
+    pub(crate) next_document_id: u64,
     /// `Some` while the "open repository" path dialog is showing.
     pub(crate) open_repo_dialog: Option<OpenRepoDialog>,
     /// Most-recently-opened repo roots (newest first), surfaced as quick-pick

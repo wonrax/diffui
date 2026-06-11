@@ -178,13 +178,20 @@ pub struct DiffView<'a, Message> {
     /// Used to re-apply a tab's saved scroll on activation.
     restore_offset: f32,
     restore_token: u64,
-    /// Monotonic version of the diff content, bumped by the app on every
-    /// document swap. The per-line paragraph cache is keyed by
-    /// `(file, hunk, line)`, which point at *different* text after a reload,
-    /// a working-copy edit, or a tab switch (the widget `State` — cache included
-    /// — is shared across tabs). `revision_key` alone can't catch those: it's a
-    /// constant `"working-copy"` for any `@`. A version bump drops the cache.
+    /// Monotonic version of the diff content's *paint*, bumped by the app on
+    /// every document swap and on background-highlight merges. The per-line
+    /// paragraph cache is keyed by `(file, hunk, line)`, which point at
+    /// *different* text after a reload, a working-copy edit, or a tab switch
+    /// (the widget `State` — cache included — is shared across tabs).
+    /// `revision_key` alone can't catch those: it's a constant
+    /// `"working-copy"` for any `@`. A version bump drops the cache.
     content_version: u64,
+    /// Monotonic identity of the document's *layout* (the app's per-document
+    /// id), bumped only when the document is replaced — not when highlight
+    /// spans merge in. Keys the [`HeightIndex`]: span merges repaint rows but
+    /// never move them, so rebuilding the (potentially 1M-row) index for each
+    /// would be pure waste.
+    layout_version: u64,
 }
 
 /// Per-render find-match data fed into `DiffView::with_find`. The widget
@@ -278,11 +285,13 @@ struct ParagraphKey {
 /// lines themselves.
 #[derive(Debug, Default)]
 struct HeightIndex {
-    /// Rebuild key: `(content_version, files.len(), header.len(),
+    /// Rebuild key: `(layout_version, files.len(), header.len(),
     /// content_width bits)`. The file/header counts are part of the key
     /// because streaming PR loads *append* files (and the header appears when
-    /// `gh pr view` lands) without bumping `content_version` — appends leave
-    /// existing paragraph-cache keys valid, but they do move offsets.
+    /// `gh pr view` lands) without replacing the document — appends leave
+    /// existing rows in place, but they extend the layout. Keyed on the
+    /// layout id, NOT the paint `content_version`: highlight merges bump the
+    /// latter to re-shape paint without moving anything.
     key: Option<(u64, usize, usize, u32)>,
     /// Content-space y of each file's header top, plus one trailing sentinel
     /// holding the content end. `file_tops[0]` equals the revision-header
@@ -523,6 +532,7 @@ impl<'a, Message> DiffView<'a, Message> {
             restore_offset: 0.0,
             restore_token: 0,
             content_version: 0,
+            layout_version: 0,
         }
     }
 
@@ -553,6 +563,15 @@ impl<'a, Message> DiffView<'a, Message> {
     /// this whenever it swaps the displayed document.
     pub fn content_version(mut self, version: u64) -> Self {
         self.content_version = version;
+        self
+    }
+
+    /// Set the document's layout identity (see the field docs) — keys the
+    /// height index, unlike `content_version` which keys the paint cache.
+    /// Span merges bump only the latter, so the (potentially 1M-row) index
+    /// survives them.
+    pub fn layout_version(mut self, version: u64) -> Self {
+        self.layout_version = version;
         self
     }
 
@@ -716,7 +735,7 @@ impl<'a, Message> DiffView<'a, Message> {
     fn ensure_height_index(&self, cell: &RefCell<HeightIndex>, width: f32) {
         let content_width = self.content_width(width);
         let key = Some((
-            self.content_version,
+            self.layout_version,
             self.files.len(),
             self.header.len(),
             content_width.to_bits(),
@@ -2958,8 +2977,8 @@ mod tests {
         view.ensure_height_index(&cell, 4000.0);
         assert_eq!(cell.borrow().key, key);
 
-        // A streamed append (more files, same content_version) must rebuild.
-        view.content_version = 7;
+        // A replaced document (new layout id) must rebuild.
+        view.layout_version = 7;
         view.ensure_height_index(&cell, 4000.0);
         assert_ne!(cell.borrow().key, key);
     }

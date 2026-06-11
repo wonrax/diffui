@@ -192,6 +192,62 @@ async fn run_command(current_dir: &Path, program: &str, args: Vec<OsString>) -> 
     String::from_utf8(output.stdout).with_context(|| format!("{program} emitted non-utf8 output"))
 }
 
+/// Read the full old/new contents of one file at `revision`, for full-context
+/// syntax highlighting. Best-effort: a side that doesn't resolve (added or
+/// deleted file, root commit's parent, binary/non-UTF-8 content, oversized)
+/// comes back `None` and the caller falls back to the diff-only
+/// reconstruction.
+pub async fn read_git_file_pair(
+    repository: &Repository,
+    revision: &RevisionSelection,
+    path: &str,
+    old_path: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    const MAX_SOURCE_BYTES: usize = 8 * 1024 * 1024;
+    let cap = |content: String| (content.len() <= MAX_SOURCE_BYTES).then_some(content);
+    let old_path = old_path.unwrap_or(path);
+
+    match revision {
+        RevisionSelection::WorkingCopy => {
+            // The new side is the working tree itself; the old side is what
+            // the diff compared against (`git diff HEAD`).
+            let new = tokio::fs::read(repository.root.join(path))
+                .await
+                .ok()
+                .and_then(|bytes| {
+                    (bytes.len() <= MAX_SOURCE_BYTES).then(|| {
+                        String::from_utf8_lossy(&bytes).into_owned()
+                    })
+                });
+            let old = git_show_file(&repository.root, &format!("HEAD:{old_path}"))
+                .await
+                .and_then(cap);
+            (old, new)
+        }
+        RevisionSelection::Commit(id) => {
+            let new = git_show_file(&repository.root, &format!("{id}:{path}"))
+                .await
+                .and_then(cap);
+            let old = git_show_file(&repository.root, &format!("{id}^:{old_path}"))
+                .await
+                .and_then(cap);
+            (old, new)
+        }
+    }
+}
+
+/// `git show <rev>:<path>`, `None` on any failure (missing path, bad rev,
+/// non-UTF-8 output — `run_command` rejects those).
+async fn git_show_file(repository_root: &Path, spec: &str) -> Option<String> {
+    run_command(
+        repository_root,
+        "git",
+        vec![OsString::from("show"), OsString::from(spec)],
+    )
+    .await
+    .ok()
+}
+
 async fn git_has_uncommitted_changes(repository_root: &Path) -> Result<bool> {
     // `git status --porcelain` prints one line per change (staged, unstaged,
     // or untracked) and nothing on a clean tree.

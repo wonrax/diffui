@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use crate::graph_layout::GraphLayout;
 use crate::model::{
     BackendOutput, BookmarksInfo, BranchStatus, CommitStore, CommitStoreBuilder, DiffDocument,
-    LoadProgress, RevisionDetails, RevisionSelection,
+    DiffFile, LoadProgress, RevisionDetails, RevisionSelection,
 };
 use crate::mutations::{MutationOp, MutationOutcome};
 use crate::repository::{FetchTarget, Repository, RepositorySnapshot, Vcs};
@@ -160,6 +160,71 @@ pub async fn compute_empty_status(
         }
         Vcs::Git => Vec::new(),
     }
+}
+
+/// Background syntax highlighting for one file of a displayed document.
+///
+/// When `repository` is given, both sides' **full contents** are read first
+/// (jj: materialized from the trees; git: `git show` / the working tree) so
+/// tree-sitter parses the real documents — constructs that span hunk
+/// boundaries (multi-line strings, block comments, the enclosing class)
+/// highlight correctly, which the diff-only reconstruction gets wrong.
+/// Sourceless inputs (PR tabs, unreadable sides) fall back to that
+/// reconstruction, so the result is never worse than the old inline pass.
+///
+/// Returns the per-line spans sparsely as `(hunk, line, spans)`; empty when
+/// the language is unknown. The parse runs on a blocking thread — this is
+/// seconds of CPU for huge files, which is exactly why it left the load path.
+pub async fn highlight_file(
+    repository: Option<Repository>,
+    revision: RevisionSelection,
+    file: DiffFile,
+) -> Vec<(usize, usize, Vec<crate::SyntaxSpan>)> {
+    let sources = match &repository {
+        Some(repository) => match repository.vcs {
+            Vcs::Jj => crate::jj::read_jj_file_pair(
+                repository.clone(),
+                revision,
+                file.path.clone(),
+                file.old_path.clone(),
+            )
+            .await
+            .unwrap_or((None, None)),
+            Vcs::Git => {
+                crate::git::read_git_file_pair(
+                    repository,
+                    &revision,
+                    &file.path,
+                    file.old_path.as_deref(),
+                )
+                .await
+            }
+        },
+        None => (None, None),
+    };
+
+    let joined = tokio::task::spawn_blocking(move || {
+        let (old_source, new_source) = sources;
+        let mut file = file;
+        crate::syntax::apply_syntax_highlighting_with_sources(
+            &mut file,
+            old_source.as_deref(),
+            new_source.as_deref(),
+        );
+        file.hunks
+            .into_iter()
+            .enumerate()
+            .flat_map(|(hunk_index, hunk)| {
+                hunk.lines
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, line)| !line.syntax.is_empty())
+                    .map(move |(line_index, line)| (hunk_index, line_index, line.syntax))
+            })
+            .collect()
+    })
+    .await;
+    joined.unwrap_or_default()
 }
 
 /// Fetch from the remote(s) and return the captured remote/sideband output for

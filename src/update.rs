@@ -217,6 +217,7 @@ impl Diffui {
             active_tab,
             next_tab_id,
             next_load_version: 0,
+            next_document_id: 0,
             open_repo_dialog: None,
             recent_repos,
             default_revset: active_repository
@@ -249,6 +250,7 @@ impl Diffui {
                     // tab is backgrounded still lands — without the tab
                     // routing, two tabs both pending on `@` would pass the
                     // revision check and swap repos' contents.
+                    let document_id = self.allocate_document_id();
                     let Some(mut target) = self.tab_target_mut(tab) else {
                         return Task::none();
                     };
@@ -301,16 +303,19 @@ impl Diffui {
                     // it rather than yanking the user to `@`. Only a *failed*
                     // resolve (the `Err` arm) means the commit is truly gone.
                     target.session.rebuild_sidebar_index();
+                    target.session.reset_highlights(document_id);
                     target.finish_load_activity(activity::ActivityStatus::Done, None);
                     // The document was replaced in place; drop the active view's
                     // shaped-paragraph cache. (A stashed tab gets the bump on
                     // restore.) Empty-status + coalesced refreshes are
                     // active-only; a backgrounded tab runs them on activation.
+                    let highlights = self.spawn_highlights(document_id);
                     if is_active {
                         self.document_version = self.document_version.wrapping_add(1);
                         let empty = self.resolve_empty_status();
-                        return Task::batch([empty, self.take_pending_refresh()]);
+                        return Task::batch([highlights, empty, self.take_pending_refresh()]);
                     }
+                    return highlights;
                 }
                 Err(error) => {
                     let Some(mut target) = self.tab_target_mut(tab) else {
@@ -451,6 +456,7 @@ impl Diffui {
                 // one-shot switches were abandoned on stash.) Leaves `status`
                 // as `Loading` so the sidebar stays empty until the first
                 // commit batch; loading feedback is in the toolbar.
+                let document_id = self.allocate_document_id();
                 let Some(target) = self.load_target_mut(version) else {
                     return Task::none();
                 };
@@ -472,12 +478,14 @@ impl Diffui {
                         target.session.document = document;
                         target.session.revision_details = details;
                         *target.selected_file = 0;
+                        target.session.reset_highlights(document_id);
                         // The shaped-paragraph cache keys map to the replaced
                         // text — drop it. A stashed tab gets the same bump on
                         // restore, so only the active one needs it here.
                         if bump {
                             self.document_version = self.document_version.wrapping_add(1);
                         }
+                        return self.spawn_highlights(document_id);
                     }
                     Err(error) => {
                         eprintln!("diffui: working-copy diff failed during load: {error}");
@@ -538,6 +546,7 @@ impl Diffui {
                 // (file, hunk, line) cache keys still map to the same text,
                 // so visible rows don't re-shape on every batch of a
                 // million-line stream.
+                let appended_from = target.session.document.files.len();
                 for file in &files {
                     target.session.document.total_additions += file.additions;
                     target.session.document.total_deletions += file.deletions;
@@ -549,6 +558,11 @@ impl Diffui {
                     target.session.status = LoadStatus::Loaded;
                     target.session.loading_since = None;
                 }
+                // Queue the new tail for background highlighting (appends keep
+                // the document id, so results for earlier files stay valid).
+                let document_id = target.session.document_id;
+                target.session.enqueue_unhighlighted(appended_from);
+                return self.spawn_highlights(document_id);
             }
             Message::PrFinished(version, result) => {
                 let Some(mut target) = self.load_target_mut(version) else {
@@ -587,6 +601,7 @@ impl Diffui {
                 Ok((document, details)) => {
                     // Routed to the owning tab (active or stashed); see
                     // `BackendLoaded`.
+                    let document_id = self.allocate_document_id();
                     let Some(target) = self.tab_target_mut(tab) else {
                         return Task::none();
                     };
@@ -654,9 +669,11 @@ impl Diffui {
                         *target.revision_reveal_token =
                             target.revision_reveal_token.wrapping_add(1);
                     }
+                    target.session.reset_highlights(document_id);
                     if is_active {
                         self.document_version = self.document_version.wrapping_add(1);
                     }
+                    return self.spawn_highlights(document_id);
                 }
                 Err(error) => {
                     let Some(target) = self.tab_target_mut(tab) else {
@@ -948,6 +965,35 @@ impl Diffui {
                 }
             }
             Message::ConfirmNoOp => {}
+            Message::FileHighlighted(document_id, file_index, spans) => {
+                let Some((session, is_active)) = self.session_by_document_mut(document_id) else {
+                    // The document was replaced; this result highlighted a
+                    // dead snapshot.
+                    return Task::none();
+                };
+                session.highlight_in_flight = session.highlight_in_flight.saturating_sub(1);
+                let mut applied = false;
+                if let Some(file) = session.document.files.get_mut(file_index) {
+                    for (hunk_index, line_index, line_spans) in spans {
+                        if let Some(line) = file
+                            .hunks
+                            .get_mut(hunk_index)
+                            .and_then(|hunk| hunk.lines.get_mut(line_index))
+                        {
+                            line.syntax = line_spans;
+                            applied = true;
+                        }
+                    }
+                }
+                // Repaint (re-shape) the rows now carrying spans; the layout
+                // is untouched, so the height index survives — that's the
+                // whole point of the paint/layout version split. A stashed
+                // tab repaints on restore anyway.
+                if applied && is_active {
+                    self.document_version = self.document_version.wrapping_add(1);
+                }
+                return self.spawn_highlights(document_id);
+            }
             Message::WindowFocusChanged(focused) => {
                 let gained_focus = focused && !self.app_focused;
                 let lost_focus = !focused && self.app_focused;
@@ -1882,14 +1928,69 @@ impl Diffui {
     }
 
     /// Replace the displayed diff, bumping [`document_version`](Self::document_version)
-    /// so the diff view drops its per-line shaped-paragraph cache. Every write
-    /// to `self.session.document` must go through here — a missed one leaves the diff
-    /// view rendering another revision's (or repo's) stale highlighted text.
-    /// (Streaming loads write their owner's session directly instead: appends
-    /// don't invalidate existing keys, and a stashed tab's restore bumps.)
+    /// so the diff view drops its per-line shaped-paragraph cache, and
+    /// stamping a fresh document id (which restarts highlight bookkeeping —
+    /// see [`Session::reset_highlights`]). Every write to
+    /// `self.session.document` must go through here — a missed one leaves the
+    /// diff view rendering another revision's (or repo's) stale highlighted
+    /// text. (Routed load completions write their owner's session directly
+    /// instead, with the same id + reset discipline; a stashed tab's restore
+    /// bumps the paint version.)
     pub(crate) fn set_document(&mut self, document: DiffDocument) {
         self.session.document = document;
         self.document_version = self.document_version.wrapping_add(1);
+        let document_id = self.allocate_document_id();
+        self.session.reset_highlights(document_id);
+    }
+
+    /// Hand out the next document identity (monotonic across every tab).
+    pub(crate) fn allocate_document_id(&mut self) -> u64 {
+        self.next_document_id = self.next_document_id.wrapping_add(1);
+        self.next_document_id
+    }
+
+    /// The session displaying document `id` — active or stashed — plus
+    /// whether it's the active one. Background per-file results (syntax
+    /// highlights) route through this; `None` means the document is gone and
+    /// the result must be dropped.
+    pub(crate) fn session_by_document_mut(&mut self, id: u64) -> Option<(&mut Session, bool)> {
+        if self.session.document_id == id {
+            return Some((&mut self.session, true));
+        }
+        self.tabs.iter_mut().find_map(|tab| {
+            let stash = tab.stash.as_mut()?;
+            (stash.session.document_id == id).then_some((&mut stash.session, false))
+        })
+    }
+
+    /// Drain the highlight queue of document `id`, keeping a couple of jobs
+    /// in flight. Each job clones one file (memory bounded by the concurrency
+    /// window, not the document) and reports back as `FileHighlighted` — for
+    /// a backgrounded tab too, so highlighting keeps progressing off-screen.
+    pub(crate) fn spawn_highlights(&mut self, document_id: u64) -> Task<Message> {
+        const HIGHLIGHT_CONCURRENCY: usize = 2;
+        let Some((session, _)) = self.session_by_document_mut(document_id) else {
+            return Task::none();
+        };
+        let repository = session.repository.clone();
+        let revision = session.selected_revision.clone();
+        let mut tasks = Vec::new();
+        while session.highlight_in_flight < HIGHLIGHT_CONCURRENCY {
+            let Some(file_index) = session.highlight_pending.pop_front() else {
+                break;
+            };
+            let Some(file) = session.document.files.get(file_index).cloned() else {
+                continue;
+            };
+            session.highlight_in_flight += 1;
+            let repository = repository.clone();
+            let revision = revision.clone();
+            tasks.push(Task::perform(
+                diffui_core::highlight_file(repository, revision, file),
+                move |spans| Message::FileHighlighted(document_id, file_index, spans),
+            ));
+        }
+        Task::batch(tasks)
     }
 
     /// Find the tab whose live streaming cursor is `version` — the active one
@@ -2034,7 +2135,9 @@ impl Diffui {
             self.session.selected_revision = selection;
             self.session.selected_commit_index = self.session.find_selected_commit_index();
             self.selected_file = 0;
-            return Task::none();
+            // The parked document kept the spans it had earned; resume
+            // highlighting whatever was still pending when it was parked.
+            return self.spawn_highlights(self.session.document_id);
         }
 
         self.session.pending_revision = Some(selection.clone());

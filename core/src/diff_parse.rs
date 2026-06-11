@@ -3,7 +3,6 @@
 //! `crate::syntax` as each file is flushed.
 
 use crate::model::{DiffDocument, DiffFile, DiffFileStatus, DiffHunkView, DiffLine, DiffLineKind};
-use crate::syntax::apply_syntax_highlighting;
 
 #[derive(Debug, Clone)]
 struct PendingHunk {
@@ -109,7 +108,9 @@ impl DiffStreamParser {
     fn take_file(&mut self) -> Option<DiffFile> {
         let mut file = self.current_file.take()?;
         flush_current_hunk(&mut file, &mut self.current_hunk);
-        apply_syntax_highlighting(&mut file);
+        // No highlighting here: tree-sitter over whole documents is seconds of
+        // CPU on big files, so it runs in the background after the document is
+        // already on screen (see `source::highlight_file`).
         Some(file)
     }
 }
@@ -293,7 +294,9 @@ mod tests {
         assert_eq!(file.hunks[0].lines[2].kind, DiffLineKind::Addition);
         assert_eq!(file.hunks[0].lines[2].old_line, None);
         assert_eq!(file.hunks[0].lines[2].new_line, Some(11));
-        assert!(!file.hunks[0].lines[2].syntax.is_empty());
+        // Highlighting no longer runs in the parser — it's applied in the
+        // background after the document is on screen.
+        assert!(file.hunks[0].lines[2].syntax.is_empty());
     }
 
     #[test]

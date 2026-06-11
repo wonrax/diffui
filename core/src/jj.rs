@@ -12,7 +12,10 @@ use jj_lib::{
     backend::{CommitId, TreeId},
     commit::Commit,
     config::{ConfigLayer, ConfigSource, StackedConfig},
-    conflicts::{ConflictMarkerStyle, ConflictMaterializeOptions, materialized_diff_stream},
+    conflicts::{
+        ConflictMarkerStyle, ConflictMaterializeOptions, materialize_tree_value,
+        materialized_diff_stream,
+    },
     copies::CopyRecords,
     diff_presentation::{
         LineCompareMode,
@@ -53,6 +56,8 @@ use jj_lib::{
 
 use crate::FetchTarget;
 use crate::diff_parse::format_hunk_header;
+// (`crate::syntax` is no longer called on the load path — highlighting moved
+// to the background; see `source::highlight_file`.)
 use crate::graph::LaneAssigner;
 use crate::graph_layout::{GraphLayout, LaneFoldState};
 use crate::model::{
@@ -62,7 +67,6 @@ use crate::model::{
 };
 use crate::mutations::{MutationOp, MutationOutcome};
 use crate::repository::{Repository, RepositorySnapshot};
-use crate::syntax::apply_syntax_highlighting;
 
 // Fallback used only when the user has not configured `snapshot.max-new-file-size`.
 // Matches jj-cli's shipped default (1 MiB).
@@ -952,7 +956,10 @@ async fn diff_jj_with_repo(
             }
         }
 
-        apply_syntax_highlighting(&mut file);
+        // Highlighting is deliberately NOT applied here: it's tree-sitter
+        // over whole documents — seconds of CPU on big files — and runs in
+        // the background instead (see `source::highlight_file`), so the diff
+        // paints plain immediately and colorizes progressively.
         files.push(file);
     }
 
@@ -1176,6 +1183,107 @@ async fn check_bookmark_move_backwards(
         .is_ancestor(current, &new_target)
         .context("failed to check bookmark ancestry")?;
     Ok(!forward)
+}
+
+/// Read the full old/new contents of one file at `revision`, for full-context
+/// syntax highlighting (the old side comes from the first parent — matching
+/// what the diff was computed against). Best-effort by design: absent,
+/// binary, conflicted, or oversized sides come back `None` and the caller
+/// falls back to diff-only reconstruction. Read-only: no snapshot, no lock.
+pub async fn read_jj_file_pair(
+    repository: Repository,
+    revision: RevisionSelection,
+    path: String,
+    old_path: Option<String>,
+) -> Result<(Option<String>, Option<String>)> {
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        handle.block_on(read_jj_file_pair_inner(repository, revision, path, old_path))
+    })
+    .await
+    .context("jj file-pair read task failed")?
+}
+
+async fn read_jj_file_pair_inner(
+    repository: Repository,
+    revision: RevisionSelection,
+    path: String,
+    old_path: Option<String>,
+) -> Result<(Option<String>, Option<String>)> {
+    let settings = jj_settings(&repository.root)?;
+    let workspace = Workspace::load(
+        &settings,
+        &repository.root,
+        &StoreFactories::default(),
+        &default_working_copy_factories(),
+    )
+    .context("failed to load jj workspace")?;
+    let repo = workspace
+        .repo_loader()
+        .load_at_head()
+        .await
+        .context("failed to load jj repo")?;
+
+    let commit_id = match &revision {
+        RevisionSelection::WorkingCopy => repo
+            .view()
+            .get_wc_commit_id(workspace.workspace_name())
+            .context("jj workspace has no working-copy commit")?
+            .clone(),
+        RevisionSelection::Commit(hex) => {
+            CommitId::try_from_hex(hex).with_context(|| format!("invalid jj commit id {hex}"))?
+        }
+    };
+    let commit = repo
+        .store()
+        .get_commit_async(&commit_id)
+        .await
+        .with_context(|| format!("failed to load jj commit {}", commit_id.hex()))?;
+
+    let new_tree = commit.tree();
+    let old_tree = commit
+        .parent_tree(repo.as_ref())
+        .await
+        .with_context(|| format!("failed to load jj parent tree for {}", commit_id.hex()))?;
+
+    let new = read_jj_tree_file(repo.as_ref(), &new_tree, &path).await;
+    let old =
+        read_jj_tree_file(repo.as_ref(), &old_tree, old_path.as_deref().unwrap_or(&path)).await;
+    Ok((old, new))
+}
+
+/// Materialize one tree entry as text, `None` for anything full-context
+/// highlighting can't use (absent, binary, conflicted, oversized, bad path).
+async fn read_jj_tree_file(
+    repo: &ReadonlyRepo,
+    tree: &jj_lib::merged_tree::MergedTree,
+    path: &str,
+) -> Option<String> {
+    // Past this, a parse costs more than the highlight is worth — the caller
+    // falls back to the (cheap) diff-only reconstruction.
+    const MAX_SOURCE_BYTES: usize = 8 * 1024 * 1024;
+
+    let repo_path = RepoPathBuf::from_internal_string(path.to_owned()).ok()?;
+    let value = tree.path_value(&repo_path).await.ok()?;
+    if value.is_absent() {
+        return None;
+    }
+    let materialized = materialize_tree_value(repo.store(), &repo_path, value, tree.labels())
+        .await
+        .ok()?;
+    let options = ConflictMaterializeOptions {
+        marker_style: ConflictMarkerStyle::Diff,
+        marker_len: None,
+        merge: MergeOptions {
+            hunk_level: FileMergeHunkLevel::Line,
+            same_change: SameChange::Accept,
+        },
+    };
+    let part = git_diff_part(&repo_path, materialized, &options).await.ok()?;
+    if part.content.is_binary || part.content.contents.len() > MAX_SOURCE_BYTES {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&part.content.contents).into_owned())
 }
 
 /// Apply a revision-context-menu mutation (`new` / `edit` / `abandon`) and
