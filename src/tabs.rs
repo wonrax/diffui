@@ -14,21 +14,15 @@ impl Diffui {
         // The whole domain + orchestration bundle swaps as one unit — no
         // field-by-field list to keep in sync.
         let mut session = std::mem::take(&mut self.session);
-        // One-shot completions (a pending diff switch, a snapshot) are
-        // tab-guarded and dropped while this tab is backgrounded — clear
-        // their in-flight markers so the stash can't sit "busy" forever (the
-        // view keeps showing the previous, still-consistent selection).
-        // Streaming loads are NOT abandoned: their batches are routed into
-        // this stash by version (`load_target_mut`), so a half-done graph
-        // walk / PR stream keeps its progress off-screen.
-        session.pending_revision = None;
+        // In-flight loads survive backgrounding: streaming batches are routed
+        // into this stash by version (`load_target_mut`) and one-shot
+        // completions (diff switches, graph reloads, revset evals) by tab id
+        // (`tab_target_mut`), so a half-done load keeps its progress — and a
+        // revset eval that lands off-screen still swaps the stashed graph.
+        // Only the snapshot is abandoned: its completion is dropped while
+        // backgrounded (activation re-runs a Focus snapshot anyway), so the
+        // flag must clear or the stash would sit "busy" forever.
         session.snapshot_pending = false;
-        if session.load.is_none() {
-            // Nothing left in flight — drop the spinner timestamp so the
-            // restored tab doesn't show (and tick for) phantom progress. A
-            // live stream keeps it: its loading state is real.
-            session.loading_since = None;
-        }
         RepoState {
             session,
             file_list_expanded: self.file_list_expanded,

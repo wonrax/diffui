@@ -898,6 +898,16 @@ fn stream_github_pr_load(
                 let _ = meta_tx.send(Message::PrMetaLoaded(version, Box::new(result)));
             });
 
+            // The commit list fills the sidebar; independent of the diff.
+            let commits_tx = tx.clone();
+            let commits_spec = spec.clone();
+            let commits_task = tokio::spawn(async move {
+                let result = github::fetch_pr_commits(&commits_spec)
+                    .await
+                    .map_err(|error| format!("{error:#}"));
+                let _ = commits_tx.send(Message::PrCommitsLoaded(version, Box::new(result)));
+            });
+
             let diff_tx = tx;
             let diff_task = tokio::spawn(async move {
                 let mut batch: Vec<DiffFile> = Vec::new();
@@ -921,13 +931,13 @@ fn stream_github_pr_load(
             });
 
             // Relay worker messages to iced, honoring its backpressure. The
-            // loop ends once both workers finished and dropped their senders.
+            // loop ends once all workers finished and dropped their senders.
             while let Some(message) = rx.recv().await {
                 if output.send(message).await.is_err() {
                     break;
                 }
             }
-            let _ = tokio::join!(meta_task, diff_task);
+            let _ = tokio::join!(meta_task, commits_task, diff_task);
         },
     ))
 }

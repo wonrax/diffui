@@ -456,6 +456,11 @@ pub fn build_confirm_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
 /// the working copy's emptiness may still be unresolved (it resolves lazily),
 /// in which case we draw no dot rather than guess.
 fn tab_is_dirty(ui: &Diffui, tab: &crate::Tab, active: bool) -> bool {
+    // PR tabs have no working copy; their synthetic "All changes" row would
+    // otherwise read as permanently dirty.
+    if matches!(tab.source, crate::TabSource::GitHubPr(_)) {
+        return false;
+    }
     let commits = if active {
         Some(&ui.session.commits)
     } else {

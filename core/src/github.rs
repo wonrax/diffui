@@ -11,8 +11,15 @@ use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
+use jj_lib::graph::GraphEdge;
+
 use crate::diff_parse::DiffStreamParser;
-use crate::model::{DiffFile, DiffFileStatus, RevisionDetails, SignatureInfo};
+use crate::graph::assign_lanes;
+use crate::graph_layout::{GraphLayout, GraphLayoutBuilder};
+use crate::model::{
+    CommitStore, CommitStoreBuilder, CommitSummary, DiffDocument, DiffFile, DiffFileStatus,
+    RevisionDetails, SignatureInfo,
+};
 
 /// A pull-request reference: `owner/repo#number`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +154,252 @@ pub async fn fetch_pr_info(spec: &PrSpec) -> Result<PrInfo> {
         changed_files: next().parse().unwrap_or(0),
         url: next(),
     })
+}
+
+/// One commit of a pull request, from `gh pr view --json commits`.
+#[derive(Debug, Clone)]
+pub struct PrCommit {
+    pub oid: String,
+    pub author: String,
+    pub headline: String,
+}
+
+/// Fetch the PR's commits, oldest first (GitHub's order). Same `\u{1f}` field
+/// framing as [`fetch_pr_info`]; headlines are single-line by construction.
+pub async fn fetch_pr_commits(spec: &PrSpec) -> Result<Vec<PrCommit>> {
+    const JQ: &str =
+        r#".commits[] | [.oid, (.authors[0].login // ""), .messageHeadline] | join("\u001f")"#;
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &spec.number.to_string(),
+            "--repo",
+            &spec.slug(),
+            "--json",
+            "commits",
+            "--jq",
+            JQ,
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .context("failed to run `gh` — is the GitHub CLI installed and on PATH?")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "gh pr view --json commits exited with {}: {}",
+            output.status,
+            stderr.trim()
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let mut parts = line.split('\u{1f}');
+            let mut next = || parts.next().unwrap_or("").to_owned();
+            PrCommit {
+                oid: next(),
+                author: next(),
+                headline: next(),
+            }
+        })
+        .collect())
+}
+
+/// Lower the PR's commits into the sidebar's commit store + a single-lane
+/// graph, newest first (matching `jj log`), with a synthetic "All changes"
+/// row pinned on top. That row is flagged as the working copy, so the
+/// existing `RevisionSelection::WorkingCopy` selection — the tab's default —
+/// means "the whole PR diff" and clicking it brings the full diff back after
+/// viewing an individual commit.
+pub fn pr_commit_store(commits: &[PrCommit]) -> (CommitStore, GraphLayout) {
+    let mut rows = Vec::with_capacity(commits.len() + 1);
+    rows.push(CommitSummary {
+        change_id: "pr".to_owned(),
+        commit_id: "pr".to_owned(),
+        shortest_change_id_len: None,
+        description: "All changes".to_owned(),
+        author: String::new(),
+        has_description: true,
+        is_empty: Some(false),
+        has_conflict: false,
+        is_working_copy: true,
+        bookmarks: Vec::new(),
+    });
+    for commit in commits.iter().rev() {
+        rows.push(CommitSummary {
+            change_id: commit.oid.clone(),
+            commit_id: commit.oid.clone(),
+            shortest_change_id_len: None,
+            description: if commit.headline.is_empty() {
+                "(no description set)".to_owned()
+            } else {
+                commit.headline.clone()
+            },
+            author: commit.author.clone(),
+            has_description: !commit.headline.is_empty(),
+            is_empty: Some(false),
+            has_conflict: false,
+            is_working_copy: false,
+            bookmarks: Vec::new(),
+        });
+    }
+
+    // A straight chain: each row's parent is the next one down; the last has
+    // no listed parent (its real parent is the PR's base, outside this view).
+    let lane_inputs = rows.iter().enumerate().map(|(index, row)| {
+        let edges: Vec<GraphEdge<String>> = match rows.get(index + 1) {
+            Some(parent) => vec![GraphEdge::direct(parent.commit_id.clone())],
+            None => Vec::new(),
+        };
+        (row.commit_id.clone(), edges)
+    });
+    let frames = assign_lanes(lane_inputs);
+    let mut graph = GraphLayoutBuilder::new();
+    for frame in &frames {
+        graph.push(frame, &[]);
+    }
+
+    let mut builder = CommitStoreBuilder::with_capacity(rows.len());
+    for row in rows {
+        builder.push(row);
+    }
+    (builder.finish(), graph.finish())
+}
+
+/// Wire shape of `GET /repos/{owner}/{repo}/commits/{sha}` — the same
+/// per-file entries as the PR files endpoint, wrapped in a commit object.
+#[derive(serde::Deserialize)]
+struct ApiCommit {
+    #[serde(default)]
+    files: Vec<ApiPrFile>,
+    #[serde(default)]
+    stats: Option<ApiCommitStats>,
+    #[serde(default)]
+    commit: Option<ApiCommitMeta>,
+}
+
+#[derive(serde::Deserialize)]
+struct ApiCommitStats {
+    #[serde(default)]
+    additions: usize,
+    #[serde(default)]
+    deletions: usize,
+}
+
+#[derive(serde::Deserialize)]
+struct ApiCommitMeta {
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    author: Option<ApiCommitSignature>,
+}
+
+#[derive(serde::Deserialize)]
+struct ApiCommitSignature {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    email: String,
+    #[serde(default)]
+    date: String,
+}
+
+/// Load one PR commit's diff through the commits REST endpoint (paginated —
+/// the per-file entries match the files-API shape, so the same lowering
+/// applies). Returns the document plus a `jj show`-style header built from
+/// the commit's message and author.
+pub async fn load_pr_commit_diff(
+    spec: &PrSpec,
+    oid: &str,
+) -> Result<(DiffDocument, Option<RevisionDetails>), String> {
+    fetch_pr_commit_diff(spec, oid)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+async fn fetch_pr_commit_diff(
+    spec: &PrSpec,
+    oid: &str,
+) -> Result<(DiffDocument, Option<RevisionDetails>)> {
+    let mut files = Vec::new();
+    let mut details: Option<RevisionDetails> = None;
+    let mut totals: Option<(usize, usize)> = None;
+    let mut page = 1usize;
+    loop {
+        let path = format!(
+            "repos/{}/commits/{oid}?per_page=100&page={page}",
+            spec.slug()
+        );
+        let output = Command::new("gh")
+            .args(["api", &path])
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .context("failed to run `gh` — is the GitHub CLI installed and on PATH?")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "gh api commit diff exited with {}: {}",
+                output.status,
+                stderr.trim()
+            );
+        }
+        let commit: ApiCommit = serde_json::from_slice(&output.stdout)
+            .context("failed to parse the commit API response")?;
+        if details.is_none() {
+            details = commit.commit.map(|meta| {
+                let author = meta.author.unwrap_or(ApiCommitSignature {
+                    name: String::new(),
+                    email: String::new(),
+                    date: String::new(),
+                });
+                RevisionDetails {
+                    commit_id: oid.to_owned(),
+                    change_id: None,
+                    bookmarks: Vec::new(),
+                    author: SignatureInfo {
+                        name: author.name,
+                        email: author.email,
+                        timestamp: Some(author.date).filter(|date| !date.is_empty()),
+                    },
+                    committer: None,
+                    signature: None,
+                    description: meta.message,
+                }
+            });
+        }
+        if totals.is_none() {
+            totals = commit.stats.map(|stats| (stats.additions, stats.deletions));
+        }
+        let last = commit.files.len() < 100;
+        files.extend(commit.files.into_iter().map(api_file_to_diff_file));
+        if last {
+            break;
+        }
+        page += 1;
+    }
+
+    // Prefer the commit's own stats over summed files — same oversized-blob
+    // zeroing as the PR files endpoint.
+    let (total_additions, total_deletions) = totals.unwrap_or_else(|| {
+        (
+            files.iter().map(|file| file.additions).sum(),
+            files.iter().map(|file| file.deletions).sum(),
+        )
+    });
+    Ok((
+        DiffDocument {
+            files,
+            total_additions,
+            total_deletions,
+        },
+        details,
+    ))
 }
 
 /// Map PR metadata onto the [`RevisionDetails`] header the diff pane already

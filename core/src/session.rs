@@ -22,6 +22,19 @@ use crate::model::{
 };
 use crate::repository::{Repository, RepositorySnapshot};
 
+/// A parked diff document for a source that flips between several documents —
+/// a PR's "all changes" view vs its per-commit diffs — so flipping back is an
+/// in-memory move instead of a re-download. Keyed in [`Session::pr_diffs`]
+/// by commit id (`""` = the whole-PR diff).
+#[derive(Debug, Clone, Default)]
+pub struct CachedDiff {
+    pub document: DiffDocument,
+    /// The source-reported totals that go with the document (see
+    /// [`Session::authoritative_totals`]).
+    pub totals: Option<(usize, usize)>,
+    pub details: Option<RevisionDetails>,
+}
+
 /// What triggered a repository refresh — decides how much we reload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefreshOrigin {
@@ -268,6 +281,10 @@ pub struct Session {
     /// The revset / revision-range filtering the log. Empty or `all()` is the
     /// default; the frontend persists it per repo root.
     pub revset: String,
+    /// Parked documents for sources that flip between several (PR tabs:
+    /// whole-PR diff ↔ per-commit diffs). The *displayed* document is never
+    /// in here — switching moves it in and the target out. Cleared on reload.
+    pub pr_diffs: HashMap<String, CachedDiff>,
     /// A refresh requested while a load/snapshot was already in flight, held
     /// (coalesced — `Focus` subsumes `Watcher`) so it runs once the current work
     /// finishes rather than racing it (a second wc snapshot thrashes jj's lock).

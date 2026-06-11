@@ -191,6 +191,8 @@ pub(crate) enum Message {
     PrMetaLoaded(u64, Box<Result<github::PrInfo, String>>),
     /// One batch of completed files off the PR diff stream.
     PrFilesBatch(u64, Vec<DiffFile>),
+    /// The PR's commit list (`gh pr view --json commits`), for the sidebar.
+    PrCommitsLoaded(u64, Box<Result<Vec<github::PrCommit>, String>>),
     /// The PR diff stream ended — every file was emitted, or it failed.
     PrFinished(u64, Box<Result<(), String>>),
 }
