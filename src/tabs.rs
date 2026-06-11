@@ -14,22 +14,21 @@ impl Diffui {
         // The whole domain + orchestration bundle swaps as one unit — no
         // field-by-field list to keep in sync.
         let mut session = std::mem::take(&mut self.session);
-        // Abandon whatever async work was in flight: per-tab completions are
-        // dropped while this tab is backgrounded (tab-id / version guards), so
-        // leaving the in-flight markers set would strand the stash "busy"
-        // forever — a cursor that never finishes, a `pending_revision` whose
-        // `DiffLoaded` never lands, a `snapshot_pending` that never clears.
-        if session.load.take().is_some() {
-            // A half-streamed cold load is worse than busy: the batches it
-            // emits while backgrounded are version-dropped, so resuming it on
-            // reactivation would leave a silent gap in the commit store (and
-            // mis-index the loader's final empty-status pass). Mark the tab
-            // unloaded so reactivation re-kicks the stream from scratch.
-            session.status = LoadStatus::Loading;
-        }
+        // One-shot completions (a pending diff switch, a snapshot) are
+        // tab-guarded and dropped while this tab is backgrounded — clear
+        // their in-flight markers so the stash can't sit "busy" forever (the
+        // view keeps showing the previous, still-consistent selection).
+        // Streaming loads are NOT abandoned: their batches are routed into
+        // this stash by version (`load_target_mut`), so a half-done graph
+        // walk / PR stream keeps its progress off-screen.
         session.pending_revision = None;
         session.snapshot_pending = false;
-        session.loading_since = None;
+        if session.load.is_none() {
+            // Nothing left in flight — drop the spinner timestamp so the
+            // restored tab doesn't show (and tick for) phantom progress. A
+            // live stream keeps it: its loading state is real.
+            session.loading_since = None;
+        }
         RepoState {
             session,
             file_list_expanded: self.file_list_expanded,
@@ -109,11 +108,15 @@ impl Diffui {
     /// makes it a no-op (no graph re-walk) when nothing changed, and a full
     /// reload only when an external op actually landed.
     pub(crate) fn ensure_active_loaded(&mut self) -> Task<Message> {
+        // A streaming load that kept running while this tab was backgrounded
+        // (batches route into the stash) is still the live load — re-kicking
+        // would double it and discard its progress.
+        let streaming = self.session.load.is_some();
         // A GitHub-PR tab has no local repository: (re)stream it when it
-        // hasn't loaded (or its stream was abandoned while backgrounded);
-        // a loaded one has no watcher/snapshot machinery to re-arm.
+        // hasn't loaded and isn't mid-stream; a loaded one has no
+        // watcher/snapshot machinery to re-arm.
         if let Some(spec) = self.active_pr_spec() {
-            return if matches!(self.session.status, LoadStatus::Loaded) {
+            return if streaming || matches!(self.session.status, LoadStatus::Loaded) {
                 Task::none()
             } else {
                 self.kick_pr_load(spec)
@@ -123,7 +126,17 @@ impl Diffui {
             return Task::none();
         }
         if matches!(self.session.status, LoadStatus::Loaded) {
-            self.start_repository_snapshot(RefreshOrigin::Focus)
+            // The Focus snapshot subsumes any refresh coalesced while the tab
+            // was backgrounded; clear it so it can't fire a redundant one
+            // later. The empty-status pass re-runs here because a load that
+            // finished off-screen skipped it (its results are active-only).
+            self.session.pending_refresh = None;
+            Task::batch([
+                self.start_repository_snapshot(RefreshOrigin::Focus),
+                self.resolve_empty_status(),
+            ])
+        } else if streaming {
+            Task::none()
         } else {
             self.kick_initial_load()
         }

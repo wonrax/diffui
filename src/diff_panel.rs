@@ -123,12 +123,19 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
 /// stays focused on the revision list and the totals sit next to the
 /// content they describe.
 fn build_stats_bar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
+    // Prefer source-reported totals (a PR's header counts) over the summed
+    // files — the GitHub files API zeroes counts on oversized blobs, so the
+    // sum can undercount what the PR page shows.
+    let (additions, deletions) = ui.session.authoritative_totals.unwrap_or((
+        ui.session.document.total_additions,
+        ui.session.document.total_deletions,
+    ));
     let bar = row![
-        text(format!("+{}", ui.session.document.total_additions))
+        text(format!("+{additions}"))
             .size(STATS_TEXT_SIZE)
             .font(ui.config.mono_font)
             .color(theme.added_text),
-        text(format!("−{}", ui.session.document.total_deletions))
+        text(format!("−{deletions}"))
             .size(STATS_TEXT_SIZE)
             .font(ui.config.mono_font)
             .color(theme.removed_text),

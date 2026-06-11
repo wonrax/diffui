@@ -267,6 +267,58 @@ struct ParagraphKey {
     content_width_bits: u32,
 }
 
+/// Prefix-sum layout index over the rendered document — the "position
+/// checkpoint" idea from pierre.computer's diff-rendering writeup. Built once
+/// per `(content shape, wrap width)` and consulted by every height/position
+/// query, so scroll frames, file jumps, and hit tests are O(log n) binary
+/// searches instead of O(total lines) walks re-counting every line's chars
+/// (which at ~1M lines costs hundreds of ms *per frame*).
+///
+/// ~16 bytes per row — ~16 MB at 1M lines, an order of magnitude under the
+/// lines themselves.
+#[derive(Debug, Default)]
+struct HeightIndex {
+    /// Rebuild key: `(content_version, files.len(), header.len(),
+    /// content_width bits)`. The file/header counts are part of the key
+    /// because streaming PR loads *append* files (and the header appears when
+    /// `gh pr view` lands) without bumping `content_version` — appends leave
+    /// existing paragraph-cache keys valid, but they do move offsets.
+    key: Option<(u64, usize, usize, u32)>,
+    /// Content-space y of each file's header top, plus one trailing sentinel
+    /// holding the content end. `file_tops[0]` equals the revision-header
+    /// height.
+    file_tops: Vec<f32>,
+    /// Content-space y of each hunk header, in document order.
+    hunk_tops: Vec<f32>,
+    /// `(file, hunk)` of each `hunk_tops` entry.
+    hunk_ids: Vec<(u32, u32)>,
+    /// Content-space y of each diff row, in document order.
+    row_tops: Vec<f32>,
+    /// `(file, hunk, line)` of each `row_tops` entry. Document order makes
+    /// this lexicographically sorted, so a row is also findable *by id*.
+    row_ids: Vec<(u32, u32, u32)>,
+    /// Total content height (revision header + every file).
+    total_height: f32,
+}
+
+impl HeightIndex {
+    /// Index into `row_tops`/`row_ids` of the last row starting at or above
+    /// `target_y` — the candidate row containing that y (the caller checks
+    /// the row's actual height; `target_y` may sit in a header band).
+    fn row_at(&self, target_y: f32) -> Option<usize> {
+        self.row_tops
+            .partition_point(|&top| top <= target_y)
+            .checked_sub(1)
+    }
+
+    /// Index of row `(file, hunk, line)`, by binary search over the sorted ids.
+    fn row_index_of(&self, file: usize, hunk: usize, line: usize) -> Option<usize> {
+        self.row_ids
+            .binary_search(&(file as u32, hunk as u32, line as u32))
+            .ok()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SelectionUnit {
     Character,
@@ -332,6 +384,10 @@ struct State<Paragraph> {
     /// cache (whose keys would otherwise map to stale text). Starts at 0 to
     /// match the app's initial version.
     last_content_version: u64,
+    /// Prefix-sum layout index (see [`HeightIndex`]). `RefCell` because
+    /// `draw`/`mouse_interaction` only get `&State` but must be able to
+    /// (re)build it lazily; borrows are short and never overlap.
+    height_index: RefCell<HeightIndex>,
 }
 
 /// Stable cursor position inside the diff document. We index by
@@ -654,84 +710,74 @@ impl<'a, Message> DiffView<'a, Message> {
         }
     }
 
-    fn content_height(&self, width: f32) -> f32 {
+    /// Rebuild `cell`'s [`HeightIndex`] if the content shape or wrap width
+    /// changed since it was built. One O(total lines) pass per change — every
+    /// per-frame query then reads prefix sums instead of re-walking.
+    fn ensure_height_index(&self, cell: &RefCell<HeightIndex>, width: f32) {
         let content_width = self.content_width(width);
-
-        self.header_height()
-            + self
-                .files
-                .iter()
-                .map(|file| {
-                    self.metrics.file_header_height
-                        + file
-                            .hunks
-                            .iter()
-                            .map(|hunk| {
-                                self.metrics.hunk_header_height
-                                    + hunk
-                                        .lines
-                                        .iter()
-                                        .map(|line| self.row_height(line, content_width))
-                                        .sum::<f32>()
-                            })
-                            .sum::<f32>()
-                })
-                .sum::<f32>()
-    }
-
-    fn file_offset(&self, file_index: usize, width: f32) -> f32 {
-        let content_width = self.content_width(width);
-
-        self.header_height()
-            + self
-                .files
-                .iter()
-                .take(file_index)
-                .map(|file| {
-                    self.metrics.file_header_height
-                        + file
-                            .hunks
-                            .iter()
-                            .map(|hunk| {
-                                self.metrics.hunk_header_height
-                                    + hunk
-                                        .lines
-                                        .iter()
-                                        .map(|line| self.row_height(line, content_width))
-                                        .sum::<f32>()
-                            })
-                            .sum::<f32>()
-                })
-                .sum::<f32>()
-    }
-
-    fn file_at_offset(&self, offset: f32, width: f32) -> usize {
-        let content_width = self.content_width(width);
-        let mut content_y = self.header_height();
-
-        for (file_index, file) in self.files.iter().enumerate() {
-            let file_height = self.metrics.file_header_height
-                + file
-                    .hunks
-                    .iter()
-                    .map(|hunk| {
-                        self.metrics.hunk_header_height
-                            + hunk
-                                .lines
-                                .iter()
-                                .map(|line| self.row_height(line, content_width))
-                                .sum::<f32>()
-                    })
-                    .sum::<f32>();
-
-            if offset < content_y + file_height {
-                return file_index;
-            }
-
-            content_y += file_height;
+        let key = Some((
+            self.content_version,
+            self.files.len(),
+            self.header.len(),
+            content_width.to_bits(),
+        ));
+        if cell.borrow().key == key {
+            return;
         }
 
-        self.files.len().saturating_sub(1)
+        let mut index = cell.borrow_mut();
+        let row_count: usize = self
+            .files
+            .iter()
+            .map(|file| file.hunks.iter().map(|hunk| hunk.lines.len()).sum::<usize>())
+            .sum();
+        index.file_tops.clear();
+        index.file_tops.reserve(self.files.len() + 1);
+        index.hunk_tops.clear();
+        index.hunk_ids.clear();
+        index.row_tops.clear();
+        index.row_tops.reserve(row_count);
+        index.row_ids.clear();
+        index.row_ids.reserve(row_count);
+
+        let mut y = self.header_height();
+        for (file_index, file) in self.files.iter().enumerate() {
+            index.file_tops.push(y);
+            y += self.metrics.file_header_height;
+            for (hunk_index, hunk) in file.hunks.iter().enumerate() {
+                index.hunk_tops.push(y);
+                index.hunk_ids.push((file_index as u32, hunk_index as u32));
+                y += self.metrics.hunk_header_height;
+                for (line_index, line) in hunk.lines.iter().enumerate() {
+                    index.row_tops.push(y);
+                    index
+                        .row_ids
+                        .push((file_index as u32, hunk_index as u32, line_index as u32));
+                    y += self.row_height(line, content_width);
+                }
+            }
+        }
+        index.file_tops.push(y);
+        index.total_height = y;
+        index.key = key;
+    }
+
+    fn file_offset(&self, index: &HeightIndex, file_index: usize) -> f32 {
+        index
+            .file_tops
+            .get(file_index)
+            .copied()
+            .unwrap_or(index.total_height)
+    }
+
+    fn file_at_offset(&self, index: &HeightIndex, offset: f32) -> usize {
+        // The trailing sentinel is the content end, not a file.
+        let file_count = self.files.len();
+        let tops = &index.file_tops[..file_count.min(index.file_tops.len())];
+        // Number of file tops at or above `offset`, minus one = the file whose
+        // span contains it. An offset in the revision header maps to file 0;
+        // past the end clamps to the last file — both as the walk did.
+        tops.partition_point(|&top| top <= offset).saturating_sub(1)
     }
 
     fn content_width(&self, viewport_width: f32) -> f32 {
@@ -752,51 +798,27 @@ impl<'a, Message> DiffView<'a, Message> {
     /// indices are out of bounds.
     fn match_target_y(
         &self,
+        index: &HeightIndex,
         file_idx: usize,
         hunk_idx: usize,
         line_idx: usize,
         byte_offset: usize,
         bounds: Rectangle,
     ) -> Option<f32> {
-        let file = self.files.get(file_idx)?;
-        let hunk = file.hunks.get(hunk_idx)?;
-        let line = hunk.lines.get(line_idx)?;
-
-        let content_width = self.content_width(bounds.width);
-        let mut y = self.header_height();
-        for (f_i, f) in self.files.iter().enumerate() {
-            if f_i == file_idx {
-                break;
-            }
-            y += self.metrics.file_header_height;
-            for h in f.hunks {
-                y += self.metrics.hunk_header_height;
-                for ln in &h.lines {
-                    y += self.row_height(ln, content_width);
-                }
-            }
-        }
-        y += self.metrics.file_header_height;
-        for (h_i, h) in file.hunks.iter().enumerate() {
-            if h_i == hunk_idx {
-                break;
-            }
-            y += self.metrics.hunk_header_height;
-            for ln in &h.lines {
-                y += self.row_height(ln, content_width);
-            }
-        }
-        y += self.metrics.hunk_header_height;
-        for (l_i, ln) in hunk.lines.iter().enumerate() {
-            if l_i == line_idx {
-                break;
-            }
-            y += self.row_height(ln, content_width);
-        }
+        let line = self
+            .files
+            .get(file_idx)?
+            .hunks
+            .get(hunk_idx)?
+            .lines
+            .get(line_idx)?;
+        let row = index.row_index_of(file_idx, hunk_idx, line_idx)?;
+        let mut y = *index.row_tops.get(row)?;
 
         // Offset within the wrapped row: figure out which visual line the
         // byte sits on so a match on the 5th wrap row of a 200-char line
         // doesn't scroll to the row top and leave the match off-screen.
+        let content_width = self.content_width(bounds.width);
         let chars_per_line = chars_per_visual_line(content_width, self.metrics.char_width);
         let char_offset = char_count_at_byte(&line.content, byte_offset);
         let visual_idx = char_offset / chars_per_line;
@@ -821,6 +843,7 @@ impl<'a, Message> DiffView<'a, Message> {
     /// selection endpoint.
     fn position_at_point(
         &self,
+        index: &HeightIndex,
         point: Point,
         bounds: Rectangle,
         vertical_offset: f32,
@@ -854,65 +877,55 @@ impl<'a, Message> DiffView<'a, Message> {
             });
         }
 
-        let mut content_y = header_height;
-        let mut last_row: Option<(usize, usize, usize, f32, f32, usize)> = None;
-
-        for (file_index, file) in self.files.iter().enumerate() {
-            content_y += self.metrics.file_header_height;
-            for (hunk_index, hunk) in file.hunks.iter().enumerate() {
-                content_y += self.metrics.hunk_header_height;
-                for (line_index, line) in hunk.lines.iter().enumerate() {
-                    let height = self.row_height(line, content_width);
-                    let row_top = content_y;
-                    let row_bottom = row_top + height;
-                    let char_count = line.content.chars().count();
-                    last_row = Some((
-                        file_index, hunk_index, line_index, row_top, height, char_count,
-                    ));
-
-                    if target_y >= row_top && target_y < row_bottom {
-                        // Each row may span multiple wrapped visual lines.
-                        // Figure out which visual line the click lands on,
-                        // then translate the horizontal click into a char
-                        // offset within that visual line's slice of the
-                        // source content.
-                        let cw = self.metrics.char_width;
-                        let chars_per_line = chars_per_visual_line(content_width, cw);
-                        let visual_idx =
-                            ((target_y - row_top) / self.metrics.row_height).floor() as usize;
-                        let line_char_start = visual_idx.saturating_mul(chars_per_line);
-                        let relative_x = (point.x - text_x).max(0.0);
-                        let local_char = (relative_x / cw + 0.5).floor() as usize;
-                        let char_offset = (line_char_start + local_char).min(char_count);
-                        let byte = byte_offset_for_char(&line.content, char_offset);
-                        return Some(TextPosition {
-                            region: Region::Body,
-                            file_index,
-                            hunk_index,
-                            line_index,
-                            byte,
-                        });
-                    }
-                    content_y += height;
-                }
-            }
-        }
-
-        // Cursor is past the last row (e.g. user dragged below content). Snap
-        // to the end of the document so selection covers everything up to here.
-        last_row.map(
-            |(file_index, hunk_index, line_index, _row_top, _height, char_count)| {
-                let line = &self.files[file_index].hunks[hunk_index].lines[line_index];
-                let byte = byte_offset_for_char(&line.content, char_count);
-                TextPosition {
+        // Candidate row by binary search: the last row starting at or above
+        // the target y. The target may instead sit in a file/hunk header band
+        // (or past the end) — those fall through to the end-of-document snap
+        // below, exactly like the walk did.
+        if let Some(row) = index.row_at(target_y) {
+            let &(file_index, hunk_index, line_index) = index.row_ids.get(row)?;
+            let (file_index, hunk_index, line_index) =
+                (file_index as usize, hunk_index as usize, line_index as usize);
+            let line = &self.files[file_index].hunks[hunk_index].lines[line_index];
+            let row_top = index.row_tops[row];
+            let height = self.row_height(line, content_width);
+            if target_y < row_top + height {
+                // Each row may span multiple wrapped visual lines. Figure out
+                // which visual line the click lands on, then translate the
+                // horizontal click into a char offset within that visual
+                // line's slice of the source content.
+                let char_count = line.content.chars().count();
+                let cw = self.metrics.char_width;
+                let chars_per_line = chars_per_visual_line(content_width, cw);
+                let visual_idx = ((target_y - row_top) / self.metrics.row_height).floor() as usize;
+                let line_char_start = visual_idx.saturating_mul(chars_per_line);
+                let relative_x = (point.x - text_x).max(0.0);
+                let local_char = (relative_x / cw + 0.5).floor() as usize;
+                let char_offset = (line_char_start + local_char).min(char_count);
+                let byte = byte_offset_for_char(&line.content, char_offset);
+                return Some(TextPosition {
                     region: Region::Body,
                     file_index,
                     hunk_index,
                     line_index,
                     byte,
-                }
-            },
-        )
+                });
+            }
+        }
+
+        // Not on a row (a header band, or past the last row). Snap to the end
+        // of the document so a drag below content selects everything up to it.
+        index.row_ids.last().map(|&(file, hunk, line)| {
+            let (file_index, hunk_index, line_index) =
+                (file as usize, hunk as usize, line as usize);
+            let line = &self.files[file_index].hunks[hunk_index].lines[line_index];
+            TextPosition {
+                region: Region::Body,
+                file_index,
+                hunk_index,
+                line_index,
+                byte: line.content.len(),
+            }
+        })
     }
 
     /// Build the substring inside the inclusive selection range
@@ -1335,6 +1348,7 @@ where
             last_restore_token: 0,
             pending_set_offset: None,
             last_content_version: 0,
+            height_index: RefCell::new(HeightIndex::default()),
         })
     }
 
@@ -1429,11 +1443,15 @@ where
         let bounds = layout.bounds();
         let on_scroll = self.on_scroll;
         let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
+        // (Re)build the layout index up front: every height/position read this
+        // pass — and the following `draw` — is a prefix-sum lookup against it.
+        self.ensure_height_index(&state.height_index, bounds.width);
+        let content_height = state.height_index.borrow().total_height;
         // Offset on entry; compared on the way out so any change this pass
         // (wheel, scrollbar, file jump, find, restore, clamp) is reported once
         // via `on_scroll`. `fn` pointers are `Copy`, so this borrows nothing.
         let prev_offset = state.vertical_offset;
-        let max_vertical = (self.content_height(bounds.width) - bounds.height).max(0.0);
+        let max_vertical = (content_height - bounds.height).max(0.0);
 
         if state.vertical_offset > max_vertical {
             state.vertical_offset = max_vertical;
@@ -1452,7 +1470,7 @@ where
             let target = if file_index == 0 {
                 0.0
             } else {
-                self.file_offset(file_index, bounds.width)
+                self.file_offset(&state.height_index.borrow(), file_index)
             };
             state.vertical_offset = target.clamp(0.0, max_vertical);
             state.selected_file = file_index;
@@ -1460,15 +1478,18 @@ where
         }
 
         if let Some((file_idx, hunk_idx, line_idx, byte_offset)) = state.pending_find_scroll.take()
-            && let Some(target) =
-                self.match_target_y(file_idx, hunk_idx, line_idx, byte_offset, bounds)
+            && let Some(target) = {
+                let index = state.height_index.borrow();
+                self.match_target_y(&index, file_idx, hunk_idx, line_idx, byte_offset, bounds)
+            }
         {
             // Center the row in the viewport when there's room; clamp
             // otherwise. Centering keeps the match's surrounding context
             // visible instead of pinning it to the top edge.
             let centered = target - (bounds.height - self.metrics.row_height) / 2.0;
             state.vertical_offset = centered.clamp(0.0, max_vertical);
-            let selected_file = self.file_at_offset(state.vertical_offset, bounds.width);
+            let selected_file =
+                self.file_at_offset(&state.height_index.borrow(), state.vertical_offset);
             if selected_file != state.selected_file {
                 state.selected_file = selected_file;
                 shell.publish((self.on_selected_file_changed)(selected_file));
@@ -1491,8 +1512,6 @@ where
             }
         }
 
-        let content_height = self.content_height(bounds.width);
-
         match event {
             Event::Window(window::Event::RedrawRequested(_)) => {
                 if state.is_selecting
@@ -1505,8 +1524,8 @@ where
                         if (new_offset - state.vertical_offset).abs() > f32::EPSILON {
                             state.vertical_offset = new_offset;
                             self.advance_drag_selection(state, cursor_pos, bounds);
-                            let selected_file =
-                                self.file_at_offset(state.vertical_offset, bounds.width);
+                            let selected_file = self
+                                .file_at_offset(&state.height_index.borrow(), state.vertical_offset);
                             if selected_file != state.selected_file {
                                 state.selected_file = selected_file;
                                 shell.publish((self.on_selected_file_changed)(selected_file));
@@ -1533,7 +1552,8 @@ where
                 if movement.y != 0.0 {
                     state.vertical_offset =
                         (state.vertical_offset + movement.y).clamp(0.0, max_vertical);
-                    let selected_file = self.file_at_offset(state.vertical_offset, bounds.width);
+                    let selected_file =
+                        self.file_at_offset(&state.height_index.borrow(), state.vertical_offset);
                     if selected_file != state.selected_file {
                         state.selected_file = selected_file;
                         shell.publish((self.on_selected_file_changed)(selected_file));
@@ -1566,8 +1586,8 @@ where
                 ) {
                     scrollbar::ScrollbarEvent::OffsetChanged(new_offset) => {
                         state.vertical_offset = new_offset.clamp(0.0, max_vertical);
-                        let selected_file =
-                            self.file_at_offset(state.vertical_offset, bounds.width);
+                        let selected_file = self
+                            .file_at_offset(&state.height_index.borrow(), state.vertical_offset);
                         if selected_file != state.selected_file {
                             state.selected_file = selected_file;
                             shell.publish((self.on_selected_file_changed)(selected_file));
@@ -1587,8 +1607,11 @@ where
                     }
                     scrollbar::ScrollbarEvent::None => {}
                 }
-                let Some(position) = self.position_at_point(point, bounds, state.vertical_offset)
-                else {
+                let position = {
+                    let index = state.height_index.borrow();
+                    self.position_at_point(&index, point, bounds, state.vertical_offset)
+                };
+                let Some(position) = position else {
                     return;
                 };
 
@@ -1639,8 +1662,8 @@ where
                         )
                     {
                         state.vertical_offset = new_offset.clamp(0.0, max_vertical);
-                        let selected_file =
-                            self.file_at_offset(state.vertical_offset, bounds.width);
+                        let selected_file = self
+                            .file_at_offset(&state.height_index.borrow(), state.vertical_offset);
                         if selected_file != state.selected_file {
                             state.selected_file = selected_file;
                             shell.publish((self.on_selected_file_changed)(selected_file));
@@ -1740,6 +1763,10 @@ where
 
         let state = tree.state.downcast_ref::<State<Renderer::Paragraph>>();
         let content_width = self.content_width(bounds.width);
+        // Normally a no-op — `update` ran first and built it — but draw must
+        // not rely on event ordering for correctness.
+        self.ensure_height_index(&state.height_index, bounds.width);
+        let height_index = state.height_index.borrow();
         // Keys touched this frame; entries not in this set get evicted
         // at the end so the cache doesn't grow unbounded as the user
         // scrolls past new rows. Eviction-at-end is safe because the
@@ -1767,66 +1794,79 @@ where
             let visible_top = state.vertical_offset;
             let visible_bottom = visible_top + bounds.height;
             let header_height = self.header_height();
-            let mut content_y = header_height;
             let visible_capacity = (bounds.height / self.metrics.row_height).ceil() as usize + 8;
             let mut visible_file_headers = Vec::new();
             let mut visible_hunk_headers = Vec::new();
             let mut visible_rows = Vec::with_capacity(visible_capacity);
             let mut visible_bands = Vec::new();
-            // Content-space top of each file's header, for the sticky header.
-            let mut file_tops: Vec<f32> = Vec::with_capacity(self.files.len());
 
-            for (file_index, file) in self.files.iter().enumerate() {
-                let file_header_top = content_y;
-                file_tops.push(file_header_top);
-                push_if_visible(
-                    &mut visible_file_headers,
-                    VisibleFileHeader {
-                        file_index,
-                        y: bounds.y + (file_header_top - visible_top),
-                    },
-                    file_header_top,
-                    self.metrics.file_header_height,
-                    visible_top,
-                    visible_bottom,
-                );
-                content_y += self.metrics.file_header_height;
+            // Everything below is O(log n + visible) against the prefix-sum
+            // index — never a walk over the whole document.
+            // Content-space top of each file's header (sans the sentinel).
+            let file_tops = &height_index.file_tops[..self
+                .files
+                .len()
+                .min(height_index.file_tops.len())];
 
-                for (hunk_index, hunk) in file.hunks.iter().enumerate() {
-                    let hunk_top = content_y;
-                    push_if_visible(
-                        &mut visible_hunk_headers,
-                        VisibleHunkHeader {
-                            file_index,
-                            hunk_index,
-                            y: bounds.y + (hunk_top - visible_top),
-                        },
-                        hunk_top,
-                        self.metrics.hunk_header_height,
-                        visible_top,
-                        visible_bottom,
-                    );
-                    content_y += self.metrics.hunk_header_height;
-
-                    for (line_index, line) in hunk.lines.iter().enumerate() {
-                        let height = self.row_height(line, content_width);
-                        let row_top = content_y;
-                        let y = bounds.y + (row_top - visible_top);
-
-                        if row_top + height >= visible_top && row_top <= visible_bottom {
-                            visible_rows.push(VisibleRow {
-                                file_index,
-                                hunk_index,
-                                line_index,
-                                y,
-                                height,
-                            });
-                            push_visible_band(&mut visible_bands, line.kind, y, height);
-                        }
-
-                        content_y += height;
-                    }
+            let first_file = file_tops
+                .partition_point(|&top| top + self.metrics.file_header_height < visible_top);
+            for (file_index, &top) in file_tops.iter().enumerate().skip(first_file) {
+                if top > visible_bottom {
+                    break;
                 }
+                visible_file_headers.push(VisibleFileHeader {
+                    file_index,
+                    y: bounds.y + (top - visible_top),
+                });
+            }
+
+            let first_hunk = height_index
+                .hunk_tops
+                .partition_point(|&top| top + self.metrics.hunk_header_height < visible_top);
+            for (i, &top) in height_index
+                .hunk_tops
+                .iter()
+                .enumerate()
+                .skip(first_hunk)
+            {
+                if top > visible_bottom {
+                    break;
+                }
+                let (file_index, hunk_index) = height_index.hunk_ids[i];
+                visible_hunk_headers.push(VisibleHunkHeader {
+                    file_index: file_index as usize,
+                    hunk_index: hunk_index as usize,
+                    y: bounds.y + (top - visible_top),
+                });
+            }
+
+            // The candidate first row may still end above the viewport when
+            // the top lands in a header band — the in-loop check skips it.
+            let first_row = height_index
+                .row_tops
+                .partition_point(|&top| top <= visible_top)
+                .saturating_sub(1);
+            for (i, &row_top) in height_index.row_tops.iter().enumerate().skip(first_row) {
+                if row_top > visible_bottom {
+                    break;
+                }
+                let (file_index, hunk_index, line_index) = height_index.row_ids[i];
+                let (file_index, hunk_index, line_index) =
+                    (file_index as usize, hunk_index as usize, line_index as usize);
+                let line = &self.files[file_index].hunks[hunk_index].lines[line_index];
+                let height = self.row_height(line, content_width);
+                if row_top + height < visible_top {
+                    continue;
+                }
+                let y = bounds.y + (row_top - visible_top);
+                visible_rows.push(VisibleRow {
+                    file_index,
+                    hunk_index,
+                    line_index,
+                    y,
+                    height,
+                });
+                push_visible_band(&mut visible_bands, line.kind, y, height);
             }
 
             // Sticky file header: the file occupying the top of the viewport
@@ -1834,10 +1874,10 @@ where
             // next file's header slides up to push it off. Only kicks in once
             // that file's header has scrolled above the viewport top — which is
             // always below the revision header, so the two never overlap.
-            let content_end = content_y;
+            let content_end = height_index.total_height;
             let sticky_file = file_tops
-                .iter()
-                .rposition(|&top| top <= visible_top)
+                .partition_point(|&top| top <= visible_top)
+                .checked_sub(1)
                 .filter(|&i| file_tops[i] < visible_top);
             let sticky_pin_y = sticky_file.map(|i| {
                 let next_top = file_tops.get(i + 1).copied().unwrap_or(content_end);
@@ -2066,11 +2106,7 @@ where
                 });
             }
 
-            let geom = scrollbar::geometry(
-                bounds,
-                self.content_height(bounds.width),
-                state.vertical_offset,
-            );
+            let geom = scrollbar::geometry(bounds, height_index.total_height, state.vertical_offset);
             // Draw the scrollbar in its own layer, created *after* the sticky
             // header's, so it composites above it — sub-layers stack in creation
             // order, so otherwise the full-width sticky strip would hide the
@@ -2105,8 +2141,10 @@ where
             return mouse::Interaction::None;
         };
         let state = tree.state.downcast_ref::<State<Renderer::Paragraph>>();
+        self.ensure_height_index(&state.height_index, bounds.width);
+        let content_height = state.height_index.borrow().total_height;
         if scrollbar::is_dragging(&state.scrollbar)
-            || scrollbar::hits_container(bounds, point, self.content_height(bounds.width))
+            || scrollbar::hits_container(bounds, point, content_height)
         {
             return mouse::Interaction::Idle;
         }
@@ -2150,8 +2188,11 @@ impl<Message> DiffView<'_, Message> {
         cursor_pos: Point,
         bounds: Rectangle,
     ) {
-        let Some(focus_pos) = self.position_at_point(cursor_pos, bounds, state.vertical_offset)
-        else {
+        let focus_pos = {
+            let index = state.height_index.borrow();
+            self.position_at_point(&index, cursor_pos, bounds, state.vertical_offset)
+        };
+        let Some(focus_pos) = focus_pos else {
             return;
         };
 
@@ -2479,19 +2520,6 @@ fn chars_per_visual_line(content_width: f32, cw: f32) -> usize {
     (content_width / cw.max(1.0)).floor().max(1.0) as usize
 }
 
-fn push_if_visible<T>(
-    items: &mut Vec<T>,
-    item: T,
-    item_top: f32,
-    item_height: f32,
-    visible_top: f32,
-    visible_bottom: f32,
-) {
-    if item_top + item_height >= visible_top && item_top <= visible_bottom {
-        items.push(item);
-    }
-}
-
 fn push_visible_band(bands: &mut Vec<VisibleBand>, kind: DiffLineKind, y: f32, height: f32) {
     if kind == DiffLineKind::Context {
         return;
@@ -2516,18 +2544,35 @@ fn format_gutter(old_line: Option<usize>, new_line: Option<usize>, digit_count: 
 /// padding, so a 30k-line file isn't truncated and a 50-line file doesn't
 /// waste a third of the viewport on whitespace.
 fn compute_gutter_digit_count(files: &[DiffFileView<'_>]) -> usize {
+    // Runs on every `view()` rebuild, so it must not walk the whole diff.
+    // Line numbers grow monotonically through a file's hunks, so each file's
+    // maximum lives at the *tail of its last hunk* — scan that tail backwards
+    // until both counters have been seen. The cap bounds the pathological
+    // single-sided hunk (e.g. a 1M-line pure addition never carries an old
+    // number); past it the other counter is at most one digit off anyway,
+    // and the found side dominates the gutter width.
+    const TAIL_SCAN_CAP: usize = 4_096;
     let mut max_line = 0usize;
     for file in files {
-        for hunk in file.hunks {
-            for line in &hunk.lines {
-                if let Some(n) = line.old_line {
-                    max_line = max_line.max(n);
-                }
-                if let Some(n) = line.new_line {
-                    max_line = max_line.max(n);
-                }
+        let Some(hunk) = file.hunks.last() else {
+            continue;
+        };
+        let mut last_old = None;
+        let mut last_new = None;
+        for line in hunk.lines.iter().rev().take(TAIL_SCAN_CAP) {
+            if last_old.is_none() {
+                last_old = line.old_line;
+            }
+            if last_new.is_none() {
+                last_new = line.new_line;
+            }
+            if last_old.is_some() && last_new.is_some() {
+                break;
             }
         }
+        max_line = max_line
+            .max(last_old.unwrap_or(0))
+            .max(last_new.unwrap_or(0));
     }
     // Floor at 3 so the gutter still feels like a column for tiny files.
     digits(max_line).max(3)
@@ -2728,5 +2773,298 @@ where
 {
     fn from(diff_view: DiffView<'a, Message>) -> Self {
         Element::new(diff_view)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    pub(super) fn test_palette() -> Palette {
+        let c = Color::WHITE;
+        Palette {
+            text: c,
+            text_muted: c,
+            addition_text: c,
+            deletion_text: c,
+            modified_token: c,
+            conflict_marker: c,
+            note_text: c,
+            panel: c,
+            file_header: c,
+            hunk_header: c,
+            addition_background: c,
+            deletion_background: c,
+            note_background: c,
+            gutter_background: c,
+            border: c,
+            selection: c,
+            scrollbar: ScrollbarStyle {
+                track_color: c,
+                thumb_color: c,
+            },
+        }
+    }
+
+    fn line(kind: DiffLineKind, content: &str, n: usize) -> DiffLine {
+        DiffLine {
+            kind,
+            old_line: Some(n),
+            new_line: Some(n),
+            content: content.to_owned(),
+            syntax: Vec::new(),
+        }
+    }
+
+    /// A doc with several files/hunks and one long line that wraps, so the
+    /// index has non-uniform row heights to account for.
+    fn test_hunks() -> Vec<Vec<DiffHunkView>> {
+        let long = "x".repeat(500);
+        vec![
+            vec![DiffHunkView {
+                header: "@@ -1,3 +1,3 @@".to_owned(),
+                lines: vec![
+                    line(DiffLineKind::Context, "alpha", 1),
+                    line(DiffLineKind::Addition, &long, 2),
+                    line(DiffLineKind::Deletion, "gamma", 3),
+                ],
+            }],
+            vec![
+                DiffHunkView {
+                    header: "@@ -10,2 +10,2 @@".to_owned(),
+                    lines: vec![
+                        line(DiffLineKind::Context, "delta", 10),
+                        line(DiffLineKind::Addition, "", 11),
+                    ],
+                },
+                DiffHunkView {
+                    header: "@@ -40,1 +40,1 @@".to_owned(),
+                    lines: vec![line(DiffLineKind::Context, "epsilon", 40)],
+                },
+            ],
+        ]
+    }
+
+    fn test_view(hunks: &[Vec<DiffHunkView>]) -> DiffView<'_, ()> {
+        let files = hunks
+            .iter()
+            .enumerate()
+            .map(|(i, hunks)| DiffFileView {
+                title: format!("file-{i}"),
+                status: "M",
+                hunks,
+                additions: 1,
+                deletions: 1,
+            })
+            .collect();
+        DiffView::new(
+            files,
+            0,
+            "test",
+            test_palette(),
+            Font::MONOSPACE,
+            13.0,
+            500,
+            |_| (),
+        )
+    }
+
+    /// Brute-force row walk mirroring the pre-index geometry, used as the
+    /// oracle the prefix sums must agree with.
+    fn brute_force_tops(view: &DiffView<'_, ()>, content_width: f32) -> (Vec<f32>, Vec<f32>, f32) {
+        let mut file_tops = Vec::new();
+        let mut row_tops = Vec::new();
+        let mut y = view.header_height();
+        for file in &view.files {
+            file_tops.push(y);
+            y += view.metrics.file_header_height;
+            for hunk in file.hunks {
+                y += view.metrics.hunk_header_height;
+                for l in &hunk.lines {
+                    row_tops.push(y);
+                    y += view.row_height(l, content_width);
+                }
+            }
+        }
+        (file_tops, row_tops, y)
+    }
+
+    #[test]
+    fn height_index_matches_brute_force_walk() {
+        let hunks = test_hunks();
+        let view = test_view(&hunks);
+        let width = 400.0;
+        let content_width = view.content_width(width);
+
+        let cell = RefCell::new(HeightIndex::default());
+        view.ensure_height_index(&cell, width);
+        let index = cell.borrow();
+
+        let (file_tops, row_tops, total) = brute_force_tops(&view, content_width);
+        assert_eq!(&index.file_tops[..file_tops.len()], file_tops.as_slice());
+        assert_eq!(index.file_tops.last().copied(), Some(total));
+        assert_eq!(index.row_tops, row_tops);
+        assert_eq!(index.total_height, total);
+        // The long line wraps: its row is taller than one row height, so the
+        // following row's top reflects the wrap.
+        assert!(index.row_tops[2] - index.row_tops[1] > view.metrics.row_height * 1.5);
+
+        // file_offset / file_at_offset agree with the prefix sums.
+        assert_eq!(view.file_offset(&index, 0), file_tops[0]);
+        assert_eq!(view.file_offset(&index, 1), file_tops[1]);
+        assert_eq!(view.file_at_offset(&index, 0.0), 0);
+        assert_eq!(view.file_at_offset(&index, file_tops[1] - 1.0), 0);
+        assert_eq!(view.file_at_offset(&index, file_tops[1]), 1);
+        assert_eq!(view.file_at_offset(&index, total + 100.0), 1);
+
+        // Row lookup by id and by y agree with the walk.
+        for (i, &(f, h, l)) in index.row_ids.iter().enumerate() {
+            assert_eq!(
+                view.match_target_y(
+                    &index,
+                    f as usize,
+                    h as usize,
+                    l as usize,
+                    0,
+                    Rectangle::new(Point::ORIGIN, Size::new(width, 600.0)),
+                ),
+                Some(index.row_tops[i]),
+            );
+            assert_eq!(index.row_at(index.row_tops[i] + 0.5), Some(i));
+        }
+        // A y above the first row (in the file-0 header band) still resolves
+        // to no candidate row... the candidate is `None` only above row 0.
+        assert_eq!(index.row_at(index.row_tops[0] - 1.0), None);
+    }
+
+    #[test]
+    fn height_index_rebuilds_on_shape_or_width_change() {
+        let hunks = test_hunks();
+        let mut view = test_view(&hunks);
+        let cell = RefCell::new(HeightIndex::default());
+
+        view.ensure_height_index(&cell, 400.0);
+        let narrow_total = cell.borrow().total_height;
+        let narrow_key = cell.borrow().key;
+
+        // Wider viewport: the 500-char line wraps fewer times, so the total
+        // shrinks and the key changes.
+        view.ensure_height_index(&cell, 4000.0);
+        assert_ne!(cell.borrow().key, narrow_key);
+        assert!(cell.borrow().total_height < narrow_total);
+
+        // Same shape + width: cache hit, key stable.
+        let key = cell.borrow().key;
+        view.ensure_height_index(&cell, 4000.0);
+        assert_eq!(cell.borrow().key, key);
+
+        // A streamed append (more files, same content_version) must rebuild.
+        view.content_version = 7;
+        view.ensure_height_index(&cell, 4000.0);
+        assert_ne!(cell.borrow().key, key);
+    }
+
+    #[test]
+    fn gutter_digits_use_hunk_tails() {
+        let long = vec![
+            DiffHunkView {
+                header: String::new(),
+                lines: vec![line(DiffLineKind::Context, "a", 5)],
+            },
+            DiffHunkView {
+                header: String::new(),
+                lines: vec![
+                    line(DiffLineKind::Context, "b", 99_950),
+                    // Trailing note without line numbers — the tail scan must
+                    // step past it.
+                    DiffLine {
+                        kind: DiffLineKind::Note,
+                        old_line: None,
+                        new_line: None,
+                        content: "\\ No newline at end of file".to_owned(),
+                        syntax: Vec::new(),
+                    },
+                ],
+            },
+        ];
+        let files = vec![DiffFileView {
+            title: "f".to_owned(),
+            status: "M",
+            hunks: &long,
+            additions: 0,
+            deletions: 0,
+        }];
+        assert_eq!(compute_gutter_digit_count(&files), 5);
+        assert_eq!(compute_gutter_digit_count(&[]), 3);
+    }
+}
+
+/// Height-index scaling profile on a synthetic ~1M-line diff:
+///   cargo test -p diffui profile_height_index -- --ignored --nocapture
+#[cfg(test)]
+mod height_profile {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn profile_height_index() {
+        let lines: Vec<DiffLine> = (0..1_000_000)
+            .map(|i| DiffLine {
+                kind: DiffLineKind::Context,
+                old_line: Some(i + 1),
+                new_line: Some(i + 1),
+                content: format!("    let value_{i} = compute({i}) + offset; // padding padding"),
+                syntax: Vec::new(),
+            })
+            .collect();
+        let hunks: Vec<DiffHunkView> = lines
+            .chunks(5_000)
+            .map(|chunk| DiffHunkView {
+                header: "@@ @@".to_owned(),
+                lines: chunk.to_vec(),
+            })
+            .collect();
+        let files: Vec<Vec<DiffHunkView>> = hunks.chunks(20).map(<[_]>::to_vec).collect();
+        let views: Vec<DiffFileView<'_>> = files
+            .iter()
+            .enumerate()
+            .map(|(i, hunks)| DiffFileView {
+                title: format!("file-{i}"),
+                status: "M",
+                hunks,
+                additions: 0,
+                deletions: 0,
+            })
+            .collect();
+        let view: DiffView<'_, ()> = DiffView::new(
+            views,
+            0,
+            "profile",
+            tests::test_palette(),
+            Font::MONOSPACE,
+            13.0,
+            500,
+            |_| (),
+        );
+
+        let cell = RefCell::new(HeightIndex::default());
+        let t = std::time::Instant::now();
+        view.ensure_height_index(&cell, 1200.0);
+        let build = t.elapsed();
+
+        let index = cell.borrow();
+        let t = std::time::Instant::now();
+        let mut acc = 0usize;
+        for i in 0..10_000 {
+            acc += view.file_at_offset(&index, (i * 137) as f32 % index.total_height);
+            acc += index.row_at((i * 631) as f32 % index.total_height).unwrap_or(0);
+        }
+        let queries = t.elapsed();
+
+        eprintln!("\n=== height index profile (1M lines) ===");
+        eprintln!("build (once per content/width change): {build:?}");
+        eprintln!("20k mixed queries                    : {queries:?}  (sink {acc})");
+        eprintln!("per query                            : {:?}", queries / 20_000);
+        eprintln!("=======================================\n");
     }
 }

@@ -91,6 +91,16 @@ impl DiffStreamParser {
         None
     }
 
+    /// Seed the parser as if a `diff --git` header for `file` was just
+    /// consumed, so bare hunk sequences — the shape GitHub's files API returns
+    /// in its `patch` field — can be fed straight in. Returns the previously
+    /// in-progress file like [`push_line`](Self::push_line) does.
+    pub fn begin_file(&mut self, file: DiffFile) -> Option<DiffFile> {
+        let finished = self.take_file();
+        self.current_file = Some(file);
+        finished
+    }
+
     /// End of input: the file still in progress, if any.
     pub fn finish(mut self) -> Option<DiffFile> {
         self.take_file()

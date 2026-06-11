@@ -301,13 +301,31 @@ impl Diffui {
         // local ops, so they stay indeterminate.
         let determinate = matches!(op, MutationOp::PushBookmark { .. });
         let (activity_id, progress) = self.begin_activity(label, determinate);
-        self.enqueue_or_run_mutation(PendingMutation {
+        let pending = PendingMutation {
             repository,
             op,
             tab_id,
             activity_id,
             progress,
-        })
+        };
+        // jj CLI parity: `jj bookmark set` refuses a backwards/sideways move
+        // without `--allow-backwards`. Check ancestry off-thread first — the
+        // result either runs the move directly (fast-forward) or raises a
+        // confirmation dialog. The activity sits Queued meanwhile so the
+        // action stays visible (and is resolved on cancel).
+        if let MutationOp::MoveBookmark { name, to } = &pending.op {
+            if let Some(log) = self.activity_log_for(pending.tab_id) {
+                log.set_status(pending.activity_id, activity::ActivityStatus::Queued);
+            }
+            let repository = pending.repository.clone();
+            let (name, to) = (name.clone(), to.clone());
+            let pending = Box::new(pending);
+            return Task::perform(
+                crate::jj::bookmark_move_is_backwards(repository, name, to),
+                move |result| Message::BookmarkMoveChecked(pending.clone(), Box::new(result)),
+            );
+        }
+        self.enqueue_or_run_mutation(pending)
     }
 
     /// macOS: lower the shared tree to a native `NSMenu`, pop it (blocking, with

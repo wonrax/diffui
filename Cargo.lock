@@ -2209,6 +2209,8 @@ dependencies = [
  "futures",
  "jj-lib",
  "notify",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

@@ -328,11 +328,27 @@ pub(crate) struct Diffui {
     /// Open popup menu (toolbar fetch/revset dropdown or revision right-click),
     /// if any. macOS uses native `NSMenu`s instead and leaves this `None`.
     pub(crate) menu: Option<menu::OverlayMenu>,
+    /// Modal confirmation for a guarded mutation (backwards bookmark move),
+    /// or `None` when closed.
+    pub(crate) confirm: Option<ConfirmDialog>,
     /// Whether the activity popover is showing.
     pub(crate) activity_popover_open: bool,
     /// The caret control the cursor is currently over, if any — drives the
     /// hover highlight that `mouse_area` (unlike `button`) doesn't provide.
     pub(crate) hovered: Option<HoverTarget>,
+}
+
+/// A modal confirmation gating a mutation the jj CLI would refuse outright
+/// (today: a backwards/sideways bookmark move, where the CLI demands
+/// `--allow-backwards`). Accept runs the held mutation; cancel resolves its
+/// queued activity. The `PendingMutation` is fully self-addressed
+/// (repo/tab/activity), so accepting still runs correctly after a tab switch.
+#[derive(Debug, Clone)]
+pub(crate) struct ConfirmDialog {
+    pub(crate) title: String,
+    pub(crate) body: String,
+    pub(crate) confirm_label: String,
+    pub(crate) pending: PendingMutation,
 }
 
 /// Which toolbar dropdown is open. Both render as iced overlays anchored near
@@ -729,7 +745,7 @@ fn proximity_key(
 
 fn commit_for_ref<'a>(ui: &'a Diffui, item: &ResultRef) -> Option<RowView<'a>> {
     match item {
-        ResultRef::Commit(id) => ui.session.commits.find_by_change_id(id),
+        ResultRef::Commit(id) => ui.session.commits.find_by_change_id(id.as_str()),
         ResultRef::Bookmark(name) => ui
             .session
             .commits

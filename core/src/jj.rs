@@ -1112,6 +1112,72 @@ pub async fn read_jj_op_head(repository: Repository) -> Result<String> {
     Ok(heads.join(","))
 }
 
+/// Whether moving local bookmark `name` to `to` is a **backwards or sideways**
+/// move — the bookmark exists and its current target is not an ancestor of the
+/// new one. The jj CLI refuses such moves without `--allow-backwards`, so the
+/// UI asks for confirmation first instead of silently diverging from it.
+/// A missing bookmark (or one with no local target) is a creation and never
+/// backwards; a conflicted bookmark reports `true` (the conservative answer —
+/// jj can't fast-forward those either). Read-only: no snapshot, no wc lock.
+pub async fn bookmark_move_is_backwards(
+    repository: Repository,
+    name: String,
+    to: RevisionSelection,
+) -> Result<bool, String> {
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        handle.block_on(check_bookmark_move_backwards(repository, name, to))
+    })
+    .await
+    .map_err(|error| format!("bookmark ancestry check task failed: {error}"))?
+    .map_err(|error| format!("{error:#}"))
+}
+
+async fn check_bookmark_move_backwards(
+    repository: Repository,
+    name: String,
+    to: RevisionSelection,
+) -> Result<bool> {
+    let settings = jj_settings(&repository.root)?;
+    let workspace = Workspace::load(
+        &settings,
+        &repository.root,
+        &StoreFactories::default(),
+        &default_working_copy_factories(),
+    )
+    .context("failed to load jj workspace")?;
+    let repo = workspace
+        .repo_loader()
+        .load_at_head()
+        .await
+        .context("failed to load jj repo")?;
+
+    let current = repo.view().get_local_bookmark(RefName::new(&name));
+    if current.is_absent() {
+        return Ok(false);
+    }
+    let Some(current) = current.as_normal() else {
+        return Ok(true);
+    };
+
+    let new_target = match &to {
+        RevisionSelection::WorkingCopy => repo
+            .view()
+            .get_wc_commit_id(workspace.workspace_name())
+            .context("jj workspace has no working-copy commit")?
+            .clone(),
+        RevisionSelection::Commit(hex) => {
+            CommitId::try_from_hex(hex).with_context(|| format!("invalid jj commit id {hex}"))?
+        }
+    };
+
+    let forward = repo
+        .index()
+        .is_ancestor(current, &new_target)
+        .context("failed to check bookmark ancestry")?;
+    Ok(!forward)
+}
+
 /// Apply a revision-context-menu mutation (`new` / `edit` / `abandon`) and
 /// reconcile the working copy on disk.
 ///

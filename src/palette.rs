@@ -189,13 +189,27 @@ pub enum ColumnSource {
     Actions(ResultRef),
 }
 
+/// A jj change id (the stable k–z identifier) — **not** a commit id. Wrapped
+/// so it can't silently flow into `RevisionSelection::Commit`, which carries
+/// commit-id hex: a change id passed there targets the wrong (usually no)
+/// revision. Resolve through the commit store first — see
+/// [`revision_selection`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ChangeId(pub String);
+
+impl ChangeId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ResultRef {
     /// `@` / working copy. Modelled separately from `Commit(_)` because it
     /// doesn't have a stable change-id.
     WorkingCopy,
     /// A revision, identified by its change-id.
-    Commit(String),
+    Commit(ChangeId),
     /// A bookmark, identified by its name. Resolves to the revision that
     /// owns it at accept time so the rest of the action pipeline can
     /// treat it as a regular revision jump.
@@ -674,7 +688,7 @@ pub fn recompute_matches(column: &mut PaletteColumn, ui: &Diffui, search_revisio
         let Some(raw_score) = score else { continue };
 
         let bonus = match &candidate.item {
-            ResultRef::Commit(id) => ui.recents.revision_bonus(id),
+            ResultRef::Commit(id) => ui.recents.revision_bonus(id.as_str()),
             ResultRef::Command(id) => ui.recents.command_bonus(*id),
             ResultRef::WorkingCopy | ResultRef::Bookmark(_) | ResultRef::File(_) => 0,
         };
@@ -735,7 +749,7 @@ fn push_revision_candidates(out: &mut Vec<Candidate>, ui: &Diffui) {
             haystack.push_str(bookmark);
         }
         out.push(Candidate {
-            item: ResultRef::Commit(commit.change_id().to_owned()),
+            item: ResultRef::Commit(ChangeId(commit.change_id().to_owned())),
             haystack,
         });
     }
@@ -1179,13 +1193,13 @@ fn result_row_body<'a>(
         .align_y(alignment::Vertical::Center)
         .into(),
         ResultRef::Commit(change_id) => {
-            let commit = ui.session.commits.find_by_change_id(change_id);
+            let commit = ui.session.commits.find_by_change_id(change_id.as_str());
             let prefix = commit
                 .map(|c| {
                     let len = c.shortest_change_id_len().unwrap_or(8).max(8);
                     c.change_id().chars().take(len).collect::<String>()
                 })
-                .unwrap_or_else(|| change_id.chars().take(8).collect::<String>());
+                .unwrap_or_else(|| change_id.as_str().chars().take(8).collect::<String>());
             let description = commit
                 .map(|c| {
                     if c.has_description() {
@@ -1314,12 +1328,12 @@ fn target_label(target: &ResultRef, ui: &Diffui) -> String {
         ResultRef::Commit(change_id) => ui
             .session
             .commits
-            .find_by_change_id(change_id)
+            .find_by_change_id(change_id.as_str())
             .map(|c| {
                 let len = c.shortest_change_id_len().unwrap_or(8).max(8);
                 c.change_id().chars().take(len).collect()
             })
-            .unwrap_or_else(|| change_id.chars().take(8).collect()),
+            .unwrap_or_else(|| change_id.as_str().chars().take(8).collect()),
         ResultRef::Bookmark(name) => name.clone(),
         ResultRef::File(path) => path.clone(),
         ResultRef::Command(cmd) => cmd.label().to_owned(),
@@ -1342,7 +1356,7 @@ pub fn revision_selection(item: &ResultRef, ui: &Diffui) -> Option<RevisionSelec
         ResultRef::Commit(change_id) => ui
             .session
             .commits
-            .find_by_change_id(change_id)
+            .find_by_change_id(change_id.as_str())
             .map(|c| RevisionSelection::Commit(c.commit_id().to_owned())),
         ResultRef::Bookmark(name) => ui
             .session
@@ -1360,7 +1374,7 @@ pub fn revision_selection(item: &ResultRef, ui: &Diffui) -> Option<RevisionSelec
 /// flagged as the WC right now.
 pub fn change_id_for_recents(item: &ResultRef, ui: &Diffui) -> Option<String> {
     match item {
-        ResultRef::Commit(change_id) => Some(change_id.clone()),
+        ResultRef::Commit(change_id) => Some(change_id.0.clone()),
         ResultRef::Bookmark(name) => ui
             .session
             .commits

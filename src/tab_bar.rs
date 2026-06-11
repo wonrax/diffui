@@ -331,6 +331,127 @@ fn palette_hint(theme: ThemeSpec, mono: iced::Font) -> Element<'static, Message>
         .into()
 }
 
+/// Modal confirmation for a guarded mutation (see [`crate::ConfirmDialog`]).
+/// Returns an empty `Space` when closed. Lives here because it mirrors the
+/// open-repository modal's scrim + card construction exactly.
+pub fn build_confirm_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
+    let Some(dialog) = &ui.confirm else {
+        return Space::new().into();
+    };
+
+    let scrim = mouse_area(
+        container(Space::new().width(Length::Fill).height(Length::Fill))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|_| container::Style {
+                background: Some(Background::Color(Color {
+                    a: 0.40,
+                    ..Color::BLACK
+                })),
+                ..container::Style::default()
+            }),
+    )
+    .on_press(Message::ConfirmCancel);
+
+    let cancel = button(
+        text("Cancel")
+            .size(13)
+            .color(theme.text)
+            .font(ui.config.ui_font),
+    )
+    .padding(Padding::from([7, 15]))
+    .on_press(Message::ConfirmCancel)
+    .style(move |_, status| button::Style {
+        background: match status {
+            button::Status::Hovered | button::Status::Pressed => {
+                Some(Background::Color(theme.selected_file))
+            }
+            _ => Some(Background::Color(theme.panel_background)),
+        },
+        text_color: theme.text,
+        border: Border {
+            width: 1.0,
+            color: theme.border,
+            radius: 8.0.into(),
+        },
+        shadow: Default::default(),
+        snap: true,
+    });
+
+    // Red fill: the confirm runs a mutation the jj CLI refuses by default.
+    let accept = button(
+        text(dialog.confirm_label.as_str())
+            .size(13)
+            .color(theme.background)
+            .font(ui.config.ui_font),
+    )
+    .padding(Padding::from([7, 15]))
+    .on_press(Message::ConfirmAccept)
+    .style(move |_, _| button::Style {
+        background: Some(Background::Color(theme.removed_text)),
+        text_color: theme.background,
+        border: Border {
+            width: 0.0,
+            color: Color::TRANSPARENT,
+            radius: 8.0.into(),
+        },
+        shadow: Default::default(),
+        snap: true,
+    });
+
+    let body = column![
+        text(dialog.title.as_str())
+            .size(15)
+            .color(theme.text)
+            .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
+        text(dialog.body.as_str())
+            .size(12)
+            .color(theme.muted_text)
+            .font(ui.config.ui_font),
+        row![Space::new().width(Length::Fill), cancel, accept]
+            .spacing(8)
+            .align_y(alignment::Vertical::Center),
+    ]
+    .spacing(12);
+
+    let card = mouse_area(
+        container(body)
+            .width(Length::Fixed(460.0))
+            .padding(Padding::from([18, 20]))
+            .style(move |_| container::Style {
+                background: Some(Background::Color(theme.panel_background_elevated)),
+                border: Border {
+                    width: 1.0,
+                    color: theme.border,
+                    radius: 14.0.into(),
+                },
+                shadow: iced::Shadow {
+                    color: Color {
+                        a: 0.30,
+                        ..Color::BLACK
+                    },
+                    offset: iced::Vector::new(0.0, 8.0),
+                    blur_radius: 24.0,
+                },
+                ..container::Style::default()
+            }),
+    )
+    .on_press(Message::ConfirmNoOp);
+
+    let centered = container(card)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(alignment::Horizontal::Center)
+        .padding(Padding {
+            top: 140.0,
+            right: 0.0,
+            bottom: 0.0,
+            left: 0.0,
+        });
+
+    stack![scrim, centered].into()
+}
+
 /// True when the repo behind `tab` has a non-empty working copy. Best-effort:
 /// the working copy's emptiness may still be unresolved (it resolves lazily),
 /// in which case we draw no dot rather than guess.

@@ -161,6 +161,17 @@ pub(crate) enum Message {
     OpenToolbarMenu(ToolbarMenu, iced::Rectangle),
     /// Popup-menu messages — see [`crate::menu::MenuMessage`].
     Menu(crate::menu::MenuMessage),
+    /// Ancestry check for a bookmark move resolved: `true` = backwards or
+    /// sideways (the jj CLI would refuse without `--allow-backwards`) → raise
+    /// the confirmation dialog; `false` (or check failure) → run it. Carries
+    /// the fully-wired mutation either way.
+    BookmarkMoveChecked(Box<crate::PendingMutation>, Box<Result<bool, String>>),
+    /// Confirmation dialog: run the held mutation.
+    ConfirmAccept,
+    /// Confirmation dialog: dismiss, resolving the held activity as canceled.
+    ConfirmCancel,
+    /// Swallow clicks on the confirmation card so they don't hit the scrim.
+    ConfirmNoOp,
     /// Open/close the activity popover.
     ActivityToggle,
     /// Expand/collapse one activity row's captured output.

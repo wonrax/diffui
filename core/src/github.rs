@@ -12,7 +12,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
 use crate::diff_parse::DiffStreamParser;
-use crate::model::{DiffFile, RevisionDetails, SignatureInfo};
+use crate::model::{DiffFile, DiffFileStatus, RevisionDetails, SignatureInfo};
 
 /// A pull-request reference: `owner/repo#number`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,10 +171,140 @@ pub fn pr_revision_details(info: &PrInfo) -> RevisionDetails {
     }
 }
 
-/// Stream the PR's unified diff, invoking `on_file` for each completed
-/// (already-highlighted) file as it parses off the pipe. Returns once the
-/// stream ends; a non-zero `gh` exit fails with its captured stderr.
+/// Stream the PR's diff, invoking `on_file` for each completed
+/// (already-highlighted) file. Prefers `gh pr diff` (one request, true
+/// streaming); when GitHub refuses to serve the unified diff outright
+/// (HTTP 406 — more than 300 changed files), falls back to paging through the
+/// REST files endpoint, which serves per-file patches up to GitHub's
+/// 3,000-file listing cap (the app surfaces any shortfall against
+/// `changedFiles` in the activity log).
 pub async fn stream_pr_diff(spec: &PrSpec, mut on_file: impl FnMut(DiffFile)) -> Result<()> {
+    let mut emitted = 0usize;
+    let result = stream_pr_diff_gh(spec, |file| {
+        emitted += 1;
+        on_file(file);
+    })
+    .await;
+    match result {
+        // Only the too-large refusal reroutes — an auth/network failure would
+        // fail the files API identically, and a second error just confuses.
+        // `emitted == 0` because the 406 arrives before any diff bytes; if
+        // files already streamed, rerouting would duplicate them.
+        Err(error) if emitted == 0 && is_diff_too_large(&error) => {
+            stream_pr_files_api(spec, on_file).await
+        }
+        other => other,
+    }
+}
+
+/// GitHub's "Sorry, the diff exceeded the maximum number of files" refusal
+/// (HTTP 406 / `PullRequest.diff too_large`), as relayed through gh's stderr.
+fn is_diff_too_large(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}");
+    text.contains("HTTP 406") || text.contains("too_large") || text.contains("exceeded the maximum")
+}
+
+/// One file from the REST "List pull request files" endpoint. `patch` is
+/// absent for binary or oversized files.
+#[derive(serde::Deserialize)]
+struct ApiPrFile {
+    filename: String,
+    #[serde(default)]
+    previous_filename: Option<String>,
+    status: String,
+    #[serde(default)]
+    additions: usize,
+    #[serde(default)]
+    deletions: usize,
+    #[serde(default)]
+    patch: Option<String>,
+}
+
+/// Page through `GET /repos/{owner}/{repo}/pulls/{n}/files`, lowering each
+/// entry to a [`DiffFile`]. Streams page-by-page (100 files per request).
+async fn stream_pr_files_api(spec: &PrSpec, mut on_file: impl FnMut(DiffFile)) -> Result<()> {
+    let mut page = 1usize;
+    loop {
+        let path = format!(
+            "repos/{}/pulls/{}/files?per_page=100&page={page}",
+            spec.slug(),
+            spec.number
+        );
+        let output = Command::new("gh")
+            .args(["api", &path])
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .context("failed to run `gh` — is the GitHub CLI installed and on PATH?")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "gh api pull-request files exited with {}: {}",
+                output.status,
+                stderr.trim()
+            );
+        }
+        let files: Vec<ApiPrFile> = serde_json::from_slice(&output.stdout)
+            .context("failed to parse the pull-request files API response")?;
+        // A short (or empty) page is the last one; GitHub also simply stops
+        // listing past its 3,000-file cap.
+        let last = files.len() < 100;
+        for file in files {
+            on_file(api_file_to_diff_file(file));
+        }
+        if last {
+            return Ok(());
+        }
+        page += 1;
+    }
+}
+
+/// Lower one files-API entry to a [`DiffFile`], feeding its `patch` (bare
+/// hunks, no `diff --git` header) through the streaming parser so row
+/// numbering and highlighting match the `gh pr diff` path.
+fn api_file_to_diff_file(file: ApiPrFile) -> DiffFile {
+    let status = match file.status.as_str() {
+        "added" => DiffFileStatus::Added,
+        "removed" => DiffFileStatus::Deleted,
+        // The REST vocabulary also has "copied"; rendering it as a rename
+        // shows the source path, which is the closest fit we have.
+        "renamed" | "copied" => DiffFileStatus::Renamed,
+        _ => DiffFileStatus::Modified,
+    };
+    let mut parser = DiffStreamParser::default();
+    parser.begin_file(DiffFile {
+        path: file.filename,
+        old_path: file.previous_filename,
+        status,
+        hunks: Vec::new(),
+        additions: 0,
+        deletions: 0,
+    });
+    match &file.patch {
+        Some(patch) => {
+            for line in patch.lines() {
+                parser.push_line(line);
+            }
+        }
+        None => {
+            // Keep the row visible with its counts so the file list stays
+            // complete even though there's nothing to render.
+            parser.push_line("@@ diff unavailable (binary or oversized file) @@");
+        }
+    }
+    let mut out = parser
+        .finish()
+        .expect("begin_file seeded a file, so finish returns it");
+    // The API's counts cover the whole file even when the patch was omitted;
+    // trust them over the parsed rows.
+    out.additions = file.additions;
+    out.deletions = file.deletions;
+    out
+}
+
+/// The `gh pr diff` path: one process, unified diff streamed off its stdout.
+/// Returns once the stream ends; a non-zero exit fails with captured stderr.
+async fn stream_pr_diff_gh(spec: &PrSpec, mut on_file: impl FnMut(DiffFile)) -> Result<()> {
     let mut child = Command::new("gh")
         .args([
             "pr",
@@ -254,6 +384,39 @@ mod tests {
             expected
         );
         assert_eq!(PrSpec::parse("anthropics/claude-code#123"), expected);
+    }
+
+    #[test]
+    fn api_file_lowering_parses_patch_and_statuses() {
+        let file = api_file_to_diff_file(ApiPrFile {
+            filename: "src/new name.rs".to_owned(),
+            previous_filename: Some("src/old name.rs".to_owned()),
+            status: "renamed".to_owned(),
+            additions: 1,
+            deletions: 1,
+            patch: Some("@@ -10,2 +10,2 @@\n context\n-old line\n+new line".to_owned()),
+        });
+        // Paths with spaces survive (no `diff --git` header round-trip).
+        assert_eq!(file.path, "src/new name.rs");
+        assert_eq!(file.old_path.as_deref(), Some("src/old name.rs"));
+        assert_eq!(file.status, DiffFileStatus::Renamed);
+        assert_eq!(file.hunks.len(), 1);
+        assert_eq!(file.hunks[0].lines[0].old_line, Some(10));
+        assert_eq!(file.hunks[0].lines[0].new_line, Some(10));
+        assert_eq!((file.additions, file.deletions), (1, 1));
+
+        // No patch (binary / oversized): the row survives with its counts.
+        let binary = api_file_to_diff_file(ApiPrFile {
+            filename: "big.bin".to_owned(),
+            previous_filename: None,
+            status: "added".to_owned(),
+            additions: 0,
+            deletions: 0,
+            patch: None,
+        });
+        assert_eq!(binary.status, DiffFileStatus::Added);
+        assert_eq!(binary.hunks.len(), 1);
+        assert!(binary.hunks[0].header.contains("diff unavailable"));
     }
 
     #[test]

@@ -224,6 +224,12 @@ pub struct Session {
     pub status: LoadStatus,
     /// The diff currently shown — the selected revision's, or the working copy's.
     pub document: DiffDocument,
+    /// Diff totals reported by the source itself, when it knows better than a
+    /// sum over the parsed files — a GitHub PR's header counts: the files-API
+    /// fallback zeroes per-file counts for oversized blobs, so the summed
+    /// document totals can undercount. Frontends prefer these for the header
+    /// totals; `None` for repo-backed sources.
+    pub authoritative_totals: Option<(usize, usize)>,
     /// Compact commit store backing the sidebar. A streaming cold load appends to
     /// it per batch; a refresh swaps it wholesale.
     pub commits: CommitStore,

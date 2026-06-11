@@ -51,6 +51,11 @@ impl LoadProgress {
 pub enum RevisionSelection {
     #[default]
     WorkingCopy,
+    /// A specific revision by **commit-id hex** (jj commit id / git sha) —
+    /// never a jj change id. The jj backend feeds this straight into
+    /// `CommitId::try_from_hex`; a change id (the k–z alphabet) must be
+    /// resolved through the commit store first (the palette does this in
+    /// `revision_selection`).
     Commit(String),
 }
 
@@ -58,7 +63,7 @@ impl RevisionSelection {
     pub fn view_key(&self) -> String {
         match self {
             Self::WorkingCopy => "working-copy".to_owned(),
-            Self::Commit(change_id) => format!("commit:{change_id}"),
+            Self::Commit(commit_id) => format!("commit:{commit_id}"),
         }
     }
 }

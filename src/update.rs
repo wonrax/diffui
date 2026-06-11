@@ -12,6 +12,32 @@ use crate::menu::MenuMessage;
 use crate::palette::PaletteMessage;
 use iced::widget::column;
 
+/// The per-tab fields a streaming-load completion touches, borrowed from the
+/// active inline state or from a backgrounded tab's stash. Routing results to
+/// their owner (instead of dropping foreign ones) is what lets a cold graph
+/// walk / PR stream keep its progress while its tab is backgrounded — a tab
+/// switch no longer restarts a half-done load.
+pub(crate) struct LoadTargetMut<'a> {
+    pub(crate) session: &'a mut Session,
+    pub(crate) selected_file: &'a mut usize,
+    pub(crate) activities: &'a mut activity::ActivityLog,
+    pub(crate) pending_load_activity: &'a mut Option<activity::ActivityId>,
+    /// Whether this is the active tab — gates the active-only follow-ups
+    /// (the shaped-paragraph cache bump, empty-status spawns, coalesced
+    /// refreshes; a backgrounded tab runs those on its next activation).
+    pub(crate) is_active: bool,
+}
+
+impl<'a> LoadTargetMut<'a> {
+    /// Resolve the owning tab's pending load activity (mirrors
+    /// `finish_load_activity`, which only knows the active tab).
+    fn finish_load_activity(&mut self, status: activity::ActivityStatus, result: Option<String>) {
+        if let Some(id) = self.pending_load_activity.take() {
+            self.activities.finish(id, status, result);
+        }
+    }
+}
+
 impl Diffui {
     pub(crate) fn new(cli: Cli, saved: WindowState) -> (Self, Task<Message>) {
         let config = AppConfig::load();
@@ -200,6 +226,7 @@ impl Diffui {
             next_activity_id: 0,
             mutation_queue: diffui_core::session::MutationQueue::default(),
             menu: None,
+            confirm: None,
             activity_popover_open: false,
             hovered: None,
         };
@@ -318,99 +345,125 @@ impl Diffui {
                 }
             },
             Message::CommitsBatch(version, rows) => {
-                // Take the cursor out so the appends below borrow `self` fields
-                // freely (same idiom the palette uses). Drop batches from a
-                // superseded load — their row indices no longer line up.
-                // `take_if` (not `take().filter()`) leaves the cursor in place
-                // when a *stale* batch arrives mid-stream: taking it out and
-                // dropping it would orphan the live load, so its later batches
-                // would be lost and the store would end up shorter than the
-                // loader's `empty_updates` indices (an out-of-bounds panic).
-                let Some(mut cursor) = self.session.load.take_if(|c| c.version == version) else {
+                // Route to whichever tab owns this stream — the active one or
+                // a backgrounded stash — so a tab switch doesn't discard a
+                // half-done walk. Take the cursor out so the appends below
+                // borrow the session fields freely; `take_if` re-asserts the
+                // version the router already matched.
+                let Some(target) = self.load_target_mut(version) else {
+                    return Task::none();
+                };
+                let Some(mut cursor) = target.session.load.take_if(|c| c.version == version)
+                else {
                     return Task::none();
                 };
                 let selecting_wc = matches!(
-                    self.session.selected_revision,
+                    target.session.selected_revision,
                     RevisionSelection::WorkingCopy
                 );
                 // Fold the batch into the growing store/graph via the core
                 // engine, then apply the UI-side bits it reports back.
                 let fold = diffui_core::session::fold_cold_batch(
-                    &mut self.session.commits,
-                    &mut self.session.graph,
+                    &mut target.session.commits,
+                    &mut target.session.graph,
                     &mut cursor,
                     rows,
                     selecting_wc,
                 );
-                self.session.sidebar_prefix_lens.extend(fold.prefix_lens);
+                target.session.sidebar_prefix_lens.extend(fold.prefix_lens);
                 if let Some(index) = fold.working_copy_index {
-                    self.session.selected_commit_index = Some(index);
+                    target.session.selected_commit_index = Some(index);
                 }
-                self.session.load = Some(cursor);
+                target.session.load = Some(cursor);
                 // First batch on screen: lift the full-window loading indicator
                 // and reveal the (still-growing) sidebar.
-                if matches!(self.session.status, LoadStatus::Loading) {
-                    self.session.status = LoadStatus::Loaded;
-                    self.session.loading_since = None;
+                if matches!(target.session.status, LoadStatus::Loading) {
+                    target.session.status = LoadStatus::Loaded;
+                    target.session.loading_since = None;
                 }
             }
             Message::CommitsFinished(version, result) => {
-                if self.session.load.as_ref().map(|c| c.version) != Some(version) {
+                let Some(mut target) = self.load_target_mut(version) else {
                     return Task::none();
-                }
-                self.session.load = None;
+                };
+                target.session.load = None;
+                let is_active = target.is_active;
                 match *result {
                     Ok(tail) => {
-                        self.session.repository_snapshot = Some(tail.snapshot);
-                        self.session.branch_status = tail.branch_status;
-                        self.session.bookmarks = tail.bookmarks;
+                        target.session.repository_snapshot = Some(tail.snapshot);
+                        target.session.branch_status = tail.branch_status;
+                        target.session.bookmarks = tail.bookmarks;
                         // Apply the single-parent emptiness resolved in the
                         // loader's final pass, caching each so reloads skip it.
                         for (index, empty) in tail.empty_updates {
                             // Defensive: a superseded/shorter store must never
                             // index past its end (`set_is_empty` already guards
                             // with `get_mut`; the row read did not).
-                            if index >= self.session.commits.len() {
+                            if index >= target.session.commits.len() {
                                 continue;
                             }
-                            let commit_id = self.session.commits.row(index).commit_id().to_owned();
-                            self.session.empty_cache.insert(commit_id, empty);
-                            self.session.commits.set_is_empty(index, empty);
+                            let commit_id =
+                                target.session.commits.row(index).commit_id().to_owned();
+                            target.session.empty_cache.insert(commit_id, empty);
+                            target.session.commits.set_is_empty(index, empty);
                         }
-                        self.session.commits_version = self.session.commits_version.wrapping_add(1);
-                        self.session.selected_commit_index =
-                            self.session.find_selected_commit_index();
-                        self.finish_load_activity(activity::ActivityStatus::Done, None);
+                        target.session.commits_version =
+                            target.session.commits_version.wrapping_add(1);
+                        target.session.selected_commit_index =
+                            target.session.find_selected_commit_index();
+                        target.finish_load_activity(activity::ActivityStatus::Done, None);
                         // Fill in the merges/roots the loader left unknown, then
-                        // run any refresh coalesced during the cold load.
-                        let empty = self.resolve_empty_status();
-                        return Task::batch([empty, self.take_pending_refresh()]);
+                        // run any refresh coalesced during the cold load — but
+                        // only for the active tab: those results are guarded to
+                        // it, so a backgrounded tab runs both on activation
+                        // instead (`ensure_active_loaded`).
+                        if is_active {
+                            let empty = self.resolve_empty_status();
+                            return Task::batch([empty, self.take_pending_refresh()]);
+                        }
                     }
                     Err(error) => {
-                        self.session.status = LoadStatus::Failed(error.clone());
-                        self.session.loading_since = None;
-                        self.finish_load_activity(activity::ActivityStatus::Error, Some(error));
+                        target.session.status = LoadStatus::Failed(error.clone());
+                        target.session.loading_since = None;
+                        target.finish_load_activity(activity::ActivityStatus::Error, Some(error));
                     }
                 }
             }
             Message::InitialDiff(version, result) => {
-                // Apply only while this stream is the active load and the user
-                // hasn't navigated off the working copy (e.g. via the palette
-                // during load). Leaves `status` as `Loading` so the sidebar
-                // stays empty (rather than flashing a stale graph) until the
-                // first commit batch; loading feedback is in the toolbar.
-                let active = self.session.load.as_ref().map(|c| c.version) == Some(version)
-                    && self.session.pending_revision.as_ref()
-                        == Some(&RevisionSelection::WorkingCopy);
-                if !active {
+                // Routed by stream version like `CommitsBatch`. Apply only
+                // while the owning tab is still on the working copy — a
+                // palette jump mid-load supersedes this initial @ diff. (A
+                // backgrounded tab has `pending_revision == None`: its
+                // one-shot switches were abandoned on stash.) Leaves `status`
+                // as `Loading` so the sidebar stays empty until the first
+                // commit batch; loading feedback is in the toolbar.
+                let Some(target) = self.load_target_mut(version) else {
+                    return Task::none();
+                };
+                let on_working_copy = matches!(
+                    target.session.selected_revision,
+                    RevisionSelection::WorkingCopy
+                ) && target
+                    .session
+                    .pending_revision
+                    .as_ref()
+                    .is_none_or(|pending| matches!(pending, RevisionSelection::WorkingCopy));
+                if !on_working_copy {
                     return Task::none();
                 }
-                self.session.pending_revision = None;
+                target.session.pending_revision = None;
+                let bump = target.is_active;
                 match *result {
                     Ok((document, details)) => {
-                        self.set_document(document);
-                        self.session.revision_details = details;
-                        self.selected_file = 0;
+                        target.session.document = document;
+                        target.session.revision_details = details;
+                        *target.selected_file = 0;
+                        // The shaped-paragraph cache keys map to the replaced
+                        // text — drop it. A stashed tab gets the same bump on
+                        // restore, so only the active one needs it here.
+                        if bump {
+                            self.document_version = self.document_version.wrapping_add(1);
+                        }
                     }
                     Err(error) => {
                         eprintln!("diffui: working-copy diff failed during load: {error}");
@@ -418,15 +471,22 @@ impl Diffui {
                 }
             }
             Message::PrMetaLoaded(version, result) => {
-                // The PR stream reuses the `session.load` cursor purely as its
-                // version guard (interner/fold stay unused) — globally
-                // monotonic versions make this safe across tabs and reloads.
-                if self.session.load.as_ref().map(|c| c.version) != Some(version) {
+                // Routed by stream version like `CommitsBatch` — the PR
+                // stream reuses the `session.load` cursor purely as its
+                // guard (interner/fold stay unused); globally monotonic
+                // versions make it tab-unique.
+                let Some(target) = self.load_target_mut(version) else {
                     return Task::none();
-                }
+                };
                 match *result {
                     Ok(info) => {
-                        self.session.revision_details =
+                        // The PR header's totals are authoritative: the
+                        // files-API fallback zeroes per-file counts on
+                        // oversized blobs, so summing parsed files can
+                        // undercount (react#36173: 73k summed vs 123k real).
+                        target.session.authoritative_totals =
+                            Some((info.additions, info.deletions));
+                        target.session.revision_details =
                             Some(github::pr_revision_details(&info));
                     }
                     Err(error) => {
@@ -437,38 +497,55 @@ impl Diffui {
                 }
             }
             Message::PrFilesBatch(version, files) => {
-                if self.session.load.as_ref().map(|c| c.version) != Some(version) {
+                let Some(target) = self.load_target_mut(version) else {
                     return Task::none();
+                };
+                // Append without bumping `document_version`: the existing
+                // (file, hunk, line) cache keys still map to the same text,
+                // so visible rows don't re-shape on every batch of a
+                // million-line stream.
+                for file in &files {
+                    target.session.document.total_additions += file.additions;
+                    target.session.document.total_deletions += file.deletions;
                 }
-                self.append_document_files(files);
+                target.session.document.files.extend(files);
                 // First batch on screen: lift the loading indicator and show
                 // the (still-growing) diff.
-                if matches!(self.session.status, LoadStatus::Loading) {
-                    self.session.status = LoadStatus::Loaded;
-                    self.session.loading_since = None;
+                if matches!(target.session.status, LoadStatus::Loading) {
+                    target.session.status = LoadStatus::Loaded;
+                    target.session.loading_since = None;
                 }
             }
             Message::PrFinished(version, result) => {
-                if self.session.load.as_ref().map(|c| c.version) != Some(version) {
+                let Some(mut target) = self.load_target_mut(version) else {
                     return Task::none();
-                }
-                self.session.load = None;
-                self.session.loading_since = None;
+                };
+                target.session.load = None;
+                target.session.loading_since = None;
                 match *result {
                     Ok(()) => {
                         // An empty PR never sends a batch — the stream ending
                         // is what lifts the loading screen then.
-                        self.session.status = LoadStatus::Loaded;
-                        self.finish_load_activity(activity::ActivityStatus::Done, None);
+                        target.session.status = LoadStatus::Loaded;
+                        // GitHub's files API stops listing at 3,000 files;
+                        // say so rather than looking complete.
+                        let (loaded, total) = target.session.commit_progress.snapshot();
+                        let note = (total > 0 && loaded < total).then(|| {
+                            format!(
+                                "Streamed {loaded} of {total} files \
+                                 (GitHub's files API caps the listing)"
+                            )
+                        });
+                        target.finish_load_activity(activity::ActivityStatus::Done, note);
                     }
                     Err(error) => {
                         // Keep a partially-streamed diff on screen (the error
                         // lands in the activity log); fail the tab only when
                         // nothing rendered at all.
-                        if self.session.document.files.is_empty() {
-                            self.session.status = LoadStatus::Failed(error.clone());
+                        if target.session.document.files.is_empty() {
+                            target.session.status = LoadStatus::Failed(error.clone());
                         }
-                        self.finish_load_activity(activity::ActivityStatus::Error, Some(error));
+                        target.finish_load_activity(activity::ActivityStatus::Error, Some(error));
                     }
                 }
             }
@@ -734,6 +811,64 @@ impl Diffui {
                 // done. Unconditional so a failure can't strand the queue.
                 return self.advance_mutation_queue();
             }
+            Message::BookmarkMoveChecked(pending, result) => {
+                let backwards = match *result {
+                    Ok(backwards) => backwards,
+                    Err(error) => {
+                        // Couldn't determine ancestry — run the move like
+                        // before the guard existed; the mutation path
+                        // surfaces any real failure.
+                        eprintln!("diffui: bookmark ancestry check failed: {error}");
+                        false
+                    }
+                };
+                let mutations::MutationOp::MoveBookmark { name, to } = &pending.op else {
+                    return self.enqueue_or_run_mutation(*pending);
+                };
+                if !backwards {
+                    return self.enqueue_or_run_mutation(*pending);
+                }
+                let target = match to {
+                    RevisionSelection::WorkingCopy => "The working copy".to_owned(),
+                    RevisionSelection::Commit(hex) => self
+                        .session
+                        .commits
+                        .find_by_commit_id(hex)
+                        .map(|c| {
+                            let len = c.shortest_change_id_len().unwrap_or(8).max(8);
+                            c.change_id().chars().take(len).collect::<String>()
+                        })
+                        .unwrap_or_else(|| hex.chars().take(12).collect()),
+                };
+                self.confirm = Some(ConfirmDialog {
+                    title: format!("Move bookmark \u{201c}{name}\u{201d} backwards?"),
+                    body: format!(
+                        "{target} is not a descendant of the commit \u{201c}{name}\u{201d} \
+                         points at, so this is a backwards or sideways move — the jj CLI \
+                         refuses it without --allow-backwards."
+                    ),
+                    confirm_label: "Move anyway".to_owned(),
+                    pending: *pending,
+                });
+            }
+            Message::ConfirmAccept => {
+                if let Some(dialog) = self.confirm.take() {
+                    return self.enqueue_or_run_mutation(dialog.pending);
+                }
+            }
+            Message::ConfirmCancel => {
+                if let Some(dialog) = self.confirm.take() {
+                    // Resolve the held activity so it doesn't sit queued forever.
+                    if let Some(log) = self.activity_log_for(dialog.pending.tab_id) {
+                        log.finish(
+                            dialog.pending.activity_id,
+                            activity::ActivityStatus::Done,
+                            Some("Canceled".to_owned()),
+                        );
+                    }
+                }
+            }
+            Message::ConfirmNoOp => {}
             Message::WindowFocusChanged(focused) => {
                 let gained_focus = focused && !self.app_focused;
                 let lost_focus = !focused && self.app_focused;
@@ -1671,23 +1806,41 @@ impl Diffui {
     /// so the diff view drops its per-line shaped-paragraph cache. Every write
     /// to `self.session.document` must go through here — a missed one leaves the diff
     /// view rendering another revision's (or repo's) stale highlighted text.
+    /// (Streaming loads write their owner's session directly instead: appends
+    /// don't invalidate existing keys, and a stashed tab's restore bumps.)
     pub(crate) fn set_document(&mut self, document: DiffDocument) {
         self.session.document = document;
         self.document_version = self.document_version.wrapping_add(1);
     }
 
-    /// Append streamed files to the displayed document (the GitHub-PR load).
-    /// Deliberately **not** [`set_document`](Self::set_document): appending
-    /// leaves every existing `(file, hunk, line)` row's text untouched, so the
-    /// shaped-paragraph cache stays valid — bumping `document_version` per
-    /// batch would re-shape every visible row on each batch of a million-line
-    /// stream.
-    pub(crate) fn append_document_files(&mut self, files: Vec<DiffFile>) {
-        for file in &files {
-            self.session.document.total_additions += file.additions;
-            self.session.document.total_deletions += file.deletions;
+    /// Find the tab whose live streaming cursor is `version` — the active one
+    /// or a backgrounded stash. Streaming results are routed here instead of
+    /// dropped, so a cold walk / PR stream keeps its progress while its tab
+    /// is backgrounded. `None` means the load was superseded (its tab
+    /// re-kicked, or closed) and the result must be discarded.
+    pub(crate) fn load_target_mut(&mut self, version: u64) -> Option<LoadTargetMut<'_>> {
+        if self.session.load.as_ref().map(|c| c.version) == Some(version) {
+            return Some(LoadTargetMut {
+                session: &mut self.session,
+                selected_file: &mut self.selected_file,
+                activities: &mut self.activities,
+                pending_load_activity: &mut self.pending_load_activity,
+                is_active: true,
+            });
         }
-        self.session.document.files.extend(files);
+        self.tabs.iter_mut().find_map(|tab| {
+            let stash = tab.stash.as_mut()?;
+            if stash.session.load.as_ref().map(|c| c.version) != Some(version) {
+                return None;
+            }
+            Some(LoadTargetMut {
+                session: &mut stash.session,
+                selected_file: &mut stash.selected_file,
+                activities: &mut stash.activities,
+                pending_load_activity: &mut stash.pending_load_activity,
+                is_active: false,
+            })
+        })
     }
 
     /// (Re)start the streaming load for a GitHub-PR tab: reset the per-tab
@@ -1706,6 +1859,7 @@ impl Diffui {
         self.sidebar_scroll_offset = 0.0;
         self.diff_scroll_offset = 0.0;
         self.set_document(DiffDocument::default());
+        self.session.authoritative_totals = None;
         self.session.commits = CommitStore::default();
         self.session.graph = graph_layout::GraphLayout::default();
         self.session.sidebar_prefix_lens.clear();
@@ -1748,6 +1902,7 @@ impl Diffui {
         self.sidebar_scroll_offset = 0.0;
         self.diff_scroll_offset = 0.0;
         self.set_document(DiffDocument::default());
+        self.session.authoritative_totals = None;
         self.session.commits = CommitStore::default();
         self.session.graph = graph_layout::GraphLayout::default();
         self.session.sidebar_prefix_lens.clear();
@@ -2100,6 +2255,7 @@ impl Diffui {
             activity::activity_popover(self, theme),
             menu::build_overlay(self, theme),
             tab_bar::build_open_repo_dialog(self, theme),
+            tab_bar::build_confirm_dialog(self, theme),
         ]
         .width(Length::Fill)
         .height(Length::Fill)
@@ -2143,6 +2299,7 @@ impl Diffui {
             self.open_repo_dialog.is_some(),
             self.menu.is_some(),
             self.activity_popover_open,
+            self.confirm.is_some(),
         );
 
         let keyboard = event::listen_with(|event, status, _window| match event {
@@ -2157,9 +2314,21 @@ impl Diffui {
         .with(flags)
         .filter_map(
             |(
-                (palette_open, find_open, dialog_open, menu_open, popover_open),
+                (palette_open, find_open, dialog_open, menu_open, popover_open, confirm_open),
                 (key, modifiers, ignored),
             )| {
+                // A confirmation dialog owns the keyboard: Esc cancels (there
+                // is deliberately no Enter-accept — the confirm gates a
+                // mutation jj itself refuses), everything else is swallowed.
+                if confirm_open {
+                    return match key.as_ref() {
+                        keyboard::Key::Named(keyboard::key::Named::Escape) => {
+                            Some(Message::ConfirmCancel)
+                        }
+                        _ => None,
+                    };
+                }
+
                 // A toolbar dropdown / activity popover is open: Esc dismisses it
                 // and other keys are swallowed so they don't reach file nav.
                 if menu_open || popover_open {
