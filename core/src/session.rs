@@ -21,6 +21,7 @@ use crate::model::{
     RevisionSelection, StreamRow,
 };
 use crate::repository::{Repository, RepositorySnapshot};
+use crate::source::{RepoSource, SourceHandle};
 
 /// A parked diff document for a source that flips between several documents —
 /// a PR's "all changes" view vs its per-commit diffs — so flipping back is an
@@ -232,8 +233,14 @@ pub enum LoadStatus {
 /// the store stays resident and rendering is O(visible rows) even at ~1M commits.
 #[derive(Debug, Clone, Default)]
 pub struct Session {
-    /// The repository this session views, or `None` for the empty (no-repo) state.
+    /// The repository this session views, or `None` for the empty (no-repo)
+    /// state and for non-repo sources (a GitHub PR). Repo-*specific* machinery
+    /// — the fs-watcher, the jj streaming cold load, mutations — keys off this;
+    /// everything load-shaped dispatches through [`Session::source`].
     pub repository: Option<Repository>,
+    /// The diff source behind this session: what diff/graph loads, fetch and
+    /// undo dispatch through. `None` only for the empty (no-tab) state.
+    pub source: Option<SourceHandle>,
     pub status: LoadStatus,
     /// The diff currently shown — the selected revision's, or the working copy's.
     pub document: DiffDocument,
@@ -304,14 +311,29 @@ pub struct Session {
 
 impl Session {
     /// A never-loaded session for `repository`: empty graph, `Loading` status, no
-    /// work in flight. `revset` is the persisted (or default) filter.
+    /// work in flight. `revset` is the persisted (or default) filter. The
+    /// session's [`SourceHandle`] is derived — a [`RepoSource`] over the repo.
     pub fn unloaded(repository: Option<Repository>, revset: String) -> Self {
+        let source = repository
+            .clone()
+            .map(|repository| SourceHandle::new(RepoSource::new(repository)));
         Self {
             repository,
+            source,
             status: LoadStatus::Loading,
             selected_revision: RevisionSelection::WorkingCopy,
             revset,
             ..Self::default()
+        }
+    }
+
+    /// A never-loaded session over a non-repo source (e.g. a GitHub PR): no
+    /// repository — so the watcher/mutation machinery stays off — and every
+    /// load dispatches through `source`.
+    pub fn for_source(source: SourceHandle) -> Self {
+        Self {
+            source: Some(source),
+            ..Self::unloaded(None, String::new())
         }
     }
 

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     pin::Pin,
     time::{Duration, Instant},
@@ -109,17 +109,18 @@ use clap::Parser;
 use config::AppConfig;
 use diffui_core::{
     CommitStore, CommitsTail, DiffDocument, DiffFile, LoadProgress, RevisionDetails,
-    RevisionSelection, RowView, SignatureInfo, StreamRow, compute_empty_status, load_backend,
-    load_diff, load_repository_snapshot, read_op_head,
+    RevisionSelection, RowView, SignatureInfo, StreamRow,
 };
 use find::FindState;
 use futures::{SinkExt, Stream, StreamExt};
 use iced::theme as iced_theme;
 use iced::{
-    Element, Length, Point, Size, Subscription, Task, Theme, alignment,
+    Background, Border, Color, Element, Length, Padding, Point, Size, Subscription, Task, Theme,
+    alignment,
     event::{self, Event},
+    font::Weight,
     keyboard, system, time,
-    widget::{self, column, container, row, stack, text},
+    widget::{self, button, column, container, row, stack, text},
     window,
 };
 use palette::{
@@ -129,7 +130,7 @@ use palette::{
 use repository::{Repository, Vcs, prepare_repository};
 use resize_handle::ResizeHandle;
 use theme::{
-    ResolvedTheme, ThemePreference, ThemeSpec, app_shell_style, horizontal_divider,
+    ResolvedTheme, ThemePreference, ThemeSpec, app_shell_style, emphasis_font, horizontal_divider,
     vertical_divider,
 };
 use window_state::WindowState;
@@ -149,6 +150,19 @@ const RECENT_REPOS_MAX: usize = 12;
 
 fn main() -> iced::Result {
     let cli = Cli::parse();
+
+    // Positional paths are reserved for a future file-diff mode
+    // (`diffui SIDE_1 SIDE_2`) and aren't implemented yet. Reject them up front
+    // with a pointer to `--path`, so the pre-existing `diffui <repo>` muscle
+    // memory gets a clear nudge instead of silently doing nothing.
+    if !cli.diff_args.is_empty() {
+        eprintln!(
+            "diffui: file diff (diffui <side1> <side2>) isn't supported yet — \
+             positional paths are reserved for it."
+        );
+        eprintln!("        to open a repository, use: diffui --path <repo>");
+        std::process::exit(2);
+    }
 
     // Restore the last window geometry before the window is created. The
     // sidebar split lives in app state, so it's restored later in
@@ -180,10 +194,18 @@ fn main() -> iced::Result {
 #[derive(Debug, Clone, Parser)]
 #[command(version, about = "Native GUI diff viewer for jj and git")]
 struct Cli {
-    /// One or more repository paths to open as tabs. Defaults to the current
-    /// directory when none are given.
-    #[arg(value_name = "PATH")]
+    /// Repository path to open as a tab; repeat to open several. When omitted,
+    /// diffui restores your last session, falls back to the current directory
+    /// if it's a repository, and otherwise opens the welcome screen.
+    #[arg(short = 'p', long = "path", value_name = "REPO")]
     paths: Vec<PathBuf>,
+
+    /// Reserved for a future file/dir diff mode (`diffui SIDE_1 SIDE_2`); not
+    /// wired up yet. Kept as a positional (hidden from `--help`) so the old
+    /// `diffui <repo>` habit gets a clear pointer to `--path` rather than
+    /// silently opening the wrong thing — see the guard in `main`.
+    #[arg(value_name = "PATH", hide = true)]
+    diff_args: Vec<PathBuf>,
 }
 
 /// A revision-context-menu mutation captured for serial execution. Mutations
@@ -219,6 +241,25 @@ pub(crate) struct Diffui {
     pub(crate) system_theme: iced_theme::Mode,
     pub(crate) selected_file: usize,
     pub(crate) sidebar_width: f32,
+    /// Whether the diff pane wraps long lines (default) or clips them at the
+    /// pane edge. Global across tabs, persisted with the window state.
+    pub(crate) diff_wrap: bool,
+    /// Two-column (side-by-side) diff layout. Global across tabs, persisted
+    /// with the window state.
+    pub(crate) diff_split: bool,
+    /// Collapsed directories of the sidebar file tree, by full path prefix.
+    /// Per-tab (stashed with the rest of the view state); collapsing once
+    /// stays collapsed across revision switches within the tab.
+    pub(crate) collapsed_dirs: HashSet<String>,
+    /// View-time memo for the file list's stat-column widths and flattened file
+    /// tree, keyed on document identity. Without it, the sidebar re-shaped ~5·N
+    /// strings through `cosmic_text` on every diff-scroll file-boundary crossing
+    /// (each crossing publishes `SelectFile`, which forces a full `view()`
+    /// rebuild) and tanked the frame rate on large PRs. Interior-mutable because
+    /// `view()` only has `&self`; not stashed per-tab since a tab switch
+    /// reassigns `document_id`, which the cache keys already treat as a miss.
+    /// See [`sidebar::SidebarFileCache`].
+    pub(crate) sidebar_file_cache: std::cell::RefCell<sidebar::SidebarFileCache>,
     /// Cached result of `sidebar::min_width(config)`. The min width is
     /// purely a function of `config.ui_font` + `config.mono_font` glyph
     /// advances at `CAPTION_TEXT_SIZE`, which are stable for the life of
@@ -387,6 +428,7 @@ pub(crate) enum HoverTarget {
 pub(crate) struct RepoState {
     pub(crate) session: Session,
     pub(crate) file_list_expanded: bool,
+    pub(crate) collapsed_dirs: HashSet<String>,
     pub(crate) selected_file: usize,
     pub(crate) revision_reveal_token: u64,
     pub(crate) pending_revision_reveal: bool,
@@ -405,6 +447,7 @@ impl RepoState {
         Self {
             session: Session::unloaded(repository, revset),
             file_list_expanded: true,
+            collapsed_dirs: HashSet::new(),
             selected_file: 0,
             revision_reveal_token: 0,
             pending_revision_reveal: false,
@@ -412,6 +455,18 @@ impl RepoState {
             diff_scroll_offset: 0.0,
             activities: activity::ActivityLog::default(),
             pending_load_activity: None,
+        }
+    }
+
+    /// A never-loaded GitHub-PR tab: a `Session` whose source is the PR. No
+    /// local repository, so the watcher/snapshot/mutation machinery stays off
+    /// and `ensure_active_loaded` routes to the streaming PR load.
+    fn unloaded_pr(spec: &github::PrSpec) -> Self {
+        Self {
+            session: Session::for_source(diffui_core::SourceHandle::new(github::PrSource::new(
+                spec.clone(),
+            ))),
+            ..Self::unloaded(None, String::new())
         }
     }
 
@@ -530,25 +585,79 @@ fn selection_from_key(key: &revision_list::RowSelectionKey) -> RevisionSelection
     }
 }
 
-/// Centered empty state shown when no repositories are open (e.g. after
-/// closing the last tab, or when the launch path wasn't a repository).
+/// Welcome screen shown whenever no repository is open: a fresh launch with
+/// nothing to restore (including from the macOS/Spotlight launcher, where cwd is
+/// `/`), or after the last tab is closed. It's the "select a repo" entry point —
+/// a primary open button (the strip's `+` isn't here) plus a click-to-reopen
+/// list of recents. Only an explicit `--path` that failed to resolve surfaces an
+/// error; the session and cwd fallbacks resolve silently to this screen instead.
 fn empty_state<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
-    let heading = match &ui.session.status {
-        LoadStatus::Failed(error) => format!("Couldn't open repository: {error}"),
-        _ => "No repositories open".to_owned(),
-    };
-    let body = column![
-        text(heading)
-            .size(15)
+    let mut body = column![
+        text("Diffui")
+            .size(22)
             .color(theme.text)
-            .font(ui.config.ui_font),
-        text("Press \u{2318}O or + to open a repository.")
+            .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
+    ]
+    .spacing(14)
+    .align_x(alignment::Horizontal::Center);
+
+    // A `Failed` status can now only come from an explicit `--path` (the session
+    // and cwd fallbacks resolve silently), so it's always worth surfacing.
+    if let LoadStatus::Failed(error) = &ui.session.status {
+        body = body.push(
+            text(format!("Couldn't open repository: {error}"))
+                .size(12)
+                .color(theme.removed_text)
+                .font(ui.config.ui_font),
+        );
+    }
+
+    body = body.push(
+        button(
+            text("Open repository\u{2026}")
+                .size(13)
+                .color(theme.background)
+                .font(ui.config.ui_font),
+        )
+        .padding(Padding::from([8, 18]))
+        .on_press(Message::OpenRepoDialogOpen)
+        .style(move |_, _| button::Style {
+            background: Some(Background::Color(theme.accent)),
+            text_color: theme.background,
+            border: Border {
+                width: 0.0,
+                color: Color::TRANSPARENT,
+                radius: 8.0.into(),
+            },
+            shadow: Default::default(),
+            snap: true,
+        }),
+    );
+
+    // Click-to-reopen recents — reuses the open dialog's row builder so both
+    // entry points look identical. `tabs` is empty in this state, so (unlike the
+    // dialog) there's nothing already-open to filter out.
+    let recents: Vec<&String> = ui.recent_repos.iter().take(6).collect();
+    if !recents.is_empty() {
+        let mut list = column![
+            text("Recent")
+                .size(11)
+                .color(theme.subtle_text)
+                .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
+        ]
+        .spacing(2);
+        for root in recents {
+            list = list.push(tab_bar::recent_repo_row(ui, theme, root));
+        }
+        body = body.push(container(list).width(Length::Fixed(320.0)));
+    }
+
+    body = body.push(
+        text("or press \u{2318}O")
             .size(12)
             .color(theme.muted_text)
             .font(ui.config.ui_font),
-    ]
-    .spacing(8)
-    .align_x(alignment::Horizontal::Center);
+    );
 
     container(body)
         .center_x(Length::Fill)
@@ -918,7 +1027,11 @@ fn stream_github_pr_load(
                 let mut batch_lines = 0usize;
                 let result = github::stream_pr_diff(&spec, |file| {
                     progress.increment();
-                    batch_lines += file.hunks.iter().map(|hunk| hunk.lines.len()).sum::<usize>();
+                    batch_lines += file
+                        .hunks
+                        .iter()
+                        .map(|hunk| hunk.lines.len())
+                        .sum::<usize>();
                     batch.push(file);
                     if batch_lines >= BATCH_LINE_LIMIT {
                         let _ = diff_tx

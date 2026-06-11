@@ -72,6 +72,16 @@ pub(crate) enum Message {
         Box<Result<mutations::MutationOutcome, String>>,
     ),
     SelectTheme(ThemePreference),
+    /// Toggle diff-pane line wrapping (toolbar button / ⌥Z). Global and
+    /// persisted with the window state.
+    ToggleDiffWrap,
+    /// Toggle the side-by-side diff layout (toolbar button). Global and
+    /// persisted with the window state.
+    ToggleDiffSplit,
+    /// A click on a file-tree row in the sidebar, by *display* row index
+    /// (the flattened tree, not the document file index): a file row
+    /// selects that file, a directory row toggles its collapse.
+    SidebarFileRow(usize),
     SystemThemeChanged(iced_theme::Mode),
     WindowFocusChanged(bool),
     RefreshRepository,

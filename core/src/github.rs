@@ -8,6 +8,7 @@
 use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
@@ -18,8 +19,9 @@ use crate::graph::assign_lanes;
 use crate::graph_layout::{GraphLayout, GraphLayoutBuilder};
 use crate::model::{
     CommitStore, CommitStoreBuilder, CommitSummary, DiffDocument, DiffFile, DiffFileStatus,
-    RevisionDetails, SignatureInfo,
+    RevisionDetails, RevisionSelection, SignatureInfo,
 };
+use crate::source::{DiffSource, DiffTarget};
 
 /// A pull-request reference: `owner/repo#number`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +99,62 @@ impl PrSpec {
     }
 }
 
+/// A [`DiffSource`] over a GitHub pull request — the first graph-less source.
+/// `WorkingCopy` targets the PR's "all changes" diff; `Commit(oid)` one of its
+/// commits. No `RevisionGraph` capability (interactive frontends stream the
+/// commit list/diff via [`stream_pr_diff`] + [`pr_commit_store`] instead) and
+/// no `Mutable` — a PR is read-only here.
+pub struct PrSource {
+    spec: PrSpec,
+}
+
+impl PrSource {
+    pub fn new(spec: PrSpec) -> Self {
+        Self { spec }
+    }
+
+    pub fn spec(&self) -> &PrSpec {
+        &self.spec
+    }
+}
+
+#[async_trait]
+impl DiffSource for PrSource {
+    fn describe(&self) -> Option<String> {
+        Some(format!("{}/{}", self.spec.owner, self.spec.label()))
+    }
+
+    async fn load_diff(
+        &self,
+        target: &DiffTarget,
+    ) -> Result<(DiffDocument, Option<RevisionDetails>), String> {
+        match target {
+            DiffTarget::Revision(RevisionSelection::Commit(oid)) => {
+                load_pr_commit_diff(&self.spec, oid).await
+            }
+            // The whole-PR diff, collected. Interactive frontends prefer the
+            // streaming [`stream_pr_diff`] (progressive paint); this atomic
+            // form keeps the universal capability complete.
+            DiffTarget::Revision(RevisionSelection::WorkingCopy) => {
+                let mut files = Vec::new();
+                stream_pr_diff(&self.spec, |file| files.push(file))
+                    .await
+                    .map_err(|error| format!("{error:#}"))?;
+                let total_additions = files.iter().map(|file| file.additions).sum();
+                let total_deletions = files.iter().map(|file| file.deletions).sum();
+                Ok((
+                    DiffDocument {
+                        files,
+                        total_additions,
+                        total_deletions,
+                    },
+                    None,
+                ))
+            }
+        }
+    }
+}
+
 /// PR header metadata from `gh pr view`.
 #[derive(Debug, Clone, Default)]
 pub struct PrInfo {
@@ -136,7 +194,11 @@ pub async fn fetch_pr_info(spec: &PrSpec) -> Result<PrInfo> {
         .context("failed to run `gh` — is the GitHub CLI installed and on PATH?")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("gh pr view exited with {}: {}", output.status, stderr.trim());
+        bail!(
+            "gh pr view exited with {}: {}",
+            output.status,
+            stderr.trim()
+        );
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -600,11 +662,7 @@ async fn stream_pr_diff_gh(spec: &PrSpec, mut on_file: impl FnMut(DiffFile)) -> 
     let status = child.wait().await.context("failed to await gh")?;
     let stderr_text = stderr_task.await.unwrap_or_default();
     if !status.success() {
-        bail!(
-            "gh pr diff exited with {}: {}",
-            status,
-            stderr_text.trim()
-        );
+        bail!("gh pr diff exited with {}: {}", status, stderr_text.trim());
     }
     Ok(())
 }
@@ -632,10 +690,7 @@ mod tests {
             PrSpec::parse("github.com/anthropics/claude-code/pull/123"),
             expected
         );
-        assert_eq!(
-            PrSpec::parse("anthropics/claude-code/pull/123"),
-            expected
-        );
+        assert_eq!(PrSpec::parse("anthropics/claude-code/pull/123"), expected);
         assert_eq!(PrSpec::parse("anthropics/claude-code#123"), expected);
     }
 

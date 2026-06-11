@@ -440,6 +440,110 @@ pub trait Mutable: Send + Sync {
     async fn undo(&self) -> Result<Vec<String>, String>;
 }
 
+/// Cloneable, frontend-facing handle to a [`DiffSource`]. A newtype so state
+/// structs (e.g. [`crate::session::Session`]) keep `#[derive(Debug)]` — trait
+/// objects aren't `Debug`, so this prints the source's label instead.
+///
+/// The async helpers take `self` by value (a cheap `Arc` clone) so the
+/// returned futures are `'static` and hand straight to a runtime
+/// (`Task::perform`, `tokio::spawn`) without borrowing the app. Capability
+/// helpers (`load`, `fetch`, `undo`, …) resolve the downcast internally and
+/// surface "unsupported" as a plain `Err`, so call sites stay one-liners.
+#[derive(Clone)]
+pub struct SourceHandle(pub std::sync::Arc<dyn DiffSource>);
+
+impl SourceHandle {
+    pub fn new(source: impl DiffSource + 'static) -> Self {
+        Self(std::sync::Arc::new(source))
+    }
+
+    /// The diff for `revision`, via the universal capability.
+    pub async fn diff(
+        self,
+        revision: RevisionSelection,
+    ) -> Result<(DiffDocument, Option<RevisionDetails>), String> {
+        self.0.load_diff(&DiffTarget::Revision(revision)).await
+    }
+
+    /// Atomic full load via the revision-graph capability.
+    pub async fn load(
+        self,
+        revision: RevisionSelection,
+        revset: String,
+        progress: LoadProgress,
+    ) -> Result<BackendOutput, String> {
+        match self.0.as_revision_graph() {
+            Some(graph) => graph.load(&revision, &revset, progress).await,
+            None => Err("this source has no revision graph to load".to_owned()),
+        }
+    }
+
+    pub async fn snapshot(self) -> Result<RepositorySnapshot, String> {
+        match self.0.as_revision_graph() {
+            Some(graph) => graph.snapshot().await,
+            None => Err("this source has no working copy to snapshot".to_owned()),
+        }
+    }
+
+    /// Op-log head fingerprint; `Ok(None)` for sources without one.
+    pub async fn op_head(self) -> Result<Option<String>, String> {
+        match self.0.as_revision_graph() {
+            Some(graph) => graph.op_head().await,
+            None => Ok(None),
+        }
+    }
+
+    pub async fn details(self, revision: RevisionSelection) -> Result<RevisionDetails, String> {
+        match self.0.as_revision_graph() {
+            Some(graph) => graph.revision_details(&revision).await,
+            None => Err("revision details are not supported by this source".to_owned()),
+        }
+    }
+
+    /// Deferred empty-status resolution; nothing for graph-less sources
+    /// (the marker is cosmetic, so "unsupported" is just an empty result).
+    pub async fn empty_status(self, targets: Vec<(usize, String)>) -> Vec<(usize, bool)> {
+        match self.0.as_revision_graph() {
+            Some(graph) => graph.compute_empty_status(targets).await,
+            None => Vec::new(),
+        }
+    }
+
+    pub async fn fetch(
+        self,
+        target: FetchTarget,
+        progress: LoadProgress,
+    ) -> Result<Vec<String>, String> {
+        match self.0.as_revision_graph() {
+            Some(graph) => graph.fetch(target, progress).await,
+            None => Err("this source cannot fetch".to_owned()),
+        }
+    }
+
+    pub async fn undo(self) -> Result<Vec<String>, String> {
+        match self.0.as_mutable() {
+            Some(mutable) => mutable.undo().await,
+            None => Err("this source does not support undo".to_owned()),
+        }
+    }
+}
+
+impl std::fmt::Debug for SourceHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SourceHandle")
+            .field(&self.0.describe())
+            .finish()
+    }
+}
+
+impl std::ops::Deref for SourceHandle {
+    type Target = dyn DiffSource;
+
+    fn deref(&self) -> &Self::Target {
+        &*self.0
+    }
+}
+
 /// A [`DiffSource`] backed by a local jj/git [`Repository`] — the first concrete
 /// source. The internal `match vcs` keeps today's dispatch; splitting into
 /// `JjSource`/`GitSource` later is invisible to callers behind the traits.

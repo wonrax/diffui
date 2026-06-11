@@ -912,7 +912,7 @@ async fn diff_jj_with_repo(
                 let mut old_line = hunk.left_line_range.start + 1;
                 let mut new_line = hunk.right_line_range.start + 1;
                 for (line_type, tokens) in hunk.lines {
-                    let content = diff_tokens_to_string(tokens);
+                    let (content, raw_emphasis) = diff_tokens_to_line(tokens);
                     match line_type {
                         DiffLineType::Context => {
                             rows.push(DiffLine {
@@ -921,29 +921,36 @@ async fn diff_jj_with_repo(
                                 new_line: Some(new_line),
                                 content,
                                 syntax: Vec::new(),
+                                emphasis: Vec::new(),
                             });
                             old_line += 1;
                             new_line += 1;
                         }
                         DiffLineType::Removed => {
                             file.deletions += 1;
+                            let emphasis =
+                                crate::diff_parse::finish_line_emphasis(&content, raw_emphasis);
                             rows.push(DiffLine {
                                 kind: DiffLineKind::Deletion,
                                 old_line: Some(old_line),
                                 new_line: None,
                                 content,
                                 syntax: Vec::new(),
+                                emphasis,
                             });
                             old_line += 1;
                         }
                         DiffLineType::Added => {
                             file.additions += 1;
+                            let emphasis =
+                                crate::diff_parse::finish_line_emphasis(&content, raw_emphasis);
                             rows.push(DiffLine {
                                 kind: DiffLineKind::Addition,
                                 old_line: None,
                                 new_line: Some(new_line),
                                 content,
                                 syntax: Vec::new(),
+                                emphasis,
                             });
                             new_line += 1;
                         }
@@ -1198,7 +1205,9 @@ pub async fn read_jj_file_pair(
 ) -> Result<(Option<String>, Option<String>)> {
     let handle = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
-        handle.block_on(read_jj_file_pair_inner(repository, revision, path, old_path))
+        handle.block_on(read_jj_file_pair_inner(
+            repository, revision, path, old_path,
+        ))
     })
     .await
     .context("jj file-pair read task failed")?
@@ -1247,8 +1256,12 @@ async fn read_jj_file_pair_inner(
         .with_context(|| format!("failed to load jj parent tree for {}", commit_id.hex()))?;
 
     let new = read_jj_tree_file(repo.as_ref(), &new_tree, &path).await;
-    let old =
-        read_jj_tree_file(repo.as_ref(), &old_tree, old_path.as_deref().unwrap_or(&path)).await;
+    let old = read_jj_tree_file(
+        repo.as_ref(),
+        &old_tree,
+        old_path.as_deref().unwrap_or(&path),
+    )
+    .await;
     Ok((old, new))
 }
 
@@ -1279,7 +1292,9 @@ async fn read_jj_tree_file(
             same_change: SameChange::Accept,
         },
     };
-    let part = git_diff_part(&repo_path, materialized, &options).await.ok()?;
+    let part = git_diff_part(&repo_path, materialized, &options)
+        .await
+        .ok()?;
     if part.content.is_binary || part.content.contents.len() > MAX_SOURCE_BYTES {
         return None;
     }
@@ -2110,17 +2125,33 @@ fn repo_path_label(path: &RepoPath) -> String {
     path.as_internal_file_string().to_owned()
 }
 
-fn diff_tokens_to_string(tokens: Vec<(jj_lib::diff_presentation::DiffTokenType, &[u8])>) -> String {
-    let mut bytes = Vec::new();
-    for (_, token) in tokens {
-        bytes.extend_from_slice(token);
+/// Flatten one line's diff tokens to its content string plus the byte ranges
+/// of the `Different` tokens — jj-lib's word-level refinement, reused as the
+/// intra-line emphasis the parser-based backends compute themselves. Ranges
+/// are tracked in output-string coordinates so lossy UTF-8 conversion can't
+/// shift them; the trailing-newline trim may leave the last range pointing
+/// past the content, which `finish_line_emphasis` clamps.
+fn diff_tokens_to_line(
+    tokens: Vec<(jj_lib::diff_presentation::DiffTokenType, &[u8])>,
+) -> (String, Vec<(usize, usize)>) {
+    let mut content = String::new();
+    let mut raw = Vec::new();
+    for (token_type, token) in tokens {
+        let start = content.len();
+        match std::str::from_utf8(token) {
+            Ok(text) => content.push_str(text),
+            Err(_) => content.push_str(&String::from_utf8_lossy(token)),
+        }
+        if token_type == jj_lib::diff_presentation::DiffTokenType::Different {
+            raw.push((start, content.len()));
+        }
     }
 
-    while matches!(bytes.last(), Some(b'\n' | b'\r')) {
-        bytes.pop();
+    while content.ends_with(['\n', '\r']) {
+        content.pop();
     }
 
-    String::from_utf8_lossy(&bytes).into_owned()
+    (content, raw)
 }
 
 #[cfg(test)]

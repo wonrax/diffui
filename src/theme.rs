@@ -219,6 +219,17 @@ pub fn diff_palette(theme: ThemeSpec) -> Palette {
         hunk_header: theme.hunk_header,
         addition_background: theme.added_line,
         deletion_background: theme.removed_line,
+        // Word-diff token tint, composited over the line tint. A translucent
+        // wash of the add/del *text* color tracks both light and dark themes
+        // without growing the theme spec.
+        addition_emphasis: Color {
+            a: 0.28,
+            ..theme.added_text
+        },
+        deletion_emphasis: Color {
+            a: 0.28,
+            ..theme.removed_text
+        },
         note_background: theme.note_background,
         gutter_background: theme.panel_background,
         border: theme.border,

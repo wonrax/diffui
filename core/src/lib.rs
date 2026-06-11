@@ -29,8 +29,8 @@ pub use session::{
     ColdBatchFold, ColdCursor, LoadStatus, LoadVersion, MutationQueue, QueueAction, RefreshOrigin,
     Session, coalesce_refresh, fold_cold_batch,
 };
-pub use source::{DiffSource, DiffTarget, Mutable, RepoSource, RevisionGraph};
+pub use source::{DiffSource, DiffTarget, Mutable, RepoSource, RevisionGraph, SourceHandle};
 pub use source::{
-    compute_empty_status, fetch, highlight_file, load_backend, load_diff,
-    load_repository_snapshot, load_revision_details, read_op_head, undo,
+    compute_empty_status, fetch, highlight_file, load_backend, load_diff, load_repository_snapshot,
+    load_revision_details, read_op_head, undo,
 };

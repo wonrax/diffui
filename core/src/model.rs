@@ -453,6 +453,110 @@ fn intern_author(
     idx
 }
 
+/// One display row of the changed-files tree: a collapsible directory
+/// (possibly a compacted single-child chain, e.g. `src/sub/dir`) or a file
+/// leaf pointing back into the `files` slice it was built from. Produced by
+/// [`file_tree_rows`]; the frontend renders these flat with `depth`-based
+/// indentation, so its row virtualization stays simple arithmetic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileTreeRow {
+    Dir {
+        /// Display name: the path component, or a `a/b/c` chain when every
+        /// intermediate directory has exactly one child.
+        label: String,
+        /// Full path prefix from the root — the stable collapse key.
+        path: String,
+        depth: usize,
+        collapsed: bool,
+    },
+    File {
+        file_index: usize,
+        /// The basename (the tree shows structure; the full path lives on
+        /// the file entry itself).
+        label: String,
+        depth: usize,
+    },
+}
+
+/// Flatten `files` into tree display rows: directories first (alphabetical,
+/// single-child chains compacted), then files (alphabetical), recursively —
+/// skipping the contents of any directory whose path is in `collapsed`.
+pub fn file_tree_rows(
+    files: &[DiffFile],
+    collapsed: &std::collections::HashSet<String>,
+) -> Vec<FileTreeRow> {
+    use std::collections::BTreeMap;
+
+    #[derive(Default)]
+    struct Node {
+        dirs: BTreeMap<String, Node>,
+        files: BTreeMap<String, usize>,
+    }
+
+    let mut root = Node::default();
+    for (index, file) in files.iter().enumerate() {
+        let mut node = &mut root;
+        let mut components = file.path.split('/').peekable();
+        while let Some(component) = components.next() {
+            if components.peek().is_none() {
+                // Duplicate basenames within one directory can't happen in
+                // one diff; last-wins is harmless if a source ever emits one.
+                node.files.insert(component.to_owned(), index);
+            } else {
+                node = node.dirs.entry(component.to_owned()).or_default();
+            }
+        }
+    }
+
+    fn emit(
+        node: &Node,
+        prefix: &str,
+        depth: usize,
+        collapsed: &std::collections::HashSet<String>,
+        rows: &mut Vec<FileTreeRow>,
+    ) {
+        for (name, child) in &node.dirs {
+            // Compact single-child directory chains into one row.
+            let mut label = name.clone();
+            let mut child = child;
+            while child.files.is_empty() && child.dirs.len() == 1 {
+                let Some((next_name, next_child)) = child.dirs.iter().next() else {
+                    break;
+                };
+                label.push('/');
+                label.push_str(next_name);
+                child = next_child;
+            }
+            let path = if prefix.is_empty() {
+                label.clone()
+            } else {
+                format!("{prefix}/{label}")
+            };
+            let is_collapsed = collapsed.contains(&path);
+            rows.push(FileTreeRow::Dir {
+                label,
+                path: path.clone(),
+                depth,
+                collapsed: is_collapsed,
+            });
+            if !is_collapsed {
+                emit(child, &path, depth + 1, collapsed, rows);
+            }
+        }
+        for (name, &file_index) in &node.files {
+            rows.push(FileTreeRow::File {
+                file_index,
+                label: name.clone(),
+                depth,
+            });
+        }
+    }
+
+    let mut rows = Vec::with_capacity(files.len());
+    emit(&root, "", 0, collapsed, &mut rows);
+    rows
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffFileStatus {
     Added,
@@ -601,6 +705,12 @@ pub struct DiffLine {
     pub new_line: Option<usize>,
     pub content: String,
     pub syntax: Vec<SyntaxSpan>,
+    /// Byte ranges of the tokens that actually changed within this line
+    /// (intra-line/word diff), present on deletion/addition lines that pair
+    /// up across a change. Empty for unpaired lines and for lines rewritten
+    /// nearly wholesale, where token emphasis would just restate the line
+    /// tint. See `diff_parse::mark_intra_line_changes`.
+    pub emphasis: Vec<(usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -635,4 +745,94 @@ pub enum SyntaxKind {
     Type,
     Property,
     Punctuation,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn file(path: &str) -> DiffFile {
+        DiffFile {
+            path: path.to_owned(),
+            old_path: None,
+            status: DiffFileStatus::Modified,
+            hunks: Vec::new(),
+            additions: 0,
+            deletions: 0,
+        }
+    }
+
+    #[test]
+    fn file_tree_compacts_chains_and_sorts_dirs_first() {
+        let files = vec![
+            file("src/deep/only/child.rs"),
+            file("src/main.rs"),
+            file("README.md"),
+            file("src/a.rs"),
+        ];
+        let rows = file_tree_rows(&files, &HashSet::new());
+        assert_eq!(
+            rows,
+            vec![
+                FileTreeRow::Dir {
+                    label: "src".to_owned(),
+                    path: "src".to_owned(),
+                    depth: 0,
+                    collapsed: false,
+                },
+                FileTreeRow::Dir {
+                    label: "deep/only".to_owned(),
+                    path: "src/deep/only".to_owned(),
+                    depth: 1,
+                    collapsed: false,
+                },
+                FileTreeRow::File {
+                    file_index: 0,
+                    label: "child.rs".to_owned(),
+                    depth: 2,
+                },
+                FileTreeRow::File {
+                    file_index: 3,
+                    label: "a.rs".to_owned(),
+                    depth: 1,
+                },
+                FileTreeRow::File {
+                    file_index: 1,
+                    label: "main.rs".to_owned(),
+                    depth: 1,
+                },
+                FileTreeRow::File {
+                    file_index: 2,
+                    label: "README.md".to_owned(),
+                    depth: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn collapsed_dirs_hide_their_contents() {
+        let files = vec![file("src/deep/only/child.rs"), file("src/main.rs")];
+        let collapsed: HashSet<String> = ["src/deep/only".to_owned()].into();
+        let rows = file_tree_rows(&files, &collapsed);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| matches!(row, FileTreeRow::File { .. }))
+                .count(),
+            1
+        );
+        assert!(rows.iter().any(|row| matches!(
+            row,
+            FileTreeRow::Dir {
+                collapsed: true,
+                ..
+            }
+        )));
+
+        // Collapsing the root dir hides everything beneath it.
+        let collapsed: HashSet<String> = ["src".to_owned()].into();
+        let rows = file_tree_rows(&files, &collapsed);
+        assert_eq!(rows.len(), 1);
+    }
 }

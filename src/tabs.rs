@@ -26,6 +26,7 @@ impl Diffui {
         RepoState {
             session,
             file_list_expanded: self.file_list_expanded,
+            collapsed_dirs: std::mem::take(&mut self.collapsed_dirs),
             selected_file: self.selected_file,
             revision_reveal_token: self.revision_reveal_token,
             pending_revision_reveal: self.pending_revision_reveal,
@@ -52,6 +53,7 @@ impl Diffui {
         // `(file, hunk, line)` keys map to that tab's text, not this one's.
         self.document_version = self.document_version.wrapping_add(1);
         self.file_list_expanded = state.file_list_expanded;
+        self.collapsed_dirs = state.collapsed_dirs;
         self.selected_file = state.selected_file;
         self.revision_reveal_token = state.revision_reveal_token;
         self.pending_revision_reveal = state.pending_revision_reveal;
@@ -252,7 +254,8 @@ impl Diffui {
         }
         let owner = spec.owner.clone();
         let name = spec.label();
-        self.push_tab(owner, name, source, RepoState::unloaded(None, String::new()))
+        let state = RepoState::unloaded_pr(&spec);
+        self.push_tab(owner, name, source, state)
     }
 
     /// Append a new tab and make it active, kicking its load. Shared tail of

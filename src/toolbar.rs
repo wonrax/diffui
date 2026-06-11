@@ -92,6 +92,22 @@ pub fn build_toolbar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             font,
         ));
     }
+    actions = actions.push(toolbar_toggle_button(
+        "\u{21B5}",
+        "Wrap",
+        ui.diff_wrap,
+        Message::ToggleDiffWrap,
+        theme,
+        font,
+    ));
+    actions = actions.push(toolbar_toggle_button(
+        "\u{2016}",
+        "Split",
+        ui.diff_split,
+        Message::ToggleDiffSplit,
+        theme,
+        font,
+    ));
 
     let bar = row![
         actions,
@@ -139,6 +155,47 @@ fn toolbar_button(
         .padding(Padding::from([4, 9]))
         .on_press(message)
         .style(move |_, status| bordered_button_style(theme, status))
+        .into()
+}
+
+/// A toolbar toggle: like [`toolbar_button`], but with a persistent accent
+/// tint while active so the on state reads at a glance (the diff-wrap
+/// toggle). The glyph carries the accent; the fill/border deepen with it.
+fn toolbar_toggle_button(
+    glyph: &str,
+    label: &str,
+    active: bool,
+    message: Message,
+    theme: ThemeSpec,
+    font: iced::Font,
+) -> Element<'static, Message> {
+    let glyph_color = if active {
+        theme.accent
+    } else {
+        theme.muted_text
+    };
+    let content = row![
+        text(glyph.to_owned())
+            .size(13)
+            .color(glyph_color)
+            .font(font),
+        text(label.to_owned()).size(12).color(theme.text).font(font),
+    ]
+    .spacing(5)
+    .align_y(alignment::Vertical::Center);
+    button(content)
+        .padding(Padding::from([4, 9]))
+        .on_press(message)
+        .style(move |_, status| {
+            let mut style = bordered_button_style(theme, status);
+            if active {
+                style
+                    .background
+                    .get_or_insert(Background::Color(chip_background(theme.accent)));
+                style.border.color = theme.accent;
+            }
+            style
+        })
         .into()
 }
 

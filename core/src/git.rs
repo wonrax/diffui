@@ -215,9 +215,8 @@ pub async fn read_git_file_pair(
                 .await
                 .ok()
                 .and_then(|bytes| {
-                    (bytes.len() <= MAX_SOURCE_BYTES).then(|| {
-                        String::from_utf8_lossy(&bytes).into_owned()
-                    })
+                    (bytes.len() <= MAX_SOURCE_BYTES)
+                        .then(|| String::from_utf8_lossy(&bytes).into_owned())
                 });
             let old = git_show_file(&repository.root, &format!("HEAD:{old_path}"))
                 .await

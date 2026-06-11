@@ -42,6 +42,14 @@ pub struct WindowState {
     pub y: Option<f32>,
     #[serde(default)]
     pub sidebar_width: Option<f32>,
+    /// Whether the diff pane wraps long lines. `None` (older state files)
+    /// falls back to wrapping on.
+    #[serde(default)]
+    pub diff_wrap: Option<bool>,
+    /// Whether the diff pane uses the side-by-side layout. `None` falls back
+    /// to the unified view.
+    #[serde(default)]
+    pub diff_split: Option<bool>,
     /// Repository roots that were open as tabs, in tab order. Restored on the
     /// next launch when no repositories are given on the command line.
     #[serde(default)]
@@ -214,6 +222,8 @@ mod tests {
             x: Some(100.0),
             y: Some(50.0),
             sidebar_width: Some(280.0),
+            diff_wrap: Some(false),
+            diff_split: Some(true),
             open_repos: vec!["/a/repo".to_owned(), "/b/repo".to_owned()],
             active_repo: Some("/b/repo".to_owned()),
             revsets: BTreeMap::from([
@@ -227,6 +237,8 @@ mod tests {
         assert_eq!(parsed.size(), Some((1200.0, 800.0)));
         assert_eq!(parsed.position(), Some((100.0, 50.0)));
         assert_eq!(parsed.sidebar_width, Some(280.0));
+        assert_eq!(parsed.diff_wrap, Some(false));
+        assert_eq!(parsed.diff_split, Some(true));
         assert_eq!(
             parsed.open_repos,
             vec!["/a/repo".to_owned(), "/b/repo".to_owned()]

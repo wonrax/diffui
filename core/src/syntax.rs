@@ -387,6 +387,7 @@ mod tests {
             new_line: Some(new),
             content: content.to_owned(),
             syntax: Vec::new(),
+            emphasis: Vec::new(),
         }
     }
 
@@ -396,7 +397,8 @@ mod tests {
     /// string interior.
     #[test]
     fn full_source_highlights_across_hunk_boundaries() {
-        let source = "const GREETING: &str = \"hello\nworld of let keywords\nbye\";\nfn main() {}\n";
+        let source =
+            "const GREETING: &str = \"hello\nworld of let keywords\nbye\";\nfn main() {}\n";
         let make_file = || DiffFile {
             path: "test.rs".to_owned(),
             old_path: None,

@@ -37,7 +37,9 @@ const LINE_SCROLL_ROWS: f32 = 1.5;
 const PIXEL_SCROLL_SCALE: f32 = 0.65;
 
 const REVISION_ROW_HEIGHT: f32 = 46.0;
-const FILE_ROW_HEIGHT: f32 = 42.0;
+const FILE_ROW_HEIGHT: f32 = 26.0;
+/// Horizontal indent per tree depth level for file/directory rows.
+pub const FILE_TREE_INDENT: f32 = 14.0;
 pub const GUTTER_LEFT_PADDING: f32 = 8.0;
 pub const GUTTER_PADDING: f32 = 8.0;
 const CONTENT_PADDING: f32 = 12.0;
@@ -113,6 +115,11 @@ pub struct RevisionRowView {
     /// Color for the `+N` overflow chip (= the row's lane color).
     pub lane_color: Color,
     pub frame: LaneFrame,
+    /// Warped lane → display-column maps for this row and the previous one
+    /// (`LaneFrame::display_columns`): x positions only — every lane-keyed
+    /// lookup (labels, segments, colors) stays on original indices.
+    pub columns: Vec<Option<usize>>,
+    pub prev_columns: Vec<Option<usize>>,
     /// Bookmarks naming each lane visible at this row. Indexed by lane.
     /// An empty inner vec means the lane segment is anonymous (no
     /// bookmark up to this point in the walk). Used for the
@@ -142,8 +149,9 @@ pub struct RevisionRowView {
 
 #[derive(Debug, Clone)]
 pub struct FileRowView {
+    /// Display label: a file's basename, or a directory's (possibly
+    /// chain-compacted) name.
     pub primary: String,
-    pub secondary: String,
     pub raw_path: String,
     pub status_label: String,
     pub status_background: Color,
@@ -153,10 +161,20 @@ pub struct FileRowView {
     pub additions_text: Color,
     pub deletions_text: Color,
     pub continuation: Vec<Option<GraphEdgeType>>,
+    /// Warped display columns of the parent revision row (see
+    /// [`RevisionRowView::columns`]); the continuation strokes inherit its
+    /// packing so the strip doesn't jump at the revision/file boundary.
+    pub columns: Vec<Option<usize>>,
     pub additions_width: f32,
     pub deletions_width: f32,
     pub primary_color: Color,
-    pub secondary_color: Color,
+    /// Tree indentation in px (depth × step), applied left of the badge.
+    pub indent: f32,
+    /// `Some(collapsed)` renders this as a directory row: a chevron instead
+    /// of the status badge, no +/- stats. `None` is a file leaf.
+    pub chevron: Option<bool>,
+    /// The document file index for leaves (selection highlight + click);
+    /// `usize::MAX` for directory rows, which never match a selection.
     pub file_index: usize,
     /// Lane → bookmark labels for the continuation strokes at this file
     /// row. Equals the post-trim snapshot of the parent revision's
@@ -184,7 +202,7 @@ pub enum Item {
 }
 
 /// What a flat row index maps to: a commit (by index) or a file row under the
-/// expanded commit (by file index).
+/// expanded commit (by its display index into the file tree).
 #[derive(Clone, Copy)]
 enum RowKind {
     Revision(usize),
@@ -222,6 +240,8 @@ pub struct RevisionList<'a, Message> {
     /// `scroll_token` mechanism in `DiffView` for find matches.
     reveal_token: Option<u64>,
     on_select_revision: fn(RowSelectionKey) -> Message,
+    /// Receives the clicked file row's *display* index into the file tree
+    /// (dir rows included), not a document file index.
     on_select_file: fn(usize) -> Message,
     /// Optional right-click handler for a revision row — opens the context
     /// menu. Receives the row's selection key and its on-screen rectangle (in
@@ -343,9 +363,23 @@ impl<'a, Message> RevisionList<'a, Message> {
     }
 
     fn item_gutter_width(&self, item: &Item) -> f32 {
+        // Warped width: the strip is as wide as the rightmost *display*
+        // column in use, not the rightmost original lane index.
         let lanes = match item {
-            Item::Revision(row) => row.frame.lane_count(),
-            Item::File(row) => row.continuation.len(),
+            Item::Revision(row) => row
+                .columns
+                .iter()
+                .flatten()
+                .max()
+                .map_or(row.frame.lane_count(), |max| max + 1),
+            Item::File(row) => row
+                .continuation
+                .iter()
+                .enumerate()
+                .filter(|(_, kind)| kind.is_some())
+                .filter_map(|(lane, _)| row.columns.get(lane).copied().flatten())
+                .max()
+                .map_or(row.continuation.len(), |max| max + 1),
         };
         GUTTER_LEFT_PADDING + lane_strip_width(lanes) + GUTTER_PADDING
     }
@@ -623,22 +657,27 @@ where
             // labeled lane wins over the content-area file tooltip.
             if local_x >= GUTTER_LEFT_PADDING && local_x < gutter_total - GUTTER_PADDING {
                 let strip_x = local_x - GUTTER_LEFT_PADDING;
-                let lane = (strip_x / LANE_WIDTH).floor() as usize;
-                let labels = item_lane_labels(&item, lane);
-                if !labels.is_empty() {
-                    // Pick the half from the cursor's vertical position
-                    // within the row, so a click on the incoming stub of
-                    // a split lane resolves to that branch's segment
-                    // (not the unrelated new branch starting below).
-                    let row_top = this.row_top(row_idx);
-                    let row_h = this.row_height(&item);
-                    let half = if local_y - row_top < f64::from(row_h) / 2.0 {
-                        LaneHalf::Before
-                    } else {
-                        LaneHalf::After
-                    };
-                    state.hovered_lane = Some((row_idx, lane, half));
-                    return;
+                let display = (strip_x / LANE_WIDTH).floor() as usize;
+                // Pick the half from the cursor's vertical position
+                // within the row, so a click on the incoming stub of
+                // a split lane resolves to that branch's segment
+                // (not the unrelated new branch starting below).
+                let row_top = this.row_top(row_idx);
+                let row_h = this.row_height(&item);
+                let half = if local_y - row_top < f64::from(row_h) / 2.0 {
+                    LaneHalf::Before
+                } else {
+                    LaneHalf::After
+                };
+                // The cursor x is a *display* column under lane warping;
+                // everything downstream (labels, segments) keys on the
+                // original lane, so map it back first.
+                if let Some(lane) = item_display_to_lane(&item, display, half) {
+                    let labels = item_lane_labels(&item, lane);
+                    if !labels.is_empty() {
+                        state.hovered_lane = Some((row_idx, lane, half));
+                        return;
+                    }
                 }
             }
             if matches!(item, Item::File(_)) {
@@ -751,13 +790,19 @@ where
                 }
                 let local_y = (cursor_pos.y - bounds.y) as f64 + state.vertical_offset;
                 if let Some(row_idx) = self.row_at_offset(local_y) {
-                    match self.item_at(row_idx) {
-                        Item::Revision(rev) => {
-                            shell.publish((self.on_select_revision)(rev.selection_key));
+                    match self.row_kind(row_idx) {
+                        RowKind::Revision(_) => {
+                            if let Item::Revision(rev) = self.item_at(row_idx) {
+                                shell.publish((self.on_select_revision)(rev.selection_key));
+                            }
                             shell.capture_event();
                         }
-                        Item::File(f) => {
-                            shell.publish((self.on_select_file)(f.file_index));
+                        // The callback wants the *display* row index into the
+                        // file tree (directories toggle their collapse state
+                        // by position), not `FileRowView::file_index` — which
+                        // is the document index and `usize::MAX` for dirs.
+                        RowKind::File(display_index) => {
+                            shell.publish((self.on_select_file)(display_index));
                             shell.capture_event();
                         }
                     }
@@ -1452,6 +1497,8 @@ impl<'a, Message> RevisionList<'a, Message> {
             renderer,
             gutter_bounds,
             &rev.frame,
+            &rev.columns,
+            &rev.prev_columns,
             &self.style.graph,
             node_override,
             emphasized_lane_before,
@@ -1489,121 +1536,117 @@ impl<'a, Message> RevisionList<'a, Message> {
             self.style.border,
         );
 
-        let content_x = row_bounds.x + gutter_total;
+        let content_x = row_bounds.x + gutter_total + f.indent;
         let row_clip = row_bounds;
         let row_mid_y = row_bounds.y + row_bounds.height / 2.0;
 
-        // Status badge — vertically centered on the row mid-line.
         let badge_w = self.style.file_badge_width;
-        let badge_h = 14.0;
-        let badge_y = row_mid_y - badge_h / 2.0;
-        fill_quad(
-            renderer,
-            Rectangle {
-                x: content_x,
-                y: badge_y,
-                width: badge_w,
-                height: badge_h,
-            },
-            f.status_background,
-            INDICATOR_RADIUS,
-        );
-        fill_text_centered_y(
-            renderer,
-            &f.status_label,
-            content_x + badge_w / 2.0,
-            row_mid_y,
-            badge_w,
-            FILE_BADGE_TEXT_SIZE,
-            f.status_text,
-            self.style.primary_font,
-            row_clip,
-            text::Alignment::Center,
-        );
+        match f.chevron {
+            // Directory row: a collapse chevron stands in for the badge.
+            Some(collapsed) => {
+                let glyph = if collapsed { "\u{25B8}" } else { "\u{25BE}" };
+                fill_text_centered_y(
+                    renderer,
+                    glyph,
+                    content_x + badge_w / 2.0,
+                    row_mid_y,
+                    badge_w,
+                    CAPTION_TEXT_SIZE,
+                    f.primary_color,
+                    self.style.primary_font,
+                    row_clip,
+                    text::Alignment::Center,
+                );
+            }
+            // File row: status badge — vertically centered on the mid-line.
+            None => {
+                let badge_h = 14.0;
+                let badge_y = row_mid_y - badge_h / 2.0;
+                fill_quad(
+                    renderer,
+                    Rectangle {
+                        x: content_x,
+                        y: badge_y,
+                        width: badge_w,
+                        height: badge_h,
+                    },
+                    f.status_background,
+                    INDICATOR_RADIUS,
+                );
+                fill_text_centered_y(
+                    renderer,
+                    &f.status_label,
+                    content_x + badge_w / 2.0,
+                    row_mid_y,
+                    badge_w,
+                    FILE_BADGE_TEXT_SIZE,
+                    f.status_text,
+                    self.style.primary_font,
+                    row_clip,
+                    text::Alignment::Center,
+                );
+            }
+        }
 
-        // Layout: [badge] gap [path] gap [+N width=additions_width] gap [-N width=deletions_width] right_pad
+        // Layout: [indent] [badge|chevron] gap [name] gap [+N] gap [-N] right_pad
+        // (directory rows skip the stats and run the name to the right edge).
         let row_gap = FILE_ROW_GAP;
         let right_pad = FILE_ROW_RIGHT_PAD;
         let minus_x = row_bounds.x + row_bounds.width - f.deletions_width - right_pad;
         let plus_x = minus_x - row_gap - f.additions_width;
 
-        // Path: primary line + (optional) secondary parent line.
         let path_x = content_x + badge_w + row_gap;
-        let path_w = (plus_x - path_x - row_gap).max(1.0);
-
-        // `fill_text_truncated` applies an end-ellipsis at the renderer level.
-        // The display models from main.rs already pick a smart truncation
-        // (preserves the basename, middle-ellipses the prefix); the renderer
-        // ellipsis is a safety net for the cases that logic can't squeeze —
-        // e.g. a basename that itself is wider than `path_w` — so the text
-        // doesn't bleed visually into the +N / -N columns to the right.
-        if f.secondary.is_empty() {
-            fill_text_truncated(
-                renderer,
-                &f.primary,
-                path_x,
-                row_mid_y,
-                path_w,
-                CAPTION_TEXT_SIZE,
-                f.primary_color,
-                self.style.primary_font,
-                row_clip,
-            );
+        let path_right = if f.chevron.is_some() {
+            row_bounds.x + row_bounds.width - right_pad
         } else {
-            let secondary_size = (CAPTION_TEXT_SIZE - 2.0).max(9.0);
-            // Stack two text rows visually centered on the row mid-line.
-            let primary_mid = row_mid_y - secondary_size * 0.55;
-            let secondary_mid = row_mid_y + CAPTION_TEXT_SIZE * 0.55;
-            fill_text_truncated(
+            plus_x - row_gap
+        };
+        let path_w = (path_right - path_x).max(1.0);
+
+        // `fill_text_truncated` applies an end-ellipsis at the renderer
+        // level, so a name wider than `path_w` doesn't bleed into the +N /
+        // -N columns; the full path is on the hover tooltip.
+        fill_text_truncated(
+            renderer,
+            &f.primary,
+            path_x,
+            row_mid_y,
+            path_w,
+            CAPTION_TEXT_SIZE,
+            f.primary_color,
+            self.style.primary_font,
+            row_clip,
+        );
+
+        // Directory rows carry no stats; their name runs to the right edge.
+        if f.chevron.is_none() {
+            let plus = format!("+{}", f.additions);
+            let minus = format!("-{}", f.deletions);
+            fill_text_centered_y(
                 renderer,
-                &f.primary,
-                path_x,
-                primary_mid,
-                path_w,
+                &plus,
+                plus_x,
+                row_mid_y,
+                f.additions_width,
                 CAPTION_TEXT_SIZE,
-                f.primary_color,
+                f.additions_text,
                 self.style.primary_font,
                 row_clip,
+                text::Alignment::Left,
             );
-            fill_text_truncated(
+            fill_text_centered_y(
                 renderer,
-                &f.secondary,
-                path_x,
-                secondary_mid,
-                path_w,
-                secondary_size,
-                f.secondary_color,
+                &minus,
+                minus_x,
+                row_mid_y,
+                f.deletions_width + right_pad,
+                CAPTION_TEXT_SIZE,
+                f.deletions_text,
                 self.style.primary_font,
                 row_clip,
+                text::Alignment::Left,
             );
         }
-
-        let plus = format!("+{}", f.additions);
-        let minus = format!("-{}", f.deletions);
-        fill_text_centered_y(
-            renderer,
-            &plus,
-            plus_x,
-            row_mid_y,
-            f.additions_width,
-            CAPTION_TEXT_SIZE,
-            f.additions_text,
-            self.style.primary_font,
-            row_clip,
-            text::Alignment::Left,
-        );
-        fill_text_centered_y(
-            renderer,
-            &minus,
-            minus_x,
-            row_mid_y,
-            f.deletions_width + right_pad,
-            CAPTION_TEXT_SIZE,
-            f.deletions_text,
-            self.style.primary_font,
-            row_clip,
-            text::Alignment::Left,
-        );
 
         // Graph last — same z-order rationale as draw_revision.
         let gutter_bounds = Rectangle {
@@ -1616,6 +1659,7 @@ impl<'a, Message> RevisionList<'a, Message> {
             renderer,
             gutter_bounds,
             &f.continuation,
+            &f.columns,
             &self.style.graph,
             emphasized_lane,
         );
@@ -1691,6 +1735,20 @@ impl<'a, Message> RevisionList<'a, Message> {
         );
         chip_w
     }
+}
+
+/// Original lane index occupying warped `display` column at this item's
+/// row, or `None` for an empty column. The top half of a transitioning row
+/// reads the previous row's packing (that's where the slide starts).
+fn item_display_to_lane(item: &Item, display: usize, half: LaneHalf) -> Option<usize> {
+    let columns = match (item, half) {
+        (Item::Revision(row), LaneHalf::Before) if !row.prev_columns.is_empty() => {
+            &row.prev_columns
+        }
+        (Item::Revision(row), _) => &row.columns,
+        (Item::File(row), _) => &row.columns,
+    };
+    columns.iter().position(|column| *column == Some(display))
 }
 
 /// Bookmark labels for `lane` at this item's row, or an empty slice

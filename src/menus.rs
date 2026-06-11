@@ -262,21 +262,17 @@ impl Diffui {
             // read the revision off-thread, format the field, and copy — falling
             // back to the in-memory value on failure.
             MenuAction::CopyDetail { field, fallback } => {
-                let (Some(repository), Some(selection)) =
-                    (self.session.repository.clone(), selection)
+                let (Some(source), Some(selection)) = (self.session.source.clone(), selection)
                 else {
                     return Task::none();
                 };
-                return Task::perform(
-                    diffui_core::load_revision_details(repository, selection),
-                    move |result| {
-                        let text = result
-                            .ok()
-                            .and_then(|details| format_detail(&details, field))
-                            .unwrap_or(fallback);
-                        Message::CopyToClipboard(text)
-                    },
-                );
+                return Task::perform(source.details(selection), move |result| {
+                    let text = result
+                        .ok()
+                        .and_then(|details| format_detail(&details, field))
+                        .unwrap_or(fallback);
+                    Message::CopyToClipboard(text)
+                });
             }
             MenuAction::Mutate(op) => op,
         };

@@ -70,6 +70,29 @@ impl LaneFrame {
             .max(self.node_lane + 1)
     }
 
+    /// Display-column packing for the "warped" graph rendering: live lanes
+    /// (occupied in either half, or carrying the node) compact leftward in
+    /// index order — so a lane stranded far right slides into free space —
+    /// and dead lanes get `None`. Index order is preserved, so warped edges
+    /// never cross; colors, labels and hit-testing stay keyed by the
+    /// original lane index and only x positions move. The renderer pairs a
+    /// row's columns with the previous row's to draw transition slants.
+    pub fn display_columns(&self) -> Vec<Option<usize>> {
+        let width = self.lane_count();
+        let mut columns = vec![None; width];
+        let mut next = 0;
+        for (lane, column) in columns.iter_mut().enumerate() {
+            let live = lane == self.node_lane
+                || self.before.get(lane).copied().flatten().is_some()
+                || self.after.get(lane).copied().flatten().is_some();
+            if live {
+                *column = Some(next);
+                next += 1;
+            }
+        }
+        columns
+    }
+
     /// True if lane `i` runs straight through this row uninterrupted by the
     /// node — same edge kind in `before` and `after`, not the node lane, and
     /// not part of an incoming merge.
@@ -287,6 +310,41 @@ mod tests {
         rows.iter()
             .map(|(id, frame)| (*id, frame.node_lane))
             .collect()
+    }
+
+    #[test]
+    fn display_columns_pack_live_lanes_in_order() {
+        // A row where lane 1 is dead but lanes 0 and 2 are alive: the
+        // packing slides lane 2 into column 1 and skips the dead lane.
+        let frame = LaneFrame {
+            before: vec![
+                Some(GraphEdgeType::Direct),
+                None,
+                Some(GraphEdgeType::Direct),
+            ],
+            after: vec![
+                Some(GraphEdgeType::Direct),
+                None,
+                Some(GraphEdgeType::Direct),
+            ],
+            node_lane: 0,
+            merging_lanes: Vec::new(),
+            missing_parents: 0,
+        };
+        assert_eq!(frame.display_columns(), vec![Some(0), None, Some(1)]);
+
+        // The node's lane counts as live even with no edges on it.
+        let solo_far_right = LaneFrame {
+            before: vec![Some(GraphEdgeType::Direct), None, None],
+            after: vec![Some(GraphEdgeType::Direct)],
+            node_lane: 2,
+            merging_lanes: Vec::new(),
+            missing_parents: 0,
+        };
+        assert_eq!(
+            solo_far_right.display_columns(),
+            vec![Some(0), None, Some(1)]
+        );
     }
 
     /// Render the lane state of every row as a textual sketch:

@@ -60,36 +60,48 @@ impl Diffui {
             .unwrap_or_else(|| window::Settings::default().size);
         let window_position = saved.position().map(|(x, y)| Point::new(x, y));
 
-        // Targets to open: explicit CLI args win; otherwise restore last
-        // session's open repos; otherwise the current directory. An arg is a
-        // GitHub PR reference (URL / `owner/repo#123`) or a repository path.
-        // Unresolvable paths are skipped (keeping the first error so a single
-        // bad path still surfaces a message); the survivors each become a tab.
+        // Launch precedence: explicit `--path` args win; else restore last
+        // session; else fall back to the current directory *only if it's a
+        // repo* (the `cd repo && diffui` terminal flow). A `--path` arg is a
+        // GitHub PR reference (URL / `owner/repo#123`) or a repository path;
+        // session and cwd entries are always local repos (PR tabs are
+        // session-only and never persisted). Only `--path` failures surface
+        // an error — the user named those this launch. A vanished session
+        // repo or a non-repo cwd (e.g. `/` from the Spotlight/Dock launcher)
+        // is silently skipped, leaving zero tabs and the welcome screen
+        // rather than a "not inside a repository" error.
         enum BootTarget {
             Repo(Repository),
             Pr(github::PrSpec),
         }
-        let requested: Vec<PathBuf> = if !cli.paths.is_empty() {
-            cli.paths
-        } else if !saved.open_repos.is_empty() {
-            saved.open_repos.iter().map(PathBuf::from).collect()
-        } else {
-            vec![PathBuf::from(".")]
-        };
         let mut targets = Vec::new();
         let mut first_error = None;
-        for path in &requested {
-            if let Some(spec) = github::PrSpec::parse(&path.to_string_lossy()) {
-                targets.push(BootTarget::Pr(spec));
-                continue;
-            }
-            match prepare_repository(path) {
-                Ok(repository) => targets.push(BootTarget::Repo(repository)),
-                Err(error) => {
-                    if first_error.is_none() {
-                        first_error = Some(format!("{error:#}"));
+        if !cli.paths.is_empty() {
+            for path in &cli.paths {
+                if let Some(spec) = github::PrSpec::parse(&path.to_string_lossy()) {
+                    targets.push(BootTarget::Pr(spec));
+                    continue;
+                }
+                match prepare_repository(path) {
+                    Ok(repository) => targets.push(BootTarget::Repo(repository)),
+                    Err(error) => {
+                        if first_error.is_none() {
+                            first_error = Some(format!("{error:#}"));
+                        }
                     }
                 }
+            }
+        } else {
+            for path in &saved.open_repos {
+                if let Ok(repository) = prepare_repository(Path::new(path)) {
+                    targets.push(BootTarget::Repo(repository));
+                }
+            }
+            if targets.is_empty()
+                && let Ok(cwd) = std::env::current_dir()
+                && let Ok(repository) = prepare_repository(&cwd)
+            {
+                targets.push(BootTarget::Repo(repository));
             }
         }
 
@@ -100,9 +112,7 @@ impl Diffui {
             .as_deref()
             .and_then(|active| {
                 targets.iter().position(|target| match target {
-                    BootTarget::Repo(repository) => {
-                        repository.root.to_string_lossy() == active
-                    }
+                    BootTarget::Repo(repository) => repository.root.to_string_lossy() == active,
                     BootTarget::Pr(_) => false,
                 })
             })
@@ -194,11 +204,14 @@ impl Diffui {
                 session
             },
             file_list_expanded: true,
+            collapsed_dirs: Default::default(),
             app_focused: true,
             selected_theme: config.theme,
             system_theme: iced_theme::Mode::None,
             selected_file: 0,
             sidebar_width,
+            diff_wrap: saved.diff_wrap.unwrap_or(true),
+            diff_split: saved.diff_split.unwrap_or(false),
             sidebar_min_width,
             window_size,
             window_position,
@@ -213,6 +226,7 @@ impl Diffui {
             diff_scroll_offset: 0.0,
             scroll_restore_token: 0,
             document_version: 0,
+            sidebar_file_cache: Default::default(),
             tabs,
             active_tab,
             next_tab_id,
@@ -271,8 +285,7 @@ impl Diffui {
                     // somehow still in flight, supersede it so its late batches
                     // (which assume the now-replaced row indices) are dropped.
                     target.session.load = None;
-                    target.session.commits_version =
-                        target.session.commits_version.wrapping_add(1);
+                    target.session.commits_version = target.session.commits_version.wrapping_add(1);
                     target.session.repository_snapshot = Some(output.snapshot);
                     target.session.branch_status = output.branch_status;
                     target.session.bookmarks = output.bookmarks;
@@ -335,7 +348,7 @@ impl Diffui {
                     // revision being a commit, so a genuine `@` failure (or a
                     // failure of this very retry) still surfaces.
                     if !matches!(revision, RevisionSelection::WorkingCopy)
-                        && let Some(repository) = target.session.repository.clone()
+                        && let Some(source) = target.session.source.clone()
                     {
                         eprintln!(
                             "diffui: reload of {revision:?} failed ({error}); \
@@ -355,7 +368,7 @@ impl Diffui {
                             self.diff_scroll_offset = 0.0;
                         }
                         return Task::perform(
-                            load_backend(repository, fallback.clone(), revset, progress),
+                            source.load(fallback.clone(), revset, progress),
                             move |result| Message::BackendLoaded(tab, fallback, Box::new(result)),
                         );
                     }
@@ -372,8 +385,7 @@ impl Diffui {
                 let Some(target) = self.load_target_mut(version) else {
                     return Task::none();
                 };
-                let Some(mut cursor) = target.session.load.take_if(|c| c.version == version)
-                else {
+                let Some(mut cursor) = target.session.load.take_if(|c| c.version == version) else {
                     return Task::none();
                 };
                 let selecting_wc = matches!(
@@ -508,8 +520,7 @@ impl Diffui {
                         // undercount (react#36173: 73k summed vs 123k real).
                         target.session.authoritative_totals =
                             Some((info.additions, info.deletions));
-                        target.session.revision_details =
-                            Some(github::pr_revision_details(&info));
+                        target.session.revision_details = Some(github::pr_revision_details(&info));
                     }
                     Err(error) => {
                         // Header metadata is cosmetic; the diff stream decides
@@ -701,7 +712,7 @@ impl Diffui {
                 self.session.snapshot_pending = false;
                 if self.session.repository_snapshot.as_ref() != Some(&snapshot)
                     && self.session.pending_revision.is_none()
-                    && let Some(repository) = self.session.repository.clone()
+                    && let Some(source) = self.session.source.clone()
                 {
                     match origin {
                         RefreshOrigin::Watcher => {
@@ -737,7 +748,7 @@ impl Diffui {
                                 self.session.pending_revision = Some(revision.clone());
                                 self.session.loading_since = Some(Instant::now());
                                 return Task::perform(
-                                    load_diff(repository, revision.clone()),
+                                    source.diff(revision.clone()),
                                     move |result| {
                                         Message::DiffLoaded(tab, revision, Box::new(result))
                                     },
@@ -764,7 +775,7 @@ impl Diffui {
                             self.session.commit_progress = progress.clone();
                             let revset = self.session.revset.clone();
                             return Task::perform(
-                                load_backend(repository, revision.clone(), revset, progress),
+                                source.load(revision.clone(), revset, progress),
                                 move |result| {
                                     Message::BackendLoaded(tab, revision, Box::new(result))
                                 },
@@ -810,7 +821,25 @@ impl Diffui {
             Message::SelectFile(index) => {
                 if index < self.session.document.files.len() {
                     self.selected_file = index;
+                    self.reveal_selected_file_in_tree();
                     return scroll_sidebar_to_file(index, self);
+                }
+            }
+            Message::SidebarFileRow(display_index) => {
+                let rows =
+                    diffui_core::file_tree_rows(&self.session.document.files, &self.collapsed_dirs);
+                match rows.get(display_index) {
+                    Some(diffui_core::FileTreeRow::File { file_index, .. }) => {
+                        if *file_index < self.session.document.files.len() {
+                            self.selected_file = *file_index;
+                        }
+                    }
+                    Some(diffui_core::FileTreeRow::Dir { path, .. }) => {
+                        if !self.collapsed_dirs.remove(path) {
+                            self.collapsed_dirs.insert(path.clone());
+                        }
+                    }
+                    None => {}
                 }
             }
             Message::SidebarScrolled(offset) => {
@@ -833,23 +862,40 @@ impl Diffui {
                     self.file_list_expanded = !self.file_list_expanded;
                 } else if self.session.pending_revision.as_ref() == Some(&selection) {
                     // Already loading this revision — let it land.
-                } else if let Some(repository) = self.session.repository.clone()
-                    && let Some(tab) = self.active_tab_id()
-                {
-                    self.session.pending_revision = Some(selection.clone());
-                    self.session.loading_since = Some(Instant::now());
-                    let revision = selection.clone();
-                    return Task::perform(load_diff(repository, selection), move |result| {
-                        Message::DiffLoaded(tab, revision, Box::new(result))
-                    });
-                } else if let Some(spec) = self.active_pr_spec()
-                    && let Some(tab) = self.active_tab_id()
-                {
-                    return self.select_pr_revision(spec, tab, selection);
+                } else if let Some(tab) = self.active_tab_id() {
+                    // Graph-less (PR) sources go through the cache-aware
+                    // switcher: parked documents swap back in for free, and a
+                    // live stream blocks the switch.
+                    if self.active_pr_spec().is_some() {
+                        return self.select_pr_revision(tab, selection);
+                    }
+                    if let Some(source) = self.session.source.clone() {
+                        self.session.pending_revision = Some(selection.clone());
+                        self.session.loading_since = Some(Instant::now());
+                        let revision = selection.clone();
+                        return Task::perform(source.diff(selection), move |result| {
+                            Message::DiffLoaded(tab, revision, Box::new(result))
+                        });
+                    }
                 }
             }
             Message::SelectTheme(theme) => {
                 self.selected_theme = theme;
+            }
+            Message::ToggleDiffWrap => {
+                self.diff_wrap = !self.diff_wrap;
+                // Wrap changes shaping, so drop the paragraph cache; the
+                // height index re-keys off the flag itself. Persist with the
+                // usual geometry debounce.
+                self.document_version = self.document_version.wrapping_add(1);
+                self.mark_geometry_dirty();
+            }
+            Message::ToggleDiffSplit => {
+                self.diff_split = !self.diff_split;
+                // Same cache discipline as the wrap toggle: column widths
+                // change shaping, the height index re-keys off the flag.
+                self.document_version = self.document_version.wrapping_add(1);
+                self.mark_geometry_dirty();
             }
             Message::SystemThemeChanged(theme) => {
                 self.system_theme = theme;
@@ -1029,10 +1075,10 @@ impl Diffui {
                     && !self.mutation_busy()
                     && !self.session.snapshot_pending
                     && self.session.load.is_none()
-                    && let Some(repository) = self.session.repository.clone()
+                    && let Some(source) = self.session.source.clone()
                     && let Some(tab) = self.active_tab_id()
                 {
-                    return Task::perform(read_op_head(repository), move |result| {
+                    return Task::perform(source.op_head(), move |result| {
                         Message::OpHeadChecked(tab, Box::new(result))
                     });
                 }
@@ -1063,6 +1109,7 @@ impl Diffui {
                 if !self.session.document.files.is_empty() {
                     self.selected_file = (self.selected_file + 1)
                         .min(self.session.document.files.len().saturating_sub(1));
+                    self.reveal_selected_file_in_tree();
                     return scroll_sidebar_to_file(self.selected_file, self);
                 }
             }
@@ -1070,6 +1117,7 @@ impl Diffui {
                 let previous = self.selected_file.saturating_sub(1);
                 if previous != self.selected_file {
                     self.selected_file = previous;
+                    self.reveal_selected_file_in_tree();
                     return scroll_sidebar_to_file(self.selected_file, self);
                 }
             }
@@ -1749,10 +1797,16 @@ impl Diffui {
             return Task::none();
         }
 
-        let Some(repository) = self.session.repository.clone() else {
+        let Some(tab) = self.active_tab_id() else {
             return Task::none();
         };
-        let Some(tab) = self.active_tab_id() else {
+        // PR tabs switch through the cache-aware switcher (parked documents,
+        // live-stream guard) — a palette jump lands on its commits too.
+        if self.active_pr_spec().is_some() {
+            self.pending_revision_reveal = true;
+            return self.select_pr_revision(tab, selection);
+        }
+        let Some(source) = self.session.source.clone() else {
             return Task::none();
         };
         self.session.pending_revision = Some(selection.clone());
@@ -1760,7 +1814,7 @@ impl Diffui {
         // Deferred bump — see comment on `pending_revision_reveal`.
         self.pending_revision_reveal = true;
         let revision = selection.clone();
-        Task::perform(load_diff(repository, selection), move |result| {
+        Task::perform(source.diff(selection), move |result| {
             Message::DiffLoaded(tab, revision.clone(), Box::new(result))
         })
     }
@@ -1774,7 +1828,23 @@ impl Diffui {
             .position(|f| f.path == path)
         {
             self.selected_file = index;
+            self.reveal_selected_file_in_tree();
         }
+    }
+
+    /// Expand any collapsed ancestors of the selected file so its tree row
+    /// is visible (selection moved by j/k, the palette, or the diff scroll
+    /// spy may land inside a collapsed directory).
+    pub(crate) fn reveal_selected_file_in_tree(&mut self) {
+        if self.collapsed_dirs.is_empty() {
+            return;
+        }
+        let Some(file) = self.session.document.files.get(self.selected_file) else {
+            return;
+        };
+        let path = file.path.clone();
+        self.collapsed_dirs
+            .retain(|dir| !path.starts_with(&format!("{dir}/")));
     }
 
     /// Refresh the working-copy (`@`) row's "empty" chip from a snapshot's
@@ -1810,7 +1880,12 @@ impl Diffui {
             return Task::none();
         }
 
-        let Some(repository) = self.session.repository.clone() else {
+        // Only graph-backed sources have a working copy to snapshot; a PR
+        // tab's `source` would just error.
+        if self.session.repository.is_none() {
+            return Task::none();
+        }
+        let Some(source) = self.session.source.clone() else {
             return Task::none();
         };
         let Some(tab) = self.active_tab_id() else {
@@ -1818,12 +1893,8 @@ impl Diffui {
         };
 
         self.session.snapshot_pending = true;
-        Task::perform(load_repository_snapshot(repository), move |result| {
-            Message::RepositorySnapshotLoaded(
-                tab,
-                origin,
-                result.map_err(|error| format!("{error:#}")),
-            )
+        Task::perform(source.snapshot(), move |result| {
+            Message::RepositorySnapshotLoaded(tab, origin, result)
         })
     }
 
@@ -1849,7 +1920,7 @@ impl Diffui {
     /// task for the rest (single-parent commits were already decided cheaply
     /// during load).
     pub(crate) fn resolve_empty_status(&mut self) -> Task<Message> {
-        let Some(repository) = self.session.repository.clone() else {
+        let Some(source) = self.session.source.clone() else {
             return Task::none();
         };
 
@@ -1870,7 +1941,7 @@ impl Diffui {
             return Task::none();
         };
         let version = self.session.commits_version;
-        Task::perform(compute_empty_status(repository, targets), move |updates| {
+        Task::perform(source.empty_status(targets), move |updates| {
             Message::EmptyStatusComputed(tab, version, updates)
         })
     }
@@ -2101,7 +2172,6 @@ impl Diffui {
     /// through the commits REST endpoint and land as a `DiffLoaded`.
     pub(crate) fn select_pr_revision(
         &mut self,
-        spec: github::PrSpec,
         tab: TabId,
         selection: RevisionSelection,
     ) -> Task<Message> {
@@ -2135,19 +2205,26 @@ impl Diffui {
             self.session.selected_revision = selection;
             self.session.selected_commit_index = self.session.find_selected_commit_index();
             self.selected_file = 0;
+            // An instant swap never lands a `DiffLoaded`, so honor a deferred
+            // reveal (palette jump) here.
+            if self.pending_revision_reveal {
+                self.pending_revision_reveal = false;
+                self.revision_reveal_token = self.revision_reveal_token.wrapping_add(1);
+            }
             // The parked document kept the spans it had earned; resume
             // highlighting whatever was still pending when it was parked.
             return self.spawn_highlights(self.session.document_id);
         }
 
+        let Some(source) = self.session.source.clone() else {
+            return Task::none();
+        };
         self.session.pending_revision = Some(selection.clone());
         self.session.loading_since = Some(Instant::now());
-        let revision = selection;
-        let oid = key;
-        Task::perform(
-            async move { github::load_pr_commit_diff(&spec, &oid).await },
-            move |result| Message::DiffLoaded(tab, revision.clone(), Box::new(result)),
-        )
+        let revision = selection.clone();
+        Task::perform(source.diff(selection), move |result| {
+            Message::DiffLoaded(tab, revision.clone(), Box::new(result))
+        })
     }
 
     /// As [`kick_initial_load`], with an optional activity label (defaults to
@@ -2205,8 +2282,11 @@ impl Diffui {
                 let Some(tab) = self.active_tab_id() else {
                     return Task::none();
                 };
+                let Some(source) = self.session.source.clone() else {
+                    return Task::none();
+                };
                 Task::perform(
-                    load_backend(repository, revision.clone(), revset, progress),
+                    source.load(revision.clone(), revset, progress),
                     move |result| Message::BackendLoaded(tab, revision, Box::new(result)),
                 )
             }
@@ -2377,7 +2457,14 @@ impl Diffui {
     /// surfaced as an activity whose expanded output shows the remote messages.
     /// On success `finish_remote_op` reloads so new commits appear.
     pub(crate) fn start_fetch(&mut self, target: FetchTarget) -> Task<Message> {
-        let Some(repository) = self.session.repository.clone() else {
+        // Capability-gated: graph-less sources (PR tabs) have nothing to
+        // fetch from, so the toolbar action stays a silent no-op there.
+        let Some(source) = self
+            .session
+            .source
+            .clone()
+            .filter(|source| source.as_revision_graph().is_some())
+        else {
             return Task::none();
         };
         let Some(tab_id) = self.active_tab_id() else {
@@ -2389,26 +2476,26 @@ impl Diffui {
             FetchTarget::RemoteBranch { remote, branch } => format!("Fetch {branch}@{remote}"),
         };
         let (id, progress) = self.begin_activity(label, true);
-        Task::perform(
-            diffui_core::fetch(repository, target, progress),
-            move |result| Message::FetchCompleted(tab_id, id, Box::new(result)),
-        )
+        Task::perform(source.fetch(target, progress), move |result| {
+            Message::FetchCompleted(tab_id, id, Box::new(result))
+        })
     }
 
-    /// Toolbar "Undo": revert the latest jj operation, surfaced as an activity.
-    /// jj-only; `finish_remote_op` reloads on success.
+    /// Toolbar "Undo": revert the latest operation, surfaced as an activity.
+    /// Capability-gated (jj repos only today); `finish_remote_op` reloads on
+    /// success.
     pub(crate) fn start_undo(&mut self) -> Task<Message> {
-        let Some(repository) = self.session.repository.clone() else {
+        let Some(source) = self.session.source.clone() else {
             return Task::none();
         };
-        if !matches!(repository.vcs, Vcs::Jj) {
+        if source.as_mutable().is_none() {
             return Task::none();
         }
         let Some(tab_id) = self.active_tab_id() else {
             return Task::none();
         };
         let (id, _progress) = self.begin_activity("Undo", false);
-        Task::perform(diffui_core::undo(repository), move |result| {
+        Task::perform(source.undo(), move |result| {
             Message::UndoCompleted(tab_id, id, Box::new(result))
         })
     }
@@ -2443,7 +2530,14 @@ impl Diffui {
     }
 
     pub(crate) fn evaluate_revset(&mut self) -> Task<Message> {
-        let Some(repository) = self.session.repository.clone() else {
+        // Silent no-op for graph-less sources (a PR tab has no revset),
+        // matching the capability rather than erroring through the load.
+        let Some(source) = self
+            .session
+            .source
+            .clone()
+            .filter(|source| source.as_revision_graph().is_some())
+        else {
             return Task::none();
         };
         self.menu = None;
@@ -2474,7 +2568,7 @@ impl Diffui {
         self.session.loading_since = Some(Instant::now());
         let revset = self.session.revset.clone();
         Task::perform(
-            load_backend(repository, revision.clone(), revset, progress),
+            source.load(revision.clone(), revset, progress),
             move |result| Message::BackendLoaded(tab, revision, Box::new(result)),
         )
     }
@@ -2482,9 +2576,20 @@ impl Diffui {
     pub(crate) fn view(&self) -> Element<'_, Message> {
         let theme = self.resolved_theme().spec();
 
-        // No repositories open: the empty state owns the whole window.
+        // No repositories open: the empty state owns the whole window. The
+        // open-repo dialog still has to be stacked on top here — it's the only
+        // way in from this state (⌘O and the empty-state button both summon it),
+        // and the main `stack!` that normally carries the overlay is below the
+        // early return. Without this the dialog would never render with no tabs
+        // open, so ⌘O would look dead and there'd be no visible path forward.
         if self.tabs.is_empty() {
-            return container(empty_state(self, theme))
+            let content = stack![
+                empty_state(self, theme),
+                tab_bar::build_open_repo_dialog(self, theme),
+            ]
+            .width(Length::Fill)
+            .height(Length::Fill);
+            return container(content)
                 .height(Length::Fill)
                 .width(Length::Fill)
                 .style(move |_| app_shell_style(theme))
@@ -2712,6 +2817,17 @@ impl Diffui {
                     }
                 }
 
+                // ⌥Z toggles diff line-wrap (the editor-world convention).
+                // macOS composes ⌥Z into "Ω", so match that form too.
+                if modifiers.alt()
+                    && !modifiers.command()
+                    && !modifiers.control()
+                    && let keyboard::Key::Character(c) = key.as_ref()
+                    && matches!(c, "z" | "Z" | "Ω" | "ω")
+                {
+                    return Some(Message::ToggleDiffWrap);
+                }
+
                 // No overlay — global j/k/arrow file shortcuts apply. Only
                 // fire when no modifier is held, otherwise ⌘J / ⌘K combos
                 // would also trigger file nav.
@@ -2881,6 +2997,8 @@ impl Diffui {
             x: self.window_position.map(|p| p.x),
             y: self.window_position.map(|p| p.y),
             sidebar_width: Some(self.sidebar_width),
+            diff_wrap: Some(self.diff_wrap),
+            diff_split: Some(self.diff_split),
             // GitHub-PR tabs are session-only (no local root to restore from),
             // so they drop out of the persisted set here.
             open_repos: self

@@ -2,7 +2,9 @@ use std::cell::RefCell;
 use std::time::Instant;
 
 use iced::advanced::{
-    Layout, Shell, Widget, layout, mouse, renderer, text,
+    Layout, Shell, Widget,
+    graphics::geometry::{self, Frame, LineCap, Path, Stroke},
+    layout, mouse, renderer, text,
     widget::{Tree, tree},
 };
 use iced::{
@@ -29,7 +31,10 @@ const TEXT_Y_PADDING: f32 = 2.0;
 // pixel path below). Above the ~3-line OS default — browsing a long diff with a
 // wheel felt sluggish otherwise.
 const LINE_SCROLL_ROWS: f32 = 5.0;
-const PIXEL_SCROLL_SCALE: f32 = 0.65;
+const PIXEL_SCROLL_SCALE: f32 = 0.5;
+// Corner radius of the intra-line word-diff emphasis rectangles, so the
+// token tint reads as a soft chip rather than a hard block.
+const EMPHASIS_CORNER_RADIUS: f32 = 2.0;
 // Floor for the gutter so two single-digit columns still look intentional.
 const GUTTER_MIN_WIDTH: f32 = 56.0;
 // Padding flanking the gutter text on both sides.
@@ -147,6 +152,10 @@ pub struct Palette {
     pub hunk_header: Color,
     pub addition_background: Color,
     pub deletion_background: Color,
+    /// Stronger tint over the changed tokens *inside* a modified line
+    /// (intra-line word diff), layered on the add/del line backgrounds.
+    pub addition_emphasis: Color,
+    pub deletion_emphasis: Color,
     pub note_background: Color,
     pub gutter_background: Color,
     pub border: Color,
@@ -186,6 +195,10 @@ pub struct DiffView<'a, Message> {
     /// `revision_key` alone can't catch those: it's a constant
     /// `"working-copy"` for any `@`. A version bump drops the cache.
     content_version: u64,
+    /// Whether long lines wrap (see [`Self::wrap`]).
+    wrap: bool,
+    /// Two-column old/new layout (see [`Self::side_by_side`]).
+    side_by_side: bool,
     /// Monotonic identity of the document's *layout* (the app's per-document
     /// id), bumped only when the document is replaced — not when highlight
     /// spans merge in. Keys the [`HeightIndex`]: span merges repaint rows but
@@ -291,8 +304,10 @@ struct HeightIndex {
     /// `gh pr view` lands) without replacing the document — appends leave
     /// existing rows in place, but they extend the layout. Keyed on the
     /// layout id, NOT the paint `content_version`: highlight merges bump the
-    /// latter to re-shape paint without moving anything.
-    key: Option<(u64, usize, usize, u32)>,
+    /// latter to re-shape paint without moving anything. The wrap and
+    /// side-by-side flags are in the key because toggling either moves
+    /// every row.
+    key: Option<(u64, usize, usize, u32, bool, bool)>,
     /// Content-space y of each file's header top, plus one trailing sentinel
     /// holding the content end. `file_tops[0]` equals the revision-header
     /// height.
@@ -304,13 +319,52 @@ struct HeightIndex {
     /// Content-space y of each diff row, in document order.
     row_tops: Vec<f32>,
     /// `(file, hunk, line)` of each `row_tops` entry. Document order makes
-    /// this lexicographically sorted, so a row is also findable *by id*.
+    /// this lexicographically sorted, so a row is also findable *by id*. In
+    /// side-by-side mode the line component is the pair's *first* member
+    /// (which preserves the sort); the full pair lives in `pair_lines`.
     row_ids: Vec<(u32, u32, u32)>,
+    /// Side-by-side only (empty in unified mode): each row's `(left, right)`
+    /// line indices into its hunk, [`NO_LINE`] for a padded side. Context /
+    /// note rows carry the same line on both sides; rows of full-width files
+    /// carry `(line, line)` purely to keep this aligned with `row_tops`.
+    pair_lines: Vec<(u32, u32)>,
+    /// Side-by-side only: files rendered as a single full-width column even
+    /// in split mode. A single-sided file (all additions or all deletions)
+    /// has nothing to mirror, so splitting it would waste half the pane on
+    /// padding. Empty in unified mode.
+    full_width_files: Vec<bool>,
+    /// Wrap width of one split column's text area; what split-file rows were
+    /// measured against. Equals `unified_text_width` in unified mode.
+    split_text_width: f32,
+    /// Wrap width of the whole text area; what unified-mode and full-width
+    /// rows were measured against.
+    unified_text_width: f32,
+    /// Longest line of the document in chars — the horizontal extent the
+    /// no-wrap mode can scroll across. (Wrap mode never scrolls sideways.)
+    max_line_chars: usize,
     /// Total content height (revision header + every file).
     total_height: f32,
 }
 
+/// `pair_lines` sentinel: this side of the row has no line (padding).
+const NO_LINE: u32 = u32::MAX;
+
 impl HeightIndex {
+    /// True when `file` renders as one full-width column despite split mode.
+    fn is_full_width(&self, file: usize) -> bool {
+        self.full_width_files.get(file).copied().unwrap_or(false)
+    }
+
+    /// The wrap width `file`'s rows were measured against: one split column
+    /// for split files, the whole text area for unified/full-width ones.
+    fn text_width_for_file(&self, file: usize) -> f32 {
+        if self.is_full_width(file) {
+            self.unified_text_width
+        } else {
+            self.split_text_width
+        }
+    }
+
     /// Index into `row_tops`/`row_ids` of the last row starting at or above
     /// `target_y` — the candidate row containing that y (the caller checks
     /// the row's actual height; `target_y` may sit in a header band).
@@ -325,6 +379,34 @@ impl HeightIndex {
         self.row_ids
             .binary_search(&(file as u32, hunk as u32, line as u32))
             .ok()
+    }
+
+    /// Index of the row *containing* `(file, hunk, line)` on either side. In
+    /// unified mode this is [`Self::row_index_of`]; in side-by-side a right
+    /// member's row is keyed by its left partner, so walk back from the last
+    /// row at or before the id until a pair carries the line. The walk is
+    /// bounded by one change run (an addition can only pair leftward within
+    /// its own run).
+    fn row_of_line(&self, file: usize, hunk: usize, line: usize) -> Option<usize> {
+        if self.pair_lines.is_empty() {
+            return self.row_index_of(file, hunk, line);
+        }
+        let target = (file as u32, hunk as u32, line as u32);
+        let mut row = self
+            .row_ids
+            .partition_point(|id| *id <= target)
+            .checked_sub(1)?;
+        loop {
+            let (row_file, row_hunk, _) = *self.row_ids.get(row)?;
+            if (row_file, row_hunk) != (file as u32, hunk as u32) {
+                return None;
+            }
+            let &(left, right) = self.pair_lines.get(row)?;
+            if left == line as u32 || right == line as u32 {
+                return Some(row);
+            }
+            row = row.checked_sub(1)?;
+        }
     }
 }
 
@@ -349,6 +431,16 @@ struct State<Paragraph> {
     /// schedules a scroll. Wrapping `u64` is fine — only equality matters.
     last_find_scroll_token: Option<u64>,
     vertical_offset: f32,
+    /// Horizontal scroll of the code text in no-wrap mode (px). Forced to
+    /// zero while wrapping — wrapped content never exceeds the pane. The
+    /// gutter/prefix chrome stays fixed; only text and its highlight rects
+    /// shift. Side-by-side scrolls both columns in lockstep.
+    horizontal_offset: f32,
+    /// Wrap flag last seen, to zero `horizontal_offset` when wrap turns on.
+    last_wrap: bool,
+    /// Live keyboard modifiers, tracked so the wheel handler can redirect
+    /// shift+scroll into horizontal panning.
+    modifiers: keyboard::Modifiers,
     /// Shaped `Paragraph`s for syntax-highlighted code lines, keyed by
     /// `(file, hunk, line, content_width)`. Reused across frames during
     /// scrolling — `with_spans` shaping is ~280µs/row in release and
@@ -361,6 +453,11 @@ struct State<Paragraph> {
     selection_anchor: Option<TextPosition>,
     /// Focus (current/release position) of the selection.
     selection_focus: Option<TextPosition>,
+    /// Side-by-side only: the column the selection lives in, locked at
+    /// mouse-down. Drags stay in this column, the highlight draws only
+    /// there, and copy skips the other column's lines. `None` for unified
+    /// mode, header, and full-width-file selections.
+    selection_lane: Option<SplitSide>,
     /// When the user drags after a double/triple click, the selection grows
     /// in word- or line-sized chunks instead of by character. We remember
     /// where the anchor "click unit" started/ended so the resulting
@@ -455,6 +552,9 @@ fn body_position(
 
 #[derive(Debug, Clone, Copy)]
 struct RowRenderParams {
+    /// Horizontal scroll (px) of the code text in no-wrap mode; the
+    /// gutter/prefix chrome stays fixed.
+    horizontal_offset: f32,
     bounds: Rectangle,
     content_clip_bounds: Rectangle,
     y: f32,
@@ -490,8 +590,35 @@ struct VisibleRow {
     file_index: usize,
     hunk_index: usize,
     line_index: usize,
+    /// The row's `(left, right)` pair ([`NO_LINE`] for a padded side) when
+    /// it renders as two split columns; `None` when it renders full-width —
+    /// unified mode, or a full-width (single-sided) file in split mode.
+    pair: Option<(u32, u32)>,
     y: f32,
     height: f32,
+}
+
+/// One column of the side-by-side layout, or the whole text area in unified
+/// mode (`None`). Selection/find/emphasis passes iterate per lane.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SplitSide {
+    Left,
+    Right,
+}
+
+impl VisibleRow {
+    /// The row's line shown in `lane`, or `None` when that side is padding
+    /// or the row doesn't participate in the lane at all (full-width rows
+    /// live only in the `None` lane; split rows only in the column lanes).
+    /// Context (and note) rows appear in both column lanes.
+    fn line_in_lane(&self, lane: Option<SplitSide>) -> Option<usize> {
+        match (lane, self.pair) {
+            (None, None) => Some(self.line_index),
+            (Some(SplitSide::Left), Some((left, _))) if left != NO_LINE => Some(left as usize),
+            (Some(SplitSide::Right), Some((_, right))) if right != NO_LINE => Some(right as usize),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -533,11 +660,28 @@ impl<'a, Message> DiffView<'a, Message> {
             restore_token: 0,
             content_version: 0,
             layout_version: 0,
+            wrap: true,
+            side_by_side: false,
         }
     }
 
     pub fn with_header(mut self, header: Vec<HeaderLine>) -> Self {
         self.header = header;
+        self
+    }
+
+    /// Whether long lines wrap into extra visual lines (the default) or clip
+    /// at the pane edge, leaving every row exactly one line tall.
+    pub fn wrap(mut self, wrap: bool) -> Self {
+        self.wrap = wrap;
+        self
+    }
+
+    /// Two-column layout: deletions/context on the left, additions/context
+    /// on the right, paired index-wise within each change run and padded
+    /// where one side is longer. Off (the default) is the unified view.
+    pub fn side_by_side(mut self, side_by_side: bool) -> Self {
+        self.side_by_side = side_by_side;
         self
     }
 
@@ -733,12 +877,15 @@ impl<'a, Message> DiffView<'a, Message> {
     /// changed since it was built. One O(total lines) pass per change — every
     /// per-frame query then reads prefix sums instead of re-walking.
     fn ensure_height_index(&self, cell: &RefCell<HeightIndex>, width: f32) {
-        let content_width = self.content_width(width);
+        // Keyed on the viewport width (not a derived text width): split and
+        // full-width rows wrap against different widths, both functions of it.
         let key = Some((
             self.layout_version,
             self.files.len(),
             self.header.len(),
-            content_width.to_bits(),
+            width.to_bits(),
+            self.wrap,
+            self.side_by_side,
         ));
         if cell.borrow().key == key {
             return;
@@ -748,7 +895,12 @@ impl<'a, Message> DiffView<'a, Message> {
         let row_count: usize = self
             .files
             .iter()
-            .map(|file| file.hunks.iter().map(|hunk| hunk.lines.len()).sum::<usize>())
+            .map(|file| {
+                file.hunks
+                    .iter()
+                    .map(|hunk| hunk.lines.len())
+                    .sum::<usize>()
+            })
             .sum();
         index.file_tops.clear();
         index.file_tops.reserve(self.files.len() + 1);
@@ -758,27 +910,164 @@ impl<'a, Message> DiffView<'a, Message> {
         index.row_tops.reserve(row_count);
         index.row_ids.clear();
         index.row_ids.reserve(row_count);
+        index.pair_lines.clear();
+        if self.side_by_side {
+            index.pair_lines.reserve(row_count);
+        }
+        index.max_line_chars = 0;
+        index.unified_text_width = self.content_width(width);
+        index.split_text_width = self.effective_text_width(width);
+        index.full_width_files = if self.side_by_side {
+            self.files.iter().map(Self::file_is_single_sided).collect()
+        } else {
+            Vec::new()
+        };
 
         let mut y = self.header_height();
         for (file_index, file) in self.files.iter().enumerate() {
             index.file_tops.push(y);
             y += self.metrics.file_header_height;
+            let split_file = self.side_by_side && !index.is_full_width(file_index);
             for (hunk_index, hunk) in file.hunks.iter().enumerate() {
                 index.hunk_tops.push(y);
                 index.hunk_ids.push((file_index as u32, hunk_index as u32));
                 y += self.metrics.hunk_header_height;
-                for (line_index, line) in hunk.lines.iter().enumerate() {
-                    index.row_tops.push(y);
-                    index
-                        .row_ids
-                        .push((file_index as u32, hunk_index as u32, line_index as u32));
-                    y += self.row_height(line, content_width);
+                if split_file {
+                    let split_width = index.split_text_width;
+                    y = self.push_split_rows(
+                        &mut index,
+                        file_index,
+                        hunk_index,
+                        hunk,
+                        y,
+                        split_width,
+                    );
+                } else {
+                    let unified_width = index.unified_text_width;
+                    for (line_index, line) in hunk.lines.iter().enumerate() {
+                        index.row_tops.push(y);
+                        index.row_ids.push((
+                            file_index as u32,
+                            hunk_index as u32,
+                            line_index as u32,
+                        ));
+                        if self.side_by_side {
+                            // Keep `pair_lines` aligned with `row_tops` for
+                            // full-width files; consumers see `pair: None`
+                            // via the `is_full_width` filter.
+                            index
+                                .pair_lines
+                                .push((line_index as u32, line_index as u32));
+                        }
+                        let chars = line.content.chars().count();
+                        index.max_line_chars = index.max_line_chars.max(chars);
+                        y += self.row_height_for_chars(chars, unified_width);
+                    }
                 }
             }
         }
         index.file_tops.push(y);
         index.total_height = y;
         index.key = key;
+    }
+
+    /// Append one hunk's side-by-side row pairs to the index: context (and
+    /// note/conflict) lines sit on both sides; each deletion run + addition
+    /// run pairs index-wise, padding whichever side is shorter. The row id's
+    /// line component is the pair's first member, which keeps `row_ids`
+    /// sorted within the hunk. Returns the new running `y`.
+    fn push_split_rows(
+        &self,
+        index: &mut HeightIndex,
+        file_index: usize,
+        hunk_index: usize,
+        hunk: &DiffHunkView,
+        mut y: f32,
+        content_width: f32,
+    ) -> f32 {
+        let lines = &hunk.lines;
+        let mut push = |index: &mut HeightIndex, rep: usize, pair: (u32, u32), height: f32| {
+            index.row_tops.push(y);
+            index
+                .row_ids
+                .push((file_index as u32, hunk_index as u32, rep as u32));
+            index.pair_lines.push(pair);
+            y += height;
+        };
+        let mut max_chars = 0usize;
+        let mut height_of = |this: &Self, line: &DiffLine| {
+            let chars = line.content.chars().count();
+            max_chars = max_chars.max(chars);
+            this.row_height_for_chars(chars, content_width)
+        };
+        let mut i = 0;
+        while i < lines.len() {
+            if lines[i].kind == DiffLineKind::Addition {
+                // An addition run with no deletion run in front of it (those
+                // are consumed below as pairs): new lines only — they belong
+                // to the right column, the left side is padding.
+                let height = height_of(self, &lines[i]);
+                push(&mut *index, i, (NO_LINE, i as u32), height);
+                i += 1;
+                continue;
+            }
+            if lines[i].kind != DiffLineKind::Deletion {
+                let height = height_of(self, &lines[i]);
+                push(&mut *index, i, (i as u32, i as u32), height);
+                i += 1;
+                continue;
+            }
+            let del_start = i;
+            while i < lines.len() && lines[i].kind == DiffLineKind::Deletion {
+                i += 1;
+            }
+            let add_start = i;
+            while i < lines.len() && lines[i].kind == DiffLineKind::Addition {
+                i += 1;
+            }
+            let dels = add_start - del_start;
+            let adds = i - add_start;
+            for k in 0..dels.max(adds) {
+                let left = (k < dels).then_some(del_start + k);
+                let right = (k < adds).then_some(add_start + k);
+                let rep = left.or(right).unwrap_or(del_start);
+                let height = [left, right]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|line| lines.get(line))
+                    .map(|line| height_of(self, line))
+                    .fold(self.metrics.row_height, f32::max);
+                push(
+                    &mut *index,
+                    rep,
+                    (
+                        left.map_or(NO_LINE, |l| l as u32),
+                        right.map_or(NO_LINE, |r| r as u32),
+                    ),
+                    height,
+                );
+            }
+        }
+        index.max_line_chars = index.max_line_chars.max(max_chars);
+        y
+    }
+
+    /// True when every line of `file` sits on one side of the diff — all
+    /// additions or all deletions (context and notes appear on both sides,
+    /// so their presence makes the file two-sided). Such a file renders as
+    /// a single full-width column in split mode: there is nothing to mirror,
+    /// and splitting it would waste half the pane on padding.
+    fn file_is_single_sided(file: &DiffFileView<'_>) -> bool {
+        let mut kinds = file
+            .hunks
+            .iter()
+            .flat_map(|hunk| hunk.lines.iter())
+            .map(|line| line.kind);
+        let Some(first) = kinds.next() else {
+            return false;
+        };
+        matches!(first, DiffLineKind::Addition | DiffLineKind::Deletion)
+            && kinds.all(|kind| kind == first)
     }
 
     fn file_offset(&self, index: &HeightIndex, file_index: usize) -> f32 {
@@ -804,11 +1093,95 @@ impl<'a, Message> DiffView<'a, Message> {
             .max(self.metrics.char_width)
     }
 
+    /// The width one logical line wraps against: the whole text area in
+    /// unified mode, one column's text area in side-by-side. Every wrap /
+    /// row-height / hit-test computation keys off this, so both modes share
+    /// the same visual-line math.
+    fn effective_text_width(&self, viewport_width: f32) -> f32 {
+        if self.side_by_side {
+            self.split_layout(viewport_width).text_width
+        } else {
+            self.content_width(viewport_width)
+        }
+    }
+
+    /// Per-column x-geometry for the side-by-side layout (offsets relative
+    /// to the pane's left edge). Both columns share one `text_width`, so the
+    /// wrap math stays column-agnostic; only x origins differ. Each side
+    /// gets a single-number gutter (old line numbers left, new right).
+    fn split_layout(&self, viewport_width: f32) -> SplitLayout {
+        let gutter_width = (self.metrics.gutter_digit_count as f32 * self.metrics.char_width
+            + GUTTER_HORIZONTAL_PADDING * 2.0)
+            .max(GUTTER_MIN_WIDTH * 0.5);
+        let column_width = ((viewport_width - 1.0) / 2.0).max(1.0);
+        let text_width =
+            (column_width - gutter_width - PREFIX_WIDTH - 12.0).max(self.metrics.char_width);
+        SplitLayout {
+            gutter_width,
+            text_width,
+            left_text_x: gutter_width + PREFIX_WIDTH + TEXT_X_PADDING,
+            divider_x: column_width,
+            right_gutter_x: column_width + 1.0,
+            right_text_x: column_width + 1.0 + gutter_width + PREFIX_WIDTH + TEXT_X_PADDING,
+        }
+    }
+
     fn row_height(&self, line: &DiffLine, content_width: f32) -> f32 {
-        let chars_per_line = chars_per_visual_line(content_width, self.metrics.char_width);
-        let wrapped_lines = line.content.chars().count().max(1).div_ceil(chars_per_line);
+        self.row_height_for_chars(line.content.chars().count(), content_width)
+    }
+
+    fn row_height_for_chars(&self, chars: usize, content_width: f32) -> f32 {
+        let chars_per_line = self.chars_per_line(content_width);
+        let wrapped_lines = chars.max(1).div_ceil(chars_per_line);
 
         wrapped_lines as f32 * self.metrics.row_height
+    }
+
+    /// How far the no-wrap mode can scroll sideways: the longest line's
+    /// width beyond the visible text area (plus one char of breathing
+    /// room), zero while wrapping.
+    fn max_horizontal(&self, index: &HeightIndex, viewport_width: f32) -> f32 {
+        if self.wrap {
+            return 0.0;
+        }
+        let text_width = self.effective_text_width(viewport_width);
+        let content = (index.max_line_chars as f32 + 1.0) * self.metrics.char_width;
+        (content - text_width).max(0.0)
+    }
+
+    /// Height of index row `row`: the single line's height in unified mode,
+    /// the taller member's in side-by-side. The wrap width comes from the
+    /// index — split columns and full-width files measure differently.
+    fn index_row_height(&self, index: &HeightIndex, row: usize) -> f32 {
+        let Some(&(file, hunk, line)) = index.row_ids.get(row) else {
+            return self.metrics.row_height;
+        };
+        let content_width = index.text_width_for_file(file as usize);
+        let lines = &self.files[file as usize].hunks[hunk as usize].lines;
+        match index.pair_lines.get(row) {
+            Some(&(left, right)) => [left, right]
+                .into_iter()
+                .filter(|&l| l != NO_LINE)
+                .filter_map(|l| lines.get(l as usize))
+                .map(|line| self.row_height(line, content_width))
+                .fold(self.metrics.row_height, f32::max),
+            None => lines
+                .get(line as usize)
+                .map(|line| self.row_height(line, content_width))
+                .unwrap_or(self.metrics.row_height),
+        }
+    }
+
+    /// Effective wrap column: the real chars-per-visual-line when wrapping,
+    /// else a huge sentinel every line length stays under, so all the shared
+    /// visual-line math degenerates to one visual line per row. (`/ 4` keeps
+    /// the `(idx + 1) * chars_per_line` products comfortably overflow-free.)
+    fn chars_per_line(&self, content_width: f32) -> usize {
+        if self.wrap {
+            chars_per_visual_line(content_width, self.metrics.char_width)
+        } else {
+            usize::MAX / 4
+        }
     }
 
     /// Y position (in content space, before viewport scroll) of the visual
@@ -822,7 +1195,6 @@ impl<'a, Message> DiffView<'a, Message> {
         hunk_idx: usize,
         line_idx: usize,
         byte_offset: usize,
-        bounds: Rectangle,
     ) -> Option<f32> {
         let line = self
             .files
@@ -831,21 +1203,22 @@ impl<'a, Message> DiffView<'a, Message> {
             .get(hunk_idx)?
             .lines
             .get(line_idx)?;
-        let row = index.row_index_of(file_idx, hunk_idx, line_idx)?;
+        let row = index.row_of_line(file_idx, hunk_idx, line_idx)?;
         let mut y = *index.row_tops.get(row)?;
 
         // Offset within the wrapped row: figure out which visual line the
         // byte sits on so a match on the 5th wrap row of a 200-char line
         // doesn't scroll to the row top and leave the match off-screen.
-        let content_width = self.content_width(bounds.width);
-        let chars_per_line = chars_per_visual_line(content_width, self.metrics.char_width);
+        let content_width = index.text_width_for_file(file_idx);
+        let chars_per_line = self.chars_per_line(content_width);
         let char_offset = char_count_at_byte(&line.content, byte_offset);
         let visual_idx = char_offset / chars_per_line;
         y += visual_idx as f32 * self.metrics.row_height;
         Some(y)
     }
 
-    /// Convert a screen point into a `TextPosition` if it falls on a row's
+    /// Convert a screen point into a `TextPosition` (and, for split rows,
+    /// the column it resolved in) if it falls on a row's
     /// text area. Returns `None` for clicks on the gutter, file/hunk
     /// headers, or empty space below the last row.
     ///
@@ -860,15 +1233,26 @@ impl<'a, Message> DiffView<'a, Message> {
     /// row even when the click is in the chrome / below the last row, so
     /// dragging the mouse outside the viewport still produces a sensible
     /// selection endpoint.
+    ///
+    /// `lock` holds split-row resolution to one column regardless of the
+    /// cursor's x — a drag stays in the column the selection started in.
+    #[allow(clippy::too_many_arguments)]
     fn position_at_point(
         &self,
         index: &HeightIndex,
         point: Point,
         bounds: Rectangle,
         vertical_offset: f32,
-    ) -> Option<TextPosition> {
-        let content_width = self.content_width(bounds.width);
-        let text_x = bounds.x + self.metrics.gutter_width + PREFIX_WIDTH + TEXT_X_PADDING;
+        horizontal_offset: f32,
+        lock: Option<SplitSide>,
+    ) -> Option<(TextPosition, Option<SplitSide>)> {
+        let split = self.side_by_side.then(|| self.split_layout(bounds.width));
+        let unified_text_x = bounds.x + self.metrics.gutter_width + PREFIX_WIDTH + TEXT_X_PADDING;
+        let text_x = match &split {
+            // Side picked by the divider below; seed with the left column.
+            Some(split) => bounds.x + split.left_text_x,
+            None => unified_text_x,
+        };
         let target_y = point.y - bounds.y + vertical_offset;
         let header_height = self.header_height();
 
@@ -887,13 +1271,16 @@ impl<'a, Message> DiffView<'a, Message> {
             let relative_x = (point.x - origin_x).max(0.0);
             let char_offset =
                 ((relative_x / self.metrics.char_width + 0.5).floor() as usize).min(char_count);
-            return Some(TextPosition {
-                region: Region::Header,
-                file_index: 0,
-                hunk_index: 0,
-                line_index,
-                byte: byte_offset_for_char(text, char_offset),
-            });
+            return Some((
+                TextPosition {
+                    region: Region::Header,
+                    file_index: 0,
+                    hunk_index: 0,
+                    line_index,
+                    byte: byte_offset_for_char(text, char_offset),
+                },
+                None,
+            ));
         }
 
         // Candidate row by binary search: the last row starting at or above
@@ -902,11 +1289,50 @@ impl<'a, Message> DiffView<'a, Message> {
         // below, exactly like the walk did.
         if let Some(row) = index.row_at(target_y) {
             let &(file_index, hunk_index, line_index) = index.row_ids.get(row)?;
-            let (file_index, hunk_index, line_index) =
-                (file_index as usize, hunk_index as usize, line_index as usize);
+            let (file_index, hunk_index, mut line_index) = (
+                file_index as usize,
+                hunk_index as usize,
+                line_index as usize,
+            );
+            // Side-by-side: resolve which column the point is in (held to
+            // `lock`'s column when set), falling back to the populated side
+            // of a padded pair, and shift the text origin to that column's.
+            // Full-width files don't have columns — they hit-test like
+            // unified rows.
+            let mut text_x = text_x;
+            let mut resolved_lane = None;
+            if index.is_full_width(file_index) {
+                text_x = unified_text_x;
+            } else if let (Some(split), Some(&(left, right))) = (&split, index.pair_lines.get(row))
+            {
+                let in_right = match lock {
+                    Some(SplitSide::Right) => true,
+                    Some(SplitSide::Left) => false,
+                    None => point.x >= bounds.x + split.divider_x,
+                };
+                let pick_right = if in_right {
+                    right != NO_LINE || left == NO_LINE
+                } else {
+                    left == NO_LINE
+                };
+                let (member, side) = if pick_right {
+                    (right, SplitSide::Right)
+                } else {
+                    (left, SplitSide::Left)
+                };
+                if member == NO_LINE {
+                    return None;
+                }
+                if side == SplitSide::Right {
+                    text_x = bounds.x + split.right_text_x;
+                }
+                resolved_lane = Some(side);
+                line_index = member as usize;
+            }
             let line = &self.files[file_index].hunks[hunk_index].lines[line_index];
             let row_top = index.row_tops[row];
-            let height = self.row_height(line, content_width);
+            let content_width = index.text_width_for_file(file_index);
+            let height = self.index_row_height(index, row);
             if target_y < row_top + height {
                 // Each row may span multiple wrapped visual lines. Figure out
                 // which visual line the click lands on, then translate the
@@ -914,44 +1340,67 @@ impl<'a, Message> DiffView<'a, Message> {
                 // line's slice of the source content.
                 let char_count = line.content.chars().count();
                 let cw = self.metrics.char_width;
-                let chars_per_line = chars_per_visual_line(content_width, cw);
+                let chars_per_line = self.chars_per_line(content_width);
                 let visual_idx = ((target_y - row_top) / self.metrics.row_height).floor() as usize;
                 let line_char_start = visual_idx.saturating_mul(chars_per_line);
-                let relative_x = (point.x - text_x).max(0.0);
+                // The text is drawn shifted left by the horizontal scroll;
+                // shift the cursor the other way to land on the same char.
+                let relative_x = (point.x - text_x + horizontal_offset).max(0.0);
                 let local_char = (relative_x / cw + 0.5).floor() as usize;
                 let char_offset = (line_char_start + local_char).min(char_count);
                 let byte = byte_offset_for_char(&line.content, char_offset);
-                return Some(TextPosition {
-                    region: Region::Body,
-                    file_index,
-                    hunk_index,
-                    line_index,
-                    byte,
-                });
+                return Some((
+                    TextPosition {
+                        region: Region::Body,
+                        file_index,
+                        hunk_index,
+                        line_index,
+                        byte,
+                    },
+                    resolved_lane,
+                ));
             }
         }
 
         // Not on a row (a header band, or past the last row). Snap to the end
         // of the document so a drag below content selects everything up to it.
         index.row_ids.last().map(|&(file, hunk, line)| {
-            let (file_index, hunk_index, line_index) =
+            let (file_index, hunk_index, mut line_index) =
                 (file as usize, hunk as usize, line as usize);
-            let line = &self.files[file_index].hunks[hunk_index].lines[line_index];
-            TextPosition {
-                region: Region::Body,
-                file_index,
-                hunk_index,
-                line_index,
-                byte: line.content.len(),
+            if let Some(&(left, right)) = index.pair_lines.last() {
+                // The last pair's later member is the true document tail.
+                let tail = if right != NO_LINE { right } else { left };
+                if tail != NO_LINE {
+                    line_index = (line_index).max(tail as usize);
+                }
             }
+            let line = &self.files[file_index].hunks[hunk_index].lines[line_index];
+            (
+                TextPosition {
+                    region: Region::Body,
+                    file_index,
+                    hunk_index,
+                    line_index,
+                    byte: line.content.len(),
+                },
+                None,
+            )
         })
     }
 
     /// Build the substring inside the inclusive selection range
     /// `[start, end)`, walking files/hunks/lines in document order so the
     /// pasted text reads naturally regardless of which direction the user
-    /// dragged.
-    fn collect_selected_text(&self, start: TextPosition, end: TextPosition) -> String {
+    /// dragged. `side` is the column a side-by-side selection lives in:
+    /// lines the *other* column owns (deletions for a right-side selection,
+    /// additions for a left-side one) aren't part of what the user sees
+    /// selected, so they're skipped.
+    fn collect_selected_text(
+        &self,
+        start: TextPosition,
+        end: TextPosition,
+        side: Option<SplitSide>,
+    ) -> String {
         if start == end {
             return String::new();
         }
@@ -990,8 +1439,19 @@ impl<'a, Message> DiffView<'a, Message> {
 
         // Then the diff body, in document order.
         for (file_index, file) in self.files.iter().enumerate() {
+            // Full-width (single-sided) files show every line regardless of
+            // the selection's column, so nothing is filtered there.
+            let hidden_kind = match side {
+                Some(SplitSide::Left) => Some(DiffLineKind::Addition),
+                Some(SplitSide::Right) => Some(DiffLineKind::Deletion),
+                None => None,
+            }
+            .filter(|_| self.side_by_side && !Self::file_is_single_sided(file));
             for (hunk_index, hunk) in file.hunks.iter().enumerate() {
                 for (line_index, line) in hunk.lines.iter().enumerate() {
+                    if Some(line.kind) == hidden_kind {
+                        continue;
+                    }
                     let pos_start = body_position(file_index, hunk_index, line_index, 0);
                     let pos_end =
                         body_position(file_index, hunk_index, line_index, line.content.len());
@@ -1055,7 +1515,8 @@ impl<'a, Message> DiffView<'a, Message> {
         );
 
         let position = Point::new(
-            bounds.x + self.metrics.gutter_width + PREFIX_WIDTH + TEXT_X_PADDING,
+            bounds.x + self.metrics.gutter_width + PREFIX_WIDTH + TEXT_X_PADDING
+                - render.horizontal_offset,
             render.y + TEXT_Y_PADDING,
         );
 
@@ -1066,17 +1527,28 @@ impl<'a, Message> DiffView<'a, Message> {
         // predicts — and that's what made selection rectangles on wrapped
         // code drift before/after the true text on the last visual line.
         // For monospaced source code, glyph wrapping is also visually
-        // tighter (no ragged whitespace gaps on the right edge).
+        // tighter (no ragged whitespace gaps on the right edge). With wrap
+        // off, rows are one visual line and clip at the pane edge instead.
         self.draw_code_text(
             renderer,
             line,
             TextRenderParams {
-                width: render.content_width,
+                // No-wrap shaping must not be bounded by the pane, or the
+                // scrolled-into tail of a long line would never be laid out.
+                width: if self.wrap {
+                    render.content_width
+                } else {
+                    f32::INFINITY
+                },
                 height: render.height,
                 position,
                 color: text_color,
                 clip_bounds: render.content_clip_bounds,
-                wrapping: text::Wrapping::Glyph,
+                wrapping: if self.wrap {
+                    text::Wrapping::Glyph
+                } else {
+                    text::Wrapping::None
+                },
             },
             cache_key,
             paragraph_cache,
@@ -1092,76 +1564,448 @@ impl<'a, Message> DiffView<'a, Message> {
         renderer: &mut Renderer,
         find: &FindOverlay<'_>,
         visible_rows: &[VisibleRow],
-        content_clip_bounds: Rectangle,
         bounds: Rectangle,
-        content_width: f32,
+        split: Option<&SplitLayout>,
+        horizontal_offset: f32,
     ) where
         Renderer: renderer::Renderer,
     {
         if find.matches.is_empty() {
             return;
         }
-        let cw = self.metrics.char_width;
-        let chars_per_line = chars_per_visual_line(content_width, cw);
-        let text_x = bounds.x + self.metrics.gutter_width + PREFIX_WIDTH + TEXT_X_PADDING;
-        let max_right = content_clip_bounds.x + content_clip_bounds.width;
 
         // Single pass over visible rows; for each, find matches landing on
         // it. With small numbers of matches per row this is fine; for
         // pathological cases (e.g. a `\w` regex with thousands of hits) we
         // could pre-sort matches by row and binary-search, but typical
         // queries match a few dozen times max.
-        for row in visible_rows {
-            let line = &self.files[row.file_index].hunks[row.hunk_index].lines[row.line_index];
-            for (match_idx, m) in find.matches.iter().enumerate() {
-                if m.file_index != row.file_index
-                    || m.hunk_index != row.hunk_index
-                    || m.line_index != row.line_index
-                {
+        for (geometry, lane) in self.lane_geometries(bounds, split, horizontal_offset) {
+            for row in visible_rows {
+                let Some(line_index) = row.line_in_lane(lane) else {
                     continue;
-                }
-                if !line.content.is_char_boundary(m.byte_start)
-                    || !line
-                        .content
-                        .is_char_boundary(m.byte_end.min(line.content.len()))
-                {
-                    continue;
-                }
-                let color = if find.active == Some(match_idx) {
-                    find.active_highlight
-                } else {
-                    find.highlight
                 };
-                let start_chars = char_count_at_byte(&line.content, m.byte_start);
-                let end_chars =
-                    char_count_at_byte(&line.content, m.byte_end.min(line.content.len()));
-                let total_chars = line.content.chars().count();
-                let visual_lines = total_chars.max(1).div_ceil(chars_per_line);
-                for visual_idx in 0..visual_lines {
-                    let vline_start = visual_idx * chars_per_line;
-                    let vline_end = ((visual_idx + 1) * chars_per_line).min(total_chars);
-                    let seg_start = start_chars.max(vline_start);
-                    let seg_end = end_chars.min(vline_end);
-                    if seg_start >= seg_end {
+                let line = &self.files[row.file_index].hunks[row.hunk_index].lines[line_index];
+                for (match_idx, m) in find.matches.iter().enumerate() {
+                    if m.file_index != row.file_index
+                        || m.hunk_index != row.hunk_index
+                        || m.line_index != line_index
+                    {
                         continue;
                     }
-                    let mut x = text_x + (seg_start - vline_start) as f32 * cw;
-                    let mut width = (seg_end - seg_start) as f32 * cw;
-                    if x < content_clip_bounds.x {
-                        let trim = content_clip_bounds.x - x;
-                        x = content_clip_bounds.x;
-                        width = (width - trim).max(0.0);
-                    }
-                    if x + width > max_right {
-                        width = (max_right - x).max(0.0);
-                    }
-                    if width <= 0.0 {
+                    if !line.content.is_char_boundary(m.byte_start)
+                        || !line
+                            .content
+                            .is_char_boundary(m.byte_end.min(line.content.len()))
+                    {
                         continue;
                     }
-                    let y = row.y + visual_idx as f32 * self.metrics.row_height;
-                    self.draw_background(renderer, x, y, width, self.metrics.row_height, color);
+                    let color = if find.active == Some(match_idx) {
+                        find.active_highlight
+                    } else {
+                        find.highlight
+                    };
+                    self.draw_byte_range_highlight(
+                        renderer,
+                        &line.content,
+                        row.y,
+                        m.byte_start,
+                        m.byte_end,
+                        color,
+                        0.0,
+                        &geometry,
+                    );
                 }
             }
+        }
+    }
+
+    /// Tint the changed tokens inside modified lines (intra-line word diff).
+    /// Drawn over the add/del line band, under selection/find highlights and
+    /// the text itself.
+    fn draw_emphasis_highlights<Renderer>(
+        &self,
+        renderer: &mut Renderer,
+        visible_rows: &[VisibleRow],
+        bounds: Rectangle,
+        split: Option<&SplitLayout>,
+        horizontal_offset: f32,
+    ) where
+        Renderer: renderer::Renderer,
+    {
+        for (geometry, lane) in self.lane_geometries(bounds, split, horizontal_offset) {
+            for row in visible_rows {
+                let Some(line_index) = row.line_in_lane(lane) else {
+                    continue;
+                };
+                let line = &self.files[row.file_index].hunks[row.hunk_index].lines[line_index];
+                if line.emphasis.is_empty() {
+                    continue;
+                }
+                let color = match line.kind {
+                    DiffLineKind::Addition => self.palette.addition_emphasis,
+                    DiffLineKind::Deletion => self.palette.deletion_emphasis,
+                    _ => continue,
+                };
+                for &(byte_start, byte_end) in &line.emphasis {
+                    self.draw_byte_range_highlight(
+                        renderer,
+                        &line.content,
+                        row.y,
+                        byte_start,
+                        byte_end,
+                        color,
+                        EMPHASIS_CORNER_RADIUS,
+                        &geometry,
+                    );
+                }
+            }
+        }
+    }
+
+    /// The highlight lanes of the current mode: the full text area (the
+    /// `None` lane — every row in unified mode, full-width files' rows in
+    /// split mode) plus one lane per column in side-by-side. Selection/
+    /// find/emphasis passes loop these so their per-row geometry stays
+    /// mode-agnostic; `VisibleRow::line_in_lane` keeps each row in the
+    /// lanes it actually renders in.
+    fn lane_geometries(
+        &self,
+        bounds: Rectangle,
+        split: Option<&SplitLayout>,
+        horizontal_offset: f32,
+    ) -> Vec<(HighlightGeometry, Option<SplitSide>)> {
+        let unified = (
+            HighlightGeometry {
+                char_width: self.metrics.char_width,
+                chars_per_line: self.chars_per_line(self.content_width(bounds.width)),
+                text_x: bounds.x + self.metrics.gutter_width + PREFIX_WIDTH + TEXT_X_PADDING
+                    - horizontal_offset,
+                clip_left: bounds.x + self.metrics.gutter_width + PREFIX_WIDTH,
+                clip_right: bounds.x + bounds.width,
+                row_height: self.metrics.row_height,
+            },
+            None,
+        );
+        let Some(split) = split else {
+            return vec![unified];
+        };
+        let lane = |text_x: f32, clip_left: f32, clip_right: f32| HighlightGeometry {
+            char_width: self.metrics.char_width,
+            chars_per_line: self.chars_per_line(split.text_width),
+            text_x,
+            clip_left,
+            clip_right,
+            row_height: self.metrics.row_height,
+        };
+        vec![
+            unified,
+            (
+                lane(
+                    bounds.x + split.left_text_x - horizontal_offset,
+                    bounds.x + split.gutter_width + PREFIX_WIDTH,
+                    bounds.x + split.divider_x,
+                ),
+                Some(SplitSide::Left),
+            ),
+            (
+                lane(
+                    bounds.x + split.right_text_x - horizontal_offset,
+                    bounds.x + split.right_gutter_x + split.gutter_width + PREFIX_WIDTH,
+                    bounds.x + bounds.width,
+                ),
+                Some(SplitSide::Right),
+            ),
+        ]
+    }
+
+    /// Per-side row tints for the split layout (the unified view's merged
+    /// full-width bands don't apply: each half tints by its own line's
+    /// kind). A padded side — no line to show — gets a faint neutral wash
+    /// plus a diagonal hatch, the classic "nothing here" treatment.
+    fn draw_split_row_tints<Renderer>(
+        &self,
+        renderer: &mut Renderer,
+        visible_rows: &[VisibleRow],
+        split: &SplitLayout,
+        bounds: Rectangle,
+    ) where
+        Renderer: renderer::Renderer + geometry::Renderer,
+    {
+        let mut padded: Vec<Rectangle> = Vec::new();
+        for row in visible_rows {
+            let Some((left, right)) = row.pair else {
+                continue;
+            };
+            let lines = &self.files[row.file_index].hunks[row.hunk_index].lines;
+            let halves = [
+                (left, bounds.x, split.divider_x),
+                (
+                    right,
+                    bounds.x + split.right_gutter_x,
+                    bounds.width - split.right_gutter_x,
+                ),
+            ];
+            for (member, x, width) in halves {
+                let color = if member == NO_LINE {
+                    padded.push(Rectangle {
+                        x,
+                        y: row.y,
+                        width,
+                        height: row.height,
+                    });
+                    Some(Color {
+                        a: 0.5,
+                        ..self.palette.gutter_background
+                    })
+                } else {
+                    lines
+                        .get(member as usize)
+                        .and_then(|line| self.changed_line_background_color(line.kind))
+                };
+                if let Some(color) = color {
+                    self.draw_background(renderer, x, row.y, width, row.height, color);
+                }
+            }
+        }
+        if !padded.is_empty() {
+            self.draw_padding_hatch(renderer, bounds, &padded);
+        }
+    }
+
+    /// 45° hatching over the padded halves of split rows. One geometry
+    /// frame for the whole frame's worth of rects; the stripe phase is
+    /// anchored globally (`x - y ≡ 0 mod step`) so the pattern runs
+    /// seamlessly across vertically adjacent padded rows.
+    fn draw_padding_hatch<Renderer>(
+        &self,
+        renderer: &mut Renderer,
+        bounds: Rectangle,
+        rects: &[Rectangle],
+    ) where
+        Renderer: geometry::Renderer,
+    {
+        const STEP: f32 = 6.0;
+        let stroke = Stroke::default()
+            .with_color(Color {
+                a: 0.4,
+                ..self.palette.border
+            })
+            .with_width(1.0)
+            .with_line_cap(LineCap::Butt);
+        let mut frame = Frame::new(
+            renderer,
+            Size::new(bounds.x + bounds.width, bounds.y + bounds.height),
+        );
+        let path = Path::new(|builder| {
+            for rect in rects {
+                // Stripes are the lines x - y = c. Visible c values run from
+                // the bottom-left corner to the top-right one.
+                let c_min = rect.x - (rect.y + rect.height);
+                let c_max = rect.x + rect.width - rect.y;
+                let mut c = (c_min / STEP).ceil() * STEP;
+                while c <= c_max {
+                    let y_start = rect.y.max(rect.x - c);
+                    let y_end = (rect.y + rect.height).min(rect.x + rect.width - c);
+                    if y_start < y_end {
+                        builder.move_to(Point::new(y_start + c, y_start));
+                        builder.line_to(Point::new(y_end + c, y_end));
+                    }
+                    c += STEP;
+                }
+            }
+        });
+        frame.stroke(&path, stroke);
+        renderer.draw_geometry(frame.into_geometry());
+    }
+
+    /// Draw one side-by-side row: each populated column gets its own
+    /// single-number gutter, prefix, and (independently wrapped) code text,
+    /// clipped to its column. A shared line (context) appears in both
+    /// columns — the paragraph cache key is per line, so it shapes once.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_split_row<Renderer>(
+        &self,
+        renderer: &mut Renderer,
+        row: &VisibleRow,
+        split: &SplitLayout,
+        bounds: Rectangle,
+        content_width: f32,
+        horizontal_offset: f32,
+        paragraph_cache: &RefCell<std::collections::HashMap<ParagraphKey, Renderer::Paragraph>>,
+        paragraph_seen: &mut std::collections::HashSet<ParagraphKey>,
+    ) where
+        Renderer: text::Renderer<Font = Font>,
+    {
+        let content_width_bits = content_width.to_bits();
+        let lines = &self.files[row.file_index].hunks[row.hunk_index].lines;
+        let sides = [
+            (
+                SplitSide::Left,
+                0.0,
+                split.left_text_x,
+                bounds.x + split.gutter_width + PREFIX_WIDTH,
+                bounds.x + split.divider_x,
+            ),
+            (
+                SplitSide::Right,
+                split.right_gutter_x,
+                split.right_text_x,
+                bounds.x + split.right_gutter_x + split.gutter_width + PREFIX_WIDTH,
+                bounds.x + bounds.width,
+            ),
+        ];
+        for (side, gutter_x, text_x, clip_left, clip_right) in sides {
+            let Some(line_index) = row.line_in_lane(Some(side)) else {
+                continue;
+            };
+            let Some(line) = lines.get(line_index) else {
+                continue;
+            };
+            let clip = Rectangle {
+                x: clip_left,
+                y: bounds.y,
+                width: (clip_right - clip_left).max(1.0),
+                height: bounds.height,
+            };
+            let number = match side {
+                SplitSide::Left => line.old_line,
+                SplitSide::Right => line.new_line,
+            };
+            let gutter = match number {
+                Some(n) => format!("{n:>width$}", width = self.metrics.gutter_digit_count),
+                None => String::new(),
+            };
+            let text_color = self.line_text_color(line.kind);
+            self.draw_text(
+                renderer,
+                &gutter,
+                TextRenderParams {
+                    width: (split.gutter_width - GUTTER_HORIZONTAL_PADDING * 2.0).max(1.0),
+                    height: self.metrics.row_height,
+                    position: Point::new(
+                        bounds.x + gutter_x + GUTTER_HORIZONTAL_PADDING,
+                        row.y + TEXT_Y_PADDING,
+                    ),
+                    color: self.palette.text_muted,
+                    clip_bounds: bounds,
+                    wrapping: text::Wrapping::None,
+                },
+            );
+            self.draw_text(
+                renderer,
+                prefix_for_kind(line.kind),
+                TextRenderParams {
+                    width: PREFIX_WIDTH,
+                    height: self.metrics.row_height,
+                    position: Point::new(
+                        bounds.x + gutter_x + split.gutter_width + TEXT_X_PADDING,
+                        row.y + TEXT_Y_PADDING,
+                    ),
+                    color: text_color,
+                    clip_bounds: bounds,
+                    wrapping: text::Wrapping::None,
+                },
+            );
+            self.draw_code_text(
+                renderer,
+                line,
+                TextRenderParams {
+                    // See `draw_row`: unbounded shaping in no-wrap mode.
+                    width: if self.wrap {
+                        content_width
+                    } else {
+                        f32::INFINITY
+                    },
+                    height: row.height,
+                    position: Point::new(
+                        bounds.x + text_x - horizontal_offset,
+                        row.y + TEXT_Y_PADDING,
+                    ),
+                    color: text_color,
+                    clip_bounds: clip,
+                    wrapping: if self.wrap {
+                        text::Wrapping::Glyph
+                    } else {
+                        text::Wrapping::None
+                    },
+                },
+                ParagraphKey {
+                    file_index: row.file_index as u32,
+                    hunk_index: row.hunk_index as u32,
+                    line_index: line_index as u32,
+                    content_width_bits,
+                },
+                paragraph_cache,
+                paragraph_seen,
+            );
+        }
+    }
+
+    /// Paint translucent rectangles behind `content[byte_start..byte_end]`,
+    /// one per visual sub-line the range crosses on a wrapped row. The char
+    /// math mirrors `row_height`/hit-testing (glyph wrapping at a fixed
+    /// column), which is what keeps the rects glued to the glyphs.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    fn draw_byte_range_highlight<Renderer>(
+        &self,
+        renderer: &mut Renderer,
+        content: &str,
+        row_y: f32,
+        byte_start: usize,
+        byte_end: usize,
+        color: Color,
+        corner_radius: f32,
+        geometry: &HighlightGeometry,
+    ) where
+        Renderer: renderer::Renderer,
+    {
+        let start_chars = char_count_at_byte(content, byte_start);
+        let end_chars = char_count_at_byte(content, byte_end.min(content.len()));
+        if start_chars >= end_chars {
+            return;
+        }
+        let total_chars = content.chars().count();
+        let visual_lines = total_chars.max(1).div_ceil(geometry.chars_per_line);
+        for visual_idx in 0..visual_lines {
+            let vline_start = visual_idx * geometry.chars_per_line;
+            let vline_end = ((visual_idx + 1) * geometry.chars_per_line).min(total_chars);
+            let seg_start = start_chars.max(vline_start);
+            let seg_end = end_chars.min(vline_end);
+            if seg_start >= seg_end {
+                continue;
+            }
+            let mut x = geometry.text_x + (seg_start - vline_start) as f32 * geometry.char_width;
+            let mut width = (seg_end - seg_start) as f32 * geometry.char_width;
+            if x < geometry.clip_left {
+                let trim = geometry.clip_left - x;
+                x = geometry.clip_left;
+                width = (width - trim).max(0.0);
+            }
+            if x + width > geometry.clip_right {
+                width = (geometry.clip_right - x).max(0.0);
+            }
+            if width <= 0.0 {
+                continue;
+            }
+            let y = row_y + visual_idx as f32 * geometry.row_height;
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: Rectangle {
+                        x,
+                        y,
+                        width,
+                        height: geometry.row_height,
+                    },
+                    border: Border {
+                        radius: corner_radius.into(),
+                        ..Border::default()
+                    },
+                    shadow: Shadow::default(),
+                    snap: true,
+                },
+                color,
+            );
         }
     }
 
@@ -1338,7 +2182,7 @@ impl<'a, Message> DiffView<'a, Message> {
 
 impl<'a, Message, Renderer> Widget<Message, Theme, Renderer> for DiffView<'a, Message>
 where
-    Renderer: text::Renderer<Font = Font>,
+    Renderer: text::Renderer<Font = Font> + geometry::Renderer,
 {
     fn tag(&self) -> tree::Tag {
         tree::Tag::of::<State<Renderer::Paragraph>>()
@@ -1352,9 +2196,13 @@ where
             pending_find_scroll: None,
             last_find_scroll_token: None,
             vertical_offset: 0.0,
+            horizontal_offset: 0.0,
+            last_wrap: self.wrap,
+            modifiers: keyboard::Modifiers::default(),
             paragraph_cache: RefCell::new(std::collections::HashMap::new()),
             selection_anchor: None,
             selection_focus: None,
+            selection_lane: None,
             selection_anchor_unit_start: None,
             selection_anchor_unit_end: None,
             selection_unit: SelectionUnit::Character,
@@ -1394,9 +2242,17 @@ where
             state.paragraph_cache.borrow_mut().clear();
         }
 
+        // Wrap-mode flips zero the sideways scroll: wrapped content never
+        // overflows, and a stale offset would blank the whole pane.
+        if self.wrap != state.last_wrap {
+            state.last_wrap = self.wrap;
+            state.horizontal_offset = 0.0;
+        }
+
         if state.revision_key != self.revision_key {
             state.revision_key = self.revision_key.clone();
             state.vertical_offset = 0.0;
+            state.horizontal_offset = 0.0;
             state.selected_file = self.selected_file;
             state.pending_file_jump = Some(self.selected_file);
             // A revision change means the underlying line indices no longer
@@ -1404,6 +2260,7 @@ where
             // copying stale content.
             state.selection_anchor = None;
             state.selection_focus = None;
+            state.selection_lane = None;
             state.selection_anchor_unit_start = None;
             state.selection_anchor_unit_end = None;
             state.selection_unit = SelectionUnit::Character;
@@ -1471,9 +2328,14 @@ where
         // via `on_scroll`. `fn` pointers are `Copy`, so this borrows nothing.
         let prev_offset = state.vertical_offset;
         let max_vertical = (content_height - bounds.height).max(0.0);
+        let max_horizontal = self.max_horizontal(&state.height_index.borrow(), bounds.width);
 
         if state.vertical_offset > max_vertical {
             state.vertical_offset = max_vertical;
+            shell.request_redraw();
+        }
+        if state.horizontal_offset > max_horizontal {
+            state.horizontal_offset = max_horizontal;
             shell.request_redraw();
         }
 
@@ -1499,7 +2361,7 @@ where
         if let Some((file_idx, hunk_idx, line_idx, byte_offset)) = state.pending_find_scroll.take()
             && let Some(target) = {
                 let index = state.height_index.borrow();
-                self.match_target_y(&index, file_idx, hunk_idx, line_idx, byte_offset, bounds)
+                self.match_target_y(&index, file_idx, hunk_idx, line_idx, byte_offset)
             }
         {
             // Center the row in the viewport when there's room; clamp
@@ -1507,6 +2369,26 @@ where
             // visible instead of pinning it to the top edge.
             let centered = target - (bounds.height - self.metrics.row_height) / 2.0;
             state.vertical_offset = centered.clamp(0.0, max_vertical);
+            // In no-wrap mode the match may sit past the right edge —
+            // scroll sideways so it lands ~1/3 into the text area (some
+            // leading context, most of the room for what follows).
+            if max_horizontal > 0.0
+                && let Some(line) = self
+                    .files
+                    .get(file_idx)
+                    .and_then(|file| file.hunks.get(hunk_idx))
+                    .and_then(|hunk| hunk.lines.get(line_idx))
+            {
+                let match_x =
+                    char_count_at_byte(&line.content, byte_offset) as f32 * self.metrics.char_width;
+                let text_width = self.effective_text_width(bounds.width);
+                let off_screen = match_x < state.horizontal_offset
+                    || match_x > state.horizontal_offset + text_width - self.metrics.char_width;
+                if off_screen {
+                    state.horizontal_offset =
+                        (match_x - text_width / 3.0).clamp(0.0, max_horizontal);
+                }
+            }
             let selected_file =
                 self.file_at_offset(&state.height_index.borrow(), state.vertical_offset);
             if selected_file != state.selected_file {
@@ -1543,8 +2425,10 @@ where
                         if (new_offset - state.vertical_offset).abs() > f32::EPSILON {
                             state.vertical_offset = new_offset;
                             self.advance_drag_selection(state, cursor_pos, bounds);
-                            let selected_file = self
-                                .file_at_offset(&state.height_index.borrow(), state.vertical_offset);
+                            let selected_file = self.file_at_offset(
+                                &state.height_index.borrow(),
+                                state.vertical_offset,
+                            );
                             if selected_file != state.selected_file {
                                 state.selected_file = selected_file;
                                 shell.publish((self.on_selected_file_changed)(selected_file));
@@ -1559,12 +2443,29 @@ where
                     return;
                 };
 
-                let movement = match *delta {
-                    mouse::ScrollDelta::Lines { x: _, y } => {
-                        Vector::new(0.0, -y * self.metrics.row_height * LINE_SCROLL_ROWS)
+                // Shift+wheel pans sideways, matching editors. Only redirect
+                // when the event has no native x component: macOS folds
+                // shift+wheel into the x delta itself, and trackpads / tilt
+                // wheels emit real x deltas — swapping those would just
+                // re-derive vertical scroll.
+                let shift_swap = |x: f32, y: f32| {
+                    if state.modifiers.shift() && x == 0.0 {
+                        (y, 0.0)
+                    } else {
+                        (x, y)
                     }
-                    mouse::ScrollDelta::Pixels { x: _, y } => {
-                        Vector::new(0.0, -y * PIXEL_SCROLL_SCALE)
+                };
+                let movement = match *delta {
+                    mouse::ScrollDelta::Lines { x, y } => {
+                        let (x, y) = shift_swap(x, y);
+                        Vector::new(
+                            -x * self.metrics.char_width * LINE_SCROLL_ROWS,
+                            -y * self.metrics.row_height * LINE_SCROLL_ROWS,
+                        )
+                    }
+                    mouse::ScrollDelta::Pixels { x, y } => {
+                        let (x, y) = shift_swap(x, y);
+                        Vector::new(-x * PIXEL_SCROLL_SCALE, -y * PIXEL_SCROLL_SCALE)
                     }
                 };
 
@@ -1578,6 +2479,13 @@ where
                         shell.publish((self.on_selected_file_changed)(selected_file));
                     }
                 }
+                // Sideways: trackpads and tilt wheels report an x delta
+                // (macOS also folds shift+wheel into it). Only live in
+                // no-wrap mode, where content can actually overflow.
+                if movement.x != 0.0 && max_horizontal > 0.0 {
+                    state.horizontal_offset =
+                        (state.horizontal_offset + movement.x).clamp(0.0, max_horizontal);
+                }
 
                 shell.capture_event();
                 shell.request_redraw();
@@ -1589,6 +2497,7 @@ where
                     if state.selection_anchor.is_some() {
                         state.selection_anchor = None;
                         state.selection_focus = None;
+                        state.selection_lane = None;
                         state.selection_anchor_unit_start = None;
                         state.selection_anchor_unit_end = None;
                         state.selection_unit = SelectionUnit::Character;
@@ -1628,9 +2537,16 @@ where
                 }
                 let position = {
                     let index = state.height_index.borrow();
-                    self.position_at_point(&index, point, bounds, state.vertical_offset)
+                    self.position_at_point(
+                        &index,
+                        point,
+                        bounds,
+                        state.vertical_offset,
+                        state.horizontal_offset,
+                        None,
+                    )
                 };
-                let Some(position) = position else {
+                let Some((position, lane)) = position else {
                     return;
                 };
 
@@ -1665,6 +2581,7 @@ where
                 state.selection_anchor_unit_end = Some(anchor_end);
                 state.selection_anchor = Some(anchor_start);
                 state.selection_focus = Some(anchor_end);
+                state.selection_lane = lane;
                 state.is_selecting = true;
                 state.last_drag_cursor = Some(point);
                 shell.capture_event();
@@ -1728,6 +2645,7 @@ where
                 {
                     state.selection_anchor = None;
                     state.selection_focus = None;
+                    state.selection_lane = None;
                 }
                 shell.request_redraw();
             }
@@ -1746,11 +2664,16 @@ where
                 let Some(on_copy) = self.on_copy else {
                     return;
                 };
-                let text = self.collect_selected_text(start, end);
+                let text = self.collect_selected_text(start, end, state.selection_lane);
                 if !text.is_empty() {
                     shell.publish(on_copy(text));
                     shell.capture_event();
                 }
+            }
+            Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
+                // Tracked for shift+wheel panning; deliberately not captured
+                // — other widgets follow modifier changes too.
+                state.modifiers = *modifiers;
             }
             _ => {}
         }
@@ -1781,7 +2704,11 @@ where
         };
 
         let state = tree.state.downcast_ref::<State<Renderer::Paragraph>>();
-        let content_width = self.content_width(bounds.width);
+        // Split-column wrap width in split mode, the whole text area
+        // otherwise; full-width rows always use `unified_width`.
+        let content_width = self.effective_text_width(bounds.width);
+        let unified_width = self.content_width(bounds.width);
+        let split = self.side_by_side.then(|| self.split_layout(bounds.width));
         // Normally a no-op — `update` ran first and built it — but draw must
         // not rely on event ordering for correctness.
         self.ensure_height_index(&state.height_index, bounds.width);
@@ -1793,10 +2720,27 @@ where
         // (i.e. ones we add to `seen` here).
         let mut paragraph_seen: std::collections::HashSet<ParagraphKey> =
             std::collections::HashSet::new();
+        let horizontal_offset = state.horizontal_offset;
+        // Everything text-shaped clips out of the (left) gutter band; the
+        // split layout's narrower gutter widens this accordingly.
+        let text_region_x = match &split {
+            Some(split) => split.gutter_width + PREFIX_WIDTH,
+            None => self.metrics.gutter_width + PREFIX_WIDTH,
+        };
         let content_clip_bounds = Rectangle {
-            x: bounds.x + self.metrics.gutter_width + PREFIX_WIDTH,
+            x: bounds.x + text_region_x,
             y: bounds.y,
-            width: (bounds.width - self.metrics.gutter_width - PREFIX_WIDTH).max(1.0),
+            width: (bounds.width - text_region_x).max(1.0),
+            height: bounds.height,
+        };
+        // Clip for unified-rendered rows — in split mode their (wider)
+        // double gutter sits to the right of the split columns' clip edge,
+        // so they need their own rect or h-scrolled text would paint over it.
+        let unified_region_x = self.metrics.gutter_width + PREFIX_WIDTH;
+        let unified_clip_bounds = Rectangle {
+            x: bounds.x + unified_region_x,
+            y: bounds.y,
+            width: (bounds.width - unified_region_x).max(1.0),
             height: bounds.height,
         };
 
@@ -1822,10 +2766,8 @@ where
             // Everything below is O(log n + visible) against the prefix-sum
             // index — never a walk over the whole document.
             // Content-space top of each file's header (sans the sentinel).
-            let file_tops = &height_index.file_tops[..self
-                .files
-                .len()
-                .min(height_index.file_tops.len())];
+            let file_tops =
+                &height_index.file_tops[..self.files.len().min(height_index.file_tops.len())];
 
             let first_file = file_tops
                 .partition_point(|&top| top + self.metrics.file_header_height < visible_top);
@@ -1842,12 +2784,7 @@ where
             let first_hunk = height_index
                 .hunk_tops
                 .partition_point(|&top| top + self.metrics.hunk_header_height < visible_top);
-            for (i, &top) in height_index
-                .hunk_tops
-                .iter()
-                .enumerate()
-                .skip(first_hunk)
-            {
+            for (i, &top) in height_index.hunk_tops.iter().enumerate().skip(first_hunk) {
                 if top > visible_bottom {
                     break;
                 }
@@ -1870,22 +2807,35 @@ where
                     break;
                 }
                 let (file_index, hunk_index, line_index) = height_index.row_ids[i];
-                let (file_index, hunk_index, line_index) =
-                    (file_index as usize, hunk_index as usize, line_index as usize);
-                let line = &self.files[file_index].hunks[hunk_index].lines[line_index];
-                let height = self.row_height(line, content_width);
+                let (file_index, hunk_index, line_index) = (
+                    file_index as usize,
+                    hunk_index as usize,
+                    line_index as usize,
+                );
+                let height = self.index_row_height(&height_index, i);
                 if row_top + height < visible_top {
                     continue;
                 }
                 let y = bounds.y + (row_top - visible_top);
+                // Full-width files drop their alignment-only pair so the row
+                // renders (and band-tints) like a unified one.
+                let pair = height_index
+                    .pair_lines
+                    .get(i)
+                    .copied()
+                    .filter(|_| !height_index.is_full_width(file_index));
                 visible_rows.push(VisibleRow {
                     file_index,
                     hunk_index,
                     line_index,
+                    pair,
                     y,
                     height,
                 });
-                push_visible_band(&mut visible_bands, line.kind, y, height);
+                if pair.is_none() {
+                    let line = &self.files[file_index].hunks[hunk_index].lines[line_index];
+                    push_visible_band(&mut visible_bands, line.kind, y, height);
+                }
             }
 
             // Sticky file header: the file occupying the top of the viewport
@@ -1904,22 +2854,100 @@ where
                 bounds.y + (pinned_content_y - visible_top)
             });
 
-            self.draw_background(
-                renderer,
-                bounds.x,
-                bounds.y,
-                self.metrics.gutter_width,
-                bounds.height,
-                self.palette.gutter_background,
-            );
-            self.draw_background(
-                renderer,
-                bounds.x + self.metrics.gutter_width,
-                bounds.y,
-                1.0,
-                bounds.height,
-                self.palette.border,
-            );
+            match &split {
+                Some(split) => {
+                    // One gutter strip per column, plus the center divider —
+                    // segmented per file, because full-width (single-sided)
+                    // files keep the unified double gutter instead. The last
+                    // segment runs to the pane bottom so short documents
+                    // keep their chrome below the content, as before.
+                    let split_chrome = |renderer: &mut Renderer, y: f32, height: f32| {
+                        for gutter_x in [0.0, split.right_gutter_x] {
+                            self.draw_background(
+                                renderer,
+                                bounds.x + gutter_x,
+                                y,
+                                split.gutter_width,
+                                height,
+                                self.palette.gutter_background,
+                            );
+                            self.draw_background(
+                                renderer,
+                                bounds.x + gutter_x + split.gutter_width,
+                                y,
+                                1.0,
+                                height,
+                                self.palette.border,
+                            );
+                        }
+                        self.draw_background(
+                            renderer,
+                            bounds.x + split.divider_x,
+                            y,
+                            1.0,
+                            height,
+                            self.palette.border,
+                        );
+                    };
+                    if self.files.is_empty() {
+                        split_chrome(renderer, bounds.y, bounds.height);
+                    }
+                    for (file_index, &top) in file_tops.iter().enumerate() {
+                        let bottom = if file_index + 1 < self.files.len() {
+                            height_index.file_tops[file_index + 1]
+                        } else {
+                            f32::MAX
+                        };
+                        if bottom < visible_top || top > visible_bottom {
+                            continue;
+                        }
+                        let seg_top = top.max(visible_top);
+                        let y = bounds.y + (seg_top - visible_top);
+                        let height = bottom.min(visible_bottom) - seg_top;
+                        if height <= 0.0 {
+                            continue;
+                        }
+                        if height_index.is_full_width(file_index) {
+                            self.draw_background(
+                                renderer,
+                                bounds.x,
+                                y,
+                                self.metrics.gutter_width,
+                                height,
+                                self.palette.gutter_background,
+                            );
+                            self.draw_background(
+                                renderer,
+                                bounds.x + self.metrics.gutter_width,
+                                y,
+                                1.0,
+                                height,
+                                self.palette.border,
+                            );
+                        } else {
+                            split_chrome(renderer, y, height);
+                        }
+                    }
+                }
+                None => {
+                    self.draw_background(
+                        renderer,
+                        bounds.x,
+                        bounds.y,
+                        self.metrics.gutter_width,
+                        bounds.height,
+                        self.palette.gutter_background,
+                    );
+                    self.draw_background(
+                        renderer,
+                        bounds.x + self.metrics.gutter_width,
+                        bounds.y,
+                        1.0,
+                        bounds.height,
+                        self.palette.border,
+                    );
+                }
+            }
 
             for band in &visible_bands {
                 let Some(background) = self.changed_line_background_color(band.kind) else {
@@ -1935,6 +2963,17 @@ where
                     background,
                 );
             }
+            if let Some(split) = &split {
+                self.draw_split_row_tints(renderer, &visible_rows, split, bounds);
+            }
+
+            self.draw_emphasis_highlights(
+                renderer,
+                &visible_rows,
+                bounds,
+                split.as_ref(),
+                horizontal_offset,
+            );
 
             let selection_range = match (state.selection_anchor, state.selection_focus) {
                 (Some(anchor), Some(focus)) if anchor != focus => Some(ordered(anchor, focus)),
@@ -1970,6 +3009,11 @@ where
                     1.0,
                     self.palette.hunk_header,
                 );
+                let (header_x, header_clip) = if height_index.is_full_width(header.file_index) {
+                    (unified_region_x, unified_clip_bounds)
+                } else {
+                    (text_region_x, content_clip_bounds)
+                };
                 self.draw_text(
                     renderer,
                     &hunk.header,
@@ -1977,11 +3021,11 @@ where
                         width: self.text_width(&hunk.header),
                         height: self.metrics.hunk_header_height,
                         position: Point::new(
-                            bounds.x + self.metrics.gutter_width + PREFIX_WIDTH + TEXT_X_PADDING,
+                            bounds.x + header_x + TEXT_X_PADDING,
                             header.y + TEXT_Y_PADDING,
                         ),
                         color: self.palette.text_muted,
-                        clip_bounds: content_clip_bounds,
+                        clip_bounds: header_clip,
                         wrapping: text::Wrapping::None,
                     },
                 );
@@ -1994,85 +3038,98 @@ where
             if let (Some(anchor), Some(focus)) = (state.selection_anchor, state.selection_focus) {
                 let (sel_start, sel_end) = ordered(anchor, focus);
                 if sel_start != sel_end {
-                    let cw = self.metrics.char_width;
-                    let chars_per_line = chars_per_visual_line(content_width, cw);
-                    let text_x =
-                        bounds.x + self.metrics.gutter_width + PREFIX_WIDTH + TEXT_X_PADDING;
                     let visual_line_height = self.metrics.row_height;
-                    let max_right = content_clip_bounds.x + content_clip_bounds.width;
-                    for row in &visible_rows {
-                        let line =
-                            &self.files[row.file_index].hunks[row.hunk_index].lines[row.line_index];
-                        let row_pos_start =
-                            body_position(row.file_index, row.hunk_index, row.line_index, 0);
-                        let row_pos_end = body_position(
-                            row.file_index,
-                            row.hunk_index,
-                            row.line_index,
-                            line.content.len(),
-                        );
-                        if row_pos_end < sel_start || row_pos_start >= sel_end {
+                    for (geometry, lane) in
+                        self.lane_geometries(bounds, split.as_ref(), horizontal_offset)
+                    {
+                        // A side-by-side selection lives in one column; the
+                        // mirror column shows no highlight even where it
+                        // carries the same (context) line.
+                        if let (Some(sel_lane), Some(lane_side)) = (state.selection_lane, lane)
+                            && sel_lane != lane_side
+                        {
                             continue;
                         }
-
-                        let line_start_byte = if row_pos_start < sel_start {
-                            sel_start.byte
-                        } else {
-                            0
-                        };
-                        let line_end_byte = if row_pos_end > sel_end {
-                            sel_end.byte
-                        } else {
-                            line.content.len()
-                        };
-                        let start_chars = char_count_at_byte(&line.content, line_start_byte);
-                        let end_chars = char_count_at_byte(&line.content, line_end_byte);
-                        let total_chars = line.content.chars().count();
-                        let is_full_line = sel_start <= row_pos_start && row_pos_end < sel_end;
-
-                        // Walk each visual sub-line the row contains and
-                        // intersect the selection char range with it. Without
-                        // this loop a wrapped row would render a single full-
-                        // width rectangle across every visual line, ignoring
-                        // where the selection actually starts and ends.
-                        let visual_lines = total_chars.max(1).div_ceil(chars_per_line);
-                        for visual_idx in 0..visual_lines {
-                            let vline_start = visual_idx * chars_per_line;
-                            let vline_end = ((visual_idx + 1) * chars_per_line).min(total_chars);
-                            let seg_start = start_chars.max(vline_start);
-                            let seg_end = end_chars.min(vline_end);
-                            if seg_start >= seg_end {
+                        let cw = geometry.char_width;
+                        let chars_per_line = geometry.chars_per_line;
+                        for row in &visible_rows {
+                            let Some(line_index) = row.line_in_lane(lane) else {
                                 continue;
-                            }
-                            let mut x = text_x + (seg_start - vline_start) as f32 * cw;
-                            let mut width = (seg_end - seg_start) as f32 * cw;
-                            // The "select through end-of-line" tail only
-                            // belongs on the trailing visual line of a full
-                            // logical row, not on every wrapped segment.
-                            let is_trailing_visual = visual_idx + 1 == visual_lines;
-                            if is_full_line && is_trailing_visual {
-                                width += cw * 0.6;
-                            }
-                            if x < content_clip_bounds.x {
-                                let trim = content_clip_bounds.x - x;
-                                x = content_clip_bounds.x;
-                                width = (width - trim).max(0.0);
-                            }
-                            if x + width > max_right {
-                                width = (max_right - x).max(0.0);
-                            }
-                            if width <= 0.0 {
-                                continue;
-                            }
-                            let y = row.y + visual_idx as f32 * visual_line_height;
-                            self.draw_background(
-                                renderer,
-                                x,
-                                y,
-                                width,
-                                visual_line_height,
-                                self.palette.selection,
+                            };
+                            let line =
+                                &self.files[row.file_index].hunks[row.hunk_index].lines[line_index];
+                            let row_pos_start =
+                                body_position(row.file_index, row.hunk_index, line_index, 0);
+                            let row_pos_end = body_position(
+                                row.file_index,
+                                row.hunk_index,
+                                line_index,
+                                line.content.len(),
                             );
+                            if row_pos_end < sel_start || row_pos_start >= sel_end {
+                                continue;
+                            }
+
+                            let line_start_byte = if row_pos_start < sel_start {
+                                sel_start.byte
+                            } else {
+                                0
+                            };
+                            let line_end_byte = if row_pos_end > sel_end {
+                                sel_end.byte
+                            } else {
+                                line.content.len()
+                            };
+                            let start_chars = char_count_at_byte(&line.content, line_start_byte);
+                            let end_chars = char_count_at_byte(&line.content, line_end_byte);
+                            let total_chars = line.content.chars().count();
+                            let is_full_line = sel_start <= row_pos_start && row_pos_end < sel_end;
+
+                            // Walk each visual sub-line the row contains and
+                            // intersect the selection char range with it. Without
+                            // this loop a wrapped row would render a single full-
+                            // width rectangle across every visual line, ignoring
+                            // where the selection actually starts and ends.
+                            let visual_lines = total_chars.max(1).div_ceil(chars_per_line);
+                            for visual_idx in 0..visual_lines {
+                                let vline_start = visual_idx * chars_per_line;
+                                let vline_end =
+                                    ((visual_idx + 1) * chars_per_line).min(total_chars);
+                                let seg_start = start_chars.max(vline_start);
+                                let seg_end = end_chars.min(vline_end);
+                                if seg_start >= seg_end {
+                                    continue;
+                                }
+                                let mut x = geometry.text_x + (seg_start - vline_start) as f32 * cw;
+                                let mut width = (seg_end - seg_start) as f32 * cw;
+                                // The "select through end-of-line" tail only
+                                // belongs on the trailing visual line of a full
+                                // logical row, not on every wrapped segment.
+                                let is_trailing_visual = visual_idx + 1 == visual_lines;
+                                if is_full_line && is_trailing_visual {
+                                    width += cw * 0.6;
+                                }
+                                if x < geometry.clip_left {
+                                    let trim = geometry.clip_left - x;
+                                    x = geometry.clip_left;
+                                    width = (width - trim).max(0.0);
+                                }
+                                if x + width > geometry.clip_right {
+                                    width = (geometry.clip_right - x).max(0.0);
+                                }
+                                if width <= 0.0 {
+                                    continue;
+                                }
+                                let y = row.y + visual_idx as f32 * visual_line_height;
+                                self.draw_background(
+                                    renderer,
+                                    x,
+                                    y,
+                                    width,
+                                    visual_line_height,
+                                    self.palette.selection,
+                                );
+                            }
                         }
                     }
                 }
@@ -2083,30 +3140,46 @@ where
                     renderer,
                     find,
                     &visible_rows,
-                    content_clip_bounds,
                     bounds,
-                    content_width,
+                    split.as_ref(),
+                    horizontal_offset,
                 );
             }
 
-            let content_width_bits = content_width.to_bits();
+            let unified_width_bits = unified_width.to_bits();
             for row in &visible_rows {
+                if let (Some(split), Some(_)) = (&split, row.pair) {
+                    self.draw_split_row(
+                        renderer,
+                        row,
+                        split,
+                        bounds,
+                        content_width,
+                        horizontal_offset,
+                        &state.paragraph_cache,
+                        &mut paragraph_seen,
+                    );
+                    continue;
+                }
+                // Unified-rendered row: unified mode, or a full-width
+                // (single-sided) file in split mode.
                 let line = &self.files[row.file_index].hunks[row.hunk_index].lines[row.line_index];
                 let key = ParagraphKey {
                     file_index: row.file_index as u32,
                     hunk_index: row.hunk_index as u32,
                     line_index: row.line_index as u32,
-                    content_width_bits,
+                    content_width_bits: unified_width_bits,
                 };
                 self.draw_row(
                     renderer,
                     line,
                     RowRenderParams {
                         bounds,
-                        content_clip_bounds,
+                        content_clip_bounds: unified_clip_bounds,
                         y: row.y,
                         height: row.height,
-                        content_width,
+                        content_width: unified_width,
+                        horizontal_offset,
                     },
                     key,
                     &state.paragraph_cache,
@@ -2125,7 +3198,8 @@ where
                 });
             }
 
-            let geom = scrollbar::geometry(bounds, height_index.total_height, state.vertical_offset);
+            let geom =
+                scrollbar::geometry(bounds, height_index.total_height, state.vertical_offset);
             // Draw the scrollbar in its own layer, created *after* the sticky
             // header's, so it composites above it — sub-layers stack in creation
             // order, so otherwise the full-width sticky strip would hide the
@@ -2184,6 +3258,21 @@ where
                 mouse::Interaction::Idle
             };
         }
+        if self.side_by_side {
+            let index = state.height_index.borrow();
+            // Full-width (single-sided) files hit-test like unified rows.
+            if !index.is_full_width(self.file_at_offset(&index, target_y)) {
+                let split = self.split_layout(bounds.width);
+                let x = point.x - bounds.x;
+                let over_text = (x >= split.gutter_width + PREFIX_WIDTH && x < split.divider_x)
+                    || x >= split.right_gutter_x + split.gutter_width + PREFIX_WIDTH;
+                return if over_text {
+                    mouse::Interaction::Text
+                } else {
+                    mouse::Interaction::Idle
+                };
+            }
+        }
         if point.x >= bounds.x + self.metrics.gutter_width + PREFIX_WIDTH {
             mouse::Interaction::Text
         } else {
@@ -2209,9 +3298,17 @@ impl<Message> DiffView<'_, Message> {
     ) {
         let focus_pos = {
             let index = state.height_index.borrow();
-            self.position_at_point(&index, cursor_pos, bounds, state.vertical_offset)
+            self.position_at_point(
+                &index,
+                cursor_pos,
+                bounds,
+                state.vertical_offset,
+                state.horizontal_offset,
+                // The drag stays in the column the selection started in.
+                state.selection_lane,
+            )
         };
-        let Some(focus_pos) = focus_pos else {
+        let Some((focus_pos, _)) = focus_pos else {
             return;
         };
 
@@ -2539,6 +3636,29 @@ fn chars_per_visual_line(content_width: f32, cw: f32) -> usize {
     (content_width / cw.max(1.0)).floor().max(1.0) as usize
 }
 
+/// Per-column x-offsets of the side-by-side layout, relative to the pane's
+/// left edge. See `DiffView::split_layout`. (The left gutter sits at 0.)
+struct SplitLayout {
+    gutter_width: f32,
+    text_width: f32,
+    left_text_x: f32,
+    divider_x: f32,
+    right_gutter_x: f32,
+    right_text_x: f32,
+}
+
+/// Shared geometry for byte-range background rects (find matches, intra-line
+/// emphasis): the char-grid parameters that map a char range on a wrapped
+/// row to screen rectangles.
+struct HighlightGeometry {
+    char_width: f32,
+    chars_per_line: usize,
+    text_x: f32,
+    clip_left: f32,
+    clip_right: f32,
+    row_height: f32,
+}
+
 fn push_visible_band(bands: &mut Vec<VisibleBand>, kind: DiffLineKind, y: f32, height: f32) {
     if kind == DiffLineKind::Context {
         return;
@@ -2788,7 +3908,7 @@ fn prefix_for_kind(kind: DiffLineKind) -> &'static str {
 impl<'a, Message, Renderer> From<DiffView<'a, Message>> for Element<'a, Message, Theme, Renderer>
 where
     Message: 'a,
-    Renderer: text::Renderer<Font = Font> + 'a,
+    Renderer: text::Renderer<Font = Font> + geometry::Renderer + 'a,
 {
     fn from(diff_view: DiffView<'a, Message>) -> Self {
         Element::new(diff_view)
@@ -2814,6 +3934,8 @@ mod tests {
             hunk_header: c,
             addition_background: c,
             deletion_background: c,
+            addition_emphasis: c,
+            deletion_emphasis: c,
             note_background: c,
             gutter_background: c,
             border: c,
@@ -2832,6 +3954,7 @@ mod tests {
             new_line: Some(n),
             content: content.to_owned(),
             syntax: Vec::new(),
+            emphasis: Vec::new(),
         }
     }
 
@@ -2939,14 +4062,7 @@ mod tests {
         // Row lookup by id and by y agree with the walk.
         for (i, &(f, h, l)) in index.row_ids.iter().enumerate() {
             assert_eq!(
-                view.match_target_y(
-                    &index,
-                    f as usize,
-                    h as usize,
-                    l as usize,
-                    0,
-                    Rectangle::new(Point::ORIGIN, Size::new(width, 600.0)),
-                ),
+                view.match_target_y(&index, f as usize, h as usize, l as usize, 0),
                 Some(index.row_tops[i]),
             );
             assert_eq!(index.row_at(index.row_tops[i] + 0.5), Some(i));
@@ -2984,6 +4100,180 @@ mod tests {
     }
 
     #[test]
+    fn side_by_side_pairs_runs_and_pads() {
+        let hunks = vec![vec![DiffHunkView {
+            header: "@@".to_owned(),
+            lines: vec![
+                line(DiffLineKind::Context, "ctx", 1),
+                line(DiffLineKind::Deletion, "old a", 2),
+                line(DiffLineKind::Deletion, "old b", 3),
+                line(DiffLineKind::Addition, "new a", 2),
+                line(DiffLineKind::Addition, "new b", 3),
+                line(DiffLineKind::Addition, "new c", 4),
+                line(DiffLineKind::Context, "tail", 5),
+            ],
+        }]];
+        let mut view = test_view(&hunks);
+        view.side_by_side = true;
+        let cell = RefCell::new(HeightIndex::default());
+        view.ensure_height_index(&cell, 800.0);
+
+        let index = cell.borrow();
+        // ctx + 3 pairs (2 del × 3 add) + tail.
+        assert_eq!(index.row_tops.len(), 5);
+        assert_eq!(
+            index.pair_lines,
+            vec![(0, 0), (1, 3), (2, 4), (NO_LINE, 5), (6, 6)]
+        );
+        // Reps stay sorted, and the padded pair is keyed by its right member.
+        assert_eq!(
+            index.row_ids,
+            vec![(0, 0, 0), (0, 0, 1), (0, 0, 2), (0, 0, 5), (0, 0, 6)]
+        );
+        // Both members of a pair resolve to the same row.
+        assert_eq!(index.row_of_line(0, 0, 3), Some(1));
+        assert_eq!(index.row_of_line(0, 0, 1), Some(1));
+        assert_eq!(index.row_of_line(0, 0, 5), Some(3));
+        assert_eq!(index.row_of_line(0, 0, 6), Some(4));
+    }
+
+    #[test]
+    fn side_by_side_addition_only_runs_pad_left() {
+        // Additions with no deletion run in front belong to the right
+        // column alone — they must not mirror into the left side.
+        let hunks = vec![vec![DiffHunkView {
+            header: "@@".to_owned(),
+            lines: vec![
+                line(DiffLineKind::Context, "ctx", 1),
+                line(DiffLineKind::Addition, "new a", 2),
+                line(DiffLineKind::Addition, "new b", 3),
+                line(DiffLineKind::Context, "tail", 4),
+            ],
+        }]];
+        let mut view = test_view(&hunks);
+        view.side_by_side = true;
+        let cell = RefCell::new(HeightIndex::default());
+        view.ensure_height_index(&cell, 800.0);
+
+        let index = cell.borrow();
+        assert_eq!(
+            index.pair_lines,
+            vec![(0, 0), (NO_LINE, 1), (NO_LINE, 2), (3, 3)]
+        );
+    }
+
+    #[test]
+    fn side_by_side_single_sided_files_render_full_width() {
+        // File 0 is additions-only (a new file): it renders as one
+        // full-width column. File 1 mixes kinds and stays split.
+        let long = "x".repeat(120);
+        let hunks = vec![
+            vec![DiffHunkView {
+                header: "@@".to_owned(),
+                lines: vec![
+                    line(DiffLineKind::Addition, "a", 1),
+                    line(DiffLineKind::Addition, &long, 2),
+                ],
+            }],
+            vec![DiffHunkView {
+                header: "@@".to_owned(),
+                lines: vec![
+                    line(DiffLineKind::Context, "ctx", 1),
+                    line(DiffLineKind::Deletion, "old", 2),
+                    line(DiffLineKind::Addition, "new", 2),
+                ],
+            }],
+        ];
+        let mut view = test_view(&hunks);
+        view.side_by_side = true;
+        let cell = RefCell::new(HeightIndex::default());
+        view.ensure_height_index(&cell, 800.0);
+
+        let index = cell.borrow();
+        assert_eq!(index.full_width_files, vec![true, false]);
+        // Full-width rows keep `pair_lines` aligned via identity pairs; the
+        // mixed file still pairs its deletion/addition run.
+        assert_eq!(index.pair_lines, vec![(0, 0), (1, 1), (0, 0), (1, 2)]);
+        // Full-width rows measure against the whole text area, not a column:
+        // the long line wraps less (or not at all) compared to a split row.
+        assert!(index.unified_text_width > index.split_text_width);
+        assert_eq!(
+            view.index_row_height(&index, 1),
+            view.row_height_for_chars(120, index.unified_text_width)
+        );
+        assert!(
+            view.row_height_for_chars(120, index.split_text_width)
+                > view.index_row_height(&index, 1)
+        );
+    }
+
+    #[test]
+    fn split_selection_copies_only_its_column() {
+        let hunks = vec![vec![DiffHunkView {
+            header: "@@".to_owned(),
+            lines: vec![
+                line(DiffLineKind::Context, "ctx", 1),
+                line(DiffLineKind::Deletion, "old", 2),
+                line(DiffLineKind::Addition, "new", 2),
+                line(DiffLineKind::Context, "tail", 3),
+            ],
+        }]];
+        let mut view = test_view(&hunks);
+        view.side_by_side = true;
+        let start = body_position(0, 0, 0, 0);
+        let end = body_position(0, 0, 3, 4);
+        assert_eq!(
+            view.collect_selected_text(start, end, Some(SplitSide::Right)),
+            "ctx\nnew\ntail"
+        );
+        assert_eq!(
+            view.collect_selected_text(start, end, Some(SplitSide::Left)),
+            "ctx\nold\ntail"
+        );
+        // No side (unified mode): everything in range, both columns.
+        assert_eq!(
+            view.collect_selected_text(start, end, None),
+            "ctx\nold\nnew\ntail"
+        );
+    }
+
+    #[test]
+    fn no_wrap_makes_rows_uniform_height() {
+        let hunks = test_hunks();
+        let mut view = test_view(&hunks);
+        let cell = RefCell::new(HeightIndex::default());
+
+        // Narrow viewport: the 500-char line wraps, so heights are mixed.
+        view.ensure_height_index(&cell, 400.0);
+        let wrapped_key = cell.borrow().key;
+        let wrapped_total = cell.borrow().total_height;
+
+        // Wrap off: same width, new key, every row exactly one line tall.
+        view.wrap = false;
+        view.ensure_height_index(&cell, 400.0);
+        assert_ne!(cell.borrow().key, wrapped_key);
+        assert!(cell.borrow().total_height < wrapped_total);
+        {
+            let index = cell.borrow();
+            let row_count = index.row_tops.len();
+            for i in 1..row_count {
+                let delta = index.row_tops[i] - index.row_tops[i - 1];
+                // Consecutive rows within one hunk sit exactly one row apart;
+                // larger gaps are hunk/file header bands.
+                assert!(
+                    (delta - view.metrics.row_height).abs() < 0.01
+                        || delta > view.metrics.row_height
+                );
+            }
+            let line = &view.files[0].hunks[0].lines[0];
+            assert!(
+                (view.row_height(line, view.content_width(400.0)) - view.metrics.row_height).abs()
+                    < 0.01
+            );
+        }
+    }
+
+    #[test]
     fn gutter_digits_use_hunk_tails() {
         let long = vec![
             DiffHunkView {
@@ -3002,6 +4292,7 @@ mod tests {
                         new_line: None,
                         content: "\\ No newline at end of file".to_owned(),
                         syntax: Vec::new(),
+                        emphasis: Vec::new(),
                     },
                 ],
             },
@@ -3034,6 +4325,7 @@ mod height_profile {
                 new_line: Some(i + 1),
                 content: format!("    let value_{i} = compute({i}) + offset; // padding padding"),
                 syntax: Vec::new(),
+                emphasis: Vec::new(),
             })
             .collect();
         let hunks: Vec<DiffHunkView> = lines
@@ -3076,14 +4368,19 @@ mod height_profile {
         let mut acc = 0usize;
         for i in 0..10_000 {
             acc += view.file_at_offset(&index, (i * 137) as f32 % index.total_height);
-            acc += index.row_at((i * 631) as f32 % index.total_height).unwrap_or(0);
+            acc += index
+                .row_at((i * 631) as f32 % index.total_height)
+                .unwrap_or(0);
         }
         let queries = t.elapsed();
 
         eprintln!("\n=== height index profile (1M lines) ===");
         eprintln!("build (once per content/width change): {build:?}");
         eprintln!("20k mixed queries                    : {queries:?}  (sink {acc})");
-        eprintln!("per query                            : {:?}", queries / 20_000);
+        eprintln!(
+            "per query                            : {:?}",
+            queries / 20_000
+        );
         eprintln!("=======================================\n");
     }
 }

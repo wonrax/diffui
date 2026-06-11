@@ -35,12 +35,12 @@ impl AppConfig {
             ui_font: raw
                 .ui_font
                 .as_deref()
-                .map(font_from_name)
+                .map(|name| resolve_font(name, Font::DEFAULT))
                 .unwrap_or(Font::DEFAULT),
             mono_font: raw
                 .mono_font
                 .as_deref()
-                .map(font_from_name)
+                .map(|name| resolve_font(name, default_mono_font()))
                 .unwrap_or_else(default_mono_font),
             multi_click_ms: raw.multi_click_ms.unwrap_or(350),
             theme: raw
@@ -96,6 +96,59 @@ fn font_from_name(name: &str) -> Font {
     // startup, so the resulting heap usage is bounded.
     let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
     Font::new(leaked)
+}
+
+/// Resolve a configured family name against the installed fonts, falling
+/// back to `fallback` when it isn't there. A named family that the font
+/// database can't resolve doesn't merely degrade: requesting a non-default
+/// weight (the tab bar's `Medium`, via `theme::emphasis_font`) on a missing
+/// family makes cosmic-text's fallback come up empty and the text renders
+/// as invisible `.notdef` glyphs. Validating up front means a config shared
+/// across machines just falls back to the platform default where the font
+/// isn't installed.
+fn resolve_font(name: &str, fallback: Font) -> Font {
+    let name = name.trim();
+    match installed_family(name) {
+        Some(canonical) => font_from_name(&canonical),
+        None => {
+            eprintln!(
+                "diffui: configured font family {name:?} is not installed; \
+                 falling back to the system default"
+            );
+            fallback
+        }
+    }
+}
+
+/// Look `name` up in the same font database the renderer will use, returning
+/// the canonical family string on a hit. Exact (case-insensitive) matches
+/// win; failing that, a whitespace-insensitive match catches naming variance
+/// like `InterVariable` vs `Inter Variable`. `None` means no installed face
+/// carries the family.
+fn installed_family(name: &str) -> Option<String> {
+    let Ok(mut system) = iced::advanced::graphics::text::font_system().write() else {
+        // Can't inspect the database — trust the config rather than override.
+        return Some(name.to_owned());
+    };
+    let normalize = |s: &str| {
+        s.chars()
+            .filter(|c| !c.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+    };
+    let target = normalize(name);
+    let mut loose_hit = None;
+    for face in system.raw().db().faces() {
+        for (family, _) in &face.families {
+            if family.eq_ignore_ascii_case(name) {
+                return Some(family.clone());
+            }
+            if loose_hit.is_none() && normalize(family) == target {
+                loose_hit = Some(family.clone());
+            }
+        }
+    }
+    loose_hit
 }
 
 fn default_mono_font() -> Font {

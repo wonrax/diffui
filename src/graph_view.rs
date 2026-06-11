@@ -30,13 +30,12 @@ const LINE_THICKNESS: f32 = 1.5;
 const LINE_THICKNESS_EMPHASIZED: f32 = 2.75;
 const NODE_RADIUS: f32 = 3.5;
 
-/// Whether to draw the little stub below a node that has a parent outside the
-/// visible set (a `Missing` edge — e.g. the top/bottom boundary of a filtered
-/// `mine()` view). It's a real boundary indicator, but as a bare gray nub it
-/// reads more like a rendering glitch than a signal, so it's parked off until
-/// we design a clearer affordance. The counting/dedup logic and the drawing
-/// code below are kept intact so flipping this back on is a one-line change.
-const SHOW_MISSING_PARENT_STUB: bool = false;
+/// Geometry of the elided-ancestry squiggle (jj log's `~`): drawn below a
+/// node whose parent(s) sit outside the loaded set — the bottom of a
+/// filtered revset, or the first sighting of a boundary commit. Half-width
+/// and amplitude in px; small enough to read as graph punctuation, not data.
+const ELIDED_SQUIGGLE_HALF_WIDTH: f32 = 3.5;
+const ELIDED_SQUIGGLE_AMPLITUDE: f32 = 3.2;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RevisionGraphStyle {
@@ -202,6 +201,35 @@ fn draw_outgoing(
     builder.line_to(end);
 }
 
+/// Smooth S-bend for a lane whose warped column changed between rows: the
+/// line leaves the previous row's column at the row top and eases into this
+/// row's column by mid-height, with vertical tangents at both ends. Unlike
+/// the tilted node connectors there is no node to point at here — the curve
+/// should read as the same vertical lane drifting sideways, not as a branch
+/// — so it gets a symmetric ease instead of the tilt + corner treatment.
+fn draw_lane_shift(
+    builder: &mut iced::advanced::graphics::geometry::path::Builder,
+    x_from: f32,
+    x_to: f32,
+    y_top: f32,
+    y_mid: f32,
+) {
+    builder.move_to(Point::new(x_from, y_top));
+    if (x_to - x_from).abs() < 0.5 {
+        builder.line_to(Point::new(x_from, y_mid));
+        return;
+    }
+    // Control points at half height in each column: the standard
+    // vertical-tangent cubic, so the bend enters and leaves perfectly
+    // upright and adjacent shifting lanes stay parallel through the turn.
+    let y_blend = (y_top + y_mid) / 2.0;
+    builder.bezier_curve_to(
+        Point::new(x_from, y_blend),
+        Point::new(x_to, y_blend),
+        Point::new(x_to, y_mid),
+    );
+}
+
 /// Mirror of `draw_outgoing` for edges arriving at the node from above:
 /// vertical drop in the source column, rounded corner, tilted approach
 /// to the node centre. As with `draw_outgoing`, the path runs to the
@@ -237,10 +265,17 @@ fn draw_incoming(
     builder.line_to(node_point);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn draw_revision_row<R>(
     renderer: &mut R,
     bounds: Rectangle,
     frame_data: &LaneFrame,
+    // Warped lane → display-column maps for this row and the previous one
+    // (`LaneFrame::display_columns`). All x positions come from these; lane
+    // *indices* — colors, dash kinds, emphasis — stay original. A lane
+    // whose column differs between the rows slides over in the top half.
+    columns: &[Option<usize>],
+    prev_columns: &[Option<usize>],
     style: &RevisionGraphStyle,
     // Forces the node disc to this color instead of the lane color.
     // Used to paint the working-copy node in the accent (coral) so the
@@ -263,7 +298,15 @@ pub fn draw_revision_row<R>(
     let top = bounds.y;
     let bot = bounds.y + bounds.height;
     let mid = bounds.y + bounds.height / 2.0;
-    let x_node = lane_x(bounds.x, frame_data.node_lane);
+    let col = |lane: usize| columns.get(lane).copied().flatten().unwrap_or(lane);
+    let prev_col = |lane: usize| {
+        prev_columns
+            .get(lane)
+            .copied()
+            .flatten()
+            .unwrap_or_else(|| col(lane))
+    };
+    let x_node = lane_x(bounds.x, col(frame_data.node_lane));
 
     // Indirect-edge dash pattern. Allocated once per row so the borrow
     // outlives the strokes; the pattern itself is just two `f32`s.
@@ -272,43 +315,63 @@ pub fn draw_revision_row<R>(
     // Allocate one geometry frame per row covering the whole row's bounds.
     // Using row-local coords would be cleaner but `Frame::translate` adds
     // complexity for little gain at this granularity.
-    let mut frame = Frame::new(renderer, Size::new(bounds.x + bounds.width, bot));
+    //
+    // The frame must be wide enough for the *previous* row's columns too: a
+    // lane sliding left out of a now-free column starts its bend at the old
+    // x, which can sit beyond this row's (narrower) packed strip — sized to
+    // this row alone, the slide's upper half clips away and the lane appears
+    // chopped off mid-air.
+    let rightmost_lane = columns
+        .iter()
+        .chain(prev_columns.iter())
+        .copied()
+        .flatten()
+        .max();
+    let frame_width = rightmost_lane.map_or(bounds.width, |lane| {
+        bounds.width.max(lane_strip_width(lane + 1))
+    });
+    let mut frame = Frame::new(renderer, Size::new(bounds.x + frame_width, bot));
 
-    // Incoming edges (top half).
+    // Incoming edges (top half). Each lane enters at the column it occupied
+    // in the previous row and (when the warp shifts it) slides into this
+    // row's column by mid-height.
     for (i, kind) in frame_data.before.iter().enumerate() {
         let Some(kind) = *kind else { continue };
-        let x_i = lane_x(bounds.x, i);
+        let x_top = lane_x(bounds.x, prev_col(i));
+        let x_here = lane_x(bounds.x, col(i));
+        let stroke = style.edge_stroke(kind, i, &dash, emphasized_lane_before == Some(i));
 
         if frame_data.merging_lanes.contains(&i) {
             // This lane terminates at the node — vertical from top, then
-            // either continues straight (if i == node_lane) or curves into
-            // the node from the side.
+            // either continues straight (if it shares the node's column) or
+            // curves into the node from the side.
             let path = Path::new(|builder| {
-                draw_incoming(builder, x_i, x_node, top, mid);
+                draw_incoming(builder, x_top, x_node, top, mid);
             });
-            frame.stroke(
-                &path,
-                style.edge_stroke(kind, i, &dash, emphasized_lane_before == Some(i)),
-            );
+            frame.stroke(&path, stroke);
         } else if frame_data.is_pass_through(i) {
-            // Pure pass-through: draw a single straight vertical so we
-            // benefit from the round line cap and dashed style if needed.
-            // Pass-through means the lane isn't in `merging_lanes` and
-            // both halves are alive, so the before/after segments match
-            // — either emphasis flag is sufficient.
-            let path = Path::line(Point::new(x_i, top), Point::new(x_i, bot));
-            frame.stroke(
-                &path,
-                style.edge_stroke(kind, i, &dash, emphasized_lane_before == Some(i)),
-            );
+            // Pass-through: a single straight vertical when the column is
+            // stable; an S-bend into the new column over the top half when
+            // the warp moved it. (Pass-through means the lane isn't in
+            // `merging_lanes` and both halves are alive, so the before/
+            // after segments match — either emphasis flag is sufficient.)
+            let path = if (x_top - x_here).abs() < 0.5 {
+                Path::line(Point::new(x_here, top), Point::new(x_here, bot))
+            } else {
+                Path::new(|builder| {
+                    draw_lane_shift(builder, x_top, x_here, top, mid);
+                    builder.line_to(Point::new(x_here, bot));
+                })
+            };
+            frame.stroke(&path, stroke);
         } else {
             // Lane terminates above the node without merging into it
-            // (e.g., ended on the previous row). Just a half-line.
-            let path = Path::line(Point::new(x_i, top), Point::new(x_i, mid));
-            frame.stroke(
-                &path,
-                style.edge_stroke(kind, i, &dash, emphasized_lane_before == Some(i)),
-            );
+            // (e.g., ended on the previous row). Just a half-line, sliding
+            // if the warp shifted its column.
+            let path = Path::new(|builder| {
+                draw_lane_shift(builder, x_top, x_here, top, mid);
+            });
+            frame.stroke(&path, stroke);
         }
     }
 
@@ -320,7 +383,7 @@ pub fn draw_revision_row<R>(
             // double-stroking.
             continue;
         }
-        let x_j = lane_x(bounds.x, j);
+        let x_j = lane_x(bounds.x, col(j));
 
         let path = Path::new(|builder| {
             draw_outgoing(builder, x_node, x_j, mid, bot);
@@ -335,23 +398,43 @@ pub fn draw_revision_row<R>(
         );
     }
 
-    // Missing-parent stub goes into the same geometry frame as the edges
-    // (and the disc that follows). iced renders geometry on a layer above
-    // quad primitives, so a `fill_quad` here would visibly sit *under*
-    // the stroked edges — order of *calls* doesn't matter, layer does.
-    // Within a single frame the order *does* matter (later draws on top),
-    // so adding the stub before the disc lets the disc still cover any
-    // overlap with it.
-    if SHOW_MISSING_PARENT_STUB && frame_data.missing_parents > 0 {
-        let stub_x = x_node + NODE_RADIUS * 1.2;
-        let stub_top = mid + NODE_RADIUS;
-        let stub_bot = (mid + NODE_RADIUS + bounds.height * 0.3).min(bot);
-        let stub_path = Path::line(Point::new(stub_x, stub_top), Point::new(stub_x, stub_bot));
-        let stub_stroke = Stroke::default()
+    // Elided-ancestry marker — jj log's `~` — goes into the same geometry
+    // frame as the edges (and the disc that follows). iced renders geometry
+    // on a layer above quad primitives, so a `fill_quad` here would visibly
+    // sit *under* the stroked edges — order of *calls* doesn't matter,
+    // layer does. Within a single frame the order *does* matter (later
+    // draws on top), so adding it before the disc lets the disc cover any
+    // overlap. Centered under the node when its lane ends here (the common
+    // trailing-boundary read); nudged right when an edge continues below so
+    // the squiggle doesn't sit on the line.
+    if frame_data.missing_parents > 0 {
+        let lane_continues = frame_data
+            .after
+            .get(frame_data.node_lane)
+            .copied()
+            .flatten()
+            .is_some();
+        let x = if lane_continues {
+            x_node + NODE_RADIUS * 2.4
+        } else {
+            x_node
+        };
+        let y = (mid + NODE_RADIUS * 2.0 + 4.0).min(bot - 3.0);
+        let half = ELIDED_SQUIGGLE_HALF_WIDTH;
+        let amplitude = ELIDED_SQUIGGLE_AMPLITUDE;
+        let squiggle = Path::new(|builder| {
+            builder.move_to(Point::new(x - half, y));
+            builder.bezier_curve_to(
+                Point::new(x - half * 0.4, y - amplitude),
+                Point::new(x + half * 0.4, y + amplitude),
+                Point::new(x + half, y),
+            );
+        });
+        let stroke = Stroke::default()
             .with_color(style.missing_color)
             .with_width(LINE_THICKNESS)
             .with_line_cap(LineCap::Round);
-        frame.stroke(&stub_path, stub_stroke);
+        frame.stroke(&squiggle, stroke);
     }
 
     // Node disc — fill, not quad, so it lives in the same layer as the
@@ -375,6 +458,9 @@ pub fn draw_continuation_row<R>(
     renderer: &mut R,
     bounds: Rectangle,
     lanes: &[Option<GraphEdgeType>],
+    // Warped display columns of the parent revision row (the file rows sit
+    // inside its `after` snapshot, so they inherit its packing as-is).
+    columns: &[Option<usize>],
     style: &RevisionGraphStyle,
     emphasized_lane: Option<usize>,
 ) where
@@ -387,7 +473,8 @@ pub fn draw_continuation_row<R>(
     let mut frame = Frame::new(renderer, Size::new(bounds.x + bounds.width, bot));
     for (i, kind) in lanes.iter().enumerate() {
         let Some(kind) = *kind else { continue };
-        let x = lane_x(bounds.x, i);
+        let column = columns.get(i).copied().flatten().unwrap_or(i);
+        let x = lane_x(bounds.x, column);
         let path = Path::line(Point::new(x, top), Point::new(x, bot));
         frame.stroke(
             &path,

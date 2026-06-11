@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use iced::{
     Background, Border, Color, Element, Font, Length, Padding, alignment, mouse,
     widget::{Space, column, container, mouse_area, row, text, text_input, tooltip},
@@ -15,8 +13,12 @@ use crate::revision_list::{
 };
 use crate::theme::{self, ThemeSpec, chip_background, sidebar_panel_style};
 use crate::{Diffui, HoverTarget, LoadStatus, Message, ToolbarMenu};
-use diffui_core::{CommitStore, DiffFile, DiffFileStatus, RevisionSelection, RowView};
+use diffui_core::{
+    CommitStore, DiffFile, DiffFileStatus, FileTreeRow, RevisionSelection, RowView, file_tree_rows,
+};
 use jj_lib::graph::GraphEdgeType;
+use std::collections::HashSet;
+use std::rc::Rc;
 
 // Public sidebar layout knobs — used by main.rs to clamp the resize handle.
 // `DEFAULT_WIDTH` is a starting point; the actual floor is derived from the
@@ -338,7 +340,6 @@ fn thousands(n: usize) -> String {
 }
 
 fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
-    let metrics = sidebar_text_metrics(ui.config);
     let graph_style = RevisionGraphStyle {
         lane_base_color: theme.lane_base,
         missing_color: theme.subtle_text,
@@ -350,83 +351,31 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
         .selected_commit_index
         .filter(|_| ui.file_list_expanded);
 
-    let (file_widgets, file_badge_width): (Vec<FileRowTemplate>, f32) = if let Some(expanded) =
-        expanded_index
+    // Stat-column widths and the flattened file tree are derived purely from the
+    // document (and, for the tree, the collapse set) — never from the scroll
+    // position. But `view()` re-runs on every diff-scroll file-boundary crossing
+    // (the diff view publishes `SelectFile`, the only thing that forces an iced
+    // tree rebuild), so recomputing them here re-shaped ~5·N strings per crossing
+    // and tanked the frame rate on large PRs. Memoize on document identity
+    // (`document_id` + count — the count also catches streaming `extend`s that
+    // grow the set under a stable id) so a rebuild that didn't change the file
+    // set is free; templates themselves are built lazily per visible row below.
+    let (tree_rows, additions_w, deletions_w, file_badge_width) = if expanded_index.is_some()
         && matches!(ui.session.status, LoadStatus::Loaded)
         && !ui.session.document.files.is_empty()
     {
-        let widest_addition = ui
-            .session
-            .document
-            .files
-            .iter()
-            .map(|file| format!("+{}", file.additions))
-            .max_by(|a, b| {
-                metrics
-                    .measure(a)
-                    .partial_cmp(&metrics.measure(b))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .unwrap_or_else(|| "+0".to_owned());
-        let widest_deletion = ui
-            .session
-            .document
-            .files
-            .iter()
-            .map(|file| format!("-{}", file.deletions))
-            .max_by(|a, b| {
-                metrics
-                    .measure(a)
-                    .partial_cmp(&metrics.measure(b))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .unwrap_or_else(|| "-0".to_owned());
-        let additions_w = file_stat_width(&widest_addition, &metrics);
-        let deletions_w = file_stat_width(&widest_deletion, &metrics);
-        let badge_metrics = badge_text_metrics(ui.config);
-        let badge_w = file_badge_width(&ui.session.document.files, &badge_metrics);
-
-        // Mirror `draw_file`'s layout exactly so truncation kicks in at the
-        // same threshold the renderer clips at:
-        //   [gutter] [badge] gap [path] gap [+N] gap [-N] right_pad
-        let expanded_lane_count = ui.session.graph.frame(expanded, usize::MAX).after.len();
-        let gutter_total = revision_list::GUTTER_LEFT_PADDING
-            + expanded_lane_count as f32 * graph_view::LANE_WIDTH
-            + revision_list::GUTTER_PADDING;
-        let reserved = gutter_total
-            + badge_w
-            + additions_w
-            + deletions_w
-            + revision_list::FILE_ROW_GAP * 3.0
-            + revision_list::FILE_ROW_RIGHT_PAD;
-        let display_width = (ui.sidebar_width - reserved).max(0.0);
-        let display_models =
-            file_display_models(&ui.session.document.files, display_width, &metrics);
-        let templates = ui
-            .session
-            .document
-            .files
-            .iter()
-            .enumerate()
-            .map(|(idx, file)| FileRowTemplate {
-                primary: display_models[idx].primary.clone(),
-                secondary: display_models[idx].secondary.clone(),
-                raw_path: display_models[idx].raw_path.clone(),
-                status_label: file.status.short_label().to_owned(),
-                status_color: file_status_color(file.status, theme),
-                additions: file.additions,
-                deletions: file.deletions,
-                file_index: idx,
-                additions_width: additions_w,
-                deletions_width: deletions_w,
-            })
-            .collect();
-        (templates, badge_w)
+        let files = &ui.session.document.files;
+        let document_id = ui.session.document_id;
+        let count = files.len();
+        let mut cache = ui.sidebar_file_cache.borrow_mut();
+        let widths = cache.stat_widths(document_id, count, ui.config, files);
+        let tree_rows = cache.tree_rows(document_id, count, &ui.collapsed_dirs, files);
+        (tree_rows, widths.additions, widths.deletions, widths.badge)
     } else {
-        (Vec::new(), FILE_BADGE_MIN_WIDTH)
+        (Rc::new(Vec::new()), 0.0, 0.0, FILE_BADGE_MIN_WIDTH)
     };
 
-    let file_count = file_widgets.len();
+    let file_count = tree_rows.len();
     let expanded = expanded_index
         .filter(|_| file_count > 0)
         .map(|index| (index, file_count));
@@ -454,8 +403,12 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
 
     // File rows render under the expanded commit, so they share its
     // continuation lane state (the post-trim snapshot of that row's fold).
-    let continuation = expanded_index
-        .map(|index| ui.session.graph.frame(index, usize::MAX).after)
+    let (continuation, continuation_columns) = expanded_index
+        .map(|index| {
+            let frame = ui.session.graph.frame(index, usize::MAX);
+            let columns = frame.display_columns();
+            (frame.after, columns)
+        })
         .unwrap_or_default();
     let (continuation_labels, continuation_segments) = expanded_index
         .map(|index| {
@@ -463,10 +416,19 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
             (lane.continuation_labels, lane.continuation_segments)
         })
         .unwrap_or_default();
-    let build_file = Box::new(move |file_index: usize| {
+    let files = &ui.session.document.files;
+    let build_file = Box::new(move |row_index: usize| {
+        let template = file_row_template(
+            &tree_rows[row_index],
+            files,
+            additions_w,
+            deletions_w,
+            theme,
+        );
         build_file_row(
-            &file_widgets[file_index],
+            &template,
             &continuation,
+            &continuation_columns,
             &continuation_labels,
             &continuation_segments,
             theme,
@@ -488,7 +450,7 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
         ui.session.selected_commit_index,
         revision_list_style(theme, ui.config, file_badge_width),
         Message::SelectRowKey,
-        Message::SelectFile,
+        Message::SidebarFileRow,
     )
     .width(Length::Fill)
     .reveal_selected(ui.revision_reveal_token)
@@ -514,6 +476,14 @@ fn build_revision_row(
     let commit = commits.row(index);
     let change_id = commit.change_id();
     let lane_frame = graph.frame(index, usize::MAX);
+    // Warped display columns for this row and the one above (row 0 has no
+    // transition, so its own packing stands in).
+    let columns = lane_frame.display_columns();
+    let prev_columns = if index > 0 {
+        graph.frame(index - 1, usize::MAX).display_columns()
+    } else {
+        columns.clone()
+    };
     let bookmarks = commit.bookmarks();
     let unique_len = prefix_lens.get(index).copied().unwrap_or(REVISION_ID_CHARS);
     let label_len = revision_id_display_len(unique_len, change_id);
@@ -589,6 +559,8 @@ fn build_revision_row(
         status_chips,
         lane_color,
         frame: lane_frame,
+        columns,
+        prev_columns,
         lane_labels: lane.labels,
         lane_segments_before: lane.segments_before,
         lane_segments_after: lane.segments_after,
@@ -601,13 +573,13 @@ fn build_revision_row(
 fn build_file_row(
     template: &FileRowTemplate,
     continuation: &[Option<GraphEdgeType>],
+    continuation_columns: &[Option<usize>],
     continuation_labels: &[Vec<String>],
     continuation_segments: &[Option<usize>],
     theme: ThemeSpec,
 ) -> FileRowView {
     FileRowView {
-        primary: template.primary.clone(),
-        secondary: template.secondary.clone(),
+        primary: template.label.clone(),
         raw_path: template.raw_path.clone(),
         status_label: template.status_label.clone(),
         status_background: chip_background(template.status_color),
@@ -617,10 +589,12 @@ fn build_file_row(
         additions_text: theme.added_text,
         deletions_text: theme.removed_text,
         continuation: continuation.to_vec(),
+        columns: continuation_columns.to_vec(),
         additions_width: template.additions_width,
         deletions_width: template.deletions_width,
         primary_color: theme.text,
-        secondary_color: theme.muted_text,
+        indent: template.indent,
+        chevron: template.chevron,
         file_index: template.file_index,
         lane_labels: continuation_labels.to_vec(),
         lane_segments: continuation_segments.to_vec(),
@@ -628,8 +602,7 @@ fn build_file_row(
 }
 
 struct FileRowTemplate {
-    primary: String,
-    secondary: String,
+    label: String,
     raw_path: String,
     status_label: String,
     /// Saturated color for the file's status (e.g., green for Added).
@@ -643,6 +616,171 @@ struct FileRowTemplate {
     file_index: usize,
     additions_width: f32,
     deletions_width: f32,
+    indent: f32,
+    chevron: Option<bool>,
+}
+
+/// View-time memo for the file list's document-derived layout: the stat-column
+/// widths and the flattened file tree. The sidebar is rebuilt on every `view()`,
+/// and `view()` re-runs on every diff-scroll *file-boundary crossing* (the diff
+/// view publishes `SelectFile`, the only thing that forces an iced widget-tree
+/// rebuild — a plain redraw doesn't). Recomputing these there re-shaped ~5·N
+/// strings through `cosmic_text` per crossing, which tanked the frame rate when
+/// the list was expanded over a large PR. Neither value depends on the scroll
+/// position, so we key them on document identity and reuse across rebuilds that
+/// didn't change the file set.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SidebarFileCache {
+    widths: Option<(DocKey, FileStatWidths)>,
+    tree: Option<(TreeKey, Rc<Vec<FileTreeRow>>)>,
+}
+
+/// Identity of the file set a cached value was computed against. `document_id`
+/// is stamped fresh on every document *replacement*, but a streaming PR load
+/// `extend`s the existing document in place (same id, growing length), so the
+/// count is part of the key too. `font` invalidates on a config font change,
+/// which would re-shape the stat strings to a different width.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DocKey {
+    document_id: u64,
+    file_count: usize,
+    font: Font,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FileStatWidths {
+    additions: f32,
+    deletions: f32,
+    badge: f32,
+}
+
+/// The tree folds in the collapse set (it prunes collapsed dirs) but, unlike the
+/// widths, is independent of font and theme — so it gets its own key.
+#[derive(Debug, Clone, PartialEq)]
+struct TreeKey {
+    document_id: u64,
+    file_count: usize,
+    collapsed: HashSet<String>,
+}
+
+impl SidebarFileCache {
+    fn stat_widths(
+        &mut self,
+        document_id: u64,
+        file_count: usize,
+        config: AppConfig,
+        files: &[DiffFile],
+    ) -> FileStatWidths {
+        let key = DocKey {
+            document_id,
+            file_count,
+            font: config.ui_font,
+        };
+        if let Some((cached_key, widths)) = &self.widths
+            && *cached_key == key
+        {
+            return *widths;
+        }
+        let widths = compute_stat_widths(files, config);
+        self.widths = Some((key, widths));
+        widths
+    }
+
+    fn tree_rows(
+        &mut self,
+        document_id: u64,
+        file_count: usize,
+        collapsed: &HashSet<String>,
+        files: &[DiffFile],
+    ) -> Rc<Vec<FileTreeRow>> {
+        if let Some((key, rows)) = &self.tree
+            && key.document_id == document_id
+            && key.file_count == file_count
+            && &key.collapsed == collapsed
+        {
+            return Rc::clone(rows);
+        }
+        let rows = Rc::new(file_tree_rows(files, collapsed));
+        self.tree = Some((
+            TreeKey {
+                document_id,
+                file_count,
+                collapsed: collapsed.clone(),
+            },
+            Rc::clone(&rows),
+        ));
+        rows
+    }
+}
+
+/// Stat-column widths for the file list, measured once per document. The widest
+/// rendered `+N` / `−N` is the file with the most additions / deletions — more
+/// digits ⇒ a wider string in the UI font's near-tabular figures — so we shape
+/// one string per column. The old form measured every file's stat through a
+/// `max_by` whose comparator shaped *both* sides, i.e. ~2·N `cosmic_text` shapes
+/// per column.
+fn compute_stat_widths(files: &[DiffFile], config: AppConfig) -> FileStatWidths {
+    let metrics = sidebar_text_metrics(config);
+    let badge_metrics = badge_text_metrics(config);
+    let max_additions = files.iter().map(|file| file.additions).max().unwrap_or(0);
+    let max_deletions = files.iter().map(|file| file.deletions).max().unwrap_or(0);
+    FileStatWidths {
+        additions: file_stat_width(&format!("+{max_additions}"), &metrics),
+        deletions: file_stat_width(&format!("-{max_deletions}"), &metrics),
+        badge: file_badge_width(files, &badge_metrics),
+    }
+}
+
+/// Build one file-list row template from a flattened tree row. Called lazily,
+/// per *visible* row, by the `RevisionList` virtualization closure — the full
+/// set is never materialized (only ~a screenful exist at once).
+fn file_row_template(
+    row: &FileTreeRow,
+    files: &[DiffFile],
+    additions_width: f32,
+    deletions_width: f32,
+    theme: ThemeSpec,
+) -> FileRowTemplate {
+    match row {
+        FileTreeRow::Dir {
+            label,
+            path,
+            depth,
+            collapsed,
+        } => FileRowTemplate {
+            label: label.clone(),
+            raw_path: path.clone(),
+            status_label: String::new(),
+            status_color: theme.subtle_text,
+            additions: 0,
+            deletions: 0,
+            file_index: usize::MAX,
+            additions_width,
+            deletions_width,
+            indent: *depth as f32 * revision_list::FILE_TREE_INDENT,
+            chevron: Some(*collapsed),
+        },
+        FileTreeRow::File {
+            file_index,
+            label,
+            depth,
+        } => {
+            let file = &files[*file_index];
+            FileRowTemplate {
+                label: label.clone(),
+                raw_path: file.path.clone(),
+                status_label: file.status.short_label().to_owned(),
+                status_color: file_status_color(file.status, theme),
+                additions: file.additions,
+                deletions: file.deletions,
+                file_index: *file_index,
+                additions_width,
+                deletions_width,
+                indent: *depth as f32 * revision_list::FILE_TREE_INDENT,
+                chevron: None,
+            }
+        }
+    }
 }
 
 fn revision_list_style(
@@ -748,29 +886,14 @@ fn commit_description_color(commit: RowView, theme: ThemeSpec) -> Color {
 /// `Paragraph` type isn't reachable from here without threading renderer
 /// generics through `main.rs`. The wgpu renderer is built on top of
 /// `iced_graphics`, so the headless `Paragraph` shapes text identically.
-///
-/// Tests use `Self::fixed_per_char` to stay deterministic regardless of which
-/// system fonts happen to be installed on the host.
 #[derive(Clone)]
 pub enum TextMetrics {
-    Iced {
-        font: Font,
-        size: f32,
-    },
-    #[cfg(test)]
-    FixedPerChar {
-        width: f32,
-    },
+    Iced { font: Font, size: f32 },
 }
 
 impl TextMetrics {
     fn iced(font: Font, size: f32) -> Self {
         Self::Iced { font, size }
-    }
-
-    #[cfg(test)]
-    fn fixed_per_char(width: f32) -> Self {
-        Self::FixedPerChar { width }
     }
 
     fn measure(&self, content: &str) -> f32 {
@@ -799,8 +922,6 @@ impl TextMetrics {
                 });
                 paragraph.min_width()
             }
-            #[cfg(test)]
-            Self::FixedPerChar { width } => content.chars().count() as f32 * width,
         }
     }
 }
@@ -813,282 +934,32 @@ fn badge_text_metrics(config: AppConfig) -> TextMetrics {
     TextMetrics::iced(config.ui_font, FILE_BADGE_TEXT_SIZE)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SidebarFileDisplay {
-    primary: String,
-    secondary: String,
-    raw_path: String,
-}
-
-fn file_display_models(
-    files: &[DiffFile],
-    available_width: f32,
-    metrics: &TextMetrics,
-) -> Vec<SidebarFileDisplay> {
-    let mut basename_counts = HashMap::<&str, usize>::new();
-    let split_paths = files
-        .iter()
-        .map(|file| split_display_path(&file.path))
-        .inspect(|(_, basename)| {
-            *basename_counts.entry(*basename).or_default() += 1;
-        })
-        .collect::<Vec<_>>();
-
-    files
-        .iter()
-        .zip(split_paths.iter())
-        .map(|(file, (directories, basename))| {
-            let (primary, secondary) = if basename_counts.get(basename).copied() == Some(1) {
-                (
-                    (*basename).to_owned(),
-                    secondary_display_path(directories, available_width, metrics),
-                )
-            } else {
-                let group = split_paths
-                    .iter()
-                    .filter(|(_, other_basename)| other_basename == basename)
-                    .map(|(other_directories, _)| other_directories.as_slice())
-                    .collect::<Vec<_>>();
-                let suffix_len = collision_directory_suffix_len(directories, &group);
-                let split_at = directories.len().saturating_sub(suffix_len);
-                let primary_segments = directories[split_at..]
-                    .iter()
-                    .copied()
-                    .chain(std::iter::once(*basename))
-                    .collect::<Vec<_>>();
-
-                (
-                    primary_segments.join("/"),
-                    secondary_display_path(
-                        &common_directory_prefix(&group),
-                        available_width,
-                        metrics,
-                    ),
-                )
-            };
-
-            SidebarFileDisplay {
-                primary: truncate_primary_display(&primary, basename, available_width, metrics),
-                secondary,
-                raw_path: file.path.clone(),
-            }
-        })
-        .collect()
-}
-
-fn split_display_path(path: &str) -> (Vec<&str>, &str) {
-    let mut segments = path
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-
-    match segments.pop() {
-        Some(basename) => (segments, basename),
-        None => (Vec::new(), path),
-    }
-}
-
-fn collision_directory_suffix_len(directories: &[&str], group: &[&[&str]]) -> usize {
-    let max_depth = group
-        .iter()
-        .map(|other_directories| other_directories.len())
-        .max()
-        .unwrap_or(0);
-
-    for depth in 1..=max_depth {
-        let mut segments = group.iter().map(|other_directories| {
-            other_directories
-                .len()
-                .checked_sub(depth)
-                .and_then(|index| other_directories.get(index).copied())
-        });
-        let Some(first) = segments.next() else {
-            return 0;
-        };
-
-        if segments.any(|segment| segment != first) {
-            return directories.len().min(depth);
-        }
-    }
-
-    directories.len()
-}
-
-fn common_directory_prefix<'a>(group: &[&[&'a str]]) -> Vec<&'a str> {
-    let Some(first) = group.first() else {
-        return Vec::new();
-    };
-
-    first
-        .iter()
-        .enumerate()
-        .take_while(|(index, segment)| {
-            group
-                .iter()
-                .all(|directories| directories.get(*index) == Some(segment))
-        })
-        .map(|(_, segment)| *segment)
-        .collect()
-}
-
-fn secondary_display_path(
-    segments: &[&str],
-    available_width: f32,
-    metrics: &TextMetrics,
-) -> String {
-    let path = segments.join("/");
-    if metrics.measure(&path) <= available_width {
-        path
-    } else {
-        abbreviate_secondary_path(segments)
-    }
-}
-
-fn abbreviate_secondary_path(segments: &[&str]) -> String {
-    match segments {
-        [] => String::new(),
-        [only] => (*only).to_owned(),
-        [first, rest @ .., last] => {
-            let mut abbreviated = Vec::with_capacity(segments.len());
-            abbreviated.push((*first).to_owned());
-            abbreviated.extend(
-                rest.iter()
-                    .filter_map(|segment| segment.chars().next())
-                    .map(|character| character.to_string()),
-            );
-            abbreviated.push((*last).to_owned());
-            abbreviated.join("/")
-        }
-    }
-}
-
-fn truncate_primary_display(
-    primary: &str,
-    basename: &str,
-    available_width: f32,
-    metrics: &TextMetrics,
-) -> String {
-    if metrics.measure(primary) <= available_width || primary == basename {
-        return primary.to_owned();
-    }
-
-    let Some(prefix) = primary.strip_suffix(basename) else {
-        return primary.to_owned();
-    };
-    let prefix = prefix.trim_end_matches('/');
-    if prefix.is_empty() {
-        return primary.to_owned();
-    }
-
-    // Always preserve the basename — the user needs to know what file this is.
-    // The prefix is what gets squeezed.
-    let suffix = format!("/{basename}");
-    let suffix_w = metrics.measure(&suffix);
-    if suffix_w >= available_width {
-        return basename.to_owned();
-    }
-    let prefix_budget = available_width - suffix_w;
-
-    let truncated_prefix = middle_truncate_to_width(prefix, prefix_budget, metrics);
-    if truncated_prefix.is_empty() {
-        return basename.to_owned();
-    }
-    format!("{truncated_prefix}{suffix}")
-}
-
-/// Middle-truncate `value` so it fits in `max_width` pixels under `metrics`.
-///
-/// Reads char-by-char from each side and stops as soon as the rendered width
-/// of `head + "…" + tail` exceeds the budget. Linear in chars; fine since
-/// these strings are short path segments and we run this once per file.
-fn middle_truncate_to_width(value: &str, max_width: f32, metrics: &TextMetrics) -> String {
-    if metrics.measure(value) <= max_width {
-        return value.to_owned();
-    }
-    let ellipsis_w = metrics.measure("…");
-    if ellipsis_w > max_width {
-        return String::new();
-    }
-
-    let chars: Vec<char> = value.chars().collect();
-    if chars.is_empty() {
-        return String::new();
-    }
-
-    let mut head = String::new();
-    let mut tail = String::new();
-    let mut head_len = 0;
-    let mut tail_len = 0;
-    // Bias: take from head first when budget allows odd counts.
-    let mut take_head = true;
-
-    while head_len + tail_len < chars.len() {
-        let next_char = if take_head {
-            chars[head_len]
-        } else {
-            chars[chars.len() - 1 - tail_len]
-        };
-
-        let mut candidate_head = head.clone();
-        let mut candidate_tail = tail.clone();
-        if take_head {
-            candidate_head.push(next_char);
-        } else {
-            candidate_tail.insert(0, next_char);
-        }
-
-        let candidate = format!("{candidate_head}…{candidate_tail}");
-        if metrics.measure(&candidate) > max_width {
-            break;
-        }
-
-        head = candidate_head;
-        tail = candidate_tail;
-        if take_head {
-            head_len += 1;
-        } else {
-            tail_len += 1;
-        }
-        take_head = !take_head;
-    }
-
-    if head_len == 0 && tail_len == 0 {
-        // We can fit the ellipsis but not even one neighbouring character.
-        return "…".to_owned();
-    }
-    format!("{head}…{tail}")
-}
-
 fn file_stat_width(text: &str, metrics: &TextMetrics) -> f32 {
     (metrics.measure(text) + FILE_STAT_HORIZONTAL_PADDING * 2.0).max(FILE_STAT_MIN_WIDTH)
 }
 
-/// Width of the status badge column ("M", "A", "D", "R", …). We measure the
-/// widest label in the document and add padding so two-letter labels like
-/// "MM" still fit comfortably.
+/// Width of the status badge column ("M", "A", "D", "R", …). We add padding so
+/// two-letter labels like "MM" still fit comfortably. A diff has only a handful
+/// of distinct status labels, so we shape each distinct one once rather than
+/// re-shaping every file's (the scan itself stays O(files), but the expensive
+/// `cosmic_text` measure runs at most a few times).
 fn file_badge_width(files: &[DiffFile], metrics: &TextMetrics) -> f32 {
-    let widest = files
-        .iter()
-        .map(|file| metrics.measure(file.status.short_label()))
-        .fold(0.0_f32, f32::max);
+    let mut seen: Vec<&str> = Vec::new();
+    let mut widest = 0.0_f32;
+    for file in files {
+        let label = file.status.short_label();
+        if !seen.contains(&label) {
+            seen.push(label);
+            widest = widest.max(metrics.measure(label));
+        }
+    }
     (widest + FILE_BADGE_HORIZONTAL_PADDING * 2.0).max(FILE_BADGE_MIN_WIDTH)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use diffui_core::{CommitStoreBuilder, CommitSummary, DiffFileStatus};
-
-    fn diff_file(path: &str) -> DiffFile {
-        DiffFile {
-            path: path.to_owned(),
-            old_path: None,
-            status: DiffFileStatus::Modified,
-            hunks: Vec::new(),
-            additions: 0,
-            deletions: 0,
-        }
-    }
+    use diffui_core::{CommitStoreBuilder, CommitSummary};
 
     fn commit_summary(change_id: &str) -> CommitSummary {
         CommitSummary {
@@ -1119,10 +990,6 @@ mod tests {
     /// don't go through real cosmic_text in tests because system font
     /// availability differs across hosts and would make the assertions
     /// flaky in CI.
-    fn test_metrics() -> TextMetrics {
-        TextMetrics::fixed_per_char(7.0)
-    }
-
     #[test]
     fn revision_id_prefix_uses_shortest_unique_change_id() {
         // No precomputed lengths (the git backend leaves them `None`), so this
@@ -1155,129 +1022,5 @@ mod tests {
         assert_eq!(revision_id_display_len(3, long_id), REVISION_ID_CHARS);
         assert_eq!(revision_id_display_len(16, long_id), 16);
         assert_eq!(revision_id_display_len(99, long_id), long_id.len());
-    }
-
-    #[test]
-    fn sidebar_display_keeps_unique_basename_primary_and_full_secondary_when_it_fits() {
-        let files = vec![diff_file("packages/frontend/src/components/Button.rs")];
-
-        let display = file_display_models(&files, 400.0, &test_metrics());
-
-        assert_eq!(
-            display,
-            [SidebarFileDisplay {
-                primary: "Button.rs".to_owned(),
-                secondary: "packages/frontend/src/components".to_owned(),
-                raw_path: "packages/frontend/src/components/Button.rs".to_owned(),
-            }]
-        );
-    }
-
-    #[test]
-    fn sidebar_display_abbreviates_secondary_only_when_width_is_tight() {
-        let files = vec![diff_file("packages/frontend/src/components/Button.rs")];
-
-        // Width tight enough that "packages/frontend/src/components" (32 chars
-        // at 7px under the test metrics → 224px) doesn't fit, forcing the
-        // abbreviation path.
-        let display = file_display_models(&files, 7.0 * 16.0, &test_metrics());
-
-        assert_eq!(display[0].primary, "Button.rs");
-        assert_eq!(display[0].secondary, "packages/f/s/components");
-    }
-
-    #[test]
-    fn sidebar_display_uses_shortest_unique_suffix_for_colliding_basenames() {
-        let files = vec![
-            diff_file("crates/ui/src/main.rs"),
-            diff_file("crates/cli/src/main.rs"),
-            diff_file("crates/worker/src/lib.rs"),
-        ];
-
-        let display = file_display_models(&files, 400.0, &test_metrics());
-
-        assert_eq!(display[0].primary, "ui/src/main.rs");
-        assert_eq!(display[0].secondary, "crates");
-        assert_eq!(display[1].primary, "cli/src/main.rs");
-        assert_eq!(display[1].secondary, "crates");
-        assert_eq!(display[2].primary, "lib.rs");
-        assert_eq!(display[2].secondary, "crates/worker/src");
-    }
-
-    #[test]
-    fn sidebar_display_collision_secondary_is_common_root_only() {
-        let files = vec![
-            diff_file("workspace/package-a/src/Button.rs"),
-            diff_file("workspace/package-b/test/Button.rs"),
-        ];
-
-        let display = file_display_models(&files, 400.0, &test_metrics());
-
-        assert_eq!(display[0].primary, "src/Button.rs");
-        assert_eq!(display[1].primary, "test/Button.rs");
-        assert_eq!(display[0].secondary, "workspace");
-        assert_eq!(display[1].secondary, "workspace");
-    }
-
-    #[test]
-    fn sidebar_display_handles_collision_at_repository_root() {
-        let files = vec![diff_file("src/main.rs"), diff_file("tests/main.rs")];
-
-        let display = file_display_models(&files, 400.0, &test_metrics());
-
-        assert_eq!(display[0].primary, "src/main.rs");
-        assert_eq!(display[0].secondary, "");
-        assert_eq!(display[1].primary, "tests/main.rs");
-        assert_eq!(display[1].secondary, "");
-    }
-
-    #[test]
-    fn sidebar_display_root_file_has_empty_secondary() {
-        let files = vec![diff_file("Cargo.lock")];
-
-        let display = file_display_models(&files, 400.0, &test_metrics());
-
-        assert_eq!(display[0].primary, "Cargo.lock");
-        assert_eq!(display[0].secondary, "");
-    }
-
-    #[test]
-    fn sidebar_display_preserves_root_and_leaf_secondary_segments() {
-        assert_eq!(
-            abbreviate_secondary_path(&["workspace", "packages", "frontend", "src"]),
-            "workspace/p/f/src"
-        );
-        assert_eq!(abbreviate_secondary_path(&["src"]), "src");
-        assert_eq!(abbreviate_secondary_path(&[]), "");
-    }
-
-    #[test]
-    fn sidebar_display_middle_truncates_only_prepended_primary_directories() {
-        // Budget = 24 chars × 7px under test metrics = 168px.
-        let primary = truncate_primary_display(
-            "very/long/generated/module/path/component/Button.rs",
-            "Button.rs",
-            7.0 * 24.0,
-            &test_metrics(),
-        );
-
-        assert_eq!(primary, "very/lo…ponent/Button.rs");
-        assert_eq!(primary.chars().count(), 24);
-        assert!(primary.ends_with("/Button.rs"));
-    }
-
-    #[test]
-    fn sidebar_display_protects_basename_when_width_is_tiny() {
-        // Even 6 chars of budget is too tight for "/Button.rs" (10 chars), so
-        // the truncator should bail out and just hand back the basename.
-        assert_eq!(
-            truncate_primary_display(
-                "deeply/nested/source/Button.rs",
-                "Button.rs",
-                7.0 * 6.0,
-                &test_metrics(),
-            ),
-            "Button.rs"
-        );
     }
 }

@@ -473,8 +473,13 @@ fn tab_is_dirty(ui: &Diffui, tab: &crate::Tab, active: bool) -> bool {
 }
 
 /// One quick-pick row in the open dialog's recent list: `owner/name` over the
-/// home-contracted path, clicking it reopens that repo.
-fn recent_repo_row<'a>(ui: &'a Diffui, theme: ThemeSpec, root: &'a str) -> Element<'a, Message> {
+/// home-contracted path, clicking it reopens that repo. Shared with the welcome
+/// screen (`empty_state`) so both recent lists render identically.
+pub(crate) fn recent_repo_row<'a>(
+    ui: &'a Diffui,
+    theme: ThemeSpec,
+    root: &'a str,
+) -> Element<'a, Message> {
     let (owner, name) = crate::repo_label(std::path::Path::new(root));
     let mut label = row![].spacing(0).align_y(alignment::Vertical::Center);
     if !owner.is_empty() {
