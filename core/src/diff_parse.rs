@@ -39,21 +39,26 @@ fn format_hunk_range(range: &std::ops::Range<usize>) -> String {
     }
 }
 
-/// Parse `git diff` / `git show` style unified diff output into a
-/// `DiffDocument`. Used by the git backend; the jj backend builds files
-/// directly from materialized trees and only feeds individual hunks through
-/// `format_hunk_header` + line construction.
-pub fn parse_unified_diff(output: &str) -> DiffDocument {
-    let mut files = Vec::new();
-    let mut current_file: Option<DiffFile> = None;
-    let mut current_hunk: Option<PendingHunk> = None;
+/// Incremental unified-diff parser: feed lines as they arrive (e.g. off a
+/// `gh pr diff` pipe) and receive each completed [`DiffFile`] — highlighted,
+/// ready to display — as soon as the next file's header shows it's done, so a
+/// huge diff renders progressively instead of after the whole download.
+/// [`parse_unified_diff`] is the one-shot wrapper over this.
+#[derive(Default)]
+pub struct DiffStreamParser {
+    current_file: Option<DiffFile>,
+    current_hunk: Option<PendingHunk>,
+}
 
-    for line in output.lines() {
+impl DiffStreamParser {
+    /// Consume one line (without its trailing newline). Returns the previous
+    /// file when `line` starts a new one.
+    pub fn push_line(&mut self, line: &str) -> Option<DiffFile> {
         if let Some(paths) = line.strip_prefix("diff --git ") {
-            flush_current_file(&mut files, &mut current_file, &mut current_hunk);
+            let finished = self.take_file();
 
             let (old_path, path) = parse_diff_git_paths(paths);
-            current_file = Some(DiffFile {
+            self.current_file = Some(DiffFile {
                 path,
                 old_path,
                 status: DiffFileStatus::Modified,
@@ -61,33 +66,55 @@ pub fn parse_unified_diff(output: &str) -> DiffDocument {
                 additions: 0,
                 deletions: 0,
             });
-            continue;
+            return finished;
         }
 
-        let Some(file) = current_file.as_mut() else {
-            continue;
-        };
+        let file = self.current_file.as_mut()?;
 
         if line.starts_with("@@") {
-            flush_current_hunk(file, &mut current_hunk);
+            flush_current_hunk(file, &mut self.current_hunk);
             let (next_old_line, next_new_line) = parse_hunk_header(line);
-            current_hunk = Some(PendingHunk {
+            self.current_hunk = Some(PendingHunk {
                 header: line.to_owned(),
                 rows: Vec::new(),
                 next_old_line,
                 next_new_line,
             });
-            continue;
+            return None;
         }
 
-        if let Some(hunk) = current_hunk.as_mut() {
+        if let Some(hunk) = self.current_hunk.as_mut() {
             push_hunk_row(file, hunk, line);
         } else {
             update_file_metadata(file, line);
         }
+        None
     }
 
-    flush_current_file(&mut files, &mut current_file, &mut current_hunk);
+    /// End of input: the file still in progress, if any.
+    pub fn finish(mut self) -> Option<DiffFile> {
+        self.take_file()
+    }
+
+    fn take_file(&mut self) -> Option<DiffFile> {
+        let mut file = self.current_file.take()?;
+        flush_current_hunk(&mut file, &mut self.current_hunk);
+        apply_syntax_highlighting(&mut file);
+        Some(file)
+    }
+}
+
+/// Parse `git diff` / `git show` style unified diff output into a
+/// `DiffDocument`. Used by the git backend; the jj backend builds files
+/// directly from materialized trees and only feeds individual hunks through
+/// `format_hunk_header` + line construction.
+pub fn parse_unified_diff(output: &str) -> DiffDocument {
+    let mut parser = DiffStreamParser::default();
+    let mut files = Vec::new();
+    for line in output.lines() {
+        files.extend(parser.push_line(line));
+    }
+    files.extend(parser.finish());
 
     let total_additions = files.iter().map(|file| file.additions).sum();
     let total_deletions = files.iter().map(|file| file.deletions).sum();
@@ -96,21 +123,6 @@ pub fn parse_unified_diff(output: &str) -> DiffDocument {
         files,
         total_additions,
         total_deletions,
-    }
-}
-
-fn flush_current_file(
-    files: &mut Vec<DiffFile>,
-    current_file: &mut Option<DiffFile>,
-    current_hunk: &mut Option<PendingHunk>,
-) {
-    if let Some(file) = current_file.as_mut() {
-        flush_current_hunk(file, current_hunk);
-    }
-
-    if let Some(mut file) = current_file.take() {
-        apply_syntax_highlighting(&mut file);
-        files.push(file);
     }
 }
 

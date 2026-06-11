@@ -7,6 +7,7 @@
 
 pub mod diff_parse;
 pub mod git;
+pub mod github;
 pub mod graph;
 pub mod graph_layout;
 pub mod jj;
@@ -20,7 +21,7 @@ pub mod syntax;
 pub mod watcher;
 
 // Curated flat surface a frontend builds against.
-pub use diff_parse::{format_hunk_header, parse_unified_diff};
+pub use diff_parse::{DiffStreamParser, format_hunk_header, parse_unified_diff};
 pub use model::*;
 pub use mutations::{MutationOp, MutationOutcome};
 pub use repository::{FetchTarget, Repository, RepositorySnapshot, Vcs, prepare_repository};

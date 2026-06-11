@@ -23,7 +23,7 @@ pub struct RepositorySnapshot {
     pub working_copy_empty: Option<bool>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Vcs {
     Jj,
     Git,

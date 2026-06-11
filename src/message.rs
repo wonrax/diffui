@@ -5,8 +5,8 @@
 use iced::{Point, Size, theme as iced_theme};
 
 use diffui_core::{
-    BackendOutput, CommitsTail, DiffDocument, FetchTarget, RepositorySnapshot, RevisionDetails,
-    RevisionSelection, StreamRow,
+    BackendOutput, CommitsTail, DiffDocument, DiffFile, FetchTarget, RepositorySnapshot,
+    RevisionDetails, RevisionSelection, StreamRow, github,
 };
 
 use crate::theme::ThemePreference;
@@ -14,7 +14,12 @@ use crate::{HoverTarget, RefreshOrigin, TabId, ToolbarMenu, activity, mutations,
 
 #[derive(Debug, Clone)]
 pub(crate) enum Message {
-    BackendLoaded(RevisionSelection, Box<Result<BackendOutput, String>>),
+    /// Atomic graph reload finished. Tab-addressed (like every per-tab load
+    /// completion): a result landing after a tab switch is dropped instead of
+    /// applying to whichever tab is now active — most dangerously, two tabs
+    /// both pending on `@` would otherwise pass the revision guard and show
+    /// one repo's diff in the other's view.
+    BackendLoaded(TabId, RevisionSelection, Box<Result<BackendOutput, String>>),
     /// One batch of commits from a streaming cold load, tagged with the
     /// `commits_version` the stream was started under. Appended into the live
     /// `commits` / `graph` so the sidebar grows as the walk progresses.
@@ -33,15 +38,21 @@ pub(crate) enum Message {
     ),
     /// Diff-only load for a revision switch — carries just the document and
     /// header details, leaving the commit graph and snapshot untouched.
+    /// Tab-addressed; see [`Message::BackendLoaded`].
     DiffLoaded(
+        TabId,
         RevisionSelection,
         Box<Result<(DiffDocument, Option<RevisionDetails>), String>>,
     ),
-    RepositorySnapshotLoaded(RefreshOrigin, Result<RepositorySnapshot, String>),
+    /// Tab-addressed; see [`Message::BackendLoaded`] — an unguarded snapshot
+    /// completing after a tab switch would write the old repo's op fingerprint
+    /// into the new tab's session.
+    RepositorySnapshotLoaded(TabId, RefreshOrigin, Result<RepositorySnapshot, String>),
     /// Background-resolved empty status for the merge/root commits the loader
     /// left unknown, tagged with the `commits_version` it was computed against
-    /// so results from a superseded load are dropped.
-    EmptyStatusComputed(u64, Vec<(usize, bool)>),
+    /// so results from a superseded load are dropped. Tab-addressed because
+    /// `commits_version` alone is not unique across tabs.
+    EmptyStatusComputed(TabId, u64, Vec<(usize, bool)>),
     SelectFile(usize),
     SelectRowKey(revision_list::RowSelectionKey),
     /// The sidebar / diff view reported a new scroll offset. Mirrored into the
@@ -71,7 +82,8 @@ pub(crate) enum Message {
     /// Result of the op-head read kicked by [`Message::OpLogChanged`]. `None` for
     /// git (no op log). Reloads only if the head differs from the one the graph
     /// already reflects (so our own writes don't cause a redundant walk).
-    OpHeadChecked(Box<Result<Option<String>, String>>),
+    /// Tab-addressed; see [`Message::BackendLoaded`].
+    OpHeadChecked(TabId, Box<Result<Option<String>, String>>),
     /// Periodic tick while a load is in flight. No-op handler — it exists only
     /// to keep `view()` re-running so the loading indicator can appear after
     /// its grace period and animate.
@@ -161,4 +173,13 @@ pub(crate) enum Message {
     OpenUrl(String),
     /// Cursor entered/left a caret control — drives its hover highlight.
     SetHover(Option<HoverTarget>),
+
+    // ── GitHub PR tabs ──────────────────────────────────────────────────
+    /// PR header metadata (`gh pr view`) for the streaming PR load tagged with
+    /// its version (the `session.load` cursor guard, like `CommitsBatch`).
+    PrMetaLoaded(u64, Box<Result<github::PrInfo, String>>),
+    /// One batch of completed files off the PR diff stream.
+    PrFilesBatch(u64, Vec<DiffFile>),
+    /// The PR diff stream ended — every file was emitted, or it failed.
+    PrFinished(u64, Box<Result<(), String>>),
 }

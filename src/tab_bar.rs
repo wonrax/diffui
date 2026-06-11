@@ -115,7 +115,10 @@ fn tab_widget<'a>(
     tab: &'a crate::Tab,
     active: bool,
 ) -> Element<'a, Message> {
-    let badge = vcs_badge(tab.vcs, theme, ui.config.mono_font);
+    let badge = match &tab.source {
+        crate::TabSource::Repo { vcs, .. } => vcs_badge(*vcs, theme, ui.config.mono_font),
+        crate::TabSource::GitHubPr(_) => pr_badge(theme, ui.config.mono_font),
+    };
 
     let name_color = if active { theme.text } else { theme.muted_text };
     // owner + name as a tight unit (no gap), matching the design's RepoLabel —
@@ -226,7 +229,17 @@ fn vcs_badge(vcs: Vcs, theme: ThemeSpec, mono: iced::Font) -> Element<'static, M
         Vcs::Jj => ("jj", theme.lane_base),
         Vcs::Git => ("git", theme.modified_token),
     };
-    container(text(label).size(9.5).color(color).font(mono))
+    badge_chip(label, color, mono)
+}
+
+/// `pr` badge for GitHub pull-request tabs — accent-colored so it reads as
+/// "remote" next to the local jj/git chips.
+fn pr_badge(theme: ThemeSpec, mono: iced::Font) -> Element<'static, Message> {
+    badge_chip("pr", theme.accent, mono)
+}
+
+fn badge_chip(label: &str, color: Color, mono: iced::Font) -> Element<'static, Message> {
+    container(text(label.to_owned()).size(9.5).color(color).font(mono))
         .padding(Padding::from([1, 4]))
         .style(move |_| container::Style {
             background: Some(Background::Color(chip_background(color))),
@@ -407,7 +420,7 @@ pub fn build_open_repo_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Mess
     )
     .on_press(Message::OpenRepoDialogClose);
 
-    let input = text_input("~/code/your-repo", &dialog.path)
+    let input = text_input("~/code/your-repo or a GitHub PR URL", &dialog.path)
         .id(OPEN_REPO_INPUT_ID)
         .padding(Padding::from([8, 10]))
         .size(13)
@@ -435,7 +448,7 @@ pub fn build_open_repo_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Mess
             .size(15)
             .color(theme.text)
             .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
-        text("Enter the path to a jj or git working copy.")
+        text("Enter the path to a jj or git working copy, or a GitHub pull request (URL or owner/repo#123).")
             .size(12)
             .color(theme.muted_text)
             .font(ui.config.ui_font),
@@ -457,7 +470,7 @@ pub fn build_open_repo_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Mess
     let open_roots: Vec<&str> = ui
         .tabs
         .iter()
-        .map(|tab| tab.root.to_str().unwrap_or_default())
+        .filter_map(|tab| tab.root()?.to_str())
         .collect();
     let recents: Vec<&String> = ui
         .recent_repos

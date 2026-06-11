@@ -32,7 +32,7 @@ mod window_state;
 // Domain logic now lives in the headless `diffui-core` crate. Re-export the
 // modules the app still reaches into by path (`crate::graph`, `crate::jj`,
 // `crate::mutations`, …) so those call sites stay unchanged.
-pub(crate) use diffui_core::{FetchTarget, graph, graph_layout, jj, mutations, repository};
+pub(crate) use diffui_core::{FetchTarget, github, graph, graph_layout, jj, mutations, repository};
 pub(crate) use message::Message;
 
 /// Profiling-only global allocator (enabled by the `track-alloc` feature). It
@@ -108,9 +108,9 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use clap::Parser;
 use config::AppConfig;
 use diffui_core::{
-    CommitStore, CommitsTail, DiffDocument, LoadProgress, RevisionDetails, RevisionSelection,
-    RowView, SignatureInfo, StreamRow, compute_empty_status, load_backend, load_diff,
-    load_repository_snapshot, read_op_head,
+    CommitStore, CommitsTail, DiffDocument, DiffFile, LoadProgress, RevisionDetails,
+    RevisionSelection, RowView, SignatureInfo, StreamRow, compute_empty_status, load_backend,
+    load_diff, load_repository_snapshot, read_op_head,
 };
 use find::FindState;
 use futures::{SinkExt, Stream, StreamExt};
@@ -439,22 +439,45 @@ pub(crate) fn revset_presets(vcs: Option<Vcs>) -> &'static [(&'static str, &'sta
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct TabId(pub(crate) u64);
 
-/// One open repository: its identity + display metadata, plus the stashed
-/// per-repo state while it's inactive. The active tab's `stash` is `None` —
-/// its state is checked out into the `Diffui` inline fields.
+/// What a tab views: a local repository, or a GitHub pull request fetched
+/// through the `gh` CLI. Equality is identity — it's what de-duplicates opens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TabSource {
+    Repo {
+        vcs: Vcs,
+        /// Repository root, used to de-duplicate opens and key the watcher.
+        root: PathBuf,
+    },
+    GitHubPr(github::PrSpec),
+}
+
+/// One open tab: its identity + display metadata, plus the stashed per-tab
+/// state while it's inactive. The active tab's `stash` is `None` — its state
+/// is checked out into the `Diffui` inline fields.
 #[derive(Debug, Clone)]
 pub(crate) struct Tab {
     pub(crate) id: TabId,
-    /// Dimmed prefix in the tab label — the repo root's parent directory.
+    /// Dimmed prefix in the tab label — the repo root's parent directory, or
+    /// the PR's GitHub org.
     pub(crate) owner: String,
-    /// Emphasized repo name — the repo root's directory name.
+    /// Emphasized name — the repo directory, or `repo#123` for a PR.
     pub(crate) name: String,
-    pub(crate) vcs: Vcs,
-    /// Repository root, used to de-duplicate opens and key the watcher.
-    pub(crate) root: PathBuf,
+    pub(crate) source: TabSource,
     /// `None` for the active tab (state is inline); `Some` for an inactive
     /// tab (loaded, or a fresh `RepoState::unloaded`).
     pub(crate) stash: Option<RepoState>,
+}
+
+impl Tab {
+    /// The local repository root, or `None` for a GitHub-PR tab. Persistence
+    /// and the recent-repos list key off this, so PR tabs (session-only for
+    /// now) drop out of both naturally.
+    pub(crate) fn root(&self) -> Option<&Path> {
+        match &self.source {
+            TabSource::Repo { root, .. } => Some(root),
+            TabSource::GitHubPr(_) => None,
+        }
+    }
 }
 
 /// Transient state of the open-repository path dialog.
@@ -819,6 +842,76 @@ fn stream_jj_initial_load(
                 }
             }
             let _ = worker.await;
+        },
+    ))
+}
+
+/// Streaming load for a GitHub-PR tab: fetch the header metadata and stream
+/// the diff concurrently (`gh pr view` + `gh pr diff`), batching completed
+/// files so a huge PR paints progressively while it downloads. Mirrors
+/// [`stream_jj_initial_load`]'s channel bridge; every message carries
+/// `version` so a superseded load's output is dropped by the cursor guard.
+fn stream_github_pr_load(
+    spec: github::PrSpec,
+    progress: LoadProgress,
+    version: u64,
+) -> Task<Message> {
+    /// Flush the pending file batch once it holds this many diff lines (always
+    /// flushing on stream end). Small enough that the first screenful paints
+    /// quickly; large enough that a million-line PR doesn't flood the update
+    /// loop with per-file messages.
+    const BATCH_LINE_LIMIT: usize = 4_096;
+
+    Task::stream(iced::stream::channel(
+        16,
+        async move |mut output: futures::channel::mpsc::Sender<Message>| {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+
+            // Header metadata rides alongside the diff; its `changedFiles`
+            // count is what turns the activity's progress determinate.
+            let meta_tx = tx.clone();
+            let meta_spec = spec.clone();
+            let meta_progress = progress.clone();
+            let meta_task = tokio::spawn(async move {
+                let result = github::fetch_pr_info(&meta_spec)
+                    .await
+                    .map_err(|error| format!("{error:#}"));
+                if let Ok(info) = &result {
+                    meta_progress.set_total(info.changed_files);
+                }
+                let _ = meta_tx.send(Message::PrMetaLoaded(version, Box::new(result)));
+            });
+
+            let diff_tx = tx;
+            let diff_task = tokio::spawn(async move {
+                let mut batch: Vec<DiffFile> = Vec::new();
+                let mut batch_lines = 0usize;
+                let result = github::stream_pr_diff(&spec, |file| {
+                    progress.increment();
+                    batch_lines += file.hunks.iter().map(|hunk| hunk.lines.len()).sum::<usize>();
+                    batch.push(file);
+                    if batch_lines >= BATCH_LINE_LIMIT {
+                        let _ = diff_tx
+                            .send(Message::PrFilesBatch(version, std::mem::take(&mut batch)));
+                        batch_lines = 0;
+                    }
+                })
+                .await
+                .map_err(|error| format!("{error:#}"));
+                if !batch.is_empty() {
+                    let _ = diff_tx.send(Message::PrFilesBatch(version, batch));
+                }
+                let _ = diff_tx.send(Message::PrFinished(version, Box::new(result)));
+            });
+
+            // Relay worker messages to iced, honoring its backpressure. The
+            // loop ends once both workers finished and dropped their senders.
+            while let Some(message) = rx.recv().await {
+                if output.send(message).await.is_err() {
+                    break;
+                }
+            }
+            let _ = tokio::join!(meta_task, diff_task);
         },
     ))
 }

@@ -32,10 +32,15 @@ impl Diffui {
             .unwrap_or_else(|| window::Settings::default().size);
         let window_position = saved.position().map(|(x, y)| Point::new(x, y));
 
-        // Repositories to open: explicit CLI paths win; otherwise restore last
-        // session's open repos; otherwise the current directory. Unresolvable
-        // paths are skipped (keeping the first error so a single bad path still
-        // surfaces a message); the survivors each become a tab.
+        // Targets to open: explicit CLI args win; otherwise restore last
+        // session's open repos; otherwise the current directory. An arg is a
+        // GitHub PR reference (URL / `owner/repo#123`) or a repository path.
+        // Unresolvable paths are skipped (keeping the first error so a single
+        // bad path still surfaces a message); the survivors each become a tab.
+        enum BootTarget {
+            Repo(Repository),
+            Pr(github::PrSpec),
+        }
         let requested: Vec<PathBuf> = if !cli.paths.is_empty() {
             cli.paths
         } else if !saved.open_repos.is_empty() {
@@ -43,11 +48,15 @@ impl Diffui {
         } else {
             vec![PathBuf::from(".")]
         };
-        let mut repositories = Vec::new();
+        let mut targets = Vec::new();
         let mut first_error = None;
         for path in &requested {
+            if let Some(spec) = github::PrSpec::parse(&path.to_string_lossy()) {
+                targets.push(BootTarget::Pr(spec));
+                continue;
+            }
             match prepare_repository(path) {
-                Ok(repository) => repositories.push(repository),
+                Ok(repository) => targets.push(BootTarget::Repo(repository)),
                 Err(error) => {
                     if first_error.is_none() {
                         first_error = Some(format!("{error:#}"));
@@ -62,9 +71,12 @@ impl Diffui {
             .active_repo
             .as_deref()
             .and_then(|active| {
-                repositories
-                    .iter()
-                    .position(|repository| repository.root.to_string_lossy() == active)
+                targets.iter().position(|target| match target {
+                    BootTarget::Repo(repository) => {
+                        repository.root.to_string_lossy() == active
+                    }
+                    BootTarget::Pr(_) => false,
+                })
             })
             .unwrap_or(0);
 
@@ -79,42 +91,50 @@ impl Diffui {
         };
 
         let mut next_tab_id = 0u64;
-        let mut tabs = Vec::with_capacity(repositories.len());
-        for (index, repository) in repositories.iter().enumerate() {
-            let (owner, name) = repo_label(&repository.root);
+        let mut tabs = Vec::with_capacity(targets.len());
+        for (index, target) in targets.iter().enumerate() {
+            let (owner, name, source, state) = match target {
+                BootTarget::Repo(repository) => {
+                    let (owner, name) = repo_label(&repository.root);
+                    let source = TabSource::Repo {
+                        vcs: repository.vcs,
+                        root: repository.root.clone(),
+                    };
+                    let state =
+                        RepoState::unloaded(Some(repository.clone()), revset_for(repository));
+                    (owner, name, source, state)
+                }
+                BootTarget::Pr(spec) => (
+                    spec.owner.clone(),
+                    spec.label(),
+                    TabSource::GitHubPr(spec.clone()),
+                    RepoState::unloaded(None, String::new()),
+                ),
+            };
             let id = TabId(next_tab_id);
             next_tab_id += 1;
             // The active tab's state lives inline (no stash); the rest start
             // unloaded and load lazily on first activation.
-            let stash = if index == active_index {
-                None
-            } else {
-                Some(RepoState::unloaded(
-                    Some(repository.clone()),
-                    revset_for(repository),
-                ))
-            };
+            let stash = (index != active_index).then_some(state);
             tabs.push(Tab {
                 id,
                 owner,
                 name,
-                vcs: repository.vcs,
-                root: repository.root.clone(),
+                source,
                 stash,
             });
         }
 
-        let active_repository = repositories.get(active_index).cloned();
+        let active_repository = match targets.get(active_index) {
+            Some(BootTarget::Repo(repository)) => Some(repository.clone()),
+            _ => None,
+        };
         let active_revset = active_repository
             .as_ref()
             .map(revset_for)
             .unwrap_or_default();
-        let active_tab = if repositories.is_empty() {
-            0
-        } else {
-            active_index
-        };
-        let status = match (&active_repository, &first_error) {
+        let active_tab = if targets.is_empty() { 0 } else { active_index };
+        let status = match (targets.get(active_index), &first_error) {
             (Some(_), _) => LoadStatus::Loading,
             (None, Some(error)) => LoadStatus::Failed(error.clone()),
             (None, None) => LoadStatus::Loaded,
@@ -122,9 +142,12 @@ impl Diffui {
 
         // Recent-repos MRU: prior history from disk, with the repos opening this
         // session promoted to the front (newest first) so they're remembered
-        // even after they're later closed.
+        // even after they're later closed. PR tabs aren't paths, so they stay out.
         let mut recent_repos = saved.recent_repos.clone();
-        for repository in repositories.iter().rev() {
+        for target in targets.iter().rev() {
+            let BootTarget::Repo(repository) = target else {
+                continue;
+            };
             let key = repository.root.to_string_lossy().into_owned();
             recent_repos.retain(|root| root != &key);
             recent_repos.insert(0, key);
@@ -182,19 +205,24 @@ impl Diffui {
         };
 
         let theme_task = system::theme().map(Message::SystemThemeChanged);
-        let load_task = if active_repository.is_some() {
-            app.kick_initial_load()
-        } else {
-            Task::none()
-        };
+        // Kicks the streaming load for whatever the active tab is — a repo
+        // walk, a PR stream, or nothing when no tab opened.
+        let load_task = app.ensure_active_loaded();
         (app, Task::batch([load_task, theme_task]))
     }
 
     pub(crate) fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::BackendLoaded(revision, result) => match *result {
+            Message::BackendLoaded(tab, revision, result) => match *result {
                 Ok(output) => {
-                    if self.session.pending_revision.as_ref() != Some(&revision) {
+                    // Dropping a backgrounded tab's completion is safe: the
+                    // stash already abandoned its in-flight markers, so the
+                    // tab re-kicks cleanly on reactivation. Without the tab
+                    // guard, two tabs both pending on `@` would pass the
+                    // revision check and swap repos' contents.
+                    if Some(tab) != self.active_tab_id()
+                        || self.session.pending_revision.as_ref() != Some(&revision)
+                    {
                         return Task::none();
                     }
 
@@ -250,7 +278,9 @@ impl Diffui {
                     return Task::batch([empty, self.take_pending_refresh()]);
                 }
                 Err(error) => {
-                    if self.session.pending_revision.as_ref() != Some(&revision) {
+                    if Some(tab) != self.active_tab_id()
+                        || self.session.pending_revision.as_ref() != Some(&revision)
+                    {
                         return Task::none();
                     }
 
@@ -280,7 +310,7 @@ impl Diffui {
                         let progress = self.session.commit_progress.clone();
                         return Task::perform(
                             load_backend(repository, fallback.clone(), revset, progress),
-                            move |result| Message::BackendLoaded(fallback, Box::new(result)),
+                            move |result| Message::BackendLoaded(tab, fallback, Box::new(result)),
                         );
                     }
                     self.session.status = LoadStatus::Failed(error.clone());
@@ -387,9 +417,66 @@ impl Diffui {
                     }
                 }
             }
-            Message::DiffLoaded(revision, result) => match *result {
+            Message::PrMetaLoaded(version, result) => {
+                // The PR stream reuses the `session.load` cursor purely as its
+                // version guard (interner/fold stay unused) — globally
+                // monotonic versions make this safe across tabs and reloads.
+                if self.session.load.as_ref().map(|c| c.version) != Some(version) {
+                    return Task::none();
+                }
+                match *result {
+                    Ok(info) => {
+                        self.session.revision_details =
+                            Some(github::pr_revision_details(&info));
+                    }
+                    Err(error) => {
+                        // Header metadata is cosmetic; the diff stream decides
+                        // the tab's fate. Log and move on.
+                        eprintln!("diffui: gh pr view failed: {error}");
+                    }
+                }
+            }
+            Message::PrFilesBatch(version, files) => {
+                if self.session.load.as_ref().map(|c| c.version) != Some(version) {
+                    return Task::none();
+                }
+                self.append_document_files(files);
+                // First batch on screen: lift the loading indicator and show
+                // the (still-growing) diff.
+                if matches!(self.session.status, LoadStatus::Loading) {
+                    self.session.status = LoadStatus::Loaded;
+                    self.session.loading_since = None;
+                }
+            }
+            Message::PrFinished(version, result) => {
+                if self.session.load.as_ref().map(|c| c.version) != Some(version) {
+                    return Task::none();
+                }
+                self.session.load = None;
+                self.session.loading_since = None;
+                match *result {
+                    Ok(()) => {
+                        // An empty PR never sends a batch — the stream ending
+                        // is what lifts the loading screen then.
+                        self.session.status = LoadStatus::Loaded;
+                        self.finish_load_activity(activity::ActivityStatus::Done, None);
+                    }
+                    Err(error) => {
+                        // Keep a partially-streamed diff on screen (the error
+                        // lands in the activity log); fail the tab only when
+                        // nothing rendered at all.
+                        if self.session.document.files.is_empty() {
+                            self.session.status = LoadStatus::Failed(error.clone());
+                        }
+                        self.finish_load_activity(activity::ActivityStatus::Error, Some(error));
+                    }
+                }
+            }
+            Message::DiffLoaded(tab, revision, result) => match *result {
                 Ok((document, details)) => {
-                    if self.session.pending_revision.as_ref() != Some(&revision) {
+                    if Some(tab) != self.active_tab_id()
+                        || self.session.pending_revision.as_ref() != Some(&revision)
+                    {
                         return Task::none();
                     }
 
@@ -428,7 +515,9 @@ impl Diffui {
                     }
                 }
                 Err(error) => {
-                    if self.session.pending_revision.as_ref() != Some(&revision) {
+                    if Some(tab) != self.active_tab_id()
+                        || self.session.pending_revision.as_ref() != Some(&revision)
+                    {
                         return Task::none();
                     }
 
@@ -437,7 +526,10 @@ impl Diffui {
                     self.session.status = LoadStatus::Failed(error);
                 }
             },
-            Message::RepositorySnapshotLoaded(origin, Ok(snapshot)) => {
+            Message::RepositorySnapshotLoaded(tab, origin, Ok(snapshot)) => {
+                if Some(tab) != self.active_tab_id() {
+                    return Task::none();
+                }
                 self.session.snapshot_pending = false;
                 if self.session.repository_snapshot.as_ref() != Some(&snapshot)
                     && self.session.pending_revision.is_none()
@@ -478,7 +570,9 @@ impl Diffui {
                                 self.session.loading_since = Some(Instant::now());
                                 return Task::perform(
                                     load_diff(repository, revision.clone()),
-                                    move |result| Message::DiffLoaded(revision, Box::new(result)),
+                                    move |result| {
+                                        Message::DiffLoaded(tab, revision, Box::new(result))
+                                    },
                                 );
                             }
                         }
@@ -503,7 +597,9 @@ impl Diffui {
                             let revset = self.session.revset.clone();
                             return Task::perform(
                                 load_backend(repository, revision.clone(), revset, progress),
-                                move |result| Message::BackendLoaded(revision, Box::new(result)),
+                                move |result| {
+                                    Message::BackendLoaded(tab, revision, Box::new(result))
+                                },
                             );
                         }
                     }
@@ -517,15 +613,23 @@ impl Diffui {
                     Some("Already up to date".to_owned()),
                 );
             }
-            Message::RepositorySnapshotLoaded(_, Err(error)) => {
+            Message::RepositorySnapshotLoaded(tab, _, Err(error)) => {
+                if Some(tab) != self.active_tab_id() {
+                    return Task::none();
+                }
                 self.session.snapshot_pending = false;
                 self.finish_load_activity(activity::ActivityStatus::Error, Some(error.clone()));
                 self.session.status = LoadStatus::Failed(error);
             }
-            Message::EmptyStatusComputed(version, updates) => {
+            Message::EmptyStatusComputed(tab, version, updates) => {
                 // Drop results computed against a graph that's since been
-                // replaced — their row indices would no longer line up.
-                if version != self.session.commits_version || updates.is_empty() {
+                // replaced — their row indices would no longer line up. The
+                // version alone isn't unique across tabs (each session counts
+                // its own), hence the tab guard.
+                if Some(tab) != self.active_tab_id()
+                    || version != self.session.commits_version
+                    || updates.is_empty()
+                {
                     return Task::none();
                 }
                 for &(index, empty) in &updates {
@@ -561,12 +665,13 @@ impl Diffui {
                     self.file_list_expanded = !self.file_list_expanded;
                 } else if self.session.pending_revision.as_ref() != Some(&selection)
                     && let Some(repository) = self.session.repository.clone()
+                    && let Some(tab) = self.active_tab_id()
                 {
                     self.session.pending_revision = Some(selection.clone());
                     self.session.loading_since = Some(Instant::now());
                     let revision = selection.clone();
                     return Task::perform(load_diff(repository, selection), move |result| {
-                        Message::DiffLoaded(revision, Box::new(result))
+                        Message::DiffLoaded(tab, revision, Box::new(result))
                     });
                 }
             }
@@ -665,13 +770,17 @@ impl Diffui {
                     && !self.session.snapshot_pending
                     && self.session.load.is_none()
                     && let Some(repository) = self.session.repository.clone()
+                    && let Some(tab) = self.active_tab_id()
                 {
-                    return Task::perform(read_op_head(repository), |result| {
-                        Message::OpHeadChecked(Box::new(result))
+                    return Task::perform(read_op_head(repository), move |result| {
+                        Message::OpHeadChecked(tab, Box::new(result))
                     });
                 }
             }
-            Message::OpHeadChecked(result) => {
+            Message::OpHeadChecked(tab, result) => {
+                if Some(tab) != self.active_tab_id() {
+                    return Task::none();
+                }
                 // Reload only when the on-disk op differs from the one the graph
                 // reflects — i.e. it was an *external* op, not our own wc
                 // snapshot / mutation (whose op is already recorded in
@@ -1383,13 +1492,16 @@ impl Diffui {
         let Some(repository) = self.session.repository.clone() else {
             return Task::none();
         };
+        let Some(tab) = self.active_tab_id() else {
+            return Task::none();
+        };
         self.session.pending_revision = Some(selection.clone());
         self.session.loading_since = Some(Instant::now());
         // Deferred bump — see comment on `pending_revision_reveal`.
         self.pending_revision_reveal = true;
         let revision = selection.clone();
         Task::perform(load_diff(repository, selection), move |result| {
-            Message::DiffLoaded(revision.clone(), Box::new(result))
+            Message::DiffLoaded(tab, revision.clone(), Box::new(result))
         })
     }
 
@@ -1441,10 +1553,17 @@ impl Diffui {
         let Some(repository) = self.session.repository.clone() else {
             return Task::none();
         };
+        let Some(tab) = self.active_tab_id() else {
+            return Task::none();
+        };
 
         self.session.snapshot_pending = true;
         Task::perform(load_repository_snapshot(repository), move |result| {
-            Message::RepositorySnapshotLoaded(origin, result.map_err(|error| format!("{error:#}")))
+            Message::RepositorySnapshotLoaded(
+                tab,
+                origin,
+                result.map_err(|error| format!("{error:#}")),
+            )
         })
     }
 
@@ -1487,9 +1606,12 @@ impl Diffui {
             return Task::none();
         }
 
+        let Some(tab) = self.active_tab_id() else {
+            return Task::none();
+        };
         let version = self.session.commits_version;
         Task::perform(compute_empty_status(repository, targets), move |updates| {
-            Message::EmptyStatusComputed(version, updates)
+            Message::EmptyStatusComputed(tab, version, updates)
         })
     }
 
@@ -1554,6 +1676,54 @@ impl Diffui {
         self.document_version = self.document_version.wrapping_add(1);
     }
 
+    /// Append streamed files to the displayed document (the GitHub-PR load).
+    /// Deliberately **not** [`set_document`](Self::set_document): appending
+    /// leaves every existing `(file, hunk, line)` row's text untouched, so the
+    /// shaped-paragraph cache stays valid — bumping `document_version` per
+    /// batch would re-shape every visible row on each batch of a million-line
+    /// stream.
+    pub(crate) fn append_document_files(&mut self, files: Vec<DiffFile>) {
+        for file in &files {
+            self.session.document.total_additions += file.additions;
+            self.session.document.total_deletions += file.deletions;
+        }
+        self.session.document.files.extend(files);
+    }
+
+    /// (Re)start the streaming load for a GitHub-PR tab: reset the per-tab
+    /// view state, then run `gh pr view` + `gh pr diff` concurrently (see
+    /// [`stream_github_pr_load`]). The `session.load` cursor carries the
+    /// version guard exactly like a jj cold stream; the commit graph stays
+    /// empty (a PR tab has no revision sidebar yet).
+    pub(crate) fn kick_pr_load(&mut self, spec: github::PrSpec) -> Task<Message> {
+        self.finish_load_activity(activity::ActivityStatus::Done, None);
+        self.session.status = LoadStatus::Loading;
+        self.session.loading_since = Some(Instant::now());
+        self.session.selected_revision = RevisionSelection::WorkingCopy;
+        self.session.pending_revision = None;
+        self.pending_revision_reveal = false;
+        self.selected_file = 0;
+        self.sidebar_scroll_offset = 0.0;
+        self.diff_scroll_offset = 0.0;
+        self.set_document(DiffDocument::default());
+        self.session.commits = CommitStore::default();
+        self.session.graph = graph_layout::GraphLayout::default();
+        self.session.sidebar_prefix_lens.clear();
+        self.session.selected_commit_index = None;
+        self.session.revision_details = None;
+        self.session.repository_snapshot = None;
+        self.session.snapshot_pending = false;
+        self.session.pending_refresh = None;
+        let label = format!("Load {}/{}", spec.owner, spec.label());
+        let (activity_id, progress) = self.begin_activity(label, true);
+        self.pending_load_activity = Some(activity_id);
+        self.session.commit_progress = progress.clone();
+        let version = self.allocate_load_version();
+        self.session.commits_version = version;
+        self.session.load = Some(diffui_core::session::ColdCursor::new(version));
+        stream_github_pr_load(spec, progress, version)
+    }
+
     /// As [`kick_initial_load`], with an optional activity label (defaults to
     /// "Load <repo>"). This is the **streaming cold load** — it clears the graph
     /// and regrows it as batches arrive, for the initial open / tab activation
@@ -1605,9 +1775,12 @@ impl Diffui {
             Vcs::Git => {
                 self.session.load = None;
                 let revision = RevisionSelection::WorkingCopy;
+                let Some(tab) = self.active_tab_id() else {
+                    return Task::none();
+                };
                 Task::perform(
                     load_backend(repository, revision.clone(), revset, progress),
-                    move |result| Message::BackendLoaded(revision, Box::new(result)),
+                    move |result| Message::BackendLoaded(tab, revision, Box::new(result)),
                 )
             }
         }
@@ -1619,6 +1792,13 @@ impl Diffui {
     pub(crate) fn allocate_load_version(&mut self) -> u64 {
         self.next_load_version = self.next_load_version.wrapping_add(1);
         self.next_load_version
+    }
+
+    /// Id of the active tab, or `None` when no tabs are open. Per-tab async
+    /// completions carry this so a result that lands after a tab switch is
+    /// dropped instead of applying to whichever tab is active by then.
+    pub(crate) fn active_tab_id(&self) -> Option<TabId> {
+        self.tabs.get(self.active_tab).map(|tab| tab.id)
     }
 
     /// Hand out the next activity id (monotonic across every tab).
@@ -1696,11 +1876,6 @@ impl Diffui {
             Some(next) => self.run_mutation_now(next),
             None => self.start_repository_snapshot(RefreshOrigin::Focus),
         }
-    }
-
-    /// The active tab's stable id, if any tab is open.
-    pub(crate) fn active_tab_id(&self) -> Option<TabId> {
-        self.tabs.get(self.active_tab).map(|tab| tab.id)
     }
 
     /// The activity log for `tab_id`: the inline one when it's the active tab,
@@ -1864,13 +2039,16 @@ impl Diffui {
 
         // Keep the current view; only `pending_revision` is set, which lights
         // the toolbar progress line. `BackendLoaded` swaps the graph atomically.
+        let Some(tab) = self.active_tab_id() else {
+            return Task::none();
+        };
         let revision = self.session.selected_revision.clone();
         self.session.pending_revision = Some(revision.clone());
         self.session.loading_since = Some(Instant::now());
         let revset = self.session.revset.clone();
         Task::perform(
             load_backend(repository, revision.clone(), revset, progress),
-            move |result| Message::BackendLoaded(revision, Box::new(result)),
+            move |result| Message::BackendLoaded(tab, revision, Box::new(result)),
         )
     }
 
@@ -2262,15 +2440,17 @@ impl Diffui {
             x: self.window_position.map(|p| p.x),
             y: self.window_position.map(|p| p.y),
             sidebar_width: Some(self.sidebar_width),
+            // GitHub-PR tabs are session-only (no local root to restore from),
+            // so they drop out of the persisted set here.
             open_repos: self
                 .tabs
                 .iter()
-                .map(|tab| tab.root.to_string_lossy().into_owned())
+                .filter_map(|tab| Some(tab.root()?.to_string_lossy().into_owned()))
                 .collect(),
             active_repo: self
                 .tabs
                 .get(self.active_tab)
-                .map(|tab| tab.root.to_string_lossy().into_owned()),
+                .and_then(|tab| Some(tab.root()?.to_string_lossy().into_owned())),
             revsets: self.collect_revsets(),
             recent_repos: self.recent_repos.clone(),
         }
@@ -2281,6 +2461,9 @@ impl Diffui {
     pub(crate) fn collect_revsets(&self) -> BTreeMap<String, String> {
         let mut revsets = BTreeMap::new();
         for (index, tab) in self.tabs.iter().enumerate() {
+            let Some(root) = tab.root() else {
+                continue;
+            };
             let revset = if index == self.active_tab {
                 self.session.revset.clone()
             } else {
@@ -2290,7 +2473,7 @@ impl Diffui {
                     .unwrap_or_default()
             };
             if !revset.is_empty() {
-                revsets.insert(tab.root.to_string_lossy().into_owned(), revset);
+                revsets.insert(root.to_string_lossy().into_owned(), revset);
             }
         }
         revsets
