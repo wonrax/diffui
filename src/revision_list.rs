@@ -407,12 +407,12 @@ impl<'a, Message> RevisionList<'a, Message> {
         // Warped width: the strip is as wide as the rightmost *display*
         // column in use, not the rightmost original lane index.
         let lanes = match item {
-            Item::Revision(row) => row
-                .columns
-                .iter()
-                .flatten()
-                .max()
-                .map_or(row.frame.lane_count(), |max| max + 1),
+            Item::Revision(row) => revision_strip_columns(
+                &row.columns,
+                &row.prev_columns,
+                &row.frame.before,
+                row.frame.lane_count(),
+            ),
             Item::File(row) => row
                 .continuation
                 .iter()
@@ -1835,6 +1835,32 @@ impl<'a, Message> RevisionList<'a, Message> {
     }
 }
 
+/// Number of display columns a revision row's gutter must reserve. It's not
+/// enough to count this row's own live columns: the top half draws each
+/// incoming lane (`before`) starting from the column it held in the *previous*
+/// row, and the warp may have packed that origin further right than anything in
+/// this row. Since the revision id is drawn in that same top half, a strip
+/// sized to this row alone lets a lane sliding in from far right run over the
+/// id (and leaves those top-half lanes outside the hover hit-region, which also
+/// keys off `prev_columns`). Lanes that don't continue into this row aren't
+/// drawn here, so dead columns to the right don't count.
+fn revision_strip_columns(
+    columns: &[Option<usize>],
+    prev_columns: &[Option<usize>],
+    before: &[Option<GraphEdgeType>],
+    fallback: usize,
+) -> usize {
+    let here = columns.iter().flatten().copied();
+    let incoming_origins = before
+        .iter()
+        .enumerate()
+        .filter(|(_, kind)| kind.is_some())
+        .filter_map(|(lane, _)| prev_columns.get(lane).copied().flatten());
+    here.chain(incoming_origins)
+        .max()
+        .map_or(fallback, |max| max + 1)
+}
+
 /// Original lane index occupying warped `display` column at this item's
 /// row, or `None` for an empty column. The top half of a transitioning row
 /// reads the previous row's packing (that's where the slide starts).
@@ -2298,6 +2324,38 @@ mod tests {
         assert_eq!(row_top_at(None, 5), 5.0 * rev);
         assert_eq!(row_at_offset_in(10, None, 5.0 * rev + 1.0), Some(5));
         assert_eq!(row_at_offset_in(10, None, 1000.0 * rev), None);
+    }
+
+    #[test]
+    fn gutter_reserves_for_far_incoming_slant() {
+        let direct = Some(GraphEdgeType::Direct);
+        // Lanes 0 and 4 survive into this row; 1–3 died, so the warp packs
+        // lane 4 from display column 4 (its slot in the row above) down to
+        // column 1 here. The incoming slant starts at column 4 in the top
+        // half, so the strip must stay 5 columns wide — not the 2 this row's
+        // own columns would suggest — or it runs over the revision id.
+        let columns = [Some(0), None, None, None, Some(1)];
+        let prev_columns = [Some(0), Some(1), Some(2), Some(3), Some(4)];
+        let before = [direct, None, None, None, direct];
+        assert_eq!(
+            revision_strip_columns(&columns, &prev_columns, &before, 5),
+            5
+        );
+    }
+
+    #[test]
+    fn gutter_ignores_dead_rightmost_prev_column() {
+        let direct = Some(GraphEdgeType::Direct);
+        // Lane 2 occupied display column 2 in the row above but doesn't
+        // continue here (no `before` edge), so nothing is drawn at column 2 —
+        // it must not widen the strip past this row's own two columns.
+        let columns = [Some(0), Some(1)];
+        let prev_columns = [Some(0), Some(1), Some(2)];
+        let before = [direct, direct];
+        assert_eq!(
+            revision_strip_columns(&columns, &prev_columns, &before, 2),
+            2
+        );
     }
 
     #[test]
