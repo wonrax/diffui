@@ -83,6 +83,10 @@ pub(crate) enum Message {
     /// selects that file, a directory row toggles its collapse.
     SidebarFileRow(usize),
     SystemThemeChanged(iced_theme::Mode),
+    /// Poll tick (macOS, System theme only): re-read the live OS appearance and
+    /// re-resolve if it changed. Covers winit going silent once iced pins the
+    /// window appearance — see [`crate::chrome::system_appearance`].
+    PollSystemTheme,
     WindowFocusChanged(bool),
     RefreshRepository,
     /// The fs watcher saw a write under `.jj/repo/op_heads` — an operation
@@ -137,6 +141,23 @@ pub(crate) enum Message {
     /// Begin an interactive window drag — fired when the user presses an empty
     /// area of the tab strip on platforms where it stands in for the title bar.
     TitleBarDrag,
+    /// Perform the system-configured title-bar double-click action (zoom /
+    /// minimize) — fired when the user double-clicks an empty area of the strip.
+    /// A native title bar does this for free; our custom strip replicates it.
+    TitleBarDoubleClick,
+    /// The double-click action resolved on the main thread (macOS): the window's
+    /// current frame, its screen's visible frame (AppKit coords `[x,y,w,h]`), the
+    /// configured action (0 = zoom, 1 = minimize, 2 = none), and AppKit's native
+    /// `animationResizeTime:` for a zoom to the visible frame. Zoom starts the
+    /// custom [`crate::ZoomAnim`]; the others dispatch directly.
+    TitleBarDoubleClickPlan {
+        current: [f64; 4],
+        visible: [f64; 4],
+        action: u8,
+        duration: f64,
+    },
+    /// One frame of the custom zoom animation — steps the window frame.
+    ZoomAnimTick,
     /// Command-palette messages — see [`crate::palette::PaletteMessage`].
     Palette(crate::palette::PaletteMessage),
     /// In-diff find bar messages (⌘F) — see [`crate::find::FindMessage`].

@@ -148,6 +148,26 @@ const WINDOW_STATE_DEBOUNCE: Duration = Duration::from_millis(400);
 /// quick-pick list. Bounded so the persisted state file stays small.
 const RECENT_REPOS_MAX: usize = 12;
 
+/// Fallback duration for the custom zoom animation when AppKit's own
+/// `animationResizeTime:` isn't available (e.g. un-zooming with no saved
+/// duration). The real path queries the native value so the timing matches a
+/// native zoom exactly; this is only a sane default.
+pub(crate) const ZOOM_FALLBACK_SECS: f64 = 0.25;
+
+/// True when two window frames (`[x, y, w, h]`) match within a pixel or two —
+/// used to tell whether the window is already sitting at its zoom target.
+pub(crate) fn frames_approx_eq(a: [f64; 4], b: [f64; 4]) -> bool {
+    a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() < 2.0)
+}
+
+/// The frame to un-zoom to when we have no saved pre-zoom frame (e.g. the window
+/// opened already maximized): a centered 70% of the screen's visible area.
+pub(crate) fn zoom_default_restore(visible: [f64; 4]) -> [f64; 4] {
+    let [vx, vy, vw, vh] = visible;
+    let (w, h) = (vw * 0.7, vh * 0.7);
+    [vx + (vw - w) / 2.0, vy + (vh - h) / 2.0, w, h]
+}
+
 fn main() -> iced::Result {
     let cli = Cli::parse();
 
@@ -278,6 +298,18 @@ pub(crate) struct Diffui {
     /// debounce timer whose tick flushes the geometry to disk after the
     /// changes settle. `None` when nothing is pending.
     pub(crate) geometry_dirty_since: Option<Instant>,
+    /// In-flight custom double-click zoom animation (macOS), or `None` when idle.
+    /// We drive the zoom ourselves frame-by-frame instead of using AppKit's
+    /// `performZoom:` so the layout re-flows each step like an edge-drag resize
+    /// rather than the whole GPU surface morphing mid-animation. While `Some`,
+    /// the subscription ticks it.
+    pub(crate) zoom_anim: Option<ZoomAnim>,
+    /// The pre-zoom window frame to restore on the next un-zoom (AppKit screen
+    /// coords `[x, y, w, h]`) paired with the native animation duration used to
+    /// zoom in — reused for the symmetric un-zoom so its timing matches without a
+    /// second `animationResizeTime:` round-trip. `None` when not in our zoomed
+    /// state.
+    pub(crate) zoom_restore: Option<([f64; 4], f64)>,
     pub(crate) config: AppConfig,
     /// `None` when closed; a non-empty column stack when open.
     pub(crate) palette: Option<PaletteState>,
@@ -416,6 +448,24 @@ pub(crate) enum HoverTarget {
     /// hover state; only the `mouse_area` caret needs manual tracking).
     FetchCaret,
     RevsetCaret,
+    /// A title-bar tab, keyed by id — drives its inset hover fill. At most one is
+    /// hovered at a time.
+    Tab(TabId),
+}
+
+/// One in-flight custom zoom animation: interpolate the window frame from `from`
+/// to `to` (AppKit screen coords `[x, y, w, h]`) over `duration` seconds, applying
+/// each step as a non-animated `setFrame:` so the resize routes through the same
+/// live-repaint path an edge-drag uses. `duration` is AppKit's own
+/// `animationResizeTime:` for this resize, so the timing matches a native zoom;
+/// `start` is the wall-clock the animation began and the tick handler eases
+/// `elapsed / duration`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ZoomAnim {
+    pub(crate) start: Instant,
+    pub(crate) from: [f64; 4],
+    pub(crate) to: [f64; 4],
+    pub(crate) duration: f64,
 }
 
 /// The per-tab state of an *inactive* tab: its core [`Session`] (all domain +

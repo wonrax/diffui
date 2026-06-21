@@ -14,6 +14,7 @@
 use iced::{
     Background, Border, Color, Element, Length, Padding, alignment,
     font::Weight,
+    mouse,
     widget::{Space, button, column, container, mouse_area, row, stack, text, text_input},
 };
 
@@ -21,7 +22,7 @@ use crate::chrome;
 use crate::palette::PaletteMessage;
 use crate::repository::Vcs;
 use crate::theme::{ThemeSpec, chip_background, emphasis_font};
-use crate::{Diffui, Message};
+use crate::{Diffui, HoverTarget, Message};
 
 /// Focus target id for the open-repository dialog's path field.
 pub const OPEN_REPO_INPUT_ID: &str = "open-repo-input";
@@ -35,10 +36,10 @@ pub fn build_tab_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         return Space::new().into();
     }
 
-    // 6px between tabs (and the trailing `+`) — the same rhythm the strip uses
-    // between its top-level groups and the toolbar uses between its actions, so
-    // every gap across the two title-bar bands is one consistent value.
-    let mut tabs_row = row![].spacing(6).align_y(alignment::Vertical::Center);
+    // Tabs sit 1px apart so the strip reads as one tight segmented control; the
+    // per-tab hover/active fill is inset inside each tab (see `tab_widget`), so
+    // the highlights still keep their own breathing room despite the tight gap.
+    let mut tabs_row = row![].spacing(1).align_y(alignment::Vertical::Center);
     for (index, tab) in ui.tabs.iter().enumerate() {
         let active = index == ui.active_tab;
         tabs_row = tabs_row.push(tab_widget(ui, theme, tab, active));
@@ -83,9 +84,14 @@ pub fn build_tab_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
 
     // When the native title bar is hidden/replaced (macOS today), the strip's
     // empty area doubles as the window-drag handle: tabs and buttons consume
-    // their own clicks, so only the gaps initiate a drag.
+    // their own clicks, so only the gaps initiate a drag. A double-click on that
+    // same empty area runs the system zoom/minimize action, matching a native
+    // title bar (the native double-click handling is lost with the title bar).
     if chrome::drag_region() {
-        mouse_area(bar).on_press(Message::TitleBarDrag).into()
+        mouse_area(bar)
+            .on_press(Message::TitleBarDrag)
+            .on_double_click(Message::TitleBarDoubleClick)
+            .into()
     } else {
         bar.into()
     }
@@ -156,7 +162,6 @@ fn tab_widget<'a>(
     });
 
     let id = tab.id;
-    let select = mouse_area(label).on_press(Message::SelectTab(id));
 
     let close = button(
         text("\u{00d7}") // × multiplication sign
@@ -183,40 +188,62 @@ fn tab_widget<'a>(
         snap: true,
     });
 
-    let inner = row![select, close]
+    let inner = row![label, close]
         .spacing(4)
         .align_y(alignment::Vertical::Center);
 
-    // The active tab is raised: a lighter fill (the pane color) plus a soft
-    // outline, matching the design's `--tab-active-bg`. Inactive tabs sit
-    // flush against the strip.
-    let (background, border) = if active {
-        (
-            Some(Background::Color(theme.panel_background)),
-            Border {
-                width: 1.0,
-                color: theme.border,
-                radius: 6.0.into(),
-            },
-        )
-    } else {
-        (
-            None,
-            Border {
+    // Border and fill live on *separate* elements so the highlight reads as
+    // inner: the inner `fill` carries the background, and the outer `frame`
+    // carries the active tab's 1px outline plus a 1px inset, so the fill sits
+    // strictly inside the outline (and inside the tab edge) instead of painting
+    // out to — and under — it. Active: a raised fill (the design's
+    // `--tab-active-bg`), lifting a touch on hover. Inactive: empty until
+    // hovered, when it takes the same faint chip wash the strip's other controls
+    // use.
+    let hovered = ui.hovered == Some(HoverTarget::Tab(id));
+    let fill_color = match (active, hovered) {
+        (true, false) => Some(theme.panel_background),
+        (true, true) => Some(theme.selected_file),
+        (false, true) => Some(chip_background(theme.muted_text)),
+        (false, false) => None,
+    };
+    let fill = container(inner)
+        .padding(Padding::from([3, 7]))
+        .style(move |_| container::Style {
+            background: fill_color.map(Background::Color),
+            border: Border {
                 width: 0.0,
                 color: Color::TRANSPARENT,
+                radius: 4.0.into(),
+            },
+            ..container::Style::default()
+        });
+
+    // The whole frame is the select target, so a press anywhere up to the tab's
+    // edge selects it (the old label-only hit box left the padding dead). The
+    // close `×` sits inside and captures its own press first (iced dispatches to
+    // children before the parent), so hitting `×` closes rather than selects.
+    // Hover is tracked in app state; `on_move` re-asserts it every frame the
+    // cursor is over the tab, so the one-frame flicker that `on_enter`/`on_exit`
+    // race into when crossing between adjacent tabs is immediately corrected.
+    let frame = container(fill)
+        .padding(Padding::from([1, 1]))
+        .style(move |_| container::Style {
+            background: None,
+            border: Border {
+                width: if active { 1.0 } else { 0.0 },
+                color: if active { theme.border } else { Color::TRANSPARENT },
                 radius: 6.0.into(),
             },
-        )
-    };
-
-    container(inner)
-        .padding(Padding::from([4, 8]))
-        .style(move |_| container::Style {
-            background,
-            border,
             ..container::Style::default()
-        })
+        });
+
+    mouse_area(frame)
+        .on_press(Message::SelectTab(id))
+        .on_enter(Message::SetHover(Some(HoverTarget::Tab(id))))
+        .on_move(move |_| Message::SetHover(Some(HoverTarget::Tab(id))))
+        .on_exit(Message::SetHover(None))
+        .interaction(mouse::Interaction::Pointer)
         .into()
 }
 

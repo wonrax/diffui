@@ -91,6 +91,69 @@ pub fn position_window_controls(handle: raw_window_handle::RawWindowHandle, bar_
     }
 }
 
+/// Resolve a title-bar double-click for the caller to act on: the window's
+/// current frame, its screen's visible frame (both AppKit screen coords
+/// `[x, y, w, h]`), and the configured action read from the same
+/// `AppleActionOnDoubleClick` user-default AppKit consults — `0` = zoom (the
+/// unset default), `1` = minimize, `2` = none. The caller drives the zoom
+/// animation itself (see [`set_window_frame`]); we only *read* here. Returns a
+/// zero-size visible frame + action `2` off macOS / non-AppKit handles so the
+/// caller no-ops. Must run on the main thread (`window::run` guarantees it).
+#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+pub fn read_double_click_plan(
+    handle: raw_window_handle::RawWindowHandle,
+) -> ([f64; 4], [f64; 4], u8, f64) {
+    #[cfg(target_os = "macos")]
+    {
+        if let raw_window_handle::RawWindowHandle::AppKit(appkit) = handle {
+            // SAFETY: `ns_view` is a live `NSView*` and this runs on the main
+            // thread. We only send well-known AppKit messages and read a default.
+            return unsafe { read_double_click_plan_impl(appkit.ns_view.as_ptr()) };
+        }
+    }
+    ([0.0; 4], [0.0; 4], 2, 0.0)
+}
+
+/// Set the window's frame instantly (no AppKit animation), wrapped in a
+/// `CATransaction` with implicit actions disabled so the GPU layer doesn't
+/// interpolate (scale) its contents between sizes. Called once per animation
+/// frame by the zoom tick, so the resize routes through the same live-repaint
+/// path an edge-drag uses. `frame` is AppKit screen coords `[x, y, w, h]`. No-op
+/// off macOS / non-AppKit handles. Must run on the main thread.
+#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+pub fn set_window_frame(handle: raw_window_handle::RawWindowHandle, frame: [f64; 4]) {
+    #[cfg(target_os = "macos")]
+    {
+        if let raw_window_handle::RawWindowHandle::AppKit(appkit) = handle {
+            // SAFETY: `ns_view` is a live `NSView*` and this runs on the main
+            // thread. We only send well-known AppKit messages.
+            unsafe { set_window_frame_impl(appkit.ns_view.as_ptr(), frame) };
+        }
+    }
+}
+
+/// The current OS appearance (light/dark), read live from the shared
+/// application's `effectiveAppearance`. We never set `NSApp`'s own appearance,
+/// so this still tracks the system even while iced has pinned the *window's*
+/// appearance to our resolved theme — which is exactly what makes winit stop
+/// reporting appearance changes (its observer ignores them once the window has
+/// an explicit appearance). Polling this is how the strip keeps following the OS
+/// without a restart. `Mode::None` means "couldn't tell" (off macOS, or AppKit
+/// returned nothing); callers treat that as "leave the current resolution be".
+/// Must run on the main thread — the iced update loop, our only caller, does.
+pub fn system_appearance() -> iced::theme::Mode {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: reads well-known AppKit appearance APIs on the main thread.
+        // `NSApplication` is process-global and these calls don't mutate state.
+        unsafe { read_system_appearance() }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        iced::theme::Mode::None
+    }
+}
+
 /// Install a native observer that re-centers the traffic lights on every window
 /// resize, **synchronously within AppKit's own resize handling**. Reacting to
 /// winit's `Resized` through the iced message loop (see
@@ -109,6 +172,63 @@ pub fn install_window_resize_observer(handle: raw_window_handle::RawWindowHandle
         };
         resize_observer::install(appkit.ns_view.as_ptr(), bar_height);
     }
+}
+
+/// Stop AppKit from moving the window when the user presses-and-drags inside our
+/// title-bar strip. With `fullSizeContentView` the content view reaches up into
+/// the title-bar region, where NSView's default `mouseDownCanMoveWindow` (YES for
+/// a non-opaque, non-control view) hands any press-drag there straight to AppKit's
+/// window move — even right on top of a tab, before our iced handlers see the
+/// event, so iced-level click capturing can't stop it. We override the method to
+/// NO, leaving the strip movable only through our explicit `TitleBarDrag` (the
+/// empty-area `mouse_area`). The window stays `movable`, so the
+/// `performWindowDragWithEvent:` drag behind `TitleBarDrag` still works. Run once
+/// at startup. No-op off macOS / non-AppKit handles.
+#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+pub fn configure_custom_titlebar(handle: raw_window_handle::RawWindowHandle) {
+    #[cfg(target_os = "macos")]
+    {
+        let raw_window_handle::RawWindowHandle::AppKit(appkit) = handle else {
+            return;
+        };
+        // SAFETY: `ns_view` is a live `NSView*` and this runs on the main thread
+        // (via `window::run`). Overriding `mouseDownCanMoveWindow` on its class
+        // only changes that one method's return value.
+        unsafe { override_mouse_down_can_move_window(appkit.ns_view.as_ptr()) };
+    }
+}
+
+/// Replace `-mouseDownCanMoveWindow` on the content view's class with a constant
+/// `NO`. The view's concrete class (winit's) doesn't define the method itself —
+/// it inherits NSView's — so this adds an override on that class only, leaving
+/// `NSView` and every other view untouched. There's a single window for the
+/// process's life, so doing it once is enough.
+#[cfg(target_os = "macos")]
+unsafe fn override_mouse_down_can_move_window(ns_view: *mut std::ffi::c_void) {
+    use objc2::ffi::class_replaceMethod;
+    use objc2::runtime::{AnyClass, AnyObject, Bool, Imp, Sel};
+    use objc2::{msg_send, sel};
+
+    let view = ns_view as *mut AnyObject;
+    if view.is_null() {
+        return;
+    }
+    let class: *mut AnyClass = msg_send![view, class];
+    if class.is_null() {
+        return;
+    }
+
+    extern "C-unwind" fn no_move(_this: *mut AnyObject, _cmd: Sel) -> Bool {
+        Bool::NO
+    }
+
+    // SAFETY: `no_move` has exactly the `(self, _cmd) -> BOOL` shape AppKit
+    // invokes `mouseDownCanMoveWindow` with; transmuting to the type-erased
+    // `Imp` only reinterprets the function pointer. "B@:" is that signature's
+    // encoding (BOOL return, self, selector), and `class` is a live class.
+    let imp: Imp =
+        unsafe { std::mem::transmute(no_move as extern "C-unwind" fn(*mut AnyObject, Sel) -> Bool) };
+    let _ = unsafe { class_replaceMethod(class, sel!(mouseDownCanMoveWindow), imp, c"B@:".as_ptr()) };
 }
 
 /// The `NSWindowDidResizeNotification` observer backing
@@ -279,4 +399,143 @@ unsafe fn position_traffic_lights(ns_view: *mut std::ffi::c_void, bar_height: f3
     let mut frame: NSRect = msg_send![container, frame];
     frame.origin.y += desired_center_y - actual_center_y;
     let _: () = msg_send![container, setFrame: frame];
+}
+
+/// Read the window frame, its screen's visible frame, and the configured
+/// double-click action behind [`read_double_click_plan`]. Action: `1` =
+/// "Minimize", `2` = "None", `0` = zoom (anything else, including the unset
+/// default — `stringForKey:` returns nil then).
+#[cfg(target_os = "macos")]
+unsafe fn read_double_click_plan_impl(
+    ns_view: *mut std::ffi::c_void,
+) -> ([f64; 4], [f64; 4], u8, f64) {
+    use objc2::runtime::{AnyObject, Bool};
+    use objc2::{class, msg_send};
+    use objc2_foundation::{NSRect, NSString};
+
+    let none = ([0.0; 4], [0.0; 4], 2u8, 0.0);
+    let ns_view = ns_view as *mut AnyObject;
+    if ns_view.is_null() {
+        return none;
+    }
+    let ns_window: *mut AnyObject = msg_send![ns_view, window];
+    if ns_window.is_null() {
+        return none;
+    }
+
+    let window_frame: NSRect = msg_send![ns_window, frame];
+    // The window's own screen (it follows the title bar across displays); fall
+    // back to the main screen if AppKit hands us nil (e.g. fully off-screen).
+    let mut screen: *mut AnyObject = msg_send![ns_window, screen];
+    if screen.is_null() {
+        screen = msg_send![class!(NSScreen), mainScreen];
+    }
+    if screen.is_null() {
+        return none;
+    }
+    let visible_frame: NSRect = msg_send![screen, visibleFrame];
+    // AppKit's own duration for animating *this* window to the visible frame —
+    // the value a native zoom would use. Scales with the resize distance, so we
+    // query rather than hardcode. (For the symmetric un-zoom the window already
+    // sits at the visible frame, so this reads ~0; the caller reuses the saved
+    // zoom-in duration there instead.)
+    let duration: f64 = msg_send![ns_window, animationResizeTime: visible_frame];
+
+    let defaults: *mut AnyObject = msg_send![class!(NSUserDefaults), standardUserDefaults];
+    let key = NSString::from_str("AppleActionOnDoubleClick");
+    let action_str: *mut AnyObject = msg_send![defaults, stringForKey: &*key];
+    let action = if action_str.is_null() {
+        0
+    } else {
+        let minimize = NSString::from_str("Minimize");
+        let is_minimize: Bool = msg_send![action_str, isEqualToString: &*minimize];
+        let none_str = NSString::from_str("None");
+        let is_none: Bool = msg_send![action_str, isEqualToString: &*none_str];
+        if is_minimize.as_bool() {
+            1
+        } else if is_none.as_bool() {
+            2
+        } else {
+            0
+        }
+    };
+
+    let rect = |r: NSRect| [r.origin.x, r.origin.y, r.size.width, r.size.height];
+    (rect(window_frame), rect(visible_frame), action, duration)
+}
+
+/// Apply `frame` to the window with no animation, inside a `CATransaction` that
+/// disables implicit layer actions — see [`set_window_frame`].
+#[cfg(target_os = "macos")]
+unsafe fn set_window_frame_impl(ns_view: *mut std::ffi::c_void, frame: [f64; 4]) {
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+    let ns_view = ns_view as *mut AnyObject;
+    if ns_view.is_null() {
+        return;
+    }
+    let ns_window: *mut AnyObject = msg_send![ns_view, window];
+    if ns_window.is_null() {
+        return;
+    }
+
+    let rect = NSRect {
+        origin: NSPoint {
+            x: frame[0],
+            y: frame[1],
+        },
+        size: NSSize {
+            width: frame[2],
+            height: frame[3],
+        },
+    };
+    let _: () = msg_send![class!(CATransaction), begin];
+    let _: () = msg_send![class!(CATransaction), setDisableActions: true];
+    let _: () = msg_send![ns_window, setFrame: rect, display: true, animate: false];
+    let _: () = msg_send![class!(CATransaction), commit];
+}
+
+/// Read `NSApp.effectiveAppearance` and collapse it to light/dark by asking
+/// AppKit which of the two standard appearance names it best matches — the same
+/// determination winit makes, so our answer agrees with what iced would resolve.
+#[cfg(target_os = "macos")]
+unsafe fn read_system_appearance() -> iced::theme::Mode {
+    use iced::theme::Mode;
+    use objc2::runtime::{AnyObject, Bool};
+    use objc2::{class, msg_send};
+    use objc2_foundation::NSString;
+
+    let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+    if app.is_null() {
+        return Mode::None;
+    }
+    let appearance: *mut AnyObject = msg_send![app, effectiveAppearance];
+    if appearance.is_null() {
+        return Mode::None;
+    }
+
+    // bestMatchFromAppearancesWithNames:[Aqua, DarkAqua] returns whichever name
+    // the effective appearance resolves to (the high-contrast variants collapse
+    // onto their base light/dark name here).
+    let aqua = NSString::from_str("NSAppearanceNameAqua");
+    let dark = NSString::from_str("NSAppearanceNameDarkAqua");
+    let names: *mut AnyObject = msg_send![class!(NSMutableArray), array];
+    if names.is_null() {
+        return Mode::None;
+    }
+    let _: () = msg_send![names, addObject: &*aqua];
+    let _: () = msg_send![names, addObject: &*dark];
+
+    let best: *mut AnyObject = msg_send![appearance, bestMatchFromAppearancesWithNames: names];
+    if best.is_null() {
+        return Mode::None;
+    }
+    let is_dark: Bool = msg_send![best, isEqualToString: &*dark];
+    if is_dark.as_bool() {
+        Mode::Dark
+    } else {
+        Mode::Light
+    }
 }

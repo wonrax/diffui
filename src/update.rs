@@ -216,6 +216,8 @@ impl Diffui {
             window_size,
             window_position,
             geometry_dirty_since: None,
+            zoom_anim: None,
+            zoom_restore: None,
             config,
             palette: None,
             recents: Recents::load(),
@@ -881,6 +883,14 @@ impl Diffui {
             }
             Message::SelectTheme(theme) => {
                 self.selected_theme = theme;
+                // Switching to System: sync to the live OS appearance now rather
+                // than render one stale frame until the first poll tick lands.
+                if theme == ThemePreference::System {
+                    let current = chrome::system_appearance();
+                    if current != iced_theme::Mode::None {
+                        self.system_theme = current;
+                    }
+                }
             }
             Message::ToggleDiffWrap => {
                 self.diff_wrap = !self.diff_wrap;
@@ -899,6 +909,18 @@ impl Diffui {
             }
             Message::SystemThemeChanged(theme) => {
                 self.system_theme = theme;
+            }
+            Message::PollSystemTheme => {
+                // iced pins the window's NSAppearance to our resolved theme,
+                // which makes winit stop reporting OS appearance changes (it
+                // ignores them once a window has an explicit appearance). So
+                // while following the OS we read the live application appearance
+                // ourselves and re-resolve on a change. `Mode::None` means
+                // "undeterminable" — leave the last known value untouched.
+                let current = chrome::system_appearance();
+                if current != iced_theme::Mode::None && current != self.system_theme {
+                    self.system_theme = current;
+                }
             }
             Message::RevisionContextMenu(key, row_rect, cursor) => {
                 let Some(repository) = self.session.repository.clone() else {
@@ -1145,6 +1167,7 @@ impl Diffui {
                 return Task::batch([
                     self.reposition_window_controls(),
                     self.install_resize_observer(),
+                    self.configure_custom_titlebar(),
                 ]);
             }
             Message::WindowResized(size) => {
@@ -1227,6 +1250,108 @@ impl Diffui {
                 // Resolve the (single) window and begin an interactive drag.
                 // No-op if the window id isn't available yet.
                 return window::latest().then(|id| id.map_or_else(Task::none, window::drag));
+            }
+            Message::TitleBarDoubleClick => {
+                // A native title bar runs the system double-click action for free;
+                // our custom strip has to resolve it. Read the window frame, its
+                // screen's visible frame, and the configured action on the main
+                // thread, then act on the result in `TitleBarDoubleClickPlan`.
+                return window::latest()
+                    .then(|maybe_id| {
+                        maybe_id.map_or_else(Task::none, |id| {
+                            window::run(id, |window| {
+                                window
+                                    .window_handle()
+                                    .ok()
+                                    .map(|h| chrome::read_double_click_plan(h.as_raw()))
+                                    .unwrap_or(([0.0; 4], [0.0; 4], 2, 0.0))
+                            })
+                        })
+                    })
+                    .map(
+                        |(current, visible, action, duration)| Message::TitleBarDoubleClickPlan {
+                            current,
+                            visible,
+                            action,
+                            duration,
+                        },
+                    );
+            }
+            Message::TitleBarDoubleClickPlan {
+                current,
+                visible,
+                action,
+                duration,
+            } => {
+                match action {
+                    // Minimize: let iced/winit miniaturize the window.
+                    1 => {
+                        return window::latest()
+                            .then(|id| id.map_or_else(Task::none, |id| window::minimize(id, true)));
+                    }
+                    // None: the user asked for nothing on double-click.
+                    2 => {}
+                    // Zoom (the default): toggle between the visible frame and the
+                    // saved restore frame, driven by our own animation. Ignore a
+                    // re-trigger mid-flight, and bail if the read came back empty.
+                    _ => {
+                        if self.zoom_anim.is_some() || visible[2] <= 0.0 {
+                            return Task::none();
+                        }
+                        let (to, dur) = if frames_approx_eq(current, visible) {
+                            // Un-zoom: restore the saved frame at the same duration
+                            // the zoom-in used (the resize is symmetric).
+                            self.zoom_restore
+                                .take()
+                                .unwrap_or_else(|| (zoom_default_restore(visible), ZOOM_FALLBACK_SECS))
+                        } else {
+                            // Zoom in: remember where to come back to, and the
+                            // native duration to come back at.
+                            self.zoom_restore = Some((current, duration));
+                            (visible, duration)
+                        };
+                        self.zoom_anim = Some(ZoomAnim {
+                            start: Instant::now(),
+                            from: current,
+                            to,
+                            duration: dur,
+                        });
+                    }
+                }
+            }
+            Message::ZoomAnimTick => {
+                let Some(anim) = self.zoom_anim else {
+                    return Task::none();
+                };
+                // Normalized progress over the native-matched duration (guarded
+                // against a zero duration). Snap to the target on the final frame
+                // so we land exactly.
+                let t = (anim.start.elapsed().as_secs_f64() / anim.duration.max(0.001)).clamp(0.0, 1.0);
+                let done = t >= 1.0;
+                let frame = if done {
+                    self.zoom_anim = None;
+                    anim.to
+                } else {
+                    // Sinusoidal ease-in-out — slow at both ends, matching the
+                    // feel of AppKit's native window-resize curve.
+                    let e = 0.5 - 0.5 * (std::f64::consts::PI * t).cos();
+                    let mut f = [0.0; 4];
+                    for (i, slot) in f.iter_mut().enumerate() {
+                        *slot = anim.from[i] + (anim.to[i] - anim.from[i]) * e;
+                    }
+                    f
+                };
+                return window::latest()
+                    .then(move |maybe_id| {
+                        maybe_id.map_or_else(Task::none, move |id| {
+                            window::run(id, move |window| {
+                                if let Ok(handle) = window.window_handle() {
+                                    chrome::set_window_frame(handle.as_raw(), frame);
+                                }
+                            })
+                        })
+                    })
+                    .discard();
             }
             Message::Palette(PaletteMessage::Open) => {
                 if self.palette.is_none() {
@@ -2920,6 +3045,28 @@ impl Diffui {
             Subscription::none()
         };
 
+        // macOS only: once iced applies our resolved theme it pins the window's
+        // NSAppearance, and winit then ignores OS appearance changes — so
+        // `theme_changes()` below goes silent on macOS after the first frame.
+        // While we're following the OS, poll the live application appearance so a
+        // system light/dark switch is picked up without a restart. Runs only in
+        // System mode; explicit themes don't care what the OS does.
+        let system_theme_poll =
+            if cfg!(target_os = "macos") && self.selected_theme == ThemePreference::System {
+                time::every(Duration::from_secs(1)).map(|_| Message::PollSystemTheme)
+            } else {
+                Subscription::none()
+            };
+
+        // Drives the custom double-click zoom: while an animation is in flight,
+        // tick at ~60fps so each frame steps the window toward its target. Tears
+        // itself down the moment the animation completes.
+        let zoom_tick = if self.zoom_anim.is_some() {
+            time::every(Duration::from_millis(16)).map(|_| Message::ZoomAnimTick)
+        } else {
+            Subscription::none()
+        };
+
         Subscription::batch([
             keyboard,
             window_events,
@@ -2928,6 +3075,8 @@ impl Diffui {
             loading_tick,
             menu_tick,
             window_state_tick,
+            system_theme_poll,
+            zoom_tick,
             system::theme_changes().map(Message::SystemThemeChanged),
         ])
     }
@@ -2966,6 +3115,28 @@ impl Diffui {
                     window::run(id, move |window| {
                         if let Ok(handle) = window.window_handle() {
                             chrome::install_window_resize_observer(handle.as_raw(), bar_height);
+                        }
+                    })
+                })
+            })
+            .discard()
+    }
+
+    /// Adjust the native window to cooperate with our custom title-bar strip:
+    /// stop AppKit auto-dragging it from the strip (tabs included) and make the
+    /// double-click zoom snap instead of morph. Runs once on `WindowOpened`; a
+    /// no-op where the strip isn't the title bar. See
+    /// [`chrome::configure_custom_titlebar`].
+    pub(crate) fn configure_custom_titlebar(&self) -> Task<Message> {
+        if !chrome::drag_region() {
+            return Task::none();
+        }
+        window::latest()
+            .then(|maybe_id| {
+                maybe_id.map_or_else(Task::none, |id| {
+                    window::run(id, |window| {
+                        if let Ok(handle) = window.window_handle() {
+                            chrome::configure_custom_titlebar(handle.as_raw());
                         }
                     })
                 })
