@@ -6,6 +6,7 @@ use iced::{
 use crate::config::AppConfig;
 use crate::graph_layout::GraphLayout;
 use crate::graph_view::{self, RevisionGraphStyle};
+use crate::icons;
 use crate::repository::Vcs;
 use crate::revision_list::{
     self, FileRowView, IndicatorChip, RevisionList, RevisionListStyle, RevisionRowView,
@@ -172,10 +173,10 @@ fn build_revset_filter(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     // (the `text_input` captures its own), which reports the whole bar's rect so
     // the presets menu anchors edge-to-edge below it.
     let caret = mouse_area(
-        // Drawn triangle (see `toolbar::caret_glyph`) so it centers exactly.
-        // Box height = the input's size-12 line box and the same vertical
-        // padding (5), so the hover fill lines up with the input box top-to-
-        // bottom instead of hugging the small glyph.
+        // Shared Lucide chevron (see `toolbar::caret_glyph`), centered in a box
+        // whose height = the input's size-12 line box; with the same vertical
+        // padding (5), the hover fill lines up with the input box top-to-bottom
+        // instead of hugging the small glyph.
         container(crate::toolbar::caret_glyph(theme.muted_text, 12.0 * 1.3))
             .padding(Padding::from([5, 7]))
             .align_y(alignment::Vertical::Center)
@@ -224,10 +225,7 @@ fn build_footer(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         Some(status) => {
             // Branch glyph + name; the tracked upstream rides along as a tooltip.
             let name = row![
-                text("\u{2387}")
-                    .size(FOOTER_TEXT_SIZE)
-                    .font(font)
-                    .color(dim),
+                icons::icon(icons::GIT_BRANCH, FOOTER_TEXT_SIZE, dim),
                 text(status.branch.clone())
                     .size(FOOTER_TEXT_SIZE)
                     .font(font)
@@ -262,18 +260,32 @@ fn build_footer(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
                 } else {
                     if status.ahead > 0 {
                         group = group.push(
-                            text(format!("\u{2191}{}", status.ahead))
-                                .size(FOOTER_TEXT_SIZE)
-                                .font(font)
-                                .color(theme.added_text),
+                            row![
+                                icons::icon(icons::ARROW_UP, FOOTER_TEXT_SIZE, theme.added_text),
+                                text(status.ahead.to_string())
+                                    .size(FOOTER_TEXT_SIZE)
+                                    .font(font)
+                                    .color(theme.added_text),
+                            ]
+                            .spacing(1)
+                            .align_y(alignment::Vertical::Center),
                         );
                     }
                     if status.behind > 0 {
                         group = group.push(
-                            text(format!("\u{2193}{}", status.behind))
-                                .size(FOOTER_TEXT_SIZE)
-                                .font(font)
-                                .color(theme.removed_text),
+                            row![
+                                icons::icon(
+                                    icons::ARROW_DOWN,
+                                    FOOTER_TEXT_SIZE,
+                                    theme.removed_text
+                                ),
+                                text(status.behind.to_string())
+                                    .size(FOOTER_TEXT_SIZE)
+                                    .font(font)
+                                    .color(theme.removed_text),
+                            ]
+                            .spacing(1)
+                            .align_y(alignment::Vertical::Center),
                         );
                     }
                 }

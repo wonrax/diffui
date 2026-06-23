@@ -21,6 +21,7 @@ use iced::{
     },
 };
 
+use crate::icons;
 use crate::theme::{ThemeSpec, chip_background, emphasis_font, iced_scrollable_style};
 use crate::{Diffui, Message};
 use diffui_core::LoadProgress;
@@ -267,12 +268,15 @@ pub fn activity_indicator(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message>
         // Idle: a muted glyph that still opens the popover so finished entries
         // remain reachable.
         let glyph = if ui.activities.is_empty() {
-            "\u{25CB}" // ○ no activity yet
+            icons::CIRCLE // no activity yet
         } else {
-            "\u{2713}" // ✓ idle — everything finished
+            icons::CHECK // idle — everything finished
         };
         row![
-            text(glyph).size(12).font(mono).color(theme.subtle_text),
+            text(glyph)
+                .size(12)
+                .font(icons::ICON_FONT)
+                .color(theme.subtle_text),
             text("Activity")
                 .size(11.5)
                 .font(ui.config.ui_font)
@@ -453,16 +457,24 @@ fn activity_row<'a>(
     let mono = ui.config.mono_font;
     let (loaded, total, determinate) = activity.progress_snapshot();
 
-    let (icon, icon_color) = match activity.status {
-        ActivityStatus::Queued => ("\u{2026}".to_owned(), theme.subtle_text), // … waiting
-        ActivityStatus::Running => (spinner_glyph(activity.started).to_owned(), theme.accent),
-        ActivityStatus::Done => ("\u{2713}".to_owned(), theme.added_text),
-        ActivityStatus::Error => ("\u{2715}".to_owned(), theme.removed_text),
+    let (icon, icon_color, icon_font) = match activity.status {
+        ActivityStatus::Queued => ("\u{2026}".to_owned(), theme.subtle_text, mono), // … waiting
+        ActivityStatus::Running => (
+            spinner_glyph(activity.started).to_owned(),
+            theme.accent,
+            mono,
+        ),
+        ActivityStatus::Done => (icons::CHECK.to_owned(), theme.added_text, icons::ICON_FONT),
+        ActivityStatus::Error => (
+            icons::CLOSE.to_owned(),
+            theme.removed_text,
+            icons::ICON_FONT,
+        ),
     };
 
     let label = activity.result.as_deref().unwrap_or(&activity.label);
     let mut head = row![
-        text(icon).size(12).font(mono).color(icon_color),
+        text(icon).size(12).font(icon_font).color(icon_color),
         text(label.to_owned())
             .size(12)
             .font(ui.config.ui_font)
@@ -492,11 +504,16 @@ fn activity_row<'a>(
     }
     if !activity.detail.is_empty() {
         let chevron = if activity.expanded {
-            "\u{25BE}"
+            icons::CHEVRON_DOWN
         } else {
-            "\u{25B8}"
+            icons::CHEVRON_RIGHT
         };
-        head = head.push(text(chevron).size(11).font(mono).color(theme.subtle_text));
+        head = head.push(
+            text(chevron)
+                .size(11)
+                .font(icons::ICON_FONT)
+                .color(theme.subtle_text),
+        );
     }
 
     // Header (status + label + the determinate bar). This is the click target

@@ -31,6 +31,7 @@ use iced::{
 };
 use nucleo_matcher::{Config, Matcher, Utf32String};
 
+use crate::icons;
 use crate::theme::{self, ThemeSpec};
 use crate::{Diffui, Message};
 use diffui_core::RevisionSelection;
@@ -1244,10 +1245,7 @@ fn result_row_body<'a>(
                 })
                 .unwrap_or_default();
             row![
-                text("⌗")
-                    .size(13)
-                    .font(ui.config.mono_font)
-                    .color(theme.modified_token),
+                icons::icon(icons::HASH, 13.0, theme.modified_token),
                 Space::new().width(Length::Fixed(10.0)),
                 mono_primary_label(ui, primary, name.clone()),
                 Space::new().width(Length::Fixed(8.0)),

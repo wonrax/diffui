@@ -31,6 +31,7 @@ use iced::{
     },
 };
 
+use crate::icons;
 use crate::theme::{self, ThemeSpec, chip_background, emphasis_font};
 use crate::{Diffui, MenuAction, Message};
 use diffui_core::RevisionSelection;
@@ -581,8 +582,9 @@ fn card_width(ui: &Diffui, entries: &[MenuEntry]) -> f32 {
     raw.clamp(MENU_MIN_WIDTH, MENU_MAX_WIDTH).ceil()
 }
 
-const CHEVRON: &str = "\u{203a}"; // ›
-const CHEVRON_WIDTH: f32 = 8.0;
+/// Footprint of the submenu chevron. The icon box is square, so this value is
+/// both the chevron's rendered size and the width the menu-width calc reserves.
+const CHEVRON_WIDTH: f32 = 13.0;
 
 fn build_card<'a>(
     ui: &'a Diffui,
@@ -708,7 +710,7 @@ fn build_row<'a>(
                 .width(Length::Fill)
                 .wrapping(iced::advanced::text::Wrapping::None)
                 .ellipsis(iced::advanced::text::Ellipsis::End),
-            text(CHEVRON).size(13).color(theme.muted_text).font(font),
+            icons::icon(icons::CHEVRON_RIGHT, CHEVRON_WIDTH, theme.muted_text),
         ]
         .spacing(MENU_ROW_GAP)
         .align_y(alignment::Vertical::Center)

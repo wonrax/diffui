@@ -226,9 +226,11 @@ unsafe fn override_mouse_down_can_move_window(ns_view: *mut std::ffi::c_void) {
     // invokes `mouseDownCanMoveWindow` with; transmuting to the type-erased
     // `Imp` only reinterprets the function pointer. "B@:" is that signature's
     // encoding (BOOL return, self, selector), and `class` is a live class.
-    let imp: Imp =
-        unsafe { std::mem::transmute(no_move as extern "C-unwind" fn(*mut AnyObject, Sel) -> Bool) };
-    let _ = unsafe { class_replaceMethod(class, sel!(mouseDownCanMoveWindow), imp, c"B@:".as_ptr()) };
+    let imp: Imp = unsafe {
+        std::mem::transmute(no_move as extern "C-unwind" fn(*mut AnyObject, Sel) -> Bool)
+    };
+    let _ =
+        unsafe { class_replaceMethod(class, sel!(mouseDownCanMoveWindow), imp, c"B@:".as_ptr()) };
 }
 
 /// The `NSWindowDidResizeNotification` observer backing

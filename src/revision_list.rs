@@ -30,6 +30,7 @@ use crate::graph::LaneFrame;
 use crate::graph_view::{
     LANE_WIDTH, RevisionGraphStyle, draw_continuation_row, draw_revision_row, lane_strip_width,
 };
+use crate::icons;
 use crate::scrollbar::{self, ScrollbarState, ScrollbarStyle};
 use crate::theme::chip_background;
 
@@ -46,10 +47,11 @@ const CONTENT_PADDING: f32 = 12.0;
 const INDICATOR_RADIUS: f32 = 5.0;
 const SMALL_TEXT_SIZE: f32 = 14.0;
 const CAPTION_TEXT_SIZE: f32 = 13.0;
-/// Text size for the `▾`/`▸` collapse chevron on the selected revision row.
-/// Exposed so the toolbar / revset carets can match it (one consistent caret
-/// size across the app).
-pub const CHEVRON_TEXT_SIZE: f32 = SMALL_TEXT_SIZE + 6.0;
+/// Text size for the collapse/expand chevron on the selected revision row. The
+/// old `▾` triangle needed an oversize bump to stay legible (it shrank to ~5px
+/// of actual ink); the Lucide glyph fills its box, so a near-text size reads
+/// clearly as a chevron without dominating the row.
+const CHEVRON_TEXT_SIZE: f32 = 15.0;
 /// Status-badge text size. Smaller than the row's caption text so the
 /// single-letter chip (M/A/D/R) reads as a compact tag rather than another
 /// full-weight column on the file row.
@@ -1439,14 +1441,16 @@ impl<'a, Message> RevisionList<'a, Message> {
         // up past the description so the affordance reads at a glance —
         // at the description's own size it shrinks to ~5px on the y axis
         // and disappears against the row chrome.
-        let chevron_glyph = rev
-            .collapse_chevron
-            .map(|expanded| if expanded { "\u{25BE}" } else { "\u{25B8}" });
+        let chevron_glyph = rev.collapse_chevron.map(|expanded| {
+            if expanded {
+                icons::CHEVRON_DOWN
+            } else {
+                icons::CHEVRON_RIGHT
+            }
+        });
         let chevron_size = CHEVRON_TEXT_SIZE;
         let chevron_width = chevron_glyph
-            .map(|glyph| {
-                measure_text_width::<R>(glyph, chevron_size, self.style.primary_font, paragraphs)
-            })
+            .map(|glyph| measure_text_width::<R>(glyph, chevron_size, icons::ICON_FONT, paragraphs))
             .unwrap_or(0.0);
         let chevron_gap = if chevron_glyph.is_some() { 6.0 } else { 0.0 };
         let description_width = (content_width - chevron_width - chevron_gap).max(1.0);
@@ -1473,7 +1477,7 @@ impl<'a, Message> RevisionList<'a, Message> {
                 chevron_width.max(1.0),
                 chevron_size,
                 self.style.subtle_text,
-                self.style.primary_font,
+                icons::ICON_FONT,
                 row_clip,
                 text::Alignment::Left,
             );
@@ -1544,7 +1548,11 @@ impl<'a, Message> RevisionList<'a, Message> {
         match f.chevron {
             // Directory row: a collapse chevron stands in for the badge.
             Some(collapsed) => {
-                let glyph = if collapsed { "\u{25B8}" } else { "\u{25BE}" };
+                let glyph = if collapsed {
+                    icons::CHEVRON_RIGHT
+                } else {
+                    icons::CHEVRON_DOWN
+                };
                 fill_text_centered_y(
                     renderer,
                     glyph,
@@ -1553,7 +1561,7 @@ impl<'a, Message> RevisionList<'a, Message> {
                     badge_w,
                     CAPTION_TEXT_SIZE,
                     f.primary_color,
-                    self.style.primary_font,
+                    icons::ICON_FONT,
                     row_clip,
                     text::Alignment::Center,
                 );

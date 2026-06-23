@@ -19,6 +19,7 @@ use iced::{
 };
 
 use crate::chrome;
+use crate::icons;
 use crate::palette::PaletteMessage;
 use crate::repository::Vcs;
 use crate::theme::{ThemeSpec, chip_background, emphasis_font};
@@ -44,7 +45,7 @@ pub fn build_tab_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         let active = index == ui.active_tab;
         tabs_row = tabs_row.push(tab_widget(ui, theme, tab, active));
     }
-    tabs_row = tabs_row.push(add_button(theme, ui.config.ui_font));
+    tabs_row = tabs_row.push(add_button(theme));
 
     // When the strip stands in for the title bar (macOS) it's pinned to a fixed
     // height and the content is centered — the native traffic lights are
@@ -163,30 +164,28 @@ fn tab_widget<'a>(
 
     let id = tab.id;
 
-    let close = button(
-        text("\u{00d7}") // × multiplication sign
-            .size(13)
-            .color(theme.subtle_text)
-            .font(ui.config.ui_font),
-    )
-    .padding(Padding::from([0, 4]))
-    .on_press(Message::CloseTab(id))
-    .style(move |_, status| button::Style {
-        background: match status {
-            button::Status::Hovered | button::Status::Pressed => {
-                Some(Background::Color(chip_background(theme.muted_text)))
-            }
-            _ => None,
-        },
-        text_color: theme.text,
-        border: Border {
-            width: 0.0,
-            color: Color::TRANSPARENT,
-            radius: 4.0.into(),
-        },
-        shadow: Default::default(),
-        snap: true,
-    });
+    let close = button(icons::icon(icons::CLOSE, 13.0, theme.subtle_text))
+        // Symmetric padding around the fixed-size icon box makes the hover
+        // target a square that fills the tab's text line height. The old
+        // asymmetric padding (0 vertical, 4 horizontal) left it short and wide.
+        .padding(Padding::from([2, 2]))
+        .on_press(Message::CloseTab(id))
+        .style(move |_, status| button::Style {
+            background: match status {
+                button::Status::Hovered | button::Status::Pressed => {
+                    Some(Background::Color(chip_background(theme.muted_text)))
+                }
+                _ => None,
+            },
+            text_color: theme.text,
+            border: Border {
+                width: 0.0,
+                color: Color::TRANSPARENT,
+                radius: 4.0.into(),
+            },
+            shadow: Default::default(),
+            snap: true,
+        });
 
     let inner = row![label, close]
         .spacing(4)
@@ -232,7 +231,11 @@ fn tab_widget<'a>(
             background: None,
             border: Border {
                 width: if active { 1.0 } else { 0.0 },
-                color: if active { theme.border } else { Color::TRANSPARENT },
+                color: if active {
+                    theme.border
+                } else {
+                    Color::TRANSPARENT
+                },
                 radius: 6.0.into(),
             },
             ..container::Style::default()
@@ -298,9 +301,11 @@ fn dirty_dot(theme: ThemeSpec) -> Element<'static, Message> {
 }
 
 /// `+` button — opens the path dialog to add another repository.
-fn add_button(theme: ThemeSpec, font: iced::Font) -> Element<'static, Message> {
-    button(text("+").size(15).color(theme.muted_text).font(font))
-        .padding(Padding::from([2, 8]))
+fn add_button(theme: ThemeSpec) -> Element<'static, Message> {
+    button(icons::icon(icons::PLUS, 15.0, theme.muted_text))
+        // Symmetric padding → a square button, instead of the wide, short pill
+        // the old asymmetric [2, 8] padding made around the square icon box.
+        .padding(Padding::from([4, 4]))
         .on_press(Message::OpenRepoDialogOpen)
         .style(move |_, status| button::Style {
             background: match status {

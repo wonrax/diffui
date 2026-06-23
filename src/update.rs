@@ -1268,14 +1268,14 @@ impl Diffui {
                             })
                         })
                     })
-                    .map(
-                        |(current, visible, action, duration)| Message::TitleBarDoubleClickPlan {
+                    .map(|(current, visible, action, duration)| {
+                        Message::TitleBarDoubleClickPlan {
                             current,
                             visible,
                             action,
                             duration,
-                        },
-                    );
+                        }
+                    });
             }
             Message::TitleBarDoubleClickPlan {
                 current,
@@ -1286,8 +1286,9 @@ impl Diffui {
                 match action {
                     // Minimize: let iced/winit miniaturize the window.
                     1 => {
-                        return window::latest()
-                            .then(|id| id.map_or_else(Task::none, |id| window::minimize(id, true)));
+                        return window::latest().then(|id| {
+                            id.map_or_else(Task::none, |id| window::minimize(id, true))
+                        });
                     }
                     // None: the user asked for nothing on double-click.
                     2 => {}
@@ -1301,9 +1302,9 @@ impl Diffui {
                         let (to, dur) = if frames_approx_eq(current, visible) {
                             // Un-zoom: restore the saved frame at the same duration
                             // the zoom-in used (the resize is symmetric).
-                            self.zoom_restore
-                                .take()
-                                .unwrap_or_else(|| (zoom_default_restore(visible), ZOOM_FALLBACK_SECS))
+                            self.zoom_restore.take().unwrap_or_else(|| {
+                                (zoom_default_restore(visible), ZOOM_FALLBACK_SECS)
+                            })
                         } else {
                             // Zoom in: remember where to come back to, and the
                             // native duration to come back at.
@@ -1326,7 +1327,8 @@ impl Diffui {
                 // Normalized progress over the native-matched duration (guarded
                 // against a zero duration). Snap to the target on the final frame
                 // so we land exactly.
-                let t = (anim.start.elapsed().as_secs_f64() / anim.duration.max(0.001)).clamp(0.0, 1.0);
+                let t =
+                    (anim.start.elapsed().as_secs_f64() / anim.duration.max(0.001)).clamp(0.0, 1.0);
                 let done = t >= 1.0;
                 let frame = if done {
                     self.zoom_anim = None;

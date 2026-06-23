@@ -5,62 +5,36 @@
 //! render as iced overlays anchored near their trigger.
 
 use iced::{
-    Background, Border, Color, Element, Length, Padding, Point, Rectangle, alignment, mouse,
-    widget::{Space, button, canvas, column, container, mouse_area, row, text},
+    Background, Border, Color, Element, Length, Padding, alignment, mouse,
+    widget::{Space, button, column, container, mouse_area, row, text},
 };
 
 use crate::activity;
+use crate::icons;
 use crate::repository::Vcs;
 use crate::theme::{ThemeSpec, chip_background};
 use crate::{Diffui, FetchTarget, HoverTarget, Message, ToolbarMenu};
 
-/// A down-pointing caret (▾) drawn as a filled triangle rather than a text
-/// glyph. The `U+25BE` glyph sits off-center within the line box in many UI
-/// fonts (notably the macOS system font), which left the fetch / revset carets
-/// looking vertically misaligned no matter how the text box was centered. A
-/// geometric triangle centers exactly on its bounds, so both carets line up
-/// regardless of the configured font. Reused by the revset caret in `sidebar`.
-struct Caret {
-    color: Color,
-}
+/// Toolbar icon size. Slightly larger than the 12px labels so the Lucide marks
+/// (which carry ~2px of internal padding in their 24px grid) read as balanced
+/// next to the text rather than visually smaller.
+const ICON_SIZE: f32 = 14.0;
 
-impl canvas::Program<Message> for Caret {
-    type State = ();
+/// Size of the dropdown carets (fetch split button, revset presets). A touch
+/// smaller than the action icons so the caret reads as a subordinate affordance.
+const CARET_ICON_SIZE: f32 = 12.0;
 
-    fn draw(
-        &self,
-        _state: &(),
-        renderer: &iced::Renderer,
-        _theme: &iced::Theme,
-        bounds: Rectangle,
-        _cursor: mouse::Cursor,
-    ) -> Vec<canvas::Geometry> {
-        let mut frame = canvas::Frame::new(renderer, bounds.size());
-        let half_w = 4.0; // 8px wide
-        let half_h = 2.0; // 4px tall — flat, matching ▾'s proportions
-        let cx = bounds.width / 2.0;
-        let cy = bounds.height / 2.0;
-        let triangle = canvas::Path::new(|b| {
-            b.move_to(Point::new(cx - half_w, cy - half_h));
-            b.line_to(Point::new(cx + half_w, cy - half_h));
-            b.line_to(Point::new(cx, cy + half_h));
-            b.close();
-        });
-        frame.fill(&triangle, self.color);
-        vec![frame.into_geometry()]
-    }
-}
-
-/// The shared caret glyph: a fixed-width canvas drawing a centered triangle in
-/// `color`. `box_height` should be the neighbour's text **line box** (iced's
-/// `Relative(1.3)` line-height ⇒ `1.3 × text_size`, which is font-independent),
-/// so that with matching vertical padding the caret's hover fill is exactly as
-/// tall as the button / input beside it. `Fill` can't be used here: nothing up
-/// the toolbar tree bounds the height, so it would stretch to the whole window.
+/// The shared dropdown caret: a Lucide chevron centered in a `box_height`-tall
+/// box. The caller adds the hover fill via padding around this, so sizing the
+/// box to the neighbour's text **line box** (iced's `Relative(1.3)` line-height
+/// ⇒ `1.3 × text_size`, which is font-independent) keeps the fill exactly as
+/// tall as the button / input beside it. Reused by the revset caret in
+/// `sidebar`. `Fill` can't be used for the height: nothing up the toolbar tree
+/// bounds it, so it would stretch to the whole window.
 pub(crate) fn caret_glyph(color: Color, box_height: f32) -> Element<'static, Message> {
-    canvas(Caret { color })
-        .width(Length::Fixed(9.0))
+    container(icons::icon(icons::CHEVRON_DOWN, CARET_ICON_SIZE, color))
         .height(Length::Fixed(box_height))
+        .center_y(Length::Fixed(box_height))
         .into()
 }
 
@@ -77,7 +51,13 @@ pub fn build_toolbar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     // 6px between actions — the same rhythm the tab strip uses between tabs, so
     // both title-bar bands share one consistent item spacing.
     let mut actions = row![
-        toolbar_button("\u{21BB}", "Refresh", Message::ToolbarRefresh, theme, font),
+        toolbar_button(
+            icons::REFRESH,
+            "Refresh",
+            Message::ToolbarRefresh,
+            theme,
+            font
+        ),
         fetch_split_button(theme, font, caret_hovered),
     ]
     .spacing(6)
@@ -85,7 +65,7 @@ pub fn build_toolbar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     // jj-only: git has no operation log to undo.
     if is_jj {
         actions = actions.push(toolbar_button(
-            "\u{21A9}",
+            icons::UNDO,
             "Undo",
             Message::Undo,
             theme,
@@ -93,7 +73,7 @@ pub fn build_toolbar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         ));
     }
     actions = actions.push(toolbar_toggle_button(
-        "\u{21B5}",
+        icons::WRAP,
         "Wrap",
         ui.diff_wrap,
         Message::ToggleDiffWrap,
@@ -101,7 +81,7 @@ pub fn build_toolbar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         font,
     ));
     actions = actions.push(toolbar_toggle_button(
-        "\u{2016}",
+        icons::SPLIT,
         "Split",
         ui.diff_split,
         Message::ToggleDiffSplit,
@@ -134,19 +114,16 @@ fn bar_style(theme: ThemeSpec) -> container::Style {
     }
 }
 
-/// A bordered toolbar action: glyph + label, transparent fill until hovered.
+/// A bordered toolbar action: icon + label, transparent fill until hovered.
 fn toolbar_button(
-    glyph: &str,
+    icon: &'static str,
     label: &str,
     message: Message,
     theme: ThemeSpec,
     font: iced::Font,
 ) -> Element<'static, Message> {
     let content = row![
-        text(glyph.to_owned())
-            .size(13)
-            .color(theme.muted_text)
-            .font(font),
+        icons::icon(icon, ICON_SIZE, theme.muted_text),
         text(label.to_owned()).size(12).color(theme.text).font(font),
     ]
     .spacing(5)
@@ -162,23 +139,20 @@ fn toolbar_button(
 /// tint while active so the on state reads at a glance (the diff-wrap
 /// toggle). The glyph carries the accent; the fill/border deepen with it.
 fn toolbar_toggle_button(
-    glyph: &str,
+    icon: &'static str,
     label: &str,
     active: bool,
     message: Message,
     theme: ThemeSpec,
     font: iced::Font,
 ) -> Element<'static, Message> {
-    let glyph_color = if active {
+    let icon_color = if active {
         theme.accent
     } else {
         theme.muted_text
     };
     let content = row![
-        text(glyph.to_owned())
-            .size(13)
-            .color(glyph_color)
-            .font(font),
+        icons::icon(icon, ICON_SIZE, icon_color),
         text(label.to_owned()).size(12).color(theme.text).font(font),
     ]
     .spacing(5)
@@ -235,7 +209,7 @@ fn fetch_split_button(
     // the pointer cursor automatically.
     let main = button(
         row![
-            text("\u{2193}").size(13).color(theme.muted_text).font(font),
+            icons::icon(icons::FETCH, ICON_SIZE, theme.muted_text),
             text("Fetch").size(12).color(theme.text).font(font),
         ]
         .spacing(5)
