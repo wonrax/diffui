@@ -20,7 +20,7 @@ trajectory-debug = []
 anyhow = "1.0"
 diffui-core = { path = "core" }
 clap = { version = "4.5", features = ["derive"] }
-iced = { git = "https://github.com/iced-rs/iced.git", features = ["advanced", "tokio", "debug", "canvas"] }
+iced = { git = "https://github.com/iced-rs/iced.git", features = ["advanced", "tokio", "debug", "canvas", "svg"] }
 jj-lib = "0.40.0"
 mimalloc = "0.1"
 futures = "0.3"
@@ -30,6 +30,12 @@ regex = "1"
 serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "1.44", features = ["process", "time"] }
 toml = "0.8"
+
+# Build-time only: fetch + checksum the Lucide icon font (see build.rs). `ureq`
+# rides on rustls so the download needs no system TLS libs on any platform.
+[build-dependencies]
+ureq = "2"
+sha2 = "0.10"
 
 # macOS-only AppKit bridges: `chrome` repositions the native traffic lights to
 # the center of our tab strip, and `macos_native` shows real `NSMenu` popups for

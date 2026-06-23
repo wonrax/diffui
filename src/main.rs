@@ -12,6 +12,7 @@ mod diff_panel;
 mod diff_view;
 mod find;
 mod graph_view;
+mod icons;
 #[cfg(target_os = "macos")]
 mod macos_native;
 mod menu;
@@ -205,6 +206,7 @@ fn main() -> iced::Result {
         Diffui::view,
     )
     .title("diffui")
+    .font(icons::ICON_FONT_BYTES)
     .window(window_settings)
     .subscription(Diffui::subscription)
     .theme(Diffui::theme)
