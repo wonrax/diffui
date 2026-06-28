@@ -150,13 +150,24 @@ pub async fn compute_empty_status(
         Vcs::Jj => {
             let root = repository.root.clone();
             let handle = tokio::runtime::Handle::current();
-            tokio::task::spawn_blocking(move || {
+            let joined = tokio::task::spawn_blocking(move || {
                 handle.block_on(crate::jj::compute_jj_empty_status(root, targets))
             })
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_default()
+            .await;
+            // Best-effort: the empty marker is cosmetic, so a failure yields no
+            // update — but log it rather than swallow it silently, so a jj crash
+            // or panicking task is visible during debugging.
+            match joined {
+                Ok(Ok(updates)) => updates,
+                Ok(Err(error)) => {
+                    eprintln!("diffui: failed to compute empty status: {error:#}");
+                    Vec::new()
+                }
+                Err(error) => {
+                    eprintln!("diffui: empty-status task failed: {error}");
+                    Vec::new()
+                }
+            }
         }
         Vcs::Git => Vec::new(),
     }

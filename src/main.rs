@@ -333,6 +333,13 @@ pub(crate) struct Diffui {
     /// actually been written into `selected_revision`, *then* bumps the
     /// token so the next render reveals the correct row.
     pub(crate) pending_revision_reveal: bool,
+    /// Bumped by [`scroll_sidebar_to_file`] when keyboard file navigation moves
+    /// the selection. The sidebar's `RevisionList` reveals the selected file's
+    /// row (which the sidebar computes from the current file tree) into view on
+    /// the change. Separate from `revision_reveal_token` so revealing a file
+    /// doesn't also re-centre the selected revision. Transient, so it isn't
+    /// stashed per-tab.
+    pub(crate) sidebar_file_reveal_token: u64,
     /// Last-known scroll offsets of the sidebar (content-space px) and diff
     /// view, kept current by the widgets' `on_scroll` callbacks. The widgets
     /// own their live offset in tree `State`, but that state is shared across
@@ -623,9 +630,13 @@ pub(crate) struct OpenRepoDialog {
 pub(crate) use diffui_core::session::{RefreshOrigin, coalesce_refresh};
 pub(crate) use diffui_core::{LoadStatus, Session};
 
-fn scroll_sidebar_to_file(_file_index: usize, _ui: &Diffui) -> Task<Message> {
-    // TODO: re-implement scroll-to-reveal against `RevisionList`'s internal
-    // scroll state once the widget exposes a scrollable operation.
+/// Reveal the keyboard-selected file's row in the sidebar tree. Bumps the
+/// file-reveal token so the sidebar's `RevisionList` scrolls the file's row
+/// (which the sidebar resolves from the current file tree) into view on the
+/// next render. The scroll itself is a no-op when the file list is closed — the
+/// sidebar passes `None` as the reveal target in that case.
+fn scroll_sidebar_to_file(ui: &mut Diffui) -> Task<Message> {
+    ui.sidebar_file_reveal_token = ui.sidebar_file_reveal_token.wrapping_add(1);
     Task::none()
 }
 
@@ -805,7 +816,9 @@ fn format_detail(details: &RevisionDetails, field: DetailField) -> Option<String
     fn signature(sig: &SignatureInfo) -> Option<String> {
         let mut out = sig.name.clone();
         if !sig.email.is_empty() {
-            out.push_str(&format!(" <{}>", sig.email));
+            out.push_str(" <");
+            out.push_str(&sig.email);
+            out.push('>');
         }
         if let Some(timestamp) = &sig.timestamp {
             if !out.is_empty() {

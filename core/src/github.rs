@@ -23,6 +23,11 @@ use crate::model::{
 };
 use crate::source::{DiffSource, DiffTarget};
 
+/// GitHub's REST API caps `per_page` at 100; we always request the max and
+/// page until a short page signals the end. Used both in the request URL and
+/// the `len() < PAGE_SIZE` end-of-pagination check.
+const GITHUB_API_PAGE_SIZE: usize = 100;
+
 /// A pull-request reference: `owner/repo#number`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrSpec {
@@ -394,7 +399,7 @@ async fn fetch_pr_commit_diff(
     let mut page = 1usize;
     loop {
         let path = format!(
-            "repos/{}/commits/{oid}?per_page=100&page={page}",
+            "repos/{}/commits/{oid}?per_page={GITHUB_API_PAGE_SIZE}&page={page}",
             spec.slug()
         );
         let output = Command::new("gh")
@@ -438,7 +443,7 @@ async fn fetch_pr_commit_diff(
         if totals.is_none() {
             totals = commit.stats.map(|stats| (stats.additions, stats.deletions));
         }
-        let last = commit.files.len() < 100;
+        let last = commit.files.len() < GITHUB_API_PAGE_SIZE;
         files.extend(commit.files.into_iter().map(api_file_to_diff_file));
         if last {
             break;
@@ -541,7 +546,7 @@ async fn stream_pr_files_api(spec: &PrSpec, mut on_file: impl FnMut(DiffFile)) -
     let mut page = 1usize;
     loop {
         let path = format!(
-            "repos/{}/pulls/{}/files?per_page=100&page={page}",
+            "repos/{}/pulls/{}/files?per_page={GITHUB_API_PAGE_SIZE}&page={page}",
             spec.slug(),
             spec.number
         );
@@ -563,7 +568,7 @@ async fn stream_pr_files_api(spec: &PrSpec, mut on_file: impl FnMut(DiffFile)) -
             .context("failed to parse the pull-request files API response")?;
         // A short (or empty) page is the last one; GitHub also simply stops
         // listing past its 3,000-file cap.
-        let last = files.len() < 100;
+        let last = files.len() < GITHUB_API_PAGE_SIZE;
         for file in files {
             on_file(api_file_to_diff_file(file));
         }

@@ -1956,8 +1956,8 @@ fn format_jj_timestamp(ts: &jj_lib::backend::Timestamp) -> String {
     let minute = ((secs / 60) % 60) as u32;
     let second = (secs % 60) as u32;
     let sign = if total_minutes >= 0 { '+' } else { '-' };
-    let offset_hours = total_minutes.abs() / 60;
-    let offset_mins = total_minutes.abs() % 60;
+    let offset_hours = total_minutes.unsigned_abs() / 60;
+    let offset_mins = total_minutes.unsigned_abs() % 60;
     format!(
         "{year:04}-{month:02}-{mday:02} {hour:02}:{minute:02}:{second:02} {sign}{offset_hours:02}{offset_mins:02}"
     )

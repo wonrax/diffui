@@ -12,6 +12,7 @@
 //! this module stays decoupled from the rest of the app's theming logic.
 
 use std::cell::RefCell;
+use std::rc::Rc;
 
 use iced::advanced::{
     Layout, Shell, Widget,
@@ -45,6 +46,12 @@ pub const GUTTER_LEFT_PADDING: f32 = 8.0;
 pub const GUTTER_PADDING: f32 = 8.0;
 const CONTENT_PADDING: f32 = 12.0;
 const INDICATOR_RADIUS: f32 = 5.0;
+/// Line-height multiplier applied to every measured/rendered text run in this
+/// widget. Kept in one place so the measurement paragraphs and the painted
+/// glyphs stay in lockstep — a mismatch makes text clip or float.
+const LINE_HEIGHT_MULTIPLIER: f32 = 1.4;
+/// Horizontal padding inside a bookmark/status chip, on each side of the label.
+const CHIP_PAD_X: f32 = 5.0;
 const SMALL_TEXT_SIZE: f32 = 14.0;
 const CAPTION_TEXT_SIZE: f32 = 13.0;
 /// Text size for the collapse/expand chevron on the selected revision row. The
@@ -162,11 +169,14 @@ pub struct FileRowView {
     pub deletions: usize,
     pub additions_text: Color,
     pub deletions_text: Color,
-    pub continuation: Vec<Option<GraphEdgeType>>,
+    /// Continuation lane state for the parent revision, shared (`Rc`) across
+    /// every file row under it rather than deep-copied per row — the data is
+    /// identical for all of them and these rows rebuild on every `view()`.
+    pub continuation: Rc<[Option<GraphEdgeType>]>,
     /// Warped display columns of the parent revision row (see
     /// [`RevisionRowView::columns`]); the continuation strokes inherit its
     /// packing so the strip doesn't jump at the revision/file boundary.
-    pub columns: Vec<Option<usize>>,
+    pub columns: Rc<[Option<usize>]>,
     pub additions_width: f32,
     pub deletions_width: f32,
     pub primary_color: Color,
@@ -182,11 +192,11 @@ pub struct FileRowView {
     /// row. Equals the post-trim snapshot of the parent revision's
     /// label state, so a lane that terminates at the parent isn't
     /// labeled here.
-    pub lane_labels: Vec<Vec<String>>,
+    pub lane_labels: Rc<[Vec<String>]>,
     /// Per-lane segment id, matching the parent revision row for any
     /// lane that survives into the continuation. See
     /// [`RevisionRowView::lane_segments`].
-    pub lane_segments: Vec<Option<usize>>,
+    pub lane_segments: Rc<[Option<usize>]>,
 }
 
 /// Key the widget reports back so the parent can map it to its own
@@ -241,6 +251,12 @@ pub struct RevisionList<'a, Message> {
     /// and triggers a scroll on disagreement — analogous to the
     /// `scroll_token` mechanism in `DiffView` for find matches.
     reveal_token: Option<u64>,
+    /// Reveal an explicit file row (keyboard file navigation) instead of the
+    /// selected revision: a bumped token plus the file's flat row. Kept separate
+    /// from `reveal_token` so scrolling to a file doesn't also re-centre the
+    /// selected revision.
+    file_reveal_token: Option<u64>,
+    reveal_file_flat: Option<usize>,
     on_select_revision: fn(RowSelectionKey) -> Message,
     /// Receives the clicked file row's *display* index into the file tree
     /// (dir rows included), not a document file index.
@@ -286,6 +302,8 @@ impl<'a, Message> RevisionList<'a, Message> {
             style,
             width: Length::Fill,
             reveal_token: None,
+            file_reveal_token: None,
+            reveal_file_flat: None,
             on_select_revision,
             on_select_file,
             on_context_menu: None,
@@ -315,6 +333,16 @@ impl<'a, Message> RevisionList<'a, Message> {
     /// in a row is a no-op.
     pub fn reveal_selected(mut self, token: u64) -> Self {
         self.reveal_token = Some(token);
+        self
+    }
+
+    /// Like [`Self::reveal_selected`], but scrolls an explicit file row into
+    /// view (keyboard file navigation) the next time `token` changes. `flat` is
+    /// the file's flat row, or `None` when the file list isn't open — in which
+    /// case the token change schedules no scroll.
+    pub fn reveal_file(mut self, token: u64, flat: Option<usize>) -> Self {
+        self.file_reveal_token = Some(token);
+        self.reveal_file_flat = flat;
         self
     }
 
@@ -498,6 +526,8 @@ struct State<Paragraph> {
     scrollbar: ScrollbarState,
     /// Most recent `reveal_token` we acted on. `None` until first reveal.
     last_reveal_token: Option<u64>,
+    /// Most recent `file_reveal_token` we acted on. `None` until first reveal.
+    last_file_reveal_token: Option<u64>,
     /// Row to bring into view on the next `update()` pass — `None` when
     /// no reveal is pending. Set in `diff()` (which sees prop changes
     /// before layout); consumed in `update()` (which has bounds).
@@ -522,6 +552,7 @@ impl<Paragraph> State<Paragraph> {
             paragraphs: RefCell::new(Vec::new()),
             scrollbar: ScrollbarState::default(),
             last_reveal_token: None,
+            last_file_reveal_token: None,
             pending_reveal_row: None,
             last_restore_token: 0,
             pending_set_offset: None,
@@ -555,6 +586,15 @@ where
             // Defer the actual scroll to `update()` — that's where bounds
             // (needed to clamp + center) are available.
             state.pending_reveal_row = self.selected_flat;
+        }
+        if self.file_reveal_token != state.last_file_reveal_token {
+            state.last_file_reveal_token = self.file_reveal_token;
+            // A file reveal targets an explicit row; skip when the file list is
+            // closed (`None`). Scheduled after the revision reveal so a file
+            // selection wins if both somehow change in one render.
+            if let Some(flat) = self.reveal_file_flat {
+                state.pending_reveal_row = Some(flat);
+            }
         }
         if self.restore_token != state.last_restore_token {
             state.last_restore_token = self.restore_token;
@@ -917,7 +957,7 @@ where
         let text_size = measure_para.min_bounds();
 
         Some(overlay::Element::new(Box::new(TooltipOverlay {
-            text: file.raw_path.clone(),
+            text: file.raw_path,
             cursor: cursor_pos + translation,
             row_anchor_x: bounds.x + bounds.width + translation.x,
             row_anchor_y: row_screen_y + translation.y,
@@ -1680,8 +1720,7 @@ impl<'a, Message> RevisionList<'a, Message> {
     ) -> f32 {
         let size = CAPTION_TEXT_SIZE;
         let label_w = measure_text_width::<R>(label, size, self.style.primary_font, paragraphs);
-        let pad_x = 5.0;
-        label_w + pad_x * 2.0
+        label_w + CHIP_PAD_X * 2.0
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1703,11 +1742,10 @@ impl<'a, Message> RevisionList<'a, Message> {
     {
         let size = CAPTION_TEXT_SIZE;
         let label_w = measure_text_width::<R>(label, size, self.style.primary_font, paragraphs);
-        let pad_x = 5.0;
         // Tight box: just enough vertical room for the cap-height plus a hair
         // of breathing room. Anything more makes the chip dwarf the title text.
         let chip_h = (size + 3.0).round();
-        let chip_w = label_w + pad_x * 2.0;
+        let chip_w = label_w + CHIP_PAD_X * 2.0;
         let chip_top = (center_y - chip_h / 2.0).round();
         let rect = Rectangle {
             x,
@@ -1749,7 +1787,7 @@ impl<'a, Message> RevisionList<'a, Message> {
 /// row, or `None` for an empty column. The top half of a transitioning row
 /// reads the previous row's packing (that's where the slide starts).
 fn item_display_to_lane(item: &Item, display: usize, half: LaneHalf) -> Option<usize> {
-    let columns = match (item, half) {
+    let columns: &[Option<usize>] = match (item, half) {
         (Item::Revision(row), LaneHalf::Before) if !row.prev_columns.is_empty() => {
             &row.prev_columns
         }
@@ -1931,7 +1969,7 @@ fn fill_text_truncated<R: text::Renderer<Font = Font>>(
     if content.is_empty() {
         return;
     }
-    let height = size * 1.4;
+    let height = size * LINE_HEIGHT_MULTIPLIER;
     renderer.fill_text(
         Text {
             content: content.to_owned(),
@@ -1961,7 +1999,7 @@ fn make_paragraph<R: text::Renderer<Font = Font>>(
     size: f32,
     font: Font,
 ) -> R::Paragraph {
-    let line_height = size * 1.4;
+    let line_height = size * LINE_HEIGHT_MULTIPLIER;
     R::Paragraph::with_text(Text {
         content,
         bounds: Size::new(f32::INFINITY, line_height.max(1.0)),
@@ -2029,7 +2067,7 @@ fn fill_text_centered_y<R: text::Renderer<Font = Font>>(
     if content.is_empty() {
         return;
     }
-    let height = size * 1.4;
+    let height = size * LINE_HEIGHT_MULTIPLIER;
     renderer.fill_text(
         Text {
             content: content.to_owned(),

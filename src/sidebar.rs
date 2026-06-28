@@ -226,7 +226,7 @@ fn build_footer(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             // Branch glyph + name; the tracked upstream rides along as a tooltip.
             let name = row![
                 icons::icon(icons::GIT_BRANCH, FOOTER_TEXT_SIZE, dim),
-                text(status.branch.clone())
+                text(&status.branch)
                     .size(FOOTER_TEXT_SIZE)
                     .font(font)
                     .color(dim),
@@ -237,7 +237,7 @@ fn build_footer(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
                 Some(upstream) => tooltip(
                     name,
                     container(
-                        text(upstream.clone())
+                        text(upstream)
                             .size(FOOTER_TEXT_SIZE)
                             .font(font)
                             .color(theme.text),
@@ -300,13 +300,13 @@ fn build_footer(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         .font(font)
         .color(dim);
 
-    let bar = row![left, container(text("")).width(Length::Fill), right]
+    let bar = row![left, Space::new().width(Length::Fill), right]
         .align_y(alignment::Vertical::Center)
         .spacing(8);
 
     // iced's `Border` paints all four edges; draw the hairline top rule as a
     // 1px line above the bar instead.
-    let hairline = container(text(""))
+    let hairline = container(Space::new())
         .width(Length::Fill)
         .height(Length::Fixed(1.0))
         .style(move |_| container::Style {
@@ -392,13 +392,26 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
         .filter(|_| file_count > 0)
         .map(|index| (index, file_count));
 
+    // Flat sidebar row of the selected file, for the keyboard-nav reveal: the
+    // expanded commit's row, then its file rows in tree-display order. `None`
+    // when the file list is closed or the file isn't currently shown, which
+    // tells the widget to schedule no scroll.
+    let reveal_file_flat = expanded.and_then(|(commit, _)| {
+        tree_rows
+            .iter()
+            .position(|row| {
+                matches!(row, FileTreeRow::File { file_index, .. } if *file_index == ui.selected_file)
+            })
+            .map(|display| commit + 1 + display)
+    });
+
     // The per-row lane fold + prefix lengths are precomputed once and held in
     // `Diffui`; the closures below build a single visible row's view from them
     // on demand, so the widget never materializes all ~N rows.
     let graph = &ui.session.graph;
     let prefix_lens = &ui.session.sidebar_prefix_lens;
     let commits = &ui.session.commits;
-    let selected = ui.session.selected_revision.clone();
+    let selected = &ui.session.selected_revision;
     let file_list_expanded = ui.file_list_expanded;
     let build_revision = Box::new(move |index: usize| {
         build_revision_row(
@@ -407,7 +420,7 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
             prefix_lens,
             theme,
             &graph_style,
-            &selected,
+            selected,
             file_list_expanded,
             index,
         )
@@ -428,6 +441,13 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
             (lane.continuation_labels, lane.continuation_segments)
         })
         .unwrap_or_default();
+    // Every file row shares the parent's continuation state, so build it into
+    // `Rc`s once and hand each row a cheap refcount clone instead of deep-copying
+    // four Vecs per row on every rebuild.
+    let continuation: Rc<[Option<GraphEdgeType>]> = continuation.into();
+    let continuation_columns: Rc<[Option<usize>]> = continuation_columns.into();
+    let continuation_labels: Rc<[Vec<String>]> = continuation_labels.into();
+    let continuation_segments: Rc<[Option<usize>]> = continuation_segments.into();
     let files = &ui.session.document.files;
     let build_file = Box::new(move |row_index: usize| {
         let template = file_row_template(
@@ -438,11 +458,11 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
             theme,
         );
         build_file_row(
-            &template,
-            &continuation,
-            &continuation_columns,
-            &continuation_labels,
-            &continuation_segments,
+            template,
+            continuation.clone(),
+            continuation_columns.clone(),
+            continuation_labels.clone(),
+            continuation_segments.clone(),
             theme,
         )
     });
@@ -466,6 +486,7 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
     )
     .width(Length::Fill)
     .reveal_selected(ui.revision_reveal_token)
+    .reveal_file(ui.sidebar_file_reveal_token, reveal_file_flat)
     .on_scroll(Message::SidebarScrolled)
     .restore_scroll(ui.sidebar_scroll_offset, ui.scroll_restore_token)
     .on_context_menu(Message::RevisionContextMenu)
@@ -583,33 +604,33 @@ fn build_revision_row(
 
 /// Build the display view for one file row under the expanded commit.
 fn build_file_row(
-    template: &FileRowTemplate,
-    continuation: &[Option<GraphEdgeType>],
-    continuation_columns: &[Option<usize>],
-    continuation_labels: &[Vec<String>],
-    continuation_segments: &[Option<usize>],
+    template: FileRowTemplate,
+    continuation: Rc<[Option<GraphEdgeType>]>,
+    continuation_columns: Rc<[Option<usize>]>,
+    continuation_labels: Rc<[Vec<String>]>,
+    continuation_segments: Rc<[Option<usize>]>,
     theme: ThemeSpec,
 ) -> FileRowView {
     FileRowView {
-        primary: template.label.clone(),
-        raw_path: template.raw_path.clone(),
-        status_label: template.status_label.clone(),
+        primary: template.label,
+        raw_path: template.raw_path,
+        status_label: template.status_label,
         status_background: chip_background(template.status_color),
         status_text: template.status_color,
         additions: template.additions,
         deletions: template.deletions,
         additions_text: theme.added_text,
         deletions_text: theme.removed_text,
-        continuation: continuation.to_vec(),
-        columns: continuation_columns.to_vec(),
+        continuation,
+        columns: continuation_columns,
         additions_width: template.additions_width,
         deletions_width: template.deletions_width,
         primary_color: theme.text,
         indent: template.indent,
         chevron: template.chevron,
         file_index: template.file_index,
-        lane_labels: continuation_labels.to_vec(),
-        lane_segments: continuation_segments.to_vec(),
+        lane_labels: continuation_labels,
+        lane_segments: continuation_segments,
     }
 }
 

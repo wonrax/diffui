@@ -232,7 +232,7 @@ pub fn activity_indicator(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message>
                 .size(12)
                 .font(mono)
                 .color(theme.accent),
-            text(active.label.clone())
+            text(active.label.as_str())
                 .size(11.5)
                 .font(ui.config.ui_font)
                 .color(theme.text),
@@ -457,25 +457,17 @@ fn activity_row<'a>(
     let mono = ui.config.mono_font;
     let (loaded, total, determinate) = activity.progress_snapshot();
 
-    let (icon, icon_color, icon_font) = match activity.status {
-        ActivityStatus::Queued => ("\u{2026}".to_owned(), theme.subtle_text, mono), // … waiting
-        ActivityStatus::Running => (
-            spinner_glyph(activity.started).to_owned(),
-            theme.accent,
-            mono,
-        ),
-        ActivityStatus::Done => (icons::CHECK.to_owned(), theme.added_text, icons::ICON_FONT),
-        ActivityStatus::Error => (
-            icons::CLOSE.to_owned(),
-            theme.removed_text,
-            icons::ICON_FONT,
-        ),
+    let (icon, icon_color, icon_font): (&'static str, _, _) = match activity.status {
+        ActivityStatus::Queued => ("\u{2026}", theme.subtle_text, mono), // … waiting
+        ActivityStatus::Running => (spinner_glyph(activity.started), theme.accent, mono),
+        ActivityStatus::Done => (icons::CHECK, theme.added_text, icons::ICON_FONT),
+        ActivityStatus::Error => (icons::CLOSE, theme.removed_text, icons::ICON_FONT),
     };
 
     let label = activity.result.as_deref().unwrap_or(&activity.label);
     let mut head = row![
         text(icon).size(12).font(icon_font).color(icon_color),
-        text(label.to_owned())
+        text(label)
             .size(12)
             .font(ui.config.ui_font)
             .color(theme.text),

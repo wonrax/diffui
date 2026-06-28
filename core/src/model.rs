@@ -145,6 +145,14 @@ pub struct CommitStore {
     shortest_change_id_len: Vec<u32>,
     flags: Vec<u8>,
     bookmarks: HashMap<usize, Vec<String>>,
+    /// Reverse index: bookmark name → owning row. Bookmark names are unique per
+    /// ref, so this is 1:1 and lets `find_by_bookmark` resolve in O(1) instead
+    /// of scanning every commit (the palette hits this per displayed row).
+    bookmark_index: HashMap<String, usize>,
+    /// Row of the working-copy (`@`) commit, recorded at push time so
+    /// `working_copy`/`working_copy_index` are O(1). The tab bar reads the
+    /// working copy's empty status for every tab on every frame.
+    working_copy_row: Option<usize>,
 }
 
 impl CommitStore {
@@ -185,15 +193,21 @@ impl CommitStore {
         self.iter().find(|row| row.commit_id() == commit_id)
     }
 
+    /// Row owning bookmark `name`, resolved through the reverse index (O(1))
+    /// rather than scanning every commit's bookmark list.
+    pub fn find_by_bookmark(&self, name: &str) -> Option<RowView<'_>> {
+        self.bookmark_index.get(name).map(|&index| self.row(index))
+    }
+
     pub fn working_copy(&self) -> Option<RowView<'_>> {
-        self.iter().find(|row| row.is_working_copy())
+        self.working_copy_row.map(|index| self.row(index))
     }
 
     /// Row index of the working-copy (`@`) commit, if it's in the loaded graph.
     /// Used to refresh @'s "empty" chip from a working-copy snapshot without
     /// re-walking the graph.
     pub fn working_copy_index(&self) -> Option<usize> {
-        (0..self.len()).find(|&index| self.row(index).is_working_copy())
+        self.working_copy_row
     }
 
     /// Shortest unique change-id prefix length for every commit, in store order.
@@ -296,15 +310,30 @@ impl CommitStore {
         }
         if commit.is_working_copy {
             flags |= commit_flags::IS_WORKING_COPY;
+            // First-wins, matching the old `iter().find` scan this replaced.
+            if self.working_copy_row.is_none() {
+                self.working_copy_row = Some(index);
+            }
         }
         self.flags.push(flags);
 
         if !commit.bookmarks.is_empty() {
+            for name in &commit.bookmarks {
+                self.bookmark_index.insert(name.clone(), index);
+            }
             self.bookmarks.insert(index, commit.bookmarks);
         }
     }
 
     fn intern_text(&mut self, text: &str) -> Span {
+        // The arena addresses every interned string with `u32` offsets, so the
+        // total interned text must stay under 4 GiB. That ceiling is far beyond
+        // any real log/diff payload; the assert turns a silent truncation (and
+        // the corrupted slices it would yield) into a loud debug-build failure.
+        debug_assert!(
+            self.text.len() + text.len() <= u32::MAX as usize,
+            "CommitStore text arena exceeded u32 addressing range"
+        );
         let start = self.text.len() as u32;
         self.text.push_str(text);
         Span {

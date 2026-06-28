@@ -111,7 +111,7 @@ impl Diffui {
         // A GitHub-PR tab has no local repository: (re)stream it when it
         // hasn't loaded and isn't mid-stream; a loaded one has no
         // watcher/snapshot machinery to re-arm.
-        if let Some(spec) = self.active_pr_spec() {
+        if let Some(spec) = self.active_pr_spec().cloned() {
             return if streaming || matches!(self.session.status, LoadStatus::Loaded) {
                 Task::none()
             } else {
@@ -140,9 +140,9 @@ impl Diffui {
 
     /// The active tab's PR spec, or `None` when it views a local repository
     /// (or no tab is open).
-    pub(crate) fn active_pr_spec(&self) -> Option<github::PrSpec> {
+    pub(crate) fn active_pr_spec(&self) -> Option<&github::PrSpec> {
         match &self.tabs.get(self.active_tab)?.source {
-            TabSource::GitHubPr(spec) => Some(spec.clone()),
+            TabSource::GitHubPr(spec) => Some(spec),
             TabSource::Repo { .. } => None,
         }
     }

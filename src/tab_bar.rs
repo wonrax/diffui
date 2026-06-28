@@ -268,8 +268,8 @@ fn pr_badge(theme: ThemeSpec, mono: iced::Font) -> Element<'static, Message> {
     badge_chip("pr", theme.accent, mono)
 }
 
-fn badge_chip(label: &str, color: Color, mono: iced::Font) -> Element<'static, Message> {
-    container(text(label.to_owned()).size(9.5).color(color).font(mono))
+fn badge_chip(label: &'static str, color: Color, mono: iced::Font) -> Element<'static, Message> {
+    container(text(label).size(9.5).color(color).font(mono))
         .padding(Padding::from([1, 4]))
         .style(move |_| container::Style {
             background: Some(Background::Color(chip_background(color))),

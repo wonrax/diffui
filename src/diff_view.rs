@@ -1946,7 +1946,6 @@ impl<'a, Message> DiffView<'a, Message> {
     /// math mirrors `row_height`/hit-testing (glyph wrapping at a fixed
     /// column), which is what keeps the rects glued to the glyphs.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn draw_byte_range_highlight<Renderer>(
         &self,
         renderer: &mut Renderer,
@@ -3673,9 +3672,23 @@ fn push_visible_band(bands: &mut Vec<VisibleBand>, kind: DiffLineKind, y: f32, h
 }
 
 fn format_gutter(old_line: Option<usize>, new_line: Option<usize>, digit_count: usize) -> String {
-    let old = old_line.map(|line| line.to_string()).unwrap_or_default();
-    let new = new_line.map(|line| line.to_string()).unwrap_or_default();
-    format!("{old:>digit_count$} {new:>digit_count$}")
+    use core::fmt::Write as _;
+    // Two right-aligned, space-padded columns in one buffer. Writing the
+    // numbers straight in avoids the two throwaway `to_string()` allocations
+    // this once did on every visible row.
+    let mut out = String::with_capacity(digit_count * 2 + 1);
+    if let Some(line) = old_line {
+        let _ = write!(out, "{line:>digit_count$}");
+    } else {
+        out.extend(std::iter::repeat_n(' ', digit_count));
+    }
+    out.push(' ');
+    if let Some(line) = new_line {
+        let _ = write!(out, "{line:>digit_count$}");
+    } else {
+        out.extend(std::iter::repeat_n(' ', digit_count));
+    }
+    out
 }
 
 /// Maximum line-number digit count across all visible files. Used to size
@@ -3770,36 +3783,37 @@ fn word_bounds(content: &str, byte_pos: usize) -> (usize, usize) {
         return (0, 0);
     }
     let byte_pos = byte_pos.min(content.len());
-    let chars: Vec<(usize, char)> = content.char_indices().collect();
-    if chars.is_empty() {
-        return (0, 0);
-    }
 
-    // Find the char index closest to byte_pos (the click might land between
-    // two char boundaries when the user clicks on a wide glyph). Bias to
-    // the char to the *left* of the cursor when the click lands at a
-    // boundary, so double-clicking the gap between two words selects the
-    // word to the left rather than picking arbitrarily.
-    let mut anchor_index = chars
-        .iter()
-        .rposition(|(idx, _)| *idx <= byte_pos)
-        .unwrap_or(0);
-    if byte_pos == content.len() {
-        anchor_index = chars.len() - 1;
+    // Anchor on the char under the cursor: floor the click to a char boundary
+    // (it may land mid-glyph), stepping back onto the last char when the cursor
+    // sits at the very end so double-clicking past the last word still selects
+    // it. Walk the `&str` directly instead of collecting every (offset, char).
+    let mut anchor_off = byte_pos;
+    if anchor_off == content.len() {
+        anchor_off -= 1;
     }
+    while !content.is_char_boundary(anchor_off) {
+        anchor_off -= 1;
+    }
+    let anchor_ch = content[anchor_off..].chars().next().unwrap_or(' ');
+    let target_class = word_class(anchor_ch);
 
-    let target_class = word_class(chars[anchor_index].1);
-    let mut start = anchor_index;
-    while start > 0 && word_class(chars[start - 1].1) == target_class {
-        start -= 1;
+    // Expand to the maximal run sharing the anchor's word class, scanning left
+    // (reverse char iterator) and right from the anchor.
+    let mut start_byte = anchor_off;
+    for ch in content[..anchor_off].chars().rev() {
+        if word_class(ch) != target_class {
+            break;
+        }
+        start_byte -= ch.len_utf8();
     }
-    let mut end = anchor_index;
-    while end + 1 < chars.len() && word_class(chars[end + 1].1) == target_class {
-        end += 1;
+    let mut end_byte = anchor_off + anchor_ch.len_utf8();
+    for ch in content[end_byte..].chars() {
+        if word_class(ch) != target_class {
+            break;
+        }
+        end_byte += ch.len_utf8();
     }
-
-    let start_byte = chars[start].0;
-    let end_byte = chars[end].0 + chars[end].1.len_utf8();
     (start_byte, end_byte)
 }
 
@@ -3846,11 +3860,15 @@ fn measure_char_advance_cached(font: Font, text_size: f32) -> f32 {
     static CACHE: OnceLock<Mutex<HashMap<(Font, u32), f32>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let key = (font, text_size.to_bits());
-    if let Some(&v) = cache.lock().unwrap().get(&key) {
+    // One lock acquisition for the get/insert pair. `measure_char_advance`
+    // doesn't touch this cache, so holding the (uncontended, layout-thread)
+    // guard across the miss path is safe and saves a re-lock.
+    let mut cache = cache.lock().unwrap();
+    if let Some(&v) = cache.get(&key) {
         return v;
     }
     let v = measure_char_advance(font, text_size);
-    cache.lock().unwrap().insert(key, v);
+    cache.insert(key, v);
     v
 }
 

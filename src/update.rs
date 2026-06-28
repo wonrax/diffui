@@ -224,6 +224,7 @@ impl Diffui {
             find: None,
             revision_reveal_token: 0,
             pending_revision_reveal: false,
+            sidebar_file_reveal_token: 0,
             sidebar_scroll_offset: 0.0,
             diff_scroll_offset: 0.0,
             scroll_restore_token: 0,
@@ -257,127 +258,142 @@ impl Diffui {
         (app, Task::batch([load_task, theme_task]))
     }
 
+    /// Handle a completed full backend load (graph + diff + snapshot) for `tab`.
+    /// See [`Message::BackendLoaded`]. Routed to the owning tab so a load that
+    /// finishes while the tab is backgrounded still lands; on a failed targeted
+    /// reload it falls back once to the working copy.
+    fn on_backend_loaded(
+        &mut self,
+        tab: TabId,
+        revision: RevisionSelection,
+        result: Box<Result<diffui_core::BackendOutput, String>>,
+    ) -> Task<Message> {
+        match *result {
+            Ok(output) => {
+                // Routed to the owning tab (active or stashed) so a revset
+                // eval / git load / focus reload that completes while its
+                // tab is backgrounded still lands — without the tab
+                // routing, two tabs both pending on `@` would pass the
+                // revision check and swap repos' contents.
+                let document_id = self.allocate_document_id();
+                let Some(mut target) = self.tab_target_mut(tab) else {
+                    return Task::none();
+                };
+                if target.session.pending_revision.as_ref() != Some(&revision) {
+                    return Task::none();
+                }
+                let is_active = target.is_active;
+
+                let revision_changed = target.session.selected_revision != revision;
+                target.session.selected_revision = revision;
+                target.session.pending_revision = None;
+                target.session.loading_since = None;
+                target.session.status = LoadStatus::Loaded;
+                target.session.document = output.document;
+                target.session.commits = output.commits;
+                target.session.graph = output.graph;
+                // A refresh swaps the graph atomically; if a cold stream was
+                // somehow still in flight, supersede it so its late batches
+                // (which assume the now-replaced row indices) are dropped.
+                target.session.load = None;
+                target.session.commits_version = target.session.commits_version.wrapping_add(1);
+                target.session.repository_snapshot = Some(output.snapshot);
+                target.session.branch_status = output.branch_status;
+                target.session.bookmarks = output.bookmarks;
+                target.session.revision_details = output.details;
+                *target.selected_file = if revision_changed {
+                    0
+                } else {
+                    (*target.selected_file)
+                        .min(target.session.document.files.len().saturating_sub(1))
+                };
+                // If this load was triggered by the palette, the
+                // sidebar didn't yet know the new selected_revision
+                // when the user accepted; bump the reveal token now
+                // that it's been written so the *next* render scrolls
+                // the correct row into view.
+                if *target.pending_revision_reveal {
+                    *target.pending_revision_reveal = false;
+                    *target.revision_reveal_token = target.revision_reveal_token.wrapping_add(1);
+                }
+                // Recompute the on-demand sidebar index (lane fold, prefix
+                // lengths, selected-row index) for the new graph. If the
+                // selected commit isn't in the new graph, `selected_commit_index`
+                // is `None` — but that's *not* a fall-back trigger: the diff
+                // loaded, so the commit still exists, it's just outside the
+                // current revset (e.g. a palette jump to an off-view commit,
+                // or an abandoned-but-not-yet-GC'd commit). We keep showing
+                // it rather than yanking the user to `@`. Only a *failed*
+                // resolve (the `Err` arm) means the commit is truly gone.
+                target.session.rebuild_sidebar_index();
+                target.session.reset_highlights(document_id);
+                target.finish_load_activity(activity::ActivityStatus::Done, None);
+                // The document was replaced in place; drop the active view's
+                // shaped-paragraph cache. (A stashed tab gets the bump on
+                // restore.) Empty-status + coalesced refreshes are
+                // active-only; a backgrounded tab runs them on activation.
+                let highlights = self.spawn_highlights(document_id);
+                if is_active {
+                    self.document_version = self.document_version.wrapping_add(1);
+                    let empty = self.resolve_empty_status();
+                    return Task::batch([highlights, empty, self.take_pending_refresh()]);
+                }
+                return highlights;
+            }
+            Err(error) => {
+                let Some(mut target) = self.tab_target_mut(tab) else {
+                    return Task::none();
+                };
+                if target.session.pending_revision.as_ref() != Some(&revision) {
+                    return Task::none();
+                }
+                let is_active = target.is_active;
+
+                target.session.pending_revision = None;
+                target.session.loading_since = None;
+                // A reload targeting a specific commit that's since vanished
+                // (abandoned *and* GC'd) can't resolve it, failing the whole
+                // walk. Retry once against the working copy rather than
+                // stranding the tab on an error screen. Guarded on the
+                // revision being a commit, so a genuine `@` failure (or a
+                // failure of this very retry) still surfaces.
+                if !matches!(revision, RevisionSelection::WorkingCopy)
+                    && let Some(source) = target.session.source.clone()
+                {
+                    eprintln!(
+                        "diffui: reload of {revision:?} failed ({error}); \
+                             falling back to the working copy"
+                    );
+                    let fallback = RevisionSelection::WorkingCopy;
+                    target.session.selected_revision = fallback.clone();
+                    *target.selected_file = 0;
+                    target.session.pending_revision = Some(fallback.clone());
+                    *target.pending_revision_reveal = true;
+                    target.session.loading_since = Some(Instant::now());
+                    let revset = target.session.revset.clone();
+                    let progress = target.session.commit_progress.clone();
+                    if is_active {
+                        // Stashed tabs keep their scroll; a stale offset is
+                        // clamped against the new content on restore.
+                        self.diff_scroll_offset = 0.0;
+                    }
+                    return Task::perform(
+                        source.load(fallback.clone(), revset, progress),
+                        move |result| Message::BackendLoaded(tab, fallback, Box::new(result)),
+                    );
+                }
+                target.session.status = LoadStatus::Failed(error.clone());
+                target.finish_load_activity(activity::ActivityStatus::Error, Some(error));
+            }
+        }
+        Task::none()
+    }
+
     pub(crate) fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::BackendLoaded(tab, revision, result) => match *result {
-                Ok(output) => {
-                    // Routed to the owning tab (active or stashed) so a revset
-                    // eval / git load / focus reload that completes while its
-                    // tab is backgrounded still lands — without the tab
-                    // routing, two tabs both pending on `@` would pass the
-                    // revision check and swap repos' contents.
-                    let document_id = self.allocate_document_id();
-                    let Some(mut target) = self.tab_target_mut(tab) else {
-                        return Task::none();
-                    };
-                    if target.session.pending_revision.as_ref() != Some(&revision) {
-                        return Task::none();
-                    }
-                    let is_active = target.is_active;
-
-                    let revision_changed = target.session.selected_revision != revision;
-                    target.session.selected_revision = revision;
-                    target.session.pending_revision = None;
-                    target.session.loading_since = None;
-                    target.session.status = LoadStatus::Loaded;
-                    target.session.document = output.document;
-                    target.session.commits = output.commits;
-                    target.session.graph = output.graph;
-                    // A refresh swaps the graph atomically; if a cold stream was
-                    // somehow still in flight, supersede it so its late batches
-                    // (which assume the now-replaced row indices) are dropped.
-                    target.session.load = None;
-                    target.session.commits_version = target.session.commits_version.wrapping_add(1);
-                    target.session.repository_snapshot = Some(output.snapshot);
-                    target.session.branch_status = output.branch_status;
-                    target.session.bookmarks = output.bookmarks;
-                    target.session.revision_details = output.details;
-                    *target.selected_file = if revision_changed {
-                        0
-                    } else {
-                        (*target.selected_file)
-                            .min(target.session.document.files.len().saturating_sub(1))
-                    };
-                    // If this load was triggered by the palette, the
-                    // sidebar didn't yet know the new selected_revision
-                    // when the user accepted; bump the reveal token now
-                    // that it's been written so the *next* render scrolls
-                    // the correct row into view.
-                    if *target.pending_revision_reveal {
-                        *target.pending_revision_reveal = false;
-                        *target.revision_reveal_token =
-                            target.revision_reveal_token.wrapping_add(1);
-                    }
-                    // Recompute the on-demand sidebar index (lane fold, prefix
-                    // lengths, selected-row index) for the new graph. If the
-                    // selected commit isn't in the new graph, `selected_commit_index`
-                    // is `None` — but that's *not* a fall-back trigger: the diff
-                    // loaded, so the commit still exists, it's just outside the
-                    // current revset (e.g. a palette jump to an off-view commit,
-                    // or an abandoned-but-not-yet-GC'd commit). We keep showing
-                    // it rather than yanking the user to `@`. Only a *failed*
-                    // resolve (the `Err` arm) means the commit is truly gone.
-                    target.session.rebuild_sidebar_index();
-                    target.session.reset_highlights(document_id);
-                    target.finish_load_activity(activity::ActivityStatus::Done, None);
-                    // The document was replaced in place; drop the active view's
-                    // shaped-paragraph cache. (A stashed tab gets the bump on
-                    // restore.) Empty-status + coalesced refreshes are
-                    // active-only; a backgrounded tab runs them on activation.
-                    let highlights = self.spawn_highlights(document_id);
-                    if is_active {
-                        self.document_version = self.document_version.wrapping_add(1);
-                        let empty = self.resolve_empty_status();
-                        return Task::batch([highlights, empty, self.take_pending_refresh()]);
-                    }
-                    return highlights;
-                }
-                Err(error) => {
-                    let Some(mut target) = self.tab_target_mut(tab) else {
-                        return Task::none();
-                    };
-                    if target.session.pending_revision.as_ref() != Some(&revision) {
-                        return Task::none();
-                    }
-                    let is_active = target.is_active;
-
-                    target.session.pending_revision = None;
-                    target.session.loading_since = None;
-                    // A reload targeting a specific commit that's since vanished
-                    // (abandoned *and* GC'd) can't resolve it, failing the whole
-                    // walk. Retry once against the working copy rather than
-                    // stranding the tab on an error screen. Guarded on the
-                    // revision being a commit, so a genuine `@` failure (or a
-                    // failure of this very retry) still surfaces.
-                    if !matches!(revision, RevisionSelection::WorkingCopy)
-                        && let Some(source) = target.session.source.clone()
-                    {
-                        eprintln!(
-                            "diffui: reload of {revision:?} failed ({error}); \
-                             falling back to the working copy"
-                        );
-                        let fallback = RevisionSelection::WorkingCopy;
-                        target.session.selected_revision = fallback.clone();
-                        *target.selected_file = 0;
-                        target.session.pending_revision = Some(fallback.clone());
-                        *target.pending_revision_reveal = true;
-                        target.session.loading_since = Some(Instant::now());
-                        let revset = target.session.revset.clone();
-                        let progress = target.session.commit_progress.clone();
-                        if is_active {
-                            // Stashed tabs keep their scroll; a stale offset is
-                            // clamped against the new content on restore.
-                            self.diff_scroll_offset = 0.0;
-                        }
-                        return Task::perform(
-                            source.load(fallback.clone(), revset, progress),
-                            move |result| Message::BackendLoaded(tab, fallback, Box::new(result)),
-                        );
-                    }
-                    target.session.status = LoadStatus::Failed(error.clone());
-                    target.finish_load_activity(activity::ActivityStatus::Error, Some(error));
-                }
-            },
+            Message::BackendLoaded(tab, revision, result) => {
+                return self.on_backend_loaded(tab, revision, result);
+            }
             Message::CommitsBatch(version, rows) => {
                 // Route to whichever tab owns this stream — the active one or
                 // a backgrounded stash — so a tab switch doesn't discard a
@@ -824,7 +840,7 @@ impl Diffui {
                 if index < self.session.document.files.len() {
                     self.selected_file = index;
                     self.reveal_selected_file_in_tree();
-                    return scroll_sidebar_to_file(index, self);
+                    return scroll_sidebar_to_file(self);
                 }
             }
             Message::SidebarFileRow(display_index) => {
@@ -1132,7 +1148,7 @@ impl Diffui {
                     self.selected_file = (self.selected_file + 1)
                         .min(self.session.document.files.len().saturating_sub(1));
                     self.reveal_selected_file_in_tree();
-                    return scroll_sidebar_to_file(self.selected_file, self);
+                    return scroll_sidebar_to_file(self);
                 }
             }
             Message::SelectPreviousFile => {
@@ -1140,7 +1156,7 @@ impl Diffui {
                 if previous != self.selected_file {
                     self.selected_file = previous;
                     self.reveal_selected_file_in_tree();
-                    return scroll_sidebar_to_file(self.selected_file, self);
+                    return scroll_sidebar_to_file(self);
                 }
             }
             Message::CopyToClipboard(text) => {
@@ -1942,7 +1958,7 @@ impl Diffui {
         self.pending_revision_reveal = true;
         let revision = selection.clone();
         Task::perform(source.diff(selection), move |result| {
-            Message::DiffLoaded(tab, revision.clone(), Box::new(result))
+            Message::DiffLoaded(tab, revision, Box::new(result))
         })
     }
 
@@ -2350,7 +2366,7 @@ impl Diffui {
         self.session.loading_since = Some(Instant::now());
         let revision = selection.clone();
         Task::perform(source.diff(selection), move |result| {
-            Message::DiffLoaded(tab, revision.clone(), Box::new(result))
+            Message::DiffLoaded(tab, revision, Box::new(result))
         })
     }
 

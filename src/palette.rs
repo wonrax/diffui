@@ -1230,11 +1230,7 @@ fn result_row_body<'a>(
             // the tail. Bookmarks without a matching commit (stale data
             // races between snapshots) still render — the tail just goes
             // empty.
-            let commit = ui
-                .session
-                .commits
-                .iter()
-                .find(|c| c.bookmarks().iter().any(|b| b == name));
+            let commit = ui.session.commits.find_by_bookmark(name);
             let tail = commit
                 .map(|c| {
                     if c.has_description() {
@@ -1359,8 +1355,7 @@ pub fn revision_selection(item: &ResultRef, ui: &Diffui) -> Option<RevisionSelec
         ResultRef::Bookmark(name) => ui
             .session
             .commits
-            .iter()
-            .find(|c| c.bookmarks().iter().any(|b| b == name))
+            .find_by_bookmark(name)
             .map(|c| RevisionSelection::Commit(c.commit_id().to_owned())),
         _ => None,
     }
@@ -1376,8 +1371,7 @@ pub fn change_id_for_recents(item: &ResultRef, ui: &Diffui) -> Option<String> {
         ResultRef::Bookmark(name) => ui
             .session
             .commits
-            .iter()
-            .find(|c| c.bookmarks().iter().any(|b| b == name))
+            .find_by_bookmark(name)
             .map(|c| c.change_id().to_owned()),
         ResultRef::WorkingCopy => ui
             .session

@@ -318,7 +318,7 @@ impl Diffui {
             let pending = Box::new(pending);
             return Task::perform(
                 crate::jj::bookmark_move_is_backwards(repository, name, to),
-                move |result| Message::BookmarkMoveChecked(pending.clone(), Box::new(result)),
+                move |result| Message::BookmarkMoveChecked(pending, Box::new(result)),
             );
         }
         self.enqueue_or_run_mutation(pending)

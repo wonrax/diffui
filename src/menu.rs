@@ -660,7 +660,7 @@ fn build_row<'a>(
             .align_y(alignment::Vertical::Center)
             .into();
         }
-        MenuEntry::Disabled { label } => text(label.clone())
+        MenuEntry::Disabled { label } => text(label)
             .size(12)
             .color(theme.subtle_text)
             .font(font)
@@ -679,7 +679,7 @@ fn build_row<'a>(
             } else {
                 font
             };
-            let label_widget = text(label.clone())
+            let label_widget = text(label)
                 .size(12)
                 .color(theme.text)
                 .font(label_font)
@@ -687,7 +687,7 @@ fn build_row<'a>(
             match detail {
                 Some(detail) => row![
                     label_widget,
-                    text(detail.clone())
+                    text(detail)
                         .size(11)
                         .color(theme.subtle_text)
                         .font(mono)
@@ -703,7 +703,7 @@ fn build_row<'a>(
             }
         }
         MenuEntry::Submenu { label, .. } => row![
-            text(label.clone())
+            text(label)
                 .size(12)
                 .color(theme.text)
                 .font(font)

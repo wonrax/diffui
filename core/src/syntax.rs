@@ -296,9 +296,15 @@ fn parse_side(
         // within one line so this loop usually fires once, but multi-line
         // constructs (block comments, raw strings) need to highlight every
         // covered line.
-        for range in &ranges {
-            if range.end <= start || range.start >= end {
-                continue;
+        // `ranges` is sorted by start and end (the buffer only grows as lines
+        // are appended), so the ranges overlapping this span form one contiguous
+        // run. Binary-search to the first range ending past the span's start,
+        // then stop as soon as a range begins at/after the span's end — instead
+        // of scanning every line's range for every span.
+        let first = ranges.partition_point(|range| range.end <= start);
+        for range in &ranges[first..] {
+            if range.start >= end {
+                break;
             }
             let local_start = start.saturating_sub(range.start);
             let local_end = (end - range.start).min(range.end - range.start);
