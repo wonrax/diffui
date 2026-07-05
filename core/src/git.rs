@@ -82,6 +82,8 @@ pub async fn load_git_repository_snapshot(repository_root: &Path) -> Result<Repo
     Ok(RepositorySnapshot {
         fingerprint: output,
         working_copy_empty: None,
+        // Git has no op log — the external-op escalation never applies.
+        parent_fingerprint: None,
     })
 }
 
@@ -415,6 +417,7 @@ fn build_commit_summaries(rows: Vec<ParsedCommitRow>) -> (Vec<CommitSummary>, Gr
             has_description: row.has_description,
             is_empty: row.is_empty,
             has_conflict: false,
+            is_divergent: false,
             is_working_copy: row.is_working_copy,
             bookmarks: Vec::new(),
         })

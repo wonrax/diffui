@@ -286,7 +286,7 @@ async fn run_repository_snapshot(repository: Repository) -> Result<RepositorySna
                 // the fingerprint (the cold path keeps the repo for reuse).
                 handle
                     .block_on(crate::jj::load_jj_repository_snapshot(repository))
-                    .map(|(snapshot, _repo, _wc_commit_id)| snapshot)
+                    .map(|(snapshot, _repo, _wc_commit_id, _workspace)| snapshot)
             })
             .await
             .context("jj repository snapshot task failed")?

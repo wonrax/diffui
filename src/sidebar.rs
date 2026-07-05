@@ -33,8 +33,8 @@ pub const RESIZE_HIT_PADDING: f32 = 2.0;
 /// row of a revision can always fit its load-bearing columns at this font:
 /// change-id (12 chars) + commit-id (12 chars) + an abbreviated author +
 /// the `+N` bookmark-overflow chip + the loudest status chip
-/// (`conflict`, 8 chars). Below this width the chip rail starts dropping
-/// rails, so the user loses the conflict signal.
+/// (`divergent`, 9 chars). Below this width the chip rail starts dropping
+/// rails, so the user loses the conflict/divergence signal.
 pub fn min_width(config: AppConfig) -> f32 {
     let id_metrics = TextMetrics::iced(config.mono_font, CAPTION_TEXT_SIZE);
     let ui_metrics = TextMetrics::iced(config.ui_font, CAPTION_TEXT_SIZE);
@@ -44,7 +44,7 @@ pub fn min_width(config: AppConfig) -> f32 {
     let at_w = id_metrics.measure("@");
     let author_w = ui_metrics.measure("Author Name");
     let plus_n_w = chip_width("+9", &ui_metrics);
-    let conflict_w = chip_width("conflict", &ui_metrics);
+    let conflict_w = chip_width("divergent", &ui_metrics);
 
     let at_gap = 4.0;
     let id_gap = 8.0;
@@ -567,6 +567,18 @@ fn build_revision_row(
             border_dashed: false,
         });
     }
+    if commit.is_divergent() {
+        // jj log flags these `??`: the change id maps to several visible
+        // commits. Amber (not conflict-red) — it's a warning about identity,
+        // not about tree state.
+        status_chips.push(IndicatorChip {
+            label: "divergent".to_owned(),
+            background: chip_background(theme.modified_token),
+            text_color: theme.modified_token,
+            border_color: None,
+            border_dashed: false,
+        });
+    }
 
     let selection_key = if commit.is_working_copy() {
         RowSelectionKey::WorkingCopy
@@ -861,6 +873,7 @@ fn file_status_color(status: DiffFileStatus, theme: ThemeSpec) -> Color {
         DiffFileStatus::Deleted => theme.removed_text,
         DiffFileStatus::Modified => theme.info,
         DiffFileStatus::Renamed => theme.modified_token,
+        DiffFileStatus::Conflicted => theme.conflict_marker,
     }
 }
 
@@ -1004,6 +1017,7 @@ mod tests {
             has_description: false,
             is_empty: None,
             has_conflict: false,
+            is_divergent: false,
             is_working_copy: false,
             bookmarks: Vec::new(),
         }

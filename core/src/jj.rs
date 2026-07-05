@@ -38,7 +38,7 @@ use jj_lib::{
     merge::{Diff, Merge, SameChange},
     object_id::ObjectId,
     op_store::{LocalRemoteRefTarget, RefTarget, View},
-    ref_name::{RefName, RefNameBuf, RemoteName, RemoteNameBuf, WorkspaceName},
+    ref_name::{RefName, RefNameBuf, RemoteName, RemoteNameBuf, WorkspaceName, WorkspaceNameBuf},
     repo::{MutableRepo, ReadonlyRepo, Repo, RepoLoader, StoreFactories},
     repo_path::{RepoPath, RepoPathBuf, RepoPathUiConverter},
     revset::{
@@ -152,12 +152,15 @@ pub fn jj_log_revset(repo_root: &Path) -> String {
 /// Parse a user-entered revset string into a jj expression for the graph
 /// loaders. Empty or `all()` short-circuits to [`RevsetExpression::all`] (the
 /// app default — and avoids any parse risk on the common path). Symbols like
-/// `@`, `mine()`, `conflicts()` resolve against the default workspace; a parse
-/// error is surfaced so the revset activity can report it. `default_ignored_remote`
-/// is jj's colocated-git pseudo-remote, matching jj's own parsing.
+/// `@`, `mine()`, `conflicts()` resolve against `workspace_name` (the loaded
+/// workspace — so `@` is *this* workspace's working copy, not the default
+/// one's); a parse error is surfaced so the revset activity can report it.
+/// `default_ignored_remote` is jj's colocated-git pseudo-remote, matching jj's
+/// own parsing.
 fn parse_user_revset(
     repo_root: &Path,
     settings: &UserSettings,
+    workspace_name: &WorkspaceName,
     src: &str,
 ) -> Result<Arc<UserRevsetExpression>> {
     let trimmed = src.trim();
@@ -173,7 +176,7 @@ fn parse_user_revset(
     };
     let workspace_ctx = RevsetWorkspaceContext {
         path_converter: &path_converter,
-        workspace_name: WorkspaceName::DEFAULT,
+        workspace_name,
     };
     let context = RevsetParseContext {
         aliases_map: &aliases,
@@ -239,7 +242,10 @@ pub async fn walk_jj_commits(
         .clone();
     walk_jj_with_repo(
         repo.as_ref(),
-        &wc_commit_id,
+        WorkspaceView {
+            wc_commit_id: &wc_commit_id,
+            workspace_name,
+        },
         &repository_root,
         &revset,
         progress,
@@ -249,23 +255,36 @@ pub async fn walk_jj_commits(
     .await
 }
 
+/// The workspace-scoped identity a graph walk renders relative to: which
+/// commit is `@`, and which workspace it belongs to — for revset resolution
+/// (`@` must be *this* workspace's working copy) and for labeling the other
+/// workspaces' working copies as `name@` chips.
+pub struct WorkspaceView<'a> {
+    pub wc_commit_id: &'a CommitId,
+    pub workspace_name: &'a WorkspaceName,
+}
+
 /// The graph-walk half of [`walk_jj_commits`], given an already-loaded repo and
 /// its working-copy commit id. Split out so the cold streaming load
 /// ([`load_jj_cold`]) reuses the repo it loaded for the snapshot instead of
 /// reading the (large) commit index a second time.
 pub async fn walk_jj_with_repo(
     repo: &ReadonlyRepo,
-    wc_commit_id: &CommitId,
+    workspace: WorkspaceView<'_>,
     repo_root: &Path,
     revset: &str,
     progress: LoadProgress,
     batch_size: usize,
     emit: &mut dyn FnMut(Vec<StreamRow>),
 ) -> Result<(Vec<(usize, bool)>, Option<BranchStatus>, BookmarksInfo)> {
+    let WorkspaceView {
+        wc_commit_id,
+        workspace_name,
+    } = workspace;
     // The user's revset controls which revisions load. The default (`all()`)
     // covers the working copy, every local bookmark, and tracked/untracked
     // remote bookmarks, so unmerged branches still appear in the graph.
-    let expr = parse_user_revset(repo_root, repo.settings(), revset)?;
+    let expr = parse_user_revset(repo_root, repo.settings(), workspace_name, revset)?;
     let symbol_resolver = SymbolResolver::new(
         repo,
         &[] as &[Box<dyn jj_lib::revset::SymbolResolverExtension>],
@@ -295,6 +314,18 @@ pub async fn walk_jj_with_repo(
                 .or_default()
                 .push(label);
         });
+    }
+    // Other workspaces' working copies render as `name@` chips (jj log's
+    // `working_copies` keyword) — `name@` is also valid revset syntax, so the
+    // chip doubles as a palette-jumpable symbol. Our own workspace's `@` keeps
+    // the dedicated working-copy marker instead of a chip.
+    for (name, id) in repo.view().wc_commit_ids() {
+        if name.as_str() != workspace_name.as_str() {
+            bookmarks_by_commit
+                .entry(id.clone())
+                .or_default()
+                .push(format!("{}@", name.as_str()));
+        }
     }
 
     let mut lane_assigner = LaneAssigner::new();
@@ -343,6 +374,16 @@ pub async fn walk_jj_with_repo(
                     )
                 })?;
             let bookmarks = bookmarks_by_commit.get(&id).cloned().unwrap_or_default();
+            // Divergent = the change id maps to more than one visible commit
+            // (jj log's `??` marker). Resolved against the repo's change-id
+            // index — the same one the shortest-prefix call above already
+            // built — so this is a lookup per row, not a scan. Best-effort:
+            // an index error just reads as "not divergent".
+            let is_divergent = repo
+                .resolve_change_id(commit.change_id())
+                .ok()
+                .flatten()
+                .is_some_and(|targets| targets.visible_with_offsets().take(2).count() > 1);
             let summary = CommitSummary {
                 change_id: commit.change_id().to_string(),
                 commit_id: id.hex(),
@@ -356,6 +397,7 @@ pub async fn walk_jj_with_repo(
                 has_description: !description.is_empty(),
                 is_empty: None,
                 has_conflict: commit.has_conflict(),
+                is_divergent,
                 is_working_copy: id == *wc_commit_id,
                 bookmarks,
             };
@@ -679,7 +721,8 @@ pub async fn load_jj_cold(
     Vec<(usize, bool)>,
     BookmarksInfo,
 )> {
-    let (snapshot, repo, wc_commit_id) = load_jj_repository_snapshot(repository.clone()).await?;
+    let (snapshot, repo, wc_commit_id, workspace_name) =
+        load_jj_repository_snapshot(repository.clone()).await?;
 
     // Emit the working-copy diff up front so the diff pane is ready the moment
     // the first commit batch lifts the loading screen.
@@ -690,7 +733,10 @@ pub async fn load_jj_cold(
 
     let (empty_updates, branch_status, bookmarks) = walk_jj_with_repo(
         repo.as_ref(),
-        &wc_commit_id,
+        WorkspaceView {
+            wc_commit_id: &wc_commit_id,
+            workspace_name: &workspace_name,
+        },
         &repository.root,
         &revset,
         progress,
@@ -969,6 +1015,65 @@ async fn diff_jj_with_repo(
         // paints plain immediately and colorizes progressively.
         files.push(file);
     }
+    drop(stream);
+
+    // A conflicted commit's parent-tree diff can miss its conflicts entirely:
+    // a fresh conflicted merge's tree *is* the merge of its parent trees, so
+    // both sides materialize identically and the stream above yields nothing
+    // (the same reason jj counts such a merge "empty"). Surface every
+    // conflicted path the stream didn't already cover as a synthetic
+    // `Conflicted` entry whose hunks are the materialized conflict regions —
+    // `jj resolve --list`, but with content.
+    if new_tree.has_conflict() {
+        let covered: std::collections::HashSet<&str> =
+            files.iter().map(|file| file.path.as_str()).collect();
+        let mut conflict_files = Vec::new();
+        for (repo_path, value) in new_tree.conflicts_matching(matcher.as_ref()) {
+            let path = repo_path_label(&repo_path);
+            if covered.contains(path.as_str()) {
+                continue;
+            }
+            let value = match value {
+                Ok(value) => value,
+                Err(error) => {
+                    eprintln!("diffui: failed to read conflict at {path}: {error}");
+                    continue;
+                }
+            };
+            let materialized =
+                materialize_tree_value(repo.store(), &repo_path, value, new_tree.labels())
+                    .await
+                    .with_context(|| format!("failed to materialize conflict at {path}"))?;
+            let part = git_diff_part(&repo_path, materialized, &materialize_options)
+                .await
+                .with_context(|| format!("failed to read conflict content for {path}"))?;
+            let mut file = DiffFile {
+                path,
+                old_path: None,
+                status: DiffFileStatus::Conflicted,
+                hunks: Vec::new(),
+                additions: 0,
+                deletions: 0,
+            };
+            if part.content.is_binary {
+                file.hunks.push(DiffHunkView {
+                    header: "binary file conflict".to_owned(),
+                    lines: Vec::new(),
+                });
+            } else {
+                let text = String::from_utf8_lossy(&part.content.contents);
+                let (hunks, additions, deletions) = conflict_hunks(&text);
+                file.hunks = hunks;
+                file.additions = additions;
+                file.deletions = deletions;
+            }
+            conflict_files.push(file);
+        }
+        if !conflict_files.is_empty() {
+            files.extend(conflict_files);
+            files.sort_by(|a, b| a.path.cmp(&b.path));
+        }
+    }
 
     let total_additions = files.iter().map(|file| file.additions).sum();
     let total_deletions = files.iter().map(|file| file.deletions).sum();
@@ -984,13 +1089,18 @@ async fn diff_jj_with_repo(
 }
 
 /// Snapshot the working copy, returning the fingerprint plus the post-snapshot
-/// repo and working-copy commit id. The cold streaming load ([`load_jj_cold`])
-/// reuses that repo for the diff + graph walk so it reads the commit index once
-/// instead of three times; the refresh path ([`run_repository_snapshot`]) drops
-/// the repo and keeps only the fingerprint.
+/// repo, working-copy commit id, and workspace name. The cold streaming load
+/// ([`load_jj_cold`]) reuses that repo for the diff + graph walk so it reads
+/// the commit index once instead of three times; the refresh path
+/// ([`run_repository_snapshot`]) drops the repo and keeps only the fingerprint.
 pub async fn load_jj_repository_snapshot(
     repository: Repository,
-) -> Result<(RepositorySnapshot, Arc<ReadonlyRepo>, CommitId)> {
+) -> Result<(
+    RepositorySnapshot,
+    Arc<ReadonlyRepo>,
+    CommitId,
+    WorkspaceNameBuf,
+)> {
     let settings = jj_settings(&repository.root)?;
     let mut workspace = Workspace::load(
         &settings,
@@ -1058,10 +1168,16 @@ pub async fn load_jj_repository_snapshot(
         let snapshot = RepositorySnapshot {
             fingerprint: base_repo.op_id().hex(),
             working_copy_empty,
+            // No op written: the snapshot *is* its own base.
+            parent_fingerprint: Some(base_repo.op_id().hex()),
         };
-        return Ok((snapshot, base_repo, wc_commit_id));
+        return Ok((snapshot, base_repo, wc_commit_id, workspace_name));
     }
 
+    // The op our snapshot tx is parented on — the frontend compares this to
+    // the op its graph reflects to spot external ops (see
+    // `RepositorySnapshot::parent_fingerprint`).
+    let base_op_id = base_repo.op_id().hex();
     let mut tx = base_repo.start_transaction();
     tx.set_is_snapshot(true);
     let new_commit = tx
@@ -1072,7 +1188,7 @@ pub async fn load_jj_repository_snapshot(
         .await
         .context("failed to rewrite jj working-copy commit with new tree")?;
     tx.repo_mut()
-        .set_wc_commit(workspace_name, new_commit.id().clone())
+        .set_wc_commit(workspace_name.clone(), new_commit.id().clone())
         .context("failed to update jj working-copy pointer")?;
     // `rewrite_commit` records a rewrite that the transaction insists on
     // resolving before commit, even when the wc commit has no descendants.
@@ -1095,8 +1211,9 @@ pub async fn load_jj_repository_snapshot(
     let snapshot = RepositorySnapshot {
         fingerprint: new_op_id.hex(),
         working_copy_empty,
+        parent_fingerprint: Some(base_op_id),
     };
-    Ok((snapshot, new_repo, new_wc_commit_id))
+    Ok((snapshot, new_repo, new_wc_commit_id, workspace_name))
 }
 
 /// Read the current jj operation-head id(s) *without* loading the working copy,
@@ -1110,7 +1227,9 @@ pub async fn load_jj_repository_snapshot(
 /// (`op_id().hex()`), so the two compare directly.
 pub async fn read_jj_op_head(repository: Repository) -> Result<String> {
     let settings = jj_settings(&repository.root)?;
-    let repo_dir = repository.root.join(".jj").join("repo");
+    // Resolve through the `.jj/repo` pointer file so a secondary workspace
+    // (whose op store lives in the primary repo) reads the right heads.
+    let repo_dir = crate::repository::resolve_jj_repo_dir(&repository.root)?;
     let loader =
         RepoLoader::init_from_file_system(&settings, &repo_dir, &StoreFactories::default())
             .context("failed to init jj repo loader for op-head read")?;
@@ -1990,11 +2109,18 @@ pub(crate) fn jj_settings(repo_root: &Path) -> Result<UserSettings> {
         load_jj_user_config_path(&mut config, &path)?;
     }
 
-    let repo_config = repo_root.join(".jj").join("repo").join("config.toml");
-    if repo_config.is_file() {
-        config
-            .load_file(ConfigSource::Repo, repo_config.clone())
-            .with_context(|| format!("failed to load jj repo config {}", repo_config.display()))?;
+    // Through the `.jj/repo` pointer so a secondary workspace picks up the
+    // primary repo's config. Best-effort: an unresolvable pointer just means
+    // no repo-level config layer (Workspace::load will surface the breakage).
+    if let Ok(repo_dir) = crate::repository::resolve_jj_repo_dir(repo_root) {
+        let repo_config = repo_dir.join("config.toml");
+        if repo_config.is_file() {
+            config
+                .load_file(ConfigSource::Repo, repo_config.clone())
+                .with_context(|| {
+                    format!("failed to load jj repo config {}", repo_config.display())
+                })?;
+        }
     }
 
     UserSettings::from_config(config).context("failed to build jj settings")
@@ -2125,6 +2251,147 @@ fn repo_path_label(path: &RepoPath) -> String {
     path.as_internal_file_string().to_owned()
 }
 
+/// Build display hunks for a materialized conflicted file: one hunk per
+/// conflict-marker block (`<<<<<<<` … `>>>>>>>`) with up to three lines of
+/// surrounding context, blocks whose context windows touch merged into one
+/// hunk. Returns `(hunks, additions, deletions)`, counting the `+`/`-` body
+/// lines inside `%%%%%%%` diff sections so the file list shows the conflict's
+/// size.
+///
+/// Classification follows jj's materialization format: a marker is a run of
+/// ≥7 identical marker characters followed by a space or end-of-line. (jj
+/// lengthens markers past 7 only when the content contains lookalike lines,
+/// so ≥7 matches every marker jj emits — at the cost of also matching those
+/// rare lookalikes, a cosmetic mislabel at worst.) Marker lines render as
+/// `Conflict`; inside a `%%%%%%%` diff section `-`/`+` prefixes render as
+/// deletion/addition; everything else is context. Lines number on the new
+/// side only — a conflict has no meaningful old-side numbering. A
+/// materialization with no markers at all (a non-file conflict's short
+/// description) becomes a single all-context hunk.
+fn conflict_hunks(text: &str) -> (Vec<DiffHunkView>, usize, usize) {
+    const CONTEXT_LINES: usize = 3;
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        return (Vec::new(), 0, 0);
+    }
+    let last = lines.len() - 1;
+
+    let mut blocks: Vec<(usize, usize)> = Vec::new();
+    let mut open: Option<usize> = None;
+    for (index, line) in lines.iter().enumerate() {
+        match conflict_marker_char(line) {
+            Some(b'<') if open.is_none() => open = Some(index),
+            Some(b'>') => {
+                if let Some(start) = open.take() {
+                    blocks.push((start, index));
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(start) = open {
+        // Unterminated block (truncated content or a lookalike line): show
+        // through to the end rather than dropping it.
+        blocks.push((start, last));
+    }
+    if blocks.is_empty() {
+        blocks.push((0, last));
+    }
+
+    // Expand each block by the context margin and merge windows that touch,
+    // so no hunk ever begins inside a block — the classification below
+    // re-walks marker state from each hunk's first line.
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for (block_start, block_end) in blocks {
+        let start = block_start.saturating_sub(CONTEXT_LINES);
+        let end = (block_end + CONTEXT_LINES).min(last);
+        match ranges.last_mut() {
+            Some((_, prev_end)) if start <= *prev_end + 1 => *prev_end = (*prev_end).max(end),
+            _ => ranges.push((start, end)),
+        }
+    }
+
+    let mut hunks = Vec::new();
+    let mut additions = 0usize;
+    let mut deletions = 0usize;
+    for (start, end) in ranges {
+        let mut rows = Vec::with_capacity(end - start + 1);
+        let mut header: Option<String> = None;
+        let mut in_block = false;
+        let mut diff_section = false;
+        for (index, line) in lines[start..=end].iter().enumerate() {
+            let kind = match conflict_marker_char(line) {
+                Some(b'<') => {
+                    in_block = true;
+                    diff_section = false;
+                    if header.is_none() {
+                        // The opening marker carries jj's own label
+                        // ("Conflict 1 of 2") — reuse it as the hunk header.
+                        let label = line.trim_start_matches('<').trim();
+                        if !label.is_empty() {
+                            header = Some(label.to_owned());
+                        }
+                    }
+                    DiffLineKind::Conflict
+                }
+                Some(b'>') => {
+                    in_block = false;
+                    diff_section = false;
+                    DiffLineKind::Conflict
+                }
+                Some(marker) if in_block => {
+                    diff_section = marker == b'%';
+                    DiffLineKind::Conflict
+                }
+                _ if in_block && diff_section => match line.as_bytes().first() {
+                    Some(b'-') => DiffLineKind::Deletion,
+                    Some(b'+') => DiffLineKind::Addition,
+                    _ => DiffLineKind::Context,
+                },
+                _ => DiffLineKind::Context,
+            };
+            match kind {
+                DiffLineKind::Addition => additions += 1,
+                DiffLineKind::Deletion => deletions += 1,
+                _ => {}
+            }
+            rows.push(DiffLine {
+                kind,
+                old_line: None,
+                new_line: Some(start + index + 1),
+                content: (*line).to_owned(),
+                syntax: Vec::new(),
+                emphasis: Vec::new(),
+            });
+        }
+        hunks.push(DiffHunkView {
+            header: header.unwrap_or_else(|| "conflict".to_owned()),
+            lines: rows,
+        });
+    }
+    (hunks, additions, deletions)
+}
+
+/// The marker character opening `line` when it is a jj conflict-marker line:
+/// a run of ≥7 identical characters from the marker alphabet, followed by a
+/// space or end-of-line.
+fn conflict_marker_char(line: &str) -> Option<u8> {
+    const MIN_MARKER_LEN: usize = 7;
+    let bytes = line.as_bytes();
+    let first = *bytes.first()?;
+    if !matches!(first, b'<' | b'>' | b'%' | b'+' | b'|' | b'=') {
+        return None;
+    }
+    let run = bytes.iter().take_while(|&&b| b == first).count();
+    if run < MIN_MARKER_LEN {
+        return None;
+    }
+    match bytes.get(run) {
+        None | Some(b' ') => Some(first),
+        _ => None,
+    }
+}
+
 /// Flatten one line's diff tokens to its content string plus the byte ranges
 /// of the `Different` tokens — jj-lib's word-level refinement, reused as the
 /// intra-line emphasis the parser-based backends compute themselves. Ranges
@@ -2166,28 +2433,30 @@ mod revset_tests {
     fn empty_and_all_are_accepted() {
         let s = settings();
         let root = Path::new("/tmp");
-        assert!(parse_user_revset(root, &s, "").is_ok());
-        assert!(parse_user_revset(root, &s, "   ").is_ok());
-        assert!(parse_user_revset(root, &s, "all()").is_ok());
-        assert!(parse_user_revset(root, &s, "  all()  ").is_ok());
+        let ws = WorkspaceName::DEFAULT;
+        assert!(parse_user_revset(root, &s, ws, "").is_ok());
+        assert!(parse_user_revset(root, &s, ws, "   ").is_ok());
+        assert!(parse_user_revset(root, &s, ws, "all()").is_ok());
+        assert!(parse_user_revset(root, &s, ws, "  all()  ").is_ok());
     }
 
     #[test]
     fn built_in_functions_and_working_copy_parse() {
         let s = settings();
         let root = Path::new("/tmp");
+        let ws = WorkspaceName::DEFAULT;
         // `@` needs the workspace context; the preset functions are built-ins.
-        assert!(parse_user_revset(root, &s, "@").is_ok());
-        assert!(parse_user_revset(root, &s, "ancestors(@)").is_ok());
-        assert!(parse_user_revset(root, &s, "mine()").is_ok());
-        assert!(parse_user_revset(root, &s, "conflicts()").is_ok());
+        assert!(parse_user_revset(root, &s, ws, "@").is_ok());
+        assert!(parse_user_revset(root, &s, ws, "ancestors(@)").is_ok());
+        assert!(parse_user_revset(root, &s, ws, "mine()").is_ok());
+        assert!(parse_user_revset(root, &s, ws, "conflicts()").is_ok());
     }
 
     #[test]
     fn malformed_revset_is_rejected() {
         let s = settings();
         let root = Path::new("/tmp");
-        assert!(parse_user_revset(root, &s, "(((").is_err());
+        assert!(parse_user_revset(root, &s, WorkspaceName::DEFAULT, "(((").is_err());
     }
 
     /// Regression: a revset that excludes the working-copy commit must not panic
@@ -2370,6 +2639,106 @@ mod lane_width_probe {
             );
         }
         eprintln!("============================================\n");
+    }
+}
+
+#[cfg(test)]
+mod conflict_hunk_tests {
+    use super::*;
+
+    const MATERIALIZED: &str = "fn one() {}\n\
+        context a\n\
+        context b\n\
+        context c\n\
+        <<<<<<< Conflict 1 of 1\n\
+        %%%%%%% Changes from base to side #1\n\
+        -old line\n\
+        +new line\n\
+        +++++++ Contents of side #2\n\
+        other side\n\
+        >>>>>>> Conflict 1 of 1 ends\n\
+        context d\n\
+        context e\n\
+        context f\n\
+        fn two() {}\n";
+
+    #[test]
+    fn single_block_becomes_one_hunk_with_context() {
+        let (hunks, additions, deletions) = conflict_hunks(MATERIALIZED);
+        assert_eq!(hunks.len(), 1);
+        let hunk = &hunks[0];
+        assert_eq!(hunk.header, "Conflict 1 of 1");
+        // 3 context above + 7 block lines + 3 context below.
+        assert_eq!(hunk.lines.len(), 13);
+        // "fn one() {}" and "fn two() {}" sit outside the context margin.
+        assert!(hunk.lines.iter().all(|l| !l.content.contains("fn ")));
+        assert_eq!(additions, 1);
+        assert_eq!(deletions, 1);
+        assert_eq!(
+            hunk.lines
+                .iter()
+                .filter(|l| l.kind == DiffLineKind::Conflict)
+                .count(),
+            4,
+            "the four marker lines render as Conflict"
+        );
+        // The snapshot-section body line is plain context, not an addition.
+        let other = hunk
+            .lines
+            .iter()
+            .find(|l| l.content == "other side")
+            .expect("side #2 content present");
+        assert_eq!(other.kind, DiffLineKind::Context);
+        // Line numbers are 1-based positions in the materialized file.
+        assert_eq!(hunk.lines[0].new_line, Some(2));
+    }
+
+    #[test]
+    fn adjacent_blocks_merge_into_one_hunk() {
+        let text = "\
+            <<<<<<< Conflict 1 of 2\n\
+            +++++++ Contents of side #1\n\
+            a\n\
+            >>>>>>> Conflict 1 of 2 ends\n\
+            between\n\
+            <<<<<<< Conflict 2 of 2\n\
+            +++++++ Contents of side #1\n\
+            b\n\
+            >>>>>>> Conflict 2 of 2 ends\n";
+        let (hunks, _, _) = conflict_hunks(text);
+        assert_eq!(hunks.len(), 1, "touching context windows merge");
+        assert_eq!(hunks[0].header, "Conflict 1 of 2");
+        assert_eq!(hunks[0].lines.len(), 9);
+    }
+
+    #[test]
+    fn markerless_content_is_one_context_hunk() {
+        let (hunks, additions, deletions) = conflict_hunks("Conflict:\n  weird tree thing\n");
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].header, "conflict");
+        assert_eq!(hunks[0].lines.len(), 2);
+        assert_eq!(additions + deletions, 0);
+        assert!(
+            hunks[0]
+                .lines
+                .iter()
+                .all(|l| l.kind == DiffLineKind::Context)
+        );
+    }
+
+    #[test]
+    fn marker_detection_requires_run_and_separator() {
+        assert_eq!(conflict_marker_char("<<<<<<< Conflict 1 of 1"), Some(b'<'));
+        assert_eq!(conflict_marker_char("<<<<<<<"), Some(b'<'));
+        assert_eq!(conflict_marker_char("<<<<<<<<<<< longer"), Some(b'<'));
+        assert_eq!(conflict_marker_char("<<<<<< too short"), None);
+        assert_eq!(conflict_marker_char("<<<<<<<not-a-marker"), None);
+        assert_eq!(
+            conflict_marker_char("+++++++ Contents of side #1"),
+            Some(b'+')
+        );
+        assert_eq!(conflict_marker_char("+e"), None);
+        assert_eq!(conflict_marker_char(""), None);
     }
 }
 

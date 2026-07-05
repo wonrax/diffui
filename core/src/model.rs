@@ -102,6 +102,9 @@ pub struct CommitSummary {
     /// commits can't carry an unresolved conflict, so this stays `false`
     /// for the git backend).
     pub has_conflict: bool,
+    /// Whether the change id maps to more than one visible commit (jj's
+    /// "divergent change"). `false` for backends without change ids (git).
+    pub is_divergent: bool,
     pub is_working_copy: bool,
     /// Bookmarks pointing at this commit. Local bookmarks are bare
     /// names; remote-tracking ones are `name@remote`. Order matches
@@ -115,6 +118,7 @@ mod commit_flags {
     pub const IS_EMPTY: u8 = 1 << 2;
     pub const HAS_CONFLICT: u8 = 1 << 3;
     pub const IS_WORKING_COPY: u8 = 1 << 4;
+    pub const IS_DIVERGENT: u8 = 1 << 5;
 }
 
 /// Byte range `[start, start+len)` into a [`CommitStore`]'s text arena.
@@ -308,6 +312,9 @@ impl CommitStore {
         if commit.has_conflict {
             flags |= commit_flags::HAS_CONFLICT;
         }
+        if commit.is_divergent {
+            flags |= commit_flags::IS_DIVERGENT;
+        }
         if commit.is_working_copy {
             flags |= commit_flags::IS_WORKING_COPY;
             // First-wins, matching the old `iter().find` scan this replaced.
@@ -419,6 +426,10 @@ impl<'a> RowView<'a> {
 
     pub fn has_conflict(&self) -> bool {
         self.flags() & commit_flags::HAS_CONFLICT != 0
+    }
+
+    pub fn is_divergent(&self) -> bool {
+        self.flags() & commit_flags::IS_DIVERGENT != 0
     }
 
     pub fn is_working_copy(&self) -> bool {
@@ -592,6 +603,11 @@ pub enum DiffFileStatus {
     Deleted,
     Modified,
     Renamed,
+    /// The file is in an unresolved conflicted state in the revision's tree
+    /// (jj only). Synthesized for conflicted files the parent-tree diff
+    /// doesn't cover — e.g. every conflict of a fresh conflicted merge, whose
+    /// tree *is* the merge of its parents and so diffs empty.
+    Conflicted,
 }
 
 impl DiffFileStatus {
@@ -601,6 +617,7 @@ impl DiffFileStatus {
             Self::Deleted => "Deleted",
             Self::Modified => "Modified",
             Self::Renamed => "Renamed",
+            Self::Conflicted => "Conflict",
         }
     }
 
@@ -610,6 +627,7 @@ impl DiffFileStatus {
             Self::Deleted => "D",
             Self::Modified => "M",
             Self::Renamed => "R",
+            Self::Conflicted => "C",
         }
     }
 }

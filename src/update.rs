@@ -642,9 +642,16 @@ impl Diffui {
                     // A working-copy diff is the definitive emptiness signal for
                     // @ (files present ⇒ not empty) — capture it before
                     // `document` moves so a watcher-refresh edit toggles the @
-                    // "empty" chip without a graph re-walk.
-                    let wc_empty = matches!(revision, RevisionSelection::WorkingCopy)
-                        .then(|| document.files.is_empty());
+                    // "empty" chip without a graph re-walk. Synthesized
+                    // conflict entries don't count: jj calls a conflicted
+                    // merge whose tree is exactly its parents' merge "empty",
+                    // and the chip should agree with the graph walk.
+                    let wc_empty = matches!(revision, RevisionSelection::WorkingCopy).then(|| {
+                        document
+                            .files
+                            .iter()
+                            .all(|file| file.status == diffui_core::DiffFileStatus::Conflicted)
+                    });
 
                     // PR tab: park the outgoing document under the key it was
                     // shown for, so flipping back ("All changes" ↔ a commit)
@@ -702,7 +709,12 @@ impl Diffui {
                     if is_active {
                         self.document_version = self.document_version.wrapping_add(1);
                     }
-                    return self.spawn_highlights(document_id);
+                    // Drain a refresh coalesced while this diff load was in
+                    // flight (e.g. an op-log signal during a watcher reload) —
+                    // this arm returns early, so it would otherwise wait for
+                    // the next unrelated message to hit the fall-through.
+                    let pending = self.take_pending_refresh();
+                    return Task::batch([self.spawn_highlights(document_id), pending]);
                 }
                 Err(error) => {
                     let Some(target) = self.tab_target_mut(tab) else {
@@ -728,10 +740,37 @@ impl Diffui {
                     return Task::none();
                 }
                 self.session.snapshot_pending = false;
-                if self.session.repository_snapshot.as_ref() != Some(&snapshot)
+                let changed = self
+                    .session
+                    .repository_snapshot
+                    .as_ref()
+                    .map(|reflected| reflected.fingerprint.as_str())
+                    != Some(snapshot.fingerprint.as_str());
+                if changed
                     && self.session.pending_revision.is_none()
                     && let Some(source) = self.session.source.clone()
                 {
+                    // Escalate a watcher (diff-only) refresh to a full reload
+                    // when ops other than our own snapshot landed since the
+                    // graph was walked: the snapshot's parent op should be
+                    // exactly the op the graph reflects. A CLI `jj edit` /
+                    // `jj rebase` fires worktree + op-log signals in one
+                    // debounce window; the worktree signal wins the race and
+                    // this snapshot advances the fingerprint *past* the
+                    // external op — without the escalation, that swallowed the
+                    // topology change and the graph stayed stale.
+                    let external_op = match (
+                        self.session.repository_snapshot.as_ref(),
+                        snapshot.parent_fingerprint.as_deref(),
+                    ) {
+                        (Some(reflected), Some(parent)) => reflected.fingerprint != parent,
+                        _ => false,
+                    };
+                    let origin = if external_op {
+                        RefreshOrigin::Focus
+                    } else {
+                        origin
+                    };
                     match origin {
                         RefreshOrigin::Watcher => {
                             // A working-tree edit moved @'s tree but not the
@@ -1105,20 +1144,30 @@ impl Diffui {
             }
             Message::OpLogChanged => {
                 // An op landed. Read the head cheaply (off-thread, no wc lock)
-                // and let `OpHeadChecked` decide; skip while busy (a reload in
-                // flight will reconcile) or mid-mutation (the post-batch reload
-                // covers it). Gated on focus like the watcher refresh — ops that
-                // land while unfocused are caught by the focus-regain reload.
-                if self.app_focused
-                    && !self.mutation_busy()
-                    && !self.session.snapshot_pending
-                    && self.session.load.is_none()
-                    && let Some(source) = self.session.source.clone()
-                    && let Some(tab) = self.active_tab_id()
-                {
-                    return Task::perform(source.op_head(), move |result| {
-                        Message::OpHeadChecked(tab, Box::new(result))
-                    });
+                // and let `OpHeadChecked` decide; while a snapshot/load is
+                // already in flight, coalesce instead of dropping — the
+                // deferred snapshot's parent-op check catches an external op
+                // that landed mid-work (dropping used to lose ops that raced a
+                // cold load). Mid-mutation stays a plain skip (the post-batch
+                // reload re-snapshots). Gated on focus like the watcher
+                // refresh — ops that land while unfocused are caught by the
+                // focus-regain reload.
+                if self.app_focused && !self.mutation_busy() {
+                    if self.session.snapshot_pending
+                        || self.session.load.is_some()
+                        || self.session.pending_revision.is_some()
+                    {
+                        self.session.pending_refresh = Some(coalesce_refresh(
+                            self.session.pending_refresh,
+                            RefreshOrigin::Watcher,
+                        ));
+                    } else if let Some(source) = self.session.source.clone()
+                        && let Some(tab) = self.active_tab_id()
+                    {
+                        return Task::perform(source.op_head(), move |result| {
+                            Message::OpHeadChecked(tab, Box::new(result))
+                        });
+                    }
                 }
             }
             Message::OpHeadChecked(tab, result) => {
