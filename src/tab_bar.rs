@@ -15,7 +15,7 @@ use iced::{
     Background, Border, Color, Element, Length, Padding, alignment,
     font::Weight,
     mouse,
-    widget::{Space, button, column, container, mouse_area, row, stack, text, text_input},
+    widget::{Space, button, column, container, mouse_area, opaque, row, stack, text, text_input},
 };
 
 use crate::chrome;
@@ -481,7 +481,9 @@ pub fn build_confirm_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
             left: 0.0,
         });
 
-    stack![scrim, centered].into()
+    // `opaque` keeps wheel events and the cursor from bleeding through to the
+    // shell below the modal (see `activity_popover` for the mechanics).
+    opaque(stack![scrim, centered])
 }
 
 /// True when the repo behind `tab` has a non-empty working copy. Best-effort:
@@ -743,5 +745,7 @@ pub fn build_open_repo_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Mess
             left: 0.0,
         });
 
-    stack![scrim, centered].into()
+    // `opaque` keeps wheel events and the cursor from bleeding through to the
+    // shell below the modal (see `activity_popover` for the mechanics).
+    opaque(stack![scrim, centered])
 }

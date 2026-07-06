@@ -4,9 +4,10 @@
 //! The toolbar shows the *active* tab's log: a right-edge indicator (spinner +
 //! the first running task's label + a `+N` chip when several run at once) and a
 //! thin progress line along the toolbar's bottom edge. Clicking the indicator
-//! opens a popover listing every entry with a progress bar, percentage, and a
-//! status icon; each row expands to its captured output (remote sideband, e.g.
-//! GitHub's "Create a pull request" hint, with clickable URLs).
+//! opens a popover listing every entry: a status icon, the title, a one-line
+//! result summary underneath, and the elapsed time. Rows with captured output
+//! expand into a code block showing the remote sideband (e.g. GitHub's
+//! "Create a pull request" hint, with clickable URLs).
 //!
 //! Entries are **persistent**: running and finished alike stay until the user
 //! clears them or the app restarts — nothing auto-dismisses.
@@ -17,7 +18,8 @@ use iced::{
     Background, Border, Color, Element, Length, Padding, alignment,
     font::Weight,
     widget::{
-        Space, button, column, container, mouse_area, row, scrollable, stack, text, text_input,
+        Space, button, column, container, mouse_area, opaque, row, scrollable, stack, text,
+        text_editor,
     },
 };
 
@@ -70,10 +72,17 @@ pub struct Activity {
     pub determinate: bool,
     /// Captured output lines (remote messages / errors), shown when expanded.
     pub detail: Vec<String>,
-    /// One-line summary recorded on finish.
+    /// One-line summary recorded on finish, shown under the title.
     pub result: Option<String>,
     pub started: Instant,
+    /// Wall time from start to finish, frozen by [`ActivityLog::finish`].
+    pub duration: Option<Duration>,
     pub expanded: bool,
+    /// The expanded row's output as one read-only `text_editor` buffer — a
+    /// single buffer so a selection can sweep across lines (separate per-line
+    /// widgets each hold their own). `Some` exactly while `expanded` with any
+    /// `detail`; rebuilt from `detail` by [`Activity::sync_detail_editor`].
+    pub detail_editor: Option<text_editor::Content>,
 }
 
 impl Activity {
@@ -81,6 +90,15 @@ impl Activity {
     fn progress_snapshot(&self) -> (usize, usize, bool) {
         let (loaded, total) = self.progress.snapshot();
         (loaded, total, self.determinate && total > 0)
+    }
+
+    /// (Re)build the output editor to mirror `detail`, or drop it when the
+    /// row is collapsed (or has nothing to show). Called on expand/collapse
+    /// and whenever output lands on an already-open row, so the buffer never
+    /// goes stale.
+    fn sync_detail_editor(&mut self) {
+        self.detail_editor = (self.expanded && !self.detail.is_empty())
+            .then(|| text_editor::Content::with_text(&self.detail.join("\n")));
     }
 }
 
@@ -112,7 +130,9 @@ impl ActivityLog {
             detail: Vec::new(),
             result: None,
             started: Instant::now(),
+            duration: None,
             expanded: false,
+            detail_editor: None,
         });
         progress
     }
@@ -120,6 +140,7 @@ impl ActivityLog {
     pub fn append_output(&mut self, id: ActivityId, line: impl Into<String>) {
         if let Some(activity) = self.get_mut(id) {
             activity.detail.push(line.into());
+            activity.sync_detail_editor();
         }
     }
 
@@ -128,12 +149,14 @@ impl ActivityLog {
     pub fn extend_output(&mut self, id: ActivityId, lines: impl IntoIterator<Item = String>) {
         if let Some(activity) = self.get_mut(id) {
             activity.detail.extend(lines);
+            activity.sync_detail_editor();
         }
     }
 
     pub fn finish(&mut self, id: ActivityId, status: ActivityStatus, result: Option<String>) {
         if let Some(activity) = self.get_mut(id) {
             activity.status = status;
+            activity.duration = Some(activity.started.elapsed());
             if result.is_some() {
                 activity.result = result;
             }
@@ -151,6 +174,21 @@ impl ActivityLog {
     pub fn toggle_expand(&mut self, id: ActivityId) {
         if let Some(activity) = self.get_mut(id) {
             activity.expanded = !activity.expanded;
+            activity.sync_detail_editor();
+        }
+    }
+
+    /// Apply a `text_editor` action to an expanded row's output buffer.
+    /// Edit actions are dropped here — the buffer is a read-only view of the
+    /// captured output; only caret, selection, and scroll go through.
+    pub fn perform_detail_action(&mut self, id: ActivityId, action: text_editor::Action) {
+        if action.is_edit() {
+            return;
+        }
+        if let Some(activity) = self.get_mut(id)
+            && let Some(editor) = activity.detail_editor.as_mut()
+        {
+            editor.perform(action);
         }
     }
 
@@ -387,8 +425,8 @@ pub fn activity_popover(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
 
     let header = row![
         text("Activity")
-            .size(13)
-            .font(emphasis_font(ui.config.ui_font, Weight::Medium))
+            .size(14)
+            .font(emphasis_font(ui.config.ui_font, Weight::Semibold))
             .color(theme.text),
         Space::new().width(Length::Fill),
         clear_button(ui, theme),
@@ -399,10 +437,13 @@ pub fn activity_popover(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     let mut list = column![].spacing(2);
     if ui.activities.is_empty() {
         list = list.push(
-            text("No activity yet.")
-                .size(12)
-                .font(ui.config.ui_font)
-                .color(theme.subtle_text),
+            container(
+                text("No activity yet.")
+                    .size(12)
+                    .font(ui.config.ui_font)
+                    .color(theme.subtle_text),
+            )
+            .padding(Padding::from([6, 8])),
         );
     } else {
         // Newest first so the latest op is on top.
@@ -411,8 +452,17 @@ pub fn activity_popover(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         }
     }
 
+    // The card carries no padding of its own so the divider can run edge to
+    // edge; the header/list insets are chosen so the rows' status icons (list
+    // pad 8 + row pad 8) sit exactly under the header text (pad 16), and the
+    // Clear label's right edge (pad 8 + button pad 8) over the durations.
     let body = column![
-        header,
+        container(header).width(Length::Fill).padding(Padding {
+            top: 12.0,
+            right: 8.0,
+            bottom: 10.0,
+            left: 16.0,
+        }),
         container(Space::new())
             .width(Length::Fill)
             .height(Length::Fixed(1.0))
@@ -422,14 +472,18 @@ pub fn activity_popover(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
                 .height(Length::Shrink)
                 .style(move |_, s| iced_scrollable_style(theme, s)),
         )
-        .max_height(520.0),
-    ]
-    .spacing(10);
+        .max_height(520.0)
+        .padding(Padding {
+            top: 6.0,
+            right: 8.0,
+            bottom: 8.0,
+            left: 8.0,
+        }),
+    ];
 
     let card = mouse_area(
         container(body)
             .width(Length::Fixed(420.0))
-            .padding(Padding::from([16, 18]))
             .style(move |_| card_style(theme)),
     )
     .on_press(Message::ActivityNoOp);
@@ -446,8 +500,21 @@ pub fn activity_popover(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             left: 0.0,
         });
 
-    stack![scrim, anchored].into()
+    // `opaque` makes the whole layer report a mouse interaction, which the
+    // view's outer `stack!` uses to levitate the cursor away from the shell
+    // underneath. Without it the popover was mouse-transparent wherever it
+    // didn't handle events itself: wheel scrolling over the card scrolled the
+    // diff view behind it, and the diff text's I-beam cursor bled through.
+    opaque(stack![scrim, anchored])
 }
+
+/// Side of the fixed square box the status glyph is centered in, so every
+/// row's title starts at the same x whether the glyph comes from the mono
+/// font (spinner, queued `…`) or the icon font (check / cross).
+const STATUS_ICON_BOX: f32 = 14.0;
+/// Left inset that aligns the subtitle / progress bar / code block with the
+/// title text (status box + the head row's spacing).
+const TITLE_INDENT: f32 = STATUS_ICON_BOX + 8.0;
 
 fn activity_row<'a>(
     ui: &'a Diffui,
@@ -456,62 +523,80 @@ fn activity_row<'a>(
 ) -> Element<'a, Message> {
     let mono = ui.config.mono_font;
     let (loaded, total, determinate) = activity.progress_snapshot();
+    let expandable = !activity.detail.is_empty();
 
-    let (icon, icon_color, icon_font): (&'static str, _, _) = match activity.status {
-        ActivityStatus::Queued => ("\u{2026}", theme.subtle_text, mono), // … waiting
-        ActivityStatus::Running => (spinner_glyph(activity.started), theme.accent, mono),
-        ActivityStatus::Done => (icons::CHECK, theme.added_text, icons::ICON_FONT),
-        ActivityStatus::Error => (icons::CLOSE, theme.removed_text, icons::ICON_FONT),
-    };
-
-    let label = activity.result.as_deref().unwrap_or(&activity.label);
     let mut head = row![
-        text(icon).size(12).font(icon_font).color(icon_color),
-        text(label)
+        status_icon(activity, theme, mono),
+        text(activity.label.as_str())
             .size(12)
-            .font(ui.config.ui_font)
-            .color(theme.text),
-        Space::new().width(Length::Fill),
+            .font(emphasis_font(ui.config.ui_font, Weight::Medium))
+            .color(theme.text)
+            .wrapping(text::Wrapping::None)
+            .ellipsis(text::Ellipsis::End)
+            .width(Length::Fill),
     ]
     .spacing(8)
     .align_y(alignment::Vertical::Center);
 
-    if determinate {
-        let pct = (loaded * 100 / total.max(1)).min(100);
+    if matches!(activity.status, ActivityStatus::Running) {
+        if determinate {
+            let pct = (loaded * 100 / total.max(1)).min(100);
+            head = head.push(
+                text(format!("{pct}%"))
+                    .size(11)
+                    .font(mono)
+                    .color(theme.muted_text),
+            );
+        } else if loaded > 0 {
+            // Indeterminate but counting (the jj lazy walk has no known total):
+            // surface the running count.
+            head = head.push(
+                text(loaded.to_string())
+                    .size(11)
+                    .font(mono)
+                    .color(theme.muted_text),
+            );
+        }
+    } else if let Some(duration) = activity.duration {
         head = head.push(
-            text(format!("{pct}%"))
+            text(format_duration(duration))
                 .size(11)
-                .font(mono)
-                .color(theme.muted_text),
-        );
-    } else if matches!(activity.status, ActivityStatus::Running) && loaded > 0 {
-        // Indeterminate but counting (the jj lazy walk has no known total):
-        // surface the running count.
-        head = head.push(
-            text(loaded.to_string())
-                .size(11)
-                .font(mono)
-                .color(theme.muted_text),
-        );
-    }
-    if !activity.detail.is_empty() {
-        let chevron = if activity.expanded {
-            icons::CHEVRON_DOWN
-        } else {
-            icons::CHEVRON_RIGHT
-        };
-        head = head.push(
-            text(chevron)
-                .size(11)
-                .font(icons::ICON_FONT)
+                .font(ui.config.ui_font)
                 .color(theme.subtle_text),
         );
     }
+    if expandable {
+        let chevron = if activity.expanded {
+            icons::CHEVRON_UP
+        } else {
+            icons::CHEVRON_DOWN
+        };
+        head = head.push(icons::icon(chevron, 13.0, theme.subtle_text));
+    }
 
-    // Header (status + label + the determinate bar). This is the click target
-    // that toggles the detail; the detail itself sits *outside* it, so dragging
-    // to select text there doesn't collapse the row.
-    let mut header = column![head].spacing(4);
+    // Header (title line + result subtitle + the determinate bar). This is the
+    // click target that toggles the detail; the detail itself sits *outside*
+    // it, so dragging to select text there doesn't collapse the row.
+    let mut header = column![head].spacing(3);
+    if let Some(result) = activity.result.as_deref() {
+        header = header.push(
+            container(
+                text(result)
+                    .size(11.5)
+                    .font(ui.config.ui_font)
+                    .color(theme.muted_text)
+                    .wrapping(text::Wrapping::None)
+                    .ellipsis(text::Ellipsis::End),
+            )
+            .width(Length::Fill)
+            .padding(Padding {
+                top: 0.0,
+                right: 0.0,
+                bottom: 0.0,
+                left: TITLE_INDENT,
+            }),
+        );
+    }
     if matches!(activity.status, ActivityStatus::Running) && determinate {
         let accent = theme.accent;
         let fill = ((loaded as f32 / total as f32).clamp(0.0, 1.0) * 1000.0) as u16;
@@ -533,7 +618,12 @@ fn activity_row<'a>(
                     .style(move |_| rounded(chip_background(theme.muted_text))),
             );
         }
-        header = header.push(bar);
+        header = header.push(container(bar).width(Length::Fill).padding(Padding {
+            top: 1.0,
+            right: 0.0,
+            bottom: 0.0,
+            left: TITLE_INDENT,
+        }));
     }
 
     let id = activity.id;
@@ -543,80 +633,54 @@ fn activity_row<'a>(
             .padding(Padding::from([6, 8])),
     );
     // Only rows with captured output expand on click.
-    let header_area: Element<'a, Message> = if activity.detail.is_empty() {
-        header_area.into()
-    } else {
+    let header_area: Element<'a, Message> = if expandable {
         header_area.on_press(Message::ActivityExpand(id)).into()
+    } else {
+        header_area.into()
     };
 
-    if !activity.expanded || activity.detail.is_empty() {
+    if !activity.expanded || !expandable {
         return header_area;
     }
 
-    // Expanded: the captured output, indented under the header. Each line is
-    // selectable (a read-only text field) so it can be copied; lines carrying a
-    // URL keep their one-click link instead.
-    let mut detail = column![].spacing(1);
-    for line in &activity.detail {
-        detail = detail.push(detail_line(line, mono, theme));
-    }
-    column![
-        header_area,
-        container(detail).width(Length::Fill).padding(Padding {
-            top: 0.0,
-            right: 8.0,
-            bottom: 6.0,
-            left: 8.0,
-        }),
-    ]
-    .into()
-}
-
-/// Render one output line, turning whitespace-delimited `http(s)://…` tokens
-/// into clickable links. Preserves the rest as monospace text.
-fn detail_line<'a>(line: &'a str, mono: iced::Font, theme: ThemeSpec) -> Element<'a, Message> {
-    if !line.contains("http://") && !line.contains("https://") {
-        // Read-only but selectable: a no-op `on_input` keeps the value pinned to
-        // `line` while still letting the user drag-select and ⌘C it — a plain
-        // `text` widget can't be selected at all. Styled to read as plain mono
-        // text (transparent, borderless, no internal padding).
-        return text_input("", line)
-            .font(mono)
+    // Expanded: the captured output in a code block under the header — one
+    // read-only text_editor holding every line, so drag-selection sweeps
+    // across lines and ⌘C copies the sweep (per-line widgets each trapped
+    // the selection). Long lines wrap instead of panning individually. URLs
+    // in the output stay plain selectable text; each one also gets a
+    // one-click link under the buffer.
+    let Some(editor) = activity.detail_editor.as_ref() else {
+        return header_area;
+    };
+    let mut block_body = column![
+        text_editor(editor)
             .size(11)
+            .font(mono)
             .padding(0)
-            .on_input(|_| Message::ActivityNoOp)
-            .style(move |_, _| text_input::Style {
+            .wrapping(text::Wrapping::WordOrGlyph)
+            .on_action(move |action| Message::ActivityDetailAction(id, action))
+            .style(move |_, _| text_editor::Style {
                 background: Background::Color(Color::TRANSPARENT),
                 border: Border {
                     width: 0.0,
                     color: Color::TRANSPARENT,
                     radius: 0.0.into(),
                 },
-                icon: theme.subtle_text,
                 placeholder: theme.subtle_text,
                 value: theme.muted_text,
                 selection: Color {
                     a: 0.25,
                     ..theme.accent
                 },
-            })
-            .into();
-    }
-
-    let mut row_widgets = row![].spacing(0).align_y(alignment::Vertical::Center);
-    let mut first = true;
-    for token in line.split(' ') {
-        let token = if first {
-            first = false;
-            token.to_owned()
-        } else {
-            format!(" {token}")
-        };
-        let trimmed = token.trim_start();
-        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-            let url = trimmed.to_owned();
-            row_widgets = row_widgets.push(
-                button(text(token).size(11).font(mono).color(theme.info))
+            }),
+    ]
+    .spacing(6);
+    let urls = detail_urls(&activity.detail);
+    if !urls.is_empty() {
+        let mut links = column![].spacing(2);
+        for url in urls {
+            links = links.push(
+                button(text(url.clone()).size(11).font(mono).color(theme.info))
                     .padding(0)
                     .on_press(Message::OpenUrl(url))
                     .style(move |_, _| button::Style {
@@ -631,11 +695,80 @@ fn detail_line<'a>(line: &'a str, mono: iced::Font, theme: ThemeSpec) -> Element
                         snap: true,
                     }),
             );
-        } else {
-            row_widgets = row_widgets.push(text(token).size(11).font(mono).color(theme.muted_text));
+        }
+        block_body = block_body.push(links);
+    }
+    let block = container(block_body)
+        .width(Length::Fill)
+        .padding(Padding::from([8, 10]))
+        .clip(true)
+        .style(move |_| code_block_style(theme));
+    column![
+        header_area,
+        container(block).width(Length::Fill).padding(Padding {
+            top: 2.0,
+            right: 8.0,
+            bottom: 8.0,
+            left: 8.0 + TITLE_INDENT,
+        }),
+    ]
+    .into()
+}
+
+/// Status glyph centered in the fixed [`STATUS_ICON_BOX`] square.
+fn status_icon<'a>(activity: &Activity, theme: ThemeSpec, mono: iced::Font) -> Element<'a, Message> {
+    match activity.status {
+        ActivityStatus::Queued => mono_glyph("\u{2026}", mono, theme.subtle_text), // … waiting
+        ActivityStatus::Running => mono_glyph(spinner_glyph(activity.started), mono, theme.accent),
+        ActivityStatus::Done => icons::icon(icons::CHECK, STATUS_ICON_BOX, theme.added_text),
+        ActivityStatus::Error => icons::icon(icons::CLOSE, STATUS_ICON_BOX, theme.removed_text),
+    }
+}
+
+/// A mono-font glyph boxed like [`icons::icon`] so both glyph sources center
+/// identically.
+fn mono_glyph<'a>(glyph: &'a str, mono: iced::Font, color: Color) -> Element<'a, Message> {
+    container(
+        text(glyph)
+            .font(mono)
+            .size(12)
+            .color(color)
+            .line_height(text::LineHeight::Relative(1.0)),
+    )
+    .center_x(Length::Fixed(STATUS_ICON_BOX))
+    .center_y(Length::Fixed(STATUS_ICON_BOX))
+    .into()
+}
+
+/// Compact elapsed-time label: "340ms", "1.5s", "42s", "1m 12s".
+fn format_duration(duration: Duration) -> String {
+    let ms = duration.as_millis();
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else if ms < 10_000 {
+        format!("{:.1}s", duration.as_secs_f32())
+    } else if ms < 60_000 {
+        format!("{}s", duration.as_secs())
+    } else {
+        format!("{}m {}s", duration.as_secs() / 60, duration.as_secs() % 60)
+    }
+}
+
+/// Unique whitespace-delimited `http(s)://…` tokens across the captured
+/// output, in first-seen order — each becomes a one-click link under the
+/// output editor.
+fn detail_urls(detail: &[String]) -> Vec<String> {
+    let mut urls: Vec<String> = Vec::new();
+    for line in detail {
+        for token in line.split_whitespace() {
+            if (token.starts_with("http://") || token.starts_with("https://"))
+                && !urls.iter().any(|url| url == token)
+            {
+                urls.push(token.to_owned());
+            }
         }
     }
-    row_widgets.into()
+    urls
 }
 
 fn clear_button(ui: &Diffui, theme: ThemeSpec) -> Element<'static, Message> {
@@ -695,6 +828,20 @@ fn solid(color: Color) -> container::Style {
     }
 }
 
+/// The expanded row's code block: a soft rounded wash behind the `$ command`
+/// and output lines.
+fn code_block_style(theme: ThemeSpec) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(chip_background(theme.subtle_text))),
+        border: Border {
+            width: 0.0,
+            color: Color::TRANSPARENT,
+            radius: 6.0.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
 fn rounded(color: Color) -> container::Style {
     container::Style {
         background: Some(Background::Color(color)),
@@ -747,6 +894,36 @@ mod tests {
         log.finish(ActivityId(1), ActivityStatus::Done, Some("done".to_owned()));
         assert!(!log.any_running());
         assert!(log.first_running().is_none());
+    }
+
+    #[test]
+    fn expand_builds_output_editor_and_collapse_drops_it() {
+        let mut log = ActivityLog::default();
+        log.start(ActivityId(1), "Push", false);
+        log.append_output(ActivityId(1), "remote: hi");
+        // Collapsed: no editor even though output exists.
+        assert!(log.activities[0].detail_editor.is_none());
+
+        log.toggle_expand(ActivityId(1));
+        let editor = log.activities[0].detail_editor.as_ref().expect("built");
+        assert_eq!(editor.text().trim_end(), "remote: hi");
+
+        // Output landing while the row is open keeps the buffer in sync.
+        log.append_output(ActivityId(1), "remote: bye");
+        let editor = log.activities[0].detail_editor.as_ref().expect("kept");
+        assert_eq!(editor.text().trim_end(), "remote: hi\nremote: bye");
+
+        log.toggle_expand(ActivityId(1));
+        assert!(log.activities[0].detail_editor.is_none());
+    }
+
+    #[test]
+    fn finish_freezes_duration() {
+        let mut log = ActivityLog::default();
+        log.start(ActivityId(1), "Fetching all remotes", false);
+        assert!(log.activities[0].duration.is_none());
+        log.finish(ActivityId(1), ActivityStatus::Done, None);
+        assert!(log.activities[0].duration.is_some());
     }
 
     #[test]

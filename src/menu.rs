@@ -25,7 +25,7 @@ use iced::{
     Background, Border, Color, Element, Event, Length, Padding, Point, Rectangle, Size, Theme,
     alignment,
     widget::{
-        Space, column, container, mouse_area, pin, row, scrollable,
+        Space, column, container, mouse_area, opaque, pin, row, scrollable,
         scrollable::{Direction, Scrollbar},
         stack, text,
     },
@@ -294,10 +294,15 @@ pub(crate) fn build_overlay(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
 
     push_trajectory_debug(&mut layers, ui, menu);
 
-    stack(layers)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+    // The Backdrop swallows *events*, but `mouse_interaction` is a separate
+    // per-layer query that ignores event capture — without `opaque`, the app
+    // underneath still painted its own cursor (the diff view's I-beam)
+    // through the menu scrim.
+    opaque(
+        stack(layers)
+            .width(Length::Fill)
+            .height(Length::Fill),
+    )
 }
 
 /// Draws the submenu trajectory triangle over the open menu: the apex (blue),

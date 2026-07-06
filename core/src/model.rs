@@ -105,6 +105,15 @@ pub struct CommitSummary {
     /// Whether the change id maps to more than one visible commit (jj's
     /// "divergent change"). `false` for backends without change ids (git).
     pub is_divergent: bool,
+    /// Whether the commit is *not* among its change id's visible commits —
+    /// rewritten/abandoned but still in the graph because a ref pins it
+    /// (e.g. a stale remote bookmark), jj log's "(hidden)". `false` for git.
+    pub is_hidden: bool,
+    /// The commit's position in its change id's target list when the change
+    /// is divergent or this copy is hidden — jj log's `changeid/N` suffix,
+    /// which revsets accept to address one copy (`xyz/1`). `None` for the
+    /// common single-visible case (and always for git).
+    pub change_offset: Option<usize>,
     pub is_working_copy: bool,
     /// Bookmarks pointing at this commit. Local bookmarks are bare
     /// names; remote-tracking ones are `name@remote`. Order matches
@@ -119,6 +128,7 @@ mod commit_flags {
     pub const HAS_CONFLICT: u8 = 1 << 3;
     pub const IS_WORKING_COPY: u8 = 1 << 4;
     pub const IS_DIVERGENT: u8 = 1 << 5;
+    pub const IS_HIDDEN: u8 = 1 << 6;
 }
 
 /// Byte range `[start, start+len)` into a [`CommitStore`]'s text arena.
@@ -149,6 +159,9 @@ pub struct CommitStore {
     shortest_change_id_len: Vec<u32>,
     flags: Vec<u8>,
     bookmarks: HashMap<usize, Vec<String>>,
+    /// `changeid/N` display offsets, stored sparsely — only divergent or
+    /// hidden copies carry one (see [`CommitSummary::change_offset`]).
+    change_offsets: HashMap<usize, u32>,
     /// Reverse index: bookmark name → owning row. Bookmark names are unique per
     /// ref, so this is 1:1 and lets `find_by_bookmark` resolve in O(1) instead
     /// of scanning every commit (the palette hits this per displayed row).
@@ -315,6 +328,12 @@ impl CommitStore {
         if commit.is_divergent {
             flags |= commit_flags::IS_DIVERGENT;
         }
+        if commit.is_hidden {
+            flags |= commit_flags::IS_HIDDEN;
+        }
+        if let Some(offset) = commit.change_offset {
+            self.change_offsets.insert(index, offset as u32);
+        }
         if commit.is_working_copy {
             flags |= commit_flags::IS_WORKING_COPY;
             // First-wins, matching the old `iter().find` scan this replaced.
@@ -372,6 +391,7 @@ impl CommitStore {
             total += names.iter().map(|name| name.capacity()).sum::<usize>();
         }
         total += self.bookmarks.capacity() * (size_of::<usize>() + size_of::<Vec<String>>());
+        total += self.change_offsets.capacity() * (size_of::<usize>() + size_of::<u32>());
         total
     }
 }
@@ -430,6 +450,17 @@ impl<'a> RowView<'a> {
 
     pub fn is_divergent(&self) -> bool {
         self.flags() & commit_flags::IS_DIVERGENT != 0
+    }
+
+    pub fn is_hidden(&self) -> bool {
+        self.flags() & commit_flags::IS_HIDDEN != 0
+    }
+
+    pub fn change_offset(&self) -> Option<usize> {
+        self.store
+            .change_offsets
+            .get(&self.index)
+            .map(|offset| *offset as usize)
     }
 
     pub fn is_working_copy(&self) -> bool {

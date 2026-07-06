@@ -24,7 +24,7 @@ use iced::{
     border,
     font::Weight,
     widget::{
-        Space, column, container, mouse_area, pin, responsive, row, scrollable,
+        Space, column, container, mouse_area, opaque, pin, responsive, row, scrollable,
         scrollable::{Direction, Scrollbar},
         stack, text, text_input,
     },
@@ -891,9 +891,14 @@ pub fn build_overlay<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Messag
     // first and consumes them while it can scroll; once it hits its
     // limit, unhandled delta bubbles up and this outer mouse_area
     // captures it so the diff view behind doesn't move.
-    mouse_area(stack![scrim, palette_block])
-        .on_scroll(|_| Message::Palette(PaletteMessage::NoOp))
-        .into()
+    //
+    // `opaque` closes the remaining hole: `mouse_interaction` is queried
+    // per-layer regardless of event capture, so without it the diff text's
+    // I-beam cursor still showed through the scrim.
+    opaque(
+        mouse_area(stack![scrim, palette_block])
+            .on_scroll(|_| Message::Palette(PaletteMessage::NoOp)),
+    )
 }
 
 fn build_column<'a>(

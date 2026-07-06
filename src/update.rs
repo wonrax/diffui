@@ -1055,7 +1055,14 @@ impl Diffui {
                         .find_by_commit_id(hex)
                         .map(|c| {
                             let len = c.shortest_change_id_len().unwrap_or(8).max(8);
-                            c.change_id().chars().take(len).collect::<String>()
+                            let mut id: String = c.change_id().chars().take(len).collect();
+                            // Divergent/hidden copies read as `changeid/N`,
+                            // like the sidebar and jj log.
+                            if let Some(offset) = c.change_offset() {
+                                id.push('/');
+                                id.push_str(&offset.to_string());
+                            }
+                            id
                         })
                         .unwrap_or_else(|| hex.chars().take(12).collect()),
                 };
@@ -1621,14 +1628,27 @@ impl Diffui {
             Message::Fetch(target) => {
                 return self.start_fetch(target);
             }
-            Message::FetchCompleted(tab_id, id, result) => {
-                return self.finish_remote_op(tab_id, id, *result);
+            Message::FetchCompleted(tab_id, id, target, result) => {
+                // "Up to date" when the remote sent nothing back; otherwise
+                // name the fetched target (the title may be ellipsized, the
+                // subtitle shows it in full).
+                let summary = match result.as_ref() {
+                    Err(_) => None,
+                    Ok(lines) if lines.is_empty() => Some("Fetched · up to date".to_owned()),
+                    Ok(_) => Some(match &target {
+                        FetchTarget::AllRemotes => "Fetched all remotes".to_owned(),
+                        FetchTarget::RemoteBranch { remote, branch } => {
+                            format!("Fetched {remote}/{branch}")
+                        }
+                    }),
+                };
+                return self.finish_remote_op(tab_id, id, *result, summary);
             }
             Message::Undo => {
                 return self.start_undo();
             }
             Message::UndoCompleted(tab_id, id, result) => {
-                return self.finish_remote_op(tab_id, id, *result);
+                return self.finish_remote_op(tab_id, id, *result, None);
             }
             Message::RevsetChanged(value) => {
                 self.session.revset = value;
@@ -1734,6 +1754,11 @@ impl Diffui {
             }
             Message::ActivityExpand(id) => {
                 self.activities.toggle_expand(id);
+            }
+            Message::ActivityDetailAction(id, action) => {
+                // Selection/caret/scroll only — the log drops edit actions,
+                // keeping the output buffer read-only.
+                self.activities.perform_detail_action(id, action);
             }
             Message::ActivityClear => {
                 self.activities.clear_finished();
@@ -2591,20 +2616,22 @@ impl Diffui {
     }
 
     /// Finish a remote op's activity (fetch / undo) on its tab, recording the
-    /// captured output or error, then — on success, if it's still the active
-    /// tab — reload so the new commits/state appear.
+    /// captured output or error — `success_result` becomes the row's subtitle
+    /// summary on success — then, if it's still the active tab, reload so the
+    /// new commits/state appear.
     pub(crate) fn finish_remote_op(
         &mut self,
         tab_id: TabId,
         id: activity::ActivityId,
         result: Result<Vec<String>, String>,
+        success_result: Option<String>,
     ) -> Task<Message> {
         let ok = result.is_ok();
         if let Some(log) = self.activity_log_for(tab_id) {
             match result {
                 Ok(lines) => {
                     log.extend_output(id, lines);
-                    log.finish(id, activity::ActivityStatus::Done, None);
+                    log.finish(id, activity::ActivityStatus::Done, success_result);
                 }
                 Err(error) => {
                     log.append_output(id, error.clone());
@@ -2664,12 +2691,13 @@ impl Diffui {
         };
         self.menu = None;
         let label = match &target {
-            FetchTarget::AllRemotes => "Fetch all remotes".to_owned(),
-            FetchTarget::RemoteBranch { remote, branch } => format!("Fetch {branch}@{remote}"),
+            FetchTarget::AllRemotes => "Fetching all remotes".to_owned(),
+            FetchTarget::RemoteBranch { remote, branch } => format!("Fetching {remote}/{branch}"),
         };
         let (id, progress) = self.begin_activity(label, true);
+        let fetched = target.clone();
         Task::perform(source.fetch(target, progress), move |result| {
-            Message::FetchCompleted(tab_id, id, Box::new(result))
+            Message::FetchCompleted(tab_id, id, fetched.clone(), Box::new(result))
         })
     }
 

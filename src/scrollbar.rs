@@ -14,6 +14,10 @@ use iced::{Background, Border, Color, Point, Rectangle, Shadow, border};
 const WIDTH: f32 = 12.0;
 /// Padding from each side of the container to the inner pill track.
 const PADDING: f32 = 2.0;
+/// Floor for the thumb height. Purely proportional sizing collapses the pill
+/// into a barely-grabbable dot on very long documents; this keeps a real
+/// handle while still reading "long". Clamped to the track for tiny panels.
+const MIN_THUMB_HEIGHT: f32 = 32.0;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ScrollbarStyle {
@@ -56,9 +60,9 @@ pub fn geometry(bounds: Rectangle, content_height: f32, offset: f32) -> Scrollba
     let thumb = if content_height <= bounds.height || track.height <= 0.0 || track.width <= 0.0 {
         None
     } else {
-        // Thumb height proportional to viewport/content ratio, but never
-        // shorter than the track width so it stays at least a circle.
-        let min_thumb = track.width;
+        // Thumb height proportional to viewport/content ratio, floored at
+        // MIN_THUMB_HEIGHT so it stays grabbable on huge content.
+        let min_thumb = MIN_THUMB_HEIGHT.min(track.height);
         let raw_h = track.height * (bounds.height / content_height);
         let thumb_h = raw_h.max(min_thumb).min(track.height);
         let scroll_range = (content_height - bounds.height).max(0.0);

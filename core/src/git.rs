@@ -120,7 +120,8 @@ fn git_backend_command(repository: &Repository, revision: &RevisionSelection) ->
 
 /// `git fetch` (all remotes, or a single remote/branch). Captures both stdout
 /// and stderr as lines for the activity log — git writes progress and remote
-/// messages to stderr even on success.
+/// messages to stderr even on success. No output means the fetch was a no-op
+/// (up to date); the caller words the summary.
 pub async fn fetch_git(repository: &Repository, target: &FetchTarget) -> Result<Vec<String>> {
     let args: Vec<OsString> = match target {
         FetchTarget::AllRemotes => {
@@ -132,12 +133,7 @@ pub async fn fetch_git(repository: &Repository, target: &FetchTarget) -> Result<
             OsString::from(branch),
         ],
     };
-    let lines = run_command_lines(&repository.root, "git", args).await?;
-    if lines.is_empty() {
-        Ok(vec!["Fetch complete.".to_owned()])
-    } else {
-        Ok(lines)
-    }
+    run_command_lines(&repository.root, "git", args).await
 }
 
 /// Run a command and return its combined stdout+stderr split into non-empty
@@ -418,6 +414,8 @@ fn build_commit_summaries(rows: Vec<ParsedCommitRow>) -> (Vec<CommitSummary>, Gr
             is_empty: row.is_empty,
             has_conflict: false,
             is_divergent: false,
+            is_hidden: false,
+            change_offset: None,
             is_working_copy: row.is_working_copy,
             bookmarks: Vec::new(),
         })

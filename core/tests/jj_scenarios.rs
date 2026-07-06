@@ -167,6 +167,98 @@ fn divergent_change_is_flagged_on_all_its_commits() {
             .all(|row| !row.is_divergent()),
         "non-divergent rows must not be flagged"
     );
+
+    // Every visible copy carries its change offset (jj log's `xyz/N` suffix);
+    // the untouched rows carry none.
+    let mut offsets: Vec<_> = divergent
+        .iter()
+        .map(|row| row.change_offset().expect("divergent copies have offsets"))
+        .collect();
+    offsets.sort_unstable();
+    assert_eq!(offsets, vec![0, 1], "copies are addressed as xyz/0, xyz/1");
+    assert!(
+        store
+            .iter()
+            .filter(|row| row.change_id() != leaf)
+            .all(|row| row.change_offset().is_none()),
+        "single-copy changes carry no offset"
+    );
+
+    // The suffix is a real revset symbol: `changeid/N` loads exactly the copy
+    // the offset was reported for.
+    for row in &divergent {
+        let symbol = format!("{leaf}/{}", row.change_offset().expect("offset"));
+        let expected = row.commit_id().to_owned();
+        let (store, _graph, _branch, _bookmarks) = block_on(load_jj_commits(
+            root.clone(),
+            symbol.clone(),
+            LoadProgress::default(),
+        ))
+        .unwrap_or_else(|err| panic!("load revset {symbol}: {err:?}"));
+        assert_eq!(store.len(), 1, "{symbol} selects a single revision");
+        assert_eq!(store.row(0).commit_id(), expected, "{symbol} picks its copy");
+    }
+}
+
+/// A rewritten commit stays loadable when a ref (here: an explicit commit id
+/// in the revset, like a stale remote bookmark would) pins it into the graph.
+/// The hidden copy must be flagged and carry the `changeid/N` offset jj log
+/// shows — while the surviving visible copy stays a plain, suffix-less id.
+#[test]
+#[ignore = "shells out to the jj CLI"]
+fn hidden_copy_is_flagged_with_its_change_offset() {
+    let root = scratch_repo("hidden-offset");
+    write(&root, "file.txt", "hello\n");
+    jj(&root, &["commit", "-m", "one"]);
+    let change = change_id(&root, "@-");
+    let old_commit = commit_id(&root, "@-");
+    // Rewrite the commit: the change id keeps pointing at the new commit,
+    // the old one becomes hidden.
+    jj(&root, &["describe", "-r", &change, "-m", "one v2"]);
+    let new_commit = commit_id(&root, "@-");
+    assert_ne!(old_commit, new_commit, "describe must rewrite the commit");
+
+    let (store, _graph, _branch, _bookmarks) = block_on(load_jj_commits(
+        root.clone(),
+        format!("{old_commit} | all()"),
+        LoadProgress::default(),
+    ))
+    .expect("load commits with the hidden copy pinned");
+
+    let hidden = store
+        .iter()
+        .find(|row| row.commit_id() == old_commit)
+        .expect("hidden copy is in the graph");
+    assert!(hidden.is_hidden(), "the old copy must be flagged hidden");
+    assert!(
+        !hidden.is_divergent(),
+        "one visible copy ⇒ the change is not divergent"
+    );
+    let offset = hidden.change_offset().expect("hidden copy has an offset");
+    assert!(offset > 0, "the visible copy owns offset 0");
+
+    let visible = store
+        .iter()
+        .find(|row| row.commit_id() == new_commit)
+        .expect("visible copy is in the graph");
+    assert!(!visible.is_hidden() && !visible.is_divergent());
+    assert_eq!(
+        visible.change_offset(),
+        None,
+        "a lone visible copy renders without a suffix, like jj log"
+    );
+
+    // The displayed suffix addresses the hidden copy in a revset.
+    let symbol = format!("{change}/{offset}");
+    let (store, _graph, _branch, _bookmarks) = block_on(load_jj_commits(
+        root.clone(),
+        symbol.clone(),
+        LoadProgress::default(),
+    ))
+    .unwrap_or_else(|err| panic!("load revset {symbol}: {err:?}"));
+    assert_eq!(store.len(), 1);
+    assert_eq!(store.row(0).commit_id(), old_commit);
+    assert!(store.row(0).is_hidden());
 }
 
 /// Opening a secondary workspace (`jj workspace add`) must resolve `@` to

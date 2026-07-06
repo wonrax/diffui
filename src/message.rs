@@ -2,7 +2,7 @@
 //! `Diffui::update`. Pulled into its own module to tame `main.rs`; variants are
 //! still flat (the self-contained overlay groups get nested in a later pass).
 
-use iced::{Point, Size, theme as iced_theme};
+use iced::{Point, Size, theme as iced_theme, widget::text_editor};
 
 use diffui_core::{
     BackendOutput, CommitsTail, DiffDocument, DiffFile, FetchTarget, RepositorySnapshot,
@@ -170,9 +170,11 @@ pub(crate) enum Message {
     Fetch(FetchTarget),
     /// A fetch finished: captured output lines, or an error. Tab-addressed so a
     /// fetch that completes after a tab switch resolves against the right log.
+    /// Carries the target so the activity's result summary can name it.
     FetchCompleted(
         TabId,
         activity::ActivityId,
+        FetchTarget,
         Box<Result<Vec<String>, String>>,
     ),
     /// Toolbar "Undo": revert the latest jj operation.
@@ -207,6 +209,9 @@ pub(crate) enum Message {
     ActivityToggle,
     /// Expand/collapse one activity row's captured output.
     ActivityExpand(activity::ActivityId),
+    /// A caret/selection/scroll action on an expanded row's read-only output
+    /// editor (edit actions are dropped before reaching the buffer).
+    ActivityDetailAction(activity::ActivityId, text_editor::Action),
     /// Clear finished activities from the active tab's log.
     ActivityClear,
     /// Swallow clicks on the activity card / dropdown so they don't dismiss it.

@@ -295,6 +295,8 @@ pub fn pr_commit_store(commits: &[PrCommit]) -> (CommitStore, GraphLayout) {
         is_empty: Some(false),
         has_conflict: false,
         is_divergent: false,
+        is_hidden: false,
+        change_offset: None,
         is_working_copy: true,
         bookmarks: Vec::new(),
     });
@@ -313,6 +315,8 @@ pub fn pr_commit_store(commits: &[PrCommit]) -> (CommitStore, GraphLayout) {
             is_empty: Some(false),
             has_conflict: false,
             is_divergent: false,
+            is_hidden: false,
+            change_offset: None,
             is_working_copy: false,
             bookmarks: Vec::new(),
         });

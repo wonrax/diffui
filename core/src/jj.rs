@@ -374,16 +374,29 @@ pub async fn walk_jj_with_repo(
                     )
                 })?;
             let bookmarks = bookmarks_by_commit.get(&id).cloned().unwrap_or_default();
-            // Divergent = the change id maps to more than one visible commit
-            // (jj log's `??` marker). Resolved against the repo's change-id
-            // index — the same one the shortest-prefix call above already
-            // built — so this is a lookup per row, not a scan. Best-effort:
-            // an index error just reads as "not divergent".
-            let is_divergent = repo
+            // Divergent = the change id maps to more than one visible commit;
+            // hidden = this commit isn't among them (rewritten, but still in
+            // the walk because a ref — e.g. a stale remote bookmark — pins it
+            // into the revset). Either way jj log suffixes the change id with
+            // the copy's offset (`xyz/1`), which revsets accept to address
+            // one copy — record it so the sidebar can render the same suffix.
+            // Resolved against the repo's change-id index — the same one the
+            // shortest-prefix call above already built — so this is a lookup
+            // per row, not a scan. Best-effort: an index error just reads as
+            // a plain visible commit.
+            let (is_divergent, is_hidden, change_offset) = repo
                 .resolve_change_id(commit.change_id())
                 .ok()
                 .flatten()
-                .is_some_and(|targets| targets.visible_with_offsets().take(2).count() > 1);
+                .map(|targets| {
+                    let divergent = targets.is_divergent();
+                    let hidden = !targets.has_visible(&id);
+                    let offset = (divergent || hidden)
+                        .then(|| targets.find_offset(&id))
+                        .flatten();
+                    (divergent, hidden, offset)
+                })
+                .unwrap_or((false, false, None));
             let summary = CommitSummary {
                 change_id: commit.change_id().to_string(),
                 commit_id: id.hex(),
@@ -398,6 +411,8 @@ pub async fn walk_jj_with_repo(
                 is_empty: None,
                 has_conflict: commit.has_conflict(),
                 is_divergent,
+                is_hidden,
+                change_offset,
                 is_working_copy: id == *wc_commit_id,
                 bookmarks,
             };
@@ -1891,11 +1906,9 @@ pub(crate) async fn fetch_jj(
         .await
         .context("failed to commit fetch")?;
 
-    if lines.is_empty() {
-        Ok(vec!["Fetch complete.".to_owned()])
-    } else {
-        Ok(lines)
-    }
+    // No sideband output means the fetch was a no-op (up to date); the caller
+    // words the summary.
+    Ok(lines)
 }
 
 /// In-process `jj undo`: restore the working state to the parent of the last

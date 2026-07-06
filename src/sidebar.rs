@@ -521,11 +521,17 @@ fn build_revision_row(
     let unique_len = prefix_lens.get(index).copied().unwrap_or(REVISION_ID_CHARS);
     let label_len = revision_id_display_len(unique_len, change_id);
     let id_prefix: String = change_id.chars().take(unique_len).collect();
-    let id_suffix: String = change_id
+    let mut id_suffix: String = change_id
         .chars()
         .skip(unique_len)
         .take(label_len.saturating_sub(unique_len))
         .collect();
+    // jj log prints divergent / hidden copies as `changeid/N`; the suffix is
+    // how a revset addresses one copy (`-r xyz/1`), so render the same form.
+    if let Some(offset) = commit.change_offset() {
+        id_suffix.push('/');
+        id_suffix.push_str(&offset.to_string());
+    }
     let commit_id_short = truncate_end(commit.commit_id(), COMMIT_ID_CHARS);
 
     let lane_color = graph_style.lane_color(lane_frame.node_lane);
@@ -567,10 +573,21 @@ fn build_revision_row(
             border_dashed: false,
         });
     }
-    if commit.is_divergent() {
-        // jj log flags these `??`: the change id maps to several visible
-        // commits. Amber (not conflict-red) — it's a warning about identity,
-        // not about tree state.
+    if commit.is_hidden() {
+        // jj log's "(hidden)": rewritten/abandoned, still shown because a ref
+        // (e.g. a stale remote bookmark) pins it into the revset. Takes
+        // precedence over the divergent chip, matching jj's log template.
+        status_chips.push(IndicatorChip {
+            label: "hidden".to_owned(),
+            background: Color::TRANSPARENT,
+            text_color: theme.subtle_text,
+            border_color: Some(theme.subtle_text),
+            border_dashed: false,
+        });
+    } else if commit.is_divergent() {
+        // jj log flags these with a change-offset suffix: the change id maps
+        // to several visible commits. Amber (not conflict-red) — it's a
+        // warning about identity, not about tree state.
         status_chips.push(IndicatorChip {
             label: "divergent".to_owned(),
             background: chip_background(theme.modified_token),
@@ -1018,6 +1035,8 @@ mod tests {
             is_empty: None,
             has_conflict: false,
             is_divergent: false,
+            is_hidden: false,
+            change_offset: None,
             is_working_copy: false,
             bookmarks: Vec::new(),
         }
