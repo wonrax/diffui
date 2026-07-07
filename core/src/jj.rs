@@ -304,21 +304,16 @@ pub async fn walk_jj_with_repo(
         progress.set_total(upper.unwrap_or(lower));
     }
 
-    // Index bookmarks by commit id once so the per-commit loop below is a
-    // map lookup instead of an O(bookmarks) scan per revision.
+    // Index ref labels by commit id once so the per-commit loop below is a
+    // map lookup instead of an O(refs) scan per revision. Other workspaces'
+    // working copies render as `name@` chips (jj log's `working_copies`
+    // keyword) — `name@` is also valid revset syntax, so the chip doubles as
+    // a palette-jumpable symbol. Our own workspace's `@` keeps the dedicated
+    // working-copy marker instead of a chip. Workspace labels go first,
+    // matching jj log's template order (working_copies before bookmarks), so
+    // the chip rail's tail-dropping `+N` overflow sheds bookmarks before it
+    // sheds a working-copy marker.
     let mut bookmarks_by_commit: HashMap<CommitId, Vec<String>> = HashMap::new();
-    for (name, target) in repo.view().bookmarks() {
-        collect_bookmark_labels(name.as_str(), &target, |id, label| {
-            bookmarks_by_commit
-                .entry(id.clone())
-                .or_default()
-                .push(label);
-        });
-    }
-    // Other workspaces' working copies render as `name@` chips (jj log's
-    // `working_copies` keyword) — `name@` is also valid revset syntax, so the
-    // chip doubles as a palette-jumpable symbol. Our own workspace's `@` keeps
-    // the dedicated working-copy marker instead of a chip.
     for (name, id) in repo.view().wc_commit_ids() {
         if name.as_str() != workspace_name.as_str() {
             bookmarks_by_commit
@@ -326,6 +321,14 @@ pub async fn walk_jj_with_repo(
                 .or_default()
                 .push(format!("{}@", name.as_str()));
         }
+    }
+    for (name, target) in repo.view().bookmarks() {
+        collect_bookmark_labels(name.as_str(), &target, |id, label| {
+            bookmarks_by_commit
+                .entry(id.clone())
+                .or_default()
+                .push(label);
+        });
     }
 
     let mut lane_assigner = LaneAssigner::new();

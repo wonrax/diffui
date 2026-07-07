@@ -115,9 +115,11 @@ pub struct CommitSummary {
     /// common single-visible case (and always for git).
     pub change_offset: Option<usize>,
     pub is_working_copy: bool,
-    /// Bookmarks pointing at this commit. Local bookmarks are bare
-    /// names; remote-tracking ones are `name@remote`. Order matches
-    /// `jj show`'s "Bookmarks:" line — local first, then remotes.
+    /// Ref labels pointing at this commit. Other workspaces' working
+    /// copies come first as `name@` (jj only; matches jj log's
+    /// `working_copies`-before-`bookmarks` order), then bookmarks as in
+    /// `jj show`'s "Bookmarks:" line — bare local names first, then
+    /// remote-tracking `name@remote`.
     pub bookmarks: Vec<String>,
 }
 

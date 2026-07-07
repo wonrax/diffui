@@ -52,6 +52,12 @@ const INDICATOR_RADIUS: f32 = 5.0;
 const LINE_HEIGHT_MULTIPLIER: f32 = 1.4;
 /// Horizontal padding inside a bookmark/status chip, on each side of the label.
 const CHIP_PAD_X: f32 = 5.0;
+/// Chip icon glyph size — a step under `CAPTION_TEXT_SIZE` so the glyph's
+/// optical weight matches the label's lowercase body rather than towering
+/// to its cap height.
+const CHIP_ICON_SIZE: f32 = 11.0;
+/// Gap between a chip's icon and its label.
+const CHIP_ICON_GAP: f32 = 3.0;
 const SMALL_TEXT_SIZE: f32 = 14.0;
 const CAPTION_TEXT_SIZE: f32 = 13.0;
 /// Text size for the collapse/expand chevron on the selected revision row. The
@@ -102,6 +108,11 @@ pub struct IndicatorChip {
     /// bookmark chips — outlined, lane-colored).
     pub border_color: Option<Color>,
     pub border_dashed: bool,
+    /// Optional Lucide glyph drawn ahead of the label, tinted like it.
+    /// Workspace chips carry one so a `name@` working-copy marker reads as
+    /// a different kind of thing than the bookmark pills around it —
+    /// color alone doesn't separate two chips in the same rail.
+    pub icon: Option<&'static str>,
 }
 
 #[derive(Debug, Clone)]
@@ -1203,12 +1214,12 @@ impl<'a, Message> RevisionList<'a, Message> {
         let bm_widths: Vec<f32> = rev
             .bookmark_chips
             .iter()
-            .map(|c| self.measure_chip_width::<R>(&c.label, paragraphs))
+            .map(|c| self.measure_chip_width::<R>(&c.label, c.icon, paragraphs))
             .collect();
         let status_widths: Vec<f32> = rev
             .status_chips
             .iter()
-            .map(|c| self.measure_chip_width::<R>(&c.label, paragraphs))
+            .map(|c| self.measure_chip_width::<R>(&c.label, c.icon, paragraphs))
             .collect();
         let status_total: f32 = status_widths.iter().sum::<f32>()
             + chip_gap * status_widths.len().saturating_sub(1) as f32;
@@ -1255,7 +1266,8 @@ impl<'a, Message> RevisionList<'a, Message> {
                     let remaining = rev.bookmark_chips.len() - i - 1;
                     let need_overflow = remaining > 0;
                     let overflow_label = format!("+{}", remaining.max(1));
-                    let overflow_chip_w = self.measure_chip_width::<R>(&overflow_label, paragraphs);
+                    let overflow_chip_w =
+                        self.measure_chip_width::<R>(&overflow_label, None, paragraphs);
                     let plus_overflow = if need_overflow {
                         chip_gap + overflow_chip_w
                     } else {
@@ -1271,7 +1283,7 @@ impl<'a, Message> RevisionList<'a, Message> {
                 if visible_bookmarks < rev.bookmark_chips.len() {
                     overflow_count = rev.bookmark_chips.len() - visible_bookmarks;
                     let label = format!("+{overflow_count}");
-                    overflow_w = self.measure_chip_width::<R>(&label, paragraphs);
+                    overflow_w = self.measure_chip_width::<R>(&label, None, paragraphs);
                 }
                 acc + if overflow_count > 0 {
                     chip_gap + overflow_w
@@ -1436,6 +1448,7 @@ impl<'a, Message> RevisionList<'a, Message> {
                 chip_x,
                 title_mid_y,
                 &chip.label,
+                chip.icon,
                 chip.background,
                 chip.text_color,
                 chip.border_color,
@@ -1452,6 +1465,7 @@ impl<'a, Message> RevisionList<'a, Message> {
                 chip_x,
                 title_mid_y,
                 &label,
+                None,
                 chip_background(overflow_color),
                 overflow_color,
                 None,
@@ -1467,6 +1481,7 @@ impl<'a, Message> RevisionList<'a, Message> {
                 chip_x,
                 title_mid_y,
                 &chip.label,
+                chip.icon,
                 chip.background,
                 chip.text_color,
                 chip.border_color,
@@ -1716,11 +1731,16 @@ impl<'a, Message> RevisionList<'a, Message> {
     fn measure_chip_width<R: text::Renderer<Font = Font>>(
         &self,
         label: &str,
+        icon: Option<&str>,
         paragraphs: &RefCell<Vec<R::Paragraph>>,
     ) -> f32 {
         let size = CAPTION_TEXT_SIZE;
         let label_w = measure_text_width::<R>(label, size, self.style.primary_font, paragraphs);
-        label_w + CHIP_PAD_X * 2.0
+        let icon_w = icon.map_or(0.0, |glyph| {
+            measure_text_width::<R>(glyph, CHIP_ICON_SIZE, icons::ICON_FONT, paragraphs)
+                + CHIP_ICON_GAP
+        });
+        label_w + icon_w + CHIP_PAD_X * 2.0
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1731,6 +1751,7 @@ impl<'a, Message> RevisionList<'a, Message> {
         x: f32,
         center_y: f32,
         label: &str,
+        icon: Option<&str>,
         background: Color,
         text_color: Color,
         border_color: Option<Color>,
@@ -1742,10 +1763,16 @@ impl<'a, Message> RevisionList<'a, Message> {
     {
         let size = CAPTION_TEXT_SIZE;
         let label_w = measure_text_width::<R>(label, size, self.style.primary_font, paragraphs);
+        let icon_block = icon.map(|glyph| {
+            let icon_w =
+                measure_text_width::<R>(glyph, CHIP_ICON_SIZE, icons::ICON_FONT, paragraphs);
+            (glyph, icon_w)
+        });
+        let icon_indent = icon_block.map_or(0.0, |(_, icon_w)| icon_w + CHIP_ICON_GAP);
         // Tight box: just enough vertical room for the cap-height plus a hair
         // of breathing room. Anything more makes the chip dwarf the title text.
         let chip_h = (size + 3.0).round();
-        let chip_w = label_w + CHIP_PAD_X * 2.0;
+        let chip_w = icon_indent + label_w + CHIP_PAD_X * 2.0;
         let chip_top = (center_y - chip_h / 2.0).round();
         let rect = Rectangle {
             x,
@@ -1766,13 +1793,38 @@ impl<'a, Message> RevisionList<'a, Message> {
                 stroke_solid_rounded_rect(renderer, rect, border_color, INDICATOR_RADIUS);
             }
         }
-        // Let iced center the glyphs vertically within the chip via align_y.
+        // The icon can't go through `fill_text_centered_y`: Lucide's em box
+        // sits entirely above the baseline (ascent = em, descent = 0), so any
+        // line-height leading beyond the glyph size lands asymmetrically and
+        // shoves the ink off-center. Collapsing the line box to exactly the
+        // glyph size makes centering it equal centering the ink — the same
+        // trick `icons::icon` documents for the widget path.
+        if let Some((glyph, icon_w)) = icon_block {
+            renderer.fill_text(
+                Text {
+                    content: glyph.to_owned(),
+                    bounds: Size::new(icon_w.max(1.0), CHIP_ICON_SIZE),
+                    size: Pixels(CHIP_ICON_SIZE),
+                    line_height: text::LineHeight::Absolute(Pixels(CHIP_ICON_SIZE)),
+                    font: icons::ICON_FONT,
+                    align_x: text::Alignment::Left,
+                    align_y: alignment::Vertical::Center,
+                    shaping: text::Shaping::Advanced,
+                    wrapping: text::Wrapping::None,
+                    ellipsis: text::Ellipsis::None,
+                    hint_factor: None,
+                },
+                Point::new(x + CHIP_PAD_X, center_y),
+                text_color,
+                clip,
+            );
+        }
         fill_text_centered_y(
             renderer,
             label,
-            x + chip_w / 2.0,
+            x + icon_indent + (chip_w - icon_indent) / 2.0,
             center_y,
-            chip_w,
+            chip_w - icon_indent,
             size,
             text_color,
             self.style.primary_font,

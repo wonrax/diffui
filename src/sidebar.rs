@@ -537,20 +537,29 @@ fn build_revision_row(
     let lane_color = graph_style.lane_color(lane_frame.node_lane);
     let mut bookmark_chips = Vec::with_capacity(bookmarks.len());
     for bookmark in bookmarks {
-        // Remote/untracked bookmarks contain `@` (e.g. `main@origin`) and
-        // render outlined (transparent fill + 1px lane-color border) so they
-        // read as "tracking" rather than "live" bookmarks.
-        let is_remote = bookmark.contains('@');
+        // Core authors the label shapes and jj forbids `@` inside bookmark
+        // and remote names, so a trailing `@` can only be another workspace's
+        // working copy (`name@`) and an interior `@` a remote bookmark
+        // (`main@origin`). Workspace chips get a folder glyph (another
+        // working-copy *directory*) and the working-copy accent — the lane
+        // palette is deliberately decoupled from it — so they read as a
+        // different kind of thing than the bookmark pills sharing the rail.
+        // Remotes render outlined (transparent fill + 1px lane-color border)
+        // so they read as "tracking" rather than "live" bookmarks.
+        let is_workspace = bookmark.ends_with('@');
+        let is_remote = !is_workspace && bookmark.contains('@');
+        let chip_color = if is_workspace { theme.accent } else { lane_color };
         bookmark_chips.push(IndicatorChip {
             label: bookmark.clone(),
             background: if is_remote {
                 Color::TRANSPARENT
             } else {
-                chip_background(lane_color)
+                chip_background(chip_color)
             },
-            text_color: lane_color,
-            border_color: if is_remote { Some(lane_color) } else { None },
+            text_color: chip_color,
+            border_color: is_remote.then_some(lane_color),
             border_dashed: false,
+            icon: is_workspace.then_some(icons::FOLDER),
         });
     }
 
@@ -562,6 +571,7 @@ fn build_revision_row(
             text_color: theme.subtle_text,
             border_color: Some(theme.subtle_text),
             border_dashed: true,
+            icon: None,
         });
     }
     if commit.has_conflict() {
@@ -571,6 +581,7 @@ fn build_revision_row(
             text_color: theme.conflict_marker,
             border_color: None,
             border_dashed: false,
+            icon: None,
         });
     }
     if commit.is_hidden() {
@@ -583,6 +594,7 @@ fn build_revision_row(
             text_color: theme.subtle_text,
             border_color: Some(theme.subtle_text),
             border_dashed: false,
+            icon: None,
         });
     } else if commit.is_divergent() {
         // jj log flags these with a change-offset suffix: the change id maps
@@ -594,6 +606,7 @@ fn build_revision_row(
             text_color: theme.modified_token,
             border_color: None,
             border_dashed: false,
+            icon: None,
         });
     }
 
