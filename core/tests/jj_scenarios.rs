@@ -196,7 +196,11 @@ fn divergent_change_is_flagged_on_all_its_commits() {
         ))
         .unwrap_or_else(|err| panic!("load revset {symbol}: {err:?}"));
         assert_eq!(store.len(), 1, "{symbol} selects a single revision");
-        assert_eq!(store.row(0).commit_id(), expected, "{symbol} picks its copy");
+        assert_eq!(
+            store.row(0).commit_id(),
+            expected,
+            "{symbol} picks its copy"
+        );
     }
 }
 

@@ -13,6 +13,7 @@ use iced::{
 };
 
 use crate::chip::{self, Chip};
+use crate::measure;
 use crate::scrollbar::{self, ScrollbarState, ScrollbarStyle};
 
 // Row height is `text_size * ROW_HEIGHT_RATIO` rounded to the nearest int,
@@ -3381,8 +3382,7 @@ impl<Message> DiffView<'_, Message> {
         let deletions = format!("-{}", file.deletions);
         // Tight monospace widths (like the bookmark chips) — `text_width`
         // adds breathing room meant for wrapped text.
-        let mono_width =
-            |content: &str| content.chars().count() as f32 * self.metrics.char_width;
+        let mono_width = |content: &str| content.chars().count() as f32 * self.metrics.char_width;
         let gap = self.metrics.char_width;
         let additions_width = mono_width(&additions);
         let deletions_width = mono_width(&deletions);
@@ -3441,8 +3441,16 @@ impl<Message> DiffView<'_, Message> {
 
         let summary_x = (bounds.x + bounds.width - summary_width - 8.0).max(bounds.x + 12.0);
         let segments = [
-            (additions.as_str(), additions_width, self.palette.addition_text),
-            (deletions.as_str(), deletions_width, self.palette.deletion_text),
+            (
+                additions.as_str(),
+                additions_width,
+                self.palette.addition_text,
+            ),
+            (
+                deletions.as_str(),
+                deletions_width,
+                self.palette.deletion_text,
+            ),
             (hunk_label.as_str(), hunk_width, self.palette.text_muted),
         ];
         let mut segment_x = summary_x;
@@ -3834,27 +3842,11 @@ fn measure_char_advance_cached(font: Font, text_size: f32) -> f32 {
 }
 
 fn measure_char_advance(font: Font, text_size: f32) -> f32 {
-    use iced::advanced::graphics::text::Paragraph;
-    use iced::advanced::text::Paragraph as _;
-
     // "M" is a stable choice for monospace measurement: it dominates hinting
     // noise at small sizes. For monospace fonts the width of one char *is*
-    // the advance, which is what we cache here.
-    let line_height = (text_size * 1.4).max(1.0);
-    let paragraph = Paragraph::with_text(text::Text {
-        content: "M",
-        bounds: Size::new(f32::INFINITY, line_height),
-        size: Pixels(text_size),
-        line_height: text::LineHeight::Absolute(Pixels(line_height)),
-        font,
-        align_x: text::Alignment::Left,
-        align_y: alignment::Vertical::Top,
-        shaping: text::Shaping::Basic,
-        wrapping: text::Wrapping::None,
-        ellipsis: text::Ellipsis::None,
-        hint_factor: None,
-    });
-    paragraph.min_width()
+    // the advance, which is what we cache here. `Shaping::Basic` matches how
+    // the grid draws its rows.
+    measure::line_width_shaped("M", text_size, font, text::Shaping::Basic)
 }
 
 fn digits(n: usize) -> usize {

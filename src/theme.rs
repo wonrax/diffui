@@ -1,8 +1,8 @@
 use iced::{
-    Background, Border, Color, Element, Font, Length, Shadow, Theme, border,
+    Background, Border, Color, Element, Font, Length, Shadow, Theme, Vector, border,
     font::{Family, Weight},
     theme,
-    widget::{container, scrollable, text},
+    widget::{button, container, scrollable, text, text_input},
 };
 
 use crate::diff_view::Palette;
@@ -367,5 +367,209 @@ pub fn file_status_color(status: diffui_core::DiffFileStatus, theme: ThemeSpec) 
         DiffFileStatus::Modified => theme.info,
         DiffFileStatus::Renamed => theme.modified_token,
         DiffFileStatus::Conflicted => theme.conflict_marker,
+    }
+}
+
+/// App-wide type scale. Every text run in the chrome picks one of these
+/// steps so sizes can't drift apart file by file. (The diff/code panes are
+/// exempt — their text follows the configured code font size.)
+pub mod text_size {
+    /// Tiny counters and markers: tab badges, `+N` pills.
+    pub const BADGE: f32 = 10.0;
+    /// Secondary metadata beside a body run: shortcut hints, timestamps,
+    /// result summaries.
+    pub const CAPTION: f32 = 11.0;
+    /// Chrome controls: buttons, tabs, menu rows, footer, dialog body.
+    pub const UI: f32 = 12.0;
+    /// Primary content runs: ids, chips, list rows, inputs.
+    pub const BODY: f32 = 13.0;
+    /// Emphasized content: revision descriptions, empty states.
+    pub const BODY_LG: f32 = 14.0;
+    /// Dialog and palette titles.
+    pub const TITLE: f32 = 15.0;
+    /// The welcome screen's app heading.
+    pub const DISPLAY: f32 = 22.0;
+}
+
+/// Corner radii shared across the chrome. Chips keep their own tighter
+/// rounding ([`crate::chip::RADIUS`]).
+pub mod radius {
+    /// Buttons, inputs, tooltips, hover washes.
+    pub const CONTROL: f32 = 6.0;
+    /// Dialog push buttons — bigger targets, slightly rounder.
+    pub const PUSH: f32 = 8.0;
+    /// Floating cards: popovers and modals.
+    pub const SURFACE: f32 = 12.0;
+}
+
+/// Ghost button: invisible at rest, translucent wash on hover/press. The
+/// wash is [`chip_background`] of `muted_text` so it reads the same on
+/// panel and elevated backgrounds. For icon-only and small-label controls
+/// (toolbar, tab strip, find bar, popover footers).
+pub fn ghost_button_style(theme: ThemeSpec, status: button::Status) -> button::Style {
+    button::Style {
+        background: match status {
+            button::Status::Hovered | button::Status::Pressed => {
+                Some(Background::Color(chip_background(theme.muted_text)))
+            }
+            _ => None,
+        },
+        text_color: theme.text,
+        border: Border {
+            width: 0.0,
+            color: Color::TRANSPARENT,
+            radius: radius::CONTROL.into(),
+        },
+        shadow: Shadow::default(),
+        snap: true,
+    }
+}
+
+/// [`ghost_button_style`] plus a 1px outline, for controls that need a
+/// visible frame at rest.
+pub fn bordered_button_style(theme: ThemeSpec, status: button::Status) -> button::Style {
+    button::Style {
+        border: Border {
+            width: 1.0,
+            color: theme.border,
+            radius: radius::CONTROL.into(),
+        },
+        ..ghost_button_style(theme, status)
+    }
+}
+
+/// Primary call-to-action: solid accent fill, inverted label. The one
+/// loudest action on a surface (the welcome screen's "Open repository…").
+pub fn primary_button_style(theme: ThemeSpec) -> button::Style {
+    button::Style {
+        background: Some(Background::Color(theme.accent)),
+        text_color: theme.background,
+        border: Border {
+            width: 0.0,
+            color: Color::TRANSPARENT,
+            radius: radius::PUSH.into(),
+        },
+        shadow: Shadow::default(),
+        snap: true,
+    }
+}
+
+/// Solid push button for dialog footers: filled at rest so it reads as a
+/// button without needing hover, brightening to the row-selection color
+/// on hover/press.
+pub fn dialog_button_style(theme: ThemeSpec, status: button::Status) -> button::Style {
+    button::Style {
+        background: match status {
+            button::Status::Hovered | button::Status::Pressed => {
+                Some(Background::Color(theme.selected_file))
+            }
+            _ => Some(Background::Color(theme.panel_background)),
+        },
+        text_color: theme.text,
+        border: Border {
+            width: 1.0,
+            color: theme.border,
+            radius: radius::PUSH.into(),
+        },
+        shadow: Shadow::default(),
+        snap: true,
+    }
+}
+
+/// Floating card anchored to a trigger with nothing dimming the content
+/// behind it (dropdown menus, the activity popover). The heavy drop shadow
+/// is what separates it from the busy panel underneath.
+pub fn popover_style(theme: ThemeSpec) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(theme.panel_background_elevated)),
+        border: Border {
+            width: 1.0,
+            color: theme.border,
+            radius: radius::SURFACE.into(),
+        },
+        shadow: Shadow {
+            color: Color {
+                a: 0.30,
+                ..Color::BLACK
+            },
+            offset: Vector::new(0.0, 8.0),
+            blur_radius: 24.0,
+        },
+        ..container::Style::default()
+    }
+}
+
+/// Centered card over a scrim (confirm dialog, open-repo dialog, command
+/// palette). The scrim already darkens what's behind the modal, so a heavy
+/// shadow would just look like double dimming — soft, just enough to
+/// suggest the card is lifted.
+pub fn modal_style(theme: ThemeSpec) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(theme.panel_background_elevated)),
+        border: Border {
+            width: 1.0,
+            color: theme.border,
+            radius: radius::SURFACE.into(),
+        },
+        shadow: Shadow {
+            color: Color {
+                a: 0.18,
+                ..Color::BLACK
+            },
+            offset: Vector::new(0.0, 4.0),
+            blur_radius: 12.0,
+        },
+        ..container::Style::default()
+    }
+}
+
+/// Dimming layer behind modal surfaces. One alpha everywhere so stacked
+/// takeovers (confirm dialog, open-repo dialog, command palette) feel
+/// equally deep.
+pub fn scrim_style() -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color {
+            a: 0.40,
+            ..Color::BLACK
+        })),
+        ..container::Style::default()
+    }
+}
+
+/// Text-input field: a 1px outline carrying the input identity colors
+/// (placeholder / value / selection). Structural variants — the palette's
+/// borderless embedded input — override background and border but keep the
+/// colors, so every input hints and selects identically.
+pub fn input_style(theme: ThemeSpec) -> text_input::Style {
+    text_input::Style {
+        background: Background::Color(theme.panel_background),
+        border: Border {
+            width: 1.0,
+            color: theme.border,
+            radius: radius::CONTROL.into(),
+        },
+        icon: theme.muted_text,
+        placeholder: theme.subtle_text,
+        value: theme.text,
+        selection: Color {
+            a: 0.25,
+            ..theme.accent
+        },
+    }
+}
+
+/// Hover tooltip card. The revision list's custom-drawn tooltip overlay
+/// mirrors these colors through `RevisionListStyle` and its radius through
+/// [`radius::CONTROL`].
+pub fn tooltip_style(theme: ThemeSpec) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(theme.panel_background_elevated)),
+        text_color: Some(theme.text),
+        border: Border {
+            color: theme.border,
+            width: 1.0,
+            radius: radius::CONTROL.into(),
+        },
+        ..container::Style::default()
     }
 }

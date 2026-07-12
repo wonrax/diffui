@@ -1,20 +1,20 @@
 //! The one chip component: small rounded-rect label used for bookmark /
 //! workspace / status indicators in the sidebar's commit rows, the file
 //! list's A/M/D badges, and the diff view's revision-header bookmarks and
-//! file-header status. Every chip in the app goes through [`draw`] so they
-//! share geometry, text treatment (mono font at [`TEXT_SIZE`]), and border
-//! styles by construction.
+//! file-header status. Every custom-drawn chip goes through [`draw`] so they
+//! share geometry, text treatment, and border styles by construction;
+//! widget-built chips (the activity bar's counters) pick up the same look
+//! via [`container_style`].
 
 use iced::advanced::graphics::geometry::{self, Frame, LineCap, LineJoin, Path, Stroke};
-use iced::advanced::text::{self, Paragraph as _};
+use iced::advanced::text;
 use iced::advanced::{renderer, text::Text};
-use iced::{
-    Background, Border, Color, Font, Pixels, Point, Rectangle, Shadow, Size, alignment,
-};
+use iced::{Background, Border, Color, Font, Pixels, Point, Rectangle, Shadow, Size, alignment};
 
-use crate::icons;
+use crate::theme::chip_background;
+use crate::{icons, measure};
 
-pub const TEXT_SIZE: f32 = 13.0;
+pub const TEXT_SIZE: f32 = crate::theme::text_size::BODY;
 pub const PAD_X: f32 = 5.0;
 pub const RADIUS: f32 = 5.0;
 /// Chip icon glyph size — a step under the label size so the glyph's optical
@@ -22,12 +22,26 @@ pub const RADIUS: f32 = 5.0;
 const ICON_SIZE: f32 = 11.0;
 /// Gap between a chip's icon and its label.
 const ICON_GAP: f32 = 3.0;
-const LINE_HEIGHT_MULTIPLIER: f32 = 1.4;
 
 /// Tight box: just enough vertical room for the cap-height plus a hair of
 /// breathing room. Anything more makes the chip dwarf the text around it.
 pub fn height() -> f32 {
     (TEXT_SIZE + 3.0).round()
+}
+
+/// Container style for chips built from iced widgets rather than drawn via
+/// [`draw`] (the activity bar's `+N` / `N queued`), so element-based chips
+/// share the drawn chips' corner radius and translucent fill.
+pub fn container_style(color: Color) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(Background::Color(chip_background(color))),
+        border: Border {
+            width: 0.0,
+            color: Color::TRANSPARENT,
+            radius: RADIUS.into(),
+        },
+        ..iced::widget::container::Style::default()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -52,39 +66,12 @@ pub struct Chip {
     pub icon: Option<&'static str>,
 }
 
-/// Pixel-accurate width measurement through headless `cosmic_text` shaping —
-/// the same engine the wgpu renderer draws with, so measurements match what
-/// gets painted (see `sidebar::TextMetrics` for the war story). Headless
-/// rather than `R::Paragraph` so `view()`-time layout budgeting and
-/// `draw()`-time rendering share the exact same numbers.
-fn measure(content: &str, font: Font, size: f32) -> f32 {
-    if content.is_empty() {
-        return 0.0;
-    }
-    use iced::advanced::graphics::text::Paragraph;
-    let line_height = (size * LINE_HEIGHT_MULTIPLIER).max(1.0);
-    let paragraph = Paragraph::with_text(Text {
-        content,
-        bounds: Size::new(f32::INFINITY, line_height),
-        size: Pixels(size),
-        line_height: text::LineHeight::Absolute(Pixels(line_height)),
-        font,
-        align_x: text::Alignment::Left,
-        align_y: alignment::Vertical::Top,
-        shaping: text::Shaping::Advanced,
-        wrapping: text::Wrapping::None,
-        ellipsis: text::Ellipsis::None,
-        hint_factor: None,
-    });
-    paragraph.min_width()
-}
-
 /// Full chip width (icon + label + horizontal padding) for the given label,
 /// rendered with `font` at [`TEXT_SIZE`].
 pub fn width(label: &str, icon: Option<&str>, font: Font) -> f32 {
-    let label_w = measure(label, font, TEXT_SIZE);
+    let label_w = measure::line_width(label, TEXT_SIZE, font);
     let icon_w = icon.map_or(0.0, |glyph| {
-        measure(glyph, icons::ICON_FONT, ICON_SIZE) + ICON_GAP
+        measure::line_width(glyph, ICON_SIZE, icons::ICON_FONT) + ICON_GAP
     });
     label_w + icon_w + PAD_X * 2.0
 }
@@ -95,10 +82,13 @@ pub fn draw<R>(renderer: &mut R, chip: &Chip, x: f32, center_y: f32, clip: Recta
 where
     R: text::Renderer<Font = Font> + geometry::Renderer,
 {
-    let label_w = measure(&chip.label, chip.font, TEXT_SIZE);
-    let icon_block = chip
-        .icon
-        .map(|glyph| (glyph, measure(glyph, icons::ICON_FONT, ICON_SIZE)));
+    let label_w = measure::line_width(&chip.label, TEXT_SIZE, chip.font);
+    let icon_block = chip.icon.map(|glyph| {
+        (
+            glyph,
+            measure::line_width(glyph, ICON_SIZE, icons::ICON_FONT),
+        )
+    });
     let icon_indent = icon_block.map_or(0.0, |(_, icon_w)| icon_w + ICON_GAP);
     let chip_h = height();
     let chip_w = icon_indent + label_w + PAD_X * 2.0;

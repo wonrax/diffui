@@ -1,22 +1,21 @@
 use iced::{
-    Background, Border, Color, Element, Font, Length, Padding, alignment, mouse,
+    Background, Color, Element, Font, Length, Padding, alignment, mouse,
     widget::{Space, column, container, mouse_area, row, text, text_input, tooltip},
 };
 
+use crate::chip::{self, Chip};
 use crate::config::AppConfig;
 use crate::graph_layout::GraphLayout;
 use crate::graph_view::{self, RevisionGraphStyle};
 use crate::icons;
-use crate::chip::{self, Chip};
+use crate::measure;
 use crate::repository::Vcs;
 use crate::revision_list::{
     self, FileRowView, RevisionList, RevisionListStyle, RevisionRowView, RowSelectionKey,
 };
 use crate::theme::{self, ThemeSpec, chip_background, file_status_color, sidebar_panel_style};
 use crate::{Diffui, HoverTarget, LoadStatus, Message, ToolbarMenu};
-use diffui_core::{
-    CommitStore, DiffFile, FileTreeRow, RevisionSelection, RowView, file_tree_rows,
-};
+use diffui_core::{CommitStore, DiffFile, FileTreeRow, RevisionSelection, RowView, file_tree_rows};
 use jj_lib::graph::GraphEdgeType;
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -36,13 +35,13 @@ pub const RESIZE_HIT_PADDING: f32 = 2.0;
 /// (`divergent`, 9 chars). Below this width the chip rail starts dropping
 /// rails, so the user loses the conflict/divergence signal.
 pub fn min_width(config: AppConfig) -> f32 {
-    let id_metrics = TextMetrics::iced(config.mono_font, CAPTION_TEXT_SIZE);
-    let ui_metrics = TextMetrics::iced(config.ui_font, CAPTION_TEXT_SIZE);
+    let id_width =
+        |content: &str| measure::line_width(content, CAPTION_TEXT_SIZE, config.mono_font);
 
-    let change_id_w = id_metrics.measure(&"a".repeat(REVISION_ID_CHARS));
-    let commit_id_w = id_metrics.measure(&"a".repeat(COMMIT_ID_CHARS));
-    let at_w = id_metrics.measure("@");
-    let author_w = ui_metrics.measure("Author Name");
+    let change_id_w = id_width(&"a".repeat(REVISION_ID_CHARS));
+    let commit_id_w = id_width(&"a".repeat(COMMIT_ID_CHARS));
+    let at_w = id_width("@");
+    let author_w = measure::line_width("Author Name", CAPTION_TEXT_SIZE, config.ui_font);
     let plus_n_w = chip::width("+9", None, config.ui_font);
     let conflict_w = chip::width("divergent", None, config.mono_font);
 
@@ -72,7 +71,7 @@ pub fn min_width(config: AppConfig) -> f32 {
 /// without exposing the constant through `revision_list`.
 const REVISION_CONTENT_RIGHT_PAD: f32 = 12.0;
 
-const CAPTION_TEXT_SIZE: f32 = 13.0;
+const CAPTION_TEXT_SIZE: f32 = theme::text_size::BODY;
 const REVISION_ID_CHARS: usize = 12;
 const COMMIT_ID_CHARS: usize = 12;
 
@@ -129,25 +128,17 @@ fn build_revset_filter(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     let input = text_input(placeholder, &ui.session.revset)
         .id(REVSET_INPUT_ID)
         .padding(Padding::from([5, 8]))
-        .size(12)
+        .size(theme::text_size::UI)
         .font(ui.config.mono_font)
         .width(Length::Fill)
         .on_input(Message::RevsetChanged)
         .on_submit(Message::RevsetSubmit)
-        .style(move |_, _| text_input::Style {
-            background: Background::Color(theme.background),
-            border: Border {
-                width: 1.0,
-                color: theme.border,
-                radius: 6.0.into(),
-            },
-            icon: theme.muted_text,
-            placeholder: theme.subtle_text,
-            value: theme.text,
-            selection: Color {
-                a: 0.25,
-                ..theme.accent
-            },
+        .style(move |_, _| {
+            // Window-background variant: the field sits on the sidebar panel,
+            // so the darker window color is what gives it a visible well.
+            let mut style = theme::input_style(theme);
+            style.background = Background::Color(theme.background);
+            style
         });
 
     // `mouse_area` (not `button`) so the presets menu opens on mouse-*down*
@@ -195,7 +186,7 @@ fn build_revset_filter(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     .into()
 }
 
-const FOOTER_TEXT_SIZE: f32 = 12.0;
+const FOOTER_TEXT_SIZE: f32 = theme::text_size::UI;
 
 /// Thin status bar pinned to the bottom of the commit-log pane: the working
 /// copy's branch + ahead/behind on the left, the total change count on the
@@ -228,7 +219,7 @@ fn build_footer(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
                             .color(theme.text),
                     )
                     .padding([3, 7])
-                    .style(move |_| footer_tooltip_style(theme)),
+                    .style(move |_| theme::tooltip_style(theme)),
                     tooltip::Position::Top,
                 )
                 .gap(4)
@@ -307,19 +298,6 @@ fn build_footer(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             .style(move |_| container::Style::default().background(theme.panel_background)),
     ]
     .into()
-}
-
-fn footer_tooltip_style(theme: ThemeSpec) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(theme.panel_background_elevated)),
-        text_color: Some(theme.text),
-        border: Border {
-            color: theme.border,
-            width: 1.0,
-            radius: 6.0.into(),
-        },
-        ..container::Style::default()
-    }
 }
 
 /// Group an integer with `,` thousands separators, e.g. 1410 -> "1,410".
@@ -536,7 +514,11 @@ fn build_revision_row(
         // so they read as "tracking" rather than "live" bookmarks.
         let is_workspace = bookmark.ends_with('@');
         let is_remote = !is_workspace && bookmark.contains('@');
-        let chip_color = if is_workspace { theme.accent } else { lane_color };
+        let chip_color = if is_workspace {
+            theme.accent
+        } else {
+            lane_color
+        };
         bookmark_chips.push(Chip {
             label: bookmark.clone(),
             font: config.ui_font,
@@ -788,12 +770,11 @@ impl SidebarFileCache {
 /// `max_by` whose comparator shaped *both* sides, i.e. ~2·N `cosmic_text` shapes
 /// per column.
 fn compute_stat_widths(files: &[DiffFile], config: AppConfig) -> FileStatWidths {
-    let metrics = sidebar_text_metrics(config);
     let max_additions = files.iter().map(|file| file.additions).max().unwrap_or(0);
     let max_deletions = files.iter().map(|file| file.deletions).max().unwrap_or(0);
     FileStatWidths {
-        additions: file_stat_width(&format!("+{max_additions}"), &metrics),
-        deletions: file_stat_width(&format!("-{max_deletions}"), &metrics),
+        additions: file_stat_width(&format!("+{max_additions}"), config.ui_font),
+        deletions: file_stat_width(&format!("-{max_deletions}"), config.ui_font),
         badge: file_badge_width(files, config.mono_font),
     }
 }
@@ -920,70 +901,9 @@ fn commit_description_color(commit: RowView, theme: ThemeSpec) -> Color {
     }
 }
 
-/// Pixel-accurate text width measurement for layout decisions made outside
-/// the renderer (path truncation, badge column sizing, etc.).
-///
-/// We previously approximated text width with `chars * 7px` heuristics, which
-/// silently misbehaved for any glyph wider or narrower than the assumed
-/// average — `@` clipped into `…` in revision IDs, abbreviated paths over- or
-/// under-shot the available room, and badges would clip if the user ever
-/// switched to a larger font. Going through real `cosmic_text` shaping fixes
-/// the entire class of bug because we use the same engine the wgpu renderer
-/// uses, so the measurements match what gets drawn.
-///
-/// Why headless `iced::advanced::graphics::text::Paragraph` rather than the
-/// renderer's `R::Paragraph`: path-truncation runs in `view()` (in
-/// `build_revision_list`), well before any `draw()` call, and we need exact
-/// widths to decide *which* string to hand to the widget. The renderer's
-/// `Paragraph` type isn't reachable from here without threading renderer
-/// generics through `main.rs`. The wgpu renderer is built on top of
-/// `iced_graphics`, so the headless `Paragraph` shapes text identically.
-#[derive(Clone)]
-pub enum TextMetrics {
-    Iced { font: Font, size: f32 },
-}
-
-impl TextMetrics {
-    fn iced(font: Font, size: f32) -> Self {
-        Self::Iced { font, size }
-    }
-
-    fn measure(&self, content: &str) -> f32 {
-        if content.is_empty() {
-            return 0.0;
-        }
-        match self {
-            Self::Iced { font, size } => {
-                use iced::advanced::graphics::text::Paragraph;
-                use iced::advanced::text::{LineHeight, Paragraph as _, Shaping, Text, Wrapping};
-                use iced::{Pixels, Size};
-
-                let line_height = (*size * 1.4).max(1.0);
-                let paragraph = Paragraph::with_text(Text {
-                    content,
-                    bounds: Size::new(f32::INFINITY, line_height),
-                    size: Pixels(*size),
-                    line_height: LineHeight::Absolute(Pixels(line_height)),
-                    font: *font,
-                    align_x: iced::advanced::text::Alignment::Left,
-                    align_y: alignment::Vertical::Top,
-                    shaping: Shaping::Advanced,
-                    wrapping: Wrapping::None,
-                    ellipsis: iced::advanced::text::Ellipsis::None,
-                    hint_factor: None,
-                });
-                paragraph.min_width()
-            }
-        }
-    }
-}
-
-fn sidebar_text_metrics(config: AppConfig) -> TextMetrics {
-    TextMetrics::iced(config.ui_font, CAPTION_TEXT_SIZE)
-}
-
-fn file_stat_width(text: &str, metrics: &TextMetrics) -> f32 {
-    (metrics.measure(text) + FILE_STAT_HORIZONTAL_PADDING * 2.0).max(FILE_STAT_MIN_WIDTH)
+fn file_stat_width(text: &str, ui_font: Font) -> f32 {
+    (measure::line_width(text, CAPTION_TEXT_SIZE, ui_font) + FILE_STAT_HORIZONTAL_PADDING * 2.0)
+        .max(FILE_STAT_MIN_WIDTH)
 }
 
 /// Width of the status badge column ("M", "A", "D", "R", …). A diff has only
@@ -1034,12 +954,6 @@ mod tests {
         builder.finish()
     }
 
-    /// Deterministic metrics for tests: each character is 7px wide, matching
-    /// the old `SIDEBAR_FILE_TEXT_CHAR_WIDTH` heuristic so the existing
-    /// fixture widths still trigger truncation at the same boundaries. We
-    /// don't go through real cosmic_text in tests because system font
-    /// availability differs across hosts and would make the assertions
-    /// flaky in CI.
     #[test]
     fn revision_id_prefix_uses_shortest_unique_change_id() {
         // No precomputed lengths (the git backend leaves them `None`), so this

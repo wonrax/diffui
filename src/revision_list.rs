@@ -11,13 +11,11 @@
 //! status background) is computed by the caller and passed in per row, so
 //! this module stays decoupled from the rest of the app's theming logic.
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use iced::advanced::{
-    Layout, Shell, Widget,
-    layout, mouse, overlay, renderer,
-    text::{self, Paragraph, Text},
+    Layout, Shell, Widget, layout, mouse, overlay, renderer,
+    text::{self, Text},
     widget::{Tree, tree},
 };
 use iced::{
@@ -32,6 +30,7 @@ use crate::graph_view::{
     LANE_WIDTH, RevisionGraphStyle, draw_continuation_row, draw_revision_row, lane_strip_width,
 };
 use crate::icons;
+use crate::measure::{self, LINE_HEIGHT_MULTIPLIER};
 use crate::scrollbar::{self, ScrollbarState, ScrollbarStyle};
 use crate::theme::chip_background;
 
@@ -45,12 +44,8 @@ pub const FILE_TREE_INDENT: f32 = 14.0;
 pub const GUTTER_LEFT_PADDING: f32 = 8.0;
 pub const GUTTER_PADDING: f32 = 8.0;
 const CONTENT_PADDING: f32 = 12.0;
-/// Line-height multiplier applied to every measured/rendered text run in this
-/// widget. Kept in one place so the measurement paragraphs and the painted
-/// glyphs stay in lockstep — a mismatch makes text clip or float.
-const LINE_HEIGHT_MULTIPLIER: f32 = 1.4;
-const SMALL_TEXT_SIZE: f32 = 14.0;
-const CAPTION_TEXT_SIZE: f32 = 13.0;
+const SMALL_TEXT_SIZE: f32 = crate::theme::text_size::BODY_LG;
+const CAPTION_TEXT_SIZE: f32 = crate::theme::text_size::BODY;
 /// Text size for the collapse/expand chevron on the selected revision row. The
 /// old `▾` triangle needed an oversize bump to stay legible (it shrank to ~5px
 /// of actual ink); the Lucide glyph fills its box, so a near-text size reads
@@ -58,7 +53,7 @@ const CAPTION_TEXT_SIZE: f32 = 13.0;
 const CHEVRON_TEXT_SIZE: f32 = 15.0;
 pub const FILE_ROW_GAP: f32 = 6.0;
 pub const FILE_ROW_RIGHT_PAD: f32 = 10.0;
-const TOOLTIP_RADIUS: f32 = 5.0;
+const TOOLTIP_RADIUS: f32 = crate::theme::radius::CONTROL;
 const TOOLTIP_PADDING: f32 = 6.0;
 const TOOLTIP_GAP: f32 = 8.0;
 
@@ -486,7 +481,7 @@ enum LaneHalf {
     After,
 }
 
-struct State<Paragraph> {
+struct State {
     /// Scroll position in `f64` content-space px (see the row-geometry helpers
     /// for why `f64`). Cast to `f32` only at the scrollbar/render boundary,
     /// where values are viewport-small and `f32` is exact.
@@ -502,7 +497,6 @@ struct State<Paragraph> {
     /// Last cursor position observed inside the widget bounds, in screen
     /// coordinates. Used to anchor the tooltip.
     cursor_position: Option<Point>,
-    paragraphs: RefCell<Vec<Paragraph>>,
     scrollbar: ScrollbarState,
     /// Most recent `reveal_token` we acted on. `None` until first reveal.
     last_reveal_token: Option<u64>,
@@ -522,14 +516,13 @@ struct State<Paragraph> {
     pending_set_offset: Option<f64>,
 }
 
-impl<Paragraph> State<Paragraph> {
+impl State {
     fn new() -> Self {
         Self {
             vertical_offset: 0.0,
             hovered_file_item: None,
             hovered_lane: None,
             cursor_position: None,
-            paragraphs: RefCell::new(Vec::new()),
             scrollbar: ScrollbarState::default(),
             last_reveal_token: None,
             last_file_reveal_token: None,
@@ -545,11 +538,11 @@ where
     Renderer: text::Renderer<Font = Font> + iced::advanced::graphics::geometry::Renderer,
 {
     fn tag(&self) -> tree::Tag {
-        tree::Tag::of::<State<Renderer::Paragraph>>()
+        tree::Tag::of::<State>()
     }
 
     fn state(&self) -> tree::State {
-        tree::State::new(State::<Renderer::Paragraph>::new())
+        tree::State::new(State::new())
     }
 
     fn size(&self) -> Size<Length> {
@@ -560,7 +553,7 @@ where
     }
 
     fn diff(&self, tree: &mut Tree) {
-        let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
+        let state = tree.state.downcast_mut::<State>();
         if self.reveal_token != state.last_reveal_token {
             state.last_reveal_token = self.reveal_token;
             // Defer the actual scroll to `update()` — that's where bounds
@@ -605,7 +598,7 @@ where
     ) {
         let bounds = layout.bounds();
         let on_scroll = self.on_scroll;
-        let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
+        let state = tree.state.downcast_mut::<State>();
         // Offset on entry; compared on the way out so any change this pass
         // (wheel, scrollbar, reveal, restore, clamp) is reported once via
         // `on_scroll`. `fn` pointers are `Copy`, so this borrows nothing.
@@ -659,7 +652,7 @@ where
             }
         }
 
-        let recompute_hover = |state: &mut State<Renderer::Paragraph>, this: &Self| {
+        let recompute_hover = |state: &mut State, this: &Self| {
             state.hovered_file_item = None;
             state.hovered_lane = None;
             let Some(pos) = state.cursor_position else {
@@ -884,7 +877,7 @@ where
         _viewport: &Rectangle,
         translation: Vector,
     ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
-        let state = tree.state.downcast_ref::<State<Renderer::Paragraph>>();
+        let state = tree.state.downcast_ref::<State>();
         let cursor_pos = state.cursor_position?;
         let bounds = layout.bounds();
 
@@ -905,9 +898,7 @@ where
             let row_screen_y = bounds.y + row_top as f32;
             let row_height = self.row_height(&item);
             let gutter_total = self.item_gutter_width(&item);
-            let measure_para =
-                make_paragraph::<Renderer>(&text, CAPTION_TEXT_SIZE, self.style.primary_font);
-            let text_size = measure_para.min_bounds();
+            let text_size = measure::line_bounds(&text, CAPTION_TEXT_SIZE, self.style.primary_font);
             return Some(overlay::Element::new(Box::new(TooltipOverlay {
                 text,
                 cursor: cursor_pos + translation,
@@ -932,9 +923,8 @@ where
         let row_screen_y = bounds.y + row_top as f32;
         let row_height = FILE_ROW_HEIGHT;
 
-        let measure_para =
-            make_paragraph::<Renderer>(&file.raw_path, CAPTION_TEXT_SIZE, self.style.primary_font);
-        let text_size = measure_para.min_bounds();
+        let text_size =
+            measure::line_bounds(&file.raw_path, CAPTION_TEXT_SIZE, self.style.primary_font);
 
         Some(overlay::Element::new(Box::new(TooltipOverlay {
             text: file.raw_path,
@@ -955,7 +945,7 @@ where
         _viewport: &Rectangle,
         _renderer: &Renderer,
     ) -> mouse::Interaction {
-        let state = tree.state.downcast_ref::<State<Renderer::Paragraph>>();
+        let state = tree.state.downcast_ref::<State>();
         let bounds = layout.bounds();
         let Some(point) = cursor.position_over(bounds) else {
             return mouse::Interaction::None;
@@ -982,8 +972,7 @@ where
         if bounds.intersection(viewport).is_none() {
             return;
         }
-        let state = tree.state.downcast_ref::<State<Renderer::Paragraph>>();
-        state.paragraphs.borrow_mut().clear();
+        let state = tree.state.downcast_ref::<State>();
 
         let visible_top = state.vertical_offset;
         let visible_bottom = visible_top + bounds.height as f64;
@@ -1043,7 +1032,6 @@ where
                             renderer,
                             row_bounds,
                             &rev,
-                            &state.paragraphs,
                             gutter_total,
                             emphasized_lane_before,
                             emphasized_lane_after,
@@ -1057,7 +1045,6 @@ where
                             renderer,
                             row_bounds,
                             &f,
-                            &state.paragraphs,
                             gutter_total,
                             emphasized_lane_after,
                         );
@@ -1079,13 +1066,11 @@ where
 }
 
 impl<'a, Message> RevisionList<'a, Message> {
-    #[allow(clippy::too_many_arguments)]
     fn draw_revision<R>(
         &self,
         renderer: &mut R,
         row_bounds: Rectangle,
         rev: &RevisionRowView,
-        paragraphs: &RefCell<Vec<R::Paragraph>>,
         gutter_total: f32,
         emphasized_lane_before: Option<usize>,
         emphasized_lane_after: Option<usize>,
@@ -1147,24 +1132,9 @@ impl<'a, Message> RevisionList<'a, Message> {
         let title_mid_y = stack_top + id_size / 2.0;
         let desc_mid_y = stack_top + id_size + line_gap + desc_size / 2.0;
 
-        let prefix_w = measure_text_width::<R>(
-            &rev.change_id_prefix,
-            id_size,
-            self.style.mono_font,
-            paragraphs,
-        );
-        let suffix_w = measure_text_width::<R>(
-            &rev.change_id_suffix,
-            id_size,
-            self.style.mono_font,
-            paragraphs,
-        );
-        let commit_w = measure_text_width::<R>(
-            &rev.commit_id_short,
-            id_size,
-            self.style.mono_font,
-            paragraphs,
-        );
+        let prefix_w = measure::line_width(&rev.change_id_prefix, id_size, self.style.mono_font);
+        let suffix_w = measure::line_width(&rev.change_id_suffix, id_size, self.style.mono_font);
+        let commit_w = measure::line_width(&rev.commit_id_short, id_size, self.style.mono_font);
 
         // === Measurements ===
         let id_gap = 8.0;
@@ -1172,13 +1142,12 @@ impl<'a, Message> RevisionList<'a, Message> {
         let at_marker = matches!(rev.selection_key, RowSelectionKey::WorkingCopy);
         let at_gap = 4.0;
         let at_w = if at_marker {
-            measure_text_width::<R>("@", id_size, self.style.mono_font, paragraphs)
+            measure::line_width("@", id_size, self.style.mono_font)
         } else {
             0.0
         };
-        let author_full_w =
-            measure_text_width::<R>(&rev.author, id_size, self.style.primary_font, paragraphs);
-        let ellipsis_w = measure_text_width::<R>("…", id_size, self.style.mono_font, paragraphs);
+        let author_full_w = measure::line_width(&rev.author, id_size, self.style.primary_font);
+        let ellipsis_w = measure::line_width("…", id_size, self.style.mono_font);
 
         let bm_widths: Vec<f32> = rev
             .bookmark_chips
@@ -1446,7 +1415,7 @@ impl<'a, Message> RevisionList<'a, Message> {
         });
         let chevron_size = CHEVRON_TEXT_SIZE;
         let chevron_width = chevron_glyph
-            .map(|glyph| measure_text_width::<R>(glyph, chevron_size, icons::ICON_FONT, paragraphs))
+            .map(|glyph| measure::line_width(glyph, chevron_size, icons::ICON_FONT))
             .unwrap_or(0.0);
         let chevron_gap = if chevron_glyph.is_some() { 6.0 } else { 0.0 };
         let description_width = (content_width - chevron_width - chevron_gap).max(1.0);
@@ -1511,7 +1480,6 @@ impl<'a, Message> RevisionList<'a, Message> {
         renderer: &mut R,
         row_bounds: Rectangle,
         f: &FileRowView,
-        _paragraphs: &RefCell<Vec<R::Paragraph>>,
         gutter_total: f32,
         emphasized_lane: Option<usize>,
     ) where
@@ -1819,62 +1787,6 @@ fn fill_text_truncated<R: text::Renderer<Font = Font>>(
     );
 }
 
-/// Build a `Paragraph` whose `min_bounds()` reflect the actual rendered
-/// width. Used purely for measurement so chip/id placement stops relying on
-/// a `chars * size * 0.55` heuristic that both over- and under-shot and
-/// caused glyphs to clip into ellipses.
-fn make_paragraph<R: text::Renderer<Font = Font>>(
-    content: &str,
-    size: f32,
-    font: Font,
-) -> R::Paragraph {
-    let line_height = size * LINE_HEIGHT_MULTIPLIER;
-    R::Paragraph::with_text(Text {
-        content,
-        bounds: Size::new(f32::INFINITY, line_height.max(1.0)),
-        size: Pixels(size),
-        line_height: text::LineHeight::Absolute(Pixels(line_height)),
-        font,
-        align_x: text::Alignment::Left,
-        align_y: alignment::Vertical::Top,
-        shaping: text::Shaping::Advanced,
-        wrapping: text::Wrapping::None,
-        ellipsis: text::Ellipsis::None,
-        hint_factor: None,
-    })
-}
-
-/// One-line rendered width of `content`, for sizing a layout to fit its text
-/// at view-build time (e.g. a dropdown that grows to its widest row). Unlike
-/// [`measure_text_width`], the paragraph isn't retained — the caller reads the
-/// width and drops it, which is fine here because this paragraph never reaches
-/// the renderer (nothing upgrades its `Weak` buffer later).
-pub(crate) fn line_width(content: &str, size: f32, font: Font) -> f32 {
-    if content.is_empty() {
-        return 0.0;
-    }
-    make_paragraph::<iced::Renderer>(content, size, font).min_width()
-}
-
-/// Measure the rendered width of `content` using a real `Paragraph`. The
-/// paragraph is stashed in the widget's cache so its backing buffer outlives
-/// the draw frame (otherwise iced's `Weak` reference upgrade fails when the
-/// renderer flushes).
-fn measure_text_width<R: text::Renderer<Font = Font>>(
-    content: &str,
-    size: f32,
-    font: Font,
-    paragraphs: &RefCell<Vec<R::Paragraph>>,
-) -> f32 {
-    if content.is_empty() {
-        return 0.0;
-    }
-    let para = make_paragraph::<R>(content, size, font);
-    let width = para.min_width();
-    paragraphs.borrow_mut().push(para);
-    width
-}
-
 /// Fill text whose bounds box is centered vertically on `center_y`. We push
 /// this through `fill_text` (the `Cached` text path) rather than
 /// `fill_paragraph` because Cached text is the only path where iced applies
@@ -1924,9 +1836,9 @@ struct TooltipOverlay {
     row_anchor_y: f32,
     row_height: f32,
     style: RevisionListStyle,
-    /// Pre-measured text size (computed from a real `Paragraph` in
-    /// `overlay()`), so layout uses true glyph extents instead of a
-    /// `chars * size * 0.55` guess that left a gap on the right.
+    /// Pre-measured text size (via [`measure::line_bounds`] in `overlay()`),
+    /// so layout uses true glyph extents instead of a `chars * size * 0.55`
+    /// guess that left a gap on the right.
     text_size: Size,
 }
 

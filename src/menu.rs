@@ -32,7 +32,8 @@ use iced::{
 };
 
 use crate::icons;
-use crate::theme::{self, ThemeSpec, chip_background, emphasis_font};
+use crate::measure;
+use crate::theme::{self, ThemeSpec, chip_background, emphasis_font, popover_style, text_size};
 use crate::{Diffui, MenuAction, Message};
 use diffui_core::RevisionSelection;
 
@@ -298,11 +299,7 @@ pub(crate) fn build_overlay(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
     // per-layer query that ignores event capture — without `opaque`, the app
     // underneath still painted its own cursor (the diff view's I-beam)
     // through the menu scrim.
-    opaque(
-        stack(layers)
-            .width(Length::Fill)
-            .height(Length::Fill),
-    )
+    opaque(stack(layers).width(Length::Fill).height(Length::Fill))
 }
 
 /// Draws the submenu trajectory triangle over the open menu: the apex (blue),
@@ -561,16 +558,16 @@ fn card_width(ui: &Diffui, entries: &[MenuEntry]) -> f32 {
                 } else {
                     font
                 };
-                let mut w = revision_line_width(label, 12.0, label_font);
+                let mut w = measure::line_width(label, text_size::UI, label_font);
                 if let Some(detail) = detail {
-                    w += MENU_ROW_GAP + revision_line_width(detail, 11.0, mono);
+                    w += MENU_ROW_GAP + measure::line_width(detail, text_size::CAPTION, mono);
                 }
                 w
             }
             MenuEntry::Submenu { label, .. } => {
-                revision_line_width(label, 12.0, font) + MENU_ROW_GAP + CHEVRON_WIDTH
+                measure::line_width(label, text_size::UI, font) + MENU_ROW_GAP + CHEVRON_WIDTH
             }
-            MenuEntry::Disabled { label } => revision_line_width(label, 12.0, font),
+            MenuEntry::Disabled { label } => measure::line_width(label, text_size::UI, font),
             MenuEntry::Separator => 0.0,
         };
         content = content.max(w);
@@ -632,7 +629,7 @@ fn build_card<'a>(
             .width(Length::Fixed(width))
             .max_height(MENU_MAX_HEIGHT)
             .padding(Padding::from([MENU_CARD_PAD, MENU_CARD_PAD]))
-            .style(move |_| menu_card_style(theme)),
+            .style(move |_| popover_style(theme)),
     )
     .on_press(Message::Menu(MenuMessage::CapturePress))
     .on_right_press(Message::Menu(MenuMessage::CapturePress))
@@ -666,7 +663,7 @@ fn build_row<'a>(
             .into();
         }
         MenuEntry::Disabled { label } => text(label)
-            .size(12)
+            .size(text_size::UI)
             .color(theme.subtle_text)
             .font(font)
             .width(Length::Fill)
@@ -685,7 +682,7 @@ fn build_row<'a>(
                 font
             };
             let label_widget = text(label)
-                .size(12)
+                .size(text_size::UI)
                 .color(theme.text)
                 .font(label_font)
                 .wrapping(iced::advanced::text::Wrapping::None);
@@ -693,7 +690,7 @@ fn build_row<'a>(
                 Some(detail) => row![
                     label_widget,
                     text(detail)
-                        .size(11)
+                        .size(text_size::CAPTION)
                         .color(theme.subtle_text)
                         .font(mono)
                         .width(Length::Fill)
@@ -709,7 +706,7 @@ fn build_row<'a>(
         }
         MenuEntry::Submenu { label, .. } => row![
             text(label)
-                .size(12)
+                .size(text_size::UI)
                 .color(theme.text)
                 .font(font)
                 .width(Length::Fill)
@@ -796,31 +793,6 @@ fn glow_card(
             ..container::Style::default()
         })
         .into()
-}
-
-fn menu_card_style(theme: ThemeSpec) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(theme.panel_background_elevated)),
-        border: Border {
-            width: 1.0,
-            color: theme.border,
-            radius: 10.0.into(),
-        },
-        shadow: iced::Shadow {
-            color: Color {
-                a: 0.30,
-                ..Color::BLACK
-            },
-            offset: iced::Vector::new(0.0, 8.0),
-            blur_radius: 24.0,
-        },
-        ..container::Style::default()
-    }
-}
-
-/// One-line text width via [`crate::revision_list::line_width`].
-fn revision_line_width(content: &str, size: f32, font: iced::Font) -> f32 {
-    crate::revision_list::line_width(content, size, font)
 }
 
 // ── AnchorArea: report a trigger's bounds on press ───────────────────────────

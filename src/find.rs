@@ -20,7 +20,7 @@ use iced::{
 };
 use regex::{Regex, RegexBuilder};
 
-use crate::theme::ThemeSpec;
+use crate::theme::{ThemeSpec, ghost_button_style, input_style, text_size};
 use crate::{Diffui, Message};
 use diffui_core::DiffDocument;
 
@@ -254,28 +254,14 @@ pub fn build_overlay<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Messag
     let input = text_input("Find in diff", &state.query)
         .id(FIND_INPUT_ID)
         .padding(Padding::from([4, 8]))
-        .size(13)
+        .size(text_size::BODY)
         .font(ui.config.ui_font)
         .on_input(|q| Message::Find(FindMessage::QueryChanged(q)))
         // Intentionally no `on_submit` — that would route Enter to FindNext
         // unconditionally and steal Shift+Enter from the keyboard
         // subscription, which is what handles forward/backward.
         .width(Length::Fixed(220.0))
-        .style(move |_, _| text_input::Style {
-            background: Background::Color(theme.panel_background),
-            border: Border {
-                width: 1.0,
-                color: theme.border,
-                radius: 4.0.into(),
-            },
-            icon: theme.muted_text,
-            placeholder: theme.subtle_text,
-            value: theme.text,
-            selection: Color {
-                a: 0.25,
-                ..theme.accent
-            },
-        });
+        .style(move |_, _| input_style(theme));
 
     let case_button = toggle_button("Aa", state.case_sensitive, theme, ui.config.ui_font)
         .on_press(Message::Find(FindMessage::ToggleCase));
@@ -303,7 +289,7 @@ pub fn build_overlay<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Messag
         Space::new().width(Length::Fixed(10.0)),
         centered_cell(
             text(count_label)
-                .size(11)
+                .size(text_size::CAPTION)
                 .color(theme.subtle_text)
                 .font(ui.config.ui_font)
                 .into(),
@@ -336,7 +322,7 @@ pub fn build_overlay<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Messag
     let error_line: Element<'_, Message> = if let Some(err) = &state.error {
         container(
             text(format!("Regex error: {err}"))
-                .size(11)
+                .size(text_size::CAPTION)
                 .color(theme.removed_text)
                 .font(ui.config.ui_font),
         )
@@ -392,7 +378,7 @@ fn toggle_button<'a>(
     button(
         container(
             text(label)
-                .size(11)
+                .size(text_size::CAPTION)
                 // See `emphasis_font` doc — Medium is only applied on
                 // explicitly-named families so the generic default
                 // doesn't end up rendering tofu on macOS.
@@ -421,22 +407,14 @@ fn nav_button<'a>(
     font: iced::Font,
 ) -> button::Button<'a, Message> {
     button(
-        container(text(label).size(13).font(font).color(theme.muted_text))
-            .padding(Padding::from([2, 6])),
+        container(
+            text(label)
+                .size(text_size::BODY)
+                .font(font)
+                .color(theme.muted_text),
+        )
+        .padding(Padding::from([2, 6])),
     )
     .padding(0)
-    .style(move |_, status| button::Style {
-        background: Some(Background::Color(match status {
-            button::Status::Hovered | button::Status::Pressed => theme.selected_file,
-            _ => Color::TRANSPARENT,
-        })),
-        text_color: theme.muted_text,
-        border: Border {
-            width: 0.0,
-            color: Color::TRANSPARENT,
-            radius: 6.0.into(),
-        },
-        shadow: Shadow::default(),
-        snap: true,
-    })
+    .style(move |_, status| ghost_button_style(theme, status))
 }

@@ -16,6 +16,7 @@ mod graph_view;
 mod icons;
 #[cfg(target_os = "macos")]
 mod macos_native;
+mod measure;
 mod menu;
 mod menus;
 mod message;
@@ -117,8 +118,7 @@ use find::FindState;
 use futures::{SinkExt, Stream, StreamExt};
 use iced::theme as iced_theme;
 use iced::{
-    Background, Border, Color, Element, Length, Padding, Point, Size, Subscription, Task, Theme,
-    alignment,
+    Element, Length, Padding, Point, Size, Subscription, Task, Theme, alignment,
     event::{self, Event},
     font::Weight,
     keyboard, system, time,
@@ -133,7 +133,7 @@ use repository::{Repository, Vcs, prepare_repository};
 use resize_handle::ResizeHandle;
 use theme::{
     ResolvedTheme, ThemePreference, ThemeSpec, app_shell_style, emphasis_font, horizontal_divider,
-    vertical_divider,
+    primary_button_style, text_size, vertical_divider,
 };
 use window_state::WindowState;
 
@@ -658,7 +658,7 @@ fn selection_from_key(key: &revision_list::RowSelectionKey) -> RevisionSelection
 fn empty_state<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
     let mut body = column![
         text("Diffui")
-            .size(22)
+            .size(text_size::DISPLAY)
             .color(theme.text)
             .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
     ]
@@ -670,7 +670,7 @@ fn empty_state<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
     if let LoadStatus::Failed(error) = &ui.session.status {
         body = body.push(
             text(format!("Couldn't open repository: {error}"))
-                .size(12)
+                .size(text_size::UI)
                 .color(theme.removed_text)
                 .font(ui.config.ui_font),
         );
@@ -679,23 +679,13 @@ fn empty_state<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
     body = body.push(
         button(
             text("Open repository\u{2026}")
-                .size(13)
+                .size(text_size::BODY)
                 .color(theme.background)
                 .font(ui.config.ui_font),
         )
         .padding(Padding::from([8, 18]))
         .on_press(Message::OpenRepoDialogOpen)
-        .style(move |_, _| button::Style {
-            background: Some(Background::Color(theme.accent)),
-            text_color: theme.background,
-            border: Border {
-                width: 0.0,
-                color: Color::TRANSPARENT,
-                radius: 8.0.into(),
-            },
-            shadow: Default::default(),
-            snap: true,
-        }),
+        .style(move |_, _| primary_button_style(theme)),
     );
 
     // Click-to-reopen recents — reuses the open dialog's row builder so both
@@ -705,7 +695,7 @@ fn empty_state<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
     if !recents.is_empty() {
         let mut list = column![
             text("Recent")
-                .size(11)
+                .size(text_size::CAPTION)
                 .color(theme.subtle_text)
                 .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
         ]
@@ -718,7 +708,7 @@ fn empty_state<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
 
     body = body.push(
         text("or press \u{2318}O")
-            .size(12)
+            .size(text_size::UI)
             .color(theme.muted_text)
             .font(ui.config.ui_font),
     );

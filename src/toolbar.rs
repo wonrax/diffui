@@ -12,7 +12,9 @@ use iced::{
 use crate::activity;
 use crate::icons;
 use crate::repository::Vcs;
-use crate::theme::{ThemeSpec, chip_background};
+use crate::theme::{
+    ThemeSpec, bordered_button_style, chip_background, ghost_button_style, text_size,
+};
 use crate::{Diffui, FetchTarget, HoverTarget, Message, ToolbarMenu};
 
 /// Toolbar icon size. Slightly larger than the 12px labels so the Lucide marks
@@ -124,7 +126,10 @@ fn toolbar_button(
 ) -> Element<'static, Message> {
     let content = row![
         icons::icon(icon, ICON_SIZE, theme.muted_text),
-        text(label.to_owned()).size(12).color(theme.text).font(font),
+        text(label.to_owned())
+            .size(text_size::UI)
+            .color(theme.text)
+            .font(font),
     ]
     .spacing(5)
     .align_y(alignment::Vertical::Center);
@@ -153,7 +158,10 @@ fn toolbar_toggle_button(
     };
     let content = row![
         icons::icon(icon, ICON_SIZE, icon_color),
-        text(label.to_owned()).size(12).color(theme.text).font(font),
+        text(label.to_owned())
+            .size(text_size::UI)
+            .color(theme.text)
+            .font(font),
     ]
     .spacing(5)
     .align_y(alignment::Vertical::Center);
@@ -173,28 +181,6 @@ fn toolbar_toggle_button(
         .into()
 }
 
-/// A bordered toolbar action — same 1px outline + radius as the Fetch split
-/// button, so Refresh / Undo read as a consistent set with it. Transparent
-/// fill until hovered.
-fn bordered_button_style(theme: ThemeSpec, status: button::Status) -> button::Style {
-    button::Style {
-        background: match status {
-            button::Status::Hovered | button::Status::Pressed => {
-                Some(Background::Color(chip_background(theme.muted_text)))
-            }
-            _ => None,
-        },
-        text_color: theme.text,
-        border: Border {
-            width: 1.0,
-            color: theme.border,
-            radius: 6.0.into(),
-        },
-        shadow: Default::default(),
-        snap: true,
-    }
-}
-
 /// The Fetch split button: a main "Fetch" action + a caret that opens the
 /// remote-branch menu, in one rounded outline. The two halves highlight
 /// **independently** on hover. The outer container carries the border with 1px
@@ -210,7 +196,10 @@ fn fetch_split_button(
     let main = button(
         row![
             icons::icon(icons::FETCH, ICON_SIZE, theme.muted_text),
-            text("Fetch").size(12).color(theme.text).font(font),
+            text("Fetch")
+                .size(text_size::UI)
+                .color(theme.text)
+                .font(font),
         ]
         .spacing(5)
         .align_y(alignment::Vertical::Center),
@@ -283,24 +272,5 @@ pub(crate) fn caret_hover_style(theme: ThemeSpec, hovered: bool) -> container::S
             radius: 4.0.into(),
         },
         ..container::Style::default()
-    }
-}
-
-fn ghost_button_style(theme: ThemeSpec, status: button::Status) -> button::Style {
-    button::Style {
-        background: match status {
-            button::Status::Hovered | button::Status::Pressed => {
-                Some(Background::Color(chip_background(theme.muted_text)))
-            }
-            _ => None,
-        },
-        text_color: theme.text,
-        border: Border {
-            width: 0.0,
-            color: Color::TRANSPARENT,
-            radius: 6.0.into(),
-        },
-        shadow: Default::default(),
-        snap: true,
     }
 }

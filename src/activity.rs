@@ -23,8 +23,12 @@ use iced::{
     },
 };
 
+use crate::chip;
 use crate::icons;
-use crate::theme::{ThemeSpec, chip_background, emphasis_font, iced_scrollable_style};
+use crate::theme::{
+    ThemeSpec, chip_background, emphasis_font, ghost_button_style, iced_scrollable_style,
+    popover_style, text_size,
+};
 use crate::{Diffui, Message};
 use diffui_core::LoadProgress;
 
@@ -267,11 +271,11 @@ pub fn activity_indicator(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message>
     let body: Element<'_, Message> = if let Some(active) = ui.activities.first_running_visible() {
         let mut chips = row![
             text(spinner_glyph(active.started))
-                .size(12)
+                .size(text_size::UI)
                 .font(mono)
                 .color(theme.accent),
             text(active.label.as_str())
-                .size(11.5)
+                .size(text_size::UI)
                 .font(ui.config.ui_font)
                 .color(theme.text),
         ]
@@ -281,24 +285,24 @@ pub fn activity_indicator(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message>
             chips = chips.push(
                 container(
                     text(format!("+{}", running - 1))
-                        .size(10)
+                        .size(text_size::BADGE)
                         .font(mono)
                         .color(theme.muted_text),
                 )
                 .padding(Padding::from([1, 5]))
-                .style(move |_| chip_style(chip_background(theme.muted_text))),
+                .style(move |_| chip::container_style(theme.muted_text)),
             );
         }
         if queued > 0 {
             chips = chips.push(
                 container(
                     text(format!("{queued} queued"))
-                        .size(10)
+                        .size(text_size::BADGE)
                         .font(mono)
                         .color(theme.subtle_text),
                 )
                 .padding(Padding::from([1, 5]))
-                .style(move |_| chip_style(chip_background(theme.subtle_text))),
+                .style(move |_| chip::container_style(theme.subtle_text)),
             );
         }
         chips.into()
@@ -312,11 +316,11 @@ pub fn activity_indicator(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message>
         };
         row![
             text(glyph)
-                .size(12)
+                .size(text_size::UI)
                 .font(icons::ICON_FONT)
                 .color(theme.subtle_text),
             text("Activity")
-                .size(11.5)
+                .size(text_size::UI)
                 .font(ui.config.ui_font)
                 .color(theme.subtle_text),
         ]
@@ -425,7 +429,7 @@ pub fn activity_popover(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
 
     let header = row![
         text("Activity")
-            .size(14)
+            .size(text_size::BODY_LG)
             .font(emphasis_font(ui.config.ui_font, Weight::Semibold))
             .color(theme.text),
         Space::new().width(Length::Fill),
@@ -439,7 +443,7 @@ pub fn activity_popover(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         list = list.push(
             container(
                 text("No activity yet.")
-                    .size(12)
+                    .size(text_size::UI)
                     .font(ui.config.ui_font)
                     .color(theme.subtle_text),
             )
@@ -484,7 +488,7 @@ pub fn activity_popover(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     let card = mouse_area(
         container(body)
             .width(Length::Fixed(420.0))
-            .style(move |_| card_style(theme)),
+            .style(move |_| popover_style(theme)),
     )
     .on_press(Message::ActivityNoOp);
 
@@ -528,7 +532,7 @@ fn activity_row<'a>(
     let mut head = row![
         status_icon(activity, theme, mono),
         text(activity.label.as_str())
-            .size(12)
+            .size(text_size::UI)
             .font(emphasis_font(ui.config.ui_font, Weight::Medium))
             .color(theme.text)
             .wrapping(text::Wrapping::None)
@@ -543,7 +547,7 @@ fn activity_row<'a>(
             let pct = (loaded * 100 / total.max(1)).min(100);
             head = head.push(
                 text(format!("{pct}%"))
-                    .size(11)
+                    .size(text_size::CAPTION)
                     .font(mono)
                     .color(theme.muted_text),
             );
@@ -552,7 +556,7 @@ fn activity_row<'a>(
             // surface the running count.
             head = head.push(
                 text(loaded.to_string())
-                    .size(11)
+                    .size(text_size::CAPTION)
                     .font(mono)
                     .color(theme.muted_text),
             );
@@ -560,7 +564,7 @@ fn activity_row<'a>(
     } else if let Some(duration) = activity.duration {
         head = head.push(
             text(format_duration(duration))
-                .size(11)
+                .size(text_size::CAPTION)
                 .font(ui.config.ui_font)
                 .color(theme.subtle_text),
         );
@@ -582,7 +586,7 @@ fn activity_row<'a>(
         header = header.push(
             container(
                 text(result)
-                    .size(11.5)
+                    .size(text_size::UI)
                     .font(ui.config.ui_font)
                     .color(theme.muted_text)
                     .wrapping(text::Wrapping::None)
@@ -654,7 +658,7 @@ fn activity_row<'a>(
     };
     let mut block_body = column![
         text_editor(editor)
-            .size(11)
+            .size(text_size::CAPTION)
             .font(mono)
             .padding(0)
             .wrapping(text::Wrapping::WordOrGlyph)
@@ -680,20 +684,25 @@ fn activity_row<'a>(
         let mut links = column![].spacing(2);
         for url in urls {
             links = links.push(
-                button(text(url.clone()).size(11).font(mono).color(theme.info))
-                    .padding(0)
-                    .on_press(Message::OpenUrl(url))
-                    .style(move |_, _| button::Style {
-                        background: None,
-                        text_color: theme.info,
-                        border: Border {
-                            width: 0.0,
-                            color: Color::TRANSPARENT,
-                            radius: 0.0.into(),
-                        },
-                        shadow: Default::default(),
-                        snap: true,
-                    }),
+                button(
+                    text(url.clone())
+                        .size(text_size::CAPTION)
+                        .font(mono)
+                        .color(theme.info),
+                )
+                .padding(0)
+                .on_press(Message::OpenUrl(url))
+                .style(move |_, _| button::Style {
+                    background: None,
+                    text_color: theme.info,
+                    border: Border {
+                        width: 0.0,
+                        color: Color::TRANSPARENT,
+                        radius: 0.0.into(),
+                    },
+                    shadow: Default::default(),
+                    snap: true,
+                }),
             );
         }
         block_body = block_body.push(links);
@@ -716,7 +725,11 @@ fn activity_row<'a>(
 }
 
 /// Status glyph centered in the fixed [`STATUS_ICON_BOX`] square.
-fn status_icon<'a>(activity: &Activity, theme: ThemeSpec, mono: iced::Font) -> Element<'a, Message> {
+fn status_icon<'a>(
+    activity: &Activity,
+    theme: ThemeSpec,
+    mono: iced::Font,
+) -> Element<'a, Message> {
     match activity.status {
         ActivityStatus::Queued => mono_glyph("\u{2026}", mono, theme.subtle_text), // … waiting
         ActivityStatus::Running => mono_glyph(spinner_glyph(activity.started), mono, theme.accent),
@@ -731,7 +744,7 @@ fn mono_glyph<'a>(glyph: &'a str, mono: iced::Font, color: Color) -> Element<'a,
     container(
         text(glyph)
             .font(mono)
-            .size(12)
+            .size(text_size::UI)
             .color(color)
             .line_height(text::LineHeight::Relative(1.0)),
     )
@@ -778,7 +791,7 @@ fn clear_button(ui: &Diffui, theme: ThemeSpec) -> Element<'static, Message> {
         .iter()
         .any(|a| matches!(a.status, ActivityStatus::Done | ActivityStatus::Error));
     let label = text("Clear")
-        .size(11.5)
+        .size(text_size::UI)
         .font(ui.config.ui_font)
         .color(if enabled {
             theme.muted_text
@@ -787,38 +800,11 @@ fn clear_button(ui: &Diffui, theme: ThemeSpec) -> Element<'static, Message> {
         });
     let mut b = button(label)
         .padding(Padding::from([2, 8]))
-        .style(move |_, status| button::Style {
-            background: match status {
-                button::Status::Hovered | button::Status::Pressed => {
-                    Some(Background::Color(chip_background(theme.muted_text)))
-                }
-                _ => None,
-            },
-            text_color: theme.text,
-            border: Border {
-                width: 0.0,
-                color: Color::TRANSPARENT,
-                radius: 6.0.into(),
-            },
-            shadow: Default::default(),
-            snap: true,
-        });
+        .style(move |_, status| ghost_button_style(theme, status));
     if enabled {
         b = b.on_press(Message::ActivityClear);
     }
     b.into()
-}
-
-fn chip_style(color: Color) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(color)),
-        border: Border {
-            width: 0.0,
-            color: Color::TRANSPARENT,
-            radius: 4.0.into(),
-        },
-        ..container::Style::default()
-    }
 }
 
 fn solid(color: Color) -> container::Style {
@@ -849,28 +835,6 @@ fn rounded(color: Color) -> container::Style {
             width: 0.0,
             color: Color::TRANSPARENT,
             radius: 2.0.into(),
-        },
-        ..container::Style::default()
-    }
-}
-
-fn card_style(theme: ThemeSpec) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(theme.panel_background_elevated)),
-        border: Border {
-            width: 1.0,
-            color: theme.border,
-            radius: 12.0.into(),
-        },
-        shadow: iced::Shadow {
-            // Half the previous opacity (0.12 → 0.06) — a softer, more
-            // translucent drop shadow under the popover.
-            color: Color {
-                a: 0.06,
-                ..Color::BLACK
-            },
-            offset: iced::Vector::new(0.0, 3.0),
-            blur_radius: 10.0,
         },
         ..container::Style::default()
     }

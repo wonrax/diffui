@@ -160,6 +160,22 @@ impl DiffSource for PrSource {
     }
 }
 
+/// Run `gh` with `args` and return its stdout. `what` names the invocation
+/// in the non-zero-exit error (e.g. "gh pr view").
+async fn run_gh(args: &[&str], what: &str) -> Result<Vec<u8>> {
+    let output = Command::new("gh")
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .context("failed to run `gh` — is the GitHub CLI installed and on PATH?")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("{what} exited with {}: {}", output.status, stderr.trim());
+    }
+    Ok(output.stdout)
+}
+
 /// PR header metadata from `gh pr view`.
 #[derive(Debug, Clone, Default)]
 pub struct PrInfo {
@@ -181,8 +197,8 @@ pub struct PrInfo {
 /// quotes can't break the framing; PR titles cannot contain newlines.
 pub async fn fetch_pr_info(spec: &PrSpec) -> Result<PrInfo> {
     const JQ: &str = r#"[(.number|tostring), .title, .author.login, .state, .baseRefName, .headRefName, (.additions|tostring), (.deletions|tostring), (.changedFiles|tostring), .url] | join("\u001f")"#;
-    let output = Command::new("gh")
-        .args([
+    let stdout = run_gh(
+        &[
             "pr",
             "view",
             &spec.number.to_string(),
@@ -192,21 +208,12 @@ pub async fn fetch_pr_info(spec: &PrSpec) -> Result<PrInfo> {
             "number,title,author,state,baseRefName,headRefName,additions,deletions,changedFiles,url",
             "--jq",
             JQ,
-        ])
-        .stdin(Stdio::null())
-        .output()
-        .await
-        .context("failed to run `gh` — is the GitHub CLI installed and on PATH?")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "gh pr view exited with {}: {}",
-            output.status,
-            stderr.trim()
-        );
-    }
+        ],
+        "gh pr view",
+    )
+    .await?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(&stdout);
     let mut parts = stdout.trim_end_matches('\n').split('\u{1f}');
     let mut next = || parts.next().unwrap_or("").to_owned();
     Ok(PrInfo {
@@ -236,8 +243,8 @@ pub struct PrCommit {
 pub async fn fetch_pr_commits(spec: &PrSpec) -> Result<Vec<PrCommit>> {
     const JQ: &str =
         r#".commits[] | [.oid, (.authors[0].login // ""), .messageHeadline] | join("\u001f")"#;
-    let output = Command::new("gh")
-        .args([
+    let stdout = run_gh(
+        &[
             "pr",
             "view",
             &spec.number.to_string(),
@@ -247,21 +254,12 @@ pub async fn fetch_pr_commits(spec: &PrSpec) -> Result<Vec<PrCommit>> {
             "commits",
             "--jq",
             JQ,
-        ])
-        .stdin(Stdio::null())
-        .output()
-        .await
-        .context("failed to run `gh` — is the GitHub CLI installed and on PATH?")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "gh pr view --json commits exited with {}: {}",
-            output.status,
-            stderr.trim()
-        );
-    }
+        ],
+        "gh pr view --json commits",
+    )
+    .await?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(&stdout);
     Ok(stdout
         .lines()
         .filter(|line| !line.is_empty())
@@ -408,22 +406,9 @@ async fn fetch_pr_commit_diff(
             "repos/{}/commits/{oid}?per_page={GITHUB_API_PAGE_SIZE}&page={page}",
             spec.slug()
         );
-        let output = Command::new("gh")
-            .args(["api", &path])
-            .stdin(Stdio::null())
-            .output()
-            .await
-            .context("failed to run `gh` — is the GitHub CLI installed and on PATH?")?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!(
-                "gh api commit diff exited with {}: {}",
-                output.status,
-                stderr.trim()
-            );
-        }
-        let commit: ApiCommit = serde_json::from_slice(&output.stdout)
-            .context("failed to parse the commit API response")?;
+        let stdout = run_gh(&["api", &path], "gh api commit diff").await?;
+        let commit: ApiCommit =
+            serde_json::from_slice(&stdout).context("failed to parse the commit API response")?;
         if details.is_none() {
             details = commit.commit.map(|meta| {
                 let author = meta.author.unwrap_or(ApiCommitSignature {
@@ -556,21 +541,8 @@ async fn stream_pr_files_api(spec: &PrSpec, mut on_file: impl FnMut(DiffFile)) -
             spec.slug(),
             spec.number
         );
-        let output = Command::new("gh")
-            .args(["api", &path])
-            .stdin(Stdio::null())
-            .output()
-            .await
-            .context("failed to run `gh` — is the GitHub CLI installed and on PATH?")?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!(
-                "gh api pull-request files exited with {}: {}",
-                output.status,
-                stderr.trim()
-            );
-        }
-        let files: Vec<ApiPrFile> = serde_json::from_slice(&output.stdout)
+        let stdout = run_gh(&["api", &path], "gh api pull-request files").await?;
+        let files: Vec<ApiPrFile> = serde_json::from_slice(&stdout)
             .context("failed to parse the pull-request files API response")?;
         // A short (or empty) page is the last one; GitHub also simply stops
         // listing past its 3,000-file cap.

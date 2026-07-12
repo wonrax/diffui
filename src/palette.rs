@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use iced::advanced::text::{Ellipsis, Wrapping};
 use iced::{
-    Animation, Background, Border, Color, Element, Length, Padding, Shadow, Vector, alignment,
+    Animation, Background, Border, Color, Element, Length, Padding, alignment,
     animation::Easing,
     border,
     font::Weight,
@@ -32,7 +32,7 @@ use iced::{
 use nucleo_matcher::{Config, Matcher, Utf32String};
 
 use crate::icons;
-use crate::theme::{self, ThemeSpec};
+use crate::theme::{self, ThemeSpec, text_size};
 use crate::{Diffui, Message};
 use diffui_core::RevisionSelection;
 
@@ -836,13 +836,7 @@ pub fn build_overlay<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Messag
         container(Space::new().width(Length::Fill).height(Length::Fill))
             .width(Length::Fill)
             .height(Length::Fill)
-            .style(|_| container::Style {
-                background: Some(Background::Color(Color {
-                    a: 0.45,
-                    ..Color::BLACK
-                })),
-                ..container::Style::default()
-            }),
+            .style(|_| theme::scrim_style()),
     )
     .on_press(Message::Palette(PaletteMessage::Close));
 
@@ -914,34 +908,15 @@ fn build_column<'a>(
 
     let body = column![header, input, results].spacing(0);
 
-    let panel_color = theme.panel_background_elevated;
-    let border_color = if is_focused {
-        theme.accent
-    } else {
-        theme.border
-    };
     container(body)
         .width(Length::Fixed(COLUMN_WIDTH))
         .height(Length::Fixed(COLUMN_HEIGHT))
-        .style(move |_| container::Style {
-            background: Some(Background::Color(panel_color)),
-            border: Border {
-                width: 1.0,
-                color: border_color,
-                radius: 10.0.into(),
-            },
-            // Subtle drop shadow: the scrim already darkens what's behind
-            // the modal, so a heavy shadow would just look like double
-            // dimming. Just enough to suggest the card is lifted.
-            shadow: Shadow {
-                color: Color {
-                    a: 0.18,
-                    ..Color::BLACK
-                },
-                offset: Vector::new(0.0, 4.0),
-                blur_radius: 12.0,
-            },
-            ..container::Style::default()
+        .style(move |_| {
+            let mut style = theme::modal_style(theme);
+            if is_focused {
+                style.border.color = theme.accent;
+            }
+            style
         })
         .into()
 }
@@ -957,7 +932,7 @@ fn column_header<'a>(
     };
     container(
         text(label)
-            .size(11)
+            .size(text_size::CAPTION)
             // `emphasis_font` is a no-op on the default UI font (generic
             // sans-serif) — see its docs for why. On macOS the generic
             // family won't resolve to a Medium-weight face and we'd
@@ -993,22 +968,19 @@ fn build_input<'a>(
     let mut input = text_input(placeholder, &column_state.query)
         .id(PALETTE_INPUT_ID)
         .padding(Padding::from([10, 14]))
-        .size(15)
+        .size(text_size::TITLE)
         .font(ui.config.ui_font)
-        .style(move |_, _status| text_input::Style {
-            background: Background::Color(theme.panel_background_elevated),
-            border: Border {
+        .style(move |_, _status| {
+            // Borderless variant: the input is embedded in the column card,
+            // which already frames it — keep the shared identity colors.
+            let mut style = theme::input_style(theme);
+            style.background = Background::Color(theme.panel_background_elevated);
+            style.border = Border {
                 width: 0.0,
                 color: Color::TRANSPARENT,
                 radius: 0.0.into(),
-            },
-            icon: theme.muted_text,
-            placeholder: theme.subtle_text,
-            value: theme.text,
-            selection: Color {
-                a: 0.25,
-                ..theme.accent
-            },
+            };
+            style
         });
 
     if is_focused {
@@ -1064,7 +1036,7 @@ fn build_results<'a>(
         });
         let empty = container(
             text(label)
-                .size(13)
+                .size(text_size::BODY)
                 .color(theme.subtle_text)
                 .font(ui.config.ui_font),
         )
@@ -1184,14 +1156,14 @@ fn result_row_body<'a>(
     match item {
         ResultRef::WorkingCopy => row![
             text("@")
-                .size(13)
+                .size(text_size::BODY)
                 .font(ui.config.mono_font)
                 .color(theme.accent),
             Space::new().width(Length::Fixed(10.0)),
             primary_label(ui, primary, "Working copy"),
             Space::new().width(Length::Fixed(8.0)),
             text("revision")
-                .size(11)
+                .size(text_size::CAPTION)
                 .font(ui.config.ui_font)
                 .color(muted),
         ]
@@ -1218,13 +1190,16 @@ fn result_row_body<'a>(
             let author = commit.map(|c| c.author().to_owned()).unwrap_or_default();
             row![
                 text(prefix)
-                    .size(13)
+                    .size(text_size::BODY)
                     .font(ui.config.mono_font)
                     .color(theme.accent),
                 Space::new().width(Length::Fixed(10.0)),
                 primary_label(ui, primary, description),
                 Space::new().width(Length::Fixed(8.0)),
-                text(author).size(11).font(ui.config.ui_font).color(muted),
+                text(author)
+                    .size(text_size::CAPTION)
+                    .font(ui.config.ui_font)
+                    .color(muted),
             ]
             .spacing(0)
             .align_y(alignment::Vertical::Center)
@@ -1250,7 +1225,10 @@ fn result_row_body<'a>(
                 Space::new().width(Length::Fixed(10.0)),
                 mono_primary_label(ui, primary, name.clone()),
                 Space::new().width(Length::Fixed(8.0)),
-                text(tail).size(11).font(ui.config.ui_font).color(muted),
+                text(tail)
+                    .size(text_size::CAPTION)
+                    .font(ui.config.ui_font)
+                    .color(muted),
             ]
             .spacing(0)
             .align_y(alignment::Vertical::Center)
@@ -1258,27 +1236,30 @@ fn result_row_body<'a>(
         }
         ResultRef::File(path) => row![
             text("@")
-                .size(13)
+                .size(text_size::BODY)
                 .font(ui.config.mono_font)
                 .color(theme.info),
             Space::new().width(Length::Fixed(10.0)),
             mono_primary_label(ui, primary, path.clone()),
             Space::new().width(Length::Fixed(8.0)),
-            text("file").size(11).font(ui.config.ui_font).color(muted),
+            text("file")
+                .size(text_size::CAPTION)
+                .font(ui.config.ui_font)
+                .color(muted),
         ]
         .spacing(0)
         .align_y(alignment::Vertical::Center)
         .into(),
         ResultRef::Command(cmd) => row![
             text(">")
-                .size(13)
+                .size(text_size::BODY)
                 .font(ui.config.mono_font)
                 .color(theme.modified_token),
             Space::new().width(Length::Fixed(10.0)),
             primary_label(ui, primary, cmd.label().to_owned()),
             Space::new().width(Length::Fixed(8.0)),
             text(cmd.hint())
-                .size(11)
+                .size(text_size::CAPTION)
                 .font(ui.config.ui_font)
                 .color(muted),
         ]
@@ -1297,7 +1278,7 @@ fn primary_label<'a>(
     label: impl Into<String>,
 ) -> Element<'a, Message> {
     text(label.into())
-        .size(14)
+        .size(text_size::BODY_LG)
         .font(ui.config.ui_font)
         .color(color)
         .width(Length::Fill)
@@ -1312,7 +1293,7 @@ fn mono_primary_label<'a>(
     label: impl Into<String>,
 ) -> Element<'a, Message> {
     text(label.into())
-        .size(14)
+        .size(text_size::BODY_LG)
         .font(ui.config.mono_font)
         .color(color)
         .width(Length::Fill)

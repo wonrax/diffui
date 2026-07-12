@@ -22,13 +22,16 @@ use crate::chrome;
 use crate::icons;
 use crate::palette::PaletteMessage;
 use crate::repository::Vcs;
-use crate::theme::{ThemeSpec, chip_background, emphasis_font};
+use crate::theme::{
+    ThemeSpec, chip_background, dialog_button_style, emphasis_font, ghost_button_style,
+    modal_style, scrim_style, text_size,
+};
 use crate::{Diffui, HoverTarget, Message};
 
 /// Focus target id for the open-repository dialog's path field.
 pub const OPEN_REPO_INPUT_ID: &str = "open-repo-input";
 
-const TAB_TEXT_SIZE: f32 = 12.5;
+const TAB_TEXT_SIZE: f32 = text_size::UI;
 
 /// Build the title-bar tab strip. Returns an empty `Space` when no repos are
 /// open (the empty-state view owns the window in that case).
@@ -170,22 +173,7 @@ fn tab_widget<'a>(
         // asymmetric padding (0 vertical, 4 horizontal) left it short and wide.
         .padding(Padding::from([2, 2]))
         .on_press(Message::CloseTab(id))
-        .style(move |_, status| button::Style {
-            background: match status {
-                button::Status::Hovered | button::Status::Pressed => {
-                    Some(Background::Color(chip_background(theme.muted_text)))
-                }
-                _ => None,
-            },
-            text_color: theme.text,
-            border: Border {
-                width: 0.0,
-                color: Color::TRANSPARENT,
-                radius: 4.0.into(),
-            },
-            shadow: Default::default(),
-            snap: true,
-        });
+        .style(move |_, status| ghost_button_style(theme, status));
 
     let inner = row![label, close]
         .spacing(4)
@@ -269,7 +257,7 @@ fn pr_badge(theme: ThemeSpec, mono: iced::Font) -> Element<'static, Message> {
 }
 
 fn badge_chip(label: &'static str, color: Color, mono: iced::Font) -> Element<'static, Message> {
-    container(text(label).size(9.5).color(color).font(mono))
+    container(text(label).size(text_size::BADGE).color(color).font(mono))
         .padding(Padding::from([1, 4]))
         .style(move |_| container::Style {
             background: Some(Background::Color(chip_background(color))),
@@ -307,22 +295,7 @@ fn add_button(theme: ThemeSpec) -> Element<'static, Message> {
         // the old asymmetric [2, 8] padding made around the square icon box.
         .padding(Padding::from([4, 4]))
         .on_press(Message::OpenRepoDialogOpen)
-        .style(move |_, status| button::Style {
-            background: match status {
-                button::Status::Hovered | button::Status::Pressed => {
-                    Some(Background::Color(chip_background(theme.muted_text)))
-                }
-                _ => None,
-            },
-            text_color: theme.text,
-            border: Border {
-                width: 0.0,
-                color: Color::TRANSPARENT,
-                radius: 6.0.into(),
-            },
-            shadow: Default::default(),
-            snap: true,
-        })
+        .style(move |_, status| ghost_button_style(theme, status))
         .into()
 }
 
@@ -331,7 +304,7 @@ fn add_button(theme: ThemeSpec) -> Element<'static, Message> {
 fn palette_hint(theme: ThemeSpec, mono: iced::Font) -> Element<'static, Message> {
     let chip = container(
         text("\u{2318}K")
-            .size(10.5)
+            .size(text_size::CAPTION)
             .color(theme.muted_text)
             .font(mono),
     )
@@ -375,45 +348,24 @@ pub fn build_confirm_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
         container(Space::new().width(Length::Fill).height(Length::Fill))
             .width(Length::Fill)
             .height(Length::Fill)
-            .style(|_| container::Style {
-                background: Some(Background::Color(Color {
-                    a: 0.40,
-                    ..Color::BLACK
-                })),
-                ..container::Style::default()
-            }),
+            .style(|_| scrim_style()),
     )
     .on_press(Message::ConfirmCancel);
 
     let cancel = button(
         text("Cancel")
-            .size(13)
+            .size(text_size::BODY)
             .color(theme.text)
             .font(ui.config.ui_font),
     )
     .padding(Padding::from([7, 15]))
     .on_press(Message::ConfirmCancel)
-    .style(move |_, status| button::Style {
-        background: match status {
-            button::Status::Hovered | button::Status::Pressed => {
-                Some(Background::Color(theme.selected_file))
-            }
-            _ => Some(Background::Color(theme.panel_background)),
-        },
-        text_color: theme.text,
-        border: Border {
-            width: 1.0,
-            color: theme.border,
-            radius: 8.0.into(),
-        },
-        shadow: Default::default(),
-        snap: true,
-    });
+    .style(move |_, status| dialog_button_style(theme, status));
 
     // Red fill: the confirm runs a mutation the jj CLI refuses by default.
     let accept = button(
         text(dialog.confirm_label.as_str())
-            .size(13)
+            .size(text_size::BODY)
             .color(theme.background)
             .font(ui.config.ui_font),
     )
@@ -433,11 +385,11 @@ pub fn build_confirm_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
 
     let body = column![
         text(dialog.title.as_str())
-            .size(15)
+            .size(text_size::TITLE)
             .color(theme.text)
             .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
         text(dialog.body.as_str())
-            .size(12)
+            .size(text_size::UI)
             .color(theme.muted_text)
             .font(ui.config.ui_font),
         row![Space::new().width(Length::Fill), cancel, accept]
@@ -450,23 +402,7 @@ pub fn build_confirm_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
         container(body)
             .width(Length::Fixed(460.0))
             .padding(Padding::from([18, 20]))
-            .style(move |_| container::Style {
-                background: Some(Background::Color(theme.panel_background_elevated)),
-                border: Border {
-                    width: 1.0,
-                    color: theme.border,
-                    radius: 14.0.into(),
-                },
-                shadow: iced::Shadow {
-                    color: Color {
-                        a: 0.30,
-                        ..Color::BLACK
-                    },
-                    offset: iced::Vector::new(0.0, 8.0),
-                    blur_radius: 24.0,
-                },
-                ..container::Style::default()
-            }),
+            .style(move |_| modal_style(theme)),
     )
     .on_press(Message::ConfirmNoOp);
 
@@ -519,14 +455,14 @@ pub(crate) fn recent_repo_row<'a>(
     if !owner.is_empty() {
         label = label.push(
             text(format!("{owner}/"))
-                .size(12.5)
+                .size(text_size::UI)
                 .color(theme.subtle_text)
                 .font(ui.config.ui_font),
         );
     }
     label = label.push(
         text(name)
-            .size(12.5)
+            .size(text_size::UI)
             .color(theme.text)
             .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
     );
@@ -534,7 +470,7 @@ pub(crate) fn recent_repo_row<'a>(
     let content = column![
         label,
         text(crate::contract_user_path(root))
-            .size(11)
+            .size(text_size::CAPTION)
             .color(theme.subtle_text)
             .font(ui.config.mono_font),
     ]
@@ -575,20 +511,14 @@ pub fn build_open_repo_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Mess
         container(Space::new().width(Length::Fill).height(Length::Fill))
             .width(Length::Fill)
             .height(Length::Fill)
-            .style(|_| container::Style {
-                background: Some(Background::Color(Color {
-                    a: 0.40,
-                    ..Color::BLACK
-                })),
-                ..container::Style::default()
-            }),
+            .style(|_| scrim_style()),
     )
     .on_press(Message::OpenRepoDialogClose);
 
     let input = text_input("~/code/your-repo or a GitHub PR URL", &dialog.path)
         .id(OPEN_REPO_INPUT_ID)
         .padding(Padding::from([8, 10]))
-        .size(13)
+        .size(text_size::BODY)
         .font(ui.config.mono_font)
         .on_input(Message::OpenRepoPathChanged)
         .on_submit(Message::OpenRepoSubmit)
@@ -610,11 +540,11 @@ pub fn build_open_repo_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Mess
 
     let mut body = column![
         text("Open repository")
-            .size(15)
+            .size(text_size::TITLE)
             .color(theme.text)
             .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
         text("Enter the path to a jj or git working copy, or a GitHub pull request (URL or owner/repo#123).")
-            .size(12)
+            .size(text_size::UI)
             .color(theme.muted_text)
             .font(ui.config.ui_font),
         input,
@@ -624,7 +554,7 @@ pub fn build_open_repo_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Mess
     if let Some(error) = &dialog.error {
         body = body.push(
             text(error.as_str())
-                .size(12)
+                .size(text_size::UI)
                 .color(theme.removed_text)
                 .font(ui.config.ui_font),
         );
@@ -646,7 +576,7 @@ pub fn build_open_repo_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Mess
     if !recents.is_empty() {
         body = body.push(
             text("Recent")
-                .size(11)
+                .size(text_size::CAPTION)
                 .color(theme.subtle_text)
                 .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
         );
@@ -659,32 +589,17 @@ pub fn build_open_repo_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Mess
 
     let cancel = button(
         text("Cancel")
-            .size(13)
+            .size(text_size::BODY)
             .color(theme.text)
             .font(ui.config.ui_font),
     )
     .padding(Padding::from([7, 15]))
     .on_press(Message::OpenRepoDialogClose)
-    .style(move |_, status| button::Style {
-        background: match status {
-            button::Status::Hovered | button::Status::Pressed => {
-                Some(Background::Color(theme.selected_file))
-            }
-            _ => Some(Background::Color(theme.panel_background)),
-        },
-        text_color: theme.text,
-        border: Border {
-            width: 1.0,
-            color: theme.border,
-            radius: 8.0.into(),
-        },
-        shadow: Default::default(),
-        snap: true,
-    });
+    .style(move |_, status| dialog_button_style(theme, status));
 
     let open = button(
         text("Open")
-            .size(13)
+            .size(text_size::BODY)
             .color(theme.background)
             .font(ui.config.ui_font),
     )
@@ -714,23 +629,7 @@ pub fn build_open_repo_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Mess
         container(body)
             .width(Length::Fixed(460.0))
             .padding(Padding::from([18, 20]))
-            .style(move |_| container::Style {
-                background: Some(Background::Color(theme.panel_background_elevated)),
-                border: Border {
-                    width: 1.0,
-                    color: theme.border,
-                    radius: 14.0.into(),
-                },
-                shadow: iced::Shadow {
-                    color: Color {
-                        a: 0.30,
-                        ..Color::BLACK
-                    },
-                    offset: iced::Vector::new(0.0, 8.0),
-                    blur_radius: 24.0,
-                },
-                ..container::Style::default()
-            }),
+            .style(move |_| modal_style(theme)),
     )
     .on_press(Message::OpenRepoNoOp);
 

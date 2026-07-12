@@ -6,13 +6,16 @@ use iced::{
 use crate::chip::Chip;
 use crate::diff_view::{self, DiffFileView, DiffView};
 use crate::find;
-use crate::theme::{ThemeSpec, chip_background, diff_palette, diff_panel_style, file_status_color};
+use crate::theme::{
+    ThemeSpec, chip_background, diff_palette, diff_panel_style, file_status_color, text_size,
+};
 use crate::{Diffui, LoadStatus, Message};
 use diffui_core::{RevisionDetails, SignatureInfo};
 
+// Diff pane code size — tied to the code font, not the chrome type scale.
 const CODE_TEXT_SIZE: f32 = 12.0;
-const EMPTY_STATE_TEXT_SIZE: f32 = 14.0;
-const STATS_TEXT_SIZE: f32 = 13.0;
+const EMPTY_STATE_TEXT_SIZE: f32 = text_size::BODY_LG;
+const STATS_TEXT_SIZE: f32 = text_size::BODY;
 
 pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
     let body: Element<'a, Message> = if matches!(ui.session.status, LoadStatus::Loading)
