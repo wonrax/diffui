@@ -20,7 +20,8 @@ use iced::{
 };
 use regex::{Regex, RegexBuilder};
 
-use crate::theme::{ThemeSpec, ghost_button_style, input_style, text_size};
+use crate::icons;
+use crate::theme::{ThemeSpec, ghost_button_style, input_style, popover_style, text_size};
 use crate::{Diffui, Message};
 use diffui_core::DiffFile;
 
@@ -267,11 +268,10 @@ pub fn build_overlay<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Messag
         .on_press(Message::Find(FindMessage::ToggleRegex));
 
     let prev_button =
-        nav_button("‹", theme, ui.config.ui_font).on_press(Message::Find(FindMessage::Prev));
+        nav_button(icons::CHEVRON_UP, theme).on_press(Message::Find(FindMessage::Prev));
     let next_button =
-        nav_button("›", theme, ui.config.ui_font).on_press(Message::Find(FindMessage::Next));
-    let close_button =
-        nav_button("✕", theme, ui.config.ui_font).on_press(Message::Find(FindMessage::Close));
+        nav_button(icons::CHEVRON_DOWN, theme).on_press(Message::Find(FindMessage::Next));
+    let close_button = nav_button(icons::CLOSE, theme).on_press(Message::Find(FindMessage::Close));
 
     // Each row item is wrapped in a container that asks for
     // `Length::Shrink` height + centered Y. iced's `Row::align_y` only
@@ -292,7 +292,7 @@ pub fn build_overlay<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Messag
                 .font(ui.config.ui_font)
                 .into(),
         ),
-        Space::new().width(Length::Fill),
+        Space::new().width(Length::Fixed(10.0)),
         centered_cell(prev_button.into()),
         centered_cell(next_button.into()),
         Space::new().width(Length::Fixed(4.0)),
@@ -301,53 +301,32 @@ pub fn build_overlay<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Messag
     .spacing(4)
     .align_y(alignment::Vertical::Center);
 
-    // Square, shadowless card flush against the bottom of the stats bar.
-    // The diff panel already provides a `+N -N · files` strip above, so
-    // the find bar visually reads as an extension of that strip rather
-    // than as a floating popover.
-    let bar_card = container(bar)
-        .padding(Padding::from([6, 10]))
-        .style(move |_| container::Style {
-            background: Some(Background::Color(theme.panel_background_elevated)),
-            border: Border {
-                width: 0.0,
-                color: Color::TRANSPARENT,
-                radius: 0.0.into(),
-            },
-            ..container::Style::default()
-        });
-
-    let error_line: Element<'_, Message> = if let Some(err) = &state.error {
-        container(
+    // Floating rounded card hovering over the diff's top-right corner —
+    // shares the popover elevation language so it reads as a transient
+    // control, not as pane chrome. A regex error joins inside the card.
+    let mut card_body = column![bar].spacing(4);
+    if let Some(err) = &state.error {
+        card_body = card_body.push(
             text(format!("Regex error: {err}"))
                 .size(text_size::CAPTION)
                 .color(theme.removed_text)
                 .font(ui.config.ui_font),
-        )
-        .padding(Padding::from([4, 10]))
-        .style(move |_| container::Style {
-            background: Some(Background::Color(theme.panel_background_elevated)),
-            border: Border {
-                width: 0.0,
-                color: Color::TRANSPARENT,
-                radius: 0.0.into(),
-            },
-            ..container::Style::default()
-        })
-        .into()
-    } else {
-        Space::new().into()
-    };
+        );
+    }
+    let bar_card = container(card_body)
+        .padding(Padding::from([6, 8]))
+        .style(move |_| popover_style(theme));
 
-    let stack = column![bar_card, error_line]
-        .align_x(alignment::Horizontal::Right)
-        .spacing(0);
-
-    // Flush with the diff viewport's top edge (no padding) and pulled to
-    // the right so it sits under the stats bar's right edge.
-    container(stack)
+    // Hover a small gap in from the pane's top-right corner.
+    container(bar_card)
         .width(Length::Fill)
         .align_x(alignment::Horizontal::Right)
+        .padding(Padding {
+            top: 8.0,
+            right: 12.0,
+            bottom: 0.0,
+            left: 0.0,
+        })
         .into()
 }
 
@@ -392,27 +371,15 @@ fn toggle_button<'a>(
         border: Border {
             width: 1.0,
             color: if on { theme.accent } else { theme.border },
-            radius: 6.0.into(),
+            radius: crate::theme::radius::BUTTON.into(),
         },
         shadow: Shadow::default(),
         snap: true,
     })
 }
 
-fn nav_button<'a>(
-    label: &'a str,
-    theme: ThemeSpec,
-    font: iced::Font,
-) -> button::Button<'a, Message> {
-    button(
-        container(
-            text(label)
-                .size(text_size::BODY)
-                .font(font)
-                .color(theme.muted_text),
-        )
-        .padding(Padding::from([2, 6])),
-    )
-    .padding(0)
-    .style(move |_, status| ghost_button_style(theme, status))
+fn nav_button<'a>(glyph: &'static str, theme: ThemeSpec) -> button::Button<'a, Message> {
+    button(container(icons::icon(glyph, 13.0, theme.muted_text)).padding(Padding::from([2, 4])))
+        .padding(0)
+        .style(move |_, status| ghost_button_style(theme, status))
 }

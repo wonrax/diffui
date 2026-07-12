@@ -274,7 +274,7 @@ impl CommandId {
             Self::ThemeSystem => "Follow OS appearance",
             Self::ThemeLight | Self::ThemeDark | Self::ThemeHighContrast => "Set palette theme",
             Self::CopyFileDiff => "Copy the selected file's diff text",
-            Self::OpenFind => "⌘F-style in-diff search across all files",
+            Self::OpenFind => "In-diff search across all files",
             Self::JumpToRevision => "Show this revision in the diff view",
             Self::CopyChangeId => "Copy the revision's change-id",
             Self::CopyCommitMessage => "Copy the commit message",
@@ -947,7 +947,7 @@ fn column_header<'a>(
         border: Border {
             width: 0.0,
             color: Color::TRANSPARENT,
-            radius: border::Radius::default().top(10.0),
+            radius: border::Radius::default().top(theme::radius::SURFACE - 1.0),
         },
         ..container::Style::default()
     })
@@ -1052,7 +1052,7 @@ fn build_results<'a>(
                 border: Border {
                     width: 0.0,
                     color: Color::TRANSPARENT,
-                    radius: border::Radius::default().bottom(10.0),
+                    radius: border::Radius::default().bottom(theme::radius::SURFACE - 1.0),
                 },
                 ..container::Style::default()
             })
@@ -1091,7 +1091,7 @@ fn build_results<'a>(
             border: Border {
                 width: 0.0,
                 color: Color::TRANSPARENT,
-                radius: border::Radius::default().bottom(10.0),
+                radius: border::Radius::default().bottom(theme::radius::SURFACE - 1.0),
             },
             ..container::Style::default()
         })
@@ -1129,7 +1129,7 @@ fn build_result_row<'a>(
             border: Border {
                 width: 0.0,
                 color: Color::TRANSPARENT,
-                radius: 6.0.into(),
+                radius: theme::radius::CONTROL.into(),
             },
             ..container::Style::default()
         });
@@ -1235,10 +1235,7 @@ fn result_row_body<'a>(
             .into()
         }
         ResultRef::File(path) => row![
-            text("@")
-                .size(text_size::BODY)
-                .font(ui.config.mono_font)
-                .color(theme.info),
+            icons::icon(icons::FILE, 13.0, theme.info),
             Space::new().width(Length::Fixed(10.0)),
             mono_primary_label(ui, primary, path.clone()),
             Space::new().width(Length::Fixed(8.0)),

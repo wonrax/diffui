@@ -94,17 +94,21 @@ impl ResolvedTheme {
                 removed_text: Color::from_rgb(0.929, 0.431, 0.361),
                 modified_token: Color::from_rgb(0.961, 0.706, 0.345),
                 info: Color::from_rgb(0.416, 0.659, 1.000),
-                // Pulled darker than `panel_background` so the file
-                // header strip reads as a clear divider when scrolling
-                // across files (the previous value matched the panel
-                // and made the header invisible against the diff body).
-                file_header: Color::from_rgb(0.043, 0.051, 0.071),
-                hunk_header: Color::from_rgba(0.416, 0.659, 1.000, 0.06),
+                // A step *lighter* than the elevated code surface so the
+                // strip reads as a raised header rather than a hole cut
+                // into the scroll body.
+                file_header: Color::from_rgb(0.122, 0.141, 0.184),
+                hunk_header: Color::from_rgba(0.416, 0.659, 1.000, 0.08),
                 conflict_marker: Color::from_rgb(0.949, 0.361, 0.361),
                 border: Color::from_rgb(0.137, 0.153, 0.196),
                 note_background: Color::from_rgba(0.961, 0.706, 0.345, 0.14),
                 note_text: Color::from_rgb(0.961, 0.706, 0.345),
                 lane_base: Color::from_rgb(0.655, 0.545, 0.980),
+                syntax_keyword: Color::from_rgb(0.729, 0.624, 0.996),
+                syntax_type: Color::from_rgb(0.337, 0.788, 0.745),
+                syntax_function: Color::from_rgb(0.541, 0.729, 1.000),
+                syntax_literal: Color::from_rgb(0.961, 0.706, 0.345),
+                syntax_property: Color::from_rgb(0.557, 0.812, 0.902),
             },
             // Neutral whites — panes are pure white, canvas is a faint
             // gray so the panes still read as elevated. Coral accent stays
@@ -124,17 +128,22 @@ impl ResolvedTheme {
                 removed_text: Color::from_rgb(0.800, 0.247, 0.184),
                 modified_token: Color::from_rgb(0.773, 0.518, 0.133),
                 info: Color::from_rgb(0.165, 0.435, 0.859),
-                // Same role as in the dark theme: visibly darker than the
-                // surrounding panel so file headers stand out as the
-                // scroll body slides past, but not so dark that it
-                // overpowers the body content.
-                file_header: Color::from_rgb(0.937, 0.941, 0.949),
+                // Same role as in the dark theme: distinct from the white
+                // code surface so file headers stand out as the scroll
+                // body slides past, but not so dark that it overpowers
+                // the body content.
+                file_header: Color::from_rgb(0.949, 0.953, 0.961),
                 hunk_header: Color::from_rgba(0.165, 0.435, 0.859, 0.06),
                 conflict_marker: Color::from_rgb(0.800, 0.247, 0.184),
                 border: Color::from_rgb(0.882, 0.886, 0.898),
                 note_background: Color::from_rgba(0.773, 0.518, 0.133, 0.14),
                 note_text: Color::from_rgb(0.500, 0.320, 0.045),
                 lane_base: Color::from_rgb(0.486, 0.357, 0.910),
+                syntax_keyword: Color::from_rgb(0.475, 0.302, 0.859),
+                syntax_type: Color::from_rgb(0.047, 0.494, 0.463),
+                syntax_function: Color::from_rgb(0.157, 0.408, 0.792),
+                syntax_literal: Color::from_rgb(0.694, 0.443, 0.078),
+                syntax_property: Color::from_rgb(0.129, 0.443, 0.612),
             },
             Self::HighContrast => ThemeSpec {
                 background: Color::BLACK,
@@ -158,6 +167,11 @@ impl ResolvedTheme {
                 note_background: Color::from_rgb(0.260, 0.210, 0.000),
                 note_text: Color::from_rgb(1.000, 0.940, 0.500),
                 lane_base: Color::from_rgb(0.760, 0.620, 1.000),
+                syntax_keyword: Color::from_rgb(0.870, 0.740, 1.000),
+                syntax_type: Color::from_rgb(0.400, 1.000, 0.920),
+                syntax_function: Color::from_rgb(0.600, 0.840, 1.000),
+                syntax_literal: Color::from_rgb(1.000, 0.880, 0.420),
+                syntax_property: Color::from_rgb(0.720, 0.920, 1.000),
             },
         }
     }
@@ -203,6 +217,16 @@ pub struct ThemeSpec {
     /// design) doesn't fight diff add/del greens and reds, and so the
     /// coral accent stays reserved for the working copy and selection.
     pub lane_base: Color,
+    /// Dedicated syntax ramp. Deliberately decoupled from the diff
+    /// semantics (`added_text`, `removed_text`, `conflict_marker`) so
+    /// code coloring never echoes add/del/conflict signals — a keyword
+    /// must not look like a conflict just because both are red.
+    pub syntax_keyword: Color,
+    pub syntax_type: Color,
+    pub syntax_function: Color,
+    /// Strings and numbers.
+    pub syntax_literal: Color,
+    pub syntax_property: Color,
 }
 
 pub fn diff_palette(theme: ThemeSpec) -> Palette {
@@ -214,6 +238,11 @@ pub fn diff_palette(theme: ThemeSpec) -> Palette {
         modified_token: theme.modified_token,
         conflict_marker: theme.conflict_marker,
         note_text: theme.note_text,
+        syntax_keyword: theme.syntax_keyword,
+        syntax_type: theme.syntax_type,
+        syntax_function: theme.syntax_function,
+        syntax_literal: theme.syntax_literal,
+        syntax_property: theme.syntax_property,
         panel: theme.panel_background_elevated,
         file_header: theme.file_header,
         hunk_header: theme.hunk_header,
@@ -394,18 +423,24 @@ pub mod text_size {
 /// Corner radii shared across the chrome. Chips keep their own tighter
 /// rounding ([`crate::chip::RADIUS`]).
 pub mod radius {
-    /// Buttons, inputs, tooltips, hover washes.
-    pub const CONTROL: f32 = 6.0;
-    /// Dialog push buttons — bigger targets, slightly rounder.
-    pub const PUSH: f32 = 8.0;
+    /// Inputs, tooltips, hover washes, list/menu rows.
+    pub const CONTROL: f32 = 5.0;
+    /// Every button-shaped control (ghost, raised, primary, dialog) and
+    /// the toolbar's segmented well — one rounding for everything that
+    /// reads as a button.
+    pub const BUTTON: f32 = 7.0;
+    /// Inset row cards (revision/file selection).
+    pub const PUSH: f32 = 6.0;
     /// Floating cards: popovers and modals.
-    pub const SURFACE: f32 = 12.0;
+    pub const SURFACE: f32 = 10.0;
 }
 
 /// Ghost button: invisible at rest, translucent wash on hover/press. The
 /// wash is [`chip_background`] of `muted_text` so it reads the same on
 /// panel and elevated backgrounds. For icon-only and small-label controls
-/// (toolbar, tab strip, find bar, popover footers).
+/// embedded in framed surfaces (tab strip, find card, popover footers) —
+/// standalone actions use [`raised_button_style`] so they stay visible at
+/// rest.
 pub fn ghost_button_style(theme: ThemeSpec, status: button::Status) -> button::Style {
     button::Style {
         background: match status {
@@ -418,28 +453,79 @@ pub fn ghost_button_style(theme: ThemeSpec, status: button::Status) -> button::S
         border: Border {
             width: 0.0,
             color: Color::TRANSPARENT,
-            radius: radius::CONTROL.into(),
+            radius: radius::BUTTON.into(),
         },
         shadow: Shadow::default(),
         snap: true,
     }
 }
 
-/// [`ghost_button_style`] plus a 1px outline, for controls that need a
-/// visible frame at rest.
-pub fn bordered_button_style(theme: ThemeSpec, status: button::Status) -> button::Style {
-    button::Style {
-        border: Border {
-            width: 1.0,
-            color: theme.border,
-            radius: radius::CONTROL.into(),
-        },
-        ..ghost_button_style(theme, status)
+/// Blend `a` toward `b` by `t` (0..=1), ignoring alpha. Used to derive the
+/// raised buttons' bezel stops from surface tokens without growing the spec.
+fn mix(a: Color, b: Color, t: f32) -> Color {
+    Color {
+        r: a.r + (b.r - a.r) * t,
+        g: a.g + (b.g - a.g) * t,
+        b: a.b + (b.b - a.b) * t,
+        a: 1.0,
     }
 }
 
-/// Primary call-to-action: solid accent fill, inverted label. The one
-/// loudest action on a surface (the welcome screen's "Open repository…").
+/// Whisper of a drop shadow shared by the raised/primary/destructive
+/// buttons — just enough to lift them off the bar, nowhere near a card.
+fn button_shadow() -> Shadow {
+    Shadow {
+        color: Color {
+            a: 0.15,
+            ..Color::BLACK
+        },
+        offset: Vector::new(0.0, 1.0),
+        blur_radius: 2.0,
+    }
+}
+
+/// Fill for [`raised_button_style`] at rest: a flat step from the toolbar
+/// surface toward the selection tone, so the button separates from the
+/// (also elevated) bar it sits on. Lighter on dark themes, darker on
+/// light — both the conventional direction.
+fn raised_fill(theme: ThemeSpec, t: f32) -> Color {
+    mix(theme.panel_background_elevated, theme.selected_file, t)
+}
+
+/// Fill for recessed wells (the toolbar's Diff/Source switcher): the
+/// window canvas pushed a step darker, so the well clearly sinks below
+/// both the canvas and the elevated bar it sits on — recessed surfaces
+/// deepen in both dark and light themes.
+pub fn well_fill(theme: ThemeSpec) -> Color {
+    mix(theme.background, Color::BLACK, 0.06)
+}
+
+/// The standard button: a flat fill one step above its surface, a crisp
+/// 1px border, and a whisper of drop shadow — visible at rest without any
+/// skeuomorphic shading. Hover deepens the fill; pressing deepens it
+/// further and drops the shadow so the button reads as pushed in.
+pub fn raised_button_style(theme: ThemeSpec, status: button::Status) -> button::Style {
+    let (fill, shadow) = match status {
+        button::Status::Pressed => (raised_fill(theme, 0.9), Shadow::default()),
+        button::Status::Hovered => (raised_fill(theme, 0.65), button_shadow()),
+        _ => (raised_fill(theme, 0.35), button_shadow()),
+    };
+    button::Style {
+        background: Some(Background::Color(fill)),
+        text_color: theme.text,
+        border: Border {
+            width: 1.0,
+            color: theme.border,
+            radius: radius::BUTTON.into(),
+        },
+        shadow,
+        snap: true,
+    }
+}
+
+/// Primary call-to-action: flat accent fill with the raised buttons\'
+/// whisper of shadow, inverted label. The one loudest action on a
+/// surface (the welcome screen\'s "Open repository…").
 pub fn primary_button_style(theme: ThemeSpec) -> button::Style {
     button::Style {
         background: Some(Background::Color(theme.accent)),
@@ -447,33 +533,32 @@ pub fn primary_button_style(theme: ThemeSpec) -> button::Style {
         border: Border {
             width: 0.0,
             color: Color::TRANSPARENT,
-            radius: radius::PUSH.into(),
+            radius: radius::BUTTON.into(),
         },
-        shadow: Shadow::default(),
+        shadow: button_shadow(),
         snap: true,
     }
 }
 
-/// Solid push button for dialog footers: filled at rest so it reads as a
-/// button without needing hover, brightening to the row-selection color
-/// on hover/press.
-pub fn dialog_button_style(theme: ThemeSpec, status: button::Status) -> button::Style {
+/// Destructive call-to-action for confirm dialogs: flat red fill so the
+/// dangerous choice is unmistakable next to the neutral cancel button.
+pub fn destructive_button_style(theme: ThemeSpec) -> button::Style {
     button::Style {
-        background: match status {
-            button::Status::Hovered | button::Status::Pressed => {
-                Some(Background::Color(theme.selected_file))
-            }
-            _ => Some(Background::Color(theme.panel_background)),
-        },
-        text_color: theme.text,
+        background: Some(Background::Color(theme.removed_text)),
+        text_color: theme.background,
         border: Border {
-            width: 1.0,
-            color: theme.border,
-            radius: radius::PUSH.into(),
+            width: 0.0,
+            color: Color::TRANSPARENT,
+            radius: radius::BUTTON.into(),
         },
-        shadow: Shadow::default(),
+        shadow: button_shadow(),
         snap: true,
     }
+}
+
+/// Push button for dialog footers — the shared raised chrome.
+pub fn dialog_button_style(theme: ThemeSpec, status: button::Status) -> button::Style {
+    raised_button_style(theme, status)
 }
 
 /// Floating card anchored to a trigger with nothing dimming the content

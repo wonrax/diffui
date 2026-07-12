@@ -32,10 +32,13 @@ use crate::theme::{
 use crate::{Diffui, Message};
 use diffui_core::LoadProgress;
 
-/// Frames for the running spinner. ASCII so it renders under any configured
-/// font; advanced at ~12fps off the activity's elapsed time (the toolbar tick
-/// keeps `view()` re-running while anything is in flight).
-const SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
+/// Frames for the running spinner. Braille-dot frames read as a smooth orbit
+/// at small sizes (the cargo/npm convention) where the old `|/-\` ASCII set
+/// looked like a teletype; advanced off the activity's elapsed time (the
+/// toolbar tick keeps `view()` re-running while anything is in flight).
+/// Falls back to `.notdef` boxes only if the mono font lacks Braille — every
+/// bundled/system mono we target ships it.
+const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// How long an operation must run before its spinner / progress line is painted.
 /// Anything that finishes faster than this never shows a visual, so a quick
@@ -256,7 +259,7 @@ impl ActivityLog {
 
 /// Spinner glyph for an activity that has been running for `elapsed`.
 fn spinner_glyph(started: Instant) -> &'static str {
-    let frame = (started.elapsed().as_millis() / 90) as usize % SPINNER_FRAMES.len();
+    let frame = (started.elapsed().as_millis() / 80) as usize % SPINNER_FRAMES.len();
     SPINNER_FRAMES[frame]
 }
 
@@ -330,24 +333,9 @@ pub fn activity_indicator(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message>
     };
 
     button(body)
-        .padding(Padding::from([4, 9]))
+        .padding(Padding::from([5, 10]))
         .on_press(Message::ActivityToggle)
-        .style(move |_, status| button::Style {
-            background: match status {
-                button::Status::Hovered | button::Status::Pressed => {
-                    Some(Background::Color(chip_background(theme.muted_text)))
-                }
-                _ => None,
-            },
-            text_color: theme.text,
-            border: Border {
-                width: 1.0,
-                color: theme.border,
-                radius: 6.0.into(),
-            },
-            shadow: Default::default(),
-            snap: true,
-        })
+        .style(move |_, status| ghost_button_style(theme, status))
         .into()
 }
 
@@ -822,7 +810,7 @@ fn code_block_style(theme: ThemeSpec) -> container::Style {
         border: Border {
             width: 0.0,
             color: Color::TRANSPARENT,
-            radius: 6.0.into(),
+            radius: crate::theme::radius::CONTROL.into(),
         },
         ..container::Style::default()
     }

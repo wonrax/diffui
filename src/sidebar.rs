@@ -1,5 +1,5 @@
 use iced::{
-    Background, Color, Element, Font, Length, Padding, alignment, mouse,
+    Background, Border, Color, Element, Font, Length, Padding, alignment, mouse,
     widget::{Space, column, container, mouse_area, row, text, text_input, tooltip},
 };
 
@@ -90,17 +90,30 @@ pub fn build_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     // The revset / revision-range filter sits at the very top of the pane.
     body = body.push(build_revset_filter(ui, theme));
     // Load failures no longer have a header to live under — surface them as a
-    // slim banner above the list.
+    // soft alert card above the list rather than bare red text.
     if let LoadStatus::Failed(error) = &ui.session.status {
         body = body.push(
             container(
-                text(format!("Failed: {error}"))
-                    .size(CAPTION_TEXT_SIZE)
-                    .font(ui.config.ui_font)
-                    .color(theme.removed_text),
+                container(
+                    text(format!("Failed: {error}"))
+                        .size(CAPTION_TEXT_SIZE)
+                        .font(ui.config.ui_font)
+                        .color(theme.removed_text),
+                )
+                .width(Length::Fill)
+                .padding([6, 10])
+                .style(move |_| container::Style {
+                    background: Some(Background::Color(chip_background(theme.removed_text))),
+                    border: Border {
+                        width: 0.0,
+                        color: Color::TRANSPARENT,
+                        radius: theme::radius::CONTROL.into(),
+                    },
+                    ..container::Style::default()
+                }),
             )
             .width(Length::Fill)
-            .padding([8, 12]),
+            .padding([6, 8]),
         );
     }
     body = body.push(revision_list);
@@ -124,66 +137,127 @@ fn build_revset_filter(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         Some(Vcs::Git) => "revision range — e.g. --all, main..@",
         _ => "revset — e.g. all(), mine()",
     };
+    filter_field(
+        theme,
+        ui.config.mono_font,
+        FilterField {
+            id: REVSET_INPUT_ID,
+            placeholder,
+            value: &ui.session.revset,
+            on_input: Message::RevsetChanged,
+            on_submit: Message::RevsetSubmit,
+            caret: Some(FilterCaret {
+                hovered: ui.hovered == Some(HoverTarget::RevsetCaret),
+                target: HoverTarget::RevsetCaret,
+                menu: ToolbarMenu::RevsetPresets,
+            }),
+        },
+    )
+}
 
-    let input = text_input(placeholder, &ui.session.revset)
-        .id(REVSET_INPUT_ID)
-        .padding(Padding::from([5, 8]))
+/// The trailing in-field caret of a [`filter_field`]: opens `menu` on press,
+/// with its hover wash driven by app-tracked state (`hovered` / `target`).
+pub(crate) struct FilterCaret {
+    pub hovered: bool,
+    pub target: HoverTarget,
+    pub menu: ToolbarMenu,
+}
+
+/// What varies between [`filter_field`] instances: the input's identity and
+/// wiring, plus the optional in-field presets caret.
+pub(crate) struct FilterField<'a> {
+    pub id: &'static str,
+    pub placeholder: &'a str,
+    pub value: &'a str,
+    pub on_input: fn(String) -> Message,
+    pub on_submit: Message,
+    pub caret: Option<FilterCaret>,
+}
+
+/// One sidebar filter field, shared by the diff sidebar's revset input and
+/// the source sidebar's file search so both views' top bars are identical.
+/// The field chrome (recessed window-colored well + hairline border) lives
+/// on a wrapping container rather than the `text_input` itself so the
+/// optional presets caret can sit *inside* the field.
+pub(crate) fn filter_field(
+    theme: ThemeSpec,
+    font: Font,
+    spec: FilterField<'_>,
+) -> Element<'_, Message> {
+    let input = text_input(spec.placeholder, spec.value)
+        .id(spec.id)
+        .padding(Padding::from([6, 9]))
         .size(theme::text_size::UI)
-        .font(ui.config.mono_font)
+        .font(font)
         .width(Length::Fill)
-        .on_input(Message::RevsetChanged)
-        .on_submit(Message::RevsetSubmit)
+        .on_input(spec.on_input)
+        .on_submit(spec.on_submit)
         .style(move |_, _| {
-            // Window-background variant: the field sits on the sidebar panel,
-            // so the darker window color is what gives it a visible well.
+            // Bare input: the wrapping container carries the well + border.
             let mut style = theme::input_style(theme);
-            style.background = Background::Color(theme.background);
+            style.background = Background::Color(Color::TRANSPARENT);
+            style.border.width = 0.0;
             style
         });
 
-    // `mouse_area` (not `button`) so the presets menu opens on mouse-*down*
-    // while held — required for the native NSMenu's press-drag-release select.
-    // Hover is tracked manually (mouse_area has no built-in hover style).
-    let caret_hovered = ui.hovered == Some(HoverTarget::RevsetCaret);
-    // No press handler — the press falls through to the wrapping `AnchorArea`
-    // (the `text_input` captures its own), which reports the whole bar's rect so
-    // the presets menu anchors edge-to-edge below it.
-    let caret = mouse_area(
-        // Shared Lucide chevron (see `toolbar::caret_glyph`), centered in a box
-        // whose height = the input's size-12 line box; with the same vertical
-        // padding (5), the hover fill lines up with the input box top-to-bottom
-        // instead of hugging the small glyph.
-        container(crate::toolbar::caret_glyph(theme.muted_text, 12.0 * 1.3))
-            .padding(Padding::from([5, 7]))
+    let menu = spec.caret.as_ref().map(|caret| caret.menu);
+    let mut bar = row![input].align_y(alignment::Vertical::Center);
+    if let Some(caret) = spec.caret {
+        // `mouse_area` (not `button`) so the presets menu opens on
+        // mouse-*down* while held — required for the native NSMenu's
+        // press-drag-release select. Hover is tracked manually (mouse_area
+        // has no built-in hover style), and the press falls through to the
+        // wrapping `AnchorArea` (the `text_input` captures its own).
+        let caret_el = mouse_area(
+            container(crate::toolbar::caret_glyph(
+                theme.muted_text,
+                theme::text_size::UI * 1.3,
+            ))
+            .padding(Padding::from([3, 6]))
             .align_y(alignment::Vertical::Center)
-            .style(move |_| crate::toolbar::caret_hover_style(theme, caret_hovered)),
-    )
-    .on_enter(Message::SetHover(Some(HoverTarget::RevsetCaret)))
-    .on_exit(Message::SetHover(None))
-    .interaction(mouse::Interaction::Pointer);
+            .style(move |_| {
+                crate::toolbar::caret_hover_style(theme, caret.hovered, theme::radius::CONTROL)
+            }),
+        )
+        .on_enter(Message::SetHover(Some(caret.target)))
+        .on_exit(Message::SetHover(None))
+        .interaction(mouse::Interaction::Pointer);
+        // 2px so the hover wash reads as an inset island instead of fusing
+        // with the field's right edge.
+        bar = bar
+            .push(caret_el)
+            .push(Space::new().width(Length::Fixed(2.0)));
+    }
 
-    let bar = crate::menu::anchor_area(
-        row![input, caret]
-            .spacing(4)
-            .align_y(alignment::Vertical::Center),
-        |rect| Message::OpenToolbarMenu(ToolbarMenu::RevsetPresets, rect),
-    );
-
-    let hairline = container(Space::new())
-        .width(Length::Fill)
-        .height(Length::Fixed(1.0))
-        .style(move |_| container::Style {
-            background: Some(Background::Color(theme.border)),
+    let field = container(bar).width(Length::Fill).style(move |_| {
+        // Window-background well: the field sits on the sidebar panel, so
+        // the darker window color is what makes it read as recessed.
+        container::Style {
+            background: Some(Background::Color(theme.background)),
+            border: Border {
+                width: 1.0,
+                color: theme.border,
+                radius: theme::radius::CONTROL.into(),
+            },
             ..container::Style::default()
-        });
+        }
+    });
 
-    column![
-        container(bar)
-            .width(Length::Fill)
-            .padding(Padding::from([6, 8])),
-        hairline,
-    ]
-    .into()
+    let field: Element<'_, Message> = match menu {
+        // The AnchorArea wraps the whole field so the presets menu anchors
+        // edge-to-edge below it.
+        Some(menu) => {
+            crate::menu::anchor_area(field, move |rect| Message::OpenToolbarMenu(menu, rect)).into()
+        }
+        None => field.into(),
+    };
+
+    // No rule under the field — its recessed well already separates it
+    // from the list below.
+    container(field)
+        .width(Length::Fill)
+        .padding(Padding::from([6, 8]))
+        .into()
 }
 
 const FOOTER_TEXT_SIZE: f32 = theme::text_size::UI;

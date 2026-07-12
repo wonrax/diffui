@@ -107,9 +107,15 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
                 matches: &find_state.matches,
                 active: find_state.active,
                 scroll_token: find_state.scroll_token,
-                highlight: theme.accent,
+                // All matches wear a soft wash; the *active* one is the
+                // strong fill (the previous full-opacity inactive /
+                // translucent active read backwards and drowned the text).
+                highlight: Color {
+                    a: 0.20,
+                    ..theme.accent
+                },
                 active_highlight: Color {
-                    a: 0.45,
+                    a: 0.50,
                     ..theme.accent
                 },
             });
@@ -169,14 +175,9 @@ fn build_stats_bar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message>
 
     container(bar)
         .width(Length::Fill)
-        .padding([8, 14])
+        .padding([9, 16])
         .style(move |_| container::Style {
             background: Some(iced::Background::Color(theme.panel_background)),
-            border: iced::Border {
-                color: theme.border,
-                width: 0.0,
-                radius: 0.0.into(),
-            },
             ..container::Style::default()
         })
         .into()
@@ -206,9 +207,10 @@ fn selected_lane_color(ui: &Diffui, theme: ThemeSpec) -> Color {
 }
 
 /// Format a `RevisionDetails` value into the line-by-line layout the diff
-/// view renders at the top of its scroll area. Mirrors `jj show`'s
-/// formatting: labels padded to 9 chars, blank line between the metadata
-/// block and the indented description.
+/// view renders at the top of its scroll area. The description leads as the
+/// header's title, followed by a compact metadata block — lowercase muted
+/// labels padded to a column, change id first (it's the primary handle in a
+/// jj-first tool; the sidebar leads with it too).
 fn build_header_lines(
     details: &RevisionDetails,
     bookmark_color: Color,
@@ -217,10 +219,17 @@ fn build_header_lines(
     use diff_view::HeaderLine;
     let mut lines: Vec<HeaderLine> = Vec::new();
 
-    lines.push(HeaderLine::field("Commit ID", &details.commit_id));
-    if let Some(change_id) = &details.change_id {
-        lines.push(HeaderLine::field("Change ID", change_id));
+    if !details.description.is_empty() {
+        for line in details.description.lines() {
+            lines.push(HeaderLine::description(line));
+        }
+        lines.push(HeaderLine::blank());
     }
+
+    if let Some(change_id) = &details.change_id {
+        lines.push(HeaderLine::field("change", change_id));
+    }
+    lines.push(HeaderLine::field("commit", &details.commit_id));
     if !details.bookmarks.is_empty() {
         // Chips match the sidebar: a tint of the commit's lane color for local
         // bookmarks, outlined for remote (`name@remote`) ones.
@@ -244,27 +253,20 @@ fn build_header_lines(
                 }
             })
             .collect();
-        lines.push(HeaderLine::bookmarks("Bookmarks", chips));
+        lines.push(HeaderLine::bookmarks("bookmarks", chips));
     }
     lines.push(HeaderLine::field(
-        "Author",
+        "author",
         &format_signature_line(&details.author),
     ));
     if let Some(committer) = &details.committer {
         lines.push(HeaderLine::field(
-            "Committer",
+            "committer",
             &format_signature_line(committer),
         ));
     }
     if let Some(sig) = &details.signature {
-        lines.push(HeaderLine::field("Signature", sig));
-    }
-
-    if !details.description.is_empty() {
-        lines.push(HeaderLine::blank());
-        for line in details.description.lines() {
-            lines.push(HeaderLine::description(line));
-        }
+        lines.push(HeaderLine::field("signature", sig));
     }
 
     lines

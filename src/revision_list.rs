@@ -39,6 +39,15 @@ const PIXEL_SCROLL_SCALE: f32 = 0.65;
 
 pub const REVISION_ROW_HEIGHT: f32 = 46.0;
 pub const FILE_ROW_HEIGHT: f32 = 26.0;
+/// Selection/hover chrome is an inset rounded card, not an edge-to-edge
+/// band: rows separate by whitespace, and the card gives the active row a
+/// modern object-like read. Y-inset keeps consecutive cards from fusing
+/// into a column; the X-inset equals the resulting card-to-card gap
+/// (2 × Y) so the margin against the pane edges reads the same as the
+/// spacing between rows.
+const ROW_CARD_INSET_X: f32 = 2.0 * ROW_CARD_INSET_Y;
+const ROW_CARD_INSET_Y: f32 = 1.0;
+const ROW_CARD_RADIUS: f32 = crate::theme::radius::PUSH;
 /// Horizontal indent per tree depth level for file/directory rows.
 pub const FILE_TREE_INDENT: f32 = 14.0;
 /// Width of the collapse-chevron column in file/directory rows (empty for
@@ -514,6 +523,9 @@ struct State {
     /// Item index of the file row currently hovered (only set for files,
     /// not revisions). Drives the tooltip overlay.
     hovered_file_item: Option<usize>,
+    /// Item index of the revision row currently hovered. Drives the row's
+    /// hover wash (files get theirs via `hovered_file_item`).
+    hovered_revision_item: Option<usize>,
     /// Item index + lane index + which half of the row the cursor is on,
     /// when the cursor is over a graph stroke whose lane has bookmark
     /// labels at that row. Drives the branch-name tooltip on the graph
@@ -546,6 +558,7 @@ impl State {
         Self {
             vertical_offset: 0.0,
             hovered_file_item: None,
+            hovered_revision_item: None,
             hovered_lane: None,
             cursor_position: None,
             scrollbar: ScrollbarState::default(),
@@ -679,6 +692,7 @@ where
 
         let recompute_hover = |state: &mut State, this: &Self| {
             state.hovered_file_item = None;
+            state.hovered_revision_item = None;
             state.hovered_lane = None;
             let Some(pos) = state.cursor_position else {
                 return;
@@ -720,8 +734,9 @@ where
                     }
                 }
             }
-            if matches!(item, Item::File(_)) {
-                state.hovered_file_item = Some(row_idx);
+            match item {
+                Item::File(_) => state.hovered_file_item = Some(row_idx),
+                Item::Revision(_) => state.hovered_revision_item = Some(row_idx),
             }
         };
 
@@ -747,6 +762,7 @@ where
                     }
                     state.cursor_position = None;
                     let had_hover = state.hovered_file_item.take().is_some()
+                        || state.hovered_revision_item.take().is_some()
                         || state.hovered_lane.take().is_some();
                     if had_hover {
                         shell.request_redraw();
@@ -764,16 +780,21 @@ where
                     state.cursor_position = None;
                 }
                 let prev_file = state.hovered_file_item;
+                let prev_revision = state.hovered_revision_item;
                 let prev_lane = state.hovered_lane;
                 recompute_hover(state, self);
-                if state.hovered_file_item != prev_file || state.hovered_lane != prev_lane {
+                if state.hovered_file_item != prev_file
+                    || state.hovered_revision_item != prev_revision
+                    || state.hovered_lane != prev_lane
+                {
                     shell.request_redraw();
                 }
             }
             Event::Mouse(mouse::Event::CursorLeft) => {
                 state.cursor_position = None;
-                let had_hover =
-                    state.hovered_file_item.take().is_some() || state.hovered_lane.take().is_some();
+                let had_hover = state.hovered_file_item.take().is_some()
+                    || state.hovered_revision_item.take().is_some()
+                    || state.hovered_lane.take().is_some();
                 if had_hover {
                     shell.request_redraw();
                 }
@@ -1104,6 +1125,7 @@ where
                             gutter_total,
                             emphasized_lane_before,
                             emphasized_lane_after,
+                            state.hovered_revision_item == Some(flat),
                         );
                     }
                     Item::File(f) => {
@@ -1140,6 +1162,7 @@ where
 }
 
 impl<'a, Message> RevisionList<'a, Message> {
+    #[allow(clippy::too_many_arguments)]
     fn draw_revision<R>(
         &self,
         renderer: &mut R,
@@ -1148,6 +1171,7 @@ impl<'a, Message> RevisionList<'a, Message> {
         gutter_total: f32,
         emphasized_lane_before: Option<usize>,
         emphasized_lane_after: Option<usize>,
+        hovered: bool,
     ) where
         R: text::Renderer<Font = Font> + iced::advanced::graphics::geometry::Renderer,
     {
@@ -1158,8 +1182,17 @@ impl<'a, Message> RevisionList<'a, Message> {
             .unwrap_or(false);
         let is_working_copy = matches!(rev.selection_key, RowSelectionKey::WorkingCopy);
 
-        // Row chrome extends edge-to-edge. The graph is drawn last in this
-        // method so its lines & node still sit visually above any chrome.
+        // Row chrome is an inset rounded card rather than an edge-to-edge
+        // band, so selection/hover read as objects sitting in the pane
+        // (rows separate by whitespace — there is no per-row hairline).
+        // The graph is drawn last in this method so its lines & node still
+        // sit visually above any chrome.
+        let card_bounds = Rectangle {
+            x: row_bounds.x + ROW_CARD_INSET_X,
+            y: row_bounds.y + ROW_CARD_INSET_Y,
+            width: (row_bounds.width - ROW_CARD_INSET_X * 2.0).max(0.0),
+            height: (row_bounds.height - ROW_CARD_INSET_Y * 2.0).max(0.0),
+        };
         // Working-copy rows get a left→right gradient with a fixed light
         // accent on the left fading into the row's base color on the
         // right (panel background normally, the selected gray when
@@ -1175,20 +1208,25 @@ impl<'a, Message> RevisionList<'a, Message> {
             let gradient = gradient::Linear::new(Radians(std::f32::consts::FRAC_PI_2))
                 .add_stop(0.0, left)
                 .add_stop(1.0, right);
-            fill_gradient(renderer, row_bounds, gradient);
+            fill_gradient_rounded(renderer, card_bounds, gradient, ROW_CARD_RADIUS);
         } else if selected {
-            fill_background(renderer, row_bounds, self.style.selected_background);
+            fill_rounded(
+                renderer,
+                card_bounds,
+                self.style.selected_background,
+                ROW_CARD_RADIUS,
+            );
+        } else if hovered {
+            fill_rounded(
+                renderer,
+                card_bounds,
+                Color {
+                    a: 0.06,
+                    ..self.style.muted_text
+                },
+                ROW_CARD_RADIUS,
+            );
         }
-        fill_background(
-            renderer,
-            Rectangle {
-                x: row_bounds.x,
-                y: row_bounds.y + row_bounds.height - 1.0,
-                width: row_bounds.width,
-                height: 1.0,
-            },
-            self.style.border,
-        );
 
         let content_left = row_bounds.x + gutter_total;
         let content_right_pad = CONTENT_PADDING;
@@ -1567,18 +1605,32 @@ impl<'a, Message> RevisionList<'a, Message> {
             .map(|idx| idx == f.file_index)
             .unwrap_or(false);
 
+        // Same inset rounded card as revision rows, so every selectable row
+        // shares one selection language.
+        let card_bounds = Rectangle {
+            x: row_bounds.x + ROW_CARD_INSET_X,
+            y: row_bounds.y + ROW_CARD_INSET_Y,
+            width: (row_bounds.width - ROW_CARD_INSET_X * 2.0).max(0.0),
+            height: (row_bounds.height - ROW_CARD_INSET_Y * 2.0).max(0.0),
+        };
         if selected {
-            fill_background(renderer, row_bounds, self.style.selected_background);
+            fill_rounded(
+                renderer,
+                card_bounds,
+                self.style.selected_background,
+                ROW_CARD_RADIUS,
+            );
         } else if hovered {
             // Soft hover wash — weaker than selection so the two never
             // compete when the cursor crosses the selected row.
-            fill_background(
+            fill_rounded(
                 renderer,
-                row_bounds,
+                card_bounds,
                 Color {
                     a: 0.06,
                     ..self.style.muted_text
                 },
+                ROW_CARD_RADIUS,
             );
         }
         // Deliberately no per-row separator: the indent guides supply the
@@ -1850,6 +1902,26 @@ fn fill_background<R: renderer::Renderer>(renderer: &mut R, rect: Rectangle, col
     );
 }
 
+fn fill_rounded<R: renderer::Renderer>(
+    renderer: &mut R,
+    rect: Rectangle,
+    color: Color,
+    radius: f32,
+) {
+    renderer.fill_quad(
+        renderer::Quad {
+            bounds: rect,
+            border: Border {
+                radius: radius.into(),
+                ..Border::default()
+            },
+            shadow: Shadow::default(),
+            snap: true,
+        },
+        color,
+    );
+}
+
 /// Blend `fg` onto `bg` as if drawing `fg` (with its alpha replaced by
 /// `weight`) over an opaque `bg`. Returns an opaque color.
 fn mix_color(fg: Color, bg: Color, weight: f32) -> Color {
@@ -1862,15 +1934,19 @@ fn mix_color(fg: Color, bg: Color, weight: f32) -> Color {
     }
 }
 
-fn fill_gradient<R: renderer::Renderer>(
+fn fill_gradient_rounded<R: renderer::Renderer>(
     renderer: &mut R,
     rect: Rectangle,
     gradient: gradient::Linear,
+    radius: f32,
 ) {
     renderer.fill_quad(
         renderer::Quad {
             bounds: rect,
-            border: Border::default(),
+            border: Border {
+                radius: radius.into(),
+                ..Border::default()
+            },
             shadow: Shadow::default(),
             snap: true,
         },
@@ -2022,7 +2098,17 @@ where
                     width: 1.0,
                     radius: iced::border::Radius::from(TOOLTIP_RADIUS),
                 },
-                shadow: Shadow::default(),
+                // Same soft lift every other floating surface carries
+                // (`theme::popover_style` at tooltip scale) — shadowless,
+                // the card sank into the busy rows behind it.
+                shadow: Shadow {
+                    color: Color {
+                        a: 0.25,
+                        ..Color::BLACK
+                    },
+                    offset: iced::Vector::new(0.0, 3.0),
+                    blur_radius: 10.0,
+                },
                 snap: true,
             },
             Background::Color(self.style.tooltip_background),

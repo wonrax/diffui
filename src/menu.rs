@@ -33,7 +33,7 @@ use iced::{
 
 use crate::icons;
 use crate::measure;
-use crate::theme::{self, ThemeSpec, chip_background, emphasis_font, popover_style, text_size};
+use crate::theme::{self, ThemeSpec, emphasis_font, popover_style, text_size};
 use crate::{Diffui, MenuAction, Message};
 use diffui_core::RevisionSelection;
 
@@ -77,7 +77,7 @@ const MENU_TEXT_SLACK: f32 = 2.0;
 const MENU_ROW_GAP: f32 = 16.0;
 /// Fixed per-row heights — fixed so flyout positions (which key off a parent
 /// row's offset down its card) are exact rather than guessed.
-const MENU_ROW_HEIGHT: f32 = 26.0;
+const MENU_ROW_HEIGHT: f32 = 28.0;
 const MENU_SEP_HEIGHT: f32 = 9.0;
 /// Gap between a trigger's bottom edge and the menu it drops (toolbar carets).
 const MENU_ANCHOR_GAP: f32 = 4.0;
@@ -720,7 +720,9 @@ fn build_row<'a>(
     };
 
     let bg = if active {
-        Some(Background::Color(chip_background(theme.muted_text)))
+        // Same solid selection fill the palette's rows use, so "the row
+        // you're on" looks identical across every list overlay.
+        Some(Background::Color(theme.selected_file))
     } else {
         None
     };
@@ -732,7 +734,7 @@ fn build_row<'a>(
         .style(move |_| container::Style {
             background: bg,
             border: Border {
-                radius: 6.0.into(),
+                radius: crate::theme::radius::CONTROL.into(),
                 ..Border::default()
             },
             ..container::Style::default()
@@ -778,7 +780,7 @@ fn glow_card(
             border: Border {
                 width: 1.5,
                 color: border,
-                radius: 6.0.into(),
+                radius: crate::theme::radius::CONTROL.into(),
             },
             // A soft accent halo — the "glow" half of the effect, pulsing with
             // the border.

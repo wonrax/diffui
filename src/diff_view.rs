@@ -25,7 +25,7 @@ const ROW_HEIGHT_RATIO: f32 = 1.85;
 // Padding above and below the centered title row inside the file-header strip.
 const FILE_HEADER_VPAD: f32 = 8.0;
 // Padding above and below the centered title row inside the hunk-header strip.
-const HUNK_HEADER_VPAD: f32 = 1.0;
+const HUNK_HEADER_VPAD: f32 = 3.0;
 const PREFIX_WIDTH: f32 = 24.0;
 const TEXT_X_PADDING: f32 = 8.0;
 const TEXT_Y_PADDING: f32 = 2.0;
@@ -34,24 +34,23 @@ const TEXT_Y_PADDING: f32 = 2.0;
 // wheel felt sluggish otherwise.
 const LINE_SCROLL_ROWS: f32 = 5.0;
 const PIXEL_SCROLL_SCALE: f32 = 0.5;
-// Corner radius of the intra-line word-diff emphasis rectangles, so the
-// token tint reads as a soft chip rather than a hard block.
-const EMPHASIS_CORNER_RADIUS: f32 = 2.0;
+// Corner radius of the intra-line word-diff emphasis rectangles (find
+// match highlights share it), so token tints read as soft chips rather
+// than hard blocks.
+const EMPHASIS_CORNER_RADIUS: f32 = 3.0;
 // Floor for the gutter so two single-digit columns still look intentional.
 const GUTTER_MIN_WIDTH: f32 = 56.0;
 // Padding flanking the gutter text on both sides.
 const GUTTER_HORIZONTAL_PADDING: f32 = 8.0;
 // Padding above and below the revision-header block when it's present.
-const HEADER_VERTICAL_PADDING: f32 = 10.0;
+const HEADER_VERTICAL_PADDING: f32 = 12.0;
 // Left/right padding inside the header block (between the panel edge and
 // the first character of label/description text).
-const HEADER_HORIZONTAL_PADDING: f32 = 14.0;
-// Space drawn between the label column and the value column so the colon
-// sits a hair away from the value text.
-const HEADER_LABEL_GAP: f32 = 6.0;
-// Description lines are indented by this many monospace columns under the
-// metadata block (matches the four-space indent jj uses).
-const HEADER_DESCRIPTION_INDENT: f32 = 4.0;
+const HEADER_HORIZONTAL_PADDING: f32 = 16.0;
+// Space drawn between the label column and the value column.
+const HEADER_LABEL_GAP: f32 = 8.0;
+// Description lines lead the header as its title, flush with the labels.
+const HEADER_DESCRIPTION_INDENT: f32 = 0.0;
 // Click within this distance of the previous click counts as a multi-click
 // rather than a fresh selection anchor.
 const MULTI_CLICK_RADIUS: f32 = 4.0;
@@ -92,29 +91,29 @@ pub struct DiffFileView<'a> {
 /// content without leaking `RevisionDetails` into this module.
 #[derive(Debug, Clone)]
 pub enum HeaderLine {
-    /// "Label: value" — label colored muted, value colored as text. The
-    /// `label` field is the rendered label including its trailing colon
-    /// (e.g. `"Commit ID:"`), padded to the column width by the caller.
+    /// "label  value" — label colored muted, value colored as text. The
+    /// `label` field is padded to the column width by the caller so values
+    /// stack in a column across the block (no colons — the color split
+    /// already separates label from value).
     Field { label: String, value: String },
     /// Bookmarks rendered as colored chips that match the sidebar. The chips'
     /// colors are resolved by the caller (the selected commit's lane color);
     /// remote `name@remote` bookmarks render outlined.
     Bookmarks { label: String, chips: Vec<Chip> },
-    /// A line of the description, rendered indented under the metadata
-    /// block. Stored without indentation; the renderer prepends four
-    /// spaces.
+    /// A line of the description. Leads the header as its title — the "what
+    /// is this change" — with the metadata block following below.
     Description(String),
-    /// Blank separator between the metadata block and the description.
+    /// Blank separator between the description and the metadata block.
     Blank,
 }
 
 impl HeaderLine {
     /// Build a metadata row with the label padded to nine characters — the
-    /// width of "Commit ID" / "Committer" / "Signature", the longest labels
-    /// jj ships — so colons stack in a column across the block.
+    /// width of "committer" / "bookmarks" / "signature", the longest labels
+    /// we ship — so values stack in a column across the block.
     pub fn field(label: &str, value: &str) -> Self {
         Self::Field {
-            label: format!("{label:<9}:"),
+            label: format!("{label:<9}"),
             value: value.to_owned(),
         }
     }
@@ -123,7 +122,7 @@ impl HeaderLine {
     /// metadata column.
     pub fn bookmarks(label: &str, chips: Vec<Chip>) -> Self {
         Self::Bookmarks {
-            label: format!("{label:<9}:"),
+            label: format!("{label:<9}"),
             chips,
         }
     }
@@ -146,6 +145,11 @@ pub struct Palette {
     pub modified_token: Color,
     pub conflict_marker: Color,
     pub note_text: Color,
+    pub syntax_keyword: Color,
+    pub syntax_type: Color,
+    pub syntax_function: Color,
+    pub syntax_literal: Color,
+    pub syntax_property: Color,
     pub panel: Color,
     pub file_header: Color,
     pub hunk_header: Color,
@@ -517,6 +521,12 @@ struct State<Paragraph> {
     /// cache (whose keys would otherwise map to stale text). Starts at 0 to
     /// match the app's initial version.
     last_content_version: u64,
+    /// Palette identity last seen. Cached paragraphs bake the syntax span
+    /// colors in at shaping time, so a theme switch must drop the cache or
+    /// stale-theme text keeps rendering (near-invisible when the old theme's
+    /// text color lands on the new theme's background). `text` alone
+    /// distinguishes every built-in theme.
+    last_palette_text: Option<Color>,
     /// File whose header's browse button the cursor is over, if any —
     /// drives its hover wash (manual, like every hover in this widget).
     hovered_browse: Option<usize>,
@@ -1677,7 +1687,7 @@ impl<'a, Message> DiffView<'a, Message> {
                         m.byte_start,
                         m.byte_end,
                         color,
-                        0.0,
+                        EMPHASIS_CORNER_RADIUS,
                         &geometry,
                     );
                 }
@@ -2252,6 +2262,7 @@ where
             last_restore_token: 0,
             pending_set_offset: None,
             last_content_version: 0,
+            last_palette_text: None,
             hovered_browse: None,
             height_index: RefCell::new(HeightIndex::default()),
         })
@@ -2277,6 +2288,13 @@ where
         // must refresh the rendered text without resetting scroll or selection.
         if self.content_version != state.last_content_version {
             state.last_content_version = self.content_version;
+            state.paragraph_cache.borrow_mut().clear();
+        }
+
+        // Theme switch: the cached paragraphs carry the old theme's span
+        // colors baked in — drop them so text reshapes in the new palette.
+        if state.last_palette_text != Some(self.palette.text) {
+            state.last_palette_text = Some(self.palette.text);
             state.paragraph_cache.borrow_mut().clear();
         }
 
@@ -3081,12 +3099,14 @@ where
 
             for header in &visible_hunk_headers {
                 let hunk = &self.files[header.file_index].hunks[header.hunk_index];
+                // A soft full-width info-tinted band — a faint 1px underline
+                // alone made hunk boundaries nearly invisible while scrolling.
                 self.draw_background(
                     renderer,
                     bounds.x,
-                    header.y + self.metrics.hunk_header_height - 1.0,
+                    header.y,
                     bounds.width,
-                    1.0,
+                    self.metrics.hunk_header_height,
                     self.palette.hunk_header,
                 );
                 let (header_x, header_clip) = if height_index.is_full_width(header.file_index) {
@@ -3665,23 +3685,56 @@ impl<Message> DiffView<'_, Message> {
             0.0
         };
         let title_x = bounds.x + 12.0 + chip_w + 8.0;
-        self.draw_text(
-            renderer,
-            &file.title,
-            TextRenderParams {
-                width: (bounds.width
-                    - (title_x - bounds.x)
-                    - summary_width
-                    - 16.0
-                    - browse_reserve)
-                    .max(1.0),
-                height: self.metrics.row_height,
-                position: Point::new(title_x, text_y),
-                color: self.palette.text,
-                clip_bounds: bounds,
-                wrapping: text::Wrapping::WordOrGlyph,
-            },
-        );
+        let title_width =
+            (bounds.width - (title_x - bounds.x) - summary_width - 16.0 - browse_reserve).max(1.0);
+        // Dim the directory prefix so the basename carries the header —
+        // the path tail is what distinguishes files at a glance. Renames
+        // ("old -> new") and squeezed headers fall back to one plain run.
+        let split_at = (!file.title.contains(" -> "))
+            .then(|| file.title.rfind('/').map(|i| i + 1))
+            .flatten()
+            .filter(|&i| mono_width(&file.title) <= title_width && i < file.title.len());
+        if let Some(split) = split_at {
+            let (dir, base) = file.title.split_at(split);
+            let dir_w = mono_width(dir);
+            self.draw_text(
+                renderer,
+                dir,
+                TextRenderParams {
+                    width: dir_w.max(1.0),
+                    height: self.metrics.row_height,
+                    position: Point::new(title_x, text_y),
+                    color: self.palette.text_muted,
+                    clip_bounds: bounds,
+                    wrapping: text::Wrapping::None,
+                },
+            );
+            self.draw_text(
+                renderer,
+                base,
+                TextRenderParams {
+                    width: (title_width - dir_w).max(1.0),
+                    height: self.metrics.row_height,
+                    position: Point::new(title_x + dir_w, text_y),
+                    color: self.palette.text,
+                    clip_bounds: bounds,
+                    wrapping: text::Wrapping::None,
+                },
+            );
+        } else {
+            self.draw_text(
+                renderer,
+                &file.title,
+                TextRenderParams {
+                    width: title_width,
+                    height: self.metrics.row_height,
+                    position: Point::new(title_x, text_y),
+                    color: self.palette.text,
+                    clip_bounds: bounds,
+                    wrapping: text::Wrapping::WordOrGlyph,
+                },
+            );
+        }
 
         if let Some(rect) = browse_rect {
             // Hover wash mirrors the app's ghost buttons: a translucent
@@ -3691,7 +3744,7 @@ impl<Message> DiffView<'_, Message> {
                     iced::advanced::renderer::Quad {
                         bounds: rect,
                         border: Border {
-                            radius: 4.0.into(),
+                            radius: crate::theme::radius::CONTROL.into(),
                             ..Border::default()
                         },
                         shadow: Shadow::default(),
@@ -3874,12 +3927,12 @@ impl<Message> DiffView<'_, Message> {
     fn syntax_color(&self, kind: SyntaxKind) -> Color {
         match kind {
             SyntaxKind::Comment => self.palette.text_muted,
-            SyntaxKind::String => self.palette.modified_token,
-            SyntaxKind::Number => self.palette.modified_token,
-            SyntaxKind::Keyword => self.palette.conflict_marker,
-            SyntaxKind::Function => self.palette.text,
-            SyntaxKind::Type => self.palette.addition_text,
-            SyntaxKind::Property => self.palette.modified_token,
+            SyntaxKind::String => self.palette.syntax_literal,
+            SyntaxKind::Number => self.palette.syntax_literal,
+            SyntaxKind::Keyword => self.palette.syntax_keyword,
+            SyntaxKind::Function => self.palette.syntax_function,
+            SyntaxKind::Type => self.palette.syntax_type,
+            SyntaxKind::Property => self.palette.syntax_property,
             SyntaxKind::Punctuation => self.palette.text_muted,
         }
     }
@@ -4200,6 +4253,11 @@ mod tests {
             modified_token: c,
             conflict_marker: c,
             note_text: c,
+            syntax_keyword: c,
+            syntax_type: c,
+            syntax_function: c,
+            syntax_literal: c,
+            syntax_property: c,
             panel: c,
             file_header: c,
             hunk_header: c,

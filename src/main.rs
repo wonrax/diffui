@@ -740,11 +740,35 @@ fn selection_from_key(key: &revision_list::RowSelectionKey) -> RevisionSelection
 /// list of recents. Only an explicit `--path` that failed to resolve surfaces an
 /// error; the session and cwd fallbacks resolve silently to this screen instead.
 fn empty_state<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
+    // App mark: the diff glyph in a soft accent-tinted rounded square, so
+    // the empty window opens on an identity rather than bare text.
+    let mark = container(icons::icon(icons::FILE_DIFF, 30.0, theme.accent))
+        .width(Length::Fixed(64.0))
+        .height(Length::Fixed(64.0))
+        .center_x(Length::Fixed(64.0))
+        .center_y(Length::Fixed(64.0))
+        .style(move |_| container::Style {
+            background: Some(iced::Background::Color(theme::chip_background(
+                theme.accent,
+            ))),
+            border: iced::Border {
+                width: 0.0,
+                color: iced::Color::TRANSPARENT,
+                radius: 16.0.into(),
+            },
+            ..container::Style::default()
+        });
+
     let mut body = column![
+        mark,
         text("Diffui")
             .size(text_size::DISPLAY)
             .color(theme.text)
             .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
+        text("Browse revisions and review changes in jj and git repositories.")
+            .size(text_size::BODY)
+            .color(theme.muted_text)
+            .font(ui.config.ui_font),
     ]
     .spacing(14)
     .align_x(alignment::Horizontal::Center);
@@ -767,31 +791,53 @@ fn empty_state<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
                 .color(theme.background)
                 .font(ui.config.ui_font),
         )
-        .padding(Padding::from([8, 18]))
+        .padding(Padding::from([9, 20]))
         .on_press(Message::OpenRepoDialogOpen)
         .style(move |_, _| primary_button_style(theme)),
     );
 
     // Click-to-reopen recents — reuses the open dialog's row builder so both
-    // entry points look identical. `tabs` is empty in this state, so (unlike the
-    // dialog) there's nothing already-open to filter out.
+    // entry points look identical, wrapped in a quiet card so the list reads
+    // as one unit against the canvas. `tabs` is empty in this state, so
+    // (unlike the dialog) there's nothing already-open to filter out.
     let recents: Vec<&String> = ui.recent_repos.iter().take(6).collect();
     if !recents.is_empty() {
         let mut list = column![
-            text("Recent")
-                .size(text_size::CAPTION)
-                .color(theme.subtle_text)
-                .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
+            container(
+                text("Recent")
+                    .size(text_size::CAPTION)
+                    .color(theme.subtle_text)
+                    .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
+            )
+            .padding(Padding {
+                top: 2.0,
+                right: 8.0,
+                bottom: 4.0,
+                left: 8.0,
+            }),
         ]
         .spacing(2);
         for root in recents {
             list = list.push(tab_bar::recent_repo_row(ui, theme, root));
         }
-        body = body.push(container(list).width(Length::Fixed(320.0)));
+        body = body.push(
+            container(list)
+                .width(Length::Fixed(340.0))
+                .padding(6)
+                .style(move |_| container::Style {
+                    background: Some(iced::Background::Color(theme.panel_background)),
+                    border: iced::Border {
+                        width: 1.0,
+                        color: theme.border,
+                        radius: theme::radius::SURFACE.into(),
+                    },
+                    ..container::Style::default()
+                }),
+        );
     }
 
     body = body.push(
-        text("or press \u{2318}O")
+        text(format!("or press {}", chrome::cmd_label("O")))
             .size(text_size::UI)
             .color(theme.muted_text)
             .font(ui.config.ui_font),

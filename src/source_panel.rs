@@ -11,7 +11,7 @@ use std::rc::Rc;
 
 use iced::{
     Background, Color, Element, Length, Padding, alignment,
-    widget::{Space, column, container, row, stack, text, text_input},
+    widget::{Space, column, container, row, stack, text},
 };
 use jj_lib::graph::GraphEdgeType;
 use nucleo_matcher::{Config, Matcher, Utf32String};
@@ -188,41 +188,23 @@ fn source_view_file_changed(_index: usize) -> Message {
 pub const SOURCE_FILTER_INPUT_ID: &str = "source-filter-input";
 
 /// The fuzzy file-search box at the top of the source sidebar — the source
-/// view's counterpart of the diff sidebar's revset input, sharing its
-/// styling. Typing filters the tree into a ranked match list; Enter opens
-/// the best match.
+/// view's counterpart of the diff sidebar's revset input, built from the
+/// same [`sidebar::filter_field`] (caretless variant) so both sidebars'
+/// top bars match. Typing filters the tree into a ranked match list;
+/// Enter opens the best match.
 fn build_source_filter(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
-    let input = text_input("search files — fuzzy", &ui.source.filter)
-        .id(SOURCE_FILTER_INPUT_ID)
-        .padding(Padding::from([5, 8]))
-        .size(text_size::UI)
-        .font(ui.config.mono_font)
-        .width(Length::Fill)
-        .on_input(Message::SourceFilterChanged)
-        .on_submit(Message::SourceFilterSubmit)
-        .style(move |_, _| {
-            // Window-background variant, like the revset input: the darker
-            // window color gives the field a visible well on the panel.
-            let mut style = crate::theme::input_style(theme);
-            style.background = Background::Color(theme.background);
-            style
-        });
-
-    let hairline = container(Space::new())
-        .width(Length::Fill)
-        .height(Length::Fixed(1.0))
-        .style(move |_| container::Style {
-            background: Some(Background::Color(theme.border)),
-            ..container::Style::default()
-        });
-
-    column![
-        container(input)
-            .width(Length::Fill)
-            .padding(Padding::from([6, 8])),
-        hairline,
-    ]
-    .into()
+    sidebar::filter_field(
+        theme,
+        ui.config.mono_font,
+        sidebar::FilterField {
+            id: SOURCE_FILTER_INPUT_ID,
+            placeholder: "search files — fuzzy",
+            value: &ui.source.filter,
+            on_input: Message::SourceFilterChanged,
+            on_submit: Message::SourceFilterSubmit,
+            caret: None,
+        },
+    )
 }
 
 /// Sidebar for the source browser: the fuzzy file-search box, then the
@@ -610,9 +592,14 @@ pub fn build_source_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, M
                     matches: &find_state.matches,
                     active: find_state.active,
                     scroll_token: find_state.scroll_token,
-                    highlight: theme.accent,
+                    // Soft wash for every match, strong fill for the active
+                    // one — mirrors `diff_panel`'s find colors.
+                    highlight: Color {
+                        a: 0.20,
+                        ..theme.accent
+                    },
                     active_highlight: Color {
-                        a: 0.45,
+                        a: 0.50,
                         ..theme.accent
                     },
                 });
@@ -726,7 +713,7 @@ fn build_info_bar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> 
 
     container(bar)
         .width(Length::Fill)
-        .padding([8, 14])
+        .padding([9, 16])
         .style(move |_| container::Style {
             background: Some(Background::Color(theme.panel_background)),
             ..container::Style::default()

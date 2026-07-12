@@ -41,6 +41,17 @@ pub fn drag_region() -> bool {
     cfg!(target_os = "macos")
 }
 
+/// Platform spelling of the primary command modifier for UI hints — `⌘` on
+/// macOS, `Ctrl` elsewhere, matching what the keyboard handlers actually
+/// bind (`modifiers.command()` maps to Ctrl off-mac).
+pub fn cmd_label(key: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("\u{2318}{key}")
+    } else {
+        format!("Ctrl {key}")
+    }
+}
+
 /// Fixed height for the strip when it stands in for the OS title bar — the tabs
 /// center in it, and `position_window_controls` repositions the native traffic
 /// lights to that same center so the two line up. Kept comfortably taller than

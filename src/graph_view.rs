@@ -28,7 +28,7 @@ use crate::graph::LaneFrame;
 pub const LANE_WIDTH: f32 = 10.0;
 const LINE_THICKNESS: f32 = 1.5;
 const LINE_THICKNESS_EMPHASIZED: f32 = 2.75;
-const NODE_RADIUS: f32 = 3.5;
+const NODE_RADIUS: f32 = 4.0;
 
 /// Geometry of the elided-ancestry squiggle (jj log's `~`): drawn below a
 /// node whose parent(s) sit outside the loaded set — the bottom of a
@@ -448,6 +448,18 @@ pub fn draw_revision_row<R>(
     //      rule means `node_lane` is also the first parent's lane, so
     //      this picks the closest possible match in hue.
     let disc_color = node_color_override.unwrap_or_else(|| style.lane_color(frame_data.node_lane));
+    // The working copy (the only override caller) gets a soft halo behind
+    // its disc so "you are here" reads even at a glance across the gutter.
+    if node_color_override.is_some() {
+        let halo = Path::new(|b| b.circle(Point::new(x_node, mid), NODE_RADIUS + 2.5));
+        frame.fill(
+            &halo,
+            Color {
+                a: 0.30,
+                ..disc_color
+            },
+        );
+    }
     let disc_path = Path::new(|b| b.circle(Point::new(x_node, mid), NODE_RADIUS));
     frame.fill(&disc_path, disc_color);
 

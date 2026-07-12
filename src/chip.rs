@@ -15,8 +15,10 @@ use crate::theme::chip_background;
 use crate::{icons, measure};
 
 pub const TEXT_SIZE: f32 = crate::theme::text_size::BODY;
-pub const PAD_X: f32 = 5.0;
-pub const RADIUS: f32 = 5.0;
+pub const PAD_X: f32 = 6.0;
+/// Soft rounding just under half of [`height`] — rounder than a plain tag,
+/// deliberately short of a full pill.
+pub const RADIUS: f32 = 6.0;
 /// Chip icon glyph size — a step under the label size so the glyph's optical
 /// weight matches the text next to it.
 const ICON_SIZE: f32 = 11.0;

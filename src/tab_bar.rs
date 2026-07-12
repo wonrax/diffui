@@ -23,8 +23,9 @@ use crate::icons;
 use crate::palette::PaletteMessage;
 use crate::repository::Vcs;
 use crate::theme::{
-    ThemeSpec, chip_background, dialog_button_style, emphasis_font, ghost_button_style,
-    modal_style, scrim_style, text_size,
+    ThemeSpec, chip_background, destructive_button_style, dialog_button_style, emphasis_font,
+    ghost_button_style, input_style, modal_style, primary_button_style, radius, scrim_style,
+    text_size, well_fill,
 };
 use crate::{Diffui, HoverTarget, Message};
 
@@ -33,6 +34,35 @@ pub const OPEN_REPO_INPUT_ID: &str = "open-repo-input";
 
 const TAB_TEXT_SIZE: f32 = text_size::UI;
 
+/// Fixed tab height: tall enough for the label row plus the hover wash's
+/// breathing room, and the unit the strip's other controls center against.
+/// Tabs run flush to the strip's bottom edge (browser-style), so this — plus
+/// the strip's top padding — decides the whole strip's height.
+const TAB_HEIGHT: f32 = 29.0;
+
+/// Gap between the inactive hover wash's bottom edge and the strip floor —
+/// what keeps the wash reading as floating rather than connected like the
+/// active tab.
+const WASH_BOTTOM_GAP: f32 = 3.0;
+
+/// Radius of the concave join fillets flaring the active tab's fill into the
+/// toolbar band, and the width of the apron every tab reserves for them (so
+/// a tab's footprint doesn't change when activation moves). Adjacent aprons
+/// overlap 1:1 via the tabs row's `-FILLET` spacing, making this the exact
+/// visible gap between tabs — and the floor below which the side gap cannot
+/// go: the hover wash must stay within the fill zone so that activating a
+/// hovered tab never *shrinks* the highlight, so a wash always sits one
+/// apron away from an adjacent active fill.
+const FILLET: f32 = 10.0;
+
+/// Label padding inside a tab's fill / hover wash.
+const LABEL_PAD_X: f32 = 8.0;
+
+/// Both modal cards (confirm, open-repo) hang at the same distance below the
+/// top edge, like the command palette — anchored rather than centered, so
+/// they don't jump when their content grows (error lines, recents).
+const DIALOG_TOP_OFFSET: f32 = 120.0;
+
 /// Build the title-bar tab strip. Returns an empty `Space` when no repos are
 /// open (the empty-state view owns the window in that case).
 pub fn build_tab_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
@@ -40,21 +70,35 @@ pub fn build_tab_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         return Space::new().into();
     }
 
-    // Tabs sit 1px apart so the strip reads as one tight segmented control; the
-    // per-tab hover/active fill is inset inside each tab (see `tab_widget`), so
-    // the highlights still keep their own breathing room despite the tight gap.
-    let mut tabs_row = row![].spacing(1).align_y(alignment::Vertical::Center);
+    // Adjacent tabs overlap by exactly one apron (negative spacing): tab N's
+    // right apron and tab N+1's left apron are the same strip of pixels, so
+    // the gap between two tabs' visible boxes is `FILLET`, not `2 × FILLET` —
+    // the flare's true minimum. The shared strip can't fight over paint or
+    // input: hit areas stop at the visible box (see `tab_widget`), and the
+    // only thing ever drawn there is an active tab's fillet against the
+    // neighbour's transparent apron.
+    let mut tabs_row = row![].spacing(-FILLET).align_y(alignment::Vertical::Center);
     for (index, tab) in ui.tabs.iter().enumerate() {
         let active = index == ui.active_tab;
         tabs_row = tabs_row.push(tab_widget(ui, theme, tab, active));
     }
-    tabs_row = tabs_row.push(add_button(theme));
+    // The `+` rides in the same overlapping row, its own left apron supplied
+    // by explicit padding: the negative spacing puts the wrapper's edge at
+    // the last tab's visible box, so the `+` sits exactly one `FILLET` away —
+    // the same gap tabs keep from each other.
+    tabs_row = tabs_row.push(container(add_button(theme)).padding(Padding {
+        top: 0.0,
+        right: 0.0,
+        bottom: 0.0,
+        left: FILLET,
+    }));
 
-    // When the strip stands in for the title bar (macOS) it's pinned to a fixed
-    // height and the content is centered — the native traffic lights are
-    // repositioned to that same center (see `chrome::position_window_controls`),
-    // so the two line up. Below a native title bar it sizes to its content with
-    // balanced 6px vertical padding (matching the 6px spacing).
+    // Top padding only: the tabs run flush to the strip's bottom edge so the
+    // active one connects to the toolbar band below (see `tab_widget`). When
+    // the strip stands in for the title bar (macOS) it's pinned to a fixed
+    // height with the content bottom-aligned instead; the traffic lights stay
+    // centered on the full strip (see `chrome::position_window_controls`),
+    // like a native browser window.
     let titlebar_height = chrome::title_bar_height();
     let v_pad = if titlebar_height.is_some() { 0.0 } else { 6.0 };
     let mut strip = row![]
@@ -63,7 +107,7 @@ pub fn build_tab_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         .padding(Padding {
             top: v_pad,
             right: 8.0,
-            bottom: v_pad,
+            bottom: 0.0,
             left: 8.0,
         });
     // Reserve space at the leading edge for OS window controls that overlap our
@@ -83,7 +127,7 @@ pub fn build_tab_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     if let Some(height) = titlebar_height {
         bar = bar
             .height(Length::Fixed(height))
-            .align_y(alignment::Vertical::Center);
+            .align_y(alignment::Vertical::Bottom);
     }
 
     // When the native title bar is hidden/replaced (macOS today), the strip's
@@ -101,16 +145,16 @@ pub fn build_tab_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     }
 }
 
-/// Background for the tab strip / title-bar surface.
+/// Background for the tab strip / title-bar surface: a recessed band, darker
+/// than the toolbar below it, so the active tab — filled with the toolbar's
+/// color — reads as a connected block against it (browser-style). No border:
+/// the seam between the active tab and the toolbar must stay invisible.
 fn bar_style(theme: ThemeSpec) -> container::Style {
     container::Style {
-        background: Some(Background::Color(theme.panel_background_elevated)),
+        background: Some(Background::Color(well_fill(theme))),
         border: Border {
             width: 0.0,
             color: Color::TRANSPARENT,
-            // A single hairline at the bottom separates the strip from the
-            // panes; iced borders are uniform, so the divider is drawn by the
-            // panel below instead — keep this borderless.
             radius: 0.0.into(),
         },
         ..container::Style::default()
@@ -179,63 +223,120 @@ fn tab_widget<'a>(
         .spacing(4)
         .align_y(alignment::Vertical::Center);
 
-    // Border and fill live on *separate* elements so the highlight reads as
-    // inner: the inner `fill` carries the background, and the outer `frame`
-    // carries the active tab's 1px outline plus a 1px inset, so the fill sits
-    // strictly inside the outline (and inside the tab edge) instead of painting
-    // out to — and under — it. Active: a raised fill (the design's
-    // `--tab-active-bg`), lifting a touch on hover. Inactive: empty until
-    // hovered, when it takes the same faint chip wash the strip's other controls
-    // use.
+    // Browser-style tab: the active tab is a top-rounded block filled with the
+    // toolbar band's own color, running flush to the strip's bottom edge and
+    // flaring into it through concave corner fillets — so it reads as
+    // physically connected to the content below (no border, no gap; the
+    // strip's recessed `well_fill` supplies the contrast). Inactive tabs stay
+    // quiet; hovering one paints a floating wash over exactly the fill zone —
+    // the same box the active fill paints — so clicking a hovered tab never
+    // shrinks the highlight: it recolors, grows `WASH_BOTTOM_GAP` down to the
+    // floor, and gains the flares. The label centers in the same top-anchored
+    // box in every state, so nothing shifts as activation or hover moves.
     let hovered = ui.hovered == Some(HoverTarget::Tab(id));
-    let fill_color = match (active, hovered) {
-        (true, false) => Some(theme.panel_background),
-        (true, true) => Some(theme.selected_file),
-        (false, true) => Some(chip_background(theme.muted_text)),
-        (false, false) => None,
-    };
-    let fill = container(inner)
-        .padding(Padding::from([3, 7]))
+    let wash_fill = (!active && hovered).then(|| chip_background(theme.muted_text));
+    let wash = container(inner)
+        .padding(Padding::from([0.0, LABEL_PAD_X]))
+        .height(Length::Fixed(TAB_HEIGHT - WASH_BOTTOM_GAP))
+        .align_y(alignment::Vertical::Center)
         .style(move |_| container::Style {
-            background: fill_color.map(Background::Color),
+            background: wash_fill.map(Background::Color),
             border: Border {
                 width: 0.0,
                 color: Color::TRANSPARENT,
-                radius: 4.0.into(),
+                radius: radius::BUTTON.into(),
             },
             ..container::Style::default()
         });
 
-    // The whole frame is the select target, so a press anywhere up to the tab's
-    // edge selects it (the old label-only hit box left the padding dead). The
-    // close `×` sits inside and captures its own press first (iced dispatches to
-    // children before the parent), so hitting `×` closes rather than selects.
-    // Hover is tracked in app state; `on_move` re-asserts it every frame the
-    // cursor is over the tab, so the one-frame flicker that `on_enter`/`on_exit`
-    // race into when crossing between adjacent tabs is immediately corrected.
-    let frame = container(fill)
-        .padding(Padding::from([1, 1]))
+    let body = container(wash)
+        .height(Length::Fixed(TAB_HEIGHT))
+        .align_y(alignment::Vertical::Top)
         .style(move |_| container::Style {
-            background: None,
+            background: active.then_some(Background::Color(theme.panel_background_elevated)),
             border: Border {
-                width: if active { 1.0 } else { 0.0 },
-                color: if active {
-                    theme.border
-                } else {
-                    Color::TRANSPARENT
-                },
-                radius: 6.0.into(),
+                width: 0.0,
+                color: Color::TRANSPARENT,
+                radius: iced::border::top(radius::BUTTON),
             },
             ..container::Style::default()
         });
 
-    mouse_area(frame)
+    // The visible box is the select target — the hit area deliberately stops
+    // at the fill/wash edge, leaving the aprons inert so the overlap zone two
+    // tabs share (see `build_tab_bar`) can never route a press or hover to an
+    // ambiguous owner. The close `×` sits inside and captures its own press
+    // first (iced dispatches to children before the parent), so hitting `×`
+    // closes rather than selects. Hover is tracked in app state; `on_move`
+    // re-asserts it every frame the cursor is over the tab, so the one-frame
+    // flicker that `on_enter`/`on_exit` race into when crossing between
+    // adjacent tabs is immediately corrected.
+    let interactive = mouse_area(body)
         .on_press(Message::SelectTab(id))
         .on_enter(Message::SetHover(Some(HoverTarget::Tab(id))))
         .on_move(move |_| Message::SetHover(Some(HoverTarget::Tab(id))))
         .on_exit(Message::SetHover(None))
-        .interaction(mouse::Interaction::Pointer)
-        .into()
+        .interaction(mouse::Interaction::Pointer);
+
+    // Constant fillet-wide aprons on every tab, active or not, so a tab's
+    // footprint never changes as activation moves.
+    let framed = container(interactive).padding(Padding {
+        top: 0.0,
+        right: FILLET,
+        bottom: 0.0,
+        left: FILLET,
+    });
+
+    // One concave join fillet: a `FILLET`-square pinned to a bottom corner of
+    // the tab's footprint (inside the apron), showing the toolbar color
+    // through a strip-colored cover whose inner corner is rounded — the
+    // classic browser-tab flare that welds the active fill to the band below.
+    let fillet = move |left: bool| -> Element<'static, Message> {
+        let cover_radius = if left {
+            iced::border::bottom_right(FILLET)
+        } else {
+            iced::border::bottom_left(FILLET)
+        };
+        let arc = stack![
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(move |_| container::Style {
+                    background: Some(Background::Color(theme.panel_background_elevated)),
+                    ..container::Style::default()
+                }),
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(move |_| container::Style {
+                    background: Some(Background::Color(well_fill(theme))),
+                    border: Border {
+                        width: 0.0,
+                        color: Color::TRANSPARENT,
+                        radius: cover_radius,
+                    },
+                    ..container::Style::default()
+                }),
+        ]
+        .width(Length::Fixed(FILLET))
+        .height(Length::Fixed(FILLET));
+        container(arc)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(if left {
+                alignment::Horizontal::Left
+            } else {
+                alignment::Horizontal::Right
+            })
+            .align_y(alignment::Vertical::Bottom)
+            .into()
+    };
+
+    if active {
+        stack![framed, fillet(true), fillet(false)].into()
+    } else {
+        framed.into()
+    }
 }
 
 /// `jj` / `git` badge — a soft colored chip carrying the VCS kind, so a
@@ -288,22 +389,32 @@ fn dirty_dot(theme: ThemeSpec) -> Element<'static, Message> {
         .into()
 }
 
-/// `+` button — opens the path dialog to add another repository.
+/// `+` button — opens the path dialog to add another repository. A square
+/// sized and anchored exactly like an inactive tab's hover wash (same
+/// height, same top edge, same clearance from the strip floor), so the
+/// strip's controls sit on one visual grid.
 fn add_button(theme: ThemeSpec) -> Element<'static, Message> {
-    button(icons::icon(icons::PLUS, 15.0, theme.muted_text))
-        // Symmetric padding → a square button, instead of the wide, short pill
-        // the old asymmetric [2, 8] padding made around the square icon box.
-        .padding(Padding::from([4, 4]))
-        .on_press(Message::OpenRepoDialogOpen)
-        .style(move |_, status| ghost_button_style(theme, status))
-        .into()
+    let side = TAB_HEIGHT - WASH_BOTTOM_GAP;
+    container(
+        button(container(icons::icon(icons::PLUS, 15.0, theme.muted_text)).center(Length::Fill))
+            .width(Length::Fixed(side))
+            .height(Length::Fixed(side))
+            .padding(0)
+            .on_press(Message::OpenRepoDialogOpen)
+            .style(move |_, status| ghost_button_style(theme, status)),
+    )
+    .height(Length::Fixed(TAB_HEIGHT))
+    .align_y(alignment::Vertical::Top)
+    .into()
 }
 
 /// The right-hand `⌘K` control. The design put a repo-search `⌘P` here; per
-/// the spec it instead opens our existing command palette.
+/// the spec it instead opens our existing command palette. Styled as a
+/// keycap — hairline border, mono glyphs — so it reads as "press this key",
+/// not as another action button.
 fn palette_hint(theme: ThemeSpec, mono: iced::Font) -> Element<'static, Message> {
     let chip = container(
-        text("\u{2318}K")
+        text(chrome::cmd_label("K"))
             .size(text_size::CAPTION)
             .color(theme.muted_text)
             .font(mono),
@@ -312,8 +423,8 @@ fn palette_hint(theme: ThemeSpec, mono: iced::Font) -> Element<'static, Message>
     .style(move |_| container::Style {
         background: Some(Background::Color(chip_background(theme.muted_text))),
         border: Border {
-            width: 0.0,
-            color: Color::TRANSPARENT,
+            width: 1.0,
+            color: theme.border,
             radius: 4.0.into(),
         },
         ..container::Style::default()
@@ -328,7 +439,7 @@ fn palette_hint(theme: ThemeSpec, mono: iced::Font) -> Element<'static, Message>
             border: Border {
                 width: 0.0,
                 color: Color::TRANSPARENT,
-                radius: 6.0.into(),
+                radius: radius::CONTROL.into(),
             },
             shadow: Default::default(),
             snap: true,
@@ -358,7 +469,7 @@ pub fn build_confirm_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
             .color(theme.text)
             .font(ui.config.ui_font),
     )
-    .padding(Padding::from([7, 15]))
+    .padding(Padding::from([7, 16]))
     .on_press(Message::ConfirmCancel)
     .style(move |_, status| dialog_button_style(theme, status));
 
@@ -369,19 +480,9 @@ pub fn build_confirm_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
             .color(theme.background)
             .font(ui.config.ui_font),
     )
-    .padding(Padding::from([7, 15]))
+    .padding(Padding::from([7, 16]))
     .on_press(Message::ConfirmAccept)
-    .style(move |_, _| button::Style {
-        background: Some(Background::Color(theme.removed_text)),
-        text_color: theme.background,
-        border: Border {
-            width: 0.0,
-            color: Color::TRANSPARENT,
-            radius: 8.0.into(),
-        },
-        shadow: Default::default(),
-        snap: true,
-    });
+    .style(move |_, _| destructive_button_style(theme));
 
     let body = column![
         text(dialog.title.as_str())
@@ -401,7 +502,7 @@ pub fn build_confirm_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
     let card = mouse_area(
         container(body)
             .width(Length::Fixed(460.0))
-            .padding(Padding::from([18, 20]))
+            .padding(Padding::from([20, 22]))
             .style(move |_| modal_style(theme)),
     )
     .on_press(Message::ConfirmNoOp);
@@ -411,7 +512,7 @@ pub fn build_confirm_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
         .height(Length::Fill)
         .align_x(alignment::Horizontal::Center)
         .padding(Padding {
-            top: 140.0,
+            top: DIALOG_TOP_OFFSET,
             right: 0.0,
             bottom: 0.0,
             left: 0.0,
@@ -491,7 +592,7 @@ pub(crate) fn recent_repo_row<'a>(
             border: Border {
                 width: 0.0,
                 color: Color::TRANSPARENT,
-                radius: 6.0.into(),
+                radius: radius::CONTROL.into(),
             },
             shadow: Default::default(),
             snap: true,
@@ -523,19 +624,10 @@ pub fn build_open_repo_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Mess
         .on_input(Message::OpenRepoPathChanged)
         .on_submit(Message::OpenRepoSubmit)
         .style(move |_, _| text_input::Style {
+            // Recessed into the elevated card, otherwise identical to the
+            // shared input identity.
             background: Background::Color(theme.background),
-            border: Border {
-                width: 1.0,
-                color: theme.border,
-                radius: 8.0.into(),
-            },
-            icon: theme.muted_text,
-            placeholder: theme.subtle_text,
-            value: theme.text,
-            selection: Color {
-                a: 0.25,
-                ..theme.accent
-            },
+            ..input_style(theme)
         });
 
     let mut body = column![
@@ -593,7 +685,7 @@ pub fn build_open_repo_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Mess
             .color(theme.text)
             .font(ui.config.ui_font),
     )
-    .padding(Padding::from([7, 15]))
+    .padding(Padding::from([7, 16]))
     .on_press(Message::OpenRepoDialogClose)
     .style(move |_, status| dialog_button_style(theme, status));
 
@@ -603,19 +695,9 @@ pub fn build_open_repo_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Mess
             .color(theme.background)
             .font(ui.config.ui_font),
     )
-    .padding(Padding::from([7, 15]))
+    .padding(Padding::from([7, 16]))
     .on_press(Message::OpenRepoSubmit)
-    .style(move |_, _| button::Style {
-        background: Some(Background::Color(theme.accent)),
-        text_color: theme.background,
-        border: Border {
-            width: 0.0,
-            color: Color::TRANSPARENT,
-            radius: 8.0.into(),
-        },
-        shadow: Default::default(),
-        snap: true,
-    });
+    .style(move |_, _| primary_button_style(theme));
 
     body = body.push(
         row![Space::new().width(Length::Fill), cancel, open]
@@ -628,7 +710,7 @@ pub fn build_open_repo_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Mess
     let card = mouse_area(
         container(body)
             .width(Length::Fixed(460.0))
-            .padding(Padding::from([18, 20]))
+            .padding(Padding::from([20, 22]))
             .style(move |_| modal_style(theme)),
     )
     .on_press(Message::OpenRepoNoOp);
@@ -638,7 +720,7 @@ pub fn build_open_repo_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Mess
         .height(Length::Fill)
         .align_x(alignment::Horizontal::Center)
         .padding(Padding {
-            top: 120.0,
+            top: DIALOG_TOP_OFFSET,
             right: 0.0,
             bottom: 0.0,
             left: 0.0,
