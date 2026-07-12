@@ -12,6 +12,7 @@ use iced::{
     Vector, alignment, keyboard, window,
 };
 
+use crate::chip::{self, Chip};
 use crate::scrollbar::{self, ScrollbarState, ScrollbarStyle};
 
 // Row height is `text_size * ROW_HEIGHT_RATIO` rounded to the nearest int,
@@ -63,12 +64,19 @@ const AUTO_SCROLL_RAMP_PX: f32 = 80.0;
 
 // The diff data model lives in `diffui_core`; re-export the types this widget
 // renders so `crate::diff_view::DiffLine` etc. still resolve for callers.
-pub use diffui_core::{DiffHunkView, DiffLine, DiffLineKind, SyntaxKind, SyntaxSpan};
+pub use diffui_core::{
+    DiffFileStatus, DiffHunkView, DiffLine, DiffLineKind, SyntaxKind, SyntaxSpan,
+};
 
 #[derive(Debug, Clone)]
 pub struct DiffFileView<'a> {
     pub title: String,
-    pub status: &'a str,
+    pub status: DiffFileStatus,
+    /// Saturated status color (chip glyph, matching the sidebar's file list).
+    pub status_color: Color,
+    /// Translucent tint behind the status letter, pre-resolved by the caller
+    /// (`chip_background(status_color)`) so this widget stays theme-agnostic.
+    pub status_fill: Color,
     pub hunks: &'a [DiffHunkView],
     pub additions: usize,
     pub deletions: usize,
@@ -86,27 +94,13 @@ pub enum HeaderLine {
     /// Bookmarks rendered as colored chips that match the sidebar. The chips'
     /// colors are resolved by the caller (the selected commit's lane color);
     /// remote `name@remote` bookmarks render outlined.
-    Bookmarks {
-        label: String,
-        chips: Vec<HeaderChip>,
-    },
+    Bookmarks { label: String, chips: Vec<Chip> },
     /// A line of the description, rendered indented under the metadata
     /// block. Stored without indentation; the renderer prepends four
     /// spaces.
     Description(String),
     /// Blank separator between the metadata block and the description.
     Blank,
-}
-
-/// One bookmark chip in the revision header, with its styling pre-resolved so
-/// the renderer just paints it. Mirrors the sidebar's `IndicatorChip`.
-#[derive(Debug, Clone)]
-pub struct HeaderChip {
-    pub label: String,
-    pub fill: Color,
-    pub text: Color,
-    /// `Some` for outlined (remote) chips; `None` for filled (local) ones.
-    pub border: Option<Color>,
 }
 
 impl HeaderLine {
@@ -122,7 +116,7 @@ impl HeaderLine {
 
     /// Bookmarks row — `label` padded like `field` so it aligns with the
     /// metadata column.
-    pub fn bookmarks(label: &str, chips: Vec<HeaderChip>) -> Self {
+    pub fn bookmarks(label: &str, chips: Vec<Chip>) -> Self {
         Self::Bookmarks {
             label: format!("{label:<9}:"),
             chips,
@@ -2016,7 +2010,7 @@ impl<'a, Message> DiffView<'a, Message> {
         header_height: f32,
         selection: Option<(TextPosition, TextPosition)>,
     ) where
-        Renderer: text::Renderer<Font = Font>,
+        Renderer: text::Renderer<Font = Font> + geometry::Renderer,
     {
         // Header occupies content_y in `[0, header_height)`. Translate to
         // screen coords for the section that intersects the viewport.
@@ -2107,46 +2101,18 @@ impl<'a, Message> DiffView<'a, Message> {
                             wrapping: text::Wrapping::None,
                         },
                     );
-                    let chip_h = (self.metrics.row_height - 4.0).max(1.0);
-                    let chip_y = y + 2.0;
-                    let pad_x = 5.0;
                     let gap = 6.0;
                     let right_edge = bounds.x + bounds.width - HEADER_HORIZONTAL_PADDING;
+                    let center_y = y + self.metrics.row_height / 2.0;
                     let mut chip_x = value_x;
-                    for chip in chips {
-                        // Tight monospace width — `text_width` adds breathing
-                        // room meant for wrapped text, which would bloat the
-                        // chip's right side.
-                        let label_w = chip.label.chars().count() as f32 * self.metrics.char_width;
-                        let chip_w = label_w + pad_x * 2.0;
+                    for c in chips {
+                        let chip_w = chip::width(&c.label, c.icon, c.font);
                         // Drop chips that would overflow the panel rather than
                         // clip them mid-glyph.
                         if chip_x + chip_w > right_edge {
                             break;
                         }
-                        self.draw_chip(
-                            renderer,
-                            Rectangle {
-                                x: chip_x,
-                                y: chip_y,
-                                width: chip_w,
-                                height: chip_h,
-                            },
-                            chip.fill,
-                            chip.border,
-                        );
-                        self.draw_text(
-                            renderer,
-                            &chip.label,
-                            TextRenderParams {
-                                width: label_w,
-                                height: self.metrics.row_height,
-                                position: Point::new(chip_x + pad_x, y + TEXT_Y_PADDING),
-                                color: chip.text,
-                                clip_bounds: clip,
-                                wrapping: text::Wrapping::None,
-                            },
-                        );
+                        chip::draw(renderer, c, chip_x, center_y, clip);
                         chip_x += chip_w + gap;
                     }
                 }
@@ -3393,41 +3359,6 @@ impl<Message> DiffView<'_, Message> {
         );
     }
 
-    /// Draw a pill-shaped chip (filled, or outlined when `border` is `Some`).
-    /// Used for bookmark chips in the revision header.
-    fn draw_chip<Renderer>(
-        &self,
-        renderer: &mut Renderer,
-        bounds: Rectangle,
-        fill: Color,
-        border: Option<Color>,
-    ) where
-        Renderer: renderer::Renderer,
-    {
-        let radius = (bounds.height / 2.0).into();
-        let border = match border {
-            Some(color) => Border {
-                color,
-                width: 1.0,
-                radius,
-            },
-            None => Border {
-                color: Color::TRANSPARENT,
-                width: 0.0,
-                radius,
-            },
-        };
-        renderer.fill_quad(
-            renderer::Quad {
-                bounds,
-                border,
-                shadow: Shadow::default(),
-                snap: true,
-            },
-            fill,
-        );
-    }
-
     /// Draw one file's header strip (background + bottom border + title +
     /// stats) at screen-y `y`. Shared by the normal scrolling draw and the
     /// pinned sticky draw.
@@ -3438,7 +3369,7 @@ impl<Message> DiffView<'_, Message> {
         y: f32,
         bounds: Rectangle,
     ) where
-        Renderer: text::Renderer<Font = Font>,
+        Renderer: text::Renderer<Font = Font> + geometry::Renderer,
     {
         let file = &self.files[file_index];
         let hunk_label = if file.hunks.len() == 1 {
@@ -3446,12 +3377,17 @@ impl<Message> DiffView<'_, Message> {
         } else {
             format!("{} Hunks", file.hunks.len())
         };
-        let summary = format!(
-            "{}  +{} -{}  {}",
-            file.status, file.additions, file.deletions, hunk_label
-        );
-        let summary_width = self
-            .text_width(&summary)
+        let additions = format!("+{}", file.additions);
+        let deletions = format!("-{}", file.deletions);
+        // Tight monospace widths (like the bookmark chips) — `text_width`
+        // adds breathing room meant for wrapped text.
+        let mono_width =
+            |content: &str| content.chars().count() as f32 * self.metrics.char_width;
+        let gap = self.metrics.char_width;
+        let additions_width = mono_width(&additions);
+        let deletions_width = mono_width(&deletions);
+        let hunk_width = mono_width(&hunk_label);
+        let summary_width = (additions_width + gap + deletions_width + 2.0 * gap + hunk_width)
             .min((bounds.width - 24.0).max(1.0));
 
         self.draw_background(
@@ -3470,36 +3406,61 @@ impl<Message> DiffView<'_, Message> {
             1.0,
             self.palette.border,
         );
+
+        let text_y = centered_text_y(y, self.metrics.file_header_height, self.metrics.row_height);
+        let status_chip = Chip {
+            label: file.status.short_label().to_owned(),
+            font: self.font,
+            background: file.status_fill,
+            text_color: file.status_color,
+            border_color: None,
+            border_dashed: false,
+            icon: None,
+        };
+        let chip_w = chip::draw(
+            renderer,
+            &status_chip,
+            bounds.x + 12.0,
+            y + self.metrics.file_header_height / 2.0,
+            bounds,
+        );
+
+        let title_x = bounds.x + 12.0 + chip_w + 8.0;
         self.draw_text(
             renderer,
             &file.title,
             TextRenderParams {
-                width: (bounds.width - summary_width - 28.0).max(1.0),
+                width: (bounds.width - (title_x - bounds.x) - summary_width - 16.0).max(1.0),
                 height: self.metrics.row_height,
-                position: Point::new(
-                    bounds.x + 12.0,
-                    centered_text_y(y, self.metrics.file_header_height, self.metrics.row_height),
-                ),
+                position: Point::new(title_x, text_y),
                 color: self.palette.text,
                 clip_bounds: bounds,
                 wrapping: text::Wrapping::WordOrGlyph,
             },
         );
-        self.draw_text(
-            renderer,
-            &summary,
-            TextRenderParams {
-                width: summary_width,
-                height: self.metrics.row_height,
-                position: Point::new(
-                    (bounds.x + bounds.width - summary_width - 8.0).max(bounds.x + 12.0),
-                    centered_text_y(y, self.metrics.file_header_height, self.metrics.row_height),
-                ),
-                color: self.palette.text_muted,
-                clip_bounds: bounds,
-                wrapping: text::Wrapping::None,
-            },
-        );
+
+        let summary_x = (bounds.x + bounds.width - summary_width - 8.0).max(bounds.x + 12.0);
+        let segments = [
+            (additions.as_str(), additions_width, self.palette.addition_text),
+            (deletions.as_str(), deletions_width, self.palette.deletion_text),
+            (hunk_label.as_str(), hunk_width, self.palette.text_muted),
+        ];
+        let mut segment_x = summary_x;
+        for (index, (content, width, color)) in segments.into_iter().enumerate() {
+            self.draw_text(
+                renderer,
+                content,
+                TextRenderParams {
+                    width,
+                    height: self.metrics.row_height,
+                    position: Point::new(segment_x, text_y),
+                    color,
+                    clip_bounds: bounds,
+                    wrapping: text::Wrapping::None,
+                },
+            );
+            segment_x += width + if index == 0 { gap } else { 2.0 * gap };
+        }
     }
 
     fn draw_text<Renderer>(&self, renderer: &mut Renderer, content: &str, render: TextRenderParams)
@@ -4011,7 +3972,9 @@ mod tests {
             .enumerate()
             .map(|(i, hunks)| DiffFileView {
                 title: format!("file-{i}"),
-                status: "M",
+                status: DiffFileStatus::Modified,
+                status_color: Color::WHITE,
+                status_fill: Color::TRANSPARENT,
                 hunks,
                 additions: 1,
                 deletions: 1,
@@ -4317,7 +4280,9 @@ mod tests {
         ];
         let files = vec![DiffFileView {
             title: "f".to_owned(),
-            status: "M",
+            status: DiffFileStatus::Modified,
+            status_color: Color::WHITE,
+            status_fill: Color::TRANSPARENT,
             hunks: &long,
             additions: 0,
             deletions: 0,
@@ -4359,7 +4324,9 @@ mod height_profile {
             .enumerate()
             .map(|(i, hunks)| DiffFileView {
                 title: format!("file-{i}"),
-                status: "M",
+                status: DiffFileStatus::Modified,
+                status_color: Color::WHITE,
+                status_fill: Color::TRANSPARENT,
                 hunks,
                 additions: 0,
                 deletions: 0,

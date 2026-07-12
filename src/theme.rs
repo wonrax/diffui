@@ -354,3 +354,18 @@ pub fn diff_panel_style(theme: ThemeSpec) -> container::Style {
 pub fn chip_background(color: Color) -> Color {
     Color { a: 0.14, ..color }
 }
+
+/// Saturated color for a file's status letter chip. Mapping follows the
+/// design system: A→green (added_text), M→blue (info), D→red (removed_text),
+/// R→amber (modified_token). The chip's background is derived from this
+/// color via `chip_background` so the glyph and the tint share a hue.
+pub fn file_status_color(status: diffui_core::DiffFileStatus, theme: ThemeSpec) -> Color {
+    use diffui_core::DiffFileStatus;
+    match status {
+        DiffFileStatus::Added => theme.added_text,
+        DiffFileStatus::Deleted => theme.removed_text,
+        DiffFileStatus::Modified => theme.info,
+        DiffFileStatus::Renamed => theme.modified_token,
+        DiffFileStatus::Conflicted => theme.conflict_marker,
+    }
+}

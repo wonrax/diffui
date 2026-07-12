@@ -3,9 +3,10 @@ use iced::{
     widget::{column, container, row, stack, text},
 };
 
+use crate::chip::Chip;
 use crate::diff_view::{self, DiffFileView, DiffView};
 use crate::find;
-use crate::theme::{ThemeSpec, chip_background, diff_palette, diff_panel_style};
+use crate::theme::{ThemeSpec, chip_background, diff_palette, diff_panel_style, file_status_color};
 use crate::{Diffui, LoadStatus, Message};
 use diffui_core::{RevisionDetails, SignatureInfo};
 
@@ -44,17 +45,22 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
             .document
             .files
             .iter()
-            .map(|file| DiffFileView {
-                title: match &file.old_path {
-                    Some(old_path) if old_path != &file.path => {
-                        format!("{old_path} -> {}", file.path)
-                    }
-                    _ => file.path.clone(),
-                },
-                status: file.status.label(),
-                hunks: &file.hunks,
-                additions: file.additions,
-                deletions: file.deletions,
+            .map(|file| {
+                let status_color = file_status_color(file.status, theme);
+                DiffFileView {
+                    title: match &file.old_path {
+                        Some(old_path) if old_path != &file.path => {
+                            format!("{old_path} -> {}", file.path)
+                        }
+                        _ => file.path.clone(),
+                    },
+                    status: file.status,
+                    status_color,
+                    status_fill: chip_background(status_color),
+                    hunks: &file.hunks,
+                    additions: file.additions,
+                    deletions: file.deletions,
+                }
             })
             .collect::<Vec<_>>();
 
@@ -63,7 +69,7 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
             .session
             .revision_details
             .as_ref()
-            .map(|details| build_header_lines(details, bookmark_color))
+            .map(|details| build_header_lines(details, bookmark_color, ui.config.ui_font))
             .unwrap_or_default();
 
         let stats_bar = build_stats_bar(ui, theme);
@@ -197,8 +203,9 @@ fn selected_lane_color(ui: &Diffui, theme: ThemeSpec) -> Color {
 fn build_header_lines(
     details: &RevisionDetails,
     bookmark_color: Color,
+    bookmark_font: iced::Font,
 ) -> Vec<diff_view::HeaderLine> {
-    use diff_view::{HeaderChip, HeaderLine};
+    use diff_view::HeaderLine;
     let mut lines: Vec<HeaderLine> = Vec::new();
 
     lines.push(HeaderLine::field("Commit ID", &details.commit_id));
@@ -213,15 +220,18 @@ fn build_header_lines(
             .iter()
             .map(|bookmark| {
                 let is_remote = bookmark.contains('@');
-                HeaderChip {
+                Chip {
                     label: bookmark.clone(),
-                    fill: if is_remote {
+                    font: bookmark_font,
+                    background: if is_remote {
                         Color::TRANSPARENT
                     } else {
                         chip_background(bookmark_color)
                     },
-                    text: bookmark_color,
-                    border: is_remote.then_some(bookmark_color),
+                    text_color: bookmark_color,
+                    border_color: is_remote.then_some(bookmark_color),
+                    border_dashed: false,
+                    icon: None,
                 }
             })
             .collect();

@@ -644,16 +644,6 @@ pub enum DiffFileStatus {
 }
 
 impl DiffFileStatus {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Added => "Added",
-            Self::Deleted => "Deleted",
-            Self::Modified => "Modified",
-            Self::Renamed => "Renamed",
-            Self::Conflicted => "Conflict",
-        }
-    }
-
     pub fn short_label(self) -> &'static str {
         match self {
             Self::Added => "A",

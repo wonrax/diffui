@@ -16,7 +16,6 @@ use std::rc::Rc;
 
 use iced::advanced::{
     Layout, Shell, Widget,
-    graphics::geometry::{self, Frame, LineCap, LineJoin, Path, Stroke},
     layout, mouse, overlay, renderer,
     text::{self, Paragraph, Text},
     widget::{Tree, tree},
@@ -27,6 +26,7 @@ use iced::{
 };
 use jj_lib::graph::GraphEdgeType;
 
+use crate::chip::{self, Chip};
 use crate::graph::LaneFrame;
 use crate::graph_view::{
     LANE_WIDTH, RevisionGraphStyle, draw_continuation_row, draw_revision_row, lane_strip_width,
@@ -45,19 +45,10 @@ pub const FILE_TREE_INDENT: f32 = 14.0;
 pub const GUTTER_LEFT_PADDING: f32 = 8.0;
 pub const GUTTER_PADDING: f32 = 8.0;
 const CONTENT_PADDING: f32 = 12.0;
-const INDICATOR_RADIUS: f32 = 5.0;
 /// Line-height multiplier applied to every measured/rendered text run in this
 /// widget. Kept in one place so the measurement paragraphs and the painted
 /// glyphs stay in lockstep — a mismatch makes text clip or float.
 const LINE_HEIGHT_MULTIPLIER: f32 = 1.4;
-/// Horizontal padding inside a bookmark/status chip, on each side of the label.
-const CHIP_PAD_X: f32 = 5.0;
-/// Chip icon glyph size — a step under `CAPTION_TEXT_SIZE` so the glyph's
-/// optical weight matches the label's lowercase body rather than towering
-/// to its cap height.
-const CHIP_ICON_SIZE: f32 = 11.0;
-/// Gap between a chip's icon and its label.
-const CHIP_ICON_GAP: f32 = 3.0;
 const SMALL_TEXT_SIZE: f32 = 14.0;
 const CAPTION_TEXT_SIZE: f32 = 13.0;
 /// Text size for the collapse/expand chevron on the selected revision row. The
@@ -65,10 +56,6 @@ const CAPTION_TEXT_SIZE: f32 = 13.0;
 /// of actual ink); the Lucide glyph fills its box, so a near-text size reads
 /// clearly as a chevron without dominating the row.
 const CHEVRON_TEXT_SIZE: f32 = 15.0;
-/// Status-badge text size. Smaller than the row's caption text so the
-/// single-letter chip (M/A/D/R) reads as a compact tag rather than another
-/// full-weight column on the file row.
-const FILE_BADGE_TEXT_SIZE: f32 = 10.0;
 pub const FILE_ROW_GAP: f32 = 6.0;
 pub const FILE_ROW_RIGHT_PAD: f32 = 10.0;
 const TOOLTIP_RADIUS: f32 = 5.0;
@@ -98,24 +85,6 @@ pub struct RevisionListStyle {
 }
 
 #[derive(Debug, Clone)]
-pub struct IndicatorChip {
-    pub label: String,
-    pub background: Color,
-    pub text_color: Color,
-    /// Optional 1px chip border. When `border_dashed` is `true`, the
-    /// stroke is dashed (used by the `empty` chip in the design
-    /// system). When `false`, it's a solid 1px line (used by remote
-    /// bookmark chips — outlined, lane-colored).
-    pub border_color: Option<Color>,
-    pub border_dashed: bool,
-    /// Optional Lucide glyph drawn ahead of the label, tinted like it.
-    /// Workspace chips carry one so a `name@` working-copy marker reads as
-    /// a different kind of thing than the bookmark pills around it —
-    /// color alone doesn't separate two chips in the same rail.
-    pub icon: Option<&'static str>,
-}
-
-#[derive(Debug, Clone)]
 pub struct RevisionRowView {
     pub selection_key: RowSelectionKey,
     pub change_id_prefix: String,
@@ -128,10 +97,10 @@ pub struct RevisionRowView {
     /// a synthetic `+N` overflow chip when there's not enough horizontal
     /// room — see the layout logic in `draw_revision`. The lane color
     /// these chips wear is also the color of the overflow chip.
-    pub bookmark_chips: Vec<IndicatorChip>,
+    pub bookmark_chips: Vec<Chip>,
     /// Status chips (e.g. `empty`, `conflict`). Always shown — they're
     /// load-bearing semantics and shouldn't compress.
-    pub status_chips: Vec<IndicatorChip>,
+    pub status_chips: Vec<Chip>,
     /// Color for the `+N` overflow chip (= the row's lane color).
     pub lane_color: Color,
     pub frame: LaneFrame,
@@ -1214,12 +1183,12 @@ impl<'a, Message> RevisionList<'a, Message> {
         let bm_widths: Vec<f32> = rev
             .bookmark_chips
             .iter()
-            .map(|c| self.measure_chip_width::<R>(&c.label, c.icon, paragraphs))
+            .map(|c| chip::width(&c.label, c.icon, c.font))
             .collect();
         let status_widths: Vec<f32> = rev
             .status_chips
             .iter()
-            .map(|c| self.measure_chip_width::<R>(&c.label, c.icon, paragraphs))
+            .map(|c| chip::width(&c.label, c.icon, c.font))
             .collect();
         let status_total: f32 = status_widths.iter().sum::<f32>()
             + chip_gap * status_widths.len().saturating_sub(1) as f32;
@@ -1267,7 +1236,7 @@ impl<'a, Message> RevisionList<'a, Message> {
                     let need_overflow = remaining > 0;
                     let overflow_label = format!("+{}", remaining.max(1));
                     let overflow_chip_w =
-                        self.measure_chip_width::<R>(&overflow_label, None, paragraphs);
+                        chip::width(&overflow_label, None, self.style.primary_font);
                     let plus_overflow = if need_overflow {
                         chip_gap + overflow_chip_w
                     } else {
@@ -1283,7 +1252,7 @@ impl<'a, Message> RevisionList<'a, Message> {
                 if visible_bookmarks < rev.bookmark_chips.len() {
                     overflow_count = rev.bookmark_chips.len() - visible_bookmarks;
                     let label = format!("+{overflow_count}");
-                    overflow_w = self.measure_chip_width::<R>(&label, None, paragraphs);
+                    overflow_w = chip::width(&label, None, self.style.primary_font);
                 }
                 acc + if overflow_count > 0 {
                     chip_gap + overflow_w
@@ -1436,58 +1405,30 @@ impl<'a, Message> RevisionList<'a, Message> {
         };
         let mut chip_x = content_right - rail_w;
         let overflow_color = rev.lane_color;
-        for (chip, bw) in rev
+        for (c, bw) in rev
             .bookmark_chips
             .iter()
             .zip(bm_widths.iter())
             .take(visible_bookmarks)
         {
-            self.draw_chip(
-                renderer,
-                paragraphs,
-                chip_x,
-                title_mid_y,
-                &chip.label,
-                chip.icon,
-                chip.background,
-                chip.text_color,
-                chip.border_color,
-                chip.border_dashed,
-                row_clip,
-            );
+            chip::draw(renderer, c, chip_x, title_mid_y, row_clip);
             chip_x += bw + chip_gap;
         }
         if overflow_count > 0 {
-            let label = format!("+{overflow_count}");
-            self.draw_chip(
-                renderer,
-                paragraphs,
-                chip_x,
-                title_mid_y,
-                &label,
-                None,
-                chip_background(overflow_color),
-                overflow_color,
-                None,
-                false,
-                row_clip,
-            );
+            let overflow_chip = Chip {
+                label: format!("+{overflow_count}"),
+                font: self.style.primary_font,
+                background: chip_background(overflow_color),
+                text_color: overflow_color,
+                border_color: None,
+                border_dashed: false,
+                icon: None,
+            };
+            chip::draw(renderer, &overflow_chip, chip_x, title_mid_y, row_clip);
             chip_x += overflow_w + chip_gap;
         }
-        for (i, chip) in rev.status_chips.iter().enumerate() {
-            self.draw_chip(
-                renderer,
-                paragraphs,
-                chip_x,
-                title_mid_y,
-                &chip.label,
-                chip.icon,
-                chip.background,
-                chip.text_color,
-                chip.border_color,
-                chip.border_dashed,
-                row_clip,
-            );
+        for (i, c) in rev.status_chips.iter().enumerate() {
+            chip::draw(renderer, c, chip_x, title_mid_y, row_clip);
             chip_x += status_widths[i] + chip_gap;
         }
 
@@ -1622,31 +1563,26 @@ impl<'a, Message> RevisionList<'a, Message> {
                 );
             }
             // File row: status badge — vertically centered on the mid-line.
+            // All status labels are single letters, so a self-sized chip and
+            // the measured `badge_w` column agree; centering inside the column
+            // keeps hypothetical wider labels aligned anyway.
             None => {
-                let badge_h = 14.0;
-                let badge_y = row_mid_y - badge_h / 2.0;
-                fill_quad(
+                let status_chip = Chip {
+                    label: f.status_label.clone(),
+                    font: self.style.mono_font,
+                    background: f.status_background,
+                    text_color: f.status_text,
+                    border_color: None,
+                    border_dashed: false,
+                    icon: None,
+                };
+                let chip_w = chip::width(&f.status_label, None, self.style.mono_font);
+                chip::draw(
                     renderer,
-                    Rectangle {
-                        x: content_x,
-                        y: badge_y,
-                        width: badge_w,
-                        height: badge_h,
-                    },
-                    f.status_background,
-                    INDICATOR_RADIUS,
-                );
-                fill_text_centered_y(
-                    renderer,
-                    &f.status_label,
-                    content_x + badge_w / 2.0,
+                    &status_chip,
+                    content_x + ((badge_w - chip_w) / 2.0).max(0.0),
                     row_mid_y,
-                    badge_w,
-                    FILE_BADGE_TEXT_SIZE,
-                    f.status_text,
-                    self.style.primary_font,
                     row_clip,
-                    text::Alignment::Center,
                 );
             }
         }
@@ -1726,112 +1662,6 @@ impl<'a, Message> RevisionList<'a, Message> {
             &self.style.graph,
             emphasized_lane,
         );
-    }
-
-    fn measure_chip_width<R: text::Renderer<Font = Font>>(
-        &self,
-        label: &str,
-        icon: Option<&str>,
-        paragraphs: &RefCell<Vec<R::Paragraph>>,
-    ) -> f32 {
-        let size = CAPTION_TEXT_SIZE;
-        let label_w = measure_text_width::<R>(label, size, self.style.primary_font, paragraphs);
-        let icon_w = icon.map_or(0.0, |glyph| {
-            measure_text_width::<R>(glyph, CHIP_ICON_SIZE, icons::ICON_FONT, paragraphs)
-                + CHIP_ICON_GAP
-        });
-        label_w + icon_w + CHIP_PAD_X * 2.0
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn draw_chip<R>(
-        &self,
-        renderer: &mut R,
-        paragraphs: &RefCell<Vec<R::Paragraph>>,
-        x: f32,
-        center_y: f32,
-        label: &str,
-        icon: Option<&str>,
-        background: Color,
-        text_color: Color,
-        border_color: Option<Color>,
-        border_dashed: bool,
-        clip: Rectangle,
-    ) -> f32
-    where
-        R: text::Renderer<Font = Font> + geometry::Renderer,
-    {
-        let size = CAPTION_TEXT_SIZE;
-        let label_w = measure_text_width::<R>(label, size, self.style.primary_font, paragraphs);
-        let icon_block = icon.map(|glyph| {
-            let icon_w =
-                measure_text_width::<R>(glyph, CHIP_ICON_SIZE, icons::ICON_FONT, paragraphs);
-            (glyph, icon_w)
-        });
-        let icon_indent = icon_block.map_or(0.0, |(_, icon_w)| icon_w + CHIP_ICON_GAP);
-        // Tight box: just enough vertical room for the cap-height plus a hair
-        // of breathing room. Anything more makes the chip dwarf the title text.
-        let chip_h = (size + 3.0).round();
-        let chip_w = icon_indent + label_w + CHIP_PAD_X * 2.0;
-        let chip_top = (center_y - chip_h / 2.0).round();
-        let rect = Rectangle {
-            x,
-            y: chip_top,
-            width: chip_w,
-            height: chip_h,
-        };
-        // Skip the fill when the chip is meant to read as outlined-only —
-        // a translucent fill with `a == 0` would still emit a quad but
-        // avoiding it keeps the layer count down and makes intent clear.
-        if background.a > f32::EPSILON {
-            fill_quad(renderer, rect, background, INDICATOR_RADIUS);
-        }
-        if let Some(border_color) = border_color {
-            if border_dashed {
-                stroke_dashed_rounded_rect(renderer, rect, border_color, INDICATOR_RADIUS);
-            } else {
-                stroke_solid_rounded_rect(renderer, rect, border_color, INDICATOR_RADIUS);
-            }
-        }
-        // The icon can't go through `fill_text_centered_y`: Lucide's em box
-        // sits entirely above the baseline (ascent = em, descent = 0), so any
-        // line-height leading beyond the glyph size lands asymmetrically and
-        // shoves the ink off-center. Collapsing the line box to exactly the
-        // glyph size makes centering it equal centering the ink — the same
-        // trick `icons::icon` documents for the widget path.
-        if let Some((glyph, icon_w)) = icon_block {
-            renderer.fill_text(
-                Text {
-                    content: glyph.to_owned(),
-                    bounds: Size::new(icon_w.max(1.0), CHIP_ICON_SIZE),
-                    size: Pixels(CHIP_ICON_SIZE),
-                    line_height: text::LineHeight::Absolute(Pixels(CHIP_ICON_SIZE)),
-                    font: icons::ICON_FONT,
-                    align_x: text::Alignment::Left,
-                    align_y: alignment::Vertical::Center,
-                    shaping: text::Shaping::Advanced,
-                    wrapping: text::Wrapping::None,
-                    ellipsis: text::Ellipsis::None,
-                    hint_factor: None,
-                },
-                Point::new(x + CHIP_PAD_X, center_y),
-                text_color,
-                clip,
-            );
-        }
-        fill_text_centered_y(
-            renderer,
-            label,
-            x + icon_indent + (chip_w - icon_indent) / 2.0,
-            center_y,
-            chip_w - icon_indent,
-            size,
-            text_color,
-            self.style.primary_font,
-            clip,
-            text::Alignment::Center,
-        );
-        chip_w
     }
 }
 
@@ -1947,85 +1777,6 @@ fn fill_gradient<R: renderer::Renderer>(
         },
         gradient,
     );
-}
-
-fn fill_quad<R: renderer::Renderer>(renderer: &mut R, rect: Rectangle, color: Color, radius: f32) {
-    renderer.fill_quad(
-        renderer::Quad {
-            bounds: rect,
-            border: Border {
-                radius: iced::border::Radius::from(radius),
-                ..Border::default()
-            },
-            shadow: Shadow::default(),
-            snap: true,
-        },
-        Background::Color(color),
-    );
-}
-
-/// Solid 1px rounded-rect outline. Cheaper than the dashed variant —
-/// goes through iced's quad border instead of a geometry path. Used by
-/// remote-bookmark chips that want a crisp outlined look.
-fn stroke_solid_rounded_rect<R: renderer::Renderer>(
-    renderer: &mut R,
-    rect: Rectangle,
-    color: Color,
-    radius: f32,
-) {
-    renderer.fill_quad(
-        renderer::Quad {
-            bounds: rect,
-            border: Border {
-                color,
-                width: 1.0,
-                radius: iced::border::Radius::from(radius),
-            },
-            shadow: Shadow::default(),
-            snap: true,
-        },
-        Background::Color(Color::TRANSPARENT),
-    );
-}
-
-/// Dashed 1px rounded-rect outline. Used by outlined chips (e.g. the
-/// `empty` indicator). Iced's quad border can't be dashed, so we stroke
-/// a canvas path with a `LineDash` pattern.
-fn stroke_dashed_rounded_rect<R: geometry::Renderer>(
-    renderer: &mut R,
-    rect: Rectangle,
-    color: Color,
-    radius: f32,
-) {
-    // Inset by half a pixel so the 1px stroke sits on the rect's
-    // edge rather than straddling it (avoids fuzzy aliasing).
-    let inset_rect = Rectangle {
-        x: rect.x + 0.5,
-        y: rect.y + 0.5,
-        width: rect.width - 1.0,
-        height: rect.height - 1.0,
-    };
-    let path = Path::rounded_rectangle(
-        Point::new(inset_rect.x, inset_rect.y),
-        Size::new(inset_rect.width, inset_rect.height),
-        iced::border::Radius::from(radius),
-    );
-    let segments: [f32; 2] = [4.0, 2.2];
-    let mut stroke = Stroke::default()
-        .with_color(color)
-        .with_width(1.0)
-        .with_line_cap(LineCap::Butt)
-        .with_line_join(LineJoin::Miter);
-    stroke.line_dash = geometry::LineDash {
-        segments: &segments,
-        offset: 0,
-    };
-    let mut frame = Frame::new(
-        renderer,
-        Size::new(rect.x + rect.width + 1.0, rect.y + rect.height + 1.0),
-    );
-    frame.stroke(&path, stroke);
-    renderer.draw_geometry(frame.into_geometry());
 }
 
 /// Truncating text run, vertically centered on `center_y`. Used for

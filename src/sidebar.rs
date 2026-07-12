@@ -7,15 +7,15 @@ use crate::config::AppConfig;
 use crate::graph_layout::GraphLayout;
 use crate::graph_view::{self, RevisionGraphStyle};
 use crate::icons;
+use crate::chip::{self, Chip};
 use crate::repository::Vcs;
 use crate::revision_list::{
-    self, FileRowView, IndicatorChip, RevisionList, RevisionListStyle, RevisionRowView,
-    RowSelectionKey,
+    self, FileRowView, RevisionList, RevisionListStyle, RevisionRowView, RowSelectionKey,
 };
-use crate::theme::{self, ThemeSpec, chip_background, sidebar_panel_style};
+use crate::theme::{self, ThemeSpec, chip_background, file_status_color, sidebar_panel_style};
 use crate::{Diffui, HoverTarget, LoadStatus, Message, ToolbarMenu};
 use diffui_core::{
-    CommitStore, DiffFile, DiffFileStatus, FileTreeRow, RevisionSelection, RowView, file_tree_rows,
+    CommitStore, DiffFile, FileTreeRow, RevisionSelection, RowView, file_tree_rows,
 };
 use jj_lib::graph::GraphEdgeType;
 use std::collections::HashSet;
@@ -43,8 +43,8 @@ pub fn min_width(config: AppConfig) -> f32 {
     let commit_id_w = id_metrics.measure(&"a".repeat(COMMIT_ID_CHARS));
     let at_w = id_metrics.measure("@");
     let author_w = ui_metrics.measure("Author Name");
-    let plus_n_w = chip_width("+9", &ui_metrics);
-    let conflict_w = chip_width("divergent", &ui_metrics);
+    let plus_n_w = chip::width("+9", None, config.ui_font);
+    let conflict_w = chip::width("divergent", None, config.mono_font);
 
     let at_gap = 4.0;
     let id_gap = 8.0;
@@ -67,12 +67,6 @@ pub fn min_width(config: AppConfig) -> f32 {
     gutter + row_content + REVISION_CONTENT_RIGHT_PAD
 }
 
-/// Width budget for a single chip (label + horizontal padding), matching
-/// `RevisionList::measure_chip_width`'s `pad_x = 5.0` on each side.
-fn chip_width(label: &str, metrics: &TextMetrics) -> f32 {
-    metrics.measure(label) + 10.0
-}
-
 /// Mirrors `revision_list::CONTENT_PADDING` — the right-edge padding
 /// inside a revision row. Kept here so `min_width` can budget the row
 /// without exposing the constant through `revision_list`.
@@ -82,15 +76,6 @@ const CAPTION_TEXT_SIZE: f32 = 13.0;
 const REVISION_ID_CHARS: usize = 12;
 const COMMIT_ID_CHARS: usize = 12;
 
-// Floor for the badge column. We measure the actual status labels to size the
-// column, but a single-character label like "M" can render thinner than the
-// chip looks tasteful at, so we keep a small visual minimum.
-const FILE_BADGE_MIN_WIDTH: f32 = 13.0;
-const FILE_BADGE_HORIZONTAL_PADDING: f32 = 4.0;
-/// Mirrors `revision_list::FILE_BADGE_TEXT_SIZE`. The badge column width is
-/// computed in `view()`, so we measure label widths at the same point size
-/// the renderer actually paints them at.
-const FILE_BADGE_TEXT_SIZE: f32 = 10.0;
 // Horizontal padding flanking the `+N` / `-N` numeric columns.
 const FILE_STAT_HORIZONTAL_PADDING: f32 = 4.0;
 const FILE_STAT_MIN_WIDTH: f32 = 24.0;
@@ -384,7 +369,7 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
         let tree_rows = cache.tree_rows(document_id, count, &ui.collapsed_dirs, files);
         (tree_rows, widths.additions, widths.deletions, widths.badge)
     } else {
-        (Rc::new(Vec::new()), 0.0, 0.0, FILE_BADGE_MIN_WIDTH)
+        (Rc::new(Vec::new()), 0.0, 0.0, 0.0)
     };
 
     let file_count = tree_rows.len();
@@ -413,12 +398,14 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
     let commits = &ui.session.commits;
     let selected = &ui.session.selected_revision;
     let file_list_expanded = ui.file_list_expanded;
+    let config = ui.config;
     let build_revision = Box::new(move |index: usize| {
         build_revision_row(
             commits,
             graph,
             prefix_lens,
             theme,
+            config,
             &graph_style,
             selected,
             file_list_expanded,
@@ -501,6 +488,7 @@ fn build_revision_row(
     graph: &GraphLayout,
     prefix_lens: &[usize],
     theme: ThemeSpec,
+    config: AppConfig,
     graph_style: &RevisionGraphStyle,
     selected: &RevisionSelection,
     file_list_expanded: bool,
@@ -549,8 +537,9 @@ fn build_revision_row(
         let is_workspace = bookmark.ends_with('@');
         let is_remote = !is_workspace && bookmark.contains('@');
         let chip_color = if is_workspace { theme.accent } else { lane_color };
-        bookmark_chips.push(IndicatorChip {
+        bookmark_chips.push(Chip {
             label: bookmark.clone(),
+            font: config.ui_font,
             background: if is_remote {
                 Color::TRANSPARENT
             } else {
@@ -565,8 +554,9 @@ fn build_revision_row(
 
     let mut status_chips = Vec::new();
     if commit.is_empty() == Some(true) {
-        status_chips.push(IndicatorChip {
+        status_chips.push(Chip {
             label: "empty".to_owned(),
+            font: config.mono_font,
             background: Color::TRANSPARENT,
             text_color: theme.subtle_text,
             border_color: Some(theme.subtle_text),
@@ -575,8 +565,9 @@ fn build_revision_row(
         });
     }
     if commit.has_conflict() {
-        status_chips.push(IndicatorChip {
+        status_chips.push(Chip {
             label: "conflict".to_owned(),
+            font: config.mono_font,
             background: chip_background(theme.conflict_marker),
             text_color: theme.conflict_marker,
             border_color: None,
@@ -588,8 +579,9 @@ fn build_revision_row(
         // jj log's "(hidden)": rewritten/abandoned, still shown because a ref
         // (e.g. a stale remote bookmark) pins it into the revset. Takes
         // precedence over the divergent chip, matching jj's log template.
-        status_chips.push(IndicatorChip {
+        status_chips.push(Chip {
             label: "hidden".to_owned(),
+            font: config.mono_font,
             background: Color::TRANSPARENT,
             text_color: theme.subtle_text,
             border_color: Some(theme.subtle_text),
@@ -600,8 +592,9 @@ fn build_revision_row(
         // jj log flags these with a change-offset suffix: the change id maps
         // to several visible commits. Amber (not conflict-red) — it's a
         // warning about identity, not about tree state.
-        status_chips.push(IndicatorChip {
+        status_chips.push(Chip {
             label: "divergent".to_owned(),
+            font: config.mono_font,
             background: chip_background(theme.modified_token),
             text_color: theme.modified_token,
             border_color: None,
@@ -796,13 +789,12 @@ impl SidebarFileCache {
 /// per column.
 fn compute_stat_widths(files: &[DiffFile], config: AppConfig) -> FileStatWidths {
     let metrics = sidebar_text_metrics(config);
-    let badge_metrics = badge_text_metrics(config);
     let max_additions = files.iter().map(|file| file.additions).max().unwrap_or(0);
     let max_deletions = files.iter().map(|file| file.deletions).max().unwrap_or(0);
     FileStatWidths {
         additions: file_stat_width(&format!("+{max_additions}"), &metrics),
         deletions: file_stat_width(&format!("-{max_deletions}"), &metrics),
-        badge: file_badge_width(files, &badge_metrics),
+        badge: file_badge_width(files, config.mono_font),
     }
 }
 
@@ -888,22 +880,6 @@ fn revision_list_style(
         tooltip_text: theme.text,
         tooltip_border: theme.border,
         scrollbar: theme::scrollbar_style(theme),
-    }
-}
-
-/// Saturated color associated with a file's diff status, used to tint
-/// the status chip in the revision list. Mapping follows the design
-/// system: A→green (added_text), M→blue (info), D→red (removed_text),
-/// R→amber (modified_token). The chip's background is derived from
-/// this color via `chip_background` so the glyph and the tint share
-/// a hue.
-fn file_status_color(status: DiffFileStatus, theme: ThemeSpec) -> Color {
-    match status {
-        DiffFileStatus::Added => theme.added_text,
-        DiffFileStatus::Deleted => theme.removed_text,
-        DiffFileStatus::Modified => theme.info,
-        DiffFileStatus::Renamed => theme.modified_token,
-        DiffFileStatus::Conflicted => theme.conflict_marker,
     }
 }
 
@@ -1006,30 +982,25 @@ fn sidebar_text_metrics(config: AppConfig) -> TextMetrics {
     TextMetrics::iced(config.ui_font, CAPTION_TEXT_SIZE)
 }
 
-fn badge_text_metrics(config: AppConfig) -> TextMetrics {
-    TextMetrics::iced(config.ui_font, FILE_BADGE_TEXT_SIZE)
-}
-
 fn file_stat_width(text: &str, metrics: &TextMetrics) -> f32 {
     (metrics.measure(text) + FILE_STAT_HORIZONTAL_PADDING * 2.0).max(FILE_STAT_MIN_WIDTH)
 }
 
-/// Width of the status badge column ("M", "A", "D", "R", …). We add padding so
-/// two-letter labels like "MM" still fit comfortably. A diff has only a handful
-/// of distinct status labels, so we shape each distinct one once rather than
-/// re-shaping every file's (the scan itself stays O(files), but the expensive
-/// `cosmic_text` measure runs at most a few times).
-fn file_badge_width(files: &[DiffFile], metrics: &TextMetrics) -> f32 {
+/// Width of the status badge column ("M", "A", "D", "R", …). A diff has only
+/// a handful of distinct status labels, so we shape each distinct one once
+/// rather than re-shaping every file's (the scan itself stays O(files), but
+/// the expensive `cosmic_text` measure runs at most a few times).
+fn file_badge_width(files: &[DiffFile], mono_font: iced::Font) -> f32 {
     let mut seen: Vec<&str> = Vec::new();
     let mut widest = 0.0_f32;
     for file in files {
         let label = file.status.short_label();
         if !seen.contains(&label) {
             seen.push(label);
-            widest = widest.max(metrics.measure(label));
+            widest = widest.max(chip::width(label, None, mono_font));
         }
     }
-    (widest + FILE_BADGE_HORIZONTAL_PADDING * 2.0).max(FILE_BADGE_MIN_WIDTH)
+    widest
 }
 
 #[cfg(test)]

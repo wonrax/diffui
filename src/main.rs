@@ -6,6 +6,7 @@ use std::{
 };
 
 mod activity;
+mod chip;
 mod chrome;
 mod config;
 mod diff_panel;
