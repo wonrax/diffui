@@ -72,8 +72,8 @@ pub fn min_width(config: AppConfig) -> f32 {
 const REVISION_CONTENT_RIGHT_PAD: f32 = 12.0;
 
 const CAPTION_TEXT_SIZE: f32 = theme::text_size::BODY;
-const REVISION_ID_CHARS: usize = 12;
-const COMMIT_ID_CHARS: usize = 12;
+pub(crate) const REVISION_ID_CHARS: usize = 12;
+pub(crate) const COMMIT_ID_CHARS: usize = 12;
 
 // Horizontal padding flanking the `+N` / `-N` numeric columns.
 const FILE_STAT_HORIZONTAL_PADDING: f32 = 4.0;
@@ -455,6 +455,7 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
     .on_scroll(Message::SidebarScrolled)
     .restore_scroll(ui.sidebar_scroll_offset, ui.scroll_restore_token)
     .on_context_menu(Message::RevisionContextMenu)
+    .on_file_context_menu(Message::SidebarFileContextMenu)
     .into()
 }
 
@@ -501,17 +502,62 @@ fn build_revision_row(
     let commit_id_short = truncate_end(commit.commit_id(), COMMIT_ID_CHARS);
 
     let lane_color = graph_style.lane_color(lane_frame.node_lane);
-    let mut bookmark_chips = Vec::with_capacity(bookmarks.len());
+    let bookmark_chips = bookmark_chips_for(bookmarks, lane_color, theme, config);
+    let status_chips = status_chips_for(commit, theme, config);
+
+    let selection_key = if commit.is_working_copy() {
+        RowSelectionKey::WorkingCopy
+    } else {
+        RowSelectionKey::Commit(commit.commit_id().to_owned())
+    };
+    let is_expanded = is_expanded_commit(selected, file_list_expanded, commit);
+    let is_selected = match selected {
+        RevisionSelection::WorkingCopy => commit.is_working_copy(),
+        RevisionSelection::Commit(id) => !commit.is_working_copy() && id == commit.commit_id(),
+    };
+
+    let lane = graph.fold(index, usize::MAX);
+    RevisionRowView {
+        selection_key,
+        change_id_prefix: id_prefix,
+        change_id_suffix: id_suffix,
+        commit_id_short,
+        author: commit.author().to_owned(),
+        description: commit.description().to_owned(),
+        description_color: commit_description_color(commit, theme),
+        bookmark_chips,
+        status_chips,
+        lane_color,
+        frame: lane_frame,
+        columns,
+        prev_columns,
+        lane_labels: lane.labels,
+        lane_segments_before: lane.segments_before,
+        lane_segments_after: lane.segments_after,
+        // The collapse/expand chevron shows only on the selected row.
+        collapse_chevron: is_selected.then_some(is_expanded),
+    }
+}
+
+/// Bookmark chips for a revision row, wearing `lane_color`. Shared with the
+/// source browser's revision-header row so both rails style identically.
+///
+/// Core authors the label shapes and jj forbids `@` inside bookmark and
+/// remote names, so a trailing `@` can only be another workspace's working
+/// copy (`name@`) and an interior `@` a remote bookmark (`main@origin`).
+/// Workspace chips get a folder glyph (another working-copy *directory*) and
+/// the working-copy accent — the lane palette is deliberately decoupled from
+/// it — so they read as a different kind of thing than the bookmark pills
+/// sharing the rail. Remotes render outlined (transparent fill + 1px
+/// lane-color border) so they read as "tracking" rather than "live".
+pub(crate) fn bookmark_chips_for(
+    bookmarks: &[String],
+    lane_color: Color,
+    theme: ThemeSpec,
+    config: AppConfig,
+) -> Vec<Chip> {
+    let mut chips = Vec::with_capacity(bookmarks.len());
     for bookmark in bookmarks {
-        // Core authors the label shapes and jj forbids `@` inside bookmark
-        // and remote names, so a trailing `@` can only be another workspace's
-        // working copy (`name@`) and an interior `@` a remote bookmark
-        // (`main@origin`). Workspace chips get a folder glyph (another
-        // working-copy *directory*) and the working-copy accent — the lane
-        // palette is deliberately decoupled from it — so they read as a
-        // different kind of thing than the bookmark pills sharing the rail.
-        // Remotes render outlined (transparent fill + 1px lane-color border)
-        // so they read as "tracking" rather than "live" bookmarks.
         let is_workspace = bookmark.ends_with('@');
         let is_remote = !is_workspace && bookmark.contains('@');
         let chip_color = if is_workspace {
@@ -519,7 +565,7 @@ fn build_revision_row(
         } else {
             lane_color
         };
-        bookmark_chips.push(Chip {
+        chips.push(Chip {
             label: bookmark.clone(),
             font: config.ui_font,
             background: if is_remote {
@@ -533,7 +579,12 @@ fn build_revision_row(
             icon: is_workspace.then_some(icons::FOLDER),
         });
     }
+    chips
+}
 
+/// Status chips (`empty`, `conflict`, `hidden`/`divergent`) for a commit row.
+/// Shared with the source browser's revision-header row.
+pub(crate) fn status_chips_for(commit: RowView, theme: ThemeSpec, config: AppConfig) -> Vec<Chip> {
     let mut status_chips = Vec::new();
     if commit.is_empty() == Some(true) {
         status_chips.push(Chip {
@@ -584,39 +635,7 @@ fn build_revision_row(
             icon: None,
         });
     }
-
-    let selection_key = if commit.is_working_copy() {
-        RowSelectionKey::WorkingCopy
-    } else {
-        RowSelectionKey::Commit(commit.commit_id().to_owned())
-    };
-    let is_expanded = is_expanded_commit(selected, file_list_expanded, commit);
-    let is_selected = match selected {
-        RevisionSelection::WorkingCopy => commit.is_working_copy(),
-        RevisionSelection::Commit(id) => !commit.is_working_copy() && id == commit.commit_id(),
-    };
-
-    let lane = graph.fold(index, usize::MAX);
-    RevisionRowView {
-        selection_key,
-        change_id_prefix: id_prefix,
-        change_id_suffix: id_suffix,
-        commit_id_short,
-        author: commit.author().to_owned(),
-        description: commit.description().to_owned(),
-        description_color: commit_description_color(commit, theme),
-        bookmark_chips,
-        status_chips,
-        lane_color,
-        frame: lane_frame,
-        columns,
-        prev_columns,
-        lane_labels: lane.labels,
-        lane_segments_before: lane.segments_before,
-        lane_segments_after: lane.segments_after,
-        // The collapse/expand chevron shows only on the selected row.
-        collapse_chevron: is_selected.then_some(is_expanded),
-    }
+    status_chips
 }
 
 /// Build the display view for one file row under the expanded commit.
@@ -643,6 +662,7 @@ fn build_file_row(
         additions_width: template.additions_width,
         deletions_width: template.deletions_width,
         primary_color: theme.text,
+        icon_color: theme.subtle_text,
         indent: template.indent,
         chevron: template.chevron,
         file_index: template.file_index,
@@ -831,7 +851,7 @@ fn file_row_template(
     }
 }
 
-fn revision_list_style(
+pub(crate) fn revision_list_style(
     theme: ThemeSpec,
     config: AppConfig,
     file_badge_width: f32,
@@ -879,13 +899,13 @@ fn is_expanded_commit(selected: &RevisionSelection, expanded: bool, commit: RowV
     }
 }
 
-fn revision_id_display_len(unique_len: usize, revision_id: &str) -> usize {
+pub(crate) fn revision_id_display_len(unique_len: usize, revision_id: &str) -> usize {
     REVISION_ID_CHARS
         .max(unique_len)
         .min(revision_id.chars().count())
 }
 
-fn truncate_end(value: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_end(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 

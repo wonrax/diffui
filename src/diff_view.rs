@@ -62,6 +62,10 @@ const AUTO_SCROLL_MAX_SPEED: f32 = 1200.0;
 // speed ramps up. The cursor sitting just past the edge scrolls slowly; a
 // cursor far outside the viewport scrolls at full speed.
 const AUTO_SCROLL_RAMP_PX: f32 = 80.0;
+// Square hit target of the per-file "browse source" button in file headers.
+const BROWSE_BUTTON_SIZE: f32 = 22.0;
+// Glyph size of the browse button's icon within that square.
+const BROWSE_ICON_SIZE: f32 = 13.0;
 
 // The diff data model lives in `diffui_core`; re-export the types this widget
 // renders so `crate::diff_view::DiffLine` etc. still resolve for callers.
@@ -200,6 +204,14 @@ pub struct DiffView<'a, Message> {
     /// never move them, so rebuilding the (potentially 1M-row) index for each
     /// would be pure waste.
     layout_version: u64,
+    /// Plain source-document rendering (the source browser): no file/hunk
+    /// header strips and a single line-number gutter column. See
+    /// [`Self::plain`].
+    plain: bool,
+    /// Per-file "browse source" affordance drawn in each file header
+    /// (diff mode only — plain documents have no headers). Receives the
+    /// file index on click.
+    on_browse_file: Option<fn(usize) -> Message>,
 }
 
 /// Per-render find-match data fed into `DiffView::with_find`. The widget
@@ -241,10 +253,19 @@ struct LayoutMetrics {
 }
 
 impl LayoutMetrics {
-    fn new(text_size: f32, gutter_digit_count: usize, font: Font) -> Self {
+    fn new(text_size: f32, gutter_digit_count: usize, font: Font, plain: bool) -> Self {
         let row_height = (text_size * ROW_HEIGHT_RATIO).round();
-        let file_header_height = row_height + 2.0 * FILE_HEADER_VPAD;
-        let hunk_header_height = row_height + 2.0 * HUNK_HEADER_VPAD;
+        // Plain (source-browse) documents render no file/hunk header strips;
+        // zero heights keep the prefix-sum index, hit tests, and draw all
+        // consistent without a parallel layout mode.
+        let (file_header_height, hunk_header_height) = if plain {
+            (0.0, 0.0)
+        } else {
+            (
+                row_height + 2.0 * FILE_HEADER_VPAD,
+                row_height + 2.0 * HUNK_HEADER_VPAD,
+            )
+        };
         // Headless cosmic_text shaping gives the actual glyph advance, so
         // the row-height wrap math matches iced's renderer instead of the
         // historical `text_size * 0.62` heuristic that consistently
@@ -254,10 +275,21 @@ impl LayoutMetrics {
         // `view()` cycle, and uncached this re-shapes "M" each time
         // (~40µs release / ~450µs debug per rebuild).
         let char_width = measure_char_advance_cached(font, text_size).max(1.0);
-        let gutter_text_chars = gutter_digit_count * 2 + 1; // two columns + one separating space
+        // Two line-number columns + a separating space; plain documents have
+        // no old side, so a single column suffices.
+        let gutter_text_chars = if plain {
+            gutter_digit_count
+        } else {
+            gutter_digit_count * 2 + 1
+        };
+        let gutter_min = if plain {
+            GUTTER_MIN_WIDTH / 2.0
+        } else {
+            GUTTER_MIN_WIDTH
+        };
         let gutter_width = (gutter_text_chars as f32 * char_width
             + GUTTER_HORIZONTAL_PADDING * 2.0)
-            .max(GUTTER_MIN_WIDTH);
+            .max(gutter_min);
         Self {
             row_height,
             file_header_height,
@@ -485,6 +517,9 @@ struct State<Paragraph> {
     /// cache (whose keys would otherwise map to stale text). Starts at 0 to
     /// match the app's initial version.
     last_content_version: u64,
+    /// File whose header's browse button the cursor is over, if any —
+    /// drives its hover wash (manual, like every hover in this widget).
+    hovered_browse: Option<usize>,
     /// Prefix-sum layout index (see [`HeightIndex`]). `RefCell` because
     /// `draw`/`mouse_interaction` only get `&State` but must be able to
     /// (re)build it lazily; borrows are short and never overlap.
@@ -636,7 +671,7 @@ impl<'a, Message> DiffView<'a, Message> {
         on_selected_file_changed: fn(usize) -> Message,
     ) -> Self {
         let gutter_digit_count = compute_gutter_digit_count(&files);
-        let metrics = LayoutMetrics::new(text_size, gutter_digit_count, font);
+        let metrics = LayoutMetrics::new(text_size, gutter_digit_count, font, false);
         Self {
             files,
             selected_file,
@@ -657,7 +692,36 @@ impl<'a, Message> DiffView<'a, Message> {
             layout_version: 0,
             wrap: true,
             side_by_side: false,
+            plain: false,
+            on_browse_file: None,
         }
+    }
+
+    /// Render as a plain source document (the source browser): no file/hunk
+    /// header strips, a single line-number column, and never side-by-side.
+    pub fn plain(mut self, plain: bool) -> Self {
+        if self.plain != plain {
+            self.plain = plain;
+            self.metrics = LayoutMetrics::new(
+                self.text_size,
+                self.metrics.gutter_digit_count,
+                self.font,
+                plain,
+            );
+        }
+        if plain {
+            // A source document has one side; a split layout would just
+            // mirror it. Forced off so a caller can't combine the two.
+            self.side_by_side = false;
+        }
+        self
+    }
+
+    /// Draw a "browse source" icon button in every file header, firing with
+    /// the file index when clicked. Ignored for plain documents.
+    pub fn on_browse_file(mut self, callback: fn(usize) -> Message) -> Self {
+        self.on_browse_file = Some(callback);
+        self
     }
 
     pub fn with_header(mut self, header: Vec<HeaderLine>) -> Self {
@@ -675,8 +739,9 @@ impl<'a, Message> DiffView<'a, Message> {
     /// Two-column layout: deletions/context on the left, additions/context
     /// on the right, paired index-wise within each change run and padded
     /// where one side is longer. Off (the default) is the unified view.
+    /// Ignored for plain documents (see [`Self::plain`]).
     pub fn side_by_side(mut self, side_by_side: bool) -> Self {
-        self.side_by_side = side_by_side;
+        self.side_by_side = side_by_side && !self.plain;
         self
     }
 
@@ -1470,11 +1535,17 @@ impl<'a, Message> DiffView<'a, Message> {
         Renderer: text::Renderer<Font = Font>,
     {
         let text_color = self.line_text_color(line.kind);
-        let gutter = format_gutter(
-            line.old_line,
-            line.new_line,
-            self.metrics.gutter_digit_count,
-        );
+        // Plain source documents have one side, so a single right-aligned
+        // line-number column (the metrics sized the gutter to match).
+        let gutter = if self.plain {
+            format_gutter_plain(line.new_line, self.metrics.gutter_digit_count)
+        } else {
+            format_gutter(
+                line.old_line,
+                line.new_line,
+                self.metrics.gutter_digit_count,
+            )
+        };
         let prefix = prefix_for_kind(line.kind);
         let bounds = render.bounds;
 
@@ -2181,6 +2252,7 @@ where
             last_restore_token: 0,
             pending_set_offset: None,
             last_content_version: 0,
+            hovered_browse: None,
             height_index: RefCell::new(HeightIndex::default()),
         })
     }
@@ -2453,6 +2525,15 @@ where
                         (state.horizontal_offset + movement.x).clamp(0.0, max_horizontal);
                 }
 
+                // Headers slid under the (stationary) cursor — refresh the
+                // browse-button hover so a wash doesn't linger on a moved row.
+                let hovered = cursor
+                    .position_over(bounds)
+                    .and_then(|point| self.browse_button_at(state, bounds, point));
+                if hovered != state.hovered_browse {
+                    state.hovered_browse = hovered;
+                }
+
                 shell.capture_event();
                 shell.request_redraw();
             }
@@ -2500,6 +2581,15 @@ where
                         return;
                     }
                     scrollbar::ScrollbarEvent::None => {}
+                }
+                // The per-file browse button wins over selection: a press on
+                // it fires the callback instead of anchoring a drag.
+                if let Some(file_index) = self.browse_button_at(state, bounds, point) {
+                    if let Some(on_browse) = self.on_browse_file {
+                        shell.publish(on_browse(file_index));
+                    }
+                    shell.capture_event();
+                    return;
                 }
                 let position = {
                     let index = state.height_index.borrow();
@@ -2581,6 +2671,15 @@ where
                     return;
                 }
                 if !state.is_selecting {
+                    // Browse-button hover wash (manual — this widget has no
+                    // per-region hover for free).
+                    let hovered = cursor
+                        .position_over(bounds)
+                        .and_then(|point| self.browse_button_at(state, bounds, point));
+                    if hovered != state.hovered_browse {
+                        state.hovered_browse = hovered;
+                        shell.request_redraw();
+                    }
                     return;
                 }
                 state.last_drag_cursor = Some(*position);
@@ -2735,31 +2834,36 @@ where
             let file_tops =
                 &height_index.file_tops[..self.files.len().min(height_index.file_tops.len())];
 
-            let first_file = file_tops
-                .partition_point(|&top| top + self.metrics.file_header_height < visible_top);
-            for (file_index, &top) in file_tops.iter().enumerate().skip(first_file) {
-                if top > visible_bottom {
-                    break;
+            // Plain documents draw no header strips (their heights are zero
+            // anyway — collecting them would just emit invisible-height rows
+            // whose text still paints).
+            if !self.plain {
+                let first_file = file_tops
+                    .partition_point(|&top| top + self.metrics.file_header_height < visible_top);
+                for (file_index, &top) in file_tops.iter().enumerate().skip(first_file) {
+                    if top > visible_bottom {
+                        break;
+                    }
+                    visible_file_headers.push(VisibleFileHeader {
+                        file_index,
+                        y: bounds.y + (top - visible_top),
+                    });
                 }
-                visible_file_headers.push(VisibleFileHeader {
-                    file_index,
-                    y: bounds.y + (top - visible_top),
-                });
-            }
 
-            let first_hunk = height_index
-                .hunk_tops
-                .partition_point(|&top| top + self.metrics.hunk_header_height < visible_top);
-            for (i, &top) in height_index.hunk_tops.iter().enumerate().skip(first_hunk) {
-                if top > visible_bottom {
-                    break;
+                let first_hunk = height_index
+                    .hunk_tops
+                    .partition_point(|&top| top + self.metrics.hunk_header_height < visible_top);
+                for (i, &top) in height_index.hunk_tops.iter().enumerate().skip(first_hunk) {
+                    if top > visible_bottom {
+                        break;
+                    }
+                    let (file_index, hunk_index) = height_index.hunk_ids[i];
+                    visible_hunk_headers.push(VisibleHunkHeader {
+                        file_index: file_index as usize,
+                        hunk_index: hunk_index as usize,
+                        y: bounds.y + (top - visible_top),
+                    });
                 }
-                let (file_index, hunk_index) = height_index.hunk_ids[i];
-                visible_hunk_headers.push(VisibleHunkHeader {
-                    file_index: file_index as usize,
-                    hunk_index: hunk_index as usize,
-                    y: bounds.y + (top - visible_top),
-                });
             }
 
             // The candidate first row may still end above the viewport when
@@ -2810,10 +2914,14 @@ where
             // that file's header has scrolled above the viewport top — which is
             // always below the revision header, so the two never overlap.
             let content_end = height_index.total_height;
-            let sticky_file = file_tops
-                .partition_point(|&top| top <= visible_top)
-                .checked_sub(1)
-                .filter(|&i| file_tops[i] < visible_top);
+            let sticky_file = (!self.plain)
+                .then(|| {
+                    file_tops
+                        .partition_point(|&top| top <= visible_top)
+                        .checked_sub(1)
+                        .filter(|&i| file_tops[i] < visible_top)
+                })
+                .flatten();
             let sticky_pin_y = sticky_file.map(|i| {
                 let next_top = file_tops.get(i + 1).copied().unwrap_or(content_end);
                 let pinned_content_y = visible_top.min(next_top - self.metrics.file_header_height);
@@ -2962,7 +3070,13 @@ where
                 if Some(header.file_index) == sticky_file {
                     continue;
                 }
-                self.draw_file_header(renderer, header.file_index, header.y, bounds);
+                self.draw_file_header(
+                    renderer,
+                    header.file_index,
+                    header.y,
+                    bounds,
+                    state.hovered_browse == Some(header.file_index),
+                );
             }
 
             for header in &visible_hunk_headers {
@@ -3160,7 +3274,13 @@ where
             // it — only a new layer does.
             if let (Some(file_index), Some(y)) = (sticky_file, sticky_pin_y) {
                 renderer.with_layer(bounds, |renderer| {
-                    self.draw_file_header(renderer, file_index, y, bounds);
+                    self.draw_file_header(
+                        renderer,
+                        file_index,
+                        y,
+                        bounds,
+                        state.hovered_browse == Some(file_index),
+                    );
                 });
             }
 
@@ -3207,6 +3327,9 @@ where
         {
             return mouse::Interaction::Idle;
         }
+        if self.browse_button_at(state, bounds, point).is_some() {
+            return mouse::Interaction::Pointer;
+        }
         // In the revision-header strip, show the text cursor only over the
         // selectable values (field values + description), and the arrow over
         // labels, bookmark chips, and blank space.
@@ -3250,6 +3373,122 @@ where
 impl<Message> DiffView<'_, Message> {
     fn text_width(&self, content: &str) -> f32 {
         (content.chars().count() as f32 * self.metrics.char_width + 16.0).max(1.0)
+    }
+
+    /// The right-aligned `+N -N  K Hunks` summary of a file header, and its
+    /// clamped width — shared by the header draw and the browse-button hit
+    /// test so the two agree on geometry.
+    fn file_header_summary(
+        &self,
+        file: &DiffFileView<'_>,
+        bounds: Rectangle,
+    ) -> (String, String, String, f32) {
+        let hunk_label = if file.hunks.len() == 1 {
+            "1 Hunk".to_owned()
+        } else {
+            format!("{} Hunks", file.hunks.len())
+        };
+        let additions = format!("+{}", file.additions);
+        let deletions = format!("-{}", file.deletions);
+        let mono_width = |content: &str| content.chars().count() as f32 * self.metrics.char_width;
+        let gap = self.metrics.char_width;
+        let summary_width = (mono_width(&additions)
+            + gap
+            + mono_width(&deletions)
+            + 2.0 * gap
+            + mono_width(&hunk_label))
+        .min((bounds.width - 24.0).max(1.0));
+        (additions, deletions, hunk_label, summary_width)
+    }
+
+    /// Screen rect of a file header's browse button when the header is drawn
+    /// at `header_y`, or `None` when the affordance is off or there's no room.
+    fn browse_button_rect(
+        &self,
+        file_index: usize,
+        header_y: f32,
+        bounds: Rectangle,
+    ) -> Option<Rectangle> {
+        self.on_browse_file?;
+        if self.plain {
+            return None;
+        }
+        let file = self.files.get(file_index)?;
+        let (_, _, _, summary_width) = self.file_header_summary(file, bounds);
+        let summary_x = (bounds.x + bounds.width - summary_width - 8.0).max(bounds.x + 12.0);
+        let size = BROWSE_BUTTON_SIZE;
+        let x = summary_x - 10.0 - size;
+        let y = header_y + (self.metrics.file_header_height - size) / 2.0;
+        // Vanishes rather than colliding with the title when the pane is
+        // squeezed to nothing.
+        (x > bounds.x + 48.0).then_some(Rectangle {
+            x,
+            y,
+            width: size,
+            height: size,
+        })
+    }
+
+    /// `(file index, header screen y)` for every file header currently
+    /// visible, with the sticky pinned header replacing its natural position
+    /// — the browse-button hit test must match where headers actually draw.
+    fn visible_file_header_positions(
+        &self,
+        index: &HeightIndex,
+        bounds: Rectangle,
+        visible_top: f32,
+    ) -> Vec<(usize, f32)> {
+        if self.plain || self.metrics.file_header_height <= 0.0 {
+            return Vec::new();
+        }
+        let visible_bottom = visible_top + bounds.height;
+        let file_tops = &index.file_tops[..self.files.len().min(index.file_tops.len())];
+        let mut out = Vec::new();
+        let first =
+            file_tops.partition_point(|&top| top + self.metrics.file_header_height < visible_top);
+        for (file_index, &top) in file_tops.iter().enumerate().skip(first) {
+            if top > visible_bottom {
+                break;
+            }
+            out.push((file_index, bounds.y + (top - visible_top)));
+        }
+        // Mirror draw()'s sticky pin: that file's header sits pinned, not at
+        // its natural offset.
+        let content_end = index.total_height;
+        if let Some(sticky) = file_tops
+            .partition_point(|&top| top <= visible_top)
+            .checked_sub(1)
+            .filter(|&i| file_tops[i] < visible_top)
+        {
+            let next_top = file_tops.get(sticky + 1).copied().unwrap_or(content_end);
+            let pinned = visible_top.min(next_top - self.metrics.file_header_height);
+            let y = bounds.y + (pinned - visible_top);
+            if let Some(slot) = out.iter_mut().find(|(file, _)| *file == sticky) {
+                slot.1 = y;
+            } else {
+                out.insert(0, (sticky, y));
+            }
+        }
+        out
+    }
+
+    /// The browse button under `point`, if any.
+    fn browse_button_at<P>(
+        &self,
+        state: &State<P>,
+        bounds: Rectangle,
+        point: Point,
+    ) -> Option<usize> {
+        self.on_browse_file?;
+        let headers = {
+            let index = state.height_index.borrow();
+            self.visible_file_header_positions(&index, bounds, state.vertical_offset)
+        };
+        headers.into_iter().find_map(|(file_index, y)| {
+            self.browse_button_rect(file_index, y, bounds)
+                .filter(|rect| rect.contains(point))
+                .map(|_| file_index)
+        })
     }
 
     /// Update the selection focus based on the cursor's current screen
@@ -3369,17 +3608,13 @@ impl<Message> DiffView<'_, Message> {
         file_index: usize,
         y: f32,
         bounds: Rectangle,
+        browse_hovered: bool,
     ) where
         Renderer: text::Renderer<Font = Font> + geometry::Renderer,
     {
         let file = &self.files[file_index];
-        let hunk_label = if file.hunks.len() == 1 {
-            "1 Hunk".to_owned()
-        } else {
-            format!("{} Hunks", file.hunks.len())
-        };
-        let additions = format!("+{}", file.additions);
-        let deletions = format!("-{}", file.deletions);
+        let (additions, deletions, hunk_label, summary_width) =
+            self.file_header_summary(file, bounds);
         // Tight monospace widths (like the bookmark chips) — `text_width`
         // adds breathing room meant for wrapped text.
         let mono_width = |content: &str| content.chars().count() as f32 * self.metrics.char_width;
@@ -3387,8 +3622,6 @@ impl<Message> DiffView<'_, Message> {
         let additions_width = mono_width(&additions);
         let deletions_width = mono_width(&deletions);
         let hunk_width = mono_width(&hunk_label);
-        let summary_width = (additions_width + gap + deletions_width + 2.0 * gap + hunk_width)
-            .min((bounds.width - 24.0).max(1.0));
 
         self.draw_background(
             renderer,
@@ -3425,12 +3658,23 @@ impl<Message> DiffView<'_, Message> {
             bounds,
         );
 
+        let browse_rect = self.browse_button_rect(file_index, y, bounds);
+        let browse_reserve = if browse_rect.is_some() {
+            BROWSE_BUTTON_SIZE + 10.0
+        } else {
+            0.0
+        };
         let title_x = bounds.x + 12.0 + chip_w + 8.0;
         self.draw_text(
             renderer,
             &file.title,
             TextRenderParams {
-                width: (bounds.width - (title_x - bounds.x) - summary_width - 16.0).max(1.0),
+                width: (bounds.width
+                    - (title_x - bounds.x)
+                    - summary_width
+                    - 16.0
+                    - browse_reserve)
+                    .max(1.0),
                 height: self.metrics.row_height,
                 position: Point::new(title_x, text_y),
                 color: self.palette.text,
@@ -3438,6 +3682,50 @@ impl<Message> DiffView<'_, Message> {
                 wrapping: text::Wrapping::WordOrGlyph,
             },
         );
+
+        if let Some(rect) = browse_rect {
+            // Hover wash mirrors the app's ghost buttons: a translucent
+            // muted-text tint behind the glyph.
+            if browse_hovered {
+                renderer.fill_quad(
+                    iced::advanced::renderer::Quad {
+                        bounds: rect,
+                        border: Border {
+                            radius: 4.0.into(),
+                            ..Border::default()
+                        },
+                        shadow: Shadow::default(),
+                        snap: true,
+                    },
+                    Color {
+                        a: 0.14,
+                        ..self.palette.text_muted
+                    },
+                );
+            }
+            renderer.fill_text(
+                text::Text {
+                    content: crate::icons::CODE.to_owned(),
+                    bounds: Size::new(rect.width, rect.height),
+                    size: Pixels(BROWSE_ICON_SIZE),
+                    line_height: text::LineHeight::Absolute(Pixels(rect.height)),
+                    font: crate::icons::ICON_FONT,
+                    align_x: text::Alignment::Center,
+                    align_y: alignment::Vertical::Center,
+                    shaping: text::Shaping::Basic,
+                    wrapping: text::Wrapping::None,
+                    ellipsis: text::Ellipsis::None,
+                    hint_factor: None,
+                },
+                Point::new(rect.center_x(), rect.center_y()),
+                if browse_hovered {
+                    self.palette.text
+                } else {
+                    self.palette.text_muted
+                },
+                bounds,
+            );
+        }
 
         let summary_x = (bounds.x + bounds.width - summary_width - 8.0).max(bounds.x + 12.0);
         let segments = [
@@ -3653,6 +3941,18 @@ fn format_gutter(old_line: Option<usize>, new_line: Option<usize>, digit_count: 
     }
     out.push(' ');
     if let Some(line) = new_line {
+        let _ = write!(out, "{line:>digit_count$}");
+    } else {
+        out.extend(std::iter::repeat_n(' ', digit_count));
+    }
+    out
+}
+
+/// Single right-aligned line-number column for plain source documents.
+fn format_gutter_plain(line: Option<usize>, digit_count: usize) -> String {
+    use core::fmt::Write as _;
+    let mut out = String::with_capacity(digit_count);
+    if let Some(line) = line {
         let _ = write!(out, "{line:>digit_count$}");
     } else {
         out.extend(std::iter::repeat_n(' ', digit_count));

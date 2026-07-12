@@ -16,7 +16,10 @@ use std::process::Command;
 use diffui_core::jj::{
     load_jj_commits, load_jj_diff, load_jj_repository_snapshot, read_jj_op_head,
 };
-use diffui_core::{DiffFileStatus, DiffLineKind, LoadProgress, Repository, RevisionSelection, Vcs};
+use diffui_core::{
+    DiffFileStatus, DiffLineKind, LoadProgress, Repository, RevisionSelection, SourceEntryStatus,
+    Vcs, list_ignored_dir, list_source_tree, load_source_file,
+};
 
 fn block_on<F: Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
@@ -329,6 +332,152 @@ fn secondary_workspace_resolves_and_labels() {
         "expected workspace chip, got {:?}",
         ws_row.bookmarks()
     );
+}
+
+/// The source browser's two backends against a real repo: the working copy
+/// lists the on-disk directory — tracked files plus classified untracked /
+/// ignored ones, with ignored dirs collapsed unenumerated — while a commit
+/// lists exactly its tree; reads come from the right side (disk vs tree).
+#[test]
+#[ignore = "shells out to the jj CLI"]
+fn source_browser_lists_and_reads_working_copy_and_commits() {
+    let root = scratch_repo("source-browse");
+    write(&root, ".gitignore", "/target/\n*.log\n");
+    std::fs::create_dir_all(root.join("src")).expect("mkdir src");
+    write(&root, "src/main.rs", "fn main() {}\n");
+    write(&root, "README.md", "hello\n");
+    jj(&root, &["commit", "-m", "base"]);
+    let base_commit = commit_id(&root, "@-");
+
+    // Rewrite a tracked file, then lay down ignored + untracked content
+    // *after* the last jj op so nothing snapshots them into the tree.
+    write(&root, "src/main.rs", "fn main() { println!(\"v2\"); }\n");
+    jj(&root, &["status"]); // snapshots the edit into @
+    std::fs::create_dir_all(root.join("target/debug")).expect("mkdir target");
+    write(&root, "target/debug/junk.bin", "junk");
+    write(&root, "debug.log", "log line\n");
+    write(&root, "notes.txt", "untracked note\n");
+
+    // ── Working copy: mirrors the directory ────────────────────────────
+    let entries = block_on(list_source_tree(
+        repository(&root),
+        RevisionSelection::WorkingCopy,
+    ))
+    .expect("list working copy");
+    let find = |path: &str| {
+        entries
+            .iter()
+            .find(|entry| entry.path == path)
+            .unwrap_or_else(|| panic!("{path} missing from {entries:#?}"))
+    };
+    assert_eq!(find("src/main.rs").status, SourceEntryStatus::Tracked);
+    assert_eq!(find("README.md").status, SourceEntryStatus::Tracked);
+    assert_eq!(find("notes.txt").status, SourceEntryStatus::Untracked);
+    assert_eq!(find("debug.log").status, SourceEntryStatus::Ignored);
+    let target = find("target");
+    assert!(
+        target.is_dir && target.status == SourceEntryStatus::Ignored,
+        "ignored dir arrives collapsed: {target:?}"
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry.path.starts_with("target/")),
+        "ignored dir contents must not be enumerated"
+    );
+
+    // Diff-status chips: the edited file reads Modified; untouched tracked
+    // files carry no chip; untracked/ignored never do.
+    assert_eq!(
+        find("src/main.rs").change,
+        Some(DiffFileStatus::Modified),
+        "the wc edit must chip as modified"
+    );
+    assert_eq!(find("README.md").change, None);
+    assert_eq!(find("notes.txt").change, None);
+    assert_eq!(find("debug.log").change, None);
+
+    // Lazily listing the ignored dir returns one level: a nested dir marker
+    // (expandable in turn) — its contents stay unenumerated.
+    let children = block_on(list_ignored_dir(repository(&root), "target".to_owned()))
+        .expect("list ignored dir");
+    assert_eq!(children.len(), 1, "one level only: {children:#?}");
+    assert_eq!(children[0].path, "target/debug");
+    assert!(children[0].is_dir);
+    assert_eq!(children[0].status, SourceEntryStatus::Ignored);
+    let nested = block_on(list_ignored_dir(
+        repository(&root),
+        "target/debug".to_owned(),
+    ))
+    .expect("list nested ignored dir");
+    assert_eq!(nested.len(), 1);
+    assert_eq!(nested[0].path, "target/debug/junk.bin");
+    assert!(!nested[0].is_dir);
+
+    // ── A commit: exactly its tree ──────────────────────────────────────
+    let entries = block_on(list_source_tree(
+        repository(&root),
+        RevisionSelection::Commit(base_commit.clone()),
+    ))
+    .expect("list base commit");
+    let mut paths: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+    paths.sort_unstable();
+    assert_eq!(paths, vec![".gitignore", "README.md", "src/main.rs"]);
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.status == SourceEntryStatus::Tracked && !entry.is_dir)
+    );
+
+    // ── Reads: tree side vs disk side ──────────────────────────────────
+    let at_base = block_on(load_source_file(
+        repository(&root),
+        RevisionSelection::Commit(base_commit.clone()),
+        "src/main.rs".to_owned(),
+    ))
+    .expect("read src/main.rs at base");
+    let text = |load: &diffui_core::SourceFileLoad| {
+        load.file.hunks[0]
+            .lines
+            .iter()
+            .map(|line| line.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(text(&at_base), "fn main() {}");
+    assert!(
+        at_base.file.hunks[0]
+            .lines
+            .iter()
+            .any(|line| !line.syntax.is_empty()),
+        "a .rs file gets syntax spans"
+    );
+    assert_eq!(at_base.line_count, 1);
+
+    let at_wc = block_on(load_source_file(
+        repository(&root),
+        RevisionSelection::WorkingCopy,
+        "src/main.rs".to_owned(),
+    ))
+    .expect("read src/main.rs in wc");
+    assert_eq!(text(&at_wc), "fn main() { println!(\"v2\"); }");
+
+    // Ignored files exist only on disk — the working-copy read serves them.
+    let ignored = block_on(load_source_file(
+        repository(&root),
+        RevisionSelection::WorkingCopy,
+        "debug.log".to_owned(),
+    ))
+    .expect("read ignored file");
+    assert_eq!(text(&ignored), "log line");
+
+    // Absent path at a commit errors instead of coming back empty.
+    let missing = block_on(load_source_file(
+        repository(&root),
+        RevisionSelection::Commit(base_commit),
+        "notes.txt".to_owned(),
+    ));
+    assert!(missing.is_err(), "missing paths must error: {missing:?}");
 }
 
 /// The snapshot must expose the op it was based on, so a frontend can tell

@@ -10,7 +10,9 @@ use diffui_core::{
 };
 
 use crate::theme::ThemePreference;
-use crate::{HoverTarget, RefreshOrigin, TabId, ToolbarMenu, activity, mutations, revision_list};
+use crate::{
+    HoverTarget, MainView, RefreshOrigin, TabId, ToolbarMenu, activity, mutations, revision_list,
+};
 
 #[derive(Debug, Clone)]
 pub(crate) enum Message {
@@ -237,4 +239,55 @@ pub(crate) enum Message {
     /// `document_id` (routed to whichever session still shows it — active or
     /// stashed — and dropped once that document is gone).
     FileHighlighted(u64, usize, Vec<(usize, usize, Vec<SyntaxSpan>)>),
+
+    // ── Source browser ──────────────────────────────────────────────────
+    /// Toolbar view switcher: show the diff or the source browser. Switching
+    /// to Source with no browsed revision yet browses the selected revision,
+    /// jumped to the diff's selected file.
+    SetMainView(MainView),
+    /// The diff view's per-file-header browse button: open the source browser
+    /// at the shown revision, jumped to this file (by document file index —
+    /// the widget callback can't capture the revision; the context-menu
+    /// entry points dispatch through `MenuAction::BrowseSource` instead).
+    BrowseFileFromDiff(usize),
+    /// The browsed revision's file listing finished. Tab-addressed and
+    /// version-guarded (`SourceState::version`) like every per-tab load.
+    SourceTreeLoaded(
+        TabId,
+        u64,
+        Box<Result<Vec<diffui_core::SourceEntry>, String>>,
+    ),
+    /// One file's contents finished loading for the source browser. Carries
+    /// the path so a result for a superseded selection is dropped.
+    SourceFileLoaded(
+        TabId,
+        u64,
+        String,
+        Box<Result<diffui_core::SourceFileLoad, String>>,
+    ),
+    /// A lazy one-level listing of an ignored directory finished (the user
+    /// expanded its unenumerated row). Carries the dir path it lists.
+    SourceDirLoaded(
+        TabId,
+        u64,
+        String,
+        Box<Result<Vec<diffui_core::SourceEntry>, String>>,
+    ),
+    /// Click on a row of the source sidebar's file tree, by display index:
+    /// files load into the viewer, directories toggle their collapse.
+    SourceSidebarRow(usize),
+    /// Click on the source sidebar's revision header row — a no-op (the row
+    /// is informational), but the widget requires a message.
+    SourceHeaderClicked,
+    /// The sidebar's fuzzy file-search query was edited.
+    SourceFilterChanged(String),
+    /// Enter in the file-search box: open the best match.
+    SourceFilterSubmit,
+    /// Source view / source tree scroll offsets, mirrored for stash/restore
+    /// like [`Message::DiffScrolled`] / [`Message::SidebarScrolled`].
+    SourceScrolled(f32),
+    SourceTreeScrolled(f64),
+    /// Right-click on a file row in either sidebar tree (diff or source
+    /// mode), by display index; opens the file context menu at the cursor.
+    SidebarFileContextMenu(usize, iced::Rectangle, iced::Point),
 }

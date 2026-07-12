@@ -235,6 +235,9 @@ impl Diffui {
             next_tab_id,
             next_load_version: 0,
             next_document_id: 0,
+            main_view: MainView::default(),
+            source: SourceState::default(),
+            source_tree_cache: Default::default(),
             open_repo_dialog: None,
             recent_repos,
             default_revset: active_repository
@@ -1200,6 +1203,9 @@ impl Diffui {
             }
             Message::LoadingTick => {}
             Message::SelectNextFile => {
+                if self.main_view == MainView::Source {
+                    return self.source_select_neighbor(1);
+                }
                 if !self.session.document.files.is_empty() {
                     self.selected_file = (self.selected_file + 1)
                         .min(self.session.document.files.len().saturating_sub(1));
@@ -1208,6 +1214,9 @@ impl Diffui {
                 }
             }
             Message::SelectPreviousFile => {
+                if self.main_view == MainView::Source {
+                    return self.source_select_neighbor(-1);
+                }
                 let previous = self.selected_file.saturating_sub(1);
                 if previous != self.selected_file {
                     self.selected_file = previous;
@@ -1588,18 +1597,20 @@ impl Diffui {
                 }
             }
             Message::Find(FindMessage::Recompute(version)) => {
-                if let Some(state) = self.find.as_mut()
+                if let Some(state) = self.find.as_ref()
                     && state.query_version == version
                 {
-                    let (matches, error) = find::compute_matches(state, &self.session.document);
-                    state.matches = matches;
-                    state.error = error;
-                    state.active = if state.matches.is_empty() {
-                        None
-                    } else {
-                        Some(0)
-                    };
-                    state.scroll_token = state.scroll_token.wrapping_add(1);
+                    let (matches, error) = find::compute_matches(state, self.find_files());
+                    if let Some(state) = self.find.as_mut() {
+                        state.matches = matches;
+                        state.error = error;
+                        state.active = if state.matches.is_empty() {
+                            None
+                        } else {
+                            Some(0)
+                        };
+                        state.scroll_token = state.scroll_token.wrapping_add(1);
+                    }
                 }
             }
             Message::Find(FindMessage::ToggleCase) => {
@@ -1770,6 +1781,189 @@ impl Diffui {
             Message::SetHover(target) => {
                 self.hovered = target;
             }
+
+            // ── Source browser ──────────────────────────────────────────
+            Message::SetMainView(mode) => {
+                if mode != self.main_view {
+                    match mode {
+                        MainView::Diff => {
+                            self.main_view = MainView::Diff;
+                            // The shared code widget swaps documents: restore
+                            // this view's saved scroll and drop the other
+                            // view's shaped-paragraph cache.
+                            self.scroll_restore_token = self.scroll_restore_token.wrapping_add(1);
+                            self.document_version = self.document_version.wrapping_add(1);
+                        }
+                        MainView::Source => {
+                            // First open browses the selected revision jumped
+                            // to the diff's selected file; later toggles
+                            // return to whatever was being browsed.
+                            let revision = self
+                                .source
+                                .revision
+                                .clone()
+                                .unwrap_or_else(|| self.session.selected_revision.clone());
+                            let jump = if self.source.revision.is_none() {
+                                self.session
+                                    .document
+                                    .files
+                                    .get(self.selected_file)
+                                    .map(|file| file.path.clone())
+                            } else {
+                                None
+                            };
+                            return self.open_source_browser(revision, jump);
+                        }
+                    }
+                }
+            }
+            Message::BrowseFileFromDiff(file_index) => {
+                let Some(file) = self.session.document.files.get(file_index) else {
+                    return Task::none();
+                };
+                let revision = self.session.selected_revision.clone();
+                let path = file.path.clone();
+                return self.open_source_browser(revision, Some(path));
+            }
+            Message::SourceTreeLoaded(tab, version, result) => {
+                let is_active_tab = self.active_tab_id() == Some(tab);
+                let Some(state) = self.source_state_for(tab) else {
+                    return Task::none();
+                };
+                if state.version != version {
+                    return Task::none();
+                }
+                match *result {
+                    Ok(entries) => {
+                        state.tree = Some(entries);
+                        state.tree_epoch = state.tree_epoch.wrapping_add(1);
+                        state.tree_error = None;
+                        // A jump scheduled before the listing arrived had no
+                        // row to reveal yet — re-arm it now that the selected
+                        // path has one. One-shot, so periodic wc re-lists
+                        // don't yank the scroll back to the selection.
+                        let rearm = state.reveal_pending && state.selected.is_some();
+                        state.reveal_pending = false;
+                        if rearm {
+                            state.reveal_token = state.reveal_token.wrapping_add(1);
+                            if is_active_tab {
+                                self.aim_tree_scroll_at_selected();
+                            }
+                        }
+                    }
+                    // Keep a previously-listed tree usable under the error
+                    // banner (a wc re-list that failed shouldn't blank the
+                    // pane).
+                    Err(error) => state.tree_error = Some(error),
+                }
+            }
+            Message::SourceFileLoaded(tab, version, path, result) => {
+                // Allocated up front — `source_state_for` borrows self.
+                let doc_id = self.allocate_document_id();
+                let is_active_tab = self.active_tab_id() == Some(tab);
+                let Some(state) = self.source_state_for(tab) else {
+                    return Task::none();
+                };
+                // Stale guards: a superseded browse (version) or a selection
+                // that moved on (path) drops the result.
+                if state.version != version || state.selected.as_deref() != Some(path.as_str()) {
+                    return Task::none();
+                }
+                state.loading = None;
+                match *result {
+                    Ok(load) => {
+                        state.file = Some(SourceFileView {
+                            file: load.file,
+                            line_count: load.line_count,
+                            byte_len: load.byte_len,
+                            binary: load.binary,
+                            too_large: load.too_large,
+                            doc_id,
+                        });
+                        state.file_error = None;
+                    }
+                    Err(error) => {
+                        state.file = None;
+                        state.file_error = Some(error);
+                    }
+                }
+                // Repaint the (shared) code widget with the new document.
+                if is_active_tab {
+                    self.document_version = self.document_version.wrapping_add(1);
+                }
+            }
+            Message::SourceSidebarRow(display_index) => {
+                let (entries, rows) = self.source_entries_and_rows();
+                match rows.get(display_index).cloned() {
+                    Some(diffui_core::SourceTreeRow::Dir { path, unlisted, .. }) => {
+                        if unlisted {
+                            // Unenumerated ignored dir: expanding it is a
+                            // lazy disk listing. Mark it expanded now so the
+                            // arriving children render straight away.
+                            self.source.expanded.insert(path.clone());
+                            return self.kick_ignored_dir_load(path);
+                        }
+                        if !self.source.expanded.remove(&path) {
+                            self.source.expanded.insert(path);
+                        }
+                    }
+                    Some(diffui_core::SourceTreeRow::File { entry_index, .. }) => {
+                        let path = entries.get(entry_index).map(|entry| entry.path.clone());
+                        if let Some(path) = path {
+                            return self.select_source_file(path);
+                        }
+                    }
+                    None => {}
+                }
+            }
+            Message::SourceDirLoaded(tab, version, dir, result) => {
+                let Some(state) = self.source_state_for(tab) else {
+                    return Task::none();
+                };
+                if state.version != version {
+                    return Task::none();
+                }
+                match *result {
+                    Ok(entries) => {
+                        state.dir_children.insert(dir, entries);
+                        state.tree_epoch = state.tree_epoch.wrapping_add(1);
+                    }
+                    // Surface a failed readdir in the tree banner; the row
+                    // stays unlisted so the click can retry.
+                    Err(error) => {
+                        state.expanded.remove(&dir);
+                        state.tree_error = Some(error);
+                    }
+                }
+            }
+            Message::SourceHeaderClicked => {}
+            Message::SourceFilterChanged(query) => {
+                self.source.filter = query;
+                // New result set — jump the list back to the top. The code
+                // pane's restore re-applies its own live offset, so only the
+                // sidebar actually moves.
+                self.source.tree_scroll_offset = 0.0;
+                self.scroll_restore_token = self.scroll_restore_token.wrapping_add(1);
+            }
+            Message::SourceFilterSubmit => {
+                // Open the best match (the ranked list's first row). A no-op
+                // when the box is empty — the first tree row is a directory.
+                let (entries, rows) = self.source_entries_and_rows();
+                if let Some(diffui_core::SourceTreeRow::File { entry_index, .. }) = rows.first()
+                    && let Some(path) = entries.get(*entry_index).map(|entry| entry.path.clone())
+                {
+                    return self.select_source_file(path);
+                }
+            }
+            Message::SourceScrolled(offset) => {
+                self.source.scroll_offset = offset;
+            }
+            Message::SourceTreeScrolled(offset) => {
+                self.source.tree_scroll_offset = offset;
+            }
+            Message::SidebarFileContextMenu(display_index, row_rect, cursor) => {
+                return self.open_file_context_menu(display_index, row_rect, cursor);
+            }
         }
 
         // Fall-through chokepoint for every arm that didn't return its own task:
@@ -1778,22 +1972,316 @@ impl Diffui {
         self.take_pending_refresh()
     }
 
+    /// Open (or re-focus) the source browser at `revision`, optionally jumped
+    /// to `jump` — the entry point behind the toolbar switcher, the revision
+    /// context menu, file-tree right-clicks, and the diff view's per-file
+    /// browse button. Repo tabs only; a PR tab has no tree to browse.
+    pub(crate) fn open_source_browser(
+        &mut self,
+        revision: RevisionSelection,
+        jump: Option<String>,
+    ) -> Task<Message> {
+        if self.session.repository.is_none() {
+            return Task::none();
+        }
+        self.main_view = MainView::Source;
+        self.scroll_restore_token = self.scroll_restore_token.wrapping_add(1);
+        self.document_version = self.document_version.wrapping_add(1);
+
+        let changed = self.source.revision.as_ref() != Some(&revision);
+        let is_working_copy = matches!(revision, RevisionSelection::WorkingCopy);
+        // Commits are immutable — their listing is reusable as-is. The
+        // working copy re-lists on every open so the browser mirrors the
+        // disk right now.
+        let need_tree = changed
+            || is_working_copy
+            || self.source.tree.is_none()
+            || self.source.tree_error.is_some();
+
+        if changed {
+            self.source.revision = Some(revision.clone());
+            // The old revision's listing is wrong for the new one; clear so
+            // the sidebar shows the loading state instead of stale rows.
+            // Expansion state, lazily-listed ignored dirs, and the selected
+            // path survive — most paths exist across revisions (and the
+            // ignored-dir markers vanish from non-wc listings, hiding the
+            // saved children automatically), which is what makes "browse
+            // this file at another revision" feel continuous.
+            self.source.tree = None;
+            self.source.tree_epoch = self.source.tree_epoch.wrapping_add(1);
+            self.source.tree_error = None;
+            self.source.file_error = None;
+        }
+
+        let mut tasks = Vec::new();
+        if need_tree {
+            self.source.version = self.source.version.wrapping_add(1);
+            self.source.tree_error = None;
+            tasks.push(self.kick_source_tree_load());
+        }
+
+        let jumped = jump.is_some();
+        if let Some(path) = jump {
+            // Expand every ancestor so the reveal target row exists (chain-
+            // compacted dir rows key on full prefixes, which this covers).
+            let mut prefix = String::new();
+            for component in path.split('/') {
+                if !prefix.is_empty() {
+                    prefix.push('/');
+                }
+                prefix.push_str(component);
+                self.source.expanded.insert(prefix.clone());
+            }
+            if self.source.selected.as_deref() != Some(path.as_str()) {
+                self.source.file = None;
+                self.source.scroll_offset = 0.0;
+            }
+            self.source.selected = Some(path);
+            self.source.file_error = None;
+            self.source.reveal_token = self.source.reveal_token.wrapping_add(1);
+            // A jump also bumps the scroll-restore token (the switched-in
+            // widget must drop the other view's offset), and a restore
+            // scheduled in the same render pass as a reveal wins over it —
+            // so the reveal alone can't be trusted to land. When the target
+            // row is computable now, aim the restore offset at it; when the
+            // listing is still in flight, its arrival re-fires the reveal
+            // (which then runs in a restore-free pass).
+            self.source.reveal_pending = need_tree;
+            if !need_tree {
+                self.aim_tree_scroll_at_selected();
+            }
+        }
+
+        let need_file = self.source.selected.is_some()
+            && (changed
+                || jumped
+                || is_working_copy
+                || (self.source.file.is_none() && self.source.file_error.is_none()));
+        if need_file {
+            tasks.push(self.kick_source_file_load());
+        }
+        Task::batch(tasks)
+    }
+
+    /// Point the source sidebar's saved scroll at the selected file's row
+    /// (a bit of context above it), so the next scroll *restore* lands
+    /// showing it. Used on jumps, where the same-pass restore outranks the
+    /// reveal (see `open_source_browser`).
+    fn aim_tree_scroll_at_selected(&mut self) {
+        const CONTEXT_ABOVE: f64 = 200.0;
+        let Some(selected) = self.source.selected.clone() else {
+            return;
+        };
+        let (entries, rows) = self.source_entries_and_rows();
+        let Some(entry_index) = entries
+            .iter()
+            .position(|entry| !entry.is_dir && entry.path == selected)
+        else {
+            return;
+        };
+        let Some(display) = rows.iter().position(|row| {
+            matches!(row, diffui_core::SourceTreeRow::File { entry_index: e, .. } if *e == entry_index)
+        }) else {
+            return;
+        };
+        let row_top = revision_list::REVISION_ROW_HEIGHT as f64
+            + display as f64 * revision_list::FILE_ROW_HEIGHT as f64;
+        self.source.tree_scroll_offset = (row_top - CONTEXT_ABOVE).max(0.0);
+    }
+
+    /// Keyboard file navigation (j/k) in the source browser: move the
+    /// selection to the next/previous *file* row among the currently visible
+    /// tree rows (collapsed dirs stay skipped) and load it.
+    fn source_select_neighbor(&mut self, delta: i32) -> Task<Message> {
+        let (entries, rows) = self.source_entries_and_rows();
+        let file_rows: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(display, row)| {
+                matches!(row, diffui_core::SourceTreeRow::File { .. }).then_some(display)
+            })
+            .collect();
+        if file_rows.is_empty() {
+            return Task::none();
+        }
+        let selected_entry = self.source.selected.as_deref().and_then(|path| {
+            entries
+                .iter()
+                .position(|entry| !entry.is_dir && entry.path == path)
+        });
+        let current_pos = selected_entry.and_then(|entry_index| {
+            file_rows.iter().position(|&display| {
+                matches!(
+                    rows[display],
+                    diffui_core::SourceTreeRow::File { entry_index: e, .. } if e == entry_index
+                )
+            })
+        });
+        let next_pos = match current_pos {
+            Some(pos) => (pos as i32 + delta).clamp(0, file_rows.len() as i32 - 1) as usize,
+            None => 0,
+        };
+        let diffui_core::SourceTreeRow::File { entry_index, .. } = rows[file_rows[next_pos]] else {
+            return Task::none();
+        };
+        let Some(path) = entries.get(entry_index).map(|entry| entry.path.clone()) else {
+            return Task::none();
+        };
+        self.source.reveal_token = self.source.reveal_token.wrapping_add(1);
+        self.select_source_file(path)
+    }
+
+    /// Select `path` in the source browser and load its contents (a sidebar
+    /// click or keyboard nav). The previous file stays visible until the new
+    /// one lands, mirroring how a revision switch keeps the prior diff.
+    fn select_source_file(&mut self, path: String) -> Task<Message> {
+        let reselect = self.source.selected.as_deref() == Some(path.as_str());
+        if reselect && (self.source.file.is_some() || self.source.loading.is_some()) {
+            return Task::none();
+        }
+        if !reselect {
+            self.source.scroll_offset = 0.0;
+        }
+        self.source.selected = Some(path);
+        self.source.file_error = None;
+        self.kick_source_file_load()
+    }
+
+    /// Spawn the tree listing for the browsed revision under the current
+    /// browse version.
+    fn kick_source_tree_load(&mut self) -> Task<Message> {
+        let (Some(repository), Some(tab)) = (self.session.repository.clone(), self.active_tab_id())
+        else {
+            return Task::none();
+        };
+        let revision = source_panel::browsed_revision(&self.source);
+        let version = self.source.version;
+        Task::perform(
+            diffui_core::list_source_tree(repository, revision),
+            move |result| Message::SourceTreeLoaded(tab, version, Box::new(result)),
+        )
+    }
+
+    /// Spawn the content load for the browser's selected path.
+    fn kick_source_file_load(&mut self) -> Task<Message> {
+        let (Some(repository), Some(tab)) = (self.session.repository.clone(), self.active_tab_id())
+        else {
+            return Task::none();
+        };
+        let Some(path) = self.source.selected.clone() else {
+            return Task::none();
+        };
+        self.source.loading = Some(path.clone());
+        let revision = source_panel::browsed_revision(&self.source);
+        let version = self.source.version;
+        let result_path = path.clone();
+        Task::perform(
+            diffui_core::load_source_file(repository, revision, path),
+            move |result| {
+                Message::SourceFileLoaded(tab, version, result_path.clone(), Box::new(result))
+            },
+        )
+    }
+
+    /// Re-list + re-read the browser when it's showing the working copy —
+    /// called wherever the repo refreshes (watcher edits, focus regain, the
+    /// post-mutation reload), so the browsed "directory" tracks the disk.
+    fn refresh_source_if_working_copy(&mut self) -> Task<Message> {
+        if self.main_view != MainView::Source
+            || !matches!(self.source.revision, Some(RevisionSelection::WorkingCopy))
+        {
+            return Task::none();
+        }
+        self.source.version = self.source.version.wrapping_add(1);
+        let mut tasks = vec![self.kick_source_tree_load()];
+        if self.source.selected.is_some() {
+            tasks.push(self.kick_source_file_load());
+        }
+        // Previously-expanded ignored dirs re-list too, so an open `target/`
+        // exploration tracks the disk like the rest of the tree.
+        for dir in self.source.dir_children.keys().cloned().collect::<Vec<_>>() {
+            tasks.push(self.kick_ignored_dir_load(dir));
+        }
+        Task::batch(tasks)
+    }
+
+    /// The source-browser state owned by `tab` — inline for the active tab,
+    /// stashed otherwise. `None` if the tab has since closed.
+    fn source_state_for(&mut self, tab: TabId) -> Option<&mut SourceState> {
+        if self.active_tab_id() == Some(tab) {
+            return Some(&mut self.source);
+        }
+        self.tabs
+            .iter_mut()
+            .find(|t| t.id == tab)
+            .and_then(|t| t.stash.as_mut())
+            .map(|state| &mut state.source)
+    }
+
+    /// The composed source entries + their flattened display rows
+    /// (memoized — see [`source_panel::SourceTreeCache`]). Row indices point
+    /// into the returned entries, so consumers take them as a pair.
+    pub(crate) fn source_entries_and_rows(
+        &self,
+    ) -> (
+        std::rc::Rc<Vec<diffui_core::SourceEntry>>,
+        std::rc::Rc<Vec<diffui_core::SourceTreeRow>>,
+    ) {
+        self.source_tree_cache
+            .borrow_mut()
+            .entries_and_rows(&self.source)
+    }
+
+    /// Spawn the lazy one-level listing of an unenumerated ignored dir.
+    fn kick_ignored_dir_load(&mut self, dir: String) -> Task<Message> {
+        let (Some(repository), Some(tab)) = (self.session.repository.clone(), self.active_tab_id())
+        else {
+            return Task::none();
+        };
+        let version = self.source.version;
+        let result_dir = dir.clone();
+        Task::perform(
+            diffui_core::list_ignored_dir(repository, dir),
+            move |result| {
+                Message::SourceDirLoaded(tab, version, result_dir.clone(), Box::new(result))
+            },
+        )
+    }
+
+    /// The files the find bar searches: the diff document, or the source
+    /// browser's loaded file when that view is active.
+    pub(crate) fn find_files(&self) -> &[DiffFile] {
+        match self.main_view {
+            MainView::Diff => &self.session.document.files,
+            MainView::Source => self
+                .source
+                .file
+                .as_ref()
+                .map(|view| std::slice::from_ref(&view.file))
+                .unwrap_or(&[]),
+        }
+    }
+
     /// Recompute find matches immediately (no debounce). Used by toggle
     /// presses where the user's intent is immediate.
     pub(crate) fn refind_now(&mut self) -> Task<Message> {
-        let Some(state) = self.find.as_mut() else {
+        if let Some(state) = self.find.as_mut() {
+            state.query_version = state.query_version.wrapping_add(1);
+        }
+        let Some(state) = self.find.as_ref() else {
             return Task::none();
         };
-        state.query_version = state.query_version.wrapping_add(1);
-        let (matches, error) = find::compute_matches(state, &self.session.document);
-        state.matches = matches;
-        state.error = error;
-        state.active = if state.matches.is_empty() {
-            None
-        } else {
-            Some(0)
-        };
-        state.scroll_token = state.scroll_token.wrapping_add(1);
+        let (matches, error) = find::compute_matches(state, self.find_files());
+        if let Some(state) = self.find.as_mut() {
+            state.matches = matches;
+            state.error = error;
+            state.active = if state.matches.is_empty() {
+                None
+            } else {
+                Some(0)
+            };
+            state.scroll_token = state.scroll_token.wrapping_add(1);
+        }
         Task::none()
     }
 
@@ -2082,6 +2570,16 @@ impl Diffui {
     }
 
     pub(crate) fn start_repository_snapshot(&mut self, origin: RefreshOrigin) -> Task<Message> {
+        // Every refresh path funnels through here (watcher edits, focus
+        // regain, tab activation, the post-mutation reload), so it's also
+        // where a working-copy source browse re-syncs with the disk. Its
+        // loads are read-only and version-guarded, so they ride alongside
+        // the snapshot without contending for jj's wc lock.
+        let source_refresh = self.refresh_source_if_working_copy();
+        Task::batch([source_refresh, self.start_snapshot_inner(origin)])
+    }
+
+    fn start_snapshot_inner(&mut self, origin: RefreshOrigin) -> Task<Message> {
         // A snapshot or reload is already in flight (the snapshot phase, a cold
         // stream still appending, or a graph walk holding `pending_revision`).
         // Coalesce rather than race it: a second snapshot thrashes the wc lock,
@@ -2824,8 +3322,18 @@ impl Diffui {
         // full-window cold-load takeover and no diff-pane spinner. On a cold
         // load the sidebar simply grows from empty as batches arrive; a revision
         // switch keeps the prior diff until `DiffLoaded` replaces it.
-        let sidebar = sidebar::build_sidebar(self, theme);
-        let diff_pane = diff_panel::build_diff_panel(self, theme);
+        // The source browser swaps in its own pair: a file-tree-only sidebar
+        // and the plain code pane.
+        let (sidebar, diff_pane) = match self.main_view {
+            MainView::Diff => (
+                sidebar::build_sidebar(self, theme),
+                diff_panel::build_diff_panel(self, theme),
+            ),
+            MainView::Source => (
+                source_panel::build_source_sidebar(self, theme),
+                source_panel::build_source_panel(self, theme),
+            ),
+        };
         let panels = row![sidebar, vertical_divider(theme), diff_pane]
             .spacing(0)
             .height(Length::Fill);

@@ -25,6 +25,7 @@ mod resize_handle;
 mod revision_list;
 mod scrollbar;
 mod sidebar;
+mod source_panel;
 mod tab_bar;
 mod tabs;
 mod theme;
@@ -361,8 +362,17 @@ pub(crate) struct Diffui {
     /// constant `"working-copy"` revision key. Global/monotonic, not per-tab:
     /// since a tab restore reassigns `document` (and bumps this), returning to a
     /// tab correctly re-clears the cache the other tab populated. Set only via
-    /// [`set_document`].
+    /// [`set_document`]. The source browser bumps it too — the code widget's
+    /// shaped-paragraph cache is shared between the two views.
     pub(crate) document_version: u64,
+    /// Which main view the active tab shows (diff / source browser).
+    pub(crate) main_view: MainView,
+    /// The active tab's source-browser state.
+    pub(crate) source: SourceState,
+    /// View-time memo of the flattened source tree, keyed on browse version +
+    /// entry count + collapse set (mirrors `sidebar_file_cache`'s rationale).
+    /// Not stashed per-tab — the key changes on tab switch anyway.
+    pub(crate) source_tree_cache: std::cell::RefCell<source_panel::SourceTreeCache>,
 
     // ── Multi-repo ──────────────────────────────────────────────────────
     /// Every open repository, in tab order. The *active* tab's heavy view
@@ -438,6 +448,76 @@ pub(crate) struct ConfirmDialog {
     pub(crate) pending: PendingMutation,
 }
 
+/// Which main view the active tab shows: the diff (default) or the source
+/// browser. Per-tab, toggled by the toolbar switcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum MainView {
+    #[default]
+    Diff,
+    Source,
+}
+
+/// One loaded file in the source browser: the synthesized all-context
+/// document plus render bookkeeping.
+#[derive(Debug, Clone)]
+pub(crate) struct SourceFileView {
+    pub(crate) file: diffui_core::DiffFile,
+    pub(crate) line_count: usize,
+    pub(crate) byte_len: usize,
+    pub(crate) binary: bool,
+    pub(crate) too_large: bool,
+    /// Layout identity for the diff-view height index, allocated from the
+    /// app's global document-id counter on every load.
+    pub(crate) doc_id: u64,
+}
+
+/// Per-tab source-browser state. Lives alongside the diff view's state (the
+/// browser is a second lens over the same repo), stashed/restored with the
+/// tab. `revision == None` means the browser was never opened in this tab.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SourceState {
+    /// The revision being browsed. Independent of the diff view's selection —
+    /// jumping into the browser pins it until the next explicit browse.
+    pub(crate) revision: Option<RevisionSelection>,
+    /// The listed tree, or `None` while it loads.
+    pub(crate) tree: Option<Vec<diffui_core::SourceEntry>>,
+    pub(crate) tree_error: Option<String>,
+    /// Lazily-listed contents of ignored directories, keyed by dir path.
+    /// Kept beside `tree` (not merged in) so watcher re-lists of the base
+    /// tree don't wipe an exploration of `target/`; the view composes the
+    /// two (see [`source_panel::SourceTreeCache`]).
+    pub(crate) dir_children: HashMap<String, Vec<diffui_core::SourceEntry>>,
+    /// Bumped whenever `tree` or `dir_children` change — the composed-entry
+    /// cache key (`version` alone misses lazy-dir merges).
+    pub(crate) tree_epoch: u64,
+    /// Expanded directories, by full path prefix. Directories are collapsed
+    /// by default, so this is the inverse of the diff tree's collapse set.
+    pub(crate) expanded: HashSet<String>,
+    /// Fuzzy file-search query typed into the sidebar's filter box. While
+    /// non-empty, the tree renders as a flat ranked match list instead.
+    pub(crate) filter: String,
+    /// Selected file path (the one shown / being loaded).
+    pub(crate) selected: Option<String>,
+    pub(crate) file: Option<SourceFileView>,
+    /// Path whose content load is in flight, if any.
+    pub(crate) loading: Option<String>,
+    pub(crate) file_error: Option<String>,
+    /// Guard for async results: bumped on every (re)browse, carried by the
+    /// tree/file load messages so a superseded browse's results are dropped.
+    pub(crate) version: u64,
+    /// Saved scroll offsets, mirrored like the diff view's (the widgets'
+    /// state is shared across views/tabs).
+    pub(crate) scroll_offset: f32,
+    pub(crate) tree_scroll_offset: f64,
+    /// Bumped to scroll the sidebar tree to the selected file's row (jumps
+    /// from the diff view / palette).
+    pub(crate) reveal_token: u64,
+    /// A jump landed before the tree listing did — re-arm the reveal when
+    /// the listing arrives (one-shot, so watcher re-lists don't yank the
+    /// scroll back to the selection).
+    pub(crate) reveal_pending: bool,
+}
+
 /// Which toolbar dropdown is open. Both render as iced overlays anchored near
 /// their trigger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -496,6 +576,8 @@ pub(crate) struct RepoState {
     pub(crate) diff_scroll_offset: f32,
     pub(crate) activities: activity::ActivityLog,
     pub(crate) pending_load_activity: Option<activity::ActivityId>,
+    pub(crate) main_view: MainView,
+    pub(crate) source: SourceState,
 }
 
 impl RepoState {
@@ -515,6 +597,8 @@ impl RepoState {
             diff_scroll_offset: 0.0,
             activities: activity::ActivityLog::default(),
             pending_load_activity: None,
+            main_view: MainView::default(),
+            source: SourceState::default(),
         }
     }
 
@@ -732,6 +816,12 @@ pub(crate) enum MenuAction {
     Mutate(mutations::MutationOp),
     /// Copy a value already in hand (revision id, commit hash, a bookmark name).
     CopyText(String),
+    /// Open the source browser at a revision, optionally jumped to a file
+    /// (the revision context menu and file-tree right-clicks).
+    BrowseSource {
+        revision: RevisionSelection,
+        path: Option<String>,
+    },
     /// Copy author / committer / the full description — read on demand. The
     /// in-memory graph keeps only the description's first line and no dates, so
     /// these need a fresh read; `fallback` is copied if that read fails.

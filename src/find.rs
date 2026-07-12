@@ -22,7 +22,7 @@ use regex::{Regex, RegexBuilder};
 
 use crate::theme::{ThemeSpec, ghost_button_style, input_style, text_size};
 use crate::{Diffui, Message};
-use diffui_core::DiffDocument;
+use diffui_core::DiffFile;
 
 pub const FIND_INPUT_ID: &str = "find-input";
 
@@ -79,15 +79,13 @@ pub struct FindMatch {
     pub byte_end: usize,
 }
 
-/// Compute matches for `state.query` across every line in `document`.
+/// Compute matches for `state.query` across every line of `files` (the diff
+/// document's files, or the source browser's single loaded file).
 /// Pure function — caller writes the result back onto `state.matches`. We
 /// avoid borrowing `state` mutably so the caller can decide how to merge
 /// (e.g. preserve `active` when widths stay stable; reset to 0 when the
 /// hit list changes).
-pub fn compute_matches(
-    state: &FindState,
-    document: &DiffDocument,
-) -> (Vec<FindMatch>, Option<String>) {
+pub fn compute_matches(state: &FindState, files: &[DiffFile]) -> (Vec<FindMatch>, Option<String>) {
     if state.query.is_empty() {
         return (Vec::new(), None);
     }
@@ -98,7 +96,7 @@ pub fn compute_matches(
     };
 
     let mut out = Vec::new();
-    for (file_index, file) in document.files.iter().enumerate() {
+    for (file_index, file) in files.iter().enumerate() {
         for (hunk_index, hunk) in file.hunks.iter().enumerate() {
             for (line_index, line) in hunk.lines.iter().enumerate() {
                 for m in matcher.find_iter(&line.content) {

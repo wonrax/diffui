@@ -37,10 +37,17 @@ use crate::theme::chip_background;
 const LINE_SCROLL_ROWS: f32 = 1.5;
 const PIXEL_SCROLL_SCALE: f32 = 0.65;
 
-const REVISION_ROW_HEIGHT: f32 = 46.0;
-const FILE_ROW_HEIGHT: f32 = 26.0;
+pub const REVISION_ROW_HEIGHT: f32 = 46.0;
+pub const FILE_ROW_HEIGHT: f32 = 26.0;
 /// Horizontal indent per tree depth level for file/directory rows.
 pub const FILE_TREE_INDENT: f32 = 14.0;
+/// Width of the collapse-chevron column in file/directory rows (empty for
+/// files). Indent guides center under it.
+const FILE_CHEVRON_COL: f32 = 14.0;
+/// Width of the file/folder icon column that follows the chevron column.
+const FILE_ICON_COL: f32 = 18.0;
+/// Glyph size of the file/folder icon.
+const FILE_ICON_SIZE: f32 = 12.0;
 pub const GUTTER_LEFT_PADDING: f32 = 8.0;
 pub const GUTTER_PADDING: f32 = 8.0;
 const CONTENT_PADDING: f32 = 12.0;
@@ -155,6 +162,9 @@ pub struct FileRowView {
     pub additions_width: f32,
     pub deletions_width: f32,
     pub primary_color: Color,
+    /// Tint of the file/folder icon ahead of the name (dimmer than the
+    /// name for regular rows; follows the row tone for untracked/ignored).
+    pub icon_color: Color,
     /// Tree indentation in px (depth × step), applied left of the badge.
     pub indent: f32,
     /// `Some(collapsed)` renders this as a directory row: a chevron instead
@@ -240,6 +250,10 @@ pub struct RevisionList<'a, Message> {
     /// menu. Receives the row's selection key and its on-screen rectangle (in
     /// window-content points), the latter used to anchor a native highlight.
     on_context_menu: Option<fn(RowSelectionKey, Rectangle, Point) -> Message>,
+    /// Optional right-click handler for a file row — receives the row's
+    /// *display* index into the file tree (like `on_select_file`), its
+    /// on-screen rect, and the cursor point.
+    on_file_context_menu: Option<fn(usize, Rectangle, Point) -> Message>,
     /// Reports the scroll offset (content-space px) whenever it changes, so the
     /// app can persist it per-tab. `None` ⇒ scroll position isn't tracked.
     on_scroll: Option<fn(f64) -> Message>,
@@ -282,6 +296,7 @@ impl<'a, Message> RevisionList<'a, Message> {
             on_select_revision,
             on_select_file,
             on_context_menu: None,
+            on_file_context_menu: None,
             on_scroll: None,
             restore_offset: 0.0,
             restore_token: 0,
@@ -300,6 +315,16 @@ impl<'a, Message> RevisionList<'a, Message> {
         callback: fn(RowSelectionKey, Rectangle, Point) -> Message,
     ) -> Self {
         self.on_context_menu = Some(callback);
+        self
+    }
+
+    /// Register a right-click handler for file rows. The callback gets the
+    /// row's display index into the file tree, its rect, and the cursor.
+    pub fn on_file_context_menu(
+        mut self,
+        callback: fn(usize, Rectangle, Point) -> Message,
+    ) -> Self {
+        self.on_file_context_menu = Some(callback);
         self
     }
 
@@ -831,30 +856,40 @@ where
                 }
             }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
-                let Some(callback) = self.on_context_menu else {
-                    return;
-                };
                 let Some(cursor_pos) = cursor.position_over(bounds) else {
                     return;
                 };
                 let local_y = (cursor_pos.y - bounds.y) as f64 + state.vertical_offset;
-                // Only revision rows get a context menu — file rows don't.
-                if let Some(row_idx) = self.row_at_offset(local_y)
-                    && let Item::Revision(rev) = self.item_at(row_idx)
-                {
-                    // The row's on-screen rect (window-content points) anchors
-                    // the native highlight drawn while the menu is open.
-                    let row_h = row_height_of(self.row_kind(row_idx));
-                    let screen_y =
-                        bounds.y + (self.row_top(row_idx) - state.vertical_offset) as f32;
-                    let row_rect = Rectangle {
-                        x: bounds.x,
-                        y: screen_y,
-                        width: bounds.width,
-                        height: row_h,
-                    };
-                    shell.publish(callback(rev.selection_key, row_rect, cursor_pos));
-                    shell.capture_event();
+                let Some(row_idx) = self.row_at_offset(local_y) else {
+                    return;
+                };
+                // The row's on-screen rect (window-content points) anchors
+                // the native highlight drawn while the menu is open.
+                let row_h = row_height_of(self.row_kind(row_idx));
+                let screen_y = bounds.y + (self.row_top(row_idx) - state.vertical_offset) as f32;
+                let row_rect = Rectangle {
+                    x: bounds.x,
+                    y: screen_y,
+                    width: bounds.width,
+                    height: row_h,
+                };
+                match self.row_kind(row_idx) {
+                    RowKind::Revision(_) => {
+                        let Some(callback) = self.on_context_menu else {
+                            return;
+                        };
+                        if let Item::Revision(rev) = self.item_at(row_idx) {
+                            shell.publish(callback(rev.selection_key, row_rect, cursor_pos));
+                            shell.capture_event();
+                        }
+                    }
+                    RowKind::File(display_index) => {
+                        let Some(callback) = self.on_file_context_menu else {
+                            return;
+                        };
+                        shell.publish(callback(display_index, row_rect, cursor_pos));
+                        shell.capture_event();
+                    }
                 }
             }
             _ => {}
@@ -997,6 +1032,40 @@ where
                         item_lane_segment(&item, hov_lane, hov_half).map(|seg| (seg, hov_lane))
                     });
 
+            // Indent-guide emphasis: hovering a tree row brightens the guide
+            // of its parent level across the contiguous sibling run (rows at
+            // the same or deeper indent around it) — VSCode's "active indent
+            // guide". Resolved once here as (level, first flat, last flat).
+            let guide_emphasis = state.hovered_file_item.and_then(|hovered| {
+                // The walk is bounded: emphasis only matters for drawn rows,
+                // and a run longer than this already spans several screens.
+                const RUN_SCAN_CAP: usize = 400;
+                if hovered >= self.row_count() {
+                    return None;
+                }
+                let depth_of = |flat: usize| match self.item_at(flat) {
+                    Item::File(row) => Some((row.indent / FILE_TREE_INDENT).round() as usize),
+                    Item::Revision(_) => None,
+                };
+                let depth = depth_of(hovered)?;
+                let level = depth.checked_sub(1)?;
+                let mut start = hovered;
+                while start > 0
+                    && hovered - start < RUN_SCAN_CAP
+                    && depth_of(start - 1).is_some_and(|d| d >= depth)
+                {
+                    start -= 1;
+                }
+                let mut end = hovered;
+                while end + 1 < self.row_count()
+                    && end - hovered < RUN_SCAN_CAP
+                    && depth_of(end + 1).is_some_and(|d| d >= depth)
+                {
+                    end += 1;
+                }
+                Some((level, start, end))
+            });
+
             // Walk only the rows that intersect the viewport, materializing
             // each one's view on demand — off-screen rows cost nothing.
             let count = self.row_count();
@@ -1041,12 +1110,17 @@ where
                         // File rows are continuation-only — they sit
                         // under the parent revision's `after` snapshot,
                         // so the after-half emphasis is what applies.
+                        let emphasized_guide = guide_emphasis
+                            .filter(|&(_, start, end)| flat >= start && flat <= end)
+                            .map(|(level, ..)| level);
                         self.draw_file(
                             renderer,
                             row_bounds,
                             &f,
                             gutter_total,
                             emphasized_lane_after,
+                            emphasized_guide,
+                            state.hovered_file_item == Some(flat),
                         );
                     }
                 }
@@ -1475,6 +1549,7 @@ impl<'a, Message> RevisionList<'a, Message> {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_file<R>(
         &self,
         renderer: &mut R,
@@ -1482,6 +1557,8 @@ impl<'a, Message> RevisionList<'a, Message> {
         f: &FileRowView,
         gutter_total: f32,
         emphasized_lane: Option<usize>,
+        emphasized_guide: Option<usize>,
+        hovered: bool,
     ) where
         R: text::Renderer<Font = Font> + iced::advanced::graphics::geometry::Renderer,
     {
@@ -1492,77 +1569,107 @@ impl<'a, Message> RevisionList<'a, Message> {
 
         if selected {
             fill_background(renderer, row_bounds, self.style.selected_background);
+        } else if hovered {
+            // Soft hover wash — weaker than selection so the two never
+            // compete when the cursor crosses the selected row.
+            fill_background(
+                renderer,
+                row_bounds,
+                Color {
+                    a: 0.06,
+                    ..self.style.muted_text
+                },
+            );
         }
-        fill_background(
-            renderer,
-            Rectangle {
-                x: row_bounds.x,
-                y: row_bounds.y + row_bounds.height - 1.0,
-                width: row_bounds.width,
-                height: 1.0,
-            },
-            self.style.border,
-        );
+        // Deliberately no per-row separator: the indent guides supply the
+        // vertical structure, and both line sets together read as a grid.
 
         let content_x = row_bounds.x + gutter_total + f.indent;
         let row_clip = row_bounds;
         let row_mid_y = row_bounds.y + row_bounds.height / 2.0;
 
-        let badge_w = self.style.file_badge_width;
-        match f.chevron {
-            // Directory row: a collapse chevron stands in for the badge.
-            Some(collapsed) => {
-                let glyph = if collapsed {
-                    icons::CHEVRON_RIGHT
+        // Indent guides: one hairline per ancestor level, aligned under the
+        // parent rows' chevron column. The hovered row's sibling run wears a
+        // brighter guide at its parent level (see `guide_emphasis` in draw).
+        let depth = (f.indent / FILE_TREE_INDENT).round() as usize;
+        if depth > 0 {
+            let guide_offset = FILE_CHEVRON_COL / 2.0;
+            for level in 0..depth {
+                let x =
+                    row_bounds.x + gutter_total + level as f32 * FILE_TREE_INDENT + guide_offset;
+                let color = if emphasized_guide == Some(level) {
+                    Color {
+                        a: 0.8,
+                        ..self.style.subtle_text
+                    }
                 } else {
-                    icons::CHEVRON_DOWN
+                    self.style.border
                 };
-                fill_text_centered_y(
+                fill_background(
                     renderer,
-                    glyph,
-                    content_x + badge_w / 2.0,
-                    row_mid_y,
-                    badge_w,
-                    CAPTION_TEXT_SIZE,
-                    f.primary_color,
-                    icons::ICON_FONT,
-                    row_clip,
-                    text::Alignment::Center,
-                );
-            }
-            // File row: status badge — vertically centered on the mid-line.
-            // All status labels are single letters, so a self-sized chip and
-            // the measured `badge_w` column agree; centering inside the column
-            // keeps hypothetical wider labels aligned anyway.
-            None => {
-                let status_chip = Chip {
-                    label: f.status_label.clone(),
-                    font: self.style.mono_font,
-                    background: f.status_background,
-                    text_color: f.status_text,
-                    border_color: None,
-                    border_dashed: false,
-                    icon: None,
-                };
-                let chip_w = chip::width(&f.status_label, None, self.style.mono_font);
-                chip::draw(
-                    renderer,
-                    &status_chip,
-                    content_x + ((badge_w - chip_w) / 2.0).max(0.0),
-                    row_mid_y,
-                    row_clip,
+                    Rectangle {
+                        x: x.round(),
+                        y: row_bounds.y,
+                        width: 1.0,
+                        height: row_bounds.height,
+                    },
+                    color,
                 );
             }
         }
 
-        // Layout: [indent] [badge|chevron] gap [name] gap [+N] gap [-N] right_pad
-        // (directory rows skip the stats and run the name to the right edge).
+        // Left columns: [chevron (dirs)] [file/folder icon] name…
+        if let Some(collapsed) = f.chevron {
+            let glyph = if collapsed {
+                icons::CHEVRON_RIGHT
+            } else {
+                icons::CHEVRON_DOWN
+            };
+            fill_text_centered_y(
+                renderer,
+                glyph,
+                content_x + FILE_CHEVRON_COL / 2.0,
+                row_mid_y,
+                FILE_CHEVRON_COL,
+                CAPTION_TEXT_SIZE,
+                f.primary_color,
+                icons::ICON_FONT,
+                row_clip,
+                text::Alignment::Center,
+            );
+        }
+        let icon_glyph = match f.chevron {
+            Some(true) => icons::FOLDER,
+            Some(false) => icons::FOLDER_OPEN,
+            None => icons::FILE,
+        };
+        fill_text_centered_y(
+            renderer,
+            icon_glyph,
+            content_x + FILE_CHEVRON_COL + FILE_ICON_COL / 2.0,
+            row_mid_y,
+            FILE_ICON_COL,
+            FILE_ICON_SIZE,
+            f.icon_color,
+            icons::ICON_FONT,
+            row_clip,
+            text::Alignment::Center,
+        );
+
+        // Layout: [indent][chevron][icon] name … [+N] [-N] [status chip] pad
+        // — the status chip is the rightmost column so badges align down the
+        // tree; directory rows have neither stats nor chip, so their name
+        // runs to the right edge. The chip column clears the scrollbar band
+        // with the same right padding the revision rows' bookmark rail uses.
         let row_gap = FILE_ROW_GAP;
         let right_pad = FILE_ROW_RIGHT_PAD;
-        let minus_x = row_bounds.x + row_bounds.width - f.deletions_width - right_pad;
+        let chip_col = self.style.file_badge_width;
+        let chip_left = row_bounds.x + row_bounds.width - CONTENT_PADDING - chip_col;
+        let chip_gap = if chip_col > 0.0 { row_gap } else { 0.0 };
+        let minus_x = chip_left - chip_gap - f.deletions_width;
         let plus_x = minus_x - row_gap - f.additions_width;
 
-        let path_x = content_x + badge_w + row_gap;
+        let path_x = content_x + FILE_CHEVRON_COL + FILE_ICON_COL + row_gap;
         let path_right = if f.chevron.is_some() {
             row_bounds.x + row_bounds.width - right_pad
         } else {
@@ -1585,8 +1692,32 @@ impl<'a, Message> RevisionList<'a, Message> {
             row_clip,
         );
 
-        // Directory rows carry no stats; their name runs to the right edge.
-        if f.chevron.is_none() {
+        // Status chip, right-aligned in the rightmost column (single-letter
+        // labels center within it so mixed labels still line up). An empty
+        // label draws nothing.
+        if f.chevron.is_none() && !f.status_label.is_empty() {
+            let status_chip = Chip {
+                label: f.status_label.clone(),
+                font: self.style.mono_font,
+                background: f.status_background,
+                text_color: f.status_text,
+                border_color: None,
+                border_dashed: false,
+                icon: None,
+            };
+            let chip_w = chip::width(&f.status_label, None, self.style.mono_font);
+            chip::draw(
+                renderer,
+                &status_chip,
+                chip_left + ((chip_col - chip_w) / 2.0).max(0.0),
+                row_mid_y,
+                row_clip,
+            );
+        }
+
+        // Directory rows carry no stats; zero-width stat columns (the source
+        // tree) skip them too.
+        if f.chevron.is_none() && f.additions_width > 0.0 {
             let plus = format!("+{}", f.additions);
             let minus = format!("-{}", f.deletions);
             fill_text_centered_y(
@@ -1606,7 +1737,7 @@ impl<'a, Message> RevisionList<'a, Message> {
                 &minus,
                 minus_x,
                 row_mid_y,
-                f.deletions_width + right_pad,
+                f.deletions_width,
                 CAPTION_TEXT_SIZE,
                 f.deletions_text,
                 self.style.primary_font,

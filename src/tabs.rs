@@ -34,6 +34,8 @@ impl Diffui {
             diff_scroll_offset: self.diff_scroll_offset,
             activities: std::mem::take(&mut self.activities),
             pending_load_activity: self.pending_load_activity.take(),
+            main_view: self.main_view,
+            source: std::mem::take(&mut self.source),
         }
     }
 
@@ -61,6 +63,8 @@ impl Diffui {
         self.diff_scroll_offset = state.diff_scroll_offset;
         self.activities = state.activities;
         self.pending_load_activity = state.pending_load_activity;
+        self.main_view = state.main_view;
+        self.source = state.source;
     }
 
     /// Switch to the tab `id`: stash the current active tab, restore the

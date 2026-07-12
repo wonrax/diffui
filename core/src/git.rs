@@ -12,6 +12,7 @@ use crate::model::{
     CommitSummary, DiffDocument, RevisionDetails, RevisionSelection, SignatureInfo,
 };
 use crate::repository::{Repository, RepositorySnapshot};
+use crate::source_browse::{SourceEntry, SourceEntryStatus};
 
 /// Sentinel commit_id used for the synthetic git working-copy row.
 /// Selection short-circuits on `is_working_copy` before this value is ever
@@ -229,6 +230,161 @@ pub async fn read_git_file_pair(
                 .await
                 .and_then(cap);
             (old, new)
+        }
+    }
+}
+
+/// List every path at `revision` for the source browser. Commits list their
+/// tree; the working copy combines `git ls-files` passes so untracked and
+/// ignored paths appear too (ignored directories arrive collapsed via
+/// `--directory`). See [`crate::source_browse::list_source_tree`].
+pub async fn list_git_source_tree(
+    repository: &Repository,
+    revision: &RevisionSelection,
+) -> Result<Vec<SourceEntry>> {
+    // NUL-separated so paths with spaces/newlines split cleanly.
+    let list = |args: &[&str]| {
+        let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+        run_command(&repository.root, "git", args)
+    };
+    let split = |output: String| -> Vec<String> {
+        output
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned)
+            .collect()
+    };
+
+    let mut entries = Vec::new();
+    match revision {
+        RevisionSelection::Commit(id) => {
+            let output = list(&["ls-tree", "-r", "-z", "--name-only", id]).await?;
+            for path in split(output) {
+                entries.push(SourceEntry::new(path, false, SourceEntryStatus::Tracked));
+            }
+        }
+        RevisionSelection::WorkingCopy => {
+            let tracked = list(&["ls-files", "-z"]).await?;
+            let untracked = list(&["ls-files", "-z", "--others", "--exclude-standard"]).await?;
+            let ignored = list(&[
+                "ls-files",
+                "-z",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--directory",
+            ])
+            .await?;
+            let changes = git_change_statuses(repository).await.unwrap_or_default();
+            // Tracked entries reflect the index; a file deleted on disk but
+            // still in the index is skipped so the browser mirrors the
+            // directory like the jj walk does.
+            for path in split(tracked) {
+                if repository.root.join(&path).symlink_metadata().is_ok() {
+                    let mut entry = SourceEntry::new(path, false, SourceEntryStatus::Tracked);
+                    entry.change = changes.get(&entry.path).copied();
+                    entries.push(entry);
+                }
+            }
+            for path in split(untracked) {
+                entries.push(SourceEntry::new(path, false, SourceEntryStatus::Untracked));
+            }
+            for path in split(ignored) {
+                let (path, is_dir) = match path.strip_suffix('/') {
+                    Some(dir) => (dir.to_owned(), true),
+                    None => (path, false),
+                };
+                entries.push(SourceEntry::new(path, is_dir, SourceEntryStatus::Ignored));
+            }
+        }
+    }
+    Ok(entries)
+}
+
+/// Per-path status of the working tree vs `HEAD` (staged or not) for the
+/// browser's chips: `git diff --name-status` letters mapped to the shared
+/// [`DiffFileStatus`]. Deletions are skipped (nothing on disk to chip);
+/// renames chip the *new* path. Best-effort — an unborn HEAD yields nothing.
+async fn git_change_statuses(
+    repository: &Repository,
+) -> Result<std::collections::HashMap<String, crate::DiffFileStatus>> {
+    use crate::DiffFileStatus;
+    let output = run_command(
+        &repository.root,
+        "git",
+        ["diff", "--name-status", "-z", "HEAD"]
+            .iter()
+            .map(OsString::from)
+            .collect(),
+    )
+    .await?;
+    let mut fields = output.split('\0').filter(|field| !field.is_empty());
+    let mut changes = std::collections::HashMap::new();
+    while let Some(status) = fields.next() {
+        let Some(kind) = status.chars().next() else {
+            continue;
+        };
+        let Some(path) = fields.next() else { break };
+        match kind {
+            'A' => {
+                changes.insert(path.to_owned(), DiffFileStatus::Added);
+            }
+            'M' | 'T' => {
+                changes.insert(path.to_owned(), DiffFileStatus::Modified);
+            }
+            'U' => {
+                changes.insert(path.to_owned(), DiffFileStatus::Conflicted);
+            }
+            // Renames/copies carry a second (destination) path field.
+            'R' | 'C' => {
+                let Some(new_path) = fields.next() else { break };
+                changes.insert(new_path.to_owned(), DiffFileStatus::Renamed);
+            }
+            _ => {}
+        }
+    }
+    Ok(changes)
+}
+
+/// Read one file for the source browser: the working copy from disk, a commit
+/// via `git show` (raw bytes, so binary detection happens on our side).
+pub async fn read_git_source_file(
+    repository: &Repository,
+    revision: &RevisionSelection,
+    path: &str,
+) -> Result<crate::source_browse::SourceFileData> {
+    match revision {
+        RevisionSelection::WorkingCopy => {
+            if Path::new(path)
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+            {
+                bail!("invalid path {path}");
+            }
+            let bytes = tokio::fs::read(repository.root.join(path))
+                .await
+                .with_context(|| format!("failed to read {path}"))?;
+            Ok(crate::source_browse::classify_disk_bytes(bytes))
+        }
+        RevisionSelection::Commit(id) => {
+            let output = Command::new("git")
+                .args([
+                    OsString::from("show"),
+                    OsString::from(format!("{id}:{path}")),
+                ])
+                .current_dir(&repository.root)
+                .stdin(Stdio::null())
+                .output()
+                .await
+                .context("failed to execute git")?;
+            if !output.status.success() {
+                bail!(
+                    "git show exited with {}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            Ok(crate::source_browse::classify_disk_bytes(output.stdout))
         }
     }
 }

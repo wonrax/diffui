@@ -34,6 +34,14 @@ impl Diffui {
                     target: selection.clone(),
                 }),
             ),
+            MenuEntry::Separator,
+            MenuEntry::item(
+                "Browse source",
+                MenuAction::BrowseSource {
+                    revision: selection.clone(),
+                    path: None,
+                },
+            ),
         ];
 
         // Copy revision metadata — values come from the loaded graph row.
@@ -258,6 +266,9 @@ impl Diffui {
             }
             // Ready-to-paste values write to the clipboard immediately.
             MenuAction::CopyText(text) => return iced::clipboard::write(text).discard(),
+            MenuAction::BrowseSource { revision, path } => {
+                return self.open_source_browser(revision, path);
+            }
             // Author / committer / full description aren't kept in the graph, so
             // read the revision off-thread, format the field, and copy — falling
             // back to the in-memory value on failure.
@@ -322,6 +333,124 @@ impl Diffui {
             );
         }
         self.enqueue_or_run_mutation(pending)
+    }
+
+    /// Context-menu tree for a file-tree row (`display_index` into the
+    /// flattened tree of whichever sidebar is showing). In the diff view a
+    /// file offers "Browse source at this revision" (jumped to it); both
+    /// views offer path copies. Empty when the row vanished under the click.
+    pub(crate) fn file_context_menu_tree(&self, display_index: usize) -> Vec<menu::MenuEntry> {
+        use menu::MenuEntry;
+
+        // Resolve the clicked row to a repo-relative path (+ whether it's a
+        // file, i.e. browseable).
+        let (path, is_file) = match self.main_view {
+            MainView::Diff => {
+                let rows =
+                    diffui_core::file_tree_rows(&self.session.document.files, &self.collapsed_dirs);
+                match rows.get(display_index) {
+                    Some(diffui_core::FileTreeRow::File { file_index, .. }) => (
+                        self.session
+                            .document
+                            .files
+                            .get(*file_index)
+                            .map(|file| file.path.clone()),
+                        true,
+                    ),
+                    Some(diffui_core::FileTreeRow::Dir { path, .. }) => (Some(path.clone()), false),
+                    None => (None, false),
+                }
+            }
+            MainView::Source => {
+                let (entries, rows) = self.source_entries_and_rows();
+                match rows.get(display_index) {
+                    Some(diffui_core::SourceTreeRow::File { entry_index, .. }) => (
+                        entries.get(*entry_index).map(|entry| entry.path.clone()),
+                        true,
+                    ),
+                    Some(diffui_core::SourceTreeRow::Dir { path, .. }) => {
+                        (Some(path.clone()), false)
+                    }
+                    None => (None, false),
+                }
+            }
+        };
+        let Some(path) = path else {
+            return Vec::new();
+        };
+
+        let mut items = Vec::new();
+        if is_file && self.main_view == MainView::Diff && self.session.repository.is_some() {
+            items.push(MenuEntry::item(
+                "Browse source at this revision",
+                MenuAction::BrowseSource {
+                    revision: self.session.selected_revision.clone(),
+                    path: Some(path.clone()),
+                },
+            ));
+            items.push(MenuEntry::Separator);
+        }
+        items.push(MenuEntry::item(
+            "Copy path",
+            MenuAction::CopyText(path.clone()),
+        ));
+        if let Some(repository) = &self.session.repository {
+            items.push(MenuEntry::item(
+                "Copy absolute path",
+                MenuAction::CopyText(repository.root.join(&path).display().to_string()),
+            ));
+        }
+        items
+    }
+
+    /// macOS: pop the file context menu natively (blocking, glowing over the
+    /// row) and dispatch the pick. Mirrors `open_revision_context_menu`.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn open_file_context_menu(
+        &mut self,
+        display_index: usize,
+        row_rect: iced::Rectangle,
+        _cursor: iced::Point,
+    ) -> Task<Message> {
+        let tree = self.file_context_menu_tree(display_index);
+        if tree.is_empty() {
+            return Task::none();
+        }
+        let mut actions: Vec<MenuAction> = Vec::new();
+        let items = lower_menu_to_native(&tree, &mut actions);
+        let glow = macos_native::GlowRect {
+            x: row_rect.x,
+            y: row_rect.y,
+            width: row_rect.width,
+            height: row_rect.height,
+        };
+        let Some(chosen) = macos_native::popup_menu(&items, Some(glow)) else {
+            return Task::none();
+        };
+        let Some(action) = actions.get(chosen as usize).cloned() else {
+            return Task::none();
+        };
+        self.dispatch_menu_action(action, None)
+    }
+
+    /// Non-macOS: open the file context menu as the iced overlay at the
+    /// cursor, pulsing the row.
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn open_file_context_menu(
+        &mut self,
+        display_index: usize,
+        row_rect: iced::Rectangle,
+        cursor: iced::Point,
+    ) -> Task<Message> {
+        let tree = self.file_context_menu_tree(display_index);
+        if tree.is_empty() {
+            return Task::none();
+        }
+        let mut overlay = menu::OverlayMenu::new(tree, menu::AnchorSpec::At(cursor), false);
+        overlay.glow = Some(row_rect);
+        self.activity_popover_open = false;
+        self.menu = Some(overlay);
+        Task::none()
     }
 
     /// macOS: lower the shared tree to a native `NSMenu`, pop it (blocking, with

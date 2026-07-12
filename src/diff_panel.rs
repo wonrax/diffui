@@ -96,6 +96,12 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
         .wrap(ui.diff_wrap)
         .side_by_side(ui.diff_split);
 
+        // Per-file "browse source" affordance — repo tabs only (a PR tab has
+        // no local tree to browse).
+        if ui.session.repository.is_some() {
+            dv = dv.on_browse_file(Message::BrowseFileFromDiff);
+        }
+
         if let Some(find_state) = &ui.find {
             dv = dv.with_find(diff_view::FindOverlay {
                 matches: &find_state.matches,

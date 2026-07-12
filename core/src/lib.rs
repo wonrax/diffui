@@ -16,6 +16,7 @@ pub mod mutations;
 pub mod repository;
 pub mod session;
 pub mod source;
+pub mod source_browse;
 pub mod syntax;
 #[cfg(feature = "watcher")]
 pub mod watcher;
@@ -33,4 +34,8 @@ pub use source::{DiffSource, DiffTarget, Mutable, RepoSource, RevisionGraph, Sou
 pub use source::{
     compute_empty_status, fetch, highlight_file, load_backend, load_diff, load_repository_snapshot,
     load_revision_details, read_op_head, undo,
+};
+pub use source_browse::{
+    SourceEntry, SourceEntryStatus, SourceFileLoad, SourceTreeRow, list_ignored_dir,
+    list_source_tree, load_source_file, source_tree_rows,
 };

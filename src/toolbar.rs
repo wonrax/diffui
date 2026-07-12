@@ -15,7 +15,7 @@ use crate::repository::Vcs;
 use crate::theme::{
     ThemeSpec, bordered_button_style, chip_background, ghost_button_style, text_size,
 };
-use crate::{Diffui, FetchTarget, HoverTarget, Message, ToolbarMenu};
+use crate::{Diffui, FetchTarget, HoverTarget, MainView, Message, ToolbarMenu};
 
 /// Toolbar icon size. Slightly larger than the 12px labels so the Lucide marks
 /// (which carry ~2px of internal padding in their 24px grid) read as balanced
@@ -52,18 +52,20 @@ pub fn build_toolbar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     let caret_hovered = ui.hovered == Some(HoverTarget::FetchCaret);
     // 6px between actions — the same rhythm the tab strip uses between tabs, so
     // both title-bar bands share one consistent item spacing.
-    let mut actions = row![
-        toolbar_button(
-            icons::REFRESH,
-            "Refresh",
-            Message::ToolbarRefresh,
-            theme,
-            font
-        ),
-        fetch_split_button(theme, font, caret_hovered),
-    ]
-    .spacing(6)
-    .align_y(alignment::Vertical::Center);
+    let mut actions = row![].spacing(6).align_y(alignment::Vertical::Center);
+    // Diff ↔ Source view switcher, leftmost so the "what am I looking at"
+    // control leads the bar. Repo tabs only — a PR has no tree to browse.
+    if ui.session.repository.is_some() {
+        actions = actions.push(view_switcher(ui, theme, font));
+    }
+    actions = actions.push(toolbar_button(
+        icons::REFRESH,
+        "Refresh",
+        Message::ToolbarRefresh,
+        theme,
+        font,
+    ));
+    actions = actions.push(fetch_split_button(theme, font, caret_hovered));
     // jj-only: git has no operation log to undo.
     if is_jj {
         actions = actions.push(toolbar_button(
@@ -82,14 +84,18 @@ pub fn build_toolbar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         theme,
         font,
     ));
-    actions = actions.push(toolbar_toggle_button(
-        icons::SPLIT,
-        "Split",
-        ui.diff_split,
-        Message::ToggleDiffSplit,
-        theme,
-        font,
-    ));
+    // Side-by-side only applies to the diff; the source view is one column
+    // by nature, so the toggle hides rather than sitting there inert.
+    if ui.main_view == MainView::Diff {
+        actions = actions.push(toolbar_toggle_button(
+            icons::SPLIT,
+            "Split",
+            ui.diff_split,
+            Message::ToggleDiffSplit,
+            theme,
+            font,
+        ));
+    }
 
     let bar = row![
         actions,
@@ -114,6 +120,90 @@ fn bar_style(theme: ThemeSpec) -> container::Style {
         background: Some(Background::Color(theme.panel_background_elevated)),
         ..container::Style::default()
     }
+}
+
+/// The Diff ↔ Source view switcher: a segmented control — a recessed well
+/// (window-background fill) holding two tabs, the active one raised as a
+/// bordered pill. Deliberately *not* the bordered-button-group look of the
+/// fetch split button: this switches what the window shows, so it reads as
+/// tabs, not as an action.
+fn view_switcher(ui: &Diffui, theme: ThemeSpec, font: iced::Font) -> Element<'static, Message> {
+    let segment = |icon: &'static str, label: &str, view: MainView| {
+        let active = ui.main_view == view;
+        let icon_color = if active {
+            theme.accent
+        } else {
+            theme.subtle_text
+        };
+        let text_color = if active { theme.text } else { theme.muted_text };
+        button(
+            row![
+                icons::icon(icon, ICON_SIZE, icon_color),
+                text(label.to_owned())
+                    .size(text_size::UI)
+                    .color(text_color)
+                    .font(font),
+            ]
+            .spacing(5)
+            .align_y(alignment::Vertical::Center),
+        )
+        .padding(Padding::from([3, 10]))
+        .on_press(Message::SetMainView(view))
+        .style(move |_, status| button::Style {
+            background: if active {
+                // The raised pill: the toolbar's own (elevated) surface color
+                // inside the darker well, so it reads as sitting on top.
+                Some(Background::Color(theme.panel_background_elevated))
+            } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+                Some(Background::Color(chip_background(theme.muted_text)))
+            } else {
+                None
+            },
+            text_color,
+            border: Border {
+                width: if active { 1.0 } else { 0.0 },
+                color: if active {
+                    theme.border
+                } else {
+                    Color::TRANSPARENT
+                },
+                radius: 5.0.into(),
+            },
+            shadow: if active {
+                iced::Shadow {
+                    color: Color {
+                        a: 0.25,
+                        ..Color::BLACK
+                    },
+                    offset: iced::Vector::new(0.0, 1.0),
+                    blur_radius: 2.0,
+                }
+            } else {
+                iced::Shadow::default()
+            },
+            snap: true,
+        })
+    };
+
+    container(
+        row![
+            segment(icons::FILE_DIFF, "Diff", MainView::Diff),
+            segment(icons::CODE, "Source", MainView::Source),
+        ]
+        .spacing(2)
+        .align_y(alignment::Vertical::Center),
+    )
+    .padding(2)
+    .style(move |_| container::Style {
+        background: Some(Background::Color(theme.background)),
+        border: Border {
+            width: 0.0,
+            color: Color::TRANSPARENT,
+            radius: 7.0.into(),
+        },
+        ..container::Style::default()
+    })
+    .into()
 }
 
 /// A bordered toolbar action: icon + label, transparent fill until hovered.
