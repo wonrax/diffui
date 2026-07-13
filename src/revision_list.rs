@@ -972,9 +972,22 @@ where
         if item_idx >= self.row_count() {
             return None;
         }
-        let Item::File(file) = self.item_at(item_idx) else {
+        let item = self.item_at(item_idx);
+        let gutter_total = self.item_gutter_width(&item);
+        let Item::File(file) = item else {
             return None;
         };
+
+        // Only show the path tooltip when the name is actually ellipsized —
+        // same column math as `draw_file`'s `fill_text_truncated` call.
+        let path_w = self
+            .file_row_columns(bounds.x, bounds.width, gutter_total, &file)
+            .path_w;
+        let name_width =
+            measure::line_bounds(&file.primary, CAPTION_TEXT_SIZE, self.style.primary_font).width;
+        if name_width <= path_w {
+            return None;
+        }
         let row_top = self.row_top(item_idx) - state.vertical_offset;
         let row_screen_y = bounds.y + row_top as f32;
         let row_height = FILE_ROW_HEIGHT;
@@ -1162,6 +1175,39 @@ where
 }
 
 impl<'a, Message> RevisionList<'a, Message> {
+    /// Horizontal layout of a file row's content columns:
+    /// [indent][chevron][icon] name … [+N] [-N] [status chip] pad.
+    /// Shared between `draw_file` (which end-ellipsizes the name into
+    /// `path_w`) and the overlay's "is the name actually truncated?" check,
+    /// so the two can never disagree.
+    fn file_row_columns(
+        &self,
+        row_x: f32,
+        row_width: f32,
+        gutter_total: f32,
+        f: &FileRowView,
+    ) -> FileRowColumns {
+        let chip_col = self.style.file_badge_width;
+        let chip_left = row_x + row_width - CONTENT_PADDING - chip_col;
+        let chip_gap = if chip_col > 0.0 { FILE_ROW_GAP } else { 0.0 };
+        let minus_x = chip_left - chip_gap - f.deletions_width;
+        let plus_x = minus_x - FILE_ROW_GAP - f.additions_width;
+        let path_x =
+            row_x + gutter_total + f.indent + FILE_CHEVRON_COL + FILE_ICON_COL + FILE_ROW_GAP;
+        let path_right = if f.chevron.is_some() {
+            row_x + row_width - FILE_ROW_RIGHT_PAD
+        } else {
+            plus_x - FILE_ROW_GAP
+        };
+        FileRowColumns {
+            chip_left,
+            minus_x,
+            plus_x,
+            path_x,
+            path_w: (path_right - path_x).max(1.0),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn draw_revision<R>(
         &self,
@@ -1713,21 +1759,14 @@ impl<'a, Message> RevisionList<'a, Message> {
         // tree; directory rows have neither stats nor chip, so their name
         // runs to the right edge. The chip column clears the scrollbar band
         // with the same right padding the revision rows' bookmark rail uses.
-        let row_gap = FILE_ROW_GAP;
-        let right_pad = FILE_ROW_RIGHT_PAD;
+        let FileRowColumns {
+            chip_left,
+            minus_x,
+            plus_x,
+            path_x,
+            path_w,
+        } = self.file_row_columns(row_bounds.x, row_bounds.width, gutter_total, f);
         let chip_col = self.style.file_badge_width;
-        let chip_left = row_bounds.x + row_bounds.width - CONTENT_PADDING - chip_col;
-        let chip_gap = if chip_col > 0.0 { row_gap } else { 0.0 };
-        let minus_x = chip_left - chip_gap - f.deletions_width;
-        let plus_x = minus_x - row_gap - f.additions_width;
-
-        let path_x = content_x + FILE_CHEVRON_COL + FILE_ICON_COL + row_gap;
-        let path_right = if f.chevron.is_some() {
-            row_bounds.x + row_bounds.width - right_pad
-        } else {
-            plus_x - row_gap
-        };
-        let path_w = (path_right - path_x).max(1.0);
 
         // `fill_text_truncated` applies an end-ellipsis at the renderer
         // level, so a name wider than `path_w` doesn't bleed into the +N /
@@ -2034,6 +2073,14 @@ fn fill_text_centered_y<R: text::Renderer<Font = Font>>(
         color,
         clip,
     );
+}
+
+struct FileRowColumns {
+    chip_left: f32,
+    minus_x: f32,
+    plus_x: f32,
+    path_x: f32,
+    path_w: f32,
 }
 
 struct TooltipOverlay {
