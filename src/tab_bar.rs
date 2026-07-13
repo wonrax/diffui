@@ -12,10 +12,18 @@
 //! keep in sync.
 
 use iced::{
-    Background, Border, Color, Element, Length, Padding, alignment,
+    Background, Border, Color, Element, Event, Length, Padding, Rectangle, Shadow, Size, Theme,
+    Vector,
+    advanced::{
+        Layout, Renderer as _, Shell, Widget, layout, mouse as advanced_mouse, overlay, renderer,
+        widget::{Operation, Tree},
+    },
+    alignment,
     font::Weight,
     mouse,
-    widget::{Space, button, column, container, mouse_area, opaque, row, stack, text, text_input},
+    widget::{
+        Row, Space, button, column, container, mouse_area, opaque, row, stack, text, text_input,
+    },
 };
 
 use crate::chrome;
@@ -45,15 +53,8 @@ const TAB_HEIGHT: f32 = 29.0;
 /// active tab.
 const WASH_BOTTOM_GAP: f32 = 3.0;
 
-/// Radius of the concave join fillets flaring the active tab's fill into the
-/// toolbar band, and the width of the apron every tab reserves for them (so
-/// a tab's footprint doesn't change when activation moves). Adjacent aprons
-/// overlap 1:1 via the tabs row's `-FILLET` spacing, making this the exact
-/// visible gap between tabs — and the floor below which the side gap cannot
-/// go: the hover wash must stay within the fill zone so that activating a
-/// hovered tab never *shrinks* the highlight, so a wash always sits one
-/// apron away from an adjacent active fill.
-const FILLET: f32 = 10.0;
+/// Gap between neighboring tabs, and between the final tab and the add button.
+const TAB_GAP: f32 = 3.0;
 
 /// Label padding inside a tab's fill / hover wash.
 const LABEL_PAD_X: f32 = 8.0;
@@ -70,28 +71,19 @@ pub fn build_tab_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         return Space::new().into();
     }
 
-    // Adjacent tabs overlap by exactly one apron (negative spacing): tab N's
-    // right apron and tab N+1's left apron are the same strip of pixels, so
-    // the gap between two tabs' visible boxes is `FILLET`, not `2 × FILLET` —
-    // the flare's true minimum. The shared strip can't fight over paint or
-    // input: hit areas stop at the visible box (see `tab_widget`), and the
-    // only thing ever drawn there is an active tab's fillet against the
-    // neighbour's transparent apron.
-    let mut tabs_row = row![].spacing(-FILLET).align_y(alignment::Vertical::Center);
+    let mut tabs = Vec::with_capacity(ui.tabs.len() + 1);
     for (index, tab) in ui.tabs.iter().enumerate() {
         let active = index == ui.active_tab;
-        tabs_row = tabs_row.push(tab_widget(ui, theme, tab, active));
+        tabs.push(tab_widget(ui, theme, tab, active));
     }
-    // The `+` rides in the same overlapping row, its own left apron supplied
-    // by explicit padding: the negative spacing puts the wrapper's edge at
-    // the last tab's visible box, so the `+` sits exactly one `FILLET` away —
-    // the same gap tabs keep from each other.
-    tabs_row = tabs_row.push(container(add_button(theme)).padding(Padding {
-        top: 0.0,
-        right: 0.0,
-        bottom: 0.0,
-        left: FILLET,
-    }));
+    tabs.push(add_button(theme));
+    let tabs_row = TabStrip {
+        row: Row::with_children(tabs)
+            .spacing(TAB_GAP)
+            .align_y(alignment::Vertical::Center),
+        active: ui.active_tab,
+        theme,
+    };
 
     // Top padding only: the tabs run flush to the strip's bottom edge so the
     // active one connects to the toolbar band below (see `tab_widget`). When
@@ -224,15 +216,13 @@ fn tab_widget<'a>(
         .align_y(alignment::Vertical::Center);
 
     // Browser-style tab: the active tab is a top-rounded block filled with the
-    // toolbar band's own color, running flush to the strip's bottom edge and
-    // flaring into it through concave corner fillets — so it reads as
-    // physically connected to the content below (no border, no gap; the
-    // strip's recessed `well_fill` supplies the contrast). Inactive tabs stay
-    // quiet; hovering one paints a floating wash over exactly the fill zone —
-    // the same box the active fill paints — so clicking a hovered tab never
-    // shrinks the highlight: it recolors, grows `WASH_BOTTOM_GAP` down to the
-    // floor, and gains the flares. The label centers in the same top-anchored
-    // box in every state, so nothing shifts as activation or hover moves.
+    // toolbar band's own color and running flush to the strip's bottom edge.
+    // Its concave joins share the top corners' radius and are painted outside
+    // layout in the strip's background pass, continuing beneath neighboring
+    // inactive tab areas.
+    // Inactive tabs stay quiet; hovering one paints a floating wash over the
+    // same box minus `WASH_BOTTOM_GAP`. The label centers in the same
+    // top-anchored box in every state, so nothing shifts on hover or selection.
     let hovered = ui.hovered == Some(HoverTarget::Tab(id));
     let wash_fill = (!active && hovered).then(|| chip_background(theme.muted_text));
     let wash = container(inner)
@@ -262,15 +252,11 @@ fn tab_widget<'a>(
             ..container::Style::default()
         });
 
-    // The visible box is the select target — the hit area deliberately stops
-    // at the fill/wash edge, leaving the aprons inert so the overlap zone two
-    // tabs share (see `build_tab_bar`) can never route a press or hover to an
-    // ambiguous owner. The close `×` sits inside and captures its own press
-    // first (iced dispatches to children before the parent), so hitting `×`
-    // closes rather than selects. Hover is tracked in app state; `on_move`
-    // re-asserts it every frame the cursor is over the tab, so the one-frame
-    // flicker that `on_enter`/`on_exit` race into when crossing between
-    // adjacent tabs is immediately corrected.
+    // The close `×` captures its own press first (iced dispatches to children
+    // before the parent), so hitting `×` closes rather than selects. Hover is
+    // tracked in app state; `on_move` re-asserts it every frame the cursor is
+    // over the tab, so the one-frame flicker that `on_enter`/`on_exit` race
+    // into when crossing between adjacent tabs is immediately corrected.
     let interactive = mouse_area(body)
         .on_press(Message::SelectTab(id))
         .on_enter(Message::SetHover(Some(HoverTarget::Tab(id))))
@@ -278,65 +264,159 @@ fn tab_widget<'a>(
         .on_exit(Message::SetHover(None))
         .interaction(mouse::Interaction::Pointer);
 
-    // Constant fillet-wide aprons on every tab, active or not, so a tab's
-    // footprint never changes as activation moves.
-    let framed = container(interactive).padding(Padding {
-        top: 0.0,
-        right: FILLET,
-        bottom: 0.0,
-        left: FILLET,
-    });
+    interactive.into()
+}
 
-    // One concave join fillet: a `FILLET`-square pinned to a bottom corner of
-    // the tab's footprint (inside the apron), showing the toolbar color
-    // through a strip-colored cover whose inner corner is rounded — the
-    // classic browser-tab flare that welds the active fill to the band below.
-    let fillet = move |left: bool| -> Element<'static, Message> {
-        let cover_radius = if left {
-            iced::border::bottom_right(FILLET)
-        } else {
-            iced::border::bottom_left(FILLET)
-        };
-        let arc = stack![
-            container(Space::new())
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(move |_| container::Style {
-                    background: Some(Background::Color(theme.panel_background_elevated)),
-                    ..container::Style::default()
-                }),
-            container(Space::new())
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(move |_| container::Style {
-                    background: Some(Background::Color(well_fill(theme))),
-                    border: Border {
-                        width: 0.0,
-                        color: Color::TRANSPARENT,
-                        radius: cover_radius,
-                    },
-                    ..container::Style::default()
-                }),
-        ]
-        .width(Length::Fixed(FILLET))
-        .height(Length::Fixed(FILLET));
-        container(arc)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .align_x(if left {
-                alignment::Horizontal::Left
-            } else {
-                alignment::Horizontal::Right
-            })
-            .align_y(alignment::Vertical::Bottom)
-            .into()
-    };
+struct TabStrip<'a> {
+    row: Row<'a, Message>,
+    active: usize,
+    theme: ThemeSpec,
+}
 
-    if active {
-        stack![framed, fillet(true), fillet(false)].into()
-    } else {
-        framed.into()
+impl Widget<Message, Theme, iced::Renderer> for TabStrip<'_> {
+    fn children(&self) -> Vec<Tree> {
+        self.row.children()
     }
+
+    fn diff(&self, tree: &mut Tree) {
+        self.row.diff(tree);
+    }
+
+    fn size(&self) -> Size<Length> {
+        self.row.size()
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &iced::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.row.layout(tree, renderer, limits)
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &iced::Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.row.operate(tree, layout, renderer, operation);
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: advanced_mouse::Cursor,
+        renderer: &iced::Renderer,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        self.row
+            .update(tree, event, layout, cursor, renderer, shell, viewport);
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: advanced_mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &iced::Renderer,
+    ) -> advanced_mouse::Interaction {
+        self.row
+            .mouse_interaction(tree, layout, cursor, viewport, renderer)
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut iced::Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: advanced_mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        let active_bounds = layout.children().nth(self.active).map(|tab| tab.bounds());
+        if let Some(bounds) = active_bounds {
+            draw_join_fillet(renderer, self.theme, bounds, true);
+            draw_join_fillet(renderer, self.theme, bounds, false);
+        }
+        self.row
+            .draw(tree, renderer, theme, style, layout, cursor, viewport);
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &iced::Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'b, Message, Theme, iced::Renderer>> {
+        self.row
+            .overlay(tree, layout, renderer, viewport, translation)
+    }
+}
+
+impl<'a> From<TabStrip<'a>> for Element<'a, Message> {
+    fn from(strip: TabStrip<'a>) -> Self {
+        Element::new(strip)
+    }
+}
+
+fn draw_join_fillet(renderer: &mut iced::Renderer, theme: ThemeSpec, tab: Rectangle, left: bool) {
+    let panel_bounds = Rectangle {
+        x: if left {
+            tab.x - radius::BUTTON
+        } else {
+            tab.x + tab.width
+        },
+        y: tab.y + tab.height - radius::BUTTON,
+        width: radius::BUTTON,
+        height: radius::BUTTON,
+    };
+    renderer.fill_quad(
+        renderer::Quad {
+            bounds: panel_bounds,
+            border: Border::default(),
+            shadow: Shadow::default(),
+            snap: true,
+        },
+        theme.panel_background_elevated,
+    );
+
+    let cover_bounds = Rectangle {
+        x: if left {
+            tab.x - radius::BUTTON * 2.0
+        } else {
+            tab.x + tab.width
+        },
+        y: tab.y + tab.height - radius::BUTTON * 2.0,
+        width: radius::BUTTON * 2.0,
+        height: radius::BUTTON * 2.0,
+    };
+    renderer.fill_quad(
+        renderer::Quad {
+            bounds: cover_bounds,
+            border: Border {
+                width: 0.0,
+                color: Color::TRANSPARENT,
+                radius: if left {
+                    iced::border::bottom_right(radius::BUTTON)
+                } else {
+                    iced::border::bottom_left(radius::BUTTON)
+                },
+            },
+            shadow: Shadow::default(),
+            snap: true,
+        },
+        well_fill(theme),
+    );
 }
 
 /// `jj` / `git` badge — a soft colored chip carrying the VCS kind, so a
