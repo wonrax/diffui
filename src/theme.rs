@@ -423,7 +423,7 @@ pub mod text_size {
 /// Corner radii shared across the chrome. Chips keep their own tighter
 /// rounding ([`crate::chip::RADIUS`]).
 pub mod radius {
-    /// Inputs, tooltips, hover washes, list/menu rows.
+    /// Inputs, hover washes, list/menu rows.
     pub const CONTROL: f32 = 5.0;
     /// Every button-shaped control (ghost, raised, primary, dialog) and
     /// the toolbar's segmented well — one rounding for everything that
@@ -431,7 +431,7 @@ pub mod radius {
     pub const BUTTON: f32 = 7.0;
     /// Inset row cards (revision/file selection).
     pub const PUSH: f32 = 6.0;
-    /// Floating cards: popovers and modals.
+    /// Floating cards: popovers, modals, and tooltips.
     pub const SURFACE: f32 = 10.0;
 }
 
@@ -645,7 +645,7 @@ pub fn input_style(theme: ThemeSpec) -> text_input::Style {
 
 /// Hover tooltip card. The revision list's custom-drawn tooltip overlay
 /// mirrors these colors through `RevisionListStyle` and its radius through
-/// [`radius::CONTROL`].
+/// [`radius::SURFACE`].
 pub fn tooltip_style(theme: ThemeSpec) -> container::Style {
     container::Style {
         background: Some(Background::Color(theme.panel_background_elevated)),
@@ -653,7 +653,7 @@ pub fn tooltip_style(theme: ThemeSpec) -> container::Style {
         border: Border {
             color: theme.border,
             width: 1.0,
-            radius: radius::CONTROL.into(),
+            radius: radius::SURFACE.into(),
         },
         ..container::Style::default()
     }

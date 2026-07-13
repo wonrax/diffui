@@ -69,8 +69,11 @@ const CAPTION_TEXT_SIZE: f32 = crate::theme::text_size::BODY;
 const CHEVRON_TEXT_SIZE: f32 = 15.0;
 pub const FILE_ROW_GAP: f32 = 6.0;
 pub const FILE_ROW_RIGHT_PAD: f32 = 10.0;
-const TOOLTIP_RADIUS: f32 = crate::theme::radius::CONTROL;
-const TOOLTIP_PADDING: f32 = 6.0;
+const TOOLTIP_RADIUS: f32 = crate::theme::radius::SURFACE;
+// Wider horizontally than vertically: the SURFACE radius eats into the
+// card's left/right ends, so the text needs extra x inset to read centered.
+const TOOLTIP_PADDING_X: f32 = 9.0;
+const TOOLTIP_PADDING_Y: f32 = 6.0;
 const TOOLTIP_GAP: f32 = 8.0;
 
 #[derive(Debug, Clone, Copy)]
@@ -2099,8 +2102,8 @@ struct TooltipOverlay {
 impl TooltipOverlay {
     fn box_size(&self) -> Size {
         Size::new(
-            self.text_size.width + TOOLTIP_PADDING * 2.0,
-            self.text_size.height + TOOLTIP_PADDING * 2.0,
+            self.text_size.width + TOOLTIP_PADDING_X * 2.0,
+            self.text_size.height + TOOLTIP_PADDING_Y * 2.0,
         )
     }
 }
@@ -2159,9 +2162,9 @@ where
         fill_text_centered_y(
             renderer,
             &self.text,
-            bounds.x + TOOLTIP_PADDING,
+            bounds.x + TOOLTIP_PADDING_X,
             bounds.y + bounds.height / 2.0,
-            bounds.width - TOOLTIP_PADDING * 2.0,
+            bounds.width - TOOLTIP_PADDING_X * 2.0,
             CAPTION_TEXT_SIZE,
             self.style.tooltip_text,
             self.style.primary_font,

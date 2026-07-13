@@ -292,7 +292,7 @@ fn build_footer(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
                             .font(font)
                             .color(theme.text),
                     )
-                    .padding([3, 7])
+                    .padding([3, 9])
                     .style(move |_| theme::tooltip_style(theme)),
                     tooltip::Position::Top,
                 )
