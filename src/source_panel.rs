@@ -1,7 +1,7 @@
 //! The source-browser view: a GitHub-style "browse the repo at this revision"
-//! lens over the active tab. The sidebar shows just the browsed revision (one
-//! header row, right-clickable like any revision row) above the full file
-//! tree; the main pane renders the selected file through the shared
+//! lens over the active tab. The sidebar is the full file tree (the browsed
+//! revision itself is named in the toolbar and the pane's info bar); the main
+//! pane renders the selected file through the shared
 //! [`DiffView`] widget in its plain mode (single line-number column, no
 //! file/hunk header strips), so selection, copy, find, and wrap all behave
 //! exactly like the diff view.
@@ -18,7 +18,6 @@ use nucleo_matcher::{Config, Matcher, Utf32String};
 
 use crate::diff_view::{DiffFileView, DiffView};
 use crate::find;
-use crate::graph_view::RevisionGraphStyle;
 use crate::icons;
 use crate::revision_list::{FileRowView, RevisionList, RevisionRowView, RowSelectionKey};
 use crate::sidebar;
@@ -207,9 +206,8 @@ fn build_source_filter(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     )
 }
 
-/// Sidebar for the source browser: the fuzzy file-search box, then the
-/// browsed revision's header row with the full file tree beneath it — no
-/// revset filter, no branch footer.
+/// Sidebar for the source browser: the fuzzy file-search box, then the full
+/// file tree — no revision rows, no revset filter, no branch footer.
 pub fn build_source_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     let source = &ui.source;
     let mut body = column![].spacing(0);
@@ -236,20 +234,18 @@ pub fn build_source_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
             .iter()
             .position(|entry| !entry.is_dir && entry.path == path)
     });
-    // Flat sidebar row of the selected file (header row 0 + display index),
-    // for the jump-into-browser reveal.
+    // Flat sidebar row of the selected file, for the jump-into-browser
+    // reveal — file rows fill the whole list, so display index == flat index.
     let reveal_file_flat = selected_entry.and_then(|entry_index| {
-        rows.iter()
-            .position(|row| {
-                matches!(row, SourceTreeRow::File { entry_index: e, .. } if *e == entry_index)
-            })
-            .map(|display| 1 + display)
+        rows.iter().position(
+            |row| matches!(row, SourceTreeRow::File { entry_index: e, .. } if *e == entry_index),
+        )
     });
 
     let revision = browsed_revision(source);
-    let header = source_header_row(ui, theme, &revision);
-    let selected_row = Some(header.selection_key.clone());
-    let build_revision = Box::new(move |_index: usize| header.clone());
+    // Never called — with zero revision rows the widget only materializes
+    // file rows — but the builder slot still wants a value.
+    let build_revision = Box::new(move |_index: usize| empty_revision_row(theme));
 
     // Status chips only exist at the working copy; reserve the badge column
     // there so names align whether or not a given row carries one.
@@ -278,13 +274,13 @@ pub fn build_source_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
     });
 
     let list = RevisionList::new(
-        1,
+        0,
         (row_count > 0).then_some((0, row_count)),
         build_revision,
         build_file,
-        selected_row,
+        None,
         selected_entry,
-        Some(0),
+        None,
         sidebar::revision_list_style(theme, ui.config, badge_width),
         header_clicked,
         Message::SourceSidebarRow,
@@ -320,99 +316,22 @@ pub fn build_source_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
         .into()
 }
 
-/// The one revision row above the source tree. Resolved from the loaded
-/// commit store when the browsed revision is in the graph; a minimal
-/// commit-id-only row otherwise (e.g. filtered out by the revset).
-fn source_header_row(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    revision: &RevisionSelection,
-) -> RevisionRowView {
-    let graph_style = RevisionGraphStyle {
-        lane_base_color: theme.lane_base,
-        missing_color: theme.subtle_text,
-    };
-    let lane_color = graph_style.lane_color(0);
-
-    let (selection_key, commit) = match revision {
-        RevisionSelection::WorkingCopy => (
-            RowSelectionKey::WorkingCopy,
-            ui.session.commits.working_copy(),
-        ),
-        RevisionSelection::Commit(hex) => (
-            RowSelectionKey::Commit(hex.clone()),
-            ui.session.commits.find_by_commit_id(hex),
-        ),
-    };
-
+/// A blank [`RevisionRowView`] for the files-only source list's revision
+/// builder slot — never rendered (the list has zero revision rows).
+fn empty_revision_row(theme: ThemeSpec) -> RevisionRowView {
     let frame = diffui_core::graph::LaneFrame::solo();
     let columns = frame.display_columns();
-
-    let (id_prefix, id_suffix, commit_id_short, author, description, description_color) =
-        match commit {
-            Some(row) => {
-                let change_id = row.change_id();
-                let unique_len = row
-                    .shortest_change_id_len()
-                    .unwrap_or(sidebar::REVISION_ID_CHARS)
-                    .min(change_id.chars().count().max(1));
-                let label_len = sidebar::revision_id_display_len(unique_len, change_id);
-                let prefix: String = change_id.chars().take(unique_len).collect();
-                let suffix: String = change_id
-                    .chars()
-                    .skip(unique_len)
-                    .take(label_len.saturating_sub(unique_len))
-                    .collect();
-                let description_color = if row.has_description() {
-                    theme.text
-                } else {
-                    theme.note_text
-                };
-                (
-                    prefix,
-                    suffix,
-                    sidebar::truncate_end(row.commit_id(), sidebar::COMMIT_ID_CHARS),
-                    row.author().to_owned(),
-                    row.description().to_owned(),
-                    description_color,
-                )
-            }
-            None => {
-                let commit_id = match revision {
-                    RevisionSelection::Commit(hex) => {
-                        sidebar::truncate_end(hex, sidebar::COMMIT_ID_CHARS)
-                    }
-                    RevisionSelection::WorkingCopy => String::new(),
-                };
-                (
-                    String::new(),
-                    String::new(),
-                    commit_id,
-                    String::new(),
-                    String::new(),
-                    theme.note_text,
-                )
-            }
-        };
-
-    let bookmark_chips = commit
-        .map(|row| sidebar::bookmark_chips_for(row.bookmarks(), lane_color, theme, ui.config))
-        .unwrap_or_default();
-    let status_chips = commit
-        .map(|row| sidebar::status_chips_for(row, theme, ui.config))
-        .unwrap_or_default();
-
     RevisionRowView {
-        selection_key,
-        change_id_prefix: id_prefix,
-        change_id_suffix: id_suffix,
-        commit_id_short,
-        author,
-        description,
-        description_color,
-        bookmark_chips,
-        status_chips,
-        lane_color,
+        selection_key: RowSelectionKey::WorkingCopy,
+        change_id_prefix: String::new(),
+        change_id_suffix: String::new(),
+        commit_id_short: String::new(),
+        author: String::new(),
+        description: String::new(),
+        description_color: theme.text,
+        bookmark_chips: Vec::new(),
+        status_chips: Vec::new(),
+        lane_color: theme.lane_base,
         prev_columns: columns.clone(),
         columns,
         frame,

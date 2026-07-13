@@ -320,21 +320,23 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
     };
 
     let file_count = tree_rows.len();
+    // The widget wants the flat index where the file block *starts*: right
+    // after the expanded commit's own row.
     let expanded = expanded_index
         .filter(|_| file_count > 0)
-        .map(|index| (index, file_count));
+        .map(|index| (index + 1, file_count));
 
     // Flat sidebar row of the selected file, for the keyboard-nav reveal: the
     // expanded commit's row, then its file rows in tree-display order. `None`
     // when the file list is closed or the file isn't currently shown, which
     // tells the widget to schedule no scroll.
-    let reveal_file_flat = expanded.and_then(|(commit, _)| {
+    let reveal_file_flat = expanded.and_then(|(files_start, _)| {
         tree_rows
             .iter()
             .position(|row| {
                 matches!(row, FileTreeRow::File { file_index, .. } if *file_index == ui.selected_file)
             })
-            .map(|display| commit + 1 + display)
+            .map(|display| files_start + display)
     });
 
     // The per-row lane fold + prefix lengths are precomputed once and held in

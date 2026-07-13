@@ -232,8 +232,10 @@ fn row_height_of(kind: RowKind) -> f32 {
 /// that are actually on screen.
 pub struct RevisionList<'a, Message> {
     commit_count: usize,
-    /// `(commit index of the expanded row, file count)`. File rows render
-    /// immediately after that commit. `None` when nothing is expanded.
+    /// `(flat index where file rows start, file count)`. For an expanded
+    /// commit that's the commit's index + 1; a files-only list (the source
+    /// tree) passes `(0, files)` with a zero `commit_count`. `None` when
+    /// nothing is expanded.
     expanded: Option<(usize, usize)>,
     build_revision: Box<dyn Fn(usize) -> RevisionRowView + 'a>,
     build_file: Box<dyn Fn(usize) -> FileRowView + 'a>,
@@ -436,8 +438,8 @@ impl<'a, Message> RevisionList<'a, Message> {
 }
 
 // Pure row-geometry helpers, split out so they can be unit-tested without
-// constructing a full widget. `expanded` is `(commit index of the expanded
-// row, file count)`; file rows sit immediately after that commit.
+// constructing a full widget. `expanded` is `(flat index where file rows
+// start, file count)`; revision rows fill the flats on either side.
 
 fn rows_total(commit_count: usize, expanded: Option<(usize, usize)>) -> usize {
     commit_count + expanded.map_or(0, |(_, files)| files)
@@ -445,10 +447,10 @@ fn rows_total(commit_count: usize, expanded: Option<(usize, usize)>) -> usize {
 
 fn row_kind_at(expanded: Option<(usize, usize)>, flat: usize) -> RowKind {
     match expanded {
-        Some((commit, files)) if flat > commit && flat <= commit + files => {
-            RowKind::File(flat - commit - 1)
+        Some((start, files)) if flat >= start && flat < start + files => {
+            RowKind::File(flat - start)
         }
-        Some((commit, files)) if flat > commit + files => RowKind::Revision(flat - files),
+        Some((start, files)) if flat >= start + files => RowKind::Revision(flat - files),
         _ => RowKind::Revision(flat),
     }
 }
@@ -466,8 +468,8 @@ fn rows_content_height(commit_count: usize, expanded: Option<(usize, usize)>) ->
 
 fn row_top_at(expanded: Option<(usize, usize)>, flat: usize) -> f64 {
     let (revisions_before, files_before) = match expanded {
-        Some((commit, files)) if flat > commit => {
-            let files_before = (flat - commit - 1).min(files);
+        Some((start, files)) if flat >= start => {
+            let files_before = (flat - start).min(files);
             (flat - files_before, files_before)
         }
         _ => (flat, 0),
@@ -487,15 +489,15 @@ fn row_at_offset_in(
     let rev_h = REVISION_ROW_HEIGHT as f64;
     let file_h = FILE_ROW_HEIGHT as f64;
     let flat = match expanded {
-        Some((commit, files)) => {
-            let files_top = (commit + 1) as f64 * rev_h;
+        Some((start, files)) => {
+            let files_top = start as f64 * rev_h;
             let files_bottom = files_top + files as f64 * file_h;
             if offset < files_top {
                 (offset / rev_h) as usize
             } else if offset < files_bottom {
-                commit + 1 + ((offset - files_top) / file_h) as usize
+                start + ((offset - files_top) / file_h) as usize
             } else {
-                commit + 1 + files + ((offset - files_bottom) / rev_h) as usize
+                start + files + ((offset - files_bottom) / rev_h) as usize
             }
         }
         None => (offset / rev_h) as usize,
@@ -2188,9 +2190,10 @@ where
 mod tests {
     use super::*;
 
-    // Three commits with the middle one (index 1) expanded over 2 file rows.
+    // Three commits with the middle one (index 1) expanded over 2 file rows,
+    // so the file block starts at flat 2.
     // Flat layout: [rev0, rev1, file0, file1, rev2].
-    const EXP: Option<(usize, usize)> = Some((1, 2));
+    const EXP: Option<(usize, usize)> = Some((2, 2));
 
     #[test]
     fn row_count_includes_expanded_files() {
@@ -2238,6 +2241,20 @@ mod tests {
             None
         );
         assert_eq!(row_at_offset_in(3, EXP, -1.0), None);
+    }
+
+    // The source sidebar's shape: no revision rows, files from flat 0.
+    #[test]
+    fn files_only_layout_starts_at_flat_zero() {
+        let exp = Some((0, 3));
+        let file = f64::from(FILE_ROW_HEIGHT);
+        assert_eq!(rows_total(0, exp), 3);
+        assert!(matches!(row_kind_at(exp, 0), RowKind::File(0)));
+        assert!(matches!(row_kind_at(exp, 2), RowKind::File(2)));
+        assert_eq!(row_top_at(exp, 0), 0.0);
+        assert_eq!(row_top_at(exp, 2), 2.0 * file);
+        assert_eq!(row_at_offset_in(0, exp, 2.0 * file + 1.0), Some(2));
+        assert_eq!(row_at_offset_in(0, exp, 3.0 * file + 1.0), None);
     }
 
     #[test]
