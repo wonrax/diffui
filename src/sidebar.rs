@@ -1,6 +1,6 @@
 use iced::{
-    Background, Border, Color, Element, Font, Length, Padding, alignment, mouse,
-    widget::{Space, column, container, mouse_area, row, text, text_input, tooltip},
+    Background, Border, Color, Element, Font, Length, alignment,
+    widget::{Space, column, container, row, text, tooltip},
 };
 
 use crate::chip::{self, Chip};
@@ -137,127 +137,22 @@ fn build_revset_filter(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         Some(Vcs::Git) => "revision range — e.g. --all, main..@",
         _ => "revset — e.g. all(), mine()",
     };
-    filter_field(
+    crate::field::sidebar_filter_field(
         theme,
         ui.config.mono_font,
-        FilterField {
+        crate::field::FilterField {
             id: REVSET_INPUT_ID,
             placeholder,
             value: &ui.session.revset,
             on_input: Message::RevsetChanged,
-            on_submit: Message::RevsetSubmit,
-            caret: Some(FilterCaret {
+            on_submit: Some(Message::RevsetSubmit),
+            caret: Some(crate::field::FilterCaret {
                 hovered: ui.hovered == Some(HoverTarget::RevsetCaret),
                 target: HoverTarget::RevsetCaret,
                 menu: ToolbarMenu::RevsetPresets,
             }),
         },
     )
-}
-
-/// The trailing in-field caret of a [`filter_field`]: opens `menu` on press,
-/// with its hover wash driven by app-tracked state (`hovered` / `target`).
-pub(crate) struct FilterCaret {
-    pub hovered: bool,
-    pub target: HoverTarget,
-    pub menu: ToolbarMenu,
-}
-
-/// What varies between [`filter_field`] instances: the input's identity and
-/// wiring, plus the optional in-field presets caret.
-pub(crate) struct FilterField<'a> {
-    pub id: &'static str,
-    pub placeholder: &'a str,
-    pub value: &'a str,
-    pub on_input: fn(String) -> Message,
-    pub on_submit: Message,
-    pub caret: Option<FilterCaret>,
-}
-
-/// One sidebar filter field, shared by the diff sidebar's revset input and
-/// the source sidebar's file search so both views' top bars are identical.
-/// The field chrome (recessed window-colored well + hairline border) lives
-/// on a wrapping container rather than the `text_input` itself so the
-/// optional presets caret can sit *inside* the field.
-pub(crate) fn filter_field(
-    theme: ThemeSpec,
-    font: Font,
-    spec: FilterField<'_>,
-) -> Element<'_, Message> {
-    let input = text_input(spec.placeholder, spec.value)
-        .id(spec.id)
-        .padding(Padding::from([6, 9]))
-        .size(theme::text_size::UI)
-        .font(font)
-        .width(Length::Fill)
-        .on_input(spec.on_input)
-        .on_submit(spec.on_submit)
-        .style(move |_, _| {
-            // Bare input: the wrapping container carries the well + border.
-            let mut style = theme::input_style(theme);
-            style.background = Background::Color(Color::TRANSPARENT);
-            style.border.width = 0.0;
-            style
-        });
-
-    let menu = spec.caret.as_ref().map(|caret| caret.menu);
-    let mut bar = row![input].align_y(alignment::Vertical::Center);
-    if let Some(caret) = spec.caret {
-        // `mouse_area` (not `button`) so the presets menu opens on
-        // mouse-*down* while held — required for the native NSMenu's
-        // press-drag-release select. Hover is tracked manually (mouse_area
-        // has no built-in hover style), and the press falls through to the
-        // wrapping `AnchorArea` (the `text_input` captures its own).
-        let caret_el = mouse_area(
-            container(crate::toolbar::caret_glyph(
-                theme.muted_text,
-                theme::text_size::UI * 1.3,
-            ))
-            .padding(Padding::from([3, 6]))
-            .align_y(alignment::Vertical::Center)
-            .style(move |_| {
-                crate::toolbar::caret_hover_style(theme, caret.hovered, theme::radius::CONTROL)
-            }),
-        )
-        .on_enter(Message::SetHover(Some(caret.target)))
-        .on_exit(Message::SetHover(None))
-        .interaction(mouse::Interaction::Pointer);
-        // 2px so the hover wash reads as an inset island instead of fusing
-        // with the field's right edge.
-        bar = bar
-            .push(caret_el)
-            .push(Space::new().width(Length::Fixed(2.0)));
-    }
-
-    let field = container(bar).width(Length::Fill).style(move |_| {
-        // Window-background well: the field sits on the sidebar panel, so
-        // the darker window color is what makes it read as recessed.
-        container::Style {
-            background: Some(Background::Color(theme.background)),
-            border: Border {
-                width: 1.0,
-                color: theme.border,
-                radius: theme::radius::CONTROL.into(),
-            },
-            ..container::Style::default()
-        }
-    });
-
-    let field: Element<'_, Message> = match menu {
-        // The AnchorArea wraps the whole field so the presets menu anchors
-        // edge-to-edge below it.
-        Some(menu) => {
-            crate::menu::anchor_area(field, move |rect| Message::OpenToolbarMenu(menu, rect)).into()
-        }
-        None => field.into(),
-    };
-
-    // No rule under the field — its recessed well already separates it
-    // from the list below.
-    container(field)
-        .width(Length::Fill)
-        .padding(Padding::from([6, 8]))
-        .into()
 }
 
 const FOOTER_TEXT_SIZE: f32 = theme::text_size::UI;

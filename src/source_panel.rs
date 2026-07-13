@@ -189,19 +189,19 @@ pub const SOURCE_FILTER_INPUT_ID: &str = "source-filter-input";
 
 /// The fuzzy file-search box at the top of the source sidebar — the source
 /// view's counterpart of the diff sidebar's revset input, built from the
-/// same [`sidebar::filter_field`] (caretless variant) so both sidebars'
+/// same [`crate::field::filter_field`] (caretless variant) so both sidebars'
 /// top bars match. Typing filters the tree into a ranked match list;
 /// Enter opens the best match.
 fn build_source_filter(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
-    sidebar::filter_field(
+    crate::field::sidebar_filter_field(
         theme,
         ui.config.mono_font,
-        sidebar::FilterField {
+        crate::field::FilterField {
             id: SOURCE_FILTER_INPUT_ID,
             placeholder: "search files — fuzzy",
             value: &ui.source.filter,
             on_input: Message::SourceFilterChanged,
-            on_submit: Message::SourceFilterSubmit,
+            on_submit: Some(Message::SourceFilterSubmit),
             caret: None,
         },
     )

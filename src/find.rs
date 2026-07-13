@@ -16,12 +16,12 @@ use std::time::Duration;
 use iced::{
     Background, Border, Color, Element, Length, Padding, Shadow, alignment,
     font::Weight,
-    widget::{Space, button, column, container, row, text, text_input},
+    widget::{Space, button, column, container, row, text},
 };
 use regex::{Regex, RegexBuilder};
 
 use crate::icons;
-use crate::theme::{ThemeSpec, ghost_button_style, input_style, popover_style, text_size};
+use crate::theme::{ThemeSpec, ghost_button_style, popover_style, text_size};
 use crate::{Diffui, Message};
 use diffui_core::DiffFile;
 
@@ -250,17 +250,22 @@ pub fn build_overlay<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Messag
         format!("{} of {}", active, state.matches.len())
     };
 
-    let input = text_input("Find in diff", &state.query)
-        .id(FIND_INPUT_ID)
-        .padding(Padding::from([4, 8]))
-        .size(text_size::BODY)
-        .font(ui.config.ui_font)
-        .on_input(|q| Message::Find(FindMessage::QueryChanged(q)))
-        // Intentionally no `on_submit` — that would route Enter to FindNext
-        // unconditionally and steal Shift+Enter from the keyboard
-        // subscription, which is what handles forward/backward.
-        .width(Length::Fixed(220.0))
-        .style(move |_, _| input_style(theme));
+    // Intentionally no `on_submit` — that would route Enter to FindNext
+    // unconditionally and steal Shift+Enter from the keyboard
+    // subscription, which is what handles forward/backward.
+    let input = container(crate::field::filter_field(
+        theme,
+        ui.config.ui_font,
+        crate::field::FilterField {
+            id: FIND_INPUT_ID,
+            placeholder: "Find in diff",
+            value: &state.query,
+            on_input: |q| Message::Find(FindMessage::QueryChanged(q)),
+            on_submit: None,
+            caret: None,
+        },
+    ))
+    .width(Length::Fixed(220.0));
 
     let case_button = toggle_button("Aa", state.case_sensitive, theme, ui.config.ui_font)
         .on_press(Message::Find(FindMessage::ToggleCase));
