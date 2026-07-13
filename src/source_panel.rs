@@ -399,6 +399,14 @@ fn source_file_row(
                     )),
                     _ => None,
                 };
+                // A chipped row's name (and icon) carries the chip's color,
+                // so a changed file reads as one colored piece rather than a
+                // plain name with a colored tag hanging off it.
+                let name_color = match (chip, status) {
+                    (Some((_, color)), _) => color,
+                    (None, SourceEntryStatus::Ignored) => theme.subtle_text,
+                    (None, _) => theme.text,
+                };
                 (
                     label.clone(),
                     // Full path for the hover tooltip.
@@ -409,17 +417,11 @@ fn source_file_row(
                     *depth as f32 * crate::revision_list::FILE_TREE_INDENT,
                     None,
                     *entry_index,
-                    match status {
-                        SourceEntryStatus::Tracked => theme.text,
-                        SourceEntryStatus::Untracked => theme.added_text,
-                        SourceEntryStatus::Ignored => theme.subtle_text,
-                    },
-                    // The icon follows the row's tone so untracked/ignored
-                    // read as one piece with their name.
-                    match status {
-                        SourceEntryStatus::Tracked => theme.subtle_text,
-                        SourceEntryStatus::Untracked => theme.added_text,
-                        SourceEntryStatus::Ignored => theme.subtle_text,
+                    name_color,
+                    if chip.is_some() {
+                        name_color
+                    } else {
+                        theme.subtle_text
                     },
                     chip,
                 )
