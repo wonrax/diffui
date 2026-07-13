@@ -2101,14 +2101,7 @@ where
                 // Same soft lift every other floating surface carries
                 // (`theme::popover_style` at tooltip scale) — shadowless,
                 // the card sank into the busy rows behind it.
-                shadow: Shadow {
-                    color: Color {
-                        a: 0.25,
-                        ..Color::BLACK
-                    },
-                    offset: iced::Vector::new(0.0, 3.0),
-                    blur_radius: 10.0,
-                },
+                shadow: crate::theme::floating_shadow(3.0, 10.0),
                 snap: true,
             },
             Background::Color(self.style.tooltip_background),

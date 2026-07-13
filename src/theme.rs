@@ -572,15 +572,22 @@ pub fn popover_style(theme: ThemeSpec) -> container::Style {
             color: theme.border,
             radius: radius::SURFACE.into(),
         },
-        shadow: Shadow {
-            color: Color {
-                a: 0.30,
-                ..Color::BLACK
-            },
-            offset: Vector::new(0.0, 8.0),
-            blur_radius: 24.0,
-        },
+        shadow: floating_shadow(8.0, 16.0),
         ..container::Style::default()
+    }
+}
+
+/// The drop shadow every floating surface shares — same tint and alpha
+/// everywhere, geometry scaled to the surface (popovers are bigger than
+/// tooltips).
+pub fn floating_shadow(offset_y: f32, blur_radius: f32) -> Shadow {
+    Shadow {
+        color: Color {
+            a: 0.05,
+            ..Color::BLACK
+        },
+        offset: Vector::new(0.0, offset_y),
+        blur_radius,
     }
 }
 
@@ -596,14 +603,7 @@ pub fn modal_style(theme: ThemeSpec) -> container::Style {
             color: theme.border,
             radius: radius::SURFACE.into(),
         },
-        shadow: Shadow {
-            color: Color {
-                a: 0.18,
-                ..Color::BLACK
-            },
-            offset: Vector::new(0.0, 4.0),
-            blur_radius: 12.0,
-        },
+        shadow: floating_shadow(4.0, 12.0),
         ..container::Style::default()
     }
 }
