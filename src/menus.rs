@@ -17,6 +17,13 @@ impl Diffui {
 
         let mut top = vec![
             MenuEntry::item(
+                "Edit description…",
+                MenuAction::EditDescription {
+                    target: selection.clone(),
+                },
+            ),
+            MenuEntry::Separator,
+            MenuEntry::item(
                 "New child",
                 MenuAction::Mutate(MutationOp::New {
                     parent: selection.clone(),
@@ -269,6 +276,19 @@ impl Diffui {
             MenuAction::BrowseSource { revision, path } => {
                 return self.open_source_browser(revision, path);
             }
+            MenuAction::EditDescription { target } => {
+                if self.session.selected_revision == target {
+                    return Task::done(Message::DescriptionEdit);
+                }
+                if let Some(editor) = self.description_editor.as_mut()
+                    && (editor.is_dirty() || editor.saving_activity.is_some())
+                {
+                    editor.switch_blocked = true;
+                    return Task::none();
+                }
+                self.pending_description_edit = Some(target.clone());
+                return self.update(Message::SelectRowKey(selection_key(&target)));
+            }
             // Author / committer / full description aren't kept in the graph, so
             // read the revision off-thread, format the field, and copy — falling
             // back to the in-memory value on failure.
@@ -299,6 +319,7 @@ impl Diffui {
             MutationOp::New { .. } => "New change".to_owned(),
             MutationOp::Edit { .. } => "Edit".to_owned(),
             MutationOp::Abandon { .. } => "Abandon".to_owned(),
+            MutationOp::Describe { .. } => "Update description".to_owned(),
             MutationOp::MoveBookmark { name, .. } => format!("Move bookmark {name}"),
             MutationOp::DeleteBookmark { name } => format!("Delete bookmark {name}"),
             MutationOp::TrackBookmark { name, remote } => format!("Track {name}@{remote}"),

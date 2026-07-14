@@ -13,6 +13,7 @@ use iced::{
 };
 
 use crate::chip::{self, Chip};
+use crate::icons;
 use crate::measure;
 use crate::scrollbar::{self, ScrollbarState, ScrollbarStyle};
 
@@ -43,14 +44,19 @@ const GUTTER_MIN_WIDTH: f32 = 56.0;
 // Padding flanking the gutter text on both sides.
 const GUTTER_HORIZONTAL_PADDING: f32 = 8.0;
 // Padding above and below the revision-header block when it's present.
-const HEADER_VERTICAL_PADDING: f32 = 12.0;
+pub(crate) const HEADER_VERTICAL_PADDING: f32 = 12.0;
 // Left/right padding inside the header block (between the panel edge and
 // the first character of label/description text).
-const HEADER_HORIZONTAL_PADDING: f32 = 16.0;
+pub(crate) const HEADER_HORIZONTAL_PADDING: f32 = 16.0;
 // Space drawn between the label column and the value column.
 const HEADER_LABEL_GAP: f32 = 8.0;
 // Description lines lead the header as its title, flush with the labels.
 const HEADER_DESCRIPTION_INDENT: f32 = 0.0;
+const HEADER_EDIT_WIDTH: f32 = 66.0;
+const HEADER_EDIT_HEIGHT: f32 = 26.0;
+const HEADER_EDIT_ICON_SIZE: f32 = 13.0;
+const HEADER_EDIT_LABEL_SIZE: f32 = 12.0;
+const HEADER_EDIT_CONTENT_GAP: f32 = 5.0;
 // Click within this distance of the previous click counts as a multi-click
 // rather than a fresh selection anchor.
 const MULTI_CLICK_RADIUS: f32 = 4.0;
@@ -105,6 +111,9 @@ pub enum HeaderLine {
     Description(String),
     /// Blank separator between the description and the metadata block.
     Blank,
+    /// Fixed-height space occupied by an interactive child layered over the
+    /// custom-rendered header (currently the description editor).
+    Spacer(f32),
 }
 
 impl HeaderLine {
@@ -133,6 +142,10 @@ impl HeaderLine {
 
     pub fn blank() -> Self {
         Self::Blank
+    }
+
+    pub fn spacer(height: f32) -> Self {
+        Self::Spacer(height)
     }
 }
 
@@ -216,6 +229,10 @@ pub struct DiffView<'a, Message> {
     /// (diff mode only — plain documents have no headers). Receives the
     /// file index on click.
     on_browse_file: Option<fn(usize) -> Message>,
+    /// Opens the selected revision's description editor. The custom widget
+    /// draws and hit-tests the affordance beside the first description line;
+    /// the actual editor is layered by the caller into the reserved spacer.
+    on_edit_description: Option<fn() -> Message>,
 }
 
 /// Per-render find-match data fed into `DiffView::with_find`. The widget
@@ -521,6 +538,10 @@ struct State<Paragraph> {
     /// cache (whose keys would otherwise map to stale text). Starts at 0 to
     /// match the app's initial version.
     last_content_version: u64,
+    /// Last revision-header height. Opening/closing the embedded editor changes
+    /// header row geometry without changing the revision key; selections use
+    /// header row indices, so they must be cleared when this shape changes.
+    last_header_height_bits: u32,
     /// Palette identity last seen. Cached paragraphs bake the syntax span
     /// colors in at shaping time, so a theme switch must drop the cache or
     /// stale-theme text keeps rendering (near-invisible when the old theme's
@@ -530,6 +551,9 @@ struct State<Paragraph> {
     /// File whose header's browse button the cursor is over, if any —
     /// drives its hover wash (manual, like every hover in this widget).
     hovered_browse: Option<usize>,
+    /// Whether the cursor is over the description block. Reveals the edit
+    /// affordance at its right edge.
+    hovered_description: bool,
     /// Prefix-sum layout index (see [`HeightIndex`]). `RefCell` because
     /// `draw`/`mouse_interaction` only get `&State` but must be able to
     /// (re)build it lazily; borrows are short and never overlap.
@@ -704,6 +728,7 @@ impl<'a, Message> DiffView<'a, Message> {
             side_by_side: false,
             plain: false,
             on_browse_file: None,
+            on_edit_description: None,
         }
     }
 
@@ -736,6 +761,11 @@ impl<'a, Message> DiffView<'a, Message> {
 
     pub fn with_header(mut self, header: Vec<HeaderLine>) -> Self {
         self.header = header;
+        self
+    }
+
+    pub fn on_edit_description(mut self, callback: fn() -> Message) -> Self {
+        self.on_edit_description = Some(callback);
         self
     }
 
@@ -805,8 +835,93 @@ impl<'a, Message> DiffView<'a, Message> {
         if self.header.is_empty() {
             0.0
         } else {
-            self.header.len() as f32 * self.metrics.row_height + HEADER_VERTICAL_PADDING * 2.0
+            self.header
+                .iter()
+                .map(|line| self.header_line_height(line))
+                .sum::<f32>()
+                + HEADER_VERTICAL_PADDING * 2.0
         }
+    }
+
+    fn header_line_height(&self, line: &HeaderLine) -> f32 {
+        match line {
+            HeaderLine::Spacer(height) => *height,
+            _ => self.metrics.row_height,
+        }
+    }
+
+    /// Header row at a content-space y coordinate, accounting for variable-
+    /// height spacer rows used by the inline editor.
+    fn header_line_at_y(&self, target_y: f32) -> Option<usize> {
+        let mut y = HEADER_VERTICAL_PADDING;
+        for (index, line) in self.header.iter().enumerate() {
+            let height = self.header_line_height(line);
+            if target_y >= y && target_y < y + height {
+                return Some(index);
+            }
+            y += height;
+        }
+        None
+    }
+
+    fn description_geometry(&self) -> Option<(f32, f32)> {
+        let mut y = HEADER_VERTICAL_PADDING;
+        let mut start = None;
+        let mut height = 0.0;
+        for line in &self.header {
+            if matches!(line, HeaderLine::Description(_)) {
+                start.get_or_insert(y);
+                height += self.header_line_height(line);
+            } else if start.is_some() {
+                break;
+            }
+            y += self.header_line_height(line);
+        }
+        start.map(|start| (start, height))
+    }
+
+    fn description_edit_bounds(
+        &self,
+        bounds: Rectangle,
+        vertical_offset: f32,
+    ) -> Option<Rectangle> {
+        self.on_edit_description?;
+        let (description_y, description_height) = self.description_geometry()?;
+        let description_top = bounds.y + description_y - vertical_offset;
+        let description_bottom = description_top + description_height;
+        if description_bottom <= bounds.y || description_top >= bounds.y + bounds.height {
+            return None;
+        }
+        // Keep the affordance visible while any part of a long description is
+        // on screen. It tracks the description block rather than becoming a
+        // sticky header: once the block scrolls away, the button does too.
+        let y = (description_top + (self.metrics.row_height - HEADER_EDIT_HEIGHT) / 2.0)
+            .max(bounds.y)
+            .min(description_bottom - HEADER_EDIT_HEIGHT);
+        Some(Rectangle {
+            x: bounds.x + bounds.width - HEADER_HORIZONTAL_PADDING - HEADER_EDIT_WIDTH,
+            y,
+            width: HEADER_EDIT_WIDTH,
+            height: HEADER_EDIT_HEIGHT,
+        })
+    }
+
+    fn description_row_contains(
+        &self,
+        bounds: Rectangle,
+        vertical_offset: f32,
+        point: Point,
+    ) -> bool {
+        let Some((y, height)) = self.description_geometry() else {
+            return false;
+        };
+        Rectangle {
+            x: bounds.x + HEADER_HORIZONTAL_PADDING,
+            y: bounds.y + y - vertical_offset,
+            width: (bounds.width - HEADER_HORIZONTAL_PADDING * 2.0).max(1.0),
+            height,
+        }
+        .contains(point)
     }
 
     /// The selectable text of header line `index`, if any — field *values* and
@@ -952,7 +1067,7 @@ impl<'a, Message> DiffView<'a, Message> {
         let key = Some((
             self.layout_version,
             self.files.len(),
-            self.header.len(),
+            self.header_height().to_bits() as usize,
             width.to_bits(),
             self.wrap,
             self.side_by_side,
@@ -1330,11 +1445,7 @@ impl<'a, Message> DiffView<'a, Message> {
         // Author, …) are selectable; clicks on labels, bookmark chips, or blank
         // lines return `None`.
         if header_height > 0.0 && target_y < header_height {
-            let line_offset = (target_y - HEADER_VERTICAL_PADDING) / self.metrics.row_height;
-            if line_offset < 0.0 {
-                return None;
-            }
-            let line_index = line_offset.floor() as usize;
+            let line_index = self.header_line_at_y(target_y)?;
             let text = self.header_selectable_text(line_index)?;
             let origin_x = self.header_text_origin_x(line_index, bounds);
             let char_count = text.chars().count();
@@ -2091,6 +2202,7 @@ impl<'a, Message> DiffView<'a, Message> {
         visible_top: f32,
         header_height: f32,
         selection: Option<(TextPosition, TextPosition)>,
+        show_description_edit: bool,
     ) where
         Renderer: text::Renderer<Font = Font> + geometry::Renderer,
     {
@@ -2210,8 +2322,15 @@ impl<'a, Message> DiffView<'a, Message> {
                         renderer,
                         line,
                         TextRenderParams {
-                            width: (bounds.x + bounds.width - HEADER_HORIZONTAL_PADDING - desc_x)
-                                .max(1.0),
+                            width: (bounds.x + bounds.width
+                                - HEADER_HORIZONTAL_PADDING
+                                - desc_x
+                                - if self.on_edit_description.is_some() {
+                                    HEADER_EDIT_WIDTH + HEADER_LABEL_GAP
+                                } else {
+                                    0.0
+                                })
+                            .max(1.0),
                             height: self.metrics.row_height,
                             position: Point::new(desc_x, y + TEXT_Y_PADDING),
                             color: value_color,
@@ -2219,10 +2338,35 @@ impl<'a, Message> DiffView<'a, Message> {
                             wrapping: text::Wrapping::None,
                         },
                     );
+                    if show_description_edit
+                        && Some(line_index)
+                            == self
+                                .header
+                                .iter()
+                                .position(|line| matches!(line, HeaderLine::Description(_)))
+                        && let Some(button) = self.description_edit_bounds(bounds, visible_top)
+                    {
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds: button,
+                                border: Border {
+                                    radius: crate::theme::radius::BUTTON.into(),
+                                    ..Border::default()
+                                },
+                                shadow: Shadow::default(),
+                                snap: true,
+                            },
+                            Color {
+                                a: 0.12,
+                                ..self.palette.text_muted
+                            },
+                        );
+                        self.draw_description_edit_label(renderer, button, clip);
+                    }
                 }
-                HeaderLine::Blank => {}
+                HeaderLine::Blank | HeaderLine::Spacer(_) => {}
             }
-            y += self.metrics.row_height;
+            y += self.header_line_height(line);
         }
     }
 }
@@ -2262,14 +2406,25 @@ where
             last_restore_token: 0,
             pending_set_offset: None,
             last_content_version: 0,
+            last_header_height_bits: 0,
             last_palette_text: None,
             hovered_browse: None,
+            hovered_description: false,
             height_index: RefCell::new(HeightIndex::default()),
         })
     }
 
     fn diff(&self, tree: &mut Tree) {
         let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
+
+        let header_height_bits = self.header_height().to_bits();
+        if state.last_header_height_bits != header_height_bits {
+            state.last_header_height_bits = header_height_bits;
+            state.selection_anchor = None;
+            state.selection_focus = None;
+            state.selection_lane = None;
+            state.is_selecting = false;
+        }
 
         // Checked before the revision-key reset below (which early-returns), so
         // a tab restore is never skipped. Applied last in `update()`, so it
@@ -2551,6 +2706,9 @@ where
                 if hovered != state.hovered_browse {
                     state.hovered_browse = hovered;
                 }
+                state.hovered_description = cursor.position_over(bounds).is_some_and(|point| {
+                    self.description_row_contains(bounds, state.vertical_offset, point)
+                });
 
                 shell.capture_event();
                 shell.request_redraw();
@@ -2602,6 +2760,16 @@ where
                 }
                 // The per-file browse button wins over selection: a press on
                 // it fires the callback instead of anchoring a drag.
+                if self
+                    .description_edit_bounds(bounds, state.vertical_offset)
+                    .is_some_and(|button| button.contains(point))
+                {
+                    if let Some(on_edit) = self.on_edit_description {
+                        shell.publish(on_edit());
+                    }
+                    shell.capture_event();
+                    return;
+                }
                 if let Some(file_index) = self.browse_button_at(state, bounds, point) {
                     if let Some(on_browse) = self.on_browse_file {
                         shell.publish(on_browse(file_index));
@@ -2696,6 +2864,12 @@ where
                         .and_then(|point| self.browse_button_at(state, bounds, point));
                     if hovered != state.hovered_browse {
                         state.hovered_browse = hovered;
+                        shell.request_redraw();
+                    }
+                    let hovered_description =
+                        self.description_row_contains(bounds, state.vertical_offset, *position);
+                    if hovered_description != state.hovered_description {
+                        state.hovered_description = hovered_description;
                         shell.request_redraw();
                     }
                     return;
@@ -3079,6 +3253,7 @@ where
                     visible_top,
                     header_height,
                     selection_range,
+                    state.hovered_description,
                 );
             }
 
@@ -3350,17 +3525,21 @@ where
         if self.browse_button_at(state, bounds, point).is_some() {
             return mouse::Interaction::Pointer;
         }
+        if self
+            .description_edit_bounds(bounds, state.vertical_offset)
+            .is_some_and(|button| button.contains(point))
+        {
+            return mouse::Interaction::Pointer;
+        }
         // In the revision-header strip, show the text cursor only over the
         // selectable values (field values + description), and the arrow over
         // labels, bookmark chips, and blank space.
         let target_y = point.y - bounds.y + state.vertical_offset;
         if target_y < self.header_height() {
-            let line_offset = (target_y - HEADER_VERTICAL_PADDING) / self.metrics.row_height;
-            let over_value = line_offset >= 0.0 && {
-                let line_index = line_offset.floor() as usize;
+            let over_value = self.header_line_at_y(target_y).is_some_and(|line_index| {
                 self.header_selectable_text(line_index).is_some()
                     && point.x >= self.header_text_origin_x(line_index, bounds)
-            };
+            });
             return if over_value {
                 mouse::Interaction::Text
             } else {
@@ -3821,6 +4000,61 @@ impl<Message> DiffView<'_, Message> {
             render.position,
             render.color,
             render.clip_bounds,
+        );
+    }
+
+    fn draw_description_edit_label<Renderer>(
+        &self,
+        renderer: &mut Renderer,
+        bounds: Rectangle,
+        clip_bounds: Rectangle,
+    ) where
+        Renderer: text::Renderer<Font = Font>,
+    {
+        let label = "Edit";
+        let label_width = measure::line_width(label, HEADER_EDIT_LABEL_SIZE, self.font);
+        let content_width = HEADER_EDIT_ICON_SIZE + HEADER_EDIT_CONTENT_GAP + label_width;
+        let content_x = bounds.center_x() - content_width / 2.0;
+        let center_y = bounds.center_y();
+
+        renderer.fill_text(
+            text::Text {
+                content: icons::PENCIL.to_owned(),
+                bounds: Size::new(HEADER_EDIT_ICON_SIZE, HEADER_EDIT_ICON_SIZE),
+                size: Pixels(HEADER_EDIT_ICON_SIZE),
+                line_height: text::LineHeight::Absolute(Pixels(HEADER_EDIT_ICON_SIZE)),
+                font: icons::ICON_FONT,
+                align_x: text::Alignment::Left,
+                align_y: alignment::Vertical::Center,
+                shaping: text::Shaping::Advanced,
+                wrapping: text::Wrapping::None,
+                ellipsis: text::Ellipsis::None,
+                hint_factor: None,
+            },
+            Point::new(content_x, center_y),
+            self.palette.text_muted,
+            clip_bounds,
+        );
+        renderer.fill_text(
+            text::Text {
+                content: label.to_owned(),
+                bounds: Size::new(label_width.max(1.0), bounds.height),
+                size: Pixels(HEADER_EDIT_LABEL_SIZE),
+                line_height: text::LineHeight::Absolute(Pixels(bounds.height)),
+                font: self.font,
+                align_x: text::Alignment::Left,
+                align_y: alignment::Vertical::Center,
+                shaping: text::Shaping::Advanced,
+                wrapping: text::Wrapping::None,
+                ellipsis: text::Ellipsis::None,
+                hint_factor: None,
+            },
+            Point::new(
+                content_x + HEADER_EDIT_ICON_SIZE + HEADER_EDIT_CONTENT_GAP,
+                center_y,
+            ),
+            self.palette.text,
+            clip_bounds,
         );
     }
 
@@ -4428,6 +4662,29 @@ mod tests {
         view.layout_version = 7;
         view.ensure_height_index(&cell, 4000.0);
         assert_ne!(cell.borrow().key, key);
+    }
+
+    #[test]
+    fn header_spacer_reserves_variable_height_and_maps_following_rows() {
+        let hunks = test_hunks();
+        let mut view = test_view(&hunks);
+        view.header = vec![
+            HeaderLine::spacer(150.0),
+            HeaderLine::field("commit", "abc"),
+        ];
+
+        assert_eq!(
+            view.header_height(),
+            HEADER_VERTICAL_PADDING * 2.0 + 150.0 + view.metrics.row_height
+        );
+        assert_eq!(
+            view.header_line_at_y(HEADER_VERTICAL_PADDING + 149.0),
+            Some(0)
+        );
+        assert_eq!(
+            view.header_line_at_y(HEADER_VERTICAL_PADDING + 150.0),
+            Some(1)
+        );
     }
 
     #[test]

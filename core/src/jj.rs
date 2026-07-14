@@ -1811,6 +1811,7 @@ pub(crate) async fn apply_mutation(
 
     // Captured remote output (push only); empty for local mutations.
     let mut push_output: Vec<String> = Vec::new();
+    let mut rewritten_commit: Option<String> = None;
     let message = match &op {
         MutationOp::New { parent } => {
             let parent_commit = resolve_mutation_target(tx.repo(), &current_wc_id, parent).await?;
@@ -1845,6 +1846,24 @@ pub(crate) async fn apply_mutation(
             let short = short_change_id(&commit);
             tx.repo_mut().record_abandoned_commit(&commit);
             format!("Abandoned {short}")
+        }
+        MutationOp::Describe {
+            target,
+            description,
+        } => {
+            let commit = resolve_mutation_target(tx.repo(), &current_wc_id, target).await?;
+            let short = short_change_id(&commit);
+            let rewritten = tx
+                .repo_mut()
+                .rewrite_commit(&commit)
+                .set_description(description.clone())
+                .write()
+                .await
+                .with_context(|| format!("failed to describe revision {short}"))?;
+            if matches!(target, RevisionSelection::Commit(_)) {
+                rewritten_commit = Some(rewritten.id().hex());
+            }
+            format!("Updated description for {short}")
         }
         MutationOp::MoveBookmark { name, to } => {
             let commit = resolve_mutation_target(tx.repo(), &current_wc_id, to).await?;
@@ -1922,6 +1941,7 @@ pub(crate) async fn apply_mutation(
     Ok(MutationOutcome {
         message,
         moved_working_copy,
+        rewritten_commit,
         output: push_output,
     })
 }

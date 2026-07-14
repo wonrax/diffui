@@ -87,6 +87,7 @@ pub const CHEVRON_DOWN: &str = "\u{e06d}"; // chevron-down
 pub const CHEVRON_RIGHT: &str = "\u{e06f}"; // chevron-right
 pub const CHEVRON_UP: &str = "\u{e070}"; // chevron-up
 pub const CHECK: &str = "\u{e06c}"; // check
+pub const PENCIL: &str = "\u{e1f9}"; // pencil
 pub const FOLDER: &str = "\u{e0d7}"; // folder
 pub const CIRCLE: &str = "\u{e076}"; // circle
 pub const HASH: &str = "\u{e0ef}"; // hash

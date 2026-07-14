@@ -1,13 +1,19 @@
+use iced::advanced::{
+    Layout, Shell, Widget, layout, mouse, renderer,
+    widget::{Tree, tree},
+};
 use iced::{
-    Color, Element, Length, alignment,
-    widget::{column, container, row, stack, text},
+    Background, Border, Color, Element, Event, Length, Padding, Rectangle, Size, Theme, Vector,
+    alignment,
+    widget::{Space, button, column, container, row, stack, text, text_editor},
 };
 
 use crate::chip::Chip;
 use crate::diff_view::{self, DiffFileView, DiffView};
 use crate::find;
 use crate::theme::{
-    ThemeSpec, chip_background, diff_palette, diff_panel_style, file_status_color, text_size,
+    ThemeSpec, chip_background, diff_palette, diff_panel_style, file_status_color,
+    primary_button_style, raised_button_style, text_size,
 };
 use crate::{Diffui, LoadStatus, Message};
 use diffui_core::{RevisionDetails, SignatureInfo};
@@ -16,6 +22,10 @@ use diffui_core::{RevisionDetails, SignatureInfo};
 const CODE_TEXT_SIZE: f32 = 12.0;
 const EMPTY_STATE_TEXT_SIZE: f32 = text_size::BODY_LG;
 const STATS_TEXT_SIZE: f32 = text_size::BODY;
+pub(crate) const DESCRIPTION_EDITOR_ID: &str = "revision-description-editor";
+const DESCRIPTION_EDITOR_ACTIONS_HEIGHT: f32 = 28.0;
+const DESCRIPTION_EDITOR_GAP: f32 = 8.0;
+const DESCRIPTION_EDITOR_PADDING_Y: f32 = 10.0;
 
 pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
     let body: Element<'a, Message> = if matches!(ui.session.status, LoadStatus::Loading)
@@ -68,11 +78,34 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
             .collect::<Vec<_>>();
 
         let bookmark_color = selected_lane_color(ui, theme);
+        let editable_description = ui
+            .session
+            .repository
+            .as_ref()
+            .is_some_and(|repo| matches!(repo.vcs, crate::repository::Vcs::Jj));
+        let editing_description = ui
+            .description_editor
+            .as_ref()
+            .is_some_and(|editor| editor.target == ui.session.selected_revision);
+        let description_editor_height = if editing_description {
+            description_editor_height(ui)
+        } else {
+            0.0
+        };
         let header_lines = ui
             .session
             .revision_details
             .as_ref()
-            .map(|details| build_header_lines(details, bookmark_color, ui.config.ui_font))
+            .map(|details| {
+                build_header_lines(
+                    details,
+                    bookmark_color,
+                    ui.config.ui_font,
+                    editable_description,
+                    editing_description,
+                    description_editor_height,
+                )
+            })
             .unwrap_or_default();
 
         let stats_bar = build_stats_bar(ui, theme);
@@ -95,6 +128,10 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
         .layout_version(ui.session.document_id)
         .wrap(ui.diff_wrap)
         .side_by_side(ui.diff_split);
+
+        if editable_description && !editing_description {
+            dv = dv.on_edit_description(|| Message::DescriptionEdit);
+        }
 
         // Per-file "browse source" affordance — repo tabs only (a PR tab has
         // no local tree to browse).
@@ -127,7 +164,11 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
         // upper-right of the panel. `stack` overlays without taking
         // the diff view out of the column flow.
         let find_overlay = find::build_overlay(ui, theme);
-        let diff_with_find: Element<'a, Message> = stack![diff_view, find_overlay].into();
+        let description_editor = build_description_editor(ui, theme, description_editor_height);
+        let diff_with_find: Element<'a, Message> =
+            stack![diff_view, description_editor, find_overlay]
+                .clip(true)
+                .into();
 
         column![stats_bar, diff_with_find].spacing(0).into()
     };
@@ -139,6 +180,243 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
         .clip(true)
         .style(move |_| diff_panel_style(theme))
         .into()
+}
+
+fn build_description_editor<'a>(
+    ui: &'a Diffui,
+    theme: ThemeSpec,
+    block_height: f32,
+) -> Element<'a, Message> {
+    if let Some(editor) = ui.description_editor.as_ref()
+        && editor.target == ui.session.selected_revision
+    {
+        let saving = editor.saving_activity.is_some();
+        let input_height =
+            block_height - DESCRIPTION_EDITOR_ACTIONS_HEIGHT - DESCRIPTION_EDITOR_GAP;
+        let mut input = text_editor(&editor.content)
+            .id(iced::widget::Id::new(DESCRIPTION_EDITOR_ID))
+            .placeholder("Describe this revision…")
+            .size(CODE_TEXT_SIZE)
+            .font(ui.config.mono_font)
+            .line_height(text::LineHeight::Relative(
+                crate::measure::LINE_HEIGHT_MULTIPLIER,
+            ))
+            .height(Length::Fixed(input_height))
+            .padding(Padding::from([DESCRIPTION_EDITOR_PADDING_Y, 12.0]))
+            .wrapping(text::Wrapping::Glyph)
+            .style(move |_, _| text_editor::Style {
+                background: Background::Color(theme.background),
+                border: Border {
+                    width: 1.0,
+                    color: theme.border,
+                    radius: crate::theme::radius::CONTROL.into(),
+                },
+                placeholder: theme.subtle_text,
+                value: theme.text,
+                selection: Color {
+                    a: 0.28,
+                    ..theme.accent
+                },
+            });
+        if !saving {
+            input = input.on_action(Message::DescriptionAction);
+        }
+
+        let cancel = button(text("Cancel").size(text_size::UI).font(ui.config.ui_font))
+            .padding(Padding::from([6, 12]))
+            .on_press_maybe((!saving).then_some(Message::DescriptionCancel))
+            .style(move |_, status| raised_button_style(theme, status));
+
+        let save_enabled = !saving && editor.is_dirty();
+        let save_label = if saving { "Saving…" } else { "Save" };
+        let save = button(text(save_label).size(text_size::UI).font(ui.config.ui_font))
+            .padding(Padding::from([6, 14]))
+            .on_press_maybe(save_enabled.then_some(Message::DescriptionSave))
+            .style(move |_, _| primary_button_style(theme));
+
+        let hint = if editor.switch_blocked {
+            "save or cancel before switching revisions"
+        } else {
+            "⌘↵ save · esc cancel"
+        };
+        let hint_color = if editor.switch_blocked {
+            theme.note_text
+        } else {
+            theme.subtle_text
+        };
+        let actions = row![
+            text(hint)
+                .size(text_size::CAPTION)
+                .font(ui.config.mono_font)
+                .color(hint_color),
+            Space::new().width(Length::Fill),
+            cancel,
+            save,
+        ]
+        .spacing(8)
+        .align_y(alignment::Vertical::Center);
+
+        let body = container(column![input, actions].spacing(8))
+            .width(Length::Fill)
+            .height(Length::Fixed(block_height));
+        let positioned = container(body)
+            .width(Length::Fill)
+            .height(Length::Fixed(
+                diff_view::HEADER_VERTICAL_PADDING + block_height,
+            ))
+            .padding(Padding {
+                top: diff_view::HEADER_VERTICAL_PADDING,
+                right: diff_view::HEADER_HORIZONTAL_PADDING,
+                bottom: 0.0,
+                left: diff_view::HEADER_HORIZONTAL_PADDING,
+            });
+        let offset = ui.diff_scroll_offset;
+        return ScrollTranslate::new(positioned.into(), Vector::new(0.0, -offset)).into();
+    }
+    Space::new().height(0).into()
+}
+
+fn description_editor_height(ui: &Diffui) -> f32 {
+    let Some(editor) = ui.description_editor.as_ref() else {
+        return 0.0;
+    };
+    let available_width = (ui.window_size.width
+        - ui.sidebar_width
+        - 1.0
+        - diff_view::HEADER_HORIZONTAL_PADDING * 2.0
+        - 24.0)
+        .max(1.0);
+    let char_width = crate::measure::line_width("M", CODE_TEXT_SIZE, ui.config.mono_font).max(1.0);
+    let chars_per_line = (available_width / char_width).floor().max(1.0) as usize;
+    let visual_lines = description_visual_line_count(&editor.text(), chars_per_line);
+    let input_height =
+        (visual_lines as f32 * CODE_TEXT_SIZE * crate::measure::LINE_HEIGHT_MULTIPLIER).ceil()
+            + DESCRIPTION_EDITOR_PADDING_Y * 2.0;
+    input_height + DESCRIPTION_EDITOR_GAP + DESCRIPTION_EDITOR_ACTIONS_HEIGHT
+}
+
+fn description_visual_line_count(content: &str, chars_per_line: usize) -> usize {
+    content
+        .split('\n')
+        .map(|line| line.chars().count().max(1).div_ceil(chars_per_line.max(1)))
+        .sum()
+}
+
+/// Moves the editor with the custom diff view's scroll offset while keeping it
+/// in the stack's normal clipped layer. `float` cannot be used here: iced
+/// promotes translated floats to a window-level overlay, letting the editor
+/// paint over the toolbar and tab strip after it scrolls above the diff pane.
+struct ScrollTranslate<'a> {
+    content: Element<'a, Message>,
+    translation: Vector,
+}
+
+impl<'a> ScrollTranslate<'a> {
+    fn new(content: Element<'a, Message>, translation: Vector) -> Self {
+        Self {
+            content,
+            translation,
+        }
+    }
+}
+
+impl Widget<Message, Theme, iced::Renderer> for ScrollTranslate<'_> {
+    fn tag(&self) -> tree::Tag {
+        self.content.as_widget().tag()
+    }
+
+    fn state(&self) -> tree::State {
+        self.content.as_widget().state()
+    }
+
+    fn children(&self) -> Vec<Tree> {
+        self.content.as_widget().children()
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        self.content.as_widget().diff(tree);
+    }
+
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+
+    fn size_hint(&self) -> Size<Length> {
+        self.content.as_widget().size_hint()
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &iced::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.content
+            .as_widget_mut()
+            .layout(tree, renderer, limits)
+            .translate(self.translation)
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &iced::Renderer,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        self.content
+            .as_widget_mut()
+            .update(tree, event, layout, cursor, renderer, shell, viewport);
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut iced::Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.content
+            .as_widget()
+            .draw(tree, renderer, theme, style, layout, cursor, viewport);
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &iced::Renderer,
+    ) -> mouse::Interaction {
+        self.content
+            .as_widget()
+            .mouse_interaction(tree, layout, cursor, viewport, renderer)
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &iced::Renderer,
+        operation: &mut dyn iced::advanced::widget::Operation,
+    ) {
+        self.content
+            .as_widget_mut()
+            .operate(tree, layout, renderer, operation);
+    }
+}
+
+impl<'a> From<ScrollTranslate<'a>> for Element<'a, Message> {
+    fn from(translated: ScrollTranslate<'a>) -> Self {
+        Element::new(translated)
+    }
 }
 
 /// Compact stats line shown above the diff scroll area: saturated
@@ -215,14 +493,22 @@ fn build_header_lines(
     details: &RevisionDetails,
     bookmark_color: Color,
     bookmark_font: iced::Font,
+    editable_description: bool,
+    editing_description: bool,
+    description_editor_height: f32,
 ) -> Vec<diff_view::HeaderLine> {
     use diff_view::HeaderLine;
     let mut lines: Vec<HeaderLine> = Vec::new();
 
-    if !details.description.is_empty() {
+    if editing_description {
+        lines.push(HeaderLine::spacer(description_editor_height));
+    } else if !details.description.is_empty() {
         for line in details.description.lines() {
             lines.push(HeaderLine::description(line));
         }
+        lines.push(HeaderLine::blank());
+    } else if editable_description {
+        lines.push(HeaderLine::description("(no description)"));
         lines.push(HeaderLine::blank());
     }
 
@@ -293,4 +579,17 @@ fn format_signature_line(sig: &SignatureInfo) -> String {
         parts.push(')');
     }
     parts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::description_visual_line_count;
+
+    #[test]
+    fn description_height_counts_newlines_wrapping_and_contraction() {
+        assert_eq!(description_visual_line_count("", 10), 1);
+        assert_eq!(description_visual_line_count("one\ntwo\n", 10), 3);
+        assert_eq!(description_visual_line_count("12345678901", 10), 2);
+        assert_eq!(description_visual_line_count("short", 10), 1);
+    }
 }

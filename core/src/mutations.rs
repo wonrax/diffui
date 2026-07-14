@@ -19,6 +19,11 @@ pub enum MutationOp {
     /// Discard `target`, re-parenting its descendants onto its parents
     /// (`jj abandon`).
     Abandon { target: RevisionSelection },
+    /// Replace the full description of `target` (`jj describe -r <target>`).
+    Describe {
+        target: RevisionSelection,
+        description: String,
+    },
     /// Point local bookmark `name` at `to`, creating it if needed
     /// (`jj bookmark set -r <to> <name>`).
     MoveBookmark { name: String, to: RevisionSelection },
@@ -39,6 +44,10 @@ pub struct MutationOutcome {
     /// working copy where it is, so the UI keeps the user's current selection
     /// instead of snapping back to the working copy.
     pub moved_working_copy: bool,
+    /// New commit id for a rewritten target that the frontend may still be
+    /// addressing by its old commit id. Lets selection follow the visible
+    /// rewritten commit after a description change.
+    pub rewritten_commit: Option<String>,
     /// Captured remote/sideband output (push only) — e.g. GitHub's "create a
     /// pull request" hint + URL. Shown in the activity's expanded row. Empty for
     /// local mutations.

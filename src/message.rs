@@ -65,6 +65,11 @@ pub(crate) enum Message {
     /// on-screen rect (window-content points) so the glow can be anchored over
     /// it, plus the cursor point the menu opens at.
     RevisionContextMenu(revision_list::RowSelectionKey, iced::Rectangle, iced::Point),
+    /// Turn the selected revision's description strip into its inline editor.
+    DescriptionEdit,
+    DescriptionAction(text_editor::Action),
+    DescriptionSave,
+    DescriptionCancel,
     /// A context-menu mutation (new/edit/abandon/bookmark/push) finished,
     /// tab-addressed with its activity id so push remote output lands in the
     /// right log.

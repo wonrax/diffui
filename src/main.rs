@@ -434,6 +434,32 @@ pub(crate) struct Diffui {
     /// The caret control the cursor is currently over, if any — drives the
     /// hover highlight that `mouse_area` (unlike `button`) doesn't provide.
     pub(crate) hovered: Option<HoverTarget>,
+    /// Inline editor for the selected jj revision's full description.
+    pub(crate) description_editor: Option<DescriptionEditor>,
+    /// A context-menu edit requested for a row that is still loading into the
+    /// detail pane. The editor opens when that revision's diff lands.
+    pub(crate) pending_description_edit: Option<RevisionSelection>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DescriptionEditor {
+    pub(crate) target: RevisionSelection,
+    pub(crate) original: String,
+    pub(crate) content: widget::text_editor::Content,
+    /// The mutation activity that owns an in-flight save. `None` means the
+    /// draft is editable.
+    pub(crate) saving_activity: Option<activity::ActivityId>,
+    pub(crate) switch_blocked: bool,
+}
+
+impl DescriptionEditor {
+    pub(crate) fn text(&self) -> String {
+        self.content.text()
+    }
+
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.text().trim_end() != self.original.trim_end()
+    }
 }
 
 /// A modal confirmation gating a mutation the jj CLI would refuse outright
@@ -734,6 +760,13 @@ fn selection_from_key(key: &revision_list::RowSelectionKey) -> RevisionSelection
     }
 }
 
+fn selection_key(selection: &RevisionSelection) -> revision_list::RowSelectionKey {
+    match selection {
+        RevisionSelection::WorkingCopy => revision_list::RowSelectionKey::WorkingCopy,
+        RevisionSelection::Commit(id) => revision_list::RowSelectionKey::Commit(id.clone()),
+    }
+}
+
 /// Welcome screen shown whenever no repository is open: a fresh launch with
 /// nothing to restore (including from the macOS/Spotlight launcher, where cwd is
 /// `/`), or after the last tab is closed. It's the "select a repo" entry point —
@@ -869,6 +902,8 @@ pub(crate) enum MenuAction {
         revision: RevisionSelection,
         path: Option<String>,
     },
+    /// Select the target revision and open its inline description editor.
+    EditDescription { target: RevisionSelection },
     /// Copy author / committer / the full description — read on demand. The
     /// in-memory graph keeps only the description's first line and no dates, so
     /// these need a fresh read; `fallback` is copied if that read fails.

@@ -17,8 +17,8 @@ use diffui_core::jj::{
     load_jj_commits, load_jj_diff, load_jj_repository_snapshot, read_jj_op_head,
 };
 use diffui_core::{
-    DiffFileStatus, DiffLineKind, LoadProgress, Repository, RevisionSelection, SourceEntryStatus,
-    Vcs, list_ignored_dir, list_source_tree, load_source_file,
+    DiffFileStatus, DiffLineKind, LoadProgress, MutationOp, Repository, RevisionSelection,
+    SourceEntryStatus, Vcs, list_ignored_dir, list_source_tree, load_source_file,
 };
 
 fn block_on<F: Future>(future: F) -> F::Output {
@@ -266,6 +266,39 @@ fn hidden_copy_is_flagged_with_its_change_offset() {
     assert_eq!(store.len(), 1);
     assert_eq!(store.row(0).commit_id(), old_commit);
     assert!(store.row(0).is_hidden());
+}
+
+#[test]
+#[ignore = "shells out to the jj CLI"]
+fn describe_mutation_replaces_the_full_message_without_moving_working_copy() {
+    let root = scratch_repo("describe-mutation");
+    write(&root, "file.txt", "hello\n");
+    jj(&root, &["commit", "-m", "old description"]);
+    let target = commit_id(&root, "@-");
+    let working_copy_change = change_id(&root, "@");
+    let description = "subject\n\nmultiline body";
+
+    let outcome = block_on(diffui_core::mutations::run_mutation(
+        repository(&root),
+        MutationOp::Describe {
+            target: RevisionSelection::Commit(target.clone()),
+            description: description.to_owned(),
+        },
+        LoadProgress::default(),
+    ))
+    .expect("describe mutation");
+
+    assert!(!outcome.moved_working_copy);
+    assert_eq!(change_id(&root, "@"), working_copy_change);
+    let rewritten = outcome.rewritten_commit.expect("rewritten commit id");
+    assert_ne!(rewritten, target, "describe rewrites the commit");
+    assert_eq!(
+        jj(
+            &root,
+            &["log", "--no-graph", "-r", &rewritten, "-T", "description",]
+        ),
+        description
+    );
 }
 
 /// Opening a secondary workspace (`jj workspace add`) must resolve `@` to

@@ -78,6 +78,13 @@ impl Diffui {
         if target == self.active_tab {
             return Task::none();
         }
+        if let Some(editor) = self.description_editor.as_mut()
+            && (editor.is_dirty() || editor.saving_activity.is_some())
+        {
+            editor.switch_blocked = true;
+            return Task::none();
+        }
+        self.description_editor = None;
         // Persist the new active tab so it's re-focused next launch.
         self.mark_geometry_dirty();
 
@@ -158,6 +165,16 @@ impl Diffui {
         let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
             return Task::none();
         };
+        if index == self.active_tab
+            && let Some(editor) = self.description_editor.as_mut()
+            && (editor.is_dirty() || editor.saving_activity.is_some())
+        {
+            editor.switch_blocked = true;
+            return Task::none();
+        }
+        if index == self.active_tab {
+            self.description_editor = None;
+        }
         // The open-tab set is changing — re-persist the session.
         self.mark_geometry_dirty();
 

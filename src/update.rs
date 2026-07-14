@@ -252,6 +252,8 @@ impl Diffui {
             confirm: None,
             activity_popover_open: false,
             hovered: None,
+            description_editor: None,
+            pending_description_edit: None,
         };
 
         let theme_task = system::theme().map(Message::SystemThemeChanged);
@@ -679,7 +681,7 @@ impl Diffui {
                     }
 
                     let revision_changed = target.session.selected_revision != revision;
-                    target.session.selected_revision = revision;
+                    target.session.selected_revision = revision.clone();
                     target.session.pending_revision = None;
                     target.session.loading_since = None;
                     target.session.status = LoadStatus::Loaded;
@@ -712,14 +714,30 @@ impl Diffui {
                     if is_active {
                         self.document_version = self.document_version.wrapping_add(1);
                     }
+                    let open_description_editor =
+                        is_active && self.pending_description_edit.as_ref() == Some(&revision);
+                    if open_description_editor {
+                        self.pending_description_edit = None;
+                    }
                     // Drain a refresh coalesced while this diff load was in
                     // flight (e.g. an op-log signal during a watcher reload) —
                     // this arm returns early, so it would otherwise wait for
                     // the next unrelated message to hit the fall-through.
                     let pending = self.take_pending_refresh();
-                    return Task::batch([self.spawn_highlights(document_id), pending]);
+                    return Task::batch([
+                        self.spawn_highlights(document_id),
+                        pending,
+                        if open_description_editor {
+                            Task::done(Message::DescriptionEdit)
+                        } else {
+                            Task::none()
+                        },
+                    ]);
                 }
                 Err(error) => {
+                    if self.pending_description_edit.as_ref() == Some(&revision) {
+                        self.pending_description_edit = None;
+                    }
                     let Some(target) = self.tab_target_mut(tab) else {
                         return Task::none();
                     };
@@ -913,6 +931,15 @@ impl Diffui {
                     revision_list::RowSelectionKey::WorkingCopy => RevisionSelection::WorkingCopy,
                     revision_list::RowSelectionKey::Commit(id) => RevisionSelection::Commit(id),
                 };
+                if self.session.selected_revision != selection {
+                    if let Some(editor) = self.description_editor.as_mut()
+                        && editor.is_dirty()
+                    {
+                        editor.switch_blocked = true;
+                        return Task::none();
+                    }
+                    self.description_editor = None;
+                }
                 // Re-clicking the already-selected revision toggles its file
                 // list without re-running the backend or changing the diff.
                 // The toggled value persists across revision switches, so
@@ -998,7 +1025,98 @@ impl Diffui {
                     cursor,
                 );
             }
+            Message::DescriptionEdit => {
+                if self
+                    .description_editor
+                    .as_ref()
+                    .is_some_and(|editor| editor.target == self.session.selected_revision)
+                {
+                    return iced::widget::operation::focus(iced::widget::Id::new(
+                        diff_panel::DESCRIPTION_EDITOR_ID,
+                    ));
+                }
+                let Some(details) = self.session.revision_details.as_ref() else {
+                    return Task::none();
+                };
+                let editable = self
+                    .session
+                    .repository
+                    .as_ref()
+                    .is_some_and(|repo| matches!(repo.vcs, Vcs::Jj));
+                if !editable {
+                    return Task::none();
+                }
+                // The editor occupies the description's slot in the scrollable
+                // revision header. Reveal it before focusing when editing was
+                // triggered from farther down a diff.
+                self.diff_scroll_offset = 0.0;
+                self.scroll_restore_token = self.scroll_restore_token.wrapping_add(1);
+                self.find = None;
+                let description = details.description.clone();
+                self.description_editor = Some(DescriptionEditor {
+                    target: self.session.selected_revision.clone(),
+                    original: description.clone(),
+                    content: widget::text_editor::Content::with_text(&description),
+                    saving_activity: None,
+                    switch_blocked: false,
+                });
+                return iced::widget::operation::focus(iced::widget::Id::new(
+                    diff_panel::DESCRIPTION_EDITOR_ID,
+                ));
+            }
+            Message::DescriptionAction(action) => {
+                if let Some(editor) = self.description_editor.as_mut()
+                    && editor.saving_activity.is_none()
+                {
+                    editor.content.perform(action);
+                    editor.switch_blocked = false;
+                }
+            }
+            Message::DescriptionCancel => {
+                if self
+                    .description_editor
+                    .as_ref()
+                    .is_some_and(|editor| editor.saving_activity.is_none())
+                {
+                    self.description_editor = None;
+                    self.pending_description_edit = None;
+                }
+            }
+            Message::DescriptionSave => {
+                let Some(editor) = self.description_editor.as_ref() else {
+                    return Task::none();
+                };
+                if editor.saving_activity.is_some() || !editor.is_dirty() {
+                    return Task::none();
+                }
+                let Some(repository) = self.session.repository.clone() else {
+                    return Task::none();
+                };
+                let Some(tab_id) = self.active_tab_id() else {
+                    return Task::none();
+                };
+                let op = mutations::MutationOp::Describe {
+                    target: editor.target.clone(),
+                    description: editor.text().trim_end().to_owned(),
+                };
+                let (activity_id, progress) = self.begin_activity("Update description", false);
+                if let Some(editor) = self.description_editor.as_mut() {
+                    editor.saving_activity = Some(activity_id);
+                    editor.switch_blocked = false;
+                }
+                return self.enqueue_or_run_mutation(PendingMutation {
+                    repository,
+                    op,
+                    tab_id,
+                    activity_id,
+                    progress,
+                });
+            }
             Message::MutationCompleted(tab_id, id, result) => {
+                let description_save = self
+                    .description_editor
+                    .as_ref()
+                    .is_some_and(|editor| editor.saving_activity == Some(id));
                 match *result {
                     Ok(outcome) => {
                         if let Some(log) = self.activity_log_for(tab_id) {
@@ -1017,6 +1135,11 @@ impl Diffui {
                         // drains, in `advance_mutation_queue`.
                         if outcome.moved_working_copy {
                             self.session.selected_revision = RevisionSelection::WorkingCopy;
+                        } else if let Some(commit_id) = outcome.rewritten_commit {
+                            self.session.selected_revision = RevisionSelection::Commit(commit_id);
+                        }
+                        if description_save {
+                            self.description_editor = None;
                         }
                     }
                     Err(error) => {
@@ -1026,6 +1149,9 @@ impl Diffui {
                         if let Some(log) = self.activity_log_for(tab_id) {
                             log.append_output(id, error.clone());
                             log.finish(id, activity::ActivityStatus::Error, Some(error));
+                        }
+                        if description_save && let Some(editor) = self.description_editor.as_mut() {
+                            editor.saving_activity = None;
                         }
                     }
                 }
@@ -3405,6 +3531,7 @@ impl Diffui {
             self.menu.is_some(),
             self.activity_popover_open,
             self.confirm.is_some(),
+            self.description_editor.is_some(),
         );
 
         let keyboard = event::listen_with(|event, status, _window| match event {
@@ -3419,7 +3546,15 @@ impl Diffui {
         .with(flags)
         .filter_map(
             |(
-                (palette_open, find_open, dialog_open, menu_open, popover_open, confirm_open),
+                (
+                    palette_open,
+                    find_open,
+                    dialog_open,
+                    menu_open,
+                    popover_open,
+                    confirm_open,
+                    description_editor_open,
+                ),
                 (key, modifiers, ignored),
             )| {
                 // A confirmation dialog owns the keyboard: Esc cancels (there
@@ -3429,6 +3564,20 @@ impl Diffui {
                     return match key.as_ref() {
                         keyboard::Key::Named(keyboard::key::Named::Escape) => {
                             Some(Message::ConfirmCancel)
+                        }
+                        _ => None,
+                    };
+                }
+
+                if description_editor_open {
+                    return match key.as_ref() {
+                        keyboard::Key::Named(keyboard::key::Named::Escape) => {
+                            Some(Message::DescriptionCancel)
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::Enter)
+                            if modifiers.command() =>
+                        {
+                            Some(Message::DescriptionSave)
                         }
                         _ => None,
                     };
