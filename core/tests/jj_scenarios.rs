@@ -17,9 +17,11 @@ use diffui_core::jj::{
     load_jj_commits, load_jj_diff, load_jj_repository_snapshot, read_jj_op_head,
 };
 use diffui_core::{
-    DiffFileStatus, DiffLineKind, LoadProgress, MutationOp, Repository, RevisionSelection,
-    SourceEntryStatus, Vcs, list_ignored_dir, list_source_tree, load_source_file,
+    Destination, DiffFileStatus, DiffLineKind, LoadProgress, MutationOp, RebaseSourceMode,
+    Repository, RevisionSelection, SquashTarget, Vcs, list_ignored_dir, list_source_tree,
+    load_source_file,
 };
+use diffui_core::{SourceEntryStatus, mutations};
 
 fn block_on<F: Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
@@ -30,9 +32,12 @@ fn block_on<F: Future>(future: F) -> F::Output {
 }
 
 /// Run `jj` in `dir`, panicking (with stderr) on failure; returns stdout.
+/// Signing is forced off: a user config with e.g. 1Password SSH signing
+/// would otherwise prompt (or hang) on every scratch-repo commit.
 fn jj(dir: &Path, args: &[&str]) -> String {
     let output = Command::new("jj")
         .current_dir(dir)
+        .args(["--config", "signing.behavior=keep"])
         .args(args)
         .env("JJ_USER", "Scenario Test")
         .env("JJ_EMAIL", "scenario@example.com")
@@ -50,12 +55,19 @@ fn write(dir: &Path, name: &str, contents: &str) {
     std::fs::write(dir.join(name), contents).expect("write scratch file");
 }
 
-/// A fresh scratch jj repo at a deterministic per-test path.
+/// A fresh scratch jj repo at a deterministic per-test path. The repo-level
+/// config turns signing off so diffui-core's *in-process* commits (which
+/// load the user's config, signing backend included) stay hermetic too.
 fn scratch_repo(test: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("diffui-core-scenario-{test}"));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create scratch dir");
     jj(&root, &["git", "init"]);
+    std::fs::write(
+        root.join(".jj/repo/config.toml"),
+        "[signing]\nbehavior = \"keep\"\n",
+    )
+    .expect("write scratch repo config");
     root
 }
 
@@ -73,6 +85,33 @@ fn change_id(dir: &Path, revset: &str) -> String {
 
 fn commit_id(dir: &Path, revset: &str) -> String {
     jj(dir, &["log", "--no-graph", "-r", revset, "-T", "commit_id"])
+}
+
+/// Commit ids of `revset`'s parents, one per line, unordered.
+fn parent_ids(dir: &Path, revset: &str) -> Vec<String> {
+    jj(
+        dir,
+        &[
+            "log",
+            "--no-graph",
+            "-r",
+            &format!("parents({revset})"),
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ],
+    )
+    .lines()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn run(root: &Path, op: MutationOp) -> mutations::MutationOutcome {
+    block_on(mutations::run_mutation(
+        repository(root),
+        op,
+        LoadProgress::default(),
+    ))
+    .expect("mutation succeeds")
 }
 
 /// base → sideA / sideB (both rewrite the same line) → `@` = conflicted merge.
@@ -511,6 +550,713 @@ fn source_browser_lists_and_reads_working_copy_and_commits() {
         "notes.txt".to_owned(),
     ));
     assert!(missing.is_err(), "missing paths must error: {missing:?}");
+}
+
+/// `jj rebase -r`: a leaf moves onto a new destination; the outcome tracks
+/// the rewritten commit so the frontend's selection can follow it.
+#[test]
+#[ignore = "shells out to the jj CLI"]
+fn rebase_revision_moves_a_leaf_onto_the_destination() {
+    let root = scratch_repo("rebase-onto");
+    write(&root, "file.txt", "base\n");
+    jj(&root, &["commit", "-m", "base"]);
+    let base = commit_id(&root, "@-");
+    write(&root, "file.txt", "base\nx\n");
+    jj(&root, &["commit", "-m", "x"]);
+    let x = commit_id(&root, "description(exact:\"x\\n\")");
+    jj(&root, &["new", "-r", &base, "-m", "y", "--no-edit"]);
+    let y = commit_id(&root, "description(exact:\"y\\n\")");
+    let y_change = change_id(&root, "description(exact:\"y\\n\")");
+
+    let outcome = run(
+        &root,
+        MutationOp::Rebase {
+            mode: RebaseSourceMode::Revisions,
+            sources: vec![RevisionSelection::Commit(y.clone())],
+            destination: Destination::Onto(RevisionSelection::Commit(x.clone())),
+        },
+    );
+
+    assert_eq!(parent_ids(&root, &y_change), vec![x.clone()]);
+    let rewritten = outcome.rewritten_commit.expect("rebase rewrote the leaf");
+    assert_ne!(rewritten, y, "a moved commit gets a new commit id");
+    assert_eq!(commit_id(&root, &y_change), rewritten);
+    assert!(!outcome.moved_working_copy);
+    assert!(outcome.operation_id.is_some());
+}
+
+/// `jj rebase -A a -B b` (the gap-drop gesture): the moved leaf lands exactly
+/// between the two revisions — child re-parented onto it, it onto the parent.
+#[test]
+#[ignore = "shells out to the jj CLI"]
+fn rebase_between_inserts_into_the_gap() {
+    let root = scratch_repo("rebase-between");
+    write(&root, "file.txt", "base\n");
+    jj(&root, &["commit", "-m", "base"]);
+    let base = commit_id(&root, "description(exact:\"base\\n\")");
+    write(&root, "file.txt", "base\nmid\n");
+    jj(&root, &["commit", "-m", "mid"]);
+    let mid_change = change_id(&root, "description(exact:\"mid\\n\")");
+    jj(&root, &["new", "-r", &base, "-m", "leaf", "--no-edit"]);
+    let leaf = commit_id(&root, "description(exact:\"leaf\\n\")");
+    let leaf_change = change_id(&root, "description(exact:\"leaf\\n\")");
+    let mid = commit_id(&root, "description(exact:\"mid\\n\")");
+
+    run(
+        &root,
+        MutationOp::Rebase {
+            mode: RebaseSourceMode::Revisions,
+            sources: vec![RevisionSelection::Commit(leaf.clone())],
+            destination: Destination::Between {
+                parent: RevisionSelection::Commit(base.clone()),
+                child: RevisionSelection::Commit(mid),
+            },
+        },
+    );
+
+    // leaf keeps base as its parent; mid is re-parented onto leaf.
+    assert_eq!(parent_ids(&root, &leaf_change), vec![base]);
+    assert_eq!(
+        parent_ids(&root, &mid_change),
+        vec![commit_id(&root, &leaf_change)]
+    );
+}
+
+/// `jj rebase -s`: the picked revision moves together with its descendants.
+#[test]
+#[ignore = "shells out to the jj CLI"]
+fn rebase_with_descendants_moves_the_subtree() {
+    let root = scratch_repo("rebase-descendants");
+    write(&root, "file.txt", "base\n");
+    jj(&root, &["commit", "-m", "base"]);
+    let base = commit_id(&root, "description(exact:\"base\\n\")");
+    write(&root, "file.txt", "base\ns1\n");
+    jj(&root, &["commit", "-m", "s1"]);
+    write(&root, "file.txt", "base\ns1\ns2\n");
+    jj(&root, &["commit", "-m", "s2"]);
+    let s1 = commit_id(&root, "description(exact:\"s1\\n\")");
+    let s1_change = change_id(&root, "description(exact:\"s1\\n\")");
+    let s2_change = change_id(&root, "description(exact:\"s2\\n\")");
+    jj(&root, &["new", "-r", &base, "-m", "dest", "--no-edit"]);
+    let dest = commit_id(&root, "description(exact:\"dest\\n\")");
+
+    run(
+        &root,
+        MutationOp::Rebase {
+            mode: RebaseSourceMode::WithDescendants,
+            sources: vec![RevisionSelection::Commit(s1)],
+            destination: Destination::Onto(RevisionSelection::Commit(dest.clone())),
+        },
+    );
+
+    assert_eq!(parent_ids(&root, &s1_change), vec![dest]);
+    assert_eq!(
+        parent_ids(&root, &s2_change),
+        vec![commit_id(&root, &s1_change)]
+    );
+}
+
+/// `jj rebase -b`: pointing at the branch *head* moves the whole branch from
+/// its fork-point root — no hunting for the first commit — and a branch
+/// that's already an ancestor of the destination refuses cleanly.
+#[test]
+#[ignore = "shells out to the jj CLI"]
+fn rebase_branch_moves_the_whole_branch_from_its_fork_point() {
+    let root = scratch_repo("rebase-branch");
+    write(&root, "file.txt", "base\n");
+    jj(&root, &["commit", "-m", "base"]);
+    let base = commit_id(&root, "description(exact:\"base\\n\")");
+    write(&root, "file.txt", "base\nmain1\n");
+    jj(&root, &["commit", "-m", "main1"]);
+    let main1 = commit_id(&root, "description(exact:\"main1\\n\")");
+    // Feature branch forked at base: f1 → f2.
+    jj(&root, &["new", &base, "-m", "f1"]);
+    write(&root, "feature.txt", "f1\n");
+    jj(&root, &["new", "-m", "f2"]);
+    write(&root, "feature.txt", "f1\nf2\n");
+    jj(&root, &["new", "@", "-m", "wc off branch"]);
+    let f1_change = change_id(&root, "description(exact:\"f1\\n\")");
+    let f1 = commit_id(&root, "description(exact:\"f1\\n\")");
+    let f2 = commit_id(&root, "description(exact:\"f2\\n\")");
+    let f2_change = change_id(&root, "description(exact:\"f2\\n\")");
+
+    // The preview resolves and names the branch: entry point = the fork
+    // root (f1), moved set = the whole branch — even though the *head* was
+    // picked. That's what the op bar shows and the sidebar washes.
+    let preview = block_on(mutations::run_rebase_preview(
+        repository(&root),
+        RebaseSourceMode::Branch,
+        vec![RevisionSelection::Commit(f2.clone())],
+        Destination::Onto(RevisionSelection::Commit(main1.clone())),
+    ))
+    .expect("branch preview succeeds");
+    let f1_short: String = f1_change.chars().take(8).collect();
+    assert_eq!(preview.entry_points, vec![f1_short]);
+    assert_eq!(preview.moved, 3, "f1 + f2 + the wc child all move");
+    assert!(preview.moved_commit_ids.contains(&f1));
+    assert!(preview.moved_commit_ids.contains(&f2));
+
+    // Point at the branch *head*; the fork-point root (f1) is what moves.
+    run(
+        &root,
+        MutationOp::Rebase {
+            mode: RebaseSourceMode::Branch,
+            sources: vec![RevisionSelection::Commit(f2)],
+            destination: Destination::Onto(RevisionSelection::Commit(main1.clone())),
+        },
+    );
+
+    assert_eq!(parent_ids(&root, &f1_change), vec![main1]);
+    assert_eq!(
+        parent_ids(&root, &f2_change),
+        vec![commit_id(&root, &f1_change)]
+    );
+
+    // A destination inside the branch (a descendant of the source) leaves
+    // nothing outside it to move: a benign no-op like the CLI's "Nothing
+    // changed" — both in the preview (so j/k walking the branch's own rows
+    // reads calmly, not as a failure)…
+    let base_sel = commit_id(&root, "description(exact:\"base\\n\")");
+    let dest = commit_id(&root, &f2_change);
+    let empty = block_on(mutations::run_rebase_preview(
+        repository(&root),
+        RebaseSourceMode::Branch,
+        vec![RevisionSelection::Commit(base_sel.clone())],
+        Destination::Onto(RevisionSelection::Commit(dest.clone())),
+    ))
+    .expect("in-branch preview is a clean empty result, not an error");
+    assert!(empty.simulated);
+    assert_eq!(empty.moved, 0);
+    assert!(empty.entry_points.is_empty());
+    // …and in the executed op.
+    let outcome = run(
+        &root,
+        MutationOp::Rebase {
+            mode: RebaseSourceMode::Branch,
+            sources: vec![RevisionSelection::Commit(base_sel)],
+            destination: Destination::Onto(RevisionSelection::Commit(dest)),
+        },
+    );
+    assert!(
+        outcome.message.contains("Nothing to rebase"),
+        "got: {}",
+        outcome.message
+    );
+}
+
+/// Squash into the parent: the source's tree change lands in the parent, the
+/// source is abandoned, and both descriptions survive joined by a blank line.
+#[test]
+#[ignore = "shells out to the jj CLI"]
+fn squash_into_parent_folds_changes_and_descriptions() {
+    let root = scratch_repo("squash-parent");
+    write(&root, "file.txt", "one\n");
+    jj(&root, &["commit", "-m", "base message"]);
+    let base_change = change_id(&root, "description(glob:\"base*\")");
+    write(&root, "file.txt", "one\ntwo\n");
+    jj(&root, &["commit", "-m", "child message"]);
+    let child = commit_id(&root, "description(glob:\"child*\")");
+    let child_change = change_id(&root, "description(glob:\"child*\")");
+
+    let outcome = run(
+        &root,
+        MutationOp::Squash {
+            from: vec![RevisionSelection::Commit(child)],
+            into: SquashTarget::Parent,
+        },
+    );
+
+    // The squashed-into parent now carries the child's tree...
+    assert_eq!(
+        jj(&root, &["file", "show", "-r", &base_change, "file.txt"]),
+        "one\ntwo\n"
+    );
+    // ...and the joined descriptions.
+    assert_eq!(
+        jj(
+            &root,
+            &["log", "--no-graph", "-r", &base_change, "-T", "description"]
+        ),
+        "base message\n\nchild message\n"
+    );
+    // The emptied source is gone from the visible set.
+    assert_eq!(
+        jj(
+            &root,
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                &format!("present({child_change})"),
+                "-T",
+                "commit_id",
+            ]
+        ),
+        ""
+    );
+    // Selection follows the rewritten destination.
+    assert_eq!(
+        outcome.rewritten_commit.expect("squash rewrites the dest"),
+        commit_id(&root, &base_change)
+    );
+}
+
+/// Squash into an arbitrary (non-parent) revision on a sibling branch.
+#[test]
+#[ignore = "shells out to the jj CLI"]
+fn squash_into_arbitrary_revision() {
+    let root = scratch_repo("squash-into");
+    write(&root, "a.txt", "a\n");
+    jj(&root, &["commit", "-m", "base"]);
+    let base = commit_id(&root, "description(exact:\"base\\n\")");
+    write(&root, "b.txt", "b\n");
+    jj(&root, &["commit", "-m", "source"]);
+    let source = commit_id(&root, "description(exact:\"source\\n\")");
+    jj(&root, &["new", "-r", &base, "-m", "dest", "--no-edit"]);
+    let dest_change = change_id(&root, "description(exact:\"dest\\n\")");
+
+    run(
+        &root,
+        MutationOp::Squash {
+            from: vec![RevisionSelection::Commit(source)],
+            into: SquashTarget::Revision(RevisionSelection::Commit(commit_id(
+                &root,
+                "description(exact:\"dest\\n\")",
+            ))),
+        },
+    );
+
+    assert_eq!(
+        jj(&root, &["file", "show", "-r", &dest_change, "b.txt"]),
+        "b\n"
+    );
+}
+
+/// `jj squash --from a --from b --into c`: the draft's add-source path folds
+/// several revisions into one destination in a single op; a parent-target
+/// squash with several sources is refused (whose parent?).
+#[test]
+#[ignore = "shells out to the jj CLI"]
+fn squash_multiple_sources_into_one_destination() {
+    let root = scratch_repo("squash-multi");
+    write(&root, "base.txt", "base\n");
+    jj(&root, &["commit", "-m", "base"]);
+    let base = commit_id(&root, "description(exact:\"base\\n\")");
+    write(&root, "a.txt", "a\n");
+    jj(&root, &["commit", "-m", "src a"]);
+    let src_a = commit_id(&root, "description(glob:\"src a*\")");
+    jj(&root, &["new", "-r", &base]);
+    write(&root, "b.txt", "b\n");
+    jj(&root, &["commit", "-m", "src b"]);
+    let src_b = commit_id(&root, "description(glob:\"src b*\")");
+    jj(&root, &["new", "-r", &base, "-m", "dest", "--no-edit"]);
+    let dest = commit_id(&root, "description(exact:\"dest\\n\")");
+    let dest_change = change_id(&root, "description(exact:\"dest\\n\")");
+
+    run(
+        &root,
+        MutationOp::Squash {
+            from: vec![
+                RevisionSelection::Commit(src_a.clone()),
+                RevisionSelection::Commit(src_b.clone()),
+            ],
+            into: SquashTarget::Revision(RevisionSelection::Commit(dest)),
+        },
+    );
+
+    // Both sources' trees landed in the destination…
+    assert_eq!(
+        jj(&root, &["file", "show", "-r", &dest_change, "a.txt"]),
+        "a\n"
+    );
+    assert_eq!(
+        jj(&root, &["file", "show", "-r", &dest_change, "b.txt"]),
+        "b\n"
+    );
+    // …with all three descriptions joined.
+    assert_eq!(
+        jj(
+            &root,
+            &["log", "--no-graph", "-r", &dest_change, "-T", "description"]
+        ),
+        "dest\n\nsrc a\n\nsrc b\n"
+    );
+
+    // Parent target + several sources is ambiguous and refused.
+    let result = block_on(mutations::run_mutation(
+        repository(&root),
+        MutationOp::Squash {
+            from: vec![
+                RevisionSelection::Commit(src_a),
+                RevisionSelection::Commit(src_b),
+            ],
+            into: SquashTarget::Parent,
+        },
+        LoadProgress::default(),
+    ));
+    let error = result.expect_err("multi-source parent squash must fail");
+    assert!(error.contains("explicit destination"), "got: {error}");
+}
+
+/// `jj new A B`: the merge draft's confirm creates a child of both picked
+/// revisions and moves `@` onto it.
+#[test]
+#[ignore = "shells out to the jj CLI"]
+fn merge_creates_a_child_of_both_parents() {
+    let root = scratch_repo("merge-two");
+    write(&root, "base.txt", "base\n");
+    jj(&root, &["commit", "-m", "base"]);
+    let base = commit_id(&root, "description(exact:\"base\\n\")");
+    write(&root, "x.txt", "x\n");
+    jj(&root, &["commit", "-m", "x"]);
+    let x = commit_id(&root, "description(exact:\"x\\n\")");
+    jj(&root, &["new", "-r", &base, "-m", "y", "--no-edit"]);
+    let y = commit_id(&root, "description(exact:\"y\\n\")");
+
+    let outcome = run(
+        &root,
+        MutationOp::Merge {
+            parents: vec![
+                RevisionSelection::Commit(x.clone()),
+                RevisionSelection::Commit(y.clone()),
+            ],
+        },
+    );
+
+    assert!(outcome.moved_working_copy, "@ moves onto the merge");
+    let mut parents = parent_ids(&root, "@");
+    parents.sort_unstable();
+    let mut expected = vec![x, y];
+    expected.sort_unstable();
+    assert_eq!(parents, expected);
+    // The merged tree carries both sides.
+    assert_eq!(jj(&root, &["file", "show", "-r", "@", "x.txt"]), "x\n");
+    assert_eq!(
+        jj(&root, &["file", "show", "-r", "@", "base.txt"]),
+        "base\n"
+    );
+
+    // A merge with one distinct parent is refused.
+    let result = block_on(mutations::run_mutation(
+        repository(&root),
+        MutationOp::Merge {
+            parents: vec![
+                RevisionSelection::Commit(base.clone()),
+                RevisionSelection::Commit(base.clone()),
+            ],
+        },
+        LoadProgress::default(),
+    ));
+    let error = result.expect_err("self-merge must fail");
+    assert!(error.contains("two distinct parents"), "got: {error}");
+
+    // Octopus: the draft's add-parent path sends all stacked parents in one
+    // op — three distinct parents make a three-way merge commit.
+    jj(&root, &["new", "-r", &base, "-m", "z", "--no-edit"]);
+    let z = commit_id(&root, "description(exact:\"z\\n\")");
+    let x = commit_id(&root, "description(exact:\"x\\n\")");
+    let y = commit_id(&root, "description(exact:\"y\\n\")");
+    run(
+        &root,
+        MutationOp::Merge {
+            parents: vec![
+                RevisionSelection::Commit(x.clone()),
+                RevisionSelection::Commit(y.clone()),
+                RevisionSelection::Commit(z.clone()),
+            ],
+        },
+    );
+    let mut parents = parent_ids(&root, "@");
+    parents.sort_unstable();
+    let mut expected = vec![x, y, z];
+    expected.sort_unstable();
+    assert_eq!(parents, expected, "three-parent octopus merge");
+}
+
+/// The merge preview names the paths that would conflict, without writing an
+/// operation.
+#[test]
+#[ignore = "shells out to the jj CLI"]
+fn merge_preview_lists_conflicting_paths() {
+    let root = scratch_repo("merge-preview");
+    write(&root, "file.txt", "line1\nline2\nline3\n");
+    jj(&root, &["commit", "-m", "base"]);
+    let base = commit_id(&root, "description(exact:\"base\\n\")");
+    write(&root, "file.txt", "line1\nSIDE-A\nline3\n");
+    jj(&root, &["commit", "-m", "sideA"]);
+    let side_a = commit_id(&root, "description(exact:\"sideA\\n\")");
+    jj(&root, &["new", "-r", &base]);
+    write(&root, "file.txt", "line1\nSIDE-B\nline3\n");
+    jj(&root, &["commit", "-m", "sideB"]);
+    let side_b = commit_id(&root, "description(exact:\"sideB\\n\")");
+
+    let head_before = block_on(diffui_core::jj::read_jj_op_head(repository(&root)))
+        .expect("read op head before preview");
+
+    let preview = block_on(mutations::run_merge_preview(
+        repository(&root),
+        vec![
+            RevisionSelection::Commit(side_a),
+            RevisionSelection::Commit(side_b.clone()),
+        ],
+    ))
+    .expect("conflicting preview succeeds");
+    assert_eq!(preview.conflicts, vec!["file.txt".to_owned()]);
+    assert!(!preview.truncated);
+
+    let clean = block_on(mutations::run_merge_preview(
+        repository(&root),
+        vec![
+            RevisionSelection::Commit(base),
+            RevisionSelection::Commit(side_b),
+        ],
+    ))
+    .expect("clean preview succeeds");
+    assert!(clean.conflicts.is_empty());
+
+    let head_after = block_on(diffui_core::jj::read_jj_op_head(repository(&root)))
+        .expect("read op head after preview");
+    assert_eq!(
+        head_before, head_after,
+        "previews must not write operations"
+    );
+}
+
+/// `jj duplicate`: a sibling copy with the same tree and parents appears; the
+/// original stays put.
+#[test]
+#[ignore = "shells out to the jj CLI"]
+fn duplicate_creates_a_sibling_copy() {
+    let root = scratch_repo("duplicate");
+    write(&root, "file.txt", "one\n");
+    jj(&root, &["commit", "-m", "base"]);
+    write(&root, "file.txt", "one\ntwo\n");
+    jj(&root, &["commit", "-m", "orig"]);
+    let orig = commit_id(&root, "description(exact:\"orig\\n\")");
+
+    let outcome = run(
+        &root,
+        MutationOp::Duplicate {
+            target: RevisionSelection::Commit(orig.clone()),
+        },
+    );
+
+    let copies = jj(
+        &root,
+        &[
+            "log",
+            "--no-graph",
+            "-r",
+            "description(exact:\"orig\\n\")",
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ],
+    );
+    let copies: Vec<&str> = copies.lines().collect();
+    assert_eq!(copies.len(), 2, "original + duplicate: {copies:?}");
+    let duplicate = outcome.rewritten_commit.expect("duplicate id reported");
+    assert_ne!(duplicate, orig);
+    assert!(copies.contains(&duplicate.as_str()));
+    assert!(copies.contains(&orig.as_str()));
+    // Same parents, same tree.
+    assert_eq!(parent_ids(&root, &duplicate), parent_ids(&root, &orig));
+    assert_eq!(
+        jj(&root, &["file", "show", "-r", &duplicate, "file.txt"]),
+        "one\ntwo\n"
+    );
+}
+
+/// `jj absorb`: the working copy's hunk lands in the ancestor that last
+/// touched those lines, and the emptied working copy is discarded.
+#[test]
+#[ignore = "shells out to the jj CLI"]
+fn absorb_moves_hunks_into_the_touching_ancestor() {
+    let root = scratch_repo("absorb");
+    write(&root, "file.txt", "line1\nline2\nline3\n");
+    jj(&root, &["commit", "-m", "base"]);
+    let base_change = change_id(&root, "description(exact:\"base\\n\")");
+    // Edit an existing line in the working copy — annotate attributes it to
+    // the base commit, so absorb folds it there.
+    write(&root, "file.txt", "line1\nline2 edited\nline3\n");
+    jj(&root, &["status"]);
+
+    let outcome = run(
+        &root,
+        MutationOp::Absorb {
+            from: RevisionSelection::WorkingCopy,
+        },
+    );
+
+    assert_eq!(
+        jj(&root, &["file", "show", "-r", &base_change, "file.txt"]),
+        "line1\nline2 edited\nline3\n"
+    );
+    assert_eq!(
+        jj(
+            &root,
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                "@",
+                "-T",
+                "if(empty, \"empty\", \"nonempty\")"
+            ]
+        ),
+        "empty"
+    );
+    assert!(
+        outcome
+            .output
+            .iter()
+            .any(|line| line.starts_with("absorbed into")),
+        "absorb reports its destinations: {:?}",
+        outcome.output
+    );
+}
+
+/// Per-activity undo: reverting one specific operation by id brings the
+/// abandoned commit back.
+#[test]
+#[ignore = "shells out to the jj CLI"]
+fn undo_operation_reverts_a_specific_mutation() {
+    let root = scratch_repo("undo-op");
+    write(&root, "file.txt", "one\n");
+    jj(&root, &["commit", "-m", "victim"]);
+    let victim_change = change_id(&root, "description(exact:\"victim\\n\")");
+    let victim = commit_id(&root, "description(exact:\"victim\\n\")");
+
+    let outcome = run(
+        &root,
+        MutationOp::Abandon {
+            target: RevisionSelection::Commit(victim),
+        },
+    );
+    assert_eq!(
+        jj(
+            &root,
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                &format!("present({victim_change})"),
+                "-T",
+                "commit_id",
+            ]
+        ),
+        "",
+        "the abandon must hide the commit first"
+    );
+
+    let op_id = outcome.operation_id.expect("mutations record their op id");
+    block_on(mutations::run_undo_operation(repository(&root), op_id)).expect("undo the abandon");
+
+    assert!(
+        !jj(
+            &root,
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                &format!("present({victim_change})"),
+                "-T",
+                "commit_id",
+            ]
+        )
+        .is_empty(),
+        "undoing the abandon brings the commit back"
+    );
+}
+
+/// Rewrites of immutable commits are refused, honoring the repo's configured
+/// `immutable_heads()` override.
+#[test]
+#[ignore = "shells out to the jj CLI"]
+fn immutable_commits_refuse_rebase() {
+    let root = scratch_repo("immutable-guard");
+    write(&root, "file.txt", "one\n");
+    jj(&root, &["commit", "-m", "protected base"]);
+    // Written straight into the repo dir (the pre-0.41 layout diffui-core
+    // reads) rather than via `jj config set --repo`, which since jj 0.41
+    // writes into the *user's* `~/.config/jj/repos/<id>/` — a test must not
+    // leave artifacts there. Keeps the scratch repo's signing-off table.
+    std::fs::write(
+        root.join(".jj/repo/config.toml"),
+        "[signing]\nbehavior = \"keep\"\n\n\
+         [revset-aliases]\n'immutable_heads()' = 'description(glob:\"protected*\")'\n",
+    )
+    .expect("write repo config");
+    let protected = commit_id(&root, "description(glob:\"protected*\")");
+    let wc = commit_id(&root, "@");
+
+    let result = block_on(mutations::run_mutation(
+        repository(&root),
+        MutationOp::Rebase {
+            mode: RebaseSourceMode::Revisions,
+            sources: vec![RevisionSelection::Commit(protected)],
+            destination: Destination::Onto(RevisionSelection::Commit(wc)),
+        },
+        LoadProgress::default(),
+    ));
+
+    let error = result.expect_err("rebasing an immutable commit must fail");
+    assert!(
+        error.contains("immutable"),
+        "error names immutability: {error}"
+    );
+}
+
+/// The rebase preview predicts conflicts without touching the repo's visible
+/// state: the op log head must not move, and the conflicting change is named.
+#[test]
+#[ignore = "shells out to the jj CLI"]
+fn rebase_preview_predicts_conflicts_without_mutating() {
+    let root = scratch_repo("rebase-preview");
+    write(&root, "file.txt", "line1\nline2\nline3\n");
+    jj(&root, &["commit", "-m", "base"]);
+    let base = commit_id(&root, "description(exact:\"base\\n\")");
+    write(&root, "file.txt", "line1\nSIDE-A\nline3\n");
+    jj(&root, &["commit", "-m", "sideA"]);
+    let side_a = commit_id(&root, "description(exact:\"sideA\\n\")");
+    jj(&root, &["new", "-r", &base]);
+    write(&root, "file.txt", "line1\nSIDE-B\nline3\n");
+    jj(&root, &["commit", "-m", "sideB"]);
+    let side_b = commit_id(&root, "description(exact:\"sideB\\n\")");
+    let side_b_change = change_id(&root, "description(exact:\"sideB\\n\")");
+
+    let head_before = block_on(diffui_core::jj::read_jj_op_head(repository(&root)))
+        .expect("read op head before preview");
+
+    let preview = block_on(mutations::run_rebase_preview(
+        repository(&root),
+        RebaseSourceMode::Revisions,
+        vec![RevisionSelection::Commit(side_b.clone())],
+        Destination::Onto(RevisionSelection::Commit(side_a)),
+    ))
+    .expect("preview succeeds");
+
+    assert!(preview.simulated);
+    assert_eq!(preview.moved, 1);
+    let expected_short: String = side_b_change.chars().take(8).collect();
+    assert_eq!(preview.new_conflicts, vec![expected_short]);
+
+    // A non-conflicting placement predicts none.
+    let clean = block_on(mutations::run_rebase_preview(
+        repository(&root),
+        RebaseSourceMode::Revisions,
+        vec![RevisionSelection::Commit(side_b)],
+        Destination::Onto(RevisionSelection::Commit(base)),
+    ))
+    .expect("clean preview succeeds");
+    assert!(clean.simulated);
+    assert!(clean.new_conflicts.is_empty());
+
+    let head_after = block_on(diffui_core::jj::read_jj_op_head(repository(&root)))
+        .expect("read op head after preview");
+    assert_eq!(
+        head_before, head_after,
+        "previews must not write operations"
+    );
 }
 
 /// The snapshot must expose the op it was based on, so a frontend can tell

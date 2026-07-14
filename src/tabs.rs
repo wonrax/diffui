@@ -85,6 +85,9 @@ impl Diffui {
             return Task::none();
         }
         self.description_editor = None;
+        // A draft's sources are rows of the tab it started in — it can't
+        // survive a tab switch.
+        self.op_draft = None;
         // Persist the new active tab so it's re-focused next launch.
         self.mark_geometry_dirty();
 

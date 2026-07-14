@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use bstr::BStr;
 use futures::StreamExt;
 use jj_lib::{
+    absorb::{AbsorbSource, absorb_hunks, split_hunks_to_trees},
     backend::{CommitId, TreeId},
     commit::Commit,
     config::{ConfigLayer, ConfigSource, StackedConfig},
@@ -37,7 +38,8 @@ use jj_lib::{
     matchers::{EverythingMatcher, Matcher, NothingMatcher, PrefixMatcher},
     merge::{Diff, Merge, SameChange},
     object_id::ObjectId,
-    op_store::{LocalRemoteRefTarget, RefTarget, View},
+    op_store::{LocalRemoteRefTarget, OperationId, RefTarget, View},
+    operation::Operation,
     ref_name::{RefName, RefNameBuf, RemoteName, RemoteNameBuf, WorkspaceName, WorkspaceNameBuf},
     repo::{MutableRepo, ReadonlyRepo, Repo, RepoLoader, StoreFactories},
     repo_path::{RepoPath, RepoPathBuf, RepoPathUiConverter},
@@ -46,7 +48,11 @@ use jj_lib::{
         RevsetParseContext, RevsetWorkspaceContext, SymbolResolver, UserRevsetExpression,
         parse as parse_revset,
     },
-    rewrite::merge_commit_trees,
+    rewrite::{
+        CommitWithSelection, MoveCommitsLocation, MoveCommitsStats, MoveCommitsTarget,
+        RebaseOptions, RebasedCommit, duplicate_commits_onto_parents, merge_commit_trees,
+        move_commits, squash_commits,
+    },
     settings::{HumanByteSize, UserSettings},
     str_util::{StringExpression, StringPattern},
     tree_merge::MergeOptions,
@@ -65,7 +71,7 @@ use crate::model::{
     DiffFileStatus, DiffHunkView, DiffLine, DiffLineKind, LoadProgress, RemoteBookmarkRef,
     RevisionDetails, RevisionSelection, SignatureInfo, StreamRow,
 };
-use crate::mutations::{MutationOp, MutationOutcome};
+use crate::mutations::{Destination, MutationOp, MutationOutcome, RebaseSourceMode, SquashTarget};
 use crate::repository::{Repository, RepositorySnapshot};
 use crate::source_browse::{SourceEntry, SourceEntryStatus, SourceFileData};
 
@@ -1809,8 +1815,9 @@ pub(crate) async fn apply_mutation(
         .context("jj workspace has no working-copy commit")?
         .clone();
 
-    // Captured remote output (push only); empty for local mutations.
-    let mut push_output: Vec<String> = Vec::new();
+    // Captured side output: remote sideband for push, skipped/absorbed notes
+    // for absorb; empty for the other mutations.
+    let mut output: Vec<String> = Vec::new();
     let mut rewritten_commit: Option<String> = None;
     let message = match &op {
         MutationOp::New { parent } => {
@@ -1865,6 +1872,268 @@ pub(crate) async fn apply_mutation(
             }
             format!("Updated description for {short}")
         }
+        MutationOp::Rebase {
+            mode,
+            sources,
+            destination,
+        } => {
+            let mut source_commits: Vec<Commit> = Vec::new();
+            let mut seen: HashSet<CommitId> = HashSet::new();
+            for selection in sources {
+                let commit = resolve_mutation_target(tx.repo(), &current_wc_id, selection).await?;
+                if seen.insert(commit.id().clone()) {
+                    source_commits.push(commit);
+                }
+            }
+            if source_commits.is_empty() {
+                bail!("rebase needs at least one source revision");
+            }
+            let source_ids: Vec<CommitId> = source_commits.iter().map(|c| c.id().clone()).collect();
+            let (new_parent_ids, mut new_child_ids, anchor) =
+                resolve_rebase_location(tx.repo(), &current_wc_id, destination).await?;
+            // `-A parent-of-X` lists X itself among the target's children;
+            // moved commits can't also be insertion children (the CLI
+            // subtracts the target set the same way).
+            new_child_ids.retain(|id| !seen.contains(id));
+            match resolve_move_target(tx.repo(), *mode, &source_ids, &new_parent_ids).await? {
+                // Branch mode with the destination inside the branch: a
+                // benign no-op, like the CLI's "Nothing changed".
+                None => format!(
+                    "Nothing to rebase — the branch is already based on {}",
+                    short_change_id(&anchor)
+                ),
+                Some(target) => {
+                    // Both the moved commits (the target set's entry points)
+                    // and the commits that gain a parent (insert-after's
+                    // children / insert-before's target) get rewritten. For
+                    // branch mode the moved roots imply the whole subtree,
+                    // and immutability is ancestor-closed — an immutable
+                    // descendant means an immutable root — so checking the
+                    // roots covers the set.
+                    let mut rewritten: Vec<CommitId> = match &target {
+                        MoveCommitsTarget::Commits(ids) | MoveCommitsTarget::Roots(ids) => {
+                            ids.clone()
+                        }
+                    };
+                    rewritten.extend(new_child_ids.iter().cloned());
+                    ensure_rewritable(
+                        &repository.root,
+                        &settings,
+                        &workspace_name,
+                        tx.repo(),
+                        &rewritten,
+                    )
+                    .await?;
+                    let location = MoveCommitsLocation {
+                        new_parent_ids,
+                        new_child_ids,
+                        target,
+                    };
+                    let stats = move_commits(tx.repo_mut(), &location, &RebaseOptions::default())
+                        .await
+                        .context("failed to rebase")?;
+                    // Follow a lone rebased source under its new commit id,
+                    // so the row the user acted on doesn't go stale in the
+                    // sidebar selection.
+                    if let [RevisionSelection::Commit(_)] = sources.as_slice()
+                        && let Some(RebasedCommit::Rewritten(new_commit)) =
+                            stats.rebased_commits.get(&source_ids[0])
+                    {
+                        rewritten_commit = Some(new_commit.id().hex());
+                    }
+                    rebase_stats_message(&stats, &short_change_id(&anchor), destination)
+                }
+            }
+        }
+        MutationOp::Squash { from, into } => {
+            let mut source_commits: Vec<Commit> = Vec::new();
+            let mut seen: HashSet<CommitId> = HashSet::new();
+            for selection in from {
+                let commit = resolve_mutation_target(tx.repo(), &current_wc_id, selection).await?;
+                if seen.insert(commit.id().clone()) {
+                    source_commits.push(commit);
+                }
+            }
+            let [first_source, ..] = source_commits.as_slice() else {
+                bail!("squash needs at least one source revision");
+            };
+            let destination = match into {
+                SquashTarget::Parent => {
+                    if source_commits.len() > 1 {
+                        bail!("pick an explicit destination when squashing several revisions");
+                    }
+                    let parents = first_source
+                        .parents()
+                        .await
+                        .context("failed to load squash source parents")?;
+                    match parents.as_slice() {
+                        [parent] => parent.clone(),
+                        [] => bail!(
+                            "{} has no parent to squash into",
+                            short_change_id(first_source)
+                        ),
+                        _ => bail!(
+                            "{} is a merge — pick an explicit squash destination",
+                            short_change_id(first_source)
+                        ),
+                    }
+                }
+                SquashTarget::Revision(target) => {
+                    resolve_mutation_target(tx.repo(), &current_wc_id, target).await?
+                }
+            };
+            if seen.contains(destination.id()) {
+                bail!("can't squash a revision into itself");
+            }
+            let mut rewritten: Vec<CommitId> = seen.iter().cloned().collect();
+            rewritten.push(destination.id().clone());
+            ensure_rewritable(
+                &repository.root,
+                &settings,
+                &workspace_name,
+                tx.repo(),
+                &rewritten,
+            )
+            .await?;
+            let source_names: Vec<String> = source_commits.iter().map(short_change_id).collect();
+            let short_dest = short_change_id(&destination);
+            let combined = combined_squash_description(&destination, &source_commits);
+            let mut selections: Vec<CommitWithSelection> = Vec::new();
+            for source in source_commits {
+                selections.push(CommitWithSelection {
+                    selected_tree: source.tree(),
+                    parent_tree: source
+                        .parent_tree(tx.repo())
+                        .await
+                        .context("failed to load squash source parent tree")?,
+                    commit: source,
+                });
+            }
+            let Some(squashed) = squash_commits(tx.repo_mut(), &selections, &destination, false)
+                .await
+                .context("failed to squash")?
+            else {
+                bail!(
+                    "nothing to squash from {} — no changes there",
+                    source_names.join(", ")
+                );
+            };
+            let new_destination = squashed
+                .commit_builder
+                .set_description(combined)
+                .write()
+                .await
+                .context("failed to write squashed commit")?;
+            rewritten_commit = Some(new_destination.id().hex());
+            format!("Squashed {} into {short_dest}", source_names.join(", "))
+        }
+        MutationOp::Merge { parents } => {
+            let mut parent_commits: Vec<Commit> = Vec::new();
+            let mut seen: HashSet<CommitId> = HashSet::new();
+            for selection in parents {
+                let commit = resolve_mutation_target(tx.repo(), &current_wc_id, selection).await?;
+                if seen.insert(commit.id().clone()) {
+                    parent_commits.push(commit);
+                }
+            }
+            if parent_commits.len() < 2 {
+                bail!("a merge needs at least two distinct parents");
+            }
+            let names: Vec<String> = parent_commits.iter().map(short_change_id).collect();
+            let tree = merge_commit_trees(tx.repo(), &parent_commits)
+                .await
+                .context("failed to merge parent trees")?;
+            let parent_ids: Vec<CommitId> = parent_commits.iter().map(|c| c.id().clone()).collect();
+            let merge_commit = tx
+                .repo_mut()
+                .new_commit(parent_ids, tree)
+                .write()
+                .await
+                .context("failed to write merge commit")?;
+            tx.repo_mut()
+                .edit(workspace_name.clone(), &merge_commit)
+                .await
+                .context("failed to point working copy at merge commit")?;
+            format!("New merge of {}", names.join(" + "))
+        }
+        MutationOp::Duplicate { target } => {
+            let commit = resolve_mutation_target(tx.repo(), &current_wc_id, target).await?;
+            let short = short_change_id(&commit);
+            let stats = duplicate_commits_onto_parents(
+                tx.repo_mut(),
+                &[commit.id().clone()],
+                &HashMap::new(),
+            )
+            .await
+            .context("failed to duplicate")?;
+            match stats.duplicated_commits.get(commit.id()) {
+                Some(duplicate) => {
+                    rewritten_commit = Some(duplicate.id().hex());
+                    format!("Duplicated {short} as {}", short_change_id(duplicate))
+                }
+                None => format!("Duplicated {short}"),
+            }
+        }
+        MutationOp::Absorb { from } => {
+            let source = resolve_mutation_target(tx.repo(), &current_wc_id, from).await?;
+            let short = short_change_id(&source);
+            ensure_rewritable(
+                &repository.root,
+                &settings,
+                &workspace_name,
+                tx.repo(),
+                &[source.id().clone()],
+            )
+            .await?;
+            let absorb_source = AbsorbSource::from_commit(tx.repo(), source.clone())
+                .await
+                .context("failed to prepare absorb source")?;
+            // Destinations mirror `jj absorb`'s default `--into`: the mutable
+            // ancestors of the source's parents. Scoped so the resolver's
+            // borrow of `tx` ends before the mutating absorb below.
+            let destinations = {
+                let mutable =
+                    parse_user_revset(&repository.root, &settings, &workspace_name, "mutable()")?;
+                let symbol_resolver = SymbolResolver::new(
+                    tx.repo(),
+                    &[] as &[Box<dyn jj_lib::revset::SymbolResolverExtension>],
+                );
+                let mutable = mutable
+                    .resolve_user_expression(tx.repo(), &symbol_resolver)
+                    .context("failed to resolve mutable()")?;
+                RevsetExpression::commits(source.parent_ids().to_vec())
+                    .ancestors()
+                    .intersection(&mutable)
+            };
+            let selected =
+                split_hunks_to_trees(tx.repo(), &absorb_source, &destinations, &EverythingMatcher)
+                    .await
+                    .context("failed to plan absorb")?;
+            for (path, reason) in &selected.skipped_paths {
+                output.push(format!(
+                    "skipped {}: {reason}",
+                    path.as_internal_file_string()
+                ));
+            }
+            if selected.target_commits.is_empty() {
+                bail!(
+                    "nothing to absorb from {short} — no mutable ancestor touches the same lines"
+                );
+            }
+            let stats = absorb_hunks(tx.repo_mut(), &absorb_source, selected.target_commits)
+                .await
+                .context("failed to absorb")?;
+            for commit in &stats.rewritten_destinations {
+                let subject = commit.description().lines().next().unwrap_or("").trim();
+                output.push(format!(
+                    "absorbed into {} {subject}",
+                    short_change_id(commit)
+                ));
+            }
+            let count = stats.rewritten_destinations.len();
+            let plural = if count == 1 { "" } else { "s" };
+            format!("Absorbed {short} into {count} revision{plural}")
+        }
         MutationOp::MoveBookmark { name, to } => {
             let commit = resolve_mutation_target(tx.repo(), &current_wc_id, to).await?;
             let short = short_change_id(&commit);
@@ -1887,9 +2156,9 @@ pub(crate) async fn apply_mutation(
             format!("Tracking {name}@{remote}")
         }
         MutationOp::PushBookmark { name, remote } => {
-            let (message, output) =
+            let (message, remote_output) =
                 push_bookmark(&settings, tx.repo_mut(), name, remote, &progress)?;
-            push_output = output;
+            output = remote_output;
             message
         }
     };
@@ -1936,13 +2205,413 @@ pub(crate) async fn apply_mutation(
 
     let moved_working_copy = matches!(
         op,
-        MutationOp::New { .. } | MutationOp::Edit { .. } | MutationOp::Abandon { .. }
+        MutationOp::New { .. }
+            | MutationOp::Edit { .. }
+            | MutationOp::Abandon { .. }
+            | MutationOp::Merge { .. }
     );
     Ok(MutationOutcome {
         message,
         moved_working_copy,
         rewritten_commit,
-        output: push_output,
+        output,
+        operation_id: Some(new_repo.op_id().hex()),
+    })
+}
+
+/// Resolve a rebase [`Destination`] into jj-lib's location parts: the new
+/// parents, the new children (the commits that get the moved set inserted
+/// under them), and the anchor commit for labels. Mirrors `jj rebase`'s
+/// `-d` / `-A` / `-B` / `-A x -B y` resolution.
+async fn resolve_rebase_location(
+    repo: &MutableRepo,
+    current_wc_id: &CommitId,
+    destination: &Destination,
+) -> Result<(Vec<CommitId>, Vec<CommitId>, Commit)> {
+    Ok(match destination {
+        Destination::Onto(target) => {
+            let anchor = resolve_mutation_target(repo, current_wc_id, target).await?;
+            (vec![anchor.id().clone()], Vec::new(), anchor)
+        }
+        Destination::After(target) => {
+            let anchor = resolve_mutation_target(repo, current_wc_id, target).await?;
+            let children = RevsetExpression::commits(vec![anchor.id().clone()])
+                .children()
+                .evaluate(repo)
+                .context("failed to resolve the target's children")?
+                .iter()
+                .map(|entry| entry.context("failed to walk the target's children"))
+                .collect::<Result<Vec<CommitId>>>()?;
+            (vec![anchor.id().clone()], children, anchor)
+        }
+        Destination::Before(target) => {
+            let anchor = resolve_mutation_target(repo, current_wc_id, target).await?;
+            (
+                anchor.parent_ids().to_vec(),
+                vec![anchor.id().clone()],
+                anchor,
+            )
+        }
+        Destination::Between { parent, child } => {
+            let parent = resolve_mutation_target(repo, current_wc_id, parent).await?;
+            let child = resolve_mutation_target(repo, current_wc_id, child).await?;
+            (vec![parent.id().clone()], vec![child.id().clone()], parent)
+        }
+    })
+}
+
+/// The ids in the reverse-topological order (children first) that
+/// `MoveCommitsTarget::Commits` requires — revset iteration order guarantees
+/// it.
+async fn reverse_topo_order(repo: &MutableRepo, ids: &[CommitId]) -> Result<Vec<CommitId>> {
+    RevsetExpression::commits(ids.to_vec())
+        .evaluate(repo)
+        .context("failed to order rebase sources")?
+        .iter()
+        .map(|entry| entry.context("failed to walk rebase sources"))
+        .collect()
+}
+
+/// Lower a rebase mode + picked sources into jj-lib's move target. Branch
+/// mode resolves here — against the destination — because the moved set is
+/// `roots(destination..sources)` (the CLI's `-b`): every commit reachable
+/// from the picked revisions but not from the new parents, entered at its
+/// fork-point roots.
+/// `None` means the branch has no commits outside the destination (the
+/// destination is the branch itself or one of its descendants) — a benign
+/// nothing-to-do, mirroring the CLI's "Nothing changed", not an error.
+async fn resolve_move_target(
+    repo: &MutableRepo,
+    mode: RebaseSourceMode,
+    source_ids: &[CommitId],
+    new_parent_ids: &[CommitId],
+) -> Result<Option<MoveCommitsTarget>> {
+    Ok(Some(match mode {
+        RebaseSourceMode::Revisions => {
+            MoveCommitsTarget::Commits(reverse_topo_order(repo, source_ids).await?)
+        }
+        RebaseSourceMode::WithDescendants => MoveCommitsTarget::Roots(source_ids.to_vec()),
+        RebaseSourceMode::Branch => {
+            let roots: Vec<CommitId> = RevsetExpression::commits(new_parent_ids.to_vec())
+                .range(&RevsetExpression::commits(source_ids.to_vec()))
+                .roots()
+                .evaluate(repo)
+                .context("failed to resolve the branch's fork-point roots")?
+                .iter()
+                .map(|entry| entry.context("failed to walk the branch roots"))
+                .collect::<Result<_>>()?;
+            if roots.is_empty() {
+                return Ok(None);
+            }
+            MoveCommitsTarget::Roots(roots)
+        }
+    }))
+}
+
+/// jj CLI parity: refuse to rewrite immutable commits. `immutable()` resolves
+/// through the same alias map the revset filter uses, so a user override of
+/// `immutable_heads()` is honored.
+async fn ensure_rewritable(
+    repo_root: &Path,
+    settings: &UserSettings,
+    workspace_name: &WorkspaceName,
+    repo: &MutableRepo,
+    ids: &[CommitId],
+) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let expr = parse_user_revset(repo_root, settings, workspace_name, "immutable()")?;
+    let symbol_resolver = SymbolResolver::new(
+        repo,
+        &[] as &[Box<dyn jj_lib::revset::SymbolResolverExtension>],
+    );
+    let resolved = expr
+        .resolve_user_expression(repo, &symbol_resolver)
+        .context("failed to resolve immutable()")?;
+    let check = resolved.intersection(&RevsetExpression::commits(ids.to_vec()));
+    let first = check
+        .evaluate(repo)
+        .context("failed to evaluate immutable()")?
+        .iter()
+        .next()
+        .transpose()
+        .context("failed to check immutability")?;
+    if let Some(id) = first {
+        let commit = repo
+            .store()
+            .get_commit_async(&id)
+            .await
+            .with_context(|| format!("failed to load jj commit {}", id.hex()))?;
+        bail!(
+            "refusing to rewrite immutable commit {} — override \
+             revset-aliases.\"immutable_heads()\" if this is intentional",
+            short_change_id(&commit)
+        );
+    }
+    Ok(())
+}
+
+/// One-line activity summary for a finished rebase, from jj-lib's stats.
+fn rebase_stats_message(
+    stats: &MoveCommitsStats,
+    anchor: &str,
+    destination: &Destination,
+) -> String {
+    let place = match destination {
+        Destination::Onto(_) => "onto",
+        Destination::After(_) => "after",
+        Destination::Before(_) => "before",
+        Destination::Between { .. } => "between",
+    };
+    let moved = stats.num_rebased_targets;
+    if moved == 0 && stats.num_skipped_rebases > 0 {
+        return "Nothing to rebase — already in place".to_owned();
+    }
+    let plural = if moved == 1 { "" } else { "s" };
+    let mut message = format!("Rebased {moved} revision{plural} {place} {anchor}");
+    if stats.num_rebased_descendants > 0 {
+        let n = stats.num_rebased_descendants;
+        let plural = if n == 1 { "" } else { "s" };
+        message.push_str(&format!(" ({n} descendant{plural} followed)"));
+    }
+    if stats.num_abandoned_empty > 0 {
+        message.push_str(&format!(
+            " ({} emptied, abandoned)",
+            stats.num_abandoned_empty
+        ));
+    }
+    message
+}
+
+/// Squash description policy: keep whichever side has one; when both do,
+/// join them with a blank line (destination first, like `jj squash`'s
+/// combined-editor prefill). The user can refine it afterwards with the
+/// inline description editor.
+fn combined_squash_description(destination: &Commit, sources: &[Commit]) -> String {
+    let parts: Vec<&str> = std::iter::once(destination)
+        .chain(sources)
+        .map(|commit| commit.description().trim())
+        .filter(|description| !description.is_empty())
+        .collect();
+    if parts.is_empty() {
+        return String::new();
+    }
+    // Stored descriptions end with a newline (jj's own convention).
+    let mut combined = parts.join("\n\n");
+    combined.push('\n');
+    combined
+}
+
+/// Predict a merge draft's outcome: merge the parents' trees in a throwaway
+/// transaction and list the paths that stay conflicted. Same storage caveat
+/// as [`preview_rebase`] — unreachable objects only, no op written.
+pub(crate) async fn preview_merge(
+    repository: Repository,
+    parents: Vec<RevisionSelection>,
+) -> Result<crate::mutations::MergePreview> {
+    const CONFLICT_LIST_CAP: usize = 6;
+
+    let settings = jj_settings(&repository.root)?;
+    let workspace = Workspace::load(
+        &settings,
+        &repository.root,
+        &StoreFactories::default(),
+        &default_working_copy_factories(),
+    )
+    .context("failed to load jj workspace")?;
+    let workspace_name = workspace.workspace_name().to_owned();
+    let repo = workspace
+        .repo_loader()
+        .load_at_head()
+        .await
+        .context("failed to load jj repo")?;
+    let wc_commit_id = repo
+        .view()
+        .get_wc_commit_id(&workspace_name)
+        .context("jj workspace has no working-copy commit")?
+        .clone();
+
+    let tx = repo.start_transaction();
+    let mut parent_commits: Vec<Commit> = Vec::new();
+    let mut seen: HashSet<CommitId> = HashSet::new();
+    for selection in &parents {
+        let commit = resolve_mutation_target(tx.repo(), &wc_commit_id, selection).await?;
+        if seen.insert(commit.id().clone()) {
+            parent_commits.push(commit);
+        }
+    }
+    if parent_commits.len() < 2 {
+        bail!("a merge needs at least two distinct parents");
+    }
+    let tree = merge_commit_trees(tx.repo(), &parent_commits)
+        .await
+        .context("failed to merge parent trees")?;
+    let mut conflicts: Vec<String> = Vec::new();
+    let mut truncated = false;
+    for (path, _value) in tree.conflicts() {
+        if conflicts.len() == CONFLICT_LIST_CAP {
+            truncated = true;
+            break;
+        }
+        conflicts.push(path.as_internal_file_string().to_owned());
+    }
+    // `tx` dropped — nothing committed.
+    Ok(crate::mutations::MergePreview {
+        conflicts,
+        truncated,
+    })
+}
+
+/// Predict a rebase draft's outcome by running the real `move_commits` inside
+/// a transaction that is never committed: exact moved/descendant counts and
+/// which commits become conflicted that weren't before. The simulation writes
+/// unreachable content-addressed objects to the backend store (like any
+/// abandoned jj op would); the op log and views are untouched, so nothing is
+/// visible and `jj util gc` reclaims them. Skipped past
+/// [`REBASE_PREVIEW_SIMULATION_CAP`] affected commits — counts only then.
+pub(crate) async fn preview_rebase(
+    repository: Repository,
+    mode: RebaseSourceMode,
+    sources: Vec<RevisionSelection>,
+    destination: Destination,
+) -> Result<crate::mutations::RebasePreview> {
+    const REBASE_PREVIEW_SIMULATION_CAP: usize = 400;
+
+    let settings = jj_settings(&repository.root)?;
+    let workspace = Workspace::load(
+        &settings,
+        &repository.root,
+        &StoreFactories::default(),
+        &default_working_copy_factories(),
+    )
+    .context("failed to load jj workspace")?;
+    let workspace_name = workspace.workspace_name().to_owned();
+    let repo = workspace
+        .repo_loader()
+        .load_at_head()
+        .await
+        .context("failed to load jj repo")?;
+    let wc_commit_id = repo
+        .view()
+        .get_wc_commit_id(&workspace_name)
+        .context("jj workspace has no working-copy commit")?
+        .clone();
+
+    let mut tx = repo.start_transaction();
+    let mut source_ids: Vec<CommitId> = Vec::new();
+    let mut seen: HashSet<CommitId> = HashSet::new();
+    for selection in &sources {
+        let commit = resolve_mutation_target(tx.repo(), &wc_commit_id, selection).await?;
+        if seen.insert(commit.id().clone()) {
+            source_ids.push(commit.id().clone());
+        }
+    }
+    if source_ids.is_empty() {
+        bail!("rebase needs at least one source revision");
+    }
+    let (new_parent_ids, mut new_child_ids, _anchor) =
+        resolve_rebase_location(tx.repo(), &wc_commit_id, &destination).await?;
+    new_child_ids.retain(|id| !seen.contains(id));
+    let Some(target) = resolve_move_target(tx.repo(), mode, &source_ids, &new_parent_ids).await?
+    else {
+        // Branch mode with the destination inside the branch itself: nothing
+        // would move. A first-class empty preview (not an error) so the op
+        // bar can say so while the candidate walks the branch's own rows.
+        return Ok(crate::mutations::RebasePreview {
+            moved: 0,
+            descendants: 0,
+            abandoned_empty: 0,
+            new_conflicts: Vec::new(),
+            entry_points: Vec::new(),
+            moved_commit_ids: Vec::new(),
+            simulated: true,
+        });
+    };
+
+    // Entry points of the moved set — for branch mode these are the resolved
+    // fork-point roots, i.e. the answer to "which branch would this move?".
+    let entry_ids: Vec<CommitId> = match &target {
+        MoveCommitsTarget::Commits(ids) | MoveCommitsTarget::Roots(ids) => ids.clone(),
+    };
+    let mut entry_points: Vec<String> = Vec::new();
+    for id in &entry_ids {
+        let commit = tx
+            .repo()
+            .store()
+            .get_commit_async(id)
+            .await
+            .with_context(|| format!("failed to load jj commit {}", id.hex()))?;
+        entry_points.push(short_change_id(&commit));
+    }
+    entry_points.sort_unstable();
+
+    // The full moved set (Roots targets move their entire subtree; Commits
+    // targets move exactly themselves) — doubles as the size guard: past the
+    // cap each preview would cost a real rebase's worth of work, so it
+    // degrades to counts + entry points only. Also the sidebar's
+    // whole-branch wash.
+    let moved_ids: Vec<CommitId> = match &target {
+        MoveCommitsTarget::Commits(ids) => ids.clone(),
+        MoveCommitsTarget::Roots(ids) => RevsetExpression::commits(ids.clone())
+            .descendants()
+            .evaluate(tx.repo())
+            .context("failed to enumerate the moved set")?
+            .iter()
+            .take(REBASE_PREVIEW_SIMULATION_CAP + 1)
+            .map(|entry| entry.context("failed to walk the moved set"))
+            .collect::<Result<_>>()?,
+    };
+    if moved_ids.len() > REBASE_PREVIEW_SIMULATION_CAP {
+        return Ok(crate::mutations::RebasePreview {
+            moved: moved_ids.len() as u32,
+            descendants: 0,
+            abandoned_empty: 0,
+            new_conflicts: Vec::new(),
+            entry_points,
+            moved_commit_ids: Vec::new(),
+            simulated: false,
+        });
+    }
+    let moved_commit_ids: Vec<String> = moved_ids.iter().map(|id| id.hex()).collect();
+
+    let location = MoveCommitsLocation {
+        new_parent_ids,
+        new_child_ids,
+        target,
+    };
+    let stats = move_commits(tx.repo_mut(), &location, &RebaseOptions::default())
+        .await
+        .context("failed to simulate rebase")?;
+
+    let mut new_conflicts: Vec<String> = Vec::new();
+    for (old_id, rebased) in &stats.rebased_commits {
+        let RebasedCommit::Rewritten(new_commit) = rebased else {
+            continue;
+        };
+        if new_commit.tree_ids().is_resolved() {
+            continue;
+        }
+        let old = tx
+            .repo()
+            .store()
+            .get_commit_async(old_id)
+            .await
+            .with_context(|| format!("failed to load jj commit {}", old_id.hex()))?;
+        if old.tree_ids().is_resolved() {
+            new_conflicts.push(short_change_id(&old));
+        }
+    }
+    new_conflicts.sort_unstable();
+    // Dropping `tx` here discards the simulation — no op is committed.
+    Ok(crate::mutations::RebasePreview {
+        moved: stats.num_rebased_targets,
+        descendants: stats.num_rebased_descendants,
+        abandoned_empty: stats.num_abandoned_empty,
+        new_conflicts,
+        entry_points,
+        moved_commit_ids,
+        simulated: true,
     })
 }
 
@@ -1966,7 +2635,9 @@ async fn resolve_mutation_target(
 }
 
 fn short_change_id(commit: &Commit) -> String {
-    commit.change_id().hex().chars().take(8).collect()
+    // `to_string` is the k–z reverse-hex form jj log (and the sidebar) shows;
+    // `.hex()` would print the raw hex nobody ever sees.
+    commit.change_id().to_string().chars().take(8).collect()
 }
 
 /// Push a single local bookmark to `remote` inside the caller's transaction.
@@ -2334,6 +3005,107 @@ fn restore_repo_and_remote_tracking(restored: &View, current: &View) -> View {
     }
 }
 
+/// In-process `jj op undo <id>`: revert what *one specific operation* did,
+/// even when later operations exist — the activity log's per-entry Undo.
+/// Merges `(parent(op) − op)` onto the current view through jj's own op-merge
+/// machinery (exactly what `jj undo <op>` does), so unrelated later work is
+/// preserved rather than wiped the way an op *restore* would.
+pub(crate) async fn undo_jj_operation(
+    repository: Repository,
+    op_id_hex: String,
+) -> Result<Vec<String>> {
+    let settings = jj_settings(&repository.root)?;
+    let mut workspace = Workspace::load(
+        &settings,
+        &repository.root,
+        &StoreFactories::default(),
+        &default_working_copy_factories(),
+    )
+    .context("failed to load jj workspace")?;
+    let workspace_name = workspace.workspace_name().to_owned();
+
+    let repo_loader = workspace.repo_loader().clone();
+    let mut locked_ws = workspace
+        .start_working_copy_mutation()
+        .context("failed to lock jj working copy")?;
+    let base_repo = repo_loader
+        .load_at_head()
+        .await
+        .context("failed to load jj repo")?;
+
+    let op_id = OperationId::try_from_hex(&op_id_hex)
+        .with_context(|| format!("invalid jj operation id {op_id_hex}"))?;
+    let data = repo_loader
+        .op_store()
+        .read_operation(&op_id)
+        .await
+        .context("failed to load the operation to undo")?;
+    let op_to_undo = Operation::new(repo_loader.op_store().clone(), op_id, data);
+
+    let parents = op_to_undo
+        .parents()
+        .await
+        .context("failed to read operation parents")?;
+    let op_parent = match parents.as_slice() {
+        [parent] => parent.clone(),
+        [] => bail!("can't undo the root operation"),
+        _ => bail!("can't undo a merge operation"),
+    };
+    let undone_description = op_to_undo.metadata().description.clone();
+
+    let op_repo = repo_loader
+        .load_at(&op_to_undo)
+        .await
+        .context("failed to load the repo at the operation to undo")?;
+    let parent_repo = repo_loader
+        .load_at(&op_parent)
+        .await
+        .context("failed to load the repo before the operation to undo")?;
+
+    let mut tx = base_repo.start_transaction();
+    tx.repo_mut()
+        .merge(&op_repo, &parent_repo)
+        .await
+        .context("failed to merge the undo into the current view")?;
+    tx.repo_mut()
+        .rebase_descendants()
+        .await
+        .context("failed to rebase descendants after undo")?;
+    let new_repo = tx
+        .commit(format!("undo operation {}", op_to_undo.id().hex()))
+        .await
+        .context("failed to commit undo")?;
+
+    // Check out the resulting `@` so the working-copy files match it.
+    let new_wc_id = new_repo
+        .view()
+        .get_wc_commit_id(&workspace_name)
+        .context("jj workspace has no working-copy commit after undo")?
+        .clone();
+    let new_wc_commit = new_repo
+        .store()
+        .get_commit_async(&new_wc_id)
+        .await
+        .with_context(|| format!("failed to load working-copy commit {}", new_wc_id.hex()))?;
+    locked_ws
+        .locked_wc()
+        .check_out(&new_wc_commit)
+        .await
+        .context("failed to check out working copy after undo")?;
+    locked_ws
+        .finish(new_repo.op_id().clone())
+        .await
+        .context("failed to finish working-copy mutation after undo")?;
+
+    let undone = undone_description
+        .lines()
+        .next()
+        .filter(|line| !line.is_empty())
+        .unwrap_or("operation")
+        .to_owned();
+    Ok(vec![format!("Undid: {undone}")])
+}
+
 fn jj_revision_details(repo: &dyn Repo, commit: &jj_lib::commit::Commit) -> RevisionDetails {
     let commit_id = commit.id().clone();
     let change_id = commit.change_id().to_string();
@@ -2424,7 +3196,26 @@ pub(crate) fn jj_settings(repo_root: &Path) -> Result<UserSettings> {
     // primary repo's config. Best-effort: an unresolvable pointer just means
     // no repo-level config layer (Workspace::load will surface the breakage).
     if let Ok(repo_dir) = crate::repository::resolve_jj_repo_dir(repo_root) {
-        let repo_config = repo_dir.join("config.toml");
+        // jj ≤ 0.40 kept the repo config inside the repo dir; jj 0.41 moved it
+        // to `<user config dir>/repos/<config-id>/config.toml` with a
+        // `config-id` pointer file in the repo dir. Honor both, or a repo
+        // config written by a newer `jj config set --repo` is silently
+        // invisible here (revsets.log, immutable_heads() overrides, …).
+        let mut repo_config = repo_dir.join("config.toml");
+        if !repo_config.is_file()
+            && let Ok(id) = std::fs::read_to_string(repo_dir.join("config-id"))
+        {
+            let id = id.trim();
+            if !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric()) {
+                for dir in jj_user_config_paths() {
+                    let candidate = dir.join("repos").join(id).join("config.toml");
+                    if candidate.is_file() {
+                        repo_config = candidate;
+                        break;
+                    }
+                }
+            }
+        }
         if repo_config.is_file() {
             config
                 .load_file(ConfigSource::Repo, repo_config.clone())

@@ -439,7 +439,79 @@ pub(crate) struct Diffui {
     /// A context-menu edit requested for a row that is still loading into the
     /// detail pane. The editor opens when that revision's diff lands.
     pub(crate) pending_description_edit: Option<RevisionSelection>,
+    /// Active target-mode draft (rebase/squash destination picking), or
+    /// `None` outside target mode. Cleared on tab switch — a draft's sources
+    /// are rows of the tab it started in.
+    pub(crate) op_draft: Option<DraftUi>,
+    /// Transient error toasts (failed mutation/fetch/undo), newest last.
+    /// The activity log keeps the durable record; these only make a failure
+    /// impossible to miss. Auto-pruned after a few seconds, click to dismiss.
+    pub(crate) toasts: Vec<Toast>,
+    pub(crate) next_toast_id: u64,
+    /// Live keyboard modifier state, tracked from the event subscription so
+    /// pointer gestures can read it at decision time (⌥-drop = rebase with
+    /// descendants).
+    pub(crate) modifiers: keyboard::Modifiers,
 }
+
+/// Frontend wrapper around the core [`diffui_core::OpDraft`]: the draft
+/// itself plus the preview bookkeeping (version-guarded like every async
+/// load).
+#[derive(Debug, Clone)]
+pub(crate) struct DraftUi {
+    pub(crate) draft: diffui_core::OpDraft,
+    /// The live drag's drop spot, mirrored from the sidebar widget. While
+    /// `Some`, the widget draws the drop indicators itself and the keyboard
+    /// candidate's marker is suppressed.
+    pub(crate) hover_spot: Option<revision_list::DropSpot>,
+    /// Bumped on every candidate/placement change; `DraftPreview` results
+    /// carrying an older version are dropped.
+    pub(crate) preview_version: u64,
+    pub(crate) preview: DraftPreviewState,
+    /// Commit ids (hex) of the moved set the last rebase simulation resolved
+    /// — the sidebar washes these rows so a branch-mode draft shows exactly
+    /// which branch is coming along. Kept until the next simulation lands
+    /// (so it doesn't flicker per candidate hop); dropped with the draft.
+    pub(crate) moved_highlight: HashSet<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) enum DraftPreviewState {
+    /// No candidate armed yet (or the draft kind has no preview).
+    #[default]
+    Idle,
+    /// A debounced simulation is in flight.
+    Loading,
+    Ready(diffui_core::DraftSimulation),
+    Failed(String),
+}
+
+impl DraftUi {
+    pub(crate) fn new(draft: diffui_core::OpDraft) -> Self {
+        Self {
+            draft,
+            hover_spot: None,
+            preview_version: 0,
+            preview: DraftPreviewState::Idle,
+            moved_highlight: HashSet::new(),
+        }
+    }
+}
+
+/// One floating error card — see [`Diffui::toasts`].
+#[derive(Debug, Clone)]
+pub(crate) struct Toast {
+    pub(crate) id: u64,
+    /// What failed, e.g. "Rebase failed".
+    pub(crate) title: String,
+    /// First line of the error, truncated; the full text lives in the
+    /// activity row.
+    pub(crate) detail: String,
+    pub(crate) born: Instant,
+}
+
+/// How long a toast lingers before the tick prunes it.
+pub(crate) const TOAST_TTL: Duration = Duration::from_secs(7);
 
 #[derive(Debug, Clone)]
 pub(crate) struct DescriptionEditor {
@@ -904,6 +976,11 @@ pub(crate) enum MenuAction {
     },
     /// Select the target revision and open its inline description editor.
     EditDescription { target: RevisionSelection },
+    /// Enter target mode: pick a destination for a rebase/squash of `source`.
+    StartDraft {
+        kind: mutations::DraftKind,
+        source: RevisionSelection,
+    },
     /// Copy author / committer / the full description — read on demand. The
     /// in-memory graph keeps only the description's first line and no dates, so
     /// these need a fresh read; `fallback` is copied if that read fails.

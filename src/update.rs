@@ -254,6 +254,10 @@ impl Diffui {
             hovered: None,
             description_editor: None,
             pending_description_edit: None,
+            op_draft: None,
+            modifiers: keyboard::Modifiers::default(),
+            toasts: Vec::new(),
+            next_toast_id: 0,
         };
 
         let theme_task = system::theme().map(Message::SystemThemeChanged);
@@ -931,6 +935,16 @@ impl Diffui {
                     revision_list::RowSelectionKey::WorkingCopy => RevisionSelection::WorkingCopy,
                     revision_list::RowSelectionKey::Commit(id) => RevisionSelection::Commit(id),
                 };
+                // Target mode: a row click picks the destination instead of
+                // changing the selection. ⌘-click toggles the row as a draft
+                // *source* and stays in the mode — stack extra merge parents /
+                // revisions to rebase / squash sources, or un-stack them.
+                if self.op_draft.is_some() {
+                    if self.modifiers.command() {
+                        return self.draft_toggle_source(selection);
+                    }
+                    return self.confirm_draft_on(selection, None);
+                }
                 if self.session.selected_revision != selection {
                     if let Some(editor) = self.description_editor.as_mut()
                         && editor.is_dirty()
@@ -1008,6 +1022,9 @@ impl Diffui {
                 }
             }
             Message::RevisionContextMenu(key, row_rect, cursor) => {
+                // Right-clicking during target mode reads as "do something
+                // else instead" — drop the draft rather than nesting modes.
+                self.op_draft = None;
                 let Some(repository) = self.session.repository.clone() else {
                     return Task::none();
                 };
@@ -1128,6 +1145,11 @@ impl Diffui {
                                 activity::ActivityStatus::Done,
                                 Some(outcome.message.clone()),
                             );
+                            // Arm the row's one-click "Undo" with the op this
+                            // mutation committed.
+                            if let Some(operation_id) = outcome.operation_id.clone() {
+                                log.set_undo_op(id, operation_id);
+                            }
                         }
                         // Only snap the selection back to `@` when the op
                         // actually moved it (new/edit/abandon); bookmark ops
@@ -1146,10 +1168,17 @@ impl Diffui {
                         // Surface the failure in the activity log rather than
                         // failing the whole view — a rejected push shouldn't
                         // blank the panes.
+                        let mut toast_title = "Operation failed".to_owned();
                         if let Some(log) = self.activity_log_for(tab_id) {
+                            if let Some(label) = log.label(id) {
+                                toast_title = format!("{label} failed");
+                            }
                             log.append_output(id, error.clone());
-                            log.finish(id, activity::ActivityStatus::Error, Some(error));
+                            log.finish(id, activity::ActivityStatus::Error, Some(error.clone()));
                         }
+                        // The log is durable but easy to miss — float the
+                        // failure too.
+                        self.push_error_toast(toast_title, &error);
                         if description_save && let Some(editor) = self.description_editor.as_mut() {
                             editor.saving_activity = None;
                         }
@@ -1224,6 +1253,272 @@ impl Diffui {
                 }
             }
             Message::ConfirmNoOp => {}
+            Message::DraftStart(kind, source) => {
+                // jj-only, like every mutation.
+                if !self
+                    .session
+                    .repository
+                    .as_ref()
+                    .is_some_and(|repo| matches!(repo.vcs, Vcs::Jj))
+                {
+                    return Task::none();
+                }
+                let Some(draft_source) = self.draft_source_for(&source) else {
+                    return Task::none();
+                };
+                let draft = match kind {
+                    mutations::DraftKind::Rebase { mode } => {
+                        diffui_core::OpDraft::rebase(mode, vec![draft_source])
+                    }
+                    mutations::DraftKind::Squash => diffui_core::OpDraft::squash(draft_source),
+                    mutations::DraftKind::Merge => diffui_core::OpDraft::merge(draft_source),
+                };
+                self.op_draft = Some(DraftUi::new(draft));
+                self.activity_popover_open = false;
+                self.menu = None;
+            }
+            Message::DraftStartKey(kind) => {
+                let source = self.session.selected_revision.clone();
+                return self.update(Message::DraftStart(kind, source));
+            }
+            Message::DraftPlacement(placement) => {
+                if let Some(ui) = self.op_draft.as_mut() {
+                    ui.draft.placement = placement;
+                    ui.hover_spot = None;
+                }
+                return self.kick_draft_preview();
+            }
+            Message::DraftPlacementKey(placement) => {
+                // With a keyboard candidate armed, `o`/`a`/`b` applies right
+                // away (jjui's flow); before that they just flip the toggle.
+                let candidate = self.op_draft.as_ref().and_then(|ui| ui.draft.candidate);
+                match candidate.and_then(|index| self.selection_at_index(index)) {
+                    Some(target) => return self.confirm_draft_on(target, Some(placement)),
+                    None => return self.update(Message::DraftPlacement(placement)),
+                }
+            }
+            Message::DraftCandidate(delta) => {
+                let len = self.session.commits.len();
+                let Some(ui) = self.op_draft.as_ref() else {
+                    return Task::none();
+                };
+                if len == 0 {
+                    return Task::none();
+                }
+                // Walk from the current candidate in `delta`'s direction to
+                // the next non-source row. The first move anchors on the
+                // *draft source's* row (the revision being moved) — a
+                // context-menu draft can start on a row that isn't the
+                // selection, and starting from the stale selection made the
+                // first j/k land somewhere unrelated. One O(n) scan, only on
+                // a draft's first nav.
+                let start = ui
+                    .draft
+                    .candidate
+                    .or_else(|| {
+                        self.session
+                            .commits
+                            .iter()
+                            .position(|row| ui.draft.is_source(row.commit_id()))
+                    })
+                    .or(self.session.selected_commit_index)
+                    .map(|index| index as i64 + delta as i64)
+                    .unwrap_or(if delta >= 0 { 0 } else { len as i64 - 1 });
+                let step = if delta >= 0 { 1 } else { -1 };
+                let mut next = start;
+                let found = loop {
+                    if next < 0 || next >= len as i64 {
+                        break None;
+                    }
+                    let row = self.session.commits.row(next as usize);
+                    if ui.draft.target_valid(row.commit_id()) {
+                        break Some(next as usize);
+                    }
+                    next += step;
+                };
+                let Some(found) = found else {
+                    return Task::none();
+                };
+                if let Some(ui) = self.op_draft.as_mut() {
+                    ui.draft.candidate = Some(found);
+                    ui.hover_spot = None;
+                }
+                // Reveal the candidate row (the sidebar routes the file-reveal
+                // token at a draft candidate while target mode is active).
+                self.sidebar_file_reveal_token = self.sidebar_file_reveal_token.wrapping_add(1);
+                return self.kick_draft_preview();
+            }
+            Message::DraftConfirm => {
+                let Some(target) = self
+                    .op_draft
+                    .as_ref()
+                    .and_then(|ui| ui.draft.candidate)
+                    .and_then(|index| self.selection_at_index(index))
+                else {
+                    return Task::none();
+                };
+                return self.confirm_draft_on(target, None);
+            }
+            Message::DraftCancel => {
+                self.op_draft = None;
+            }
+            Message::DraftPreview(version, result) => {
+                if let Some(ui) = self.op_draft.as_mut()
+                    && ui.preview_version == version
+                {
+                    ui.preview = match *result {
+                        Ok(preview) => {
+                            // Refresh the whole-moved-set wash (branch mode's
+                            // "which branch is this?" answer); non-rebase
+                            // simulations and failures drop it.
+                            ui.moved_highlight = match &preview {
+                                diffui_core::DraftSimulation::Rebase(rebase) => {
+                                    rebase.moved_commit_ids.iter().cloned().collect()
+                                }
+                                diffui_core::DraftSimulation::Merge(_) => HashSet::new(),
+                            };
+                            DraftPreviewState::Ready(preview)
+                        }
+                        Err(error) => {
+                            ui.moved_highlight = HashSet::new();
+                            DraftPreviewState::Failed(error)
+                        }
+                    };
+                }
+            }
+            Message::RevisionDragStart(index) => {
+                // A drag that activates right after a confirm-on-press (the
+                // press ran the draft, the move crossed the threshold) must
+                // not spawn a phantom draft on the mutation's target.
+                if self.mutation_busy() {
+                    return Task::none();
+                }
+                // Dragging a row that's already a source of the active draft
+                // *continues* that draft — kind, mode, and stacked sources
+                // intact. Without this, starting "Whole branch onto…" (or a
+                // squash/merge) and then dragging the row to its target
+                // silently downgraded the draft to a plain single-revision
+                // rebase, so the panel never previewed the resolved branch.
+                if let Some(ui) = self.op_draft.as_ref()
+                    && index < self.session.commits.len()
+                    && ui
+                        .draft
+                        .is_source(self.session.commits.row(index).commit_id())
+                {
+                    return Task::none();
+                }
+                let Some(source) = self.selection_at_index(index) else {
+                    return Task::none();
+                };
+                // ⌥ at drag start opts into moving the whole subtree.
+                let mode = if self.modifiers.alt() {
+                    mutations::RebaseSourceMode::WithDescendants
+                } else {
+                    mutations::RebaseSourceMode::Revisions
+                };
+                return self.update(Message::DraftStart(
+                    mutations::DraftKind::Rebase { mode },
+                    source,
+                ));
+            }
+            Message::RevisionDragHover(spot) => {
+                let Some(ui) = self.op_draft.as_mut() else {
+                    return Task::none();
+                };
+                if ui.hover_spot == spot {
+                    return Task::none();
+                }
+                ui.hover_spot = spot;
+                ui.draft.candidate = match spot {
+                    Some(revision_list::DropSpot::OnRow(index)) => Some(index),
+                    _ => None,
+                };
+                return self.kick_draft_preview();
+            }
+            Message::RevisionDragDrop(spot) => {
+                let Some(spot) = spot else {
+                    // Released outside any spot: stay in target mode so the
+                    // op bar keeps offering click / keyboard picking.
+                    if let Some(ui) = self.op_draft.as_mut() {
+                        ui.hover_spot = None;
+                    }
+                    return Task::none();
+                };
+                let Some(ui) = self.op_draft.as_ref() else {
+                    return Task::none();
+                };
+                let mut draft = ui.draft.clone();
+                // ⌥ held at drop upgrades the move to "with descendants".
+                if self.modifiers.alt()
+                    && let mutations::DraftKind::Rebase { mode } = &mut draft.kind
+                {
+                    *mode = mutations::RebaseSourceMode::WithDescendants;
+                }
+                let op = match spot {
+                    revision_list::DropSpot::OnRow(index) => self
+                        .selection_at_index(index)
+                        .and_then(|target| draft.op_for(target, mutations::PlacementKind::Onto)),
+                    revision_list::DropSpot::Gap { above, below } => {
+                        match (
+                            self.selection_at_index(below),
+                            self.selection_at_index(above),
+                        ) {
+                            (Some(parent), Some(child)) => draft.op_for_gap(parent, child),
+                            _ => None,
+                        }
+                    }
+                };
+                match op {
+                    Some(op) => {
+                        self.op_draft = None;
+                        return self.start_mutation_op(op);
+                    }
+                    // Dropped on a source / vanished row: keep target mode.
+                    None => {
+                        if let Some(ui) = self.op_draft.as_mut() {
+                            ui.hover_spot = None;
+                        }
+                    }
+                }
+            }
+            Message::UndoActivityOp(activity_id, operation_id) => {
+                let Some(repository) = self.session.repository.clone() else {
+                    return Task::none();
+                };
+                let Some(tab_id) = self.active_tab_id() else {
+                    return Task::none();
+                };
+                // One-shot: clear the button so a second click can't
+                // double-revert the same operation.
+                if let Some(log) = self.activity_log_for(tab_id) {
+                    log.clear_undo_op(activity_id);
+                }
+                let (id, _progress) = self.begin_activity("Undo", false);
+                return Task::perform(
+                    mutations::run_undo_operation(repository, operation_id),
+                    move |result| Message::UndoCompleted(tab_id, id, Box::new(result)),
+                );
+            }
+            Message::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers;
+            }
+            Message::DraftToggleSource => {
+                let Some(target) = self
+                    .op_draft
+                    .as_ref()
+                    .and_then(|ui| ui.draft.candidate)
+                    .and_then(|index| self.selection_at_index(index))
+                else {
+                    return Task::none();
+                };
+                return self.draft_toggle_source(target);
+            }
+            Message::ToastDismiss(id) => {
+                self.toasts.retain(|toast| toast.id != id);
+            }
+            Message::ToastTick => {
+                self.toasts.retain(|toast| toast.born.elapsed() < TOAST_TTL);
+            }
             Message::FileHighlighted(document_id, file_index, spans) => {
                 let Some((session, is_active)) = self.session_by_document_mut(document_id) else {
                     // The document was replaced; this result highlighted a
@@ -3176,6 +3471,232 @@ impl Diffui {
         self.mutation_queue.is_busy()
     }
 
+    /// Resolve a selection to a draft source against the loaded graph: its
+    /// commit id (for validity checks) and a short change-id label for the op
+    /// bar. `None` when the row isn't in the loaded graph.
+    pub(crate) fn draft_source_for(
+        &self,
+        selection: &RevisionSelection,
+    ) -> Option<diffui_core::DraftSource> {
+        let row = match selection {
+            RevisionSelection::WorkingCopy => self.session.commits.working_copy(),
+            RevisionSelection::Commit(id) => self.session.commits.find_by_commit_id(id),
+        }?;
+        Some(diffui_core::DraftSource {
+            selection: selection.clone(),
+            commit_id: row.commit_id().to_owned(),
+            label: row.change_id().chars().take(8).collect(),
+        })
+    }
+
+    /// The selection for a commit-store row index (`@` stays `WorkingCopy` so
+    /// it never leaks a stale commit id into a mutation).
+    pub(crate) fn selection_at_index(&self, index: usize) -> Option<RevisionSelection> {
+        if index >= self.session.commits.len() {
+            return None;
+        }
+        let row = self.session.commits.row(index);
+        Some(if row.is_working_copy() {
+            RevisionSelection::WorkingCopy
+        } else {
+            RevisionSelection::Commit(row.commit_id().to_owned())
+        })
+    }
+
+    /// Execute the active draft on `target` (click / Enter / `o`-`a`-`b`),
+    /// leaving target mode. Picking a draft source is a no-op that *keeps*
+    /// the draft, so a stray click can't silently do nothing-and-vanish.
+    pub(crate) fn confirm_draft_on(
+        &mut self,
+        target: RevisionSelection,
+        placement_override: Option<mutations::PlacementKind>,
+    ) -> Task<Message> {
+        let Some(ui) = self.op_draft.as_ref() else {
+            return Task::none();
+        };
+        if let RevisionSelection::Commit(id) = &target
+            && ui.draft.is_source(id)
+        {
+            return Task::none();
+        }
+        let placement = placement_override.unwrap_or(ui.draft.placement);
+        let Some(op) = ui.draft.op_for(target, placement) else {
+            return Task::none();
+        };
+        self.op_draft = None;
+        self.start_mutation_op(op)
+    }
+
+    /// Toggle a source on the active draft (space / ⌘-click) without leaving
+    /// target mode: stack an extra merge parent / revision to rebase / squash
+    /// source, or un-stack one that's already in. The last source can't be
+    /// removed — a sourceless draft means nothing; esc is the way out. The
+    /// destination still arrives via the normal confirm.
+    pub(crate) fn draft_toggle_source(&mut self, selection: RevisionSelection) -> Task<Message> {
+        let Some(source) = self.draft_source_for(&selection) else {
+            return Task::none();
+        };
+        // If the keyboard candidate just became a source it's no longer a
+        // valid destination — drop it rather than leaving the markers on an
+        // invalid row.
+        let candidate_now_source = self
+            .op_draft
+            .as_ref()
+            .and_then(|ui| ui.draft.candidate)
+            .and_then(|index| self.selection_at_index(index))
+            .is_some_and(|candidate| candidate == selection);
+        let Some(ui) = self.op_draft.as_mut() else {
+            return Task::none();
+        };
+        if let Some(position) = ui
+            .draft
+            .sources
+            .iter()
+            .position(|s| s.commit_id == source.commit_id)
+        {
+            if ui.draft.sources.len() == 1 {
+                return Task::none();
+            }
+            ui.draft.sources.remove(position);
+        } else {
+            ui.draft.sources.push(source);
+            if candidate_now_source {
+                ui.draft.candidate = None;
+            }
+        }
+        // The simulated moved set is definitionally stale once the sources
+        // change — clear the wash now rather than showing the old branch
+        // until the next simulation lands.
+        ui.moved_highlight.clear();
+        self.kick_draft_preview()
+    }
+
+    /// Float an error toast (bottom-right) for a failed operation. The
+    /// activity log keeps the full record; this only makes the failure
+    /// impossible to miss. Newest last, capped so a burst can't wall the UI.
+    pub(crate) fn push_error_toast(&mut self, title: String, error: &str) {
+        const MAX_TOASTS: usize = 4;
+        const MAX_DETAIL: usize = 160;
+        let mut detail: String = error
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(MAX_DETAIL)
+            .collect();
+        if error.len() > detail.len() {
+            detail.push('…');
+        }
+        self.next_toast_id = self.next_toast_id.wrapping_add(1);
+        self.toasts.push(Toast {
+            id: self.next_toast_id,
+            title,
+            detail,
+            born: Instant::now(),
+        });
+        if self.toasts.len() > MAX_TOASTS {
+            let excess = self.toasts.len() - MAX_TOASTS;
+            self.toasts.drain(..excess);
+        }
+    }
+
+    /// Kick the debounced rebase simulation for the draft's current
+    /// destination (keyboard candidate + placement, or the live drag spot).
+    /// Version-guarded: a newer candidate supersedes the in-flight preview.
+    pub(crate) fn kick_draft_preview(&mut self) -> Task<Message> {
+        let Some(repository) = self.session.repository.clone() else {
+            return Task::none();
+        };
+        // Destination from the drag spot when one is live, else the keyboard
+        // candidate + placement. Resolved before borrowing the draft mutably.
+        let (spot, candidate, placement) = match self.op_draft.as_ref() {
+            Some(ui) => (ui.hover_spot, ui.draft.candidate, ui.draft.placement),
+            None => return Task::none(),
+        };
+        let destination = match spot {
+            Some(revision_list::DropSpot::OnRow(index)) => self
+                .selection_at_index(index)
+                .map(mutations::Destination::Onto),
+            Some(revision_list::DropSpot::Gap { above, below }) => match (
+                self.selection_at_index(below),
+                self.selection_at_index(above),
+            ) {
+                (Some(parent), Some(child)) => {
+                    Some(mutations::Destination::Between { parent, child })
+                }
+                _ => None,
+            },
+            None => candidate
+                .and_then(|index| self.selection_at_index(index))
+                .map(|target| match placement {
+                    mutations::PlacementKind::Onto => mutations::Destination::Onto(target),
+                    mutations::PlacementKind::After => mutations::Destination::After(target),
+                    mutations::PlacementKind::Before => mutations::Destination::Before(target),
+                }),
+        };
+        let Some(ui) = self.op_draft.as_mut() else {
+            return Task::none();
+        };
+        if matches!(ui.draft.kind, mutations::DraftKind::Squash) {
+            // Squash has no simulation (it rarely conflicts and the op bar
+            // already names the fold target).
+            ui.preview = DraftPreviewState::Idle;
+            return Task::none();
+        }
+        let Some(destination) = destination else {
+            ui.preview = DraftPreviewState::Idle;
+            return Task::none();
+        };
+        // A destination anchored on a source is invalid — don't simulate it.
+        if let RevisionSelection::Commit(id) = destination.anchor()
+            && ui.draft.is_source(id)
+        {
+            ui.preview = DraftPreviewState::Idle;
+            return Task::none();
+        }
+        let sources: Vec<RevisionSelection> = ui
+            .draft
+            .sources
+            .iter()
+            .map(|s| s.selection.clone())
+            .collect();
+        ui.preview_version = ui.preview_version.wrapping_add(1);
+        let version = ui.preview_version;
+        ui.preview = DraftPreviewState::Loading;
+        let kind = ui.draft.kind;
+        Task::perform(
+            async move {
+                // Debounce: rapid j/j/j candidate hops supersede this version
+                // before the sleep ends, and the stale result is dropped on
+                // arrival — so at most one simulation per settle runs to
+                // completion usefully.
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                match kind {
+                    mutations::DraftKind::Rebase { mode } => {
+                        mutations::run_rebase_preview(repository, mode, sources, destination)
+                            .await
+                            .map(mutations::DraftSimulation::Rebase)
+                    }
+                    mutations::DraftKind::Merge => {
+                        // The merge's second parent is the destination's
+                        // anchor (gap drops resolve to the parent side, like
+                        // the confirm path).
+                        let parents: Vec<RevisionSelection> = sources
+                            .into_iter()
+                            .chain([destination.anchor().clone()])
+                            .collect();
+                        mutations::run_merge_preview(repository, parents)
+                            .await
+                            .map(mutations::DraftSimulation::Merge)
+                    }
+                    // Filtered out before the task was spawned.
+                    mutations::DraftKind::Squash => Err("squash has no simulation".to_owned()),
+                }
+            },
+            move |result| Message::DraftPreview(version, Box::new(result)),
+        )
+    }
+
     /// Run a mutation now, or queue it behind one already in flight. Two of our
     /// mutations running at once would contend on jj's working-copy lock and
     /// serialize opaquely; queuing keeps them in order and visible (the queued
@@ -3251,6 +3772,7 @@ impl Diffui {
         success_result: Option<String>,
     ) -> Task<Message> {
         let ok = result.is_ok();
+        let mut failure: Option<(String, String)> = None;
         if let Some(log) = self.activity_log_for(tab_id) {
             match result {
                 Ok(lines) => {
@@ -3258,10 +3780,18 @@ impl Diffui {
                     log.finish(id, activity::ActivityStatus::Done, success_result);
                 }
                 Err(error) => {
+                    let title = log
+                        .label(id)
+                        .map(|label| format!("{label} failed"))
+                        .unwrap_or_else(|| "Operation failed".to_owned());
+                    failure = Some((title, error.clone()));
                     log.append_output(id, error.clone());
                     log.finish(id, activity::ActivityStatus::Error, Some(error));
                 }
             }
+        }
+        if let Some((title, error)) = failure {
+            self.push_error_toast(title, &error);
         }
         if ok && self.active_tab_id() == Some(tab_id) {
             self.start_repository_snapshot(RefreshOrigin::Focus)
@@ -3487,6 +4017,7 @@ impl Diffui {
             menu::build_overlay(self, theme),
             tab_bar::build_open_repo_dialog(self, theme),
             tab_bar::build_confirm_dialog(self, theme),
+            activity::toast_layer(self, theme),
         ]
         .width(Length::Fill)
         .height(Length::Fill)
@@ -3532,6 +4063,7 @@ impl Diffui {
             self.activity_popover_open,
             self.confirm.is_some(),
             self.description_editor.is_some(),
+            self.op_draft.is_some(),
         );
 
         let keyboard = event::listen_with(|event, status, _window| match event {
@@ -3554,6 +4086,7 @@ impl Diffui {
                     popover_open,
                     confirm_open,
                     description_editor_open,
+                    draft_open,
                 ),
                 (key, modifiers, ignored),
             )| {
@@ -3671,6 +4204,49 @@ impl Diffui {
                     };
                 }
 
+                // Target mode owns the plain keys: arrows/j/k move the
+                // destination candidate, o/a/b pick a placement, Enter
+                // applies, Esc leaves. Unhandled plain keys are swallowed so
+                // they can't fall through to file nav; ⌘/⌥/⌃ combos still
+                // pass (tab switching, wrap toggle, …).
+                if draft_open && !modifiers.command() && !modifiers.alt() && !modifiers.control() {
+                    if matches!(
+                        key.as_ref(),
+                        keyboard::Key::Named(keyboard::key::Named::Escape)
+                    ) {
+                        return Some(Message::DraftCancel);
+                    }
+                    // A focused text input (the revset box) owns everything
+                    // but Esc — don't hijack typed characters as draft keys.
+                    if !ignored {
+                        return None;
+                    }
+                    return match key.as_ref() {
+                        keyboard::Key::Named(keyboard::key::Named::Enter) => {
+                            Some(Message::DraftConfirm)
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::ArrowDown)
+                        | keyboard::Key::Character("j") => Some(Message::DraftCandidate(1)),
+                        keyboard::Key::Named(keyboard::key::Named::ArrowUp)
+                        | keyboard::Key::Character("k") => Some(Message::DraftCandidate(-1)),
+                        keyboard::Key::Character("o") => {
+                            Some(Message::DraftPlacementKey(diffui_core::PlacementKind::Onto))
+                        }
+                        keyboard::Key::Character("a") => Some(Message::DraftPlacementKey(
+                            diffui_core::PlacementKind::After,
+                        )),
+                        keyboard::Key::Character("b") => Some(Message::DraftPlacementKey(
+                            diffui_core::PlacementKind::Before,
+                        )),
+                        // Toggle the candidate as a draft source (merge
+                        // parent / rebase revision / squash source).
+                        keyboard::Key::Named(keyboard::key::Named::Space) => {
+                            Some(Message::DraftToggleSource)
+                        }
+                        _ => None,
+                    };
+                }
+
                 // Tab management — only with no overlay holding the keyboard, so
                 // these never steal keystrokes from a focused text input. ⌘W
                 // closes the active tab, ⌘O opens the path dialog, ⌘1–9 jump to a
@@ -3721,10 +4297,47 @@ impl Diffui {
                     | keyboard::Key::Character("j") => Some(Message::SelectNextFile),
                     keyboard::Key::Named(keyboard::key::Named::ArrowUp)
                     | keyboard::Key::Character("k") => Some(Message::SelectPreviousFile),
+                    // Target-mode entry points on the selected revision:
+                    // `r` = rebase it, `R` = rebase it with descendants,
+                    // `s` = squash it into a picked destination.
+                    keyboard::Key::Character("r") => {
+                        Some(Message::DraftStartKey(diffui_core::DraftKind::Rebase {
+                            mode: diffui_core::RebaseSourceMode::Revisions,
+                        }))
+                    }
+                    keyboard::Key::Character("R") => {
+                        Some(Message::DraftStartKey(diffui_core::DraftKind::Rebase {
+                            mode: diffui_core::RebaseSourceMode::WithDescendants,
+                        }))
+                    }
+                    keyboard::Key::Character("s") | keyboard::Key::Character("S") => {
+                        Some(Message::DraftStartKey(diffui_core::DraftKind::Squash))
+                    }
+                    // `m` = merge the selected revision with a picked one.
+                    keyboard::Key::Character("m") | keyboard::Key::Character("M") => {
+                        Some(Message::DraftStartKey(diffui_core::DraftKind::Merge))
+                    }
+                    // `b` = rebase the whole branch the selected revision is
+                    // on (fork-point roots resolve against the destination).
+                    keyboard::Key::Character("b") | keyboard::Key::Character("B") => {
+                        Some(Message::DraftStartKey(diffui_core::DraftKind::Rebase {
+                            mode: diffui_core::RebaseSourceMode::Branch,
+                        }))
+                    }
                     _ => None,
                 }
             },
         );
+
+        // Modifier tracking for pointer gestures (⌥-drop = move with
+        // descendants). Separate from the key listener: `ModifiersChanged`
+        // is its own event kind.
+        let modifier_events = event::listen_with(|event, _status, _window| match event {
+            Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
+                Some(Message::ModifiersChanged(modifiers))
+            }
+            _ => None,
+        });
 
         let window_events = event::listen().filter_map(|event| match event {
             Event::Window(window::Event::Focused) => Some(Message::WindowFocusChanged(true)),
@@ -3819,8 +4432,16 @@ impl Diffui {
             Subscription::none()
         };
 
+        // Prunes expired error toasts; subscribed only while any are up.
+        let toast_tick = if self.toasts.is_empty() {
+            Subscription::none()
+        } else {
+            time::every(Duration::from_millis(500)).map(|_| Message::ToastTick)
+        };
+
         Subscription::batch([
             keyboard,
+            modifier_events,
             window_events,
             refresh,
             palette_tick,
@@ -3829,6 +4450,7 @@ impl Diffui {
             window_state_tick,
             system_theme_poll,
             zoom_tick,
+            toast_tick,
             system::theme_changes().map(Message::SystemThemeChanged),
         ])
     }

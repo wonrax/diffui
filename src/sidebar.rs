@@ -13,7 +13,9 @@ use crate::repository::Vcs;
 use crate::revision_list::{
     self, FileRowView, RevisionList, RevisionListStyle, RevisionRowView, RowSelectionKey,
 };
-use crate::theme::{self, ThemeSpec, chip_background, file_status_color, sidebar_panel_style};
+use crate::theme::{
+    self, ThemeSpec, chip_background, emphasis_font, file_status_color, sidebar_panel_style,
+};
 use crate::{Diffui, HoverTarget, LoadStatus, Message, ToolbarMenu};
 use diffui_core::{CommitStore, DiffFile, FileTreeRow, RevisionSelection, RowView, file_tree_rows};
 use jj_lib::graph::GraphEdgeType;
@@ -117,13 +119,381 @@ pub fn build_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         );
     }
     body = body.push(revision_list);
+    // Target mode: the op bar floats between the list and the footer while a
+    // rebase/squash draft is picking its destination.
+    if ui.op_draft.is_some() {
+        body = body.push(build_op_bar(ui, theme));
+    }
     body = body.push(build_footer(ui, theme));
 
+    let draft_active = ui.op_draft.is_some();
     container(body)
         .width(Length::Fixed(ui.sidebar_width))
         .height(Length::Fill)
-        .style(move |_| sidebar_panel_style(theme))
+        .style(move |_| {
+            if draft_active {
+                container::Style::default().background(draft_panel_background(theme))
+            } else {
+                sidebar_panel_style(theme)
+            }
+        })
         .into()
+}
+
+/// The sidebar's whole-pane wash while target mode is on: a light accent
+/// tint over the panel, so "a draft is in progress" reads from anywhere in
+/// the pane — not just the op bar. Also fed to the revision list's own
+/// background fill (the widget paints over the container).
+fn draft_panel_background(theme: ThemeSpec) -> Color {
+    theme::mix(theme.panel_background, theme.accent, 0.05)
+}
+
+/// The target-mode strip: what's being moved, the placement toggle
+/// (rebase only), the live preview line, and the key hints.
+fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
+    use diffui_core::{DraftKind, PlacementKind};
+    let Some(draft_ui) = ui.op_draft.as_ref() else {
+        return Space::new().into();
+    };
+    let draft = &draft_ui.draft;
+    let is_rebase = matches!(draft.kind, DraftKind::Rebase { .. });
+    // Rebase and merge both run the destination simulation; squash doesn't.
+    let has_preview = !matches!(draft.kind, DraftKind::Squash);
+
+    // The live destination readout: what a drop/confirm at the current
+    // position would do, updated instantly on every drag-spot or candidate
+    // change (the debounced simulation below trails it). `bool` = valid.
+    let short_id = |index: usize| -> Option<String> {
+        (index < ui.session.commits.len()).then(|| {
+            ui.session
+                .commits
+                .row(index)
+                .change_id()
+                .chars()
+                .take(8)
+                .collect::<String>()
+        })
+    };
+    let is_source_index = |index: usize| -> bool {
+        index < ui.session.commits.len()
+            && draft.is_source(ui.session.commits.row(index).commit_id())
+    };
+    let on_row_label = |id: String| match draft.kind {
+        DraftKind::Rebase { .. } => format!("onto {id}"),
+        DraftKind::Squash => format!("into {id}"),
+        DraftKind::Merge => format!("with {id}"),
+    };
+    const INVALID_TARGET: &str = "can't target the revision being moved";
+    let destination_line: Option<(String, bool)> = match draft_ui.hover_spot {
+        Some(revision_list::DropSpot::OnRow(index)) => {
+            if is_source_index(index) {
+                Some((INVALID_TARGET.to_owned(), false))
+            } else {
+                short_id(index).map(|id| (on_row_label(id), true))
+            }
+        }
+        Some(revision_list::DropSpot::Gap { above, below }) => {
+            if is_source_index(above) || is_source_index(below) {
+                Some((INVALID_TARGET.to_owned(), false))
+            } else {
+                match (short_id(below), short_id(above)) {
+                    (Some(parent), Some(child)) => Some((
+                        match draft.kind {
+                            DraftKind::Rebase { .. } => {
+                                format!("between {parent} and {child}")
+                            }
+                            // Gap drops resolve to the parent side for these.
+                            DraftKind::Squash => format!("into {parent}"),
+                            DraftKind::Merge => format!("with {parent}"),
+                        },
+                        true,
+                    )),
+                    _ => None,
+                }
+            }
+        }
+        None => draft.candidate.and_then(|index| {
+            short_id(index).map(|id| {
+                (
+                    match draft.kind {
+                        DraftKind::Rebase { .. } => {
+                            let place = match draft.placement {
+                                PlacementKind::Onto => "onto",
+                                PlacementKind::After => "after",
+                                PlacementKind::Before => "before",
+                            };
+                            format!("{place} {id}")
+                        }
+                        DraftKind::Squash => format!("into {id}"),
+                        DraftKind::Merge => format!("with {id}"),
+                    },
+                    true,
+                )
+            })
+        }),
+    };
+    let hint: Element<'_, Message> = match &destination_line {
+        Some((label, true)) => text(format!("→ {label}"))
+            .size(theme::text_size::BODY)
+            .font(emphasis_font(ui.config.ui_font, iced::font::Weight::Medium))
+            .color(theme.accent)
+            .into(),
+        Some((label, false)) => text(label.clone())
+            .size(theme::text_size::BODY)
+            .font(ui.config.ui_font)
+            .color(theme.removed_text)
+            .into(),
+        None => text(match draft.kind {
+            DraftKind::Rebase { .. } => "— pick a destination",
+            DraftKind::Squash => "— pick the revision to fold into",
+            DraftKind::Merge => "— pick the other parent",
+        })
+        .size(theme::text_size::BODY)
+        .font(ui.config.ui_font)
+        .color(theme.muted_text)
+        .into(),
+    };
+
+    let headline = row![
+        icons::icon(
+            if is_rebase {
+                icons::GIT_BRANCH
+            } else {
+                icons::FILE_DIFF
+            },
+            15.0,
+            theme.accent
+        ),
+        text(draft.headline())
+            .size(theme::text_size::BODY)
+            .font(emphasis_font(ui.config.ui_font, iced::font::Weight::Medium))
+            .color(theme.text),
+        hint,
+        Space::new().width(Length::Fill),
+        iced::widget::button(icons::icon(icons::CLOSE, 14.0, theme.muted_text))
+            .padding([2, 6])
+            .on_press(Message::DraftCancel)
+            .style(move |_, status| theme::ghost_button_style(theme, status)),
+    ]
+    .spacing(7)
+    .align_y(alignment::Vertical::Center);
+
+    let mut body = column![headline].spacing(6);
+
+    if is_rebase {
+        // While a drag is live the toggle mirrors what a drop would do —
+        // a row means onto, a gap means between (none of the three) — and
+        // reverts to the sticky keyboard placement when the drag ends.
+        let live_placement: Option<PlacementKind> = match draft_ui.hover_spot {
+            Some(revision_list::DropSpot::OnRow(_)) => Some(PlacementKind::Onto),
+            Some(revision_list::DropSpot::Gap { .. }) => None,
+            None => Some(draft.placement),
+        };
+        let segment = |label: &'static str, key: &'static str, placement: PlacementKind| {
+            let active = live_placement == Some(placement);
+            let label_text = row![
+                text(label)
+                    .size(theme::text_size::UI)
+                    .font(ui.config.ui_font)
+                    .color(if active { theme.background } else { theme.text }),
+                text(key)
+                    .size(theme::text_size::CAPTION)
+                    .font(ui.config.mono_font)
+                    .color(if active {
+                        theme.background
+                    } else {
+                        theme.subtle_text
+                    }),
+            ]
+            .spacing(4)
+            .align_y(alignment::Vertical::Center);
+            iced::widget::button(label_text)
+                .padding([3, 9])
+                .on_press(Message::DraftPlacement(placement))
+                .style(move |_, status| {
+                    if active {
+                        theme::primary_button_style(theme)
+                    } else {
+                        theme::ghost_button_style(theme, status)
+                    }
+                })
+        };
+        let mut segments = row![
+            segment("Onto", "o", PlacementKind::Onto),
+            segment("After", "a", PlacementKind::After),
+            segment("Before", "b", PlacementKind::Before),
+        ]
+        .spacing(4)
+        .align_y(alignment::Vertical::Center);
+        // Gap hover: the drop means "between" — surfaced as a fourth, live
+        // indicator chip since it isn't one of the sticky placements.
+        if matches!(
+            draft_ui.hover_spot,
+            Some(revision_list::DropSpot::Gap { .. })
+        ) {
+            segments = segments.push(
+                container(
+                    text("Between")
+                        .size(theme::text_size::UI)
+                        .font(ui.config.ui_font)
+                        .color(theme.background),
+                )
+                .padding([3, 9])
+                .style(move |_| container::Style {
+                    background: Some(Background::Color(theme.accent)),
+                    border: Border {
+                        width: 0.0,
+                        color: Color::TRANSPARENT,
+                        radius: theme::radius::CONTROL.into(),
+                    },
+                    ..container::Style::default()
+                }),
+            );
+        }
+        body = body.push(segments);
+    }
+
+    // Preview line (rebase + merge): live simulation results for the current
+    // candidate — rebase counts + predicted new conflicts, or the merge's
+    // conflicted paths.
+    if has_preview {
+        let caption = |content: String, color: Color| -> Element<'_, Message> {
+            text(content)
+                .size(theme::text_size::UI)
+                .font(ui.config.ui_font)
+                .color(color)
+                .into()
+        };
+        let preview: Element<'_, Message> = match &draft_ui.preview {
+            // Branch mode's fork-point roots depend on the destination, so
+            // there's nothing to resolve until a candidate exists — say so.
+            crate::DraftPreviewState::Idle => caption(
+                if matches!(
+                    draft.kind,
+                    DraftKind::Rebase {
+                        mode: diffui_core::RebaseSourceMode::Branch,
+                    }
+                ) {
+                    "hover or ↑↓ a destination to resolve the branch".to_owned()
+                } else {
+                    "hover or ↑↓ to preview the result".to_owned()
+                },
+                theme.subtle_text,
+            ),
+            crate::DraftPreviewState::Loading => {
+                caption("simulating…".to_owned(), theme.subtle_text)
+            }
+            crate::DraftPreviewState::Ready(diffui_core::DraftSimulation::Rebase(preview)) => {
+                // Branch mode: name the resolved fork-point root(s) — the
+                // picked revision is just a member; this is the branch that
+                // actually moves (the washed rows in the list).
+                let branch_mode = matches!(
+                    draft.kind,
+                    DraftKind::Rebase {
+                        mode: diffui_core::RebaseSourceMode::Branch,
+                    }
+                );
+                // The candidate sits inside the branch itself (a descendant
+                // of the source): the branch has nothing outside it to move.
+                if branch_mode && preview.simulated && preview.moved == 0 {
+                    caption(
+                        "nothing to move — this destination already contains the branch".to_owned(),
+                        theme.muted_text,
+                    )
+                } else {
+                    let mut summary = if branch_mode && !preview.entry_points.is_empty() {
+                        format!(
+                            "will move the branch from {} · {} revision{}",
+                            preview.entry_points.join(", "),
+                            preview.moved,
+                            if preview.moved == 1 { "" } else { "s" },
+                        )
+                    } else {
+                        format!("will move {}", preview.moved)
+                    };
+                    if preview.descendants > 0 {
+                        summary.push_str(&format!(" + {} descendant", preview.descendants));
+                        if preview.descendants > 1 {
+                            summary.push('s');
+                        }
+                    }
+                    if preview.abandoned_empty > 0 {
+                        summary.push_str(&format!(" · {} emptied", preview.abandoned_empty));
+                    }
+                    if !preview.simulated {
+                        summary.push_str(" · too large to simulate conflicts");
+                        caption(summary, theme.muted_text)
+                    } else if preview.new_conflicts.is_empty() {
+                        summary.push_str(" · no new conflicts");
+                        caption(summary, theme.added_text)
+                    } else {
+                        summary.push_str(&format!(
+                            " · conflicts in {}",
+                            preview.new_conflicts.join(", ")
+                        ));
+                        caption(summary, theme.conflict_marker)
+                    }
+                }
+            }
+            crate::DraftPreviewState::Ready(diffui_core::DraftSimulation::Merge(preview)) => {
+                if preview.conflicts.is_empty() {
+                    caption("clean merge · no conflicts".to_owned(), theme.added_text)
+                } else {
+                    let mut summary = format!("will conflict in {}", preview.conflicts.join(", "));
+                    if preview.truncated {
+                        summary.push_str(", …");
+                    }
+                    caption(summary, theme.conflict_marker)
+                }
+            }
+            crate::DraftPreviewState::Failed(error) => {
+                caption(format!("preview failed: {error}"), theme.removed_text)
+            }
+        };
+        body = body.push(preview);
+    }
+
+    // Key hints, pinned as the bar's own last row so a widening segments row
+    // (the transient "Between" chip) can't wrap or reflow them.
+    body = body.push(
+        text(match draft.kind {
+            DraftKind::Rebase { .. } => {
+                "↑↓ target · o/a/b place · space/⌘click toggles a source · ↵ apply · esc cancels"
+            }
+            DraftKind::Merge => {
+                "click / ↵ = final parent · space/⌘click toggles a parent · esc cancels"
+            }
+            DraftKind::Squash => {
+                "click / ↑↓ + ↵ = fold into · space/⌘click toggles a source · esc cancels"
+            }
+        })
+        .size(theme::text_size::CAPTION)
+        .font(ui.config.ui_font)
+        .color(theme.subtle_text),
+    );
+
+    // Hairline on top so the bar reads as its own surface pinned above the
+    // footer. The card itself sits on the *elevated* surface — the accent
+    // mood now lives in the whole sidebar's target-mode wash, so the op bar
+    // pops as the neutral control panel on top of it.
+    let hairline = container(Space::new())
+        .width(Length::Fill)
+        .height(Length::Fixed(1.0))
+        .style(move |_| container::Style {
+            background: Some(Background::Color(theme.border)),
+            ..container::Style::default()
+        });
+    column![
+        hairline,
+        container(body)
+            .width(Length::Fill)
+            .padding([10, 12])
+            .style(move |_| container::Style {
+                background: Some(Background::Color(theme.panel_background_elevated)),
+                ..container::Style::default()
+            }),
+    ]
+    .into()
 }
 
 /// Focus target id for the revset input.
@@ -338,6 +708,18 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
             })
             .map(|display| files_start + display)
     });
+    // Target mode rides the same explicit-row reveal: candidate moves bump
+    // the file-reveal token, and the target row wins over the file row while
+    // a draft is active.
+    let reveal_file_flat = ui
+        .op_draft
+        .as_ref()
+        .and_then(|draft| draft.draft.candidate)
+        .map(|candidate| match expanded {
+            Some((files_start, files)) if candidate >= files_start => candidate + files,
+            _ => candidate,
+        })
+        .or(reveal_file_flat);
 
     // The per-row lane fold + prefix lengths are precomputed once and held in
     // `Diffui`; the closures below build a single visible row's view from them
@@ -348,6 +730,7 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
     let selected = &ui.session.selected_revision;
     let file_list_expanded = ui.file_list_expanded;
     let config = ui.config;
+    let draft = ui.op_draft.as_ref();
     let build_revision = Box::new(move |index: usize| {
         build_revision_row(
             commits,
@@ -358,6 +741,7 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
             &graph_style,
             selected,
             file_list_expanded,
+            draft,
             index,
         )
     });
@@ -408,7 +792,13 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
         RevisionSelection::Commit(id) => Some(RowSelectionKey::Commit(id.clone())),
     };
 
-    RevisionList::new(
+    // The widget fills its own background, so the target-mode wash has to
+    // reach it too — a tinted container alone would be painted over.
+    let mut list_style = revision_list_style(theme, ui.config, file_badge_width);
+    if ui.op_draft.is_some() {
+        list_style.background = draft_panel_background(theme);
+    }
+    let mut list = RevisionList::new(
         ui.session.commits.len(),
         expanded,
         build_revision,
@@ -416,7 +806,7 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
         selected_row,
         Some(ui.selected_file),
         ui.session.selected_commit_index,
-        revision_list_style(theme, ui.config, file_badge_width),
+        list_style,
         Message::SelectRowKey,
         Message::SidebarFileRow,
     )
@@ -426,8 +816,21 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
     .on_scroll(Message::SidebarScrolled)
     .restore_scroll(ui.sidebar_scroll_offset, ui.scroll_restore_token)
     .on_context_menu(Message::RevisionContextMenu)
-    .on_file_context_menu(Message::SidebarFileContextMenu)
-    .into()
+    .on_file_context_menu(Message::SidebarFileContextMenu);
+    // Drag-to-rebase, for mutable (local jj) repos only.
+    if ui
+        .session
+        .repository
+        .as_ref()
+        .is_some_and(|repo| matches!(repo.vcs, Vcs::Jj))
+    {
+        list = list.on_drag(revision_list::DragHooks {
+            start: Message::RevisionDragStart,
+            hover: Message::RevisionDragHover,
+            drop: Message::RevisionDragDrop,
+        });
+    }
+    list.into()
 }
 
 /// Build the display view for one revision row from the precomputed fold +
@@ -442,6 +845,7 @@ fn build_revision_row(
     graph_style: &RevisionGraphStyle,
     selected: &RevisionSelection,
     file_list_expanded: bool,
+    draft: Option<&crate::DraftUi>,
     index: usize,
 ) -> RevisionRowView {
     let commit = commits.row(index);
@@ -487,6 +891,33 @@ fn build_revision_row(
         RevisionSelection::Commit(id) => !commit.is_working_copy() && id == commit.commit_id(),
     };
 
+    // Target-mode decorations: the draft's sources wear the lifted-off wash —
+    // and so does every row the last simulation resolved into the moved set,
+    // so a branch-mode draft shows the whole branch that would move. The
+    // keyboard candidate wears its destination marker (the widget draws live
+    // *drag* indicators itself, so they're suppressed here mid-drag).
+    let draft_source = draft.is_some_and(|ui| {
+        ui.draft.is_source(commit.commit_id()) || ui.moved_highlight.contains(commit.commit_id())
+    });
+    let draft_marker = draft.and_then(|ui| {
+        use diffui_core::{DraftKind, PlacementKind};
+        use revision_list::DraftMarker;
+        if ui.hover_spot.is_some() {
+            return None;
+        }
+        let candidate = ui.draft.candidate?;
+        (candidate == index).then_some(match ui.draft.kind {
+            DraftKind::Squash | DraftKind::Merge => DraftMarker::Ring,
+            DraftKind::Rebase { .. } => match ui.draft.placement {
+                PlacementKind::Onto => DraftMarker::Ring,
+                // After = between the target and its children ⇒ lands just
+                // above the row; Before ⇒ just below it.
+                PlacementKind::After => DraftMarker::LineAbove,
+                PlacementKind::Before => DraftMarker::LineBelow,
+            },
+        })
+    });
+
     let lane = graph.fold(index, usize::MAX);
     RevisionRowView {
         selection_key,
@@ -507,6 +938,8 @@ fn build_revision_row(
         lane_segments_after: lane.segments_after,
         // The collapse/expand chevron shows only on the selected row.
         collapse_chevron: is_selected.then_some(is_expanded),
+        draft_source,
+        draft_marker,
     }
 }
 

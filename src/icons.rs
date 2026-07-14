@@ -82,6 +82,7 @@ pub const FETCH: &str = "\u{e0b2}"; // download
 pub const ARROW_DOWN: &str = "\u{e042}"; // arrow-down
 pub const ARROW_UP: &str = "\u{e04a}"; // arrow-up
 pub const CLOSE: &str = "\u{e1b2}"; // x
+pub const ALERT_TRIANGLE: &str = "\u{e193}"; // alert-triangle (⚠)
 pub const GIT_BRANCH: &str = "\u{e0e2}"; // git-branch
 pub const CHEVRON_DOWN: &str = "\u{e06d}"; // chevron-down
 pub const CHEVRON_RIGHT: &str = "\u{e06f}"; // chevron-right

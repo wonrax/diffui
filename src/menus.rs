@@ -35,6 +35,80 @@ impl Diffui {
                     target: selection.clone(),
                 }),
             ),
+            MenuEntry::Separator,
+            // History surgery, grouped: multi-variant ops fold into submenus;
+            // the "…" leaves enter target mode (pick the destination on the
+            // graph, or drag a row directly — same machinery).
+            MenuEntry::Submenu {
+                label: "Rebase".to_owned(),
+                items: vec![
+                    MenuEntry::item(
+                        "Onto\u{2026}",
+                        MenuAction::StartDraft {
+                            kind: mutations::DraftKind::Rebase {
+                                mode: mutations::RebaseSourceMode::Revisions,
+                            },
+                            source: selection.clone(),
+                        },
+                    ),
+                    MenuEntry::item(
+                        "With descendants onto\u{2026}",
+                        MenuAction::StartDraft {
+                            kind: mutations::DraftKind::Rebase {
+                                mode: mutations::RebaseSourceMode::WithDescendants,
+                            },
+                            source: selection.clone(),
+                        },
+                    ),
+                    MenuEntry::item(
+                        "Whole branch onto\u{2026}",
+                        MenuAction::StartDraft {
+                            kind: mutations::DraftKind::Rebase {
+                                mode: mutations::RebaseSourceMode::Branch,
+                            },
+                            source: selection.clone(),
+                        },
+                    ),
+                ],
+            },
+            MenuEntry::Submenu {
+                label: "Squash".to_owned(),
+                items: vec![
+                    MenuEntry::item(
+                        "Into parent",
+                        MenuAction::Mutate(MutationOp::Squash {
+                            from: vec![selection.clone()],
+                            into: mutations::SquashTarget::Parent,
+                        }),
+                    ),
+                    MenuEntry::item(
+                        "Into\u{2026}",
+                        MenuAction::StartDraft {
+                            kind: mutations::DraftKind::Squash,
+                            source: selection.clone(),
+                        },
+                    ),
+                ],
+            },
+            MenuEntry::item(
+                "Merge with\u{2026}",
+                MenuAction::StartDraft {
+                    kind: mutations::DraftKind::Merge,
+                    source: selection.clone(),
+                },
+            ),
+            MenuEntry::item(
+                "Duplicate",
+                MenuAction::Mutate(MutationOp::Duplicate {
+                    target: selection.clone(),
+                }),
+            ),
+            MenuEntry::item(
+                "Absorb into ancestors",
+                MenuAction::Mutate(MutationOp::Absorb {
+                    from: selection.clone(),
+                }),
+            ),
             MenuEntry::item(
                 "Abandon",
                 MenuAction::Mutate(MutationOp::Abandon {
@@ -263,8 +337,6 @@ impl Diffui {
         action: MenuAction,
         selection: Option<RevisionSelection>,
     ) -> Task<Message> {
-        use mutations::MutationOp;
-
         let op = match action {
             MenuAction::Fetch(target) => return self.start_fetch(target),
             MenuAction::SetRevset(expr) => {
@@ -289,6 +361,9 @@ impl Diffui {
                 self.pending_description_edit = Some(target.clone());
                 return self.update(Message::SelectRowKey(selection_key(&target)));
             }
+            MenuAction::StartDraft { kind, source } => {
+                return self.update(Message::DraftStart(kind, source));
+            }
             // Author / committer / full description aren't kept in the graph, so
             // read the revision off-thread, format the field, and copy — falling
             // back to the in-memory value on failure.
@@ -307,7 +382,14 @@ impl Diffui {
             }
             MenuAction::Mutate(op) => op,
         };
+        self.start_mutation_op(op)
+    }
 
+    /// Wrap `op` in an activity and run it through the serial mutation queue.
+    /// Every mutation entry point — context menu, target-mode confirm, drag &
+    /// drop — funnels through here so labels and guards can't drift apart.
+    pub(crate) fn start_mutation_op(&mut self, op: mutations::MutationOp) -> Task<Message> {
+        use mutations::MutationOp;
         let Some(repository) = self.session.repository.clone() else {
             return Task::none();
         };
@@ -320,6 +402,17 @@ impl Diffui {
             MutationOp::Edit { .. } => "Edit".to_owned(),
             MutationOp::Abandon { .. } => "Abandon".to_owned(),
             MutationOp::Describe { .. } => "Update description".to_owned(),
+            MutationOp::Rebase { sources, .. } => {
+                if sources.len() == 1 {
+                    "Rebase".to_owned()
+                } else {
+                    format!("Rebase {} revisions", sources.len())
+                }
+            }
+            MutationOp::Squash { .. } => "Squash".to_owned(),
+            MutationOp::Merge { .. } => "New merge".to_owned(),
+            MutationOp::Duplicate { .. } => "Duplicate".to_owned(),
+            MutationOp::Absorb { .. } => "Absorb".to_owned(),
             MutationOp::MoveBookmark { name, .. } => format!("Move bookmark {name}"),
             MutationOp::DeleteBookmark { name } => format!("Delete bookmark {name}"),
             MutationOp::TrackBookmark { name, remote } => format!("Track {name}@{remote}"),

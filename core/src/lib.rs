@@ -24,7 +24,10 @@ pub mod watcher;
 // Curated flat surface a frontend builds against.
 pub use diff_parse::{DiffStreamParser, format_hunk_header, parse_unified_diff};
 pub use model::*;
-pub use mutations::{MutationOp, MutationOutcome};
+pub use mutations::{
+    Destination, DraftKind, DraftSimulation, DraftSource, MergePreview, MutationOp,
+    MutationOutcome, OpDraft, PlacementKind, RebasePreview, RebaseSourceMode, SquashTarget,
+};
 pub use repository::{FetchTarget, Repository, RepositorySnapshot, Vcs, prepare_repository};
 pub use session::{
     ColdBatchFold, ColdCursor, LoadStatus, LoadVersion, MutationQueue, QueueAction, RefreshOrigin,

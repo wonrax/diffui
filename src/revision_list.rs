@@ -148,6 +148,11 @@ pub struct RevisionRowView {
     /// rows have no file list to toggle). `Some(true)` shows the
     /// "expanded" chevron, `Some(false)` shows the "collapsed" one.
     pub collapse_chevron: Option<bool>,
+    /// Target mode: this row is a draft source (the thing being moved) —
+    /// worn as an accent wash so it reads as "lifted off".
+    pub draft_source: bool,
+    /// Target mode: the keyboard candidate's destination decoration.
+    pub draft_marker: Option<DraftMarker>,
 }
 
 #[derive(Debug, Clone)]
@@ -202,6 +207,33 @@ pub struct FileRowView {
 pub enum RowSelectionKey {
     WorkingCopy,
     Commit(String),
+}
+
+/// Where a revision drag would land, in commit-store indices. Reported to
+/// the app on hover changes and on drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropSpot {
+    /// Onto this revision (drop lands as its child).
+    OnRow(usize),
+    /// Into the gap between two adjacent revision rows: `above` is the newer
+    /// (child-side) row, `below` the older (parent-side) one — the moved
+    /// commits slot exactly between them.
+    Gap { above: usize, below: usize },
+}
+
+/// Target-mode decoration for a revision row, computed by the caller from
+/// the active draft (keyboard candidate + placement). The widget draws it;
+/// live *drag* indicators are widget-internal instead (they follow the
+/// cursor, not app state).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftMarker {
+    /// The destination ring: the moved commits become children of this row
+    /// (rebase onto / squash into).
+    Ring,
+    /// Insert-after: the moved commits land just above this row.
+    LineAbove,
+    /// Insert-before: the moved commits land just below this row.
+    LineBelow,
 }
 
 #[derive(Debug, Clone)]
@@ -278,6 +310,19 @@ pub struct RevisionList<'a, Message> {
     /// Mirrors the `reveal_token` trigger pattern.
     restore_offset: f64,
     restore_token: u64,
+    /// Drag-to-rebase hooks; `None` disables dragging (git repos, PR tabs).
+    on_drag: Option<DragHooks<Message>>,
+}
+
+/// Callbacks for the drag-to-rebase gesture. All `fn` pointers, like the
+/// widget's other hooks.
+pub struct DragHooks<Message> {
+    /// The drag crossed its activation threshold on this commit row.
+    pub start: fn(usize) -> Message,
+    /// The drop spot under the cursor changed (`None` = no valid spot).
+    pub hover: fn(Option<DropSpot>) -> Message,
+    /// Released: on a spot, or `None` when let go outside any spot.
+    pub drop: fn(Option<DropSpot>) -> Message,
 }
 
 impl<'a, Message> RevisionList<'a, Message> {
@@ -314,7 +359,14 @@ impl<'a, Message> RevisionList<'a, Message> {
             on_scroll: None,
             restore_offset: 0.0,
             restore_token: 0,
+            on_drag: None,
         }
+    }
+
+    /// Enable drag-to-rebase on revision rows.
+    pub fn on_drag(mut self, hooks: DragHooks<Message>) -> Self {
+        self.on_drag = Some(hooks);
+        self
     }
 
     pub fn width(mut self, width: Length) -> Self {
@@ -434,6 +486,65 @@ impl<'a, Message> RevisionList<'a, Message> {
 
     fn row_top(&self, flat: usize) -> f64 {
         row_top_at(self.expanded, flat)
+    }
+
+    /// Flat row index of a commit-store index (the inverse of
+    /// `row_kind_at`'s `Revision` arm, accounting for the expanded file
+    /// block sitting between revisions).
+    fn commit_flat(&self, commit: usize) -> usize {
+        match self.expanded {
+            Some((start, files)) if commit >= start => commit + files,
+            _ => commit,
+        }
+    }
+
+    /// The commit a flat row resolves to for drop purposes: revision rows
+    /// map to themselves, file rows to the revision they're expanded under.
+    fn drop_commit_of(&self, flat: usize) -> Option<usize> {
+        match self.row_kind(flat) {
+            RowKind::Revision(commit) => Some(commit),
+            // The file block starts right after its revision's flat row, and
+            // revisions before it are 1:1 with flats — so the parent's commit
+            // index is `start - 1`.
+            RowKind::File(_) => self.expanded.and_then(|(start, _)| start.checked_sub(1)),
+        }
+    }
+
+    /// Resolve a drag cursor position (content-space y) to a drop spot: the
+    /// row under it, or — within a few px of a boundary between two
+    /// revision rows — the gap between them. File rows resolve to their
+    /// parent revision; only genuine revision/revision boundaries read as
+    /// gaps (plus the file-block edge, which resolves through the parent).
+    fn drop_spot_at(&self, local_y: f64) -> Option<DropSpot> {
+        const GAP_ZONE: f64 = 7.0;
+        let flat = self.row_at_offset(local_y)?;
+        let commit = self.drop_commit_of(flat)?;
+        if !matches!(self.row_kind(flat), RowKind::Revision(_)) {
+            return Some(DropSpot::OnRow(commit));
+        }
+        let top = self.row_top(flat);
+        let height = f64::from(row_height_of(self.row_kind(flat)));
+        if local_y - top < GAP_ZONE
+            && flat > 0
+            && let Some(above) = self.drop_commit_of(flat - 1)
+            && above != commit
+        {
+            return Some(DropSpot::Gap {
+                above,
+                below: commit,
+            });
+        }
+        if top + height - local_y < GAP_ZONE
+            && flat + 1 < self.row_count()
+            && let Some(below) = self.drop_commit_of(flat + 1)
+            && below != commit
+        {
+            return Some(DropSpot::Gap {
+                above: commit,
+                below,
+            });
+        }
+        Some(DropSpot::OnRow(commit))
     }
 }
 
@@ -556,6 +667,26 @@ struct State {
     /// Offset to jump to on the next `update()` pass, set when `restore_token`
     /// changed. Consumed (and clamped) once bounds are known.
     pending_set_offset: Option<f64>,
+    /// In-flight drag-to-rebase gesture, armed on a revision-row press and
+    /// activated past a small movement threshold.
+    drag: Option<DragState>,
+    /// A revision-row press waiting for its release to become a click
+    /// (`(flat row, selection key)`). Cleared when a drag activates instead.
+    pending_click: Option<(usize, RowSelectionKey)>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DragState {
+    /// Commit-store index the drag started on.
+    source_commit: usize,
+    /// Press position (screen space) — the activation threshold anchor.
+    origin: Point,
+    /// Whether the threshold was crossed (a plain click never activates).
+    active: bool,
+    /// The spot currently under the cursor, mirrored to the app on change.
+    spot: Option<DropSpot>,
+    /// Live cursor position (screen space) for the ghost chip.
+    cursor: Point,
 }
 
 impl State {
@@ -572,6 +703,8 @@ impl State {
             pending_reveal_row: None,
             last_restore_token: 0,
             pending_set_offset: None,
+            drag: None,
+            pending_click: None,
         }
     }
 }
@@ -779,6 +912,46 @@ where
                     }
                     return;
                 }
+                // Drag-to-rebase tracking: past a small threshold the press
+                // becomes a drag; from then on the widget owns the cursor
+                // (no hover washes) and mirrors spot changes to the app.
+                if self.on_drag.is_some()
+                    && let Some(drag) = state.drag.as_mut()
+                {
+                    let offset = state.vertical_offset;
+                    drag.cursor = *position;
+                    if !drag.active {
+                        let dx = position.x - drag.origin.x;
+                        let dy = position.y - drag.origin.y;
+                        if (dx * dx + dy * dy).sqrt() >= 6.0 {
+                            drag.active = true;
+                            if let Some(hooks) = &self.on_drag {
+                                shell.publish((hooks.start)(drag.source_commit));
+                            }
+                        }
+                    }
+                    if drag.active {
+                        let spot = if bounds.contains(*position) {
+                            let local_y = (position.y - bounds.y) as f64 + offset;
+                            self.drop_spot_at(local_y)
+                        } else {
+                            None
+                        };
+                        if spot != drag.spot {
+                            drag.spot = spot;
+                            if let Some(hooks) = &self.on_drag {
+                                shell.publish((hooks.hover)(spot));
+                            }
+                        }
+                        state.cursor_position = None;
+                        state.hovered_file_item = None;
+                        state.hovered_revision_item = None;
+                        state.hovered_lane = None;
+                        shell.capture_event();
+                        shell.request_redraw();
+                        return;
+                    }
+                }
                 if bounds.contains(*position) {
                     state.cursor_position = Some(*position);
                 } else {
@@ -857,9 +1030,24 @@ where
                 let local_y = (cursor_pos.y - bounds.y) as f64 + state.vertical_offset;
                 if let Some(row_idx) = self.row_at_offset(local_y) {
                     match self.row_kind(row_idx) {
-                        RowKind::Revision(_) => {
+                        RowKind::Revision(commit) => {
+                            // Arm a potential drag; it only activates past the
+                            // movement threshold, so plain clicks stay clicks.
+                            if self.on_drag.is_some() {
+                                state.drag = Some(DragState {
+                                    source_commit: commit,
+                                    origin: cursor_pos,
+                                    active: false,
+                                    spot: None,
+                                    cursor: cursor_pos,
+                                });
+                            }
+                            // The select fires on *release* (same row, no
+                            // drag): publishing on press meant starting a
+                            // drag on the selected row toggled its file list
+                            // before the drag ever armed.
                             if let Item::Revision(rev) = self.item_at(row_idx) {
-                                shell.publish((self.on_select_revision)(rev.selection_key));
+                                state.pending_click = Some((row_idx, rev.selection_key));
                             }
                             shell.capture_event();
                         }
@@ -867,7 +1055,9 @@ where
                         // file tree (directories toggle their collapse state
                         // by position), not `FileRowView::file_index` — which
                         // is the document index and `usize::MAX` for dirs.
+                        // File rows never drag, so their click stays on press.
                         RowKind::File(display_index) => {
+                            state.pending_click = None;
                             shell.publish((self.on_select_file)(display_index));
                             shell.capture_event();
                         }
@@ -875,6 +1065,31 @@ where
                 }
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                let pending_click = state.pending_click.take();
+                if let Some(drag) = state.drag.take()
+                    && drag.active
+                {
+                    if let Some(hooks) = &self.on_drag {
+                        shell.publish((hooks.drop)(drag.spot));
+                    }
+                    shell.capture_event();
+                    shell.request_redraw();
+                } else if let Some((pressed_flat, key)) = pending_click {
+                    // A click completes only when the release lands on the
+                    // row it pressed (button semantics) — releasing after
+                    // drifting off the row aborts instead of mis-selecting.
+                    let released_on_same_row = cursor
+                        .position_over(bounds)
+                        .and_then(|pos| {
+                            let local_y = (pos.y - bounds.y) as f64 + state.vertical_offset;
+                            self.row_at_offset(local_y)
+                        })
+                        .is_some_and(|flat| flat == pressed_flat);
+                    if released_on_same_row {
+                        shell.publish((self.on_select_revision)(key));
+                        shell.capture_event();
+                    }
+                }
                 if let scrollbar::ScrollbarEvent::Captured =
                     scrollbar::on_button_released(&mut state.scrollbar)
                 {
@@ -916,6 +1131,24 @@ where
                         shell.publish(callback(display_index, row_rect, cursor_pos));
                         shell.capture_event();
                     }
+                }
+            }
+            Event::Keyboard(iced::keyboard::Event::KeyPressed { key, .. }) => {
+                // Esc abandons an active drag visually; the app's own Esc
+                // handling (the draft cancel) rides the same event through
+                // the subscription.
+                if matches!(
+                    key,
+                    iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape)
+                ) && let Some(drag) = state.drag.take()
+                {
+                    state.pending_click = None;
+                    if drag.active
+                        && let Some(hooks) = &self.on_drag
+                    {
+                        shell.publish((hooks.hover)(None));
+                    }
+                    shell.request_redraw();
                 }
             }
             _ => {}
@@ -1020,6 +1253,9 @@ where
         _renderer: &Renderer,
     ) -> mouse::Interaction {
         let state = tree.state.downcast_ref::<State>();
+        if state.drag.is_some_and(|drag| drag.active) {
+            return mouse::Interaction::Grabbing;
+        }
         let bounds = layout.bounds();
         let Some(point) = cursor.position_over(bounds) else {
             return mouse::Interaction::None;
@@ -1175,6 +1411,106 @@ where
                 state.vertical_offset as f32,
             );
             scrollbar::draw(renderer, &geom, &self.style.scrollbar);
+
+            // Live drag-to-rebase indicators: the drop decoration under the
+            // cursor plus a ghost chip naming what's being moved.
+            if let Some(drag) = state.drag.filter(|drag| drag.active) {
+                let row_rect = |commit: usize| -> Option<Rectangle> {
+                    let flat = self.commit_flat(commit);
+                    if flat >= self.row_count() {
+                        return None;
+                    }
+                    let top = self.row_top(flat);
+                    Some(Rectangle {
+                        x: bounds.x,
+                        y: bounds.y + (top - visible_top) as f32,
+                        width: bounds.width,
+                        height: REVISION_ROW_HEIGHT,
+                    })
+                };
+                match drag.spot {
+                    Some(DropSpot::OnRow(commit)) => {
+                        if let Some(rect) = row_rect(commit) {
+                            let card = Rectangle {
+                                x: rect.x + ROW_CARD_INSET_X,
+                                y: rect.y + ROW_CARD_INSET_Y,
+                                width: (rect.width - ROW_CARD_INSET_X * 2.0).max(0.0),
+                                height: (rect.height - ROW_CARD_INSET_Y * 2.0).max(0.0),
+                            };
+                            stroke_rounded(renderer, card, self.style.accent, 1.5, ROW_CARD_RADIUS);
+                        }
+                    }
+                    Some(DropSpot::Gap { below, .. }) => {
+                        // The gap line sits on the *top* edge of the
+                        // parent-side (lower) row.
+                        if let Some(rect) = row_rect(below) {
+                            let item = self.item_at(self.commit_flat(below));
+                            let gutter = self.item_gutter_width(&item);
+                            draw_insertion_line(renderer, rect, gutter, true, self.style.accent);
+                        }
+                    }
+                    None => {}
+                }
+                // Ghost chip: the dragged revision's change id, trailing the
+                // cursor. Materialized per frame only while dragging.
+                let source_flat = self.commit_flat(drag.source_commit);
+                if source_flat < self.row_count()
+                    && let Item::Revision(rev) = self.item_at(source_flat)
+                {
+                    let label = format!("{}{}", rev.change_id_prefix, rev.change_id_suffix);
+                    let text_bounds =
+                        measure::line_bounds(&label, CAPTION_TEXT_SIZE, self.style.mono_font);
+                    let pad_x = 8.0;
+                    let pad_y = 4.0;
+                    let chip = Rectangle {
+                        x: drag.cursor.x + 14.0,
+                        y: drag.cursor.y + 16.0,
+                        width: text_bounds.width + pad_x * 2.0,
+                        height: text_bounds.height + pad_y * 2.0,
+                    };
+                    // The chip gets its own layer: within one layer iced
+                    // draws every quad first and every text run after, so
+                    // the rows' *text* would paint straight over the chip's
+                    // background. A nested layer composites above both.
+                    // Inflated so the shadow isn't clipped at the layer edge.
+                    let chip_layer = Rectangle {
+                        x: chip.x - 20.0,
+                        y: chip.y - 20.0,
+                        width: chip.width + 40.0,
+                        height: chip.height + 40.0,
+                    };
+                    renderer.with_layer(chip_layer, |renderer| {
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds: chip,
+                                border: Border {
+                                    color: Color {
+                                        a: 0.6,
+                                        ..self.style.accent
+                                    },
+                                    width: 1.0,
+                                    radius: crate::theme::radius::CONTROL.into(),
+                                },
+                                shadow: crate::theme::floating_shadow(3.0, 10.0),
+                                snap: true,
+                            },
+                            Background::Color(self.style.tooltip_background),
+                        );
+                        fill_text_centered_y(
+                            renderer,
+                            &label,
+                            chip.x + pad_x,
+                            chip.y + chip.height / 2.0,
+                            text_bounds.width.max(1.0),
+                            CAPTION_TEXT_SIZE,
+                            self.style.accent,
+                            self.style.mono_font,
+                            chip_layer,
+                            text::Alignment::Left,
+                        );
+                    });
+                }
+            }
         });
     }
 }
@@ -1275,6 +1611,29 @@ impl<'a, Message> RevisionList<'a, Message> {
                     a: 0.06,
                     ..self.style.muted_text
                 },
+                ROW_CARD_RADIUS,
+            );
+        }
+        // Target mode: the draft's source rows wear an accent wash + hairline
+        // so they read as "lifted off" while a destination is being picked.
+        if rev.draft_source {
+            fill_rounded(
+                renderer,
+                card_bounds,
+                Color {
+                    a: 0.08,
+                    ..self.style.accent
+                },
+                ROW_CARD_RADIUS,
+            );
+            stroke_rounded(
+                renderer,
+                card_bounds,
+                Color {
+                    a: 0.45,
+                    ..self.style.accent
+                },
+                1.0,
                 ROW_CARD_RADIUS,
             );
         }
@@ -1636,6 +1995,41 @@ impl<'a, Message> RevisionList<'a, Message> {
             emphasized_lane_before,
             emphasized_lane_after,
         );
+
+        // Target-mode destination decoration, on top of everything: the ring
+        // (lands as a child of this row) or the insertion line above/below
+        // (insert-after / insert-before).
+        if let Some(marker) = rev.draft_marker {
+            match marker {
+                DraftMarker::Ring => {
+                    stroke_rounded(
+                        renderer,
+                        card_bounds,
+                        self.style.accent,
+                        1.5,
+                        ROW_CARD_RADIUS,
+                    );
+                }
+                DraftMarker::LineAbove => {
+                    draw_insertion_line(
+                        renderer,
+                        row_bounds,
+                        gutter_total,
+                        true,
+                        self.style.accent,
+                    );
+                }
+                DraftMarker::LineBelow => {
+                    draw_insertion_line(
+                        renderer,
+                        row_bounds,
+                        gutter_total,
+                        false,
+                        self.style.accent,
+                    );
+                }
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1963,6 +2357,70 @@ fn fill_rounded<R: renderer::Renderer>(
             snap: true,
         },
         color,
+    );
+}
+
+/// Border-only rounded rect — the target ring for draft/drag destinations.
+fn stroke_rounded<R: renderer::Renderer>(
+    renderer: &mut R,
+    rect: Rectangle,
+    color: Color,
+    width: f32,
+    radius: f32,
+) {
+    renderer.fill_quad(
+        renderer::Quad {
+            bounds: rect,
+            border: Border {
+                color,
+                width,
+                radius: radius.into(),
+            },
+            shadow: Shadow::default(),
+            snap: true,
+        },
+        Color::TRANSPARENT,
+    );
+}
+
+/// The insert-here caret: a 2px accent line across a row boundary (top or
+/// bottom edge of `row_bounds`) with a small dot at its left end, spanning
+/// from the graph gutter to the row's right padding.
+fn draw_insertion_line<R: renderer::Renderer>(
+    renderer: &mut R,
+    row_bounds: Rectangle,
+    gutter_total: f32,
+    at_top: bool,
+    color: Color,
+) {
+    let y = if at_top {
+        row_bounds.y - 1.0
+    } else {
+        row_bounds.y + row_bounds.height - 1.0
+    };
+    let x = row_bounds.x + gutter_total.min(row_bounds.width);
+    let width = (row_bounds.x + row_bounds.width - CONTENT_PADDING - x).max(0.0);
+    fill_rounded(
+        renderer,
+        Rectangle {
+            x,
+            y,
+            width,
+            height: 2.0,
+        },
+        color,
+        1.0,
+    );
+    fill_rounded(
+        renderer,
+        Rectangle {
+            x: x - 6.0,
+            y: y - 2.0,
+            width: 6.0,
+            height: 6.0,
+        },
+        color,
+        3.0,
     );
 }
 

@@ -90,6 +90,10 @@ pub struct Activity {
     /// widgets each hold their own). `Some` exactly while `expanded` with any
     /// `detail`; rebuilt from `detail` by [`Activity::sync_detail_editor`].
     pub detail_editor: Option<text_editor::Content>,
+    /// The jj operation a finished mutation committed — arms the row's
+    /// one-click "Undo" (reverts exactly this op, not just the latest).
+    /// Cleared when fired, so it can't double-revert.
+    pub undo_op: Option<String>,
 }
 
 impl Activity {
@@ -140,6 +144,7 @@ impl ActivityLog {
             duration: None,
             expanded: false,
             detail_editor: None,
+            undo_op: None,
         });
         progress
     }
@@ -176,6 +181,29 @@ impl ActivityLog {
         if let Some(activity) = self.get_mut(id) {
             activity.status = status;
         }
+    }
+
+    /// Arm a finished mutation row's per-op "Undo" with the operation it
+    /// committed.
+    pub fn set_undo_op(&mut self, id: ActivityId, operation_id: String) {
+        if let Some(activity) = self.get_mut(id) {
+            activity.undo_op = Some(operation_id);
+        }
+    }
+
+    /// Disarm the per-op "Undo" (fired, or no longer safe to offer).
+    pub fn clear_undo_op(&mut self, id: ActivityId) {
+        if let Some(activity) = self.get_mut(id) {
+            activity.undo_op = None;
+        }
+    }
+
+    /// The entry's title — error toasts name what failed with it.
+    pub fn label(&self, id: ActivityId) -> Option<&str> {
+        self.activities
+            .iter()
+            .find(|activity| activity.id == id)
+            .map(|activity| activity.label.as_str())
     }
 
     pub fn toggle_expand(&mut self, id: ActivityId) {
@@ -500,6 +528,67 @@ pub fn activity_popover(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     opaque(stack![scrim, anchored])
 }
 
+/// The floating error-toast stack: bottom-right cards for failed operations,
+/// so a failure is visible without the activity popover open. Click a card
+/// to dismiss; a slow tick prunes the rest after [`crate::TOAST_TTL`].
+pub fn toast_layer(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
+    if ui.toasts.is_empty() {
+        return Space::new().into();
+    }
+    let mut cards = column![].spacing(8).width(Length::Fixed(380.0));
+    for toast in &ui.toasts {
+        // The error color lives in the glyph + title; the card itself keeps
+        // the shared quiet popover chrome so the stack doesn't read as four
+        // screaming outlines.
+        let body = column![
+            row![
+                // A warning triangle, deliberately not an ✕ — that glyph
+                // reads as a dismiss button, not severity.
+                icons::icon(icons::ALERT_TRIANGLE, 15.0, theme.removed_text),
+                text(toast.title.as_str())
+                    .size(text_size::BODY)
+                    .font(emphasis_font(ui.config.ui_font, Weight::Semibold))
+                    .color(theme.removed_text)
+                    .width(Length::Fill),
+                button(icons::icon(icons::CLOSE, 13.0, theme.muted_text))
+                    .padding(Padding::from([2, 4]))
+                    .on_press(Message::ToastDismiss(toast.id))
+                    .style(move |_, status| ghost_button_style(theme, status)),
+            ]
+            .spacing(8)
+            .align_y(alignment::Vertical::Center),
+            text(toast.detail.as_str())
+                .size(text_size::UI)
+                .font(ui.config.ui_font)
+                .color(theme.muted_text),
+        ]
+        .spacing(5);
+        cards = cards.push(
+            container(body)
+                .width(Length::Fill)
+                .padding(Padding::from([12, 14]))
+                .style(move |_| popover_style(theme)),
+        );
+    }
+    // Anchored bottom-right, floating above the status bar. Only the card
+    // stack is `opaque` — it must own the cursor and wheel over its area
+    // (without it the diff view's I-beam and scrolling bled through, like
+    // the activity popover once did) — while the full-size aligning wrapper
+    // stays transparent so the rest of the window keeps working.
+    container(opaque(cards))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(alignment::Horizontal::Right)
+        .align_y(alignment::Vertical::Bottom)
+        .padding(Padding {
+            top: 0.0,
+            right: 14.0,
+            bottom: 46.0,
+            left: 0.0,
+        })
+        .into()
+}
+
 /// Side of the fixed square box the status glyph is centered in, so every
 /// row's title starts at the same x whether the glyph comes from the mono
 /// font (spinner, queued `…`) or the icon font (check / cross).
@@ -550,6 +639,22 @@ fn activity_row<'a>(
             );
         }
     } else if let Some(duration) = activity.duration {
+        // A finished mutation offers a one-click revert of exactly its op.
+        if matches!(activity.status, ActivityStatus::Done)
+            && let Some(operation_id) = activity.undo_op.clone()
+        {
+            head = head.push(
+                button(
+                    text("Undo")
+                        .size(text_size::CAPTION)
+                        .font(ui.config.ui_font)
+                        .color(theme.accent),
+                )
+                .padding(Padding::from([1, 7]))
+                .on_press(Message::UndoActivityOp(activity.id, operation_id))
+                .style(move |_, status| ghost_button_style(theme, status)),
+            );
+        }
         head = head.push(
             text(format_duration(duration))
                 .size(text_size::CAPTION)

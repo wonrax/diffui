@@ -78,6 +78,53 @@ pub(crate) enum Message {
         activity::ActivityId,
         Box<Result<mutations::MutationOutcome, String>>,
     ),
+
+    // ── Target-mode drafts (rebase / squash destination picking) ────────
+    /// Start a draft for the given source revision and enter target mode.
+    DraftStart(mutations::DraftKind, RevisionSelection),
+    /// Keyboard entry points (`r` / `R` / `s`): start a draft on the
+    /// *selected* revision.
+    DraftStartKey(mutations::DraftKind),
+    /// Op-bar segmented control: change the pending placement.
+    DraftPlacement(mutations::PlacementKind),
+    /// `o`/`a`/`b` during a draft: apply on the keyboard candidate with that
+    /// placement, or just set the placement when no candidate is armed yet.
+    DraftPlacementKey(mutations::PlacementKind),
+    /// Keyboard: move the destination candidate row by this delta, skipping
+    /// draft sources.
+    DraftCandidate(i32),
+    /// Enter: execute the draft on the candidate with the current placement.
+    DraftConfirm,
+    /// Esc / the op bar's ✕: leave target mode without running anything.
+    DraftCancel,
+    /// Debounced draft simulation finished (rebase or merge), guarded by the
+    /// draft's preview version so a superseded candidate's result is dropped.
+    DraftPreview(u64, Box<Result<mutations::DraftSimulation, String>>),
+
+    // ── Revision drag & drop (sidebar) ──────────────────────────────────
+    /// A drag crossed the activation threshold on this commit row: start a
+    /// rebase draft with it as the source.
+    RevisionDragStart(usize),
+    /// The drop spot under the cursor changed during an active drag
+    /// (`None` = not over a valid spot). Drives the op bar hint + preview.
+    RevisionDragHover(Option<revision_list::DropSpot>),
+    /// The drag released: execute on the spot, or `None` to keep the draft
+    /// in click-to-pick mode.
+    RevisionDragDrop(Option<revision_list::DropSpot>),
+
+    /// Toggle the keyboard candidate as a draft source (space): stack it as
+    /// another merge parent / revision to move / squash source, or un-stack
+    /// it if it already is one. ⌘-click routes through `SelectRowKey`.
+    DraftToggleSource,
+    /// Click on an error toast — dismiss it.
+    ToastDismiss(u64),
+    /// Periodic prune of expired toasts; subscribed only while any are up.
+    ToastTick,
+    /// An activity row's "Undo" button: revert exactly that jj operation.
+    UndoActivityOp(activity::ActivityId, String),
+    /// Live modifier state, tracked for drop-time decisions (⌥ = move with
+    /// descendants).
+    ModifiersChanged(iced::keyboard::Modifiers),
     SelectTheme(ThemePreference),
     /// Toggle diff-pane line wrapping (toolbar button / ⌥Z). Global and
     /// persisted with the window state.

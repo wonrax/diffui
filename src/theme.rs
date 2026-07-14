@@ -461,8 +461,9 @@ pub fn ghost_button_style(theme: ThemeSpec, status: button::Status) -> button::S
 }
 
 /// Blend `a` toward `b` by `t` (0..=1), ignoring alpha. Used to derive the
-/// raised buttons' bezel stops from surface tokens without growing the spec.
-fn mix(a: Color, b: Color, t: f32) -> Color {
+/// raised buttons' bezel stops from surface tokens without growing the spec,
+/// and the sidebar's target-mode wash.
+pub(crate) fn mix(a: Color, b: Color, t: f32) -> Color {
     Color {
         r: a.r + (b.r - a.r) * t,
         g: a.g + (b.g - a.g) * t,

@@ -339,6 +339,8 @@ fn empty_revision_row(theme: ThemeSpec) -> RevisionRowView {
         lane_segments_before: Vec::new(),
         lane_segments_after: Vec::new(),
         collapse_chevron: None,
+        draft_source: false,
+        draft_marker: None,
     }
 }
 
