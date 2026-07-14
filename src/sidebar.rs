@@ -156,17 +156,12 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         return Space::new().into();
     };
     let draft = &draft_ui.draft;
-    let is_rebase = matches!(draft.kind, DraftKind::Rebase { .. });
-    // Rebase and merge both run the destination simulation; squash doesn't.
-    let has_preview = !matches!(draft.kind, DraftKind::Squash);
-
-    // The live destination readout: what a drop/confirm at the current
-    // position would do, updated instantly on every drag-spot or candidate
-    // change (the debounced simulation below trails it). `bool` = valid.
+    // Row-index helpers against the loaded graph.
+    let commits = &ui.session.commits;
+    let len = commits.len();
     let short_id = |index: usize| -> Option<String> {
-        (index < ui.session.commits.len()).then(|| {
-            ui.session
-                .commits
+        (index < len).then(|| {
+            commits
                 .row(index)
                 .change_id()
                 .chars()
@@ -174,313 +169,536 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
                 .collect::<String>()
         })
     };
-    let is_source_index = |index: usize| -> bool {
-        index < ui.session.commits.len()
-            && draft.is_source(ui.session.commits.row(index).commit_id())
-    };
-    let on_row_label = |id: String| match draft.kind {
-        DraftKind::Rebase { .. } => format!("onto {id}"),
-        DraftKind::Squash => format!("into {id}"),
-        DraftKind::Merge => format!("with {id}"),
-    };
-    const INVALID_TARGET: &str = "can't target the revision being moved";
-    let destination_line: Option<(String, bool)> = match draft_ui.hover_spot {
-        Some(revision_list::DropSpot::OnRow(index)) => {
-            if is_source_index(index) {
-                Some((INVALID_TARGET.to_owned(), false))
-            } else {
-                short_id(index).map(|id| (on_row_label(id), true))
-            }
-        }
-        Some(revision_list::DropSpot::Gap { above, below }) => {
-            if is_source_index(above) || is_source_index(below) {
-                Some((INVALID_TARGET.to_owned(), false))
-            } else {
-                match (short_id(below), short_id(above)) {
-                    (Some(parent), Some(child)) => Some((
-                        match draft.kind {
-                            DraftKind::Rebase { .. } => {
-                                format!("between {parent} and {child}")
-                            }
-                            // Gap drops resolve to the parent side for these.
-                            DraftKind::Squash => format!("into {parent}"),
-                            DraftKind::Merge => format!("with {parent}"),
-                        },
-                        true,
-                    )),
-                    _ => None,
-                }
-            }
-        }
-        None => draft.candidate.and_then(|index| {
-            // Hover can arm a source row as candidate (keyboard nav skips
-            // them) — surface the same invalid-target hint as a drag would.
-            if is_source_index(index) {
-                return Some((INVALID_TARGET.to_owned(), false));
-            }
-            short_id(index).map(|id| {
-                (
-                    match draft.kind {
-                        DraftKind::Rebase { .. } => {
-                            let place = match draft.placement {
-                                PlacementKind::Onto => "onto",
-                                PlacementKind::After => "after",
-                                PlacementKind::Before => "before",
-                            };
-                            format!("{place} {id}")
-                        }
-                        DraftKind::Squash => format!("into {id}"),
-                        DraftKind::Merge => format!("with {id}"),
-                    },
-                    true,
-                )
-            })
-        }),
-    };
-    let hint: Element<'_, Message> = match &destination_line {
-        Some((label, true)) => text(format!("→ {label}"))
-            .size(theme::text_size::BODY)
-            .font(emphasis_font(ui.config.ui_font, iced::font::Weight::Medium))
-            .color(theme.accent)
-            .into(),
-        Some((label, false)) => text(label.clone())
-            .size(theme::text_size::BODY)
-            .font(ui.config.ui_font)
-            .color(theme.removed_text)
-            .into(),
-        None => text(match draft.kind {
-            DraftKind::Rebase { .. } => "— pick a destination",
-            DraftKind::Squash => "— pick the revision to fold into",
-            DraftKind::Merge => "— pick the other parent",
-        })
-        .size(theme::text_size::BODY)
-        .font(ui.config.ui_font)
-        .color(theme.muted_text)
-        .into(),
-    };
+    let is_source_index =
+        |index: usize| -> bool { index < len && draft.is_source(commits.row(index).commit_id()) };
 
-    let headline = row![
-        icons::icon(
-            if is_rebase {
-                icons::GIT_BRANCH
-            } else {
-                icons::FILE_DIFF
+    // The armed target: the row under a live drag, else the candidate
+    // (hover / click / j-k all arm it). A gap spot has no single row.
+    let hover_row = match draft_ui.hover_spot {
+        Some(revision_list::DropSpot::OnRow(index)) => Some(index),
+        _ => None,
+    };
+    let gap_sides = match draft_ui.hover_spot {
+        Some(revision_list::DropSpot::Gap { above, below }) => Some((below, above)),
+        _ => None,
+    };
+    let armed = hover_row.or(draft.candidate).filter(|&index| index < len);
+    let armed_invalid = armed.is_some_and(is_source_index);
+    let gap_invalid =
+        gap_sides.is_some_and(|(parent, child)| is_source_index(parent) || is_source_index(child));
+    // The valid target row a confirm would land on.
+    let target = armed.filter(|&index| !is_source_index(index));
+    // Squash/merge gap drops resolve to the gap's parent side.
+    let fold_target = target.or_else(|| {
+        gap_sides
+            .map(|(parent, _)| parent)
+            .filter(|&parent| !is_source_index(parent))
+    });
+
+    // ---- Header: op glyph, what moves, live enrichment, state, cancel.
+    let sim_rebase = match &draft_ui.preview {
+        crate::DraftPreviewState::Ready(diffui_core::DraftSimulation::Rebase(preview)) => {
+            Some(preview)
+        }
+        _ => None,
+    };
+    let (glyph, verb) = match draft.kind {
+        DraftKind::Rebase {
+            mode: diffui_core::RebaseSourceMode::Branch,
+        } => (icons::GIT_MERGE, "Rebase branch of"),
+        DraftKind::Rebase { .. } => (icons::GIT_MERGE, "Rebase"),
+        DraftKind::Squash => (icons::FOLD_VERTICAL, "Squash"),
+        DraftKind::Merge => (icons::GIT_FORK, "Merge"),
+    };
+    let names = draft
+        .sources
+        .iter()
+        .map(|source| source.label.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    // "+ N descendants": exact once the simulation lands; with-descendants
+    // mode promises them even before it does.
+    let descendants_suffix = match (draft.kind, sim_rebase) {
+        (DraftKind::Rebase { .. }, Some(preview)) if preview.descendants > 0 => Some(format!(
+            "+ {} descendant{}",
+            preview.descendants,
+            if preview.descendants == 1 { "" } else { "s" }
+        )),
+        (
+            DraftKind::Rebase {
+                mode: diffui_core::RebaseSourceMode::WithDescendants,
             },
-            15.0,
-            theme.accent
-        ),
-        text(draft.headline())
+            _,
+        ) => Some("+ descendants".to_owned()),
+        _ => None,
+    };
+    let state_hint: Option<(&'static str, Color)> = if armed_invalid || gap_invalid {
+        Some((
+            "— can't target the revision being moved",
+            theme.removed_text,
+        ))
+    } else if target.is_none() && gap_sides.is_none() {
+        Some((
+            match draft.kind {
+                DraftKind::Rebase { .. } => "— pick the destination",
+                DraftKind::Squash => "— pick the revision to fold into",
+                DraftKind::Merge => "— pick the other parent",
+            },
+            theme.muted_text,
+        ))
+    } else {
+        None
+    };
+    let mut headline = row![
+        icons::icon(glyph, 15.0, theme.accent),
+        text(verb)
             .size(theme::text_size::BODY)
-            .font(emphasis_font(ui.config.ui_font, iced::font::Weight::Medium))
+            .font(emphasis_font(
+                ui.config.ui_font,
+                iced::font::Weight::Semibold
+            ))
             .color(theme.text),
-        hint,
-        Space::new().width(Length::Fill),
+        text(names.clone())
+            .size(theme::text_size::BODY)
+            .font(emphasis_font(
+                ui.config.mono_font,
+                iced::font::Weight::Medium
+            ))
+            .color(theme.text),
+    ]
+    .spacing(7)
+    .align_y(alignment::Vertical::Center);
+    if let Some(suffix) = descendants_suffix {
+        headline = headline.push(
+            text(suffix)
+                .size(theme::text_size::BODY)
+                .font(ui.config.ui_font)
+                .color(theme.muted_text),
+        );
+    }
+    if let Some((hint, color)) = state_hint {
+        headline = headline.push(
+            text(hint)
+                .size(theme::text_size::BODY)
+                .font(ui.config.ui_font)
+                .color(color),
+        );
+    }
+    headline = headline.push(Space::new().width(Length::Fill)).push(
         iced::widget::button(icons::icon(icons::CLOSE, 14.0, theme.muted_text))
             .padding([2, 6])
             .on_press(Message::DraftCancel)
             .style(move |_, status| theme::ghost_button_style(theme, status)),
-    ]
-    .spacing(7)
-    .align_y(alignment::Vertical::Center);
+    );
 
-    let mut body = column![headline].spacing(6);
-
-    if is_rebase {
-        // While a drag is live the toggle mirrors what a drop would do —
-        // a row means onto, a gap means between (none of the three) — and
-        // reverts to the sticky keyboard placement when the drag ends.
-        let live_placement: Option<PlacementKind> = match draft_ui.hover_spot {
-            Some(revision_list::DropSpot::OnRow(_)) => Some(PlacementKind::Onto),
-            Some(revision_list::DropSpot::Gap { .. }) => None,
-            None => Some(draft.placement),
+    // ---- Target rows: every way the op can land, each resolving what it
+    // means for the armed target ("After → between llpz and kymz"). The row
+    // that would actually happen wears the solid accent fill; a chosen
+    // placement still waiting on a target wears a quiet tint. Keycaps ride
+    // inside the rows, so the hints line below stays short.
+    #[derive(Clone, Copy, PartialEq)]
+    enum RowTone {
+        Armed,
+        Chosen,
+        Idle,
+    }
+    let ui_font = ui.config.ui_font;
+    let mono_font = ui.config.mono_font;
+    let target_row = |label: &'static str,
+                      key: Option<&'static str>,
+                      tone: RowTone,
+                      description: Option<String>,
+                      on_press: Option<Message>|
+     -> Element<'_, Message> {
+        // Armed is a light accent tint with accent ink, not a solid fill —
+        // a full-width solid bar next to the washed sidebar was glaring.
+        // It still outranks Chosen (accent ink, no row fill) by owning the
+        // only tinted row surface.
+        let (label_color, key_color, key_bg, desc_color) = match tone {
+            RowTone::Armed => (
+                theme.accent,
+                theme.accent,
+                chip_background(theme.accent),
+                theme.accent,
+            ),
+            RowTone::Chosen => (
+                theme.accent,
+                theme.accent,
+                chip_background(theme.accent),
+                theme.muted_text,
+            ),
+            RowTone::Idle => (
+                theme.muted_text,
+                theme.subtle_text,
+                chip_background(theme.subtle_text),
+                theme.subtle_text,
+            ),
         };
-        let segment = |label: &'static str, key: &'static str, placement: PlacementKind| {
-            let active = live_placement == Some(placement);
-            let label_text = row![
+        let mut content = row![
+            container(
                 text(label)
                     .size(theme::text_size::UI)
-                    .font(ui.config.ui_font)
-                    .color(if active { theme.background } else { theme.text }),
-                text(key)
-                    .size(theme::text_size::CAPTION)
-                    .font(ui.config.mono_font)
-                    .color(if active {
-                        theme.background
-                    } else {
-                        theme.subtle_text
-                    }),
-            ]
-            .spacing(4)
-            .align_y(alignment::Vertical::Center);
-            iced::widget::button(label_text)
-                .padding([3, 9])
-                .on_press(Message::DraftPlacement(placement))
-                .style(move |_, status| {
-                    if active {
-                        theme::primary_button_style(theme)
-                    } else {
-                        theme::ghost_button_style(theme, status)
-                    }
-                })
-        };
-        let mut segments = row![
-            segment("Onto", "o", PlacementKind::Onto),
-            segment("After", "a", PlacementKind::After),
-            segment("Before", "b", PlacementKind::Before),
+                    .font(emphasis_font(ui_font, iced::font::Weight::Semibold))
+                    .color(label_color)
+            )
+            .width(Length::Fixed(52.0)),
         ]
-        .spacing(4)
+        .spacing(8)
         .align_y(alignment::Vertical::Center);
-        // Gap hover: the drop means "between" — surfaced as a fourth, live
-        // indicator chip since it isn't one of the sticky placements.
-        if matches!(
-            draft_ui.hover_spot,
-            Some(revision_list::DropSpot::Gap { .. })
-        ) {
-            segments = segments.push(
+        if let Some(key) = key {
+            content = content.push(
                 container(
-                    text("Between")
-                        .size(theme::text_size::UI)
-                        .font(ui.config.ui_font)
-                        .color(theme.background),
+                    text(key)
+                        .size(theme::text_size::CAPTION)
+                        .font(mono_font)
+                        .color(key_color),
                 )
-                .padding([3, 9])
+                .padding([0, 5])
                 .style(move |_| container::Style {
-                    background: Some(Background::Color(theme.accent)),
+                    background: Some(Background::Color(key_bg)),
                     border: Border {
                         width: 0.0,
                         color: Color::TRANSPARENT,
-                        radius: theme::radius::CONTROL.into(),
+                        radius: 4.0.into(),
                     },
                     ..container::Style::default()
                 }),
             );
         }
-        body = body.push(segments);
+        if let Some(description) = description {
+            content = content.push(
+                text(description)
+                    .size(theme::text_size::UI)
+                    .font(ui_font)
+                    .color(desc_color),
+            );
+        }
+        let armed = tone == RowTone::Armed;
+        let styled = iced::widget::button(content)
+            .width(Length::Fill)
+            .padding([6, 10])
+            .style(move |_, status| {
+                let background = if armed {
+                    Some(Background::Color(chip_background(theme.accent)))
+                } else if matches!(status, iced::widget::button::Status::Hovered) {
+                    Some(Background::Color(chip_background(theme.subtle_text)))
+                } else {
+                    None
+                };
+                iced::widget::button::Style {
+                    background,
+                    text_color: label_color,
+                    border: Border {
+                        width: 0.0,
+                        color: Color::TRANSPARENT,
+                        radius: theme::radius::CONTROL.into(),
+                    },
+                    shadow: Default::default(),
+                    snap: true,
+                }
+            });
+        match on_press {
+            Some(message) => styled.on_press(message).into(),
+            None => styled.into(),
+        }
+    };
+
+    let mut rows_column = column![].spacing(2);
+    match draft.kind {
+        DraftKind::Rebase { .. } => {
+            // While a drag is live the fill mirrors what a drop would do —
+            // a row means onto, a gap means between — and reverts to the
+            // sticky keyboard placement when the drag ends.
+            let live_placement: Option<PlacementKind> = if gap_sides.is_some() {
+                None
+            } else if hover_row.is_some() {
+                Some(PlacementKind::Onto)
+            } else {
+                Some(draft.placement)
+            };
+            // Display-adjacent neighbors, confirmed as real edges by the
+            // same bit that legitimizes gap drops.
+            let child_of = |index: usize| -> Option<usize> {
+                let above = index.checked_sub(1)?;
+                commits.row(above).next_row_is_parent().then_some(above)
+            };
+            let parent_of = |index: usize| -> Option<usize> {
+                (index + 1 < len && commits.row(index).next_row_is_parent()).then_some(index + 1)
+            };
+            let describe = |placement: PlacementKind| -> Option<String> {
+                let target = target?;
+                let id = short_id(target)?;
+                Some(match placement {
+                    PlacementKind::Onto => format!("new child of {id}"),
+                    PlacementKind::After => match child_of(target).and_then(short_id) {
+                        Some(child) => format!("between {id} and {child}"),
+                        None => format!("directly after {id}"),
+                    },
+                    PlacementKind::Before => match parent_of(target).and_then(short_id) {
+                        Some(parent) => format!("between {parent} and {id}"),
+                        None => format!("directly before {id}"),
+                    },
+                })
+            };
+            let tone = |placement: PlacementKind| {
+                if live_placement != Some(placement) {
+                    RowTone::Idle
+                } else if target.is_some() {
+                    RowTone::Armed
+                } else {
+                    RowTone::Chosen
+                }
+            };
+            for (label, key, placement) in [
+                ("Onto", "o", PlacementKind::Onto),
+                ("After", "a", PlacementKind::After),
+                ("Before", "b", PlacementKind::Before),
+            ] {
+                rows_column = rows_column.push(target_row(
+                    label,
+                    Some(key),
+                    tone(placement),
+                    describe(placement),
+                    Some(Message::DraftPlacement(placement)),
+                ));
+            }
+            // A drag over a gap is its own, transient way to land: exactly
+            // between the two rows around it.
+            if let Some((parent, child)) = gap_sides
+                && !gap_invalid
+                && let (Some(parent), Some(child)) = (short_id(parent), short_id(child))
+            {
+                rows_column = rows_column.push(target_row(
+                    "Between",
+                    None,
+                    RowTone::Armed,
+                    Some(format!("{parent} and {child}")),
+                    None,
+                ));
+            }
+        }
+        DraftKind::Squash => {
+            let tone = if fold_target.is_some() {
+                RowTone::Armed
+            } else {
+                RowTone::Idle
+            };
+            let description = fold_target
+                .and_then(short_id)
+                .map(|id| format!("folds {names} into {id} · descriptions combine"));
+            rows_column = rows_column.push(target_row("Into", None, tone, description, None));
+        }
+        DraftKind::Merge => {
+            let tone = if fold_target.is_some() {
+                RowTone::Armed
+            } else {
+                RowTone::Idle
+            };
+            let description = fold_target
+                .and_then(short_id)
+                .map(|id| format!("new merge of {names} + {id}"));
+            rows_column = rows_column.push(target_row("With", None, tone, description, None));
+        }
     }
 
-    // Preview line (rebase + merge): live simulation results for the current
-    // candidate — rebase counts + predicted new conflicts, or the merge's
-    // conflicted paths.
-    if has_preview {
-        let caption = |content: String, color: Color| -> Element<'_, Message> {
-            text(content)
-                .size(theme::text_size::UI)
-                .font(ui.config.ui_font)
-                .color(color)
-                .into()
-        };
-        let preview: Element<'_, Message> = match &draft_ui.preview {
-            // Branch mode's fork-point roots depend on the destination, so
-            // there's nothing to resolve until a candidate exists — say so.
-            crate::DraftPreviewState::Idle => caption(
-                if matches!(
-                    draft.kind,
-                    DraftKind::Rebase {
-                        mode: diffui_core::RebaseSourceMode::Branch,
-                    }
-                ) {
-                    "hover or ↑↓ a destination to resolve the branch".to_owned()
-                } else {
-                    "hover or ↑↓ to preview the result".to_owned()
-                },
-                theme.subtle_text,
-            ),
-            crate::DraftPreviewState::Loading => {
-                caption("simulating…".to_owned(), theme.subtle_text)
-            }
-            crate::DraftPreviewState::Ready(diffui_core::DraftSimulation::Rebase(preview)) => {
-                // Branch mode: name the resolved fork-point root(s) — the
-                // picked revision is just a member; this is the branch that
-                // actually moves (the washed rows in the list).
-                let branch_mode = matches!(
-                    draft.kind,
-                    DraftKind::Rebase {
-                        mode: diffui_core::RebaseSourceMode::Branch,
-                    }
-                );
-                // The candidate sits inside the branch itself (a descendant
-                // of the source): the branch has nothing outside it to move.
-                if branch_mode && preview.simulated && preview.moved == 0 {
-                    caption(
-                        "nothing to move — this destination already contains the branch".to_owned(),
-                        theme.muted_text,
+    // ---- Footer band: live verdict + counts on the left, Apply on the
+    // right, key hints underneath.
+    let is_branch = matches!(
+        draft.kind,
+        DraftKind::Rebase {
+            mode: diffui_core::RebaseSourceMode::Branch,
+        }
+    );
+    let (status_icon, status_text, status_color, counts): (
+        Option<&str>,
+        String,
+        Color,
+        Option<String>,
+    ) = match &draft_ui.preview {
+        crate::DraftPreviewState::Idle => (
+            None,
+            match draft.kind {
+                DraftKind::Squash => {
+                    "no simulation for squash — descriptions combine on apply".to_owned()
+                }
+                _ if is_branch => "hover or ↑↓ a destination to resolve the branch".to_owned(),
+                _ => "hover or ↑↓ to preview the result".to_owned(),
+            },
+            theme.subtle_text,
+            None,
+        ),
+        crate::DraftPreviewState::Loading => {
+            (None, "simulating…".to_owned(), theme.subtle_text, None)
+        }
+        crate::DraftPreviewState::Ready(diffui_core::DraftSimulation::Rebase(preview)) => {
+            // The candidate sits inside the branch itself (a descendant of
+            // the source): the branch has nothing outside it to move.
+            if is_branch && preview.simulated && preview.moved == 0 {
+                (
+                    None,
+                    "nothing to move — this destination already contains the branch".to_owned(),
+                    theme.muted_text,
+                    None,
+                )
+            } else {
+                let total = preview.moved + preview.descendants;
+                let mut counts = if is_branch && !preview.entry_points.is_empty() {
+                    format!(
+                        "moves the branch from {} · {} revision{}",
+                        preview.entry_points.join(", "),
+                        preview.moved,
+                        if preview.moved == 1 { "" } else { "s" },
                     )
                 } else {
-                    let mut summary = if branch_mode && !preview.entry_points.is_empty() {
-                        format!(
-                            "will move the branch from {} · {} revision{}",
-                            preview.entry_points.join(", "),
-                            preview.moved,
-                            if preview.moved == 1 { "" } else { "s" },
-                        )
-                    } else {
-                        format!("will move {}", preview.moved)
-                    };
-                    if preview.descendants > 0 {
-                        summary.push_str(&format!(" + {} descendant", preview.descendants));
-                        if preview.descendants > 1 {
-                            summary.push('s');
-                        }
-                    }
-                    if preview.abandoned_empty > 0 {
-                        summary.push_str(&format!(" · {} emptied", preview.abandoned_empty));
-                    }
-                    if !preview.simulated {
-                        summary.push_str(" · too large to simulate conflicts");
-                        caption(summary, theme.muted_text)
-                    } else if preview.new_conflicts.is_empty() {
-                        summary.push_str(" · no new conflicts");
-                        caption(summary, theme.added_text)
-                    } else {
-                        summary.push_str(&format!(
-                            " · conflicts in {}",
-                            preview.new_conflicts.join(", ")
-                        ));
-                        caption(summary, theme.conflict_marker)
-                    }
+                    format!(
+                        "rebases {total} commit{}",
+                        if total == 1 { "" } else { "s" }
+                    )
+                };
+                if preview.abandoned_empty > 0 {
+                    counts.push_str(&format!(" · {} emptied", preview.abandoned_empty));
                 }
-            }
-            crate::DraftPreviewState::Ready(diffui_core::DraftSimulation::Merge(preview)) => {
-                if preview.conflicts.is_empty() {
-                    caption("clean merge · no conflicts".to_owned(), theme.added_text)
+                if !preview.simulated {
+                    (
+                        None,
+                        "too large to simulate conflicts".to_owned(),
+                        theme.muted_text,
+                        Some(counts),
+                    )
+                } else if preview.new_conflicts.is_empty() {
+                    (
+                        Some(icons::CHECK),
+                        "no new conflicts".to_owned(),
+                        theme.added_text,
+                        Some(counts),
+                    )
                 } else {
-                    let mut summary = format!("will conflict in {}", preview.conflicts.join(", "));
-                    if preview.truncated {
-                        summary.push_str(", …");
-                    }
-                    caption(summary, theme.conflict_marker)
+                    (
+                        Some(icons::ALERT_TRIANGLE),
+                        format!("conflicts in {}", preview.new_conflicts.join(", ")),
+                        theme.conflict_marker,
+                        Some(counts),
+                    )
                 }
             }
-            crate::DraftPreviewState::Failed(error) => {
-                caption(format!("preview failed: {error}"), theme.removed_text)
+        }
+        crate::DraftPreviewState::Ready(diffui_core::DraftSimulation::Merge(preview)) => {
+            let parents = draft.sources.len() + 1;
+            let counts = format!("merges {parents} parents");
+            if preview.conflicts.is_empty() {
+                (
+                    Some(icons::CHECK),
+                    "clean merge".to_owned(),
+                    theme.added_text,
+                    Some(counts),
+                )
+            } else {
+                let mut status = format!("will conflict in {}", preview.conflicts.join(", "));
+                if preview.truncated {
+                    status.push_str(", …");
+                }
+                (
+                    Some(icons::ALERT_TRIANGLE),
+                    status,
+                    theme.conflict_marker,
+                    Some(counts),
+                )
             }
-        };
-        body = body.push(preview);
+        }
+        crate::DraftPreviewState::Failed(error) => (
+            Some(icons::ALERT_TRIANGLE),
+            format!("preview failed: {error}"),
+            theme.removed_text,
+            None,
+        ),
+    };
+    let mut summary = row![].spacing(6).align_y(alignment::Vertical::Center);
+    if let Some(status_glyph) = status_icon {
+        summary = summary.push(icons::icon(status_glyph, 13.0, status_color));
+    }
+    summary = summary.push(
+        text(status_text)
+            .size(theme::text_size::UI)
+            .font(ui_font)
+            .color(status_color),
+    );
+    if let Some(counts) = counts {
+        summary = summary.push(
+            text(format!("· {counts}"))
+                .size(theme::text_size::UI)
+                .font(ui_font)
+                .color(theme.muted_text),
+        );
     }
 
-    // Key hints, pinned as the bar's own last row so a widening segments row
-    // (the transient "Between" chip) can't wrap or reflow them.
-    body = body.push(
-        text(match draft.kind {
-            DraftKind::Rebase { .. } => {
-                "↑↓ target · o/a/b place · space/⌘click toggles a source · ↵ apply · esc cancels"
+    // Apply executes the armed *candidate* (DraftConfirm); gap spots only
+    // exist mid-drag, where the drop itself is the confirm.
+    let can_apply = target.is_some();
+    let apply_color = if can_apply {
+        theme.background
+    } else {
+        theme.subtle_text
+    };
+    let apply = iced::widget::button(
+        row![
+            text("Apply")
+                .size(theme::text_size::UI)
+                .font(emphasis_font(ui_font, iced::font::Weight::Medium))
+                .color(apply_color),
+            icons::icon(icons::ENTER, 12.0, apply_color),
+        ]
+        .spacing(6)
+        .align_y(alignment::Vertical::Center),
+    )
+    .padding([4, 12])
+    .on_press_maybe(can_apply.then_some(Message::DraftConfirm))
+    .style(move |_, _| {
+        if can_apply {
+            theme::primary_button_style(theme)
+        } else {
+            iced::widget::button::Style {
+                background: Some(Background::Color(chip_background(theme.subtle_text))),
+                text_color: theme.subtle_text,
+                border: Border {
+                    width: 0.0,
+                    color: Color::TRANSPARENT,
+                    radius: theme::radius::BUTTON.into(),
+                },
+                shadow: Default::default(),
+                snap: true,
             }
-            DraftKind::Merge => {
-                "click / ↵ = final parent · space/⌘click toggles a parent · esc cancels"
-            }
-            DraftKind::Squash => {
-                "click / ↑↓ + ↵ = fold into · space/⌘click toggles a source · esc cancels"
-            }
-        })
-        .size(theme::text_size::CAPTION)
-        .font(ui.config.ui_font)
-        .color(theme.subtle_text),
-    );
+        }
+    });
+
+    let hints = text(match draft.kind {
+        DraftKind::Merge => {
+            "click / ↑↓ = target · space/⌘click toggles a parent · ↵ apply · esc cancels"
+        }
+        _ => "click / ↑↓ = target · space/⌘click toggles a source · ↵ apply · esc cancels",
+    })
+    .size(theme::text_size::CAPTION)
+    .font(ui_font)
+    .color(theme.subtle_text);
+
+    let band = container(
+        column![
+            row![summary, Space::new().width(Length::Fill), apply]
+                .spacing(8)
+                .align_y(alignment::Vertical::Center),
+            hints,
+        ]
+        .spacing(6),
+    )
+    .width(Length::Fill)
+    .padding([8, 12])
+    .style(move |_| container::Style {
+        background: Some(Background::Color(theme.panel_background)),
+        ..container::Style::default()
+    });
 
     // Hairline on top so the bar reads as its own surface pinned above the
-    // footer. The card itself sits on the *elevated* surface — the accent
-    // mood now lives in the whole sidebar's target-mode wash, so the op bar
-    // pops as the neutral control panel on top of it.
+    // footer; the rows sit on the elevated surface, the verdict band on the
+    // plain panel below them.
     let hairline = container(Space::new())
         .width(Length::Fill)
         .height(Length::Fixed(1.0))
@@ -490,13 +708,30 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         });
     column![
         hairline,
-        container(body)
-            .width(Length::Fill)
-            .padding([10, 12])
-            .style(move |_| container::Style {
-                background: Some(Background::Color(theme.panel_background_elevated)),
-                ..container::Style::default()
-            }),
+        container(column![
+            container(headline)
+                .width(Length::Fill)
+                .padding(iced::Padding {
+                    top: 8.0,
+                    right: 12.0,
+                    bottom: 4.0,
+                    left: 12.0,
+                }),
+            container(rows_column)
+                .width(Length::Fill)
+                .padding(iced::Padding {
+                    top: 0.0,
+                    right: 6.0,
+                    bottom: 8.0,
+                    left: 6.0,
+                }),
+        ])
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(theme.panel_background_elevated)),
+            ..container::Style::default()
+        }),
+        band,
     ]
     .into()
 }
@@ -890,7 +1125,7 @@ fn build_revision_row(
 
     let lane_color = graph_style.lane_color(lane_frame.node_lane);
     let bookmark_chips = bookmark_chips_for(bookmarks, lane_color, theme, config);
-    let status_chips = status_chips_for(commit, theme, config);
+    let mut status_chips = status_chips_for(commit, theme, config);
 
     let selection_key = if commit.is_working_copy() {
         RowSelectionKey::WorkingCopy
@@ -935,6 +1170,75 @@ fn build_revision_row(
             },
         })
     });
+    // Target-mode role chips: say in words what the wash/marker mean — every
+    // revision that would move wears the verb, the live destination wears the
+    // op bar's destination word. Lead the status rail so the role reads first.
+    // Styled apart from the bookmark pills sharing the rail: moved rows are
+    // dashed-outlined (the app's transient/preview language) with a ↑ "lifting
+    // off" glyph — quiet enough to repeat down a whole branch — while the one
+    // destination row is the only solid-filled chip in the app, with a ↓
+    // "lands here" glyph. Background-colored text on the accent fill is
+    // legible in every theme because accent is itself legible on background.
+    if let Some(ui) = draft {
+        use diffui_core::{DraftKind, PlacementKind};
+        if draft_source {
+            status_chips.insert(
+                0,
+                Chip {
+                    label: match ui.draft.kind {
+                        DraftKind::Rebase { .. } => "move",
+                        DraftKind::Squash => "squash",
+                        DraftKind::Merge => "merge",
+                    }
+                    .to_owned(),
+                    font: config.mono_font,
+                    background: Color::TRANSPARENT,
+                    text_color: theme.accent,
+                    border_color: Some(theme.accent),
+                    border_dashed: true,
+                    icon: Some(icons::ARROW_UP),
+                },
+            );
+        } else {
+            // The live destination: the drag spot's row while dragging, else
+            // the armed candidate. A gap spot gets no row chip — the
+            // insertion line carries the "between" meaning.
+            let destination_word = match ui.hover_spot {
+                Some(revision_list::DropSpot::OnRow(spot)) if spot == index => {
+                    Some(match ui.draft.kind {
+                        // Drops land Onto regardless of the armed placement.
+                        DraftKind::Rebase { .. } => "onto",
+                        DraftKind::Squash => "into",
+                        DraftKind::Merge => "with",
+                    })
+                }
+                Some(_) => None,
+                None => (ui.draft.candidate == Some(index)).then_some(match ui.draft.kind {
+                    DraftKind::Rebase { .. } => match ui.draft.placement {
+                        PlacementKind::Onto => "onto",
+                        PlacementKind::After => "after",
+                        PlacementKind::Before => "before",
+                    },
+                    DraftKind::Squash => "into",
+                    DraftKind::Merge => "with",
+                }),
+            };
+            if let Some(word) = destination_word {
+                status_chips.insert(
+                    0,
+                    Chip {
+                        label: word.to_owned(),
+                        font: config.mono_font,
+                        background: theme.accent,
+                        text_color: theme.background,
+                        border_color: None,
+                        border_dashed: false,
+                        icon: Some(icons::ARROW_DOWN),
+                    },
+                );
+            }
+        }
+    }
 
     let lane = graph.fold(index, usize::MAX);
     RevisionRowView {

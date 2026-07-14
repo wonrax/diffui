@@ -935,15 +935,37 @@ impl Diffui {
                     revision_list::RowSelectionKey::WorkingCopy => RevisionSelection::WorkingCopy,
                     revision_list::RowSelectionKey::Commit(id) => RevisionSelection::Commit(id),
                 };
-                // Target mode: a row click picks the destination instead of
-                // changing the selection. ⌘-click toggles the row as a draft
-                // *source* and stays in the mode — stack extra merge parents /
-                // revisions to rebase / squash sources, or un-stack them.
+                // Target mode: a plain click *arms* the row as the destination
+                // candidate (same as hover / j-k); the Apply button, ↵, or a
+                // drop executes. One-click execution was too easy to fire by
+                // accident once hover started arming rows. ⌘-click toggles the
+                // row as a draft *source* and stays in the mode — stack extra
+                // merge parents / revisions to rebase / squash sources, or
+                // un-stack them.
                 if self.op_draft.is_some() {
                     if self.modifiers.command() {
                         return self.draft_toggle_source(selection);
                     }
-                    return self.confirm_draft_on(selection, None);
+                    let index = match &selection {
+                        RevisionSelection::WorkingCopy => self.session.commits.working_copy_index(),
+                        RevisionSelection::Commit(id) => self
+                            .session
+                            .commits
+                            .iter()
+                            .position(|row| row.commit_id() == id),
+                    };
+                    let Some(index) = index else {
+                        return Task::none();
+                    };
+                    let Some(ui) = self.op_draft.as_mut() else {
+                        return Task::none();
+                    };
+                    if ui.draft.candidate == Some(index) {
+                        return Task::none();
+                    }
+                    ui.draft.candidate = Some(index);
+                    ui.hover_spot = None;
+                    return self.kick_draft_preview();
                 }
                 if self.session.selected_revision != selection {
                     if let Some(editor) = self.description_editor.as_mut()
