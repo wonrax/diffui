@@ -968,6 +968,7 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
     let prefix_lens = &ui.session.sidebar_prefix_lens;
     let commits = &ui.session.commits;
     let selected = &ui.session.selected_revision;
+    let multi_selection = ui.revision_multi_selection.as_slice();
     let file_list_expanded = ui.file_list_expanded;
     let config = ui.config;
     let draft = ui.op_draft.as_ref();
@@ -980,6 +981,7 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
             config,
             &graph_style,
             selected,
+            multi_selection,
             file_list_expanded,
             draft,
             index,
@@ -1091,6 +1093,7 @@ fn build_revision_row(
     config: AppConfig,
     graph_style: &RevisionGraphStyle,
     selected: &RevisionSelection,
+    multi_selection: &[String],
     file_list_expanded: bool,
     draft: Option<&crate::DraftUi>,
     index: usize,
@@ -1137,6 +1140,7 @@ fn build_revision_row(
         RevisionSelection::WorkingCopy => commit.is_working_copy(),
         RevisionSelection::Commit(id) => !commit.is_working_copy() && id == commit.commit_id(),
     };
+    let multi_selected = multi_selection.iter().any(|id| id == commit.commit_id());
 
     // Target-mode decorations: the draft's sources wear the lifted-off wash —
     // and so does every row the last simulation resolved into the moved set,
@@ -1261,6 +1265,7 @@ fn build_revision_row(
         // The collapse/expand chevron shows only on the selected row.
         collapse_chevron: is_selected.then_some(is_expanded),
         draft_source,
+        multi_selected,
         draft_marker,
     }
 }

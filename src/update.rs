@@ -255,6 +255,7 @@ impl Diffui {
             description_editor: None,
             pending_description_edit: None,
             op_draft: None,
+            revision_multi_selection: Vec::new(),
             modifiers: keyboard::Modifiers::default(),
             toasts: Vec::new(),
             next_toast_id: 0,
@@ -967,6 +968,61 @@ impl Diffui {
                     ui.hover_spot = None;
                     return self.kick_draft_preview();
                 }
+                // Outside target mode, ⌘-click marks/unmarks the row for a
+                // batch action and ⇧-click marks the visible range between
+                // the browsed row and the clicked one. Neither navigates —
+                // the marked set is a separate axis from the browsed
+                // revision, consumed by the context menu's batch items.
+                // jj-gated like every mutation entry point.
+                if (self.modifiers.command() || self.modifiers.shift())
+                    && self
+                        .session
+                        .repository
+                        .as_ref()
+                        .is_some_and(|repo| matches!(repo.vcs, Vcs::Jj))
+                {
+                    let commit_id = match &selection {
+                        RevisionSelection::WorkingCopy => self
+                            .session
+                            .commits
+                            .working_copy()
+                            .map(|row| row.commit_id().to_owned()),
+                        RevisionSelection::Commit(id) => Some(id.clone()),
+                    };
+                    let Some(commit_id) = commit_id else {
+                        return Task::none();
+                    };
+                    if self.modifiers.shift() {
+                        let clicked = self
+                            .session
+                            .commits
+                            .iter()
+                            .position(|row| row.commit_id() == commit_id);
+                        // Anchor on the browsed row, Finder-style; replaces
+                        // any previous marks.
+                        if let (Some(clicked), Some(anchor)) =
+                            (clicked, self.session.selected_commit_index)
+                        {
+                            let (lo, hi) = (clicked.min(anchor), clicked.max(anchor));
+                            self.revision_multi_selection = (lo..=hi)
+                                .map(|index| self.session.commits.row(index).commit_id().to_owned())
+                                .collect();
+                            return Task::none();
+                        }
+                        // No anchor to span from — fall through to a toggle.
+                    }
+                    if let Some(found) = self
+                        .revision_multi_selection
+                        .iter()
+                        .position(|id| *id == commit_id)
+                    {
+                        self.revision_multi_selection.remove(found);
+                    } else {
+                        self.revision_multi_selection.push(commit_id);
+                    }
+                    return Task::none();
+                }
+                self.revision_multi_selection.clear();
                 if self.session.selected_revision != selection {
                     if let Some(editor) = self.description_editor.as_mut()
                         && editor.is_dirty()
@@ -1001,6 +1057,9 @@ impl Diffui {
                         });
                     }
                 }
+            }
+            Message::MultiSelectClear => {
+                self.revision_multi_selection.clear();
             }
             Message::SelectTheme(theme) => {
                 self.selected_theme = theme;
@@ -1053,6 +1112,24 @@ impl Diffui {
                 // jj-only for now — the mutations are jj-lib transactions.
                 if !matches!(repository.vcs, Vcs::Jj) {
                     return Task::none();
+                }
+                // Right-click inside the marked set keeps it (the menu shows
+                // the batch actions); outside it re-targets the clicked row
+                // alone, Finder-style.
+                if !self.revision_multi_selection.is_empty() {
+                    let clicked_id = match &key {
+                        revision_list::RowSelectionKey::WorkingCopy => self
+                            .session
+                            .commits
+                            .working_copy()
+                            .map(|row| row.commit_id().to_owned()),
+                        revision_list::RowSelectionKey::Commit(id) => Some(id.clone()),
+                    };
+                    let inside =
+                        clicked_id.is_some_and(|id| self.revision_multi_selection.contains(&id));
+                    if !inside {
+                        self.revision_multi_selection.clear();
+                    }
                 }
                 // macOS pops the native menu (blocking) with a pulsing glow over
                 // `row_rect`; every other platform opens the iced overlay at the
@@ -1221,7 +1298,12 @@ impl Diffui {
                         false
                     }
                 };
-                let mutations::MutationOp::MoveBookmark { name, to } = &pending.op else {
+                let mutations::MutationOp::MoveBookmark {
+                    name,
+                    to,
+                    push_remote,
+                } = &pending.op
+                else {
                     return self.enqueue_or_run_mutation(*pending);
                 };
                 if !backwards {
@@ -1246,14 +1328,27 @@ impl Diffui {
                         })
                         .unwrap_or_else(|| hex.chars().take(12).collect()),
                 };
+                let mut body = format!(
+                    "{target} is not a descendant of the commit \u{201c}{name}\u{201d} \
+                     points at, so this is a backwards or sideways move — the jj CLI \
+                     refuses it without --allow-backwards."
+                );
+                // A backwards move that also pushes rewrites the remote
+                // branch — say so before the user commits to it.
+                let confirm_label = match push_remote {
+                    Some(remote) => {
+                        body.push_str(&format!(
+                            " The bookmark is then pushed, moving it backwards on \
+                             \u{201c}{remote}\u{201d} too."
+                        ));
+                        "Move & push anyway".to_owned()
+                    }
+                    None => "Move anyway".to_owned(),
+                };
                 self.confirm = Some(ConfirmDialog {
                     title: format!("Move bookmark \u{201c}{name}\u{201d} backwards?"),
-                    body: format!(
-                        "{target} is not a descendant of the commit \u{201c}{name}\u{201d} \
-                         points at, so this is a backwards or sideways move — the jj CLI \
-                         refuses it without --allow-backwards."
-                    ),
-                    confirm_label: "Move anyway".to_owned(),
+                    body,
+                    confirm_label,
                     pending: *pending,
                 });
             }
@@ -1295,6 +1390,9 @@ impl Diffui {
                     mutations::DraftKind::Squash => diffui_core::OpDraft::squash(draft_source),
                     mutations::DraftKind::Merge => diffui_core::OpDraft::merge(draft_source),
                 };
+                // Two marked-row languages at once would be unreadable — the
+                // draft's source wash takes over from the multi-select marks.
+                self.revision_multi_selection.clear();
                 self.op_draft = Some(DraftUi::new(draft));
                 self.activity_popover_open = false;
                 self.menu = None;
@@ -4377,6 +4475,11 @@ impl Diffui {
                     | keyboard::Key::Character("j") => Some(Message::SelectNextFile),
                     keyboard::Key::Named(keyboard::key::Named::ArrowUp)
                     | keyboard::Key::Character("k") => Some(Message::SelectPreviousFile),
+                    // With nothing else holding the keyboard, Esc drops the
+                    // sidebar's multi-selection marks (a no-op when empty).
+                    keyboard::Key::Named(keyboard::key::Named::Escape) => {
+                        Some(Message::MultiSelectClear)
+                    }
                     // Target-mode entry points on the selected revision:
                     // `r` = rebase it, `R` = rebase it with descendants,
                     // `s` = squash it into a picked destination.

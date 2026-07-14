@@ -86,8 +86,9 @@ impl Diffui {
         }
         self.description_editor = None;
         // A draft's sources are rows of the tab it started in — it can't
-        // survive a tab switch.
+        // survive a tab switch. Same for the multi-selection marks.
         self.op_draft = None;
+        self.revision_multi_selection.clear();
         // Persist the new active tab so it's re-focused next launch.
         self.mark_geometry_dirty();
 

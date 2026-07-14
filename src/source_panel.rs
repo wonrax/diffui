@@ -340,6 +340,7 @@ fn empty_revision_row(theme: ThemeSpec) -> RevisionRowView {
         lane_segments_after: Vec::new(),
         collapse_chevron: None,
         draft_source: false,
+        multi_selected: false,
         draft_marker: None,
     }
 }

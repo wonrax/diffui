@@ -57,6 +57,9 @@ pub(crate) enum Message {
     EmptyStatusComputed(TabId, u64, Vec<(usize, bool)>),
     SelectFile(usize),
     SelectRowKey(revision_list::RowSelectionKey),
+    /// Drop the sidebar's multi-selection marks (Esc with no overlay open,
+    /// or the batch menu's "Clear selection").
+    MultiSelectClear,
     /// The sidebar / diff view reported a new scroll offset. Mirrored into the
     /// active tab's state so it can be stashed and restored on tab switch.
     SidebarScrolled(f64),

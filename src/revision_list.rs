@@ -151,6 +151,10 @@ pub struct RevisionRowView {
     /// Target mode: this row is a draft source (the thing being moved) —
     /// worn as an accent wash so it reads as "lifted off".
     pub draft_source: bool,
+    /// The row is marked in the sidebar's multi-selection (⌘/⇧-click) —
+    /// wears the same accent wash as a draft source: both mean "this row is
+    /// part of the set the next action applies to".
+    pub multi_selected: bool,
     /// Target mode: the keyboard candidate's destination decoration.
     pub draft_marker: Option<DraftMarker>,
 }
@@ -1681,9 +1685,9 @@ impl<'a, Message> RevisionList<'a, Message> {
                 ROW_CARD_RADIUS,
             );
         }
-        // Target mode: the draft's source rows wear an accent wash + hairline
-        // so they read as "lifted off" while a destination is being picked.
-        if rev.draft_source {
+        // Marked rows — a draft's sources or the multi-selection — wear an
+        // accent wash + hairline so they read as "part of the pending set".
+        if rev.draft_source || rev.multi_selected {
             fill_rounded(
                 renderer,
                 card_bounds,

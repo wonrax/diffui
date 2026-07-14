@@ -72,9 +72,10 @@ pub enum MutationOp {
     New { parent: RevisionSelection },
     /// Move the working copy to `target` (`jj edit`).
     Edit { target: RevisionSelection },
-    /// Discard `target`, re-parenting its descendants onto its parents
-    /// (`jj abandon`).
-    Abandon { target: RevisionSelection },
+    /// Discard the `targets`, re-parenting their descendants onto their
+    /// parents (`jj abandon`). One transaction for the whole set, so a batch
+    /// abandon is a single op-log entry (and a single undo).
+    Abandon { targets: Vec<RevisionSelection> },
     /// Replace the full description of `target` (`jj describe -r <target>`).
     Describe {
         target: RevisionSelection,
@@ -104,8 +105,15 @@ pub enum MutationOp {
     /// lines (`jj absorb --from`).
     Absorb { from: RevisionSelection },
     /// Point local bookmark `name` at `to`, creating it if needed
-    /// (`jj bookmark set -r <to> <name>`).
-    MoveBookmark { name: String, to: RevisionSelection },
+    /// (`jj bookmark set -r <to> <name>`). With `push_remote`, the same
+    /// transaction then pushes the bookmark there (`jj git push -b <name>`)
+    /// — one activity, and a failed push rolls the move back too, so the
+    /// action never half-lands.
+    MoveBookmark {
+        name: String,
+        to: RevisionSelection,
+        push_remote: Option<String>,
+    },
     /// Delete local bookmark `name` (`jj bookmark delete <name>`).
     DeleteBookmark { name: String },
     /// Start tracking remote bookmark `name@remote`

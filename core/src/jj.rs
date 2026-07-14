@@ -1862,11 +1862,29 @@ pub(crate) async fn apply_mutation(
                 .context("failed to set working copy to target commit")?;
             format!("Working copy now at {short}")
         }
-        MutationOp::Abandon { target } => {
-            let commit = resolve_mutation_target(tx.repo(), &current_wc_id, target).await?;
-            let short = short_change_id(&commit);
-            tx.repo_mut().record_abandoned_commit(&commit);
-            format!("Abandoned {short}")
+        MutationOp::Abandon { targets } => {
+            let mut commits: Vec<Commit> = Vec::new();
+            let mut seen: HashSet<CommitId> = HashSet::new();
+            for selection in targets {
+                let commit = resolve_mutation_target(tx.repo(), &current_wc_id, selection).await?;
+                if seen.insert(commit.id().clone()) {
+                    commits.push(commit);
+                }
+            }
+            match commits.as_slice() {
+                [] => bail!("abandon needs at least one revision"),
+                [only] => {
+                    let short = short_change_id(only);
+                    tx.repo_mut().record_abandoned_commit(only);
+                    format!("Abandoned {short}")
+                }
+                many => {
+                    for commit in many {
+                        tx.repo_mut().record_abandoned_commit(commit);
+                    }
+                    format!("Abandoned {} revisions", many.len())
+                }
+            }
         }
         MutationOp::Describe {
             target,
@@ -2148,14 +2166,28 @@ pub(crate) async fn apply_mutation(
             let plural = if count == 1 { "" } else { "s" };
             format!("Absorbed {short} into {count} revision{plural}")
         }
-        MutationOp::MoveBookmark { name, to } => {
+        MutationOp::MoveBookmark {
+            name,
+            to,
+            push_remote,
+        } => {
             let commit = resolve_mutation_target(tx.repo(), &current_wc_id, to).await?;
             let short = short_change_id(&commit);
             tx.repo_mut().set_local_bookmark_target(
                 RefName::new(name),
                 RefTarget::normal(commit.id().clone()),
             );
-            format!("Moved bookmark {name} to {short}")
+            match push_remote {
+                // The push reads the bookmark's target back out of this
+                // transaction's view, so it pushes the position set above.
+                Some(remote) => {
+                    let (push_message, remote_output) =
+                        push_bookmark(&settings, tx.repo_mut(), name, remote, &progress)?;
+                    output = remote_output;
+                    format!("Moved bookmark {name} to {short} \u{b7} {push_message}")
+                }
+                None => format!("Moved bookmark {name} to {short}"),
+            }
         }
         MutationOp::DeleteBookmark { name } => {
             tx.repo_mut()

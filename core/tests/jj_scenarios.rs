@@ -1129,7 +1129,7 @@ fn undo_operation_reverts_a_specific_mutation() {
     let outcome = run(
         &root,
         MutationOp::Abandon {
-            target: RevisionSelection::Commit(victim),
+            targets: vec![RevisionSelection::Commit(victim)],
         },
     );
     assert_eq!(
@@ -1397,4 +1397,124 @@ fn snapshot_parent_fingerprint_detects_external_ops() {
     // op-log dedup comparison holds.
     let head = block_on(read_jj_op_head(repository(&root))).expect("read op head");
     assert_eq!(head, second.fingerprint);
+}
+
+/// Batch abandon: several picked revisions vanish in a single mutation (the
+/// context menu's multi-select "Abandon N revisions"), and the working copy
+/// re-parents across the hole.
+#[test]
+#[ignore = "shells out to the jj CLI"]
+fn abandon_discards_multiple_revisions_at_once() {
+    let root = scratch_repo("abandon-multi");
+    write(&root, "a.txt", "a\n");
+    jj(&root, &["commit", "-m", "keep"]);
+    write(&root, "b.txt", "b\n");
+    jj(&root, &["commit", "-m", "victim1"]);
+    write(&root, "c.txt", "c\n");
+    jj(&root, &["commit", "-m", "victim2"]);
+    let keep = commit_id(&root, "description(exact:\"keep\\n\")");
+    let victim1 = commit_id(&root, "description(exact:\"victim1\\n\")");
+    let victim1_change = change_id(&root, "description(exact:\"victim1\\n\")");
+    let victim2 = commit_id(&root, "description(exact:\"victim2\\n\")");
+    let victim2_change = change_id(&root, "description(exact:\"victim2\\n\")");
+
+    let outcome = run(
+        &root,
+        MutationOp::Abandon {
+            targets: vec![
+                RevisionSelection::Commit(victim1),
+                RevisionSelection::Commit(victim2),
+            ],
+        },
+    );
+    assert_eq!(outcome.message, "Abandoned 2 revisions");
+
+    for change in [&victim1_change, &victim2_change] {
+        assert_eq!(
+            jj(
+                &root,
+                &[
+                    "log",
+                    "--no-graph",
+                    "-r",
+                    &format!("present({change})"),
+                    "-T",
+                    "commit_id",
+                ]
+            ),
+            "",
+            "an abandoned revision must be hidden"
+        );
+    }
+    assert_eq!(
+        parent_ids(&root, "@"),
+        vec![keep],
+        "@ re-parents onto the survivor"
+    );
+}
+
+/// Move-and-push in one mutation (the context menu's "Move bookmark here &
+/// push"): the local bookmark, its remote-tracking ref, and the remote itself
+/// all land on the target.
+#[test]
+#[ignore = "shells out to the jj CLI"]
+fn move_bookmark_with_push_updates_the_remote() {
+    let root = scratch_repo("move-push");
+    // A bare git repo on disk is a perfectly good `jj git push` remote.
+    let remote = std::env::temp_dir().join("diffui-core-scenario-move-push-remote.git");
+    let _ = std::fs::remove_dir_all(&remote);
+    let status = Command::new("git")
+        .args(["init", "--bare"])
+        .arg(&remote)
+        .status()
+        .expect("git CLI must be on PATH for this scenario");
+    assert!(status.success(), "git init --bare failed");
+
+    write(&root, "file.txt", "one\n");
+    jj(&root, &["commit", "-m", "first"]);
+    jj(&root, &["bookmark", "create", "main", "-r", "@-"]);
+    jj(
+        &root,
+        &["git", "remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    jj(&root, &["git", "push", "--bookmark", "main", "--allow-new"]);
+
+    write(&root, "file.txt", "two\n");
+    jj(&root, &["commit", "-m", "second"]);
+    let target = commit_id(&root, "description(exact:\"second\\n\")");
+
+    let outcome = run(
+        &root,
+        MutationOp::MoveBookmark {
+            name: "main".to_owned(),
+            to: RevisionSelection::Commit(target.clone()),
+            push_remote: Some("origin".to_owned()),
+        },
+    );
+    assert!(
+        outcome.message.contains("Pushed main to origin"),
+        "message should report the push: {}",
+        outcome.message
+    );
+
+    assert_eq!(commit_id(&root, "main"), target, "local bookmark moved");
+    assert_eq!(
+        commit_id(&root, "main@origin"),
+        target,
+        "remote-tracking ref follows the push"
+    );
+    let on_remote = Command::new("git")
+        .current_dir(&remote)
+        .args(["rev-parse", "refs/heads/main"])
+        .output()
+        .expect("git rev-parse on the remote");
+    assert!(
+        on_remote.status.success(),
+        "remote must have refs/heads/main"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&on_remote.stdout).trim(),
+        target,
+        "the remote itself received the new position"
+    );
 }

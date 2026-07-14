@@ -443,6 +443,13 @@ pub(crate) struct Diffui {
     /// `None` outside target mode. Cleared on tab switch — a draft's sources
     /// are rows of the tab it started in.
     pub(crate) op_draft: Option<DraftUi>,
+    /// Commit ids marked via ⌘-click / ⇧-click for a batch action (the
+    /// context menu's "Abandon N revisions"), in mark order. A separate axis
+    /// from `session.selected_revision` — marking never changes which diff
+    /// is shown. Cleared on plain click, Esc, draft start, and tab switch;
+    /// ids whose rows left the loaded graph are ignored at use rather than
+    /// eagerly pruned.
+    pub(crate) revision_multi_selection: Vec<String>,
     /// Transient error toasts (failed mutation/fetch/undo), newest last.
     /// The activity log keeps the durable record; these only make a failure
     /// impossible to miss. Auto-pruned after a few seconds, click to dismiss.
@@ -1014,6 +1021,9 @@ pub(crate) enum MenuAction {
     /// for the same reason as `Fetch`.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     SetRevset(String),
+    /// Drop the sidebar's multi-selection marks (the batch menu's escape
+    /// hatch; Esc and a plain row click do the same).
+    ClearMultiSelection,
 }
 
 #[derive(Debug, Clone, Copy)]

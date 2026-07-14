@@ -15,6 +15,41 @@ impl Diffui {
         use menu::MenuEntry;
         use mutations::MutationOp;
 
+        // A live multi-selection (several marked rows, the clicked one among
+        // them) swaps the per-revision menu for the batch menu — marking rows
+        // only exists to act on all of them at once. Marks whose rows left
+        // the loaded graph (reload, revset change) are ignored rather than
+        // silently acted on.
+        let marked: Vec<&str> = self
+            .revision_multi_selection
+            .iter()
+            .map(String::as_str)
+            .filter(|id| self.session.commits.find_by_commit_id(id).is_some())
+            .collect();
+        let clicked_id = match selection {
+            RevisionSelection::WorkingCopy => self
+                .session
+                .commits
+                .working_copy()
+                .map(|row| row.commit_id().to_owned()),
+            RevisionSelection::Commit(hex) => Some(hex.clone()),
+        };
+        if marked.len() > 1 && clicked_id.as_deref().is_some_and(|id| marked.contains(&id)) {
+            return vec![
+                MenuEntry::item(
+                    format!("Abandon {} revisions", marked.len()),
+                    MenuAction::Mutate(MutationOp::Abandon {
+                        targets: marked
+                            .iter()
+                            .map(|id| RevisionSelection::Commit((*id).to_owned()))
+                            .collect(),
+                    }),
+                ),
+                MenuEntry::Separator,
+                MenuEntry::item("Clear selection", MenuAction::ClearMultiSelection),
+            ];
+        }
+
         let mut top = vec![
             MenuEntry::item(
                 "Edit description…",
@@ -112,7 +147,7 @@ impl Diffui {
             MenuEntry::item(
                 "Abandon",
                 MenuAction::Mutate(MutationOp::Abandon {
-                    target: selection.clone(),
+                    targets: vec![selection.clone()],
                 }),
             ),
             MenuEntry::Separator,
@@ -210,15 +245,43 @@ impl Diffui {
         };
         self.sort_by_proximity(&mut moves, move_reference.as_deref(), |(_, t)| t.as_str());
         let move_items: Vec<MenuEntry> = moves
-            .into_iter()
+            .iter()
             .map(|(name, _target)| {
                 MenuEntry::item(
                     name.clone(),
                     MenuAction::Mutate(MutationOp::MoveBookmark {
-                        name,
+                        name: name.clone(),
                         to: selection.clone(),
+                        push_remote: None,
                     }),
                 )
+            })
+            .collect();
+        // Same list, but landing the move also pushes the bookmark to its
+        // tracked remote — "advance main and publish it" as one pick. Kept a
+        // sibling submenu rather than a per-bookmark verb submenu so the
+        // common plain move stays one level deep. Bookmarks without a
+        // tracked remote are omitted (nowhere to push); the submenu hides
+        // entirely when none qualify instead of sitting disabled in every
+        // menu of a remote-less repo.
+        let move_push_items: Vec<MenuEntry> = moves
+            .iter()
+            .filter_map(|(name, _target)| {
+                let entry = self
+                    .session
+                    .bookmarks
+                    .bookmarks
+                    .iter()
+                    .find(|b| b.name == *name)?;
+                let remote = entry.tracked_remote()?;
+                Some(MenuEntry::item(
+                    format!("{name} \u{2192} {remote}"),
+                    MenuAction::Mutate(MutationOp::MoveBookmark {
+                        name: name.clone(),
+                        to: selection.clone(),
+                        push_remote: Some(remote.to_owned()),
+                    }),
+                ))
             })
             .collect();
         top.push(MenuEntry::Separator);
@@ -232,6 +295,12 @@ impl Diffui {
                 items: move_items,
             }
         });
+        if !move_push_items.is_empty() {
+            top.push(MenuEntry::Submenu {
+                label: "Move bookmark here & push".to_owned(),
+                items: move_push_items,
+            });
+        }
 
         // Per-bookmark actions for bookmarks sitting on this revision.
         let target_hex: Option<&str> = match selection {
@@ -380,8 +449,17 @@ impl Diffui {
                     Message::CopyToClipboard(text)
                 });
             }
+            MenuAction::ClearMultiSelection => {
+                self.revision_multi_selection.clear();
+                return Task::none();
+            }
             MenuAction::Mutate(op) => op,
         };
+        // A batch abandon consumes the marked rows — the marks (and their
+        // wash) mustn't outlive the pick.
+        if matches!(&op, mutations::MutationOp::Abandon { targets } if targets.len() > 1) {
+            self.revision_multi_selection.clear();
+        }
         self.start_mutation_op(op)
     }
 
@@ -400,7 +478,13 @@ impl Diffui {
         let label = match &op {
             MutationOp::New { .. } => "New change".to_owned(),
             MutationOp::Edit { .. } => "Edit".to_owned(),
-            MutationOp::Abandon { .. } => "Abandon".to_owned(),
+            MutationOp::Abandon { targets } => {
+                if targets.len() == 1 {
+                    "Abandon".to_owned()
+                } else {
+                    format!("Abandon {} revisions", targets.len())
+                }
+            }
             MutationOp::Describe { .. } => "Update description".to_owned(),
             MutationOp::Rebase { sources, .. } => {
                 if sources.len() == 1 {
@@ -413,15 +497,27 @@ impl Diffui {
             MutationOp::Merge { .. } => "New merge".to_owned(),
             MutationOp::Duplicate { .. } => "Duplicate".to_owned(),
             MutationOp::Absorb { .. } => "Absorb".to_owned(),
+            MutationOp::MoveBookmark {
+                name,
+                push_remote: Some(remote),
+                ..
+            } => format!("Move {name} + push to {remote}"),
             MutationOp::MoveBookmark { name, .. } => format!("Move bookmark {name}"),
             MutationOp::DeleteBookmark { name } => format!("Delete bookmark {name}"),
             MutationOp::TrackBookmark { name, remote } => format!("Track {name}@{remote}"),
             MutationOp::PushBookmark { name, remote } => format!("Push {name} to {remote}"),
             MutationOp::Undo { .. } => "Undo".to_owned(),
         };
-        // Only push reports real progress (git transfer); the rest are quick
+        // Only pushes report real progress (git transfer); the rest are quick
         // local ops, so they stay indeterminate.
-        let determinate = matches!(op, MutationOp::PushBookmark { .. });
+        let determinate = matches!(
+            op,
+            MutationOp::PushBookmark { .. }
+                | MutationOp::MoveBookmark {
+                    push_remote: Some(_),
+                    ..
+                }
+        );
         let (activity_id, progress) = self.begin_activity(label, determinate);
         let pending = PendingMutation {
             repository,
@@ -435,7 +531,7 @@ impl Diffui {
         // result either runs the move directly (fast-forward) or raises a
         // confirmation dialog. The activity sits Queued meanwhile so the
         // action stays visible (and is resolved on cancel).
-        if let MutationOp::MoveBookmark { name, to } = &pending.op {
+        if let MutationOp::MoveBookmark { name, to, .. } = &pending.op {
             if let Some(log) = self.activity_log_for(pending.tab_id) {
                 log.set_status(pending.activity_id, activity::ActivityStatus::Queued);
             }
