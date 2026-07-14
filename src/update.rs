@@ -1362,6 +1362,69 @@ impl Diffui {
             Message::DraftCancel => {
                 self.op_draft = None;
             }
+            Message::DraftHoverCandidate(index) => {
+                // Mouse-hover targeting: arm the hovered row as the candidate,
+                // exactly like j/k. Leaving the rows (`None`) keeps the last
+                // candidate armed — same persistence the keyboard gets.
+                let Some(index) = index else {
+                    return Task::none();
+                };
+                let Some(ui) = self.op_draft.as_mut() else {
+                    return Task::none();
+                };
+                if ui.draft.candidate == Some(index) || index >= self.session.commits.len() {
+                    return Task::none();
+                }
+                ui.draft.candidate = Some(index);
+                return self.kick_draft_preview();
+            }
+            Message::DraftPreviewKick(version) => {
+                // The debounce timer fired: run the simulation that was
+                // parked at kick time, unless a newer kick (or an Idle
+                // transition, which clears the request) superseded it.
+                let Some(repository) = self.session.repository.clone() else {
+                    return Task::none();
+                };
+                let Some(ui) = self.op_draft.as_mut() else {
+                    return Task::none();
+                };
+                if ui.preview_version != version {
+                    return Task::none();
+                }
+                let Some(request) = ui.preview_request.take() else {
+                    return Task::none();
+                };
+                return Task::perform(
+                    async move {
+                        match request.kind {
+                            mutations::DraftKind::Rebase { mode } => mutations::run_rebase_preview(
+                                repository,
+                                mode,
+                                request.sources,
+                                request.destination,
+                            )
+                            .await
+                            .map(mutations::DraftSimulation::Rebase),
+                            mutations::DraftKind::Merge => {
+                                // The merge's second parent is the
+                                // destination's anchor (gap drops resolve to
+                                // the parent side, like the confirm path).
+                                let anchor = request.destination.anchor().clone();
+                                let parents: Vec<RevisionSelection> =
+                                    request.sources.into_iter().chain([anchor]).collect();
+                                mutations::run_merge_preview(repository, parents)
+                                    .await
+                                    .map(mutations::DraftSimulation::Merge)
+                            }
+                            // Filtered out before the request was parked.
+                            mutations::DraftKind::Squash => {
+                                Err("squash has no simulation".to_owned())
+                            }
+                        }
+                    },
+                    move |result| Message::DraftPreview(version, Box::new(result)),
+                );
+            }
             Message::DraftPreview(version, result) => {
                 if let Some(ui) = self.op_draft.as_mut()
                     && ui.preview_version == version
@@ -1454,16 +1517,26 @@ impl Diffui {
                 {
                     *mode = mutations::RebaseSourceMode::WithDescendants;
                 }
+                // Targets resolve through the graph before the lowering's own
+                // check: `op_for`'s guard only sees the `Commit` variant, so
+                // a `WorkingCopy` selection naming a source commit would slip
+                // through it.
                 let op = match spot {
                     revision_list::DropSpot::OnRow(index) => self
                         .selection_at_index(index)
+                        .filter(|target| !self.draft_blocks_target(target))
                         .and_then(|target| draft.op_for(target, mutations::PlacementKind::Onto)),
                     revision_list::DropSpot::Gap { above, below } => {
                         match (
                             self.selection_at_index(below),
                             self.selection_at_index(above),
                         ) {
-                            (Some(parent), Some(child)) => draft.op_for_gap(parent, child),
+                            (Some(parent), Some(child))
+                                if !self.draft_blocks_target(&parent)
+                                    && !self.draft_blocks_target(&child) =>
+                            {
+                                draft.op_for_gap(parent, child)
+                            }
                             _ => None,
                         }
                     }
@@ -1482,9 +1555,6 @@ impl Diffui {
                 }
             }
             Message::UndoActivityOp(activity_id, operation_id) => {
-                let Some(repository) = self.session.repository.clone() else {
-                    return Task::none();
-                };
                 let Some(tab_id) = self.active_tab_id() else {
                     return Task::none();
                 };
@@ -1493,11 +1563,9 @@ impl Diffui {
                 if let Some(log) = self.activity_log_for(tab_id) {
                     log.clear_undo_op(activity_id);
                 }
-                let (id, _progress) = self.begin_activity("Undo", false);
-                return Task::perform(
-                    mutations::run_undo_operation(repository, operation_id),
-                    move |result| Message::UndoCompleted(tab_id, id, Box::new(result)),
-                );
+                return self.start_mutation_op(mutations::MutationOp::Undo {
+                    operation_id: Some(operation_id),
+                });
             }
             Message::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers;
@@ -2078,9 +2146,6 @@ impl Diffui {
             }
             Message::Undo => {
                 return self.start_undo();
-            }
-            Message::UndoCompleted(tab_id, id, result) => {
-                return self.finish_remote_op(tab_id, id, *result, None);
             }
             Message::RevsetChanged(value) => {
                 self.session.revset = value;
@@ -3471,6 +3536,18 @@ impl Diffui {
         self.mutation_queue.is_busy()
     }
 
+    /// Whether `target` resolves to one of the active draft's source commits.
+    /// Resolved through the loaded graph so a [`RevisionSelection::WorkingCopy`]
+    /// naming a source commit is caught too — the core-side `op_for` guard
+    /// only inspects the `Commit` variant.
+    pub(crate) fn draft_blocks_target(&self, target: &RevisionSelection) -> bool {
+        let Some(ui) = self.op_draft.as_ref() else {
+            return false;
+        };
+        self.draft_source_for(target)
+            .is_some_and(|source| ui.draft.is_source(&source.commit_id))
+    }
+
     /// Resolve a selection to a draft source against the loaded graph: its
     /// commit id (for validity checks) and a short change-id label for the op
     /// bar. `None` when the row isn't in the loaded graph.
@@ -3511,14 +3588,12 @@ impl Diffui {
         target: RevisionSelection,
         placement_override: Option<mutations::PlacementKind>,
     ) -> Task<Message> {
+        if self.draft_blocks_target(&target) {
+            return Task::none();
+        }
         let Some(ui) = self.op_draft.as_ref() else {
             return Task::none();
         };
-        if let RevisionSelection::Commit(id) = &target
-            && ui.draft.is_source(id)
-        {
-            return Task::none();
-        }
         let placement = placement_override.unwrap_or(ui.draft.placement);
         let Some(op) = ui.draft.op_for(target, placement) else {
             return Task::none();
@@ -3604,9 +3679,9 @@ impl Diffui {
     /// destination (keyboard candidate + placement, or the live drag spot).
     /// Version-guarded: a newer candidate supersedes the in-flight preview.
     pub(crate) fn kick_draft_preview(&mut self) -> Task<Message> {
-        let Some(repository) = self.session.repository.clone() else {
+        if self.session.repository.is_none() {
             return Task::none();
-        };
+        }
         // Destination from the drag spot when one is live, else the keyboard
         // candidate + placement. Resolved before borrowing the draft mutably.
         let (spot, candidate, placement) = match self.op_draft.as_ref() {
@@ -3634,24 +3709,33 @@ impl Diffui {
                     mutations::PlacementKind::Before => mutations::Destination::Before(target),
                 }),
         };
+        // A destination anchored on a source is invalid — resolved through
+        // the graph (so a WorkingCopy anchor naming a source is caught) and
+        // before the mutable draft borrow below.
+        let anchor_blocked = destination
+            .as_ref()
+            .is_some_and(|destination| self.draft_blocks_target(destination.anchor()));
         let Some(ui) = self.op_draft.as_mut() else {
             return Task::none();
         };
+        // The Idle paths must also drop any parked request: they don't bump
+        // the version, so a still-running debounce timer would otherwise
+        // pick the stale request up and revive a destination the user left.
         if matches!(ui.draft.kind, mutations::DraftKind::Squash) {
             // Squash has no simulation (it rarely conflicts and the op bar
             // already names the fold target).
             ui.preview = DraftPreviewState::Idle;
+            ui.preview_request = None;
             return Task::none();
         }
         let Some(destination) = destination else {
             ui.preview = DraftPreviewState::Idle;
+            ui.preview_request = None;
             return Task::none();
         };
-        // A destination anchored on a source is invalid — don't simulate it.
-        if let RevisionSelection::Commit(id) = destination.anchor()
-            && ui.draft.is_source(id)
-        {
+        if anchor_blocked {
             ui.preview = DraftPreviewState::Idle;
+            ui.preview_request = None;
             return Task::none();
         }
         let sources: Vec<RevisionSelection> = ui
@@ -3663,38 +3747,17 @@ impl Diffui {
         ui.preview_version = ui.preview_version.wrapping_add(1);
         let version = ui.preview_version;
         ui.preview = DraftPreviewState::Loading;
-        let kind = ui.draft.kind;
-        Task::perform(
-            async move {
-                // Debounce: rapid j/j/j candidate hops supersede this version
-                // before the sleep ends, and the stale result is dropped on
-                // arrival — so at most one simulation per settle runs to
-                // completion usefully.
-                tokio::time::sleep(Duration::from_millis(250)).await;
-                match kind {
-                    mutations::DraftKind::Rebase { mode } => {
-                        mutations::run_rebase_preview(repository, mode, sources, destination)
-                            .await
-                            .map(mutations::DraftSimulation::Rebase)
-                    }
-                    mutations::DraftKind::Merge => {
-                        // The merge's second parent is the destination's
-                        // anchor (gap drops resolve to the parent side, like
-                        // the confirm path).
-                        let parents: Vec<RevisionSelection> = sources
-                            .into_iter()
-                            .chain([destination.anchor().clone()])
-                            .collect();
-                        mutations::run_merge_preview(repository, parents)
-                            .await
-                            .map(mutations::DraftSimulation::Merge)
-                    }
-                    // Filtered out before the task was spawned.
-                    mutations::DraftKind::Squash => Err("squash has no simulation".to_owned()),
-                }
-            },
-            move |result| Message::DraftPreview(version, Box::new(result)),
-        )
+        ui.preview_request = Some(crate::PreviewRequest {
+            kind: ui.draft.kind,
+            sources,
+            destination,
+        });
+        // Debounce: only the version crosses the timer. `DraftPreviewKick`
+        // spawns the parked simulation iff the version is still current, so
+        // rapid j/j/j candidate hops expire without touching the backend.
+        Task::perform(tokio::time::sleep(Duration::from_millis(250)), move |()| {
+            Message::DraftPreviewKick(version)
+        })
     }
 
     /// Run a mutation now, or queue it behind one already in flight. Two of our
@@ -3855,9 +3918,10 @@ impl Diffui {
         })
     }
 
-    /// Toolbar "Undo": revert the latest operation, surfaced as an activity.
-    /// Capability-gated (jj repos only today); `finish_remote_op` reloads on
-    /// success.
+    /// Toolbar "Undo": revert the latest meaningful operation. Capability-gated
+    /// (jj repos only today) and routed through the mutation queue like every
+    /// other mutation, so it serializes behind in-flight ops and gets the
+    /// snapshot-before-mutate discipline.
     pub(crate) fn start_undo(&mut self) -> Task<Message> {
         let Some(source) = self.session.source.clone() else {
             return Task::none();
@@ -3865,13 +3929,7 @@ impl Diffui {
         if source.as_mutable().is_none() {
             return Task::none();
         }
-        let Some(tab_id) = self.active_tab_id() else {
-            return Task::none();
-        };
-        let (id, _progress) = self.begin_activity("Undo", false);
-        Task::perform(source.undo(), move |result| {
-            Message::UndoCompleted(tab_id, id, Box::new(result))
-        })
+        self.start_mutation_op(mutations::MutationOp::Undo { operation_id: None })
     }
 
     /// Re-evaluate the log against the current `self.session.revset` (Enter in the

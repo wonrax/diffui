@@ -312,6 +312,19 @@ pub struct RevisionList<'a, Message> {
     restore_token: u64,
     /// Drag-to-rebase hooks; `None` disables dragging (git repos, PR tabs).
     on_drag: Option<DragHooks<Message>>,
+    /// Whether the gap *below* commit index `i` is a real parent edge (the
+    /// next display row is a direct parent of row `i`). Adjacent rows in a
+    /// branched log are often unrelated — inserting "between" them would
+    /// silently rewire the upper row onto the dragged commit — so gap drop
+    /// spots only exist where this returns `true`. `None` disables gaps.
+    gap_edge: Option<Box<dyn Fn(usize) -> bool + 'a>>,
+    /// Target mode's plain-hover channel: the commit row under the cursor
+    /// (no drag needed), `None` when the cursor leaves the rows. The app
+    /// arms it as the draft *candidate* — same as keyboard `j`/`k`, honoring
+    /// the armed `o`/`a`/`b` placement — so the op bar's "hover … to
+    /// preview" holds for mouse users. Drags keep their own spot channel
+    /// (`DragHooks::hover`); gaps stay a drag-only gesture.
+    on_target_hover: Option<fn(Option<usize>) -> Message>,
 }
 
 /// Callbacks for the drag-to-rebase gesture. All `fn` pointers, like the
@@ -360,12 +373,28 @@ impl<'a, Message> RevisionList<'a, Message> {
             restore_offset: 0.0,
             restore_token: 0,
             on_drag: None,
+            gap_edge: None,
+            on_target_hover: None,
         }
+    }
+
+    /// Report the hovered commit row while an op draft is picking a
+    /// destination — see the `on_target_hover` field.
+    pub fn on_target_hover(mut self, callback: fn(Option<usize>) -> Message) -> Self {
+        self.on_target_hover = Some(callback);
+        self
     }
 
     /// Enable drag-to-rebase on revision rows.
     pub fn on_drag(mut self, hooks: DragHooks<Message>) -> Self {
         self.on_drag = Some(hooks);
+        self
+    }
+
+    /// Provide the parent-edge test that legitimizes insert-between gaps
+    /// (see the `gap_edge` field). Without it, drops only land on rows.
+    pub fn gap_edges(mut self, edge: Box<dyn Fn(usize) -> bool + 'a>) -> Self {
+        self.gap_edge = Some(edge);
         self
     }
 
@@ -513,8 +542,9 @@ impl<'a, Message> RevisionList<'a, Message> {
     /// Resolve a drag cursor position (content-space y) to a drop spot: the
     /// row under it, or — within a few px of a boundary between two
     /// revision rows — the gap between them. File rows resolve to their
-    /// parent revision; only genuine revision/revision boundaries read as
-    /// gaps (plus the file-block edge, which resolves through the parent).
+    /// parent revision; only genuine revision/revision boundaries that are
+    /// also real parent edges (`gap_edge`) read as gaps, so a drop can't
+    /// "insert between" two unrelated branches that merely render adjacently.
     fn drop_spot_at(&self, local_y: f64) -> Option<DropSpot> {
         const GAP_ZONE: f64 = 7.0;
         let flat = self.row_at_offset(local_y)?;
@@ -522,12 +552,14 @@ impl<'a, Message> RevisionList<'a, Message> {
         if !matches!(self.row_kind(flat), RowKind::Revision(_)) {
             return Some(DropSpot::OnRow(commit));
         }
+        let is_edge = |upper: usize| self.gap_edge.as_ref().is_some_and(|edge| edge(upper));
         let top = self.row_top(flat);
         let height = f64::from(row_height_of(self.row_kind(flat)));
         if local_y - top < GAP_ZONE
             && flat > 0
             && let Some(above) = self.drop_commit_of(flat - 1)
             && above != commit
+            && is_edge(above)
         {
             return Some(DropSpot::Gap {
                 above,
@@ -538,6 +570,7 @@ impl<'a, Message> RevisionList<'a, Message> {
             && flat + 1 < self.row_count()
             && let Some(below) = self.drop_commit_of(flat + 1)
             && below != commit
+            && is_edge(commit)
         {
             return Some(DropSpot::Gap {
                 above: commit,
@@ -673,6 +706,10 @@ struct State {
     /// A revision-row press waiting for its release to become a click
     /// (`(flat row, selection key)`). Cleared when a drag activates instead.
     pending_click: Option<(usize, RowSelectionKey)>,
+    /// Last commit row published through `on_target_hover` (change-detection
+    /// so plain mouse moves don't re-publish the same row). Reset around
+    /// drags and when target mode ends so the next hover re-publishes.
+    target_hover: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -705,6 +742,7 @@ impl State {
             pending_set_offset: None,
             drag: None,
             pending_click: None,
+            target_hover: None,
         }
     }
 }
@@ -925,6 +963,10 @@ where
                         let dy = position.y - drag.origin.y;
                         if (dx * dx + dy * dy).sqrt() >= 6.0 {
                             drag.active = true;
+                            // The drag owns spot publishing from here; reset
+                            // the plain-hover dedupe so the first post-drag
+                            // hover re-publishes whatever it lands on.
+                            state.target_hover = None;
                             if let Some(hooks) = &self.on_drag {
                                 shell.publish((hooks.start)(drag.source_commit));
                             }
@@ -952,6 +994,25 @@ where
                         return;
                     }
                 }
+                // Target mode without a live drag: mirror the hovered commit
+                // row to the app so mouse users get the destination hint +
+                // preview without dragging. File rows resolve to their
+                // revision, matching drop semantics.
+                if let Some(on_target_hover) = self.on_target_hover {
+                    let hovered = if bounds.contains(*position) {
+                        let local_y = (position.y - bounds.y) as f64 + state.vertical_offset;
+                        self.row_at_offset(local_y)
+                            .and_then(|flat| self.drop_commit_of(flat))
+                    } else {
+                        None
+                    };
+                    if state.target_hover != hovered {
+                        state.target_hover = hovered;
+                        shell.publish(on_target_hover(hovered));
+                    }
+                } else {
+                    state.target_hover = None;
+                }
                 if bounds.contains(*position) {
                     state.cursor_position = Some(*position);
                 } else {
@@ -970,6 +1031,11 @@ where
             }
             Event::Mouse(mouse::Event::CursorLeft) => {
                 state.cursor_position = None;
+                if state.target_hover.take().is_some()
+                    && let Some(on_target_hover) = self.on_target_hover
+                {
+                    shell.publish(on_target_hover(None));
+                }
                 let had_hover = state.hovered_file_item.take().is_some()
                     || state.hovered_revision_item.take().is_some()
                     || state.hovered_lane.take().is_some();
@@ -1069,6 +1135,7 @@ where
                 if let Some(drag) = state.drag.take()
                     && drag.active
                 {
+                    state.target_hover = None;
                     if let Some(hooks) = &self.on_drag {
                         shell.publish((hooks.drop)(drag.spot));
                     }

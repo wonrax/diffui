@@ -36,7 +36,7 @@ pub use session::{
 pub use source::{DiffSource, DiffTarget, Mutable, RepoSource, RevisionGraph, SourceHandle};
 pub use source::{
     compute_empty_status, fetch, highlight_file, load_backend, load_diff, load_repository_snapshot,
-    load_revision_details, read_op_head, undo,
+    load_revision_details, read_op_head,
 };
 pub use source_browse::{
     SourceEntry, SourceEntryStatus, SourceFileLoad, SourceTreeRow, list_ignored_dir,

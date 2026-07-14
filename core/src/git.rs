@@ -574,6 +574,7 @@ fn build_commit_summaries(rows: Vec<ParsedCommitRow>) -> (Vec<CommitSummary>, Gr
             change_offset: None,
             is_working_copy: row.is_working_copy,
             bookmarks: Vec::new(),
+            parent_ids: row.parents,
         })
         .collect();
     (summaries, graph_builder.finish())

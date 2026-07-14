@@ -38,7 +38,7 @@ use jj_lib::{
     matchers::{EverythingMatcher, Matcher, NothingMatcher, PrefixMatcher},
     merge::{Diff, Merge, SameChange},
     object_id::ObjectId,
-    op_store::{LocalRemoteRefTarget, OperationId, RefTarget, View},
+    op_store::{LocalRemoteRefTarget, OperationId, RefTarget},
     operation::Operation,
     ref_name::{RefName, RefNameBuf, RemoteName, RemoteNameBuf, WorkspaceName, WorkspaceNameBuf},
     repo::{MutableRepo, ReadonlyRepo, Repo, RepoLoader, StoreFactories},
@@ -425,6 +425,7 @@ pub async fn walk_jj_with_repo(
                 change_offset,
                 is_working_copy: id == *wc_commit_id,
                 bookmarks,
+                parent_ids: commit.parent_ids().iter().map(|id| id.hex()).collect(),
             };
             ids.push(id);
             batch.push(StreamRow { summary, frame });
@@ -1788,7 +1789,12 @@ pub(crate) async fn apply_mutation(
     let mut tx = base_repo.start_transaction();
 
     // Fold any uncommitted on-disk changes into `@` first so moving off it
-    // doesn't lose them.
+    // doesn't lose them. The fold normally rides inside the mutation's own
+    // transaction (one op per action; the folded commit stays referenced by
+    // the resulting view) — but an *undo* removes commits from the view, so a
+    // same-tx fold could end up referenced by no operation at all and be
+    // unrecoverable from the op log. For undo the fold is committed as its
+    // own snapshot op first, mirroring the CLI's snapshot-before-command.
     if new_tree.tree_ids_and_labels() != wc_commit.tree().tree_ids_and_labels() {
         let rewritten = tx
             .repo_mut()
@@ -1804,6 +1810,14 @@ pub(crate) async fn apply_mutation(
             .rebase_descendants()
             .await
             .context("failed to rebase descendants after working-copy fold")?;
+        if matches!(op, MutationOp::Undo { .. }) {
+            tx.set_is_snapshot(true);
+            let snapped = tx
+                .commit("snapshot working copy")
+                .await
+                .context("failed to commit pre-undo snapshot")?;
+            tx = snapped.start_transaction();
+        }
     }
 
     // The post-fold `@`, used to resolve a `WorkingCopy` target after the fold
@@ -2161,6 +2175,74 @@ pub(crate) async fn apply_mutation(
             output = remote_output;
             message
         }
+        MutationOp::Undo { operation_id } => {
+            let op_to_undo = match operation_id {
+                Some(hex) => {
+                    let op_id = OperationId::try_from_hex(hex)
+                        .with_context(|| format!("invalid jj operation id {hex}"))?;
+                    let data = repo_loader
+                        .op_store()
+                        .read_operation(&op_id)
+                        .await
+                        .context("failed to load the operation to undo")?;
+                    Operation::new(repo_loader.op_store().clone(), op_id, data)
+                }
+                None => {
+                    // diffui auto-snapshots the working copy on focus/refresh,
+                    // so the head op is often a pure snapshot; walk past those
+                    // so Undo targets the user's last real operation. Repeated
+                    // Undo toggles (undo-the-undo = redo) rather than walking
+                    // an undo stack.
+                    let mut op = base_repo.operation().clone();
+                    while op.metadata().is_snapshot {
+                        let parents = op
+                            .parents()
+                            .await
+                            .context("failed to read operation parents")?;
+                        match parents.as_slice() {
+                            [parent] => op = parent.clone(),
+                            _ => break,
+                        }
+                    }
+                    op
+                }
+            };
+            let parents = op_to_undo
+                .parents()
+                .await
+                .context("failed to read operation parents")?;
+            let op_parent = match parents.as_slice() {
+                [parent] => parent.clone(),
+                [] => bail!("nothing to undo"),
+                _ => bail!("can't undo a merge operation"),
+            };
+            // Merge `(parent(op) − op)` onto the current view through jj's own
+            // op-merge machinery (exactly what `jj undo <op>` does), so
+            // unrelated later work — including this transaction's
+            // working-copy fold above — is preserved rather than wiped the
+            // way an op *restore* would.
+            let op_repo = repo_loader
+                .load_at(&op_to_undo)
+                .await
+                .context("failed to load the repo at the operation to undo")?;
+            let parent_repo = repo_loader
+                .load_at(&op_parent)
+                .await
+                .context("failed to load the repo before the operation to undo")?;
+            tx.repo_mut()
+                .merge(&op_repo, &parent_repo)
+                .await
+                .context("failed to merge the undo into the current view")?;
+            let undone = op_to_undo
+                .metadata()
+                .description
+                .lines()
+                .next()
+                .filter(|line| !line.is_empty())
+                .unwrap_or("operation")
+                .to_owned();
+            format!("Undid: {undone}")
+        }
     };
 
     tx.repo_mut()
@@ -2203,13 +2285,16 @@ pub(crate) async fn apply_mutation(
         .await
         .context("failed to finish working-copy mutation")?;
 
-    let moved_working_copy = matches!(
-        op,
+    let moved_working_copy = match &op {
         MutationOp::New { .. }
-            | MutationOp::Edit { .. }
-            | MutationOp::Abandon { .. }
-            | MutationOp::Merge { .. }
-    );
+        | MutationOp::Edit { .. }
+        | MutationOp::Abandon { .. }
+        | MutationOp::Merge { .. } => true,
+        // An undo may or may not move `@` depending on what the undone op
+        // did — compare against the post-fold pointer instead of guessing.
+        MutationOp::Undo { .. } => new_wc_id != current_wc_id,
+        _ => false,
+    };
     Ok(MutationOutcome {
         message,
         moved_working_copy,
@@ -2878,232 +2963,6 @@ pub(crate) async fn fetch_jj(
     // No sideband output means the fetch was a no-op (up to date); the caller
     // words the summary.
     Ok(lines)
-}
-
-/// In-process `jj undo`: restore the working state to the parent of the last
-/// meaningful operation, then check out the restored `@` so on-disk files
-/// match. Mirrors jj-cli's `cmd_undo` (restore-to-parent of the *view*, not a
-/// merge-revert), with two diffui-specific adaptations:
-///
-///   * **Skip diffui's own background snapshot ops.** diffui auto-snapshots the
-///     working copy on focus/refresh, so the head op is often a "pure snapshot".
-///     jj-cli's interactive undo rarely hits that; here we walk past snapshot
-///     ops (`metadata().is_snapshot`) so Undo targets the user's last real
-///     operation rather than a no-op snapshot.
-///   * We don't replicate the undo/redo *stack-walking* — repeated Undo simply
-///     toggles (undo, then undo-the-undo = redo). The op description uses jj's
-///     own `undo: restore to operation <id>` prefix, so the result still
-///     composes with the jj CLI's undo/redo.
-pub(crate) async fn undo_jj(repository: Repository) -> Result<Vec<String>> {
-    let settings = jj_settings(&repository.root)?;
-    let mut workspace = Workspace::load(
-        &settings,
-        &repository.root,
-        &StoreFactories::default(),
-        &default_working_copy_factories(),
-    )
-    .context("failed to load jj workspace")?;
-    let workspace_name = workspace.workspace_name().to_owned();
-
-    let repo_loader = workspace.repo_loader().clone();
-    let mut locked_ws = workspace
-        .start_working_copy_mutation()
-        .context("failed to lock jj working copy")?;
-    let base_repo = repo_loader
-        .load_at_head()
-        .await
-        .context("failed to load jj repo")?;
-
-    // Walk past diffui's background snapshot ops to the last meaningful op.
-    let mut op_to_undo = base_repo.operation().clone();
-    while op_to_undo.metadata().is_snapshot {
-        let parents = op_to_undo
-            .parents()
-            .await
-            .context("failed to read operation parents")?;
-        match parents.as_slice() {
-            [parent] => op_to_undo = parent.clone(),
-            _ => break,
-        }
-    }
-
-    let parents = op_to_undo
-        .parents()
-        .await
-        .context("failed to read operation parents")?;
-    let op_to_restore = match parents.as_slice() {
-        [parent] => parent.clone(),
-        [] => bail!("nothing to undo"),
-        _ => bail!("can't undo a merge operation"),
-    };
-
-    let undone_description = op_to_undo.metadata().description.clone();
-
-    // Restore the parent op's view (repo state + remote-tracking bookmarks),
-    // keeping the current git refs/head — exactly jj's DEFAULT_REVERT_WHAT.
-    let restored_view = op_to_restore
-        .view()
-        .await
-        .context("failed to load operation view")?;
-    let current_view = base_repo.view().store_view();
-    let new_view = restore_repo_and_remote_tracking(restored_view.store_view(), current_view);
-
-    let mut tx = base_repo.start_transaction();
-    tx.repo_mut().set_view(new_view);
-    let description = format!("undo: restore to operation {}", op_to_restore.id().hex());
-    let new_repo = tx
-        .commit(description)
-        .await
-        .context("failed to commit undo")?;
-
-    // Check out the restored `@` so the working-copy files match it.
-    let new_wc_id = new_repo
-        .view()
-        .get_wc_commit_id(&workspace_name)
-        .context("jj workspace has no working-copy commit after undo")?
-        .clone();
-    let new_wc_commit = new_repo
-        .store()
-        .get_commit_async(&new_wc_id)
-        .await
-        .with_context(|| format!("failed to load working-copy commit {}", new_wc_id.hex()))?;
-    locked_ws
-        .locked_wc()
-        .check_out(&new_wc_commit)
-        .await
-        .context("failed to check out working copy after undo")?;
-    locked_ws
-        .finish(new_repo.op_id().clone())
-        .await
-        .context("failed to finish working-copy mutation after undo")?;
-
-    let undone = if undone_description.is_empty() {
-        "operation".to_owned()
-    } else {
-        undone_description
-            .lines()
-            .next()
-            .unwrap_or("operation")
-            .to_owned()
-    };
-    Ok(vec![format!("Undid: {undone}")])
-}
-
-/// jj's `view_with_desired_portions_restored` for the default `undo` set
-/// (`Repo` + `RemoteTracking`): take heads, local bookmarks/tags, the
-/// working-copy pointer, and remote-tracking views from the op being restored,
-/// but keep the current git refs/head. Inlined so we don't depend on jj-cli.
-fn restore_repo_and_remote_tracking(restored: &View, current: &View) -> View {
-    View {
-        head_ids: restored.head_ids.clone(),
-        local_bookmarks: restored.local_bookmarks.clone(),
-        local_tags: restored.local_tags.clone(),
-        remote_views: restored.remote_views.clone(),
-        git_refs: current.git_refs.clone(),
-        git_head: current.git_head.clone(),
-        wc_commit_ids: restored.wc_commit_ids.clone(),
-    }
-}
-
-/// In-process `jj op undo <id>`: revert what *one specific operation* did,
-/// even when later operations exist — the activity log's per-entry Undo.
-/// Merges `(parent(op) − op)` onto the current view through jj's own op-merge
-/// machinery (exactly what `jj undo <op>` does), so unrelated later work is
-/// preserved rather than wiped the way an op *restore* would.
-pub(crate) async fn undo_jj_operation(
-    repository: Repository,
-    op_id_hex: String,
-) -> Result<Vec<String>> {
-    let settings = jj_settings(&repository.root)?;
-    let mut workspace = Workspace::load(
-        &settings,
-        &repository.root,
-        &StoreFactories::default(),
-        &default_working_copy_factories(),
-    )
-    .context("failed to load jj workspace")?;
-    let workspace_name = workspace.workspace_name().to_owned();
-
-    let repo_loader = workspace.repo_loader().clone();
-    let mut locked_ws = workspace
-        .start_working_copy_mutation()
-        .context("failed to lock jj working copy")?;
-    let base_repo = repo_loader
-        .load_at_head()
-        .await
-        .context("failed to load jj repo")?;
-
-    let op_id = OperationId::try_from_hex(&op_id_hex)
-        .with_context(|| format!("invalid jj operation id {op_id_hex}"))?;
-    let data = repo_loader
-        .op_store()
-        .read_operation(&op_id)
-        .await
-        .context("failed to load the operation to undo")?;
-    let op_to_undo = Operation::new(repo_loader.op_store().clone(), op_id, data);
-
-    let parents = op_to_undo
-        .parents()
-        .await
-        .context("failed to read operation parents")?;
-    let op_parent = match parents.as_slice() {
-        [parent] => parent.clone(),
-        [] => bail!("can't undo the root operation"),
-        _ => bail!("can't undo a merge operation"),
-    };
-    let undone_description = op_to_undo.metadata().description.clone();
-
-    let op_repo = repo_loader
-        .load_at(&op_to_undo)
-        .await
-        .context("failed to load the repo at the operation to undo")?;
-    let parent_repo = repo_loader
-        .load_at(&op_parent)
-        .await
-        .context("failed to load the repo before the operation to undo")?;
-
-    let mut tx = base_repo.start_transaction();
-    tx.repo_mut()
-        .merge(&op_repo, &parent_repo)
-        .await
-        .context("failed to merge the undo into the current view")?;
-    tx.repo_mut()
-        .rebase_descendants()
-        .await
-        .context("failed to rebase descendants after undo")?;
-    let new_repo = tx
-        .commit(format!("undo operation {}", op_to_undo.id().hex()))
-        .await
-        .context("failed to commit undo")?;
-
-    // Check out the resulting `@` so the working-copy files match it.
-    let new_wc_id = new_repo
-        .view()
-        .get_wc_commit_id(&workspace_name)
-        .context("jj workspace has no working-copy commit after undo")?
-        .clone();
-    let new_wc_commit = new_repo
-        .store()
-        .get_commit_async(&new_wc_id)
-        .await
-        .with_context(|| format!("failed to load working-copy commit {}", new_wc_id.hex()))?;
-    locked_ws
-        .locked_wc()
-        .check_out(&new_wc_commit)
-        .await
-        .context("failed to check out working copy after undo")?;
-    locked_ws
-        .finish(new_repo.op_id().clone())
-        .await
-        .context("failed to finish working-copy mutation after undo")?;
-
-    let undone = undone_description
-        .lines()
-        .next()
-        .filter(|line| !line.is_empty())
-        .unwrap_or("operation")
-        .to_owned();
-    Ok(vec![format!("Undid: {undone}")])
 }
 
 fn jj_revision_details(repo: &dyn Repo, commit: &jj_lib::commit::Commit) -> RevisionDetails {

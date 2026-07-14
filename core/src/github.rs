@@ -297,6 +297,7 @@ pub fn pr_commit_store(commits: &[PrCommit]) -> (CommitStore, GraphLayout) {
         change_offset: None,
         is_working_copy: true,
         bookmarks: Vec::new(),
+        parent_ids: Vec::new(),
     });
     for commit in commits.iter().rev() {
         rows.push(CommitSummary {
@@ -317,6 +318,7 @@ pub fn pr_commit_store(commits: &[PrCommit]) -> (CommitStore, GraphLayout) {
             change_offset: None,
             is_working_copy: false,
             bookmarks: Vec::new(),
+            parent_ids: Vec::new(),
         });
     }
 

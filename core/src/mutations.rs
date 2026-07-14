@@ -113,6 +113,13 @@ pub enum MutationOp {
     TrackBookmark { name: String, remote: String },
     /// Push local bookmark `name` to `remote` (`jj git push -b <name>`).
     PushBookmark { name: String, remote: String },
+    /// Revert what one operation did (`jj undo [<op>]`): the given operation
+    /// id, or — when `None` — the latest meaningful op (background snapshot
+    /// ops are skipped). Routed through the same mutation pipeline as
+    /// everything else so it serializes behind the queue and gets the
+    /// snapshot-before-mutate discipline (an undo that moves `@` must not
+    /// clobber unsnapshotted on-disk edits).
+    Undo { operation_id: Option<String> },
 }
 
 /// User-facing summary of a successful mutation — becomes the status message.
@@ -230,21 +237,6 @@ pub async fn run_merge_preview(
     })
     .await
     .map_err(|e| format!("preview task panicked: {e}"))?
-    .map_err(|e| format!("{e:#}"))
-}
-
-/// Undo one specific jj operation (the activity log's per-entry Undo), off
-/// the iced runtime.
-pub async fn run_undo_operation(
-    repository: Repository,
-    operation_id: String,
-) -> Result<Vec<String>, String> {
-    let handle = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || {
-        handle.block_on(crate::jj::undo_jj_operation(repository, operation_id))
-    })
-    .await
-    .map_err(|e| format!("undo task panicked: {e}"))?
     .map_err(|e| format!("{e:#}"))
 }
 

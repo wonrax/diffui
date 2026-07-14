@@ -262,21 +262,6 @@ pub async fn fetch(
     }
 }
 
-/// Undo the latest jj operation, returning a one-line summary for the activity
-/// log. jj-only — git has no operation log.
-pub async fn undo(repository: Repository) -> Result<Vec<String>, String> {
-    match repository.vcs {
-        Vcs::Jj => {
-            let handle = tokio::runtime::Handle::current();
-            tokio::task::spawn_blocking(move || handle.block_on(crate::jj::undo_jj(repository)))
-                .await
-                .map_err(|error| format!("undo task panicked: {error}"))?
-                .map_err(|error| format!("{error:#}"))
-        }
-        Vcs::Git => Err("Undo is only available for jj repositories".to_owned()),
-    }
-}
-
 async fn run_repository_snapshot(repository: Repository) -> Result<RepositorySnapshot> {
     match repository.vcs {
         Vcs::Jj => {
@@ -446,9 +431,6 @@ pub trait Mutable: Send + Sync {
         op: MutationOp,
         progress: LoadProgress,
     ) -> Result<MutationOutcome, String>;
-
-    /// Undo the latest operation (jj op-log); returns an activity-log summary.
-    async fn undo(&self) -> Result<Vec<String>, String>;
 }
 
 /// Cloneable, frontend-facing handle to a [`DiffSource`]. A newtype so state
@@ -528,13 +510,6 @@ impl SourceHandle {
         match self.0.as_revision_graph() {
             Some(graph) => graph.fetch(target, progress).await,
             None => Err("this source cannot fetch".to_owned()),
-        }
-    }
-
-    pub async fn undo(self) -> Result<Vec<String>, String> {
-        match self.0.as_mutable() {
-            Some(mutable) => mutable.undo().await,
-            None => Err("this source does not support undo".to_owned()),
         }
     }
 }
@@ -657,9 +632,5 @@ impl Mutable for RepoSource {
         crate::mutations::run_mutation(self.repo.clone(), op, progress)
             .await
             .map_err(|error| format!("{error:#}"))
-    }
-
-    async fn undo(&self) -> Result<Vec<String>, String> {
-        undo(self.repo.clone()).await
     }
 }

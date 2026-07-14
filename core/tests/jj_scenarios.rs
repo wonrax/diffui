@@ -1149,7 +1149,12 @@ fn undo_operation_reverts_a_specific_mutation() {
     );
 
     let op_id = outcome.operation_id.expect("mutations record their op id");
-    block_on(mutations::run_undo_operation(repository(&root), op_id)).expect("undo the abandon");
+    run(
+        &root,
+        MutationOp::Undo {
+            operation_id: Some(op_id),
+        },
+    );
 
     assert!(
         !jj(
@@ -1165,6 +1170,98 @@ fn undo_operation_reverts_a_specific_mutation() {
         )
         .is_empty(),
         "undoing the abandon brings the commit back"
+    );
+}
+
+/// Undo with unsnapshotted on-disk edits must not lose them: the pipeline
+/// folds the working copy into `@` (as a standalone snapshot op) before
+/// reverting, so edits survive on disk when `@` stays put — and stay
+/// reachable through the op log when the undo moves `@` out from under them.
+#[test]
+#[ignore = "shells out to the jj CLI"]
+fn undo_preserves_unsnapshotted_working_copy_edits() {
+    let root = scratch_repo("undo-dirty-wc");
+    write(&root, "file.txt", "base\n");
+    jj(&root, &["commit", "-m", "base"]);
+
+    // Undoing a describe leaves `@` in place: the dirty file must be
+    // untouched on disk and folded into `@`.
+    let outcome = run(
+        &root,
+        MutationOp::Describe {
+            target: RevisionSelection::WorkingCopy,
+            description: "victim description".to_owned(),
+        },
+    );
+    let op_id = outcome.operation_id.expect("mutations record their op id");
+    write(&root, "file.txt", "precious unsnapshotted edit\n");
+    run(
+        &root,
+        MutationOp::Undo {
+            operation_id: Some(op_id),
+        },
+    );
+
+    let on_disk = std::fs::read_to_string(root.join("file.txt")).expect("file still readable");
+    assert_eq!(
+        on_disk, "precious unsnapshotted edit\n",
+        "undo must not overwrite unsnapshotted edits"
+    );
+    let diff = jj(&root, &["diff", "-r", "@", "--summary"]);
+    assert!(
+        diff.contains("file.txt"),
+        "the pre-undo snapshot folds the edit into @: {diff:?}"
+    );
+
+    // Undoing a `new` moves `@` back, so the checkout rewrites the file on
+    // disk — but the doomed edit must remain reachable via the snapshot op.
+    let outcome = run(
+        &root,
+        MutationOp::New {
+            parent: RevisionSelection::WorkingCopy,
+        },
+    );
+    let new_op = outcome.operation_id.expect("mutations record their op id");
+    write(&root, "file.txt", "edit made on the doomed working copy\n");
+    run(
+        &root,
+        MutationOp::Undo {
+            operation_id: Some(new_op),
+        },
+    );
+
+    let op_log = jj(
+        &root,
+        &[
+            "op",
+            "log",
+            "--no-graph",
+            "-T",
+            "description ++ \"|\" ++ id ++ \"\\n\"",
+        ],
+    );
+    let snapshot_op = op_log
+        .lines()
+        .find_map(|line| line.strip_prefix("snapshot working copy|"))
+        .expect("the undo committed its fold as a snapshot op");
+    let at_snapshot = jj(
+        &root,
+        &[
+            "--at-operation",
+            snapshot_op,
+            "log",
+            "--no-graph",
+            "-r",
+            "@",
+            "-T",
+            "\"\"",
+            "-p",
+            "--git",
+        ],
+    );
+    assert!(
+        at_snapshot.contains("edit made on the doomed working copy"),
+        "the doomed edit stays reachable through the op log: {at_snapshot:?}"
     );
 }
 

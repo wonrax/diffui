@@ -121,6 +121,11 @@ pub struct CommitSummary {
     /// `jj show`'s "Bookmarks:" line — bare local names first, then
     /// remote-tracking `name@remote`.
     pub bookmarks: Vec<String>,
+    /// Parent commit ids (hex). Transient: the store doesn't retain them —
+    /// it only compares each pushed row against the previous row's parents
+    /// to derive the `NEXT_ROW_IS_PARENT` flag (see [`RowView::next_row_is_parent`]).
+    /// Loaders without parent data (PR commit lists) leave this empty.
+    pub parent_ids: Vec<String>,
 }
 
 mod commit_flags {
@@ -131,6 +136,11 @@ mod commit_flags {
     pub const IS_WORKING_COPY: u8 = 1 << 4;
     pub const IS_DIVERGENT: u8 = 1 << 5;
     pub const IS_HIDDEN: u8 = 1 << 6;
+    /// The next display row is a direct parent of this one — i.e. the visual
+    /// gap below this row is a real graph edge, not two unrelated branches
+    /// rendered adjacently. Set at push time from the previous row's
+    /// `parent_ids`; drives insert-between drop targets.
+    pub const NEXT_ROW_IS_PARENT: u8 = 1 << 7;
 }
 
 /// Byte range `[start, start+len)` into a [`CommitStore`]'s text arena.
@@ -172,6 +182,9 @@ pub struct CommitStore {
     /// `working_copy`/`working_copy_index` are O(1). The tab bar reads the
     /// working copy's empty status for every tab on every frame.
     working_copy_row: Option<usize>,
+    /// The previous pushed row's parent ids, held only between two `push`
+    /// calls to derive `NEXT_ROW_IS_PARENT` — never retained per row.
+    pending_parent_ids: Vec<String>,
 }
 
 impl CommitStore {
@@ -299,6 +312,15 @@ impl CommitStore {
     /// [`CommitStoreBuilder`] is a thin wrapper over this.
     pub fn push(&mut self, commit: CommitSummary, author_interner: &mut HashMap<String, u32>) {
         let index = self.spans.len();
+        // Rows arrive in display order, so "is this row a parent of the row
+        // above it" resolves right here against the previous push's parents.
+        if index > 0
+            && self.pending_parent_ids.contains(&commit.commit_id)
+            && let Some(flags) = self.flags.last_mut()
+        {
+            *flags |= commit_flags::NEXT_ROW_IS_PARENT;
+        }
+        self.pending_parent_ids = commit.parent_ids;
         let change_id = self.intern_text(&commit.change_id);
         let commit_id = self.intern_text(&commit.commit_id);
         let description = self.intern_text(&commit.description);
@@ -467,6 +489,13 @@ impl<'a> RowView<'a> {
 
     pub fn is_working_copy(&self) -> bool {
         self.flags() & commit_flags::IS_WORKING_COPY != 0
+    }
+
+    /// Whether the next display row is a direct parent of this commit — i.e.
+    /// the visual gap below this row is a real graph edge, so an
+    /// insert-between drop there is well-defined.
+    pub fn next_row_is_parent(&self) -> bool {
+        self.flags() & commit_flags::NEXT_ROW_IS_PARENT != 0
     }
 
     pub fn bookmarks(&self) -> &'a [String] {
@@ -831,6 +860,48 @@ mod tests {
             additions: 0,
             deletions: 0,
         }
+    }
+
+    #[test]
+    fn next_row_is_parent_marks_only_real_edges() {
+        let summary = |commit_id: &str, parent_ids: &[&str]| CommitSummary {
+            change_id: commit_id.to_owned(),
+            commit_id: commit_id.to_owned(),
+            shortest_change_id_len: None,
+            description: String::new(),
+            author: String::new(),
+            has_description: false,
+            is_empty: None,
+            has_conflict: false,
+            is_divergent: false,
+            is_hidden: false,
+            change_offset: None,
+            is_working_copy: false,
+            bookmarks: Vec::new(),
+            parent_ids: parent_ids.iter().map(|id| (*id).to_owned()).collect(),
+        };
+        // Display order: b → a (b's parent) → c (an unrelated branch tip
+        // rendered adjacently) → x (c's parent, via the *second* parent slot).
+        let mut builder = CommitStoreBuilder::with_capacity(4);
+        builder.push(summary("b", &["a"]));
+        builder.push(summary("a", &["root"]));
+        builder.push(summary("c", &["y", "x"]));
+        builder.push(summary("x", &["root"]));
+        let store = builder.finish();
+
+        assert!(store.row(0).next_row_is_parent(), "a is b's parent");
+        assert!(
+            !store.row(1).next_row_is_parent(),
+            "c is unrelated to a — the gap between them is not an edge"
+        );
+        assert!(
+            store.row(2).next_row_is_parent(),
+            "merge second parents count as edges too"
+        );
+        assert!(
+            !store.row(3).next_row_is_parent(),
+            "the last row has no next row"
+        );
     }
 
     #[test]

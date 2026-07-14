@@ -99,6 +99,13 @@ pub(crate) enum Message {
     DraftCancel,
     /// Debounced draft simulation finished (rebase or merge), guarded by the
     /// draft's preview version so a superseded candidate's result is dropped.
+    /// Target mode: plain hover crossed onto a commit row (`Some`) or left
+    /// the rows (`None`). Arms the row as the draft candidate — the mouse
+    /// equivalent of `j`/`k`, honoring the armed placement.
+    DraftHoverCandidate(Option<usize>),
+    /// The preview debounce timer fired for this version — run the parked
+    /// simulation if the version is still current.
+    DraftPreviewKick(u64),
     DraftPreview(u64, Box<Result<mutations::DraftSimulation, String>>),
 
     // ── Revision drag & drop (sidebar) ──────────────────────────────────
@@ -233,12 +240,6 @@ pub(crate) enum Message {
     ),
     /// Toolbar "Undo": revert the latest jj operation.
     Undo,
-    /// An undo finished.
-    UndoCompleted(
-        TabId,
-        activity::ActivityId,
-        Box<Result<Vec<String>, String>>,
-    ),
     /// Revset input edited.
     RevsetChanged(String),
     /// Revset submitted (Enter) — re-evaluate the log.

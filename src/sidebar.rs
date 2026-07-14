@@ -213,6 +213,11 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             }
         }
         None => draft.candidate.and_then(|index| {
+            // Hover can arm a source row as candidate (keyboard nav skips
+            // them) — surface the same invalid-target hint as a drag would.
+            if is_source_index(index) {
+                return Some((INVALID_TARGET.to_owned(), false));
+            }
             short_id(index).map(|id| {
                 (
                     match draft.kind {
@@ -824,11 +829,18 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
         .as_ref()
         .is_some_and(|repo| matches!(repo.vcs, Vcs::Jj))
     {
-        list = list.on_drag(revision_list::DragHooks {
-            start: Message::RevisionDragStart,
-            hover: Message::RevisionDragHover,
-            drop: Message::RevisionDragDrop,
-        });
+        list = list
+            .on_drag(revision_list::DragHooks {
+                start: Message::RevisionDragStart,
+                hover: Message::RevisionDragHover,
+                drop: Message::RevisionDragDrop,
+            })
+            .gap_edges(Box::new(|index| {
+                ui.session.commits.row(index).next_row_is_parent()
+            }));
+        if ui.op_draft.is_some() {
+            list = list.on_target_hover(Message::DraftHoverCandidate);
+        }
     }
     list.into()
 }
@@ -903,6 +915,12 @@ fn build_revision_row(
         use diffui_core::{DraftKind, PlacementKind};
         use revision_list::DraftMarker;
         if ui.hover_spot.is_some() {
+            return None;
+        }
+        // Hover can arm any row as candidate, including a source (keyboard
+        // nav skips them) — an invalid target gets the red op-bar hint, not
+        // a destination decoration.
+        if !ui.draft.target_valid(commit.commit_id()) {
             return None;
         }
         let candidate = ui.draft.candidate?;
@@ -1367,6 +1385,7 @@ mod tests {
             change_offset: None,
             is_working_copy: false,
             bookmarks: Vec::new(),
+            parent_ids: Vec::new(),
         }
     }
 

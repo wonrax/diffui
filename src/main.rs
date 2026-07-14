@@ -473,6 +473,22 @@ pub(crate) struct DraftUi {
     /// which branch is coming along. Kept until the next simulation lands
     /// (so it doesn't flicker per candidate hop); dropped with the draft.
     pub(crate) moved_highlight: HashSet<String>,
+    /// The derived simulation parked while the debounce timer runs.
+    /// `DraftPreviewKick` takes it only if `preview_version` still matches,
+    /// so rapid candidate hops expire here without ever reaching the
+    /// backend (each stale hop would otherwise run a full simulation and
+    /// write throwaway objects).
+    pub(crate) preview_request: Option<PreviewRequest>,
+}
+
+/// A ready-to-run draft simulation: everything `kick_draft_preview` resolved
+/// at kick time, frozen so the post-debounce run simulates exactly what the
+/// user saw when the timer started.
+#[derive(Debug, Clone)]
+pub(crate) struct PreviewRequest {
+    pub(crate) kind: diffui_core::DraftKind,
+    pub(crate) sources: Vec<diffui_core::RevisionSelection>,
+    pub(crate) destination: diffui_core::Destination,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -494,6 +510,7 @@ impl DraftUi {
             preview_version: 0,
             preview: DraftPreviewState::Idle,
             moved_highlight: HashSet::new(),
+            preview_request: None,
         }
     }
 }
