@@ -1469,6 +1469,14 @@ impl Diffui {
                 return self.kick_draft_preview();
             }
             Message::DraftConfirm => {
+                if let Some(op) = self
+                    .op_draft
+                    .as_ref()
+                    .and_then(|ui| ui.draft.op_from_sources())
+                {
+                    self.op_draft = None;
+                    return self.start_mutation_op(op);
+                }
                 let Some(target) = self
                     .op_draft
                     .as_ref()
@@ -3804,37 +3812,54 @@ impl Diffui {
         }
         // Destination from the drag spot when one is live, else the keyboard
         // candidate + placement. Resolved before borrowing the draft mutably.
-        let (spot, candidate, placement) = match self.op_draft.as_ref() {
-            Some(ui) => (ui.hover_spot, ui.draft.candidate, ui.draft.placement),
+        let (spot, candidate, placement, selected_merge_target) = match self.op_draft.as_ref() {
+            Some(ui) => (
+                ui.hover_spot,
+                ui.draft.candidate,
+                ui.draft.placement,
+                matches!(ui.draft.kind, mutations::DraftKind::Merge)
+                    .then(|| ui.draft.sources.last())
+                    .flatten()
+                    .filter(|_| ui.draft.sources.len() >= 2)
+                    .map(|source| source.selection.clone()),
+            ),
             None => return Task::none(),
         };
-        let destination = match spot {
-            Some(revision_list::DropSpot::OnRow(index)) => self
-                .selection_at_index(index)
-                .map(mutations::Destination::Onto),
-            Some(revision_list::DropSpot::Gap { above, below }) => match (
-                self.selection_at_index(below),
-                self.selection_at_index(above),
-            ) {
-                (Some(parent), Some(child)) => {
-                    Some(mutations::Destination::Between { parent, child })
-                }
-                _ => None,
-            },
-            None => candidate
-                .and_then(|index| self.selection_at_index(index))
-                .map(|target| match placement {
-                    mutations::PlacementKind::Onto => mutations::Destination::Onto(target),
-                    mutations::PlacementKind::After => mutations::Destination::After(target),
-                    mutations::PlacementKind::Before => mutations::Destination::Before(target),
-                }),
+        // A merge with enough selected parents previews that exact set. Feed
+        // its final source through the request's destination slot so the
+        // shared debounce request stays destination-shaped for rebases.
+        let destination = if let Some(target) = selected_merge_target.clone() {
+            Some(mutations::Destination::Onto(target))
+        } else {
+            match spot {
+                Some(revision_list::DropSpot::OnRow(index)) => self
+                    .selection_at_index(index)
+                    .map(mutations::Destination::Onto),
+                Some(revision_list::DropSpot::Gap { above, below }) => match (
+                    self.selection_at_index(below),
+                    self.selection_at_index(above),
+                ) {
+                    (Some(parent), Some(child)) => {
+                        Some(mutations::Destination::Between { parent, child })
+                    }
+                    _ => None,
+                },
+                None => candidate
+                    .and_then(|index| self.selection_at_index(index))
+                    .map(|target| match placement {
+                        mutations::PlacementKind::Onto => mutations::Destination::Onto(target),
+                        mutations::PlacementKind::After => mutations::Destination::After(target),
+                        mutations::PlacementKind::Before => mutations::Destination::Before(target),
+                    }),
+            }
         };
         // A destination anchored on a source is invalid — resolved through
         // the graph (so a WorkingCopy anchor naming a source is caught) and
         // before the mutable draft borrow below.
-        let anchor_blocked = destination
-            .as_ref()
-            .is_some_and(|destination| self.draft_blocks_target(destination.anchor()));
+        let anchor_blocked = selected_merge_target.is_none()
+            && destination
+                .as_ref()
+                .is_some_and(|destination| self.draft_blocks_target(destination.anchor()));
         let Some(ui) = self.op_draft.as_mut() else {
             return Task::none();
         };
@@ -3858,12 +3883,15 @@ impl Diffui {
             ui.preview_request = None;
             return Task::none();
         }
-        let sources: Vec<RevisionSelection> = ui
+        let mut sources: Vec<RevisionSelection> = ui
             .draft
             .sources
             .iter()
             .map(|s| s.selection.clone())
             .collect();
+        if selected_merge_target.is_some() {
+            let _ = sources.pop();
+        }
         ui.preview_version = ui.preview_version.wrapping_add(1);
         let version = ui.preview_version;
         ui.preview = DraftPreviewState::Loading;

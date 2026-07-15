@@ -96,7 +96,8 @@ pub(crate) enum Message {
     /// Keyboard: move the destination candidate row by this delta, skipping
     /// draft sources.
     DraftCandidate(i32),
-    /// Enter: execute the draft on the candidate with the current placement.
+    /// Enter: execute a complete source-only merge, or apply the draft to the
+    /// candidate with the current placement.
     DraftConfirm,
     /// Esc / the op bar's ✕: leave target mode without running anything.
     DraftCancel,

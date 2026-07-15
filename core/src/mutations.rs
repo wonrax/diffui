@@ -358,6 +358,22 @@ impl OpDraft {
         }
     }
 
+    /// Lower an operation that is complete from its selected sources alone.
+    /// Merge drafts become complete after selecting at least two parents;
+    /// rebase and squash still need a separate destination.
+    pub fn op_from_sources(&self) -> Option<MutationOp> {
+        match self.kind {
+            DraftKind::Merge if self.sources.len() >= 2 => Some(MutationOp::Merge {
+                parents: self
+                    .sources
+                    .iter()
+                    .map(|source| source.selection.clone())
+                    .collect(),
+            }),
+            _ => None,
+        }
+    }
+
     /// Lower the draft onto `target` with `placement`, or `None` when the
     /// target is a draft source (invalid).
     pub fn op_for(
@@ -541,5 +557,23 @@ mod tests {
                 )
                 .is_none()
         );
+    }
+
+    #[test]
+    fn merge_draft_lowers_selected_parents_without_a_target() {
+        let mut draft = OpDraft::merge(source("aaaa"));
+        assert!(draft.op_from_sources().is_none());
+
+        draft.sources.push(source("bbbb"));
+        match draft.op_from_sources() {
+            Some(MutationOp::Merge { parents }) => assert_eq!(
+                parents,
+                vec![
+                    RevisionSelection::Commit("aaaa".to_owned()),
+                    RevisionSelection::Commit("bbbb".to_owned()),
+                ]
+            ),
+            other => panic!("expected a source-only merge op, got {other:?}"),
+        }
     }
 }

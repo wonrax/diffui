@@ -148,6 +148,14 @@ fn draft_panel_background(theme: ThemeSpec) -> Color {
     theme::mix(theme.panel_background, theme.accent, 0.05)
 }
 
+fn commit_list_summary(commits: &[String]) -> String {
+    match commits {
+        [] => String::new(),
+        [commit] => commit.clone(),
+        [first, rest @ ..] => format!("{first} and {} more", rest.len()),
+    }
+}
+
 /// The target-mode strip: what's being moved, the placement toggle
 /// (rebase only), the live preview line, and the key hints.
 fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
@@ -188,6 +196,7 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         gap_sides.is_some_and(|(parent, child)| is_source_index(parent) || is_source_index(child));
     // The valid target row a confirm would land on.
     let target = armed.filter(|&index| !is_source_index(index));
+    let merge_ready = matches!(draft.kind, DraftKind::Merge) && draft.sources.len() >= 2;
     // Squash/merge gap drops resolve to the gap's parent side.
     let fold_target = target.or_else(|| {
         gap_sides
@@ -210,12 +219,18 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         DraftKind::Squash => (icons::FOLD_VERTICAL, "Squash"),
         DraftKind::Merge => (icons::GIT_FORK, "Merge"),
     };
-    let names = draft
+    let mut names = draft
         .sources
         .iter()
-        .map(|source| source.label.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
+        .map(|source| source.label.clone())
+        .collect::<Vec<_>>();
+    if matches!(draft.kind, DraftKind::Merge)
+        && !merge_ready
+        && let Some(target_name) = target.and_then(short_id)
+    {
+        names.push(target_name);
+    }
+    let names = names.join(", ");
     // "+ N descendants": exact once the simulation lands; with-descendants
     // mode promises them even before it does.
     let descendants_suffix = match (draft.kind, sim_rebase) {
@@ -233,23 +248,20 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         _ => None,
     };
     let state_hint: Option<(&'static str, Color)> = if armed_invalid || gap_invalid {
-        Some((
-            "— can't target the revision being moved",
-            theme.removed_text,
-        ))
-    } else if target.is_none() && gap_sides.is_none() {
+        Some(("Can't target the revision being moved", theme.removed_text))
+    } else if !merge_ready && target.is_none() && gap_sides.is_none() {
         Some((
             match draft.kind {
-                DraftKind::Rebase { .. } => "— pick the destination",
-                DraftKind::Squash => "— pick the revision to fold into",
-                DraftKind::Merge => "— pick the other parent",
+                DraftKind::Rebase { .. } => "Pick the destination",
+                DraftKind::Squash => "Pick the revision to fold into",
+                DraftKind::Merge => "Pick the other parent",
             },
             theme.muted_text,
         ))
     } else {
         None
     };
-    let mut headline = row![
+    let mut operation = row![
         icons::icon(glyph, 15.0, theme.accent),
         text(verb)
             .size(theme::text_size::BODY)
@@ -269,27 +281,36 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     .spacing(7)
     .align_y(alignment::Vertical::Center);
     if let Some(suffix) = descendants_suffix {
-        headline = headline.push(
+        operation = operation.push(
             text(suffix)
                 .size(theme::text_size::BODY)
                 .font(ui.config.ui_font)
                 .color(theme.muted_text),
         );
     }
-    if let Some((hint, color)) = state_hint {
-        headline = headline.push(
-            text(hint)
-                .size(theme::text_size::BODY)
-                .font(ui.config.ui_font)
-                .color(color),
-        );
-    }
-    headline = headline.push(Space::new().width(Length::Fill)).push(
+    operation = operation.push(Space::new().width(Length::Fill)).push(
         iced::widget::button(icons::icon(icons::CLOSE, 14.0, theme.muted_text))
             .padding([2, 6])
             .on_press(Message::DraftCancel)
             .style(move |_, status| theme::ghost_button_style(theme, status)),
     );
+    let mut headline = column![operation].spacing(2).width(Length::Fill);
+    if let Some((hint, color)) = state_hint {
+        headline = headline.push(
+            container(
+                text(hint)
+                    .size(theme::text_size::BODY)
+                    .font(ui.config.ui_font)
+                    .color(color),
+            )
+            .padding(iced::Padding {
+                top: 0.0,
+                right: 0.0,
+                bottom: 0.0,
+                left: 22.0,
+            }),
+        );
+    }
 
     // ---- Target rows: every way the op can land, each resolving what it
     // means for the armed target ("After → between llpz and kymz"). The row
@@ -488,17 +509,7 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
                 .map(|id| format!("folds {names} into {id} · descriptions combine"));
             rows_column = rows_column.push(target_row("Into", None, tone, description, None));
         }
-        DraftKind::Merge => {
-            let tone = if fold_target.is_some() {
-                RowTone::Armed
-            } else {
-                RowTone::Idle
-            };
-            let description = fold_target
-                .and_then(short_id)
-                .map(|id| format!("new merge of {names} + {id}"));
-            rows_column = rows_column.push(target_row("With", None, tone, description, None));
-        }
+        DraftKind::Merge => {}
     }
 
     // ---- Footer band: live verdict + counts on the left, Apply on the
@@ -545,7 +556,7 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
                 let mut counts = if is_branch && !preview.entry_points.is_empty() {
                     format!(
                         "moves the branch from {} · {} revision{}",
-                        preview.entry_points.join(", "),
+                        commit_list_summary(&preview.entry_points),
                         preview.moved,
                         if preview.moved == 1 { "" } else { "s" },
                     )
@@ -575,7 +586,10 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
                 } else {
                     (
                         Some(icons::ALERT_TRIANGLE),
-                        format!("conflicts in {}", preview.new_conflicts.join(", ")),
+                        format!(
+                            "conflicts in {}",
+                            commit_list_summary(&preview.new_conflicts)
+                        ),
                         theme.conflict_marker,
                         Some(counts),
                     )
@@ -583,7 +597,7 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             }
         }
         crate::DraftPreviewState::Ready(diffui_core::DraftSimulation::Merge(preview)) => {
-            let parents = draft.sources.len() + 1;
+            let parents = draft.sources.len() + usize::from(!merge_ready);
             let counts = format!("merges {parents} parents");
             if preview.conflicts.is_empty() {
                 (
@@ -612,28 +626,30 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             None,
         ),
     };
-    let mut summary = row![].spacing(6).align_y(alignment::Vertical::Center);
+    let mut verdict = row![].spacing(6).align_y(alignment::Vertical::Center);
     if let Some(status_glyph) = status_icon {
-        summary = summary.push(icons::icon(status_glyph, 13.0, status_color));
+        verdict = verdict.push(icons::icon(status_glyph, 13.0, status_color));
     }
-    summary = summary.push(
+    verdict = verdict.push(
         text(status_text)
             .size(theme::text_size::UI)
             .font(ui_font)
             .color(status_color),
     );
+    let mut summary = column![verdict].spacing(2).width(Length::Fill);
     if let Some(counts) = counts {
         summary = summary.push(
-            text(format!("· {counts}"))
+            text(counts)
                 .size(theme::text_size::UI)
                 .font(ui_font)
                 .color(theme.muted_text),
         );
     }
 
-    // Apply executes the armed *candidate* (DraftConfirm); gap spots only
-    // exist mid-drag, where the drop itself is the confirm.
-    let can_apply = target.is_some();
+    // Merge can be complete from its selected parents alone; other drafts
+    // execute on the armed candidate. Gap spots only exist mid-drag, where
+    // the drop itself is the confirm.
+    let can_apply = merge_ready || target.is_some();
     let apply_color = if can_apply {
         theme.background
     } else {
@@ -682,7 +698,7 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
 
     let band = container(
         column![
-            row![summary, Space::new().width(Length::Fill), apply]
+            row![summary, apply]
                 .spacing(8)
                 .align_y(alignment::Vertical::Center),
             hints,
@@ -706,6 +722,7 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             background: Some(Background::Color(theme.border)),
             ..container::Style::default()
         });
+    let shows_target_rows = !matches!(draft.kind, DraftKind::Merge);
     column![
         hairline,
         container(column![
@@ -714,7 +731,7 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
                 .padding(iced::Padding {
                     top: 8.0,
                     right: 12.0,
-                    bottom: 4.0,
+                    bottom: if shows_target_rows { 4.0 } else { 8.0 },
                     left: 12.0,
                 }),
             container(rows_column)
@@ -722,7 +739,7 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
                 .padding(iced::Padding {
                     top: 0.0,
                     right: 6.0,
-                    bottom: 8.0,
+                    bottom: if shows_target_rows { 8.0 } else { 0.0 },
                     left: 6.0,
                 }),
         ])
@@ -1153,7 +1170,9 @@ fn build_revision_row(
     let draft_marker = draft.and_then(|ui| {
         use diffui_core::{DraftKind, PlacementKind};
         use revision_list::DraftMarker;
-        if ui.hover_spot.is_some() {
+        if ui.hover_spot.is_some()
+            || matches!(ui.draft.kind, DraftKind::Merge) && ui.draft.sources.len() >= 2
+        {
             return None;
         }
         // Hover can arm any row as candidate, including a source (keyboard
@@ -1207,25 +1226,31 @@ fn build_revision_row(
             // The live destination: the drag spot's row while dragging, else
             // the armed candidate. A gap spot gets no row chip — the
             // insertion line carries the "between" meaning.
-            let destination_word = match ui.hover_spot {
-                Some(revision_list::DropSpot::OnRow(spot)) if spot == index => {
-                    Some(match ui.draft.kind {
-                        // Drops land Onto regardless of the armed placement.
-                        DraftKind::Rebase { .. } => "onto",
+            let merge_ready =
+                matches!(ui.draft.kind, DraftKind::Merge) && ui.draft.sources.len() >= 2;
+            let destination_word = if merge_ready {
+                None
+            } else {
+                match ui.hover_spot {
+                    Some(revision_list::DropSpot::OnRow(spot)) if spot == index => {
+                        Some(match ui.draft.kind {
+                            // Drops land Onto regardless of the armed placement.
+                            DraftKind::Rebase { .. } => "onto",
+                            DraftKind::Squash => "into",
+                            DraftKind::Merge => "with",
+                        })
+                    }
+                    Some(_) => None,
+                    None => (ui.draft.candidate == Some(index)).then_some(match ui.draft.kind {
+                        DraftKind::Rebase { .. } => match ui.draft.placement {
+                            PlacementKind::Onto => "onto",
+                            PlacementKind::After => "after",
+                            PlacementKind::Before => "before",
+                        },
                         DraftKind::Squash => "into",
                         DraftKind::Merge => "with",
-                    })
+                    }),
                 }
-                Some(_) => None,
-                None => (ui.draft.candidate == Some(index)).then_some(match ui.draft.kind {
-                    DraftKind::Rebase { .. } => match ui.draft.placement {
-                        PlacementKind::Onto => "onto",
-                        PlacementKind::After => "after",
-                        PlacementKind::Before => "before",
-                    },
-                    DraftKind::Squash => "into",
-                    DraftKind::Merge => "with",
-                }),
             };
             if let Some(word) = destination_word {
                 status_chips.insert(
@@ -1738,5 +1763,16 @@ mod tests {
         assert_eq!(revision_id_display_len(3, long_id), REVISION_ID_CHARS);
         assert_eq!(revision_id_display_len(16, long_id), 16);
         assert_eq!(revision_id_display_len(99, long_id), long_id.len());
+    }
+
+    #[test]
+    fn commit_list_summary_keeps_only_the_first_commit() {
+        let commits = (0..10)
+            .map(|index| format!("commit-{index}"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(commit_list_summary(&[]), "");
+        assert_eq!(commit_list_summary(&commits[..1]), "commit-0");
+        assert_eq!(commit_list_summary(&commits), "commit-0 and 9 more");
     }
 }
