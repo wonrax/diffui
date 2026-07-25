@@ -77,15 +77,23 @@
             # Point build.rs at the sandbox-fetched font instead of the network.
             LUCIDE_TTF_PATH = lucideTtf;
 
-            # Linux: wrap for the runtime libs. macOS: assemble a real
-            # `Diffui.app` around the binary and keep `bin/diffui` as a symlink
-            # into it, so this one package serves the GUI (Spotlight/Dock), the
-            # CLI, and `nix run` off a single binary — the convention alacritty /
-            # kitty / wezterm follow.
+            # Linux: wrap for the runtime libs and install the XDG desktop entry
+            # (+ icon) so launchers/app grids list it, not just the CLI. macOS:
+            # assemble a real `Diffui.app` around the binary and keep `bin/diffui`
+            # as a symlink into it. Either way this one package serves the GUI
+            # (app grid / Spotlight / Dock), the CLI, and `nix run` off a single
+            # binary — the convention alacritty / kitty / wezterm follow.
             postInstall =
               lib.optionalString pkgs.stdenv.isLinux ''
                 wrapProgram $out/bin/diffui \
                   --prefix LD_LIBRARY_PATH : "${lib.makeLibraryPath linuxRuntimeLibs}"
+
+                install -Dm644 ${desktopItem}/share/applications/diffui.desktop \
+                  -t "$out/share/applications"
+                ${lib.optionalString (builtins.pathExists ./linux/diffui.svg) ''
+                  install -Dm644 ${./linux/diffui.svg} \
+                    "$out/share/icons/hicolor/scalable/apps/diffui.svg"
+                ''}
               ''
               + lib.optionalString pkgs.stdenv.isDarwin ''
                 app="$out/Applications/Diffui.app"
@@ -104,6 +112,49 @@
               mainProgram = "diffui";
               platforms = lib.platforms.unix;
             };
+          };
+
+          # Linux desktop entry — the counterpart to the macOS `Info.plist`
+          # below, and the only thing that makes diffui appear in an app
+          # launcher rather than being CLI-only.
+          #
+          # `exec` is the bare binary name rather than an absolute store path,
+          # because the store path would be this very derivation's `$out` (a
+          # cycle). Anywhere the entry is visible to a launcher — a nix profile,
+          # home-manager, `environment.systemPackages` — that prefix's `bin` is
+          # on PATH too, so the bare name resolves.
+          #
+          # `startupWMClass` must match the Wayland `app_id` / X11 `WM_CLASS`
+          # the window actually reports, which is set in `src/chrome.rs`. That's
+          # what lets a compositor tie a live window back to this entry, so the
+          # taskbar and alt-tab pick up the name and icon from here rather than
+          # showing an anonymous window.
+          #
+          # `icon` names the file installed into `hicolor/scalable/apps` —
+          # dropping a `linux/diffui.svg` into the repo picks it up, exactly like
+          # `macos/diffui.icns` for the bundle. Without one, launchers fall back
+          # to a generic icon; everything else still works.
+          desktopItem = pkgs.makeDesktopItem {
+            name = "diffui";
+            desktopName = "Diffui";
+            genericName = "Diff Viewer";
+            comment = "Native GUI diff viewer for jj and git";
+            exec = "diffui";
+            icon = "diffui";
+            terminal = false;
+            startupWMClass = "diffui";
+            categories = [
+              "Development"
+              "RevisionControl"
+            ];
+            keywords = [
+              "diff"
+              "jj"
+              "jujutsu"
+              "git"
+              "vcs"
+              "version control"
+            ];
           };
 
           # macOS bundle metadata. `CFBundleIdentifier` is the stable identity

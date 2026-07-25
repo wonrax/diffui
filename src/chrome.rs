@@ -12,8 +12,10 @@
 //!     empty area into a window-drag handle, since the hidden title bar no
 //!     longer provides one.
 //!   * **Linux** — undecorated compositors already render the strip as the top
-//!     bar with nothing above it; nothing special is needed today. A floating,
-//!     undecorated WM is the natural next opt-in for the drag handle.
+//!     bar with nothing above it, so the strip itself needs nothing; the only
+//!     platform setting is the window's `app_id`, which ties it to our desktop
+//!     entry. A floating, undecorated WM is the natural next opt-in for the drag
+//!     handle.
 //!   * **Windows** — keeps its native title bar above the strip for now.
 //!
 //! Centralizing the policy here keeps `main` / `tab_bar` platform-agnostic, so
@@ -69,15 +71,28 @@ pub fn title_bar_height() -> Option<f32> {
 
 /// Apply platform window-chrome settings to the window the app opens. On macOS
 /// this hides the title bar and lets our content fill behind the (still-shown)
-/// traffic lights; elsewhere the window defaults already give us a top-anchored
-/// strip, so this is a no-op.
-#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+/// traffic lights; on Linux it stamps the window's identity for the desktop
+/// entry; elsewhere the window defaults already give us a top-anchored strip, so
+/// this is a no-op.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    allow(unused_variables)
+)]
 pub fn apply_window_settings(settings: &mut window::Settings) {
     #[cfg(target_os = "macos")]
     {
         settings.platform_specific.title_hidden = true;
         settings.platform_specific.titlebar_transparent = true;
         settings.platform_specific.fullsize_content_view = true;
+    }
+    // iced defaults this to the empty string yet still forwards it to winit, so
+    // without it the window reports a blank Wayland `app_id` / X11 `WM_CLASS`:
+    // no name or icon in the taskbar and alt-tab, and the `StartupWMClass` in
+    // our desktop entry never matches. Must stay equal to that entry's basename
+    // (`diffui.desktop`, generated in flake.nix).
+    #[cfg(target_os = "linux")]
+    {
+        settings.platform_specific.application_id = "diffui".to_owned();
     }
 }
 
