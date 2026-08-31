@@ -11,7 +11,8 @@ use diffui_core::{
 
 use crate::theme::ThemePreference;
 use crate::{
-    HoverTarget, MainView, RefreshOrigin, TabId, ToolbarMenu, activity, mutations, revision_list,
+    HoverTarget, MainView, PendingMutation, RefreshOrigin, TabId, ToolbarMenu, activity, mutations,
+    revision_list,
 };
 
 #[derive(Debug, Clone)]
@@ -73,13 +74,13 @@ pub(crate) enum Message {
     DescriptionAction(text_editor::Action),
     DescriptionSave,
     DescriptionCancel,
-    /// A context-menu mutation (new/edit/abandon/bookmark/push) finished,
-    /// tab-addressed with its activity id so push remote output lands in the
-    /// right log.
+    /// A context-menu mutation (new/edit/abandon/bookmark/push) finished.
+    /// Carries its whole `PendingMutation` (which addresses the tab + activity)
+    /// so an immutable-commit rejection can offer a rerun with the override
+    /// armed, without reconstructing the op.
     MutationCompleted(
-        TabId,
-        activity::ActivityId,
-        Box<Result<mutations::MutationOutcome, String>>,
+        Box<PendingMutation>,
+        Box<Result<mutations::MutationOutcome, mutations::MutationError>>,
     ),
 
     // ── Target-mode drafts (rebase / squash destination picking) ────────

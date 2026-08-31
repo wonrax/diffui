@@ -1226,9 +1226,11 @@ impl Diffui {
                     tab_id,
                     activity_id,
                     progress,
+                    allow_immutable: false,
                 });
             }
-            Message::MutationCompleted(tab_id, id, result) => {
+            Message::MutationCompleted(pending, result) => {
+                let (tab_id, id) = (pending.tab_id, pending.activity_id);
                 let description_save = self
                     .description_editor
                     .as_ref()
@@ -1264,9 +1266,21 @@ impl Diffui {
                         }
                     }
                     Err(error) => {
+                        // An immutable-commit rejection isn't a dead end: the
+                        // pre-flight can only see directly-addressed rows, so a
+                        // computed-set member (a rebase's descendant, an
+                        // insert-after target's child, a parent-squash's
+                        // destination) surfaces here instead. Same dialog, op
+                        // intact, override armed — accept reruns it. The queue
+                        // still advances so ops behind it aren't stranded.
+                        if let Some(target) = error.immutable_target.clone() {
+                            let dialog = self.confirm_immutable(*pending, &[target], true);
+                            return Task::batch([dialog, self.advance_mutation_queue()]);
+                        }
                         // Surface the failure in the activity log rather than
                         // failing the whole view — a rejected push shouldn't
                         // blank the panes.
+                        let error = error.message;
                         let mut toast_title = "Operation failed".to_owned();
                         if let Some(log) = self.activity_log_for(tab_id) {
                             if let Some(label) = log.label(id) {
@@ -1366,6 +1380,13 @@ impl Diffui {
                             activity::ActivityStatus::Done,
                             Some("Canceled".to_owned()),
                         );
+                    }
+                    // A canceled describe-on-immutable leaves its editor open
+                    // and editable again (it was parked as "Saving…").
+                    if let Some(editor) = self.description_editor.as_mut()
+                        && editor.saving_activity == Some(dialog.pending.activity_id)
+                    {
+                        editor.saving_activity = None;
                     }
                 }
             }
@@ -3925,7 +3946,18 @@ impl Diffui {
     /// mutations running at once would contend on jj's working-copy lock and
     /// serialize opaquely; queuing keeps them in order and visible (the queued
     /// entry shows in the activity log until it starts).
+    ///
+    /// The single chokepoint every mutation flows through, so the immutable
+    /// pre-flight lives here: an op whose known targets are marked immutable in
+    /// the loaded graph raises the confirmation dialog instead of dispatching
+    /// (unless the dialog's accept already armed the override).
     pub(crate) fn enqueue_or_run_mutation(&mut self, pending: PendingMutation) -> Task<Message> {
+        if !pending.allow_immutable {
+            let immutable = self.immutable_op_targets(&pending.op);
+            if !immutable.is_empty() {
+                return self.confirm_immutable(pending, &immutable, false);
+            }
+        }
         let (tab_id, activity_id) = (pending.tab_id, pending.activity_id);
         match self.mutation_queue.enqueue(pending) {
             diffui_core::QueueAction::Queued => {
@@ -3946,17 +3978,155 @@ impl Diffui {
         if let Some(log) = self.activity_log_for(pending.tab_id) {
             log.set_status(pending.activity_id, activity::ActivityStatus::Running);
         }
+        let echo = Box::new(pending.clone());
         let PendingMutation {
             repository,
             op,
-            tab_id,
-            activity_id,
             progress,
+            allow_immutable,
+            ..
         } = pending;
         Task::perform(
-            mutations::run_mutation(repository, op, progress),
-            move |result| Message::MutationCompleted(tab_id, activity_id, Box::new(result)),
+            mutations::run_mutation(repository, op, progress, allow_immutable),
+            move |result| Message::MutationCompleted(echo.clone(), Box::new(result)),
         )
+    }
+
+    /// The short display labels (change-id prefix, `/N`-suffixed for divergent
+    /// copies) of `op`'s rewrite targets that the loaded graph marks immutable.
+    /// Only rows the UI directly addresses are caught here — computed sets (a
+    /// rebase's descendants, an insert-after target's other children, a
+    /// parent-squash's destination) stay the backend guard's job, whose typed
+    /// rejection re-raises the same dialog after the fact.
+    fn immutable_op_targets(&self, op: &mutations::MutationOp) -> Vec<String> {
+        use mutations::{Destination, MutationOp, SquashTarget};
+        let mut selections: Vec<&RevisionSelection> = Vec::new();
+        match op {
+            MutationOp::Describe { target, .. } | MutationOp::Edit { target } => {
+                selections.push(target);
+            }
+            MutationOp::Abandon { targets } => selections.extend(targets),
+            MutationOp::Rebase {
+                sources,
+                destination,
+                ..
+            } => {
+                selections.extend(sources);
+                match destination {
+                    // The target itself gains a parent (is rewritten).
+                    Destination::Before(target) => selections.push(target),
+                    // The gap's child side gains a parent.
+                    Destination::Between { child, .. } => selections.push(child),
+                    // Onto rewrites only the sources; After rewrites the
+                    // target's children, which the UI can't enumerate.
+                    Destination::Onto(_) | Destination::After(_) => {}
+                }
+            }
+            MutationOp::Squash { from, into } => {
+                selections.extend(from);
+                if let SquashTarget::Revision(target) = into {
+                    selections.push(target);
+                }
+            }
+            MutationOp::Absorb { from } => selections.push(from),
+            // New/Merge/Duplicate only create commits; bookmark and undo ops
+            // don't rewrite anything the graph shows as immutable.
+            _ => {}
+        }
+
+        let mut labels: Vec<String> = Vec::new();
+        for selection in selections {
+            let row = match selection {
+                RevisionSelection::WorkingCopy => self.session.commits.working_copy(),
+                RevisionSelection::Commit(hex) => self.session.commits.find_by_commit_id(hex),
+            };
+            if let Some(row) = row
+                && row.is_immutable()
+            {
+                let label = self.revision_short_label(selection);
+                if !labels.contains(&label) {
+                    labels.push(label);
+                }
+            }
+        }
+        labels
+    }
+
+    /// Park `pending` behind the immutable-rewrite confirmation dialog, its
+    /// override armed for the accept. `after_rejection` marks the fallback
+    /// path — the backend already refused once (a computed-set member was
+    /// immutable), so the wording says what *would also* be rewritten.
+    fn confirm_immutable(
+        &mut self,
+        mut pending: PendingMutation,
+        targets: &[String],
+        after_rejection: bool,
+    ) -> Task<Message> {
+        use mutations::MutationOp;
+        // Hold the activity visibly while the dialog decides; cancel resolves
+        // it (ConfirmCancel), accept re-dispatches it.
+        if let Some(log) = self.activity_log_for(pending.tab_id) {
+            log.set_status(pending.activity_id, activity::ActivityStatus::Queued);
+        }
+        pending.allow_immutable = true;
+
+        let (verb, confirm_label) = match &pending.op {
+            MutationOp::Describe { .. } => ("Describe", "Rewrite anyway"),
+            MutationOp::Abandon { .. } => ("Abandon", "Abandon anyway"),
+            MutationOp::Edit { .. } => ("Edit", "Edit anyway"),
+            MutationOp::Squash { .. } => ("Squash", "Rewrite anyway"),
+            MutationOp::Absorb { .. } => ("Absorb from", "Rewrite anyway"),
+            _ => ("Rewrite", "Rewrite anyway"),
+        };
+        let (noun, verb_be) = if targets.len() == 1 {
+            ("revision", "is")
+        } else {
+            ("revisions", "are")
+        };
+        let names = targets.join(", ");
+        let mut body = if after_rejection {
+            format!("This operation would also rewrite {names}, which {verb_be} immutable")
+        } else {
+            format!("{names} {verb_be} immutable")
+        };
+        body.push_str(
+            " — reachable from immutable_heads(), which usually means pushed or \
+             otherwise shared history. The jj CLI refuses this without \
+             --ignore-immutable.",
+        );
+        if matches!(pending.op, MutationOp::Edit { .. }) {
+            body.push_str(" Editing it makes further working-copy changes amend it in place.");
+        }
+        self.confirm = Some(ConfirmDialog {
+            title: format!("{verb} immutable {noun}?"),
+            body,
+            confirm_label: confirm_label.to_owned(),
+            pending,
+        });
+        Task::none()
+    }
+
+    /// Short display name for a revision, matching the sidebar: unique
+    /// change-id prefix (min 8 chars), `/N`-suffixed for divergent/hidden
+    /// copies, falling back to a commit-id prefix for rows not in the graph.
+    fn revision_short_label(&self, selection: &RevisionSelection) -> String {
+        let row = match selection {
+            RevisionSelection::WorkingCopy => self.session.commits.working_copy(),
+            RevisionSelection::Commit(hex) => self.session.commits.find_by_commit_id(hex),
+        };
+        match (row, selection) {
+            (Some(row), _) => {
+                let len = row.shortest_change_id_len().unwrap_or(8).max(8);
+                let mut id: String = row.change_id().chars().take(len).collect();
+                if let Some(offset) = row.change_offset() {
+                    id.push('/');
+                    id.push_str(&offset.to_string());
+                }
+                id
+            }
+            (None, RevisionSelection::WorkingCopy) => "the working copy".to_owned(),
+            (None, RevisionSelection::Commit(hex)) => hex.chars().take(12).collect(),
+        }
     }
 
     /// A mutation finished: start the next queued one, or — when the queue is

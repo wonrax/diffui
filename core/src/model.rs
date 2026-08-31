@@ -115,6 +115,11 @@ pub struct CommitSummary {
     /// common single-visible case (and always for git).
     pub change_offset: Option<usize>,
     pub is_working_copy: bool,
+    /// Whether the commit is in `immutable()` — shared history the jj CLI
+    /// refuses to rewrite without `--ignore-immutable`. Drives the UI's
+    /// rewrite-confirmation dialogs. `false` for backends without the
+    /// concept (git, PR listings).
+    pub is_immutable: bool,
     /// Ref labels pointing at this commit. Other workspaces' working
     /// copies come first as `name@` (jj only; matches jj log's
     /// `working_copies`-before-`bookmarks` order), then bookmarks as in
@@ -129,18 +134,19 @@ pub struct CommitSummary {
 }
 
 mod commit_flags {
-    pub const HAS_DESCRIPTION: u8 = 1;
-    pub const IS_EMPTY_KNOWN: u8 = 1 << 1;
-    pub const IS_EMPTY: u8 = 1 << 2;
-    pub const HAS_CONFLICT: u8 = 1 << 3;
-    pub const IS_WORKING_COPY: u8 = 1 << 4;
-    pub const IS_DIVERGENT: u8 = 1 << 5;
-    pub const IS_HIDDEN: u8 = 1 << 6;
+    pub const HAS_DESCRIPTION: u16 = 1;
+    pub const IS_EMPTY_KNOWN: u16 = 1 << 1;
+    pub const IS_EMPTY: u16 = 1 << 2;
+    pub const HAS_CONFLICT: u16 = 1 << 3;
+    pub const IS_WORKING_COPY: u16 = 1 << 4;
+    pub const IS_DIVERGENT: u16 = 1 << 5;
+    pub const IS_HIDDEN: u16 = 1 << 6;
     /// The next display row is a direct parent of this one — i.e. the visual
     /// gap below this row is a real graph edge, not two unrelated branches
     /// rendered adjacently. Set at push time from the previous row's
     /// `parent_ids`; drives insert-between drop targets.
-    pub const NEXT_ROW_IS_PARENT: u8 = 1 << 7;
+    pub const NEXT_ROW_IS_PARENT: u16 = 1 << 7;
+    pub const IS_IMMUTABLE: u16 = 1 << 8;
 }
 
 /// Byte range `[start, start+len)` into a [`CommitStore`]'s text arena.
@@ -159,9 +165,9 @@ struct CommitSpans {
 
 /// Compact, indexable storage for a commit graph. Strings live in one shared
 /// arena (no per-commit `String` headers/allocations); authors are interned
-/// (a repo has far fewer authors than commits); flags are packed into a byte;
-/// bookmarks are stored sparsely since most commits have none. Read rows with
-/// [`CommitStore::row`] / [`CommitStore::iter`].
+/// (a repo has far fewer authors than commits); flags pack into one small
+/// word; bookmarks are stored sparsely since most commits have none. Read rows
+/// with [`CommitStore::row`] / [`CommitStore::iter`].
 #[derive(Debug, Clone, Default)]
 pub struct CommitStore {
     text: String,
@@ -169,7 +175,7 @@ pub struct CommitStore {
     authors: Vec<Arc<str>>,
     author_idx: Vec<u32>,
     shortest_change_id_len: Vec<u32>,
-    flags: Vec<u8>,
+    flags: Vec<u16>,
     bookmarks: HashMap<usize, Vec<String>>,
     /// `changeid/N` display offsets, stored sparsely — only divergent or
     /// hidden copies carry one (see [`CommitSummary::change_offset`]).
@@ -336,9 +342,12 @@ impl CommitStore {
         self.shortest_change_id_len
             .push(commit.shortest_change_id_len.unwrap_or(0) as u32);
 
-        let mut flags = 0u8;
+        let mut flags = 0u16;
         if commit.has_description {
             flags |= commit_flags::HAS_DESCRIPTION;
+        }
+        if commit.is_immutable {
+            flags |= commit_flags::IS_IMMUTABLE;
         }
         if let Some(empty) = commit.is_empty {
             flags |= commit_flags::IS_EMPTY_KNOWN;
@@ -409,7 +418,7 @@ impl CommitStore {
         total += self.authors.iter().map(|name| name.len()).sum::<usize>();
         total += self.author_idx.capacity() * size_of::<u32>();
         total += self.shortest_change_id_len.capacity() * size_of::<u32>();
-        total += self.flags.capacity();
+        total += self.flags.capacity() * size_of::<u16>();
         for names in self.bookmarks.values() {
             total += names.capacity() * size_of::<String>();
             total += names.iter().map(|name| name.capacity()).sum::<usize>();
@@ -452,7 +461,7 @@ impl<'a> RowView<'a> {
         }
     }
 
-    fn flags(&self) -> u8 {
+    fn flags(&self) -> u16 {
         self.store.flags[self.index]
     }
 
@@ -489,6 +498,12 @@ impl<'a> RowView<'a> {
 
     pub fn is_working_copy(&self) -> bool {
         self.flags() & commit_flags::IS_WORKING_COPY != 0
+    }
+
+    /// Whether this commit is in `immutable()` (see
+    /// [`CommitSummary::is_immutable`]).
+    pub fn is_immutable(&self) -> bool {
+        self.flags() & commit_flags::IS_IMMUTABLE != 0
     }
 
     /// Whether the next display row is a direct parent of this commit — i.e.
@@ -877,6 +892,7 @@ mod tests {
             is_hidden: false,
             change_offset: None,
             is_working_copy: false,
+            is_immutable: false,
             bookmarks: Vec::new(),
             parent_ids: parent_ids.iter().map(|id| (*id).to_owned()).collect(),
         };

@@ -525,6 +525,7 @@ impl Diffui {
             tab_id,
             activity_id,
             progress,
+            allow_immutable: false,
         };
         // jj CLI parity: `jj bookmark set` refuses a backwards/sideways move
         // without `--allow-backwards`. Check ancestry off-thread first — the

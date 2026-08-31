@@ -110,6 +110,7 @@ fn run(root: &Path, op: MutationOp) -> mutations::MutationOutcome {
         repository(root),
         op,
         LoadProgress::default(),
+        false,
     ))
     .expect("mutation succeeds")
 }
@@ -324,6 +325,7 @@ fn describe_mutation_replaces_the_full_message_without_moving_working_copy() {
             description: description.to_owned(),
         },
         LoadProgress::default(),
+        false,
     ))
     .expect("describe mutation");
 
@@ -893,9 +895,10 @@ fn squash_multiple_sources_into_one_destination() {
             into: SquashTarget::Parent,
         },
         LoadProgress::default(),
+        false,
     ));
     let error = result.expect_err("multi-source parent squash must fail");
-    assert!(error.contains("explicit destination"), "got: {error}");
+    assert!(error.message.contains("explicit destination"), "got: {error}");
 }
 
 /// `jj new A B`: the merge draft's confirm creates a child of both picked
@@ -946,9 +949,10 @@ fn merge_creates_a_child_of_both_parents() {
             ],
         },
         LoadProgress::default(),
+        false,
     ));
     let error = result.expect_err("self-merge must fail");
-    assert!(error.contains("two distinct parents"), "got: {error}");
+    assert!(error.message.contains("two distinct parents"), "got: {error}");
 
     // Octopus: the draft's add-parent path sends all stacked parents in one
     // op — three distinct parents make a three-way merge commit.
@@ -1294,12 +1298,134 @@ fn immutable_commits_refuse_rebase() {
             destination: Destination::Onto(RevisionSelection::Commit(wc)),
         },
         LoadProgress::default(),
+        false,
     ));
 
     let error = result.expect_err("rebasing an immutable commit must fail");
     assert!(
-        error.contains("immutable"),
+        error.message.contains("immutable"),
         "error names immutability: {error}"
+    );
+    // The rejection is typed, naming the refused commit — that's what lets
+    // the frontend raise its confirm-and-rerun dialog instead of a dead end.
+    let short = error
+        .immutable_target
+        .expect("immutable rejection carries the target");
+    assert!(!short.is_empty());
+}
+
+/// Describe and abandon refuse immutable targets like the CLI does (they used
+/// to rewrite them silently), and `allow_immutable` — the confirm dialog's
+/// accept — overrides the guard like `jj --ignore-immutable`.
+#[test]
+#[ignore = "shells out to the jj CLI"]
+fn immutable_guard_covers_describe_and_honors_override() {
+    let root = scratch_repo("immutable-describe");
+    write(&root, "a.txt", "a\n");
+    jj(&root, &["commit", "-m", "protected base"]);
+    std::fs::write(
+        root.join(".jj/repo/config.toml"),
+        "[signing]\nbehavior = \"keep\"\n\n\
+         [revset-aliases]\n'immutable_heads()' = 'description(glob:\"protected*\")'\n",
+    )
+    .expect("write repo config");
+    let protected = commit_id(&root, "description(glob:\"protected*\")");
+
+    let describe = |allow: bool| {
+        block_on(mutations::run_mutation(
+            repository(&root),
+            MutationOp::Describe {
+                target: RevisionSelection::Commit(protected.clone()),
+                description: "renamed anyway".to_owned(),
+            },
+            LoadProgress::default(),
+            allow,
+        ))
+    };
+
+    let error = describe(false).expect_err("describing an immutable commit must fail");
+    assert!(
+        error.immutable_target.is_some(),
+        "typed rejection expected: {error}"
+    );
+    // Nothing was rewritten by the refused attempt.
+    assert_eq!(
+        jj(
+            &root,
+            &["log", "--no-graph", "-r", "description(glob:\"protected*\")", "-T", "description"]
+        ),
+        "protected base\n"
+    );
+
+    let abandon = block_on(mutations::run_mutation(
+        repository(&root),
+        MutationOp::Abandon {
+            targets: vec![RevisionSelection::Commit(protected.clone())],
+        },
+        LoadProgress::default(),
+        false,
+    ));
+    assert!(
+        abandon
+            .expect_err("abandoning an immutable commit must fail")
+            .immutable_target
+            .is_some()
+    );
+
+    describe(true).expect("override rewrites the immutable commit");
+    assert_eq!(
+        jj(
+            &root,
+            &["log", "--no-graph", "-r", "description(glob:\"renamed*\")", "-T", "description"]
+        ),
+        "renamed anyway"
+    );
+}
+
+/// The log walk flags rows in `immutable()` (honoring an `immutable_heads()`
+/// override), which is what the frontend's pre-flight dialog reads.
+#[test]
+#[ignore = "shells out to the jj CLI"]
+fn log_rows_carry_the_immutable_flag() {
+    let root = scratch_repo("immutable-log-flag");
+    write(&root, "a.txt", "a\n");
+    jj(&root, &["commit", "-m", "protected base"]);
+    write(&root, "a.txt", "b\n");
+    jj(&root, &["commit", "-m", "mutable child"]);
+    std::fs::write(
+        root.join(".jj/repo/config.toml"),
+        "[signing]\nbehavior = \"keep\"\n\n\
+         [revset-aliases]\n'immutable_heads()' = 'description(glob:\"protected*\")'\n",
+    )
+    .expect("write repo config");
+
+    let (store, _graph, _branch, _bookmarks) = block_on(load_jj_commits(
+        root.clone(),
+        "all()".to_owned(),
+        LoadProgress::default(),
+    ))
+    .expect("load commits");
+
+    let immutable: Vec<&str> = store
+        .iter()
+        .filter(|row| row.is_immutable())
+        .map(|row| row.description())
+        .collect();
+    // The protected head and the root commit (immutable() is ancestor-closed
+    // and includes root()) — the mutable child and `@` stay unflagged.
+    assert!(
+        immutable.contains(&"protected base"),
+        "protected head flagged, got {immutable:?}"
+    );
+    assert!(
+        !immutable.contains(&"mutable child"),
+        "mutable child unflagged, got {immutable:?}"
+    );
+    assert!(
+        store
+            .working_copy()
+            .is_some_and(|working_copy| !working_copy.is_immutable()),
+        "@ stays mutable"
     );
 }
 

@@ -296,6 +296,7 @@ pub fn pr_commit_store(commits: &[PrCommit]) -> (CommitStore, GraphLayout) {
         is_hidden: false,
         change_offset: None,
         is_working_copy: true,
+        is_immutable: false,
         bookmarks: Vec::new(),
         parent_ids: Vec::new(),
     });
@@ -317,6 +318,7 @@ pub fn pr_commit_store(commits: &[PrCommit]) -> (CommitStore, GraphLayout) {
             is_hidden: false,
             change_offset: None,
             is_working_copy: false,
+            is_immutable: false,
             bookmarks: Vec::new(),
             parent_ids: Vec::new(),
         });

@@ -573,6 +573,7 @@ fn build_commit_summaries(rows: Vec<ParsedCommitRow>) -> (Vec<CommitSummary>, Gr
             is_hidden: false,
             change_offset: None,
             is_working_copy: row.is_working_copy,
+            is_immutable: false,
             bookmarks: Vec::new(),
             parent_ids: row.parents,
         })

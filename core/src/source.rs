@@ -629,8 +629,8 @@ impl Mutable for RepoSource {
         op: MutationOp,
         progress: LoadProgress,
     ) -> Result<MutationOutcome, String> {
-        crate::mutations::run_mutation(self.repo.clone(), op, progress)
+        crate::mutations::run_mutation(self.repo.clone(), op, progress, false)
             .await
-            .map_err(|error| format!("{error:#}"))
+            .map_err(|error| error.message)
     }
 }

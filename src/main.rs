@@ -246,6 +246,10 @@ pub(crate) struct PendingMutation {
     tab_id: TabId,
     activity_id: activity::ActivityId,
     progress: LoadProgress,
+    /// Run with the immutable-commit guards off (jj's `--ignore-immutable`).
+    /// Only ever set by the confirm dialog's accept — never at op creation —
+    /// so a mutation can't skip the guards without the user saying so.
+    allow_immutable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -559,11 +563,13 @@ impl DescriptionEditor {
     }
 }
 
-/// A modal confirmation gating a mutation the jj CLI would refuse outright
-/// (today: a backwards/sideways bookmark move, where the CLI demands
-/// `--allow-backwards`). Accept runs the held mutation; cancel resolves its
-/// queued activity. The `PendingMutation` is fully self-addressed
-/// (repo/tab/activity), so accepting still runs correctly after a tab switch.
+/// A modal confirmation gating a mutation the jj CLI would refuse outright:
+/// a backwards/sideways bookmark move (the CLI demands `--allow-backwards`),
+/// or an op touching immutable revisions (the CLI demands
+/// `--ignore-immutable`; the held pending has `allow_immutable` armed).
+/// Accept runs the held mutation; cancel resolves its queued activity. The
+/// `PendingMutation` is fully self-addressed (repo/tab/activity), so
+/// accepting still runs correctly after a tab switch.
 #[derive(Debug, Clone)]
 pub(crate) struct ConfirmDialog {
     pub(crate) title: String,

@@ -152,20 +152,59 @@ pub struct MutationOutcome {
     pub operation_id: Option<String>,
 }
 
+/// A failed mutation. The immutable-commit rejection travels as data (not
+/// just prose) so a frontend can offer "rewrite anyway" — a rerun with
+/// `allow_immutable` — instead of a dead-end error.
+#[derive(Debug, Clone)]
+pub struct MutationError {
+    pub message: String,
+    /// Short change id of the immutable commit the op refused to touch, when
+    /// that's why it failed. `None` for every other kind of failure.
+    pub immutable_target: Option<String>,
+}
+
+impl std::fmt::Display for MutationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl MutationError {
+    fn other(message: String) -> Self {
+        Self {
+            message,
+            immutable_target: None,
+        }
+    }
+}
+
 /// Run `op` off the iced runtime. jj-lib holds `!Send` state, so the work runs
 /// on `spawn_blocking + block_on`, mirroring the read path in `jj.rs`.
+/// `allow_immutable` skips the immutable-commit guards — pass it only after
+/// the user has confirmed the rewrite (the jj CLI's `--ignore-immutable`).
 pub async fn run_mutation(
     repository: Repository,
     op: MutationOp,
     progress: LoadProgress,
-) -> Result<MutationOutcome, String> {
+    allow_immutable: bool,
+) -> Result<MutationOutcome, MutationError> {
     let handle = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
-        handle.block_on(crate::jj::apply_mutation(repository, op, progress))
+        handle.block_on(crate::jj::apply_mutation(
+            repository,
+            op,
+            progress,
+            allow_immutable,
+        ))
     })
     .await
-    .map_err(|e| format!("mutation task panicked: {e}"))?
-    .map_err(|e| format!("{e:#}"))
+    .map_err(|e| MutationError::other(format!("mutation task panicked: {e}")))?
+    .map_err(|e| MutationError {
+        immutable_target: e
+            .downcast_ref::<crate::jj::ImmutableRewriteError>()
+            .map(|immutable| immutable.short_id.clone()),
+        message: format!("{e:#}"),
+    })
 }
 
 /// What a draft simulation produced — the op bar renders the kind-specific

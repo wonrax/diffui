@@ -338,6 +338,27 @@ pub async fn walk_jj_with_repo(
         });
     }
 
+    // Membership test for `immutable()`, resolved through the same alias map
+    // as the log revset so a user override of `immutable_heads()` is honored.
+    // Flags each row for the UI's rewrite-confirmation dialogs. Best-effort:
+    // on any failure every row reads as mutable — the mutation path still
+    // guards for real (`ensure_rewritable`), this only degrades the warning
+    // from up-front to after-the-fact.
+    let immutable_revset = parse_user_revset(repo_root, repo.settings(), workspace_name, "immutable()")
+        .and_then(|expr| {
+            expr.resolve_user_expression(repo, &symbol_resolver)
+                .context("failed to resolve immutable()")
+        })
+        .and_then(|resolved| {
+            resolved
+                .evaluate(repo)
+                .context("failed to evaluate immutable()")
+        });
+    if let Err(error) = &immutable_revset {
+        eprintln!("diffui: immutable() unavailable for log flags: {error:#}");
+    }
+    let is_immutable_fn = immutable_revset.as_ref().ok().map(|rs| rs.containing_fn());
+
     let mut lane_assigner = LaneAssigner::new();
     let mut tree_ids: HashMap<CommitId, Merge<TreeId>> = HashMap::new();
     let mut ids: Vec<CommitId> = Vec::new();
@@ -424,6 +445,9 @@ pub async fn walk_jj_with_repo(
                 is_hidden,
                 change_offset,
                 is_working_copy: id == *wc_commit_id,
+                is_immutable: is_immutable_fn
+                    .as_ref()
+                    .is_some_and(|contains| contains(&id).unwrap_or(false)),
                 bookmarks,
                 parent_ids: commit.parent_ids().iter().map(|id| id.hex()).collect(),
             };
@@ -1733,6 +1757,7 @@ pub(crate) async fn apply_mutation(
     repository: Repository,
     op: MutationOp,
     progress: LoadProgress,
+    allow_immutable: bool,
 ) -> Result<MutationOutcome> {
     let settings = jj_settings(&repository.root)?;
     let mut workspace = Workspace::load(
@@ -1855,6 +1880,18 @@ pub(crate) async fn apply_mutation(
         }
         MutationOp::Edit { target } => {
             let commit = resolve_mutation_target(tx.repo(), &current_wc_id, target).await?;
+            // The CLI refuses `jj edit` on immutable commits: a working copy
+            // parked there would amend them on the next snapshot.
+            if !allow_immutable {
+                ensure_rewritable(
+                    &repository.root,
+                    &settings,
+                    &workspace_name,
+                    tx.repo(),
+                    &[commit.id().clone()],
+                )
+                .await?;
+            }
             let short = short_change_id(&commit);
             tx.repo_mut()
                 .edit(workspace_name.clone(), &commit)
@@ -1870,6 +1907,11 @@ pub(crate) async fn apply_mutation(
                 if seen.insert(commit.id().clone()) {
                     commits.push(commit);
                 }
+            }
+            if !allow_immutable {
+                let ids: Vec<CommitId> = commits.iter().map(|c| c.id().clone()).collect();
+                ensure_rewritable(&repository.root, &settings, &workspace_name, tx.repo(), &ids)
+                    .await?;
             }
             match commits.as_slice() {
                 [] => bail!("abandon needs at least one revision"),
@@ -1891,6 +1933,16 @@ pub(crate) async fn apply_mutation(
             description,
         } => {
             let commit = resolve_mutation_target(tx.repo(), &current_wc_id, target).await?;
+            if !allow_immutable {
+                ensure_rewritable(
+                    &repository.root,
+                    &settings,
+                    &workspace_name,
+                    tx.repo(),
+                    &[commit.id().clone()],
+                )
+                .await?;
+            }
             let short = short_change_id(&commit);
             let rewritten = tx
                 .repo_mut()
@@ -1948,14 +2000,16 @@ pub(crate) async fn apply_mutation(
                         }
                     };
                     rewritten.extend(new_child_ids.iter().cloned());
-                    ensure_rewritable(
-                        &repository.root,
-                        &settings,
-                        &workspace_name,
-                        tx.repo(),
-                        &rewritten,
-                    )
-                    .await?;
+                    if !allow_immutable {
+                        ensure_rewritable(
+                            &repository.root,
+                            &settings,
+                            &workspace_name,
+                            tx.repo(),
+                            &rewritten,
+                        )
+                        .await?;
+                    }
                     let location = MoveCommitsLocation {
                         new_parent_ids,
                         new_child_ids,
@@ -2019,14 +2073,16 @@ pub(crate) async fn apply_mutation(
             }
             let mut rewritten: Vec<CommitId> = seen.iter().cloned().collect();
             rewritten.push(destination.id().clone());
-            ensure_rewritable(
-                &repository.root,
-                &settings,
-                &workspace_name,
-                tx.repo(),
-                &rewritten,
-            )
-            .await?;
+            if !allow_immutable {
+                ensure_rewritable(
+                    &repository.root,
+                    &settings,
+                    &workspace_name,
+                    tx.repo(),
+                    &rewritten,
+                )
+                .await?;
+            }
             let source_names: Vec<String> = source_commits.iter().map(short_change_id).collect();
             let short_dest = short_change_id(&destination);
             let combined = combined_squash_description(&destination, &source_commits);
@@ -2109,14 +2165,16 @@ pub(crate) async fn apply_mutation(
         MutationOp::Absorb { from } => {
             let source = resolve_mutation_target(tx.repo(), &current_wc_id, from).await?;
             let short = short_change_id(&source);
-            ensure_rewritable(
-                &repository.root,
-                &settings,
-                &workspace_name,
-                tx.repo(),
-                &[source.id().clone()],
-            )
-            .await?;
+            if !allow_immutable {
+                ensure_rewritable(
+                    &repository.root,
+                    &settings,
+                    &workspace_name,
+                    tx.repo(),
+                    &[source.id().clone()],
+                )
+                .await?;
+            }
             let absorb_source = AbsorbSource::from_commit(tx.repo(), source.clone())
                 .await
                 .context("failed to prepare absorb source")?;
@@ -2425,9 +2483,35 @@ async fn resolve_move_target(
     }))
 }
 
-/// jj CLI parity: refuse to rewrite immutable commits. `immutable()` resolves
-/// through the same alias map the revset filter uses, so a user override of
-/// `immutable_heads()` is honored.
+/// A mutation refused because it would touch a commit in `immutable()` —
+/// rewrite it, abandon it, or check it out for editing. Typed (and kept at
+/// the root of the anyhow chain) so the frontend can downcast it and offer an
+/// explicit rerun with `allow_immutable` instead of a dead-end failure.
+#[derive(Debug, Clone)]
+pub struct ImmutableRewriteError {
+    /// Short change id of the first immutable commit the op hit.
+    pub short_id: String,
+}
+
+impl std::fmt::Display for ImmutableRewriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "commit {} is immutable — it's reachable from immutable_heads() \
+             (usually pushed/shared history)",
+            self.short_id
+        )
+    }
+}
+
+impl std::error::Error for ImmutableRewriteError {}
+
+/// jj CLI parity: refuse to touch immutable commits (rewrites, and `edit`'s
+/// checkout — a working copy parked on an immutable commit would amend it on
+/// the next snapshot). `immutable()` resolves through the same alias map the
+/// revset filter uses, so a user override of `immutable_heads()` is honored.
+/// Callers skip this under the frontend's confirmed `allow_immutable`
+/// override, mirroring `jj --ignore-immutable`.
 async fn ensure_rewritable(
     repo_root: &Path,
     settings: &UserSettings,
@@ -2460,11 +2544,10 @@ async fn ensure_rewritable(
             .get_commit_async(&id)
             .await
             .with_context(|| format!("failed to load jj commit {}", id.hex()))?;
-        bail!(
-            "refusing to rewrite immutable commit {} — override \
-             revset-aliases.\"immutable_heads()\" if this is intentional",
-            short_change_id(&commit)
-        );
+        return Err(ImmutableRewriteError {
+            short_id: short_change_id(&commit),
+        }
+        .into());
     }
     Ok(())
 }

@@ -1718,6 +1718,7 @@ mod tests {
             is_hidden: false,
             change_offset: None,
             is_working_copy: false,
+            is_immutable: false,
             bookmarks: Vec::new(),
             parent_ids: Vec::new(),
         }

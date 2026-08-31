@@ -25,7 +25,7 @@ pub mod watcher;
 pub use diff_parse::{DiffStreamParser, format_hunk_header, parse_unified_diff};
 pub use model::*;
 pub use mutations::{
-    Destination, DraftKind, DraftSimulation, DraftSource, MergePreview, MutationOp,
+    Destination, DraftKind, DraftSimulation, DraftSource, MergePreview, MutationError, MutationOp,
     MutationOutcome, OpDraft, PlacementKind, RebasePreview, RebaseSourceMode, SquashTarget,
 };
 pub use repository::{FetchTarget, Repository, RepositorySnapshot, Vcs, prepare_repository};
