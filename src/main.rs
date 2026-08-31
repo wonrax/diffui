@@ -11,6 +11,7 @@ mod chrome;
 mod config;
 mod diff_panel;
 mod diff_view;
+mod editor_drag;
 mod field;
 mod find;
 mod graph_view;

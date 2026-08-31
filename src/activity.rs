@@ -749,27 +749,34 @@ fn activity_row<'a>(
     let Some(editor) = activity.detail_editor.as_ref() else {
         return header_area;
     };
+    // The drag wrapper adds word/line extension to double/triple-click drags,
+    // publishing through the same action pipeline (the log's read-only filter
+    // applies to those like any other action).
     let mut block_body = column![
-        text_editor(editor)
-            .size(text_size::CAPTION)
-            .font(mono)
-            .padding(0)
-            .wrapping(text::Wrapping::WordOrGlyph)
-            .on_action(move |action| Message::ActivityDetailAction(id, action))
-            .style(move |_, _| text_editor::Style {
-                background: Background::Color(Color::TRANSPARENT),
-                border: Border {
-                    width: 0.0,
-                    color: Color::TRANSPARENT,
-                    radius: 0.0.into(),
-                },
-                placeholder: theme.subtle_text,
-                value: theme.muted_text,
-                selection: Color {
-                    a: 0.25,
-                    ..theme.accent
-                },
-            }),
+        crate::editor_drag::editor_drag_area(
+            text_editor(editor)
+                .size(text_size::CAPTION)
+                .font(mono)
+                .padding(0)
+                .wrapping(text::Wrapping::WordOrGlyph)
+                .on_action(move |action| Message::ActivityDetailAction(id, action))
+                .style(move |_, _| text_editor::Style {
+                    background: Background::Color(Color::TRANSPARENT),
+                    border: Border {
+                        width: 0.0,
+                        color: Color::TRANSPARENT,
+                        radius: 0.0.into(),
+                    },
+                    placeholder: theme.subtle_text,
+                    value: theme.muted_text,
+                    selection: Color {
+                        a: 0.25,
+                        ..theme.accent
+                    },
+                }),
+            0,
+            move |action| Message::ActivityDetailAction(id, action),
+        ),
     ]
     .spacing(6);
     let urls = detail_urls(&activity.detail);

@@ -193,6 +193,7 @@ fn build_description_editor<'a>(
         let saving = editor.saving_activity.is_some();
         let input_height =
             block_height - DESCRIPTION_EDITOR_ACTIONS_HEIGHT - DESCRIPTION_EDITOR_GAP;
+        let input_padding = Padding::from([DESCRIPTION_EDITOR_PADDING_Y, 12.0]);
         let mut input = text_editor(&editor.content)
             .id(iced::widget::Id::new(DESCRIPTION_EDITOR_ID))
             .placeholder("Describe this revision…")
@@ -202,7 +203,7 @@ fn build_description_editor<'a>(
                 crate::measure::LINE_HEIGHT_MULTIPLIER,
             ))
             .height(Length::Fixed(input_height))
-            .padding(Padding::from([DESCRIPTION_EDITOR_PADDING_Y, 12.0]))
+            .padding(input_padding)
             .wrapping(text::Wrapping::Glyph)
             .style(move |_, _| text_editor::Style {
                 background: Background::Color(theme.background),
@@ -221,6 +222,14 @@ fn build_description_editor<'a>(
         if !saving {
             input = input.on_action(Message::DescriptionAction);
         }
+        // Wrapped so double/triple-click drags extend by word/line. Bare while
+        // saving — the editor drops actions then, and the wrapper must too.
+        let input: Element<'_, Message> = if saving {
+            input.into()
+        } else {
+            crate::editor_drag::editor_drag_area(input, input_padding, Message::DescriptionAction)
+                .into()
+        };
 
         let cancel = button(text("Cancel").size(text_size::UI).font(ui.config.ui_font))
             .padding(Padding::from([6, 12]))
