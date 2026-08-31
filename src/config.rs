@@ -2,16 +2,26 @@
 //! (or `$HOME/.config/diffui/config.toml`).
 //!
 //! Configurable fields:
-//!   ui_font            — family used for chrome, sidebar, file names, etc.
-//!                        Falls back to the system default when unset.
-//!   mono_font          — family used for code/IDs.
-//!                        Falls back to "Menlo" on macOS and "Cascadia Code"
-//!                        elsewhere.
-//!   multi_click_ms     — max ms between clicks to count as a multi-click in
-//!                        the diff view. Defaults to 350.
-//!   theme              — color theme: System | Light | Dark | Contrast.
-//!                        `System` follows the OS appearance. Defaults to
-//!                        System.
+//!   ui_font              — family used for chrome, sidebar, file names, etc.
+//!                          Falls back to the system default when unset.
+//!   mono_font            — family used for code/IDs.
+//!                          Falls back to "Menlo" on macOS and "Cascadia Code"
+//!                          elsewhere.
+//!   multi_click_ms       — max ms between clicks to count as a multi-click in
+//!                          the diff view. Defaults to 350.
+//!   theme                — color theme: System | Light | Dark | Contrast.
+//!                          `System` follows the OS appearance. Defaults to
+//!                          System.
+//!   code_font_size       — px size of the code surfaces (diff view, source
+//!                          browser, description editor). Defaults to 12.
+//!   code_line_height     — row height of the diff/source grid as a multiple
+//!                          of `code_font_size`. Defaults to 1.85.
+//!   code_baseline_offset — px nudge of code text within its row; positive
+//!                          moves it down. Defaults to 0.
+//!
+//! Kerning and OpenType feature toggles (ligatures, stylistic sets) aren't
+//! configurable: the text stack (iced/cosmic-text) exposes no per-run feature
+//! or letter-spacing control today.
 
 use std::{env, path::PathBuf};
 
@@ -20,17 +30,46 @@ use serde::Deserialize;
 
 use crate::theme::ThemePreference;
 
+/// Default row-height factor of the code grid — 1.85 × the font size gives
+/// the historical 22px rows at the default 12px code font.
+pub const DEFAULT_CODE_LINE_HEIGHT: f32 = 1.85;
+
+/// Typography of the code surfaces, resolved and clamped at load. One value
+/// object so the diff view's metrics take the whole set at once.
+#[derive(Debug, Clone, Copy)]
+pub struct CodeTypography {
+    /// Font size in px (`code_font_size`).
+    pub size: f32,
+    /// Row height as a multiple of `size` (`code_line_height`).
+    pub line_height: f32,
+    /// Vertical nudge of text within its row, px, positive = down
+    /// (`code_baseline_offset`).
+    pub baseline_offset: f32,
+}
+
+impl Default for CodeTypography {
+    fn default() -> Self {
+        Self {
+            size: 12.0,
+            line_height: DEFAULT_CODE_LINE_HEIGHT,
+            baseline_offset: 0.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct AppConfig {
     pub ui_font: Font,
     pub mono_font: Font,
     pub multi_click_ms: u64,
     pub theme: ThemePreference,
+    pub code_type: CodeTypography,
 }
 
 impl AppConfig {
     pub fn load() -> Self {
         let raw = read_config_file().unwrap_or_default();
+        let defaults = CodeTypography::default();
         Self {
             ui_font: raw
                 .ui_font
@@ -48,6 +87,22 @@ impl AppConfig {
                 .as_deref()
                 .and_then(theme_from_name)
                 .unwrap_or(ThemePreference::System),
+            // Clamped to keep a fat-fingered config renderable rather than
+            // degenerate (zero-height rows, text nudged out of its row).
+            code_type: CodeTypography {
+                size: raw
+                    .code_font_size
+                    .map(|size| size.clamp(6.0, 32.0))
+                    .unwrap_or(defaults.size),
+                line_height: raw
+                    .code_line_height
+                    .map(|factor| factor.clamp(1.0, 3.0))
+                    .unwrap_or(defaults.line_height),
+                baseline_offset: raw
+                    .code_baseline_offset
+                    .map(|px| px.clamp(-8.0, 8.0))
+                    .unwrap_or(defaults.baseline_offset),
+            },
         }
     }
 }
@@ -58,6 +113,9 @@ struct RawConfig {
     mono_font: Option<String>,
     multi_click_ms: Option<u64>,
     theme: Option<String>,
+    code_font_size: Option<f32>,
+    code_line_height: Option<f32>,
+    code_baseline_offset: Option<f32>,
 }
 
 /// Parse a config `theme` value. Case-insensitive; `Contrast` maps to the

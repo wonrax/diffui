@@ -18,8 +18,6 @@ use crate::theme::{
 use crate::{Diffui, LoadStatus, Message};
 use diffui_core::{RevisionDetails, SignatureInfo};
 
-// Diff pane code size — tied to the code font, not the chrome type scale.
-const CODE_TEXT_SIZE: f32 = 12.0;
 const EMPTY_STATE_TEXT_SIZE: f32 = text_size::BODY_LG;
 const STATS_TEXT_SIZE: f32 = text_size::BODY;
 pub(crate) const DESCRIPTION_EDITOR_ID: &str = "revision-description-editor";
@@ -116,7 +114,7 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
             ui.session.selected_revision.view_key(),
             diff_palette(theme),
             ui.config.mono_font,
-            CODE_TEXT_SIZE,
+            ui.config.code_type,
             ui.config.multi_click_ms,
             Message::SelectFile,
         )
@@ -197,7 +195,7 @@ fn build_description_editor<'a>(
         let mut input = text_editor(&editor.content)
             .id(iced::widget::Id::new(DESCRIPTION_EDITOR_ID))
             .placeholder("Describe this revision…")
-            .size(CODE_TEXT_SIZE)
+            .size(ui.config.code_type.size)
             .font(ui.config.mono_font)
             .line_height(text::LineHeight::Relative(
                 crate::measure::LINE_HEIGHT_MULTIPLIER,
@@ -295,11 +293,13 @@ fn description_editor_height(ui: &Diffui) -> f32 {
         - diff_view::HEADER_HORIZONTAL_PADDING * 2.0
         - 24.0)
         .max(1.0);
-    let char_width = crate::measure::line_width("M", CODE_TEXT_SIZE, ui.config.mono_font).max(1.0);
+    let char_width =
+        crate::measure::line_width("M", ui.config.code_type.size, ui.config.mono_font).max(1.0);
     let chars_per_line = (available_width / char_width).floor().max(1.0) as usize;
     let visual_lines = description_visual_line_count(&editor.text(), chars_per_line);
     let input_height =
-        (visual_lines as f32 * CODE_TEXT_SIZE * crate::measure::LINE_HEIGHT_MULTIPLIER).ceil()
+        (visual_lines as f32 * ui.config.code_type.size * crate::measure::LINE_HEIGHT_MULTIPLIER)
+            .ceil()
             + DESCRIPTION_EDITOR_PADDING_Y * 2.0;
     input_height + DESCRIPTION_EDITOR_GAP + DESCRIPTION_EDITOR_ACTIONS_HEIGHT
 }

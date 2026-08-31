@@ -17,18 +17,21 @@ use crate::icons;
 use crate::measure;
 use crate::scrollbar::{self, ScrollbarState, ScrollbarStyle};
 
-// Row height is `text_size * ROW_HEIGHT_RATIO` rounded to the nearest int,
-// so glyphs (which iced renders at `text_size * 1.4` line height) sit
-// inside the row with a few px of breathing room above and below. 1.85
-// gives 24px at the default 13pt code font, matching the historical fixed
-// row height, and scales linearly when the caller passes a larger size.
-const ROW_HEIGHT_RATIO: f32 = 1.85;
+// Row height is `text_size * line_height` rounded to the nearest int, so
+// glyphs (which iced renders at `text_size * 1.4` line height) sit inside
+// the row with a few px of breathing room above and below. The default
+// factor (`config::DEFAULT_CODE_LINE_HEIGHT`, 1.85) gives the historical
+// fixed row height at the default code font size; the user can widen or
+// tighten it via `code_line_height`.
 // Padding above and below the centered title row inside the file-header strip.
 const FILE_HEADER_VPAD: f32 = 8.0;
 // Padding above and below the centered title row inside the hunk-header strip.
 const HUNK_HEADER_VPAD: f32 = 3.0;
 const PREFIX_WIDTH: f32 = 24.0;
 const TEXT_X_PADDING: f32 = 8.0;
+/// Baseline text drop within a default-ratio row. A custom `code_line_height`
+/// splits its extra (or removed) leading evenly around this, and
+/// `code_baseline_offset` shifts it — see [`LayoutMetrics::new`].
 const TEXT_Y_PADDING: f32 = 2.0;
 // Rows advanced per wheel-notch line on Linux/Windows (macOS trackpads take the
 // pixel path below). Above the ~3-line OS default — browsing a long diff with a
@@ -186,7 +189,7 @@ pub struct DiffView<'a, Message> {
     revision_key: String,
     palette: Palette,
     font: Font,
-    text_size: f32,
+    typography: crate::config::CodeTypography,
     multi_click_ms: u64,
     metrics: LayoutMetrics,
     header: Vec<HeaderLine>,
@@ -259,6 +262,10 @@ pub struct FindOverlay<'a> {
 #[derive(Debug, Clone, Copy)]
 struct LayoutMetrics {
     row_height: f32,
+    /// Vertical offset of a row's text below its top edge. The historical
+    /// [`TEXT_Y_PADDING`] at the default typography, shifted by half of any
+    /// configured extra leading plus the user's baseline offset.
+    text_y_pad: f32,
     file_header_height: f32,
     hunk_header_height: f32,
     gutter_width: f32,
@@ -274,8 +281,20 @@ struct LayoutMetrics {
 }
 
 impl LayoutMetrics {
-    fn new(text_size: f32, gutter_digit_count: usize, font: Font, plain: bool) -> Self {
-        let row_height = (text_size * ROW_HEIGHT_RATIO).round();
+    fn new(
+        typography: crate::config::CodeTypography,
+        gutter_digit_count: usize,
+        font: Font,
+        plain: bool,
+    ) -> Self {
+        let text_size = typography.size;
+        let row_height = (text_size * typography.line_height).round();
+        // Pixel-identical to the fixed TEXT_Y_PADDING at default typography;
+        // a custom line height splits its leading delta evenly above/below,
+        // and the baseline offset then nudges the result.
+        let default_row_height = (text_size * crate::config::DEFAULT_CODE_LINE_HEIGHT).round();
+        let text_y_pad =
+            TEXT_Y_PADDING + (row_height - default_row_height) / 2.0 + typography.baseline_offset;
         // Plain (source-browse) documents render no file/hunk header strips;
         // zero heights keep the prefix-sum index, hit tests, and draw all
         // consistent without a parallel layout mode.
@@ -313,6 +332,7 @@ impl LayoutMetrics {
             .max(gutter_min);
         Self {
             row_height,
+            text_y_pad,
             file_header_height,
             hunk_header_height,
             gutter_width,
@@ -700,19 +720,19 @@ impl<'a, Message> DiffView<'a, Message> {
         revision_key: impl Into<String>,
         palette: Palette,
         font: Font,
-        text_size: f32,
+        typography: crate::config::CodeTypography,
         multi_click_ms: u64,
         on_selected_file_changed: fn(usize) -> Message,
     ) -> Self {
         let gutter_digit_count = compute_gutter_digit_count(&files);
-        let metrics = LayoutMetrics::new(text_size, gutter_digit_count, font, false);
+        let metrics = LayoutMetrics::new(typography, gutter_digit_count, font, false);
         Self {
             files,
             selected_file,
             revision_key: revision_key.into(),
             palette,
             font,
-            text_size,
+            typography,
             multi_click_ms,
             metrics,
             header: Vec::new(),
@@ -738,7 +758,7 @@ impl<'a, Message> DiffView<'a, Message> {
         if self.plain != plain {
             self.plain = plain;
             self.metrics = LayoutMetrics::new(
-                self.text_size,
+                self.typography,
                 self.metrics.gutter_digit_count,
                 self.font,
                 plain,
@@ -1678,7 +1698,7 @@ impl<'a, Message> DiffView<'a, Message> {
                 height: self.metrics.row_height,
                 position: Point::new(
                     bounds.x + GUTTER_HORIZONTAL_PADDING,
-                    render.y + TEXT_Y_PADDING,
+                    render.y + self.metrics.text_y_pad,
                 ),
                 color: self.palette.text_muted,
                 clip_bounds: bounds,
@@ -1693,7 +1713,7 @@ impl<'a, Message> DiffView<'a, Message> {
                 height: self.metrics.row_height,
                 position: Point::new(
                     bounds.x + self.metrics.gutter_width + TEXT_X_PADDING,
-                    render.y + TEXT_Y_PADDING,
+                    render.y + self.metrics.text_y_pad,
                 ),
                 color: text_color,
                 clip_bounds: bounds,
@@ -1704,7 +1724,7 @@ impl<'a, Message> DiffView<'a, Message> {
         let position = Point::new(
             bounds.x + self.metrics.gutter_width + PREFIX_WIDTH + TEXT_X_PADDING
                 - render.horizontal_offset,
-            render.y + TEXT_Y_PADDING,
+            render.y + self.metrics.text_y_pad,
         );
 
         // Glyph wrapping (hard column break) instead of `WordOrGlyph`
@@ -2071,7 +2091,7 @@ impl<'a, Message> DiffView<'a, Message> {
                     height: self.metrics.row_height,
                     position: Point::new(
                         bounds.x + gutter_x + GUTTER_HORIZONTAL_PADDING,
-                        row.y + TEXT_Y_PADDING,
+                        row.y + self.metrics.text_y_pad,
                     ),
                     color: self.palette.text_muted,
                     clip_bounds: bounds,
@@ -2086,7 +2106,7 @@ impl<'a, Message> DiffView<'a, Message> {
                     height: self.metrics.row_height,
                     position: Point::new(
                         bounds.x + gutter_x + split.gutter_width + TEXT_X_PADDING,
-                        row.y + TEXT_Y_PADDING,
+                        row.y + self.metrics.text_y_pad,
                     ),
                     color: text_color,
                     clip_bounds: bounds,
@@ -2106,7 +2126,7 @@ impl<'a, Message> DiffView<'a, Message> {
                     height: row.height,
                     position: Point::new(
                         bounds.x + text_x - horizontal_offset,
-                        row.y + TEXT_Y_PADDING,
+                        row.y + self.metrics.text_y_pad,
                     ),
                     color: text_color,
                     clip_bounds: clip,
@@ -2260,7 +2280,7 @@ impl<'a, Message> DiffView<'a, Message> {
                         TextRenderParams {
                             width: label_width.max(1.0),
                             height: self.metrics.row_height,
-                            position: Point::new(left_x, y + TEXT_Y_PADDING),
+                            position: Point::new(left_x, y + self.metrics.text_y_pad),
                             color: label_color,
                             clip_bounds: clip,
                             wrapping: text::Wrapping::None,
@@ -2275,7 +2295,7 @@ impl<'a, Message> DiffView<'a, Message> {
                         TextRenderParams {
                             width: value_width,
                             height: self.metrics.row_height,
-                            position: Point::new(value_x, y + TEXT_Y_PADDING),
+                            position: Point::new(value_x, y + self.metrics.text_y_pad),
                             color: value_color,
                             clip_bounds: clip,
                             wrapping: text::Wrapping::None,
@@ -2289,7 +2309,7 @@ impl<'a, Message> DiffView<'a, Message> {
                         TextRenderParams {
                             width: label_width.max(1.0),
                             height: self.metrics.row_height,
-                            position: Point::new(left_x, y + TEXT_Y_PADDING),
+                            position: Point::new(left_x, y + self.metrics.text_y_pad),
                             color: label_color,
                             clip_bounds: clip,
                             wrapping: text::Wrapping::None,
@@ -2332,7 +2352,7 @@ impl<'a, Message> DiffView<'a, Message> {
                                 })
                             .max(1.0),
                             height: self.metrics.row_height,
-                            position: Point::new(desc_x, y + TEXT_Y_PADDING),
+                            position: Point::new(desc_x, y + self.metrics.text_y_pad),
                             color: value_color,
                             clip_bounds: clip,
                             wrapping: text::Wrapping::None,
@@ -3297,7 +3317,7 @@ where
                         height: self.metrics.hunk_header_height,
                         position: Point::new(
                             bounds.x + header_x + TEXT_X_PADDING,
-                            header.y + TEXT_Y_PADDING,
+                            header.y + self.metrics.text_y_pad,
                         ),
                         color: self.palette.text_muted,
                         clip_bounds: header_clip,
@@ -3759,7 +3779,7 @@ impl<Message> DiffView<'_, Message> {
         text::Text {
             content: content.to_owned(),
             bounds: Size::new(width.max(1.0), height.max(1.0)),
-            size: Pixels(self.text_size),
+            size: Pixels(self.typography.size),
             line_height: text::LineHeight::Absolute(Pixels(height.min(self.metrics.row_height))),
             font: self.font,
             align_x: text::Alignment::Left,
@@ -4086,7 +4106,7 @@ impl<Message> DiffView<'_, Message> {
             <Renderer::Paragraph as text::Paragraph>::with_spans(text::Text {
                 content: spans.as_slice(),
                 bounds: Size::new(render.width.max(1.0), render.height.max(1.0)),
-                size: Pixels(self.text_size),
+                size: Pixels(self.typography.size),
                 line_height: text::LineHeight::Absolute(Pixels(
                     render.height.min(self.metrics.row_height),
                 )),
@@ -4477,6 +4497,45 @@ where
 mod tests {
     use super::*;
 
+    /// The typography config drives the layout metrics: default values stay
+    /// pixel-identical to the historical constants, a custom line height
+    /// splits its leading delta evenly around the text, and the baseline
+    /// offset shifts it verbatim.
+    #[test]
+    fn layout_metrics_follow_code_typography() {
+        use crate::config::CodeTypography;
+        let metrics = |typography| LayoutMetrics::new(typography, 3, Font::MONOSPACE, false);
+
+        let default = metrics(CodeTypography::default());
+        assert_eq!(default.row_height, 22.0, "12px × 1.85 rounds to 22");
+        assert_eq!(default.text_y_pad, TEXT_Y_PADDING);
+
+        let airy = metrics(CodeTypography {
+            line_height: 2.35,
+            ..CodeTypography::default()
+        });
+        assert_eq!(airy.row_height, 28.0, "12px × 2.35 rounds to 28");
+        // 6px of extra leading, half above the text.
+        assert_eq!(airy.text_y_pad, TEXT_Y_PADDING + 3.0);
+
+        let nudged = metrics(CodeTypography {
+            baseline_offset: -1.5,
+            ..CodeTypography::default()
+        });
+        assert_eq!(nudged.row_height, default.row_height);
+        assert_eq!(nudged.text_y_pad, TEXT_Y_PADDING - 1.5);
+
+        let bigger = metrics(CodeTypography {
+            size: 16.0,
+            ..CodeTypography::default()
+        });
+        assert_eq!(bigger.row_height, 30.0, "16px × 1.85 rounds to 30");
+        // Size alone keeps the historical fixed padding (the default-ratio
+        // delta is zero by construction), matching the pre-config behavior
+        // for any `text_size`.
+        assert_eq!(bigger.text_y_pad, TEXT_Y_PADDING);
+    }
+
     pub(super) fn test_palette() -> Palette {
         let c = Color::WHITE;
         Palette {
@@ -4570,7 +4629,10 @@ mod tests {
             "test",
             test_palette(),
             Font::MONOSPACE,
-            13.0,
+            crate::config::CodeTypography {
+                size: 13.0,
+                ..crate::config::CodeTypography::default()
+            },
             500,
             |_| (),
         )
@@ -4945,7 +5007,10 @@ mod height_profile {
             "profile",
             tests::test_palette(),
             Font::MONOSPACE,
-            13.0,
+            crate::config::CodeTypography {
+                size: 13.0,
+                ..crate::config::CodeTypography::default()
+            },
             500,
             |_| (),
         );

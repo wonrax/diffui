@@ -898,7 +898,10 @@ fn squash_multiple_sources_into_one_destination() {
         false,
     ));
     let error = result.expect_err("multi-source parent squash must fail");
-    assert!(error.message.contains("explicit destination"), "got: {error}");
+    assert!(
+        error.message.contains("explicit destination"),
+        "got: {error}"
+    );
 }
 
 /// `jj new A B`: the merge draft's confirm creates a child of both picked
@@ -952,7 +955,10 @@ fn merge_creates_a_child_of_both_parents() {
         false,
     ));
     let error = result.expect_err("self-merge must fail");
-    assert!(error.message.contains("two distinct parents"), "got: {error}");
+    assert!(
+        error.message.contains("two distinct parents"),
+        "got: {error}"
+    );
 
     // Octopus: the draft's add-parent path sends all stacked parents in one
     // op — three distinct parents make a three-way merge commit.
@@ -1352,7 +1358,14 @@ fn immutable_guard_covers_describe_and_honors_override() {
     assert_eq!(
         jj(
             &root,
-            &["log", "--no-graph", "-r", "description(glob:\"protected*\")", "-T", "description"]
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                "description(glob:\"protected*\")",
+                "-T",
+                "description"
+            ]
         ),
         "protected base\n"
     );
@@ -1376,7 +1389,14 @@ fn immutable_guard_covers_describe_and_honors_override() {
     assert_eq!(
         jj(
             &root,
-            &["log", "--no-graph", "-r", "description(glob:\"renamed*\")", "-T", "description"]
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                "description(glob:\"renamed*\")",
+                "-T",
+                "description"
+            ]
         ),
         "renamed anyway"
     );

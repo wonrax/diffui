@@ -135,8 +135,7 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for EditorDragArea<'_, Mess
                 // resolves inside its bounds counts as a click on it.
                 if let Some(position) = cursor.position_in(bounds) {
                     let position = position - Vector::new(self.padding.left, self.padding.top);
-                    let click =
-                        mouse::Click::new(position, mouse::Button::Left, state.last_click);
+                    let click = mouse::Click::new(position, mouse::Button::Left, state.last_click);
                     state.drag_kind = Some(click.kind());
                     state.last_click = Some(click);
                 }

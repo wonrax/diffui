@@ -31,7 +31,6 @@ use diffui_core::{
 };
 
 // Matches the diff panel's code size — both panes render "code".
-const CODE_TEXT_SIZE: f32 = 12.0;
 const EMPTY_STATE_TEXT_SIZE: f32 = text_size::BODY_LG;
 const BAR_TEXT_SIZE: f32 = text_size::BODY;
 
@@ -499,7 +498,7 @@ pub fn build_source_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, M
                 revision_key,
                 diff_palette(theme),
                 ui.config.mono_font,
-                CODE_TEXT_SIZE,
+                ui.config.code_type,
                 ui.config.multi_click_ms,
                 source_view_file_changed,
             )

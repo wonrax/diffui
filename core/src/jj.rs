@@ -344,16 +344,17 @@ pub async fn walk_jj_with_repo(
     // on any failure every row reads as mutable — the mutation path still
     // guards for real (`ensure_rewritable`), this only degrades the warning
     // from up-front to after-the-fact.
-    let immutable_revset = parse_user_revset(repo_root, repo.settings(), workspace_name, "immutable()")
-        .and_then(|expr| {
-            expr.resolve_user_expression(repo, &symbol_resolver)
-                .context("failed to resolve immutable()")
-        })
-        .and_then(|resolved| {
-            resolved
-                .evaluate(repo)
-                .context("failed to evaluate immutable()")
-        });
+    let immutable_revset =
+        parse_user_revset(repo_root, repo.settings(), workspace_name, "immutable()")
+            .and_then(|expr| {
+                expr.resolve_user_expression(repo, &symbol_resolver)
+                    .context("failed to resolve immutable()")
+            })
+            .and_then(|resolved| {
+                resolved
+                    .evaluate(repo)
+                    .context("failed to evaluate immutable()")
+            });
     if let Err(error) = &immutable_revset {
         eprintln!("diffui: immutable() unavailable for log flags: {error:#}");
     }
@@ -1910,8 +1911,14 @@ pub(crate) async fn apply_mutation(
             }
             if !allow_immutable {
                 let ids: Vec<CommitId> = commits.iter().map(|c| c.id().clone()).collect();
-                ensure_rewritable(&repository.root, &settings, &workspace_name, tx.repo(), &ids)
-                    .await?;
+                ensure_rewritable(
+                    &repository.root,
+                    &settings,
+                    &workspace_name,
+                    tx.repo(),
+                    &ids,
+                )
+                .await?;
             }
             match commits.as_slice() {
                 [] => bail!("abandon needs at least one revision"),
