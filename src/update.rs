@@ -2288,14 +2288,16 @@ impl Diffui {
             Message::Menu(MenuMessage::Hover(path)) => {
                 // Hover is `on_enter`-driven (geometry-free, can't mis-hit). On
                 // the open branch (or with no flyout open) it commits at once.
-                // An off-branch row while a flyout is open is held as *pending*;
-                // MenuMouseMoved commits it once the cursor veers out of the
-                // trajectory wedge, so the row only opens when the sweep ends.
+                // An off-branch row while a flyout is open is held as *pending*
+                // only when the pointer is actually sweeping — a slow crawl onto
+                // a row is aim, not transit, and commits directly. A pending row
+                // commits once the cursor veers out of the trajectory wedge
+                // (MenuMouseMoved) or the sweep stalls (MenuTick).
                 let Some(m) = self.menu.as_mut() else {
                     return Task::none();
                 };
                 m.entered = true;
-                if m.open_path.is_empty() || m.on_open_branch(&path) {
+                if m.open_path.is_empty() || m.on_open_branch(&path) || m.moving_slowly() {
                     m.activate(path);
                 } else {
                     m.pending_row = Some(path);
@@ -2309,9 +2311,10 @@ impl Diffui {
                 // leaves the triangle aimed at the flyout (a veer). The apex
                 // itself is eased toward the cursor on the menu tick (see
                 // `MenuTick`), frozen while a row is pending — so it sits upstream
-                // and the wedge has room during a sweep. No timeouts: a big menu
-                // can take as long as it likes. A not-yet-set apex (submenu only
-                // just opened) holds the row pending rather than stealing it.
+                // and the wedge has room during a sweep. No distance ceiling: a
+                // big menu can take as long as the sweep keeps moving (stalls are
+                // the tick's job). A not-yet-set apex (submenu only just opened)
+                // holds the row pending rather than stealing it.
                 let commit = {
                     let m = self.menu.as_ref().unwrap();
                     m.pending_row.as_ref().map(|_| {
@@ -2322,7 +2325,7 @@ impl Diffui {
                     })
                 };
                 let m = self.menu.as_mut().unwrap();
-                m.cursor = Some(pos);
+                m.note_cursor_move(pos);
                 m.entered = true;
                 if commit == Some(true)
                     && let Some(path) = m.pending_row.take()
@@ -2359,18 +2362,28 @@ impl Diffui {
                     }
                 }
             }
-            // Drives two time-based effects while a menu is open: the right-click
-            // glow pulse (re-running `view`), and easing the trajectory apex
-            // toward the cursor. Easing on this fixed clock — not on raw moves —
-            // is what makes the apex lag by a velocity-proportional amount during
-            // a sweep yet catch up when the cursor idles. Frozen while a row is
-            // pending so the wedge keeps a stable upstream origin mid-sweep.
+            // Drives three time-based effects while a menu is open: the
+            // right-click glow pulse (re-running `view`), easing the trajectory
+            // apex toward the cursor, and the sweep-stall commit. Easing on this
+            // fixed clock — not on raw moves — is what makes the apex lag by a
+            // velocity-proportional amount during a sweep yet catch up when the
+            // cursor idles. Frozen while a row is pending so the wedge keeps a
+            // stable upstream origin mid-sweep.
             Message::Menu(MenuMessage::Tick) => {
-                if let Some(m) = self.menu.as_mut()
-                    && m.pending_row.is_none()
-                    && let Some(cursor) = m.cursor
-                {
-                    m.flyout_origin = Some(menu::ease_apex(m.flyout_origin, cursor));
+                if let Some(m) = self.menu.as_mut() {
+                    if m.pending_row.is_none() {
+                        if let Some(cursor) = m.cursor {
+                            m.flyout_origin = Some(menu::ease_apex(m.flyout_origin, cursor));
+                        }
+                    } else if m.sweep_stalled()
+                        && let Some(path) = m.pending_row.take()
+                    {
+                        // The wedge only protects an *ongoing* sweep. Idle or
+                        // crawling for a beat means the user settled on the row
+                        // they're over — the hold ends and that row wins, instead
+                        // of the guard pinning the old flyout open forever.
+                        m.activate(path);
+                    }
                 }
             }
             Message::ActivityToggle => {

@@ -168,8 +168,20 @@ pub(crate) struct OverlayMenu {
     pub flyout_origin: Option<Point>,
     /// An off-branch row the cursor is over but hasn't switched to yet, because
     /// the cursor is sweeping toward the open flyout. Switched to the moment the
-    /// pointer steers out of the triangle (veers off the flyout).
+    /// pointer steers out of the triangle (veers off the flyout), or once the
+    /// sweep stalls (see [`OverlayMenu::sweep_stalled`]).
     pub pending_row: Option<Vec<usize>>,
+    /// Cursor speed in px/s, exponentially smoothed over move events. What the
+    /// guard consults: a *slow* pointer entering an off-branch row is aiming at
+    /// that row, not the flyout, so the sweep hold doesn't arm at all.
+    pub speed: f32,
+    /// When the last cursor move arrived — anchors the speed math's Δt.
+    pub last_move_at: Option<Instant>,
+    /// Last instant the smoothed speed was at or above [`GUARD_SLOW_SPEED`].
+    /// While a row is pending, this falling [`GUARD_STALL_MS`] behind means the
+    /// sweep has stalled — the pointer is idle or crawling — and the row under
+    /// it wins. Only moves refresh it, so a fully idle cursor stalls too.
+    pub last_fast_at: Option<Instant>,
     /// Revision selection backing the menu, for actions read on demand
     /// (author/committer/description copies).
     pub selection: Option<RevisionSelection>,
@@ -194,10 +206,49 @@ impl OverlayMenu {
             cursor: None,
             flyout_origin: None,
             pending_row: None,
+            speed: 0.0,
+            last_move_at: None,
+            last_fast_at: None,
             selection: None,
             glow: None,
             opened_at: Instant::now(),
         }
+    }
+
+    /// Fold one cursor move into the smoothed speed. Δt is capped so the first
+    /// move after an idle spell reads as the flick it is (distance over one
+    /// frame-ish interval) instead of being averaged across the whole pause
+    /// into a false crawl.
+    pub(crate) fn note_cursor_move(&mut self, pos: Point) {
+        let now = Instant::now();
+        if let (Some(prev), Some(prev_at)) = (self.cursor, self.last_move_at) {
+            let dt = now
+                .saturating_duration_since(prev_at)
+                .as_secs_f32()
+                .clamp(1e-4, GUARD_SPEED_MAX_DT);
+            let inst = prev.distance(pos) / dt;
+            self.speed += (inst - self.speed) * (dt / GUARD_SPEED_TAU).min(1.0);
+        }
+        self.cursor = Some(pos);
+        self.last_move_at = Some(now);
+        if self.speed >= GUARD_SLOW_SPEED {
+            self.last_fast_at = Some(now);
+        }
+    }
+
+    /// Whether the pointer is aiming at the row under it rather than sweeping:
+    /// its smoothed speed is under [`GUARD_SLOW_SPEED`]. Consulted when an
+    /// off-branch hover arrives — a slow entry commits at once, no hold.
+    pub(crate) fn moving_slowly(&self) -> bool {
+        self.speed < GUARD_SLOW_SPEED
+    }
+
+    /// Whether a held sweep has stalled: the cursor hasn't moved fast since
+    /// [`GUARD_STALL_MS`] ago (idle counts — only moves refresh the clock).
+    /// The menu tick commits the pending row when this trips.
+    pub(crate) fn sweep_stalled(&self) -> bool {
+        self.last_fast_at
+            .is_none_or(|at| at.elapsed().as_millis() as u64 >= GUARD_STALL_MS)
     }
 
     /// Commit a hover to `path`: highlight/open it and clear any pending sweep.
@@ -517,6 +568,25 @@ const TRAJECTORY_BASE_BUFFER: f32 = 32.0;
 /// How far the triangle's base reaches into the flyout (past its near edge), to
 /// cover the card padding + border the cursor crosses before reaching a row.
 const TRAJECTORY_EDGE_BUFFER: f32 = 12.0;
+
+/// Smoothed cursor speed (px/s) separating a deliberate crawl from a sweep.
+/// Under it, an off-branch hover commits immediately — the guard never arms —
+/// and while a row is pending, time spent under it counts toward the stall.
+/// Sweeping toward a flyout runs well into the hundreds of px/s; picking a
+/// row by feel sits well under this.
+const GUARD_SLOW_SPEED: f32 = 90.0;
+/// How long the pointer must go without fast motion (idle included) before a
+/// pending off-branch row commits anyway: the sweep didn't materialize, so the
+/// row under the cursor is what the user wants.
+const GUARD_STALL_MS: u64 = 260;
+/// EMA time constant for the smoothed speed. Small enough that a flick out of
+/// rest reads fast within a couple of move events, large enough that one
+/// jittery sample doesn't flip the slow/fast verdict.
+const GUARD_SPEED_TAU: f32 = 0.08;
+/// Δt ceiling per move sample. Move events pause entirely while the cursor
+/// rests, so the gap to the *next* event says nothing about how fast that next
+/// motion is — cap it near two frames and judge the flick by its distance.
+const GUARD_SPEED_MAX_DT: f32 = 0.032;
 
 fn point_in_triangle(p: Point, a: Point, b: Point, c: Point) -> bool {
     let sign = |p1: Point, p2: Point, p3: Point| {
