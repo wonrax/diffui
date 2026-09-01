@@ -298,6 +298,7 @@ pub async fn walk_jj_with_repo(
     );
     let resolved = expr
         .resolve_user_expression(repo, &symbol_resolver)
+        .map_err(describe_resolution_error)
         .context("failed to resolve jj revset")?;
     let revset = resolved
         .evaluate(repo)
@@ -492,6 +493,9 @@ pub async fn walk_jj_with_repo(
 /// on, following jj's `bookmarks` template semantics:
 /// - the local bookmark renders as `name`, or `name*` when it diverges from any
 ///   of its tracked remotes (i.e. there are unpushed/unpulled changes);
+/// - a *conflicted* ref (multiple targets after concurrent moves / a
+///   force-pushed remote) renders as `name??` on every side, taking
+///   precedence over `*`;
 /// - a tracked remote pointing at the same commit as the local bookmark is
 ///   redundant and dropped, while a diverged or untracked remote renders as
 ///   `name@remote`;
@@ -507,12 +511,19 @@ fn collect_bookmark_labels(
     mut emit: impl FnMut(&CommitId, String),
 ) {
     let local_id = target.local_target.added_ids().next();
+    // Conflicted (several added ids — concurrent moves, a force-pushed
+    // remote): jj log suffixes `??`, and the chip lands on *every* side. The
+    // conflict marker wins over the divergence `*` — jj renders it the same
+    // way, and "this name means two commits" is the more urgent fact.
+    let local_conflicted = target.local_target.added_ids().nth(1).is_some();
     let diverged = target.remote_refs.iter().any(|(remote, remote_ref)| {
         remote.as_str() != REMOTE_NAME_FOR_LOCAL_GIT_REPO.as_str()
             && remote_ref.is_tracked()
             && remote_ref.target.added_ids().next() != local_id
     });
-    let local_label = if diverged {
+    let local_label = if local_conflicted {
+        format!("{name}??")
+    } else if diverged {
         format!("{name}*")
     } else {
         name.to_owned()
@@ -525,13 +536,62 @@ fn collect_bookmark_labels(
             continue;
         }
         let tracked = remote_ref.is_tracked();
+        // A conflicted remote ref (concurrent fetches) gets the same `??`.
+        let remote_conflicted = remote_ref.target.added_ids().nth(1).is_some();
         for id in remote_ref.target.added_ids() {
             // A tracked remote in sync with the local bookmark is redundant.
-            if tracked && Some(id) == local_id {
+            if tracked && !local_conflicted && !remote_conflicted && Some(id) == local_id {
                 continue;
             }
-            emit(id, format!("{}@{}", name, remote.as_str()));
+            let suffix = if remote_conflicted { "??" } else { "" };
+            emit(id, format!("{}@{}{}", name, remote.as_str(), suffix));
         }
+    }
+}
+
+/// jj CLI parity for symbol-resolution dead ends: the bare jj-lib messages
+/// ("Name `x` is conflicted") say what's wrong but not what to type instead.
+/// The two ambiguity errors get their escape hatches appended — the same
+/// ways forward the CLI prints as hints.
+fn describe_resolution_error(error: jj_lib::revset::RevsetResolutionError) -> anyhow::Error {
+    use jj_lib::revset::RevsetResolutionError as E;
+    let short = |id: &CommitId| id.hex().chars().take(12).collect::<String>();
+    match &error {
+        E::ConflictedRef {
+            kind: "bookmark",
+            symbol,
+            targets,
+        } => {
+            let sides: Vec<String> = targets.iter().map(short).collect();
+            anyhow::anyhow!(
+                "{error} — it points at {}; select every side with \
+                 bookmarks(exact:\"{symbol}\"), pick one by commit id, or move \
+                 the bookmark onto a revision to resolve the conflict",
+                sides.join(", ")
+            )
+        }
+        E::ConflictedRef { targets, .. } => {
+            let sides: Vec<String> = targets.iter().map(short).collect();
+            anyhow::anyhow!(
+                "{error} — it points at {}; pick one side by commit id",
+                sides.join(", ")
+            )
+        }
+        E::DivergentChangeId {
+            symbol,
+            visible_targets,
+        } => {
+            let copies: Vec<String> = visible_targets
+                .iter()
+                .map(|(offset, _)| format!("{symbol}/{offset}"))
+                .collect();
+            anyhow::anyhow!(
+                "{error} — address one copy as {} (the sidebar shows each \
+                 row's /N suffix)",
+                copies.join(", ")
+            )
+        }
+        _ => anyhow::Error::new(error),
     }
 }
 
@@ -542,9 +602,11 @@ fn collect_bookmark_labels(
 fn compute_bookmarks_info(repo: &ReadonlyRepo, wc_commit_id: &CommitId) -> BookmarksInfo {
     let mut bookmarks = Vec::new();
     for (name, target) in repo.view().bookmarks() {
-        // `added_ids().next()` (not `as_normal`) so a conflicted bookmark still
-        // resolves to one side rather than vanishing from the menu.
-        let local_target = target.local_target.added_ids().next().map(|id| id.hex());
+        // Every added id, not just the first: a conflicted bookmark carries
+        // all of its sides so the menu can flag it, match any side's row,
+        // and withhold the push actions jj would refuse.
+        let local_targets: Vec<String> =
+            target.local_target.added_ids().map(|id| id.hex()).collect();
         let mut remotes = Vec::new();
         for (remote, remote_ref) in &target.remote_refs {
             // Skip jj's colocated-git pseudo-remote ("git"): it mirrors the
@@ -561,12 +623,12 @@ fn compute_bookmarks_info(repo: &ReadonlyRepo, wc_commit_id: &CommitId) -> Bookm
                 });
             }
         }
-        if local_target.is_none() && remotes.is_empty() {
+        if local_targets.is_empty() && remotes.is_empty() {
             continue;
         }
         bookmarks.push(BookmarkEntry {
             name: name.as_str().to_owned(),
-            local_target,
+            local_targets,
             remotes,
         });
     }
@@ -3925,5 +3987,50 @@ mod bookmark_label_tests {
             ],
         };
         assert_eq!(labels(&target), vec![("aa".into(), "main".into())]);
+    }
+
+    #[test]
+    fn conflicted_local_bookmark_marks_every_side() {
+        // Two added ids = a conflicted bookmark (concurrent moves / a
+        // force-pushed remote). Every side wears `main??`, the conflict
+        // marker wins over the divergence `*`, and the tracked remote chip
+        // stays visible even on a side it matches — during a conflict,
+        // which side the remote is on is exactly the interesting fact.
+        let local = RefTarget::from_legacy_form([], [cid("aa"), cid("bb")]);
+        let origin = remote("aa", true);
+        let target = LocalRemoteRefTarget {
+            local_target: &local,
+            remote_refs: vec![(RemoteName::new("origin"), &origin)],
+        };
+        assert_eq!(
+            labels(&target),
+            vec![
+                ("aa".into(), "main??".into()),
+                ("bb".into(), "main??".into()),
+                ("aa".into(), "main@origin".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn conflicted_remote_ref_marks_its_sides() {
+        let local = RefTarget::normal(cid("aa"));
+        let origin = RemoteRef {
+            target: RefTarget::from_legacy_form([], [cid("bb"), cid("cc")]),
+            state: RemoteRefState::Tracked,
+        };
+        let target = LocalRemoteRefTarget {
+            local_target: &local,
+            remote_refs: vec![(RemoteName::new("origin"), &origin)],
+        };
+        assert_eq!(
+            labels(&target),
+            vec![
+                // The local side diverges from the conflicted remote → `*`.
+                ("aa".into(), "main*".into()),
+                ("bb".into(), "main@origin??".into()),
+                ("cc".into(), "main@origin??".into()),
+            ]
+        );
     }
 }

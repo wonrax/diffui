@@ -230,25 +230,38 @@ impl Diffui {
             });
         }
 
-        // Move a local bookmark onto this revision, nearest-first.
-        let mut moves: Vec<(String, String)> = self
+        // Move a local bookmark onto this revision, nearest-first. A
+        // conflicted bookmark stays offered — `jj bookmark set` onto a
+        // revision is exactly how a conflict resolves — wearing its `??` so
+        // the pick doubles as the resolution it is.
+        let mut moves: Vec<(String, String, bool)> = self
             .session
             .bookmarks
             .bookmarks
             .iter()
-            .filter_map(|b| b.local_target.as_ref().map(|t| (b.name.clone(), t.clone())))
+            .filter_map(|b| {
+                b.local_target()
+                    .map(|t| (b.name.clone(), t.to_owned(), b.is_conflicted()))
+            })
             .collect();
         moves.sort();
         let move_reference = match selection {
             RevisionSelection::Commit(hex) => Some(hex.clone()),
             RevisionSelection::WorkingCopy => self.session.bookmarks.working_copy_commit.clone(),
         };
-        self.sort_by_proximity(&mut moves, move_reference.as_deref(), |(_, t)| t.as_str());
+        self.sort_by_proximity(&mut moves, move_reference.as_deref(), |(_, t, _)| {
+            t.as_str()
+        });
         let move_items: Vec<MenuEntry> = moves
             .iter()
-            .map(|(name, _target)| {
+            .map(|(name, _target, conflicted)| {
+                let label = if *conflicted {
+                    format!("{name}??")
+                } else {
+                    name.clone()
+                };
                 MenuEntry::item(
-                    name.clone(),
+                    label,
                     MenuAction::Mutate(MutationOp::MoveBookmark {
                         name: name.clone(),
                         to: selection.clone(),
@@ -263,10 +276,14 @@ impl Diffui {
         // common plain move stays one level deep. Bookmarks without a
         // tracked remote are omitted (nowhere to push); the submenu hides
         // entirely when none qualify instead of sitting disabled in every
-        // menu of a remote-less repo.
+        // menu of a remote-less repo. Conflicted bookmarks are omitted too:
+        // the move is a conflict *resolution* — publishing it in the same
+        // gesture, typically right after a force-push surprise, deserves a
+        // deliberate separate push once the resolved state looks right.
         let move_push_items: Vec<MenuEntry> = moves
             .iter()
-            .filter_map(|(name, _target)| {
+            .filter(|(_, _, conflicted)| !conflicted)
+            .filter_map(|(name, _target, _)| {
                 let entry = self
                     .session
                     .bookmarks
@@ -310,9 +327,23 @@ impl Diffui {
         let mut bookmark_items: Vec<MenuEntry> = Vec::new();
         if let Some(hex) = target_hex {
             for entry in &self.session.bookmarks.bookmarks {
-                if entry.local_target.as_deref() == Some(hex) {
+                // Any side of a conflicted bookmark counts as sitting here —
+                // its `??` chip shows on every side, so the menu must too.
+                if entry.local_targets.iter().any(|t| t == hex) {
                     let mut sub = Vec::new();
-                    if let Some(remote) = entry.tracked_remote() {
+                    if entry.is_conflicted() {
+                        // jj refuses to push a conflicted bookmark; what it
+                        // wants is a resolution — `jj bookmark set` onto one
+                        // side — so that's the action offered in its place.
+                        sub.push(MenuEntry::item(
+                            "Set here (resolve conflict)",
+                            MenuAction::Mutate(MutationOp::MoveBookmark {
+                                name: entry.name.clone(),
+                                to: RevisionSelection::Commit(hex.to_owned()),
+                                push_remote: None,
+                            }),
+                        ));
+                    } else if let Some(remote) = entry.tracked_remote() {
                         sub.push(MenuEntry::item(
                             format!("Push to {remote}"),
                             MenuAction::Mutate(MutationOp::PushBookmark {
@@ -327,10 +358,12 @@ impl Diffui {
                             name: entry.name.clone(),
                         }),
                     ));
-                    bookmark_items.push(MenuEntry::Submenu {
-                        label: entry.name.clone(),
-                        items: sub,
-                    });
+                    let label = if entry.is_conflicted() {
+                        format!("{}??", entry.name)
+                    } else {
+                        entry.name.clone()
+                    };
+                    bookmark_items.push(MenuEntry::Submenu { label, items: sub });
                 }
                 for remote_ref in &entry.remotes {
                     if remote_ref.target.as_str() == hex && !remote_ref.tracked {

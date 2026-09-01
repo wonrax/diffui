@@ -180,9 +180,11 @@ pub struct CommitStore {
     /// `changeid/N` display offsets, stored sparsely — only divergent or
     /// hidden copies carry one (see [`CommitSummary::change_offset`]).
     change_offsets: HashMap<usize, u32>,
-    /// Reverse index: bookmark name → owning row. Bookmark names are unique per
-    /// ref, so this is 1:1 and lets `find_by_bookmark` resolve in O(1) instead
-    /// of scanning every commit (the palette hits this per displayed row).
+    /// Reverse index: bookmark label → owning row, letting `find_by_bookmark`
+    /// resolve in O(1) instead of scanning every commit (the palette hits
+    /// this per displayed row). Labels are normally unique per ref; a
+    /// conflicted bookmark's label sits on every side, and the index keeps
+    /// the first displayed row (see `push`).
     bookmark_index: HashMap<String, usize>,
     /// Row of the working-copy (`@`) commit, recorded at push time so
     /// `working_copy`/`working_copy_index` are O(1). The tab bar reads the
@@ -378,7 +380,12 @@ impl CommitStore {
 
         if !commit.bookmarks.is_empty() {
             for name in &commit.bookmarks {
-                self.bookmark_index.insert(name.clone(), index);
+                // First-wins: a conflicted bookmark's `name??` label lands on
+                // every side, and the first *displayed* row (rows arrive in
+                // display order, so the topmost in the graph) is the one
+                // lookups resolve to — deterministic, and the side a jump
+                // most plausibly means.
+                self.bookmark_index.entry(name.clone()).or_insert(index);
             }
             self.bookmarks.insert(index, commit.bookmarks);
         }
@@ -766,8 +773,12 @@ pub struct BookmarksInfo {
 #[derive(Debug, Clone)]
 pub struct BookmarkEntry {
     pub name: String,
-    /// Commit id (hex) the local bookmark points at, if it has a local target.
-    pub local_target: Option<String>,
+    /// Commit ids (hex) the local bookmark points at. One entry normally;
+    /// several when the bookmark is conflicted (concurrent moves, a
+    /// force-pushed remote) — resolving means picking a side (`jj bookmark
+    /// set`) and jj refuses to push it meanwhile. Empty for a
+    /// remote-only bookmark.
+    pub local_targets: Vec<String>,
     /// Remote-tracking copies of this bookmark.
     pub remotes: Vec<RemoteBookmarkRef>,
 }
@@ -787,6 +798,16 @@ impl BookmarkEntry {
             .iter()
             .find(|r| r.tracked)
             .map(|r| r.remote.as_str())
+    }
+
+    /// The local target's commit id — the first side when conflicted.
+    pub fn local_target(&self) -> Option<&str> {
+        self.local_targets.first().map(String::as_str)
+    }
+
+    /// Whether the local bookmark points at more than one commit.
+    pub fn is_conflicted(&self) -> bool {
+        self.local_targets.len() > 1
     }
 }
 

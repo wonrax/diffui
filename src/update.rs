@@ -1342,25 +1342,58 @@ impl Diffui {
                         })
                         .unwrap_or_else(|| hex.chars().take(12).collect()),
                 };
-                let mut body = format!(
-                    "{target} is not a descendant of the commit \u{201c}{name}\u{201d} \
-                     points at, so this is a backwards or sideways move — the jj CLI \
-                     refuses it without --allow-backwards."
-                );
-                // A backwards move that also pushes rewrites the remote
-                // branch — say so before the user commits to it.
-                let confirm_label = match push_remote {
-                    Some(remote) => {
+                // A conflicted bookmark also lands here (it has no single
+                // commit to be "a descendant of"), but there the move *is*
+                // the fix — the dialog explains the resolution rather than
+                // warning about a backwards move that isn't the story.
+                let conflicted_sides = self
+                    .session
+                    .bookmarks
+                    .bookmarks
+                    .iter()
+                    .find(|b| b.name == *name)
+                    .filter(|b| b.is_conflicted())
+                    .map(|b| b.local_targets.len());
+                let (title, mut body) = match conflicted_sides {
+                    Some(sides) => (
+                        format!("Resolve conflicted bookmark \u{201c}{name}\u{201d}?"),
+                        format!(
+                            "\u{201c}{name}\u{201d} is conflicted — it points at {sides} \
+                             commits at once (concurrent moves, or a force-pushed \
+                             remote). Moving it to {target} picks that side and \
+                             resolves the conflict."
+                        ),
+                    ),
+                    None => (
+                        format!("Move bookmark \u{201c}{name}\u{201d} backwards?"),
+                        format!(
+                            "{target} is not a descendant of the commit \u{201c}{name}\u{201d} \
+                             points at, so this is a backwards or sideways move — the jj CLI \
+                             refuses it without --allow-backwards."
+                        ),
+                    ),
+                };
+                // A move that also pushes rewrites the remote branch — say so
+                // before the user commits to it.
+                let confirm_label = match (push_remote, conflicted_sides) {
+                    (Some(remote), None) => {
                         body.push_str(&format!(
                             " The bookmark is then pushed, moving it backwards on \
                              \u{201c}{remote}\u{201d} too."
                         ));
                         "Move & push anyway".to_owned()
                     }
-                    None => "Move anyway".to_owned(),
+                    (Some(remote), Some(_)) => {
+                        body.push_str(&format!(
+                            " The bookmark is then pushed to \u{201c}{remote}\u{201d}."
+                        ));
+                        "Move, resolve & push".to_owned()
+                    }
+                    (None, Some(_)) => "Move & resolve".to_owned(),
+                    (None, None) => "Move anyway".to_owned(),
                 };
                 self.confirm = Some(ConfirmDialog {
-                    title: format!("Move bookmark \u{201c}{name}\u{201d} backwards?"),
+                    title,
                     body,
                     confirm_label,
                     pending: *pending,

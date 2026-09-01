@@ -767,9 +767,16 @@ fn push_bookmark_candidates(out: &mut Vec<Candidate>, ui: &Diffui) {
     // HashMap).
     let mut rows: Vec<(usize, &[String])> = ui.session.commits.bookmarked_rows().collect();
     rows.sort_by_key(|(index, _)| *index);
+    // A conflicted bookmark's `name??` chip sits on every side; one candidate
+    // is enough (the first displayed row — the same side `find_by_bookmark`
+    // resolves a pick to).
+    let mut seen_labels: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (index, bookmarks) in rows {
         let commit = ui.session.commits.row(index);
         for bookmark in bookmarks {
+            if !seen_labels.insert(bookmark.as_str()) {
+                continue;
+            }
             let mut haystack =
                 String::with_capacity(bookmark.len() + commit.description().len() + 8);
             haystack.push_str(bookmark);

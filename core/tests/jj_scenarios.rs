@@ -1402,6 +1402,110 @@ fn immutable_guard_covers_describe_and_honors_override() {
     );
 }
 
+/// A conflicted bookmark (concurrent moves — the same state a force-pushed
+/// origin leaves behind): every side's row wears the `name??` chip, lookups
+/// by that label resolve deterministically to the first displayed side, the
+/// context-menu table reports the conflict, and using the bare name as a
+/// revset fails with a hint naming the escape hatches instead of a dead end.
+#[test]
+#[ignore = "shells out to the jj CLI"]
+fn conflicted_bookmark_is_marked_and_revset_error_hints() {
+    let root = scratch_repo("conflicted-bookmark");
+    write(&root, "f.txt", "a\n");
+    jj(&root, &["commit", "-m", "base"]);
+    jj(&root, &["new", "-r", "@-", "-m", "sideA", "--no-edit"]);
+    jj(&root, &["new", "-r", "@-", "-m", "sideB", "--no-edit"]);
+    jj(
+        &root,
+        &[
+            "bookmark",
+            "set",
+            "development",
+            "-r",
+            "description(glob:\"sideA*\")",
+        ],
+    );
+    jj(
+        &root,
+        &[
+            "bookmark",
+            "set",
+            "development",
+            "-r",
+            "description(glob:\"sideB*\")",
+            "--allow-backwards",
+        ],
+    );
+    jj(
+        &root,
+        &[
+            "--at-op",
+            "@-",
+            "bookmark",
+            "set",
+            "development",
+            "-r",
+            "description(glob:\"base*\")",
+            "--allow-backwards",
+        ],
+    );
+    // Any subsequent command reconciles the concurrent ops into a conflict.
+    jj(&root, &["log", "-r", "all()"]);
+
+    let (store, _graph, _branch, bookmarks) = block_on(load_jj_commits(
+        root.clone(),
+        "all()".to_owned(),
+        LoadProgress::default(),
+    ))
+    .expect("load commits");
+
+    let marked: Vec<&str> = store
+        .iter()
+        .filter(|row| row.bookmarks().iter().any(|b| b == "development??"))
+        .map(|row| row.description())
+        .collect();
+    assert_eq!(
+        marked,
+        vec!["sideB", "base"],
+        "every conflict side wears the ?? chip, in display order"
+    );
+    assert_eq!(
+        store
+            .find_by_bookmark("development??")
+            .map(|row| row.description()),
+        Some("sideB"),
+        "label lookups resolve to the first displayed side"
+    );
+
+    let entry = bookmarks
+        .bookmarks
+        .iter()
+        .find(|b| b.name == "development")
+        .expect("menu table lists the bookmark");
+    assert!(entry.is_conflicted());
+    assert_eq!(entry.local_targets.len(), 2, "both sides are carried");
+
+    // The bare name as a revset is a real jj error (a conflicted name isn't
+    // one revision) — but it must arrive with its ways forward attached.
+    let error = format!(
+        "{:#}",
+        block_on(load_jj_commits(
+            root.clone(),
+            "development".to_owned(),
+            LoadProgress::default(),
+        ))
+        .expect_err("conflicted name as revset must fail")
+    );
+    assert!(
+        error.contains("is conflicted"),
+        "names the problem: {error}"
+    );
+    assert!(
+        error.contains("bookmarks(exact:\"development\")"),
+        "hints the select-all escape hatch: {error}"
+    );
+}
+
 /// The log walk flags rows in `immutable()` (honoring an `immutable_heads()`
 /// override), which is what the frontend's pre-flight dialog reads.
 #[test]
