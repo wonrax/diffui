@@ -38,6 +38,17 @@ const TEXT_Y_PADDING: f32 = 2.0;
 // wheel felt sluggish otherwise.
 const LINE_SCROLL_ROWS: f32 = 5.0;
 const PIXEL_SCROLL_SCALE: f32 = 0.5;
+// A pause this long between wheel events ends a scroll gesture, unlocking the
+// axis the gesture was pinned to. Touchpads stream events every few ms while
+// a finger moves (inertia included), so a real gap means a new intent.
+const SCROLL_GESTURE_GAP_MS: u64 = 200;
+
+/// Which axis a scroll gesture is locked to (see `State::scroll_axis`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrollAxis {
+    Horizontal,
+    Vertical,
+}
 // Corner radius of the intra-line word-diff emphasis rectangles (find
 // match highlights share it), so token tints read as soft chips rather
 // than hard blocks.
@@ -506,6 +517,14 @@ struct State<Paragraph> {
     horizontal_offset: f32,
     /// Wrap flag last seen, to zero `horizontal_offset` when wrap turns on.
     last_wrap: bool,
+    /// Axis a two-dimensional scroll gesture locked onto, IDE-style: the
+    /// first wheel event of a gesture picks the dominant axis and the other
+    /// component is discarded until the gesture ends (a pause in events —
+    /// see [`SCROLL_GESTURE_GAP_MS`]). Keeps touchpad panning from drifting
+    /// diagonally in no-wrap mode. `None` between gestures.
+    scroll_axis: Option<ScrollAxis>,
+    /// When the last wheel event arrived — a gap ends the gesture.
+    last_scroll_at: Option<Instant>,
     /// Live keyboard modifiers, tracked so the wheel handler can redirect
     /// shift+scroll into horizontal panning.
     modifiers: keyboard::Modifiers,
@@ -2409,6 +2428,8 @@ where
             vertical_offset: 0.0,
             horizontal_offset: 0.0,
             last_wrap: self.wrap,
+            scroll_axis: None,
+            last_scroll_at: None,
             modifiers: keyboard::Modifiers::default(),
             paragraph_cache: RefCell::new(std::collections::HashMap::new()),
             selection_anchor: None,
@@ -2686,7 +2707,7 @@ where
                         (x, y)
                     }
                 };
-                let movement = match *delta {
+                let mut movement = match *delta {
                     mouse::ScrollDelta::Lines { x, y } => {
                         let (x, y) = shift_swap(x, y);
                         Vector::new(
@@ -2699,6 +2720,37 @@ where
                         Vector::new(-x * PIXEL_SCROLL_SCALE, -y * PIXEL_SCROLL_SCALE)
                     }
                 };
+
+                // IDE-style axis lock while horizontal scrolling exists (no
+                // wrap, overflowing lines): the gesture's first event picks
+                // the dominant axis and the other component is discarded, so
+                // a touchpad pan doesn't drift diagonally. A pause in events
+                // ends the gesture and the next one re-picks.
+                if max_horizontal > 0.0 {
+                    let now = Instant::now();
+                    let gesture_ended = state.last_scroll_at.is_none_or(|at| {
+                        now.saturating_duration_since(at).as_millis() as u64
+                            >= SCROLL_GESTURE_GAP_MS
+                    });
+                    state.last_scroll_at = Some(now);
+                    if gesture_ended {
+                        state.scroll_axis = None;
+                    }
+                    let axis = *state.scroll_axis.get_or_insert(
+                        if movement.x.abs() > movement.y.abs() {
+                            ScrollAxis::Horizontal
+                        } else {
+                            ScrollAxis::Vertical
+                        },
+                    );
+                    match axis {
+                        ScrollAxis::Horizontal => movement.y = 0.0,
+                        ScrollAxis::Vertical => movement.x = 0.0,
+                    }
+                } else {
+                    state.scroll_axis = None;
+                    state.last_scroll_at = None;
+                }
 
                 if movement.y != 0.0 {
                     state.vertical_offset =
