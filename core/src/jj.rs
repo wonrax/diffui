@@ -56,7 +56,7 @@ use jj_lib::{
     settings::{HumanByteSize, UserSettings},
     str_util::{StringExpression, StringPattern},
     tree_merge::MergeOptions,
-    working_copy::SnapshotOptions,
+    working_copy::{SnapshotOptions, WorkingCopyFreshness},
     workspace::{Workspace, default_working_copy_factories},
 };
 
@@ -1258,7 +1258,6 @@ pub async fn load_jj_repository_snapshot(
                 wc_commit_id.hex()
             )
         })?;
-    let old_tree = wc_commit.tree();
 
     let snapshot_options = SnapshotOptions {
         base_ignores,
@@ -1267,6 +1266,149 @@ pub async fn load_jj_repository_snapshot(
         force_tracking_matcher: &NothingMatcher,
         max_new_file_size,
     };
+
+    // The disk may have been checked out from a *different* commit than the
+    // head view's `@` — another workspace's snapshot rebases this one's
+    // working-copy commit (a mega merge of workspace heads, most notably),
+    // leaving this working copy stale. Snapshotting regardless would amend
+    // the rebased commit with the old on-disk tree, silently reverting the
+    // other workspace's changes inside it — the exact rewrite the jj CLI's
+    // "working copy is stale" error exists to prevent. Check first; recover
+    // a stale copy like `jj workspace update-stale` instead of snapshotting.
+    let freshness =
+        WorkingCopyFreshness::check_stale(locked_ws.locked_wc(), &wc_commit, &base_repo)
+            .await
+            .context("failed to check jj working-copy freshness")?;
+    let (base_repo, wc_commit_id, wc_commit) = match freshness {
+        WorkingCopyFreshness::Fresh => (base_repo, wc_commit_id, wc_commit),
+        // The working copy was updated under an operation newer than the
+        // head we read — reload at that operation and snapshot against it,
+        // like the CLI does.
+        WorkingCopyFreshness::Updated(op) => {
+            let repo = repo_loader
+                .load_at(&op)
+                .await
+                .context("failed to load jj repo at the working copy's operation")?;
+            let id = repo
+                .view()
+                .get_wc_commit_id(&workspace_name)
+                .context("jj workspace has no working-copy commit")?
+                .clone();
+            let commit =
+                repo.store().get_commit_async(&id).await.with_context(|| {
+                    format!("failed to load jj working-copy commit {}", id.hex())
+                })?;
+            (repo, id, commit)
+        }
+        WorkingCopyFreshness::WorkingCopyStale | WorkingCopyFreshness::SiblingOperation => {
+            // `jj workspace update-stale` parity, run automatically (the
+            // CLI's `recover_stale_working_copy`, single-lock edition):
+            //
+            // 1. Snapshot the disk against the operation it was actually
+            //    checked out at, so local edits land in the op graph first
+            //    (as a concurrent op branch) instead of being clobbered.
+            // 2. Reload at head — jj merges the op branches.
+            // 3. Check the merged view's working-copy commit out onto disk
+            //    and finish the lock at the merged operation.
+            let old_op = repo_loader
+                .load_operation(locked_ws.locked_wc().old_operation_id())
+                .await
+                .context("failed to load the operation the stale jj working copy was synced at")?;
+            let old_repo = repo_loader
+                .load_at(&old_op)
+                .await
+                .context("failed to load jj repo at the stale working copy's operation")?;
+            let old_wc_id = old_repo
+                .view()
+                .get_wc_commit_id(&workspace_name)
+                .context("stale jj workspace has no working-copy commit at its own operation")?
+                .clone();
+            let old_wc_commit = old_repo
+                .store()
+                .get_commit_async(&old_wc_id)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to load stale jj working-copy commit {}",
+                        old_wc_id.hex()
+                    )
+                })?;
+            // CLI-parity guard: the disk must actually hold that commit's
+            // tree, else some other process is mid-mutation.
+            if old_wc_commit.tree().tree_ids_and_labels()
+                != locked_ws.locked_wc().old_tree().tree_ids_and_labels()
+            {
+                bail!("concurrent jj working-copy operation while recovering a stale workspace");
+            }
+
+            let (disk_tree, _stats) = locked_ws
+                .locked_wc()
+                .snapshot(&snapshot_options)
+                .await
+                .context("failed to snapshot the stale jj working copy")?;
+            if disk_tree.tree_ids_and_labels() != old_wc_commit.tree().tree_ids_and_labels() {
+                let mut tx = old_repo.start_transaction();
+                tx.set_is_snapshot(true);
+                let new_commit = tx
+                    .repo_mut()
+                    .rewrite_commit(&old_wc_commit)
+                    .set_tree(disk_tree)
+                    .write()
+                    .await
+                    .context("failed to preserve stale jj working-copy edits")?;
+                tx.repo_mut()
+                    .set_wc_commit(workspace_name.clone(), new_commit.id().clone())
+                    .context("failed to update jj working-copy pointer")?;
+                tx.repo_mut()
+                    .rebase_descendants()
+                    .await
+                    .context("failed to rebase descendants after jj snapshot")?;
+                tx.commit("snapshot working copy")
+                    .await
+                    .context("failed to commit jj snapshot transaction")?;
+            }
+
+            let merged_repo = repo_loader
+                .load_at_head()
+                .await
+                .context("failed to reload jj repo after stale-workspace recovery")?;
+            let desired_id = merged_repo
+                .view()
+                .get_wc_commit_id(&workspace_name)
+                .context("jj workspace has no working-copy commit")?
+                .clone();
+            let desired = merged_repo
+                .store()
+                .get_commit_async(&desired_id)
+                .await
+                .with_context(|| {
+                    format!("failed to load jj working-copy commit {}", desired_id.hex())
+                })?;
+            locked_ws
+                .locked_wc()
+                .check_out(&desired)
+                .await
+                .context("failed to update the stale jj working copy")?;
+            locked_ws
+                .finish(merged_repo.op_id().clone())
+                .await
+                .context("failed to finish jj working-copy recovery")?;
+
+            let working_copy_empty = desired.is_empty(merged_repo.as_ref()).await.ok();
+            let snapshot = RepositorySnapshot {
+                fingerprint: merged_repo.op_id().hex(),
+                working_copy_empty,
+                // Deliberately equal to `fingerprint`: the graph on screen
+                // reflects some pre-recovery op, so the mismatch escalates
+                // the refresh to a full reload — external ops (the rebase
+                // that made us stale, the recovery itself) always landed.
+                parent_fingerprint: Some(merged_repo.op_id().hex()),
+            };
+            return Ok((snapshot, merged_repo, desired_id, workspace_name));
+        }
+    };
+    let old_tree = wc_commit.tree();
+
     let (new_tree, _stats) = locked_ws
         .locked_wc()
         .snapshot(&snapshot_options)

@@ -408,6 +408,113 @@ fn secondary_workspace_resolves_and_labels() {
     );
 }
 
+/// Two workspaces with the default one holding a mega merge of the other's
+/// working copy — the setup where snapshotting used to corrupt history.
+/// Editing in the side workspace amends its `@`, auto-rebasing the merge and
+/// leaving the default workspace's checkout *stale*; the old snapshot path
+/// then amended the rebased merge with the old on-disk tree, silently
+/// reverting the side workspace's changes inside it (the jj CLI refuses this
+/// state outright: "The working copy is stale"). The snapshot must instead
+/// recover like `jj workspace update-stale`: materialize the rebased merge
+/// onto disk, keep the merge free of smuggled changes, and preserve any
+/// unsnapshotted local edits without data loss.
+#[test]
+#[ignore = "shells out to the jj CLI"]
+fn stale_workspace_snapshot_recovers_instead_of_reverting_the_rebase() {
+    let build = |test: &str| {
+        let root = scratch_repo(test);
+        let side = root.parent().expect("scratch parent").join(format!(
+            "{}-side",
+            root.file_name().unwrap().to_str().unwrap()
+        ));
+        let _ = std::fs::remove_dir_all(&side);
+        write(&root, "shared.txt", "base\n");
+        jj(&root, &["commit", "-m", "base"]);
+        jj(&root, &["workspace", "add", side.to_str().unwrap()]);
+        write(&side, "side.txt", "side-work\n");
+        jj(&side, &["describe", "-m", "side work"]);
+        jj(
+            &root,
+            &[
+                "new",
+                "description(glob:\"side work*\")",
+                "description(glob:\"base*\")",
+                "-m",
+                "mega merge",
+            ],
+        );
+        // Edit in the side workspace; its snapshot rebases the merge and
+        // strands the default workspace's checkout on the old tree.
+        write(&side, "side.txt", "side-work\nside-more\n");
+        jj(&side, &["log", "-r", "@", "-T", "\"\""]);
+        (root, side)
+    };
+
+    // Clean default workspace: recovery is seamless — the merge follows the
+    // rebase, stays empty, and the disk materializes the side edit.
+    let (root, _side) = build("stale-ws-clean");
+    block_on(load_jj_repository_snapshot(repository(&root))).expect("snapshot recovers");
+    assert_eq!(
+        jj(
+            &root,
+            &[
+                "diff",
+                "-r",
+                "description(glob:\"mega merge*\")",
+                "--summary"
+            ]
+        ),
+        "",
+        "the merge must not absorb (or revert) the side workspace's edit"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("side.txt")).expect("side.txt materialized"),
+        "side-work\nside-more\n",
+        "the default workspace's disk follows the rebase"
+    );
+    let flags = jj(
+        &root,
+        &[
+            "log",
+            "--no-graph",
+            "-r",
+            "all()",
+            "-T",
+            "if(divergent, \"divergent \")",
+        ],
+    );
+    assert_eq!(flags, "", "a clean recovery must not diverge anything");
+
+    // Unsnapshotted local edits in the stale workspace: jj-CLI recovery
+    // parity — the edit survives in the op graph (as a divergent copy of
+    // the merge change) rather than being clobbered or smuggled.
+    let (root, _side) = build("stale-ws-dirty");
+    write(&root, "shared.txt", "base\nlocal-edit\n");
+    block_on(load_jj_repository_snapshot(repository(&root))).expect("snapshot recovers");
+    assert_eq!(
+        jj(&root, &["diff", "-r", "@", "--summary"],),
+        "",
+        "@ lands on the rebased merge, still free of smuggled changes"
+    );
+    let preserved = jj(
+        &root,
+        &[
+            "log",
+            "--no-graph",
+            "-r",
+            "all()",
+            "-T",
+            "\"\"",
+            "-p",
+            "--git",
+        ],
+    );
+    assert!(
+        preserved.contains("+local-edit"),
+        "the local edit must survive somewhere visible:\n{preserved}"
+    );
+}
+
 /// The source browser's two backends against a real repo: the working copy
 /// lists the on-disk directory — tracked files plus classified untracked /
 /// ignored ones, with ignored dirs collapsed unenumerated — while a commit
