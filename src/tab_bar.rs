@@ -21,9 +21,7 @@ use iced::{
     alignment,
     font::Weight,
     mouse,
-    widget::{
-        Row, Space, button, column, container, mouse_area, opaque, row, stack, text, text_input,
-    },
+    widget::{Row, Space, button, column, container, mouse_area, opaque, row, stack, text},
 };
 
 use crate::chrome;
@@ -696,14 +694,14 @@ pub fn build_open_repo_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Mess
     )
     .on_press(Message::OpenRepoDialogClose);
 
-    let input = text_input("~/code/your-repo or a GitHub PR URL", &dialog.path)
+    let input = crate::input::text_input("~/code/your-repo or a GitHub PR URL", &dialog.path)
         .id(OPEN_REPO_INPUT_ID)
         .padding(Padding::from([8, 10]))
         .size(text_size::BODY)
         .font(ui.config.mono_font)
         .on_input(Message::OpenRepoPathChanged)
         .on_submit(Message::OpenRepoSubmit)
-        .style(move |_, _| text_input::Style {
+        .style(move |_, _| crate::input::Style {
             // Recessed into the elevated card, otherwise identical to the
             // shared input identity.
             background: Background::Color(theme.background),

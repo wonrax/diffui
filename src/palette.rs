@@ -26,7 +26,7 @@ use iced::{
     widget::{
         Space, column, container, mouse_area, opaque, pin, responsive, row, scrollable,
         scrollable::{Direction, Scrollbar},
-        stack, text, text_input,
+        stack, text,
     },
 };
 use nucleo_matcher::{Config, Matcher, Utf32String};
@@ -965,7 +965,7 @@ fn build_input<'a>(
         ColumnSource::Actions(_) => "Filter actions",
     };
 
-    let mut input = text_input(placeholder, &column_state.query)
+    let mut input = crate::input::text_input(placeholder, &column_state.query)
         .id(PALETTE_INPUT_ID)
         .padding(Padding::from([10, 14]))
         .size(text_size::TITLE)

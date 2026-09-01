@@ -16,6 +16,7 @@ mod field;
 mod find;
 mod graph_view;
 mod icons;
+mod input;
 #[cfg(target_os = "macos")]
 mod macos_native;
 mod measure;

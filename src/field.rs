@@ -5,8 +5,10 @@
 
 use iced::{
     Background, Border, Color, Element, Font, Length, Padding, alignment, mouse,
-    widget::{Space, container, mouse_area, row, text_input},
+    widget::{Space, container, mouse_area, row},
 };
+
+use crate::input::text_input;
 
 use crate::theme::{self, ThemeSpec};
 use crate::{HoverTarget, Message, ToolbarMenu};
