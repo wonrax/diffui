@@ -31,9 +31,29 @@ fn block_on<F: Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
+/// XDG config sandbox for every `jj` CLI invocation. Two hermeticity holes
+/// it plugs:
+///
+/// - jj ≥ 0.41 *copies* a scratch repo's `.jj/repo/config.toml` into
+///   `<user config dir>/repos/<random-id>/config.toml` on first sight (the
+///   original stays in place for older readers — diffui-core's in-process
+///   jj-lib loads read it there). Un-sandboxed, every test run left one
+///   orphaned `~/.config/jj/repos/<id>/` dir in the user's real config.
+/// - The CLI otherwise layers the user's own jj config (signing backend,
+///   aliases, templates, defaults) under every scratch-repo command.
+///
+/// Shared across tests and runs — migrations land in distinct random-id
+/// subdirs, and the whole thing lives in the system temp dir.
+fn jj_config_sandbox() -> PathBuf {
+    let dir = std::env::temp_dir().join("diffui-core-scenario-jj-config");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
 /// Run `jj` in `dir`, panicking (with stderr) on failure; returns stdout.
 /// Signing is forced off: a user config with e.g. 1Password SSH signing
-/// would otherwise prompt (or hang) on every scratch-repo commit.
+/// would otherwise prompt (or hang) on every scratch-repo commit. The XDG
+/// override keeps the run hermetic — see [`jj_config_sandbox`].
 fn jj(dir: &Path, args: &[&str]) -> String {
     let output = Command::new("jj")
         .current_dir(dir)
@@ -41,6 +61,7 @@ fn jj(dir: &Path, args: &[&str]) -> String {
         .args(args)
         .env("JJ_USER", "Scenario Test")
         .env("JJ_EMAIL", "scenario@example.com")
+        .env("XDG_CONFIG_HOME", jj_config_sandbox())
         .output()
         .expect("jj CLI must be on PATH for these scenarios");
     assert!(
@@ -1390,10 +1411,11 @@ fn immutable_commits_refuse_rebase() {
     let root = scratch_repo("immutable-guard");
     write(&root, "file.txt", "one\n");
     jj(&root, &["commit", "-m", "protected base"]);
-    // Written straight into the repo dir (the pre-0.41 layout diffui-core
-    // reads) rather than via `jj config set --repo`, which since jj 0.41
-    // writes into the *user's* `~/.config/jj/repos/<id>/` — a test must not
-    // leave artifacts there. Keeps the scratch repo's signing-off table.
+    // Written straight into the repo dir — the layout diffui-core's
+    // in-process jj-lib loads read. The jj CLI copies it into its per-repo
+    // config location on first sight; that copy lands in the test sandbox
+    // (see `jj_config_sandbox`), not the user's real config. Keeps the
+    // scratch repo's signing-off table.
     std::fs::write(
         root.join(".jj/repo/config.toml"),
         "[signing]\nbehavior = \"keep\"\n\n\
