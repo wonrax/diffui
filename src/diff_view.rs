@@ -1185,7 +1185,7 @@ impl<'a, Message> DiffView<'a, Message> {
                         }
                         let chars = line.content.chars().count();
                         index.max_line_chars = index.max_line_chars.max(chars);
-                        y += self.row_height_for_chars(chars, unified_width);
+                        y += self.row_height_for_content(&line.content, unified_width);
                     }
                 }
             }
@@ -1220,9 +1220,8 @@ impl<'a, Message> DiffView<'a, Message> {
         };
         let mut max_chars = 0usize;
         let mut height_of = |this: &Self, line: &DiffLine| {
-            let chars = line.content.chars().count();
-            max_chars = max_chars.max(chars);
-            this.row_height_for_chars(chars, content_width)
+            max_chars = max_chars.max(line.content.chars().count());
+            this.row_height_for_content(&line.content, content_width)
         };
         let mut i = 0;
         while i < lines.len() {
@@ -1351,14 +1350,51 @@ impl<'a, Message> DiffView<'a, Message> {
     }
 
     fn row_height(&self, line: &DiffLine, content_width: f32) -> f32 {
-        self.row_height_for_chars(line.content.chars().count(), content_width)
+        self.row_height_for_content(&line.content, content_width)
     }
 
-    fn row_height_for_chars(&self, chars: usize, content_width: f32) -> f32 {
-        let chars_per_line = self.chars_per_line(content_width);
-        let wrapped_lines = chars.max(1).div_ceil(chars_per_line);
+    fn row_height_for_content(&self, content: &str, content_width: f32) -> f32 {
+        self.wrapped_row_lines(content, content_width) as f32 * self.metrics.row_height
+    }
 
-        wrapped_lines as f32 * self.metrics.row_height
+    /// Visual lines `content` spans at `content_width`. The fast path — no
+    /// wrapping, or few enough chars to fit — needs no shaping; a line that
+    /// could wrap is measured with the exact shaping the renderer draws with
+    /// (word-first breaks), so reserved heights match painted pixels.
+    fn wrapped_row_lines(&self, content: &str, content_width: f32) -> usize {
+        if !self.wrap
+            || content.chars().count()
+                <= chars_per_visual_line(content_width, self.metrics.char_width)
+        {
+            return 1;
+        }
+        measure::wrapped_line_count(
+            content,
+            self.typography.size,
+            self.font,
+            self.metrics.row_height,
+            content_width,
+        )
+    }
+
+    /// Char offset each of `content`'s visual lines starts at (`[0]` when it
+    /// doesn't wrap) — the oracle hit-testing, scroll targets, and highlight
+    /// rects share so their slicing agrees with the renderer's word-first
+    /// break points char-for-char.
+    fn wrap_starts(&self, content: &str, content_width: f32) -> Vec<usize> {
+        if !self.wrap
+            || content.chars().count()
+                <= chars_per_visual_line(content_width, self.metrics.char_width)
+        {
+            return vec![0];
+        }
+        measure::wrapped_line_starts(
+            content,
+            self.typography.size,
+            self.font,
+            self.metrics.row_height,
+            content_width,
+        )
     }
 
     /// How far the no-wrap mode can scroll sideways: the longest line's
@@ -1396,18 +1432,6 @@ impl<'a, Message> DiffView<'a, Message> {
         }
     }
 
-    /// Effective wrap column: the real chars-per-visual-line when wrapping,
-    /// else a huge sentinel every line length stays under, so all the shared
-    /// visual-line math degenerates to one visual line per row. (`/ 4` keeps
-    /// the `(idx + 1) * chars_per_line` products comfortably overflow-free.)
-    fn chars_per_line(&self, content_width: f32) -> usize {
-        if self.wrap {
-            chars_per_visual_line(content_width, self.metrics.char_width)
-        } else {
-            usize::MAX / 4
-        }
-    }
-
     /// Y position (in content space, before viewport scroll) of the visual
     /// line containing the byte at `byte_offset` within
     /// `(file_idx, hunk_idx, line_idx)`. Returns `None` if any of the
@@ -1434,9 +1458,9 @@ impl<'a, Message> DiffView<'a, Message> {
         // byte sits on so a match on the 5th wrap row of a 200-char line
         // doesn't scroll to the row top and leave the match off-screen.
         let content_width = index.text_width_for_file(file_idx);
-        let chars_per_line = self.chars_per_line(content_width);
         let char_offset = char_count_at_byte(&line.content, byte_offset);
-        let visual_idx = char_offset / chars_per_line;
+        let starts = self.wrap_starts(&line.content, content_width);
+        let visual_idx = starts.partition_point(|&start| start <= char_offset) - 1;
         y += visual_idx as f32 * self.metrics.row_height;
         Some(y)
     }
@@ -1557,17 +1581,29 @@ impl<'a, Message> DiffView<'a, Message> {
                 // Each row may span multiple wrapped visual lines. Figure out
                 // which visual line the click lands on, then translate the
                 // horizontal click into a char offset within that visual
-                // line's slice of the source content.
+                // line's slice of the source content (its bounds come from
+                // the renderer's own word-first break points).
                 let char_count = line.content.chars().count();
                 let cw = self.metrics.char_width;
-                let chars_per_line = self.chars_per_line(content_width);
-                let visual_idx = ((target_y - row_top) / self.metrics.row_height).floor() as usize;
-                let line_char_start = visual_idx.saturating_mul(chars_per_line);
+                let starts = self.wrap_starts(&line.content, content_width);
+                let visual_idx = (((target_y - row_top) / self.metrics.row_height).floor()
+                    as usize)
+                    .min(starts.len() - 1);
+                let line_char_start = starts[visual_idx];
+                let line_char_end = starts
+                    .get(visual_idx + 1)
+                    .copied()
+                    .unwrap_or(char_count)
+                    .max(line_char_start);
                 // The text is drawn shifted left by the horizontal scroll;
                 // shift the cursor the other way to land on the same char.
                 let relative_x = (point.x - text_x + horizontal_offset).max(0.0);
                 let local_char = (relative_x / cw + 0.5).floor() as usize;
-                let char_offset = (line_char_start + local_char).min(char_count);
+                // Clamp into this visual line so overshooting its trailing
+                // edge selects to its end, not into the line below.
+                let char_offset = (line_char_start + local_char)
+                    .min(line_char_end)
+                    .min(char_count);
                 let byte = byte_offset_for_char(&line.content, char_offset);
                 return Some((
                     TextPosition {
@@ -1771,7 +1807,7 @@ impl<'a, Message> DiffView<'a, Message> {
                 color: text_color,
                 clip_bounds: render.content_clip_bounds,
                 wrapping: if self.wrap {
-                    text::Wrapping::Glyph
+                    text::Wrapping::WordOrGlyph
                 } else {
                     text::Wrapping::None
                 },
@@ -1903,7 +1939,7 @@ impl<'a, Message> DiffView<'a, Message> {
         let unified = (
             HighlightGeometry {
                 char_width: self.metrics.char_width,
-                chars_per_line: self.chars_per_line(self.content_width(bounds.width)),
+                content_width: self.content_width(bounds.width),
                 text_x: bounds.x + self.metrics.gutter_width + PREFIX_WIDTH + TEXT_X_PADDING
                     - horizontal_offset,
                 clip_left: bounds.x + self.metrics.gutter_width + PREFIX_WIDTH,
@@ -1917,7 +1953,7 @@ impl<'a, Message> DiffView<'a, Message> {
         };
         let lane = |text_x: f32, clip_left: f32, clip_right: f32| HighlightGeometry {
             char_width: self.metrics.char_width,
-            chars_per_line: self.chars_per_line(split.text_width),
+            content_width: split.text_width,
             text_x,
             clip_left,
             clip_right,
@@ -2191,10 +2227,14 @@ impl<'a, Message> DiffView<'a, Message> {
             return;
         }
         let total_chars = content.chars().count();
-        let visual_lines = total_chars.max(1).div_ceil(geometry.chars_per_line);
-        for visual_idx in 0..visual_lines {
-            let vline_start = visual_idx * geometry.chars_per_line;
-            let vline_end = ((visual_idx + 1) * geometry.chars_per_line).min(total_chars);
+        let starts = self.wrap_starts(content, geometry.content_width);
+        for visual_idx in 0..starts.len() {
+            let vline_start = starts[visual_idx];
+            let vline_end = starts
+                .get(visual_idx + 1)
+                .copied()
+                .unwrap_or(total_chars)
+                .max(vline_start);
             let seg_start = start_chars.max(vline_start);
             let seg_end = end_chars.min(vline_end);
             if seg_start >= seg_end {
@@ -2736,13 +2776,14 @@ where
                     if gesture_ended {
                         state.scroll_axis = None;
                     }
-                    let axis = *state.scroll_axis.get_or_insert(
-                        if movement.x.abs() > movement.y.abs() {
-                            ScrollAxis::Horizontal
-                        } else {
-                            ScrollAxis::Vertical
-                        },
-                    );
+                    let axis =
+                        *state
+                            .scroll_axis
+                            .get_or_insert(if movement.x.abs() > movement.y.abs() {
+                                ScrollAxis::Horizontal
+                            } else {
+                                ScrollAxis::Vertical
+                            });
                     match axis {
                         ScrollAxis::Horizontal => movement.y = 0.0,
                         ScrollAxis::Vertical => movement.x = 0.0,
@@ -3398,7 +3439,6 @@ where
                             continue;
                         }
                         let cw = geometry.char_width;
-                        let chars_per_line = geometry.chars_per_line;
                         for row in &visible_rows {
                             let Some(line_index) = row.line_in_lane(lane) else {
                                 continue;
@@ -3436,12 +3476,18 @@ where
                             // intersect the selection char range with it. Without
                             // this loop a wrapped row would render a single full-
                             // width rectangle across every visual line, ignoring
-                            // where the selection actually starts and ends.
-                            let visual_lines = total_chars.max(1).div_ceil(chars_per_line);
+                            // where the selection actually starts and ends. The
+                            // sub-line bounds come from the renderer's own
+                            // word-first break points.
+                            let starts = self.wrap_starts(&line.content, geometry.content_width);
+                            let visual_lines = starts.len();
                             for visual_idx in 0..visual_lines {
-                                let vline_start = visual_idx * chars_per_line;
-                                let vline_end =
-                                    ((visual_idx + 1) * chars_per_line).min(total_chars);
+                                let vline_start = starts[visual_idx];
+                                let vline_end = starts
+                                    .get(visual_idx + 1)
+                                    .copied()
+                                    .unwrap_or(total_chars)
+                                    .max(vline_start);
                                 let seg_start = start_chars.max(vline_start);
                                 let seg_end = end_chars.min(vline_end);
                                 if seg_start >= seg_end {
@@ -4267,7 +4313,9 @@ struct SplitLayout {
 /// row to screen rectangles.
 struct HighlightGeometry {
     char_width: f32,
-    chars_per_line: usize,
+    /// Wrap width the lane's rows were measured against — what
+    /// `draw_wrapped_highlight` derives each line's break points from.
+    content_width: f32,
     text_x: f32,
     clip_left: f32,
     clip_right: f32,
@@ -4901,10 +4949,10 @@ mod tests {
         assert!(index.unified_text_width > index.split_text_width);
         assert_eq!(
             view.index_row_height(&index, 1),
-            view.row_height_for_chars(120, index.unified_text_width)
+            view.row_height_for_content(&long, index.unified_text_width)
         );
         assert!(
-            view.row_height_for_chars(120, index.split_text_width)
+            view.row_height_for_content(&long, index.split_text_width)
                 > view.index_row_height(&index, 1)
         );
     }

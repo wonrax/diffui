@@ -202,7 +202,7 @@ fn build_description_editor<'a>(
             ))
             .height(Length::Fixed(input_height))
             .padding(input_padding)
-            .wrapping(text::Wrapping::Glyph)
+            .wrapping(text::Wrapping::WordOrGlyph)
             .style(move |_, _| text_editor::Style {
                 background: Background::Color(theme.background),
                 border: Border {
@@ -293,22 +293,20 @@ fn description_editor_height(ui: &Diffui) -> f32 {
         - diff_view::HEADER_HORIZONTAL_PADDING * 2.0
         - 24.0)
         .max(1.0);
-    let char_width =
-        crate::measure::line_width("M", ui.config.code_type.size, ui.config.mono_font).max(1.0);
-    let chars_per_line = (available_width / char_width).floor().max(1.0) as usize;
-    let visual_lines = description_visual_line_count(&editor.text(), chars_per_line);
+    // Sized by the same engine that lays the editor out (word-first wrap),
+    // so the box grows exactly with the wrapped text instead of estimating
+    // breaks from a chars-per-line division.
+    let line_height = (ui.config.code_type.size * crate::measure::LINE_HEIGHT_MULTIPLIER).max(1.0);
+    let visual_lines = crate::measure::wrapped_line_count(
+        &editor.text(),
+        ui.config.code_type.size,
+        ui.config.mono_font,
+        line_height,
+        available_width,
+    );
     let input_height =
-        (visual_lines as f32 * ui.config.code_type.size * crate::measure::LINE_HEIGHT_MULTIPLIER)
-            .ceil()
-            + DESCRIPTION_EDITOR_PADDING_Y * 2.0;
+        (visual_lines as f32 * line_height).ceil() + DESCRIPTION_EDITOR_PADDING_Y * 2.0;
     input_height + DESCRIPTION_EDITOR_GAP + DESCRIPTION_EDITOR_ACTIONS_HEIGHT
-}
-
-fn description_visual_line_count(content: &str, chars_per_line: usize) -> usize {
-    content
-        .split('\n')
-        .map(|line| line.chars().count().max(1).div_ceil(chars_per_line.max(1)))
-        .sum()
 }
 
 /// Moves the editor with the custom diff view's scroll offset while keeping it
@@ -592,13 +590,21 @@ fn format_signature_line(sig: &SignatureInfo) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::description_visual_line_count;
+    use iced::Font;
 
     #[test]
-    fn description_height_counts_newlines_wrapping_and_contraction() {
-        assert_eq!(description_visual_line_count("", 10), 1);
-        assert_eq!(description_visual_line_count("one\ntwo\n", 10), 3);
-        assert_eq!(description_visual_line_count("12345678901", 10), 2);
-        assert_eq!(description_visual_line_count("short", 10), 1);
+    fn description_height_counts_newlines_and_wrapping() {
+        let size = 12.0;
+        let line_height = size * crate::measure::LINE_HEIGHT_MULTIPLIER;
+        let count = |content: &str, width: f32| {
+            crate::measure::wrapped_line_count(content, size, Font::MONOSPACE, line_height, width)
+        };
+        let wide = 10_000.0;
+        assert_eq!(count("", wide), 1);
+        assert_eq!(count("one\ntwo", wide), 2);
+        assert_eq!(count("short", wide), 1);
+        // A line well past the width must wrap into several visual lines.
+        let char_width = crate::measure::line_width("M", size, Font::MONOSPACE).max(1.0);
+        assert!(count(&"word ".repeat(40), char_width * 12.0) > 2);
     }
 }
