@@ -50,6 +50,10 @@ pub enum MenuMessage {
     Select(Vec<usize>),
     /// A press inside the card — swallowed so it doesn't dismiss.
     CapturePress,
+    /// A card scrolled: `(depth, y offset)`. Recorded so flyout placement —
+    /// which keys off a parent *row's on-screen* position — tracks the rows
+    /// as they slide, instead of assuming the unscrolled layout.
+    CardScrolled(usize, f32),
     /// Dismiss the open menu (press outside, or Esc).
     Dismiss,
     /// A release on the dismiss scrim — arms/dismisses outside-dismiss.
@@ -61,7 +65,6 @@ pub enum MenuMessage {
 // ── Card geometry ───────────────────────────────────────────────────────────
 const MENU_MIN_WIDTH: f32 = 200.0;
 const MENU_MAX_WIDTH: f32 = 460.0;
-const MENU_MAX_HEIGHT: f32 = 420.0;
 const MENU_CARD_PAD: f32 = 6.0;
 const MENU_ITEM_PAD_X: f32 = 8.0;
 /// `Scrollbar::spacing` for a scrolling card — embedded rail (reserves its own
@@ -189,6 +192,12 @@ pub(crate) struct OverlayMenu {
     pub glow: Option<Rectangle>,
     /// When the menu opened — drives the glow pulse phase.
     pub opened_at: Instant,
+    /// Scroll offset of each open card, indexed by depth (root = 0). Fed by
+    /// the cards' `on_scroll`; read by [`card_rects`] so a flyout anchors to
+    /// its parent row *where it currently sits*, not where the unscrolled
+    /// layout would put it. Entries past a branch switch are invalidated in
+    /// [`Self::hover`] — the replacement card starts unscrolled.
+    pub scrolls: Vec<f32>,
 }
 
 impl OverlayMenu {
@@ -212,7 +221,13 @@ impl OverlayMenu {
             selection: None,
             glow: None,
             opened_at: Instant::now(),
+            scrolls: Vec::new(),
         }
+    }
+
+    /// Recorded scroll of the card at `depth` (0 until it reports one).
+    fn card_scroll(&self, depth: usize) -> f32 {
+        self.scrolls.get(depth).copied().unwrap_or(0.0)
     }
 
     /// Fold one cursor move into the smoothed speed. Δt is capped so the first
@@ -283,11 +298,21 @@ impl OverlayMenu {
     /// keeping its ancestors open and collapsing sibling branches.
     pub(crate) fn hover(&mut self, path: Vec<usize>) {
         self.entered = true;
-        self.open_path = match self.entry_at(&path) {
+        let open_path = match self.entry_at(&path) {
             Some(MenuEntry::Submenu { .. }) => path.clone(),
             // Keep the ancestor chain open; drop anything deeper.
             _ => path[..path.len().saturating_sub(1)].to_vec(),
         };
+        // Cards deeper than where the open chain diverges are replaced (or
+        // gone); their recorded scrolls would misplace the fresh flyouts.
+        let unchanged = self
+            .open_path
+            .iter()
+            .zip(&open_path)
+            .take_while(|(before, after)| before == after)
+            .count();
+        self.scrolls.truncate(unchanged + 1);
+        self.open_path = open_path;
         self.highlight = Some(path);
     }
 }
@@ -453,11 +478,18 @@ fn entries_at<'a>(root: &'a [MenuEntry], prefix: &[usize]) -> Option<&'a [MenuEn
     Some(entries)
 }
 
+/// Tallest a menu card may grow: the full window. Only content that doesn't
+/// fit even then scrolls.
+fn menu_max_height(ui: &Diffui) -> f32 {
+    ui.window_size.height
+}
+
 /// On-screen rect of each open card (root + one per open flyout level), in the
 /// order root → deepest. Shared by the renderer (to place cards) and the
 /// hit-test / trajectory guard (to read their geometry), so the two never drift.
 fn card_rects(ui: &Diffui, menu: &OverlayMenu) -> Vec<(Vec<usize>, Rectangle)> {
     let win = ui.window_size;
+    let max_h = menu_max_height(ui);
     let mut out: Vec<(Vec<usize>, Rectangle)> = Vec::new();
     let mut prefix: Vec<usize> = Vec::new();
     let (mut x, mut y) = match menu.anchor {
@@ -470,7 +502,7 @@ fn card_rects(ui: &Diffui, menu: &OverlayMenu) -> Vec<(Vec<usize>, Rectangle)> {
             break;
         };
         let width = card_width(ui, entries);
-        let height = card_outer_height(entries);
+        let height = card_outer_height(entries, max_h);
         let px = x.min((win.width - width).max(0.0)).max(0.0);
         let py = y.min((win.height - height).max(0.0)).max(0.0);
         out.push((
@@ -497,8 +529,9 @@ fn card_rects(ui: &Diffui, menu: &OverlayMenu) -> Vec<(Vec<usize>, Rectangle)> {
         } else {
             (px - flyout_w).max(0.0)
         };
-        // Align the flyout's first row with its parent row.
-        y = py + MENU_CARD_PAD + row_top_offset(entries, idx) - MENU_CARD_PAD;
+        // Align the flyout's first row with its parent row, *as drawn*: a
+        // scrolled parent card has slid its rows up by its scroll offset.
+        y = py + row_top_offset(entries, idx) - menu.card_scroll(level);
         prefix.push(idx);
     }
     out
@@ -600,9 +633,9 @@ fn point_in_triangle(p: Point, a: Point, b: Point, c: Point) -> bool {
     !(has_neg && has_pos)
 }
 
-fn card_outer_height(entries: &[MenuEntry]) -> f32 {
+fn card_outer_height(entries: &[MenuEntry], max_height: f32) -> f32 {
     let content: f32 = entries.iter().map(MenuEntry::height).sum();
-    (content + MENU_CARD_PAD * 2.0).min(MENU_MAX_HEIGHT)
+    (content + MENU_CARD_PAD * 2.0).min(max_height)
 }
 
 fn row_top_offset(entries: &[MenuEntry], idx: usize) -> f32 {
@@ -644,7 +677,7 @@ fn card_width(ui: &Diffui, entries: &[MenuEntry]) -> f32 {
     }
 
     let content_h: f32 = entries.iter().map(MenuEntry::height).sum();
-    let reserve = content_h + MENU_CARD_PAD * 2.0 > MENU_MAX_HEIGHT;
+    let reserve = content_h + MENU_CARD_PAD * 2.0 > menu_max_height(ui);
     let scrollbar = if reserve {
         theme::SCROLLBAR_WIDTH + MENU_SCROLLBAR_MARGIN * 2.0 + MENU_SCROLLBAR_SPACING
     } else {
@@ -674,9 +707,22 @@ fn build_card<'a>(
     });
     let list = column(rows.collect::<Vec<_>>()).spacing(0);
 
+    let max_h = menu_max_height(ui);
     let content_h: f32 = entries.iter().map(MenuEntry::height).sum();
-    let body: Element<'a, Message> = if content_h + MENU_CARD_PAD * 2.0 > MENU_MAX_HEIGHT {
+    let body: Element<'a, Message> = if content_h + MENU_CARD_PAD * 2.0 > max_h {
+        let depth = prefix.len();
+        // The id is per *branch*, not per depth: switching between sibling
+        // submenus at the same depth must not inherit the old one's scroll
+        // state. The reported offsets feed [`card_rects`]'s flyout anchoring.
+        let id_path: Vec<String> = prefix.iter().map(usize::to_string).collect();
         scrollable(list)
+            .id(format!("menu-card-{}", id_path.join("-")))
+            .on_scroll(move |viewport| {
+                Message::Menu(MenuMessage::CardScrolled(
+                    depth,
+                    viewport.absolute_offset().y,
+                ))
+            })
             .width(Length::Fill)
             .height(Length::Shrink)
             .direction(Direction::Vertical(
@@ -697,7 +743,7 @@ fn build_card<'a>(
     mouse_area(
         container(body)
             .width(Length::Fixed(width))
-            .max_height(MENU_MAX_HEIGHT)
+            .max_height(max_h)
             .padding(Padding::from([MENU_CARD_PAD, MENU_CARD_PAD]))
             .style(move |_| popover_style(theme)),
     )

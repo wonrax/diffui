@@ -2368,6 +2368,14 @@ impl Diffui {
                 }
             }
             Message::Menu(MenuMessage::CapturePress) => {}
+            Message::Menu(MenuMessage::CardScrolled(depth, offset)) => {
+                if let Some(m) = self.menu.as_mut() {
+                    if m.scrolls.len() <= depth {
+                        m.scrolls.resize(depth + 1, 0.0);
+                    }
+                    m.scrolls[depth] = offset;
+                }
+            }
             Message::Menu(MenuMessage::Dismiss) => {
                 self.menu = None;
             }
