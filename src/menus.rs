@@ -291,14 +291,19 @@ impl Diffui {
                     .iter()
                     .find(|b| b.name == *name)?;
                 let remote = entry.tracked_remote()?;
-                Some(MenuEntry::item(
-                    format!("{name} \u{2192} {remote}"),
-                    MenuAction::Mutate(MutationOp::MoveBookmark {
+                // The remote rides in the detail column rather than an arrow
+                // glyph in the label: `\u{2192}` renders as a fallback-font
+                // blob in plenty of UI fonts.
+                Some(MenuEntry::Item {
+                    label: name.clone(),
+                    detail: Some(remote.to_owned()),
+                    emphasized: false,
+                    action: MenuAction::Mutate(MutationOp::MoveBookmark {
                         name: name.clone(),
                         to: selection.clone(),
                         push_remote: Some(remote.to_owned()),
                     }),
-                ))
+                })
             })
             .collect();
         top.push(MenuEntry::Separator);

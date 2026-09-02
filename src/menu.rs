@@ -65,8 +65,12 @@ pub enum MenuMessage {
 // ── Card geometry ───────────────────────────────────────────────────────────
 const MENU_MIN_WIDTH: f32 = 200.0;
 const MENU_MAX_WIDTH: f32 = 460.0;
-const MENU_CARD_PAD: f32 = 6.0;
+const MENU_CARD_PAD: f32 = 4.0;
 const MENU_ITEM_PAD_X: f32 = 8.0;
+/// Row text runs one step above the chrome default so menus read as content,
+/// not controls. Width measurement ([`card_width`]) keys off the same sizes.
+const MENU_LABEL_SIZE: f32 = text_size::BODY;
+const MENU_DETAIL_SIZE: f32 = text_size::UI;
 /// `Scrollbar::spacing` for a scrolling card — embedded rail (reserves its own
 /// width) so long rows don't run under it.
 const MENU_SCROLLBAR_SPACING: f32 = 6.0;
@@ -84,6 +88,14 @@ const MENU_ROW_HEIGHT: f32 = 28.0;
 const MENU_SEP_HEIGHT: f32 = 9.0;
 /// Gap between a trigger's bottom edge and the menu it drops (toolbar carets).
 const MENU_ANCHOR_GAP: f32 = 4.0;
+/// How far a flyout tucks under its parent card's edge, AppKit-style, so the
+/// two read as one connected surface rather than two cards touching.
+const MENU_FLYOUT_OVERLAP: f32 = 4.0;
+/// Hover highlight rounding. Strict concentricity with the card's
+/// [`theme::radius::SURFACE`] would be `SURFACE - border - MENU_CARD_PAD`,
+/// but that small a radius reads sharper than the card's; a step up looks
+/// matched.
+const MENU_ROW_RADIUS: f32 = theme::radius::BUTTON;
 /// Radians/second for the right-click glow pulse (~1.2 s period).
 const GLOW_PULSE_SPEED: f32 = 5.0;
 
@@ -92,7 +104,8 @@ const GLOW_PULSE_SPEED: f32 = 5.0;
 /// One node of a popup menu.
 #[derive(Debug, Clone)]
 pub(crate) enum MenuEntry {
-    /// A selectable leaf. `detail` is right-aligned mono (the revset expression);
+    /// A selectable leaf. `detail` is right-aligned mono (a revset expression, a
+    /// push remote);
     /// `emphasized` bumps the label weight (the fetch menu's header row).
     Item {
         label: String,
@@ -523,11 +536,12 @@ fn card_rects(ui: &Diffui, menu: &OverlayMenu) -> Vec<(Vec<usize>, Rectangle)> {
             break;
         };
         let flyout_w = card_width(ui, items);
-        // Open to the right; flip left when there's no room.
-        x = if px + width + flyout_w <= win.width {
-            px + width
+        // Open to the right, tucked under the parent's edge; flip left when
+        // there's no room.
+        x = if px + width - MENU_FLYOUT_OVERLAP + flyout_w <= win.width {
+            px + width - MENU_FLYOUT_OVERLAP
         } else {
-            (px - flyout_w).max(0.0)
+            (px - flyout_w + MENU_FLYOUT_OVERLAP).max(0.0)
         };
         // Align the flyout's first row with its parent row, *as drawn*: a
         // scrolled parent card has slid its rows up by its scroll offset.
@@ -661,16 +675,16 @@ fn card_width(ui: &Diffui, entries: &[MenuEntry]) -> f32 {
                 } else {
                     font
                 };
-                let mut w = measure::line_width(label, text_size::UI, label_font);
+                let mut w = measure::line_width(label, MENU_LABEL_SIZE, label_font);
                 if let Some(detail) = detail {
-                    w += MENU_ROW_GAP + measure::line_width(detail, text_size::CAPTION, mono);
+                    w += MENU_ROW_GAP + measure::line_width(detail, MENU_DETAIL_SIZE, mono);
                 }
                 w
             }
             MenuEntry::Submenu { label, .. } => {
-                measure::line_width(label, text_size::UI, font) + MENU_ROW_GAP + CHEVRON_WIDTH
+                measure::line_width(label, MENU_LABEL_SIZE, font) + MENU_ROW_GAP + CHEVRON_WIDTH
             }
-            MenuEntry::Disabled { label } => measure::line_width(label, text_size::UI, font),
+            MenuEntry::Disabled { label } => measure::line_width(label, MENU_LABEL_SIZE, font),
             MenuEntry::Separator => 0.0,
         };
         content = content.max(w);
@@ -779,7 +793,7 @@ fn build_row<'a>(
             .into();
         }
         MenuEntry::Disabled { label } => text(label)
-            .size(text_size::UI)
+            .size(MENU_LABEL_SIZE)
             .color(theme.subtle_text)
             .font(font)
             .width(Length::Fill)
@@ -798,7 +812,7 @@ fn build_row<'a>(
                 font
             };
             let label_widget = text(label)
-                .size(text_size::UI)
+                .size(MENU_LABEL_SIZE)
                 .color(theme.text)
                 .font(label_font)
                 .wrapping(iced::advanced::text::Wrapping::None);
@@ -806,7 +820,7 @@ fn build_row<'a>(
                 Some(detail) => row![
                     label_widget,
                     text(detail)
-                        .size(text_size::CAPTION)
+                        .size(MENU_DETAIL_SIZE)
                         .color(theme.subtle_text)
                         .font(mono)
                         .width(Length::Fill)
@@ -822,7 +836,7 @@ fn build_row<'a>(
         }
         MenuEntry::Submenu { label, .. } => row![
             text(label)
-                .size(text_size::UI)
+                .size(MENU_LABEL_SIZE)
                 .color(theme.text)
                 .font(font)
                 .width(Length::Fill)
@@ -850,7 +864,7 @@ fn build_row<'a>(
         .style(move |_| container::Style {
             background: bg,
             border: Border {
-                radius: crate::theme::radius::CONTROL.into(),
+                radius: MENU_ROW_RADIUS.into(),
                 ..Border::default()
             },
             ..container::Style::default()
