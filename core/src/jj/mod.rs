@@ -16,7 +16,12 @@ pub(crate) mod settings;
 pub(crate) mod walk;
 pub(crate) mod workspace;
 
-pub use walk::{jj_log_revset, walk_jj_commits};
+pub use walk::jj_log_revset;
+/// Driving the walk from outside the actor, against a workspace it opens
+/// itself, is only ever the `track-alloc` memory profile: everything in the app
+/// goes through [`walk_jj_with_repo`] on the repo the actor already holds.
+#[cfg(feature = "track-alloc")]
+pub use walk::walk_jj_commits;
 pub use workspace::read_jj_op_head;
 
 pub(crate) use browse::{list_jj_source_tree, read_jj_file_pair_inner, read_jj_source_file};

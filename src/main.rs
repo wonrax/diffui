@@ -38,6 +38,7 @@ mod tabs;
 mod theme;
 mod toolbar;
 mod update;
+mod width_memo;
 mod window_state;
 
 // Domain logic now lives in the headless `diffui-core` crate. Re-export the

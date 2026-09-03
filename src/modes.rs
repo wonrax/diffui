@@ -101,6 +101,20 @@ impl TabMode {
             TabMode::Draft(_) => Context::Draft,
         }
     }
+
+    /// Where this mode sits in the tab's stack, regardless of the order the
+    /// two were opened in.
+    ///
+    /// The find bar is a strip laid over whatever else is on screen, and the
+    /// key it owns is Escape. Push order alone put a draft started after it on
+    /// top, so Escape cancelled the draft and left the find bar sitting there
+    /// — the opposite of what the visible layering says.
+    fn layer(&self) -> u8 {
+        match self {
+            TabMode::Description(_) | TabMode::Draft(_) => 0,
+            TabMode::Find(_) => 1,
+        }
+    }
 }
 
 /// Whether a chord unclaimed by `context` may be re-resolved against
@@ -152,7 +166,10 @@ impl Diffui {
         self.modes.push(mode);
     }
 
-    /// Drop every open mode of `kind`. Returns what the topmost one held.
+    /// Drop the topmost open mode of `kind` and hand it back. Only
+    /// [`ModeKind::Confirm`] ever has more than one open at a time, and a
+    /// queued confirmation is meant to survive the one above it resolving —
+    /// so this removes one, never the whole kind.
     pub(crate) fn pop_mode(&mut self, kind: ModeKind) -> Option<Mode> {
         let index = self.modes.iter().rposition(|mode| mode.kind() == kind)?;
         Some(self.modes.remove(index))
@@ -223,10 +240,17 @@ impl Diffui {
 }
 
 impl TabState {
-    /// Push a per-tab mode, replacing any open mode of the same kind.
+    /// Push a per-tab mode, replacing any open mode of the same kind and
+    /// slotting it in by [layer](TabMode::layer) rather than always on top —
+    /// so a find bar opened before a draft starts still owns Escape.
     pub(crate) fn push_mode(&mut self, mode: TabMode) {
         self.modes.retain(|open| open.kind() != mode.kind());
-        self.modes.push(mode);
+        let at = self
+            .modes
+            .iter()
+            .position(|open| open.layer() > mode.layer())
+            .unwrap_or(self.modes.len());
+        self.modes.insert(at, mode);
     }
 
     pub(crate) fn pop_mode(&mut self, kind: ModeKind) -> Option<TabMode> {
@@ -292,6 +316,31 @@ mod tests {
 
     fn chord(raw: &str) -> Chord {
         Chord::parse(raw).expect("a parsable chord")
+    }
+
+    /// Escape belongs to whatever is visually on top, and the find bar is a
+    /// strip over the sidebar. Opened before a draft starts, push order alone
+    /// buried it — Escape cancelled the draft and left the find bar open.
+    #[test]
+    fn a_find_bar_stays_above_a_draft_started_after_it() {
+        let mut tab = TabState::empty();
+        tab.push_mode(TabMode::Find(FindState::default()));
+        tab.push_mode(TabMode::Draft(DraftUi::new(diffui_core::OpDraft::squash(
+            diffui_core::DraftSource {
+                selection: diffui_core::RevisionSelection::WorkingCopy,
+                commit_id: "abc".to_owned(),
+                label: "abc".to_owned(),
+            },
+        ))));
+
+        assert_eq!(
+            tab.modes.last().map(TabMode::context),
+            Some(Context::Find),
+            "the find bar keeps the keyboard"
+        );
+        // …and closing it hands the keyboard back to the draft underneath.
+        tab.pop_mode(ModeKind::Find);
+        assert_eq!(tab.modes.last().map(TabMode::context), Some(Context::Draft));
     }
 
     #[test]

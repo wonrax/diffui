@@ -304,7 +304,7 @@ pub(super) fn snapshot_auto_track_matcher(
 // jj-cli's `base_ignores` collects: whatever `core.excludesFile` points at
 // (git's default location when unset) and `info/exclude` from the git dir
 // behind the repo.
-pub(super) fn snapshot_base_ignores(repo_root: &Path) -> Result<Arc<GitIgnoreFile>> {
+pub(crate) fn snapshot_base_ignores(repo_root: &Path) -> Result<Arc<GitIgnoreFile>> {
     snapshot_base_ignores_with_env(repo_root, &JjEnv::from_process())
 }
 

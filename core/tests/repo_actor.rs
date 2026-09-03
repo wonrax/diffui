@@ -117,6 +117,13 @@ fn a_superseded_walk_is_cancelled() {
         commit_file(&mut repo, &format!("f{index}.txt"), "x\n", "commit");
     }
 
+    // Let the watch go quiet before the race below. Building the fixture wrote
+    // forty files, the watch reports them, and an actor woken by one of those
+    // pokes picks the load below up between the test's two sends — running a
+    // forty-one row walk to completion before the cancel is even sent. The race
+    // under test is the actor's, not the fixture's.
+    std::thread::sleep(diffui_core::watcher::WATCH_DEBOUNCE * 3);
+
     let mut session = Session::unloaded(String::new());
     session.capabilities = repo.handle.capabilities();
 

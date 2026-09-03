@@ -86,12 +86,12 @@ impl ResolvedTheme {
                 selected_file: Color::from_rgb(0.153, 0.176, 0.231),
                 text: Color::from_rgb(0.902, 0.910, 0.933),
                 muted_text: Color::from_rgb(0.690, 0.710, 0.761),
-                subtle_text: Color::from_rgb(0.486, 0.510, 0.580),
+                subtle_text: Color::from_rgb(0.563, 0.584, 0.643),
                 accent: Color::from_rgb(1.000, 0.478, 0.349),
                 added_line: Color::from_rgba(0.357, 0.773, 0.478, 0.07),
-                removed_line: Color::from_rgba(0.929, 0.431, 0.361, 0.07),
+                removed_line: Color::from_rgba(0.936, 0.487, 0.424, 0.07),
                 added_text: Color::from_rgb(0.357, 0.773, 0.478),
-                removed_text: Color::from_rgb(0.929, 0.431, 0.361),
+                removed_text: Color::from_rgb(0.936, 0.487, 0.424),
                 modified_token: Color::from_rgb(0.961, 0.706, 0.345),
                 info: Color::from_rgb(0.416, 0.659, 1.000),
                 // A step *lighter* than the elevated code surface so the
@@ -99,7 +99,7 @@ impl ResolvedTheme {
                 // into the scroll body.
                 file_header: Color::from_rgb(0.122, 0.141, 0.184),
                 hunk_header: Color::from_rgba(0.416, 0.659, 1.000, 0.08),
-                conflict_marker: Color::from_rgb(0.949, 0.361, 0.361),
+                conflict_marker: Color::from_rgb(0.958, 0.469, 0.469),
                 border: Color::from_rgb(0.137, 0.153, 0.196),
                 note_background: Color::from_rgba(0.961, 0.706, 0.345, 0.14),
                 note_text: Color::from_rgb(0.961, 0.706, 0.345),
@@ -113,6 +113,15 @@ impl ResolvedTheme {
             // Neutral whites — panes are pure white, canvas is a faint
             // gray so the panes still read as elevated. Coral accent stays
             // for selection / working-copy signalling.
+            //
+            // Every ink here is derived for a white ground rather than
+            // mirrored from the dark spec: a colour that reads well against
+            // near-black is nowhere near AA against near-white, and mirroring
+            // is what left the captions, the diff inks and the chips between
+            // 2.6:1 and 3.9:1. Hues are the dark theme's; only lightness
+            // moved, down to whatever clears 4.5:1 against the *darkest*
+            // surface each ink lands on — usually the selected row, not the
+            // white pane. `every_pairing_meets_wcag_aa` holds the line.
             Self::Light => ThemeSpec {
                 background: Color::from_rgb(0.957, 0.957, 0.961),
                 panel_background: Color::from_rgb(1.000, 1.000, 1.000),
@@ -120,30 +129,30 @@ impl ResolvedTheme {
                 selected_file: Color::from_rgb(0.910, 0.918, 0.933),
                 text: Color::from_rgb(0.106, 0.114, 0.133),
                 muted_text: Color::from_rgb(0.314, 0.337, 0.380),
-                subtle_text: Color::from_rgb(0.486, 0.506, 0.553),
-                accent: Color::from_rgb(0.851, 0.275, 0.122),
-                added_line: Color::from_rgba(0.184, 0.620, 0.365, 0.06),
-                removed_line: Color::from_rgba(0.800, 0.247, 0.184, 0.05),
-                added_text: Color::from_rgb(0.184, 0.620, 0.365),
-                removed_text: Color::from_rgb(0.800, 0.247, 0.184),
-                modified_token: Color::from_rgb(0.773, 0.518, 0.133),
-                info: Color::from_rgb(0.165, 0.435, 0.859),
+                subtle_text: Color::from_rgb(0.392, 0.410, 0.451),
+                accent: Color::from_rgb(0.632, 0.204, 0.091),
+                added_line: Color::from_rgba(0.120, 0.405, 0.238, 0.06),
+                removed_line: Color::from_rgba(0.642, 0.198, 0.148, 0.05),
+                added_text: Color::from_rgb(0.120, 0.405, 0.238),
+                removed_text: Color::from_rgb(0.642, 0.198, 0.148),
+                modified_token: Color::from_rgb(0.488, 0.327, 0.084),
+                info: Color::from_rgb(0.119, 0.345, 0.702),
                 // Same role as in the dark theme: distinct from the white
                 // code surface so file headers stand out as the scroll
                 // body slides past, but not so dark that it overpowers
                 // the body content.
                 file_header: Color::from_rgb(0.949, 0.953, 0.961),
-                hunk_header: Color::from_rgba(0.165, 0.435, 0.859, 0.06),
-                conflict_marker: Color::from_rgb(0.800, 0.247, 0.184),
+                hunk_header: Color::from_rgba(0.119, 0.345, 0.702, 0.06),
+                conflict_marker: Color::from_rgb(0.642, 0.198, 0.148),
                 border: Color::from_rgb(0.882, 0.886, 0.898),
-                note_background: Color::from_rgba(0.773, 0.518, 0.133, 0.14),
+                note_background: Color::from_rgba(0.488, 0.327, 0.084, 0.14),
                 note_text: Color::from_rgb(0.500, 0.320, 0.045),
                 lane_base: Color::from_rgb(0.486, 0.357, 0.910),
-                syntax_keyword: Color::from_rgb(0.475, 0.302, 0.859),
-                syntax_type: Color::from_rgb(0.047, 0.494, 0.463),
-                syntax_function: Color::from_rgb(0.157, 0.408, 0.792),
-                syntax_literal: Color::from_rgb(0.694, 0.443, 0.078),
-                syntax_property: Color::from_rgb(0.129, 0.443, 0.612),
+                syntax_keyword: Color::from_rgb(0.399, 0.202, 0.839),
+                syntax_type: Color::from_rgb(0.038, 0.402, 0.377),
+                syntax_function: Color::from_rgb(0.134, 0.346, 0.673),
+                syntax_literal: Color::from_rgb(0.502, 0.320, 0.057),
+                syntax_property: Color::from_rgb(0.110, 0.378, 0.521),
             },
             Self::HighContrast => ThemeSpec {
                 background: Color::BLACK,
@@ -162,7 +171,7 @@ impl ResolvedTheme {
                 info: Color::from_rgb(0.380, 0.770, 1.000),
                 file_header: Color::from_rgb(0.120, 0.120, 0.120),
                 hunk_header: Color::from_rgb(0.000, 0.220, 0.310),
-                conflict_marker: Color::from_rgb(1.000, 0.140, 0.140),
+                conflict_marker: Color::from_rgb(1.000, 0.445, 0.445),
                 border: Color::from_rgb(0.570, 0.620, 0.660),
                 note_background: Color::from_rgb(0.260, 0.210, 0.000),
                 note_text: Color::from_rgb(1.000, 0.940, 0.500),
@@ -657,5 +666,166 @@ pub fn tooltip_style(theme: ThemeSpec) -> container::Style {
             radius: radius::SURFACE.into(),
         },
         ..container::Style::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// WCAG AA for body text. Everything the chrome renders is between 10 and
+    /// 22 px, so nothing here qualifies as "large text" (18 pt / 24 px) and
+    /// gets the relaxed 3:1.
+    const TEXT: f32 = 4.5;
+    /// WCAG AA for a graphical object rather than a run of prose: the graph's
+    /// lane strokes, and the single letter in a status chip — which is read off
+    /// its shape and position as much as its colour, and never carries meaning
+    /// the row's text doesn't repeat.
+    const GLYPH: f32 = 3.0;
+
+    /// Relative luminance, WCAG 2.1 §dfn-relative-luminance.
+    fn luminance(color: Color) -> f32 {
+        let channel = |c: f32| {
+            if c <= 0.039_28 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(color.r) + 0.7152 * channel(color.g) + 0.0722 * channel(color.b)
+    }
+
+    fn contrast(a: Color, b: Color) -> f32 {
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    /// `fg` composited over the opaque `bg` — how a translucent wash (a chip
+    /// tint, a diff line, the selection) actually reaches the eye.
+    fn over(fg: Color, bg: Color) -> Color {
+        Color {
+            r: fg.r * fg.a + bg.r * (1.0 - fg.a),
+            g: fg.g * fg.a + bg.g * (1.0 - fg.a),
+            b: fg.b * fg.a + bg.b * (1.0 - fg.a),
+            a: 1.0,
+        }
+    }
+
+    /// Every foreground the theme puts on a background, with the minimum ratio
+    /// it has to clear. The point of listing them out rather than checking a
+    /// couple of obvious ones is that the failures were never in the obvious
+    /// places: the body text was fine, the captions and the chip letters were
+    /// not.
+    fn pairings(spec: ThemeSpec) -> Vec<(&'static str, Color, Color, f32)> {
+        let mut pairs = Vec::new();
+        let surfaces = [
+            ("canvas", spec.background),
+            ("pane", spec.panel_background),
+            ("elevated", spec.panel_background_elevated),
+            ("selected row", spec.selected_file),
+            ("file header", spec.file_header),
+        ];
+        // Chrome text sits on any of the surfaces — a sidebar row is selected
+        // as often as not, and that is the darkest of them on a light theme.
+        for (label, color) in [
+            ("text", spec.text),
+            ("muted text", spec.muted_text),
+            ("subtle text", spec.subtle_text),
+        ] {
+            for (surface, background) in surfaces {
+                pairs.push((label, color, background, TEXT));
+                let _ = surface;
+            }
+        }
+
+        // Code and diff inks, on the code surface and each wash laid over it.
+        let code = spec.panel_background_elevated;
+        let code_surfaces = [
+            code,
+            spec.file_header,
+            over(spec.added_line, code),
+            over(spec.removed_line, code),
+            over(spec.hunk_header, code),
+            over(
+                Color {
+                    a: 0.18,
+                    ..spec.accent
+                },
+                code,
+            ),
+        ];
+        for (label, color) in [
+            ("added text", spec.added_text),
+            ("removed text", spec.removed_text),
+            ("modified token", spec.modified_token),
+            ("info", spec.info),
+            ("conflict marker", spec.conflict_marker),
+            ("syntax keyword", spec.syntax_keyword),
+            ("syntax type", spec.syntax_type),
+            ("syntax function", spec.syntax_function),
+            ("syntax literal", spec.syntax_literal),
+            ("syntax property", spec.syntax_property),
+        ] {
+            for background in code_surfaces {
+                pairs.push((label, color, background, TEXT));
+            }
+        }
+
+        // A chip's letter over its own tint — the tint is derived from the
+        // letter's colour, so the two move together and the pairing is easy to
+        // leave unchecked.
+        for (label, color) in [
+            ("added chip", spec.added_text),
+            ("removed chip", spec.removed_text),
+            ("modified chip", spec.info),
+            ("renamed chip", spec.modified_token),
+            ("conflicted chip", spec.conflict_marker),
+            ("accent chip", spec.accent),
+        ] {
+            for base in [spec.panel_background, spec.selected_file] {
+                pairs.push((label, color, over(chip_background(color), base), GLYPH));
+            }
+        }
+
+        pairs.push((
+            "note text",
+            spec.note_text,
+            over(spec.note_background, spec.panel_background_elevated),
+            TEXT,
+        ));
+        // Inverted labels on a filled button.
+        pairs.push(("primary button label", spec.background, spec.accent, TEXT));
+        pairs.push((
+            "destructive button label",
+            spec.background,
+            spec.removed_text,
+            TEXT,
+        ));
+        // The graph's lanes are strokes, not glyphs to read.
+        for base in [spec.panel_background, spec.selected_file] {
+            pairs.push(("lane", spec.lane_base, base, GLYPH));
+        }
+        pairs
+    }
+
+    /// The light palette was first written by mirroring the dark values, which
+    /// is why so much of it landed between 2.6:1 and 3.9:1 on a white ground.
+    /// Re-deriving it fixed that once; this keeps the next edit honest.
+    #[test]
+    fn every_pairing_meets_wcag_aa() {
+        let mut failures = Vec::new();
+        for theme in [
+            ResolvedTheme::Dark,
+            ResolvedTheme::Light,
+            ResolvedTheme::HighContrast,
+        ] {
+            for (label, foreground, background, minimum) in pairings(theme.spec()) {
+                let ratio = contrast(foreground, background);
+                if ratio < minimum {
+                    failures.push(format!("{theme:?}: {label} is {ratio:.2}, needs {minimum}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 }

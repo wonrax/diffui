@@ -83,7 +83,16 @@ pub struct Activity {
     /// jump from a fake 0/0); an indeterminate op never sets a total.
     pub determinate: bool,
     /// Captured output lines (remote messages / errors), shown when expanded.
+    /// Capped at [`MAX_OUTPUT_LINES`]; see [`Activity::dropped_output`].
     pub detail: Vec<String>,
+    /// How many lines the cap has dropped off the front. The row says so
+    /// rather than quietly showing a truncated buffer.
+    pub dropped_output: usize,
+    /// The `http(s)://` links in the captured output, first-seen order — the
+    /// one-click links under the buffer. Collected as output lands, because
+    /// `view` runs on every redraw and re-splitting the whole buffer there is
+    /// a per-frame cost for as long as the row stays open.
+    pub urls: Vec<String>,
     /// One-line summary recorded on finish, shown under the title.
     pub result: Option<String>,
     pub started: Instant,
@@ -113,10 +122,50 @@ impl Activity {
     /// and whenever output lands on an already-open row, so the buffer never
     /// goes stale.
     fn sync_detail_editor(&mut self) {
-        self.detail_editor = (self.expanded && !self.detail.is_empty())
-            .then(|| text_editor::Content::with_text(&self.detail.join("\n")));
+        self.detail_editor = (self.expanded && !self.detail.is_empty()).then(|| {
+            let mut text = String::new();
+            if self.dropped_output > 0 {
+                text.push_str(&format!(
+                    "… {} earlier lines dropped\n",
+                    self.dropped_output
+                ));
+            }
+            text.push_str(&self.detail.join("\n"));
+            text_editor::Content::with_text(&text)
+        });
+    }
+
+    /// Fold `lines` into the captured output: collect any links they carry,
+    /// hold the buffer to [`MAX_OUTPUT_LINES`], and rebuild the editor.
+    ///
+    /// A link outlives the line that carried it on purpose — the one worth
+    /// keeping is the "create a pull request" URL a chatty push buries under
+    /// thousands of progress lines.
+    fn take_output(&mut self, lines: impl IntoIterator<Item = String>) {
+        for line in lines {
+            for token in line.split_whitespace() {
+                if (token.starts_with("http://") || token.starts_with("https://"))
+                    && !self.urls.iter().any(|url| url == token)
+                {
+                    self.urls.push(token.to_owned());
+                }
+            }
+            self.detail.push(line);
+        }
+        if self.detail.len() > MAX_OUTPUT_LINES {
+            let excess = self.detail.len() - MAX_OUTPUT_LINES;
+            self.detail.drain(..excess);
+            self.dropped_output += excess;
+        }
+        self.sync_detail_editor();
     }
 }
+
+/// Most output lines one activity keeps. A fetch of a big repository, or a push
+/// a server is chatty about, emits tens of thousands; the row shows a few at a
+/// time and the whole buffer is re-shaped whenever it is rebuilt, so the oldest
+/// go and the row says how many.
+const MAX_OUTPUT_LINES: usize = 500;
 
 /// The per-tab activity list; one lives in every tab's [`crate::TabState`].
 #[derive(Debug, Clone, Default)]
@@ -143,6 +192,8 @@ impl ActivityLog {
             progress: progress.clone(),
             determinate,
             detail: Vec::new(),
+            dropped_output: 0,
+            urls: Vec::new(),
             result: None,
             started: Instant::now(),
             duration: None,
@@ -175,6 +226,8 @@ impl ActivityLog {
             progress: LoadProgress::default(),
             determinate: false,
             detail: Vec::new(),
+            dropped_output: 0,
+            urls: Vec::new(),
             result: None,
             started: Instant::now(),
             duration: Some(std::time::Duration::ZERO),
@@ -186,8 +239,7 @@ impl ActivityLog {
 
     pub fn append_output(&mut self, id: ActivityId, line: impl Into<String>) {
         if let Some(activity) = self.get_mut(id) {
-            activity.detail.push(line.into());
-            activity.sync_detail_editor();
+            activity.take_output([line.into()]);
         }
     }
 
@@ -195,8 +247,7 @@ impl ActivityLog {
     /// push/fetch, delivered together on completion).
     pub fn extend_output(&mut self, id: ActivityId, lines: impl IntoIterator<Item = String>) {
         if let Some(activity) = self.get_mut(id) {
-            activity.detail.extend(lines);
-            activity.sync_detail_editor();
+            activity.take_output(lines);
         }
     }
 
@@ -819,10 +870,9 @@ fn activity_row<'a>(
         move |action| Message::Ui(UiEvent::ActivityDetailAction(id, action)),
     ),]
     .spacing(6);
-    let urls = detail_urls(&activity.detail);
-    if !urls.is_empty() {
+    if !activity.urls.is_empty() {
         let mut links = column![].spacing(2);
-        for url in urls {
+        for url in activity.urls.iter().cloned() {
             links = links.push(
                 button(
                     text(url.clone())
@@ -908,23 +958,6 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
-/// Unique whitespace-delimited `http(s)://…` tokens across the captured
-/// output, in first-seen order — each becomes a one-click link under the
-/// output editor.
-fn detail_urls(detail: &[String]) -> Vec<String> {
-    let mut urls: Vec<String> = Vec::new();
-    for line in detail {
-        for token in line.split_whitespace() {
-            if (token.starts_with("http://") || token.starts_with("https://"))
-                && !urls.iter().any(|url| url == token)
-            {
-                urls.push(token.to_owned());
-            }
-        }
-    }
-    urls
-}
-
 fn clear_button(ui: &Diffui, theme: ThemeSpec) -> Element<'static, Message> {
     let enabled = ui.active().activities.activities.iter().any(|a| {
         matches!(
@@ -1000,6 +1033,27 @@ mod tests {
         log.finish(ActivityId(1), ActivityStatus::Done, Some("done".to_owned()));
         assert!(!log.any_running());
         assert!(log.first_running().is_none());
+    }
+
+    #[test]
+    fn output_is_capped_and_its_links_survive_the_cap() {
+        let mut log = ActivityLog::default();
+        log.start(ActivityId(1), "Push", false);
+        log.append_output(ActivityId(1), "remote: https://example.test/pull/new");
+        for index in 0..MAX_OUTPUT_LINES + 200 {
+            log.append_output(ActivityId(1), format!("progress {index}"));
+        }
+
+        let activity = &log.activities[0];
+        assert_eq!(activity.detail.len(), MAX_OUTPUT_LINES);
+        assert_eq!(activity.dropped_output, 201);
+        assert_eq!(
+            activity.detail.last().map(String::as_str),
+            Some("progress 699"),
+            "the newest output is what is kept"
+        );
+        // The link the push was actually for was on the very first line.
+        assert_eq!(activity.urls, vec!["https://example.test/pull/new"]);
     }
 
     #[test]

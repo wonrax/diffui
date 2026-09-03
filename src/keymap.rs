@@ -232,6 +232,10 @@ fn named_key(name: &str) -> Option<Named> {
     })
 }
 
+/// How a named key is spelled in a shortcut hint. Every key
+/// [`named_key`] accepts has one: a binding the user is allowed to write is a
+/// binding the menus and the palette have to be able to show, and an empty
+/// label renders as a shortcut hint with the key missing from it.
 fn named_label(named: Named) -> &'static str {
     match named {
         Named::Enter => "\u{21a9}",
@@ -239,10 +243,54 @@ fn named_label(named: Named) -> &'static str {
         Named::Tab => "\u{21e5}",
         Named::Space => "Space",
         Named::Backspace => "\u{232b}",
+        Named::Delete => "\u{2326}",
         Named::ArrowUp => "\u{2191}",
         Named::ArrowDown => "\u{2193}",
         Named::ArrowLeft => "\u{2190}",
         Named::ArrowRight => "\u{2192}",
+        // The glyphs macOS prints on the keys themselves; on other platforms
+        // the words are what the key caps say, so spell them out there.
+        Named::Home => {
+            if cfg!(target_os = "macos") {
+                "\u{2196}"
+            } else {
+                "Home"
+            }
+        }
+        Named::End => {
+            if cfg!(target_os = "macos") {
+                "\u{2198}"
+            } else {
+                "End"
+            }
+        }
+        Named::PageUp => {
+            if cfg!(target_os = "macos") {
+                "\u{21de}"
+            } else {
+                "PgUp"
+            }
+        }
+        Named::PageDown => {
+            if cfg!(target_os = "macos") {
+                "\u{21df}"
+            } else {
+                "PgDn"
+            }
+        }
+        Named::Insert => "Ins",
+        Named::F1 => "F1",
+        Named::F2 => "F2",
+        Named::F3 => "F3",
+        Named::F4 => "F4",
+        Named::F5 => "F5",
+        Named::F6 => "F6",
+        Named::F7 => "F7",
+        Named::F8 => "F8",
+        Named::F9 => "F9",
+        Named::F10 => "F10",
+        Named::F11 => "F11",
+        Named::F12 => "F12",
         _ => "",
     }
 }
@@ -459,6 +507,49 @@ mod tests {
         assert!(Chord::parse("").is_none());
         assert!(Chord::parse("hyper+k").is_none());
         assert!(Chord::parse("cmd+notakey").is_none());
+    }
+
+    /// A key the config is allowed to bind has to be a key a hint can show.
+    /// Home, End, the page keys, Delete, Insert and the F-keys all parsed and
+    /// then rendered as a bare modifier prefix with nothing after it.
+    #[test]
+    fn every_bindable_named_key_has_a_hint_label() {
+        let names = [
+            "enter",
+            "esc",
+            "tab",
+            "space",
+            "backspace",
+            "delete",
+            "up",
+            "down",
+            "left",
+            "right",
+            "home",
+            "end",
+            "pageup",
+            "pagedown",
+            "insert",
+            "f1",
+            "f2",
+            "f3",
+            "f4",
+            "f5",
+            "f6",
+            "f7",
+            "f8",
+            "f9",
+            "f10",
+            "f11",
+            "f12",
+        ];
+        for name in names {
+            let named = named_key(name).unwrap_or_else(|| panic!("{name} should parse"));
+            assert!(
+                !named_label(named).is_empty(),
+                "{name} renders as an empty shortcut hint"
+            );
+        }
     }
 
     #[test]

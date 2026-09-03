@@ -1,8 +1,4 @@
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use anyhow::{Context, Result};
 use jj_lib::{
@@ -15,7 +11,7 @@ use jj_lib::{
     object_id::ObjectId,
     op_store::LocalRemoteRefTarget,
     ref_name::WorkspaceName,
-    repo::{ReadonlyRepo, Repo, StoreFactories},
+    repo::{ReadonlyRepo, Repo},
     repo_path::RepoPathUiConverter,
     revset::{
         RevsetAliasesMap, RevsetDiagnostics, RevsetExpression, RevsetExtensions,
@@ -23,7 +19,6 @@ use jj_lib::{
         parse as parse_revset,
     },
     settings::UserSettings,
-    workspace::{Workspace, default_working_copy_factories},
 };
 
 use super::settings::*;
@@ -172,10 +167,12 @@ pub(super) fn parse_user_revset(
 /// the load path (see `compute_jj_empty_status`).
 ///
 /// This is the standalone entry point, opening its own workspace: the memory
-/// profile and the revset tests use it. The actor drives
-/// [`walk_jj_with_repo`] against the repo it already holds.
+/// profile and the revset tests use it, and nothing else — the actor drives
+/// [`walk_jj_with_repo`] against the repo it already holds, so an ordinary
+/// build carries neither this nor the workspace load it does.
+#[cfg(any(feature = "track-alloc", test))]
 pub async fn walk_jj_commits(
-    repository_root: PathBuf,
+    repository_root: std::path::PathBuf,
     revset: String,
     progress: LoadProgress,
     batch_size: usize,
@@ -186,11 +183,11 @@ pub async fn walk_jj_commits(
     // is empty unless `user.email` is read from the user/repo config. The cold
     // load already does this via `jj_settings`; this is the refresh path.
     let settings = jj_settings(&repository_root)?;
-    let workspace = Workspace::load(
+    let workspace = jj_lib::workspace::Workspace::load(
         &settings,
         &repository_root,
-        &StoreFactories::default(),
-        &default_working_copy_factories(),
+        &jj_lib::repo::StoreFactories::default(),
+        &jj_lib::workspace::default_working_copy_factories(),
     )
     .context("failed to load jj workspace")?;
     let workspace_name = workspace.workspace_name();

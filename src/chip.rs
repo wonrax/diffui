@@ -11,8 +11,9 @@ use iced::advanced::text;
 use iced::advanced::{renderer, text::Text};
 use iced::{Background, Border, Color, Font, Pixels, Point, Rectangle, Shadow, Size, alignment};
 
+use crate::icons;
 use crate::theme::chip_background;
-use crate::{icons, measure};
+use crate::width_memo::WidthMemo;
 
 pub const TEXT_SIZE: f32 = crate::theme::text_size::BODY;
 pub const PAD_X: f32 = 6.0;
@@ -71,9 +72,20 @@ pub struct Chip {
 /// Full chip width (icon + label + horizontal padding) for the given label,
 /// rendered with `font` at [`TEXT_SIZE`].
 pub fn width(label: &str, icon: Option<&str>, font: Font) -> f32 {
-    let label_w = measure::line_width(label, TEXT_SIZE, font);
+    width_memoized(&WidthMemo::default(), label, icon, font)
+}
+
+/// [`width`], shaping through `memo`.
+///
+/// A rail lays its chips out and then paints them, so every chip is measured at
+/// least twice per frame, and a row's chips are the same strings frame after
+/// frame. Callers that have a memo in reach (the sidebar's row painter) pass it
+/// in; the rest go through [`width`], which is the same call against an empty
+/// one.
+pub fn width_memoized(memo: &WidthMemo, label: &str, icon: Option<&str>, font: Font) -> f32 {
+    let label_w = memo.width(label, TEXT_SIZE, font);
     let icon_w = icon.map_or(0.0, |glyph| {
-        measure::line_width(glyph, ICON_SIZE, icons::ICON_FONT) + ICON_GAP
+        memo.width(glyph, ICON_SIZE, icons::ICON_FONT) + ICON_GAP
     });
     label_w + icon_w + PAD_X * 2.0
 }
@@ -84,13 +96,26 @@ pub fn draw<R>(renderer: &mut R, chip: &Chip, x: f32, center_y: f32, clip: Recta
 where
     R: text::Renderer<Font = Font> + geometry::Renderer,
 {
-    let label_w = measure::line_width(&chip.label, TEXT_SIZE, chip.font);
-    let icon_block = chip.icon.map(|glyph| {
-        (
-            glyph,
-            measure::line_width(glyph, ICON_SIZE, icons::ICON_FONT),
-        )
-    });
+    draw_memoized(renderer, chip, &WidthMemo::default(), x, center_y, clip)
+}
+
+/// [`draw`], shaping through `memo` — the label's width is the one the caller's
+/// layout pass already asked for.
+pub fn draw_memoized<R>(
+    renderer: &mut R,
+    chip: &Chip,
+    memo: &WidthMemo,
+    x: f32,
+    center_y: f32,
+    clip: Rectangle,
+) -> f32
+where
+    R: text::Renderer<Font = Font> + geometry::Renderer,
+{
+    let label_w = memo.width(&chip.label, TEXT_SIZE, chip.font);
+    let icon_block = chip
+        .icon
+        .map(|glyph| (glyph, memo.width(glyph, ICON_SIZE, icons::ICON_FONT)));
     let icon_indent = icon_block.map_or(0.0, |(_, icon_w)| icon_w + ICON_GAP);
     let chip_h = height();
     let chip_w = icon_indent + label_w + PAD_X * 2.0;

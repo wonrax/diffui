@@ -23,7 +23,7 @@ use super::cancel::CancelFlag;
 use super::protocol::{
     Command, Event, GraphTail, JobId, Payload, PreviewRequest, RepoError, RepoId,
 };
-use super::{Envelope, Jobs, route_commands};
+use super::{Envelope, Jobs, SettingsSource, route_commands};
 use crate::jj;
 use crate::model::{LoadProgress, RevisionSelection, StreamRow};
 use crate::mutations::{DraftSimulation, MutationOp};
@@ -46,6 +46,7 @@ struct WorkspaceSlot {
 pub(super) fn spawn(
     id: RepoId,
     root: PathBuf,
+    settings: SettingsSource,
     commands: mpsc::UnboundedReceiver<Envelope>,
     poke: mpsc::UnboundedSender<Envelope>,
     events: mpsc::UnboundedSender<Event>,
@@ -77,6 +78,7 @@ pub(super) fn spawn(
                     Actor {
                         id,
                         events,
+                        settings,
                         workspace: None,
                         repo: None,
                         op_head: None,
@@ -140,6 +142,7 @@ fn watch(root: PathBuf, poke: mpsc::UnboundedSender<Envelope>) {
 struct Actor {
     id: RepoId,
     events: mpsc::UnboundedSender<Event>,
+    settings: SettingsSource,
     workspace: Option<WorkspaceSlot>,
     /// The repo at head, reloaded only when the operation head actually moves.
     repo: Option<Arc<ReadonlyRepo>>,
@@ -235,7 +238,10 @@ impl Actor {
     fn slot(&mut self, repository: &Repository) -> Result<&mut WorkspaceSlot> {
         if self.workspace.is_none() {
             let root = &repository.root;
-            let settings = jj::settings::jj_settings(root)?;
+            let settings = match &self.settings {
+                SettingsSource::Layered => jj::settings::jj_settings(root)?,
+                SettingsSource::Fixed(settings) => (**settings).clone(),
+            };
             let workspace = jj::load_workspace(&settings, root)?;
             let name = workspace.workspace_name().to_owned();
             let snapshot = jj::SnapshotContext::load(&settings, root)?;

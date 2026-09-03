@@ -282,6 +282,9 @@ impl Diffui {
         // Read the draft's destination off the store this event is about to
         // replace, so it can be re-found by commit id afterwards.
         let candidate = self.draft_candidate_commit(tab);
+        // `apply` consumes the event; a diff landing is the trigger for a
+        // deferred "Edit description", so note it while the payload is here.
+        let diff_landed = matches!(event.payload, Payload::DiffLoaded { .. });
         let Some(target) = self.tab_mut(tab) else {
             return own;
         };
@@ -293,7 +296,35 @@ impl Diffui {
         if replaced {
             self.rearm_draft_candidate(tab, candidate);
         }
-        Task::batch([own, folded, self.drain_queued_mutation(tab)])
+        let description = if diff_landed {
+            self.open_pending_description_edit(tab)
+        } else {
+            Task::none()
+        };
+        Task::batch([own, folded, description, self.drain_queued_mutation(tab)])
+    }
+
+    /// Open the editor a context-menu "Edit description" is still waiting on.
+    ///
+    /// The command browses to its revision first and parks the target in
+    /// `pending_description_edit`; the editor can only open once that
+    /// revision's details are on screen, which is the diff landing. A tab that
+    /// is off screen keeps the pending target instead of losing it — the
+    /// editor is a focused control, so opening it under another tab would take
+    /// the keyboard from what the user is looking at. Activation retries.
+    pub(crate) fn open_pending_description_edit(&mut self, tab: TabId) -> Task<Message> {
+        if !self.is_active(tab) {
+            return Task::none();
+        }
+        let state = self.active();
+        let Some(pending) = state.pending_description_edit.clone() else {
+            return Task::none();
+        };
+        if state.session.selected_revision != pending {
+            return Task::none();
+        }
+        self.active_mut().pending_description_edit = None;
+        self.open_description_editor()
     }
 
     /// The commit id under `tab`'s draft destination candidate, if it has one.
@@ -337,18 +368,21 @@ impl Diffui {
     /// Which tab an event belongs to. A job names one tab; a jobless event
     /// belongs to whichever tab views that repository (the first, since the
     /// open path keeps one tab per root).
+    ///
+    /// The repository is checked either way. Job ids are minted process-wide,
+    /// so a job alone would be enough — but only as long as that stays true,
+    /// and an event delivered to a tab on another repository is the kind of
+    /// mix-up that shows up as one repo's diff under another's rows.
     fn route_event(&self, event: &diffui_core::Event) -> Option<TabId> {
+        let on_this_repo = |tab: &&Tab| tab.repo_id().as_ref() == Some(&event.repo);
         match event.job() {
             Some(job) => self
                 .tabs
                 .iter()
+                .filter(on_this_repo)
                 .find(|tab| tab.state.session.owns_job(job) || tab.state.jobs.owns(job))
                 .map(|tab| tab.id),
-            None => self
-                .tabs
-                .iter()
-                .find(|tab| tab.repo_id().as_ref() == Some(&event.repo))
-                .map(|tab| tab.id),
+            None => self.tabs.iter().find(on_this_repo).map(|tab| tab.id),
         }
     }
 
@@ -1224,6 +1258,16 @@ impl Diffui {
                 if position.is_some() {
                     self.window_position = position;
                 }
+                // The saved sidebar width was clamped against the *saved*
+                // window size. Opening onto a smaller screen — an external
+                // display unplugged since the last run — gives a narrower
+                // window, and without this the split stays where it was and
+                // the diff pane opens below its minimum.
+                self.sidebar_width = resize_handle::clamp_width(
+                    self.sidebar_width,
+                    self.sidebar_min_width,
+                    size.width,
+                );
                 // Center the native window controls on the tab strip, and arm
                 // the native resize observer that keeps them centered without a
                 // frame of lag while the window is dragged (see
@@ -4150,17 +4194,20 @@ impl Diffui {
         );
 
         // Per-frame ticks during a palette push/pop animation. iced's
-        // `Animation::interpolate_with` is read-only — to actually drive
-        // the interpolation forward in time we need iced to keep
-        // re-rendering. Subscribing to a 60-Hz timer while the animation
-        // is in progress keeps the view function re-running; the handler
-        // is a no-op, the side effect is the render itself.
+        // `Animation::interpolate_with` is read-only — to actually drive the
+        // interpolation forward in time we need iced to keep re-rendering, and
+        // the handler is a no-op: the side effect is the render itself.
+        //
+        // Driven off the frames the window actually draws rather than a 16 ms
+        // wall clock, because a frame is exactly what is being asked for. A
+        // timer that runs faster than the compositor spends work on frames
+        // nobody sees, and one that runs slower stutters.
         let palette_animating = self
             .palette()
             .map(|p| p.is_animating(std::time::Instant::now()))
             .unwrap_or(false);
         let palette_tick = if palette_animating {
-            time::every(Duration::from_millis(16)).map(|_| Message::Palette(PaletteMessage::Tick))
+            window::frames().map(|_| Message::Palette(PaletteMessage::Tick))
         } else {
             Subscription::none()
         };
@@ -4190,12 +4237,13 @@ impl Diffui {
         // Per-frame ticks while a right-click menu's row glow is up (so its pulse
         // animates — the render is the effect; only the iced overlay glows, macOS
         // animates natively) or while a submenu is open (so the trajectory apex
-        // eases toward the cursor / catches up when it idles).
+        // eases toward the cursor / catches up when it idles). Frames, not a
+        // timer, for the same reason as the palette animation above.
         let menu_ticking = self
             .menu()
             .is_some_and(|m| m.glow.is_some() || !m.open_path.is_empty());
         let menu_tick = if menu_ticking {
-            time::every(Duration::from_millis(16)).map(|_| Message::Menu(MenuMessage::Tick))
+            window::frames().map(|_| Message::Menu(MenuMessage::Tick))
         } else {
             Subscription::none()
         };
@@ -4206,6 +4254,11 @@ impl Diffui {
         // While we're following the OS, poll the live application appearance so a
         // system light/dark switch is picked up without a restart. Runs only in
         // System mode; explicit themes don't care what the OS does.
+        //
+        // This one stays a timer. `window::frames()` only reports frames the
+        // window already draws, and each tick it delivers causes another — so
+        // an idle app in System mode would render at 60 Hz forever to answer a
+        // question the OS asks once a year.
         let system_theme_poll =
             if cfg!(target_os = "macos") && self.selected_theme == ThemePreference::System {
                 time::every(Duration::from_secs(1))
@@ -4215,11 +4268,10 @@ impl Diffui {
             };
 
         // Drives the custom double-click zoom: while an animation is in flight,
-        // tick at ~60fps so each frame steps the window toward its target. Tears
-        // itself down the moment the animation completes.
+        // every drawn frame steps the window toward its target. Tears itself
+        // down the moment the animation completes.
         let zoom_tick = if self.zoom_anim.is_some() {
-            time::every(Duration::from_millis(16))
-                .map(|_| Message::Window(WindowEvent::ZoomAnimTick))
+            window::frames().map(|_| Message::Window(WindowEvent::ZoomAnimTick))
         } else {
             Subscription::none()
         };
