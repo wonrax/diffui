@@ -85,10 +85,27 @@ pub fn apply_syntax_highlighting_with_sources(
             };
 
             if let Some(spans) = spans {
-                line.syntax = spans.clone();
+                line.syntax = clamp_spans_to_content(spans, line.content.len());
             }
         }
     }
+}
+
+/// Clip spans to the diff line they'll be painted on. The full-source parse
+/// measures against the file as stored, whose lines keep the `\r` of a CRLF
+/// file that [`DiffLine::content`](crate::model::DiffLine::content) has
+/// already dropped; the renderer discards any span reaching past the content,
+/// so on a CRLF file every comment came out uncoloured.
+fn clamp_spans_to_content(spans: &[SyntaxSpan], len: usize) -> Vec<SyntaxSpan> {
+    spans
+        .iter()
+        .filter(|span| span.start < len)
+        .map(|span| SyntaxSpan {
+            start: span.start,
+            end: span.end.min(len),
+            kind: span.kind,
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -444,6 +461,45 @@ mod tests {
                 .iter()
                 .any(|span| span.kind == SyntaxKind::String && span.start == 0),
             "reconstruction can't know about the enclosing string; got {spans:?}",
+        );
+    }
+
+    /// A CRLF file: the source's lines are one byte longer than the diff's,
+    /// which dropped the `\r`. A span reaching that byte is one the renderer
+    /// throws away, so the whole line loses its colour.
+    #[test]
+    fn crlf_spans_clamp_to_the_diff_line() {
+        let source = "// a comment\r\nlet x = 1;\r\n";
+        let mut file = DiffFile {
+            path: "test.rs".to_owned(),
+            old_path: None,
+            status: DiffFileStatus::Modified,
+            hunks: vec![DiffHunkView {
+                header: "@@ -1,2 +1,2 @@".to_owned(),
+                lines: vec![
+                    context_line(1, 1, "// a comment"),
+                    context_line(2, 2, "let x = 1;"),
+                ],
+            }],
+            additions: 0,
+            deletions: 0,
+        };
+        apply_syntax_highlighting_with_sources(&mut file, None, Some(source));
+
+        for line in &file.hunks[0].lines {
+            assert!(
+                line.syntax
+                    .iter()
+                    .all(|span| span.end <= line.content.len()),
+                "spans must fit {:?}: {:?}",
+                line.content,
+                line.syntax,
+            );
+        }
+        let comment = &file.hunks[0].lines[0].syntax;
+        assert!(
+            comment.iter().any(|span| span.kind == SyntaxKind::Comment),
+            "comment line: {comment:?}",
         );
     }
 
