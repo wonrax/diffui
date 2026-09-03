@@ -329,6 +329,8 @@ pub struct RevisionList<'a, Message> {
     /// preview" holds for mouse users. Drags keep their own spot channel
     /// (`DragHooks::hover`); gaps stay a drag-only gesture.
     on_target_hover: Option<fn(Option<usize>) -> Message>,
+    /// Which sidebar slot this list occupies — see [`ListSlot`].
+    slot: ListSlot,
 }
 
 /// Callbacks for the drag-to-rebase gesture. All `fn` pointers, like the
@@ -379,7 +381,15 @@ impl<'a, Message> RevisionList<'a, Message> {
             on_drag: None,
             gap_edge: None,
             on_target_hover: None,
+            slot: ListSlot::Revisions,
         }
+    }
+
+    /// Mark this list as the source browser's file tree, so it keeps its own
+    /// widget state rather than sharing the diff sidebar's — see [`ListSlot`].
+    pub fn source_tree_slot(mut self) -> Self {
+        self.slot = ListSlot::SourceTree;
+        self
     }
 
     /// Report the hovered commit row while an op draft is picking a
@@ -668,6 +678,22 @@ enum LaneHalf {
     After,
 }
 
+/// Which of the shell's two sidebars a list is. `view()` puts the diff
+/// sidebar and the source browser's file tree in the same slot, so iced sees
+/// one widget there and — with one tag — hands both the same [`State`]. The
+/// browser then inherited the diff list's reveal/restore tokens and jumped its
+/// scroll on the first frame after a switch. A distinct tag per slot makes iced
+/// rebuild the state instead, which is what keeps the counters apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListSlot {
+    Revisions,
+    SourceTree,
+}
+
+/// Tag marker for [`ListSlot::SourceTree`]; see [`ListSlot`]. The stored value
+/// is a plain [`State`] either way — only the tag differs.
+struct SourceTreeSlot;
+
 struct State {
     /// Scroll position in `f64` content-space px (see the row-geometry helpers
     /// for why `f64`). Cast to `f32` only at the scrollbar/render boundary,
@@ -756,7 +782,10 @@ where
     Renderer: text::Renderer<Font = Font> + iced::advanced::graphics::geometry::Renderer,
 {
     fn tag(&self) -> tree::Tag {
-        tree::Tag::of::<State>()
+        match self.slot {
+            ListSlot::Revisions => tree::Tag::of::<State>(),
+            ListSlot::SourceTree => tree::Tag::of::<SourceTreeSlot>(),
+        }
     }
 
     fn state(&self) -> tree::State {

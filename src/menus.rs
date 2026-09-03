@@ -7,7 +7,7 @@ use super::*;
 
 impl Diffui {
     /// Build the revision context menu's entry tree from the already-loaded
-    /// `self.session.bookmarks` / `self.session.commits` (so it opens instantly, no repo read).
+    /// bookmarks / commit graph (so it opens instantly, no repo read).
     /// Shared by the macOS native popup and the iced overlay; author/committer/
     /// description copies carry only an in-memory fallback, with the live value
     /// read on demand when picked.
@@ -21,13 +21,21 @@ impl Diffui {
         // the loaded graph (reload, revset change) are ignored rather than
         // silently acted on.
         let marked: Vec<&str> = self
+            .active()
             .revision_multi_selection
             .iter()
             .map(String::as_str)
-            .filter(|id| self.session.commits.find_by_commit_id(id).is_some())
+            .filter(|id| {
+                self.active()
+                    .session
+                    .commits
+                    .find_by_commit_id(id)
+                    .is_some()
+            })
             .collect();
         let clicked_id = match selection {
             RevisionSelection::WorkingCopy => self
+                .active()
                 .session
                 .commits
                 .working_copy()
@@ -163,8 +171,10 @@ impl Diffui {
         // Copy revision metadata — values come from the loaded graph row.
         let copy_fields = {
             let row = match selection {
-                RevisionSelection::WorkingCopy => self.session.commits.working_copy(),
-                RevisionSelection::Commit(hex) => self.session.commits.find_by_commit_id(hex),
+                RevisionSelection::WorkingCopy => self.active().session.commits.working_copy(),
+                RevisionSelection::Commit(hex) => {
+                    self.active().session.commits.find_by_commit_id(hex)
+                }
             };
             row.map(|row| {
                 (
@@ -235,6 +245,7 @@ impl Diffui {
         // revision is exactly how a conflict resolves — wearing its `??` so
         // the pick doubles as the resolution it is.
         let mut moves: Vec<(String, String, bool)> = self
+            .active()
             .session
             .bookmarks
             .bookmarks
@@ -247,7 +258,9 @@ impl Diffui {
         moves.sort();
         let move_reference = match selection {
             RevisionSelection::Commit(hex) => Some(hex.clone()),
-            RevisionSelection::WorkingCopy => self.session.bookmarks.working_copy_commit.clone(),
+            RevisionSelection::WorkingCopy => {
+                self.active().session.bookmarks.working_copy_commit.clone()
+            }
         };
         self.sort_by_proximity(&mut moves, move_reference.as_deref(), |(_, t, _)| {
             t.as_str()
@@ -285,6 +298,7 @@ impl Diffui {
             .filter(|(_, _, conflicted)| !conflicted)
             .filter_map(|(name, _target, _)| {
                 let entry = self
+                    .active()
                     .session
                     .bookmarks
                     .bookmarks
@@ -327,11 +341,16 @@ impl Diffui {
         // Per-bookmark actions for bookmarks sitting on this revision.
         let target_hex: Option<&str> = match selection {
             RevisionSelection::Commit(hex) => Some(hex.as_str()),
-            RevisionSelection::WorkingCopy => self.session.bookmarks.working_copy_commit.as_deref(),
+            RevisionSelection::WorkingCopy => self
+                .active()
+                .session
+                .bookmarks
+                .working_copy_commit
+                .as_deref(),
         };
         let mut bookmark_items: Vec<MenuEntry> = Vec::new();
         if let Some(hex) = target_hex {
-            for entry in &self.session.bookmarks.bookmarks {
+            for entry in &self.active().session.bookmarks.bookmarks {
                 // Any side of a conflicted bookmark counts as sitting here —
                 // its `??` chip shows on every side, so the menu must too.
                 if entry.local_targets.iter().any(|t| t == hex) {
@@ -447,7 +466,7 @@ impl Diffui {
         let op = match action {
             MenuAction::Fetch(target) => return self.start_fetch(target),
             MenuAction::SetRevset(expr) => {
-                self.session.revset = expr;
+                self.active_mut().session.revset = expr;
                 return self.evaluate_revset();
             }
             // Ready-to-paste values write to the clipboard immediately.
@@ -456,16 +475,16 @@ impl Diffui {
                 return self.open_source_browser(revision, path);
             }
             MenuAction::EditDescription { target } => {
-                if self.session.selected_revision == target {
+                if self.active_mut().session.selected_revision == target {
                     return Task::done(Message::DescriptionEdit);
                 }
-                if let Some(editor) = self.description_editor.as_mut()
+                if let Some(editor) = self.active_mut().description_editor.as_mut()
                     && (editor.is_dirty() || editor.saving_activity.is_some())
                 {
                     editor.switch_blocked = true;
                     return Task::none();
                 }
-                self.pending_description_edit = Some(target.clone());
+                self.active_mut().pending_description_edit = Some(target.clone());
                 return self.update(Message::SelectRowKey(selection_key(&target)));
             }
             MenuAction::StartDraft { kind, source } => {
@@ -475,7 +494,8 @@ impl Diffui {
             // read the revision off-thread, format the field, and copy — falling
             // back to the in-memory value on failure.
             MenuAction::CopyDetail { field, fallback } => {
-                let (Some(source), Some(selection)) = (self.session.source.clone(), selection)
+                let (Some(source), Some(selection)) =
+                    (self.active_mut().session.source.clone(), selection)
                 else {
                     return Task::none();
                 };
@@ -488,7 +508,7 @@ impl Diffui {
                 });
             }
             MenuAction::ClearMultiSelection => {
-                self.revision_multi_selection.clear();
+                self.active_mut().revision_multi_selection.clear();
                 return Task::none();
             }
             MenuAction::Mutate(op) => op,
@@ -496,7 +516,7 @@ impl Diffui {
         // A batch abandon consumes the marked rows — the marks (and their
         // wash) mustn't outlive the pick.
         if matches!(&op, mutations::MutationOp::Abandon { targets } if targets.len() > 1) {
-            self.revision_multi_selection.clear();
+            self.active_mut().revision_multi_selection.clear();
         }
         self.start_mutation_op(op)
     }
@@ -506,7 +526,7 @@ impl Diffui {
     /// drop — funnels through here so labels and guards can't drift apart.
     pub(crate) fn start_mutation_op(&mut self, op: mutations::MutationOp) -> Task<Message> {
         use mutations::MutationOp;
-        let Some(repository) = self.session.repository.clone() else {
+        let Some(repository) = self.active_mut().session.repository.clone() else {
             return Task::none();
         };
         let Some(tab_id) = self.active_tab_id() else {
@@ -556,7 +576,7 @@ impl Diffui {
                     ..
                 }
         );
-        let (activity_id, progress) = self.begin_activity(label, determinate);
+        let (activity_id, progress) = self.begin_activity(tab_id, label, determinate);
         let pending = PendingMutation {
             repository,
             op,
@@ -594,13 +614,16 @@ impl Diffui {
 
         // Resolve the clicked row to a repo-relative path (+ whether it's a
         // file, i.e. browseable).
-        let (path, is_file) = match self.main_view {
+        let (path, is_file) = match self.active().main_view {
             MainView::Diff => {
-                let rows =
-                    diffui_core::file_tree_rows(&self.session.document.files, &self.collapsed_dirs);
+                let rows = diffui_core::file_tree_rows(
+                    &self.active().session.document.files,
+                    &self.active().collapsed_dirs,
+                );
                 match rows.get(display_index) {
                     Some(diffui_core::FileTreeRow::File { file_index, .. }) => (
-                        self.session
+                        self.active()
+                            .session
                             .document
                             .files
                             .get(*file_index)
@@ -630,11 +653,14 @@ impl Diffui {
         };
 
         let mut items = Vec::new();
-        if is_file && self.main_view == MainView::Diff && self.session.repository.is_some() {
+        if is_file
+            && self.active().main_view == MainView::Diff
+            && self.active().session.repository.is_some()
+        {
             items.push(MenuEntry::item(
                 "Browse source at this revision",
                 MenuAction::BrowseSource {
-                    revision: self.session.selected_revision.clone(),
+                    revision: self.active().session.selected_revision.clone(),
                     path: Some(path.clone()),
                 },
             ));
@@ -644,7 +670,7 @@ impl Diffui {
             "Copy path",
             MenuAction::CopyText(path.clone()),
         ));
-        if let Some(repository) = &self.session.repository {
+        if let Some(repository) = &self.active().session.repository {
             items.push(MenuEntry::item(
                 "Copy absolute path",
                 MenuAction::CopyText(repository.root.join(&path).display().to_string()),
@@ -803,7 +829,7 @@ impl Diffui {
                 let Some((_, expr)) = entries.get(chosen as usize) else {
                     return Task::none();
                 };
-                self.session.revset = expr.clone();
+                self.active_mut().session.revset = expr.clone();
                 self.evaluate_revset()
             }
         }

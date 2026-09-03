@@ -233,7 +233,7 @@ fn build_matcher(query: &str, case_sensitive: bool, regex: bool) -> Result<Match
 /// Returns an empty placeholder when `find` is `None` so it can be
 /// unconditionally stacked into the diff panel.
 pub fn build_overlay<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
-    let Some(state) = &ui.find else {
+    let Some(state) = &ui.active().find else {
         return Space::new().into();
     };
 

@@ -26,8 +26,8 @@ const DESCRIPTION_EDITOR_GAP: f32 = 8.0;
 const DESCRIPTION_EDITOR_PADDING_Y: f32 = 10.0;
 
 pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
-    let body: Element<'a, Message> = if matches!(ui.session.status, LoadStatus::Loading)
-        && ui.session.document.files.is_empty()
+    let body: Element<'a, Message> = if matches!(ui.active().session.status, LoadStatus::Loading)
+        && ui.active().session.document.files.is_empty()
     {
         container(text(""))
             .width(Length::Fill)
@@ -35,8 +35,10 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
             .center_x(Length::Fill)
             .center_y(Length::Fill)
             .into()
-    } else if ui.session.document.files.is_empty() && ui.session.revision_details.is_none() {
-        let message = match &ui.session.status {
+    } else if ui.active().session.document.files.is_empty()
+        && ui.active().session.revision_details.is_none()
+    {
+        let message = match &ui.active().session.status {
             LoadStatus::Failed(_) => "Failed to load changes",
             _ => "No file changes in this revision",
         };
@@ -52,6 +54,7 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
         .into()
     } else {
         let files = ui
+            .active()
             .session
             .document
             .files
@@ -77,20 +80,23 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
 
         let bookmark_color = selected_lane_color(ui, theme);
         let editable_description = ui
+            .active()
             .session
             .repository
             .as_ref()
             .is_some_and(|repo| matches!(repo.vcs, crate::repository::Vcs::Jj));
         let editing_description = ui
+            .active()
             .description_editor
             .as_ref()
-            .is_some_and(|editor| editor.target == ui.session.selected_revision);
+            .is_some_and(|editor| editor.target == ui.active().session.selected_revision);
         let description_editor_height = if editing_description {
             description_editor_height(ui)
         } else {
             0.0
         };
         let header_lines = ui
+            .active()
             .session
             .revision_details
             .as_ref()
@@ -110,8 +116,8 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
 
         let mut dv = DiffView::new(
             files,
-            ui.selected_file,
-            ui.session.selected_revision.view_key(),
+            ui.active().selected_file,
+            ui.active().session.selected_revision.view_key(),
             diff_palette(theme),
             ui.config.mono_font,
             ui.config.code_type,
@@ -121,9 +127,9 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
         .with_header(header_lines)
         .on_copy(Message::CopyToClipboard)
         .on_scroll(Message::DiffScrolled)
-        .restore_scroll(ui.diff_scroll_offset, ui.scroll_restore_token)
+        .restore_scroll(ui.active().diff_scroll_offset, ui.scroll_restore_token)
         .content_version(ui.document_version)
-        .layout_version(ui.session.document_id)
+        .layout_version(ui.active().session.document_id)
         .wrap(ui.diff_wrap)
         .side_by_side(ui.diff_split);
 
@@ -133,11 +139,11 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
 
         // Per-file "browse source" affordance — repo tabs only (a PR tab has
         // no local tree to browse).
-        if ui.session.repository.is_some() {
+        if ui.active().session.repository.is_some() {
             dv = dv.on_browse_file(Message::BrowseFileFromDiff);
         }
 
-        if let Some(find_state) = &ui.find {
+        if let Some(find_state) = &ui.active().find {
             dv = dv.with_find(diff_view::FindOverlay {
                 matches: &find_state.matches,
                 active: find_state.active,
@@ -185,8 +191,8 @@ fn build_description_editor<'a>(
     theme: ThemeSpec,
     block_height: f32,
 ) -> Element<'a, Message> {
-    if let Some(editor) = ui.description_editor.as_ref()
-        && editor.target == ui.session.selected_revision
+    if let Some(editor) = ui.active().description_editor.as_ref()
+        && editor.target == ui.active().session.selected_revision
     {
         let saving = editor.saving_activity.is_some();
         let input_height =
@@ -277,14 +283,14 @@ fn build_description_editor<'a>(
                 bottom: 0.0,
                 left: diff_view::HEADER_HORIZONTAL_PADDING,
             });
-        let offset = ui.diff_scroll_offset;
+        let offset = ui.active().diff_scroll_offset;
         return ScrollTranslate::new(positioned.into(), Vector::new(0.0, -offset)).into();
     }
     Space::new().height(0).into()
 }
 
 fn description_editor_height(ui: &Diffui) -> f32 {
-    let Some(editor) = ui.description_editor.as_ref() else {
+    let Some(editor) = ui.active().description_editor.as_ref() else {
         return 0.0;
     };
     let available_width = (ui.window_size.width
@@ -435,9 +441,10 @@ fn build_stats_bar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message>
     // Prefer source-reported totals (a PR's header counts) over the summed
     // files — the GitHub files API zeroes counts on oversized blobs, so the
     // sum can undercount what the PR page shows.
-    let (additions, deletions) = ui.session.authoritative_totals.unwrap_or((
-        ui.session.document.total_additions,
-        ui.session.document.total_deletions,
+    let session = &ui.active().session;
+    let (additions, deletions) = session.authoritative_totals.unwrap_or((
+        session.document.total_additions,
+        session.document.total_deletions,
     ));
     let bar = row![
         text(format!("+{additions}"))
@@ -450,7 +457,7 @@ fn build_stats_bar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message>
             .color(theme.removed_text),
         text(format!(
             "· {}",
-            format_file_count(ui.session.document.files.len())
+            format_file_count(ui.active().session.document.files.len())
         ))
         .size(STATS_TEXT_SIZE)
         .color(theme.subtle_text),
@@ -484,10 +491,11 @@ fn selected_lane_color(ui: &Diffui, theme: ThemeSpec) -> Color {
         lane_base_color: theme.lane_base,
         missing_color: theme.subtle_text,
     };
-    ui.session
+    let session = &ui.active().session;
+    session
         .selected_commit_index
-        .filter(|&index| index < ui.session.commits.len())
-        .map(|index| style.lane_color(ui.session.graph.frame(index, usize::MAX).node_lane))
+        .filter(|&index| index < session.commits.len())
+        .map(|index| style.lane_color(session.graph.frame(index, usize::MAX).node_lane))
         .unwrap_or(theme.accent)
 }
 

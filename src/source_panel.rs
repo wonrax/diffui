@@ -197,7 +197,7 @@ fn build_source_filter(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         crate::field::FilterField {
             id: SOURCE_FILTER_INPUT_ID,
             placeholder: "search files — fuzzy",
-            value: &ui.source.filter,
+            value: &ui.active().source.filter,
             on_input: Message::SourceFilterChanged,
             on_submit: Some(Message::SourceFilterSubmit),
             caret: None,
@@ -208,7 +208,7 @@ fn build_source_filter(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
 /// Sidebar for the source browser: the fuzzy file-search box, then the full
 /// file tree — no revision rows, no revset filter, no branch footer.
 pub fn build_source_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
-    let source = &ui.source;
+    let source = &ui.active().source;
     let mut body = column![].spacing(0);
     body = body.push(build_source_filter(ui, theme));
 
@@ -225,7 +225,11 @@ pub fn build_source_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
         );
     }
 
-    let (entries, rows) = ui.source_tree_cache.borrow_mut().entries_and_rows(source);
+    let (entries, rows) = ui
+        .active()
+        .source_tree_cache
+        .borrow_mut()
+        .entries_and_rows(source);
     let row_count = rows.len();
 
     let selected_entry = source.selected.as_deref().and_then(|path| {
@@ -284,6 +288,7 @@ pub fn build_source_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
         header_clicked,
         Message::SourceSidebarRow,
     )
+    .source_tree_slot()
     .width(Length::Fill)
     .reveal_file(source.reveal_token, reveal_file_flat)
     .on_scroll(Message::SourceTreeScrolled)
@@ -458,7 +463,7 @@ fn source_file_row(
 /// The main source pane: an info bar (revision · path · counts) above the
 /// plain code view, with the find bar overlaid like the diff panel's.
 pub fn build_source_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
-    let source = &ui.source;
+    let source = &ui.active().source;
     let info_bar = build_info_bar(ui, theme);
 
     let body: Element<'a, Message> = if let Some(error) = &source.file_error {
@@ -510,7 +515,7 @@ pub fn build_source_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, M
             .content_version(ui.document_version)
             .layout_version(view.doc_id);
 
-            if let Some(find_state) = &ui.find {
+            if let Some(find_state) = &ui.active().find {
                 code = code.with_find(crate::diff_view::FindOverlay {
                     matches: &find_state.matches,
                     active: find_state.active,
@@ -563,7 +568,7 @@ fn centered_note<'a>(message: String, color: Color) -> Element<'a, Message> {
 /// The strip above the code: browse glyph + revision label + selected path on
 /// the left, line/byte counts (and an ignored/untracked marker) on the right.
 fn build_info_bar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
-    let source = &ui.source;
+    let source = &ui.active().source;
     let mono = ui.config.mono_font;
 
     let revision_label = match browsed_revision(source) {
@@ -594,7 +599,11 @@ fn build_info_bar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> 
 
     // Right side: the selected entry's status (when notable) + size counts.
     let status = source.selected.as_deref().and_then(|path| {
-        let (entries, _) = ui.source_tree_cache.borrow_mut().entries_and_rows(source);
+        let (entries, _) = ui
+            .active()
+            .source_tree_cache
+            .borrow_mut()
+            .entries_and_rows(source);
         entries
             .iter()
             .find(|entry| !entry.is_dir && entry.path == path)

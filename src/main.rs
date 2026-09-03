@@ -253,24 +253,11 @@ pub(crate) struct PendingMutation {
     allow_immutable: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct Diffui {
-    /// All per-repo **domain + orchestration** state for the active tab — the
-    /// commit graph, the shown diff, the selection, and the load/refresh/version
-    /// bookkeeping — owned by the headless core so the frontend neither
-    /// reimplements nor hand-syncs it. Inactive tabs keep theirs in `Tab::stash`;
-    /// switching tabs swaps the two. See [`Session`].
-    pub(crate) session: Session,
-    /// Sticky inline-file-list preference. Always reflects whether the
-    /// *selected* revision's file list is shown; the user toggles it by
-    /// re-clicking the selected row, and the value persists across
-    /// revision switches so collapsing once stays collapsed for whatever
-    /// revision the user moves to next.
-    pub(crate) file_list_expanded: bool,
     pub(crate) app_focused: bool,
     pub(crate) selected_theme: ThemePreference,
     pub(crate) system_theme: iced_theme::Mode,
-    pub(crate) selected_file: usize,
     pub(crate) sidebar_width: f32,
     /// Whether the diff pane wraps long lines (default) or clips them at the
     /// pane edge. Global across tabs, persisted with the window state.
@@ -278,17 +265,14 @@ pub(crate) struct Diffui {
     /// Two-column (side-by-side) diff layout. Global across tabs, persisted
     /// with the window state.
     pub(crate) diff_split: bool,
-    /// Collapsed directories of the sidebar file tree, by full path prefix.
-    /// Per-tab (stashed with the rest of the view state); collapsing once
-    /// stays collapsed across revision switches within the tab.
-    pub(crate) collapsed_dirs: HashSet<String>,
     /// View-time memo for the file list's stat-column widths and flattened file
     /// tree, keyed on document identity. Without it, the sidebar re-shaped ~5·N
     /// strings through `cosmic_text` on every diff-scroll file-boundary crossing
     /// (each crossing publishes `SelectFile`, which forces a full `view()`
     /// rebuild) and tanked the frame rate on large PRs. Interior-mutable because
-    /// `view()` only has `&self`; not stashed per-tab since a tab switch
-    /// reassigns `document_id`, which the cache keys already treat as a miss.
+    /// `view()` only has `&self`; global rather than per-tab since every cache
+    /// key carries `document_id`, which is unique across tabs — a switch is
+    /// already a miss.
     /// See [`sidebar::SidebarFileCache`].
     pub(crate) sidebar_file_cache: std::cell::RefCell<sidebar::SidebarFileCache>,
     /// Cached result of `sidebar::min_width(config)`. The min width is
@@ -327,68 +311,43 @@ pub(crate) struct Diffui {
     /// In-session recents (revisions + commands) used to score palette
     /// matches. Persisted to the XDG data dir between sessions.
     pub(crate) recents: Recents,
-    /// `None` when the in-diff find bar is closed.
-    pub(crate) find: Option<FindState>,
-    /// Bumped whenever the user picks a revision through a path that
-    /// doesn't go through the revision list (currently: the palette).
-    /// The sidebar's `RevisionList` watches this and scrolls the matching
-    /// row into view on disagreement.
-    pub(crate) revision_reveal_token: u64,
-    /// True while a palette-initiated revision load is in flight. We
-    /// can't bump `revision_reveal_token` at the moment the user accepts
-    /// the result — at that point `selected_revision` is still the old
-    /// value, so the sidebar would scroll the wrong row into view. The
-    /// `BackendLoaded` handler reads this flag once the new revision has
-    /// actually been written into `selected_revision`, *then* bumps the
-    /// token so the next render reveals the correct row.
-    pub(crate) pending_revision_reveal: bool,
     /// Bumped by [`scroll_sidebar_to_file`] when keyboard file navigation moves
     /// the selection. The sidebar's `RevisionList` reveals the selected file's
     /// row (which the sidebar computes from the current file tree) into view on
-    /// the change. Separate from `revision_reveal_token` so revealing a file
-    /// doesn't also re-centre the selected revision. Transient, so it isn't
-    /// stashed per-tab.
+    /// the change. Separate from `TabState::revision_reveal_token` so revealing
+    /// a file doesn't also re-centre the selected revision. Transient, so it
+    /// isn't per-tab.
     pub(crate) sidebar_file_reveal_token: u64,
-    /// Last-known scroll offsets of the sidebar (content-space px) and diff
-    /// view, kept current by the widgets' `on_scroll` callbacks. The widgets
-    /// own their live offset in tree `State`, but that state is shared across
-    /// tabs; mirroring it here lets [`stash_active_state`] save a per-tab
-    /// position and [`restore_active_state`] push it back via
-    /// `scroll_restore_token`.
-    pub(crate) sidebar_scroll_offset: f64,
-    pub(crate) diff_scroll_offset: f32,
     /// Bumped whenever a tab is (re)activated. The sidebar/diff widgets watch
-    /// it and, on a change, jump to `sidebar_scroll_offset` / `diff_scroll_offset`
-    /// — re-applying the restored tab's saved scroll over whatever the shared
-    /// widget state leaked from the previous tab.
+    /// it and, on a change, jump to the active tab's saved
+    /// `sidebar_scroll_offset` / `diff_scroll_offset` — re-applying them over
+    /// whatever the shared widget state leaked from the previous tab.
     pub(crate) scroll_restore_token: u64,
-    /// Bumped whenever `document` is replaced (a diff reload, working-copy edit,
-    /// or tab switch). The diff view watches it to drop its per-line shaped-
-    /// paragraph cache, whose `(file, hunk, line)` keys would otherwise render
-    /// stale text — most visibly between two tabs both on `@`, which share the
-    /// constant `"working-copy"` revision key. Global/monotonic, not per-tab:
-    /// since a tab restore reassigns `document` (and bumps this), returning to a
-    /// tab correctly re-clears the cache the other tab populated. Set only via
-    /// [`set_document`]. The source browser bumps it too — the code widget's
+    /// Bumped whenever the shown document is replaced (a diff reload,
+    /// working-copy edit, or tab switch). The diff view watches it to drop its
+    /// per-line shaped-paragraph cache, whose `(file, hunk, line)` keys would
+    /// otherwise render stale text — most visibly between two tabs both on `@`,
+    /// which share the constant `"working-copy"` revision key. Global/monotonic,
+    /// not per-tab: the widget state it guards is itself shared across tabs, so
+    /// a switch bumps it and correctly re-clears the cache the other tab
+    /// populated. The source browser bumps it too — the code widget's
     /// shaped-paragraph cache is shared between the two views.
     pub(crate) document_version: u64,
-    /// Which main view the active tab shows (diff / source browser).
-    pub(crate) main_view: MainView,
-    /// The active tab's source-browser state.
-    pub(crate) source: SourceState,
-    /// View-time memo of the flattened source tree, keyed on browse version +
-    /// entry count + collapse set (mirrors `sidebar_file_cache`'s rationale).
-    /// Not stashed per-tab — the key changes on tab switch anyway.
-    pub(crate) source_tree_cache: std::cell::RefCell<source_panel::SourceTreeCache>,
 
     // ── Multi-repo ──────────────────────────────────────────────────────
-    /// Every open repository, in tab order. The *active* tab's heavy view
-    /// state lives in the inline fields above; every other tab keeps its in
-    /// `Tab::stash`. Switching tabs swaps the two. Empty ⇒ the empty-state
-    /// view owns the window.
+    /// Every open repository, in tab order. Each tab owns its whole per-repo
+    /// state for as long as it exists (see [`TabState`]). Empty ⇒ the
+    /// empty-state view owns the window.
     pub(crate) tabs: Vec<Tab>,
-    /// Index into `tabs` of the active tab. Meaningless when `tabs` is empty.
-    pub(crate) active_tab: usize,
+    /// Index into `tabs` of the active tab. Out of range only while `tabs` is
+    /// empty, which [`Diffui::active`] resolves to `no_tab`.
+    pub(crate) active: usize,
+    /// The state reached by [`Diffui::active`] when no tab is open at all (a
+    /// launch with nothing to restore, or after the last tab is closed). Its
+    /// `Session::empty` is `Loaded`, so `view()` renders the welcome screen
+    /// rather than a spinner, and handlers that fire with no tab open write
+    /// here harmlessly instead of forcing an `Option` on every call site.
+    pub(crate) no_tab: TabState,
     /// Monotonic source of `TabId`s, so a tab keeps a stable identity even as
     /// its index shifts when other tabs open/close.
     pub(crate) next_tab_id: u64,
@@ -406,28 +365,14 @@ pub(crate) struct Diffui {
     /// rows in the open dialog. Seeded from / persisted to `WindowState`.
     pub(crate) recent_repos: Vec<String>,
 
-    // ── Toolbar / activity / revset (per-tab where noted) ───────────────
-    /// The active repo's default revset (its `revsets.log`, or jj's default) —
-    /// what the "Default" preset in the revset menu applies. A derived cache of
-    /// `default_revset(active repo)`, recomputed on every active-repo change
-    /// (`restore_active_state`) rather than per render, so the menu never does
-    /// config-file I/O while painting. Not stashed: it's re-derivable per repo.
-    pub(crate) default_revset: String,
-    /// The active tab's activity log (long-running ops: load, refresh, revset
-    /// eval, fetch, undo, push). Per-tab; inactive tabs keep theirs in
-    /// `RepoState::activities`.
-    pub(crate) activities: activity::ActivityLog,
-    /// The activity wrapping the in-flight graph (re)load, finished when the
-    /// terminal load message arrives. Per-tab so a backgrounded load's entry is
-    /// resolved against the right log.
-    pub(crate) pending_load_activity: Option<activity::ActivityId>,
+    // ── Toolbar / activity / revset ─────────────────────────────────────
     /// Monotonic source of `ActivityId`s across every tab.
     pub(crate) next_activity_id: u64,
     /// Serial mutation execution (the core `MutationQueue`): at most one
     /// revision-menu mutation runs at a time (they contend on jj's working-copy
     /// lock); the rest drain in order. Global rather than per-tab — a
     /// `PendingMutation` carries its own repo/tab/activity, so cross-tab
-    /// serialization costs nothing and avoids stash/restore churn.
+    /// serialization costs nothing and every completion still routes home.
     pub(crate) mutation_queue: diffui_core::session::MutationQueue<PendingMutation>,
     /// Open popup menu (toolbar fetch/revset dropdown or revision right-click),
     /// if any. macOS uses native `NSMenu`s instead and leaves this `None`.
@@ -440,22 +385,6 @@ pub(crate) struct Diffui {
     /// The caret control the cursor is currently over, if any — drives the
     /// hover highlight that `mouse_area` (unlike `button`) doesn't provide.
     pub(crate) hovered: Option<HoverTarget>,
-    /// Inline editor for the selected jj revision's full description.
-    pub(crate) description_editor: Option<DescriptionEditor>,
-    /// A context-menu edit requested for a row that is still loading into the
-    /// detail pane. The editor opens when that revision's diff lands.
-    pub(crate) pending_description_edit: Option<RevisionSelection>,
-    /// Active target-mode draft (rebase/squash destination picking), or
-    /// `None` outside target mode. Cleared on tab switch — a draft's sources
-    /// are rows of the tab it started in.
-    pub(crate) op_draft: Option<DraftUi>,
-    /// Commit ids marked via ⌘-click / ⇧-click for a batch action (the
-    /// context menu's "Abandon N revisions"), in mark order. A separate axis
-    /// from `session.selected_revision` — marking never changes which diff
-    /// is shown. Cleared on plain click, Esc, draft start, and tab switch;
-    /// ids whose rows left the loaded graph are ignored at use rather than
-    /// eagerly pruned.
-    pub(crate) revision_multi_selection: Vec<String>,
     /// Transient error toasts (failed mutation/fetch/undo), newest last.
     /// The activity log keeps the durable record; these only make a failure
     /// impossible to miss. Auto-pruned after a few seconds, click to dismiss.
@@ -602,9 +531,9 @@ pub(crate) struct SourceFileView {
     pub(crate) doc_id: u64,
 }
 
-/// Per-tab source-browser state. Lives alongside the diff view's state (the
-/// browser is a second lens over the same repo), stashed/restored with the
-/// tab. `revision == None` means the browser was never opened in this tab.
+/// Per-tab source-browser state. Lives in [`TabState`] alongside the diff
+/// view's state (the browser is a second lens over the same repo).
+/// `revision == None` means the browser was never opened in this tab.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SourceState {
     /// The revision being browsed. Independent of the diff view's selection —
@@ -689,36 +618,96 @@ pub(crate) struct ZoomAnim {
     pub(crate) duration: f64,
 }
 
-/// The per-tab state of an *inactive* tab: its core [`Session`] (all domain +
-/// orchestration state, swapped as one unit) plus the handful of frontend-only
-/// UI fields that ride alongside it. The active tab's copy lives in the `Diffui`
-/// inline fields; `stash_active_state` / `restore_active_state` move a whole
-/// `RepoState` between the two — the `Session` swaps atomically, so the old
-/// 20-field domain hand-sync can no longer drift out of step.
-#[derive(Debug, Clone)]
-pub(crate) struct RepoState {
+/// Everything one tab owns: its core [`Session`] (all domain + orchestration
+/// state) plus the frontend-only view state that rides alongside it. A tab
+/// holds this for its whole life, on screen or not, so "which tab does this
+/// belong to" is answered by resolving a [`TabId`] (or a stream version) —
+/// never by writing to whichever tab happens to be active when a result lands.
+#[derive(Debug)]
+pub(crate) struct TabState {
     pub(crate) session: Session,
+    /// This repo's default revset (its `revsets.log`, or jj's default) — what
+    /// the "Default" preset in the revset menu applies. Read from jj's config
+    /// on disk once, when the tab is created, so neither a render nor a tab
+    /// switch does config-file I/O on the UI thread.
+    pub(crate) default_revset: String,
+    /// Sticky inline-file-list preference. Always reflects whether the
+    /// *selected* revision's file list is shown; the user toggles it by
+    /// re-clicking the selected row, and the value persists across revision
+    /// switches so collapsing once stays collapsed for whatever revision the
+    /// user moves to next.
     pub(crate) file_list_expanded: bool,
+    /// Collapsed directories of the sidebar file tree, by full path prefix.
     pub(crate) collapsed_dirs: HashSet<String>,
     pub(crate) selected_file: usize,
+    /// Bumped whenever the user picks a revision through a path that doesn't go
+    /// through the revision list (currently: the palette). The sidebar's
+    /// `RevisionList` watches this and scrolls the matching row into view on
+    /// disagreement.
     pub(crate) revision_reveal_token: u64,
+    /// True while a palette-initiated revision load is in flight. We can't bump
+    /// `revision_reveal_token` at the moment the user accepts the result — at
+    /// that point `selected_revision` is still the old value, so the sidebar
+    /// would scroll the wrong row into view. The `BackendLoaded` handler reads
+    /// this flag once the new revision has actually been written into
+    /// `selected_revision`, *then* bumps the token.
     pub(crate) pending_revision_reveal: bool,
+    /// Last-known scroll offsets of the sidebar (content-space px) and diff
+    /// view, kept current by the widgets' `on_scroll` callbacks. The widgets own
+    /// their live offset in tree `State`, but that state is shared across tabs;
+    /// mirroring it per tab lets an activation push this tab's position back in
+    /// via `scroll_restore_token`.
     pub(crate) sidebar_scroll_offset: f64,
     pub(crate) diff_scroll_offset: f32,
+    /// This tab's activity log (long-running ops: load, refresh, revset eval,
+    /// fetch, undo, push).
     pub(crate) activities: activity::ActivityLog,
+    /// The activity wrapping the in-flight graph (re)load, finished when the
+    /// terminal load message arrives.
     pub(crate) pending_load_activity: Option<activity::ActivityId>,
+    /// Which main view this tab shows (diff / source browser).
     pub(crate) main_view: MainView,
     pub(crate) source: SourceState,
+    /// View-time memo of the flattened source tree, keyed on browse version +
+    /// tree epoch + collapse set (mirrors `sidebar_file_cache`'s rationale).
+    /// Per-tab because those keys are per-tab counters that all start at zero:
+    /// one shared cache let a tab render — and click through to — another tab's
+    /// tree.
+    pub(crate) source_tree_cache: std::cell::RefCell<source_panel::SourceTreeCache>,
+    /// `None` when the in-diff find bar is closed. Per-tab: the match list
+    /// indexes this tab's document, and would point into the wrong text after a
+    /// switch.
+    pub(crate) find: Option<FindState>,
+    /// Inline editor for the selected jj revision's full description.
+    pub(crate) description_editor: Option<DescriptionEditor>,
+    /// A context-menu edit requested for a row that is still loading into the
+    /// detail pane. The editor opens when that revision's diff lands. Per-tab:
+    /// `WorkingCopy` matches every tab, so a global one opened the editor on
+    /// whichever tab produced the next `@` diff.
+    pub(crate) pending_description_edit: Option<RevisionSelection>,
+    /// Active target-mode draft (rebase/squash destination picking), or `None`
+    /// outside target mode. A draft's sources are rows of this tab, so it lives
+    /// and dies with it.
+    pub(crate) op_draft: Option<DraftUi>,
+    /// Commit ids marked via ⌘-click / ⇧-click for a batch action (the context
+    /// menu's "Abandon N revisions"), in mark order. A separate axis from
+    /// `session.selected_revision` — marking never changes which diff is shown.
+    /// Cleared on plain click, Esc, and draft start; ids whose rows left the
+    /// loaded graph are ignored at use rather than eagerly pruned.
+    pub(crate) revision_multi_selection: Vec<String>,
 }
 
-impl RepoState {
+impl TabState {
     /// A never-loaded tab for `repository`: a fresh `Session::unloaded` plus
     /// default UI state. `ensure_active_loaded` kicks the real load when this
     /// becomes the active tab (`status != Loaded`). `revset` is the persisted
-    /// (or default) filter for this repo.
-    fn unloaded(repository: Option<Repository>, revset: String) -> Self {
+    /// filter for this repo, or `None` to start on its default.
+    fn unloaded(repository: Option<Repository>, revset: Option<String>) -> Self {
+        let default_revset = repository.as_ref().map(default_revset).unwrap_or_default();
+        let revset = revset.unwrap_or_else(|| default_revset.clone());
         Self {
             session: Session::unloaded(repository, revset),
+            default_revset,
             file_list_expanded: true,
             collapsed_dirs: HashSet::new(),
             selected_file: 0,
@@ -730,6 +719,12 @@ impl RepoState {
             pending_load_activity: None,
             main_view: MainView::default(),
             source: SourceState::default(),
+            source_tree_cache: Default::default(),
+            find: None,
+            description_editor: None,
+            pending_description_edit: None,
+            op_draft: None,
+            revision_multi_selection: Vec::new(),
         }
     }
 
@@ -741,18 +736,74 @@ impl RepoState {
             session: Session::for_source(diffui_core::SourceHandle::new(github::PrSource::new(
                 spec.clone(),
             ))),
-            ..Self::unloaded(None, String::new())
+            ..Self::unloaded(None, Some(String::new()))
         }
     }
 
-    /// The state when no repository is open at all (closed the last tab).
-    /// `Session::empty` is `Loaded` so `view()` shows the empty state rather
-    /// than a loading indicator.
-    fn empty() -> Self {
+    /// The state shown when no repository is open at all. `Session::empty` is
+    /// `Loaded` so `view()` shows the empty state rather than a loading
+    /// indicator.
+    pub(crate) fn empty() -> Self {
         Self {
             session: Session::empty(),
-            ..Self::unloaded(None, String::new())
+            ..Self::unloaded(None, Some(String::new()))
         }
+    }
+
+    /// Replace this tab's shown diff under a freshly-allocated `document_id`
+    /// (which restarts highlight bookkeeping — see
+    /// [`Session::reset_highlights`]). Every write to a tab's
+    /// `session.document` goes through here; a missed one leaves the diff view
+    /// rendering another revision's — or another repo's — stale highlighted
+    /// text. The caller bumps [`Diffui::document_version`] when the tab is on
+    /// screen, so the shaped-paragraph cache is dropped with it.
+    pub(crate) fn set_document(&mut self, document: DiffDocument, document_id: u64) {
+        self.session.document = document;
+        self.session.reset_highlights(document_id);
+    }
+
+    /// Finish the activity wrapping this tab's in-flight graph (re)load, if one
+    /// is tracked. Called from the terminal load handlers, which have already
+    /// resolved the owning tab.
+    pub(crate) fn finish_load_activity(
+        &mut self,
+        status: activity::ActivityStatus,
+        result: Option<String>,
+    ) {
+        if let Some(id) = self.pending_load_activity.take() {
+            self.activities.finish(id, status, result);
+        }
+    }
+
+    /// The files the find bar searches: the diff document, or the source
+    /// browser's loaded file when that view is active.
+    pub(crate) fn find_files(&self) -> &[DiffFile] {
+        match self.main_view {
+            MainView::Diff => &self.session.document.files,
+            MainView::Source => self
+                .source
+                .file
+                .as_ref()
+                .map(|view| std::slice::from_ref(&view.file))
+                .unwrap_or(&[]),
+        }
+    }
+
+    /// Refresh the working-copy (`@`) row's "empty" chip from a snapshot's
+    /// `working_copy_empty`, without touching the diff pane or re-walking the
+    /// graph. A no-op when the value is unknown (git), @ isn't in the loaded
+    /// graph, or the chip already matches — so it won't needlessly bump
+    /// `commits_version` (which would invalidate the sidebar's shaped-row cache).
+    pub(crate) fn apply_working_copy_empty(&mut self, empty: Option<bool>) {
+        let Some(empty) = empty else { return };
+        let Some(index) = self.session.commits.working_copy_index() else {
+            return;
+        };
+        if self.session.commits.row(index).is_empty() == Some(empty) {
+            return;
+        }
+        self.session.commits.set_is_empty(index, empty);
+        self.session.commits_version = self.session.commits_version.wrapping_add(1);
     }
 }
 
@@ -801,10 +852,9 @@ pub(crate) enum TabSource {
     GitHubPr(github::PrSpec),
 }
 
-/// One open tab: its identity + display metadata, plus the stashed per-tab
-/// state while it's inactive. The active tab's `stash` is `None` — its state
-/// is checked out into the `Diffui` inline fields.
-#[derive(Debug, Clone)]
+/// One open tab: its identity + display metadata, plus the per-tab state it
+/// owns outright — active or not.
+#[derive(Debug)]
 pub(crate) struct Tab {
     pub(crate) id: TabId,
     /// Dimmed prefix in the tab label — the repo root's parent directory, or
@@ -813,9 +863,7 @@ pub(crate) struct Tab {
     /// Emphasized name — the repo directory, or `repo#123` for a PR.
     pub(crate) name: String,
     pub(crate) source: TabSource,
-    /// `None` for the active tab (state is inline); `Some` for an inactive
-    /// tab (loaded, or a fresh `RepoState::unloaded`).
-    pub(crate) stash: Option<RepoState>,
+    pub(crate) state: TabState,
 }
 
 impl Tab {
@@ -913,7 +961,7 @@ fn empty_state<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
 
     // A `Failed` status can now only come from an explicit `--path` (the session
     // and cwd fallbacks resolve silently), so it's always worth surfacing.
-    if let LoadStatus::Failed(error) = &ui.session.status {
+    if let LoadStatus::Failed(error) = &ui.active().session.status {
         body = body.push(
             text(format!("Couldn't open repository: {error}"))
                 .size(text_size::UI)
@@ -1197,14 +1245,13 @@ fn proximity_key(
 }
 
 fn commit_for_ref<'a>(ui: &'a Diffui, item: &ResultRef) -> Option<RowView<'a>> {
+    let commits = &ui.active().session.commits;
     match item {
-        ResultRef::Commit(id) => ui.session.commits.find_by_change_id(id.as_str()),
-        ResultRef::Bookmark(name) => ui
-            .session
-            .commits
+        ResultRef::Commit(id) => commits.find_by_change_id(id.as_str()),
+        ResultRef::Bookmark(name) => commits
             .iter()
             .find(|c| c.bookmarks().iter().any(|b| b == name)),
-        ResultRef::WorkingCopy => ui.session.commits.working_copy(),
+        ResultRef::WorkingCopy => commits.working_copy(),
         _ => None,
     }
 }
@@ -1213,7 +1260,8 @@ fn commit_for_ref<'a>(ui: &'a Diffui, item: &ResultRef) -> Option<RowView<'a>> {
 /// the palette's "Copy current file diff" command. Mirrors `git diff`'s
 /// hunk-then-rows format closely enough that pasted output reads correctly.
 fn current_file_diff_text(ui: &Diffui) -> Option<String> {
-    let file = ui.session.document.files.get(ui.selected_file)?;
+    let tab = ui.active();
+    let file = tab.session.document.files.get(tab.selected_file)?;
     let mut out = String::new();
     out.push_str(&format!("diff: {}\n", file.path));
     if let Some(old) = &file.old_path

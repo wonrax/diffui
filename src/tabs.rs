@@ -1,112 +1,129 @@
-//! Multi-repo tab lifecycle for [`Diffui`]: stashing/restoring the active
-//! tab's per-repo state (the `Session` swaps atomically), activating and
-//! closing tabs, and opening a repository as a new tab. Split out of
-//! `update.rs` to keep that module focused on the message-handling core.
+//! Multi-repo tab lifecycle for [`Diffui`]: the accessors that resolve a tab's
+//! state, activating and closing tabs, and opening a repository as a new tab.
+//! Split out of `update.rs` to keep that module focused on the message-handling
+//! core.
 
 use super::*;
 
 impl Diffui {
-    /// Move the active tab's inline view state out into a `RepoState`, leaving
-    /// the inline fields at cheap placeholders. Always paired with an
-    /// immediate `restore_active_state` of the incoming tab. The `Session` swaps
-    /// atomically, so there's no field-by-field list to keep in sync.
-    pub(crate) fn stash_active_state(&mut self) -> RepoState {
-        // The whole domain + orchestration bundle swaps as one unit — no
-        // field-by-field list to keep in sync.
-        let mut session = std::mem::take(&mut self.session);
-        // In-flight loads survive backgrounding: streaming batches are routed
-        // into this stash by version (`load_target_mut`) and one-shot
-        // completions (diff switches, graph reloads, revset evals) by tab id
-        // (`tab_target_mut`), so a half-done load keeps its progress — and a
-        // revset eval that lands off-screen still swaps the stashed graph.
-        // Only the snapshot is abandoned: its completion is dropped while
-        // backgrounded (activation re-runs a Focus snapshot anyway), so the
-        // flag must clear or the stash would sit "busy" forever.
-        session.snapshot_pending = false;
-        RepoState {
-            session,
-            file_list_expanded: self.file_list_expanded,
-            collapsed_dirs: std::mem::take(&mut self.collapsed_dirs),
-            selected_file: self.selected_file,
-            revision_reveal_token: self.revision_reveal_token,
-            pending_revision_reveal: self.pending_revision_reveal,
-            sidebar_scroll_offset: self.sidebar_scroll_offset,
-            diff_scroll_offset: self.diff_scroll_offset,
-            activities: std::mem::take(&mut self.activities),
-            pending_load_activity: self.pending_load_activity.take(),
-            main_view: self.main_view,
-            source: std::mem::take(&mut self.source),
+    /// The active tab's state, or [`Diffui::no_tab`] when none is open.
+    pub(crate) fn active(&self) -> &TabState {
+        match self.tabs.get(self.active) {
+            Some(tab) => &tab.state,
+            None => &self.no_tab,
         }
     }
 
-    /// Move a stashed `RepoState` into the inline fields, making it the active
-    /// view. The previous inline state is overwritten (its caller has already
-    /// stashed it, or is intentionally discarding it).
-    pub(crate) fn restore_active_state(&mut self, state: RepoState) {
-        self.session = state.session;
-        self.default_revset = self
-            .session
-            .repository
-            .as_ref()
-            .map(default_revset)
-            .unwrap_or_default();
-        // The document moved in with the session; bump `document_version` so the
-        // diff view drops the cache the previously-active tab populated — its
-        // `(file, hunk, line)` keys map to that tab's text, not this one's.
-        self.document_version = self.document_version.wrapping_add(1);
-        self.file_list_expanded = state.file_list_expanded;
-        self.collapsed_dirs = state.collapsed_dirs;
-        self.selected_file = state.selected_file;
-        self.revision_reveal_token = state.revision_reveal_token;
-        self.pending_revision_reveal = state.pending_revision_reveal;
-        self.sidebar_scroll_offset = state.sidebar_scroll_offset;
-        self.diff_scroll_offset = state.diff_scroll_offset;
-        self.activities = state.activities;
-        self.pending_load_activity = state.pending_load_activity;
-        self.main_view = state.main_view;
-        self.source = state.source;
+    pub(crate) fn active_mut(&mut self) -> &mut TabState {
+        match self.tabs.get_mut(self.active) {
+            Some(tab) => &mut tab.state,
+            None => &mut self.no_tab,
+        }
     }
 
-    /// Switch to the tab `id`: stash the current active tab, restore the
-    /// target's state, scroll its selection back into view, and kick a load if
-    /// it hasn't loaded yet (or its load was abandoned while backgrounded). A
-    /// fully-loaded tab is restored instantly and losslessly.
+    /// The state owned by `tab`, or `None` once that tab has closed — the
+    /// single lookup every routed async completion goes through, so a result
+    /// that outlives its tab is dropped instead of landing on a stranger.
+    pub(crate) fn tab_mut(&mut self, tab: TabId) -> Option<&mut TabState> {
+        self.tabs
+            .iter_mut()
+            .find(|candidate| candidate.id == tab)
+            .map(|candidate| &mut candidate.state)
+    }
+
+    /// Id of the active tab, or `None` when no tabs are open. Per-tab async
+    /// completions carry this so a result that lands after a tab switch is
+    /// applied to *its* tab rather than to whichever one is active by then.
+    pub(crate) fn active_tab_id(&self) -> Option<TabId> {
+        self.tabs.get(self.active).map(|tab| tab.id)
+    }
+
+    /// Whether `tab` is the one on screen — the gate on every active-only
+    /// follow-up (the paint-version bump, the empty-status spawn, the
+    /// coalesced refresh), which a backgrounded tab runs on its next
+    /// activation instead.
+    pub(crate) fn is_active(&self, tab: TabId) -> bool {
+        self.active_tab_id() == Some(tab)
+    }
+
+    /// The tab whose live streaming cursor is `version`, with its state.
+    /// Streaming results are routed by version rather than by tab id (the
+    /// worker is spawned before anything addresses a tab), so a cold walk / PR
+    /// stream keeps its progress while its tab is backgrounded. `None` means
+    /// the load was superseded — its tab re-kicked, or closed — and the result
+    /// must be discarded. The id comes back with the state so the caller can
+    /// gate its active-only follow-ups without a second lookup.
+    pub(crate) fn load_target_mut(&mut self, version: u64) -> Option<(TabId, &mut TabState)> {
+        self.tabs
+            .iter_mut()
+            .find(|tab| tab.state.session.load.as_ref().map(|c| c.version) == Some(version))
+            .map(|tab| (tab.id, &mut tab.state))
+    }
+
+    /// The tab displaying document `id`, with its state. Background per-file
+    /// work (syntax highlighting) routes its results through this; `None` means
+    /// the document is gone and the result must be dropped.
+    pub(crate) fn document_target_mut(&mut self, id: u64) -> Option<(TabId, &mut TabState)> {
+        self.tabs
+            .iter_mut()
+            .find(|tab| tab.state.session.document_id == id)
+            .map(|tab| (tab.id, &mut tab.state))
+    }
+
+    /// Per-switch cleanup for the tab being left. Everything the user was doing
+    /// *inside* a tab (a draft, marks, a find, a half-typed description) is
+    /// owned by that tab and simply stays there; what's left is the window-level
+    /// popup menu, and a description editor whose block on the switch the caller
+    /// has already cleared.
+    fn leave_active_tab(&mut self) {
+        self.menu = None;
+        self.active_mut().description_editor = None;
+    }
+
+    /// Whether the active tab's description editor refuses to let go — an
+    /// unsaved edit or an in-flight save. Flags itself in the UI and blocks the
+    /// switch/close so the text isn't silently dropped.
+    fn description_editor_blocks_switch(&mut self) -> bool {
+        match self.active_mut().description_editor.as_mut() {
+            Some(editor) if editor.is_dirty() || editor.saving_activity.is_some() => {
+                editor.switch_blocked = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Switch to the tab `id`: leave the current one, make `id` active, push its
+    /// saved scroll back into the shared widget state, and kick a load if it
+    /// hasn't loaded yet (or its load was abandoned while backgrounded). A
+    /// fully-loaded tab is switched to instantly and losslessly — its state was
+    /// never moved out from under it.
     pub(crate) fn activate_tab(&mut self, id: TabId) -> Task<Message> {
         let Some(target) = self.tabs.iter().position(|tab| tab.id == id) else {
             return Task::none();
         };
-        if target == self.active_tab {
+        if target == self.active {
             return Task::none();
         }
-        if let Some(editor) = self.description_editor.as_mut()
-            && (editor.is_dirty() || editor.saving_activity.is_some())
-        {
-            editor.switch_blocked = true;
+        if self.description_editor_blocks_switch() {
             return Task::none();
         }
-        self.description_editor = None;
-        // A draft's sources are rows of the tab it started in — it can't
-        // survive a tab switch. Same for the multi-selection marks.
-        self.op_draft = None;
-        self.revision_multi_selection.clear();
+        self.leave_active_tab();
         // Persist the new active tab so it's re-focused next launch.
         self.mark_geometry_dirty();
-
-        let current = self.stash_active_state();
-        self.tabs[self.active_tab].stash = Some(current);
-        self.active_tab = target;
-        // Inactive tabs always carry a stash; the fallback only guards against
-        // an impossible invariant break.
-        let restored = self.tabs[target]
-            .stash
-            .take()
-            .unwrap_or_else(RepoState::empty);
-        self.restore_active_state(restored);
-        // The sidebar/diff widgets' scroll offsets are shared across tabs, so
-        // push this tab's saved positions back in (the restored fields above
-        // hold them) over whatever the previous tab left in the widget state.
-        self.scroll_restore_token = self.scroll_restore_token.wrapping_add(1);
+        self.active = target;
+        self.on_active_tab_changed();
         self.ensure_active_loaded()
+    }
+
+    /// Shared tail of every path that changes which tab is on screen. The
+    /// sidebar/diff widgets' scroll offsets and shaped-paragraph caches are
+    /// shared across tabs, so push the new tab's saved positions back in and
+    /// drop the cache the previous tab populated — its `(file, hunk, line)` keys
+    /// map to that tab's text, not this one's.
+    fn on_active_tab_changed(&mut self) {
+        self.scroll_restore_token = self.scroll_restore_token.wrapping_add(1);
+        self.document_version = self.document_version.wrapping_add(1);
     }
 
     /// Kick a load for the active tab when activating it. A tab that has never
@@ -119,32 +136,35 @@ impl Diffui {
     /// makes it a no-op (no graph re-walk) when nothing changed, and a full
     /// reload only when an external op actually landed.
     pub(crate) fn ensure_active_loaded(&mut self) -> Task<Message> {
+        let Some(tab) = self.active_tab_id() else {
+            return Task::none();
+        };
         // A streaming load that kept running while this tab was backgrounded
-        // (batches route into the stash) is still the live load — re-kicking
-        // would double it and discard its progress.
-        let streaming = self.session.load.is_some();
+        // (batches route by version) is still the live load — re-kicking would
+        // double it and discard its progress.
+        let streaming = self.active().session.load.is_some();
         // A GitHub-PR tab has no local repository: (re)stream it when it
         // hasn't loaded and isn't mid-stream; a loaded one has no
         // watcher/snapshot machinery to re-arm.
         if let Some(spec) = self.active_pr_spec().cloned() {
-            return if streaming || matches!(self.session.status, LoadStatus::Loaded) {
+            return if streaming || matches!(self.active().session.status, LoadStatus::Loaded) {
                 Task::none()
             } else {
                 self.kick_pr_load(spec)
             };
         }
-        if self.session.repository.is_none() {
+        if self.active().session.repository.is_none() {
             return Task::none();
         }
-        if matches!(self.session.status, LoadStatus::Loaded) {
+        if matches!(self.active().session.status, LoadStatus::Loaded) {
             // The Focus snapshot subsumes any refresh coalesced while the tab
             // was backgrounded; clear it so it can't fire a redundant one
             // later. The empty-status pass re-runs here because a load that
             // finished off-screen skipped it (its results are active-only).
-            self.session.pending_refresh = None;
+            self.active_mut().session.pending_refresh = None;
             Task::batch([
-                self.start_repository_snapshot(RefreshOrigin::Focus),
-                self.resolve_empty_status(),
+                self.start_repository_snapshot(tab, RefreshOrigin::Focus),
+                self.resolve_empty_status(tab),
             ])
         } else if streaming {
             Task::none()
@@ -156,63 +176,50 @@ impl Diffui {
     /// The active tab's PR spec, or `None` when it views a local repository
     /// (or no tab is open).
     pub(crate) fn active_pr_spec(&self) -> Option<&github::PrSpec> {
-        match &self.tabs.get(self.active_tab)?.source {
+        match &self.tabs.get(self.active)?.source {
             TabSource::GitHubPr(spec) => Some(spec),
             TabSource::Repo { .. } => None,
         }
     }
 
-    /// Close the tab `id`. Closing an inactive tab just drops it; closing the
-    /// active tab activates a neighbour (previous, else next), or falls back to
-    /// the empty state when it was the last tab.
+    /// Close the tab `id`. Closing an inactive tab just drops it — and with it
+    /// everything it owned, so a draft or a set of marks can never outlive the
+    /// rows they name. Closing the active tab activates a neighbour (previous,
+    /// else next), or falls back to the empty state when it was the last tab.
     pub(crate) fn close_tab(&mut self, id: TabId) -> Task<Message> {
         let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
             return Task::none();
         };
-        if index == self.active_tab
-            && let Some(editor) = self.description_editor.as_mut()
-            && (editor.is_dirty() || editor.saving_activity.is_some())
-        {
-            editor.switch_blocked = true;
-            return Task::none();
-        }
-        if index == self.active_tab {
-            self.description_editor = None;
+        let closing_active = index == self.active;
+        if closing_active {
+            if self.description_editor_blocks_switch() {
+                return Task::none();
+            }
+            self.leave_active_tab();
         }
         // The open-tab set is changing — re-persist the session.
         self.mark_geometry_dirty();
 
-        if index != self.active_tab {
+        if !closing_active {
             self.tabs.remove(index);
-            if index < self.active_tab {
-                self.active_tab -= 1;
+            if index < self.active {
+                self.active -= 1;
             }
             return Task::none();
         }
 
-        if self.tabs.len() == 1 {
-            self.tabs.clear();
-            self.active_tab = 0;
-            self.restore_active_state(RepoState::empty());
-            return Task::none();
-        }
-
         // Prefer the previous neighbour, matching the design's close behaviour.
-        let neighbour = if index > 0 { index - 1 } else { 1 };
-        let neighbour_id = self.tabs[neighbour].id;
+        let neighbour = (index > 0).then(|| self.tabs[index - 1].id);
         self.tabs.remove(index);
-        self.active_tab = self
-            .tabs
-            .iter()
-            .position(|tab| tab.id == neighbour_id)
+        self.active = neighbour
+            .and_then(|id| self.tabs.iter().position(|tab| tab.id == id))
             .unwrap_or(0);
-        // Overwriting the inline fields here discards the closed tab's state.
-        let restored = self.tabs[self.active_tab]
-            .stash
-            .take()
-            .unwrap_or_else(RepoState::empty);
-        self.restore_active_state(restored);
-        self.scroll_restore_token = self.scroll_restore_token.wrapping_add(1);
+        if self.tabs.is_empty() {
+            // Back to the welcome screen. Reset the no-tab state so a prior
+            // stint there (a failed `--path`, say) doesn't resurface behind it.
+            self.no_tab = TabState::empty();
+        }
+        self.on_active_tab_changed();
         self.ensure_active_loaded()
     }
 
@@ -243,7 +250,6 @@ impl Diffui {
                     return self.activate_tab(id);
                 }
                 let (owner, name) = repo_label(&repository.root);
-                let revset = default_revset(&repository);
                 let source = TabSource::Repo {
                     vcs: repository.vcs,
                     root: repository.root.clone(),
@@ -252,7 +258,7 @@ impl Diffui {
                     owner,
                     name,
                     source,
-                    RepoState::unloaded(Some(repository), revset),
+                    TabState::unloaded(Some(repository), None),
                 )
             }
             Err(error) => {
@@ -279,7 +285,7 @@ impl Diffui {
         }
         let owner = spec.owner.clone();
         let name = spec.label();
-        let state = RepoState::unloaded_pr(&spec);
+        let state = TabState::unloaded_pr(&spec);
         self.push_tab(owner, name, source, state)
     }
 
@@ -290,7 +296,7 @@ impl Diffui {
         owner: String,
         name: String,
         source: TabSource,
-        state: RepoState,
+        state: TabState,
     ) -> Task<Message> {
         let id = TabId(self.next_tab_id);
         self.next_tab_id += 1;
@@ -300,17 +306,217 @@ impl Diffui {
             owner,
             name,
             source,
-            stash: Some(state),
+            state,
         });
         if was_empty {
-            // No active tab to switch from — check the new one out directly.
-            self.active_tab = 0;
-            if let Some(state) = self.tabs[0].stash.take() {
-                self.restore_active_state(state);
-            }
+            // No active tab to switch from — the new one is simply it.
+            self.active = 0;
+            self.on_active_tab_changed();
             self.ensure_active_loaded()
         } else {
             self.activate_tab(id)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AppConfig, CodeTypography};
+    use crate::theme::ThemePreference;
+    use diffui_core::DiffDocument;
+
+    /// A blank app with no tabs. Built field-by-field rather than through
+    /// [`Diffui::new`], which reads the config file and the saved session and
+    /// measures fonts through a renderer this headless run doesn't have.
+    fn app() -> Diffui {
+        Diffui {
+            app_focused: true,
+            selected_theme: ThemePreference::System,
+            system_theme: iced_theme::Mode::None,
+            sidebar_width: sidebar::DEFAULT_WIDTH,
+            diff_wrap: true,
+            diff_split: false,
+            sidebar_file_cache: Default::default(),
+            sidebar_min_width: 0.0,
+            window_size: Size::new(1280.0, 800.0),
+            window_position: None,
+            geometry_dirty_since: None,
+            zoom_anim: None,
+            zoom_restore: None,
+            config: AppConfig {
+                ui_font: iced::Font::DEFAULT,
+                mono_font: iced::Font::MONOSPACE,
+                multi_click_ms: 350,
+                theme: ThemePreference::System,
+                code_type: CodeTypography::default(),
+            },
+            palette: None,
+            recents: Recents::default(),
+            sidebar_file_reveal_token: 0,
+            scroll_restore_token: 0,
+            document_version: 0,
+            tabs: Vec::new(),
+            active: 0,
+            no_tab: TabState::empty(),
+            next_tab_id: 0,
+            next_load_version: 0,
+            next_document_id: 0,
+            open_repo_dialog: None,
+            recent_repos: Vec::new(),
+            next_activity_id: 0,
+            mutation_queue: Default::default(),
+            menu: None,
+            confirm: None,
+            activity_popover_open: false,
+            hovered: None,
+            toasts: Vec::new(),
+            next_toast_id: 0,
+            modifiers: keyboard::Modifiers::default(),
+        }
+    }
+
+    /// A git repository at `root` — git so `TabState::unloaded` takes its
+    /// no-I/O default-revset path instead of reading jj's config.
+    fn repository(root: &str) -> Repository {
+        Repository {
+            root: PathBuf::from(root),
+            vcs: Vcs::Git,
+            scope: PathBuf::new(),
+        }
+    }
+
+    /// Append a loaded-enough tab for `root` and return its id. Bypasses
+    /// `push_tab` so no load is kicked and the caller controls which tab ends
+    /// up active.
+    fn push_tab(ui: &mut Diffui, root: &str) -> TabId {
+        let repository = repository(root);
+        let id = TabId(ui.next_tab_id);
+        ui.next_tab_id += 1;
+        ui.tabs.push(Tab {
+            id,
+            owner: String::new(),
+            name: root.to_owned(),
+            source: TabSource::Repo {
+                vcs: repository.vcs,
+                root: repository.root.clone(),
+            },
+            state: TabState::unloaded(Some(repository), Some(String::new())),
+        });
+        id
+    }
+
+    fn document(path: &str) -> DiffDocument {
+        DiffDocument {
+            files: vec![diffui_core::DiffFile {
+                path: path.to_owned(),
+                old_path: None,
+                status: diffui_core::DiffFileStatus::Modified,
+                additions: 1,
+                deletions: 0,
+                hunks: Vec::new(),
+            }],
+            total_additions: 1,
+            total_deletions: 0,
+        }
+    }
+
+    #[test]
+    fn diff_loaded_for_a_background_tab_leaves_the_active_one_alone() {
+        let mut ui = app();
+        let first = push_tab(&mut ui, "/tmp/first");
+        let second = push_tab(&mut ui, "/tmp/second");
+        ui.active = 1;
+        assert_eq!(ui.active_tab_id(), Some(second));
+
+        // The backgrounded tab is mid-switch to a commit; its diff lands while
+        // the other tab is on screen.
+        let revision = RevisionSelection::Commit("abc".to_owned());
+        ui.tab_mut(first).unwrap().session.pending_revision = Some(revision.clone());
+        let _ = ui.update(Message::DiffLoaded(
+            first,
+            revision.clone(),
+            Box::new(Ok((document("a.rs"), None))),
+        ));
+
+        let background = ui.tab_mut(first).unwrap();
+        assert_eq!(background.session.selected_revision, revision);
+        assert_eq!(background.session.document.files.len(), 1);
+        assert_eq!(background.session.document.files[0].path, "a.rs");
+        // The tab on screen never saw it.
+        assert_eq!(
+            ui.active().session.selected_revision,
+            RevisionSelection::WorkingCopy
+        );
+        assert!(ui.active().session.document.files.is_empty());
+    }
+
+    #[test]
+    fn closing_the_active_tab_takes_its_draft_with_it() {
+        let mut ui = app();
+        let first = push_tab(&mut ui, "/tmp/first");
+        let second = push_tab(&mut ui, "/tmp/second");
+        ui.active = 1;
+
+        let draft = diffui_core::OpDraft::squash(diffui_core::DraftSource {
+            selection: RevisionSelection::Commit("abc".to_owned()),
+            commit_id: "abc".to_owned(),
+            label: "abc".to_owned(),
+        });
+        let state = ui.tab_mut(second).unwrap();
+        state.op_draft = Some(DraftUi::new(draft));
+        state.revision_multi_selection = vec!["abc".to_owned()];
+
+        let _ = ui.close_tab(second);
+
+        // The draft named rows of the closed tab; the neighbour inherits none
+        // of it — there is no shared slot for it to be left in.
+        assert_eq!(ui.active_tab_id(), Some(first));
+        assert!(ui.active().op_draft.is_none());
+        assert!(ui.active().revision_multi_selection.is_empty());
+    }
+
+    #[test]
+    fn mutation_completing_for_a_background_tab_writes_that_tabs_selection() {
+        let mut ui = app();
+        let first = push_tab(&mut ui, "/tmp/first");
+        let second = push_tab(&mut ui, "/tmp/second");
+        ui.active = 1;
+
+        let on_a_commit = RevisionSelection::Commit("abc".to_owned());
+        ui.tab_mut(first).unwrap().session.selected_revision = on_a_commit.clone();
+        ui.tab_mut(second).unwrap().session.selected_revision = on_a_commit.clone();
+
+        let (activity_id, progress) = ui.begin_activity(first, "Abandon", false);
+        let pending = PendingMutation {
+            repository: repository("/tmp/first"),
+            op: mutations::MutationOp::Abandon {
+                targets: vec![on_a_commit],
+            },
+            tab_id: first,
+            activity_id,
+            progress,
+            allow_immutable: false,
+        };
+        let _ = ui.update(Message::MutationCompleted(
+            Box::new(pending),
+            Box::new(Ok(mutations::MutationOutcome {
+                message: "Abandoned".to_owned(),
+                moved_working_copy: true,
+                rewritten_commit: None,
+                output: Vec::new(),
+                operation_id: None,
+            })),
+        ));
+
+        assert_eq!(
+            ui.tab_mut(first).unwrap().session.selected_revision,
+            RevisionSelection::WorkingCopy
+        );
+        // The tab on screen keeps the revision it was browsing.
+        assert!(matches!(
+            ui.active().session.selected_revision,
+            RevisionSelection::Commit(_)
+        ));
     }
 }

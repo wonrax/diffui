@@ -54,7 +54,10 @@ pub fn build_toolbar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         return Space::new().into();
     }
     let font = ui.config.ui_font;
-    let is_jj = matches!(ui.session.repository.as_ref().map(|r| r.vcs), Some(Vcs::Jj));
+    let is_jj = matches!(
+        ui.active().session.repository.as_ref().map(|r| r.vcs),
+        Some(Vcs::Jj)
+    );
 
     let caret_hovered = ui.hovered == Some(HoverTarget::FetchCaret);
     // 6px between actions — the same rhythm the tab strip uses between tabs, so
@@ -62,8 +65,9 @@ pub fn build_toolbar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     let mut actions = row![].spacing(6).align_y(alignment::Vertical::Center);
     // Diff ↔ Source view switcher, leftmost so the "what am I looking at"
     // control leads the bar. Repo tabs only — a PR has no tree to browse.
-    let in_source = ui.session.repository.is_some() && ui.main_view == MainView::Source;
-    if ui.session.repository.is_some() {
+    let is_repo = ui.active().session.repository.is_some();
+    let in_source = is_repo && ui.active().main_view == MainView::Source;
+    if is_repo {
         actions = actions.push(view_switcher(ui, theme, font));
     }
     if in_source {
@@ -105,7 +109,7 @@ pub fn build_toolbar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     ));
     // Side-by-side only applies to the diff; the source view is one column
     // by nature, so the toggle hides rather than sitting there inert.
-    if ui.main_view == MainView::Diff {
+    if ui.active().main_view == MainView::Diff {
         toggles = toggles.push(toolbar_toggle_button(
             icons::SPLIT,
             "Side-by-side diff",
@@ -155,7 +159,7 @@ fn view_switcher(ui: &Diffui, theme: ThemeSpec, font: iced::Font) -> Element<'st
     // height beside it.
     const SEGMENT_HEIGHT: f32 = 24.0;
     let segment = |icon: &'static str, label: &str, view: MainView| {
-        let active = ui.main_view == view;
+        let active = ui.active().main_view == view;
         let icon_color = if active {
             theme.accent
         } else {
@@ -299,10 +303,12 @@ fn toolbar_toggle_button(
 /// can't be mistaken for a pinned commit.
 fn browsed_revision_label(ui: &Diffui, theme: ThemeSpec, is_jj: bool) -> Element<'_, Message> {
     let mono = ui.config.mono_font;
-    let revision = crate::source_panel::browsed_revision(&ui.source);
+    let revision = crate::source_panel::browsed_revision(&ui.active().source);
     let (commit, working_copy) = match &revision {
-        RevisionSelection::WorkingCopy => (ui.session.commits.working_copy(), true),
-        RevisionSelection::Commit(hex) => (ui.session.commits.find_by_commit_id(hex), false),
+        RevisionSelection::WorkingCopy => (ui.active().session.commits.working_copy(), true),
+        RevisionSelection::Commit(hex) => {
+            (ui.active().session.commits.find_by_commit_id(hex), false)
+        }
     };
 
     let mut label = row![]

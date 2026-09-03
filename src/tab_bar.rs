@@ -71,7 +71,7 @@ pub fn build_tab_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
 
     let mut tabs = Vec::with_capacity(ui.tabs.len() + 1);
     for (index, tab) in ui.tabs.iter().enumerate() {
-        let active = index == ui.active_tab;
+        let active = index == ui.active;
         tabs.push(tab_widget(ui, theme, tab, active));
     }
     tabs.push(add_button(theme));
@@ -79,7 +79,7 @@ pub fn build_tab_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         row: Row::with_children(tabs)
             .spacing(TAB_GAP)
             .align_y(alignment::Vertical::Center),
-        active: ui.active_tab,
+        active: ui.active,
         theme,
     };
 
@@ -190,7 +190,7 @@ fn tab_widget<'a>(
     // Always reserve the dot's slot (a transparent placeholder when clean) so a
     // tab's width doesn't jump as its dirty status changes — e.g. when a revset
     // that excludes `@` makes the working copy drop out of the loaded set.
-    label = label.push(if tab_is_dirty(ui, tab, active) {
+    label = label.push(if tab_is_dirty(tab) {
         dirty_dot(theme)
     } else {
         Space::new()
@@ -604,19 +604,16 @@ pub fn build_confirm_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
 /// True when the repo behind `tab` has a non-empty working copy. Best-effort:
 /// the working copy's emptiness may still be unresolved (it resolves lazily),
 /// in which case we draw no dot rather than guess.
-fn tab_is_dirty(ui: &Diffui, tab: &crate::Tab, active: bool) -> bool {
+fn tab_is_dirty(tab: &crate::Tab) -> bool {
     // PR tabs have no working copy; their synthetic "All changes" row would
     // otherwise read as permanently dirty.
     if matches!(tab.source, crate::TabSource::GitHubPr(_)) {
         return false;
     }
-    let commits = if active {
-        Some(&ui.session.commits)
-    } else {
-        tab.stash.as_ref().map(|s| &s.session.commits)
-    };
-    commits
-        .and_then(|c| c.working_copy())
+    tab.state
+        .session
+        .commits
+        .working_copy()
         .and_then(|wc| wc.is_empty())
         == Some(false)
 }
