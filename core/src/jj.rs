@@ -37,6 +37,7 @@ use jj_lib::{
     graph::TopoGroupedGraphIterator,
     matchers::{EverythingMatcher, Matcher, NothingMatcher, PrefixMatcher},
     merge::{Diff, Merge, SameChange},
+    merged_tree::MergedTree,
     object_id::ObjectId,
     op_store::{LocalRemoteRefTarget, OperationId, RefTarget},
     operation::Operation,
@@ -57,7 +58,7 @@ use jj_lib::{
     str_util::{StringExpression, StringPattern},
     tree_merge::MergeOptions,
     working_copy::{SnapshotOptions, WorkingCopyFreshness},
-    workspace::{Workspace, default_working_copy_factories},
+    workspace::{LockedWorkspace, Workspace, default_working_copy_factories},
 };
 
 use crate::FetchTarget;
@@ -1201,40 +1202,51 @@ async fn diff_jj_with_repo(
     ))
 }
 
-/// Snapshot the working copy, returning the fingerprint plus the post-snapshot
-/// repo, working-copy commit id, and workspace name. The cold streaming load
-/// ([`load_jj_cold`]) reuses that repo for the diff + graph walk so it reads
-/// the commit index once instead of three times; the refresh path
-/// ([`run_repository_snapshot`]) drops the repo and keeps only the fingerprint.
-pub async fn load_jj_repository_snapshot(
-    repository: Repository,
-) -> Result<(
-    RepositorySnapshot,
-    Arc<ReadonlyRepo>,
-    CommitId,
-    WorkspaceNameBuf,
-)> {
-    let settings = jj_settings(&repository.root)?;
-    let mut workspace = Workspace::load(
-        &settings,
-        &repository.root,
-        &StoreFactories::default(),
-        &default_working_copy_factories(),
-    )
-    .context("failed to load jj workspace")?;
-    let workspace_name = workspace.workspace_name().to_owned();
+/// What [`lock_and_snapshot_working_copy`] leaves behind: either a locked
+/// working copy whose disk has been snapshotted, or a recovered one whose lock
+/// is already finished.
+enum SnapshottedWorkingCopy<'a> {
+    /// The lock is still held, `repo` / `wc_commit` are what the disk is
+    /// synced with, and `tree` is what the disk holds now. The caller owns the
+    /// rest of the lock's life: write an op and finish it, or drop it.
+    Locked {
+        locked_ws: LockedWorkspace<'a>,
+        repo: Arc<ReadonlyRepo>,
+        wc_commit_id: CommitId,
+        wc_commit: Commit,
+        tree: MergedTree,
+    },
+    /// The checkout was stale, so it was recovered instead of snapshotted: the
+    /// lock is finished at `repo`'s operation (the merged head) and `wc_commit`
+    /// is what now sits on disk. A caller that needs a lock must take a new one.
+    Recovered {
+        repo: Arc<ReadonlyRepo>,
+        wc_commit_id: CommitId,
+        wc_commit: Commit,
+    },
+}
 
-    let auto_track = snapshot_auto_track_matcher(&settings, &repository.root)?;
-    let base_ignores = snapshot_base_ignores(&repository.root)?;
-    let max_new_file_size = snapshot_max_new_file_size(&settings)?;
-
+/// Lock the working copy, resolve the repo and `@` the disk is actually synced
+/// with, and snapshot the on-disk tree. A stale checkout is recovered rather
+/// than snapshotted.
+///
+/// Both prologues that fold the disk into `@` start here (the refresh path,
+/// [`load_jj_repository_snapshot`], and the mutation path, [`apply_mutation`]),
+/// so the stale check can't go missing from one of them: a mutation that
+/// snapshotted a stale checkout would replace the rebased `@`'s tree with the
+/// old disk tree, reverting whatever the other workspace or the CLI put there.
+async fn lock_and_snapshot_working_copy<'a>(
+    workspace: &'a mut Workspace,
+    repo_loader: &RepoLoader,
+    workspace_name: &WorkspaceName,
+    snapshot_options: &SnapshotOptions<'_>,
+) -> Result<SnapshottedWorkingCopy<'a>> {
     // Take the working-copy lock *before* reading the repo head. Otherwise a
     // jj-cli command running between `load_at_head` and the lock can rewrite
     // the wc commit out from under us, and our snapshot tx — still parented on
     // the stale op — lands as a sibling of the cli's op. Both ops touch the
     // same change_id with different commit_ids, which jj's concurrent-op
     // resolver presents as a divergent change.
-    let repo_loader = workspace.repo_loader().clone();
     let mut locked_ws = workspace
         .start_working_copy_mutation()
         .context("failed to lock jj working copy")?;
@@ -1245,7 +1257,7 @@ pub async fn load_jj_repository_snapshot(
         .context("failed to load jj repo")?;
     let wc_commit_id = base_repo
         .view()
-        .get_wc_commit_id(&workspace_name)
+        .get_wc_commit_id(workspace_name)
         .context("jj workspace has no working-copy commit")?
         .clone();
     let wc_commit = base_repo
@@ -1258,14 +1270,6 @@ pub async fn load_jj_repository_snapshot(
                 wc_commit_id.hex()
             )
         })?;
-
-    let snapshot_options = SnapshotOptions {
-        base_ignores,
-        progress: None,
-        start_tracking_matcher: auto_track.as_ref(),
-        force_tracking_matcher: &NothingMatcher,
-        max_new_file_size,
-    };
 
     // The disk may have been checked out from a *different* commit than the
     // head view's `@` — another workspace's snapshot rebases this one's
@@ -1291,7 +1295,7 @@ pub async fn load_jj_repository_snapshot(
                 .context("failed to load jj repo at the working copy's operation")?;
             let id = repo
                 .view()
-                .get_wc_commit_id(&workspace_name)
+                .get_wc_commit_id(workspace_name)
                 .context("jj workspace has no working-copy commit")?
                 .clone();
             let commit =
@@ -1320,7 +1324,7 @@ pub async fn load_jj_repository_snapshot(
                 .context("failed to load jj repo at the stale working copy's operation")?;
             let old_wc_id = old_repo
                 .view()
-                .get_wc_commit_id(&workspace_name)
+                .get_wc_commit_id(workspace_name)
                 .context("stale jj workspace has no working-copy commit at its own operation")?
                 .clone();
             let old_wc_commit = old_repo
@@ -1343,7 +1347,7 @@ pub async fn load_jj_repository_snapshot(
 
             let (disk_tree, _stats) = locked_ws
                 .locked_wc()
-                .snapshot(&snapshot_options)
+                .snapshot(snapshot_options)
                 .await
                 .context("failed to snapshot the stale jj working copy")?;
             if disk_tree.tree_ids_and_labels() != old_wc_commit.tree().tree_ids_and_labels() {
@@ -1357,7 +1361,7 @@ pub async fn load_jj_repository_snapshot(
                     .await
                     .context("failed to preserve stale jj working-copy edits")?;
                 tx.repo_mut()
-                    .set_wc_commit(workspace_name.clone(), new_commit.id().clone())
+                    .set_wc_commit(workspace_name.to_owned(), new_commit.id().clone())
                     .context("failed to update jj working-copy pointer")?;
                 tx.repo_mut()
                     .rebase_descendants()
@@ -1374,7 +1378,7 @@ pub async fn load_jj_repository_snapshot(
                 .context("failed to reload jj repo after stale-workspace recovery")?;
             let desired_id = merged_repo
                 .view()
-                .get_wc_commit_id(&workspace_name)
+                .get_wc_commit_id(workspace_name)
                 .context("jj workspace has no working-copy commit")?
                 .clone();
             let desired = merged_repo
@@ -1394,26 +1398,100 @@ pub async fn load_jj_repository_snapshot(
                 .await
                 .context("failed to finish jj working-copy recovery")?;
 
-            let working_copy_empty = desired.is_empty(merged_repo.as_ref()).await.ok();
-            let snapshot = RepositorySnapshot {
-                fingerprint: merged_repo.op_id().hex(),
-                working_copy_empty,
-                // Deliberately equal to `fingerprint`: the graph on screen
-                // reflects some pre-recovery op, so the mismatch escalates
-                // the refresh to a full reload — external ops (the rebase
-                // that made us stale, the recovery itself) always landed.
-                parent_fingerprint: Some(merged_repo.op_id().hex()),
-            };
-            return Ok((snapshot, merged_repo, desired_id, workspace_name));
+            return Ok(SnapshottedWorkingCopy::Recovered {
+                repo: merged_repo,
+                wc_commit_id: desired_id,
+                wc_commit: desired,
+            });
         }
     };
-    let old_tree = wc_commit.tree();
 
-    let (new_tree, _stats) = locked_ws
+    let (tree, _stats) = locked_ws
         .locked_wc()
-        .snapshot(&snapshot_options)
+        .snapshot(snapshot_options)
         .await
         .context("failed to snapshot jj working copy")?;
+
+    Ok(SnapshottedWorkingCopy::Locked {
+        locked_ws,
+        repo: base_repo,
+        wc_commit_id,
+        wc_commit,
+        tree,
+    })
+}
+
+/// Snapshot the working copy, returning the fingerprint plus the post-snapshot
+/// repo, working-copy commit id, and workspace name. The cold streaming load
+/// ([`load_jj_cold`]) reuses that repo for the diff + graph walk so it reads
+/// the commit index once instead of three times; the refresh path
+/// ([`run_repository_snapshot`]) drops the repo and keeps only the fingerprint.
+pub async fn load_jj_repository_snapshot(
+    repository: Repository,
+) -> Result<(
+    RepositorySnapshot,
+    Arc<ReadonlyRepo>,
+    CommitId,
+    WorkspaceNameBuf,
+)> {
+    let settings = jj_settings(&repository.root)?;
+    let mut workspace = Workspace::load(
+        &settings,
+        &repository.root,
+        &StoreFactories::default(),
+        &default_working_copy_factories(),
+    )
+    .context("failed to load jj workspace")?;
+    let workspace_name = workspace.workspace_name().to_owned();
+
+    let auto_track = snapshot_auto_track_matcher(&settings, &repository.root)?;
+    let base_ignores = snapshot_base_ignores(&repository.root)?;
+    let max_new_file_size = snapshot_max_new_file_size(&settings)?;
+
+    let repo_loader = workspace.repo_loader().clone();
+    let snapshot_options = SnapshotOptions {
+        base_ignores,
+        progress: None,
+        start_tracking_matcher: auto_track.as_ref(),
+        force_tracking_matcher: &NothingMatcher,
+        max_new_file_size,
+    };
+
+    let (locked_ws, base_repo, wc_commit_id, wc_commit, new_tree) =
+        match lock_and_snapshot_working_copy(
+            &mut workspace,
+            &repo_loader,
+            &workspace_name,
+            &snapshot_options,
+        )
+        .await?
+        {
+            SnapshottedWorkingCopy::Locked {
+                locked_ws,
+                repo,
+                wc_commit_id,
+                wc_commit,
+                tree,
+            } => (locked_ws, repo, wc_commit_id, wc_commit, tree),
+            SnapshottedWorkingCopy::Recovered {
+                repo,
+                wc_commit_id,
+                wc_commit,
+            } => {
+                let working_copy_empty = wc_commit.is_empty(repo.as_ref()).await.ok();
+                let snapshot = RepositorySnapshot {
+                    fingerprint: repo.op_id().hex(),
+                    working_copy_empty,
+                    // Deliberately equal to `fingerprint`: the graph on screen
+                    // reflects some pre-recovery op, so the mismatch escalates
+                    // the refresh to a full reload — external ops (the rebase
+                    // that made us stale, the recovery itself) always landed.
+                    parent_fingerprint: Some(repo.op_id().hex()),
+                };
+                return Ok((snapshot, repo, wc_commit_id, workspace_name));
+            }
+        };
+    let old_tree = wc_commit.tree();
 
     if new_tree.tree_ids_and_labels() == old_tree.tree_ids_and_labels() {
         // No file changes: drop the lock without writing an op. This is the
@@ -1964,6 +2042,28 @@ pub(crate) async fn apply_mutation(
     progress: LoadProgress,
     allow_immutable: bool,
 ) -> Result<MutationOutcome> {
+    // Recovering a stale checkout finishes the lock session the mutation needs,
+    // so the attempt reports back without mutating and the retry runs against
+    // the recovered `@`. A second stale report means something outside is still
+    // rewriting this workspace's `@`; refuse rather than keep taking the lock.
+    for _ in 0..2 {
+        if let Some(outcome) =
+            apply_mutation_attempt(&repository, &op, &progress, allow_immutable).await?
+        {
+            return Ok(outcome);
+        }
+    }
+    bail!("jj working copy kept going stale while applying the mutation")
+}
+
+/// One pass of [`apply_mutation`]. `Ok(None)` means the working copy was stale
+/// and has been recovered instead of mutated — see [`SnapshottedWorkingCopy`].
+async fn apply_mutation_attempt(
+    repository: &Repository,
+    op: &MutationOp,
+    progress: &LoadProgress,
+    allow_immutable: bool,
+) -> Result<Option<MutationOutcome>> {
     let settings = jj_settings(&repository.root)?;
     let mut workspace = Workspace::load(
         &settings,
@@ -1979,30 +2079,6 @@ pub(crate) async fn apply_mutation(
     let max_new_file_size = snapshot_max_new_file_size(&settings)?;
 
     let repo_loader = workspace.repo_loader().clone();
-    let mut locked_ws = workspace
-        .start_working_copy_mutation()
-        .context("failed to lock jj working copy")?;
-    let base_repo = repo_loader
-        .load_at_head()
-        .await
-        .context("failed to load jj repo")?;
-
-    let wc_commit_id = base_repo
-        .view()
-        .get_wc_commit_id(&workspace_name)
-        .context("jj workspace has no working-copy commit")?
-        .clone();
-    let wc_commit = base_repo
-        .store()
-        .get_commit_async(&wc_commit_id)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to load jj working-copy commit {}",
-                wc_commit_id.hex()
-            )
-        })?;
-
     let snapshot_options = SnapshotOptions {
         base_ignores,
         progress: None,
@@ -2010,11 +2086,24 @@ pub(crate) async fn apply_mutation(
         force_tracking_matcher: &NothingMatcher,
         max_new_file_size,
     };
-    let (new_tree, _stats) = locked_ws
-        .locked_wc()
-        .snapshot(&snapshot_options)
-        .await
-        .context("failed to snapshot jj working copy")?;
+
+    let (mut locked_ws, base_repo, wc_commit, new_tree) = match lock_and_snapshot_working_copy(
+        &mut workspace,
+        &repo_loader,
+        &workspace_name,
+        &snapshot_options,
+    )
+    .await?
+    {
+        SnapshottedWorkingCopy::Locked {
+            locked_ws,
+            repo,
+            wc_commit,
+            tree,
+            ..
+        } => (locked_ws, repo, wc_commit, tree),
+        SnapshottedWorkingCopy::Recovered { .. } => return Ok(None),
+    };
 
     let mut tx = base_repo.start_transaction();
 
@@ -2063,7 +2152,7 @@ pub(crate) async fn apply_mutation(
     // for absorb; empty for the other mutations.
     let mut output: Vec<String> = Vec::new();
     let mut rewritten_commit: Option<String> = None;
-    let message = match &op {
+    let message = match op {
         MutationOp::New { parent } => {
             let parent_commit = resolve_mutation_target(tx.repo(), &current_wc_id, parent).await?;
             let short = short_change_id(&parent_commit);
@@ -2451,7 +2540,7 @@ pub(crate) async fn apply_mutation(
                 // transaction's view, so it pushes the position set above.
                 Some(remote) => {
                     let (push_message, remote_output) =
-                        push_bookmark(&settings, tx.repo_mut(), name, remote, &progress)?;
+                        push_bookmark(&settings, tx.repo_mut(), name, remote, progress)?;
                     output = remote_output;
                     format!("Moved bookmark {name} to {short} \u{b7} {push_message}")
                 }
@@ -2472,7 +2561,7 @@ pub(crate) async fn apply_mutation(
         }
         MutationOp::PushBookmark { name, remote } => {
             let (message, remote_output) =
-                push_bookmark(&settings, tx.repo_mut(), name, remote, &progress)?;
+                push_bookmark(&settings, tx.repo_mut(), name, remote, progress)?;
             output = remote_output;
             message
         }
@@ -2586,7 +2675,7 @@ pub(crate) async fn apply_mutation(
         .await
         .context("failed to finish working-copy mutation")?;
 
-    let moved_working_copy = match &op {
+    let moved_working_copy = match op {
         MutationOp::New { .. }
         | MutationOp::Edit { .. }
         | MutationOp::Abandon { .. }
@@ -2596,13 +2685,13 @@ pub(crate) async fn apply_mutation(
         MutationOp::Undo { .. } => new_wc_id != current_wc_id,
         _ => false,
     };
-    Ok(MutationOutcome {
+    Ok(Some(MutationOutcome {
         message,
         moved_working_copy,
         rewritten_commit,
         output,
         operation_id: Some(new_repo.op_id().hex()),
-    })
+    }))
 }
 
 /// Resolve a rebase [`Destination`] into jj-lib's location parts: the new

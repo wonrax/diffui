@@ -429,6 +429,39 @@ fn secondary_workspace_resolves_and_labels() {
     );
 }
 
+/// Two workspaces, the default one holding a mega merge of the other's working
+/// copy, with the default checkout left *stale*: the side workspace's snapshot
+/// rebases the merge, so the default workspace's disk still holds the old tree.
+/// Returns the two workspace roots.
+fn stale_workspace_pair(test: &str) -> (PathBuf, PathBuf) {
+    let root = scratch_repo(test);
+    let side = root.parent().expect("scratch parent").join(format!(
+        "{}-side",
+        root.file_name().unwrap().to_str().unwrap()
+    ));
+    let _ = std::fs::remove_dir_all(&side);
+    write(&root, "shared.txt", "base\n");
+    jj(&root, &["commit", "-m", "base"]);
+    jj(&root, &["workspace", "add", side.to_str().unwrap()]);
+    write(&side, "side.txt", "side-work\n");
+    jj(&side, &["describe", "-m", "side work"]);
+    jj(
+        &root,
+        &[
+            "new",
+            "description(glob:\"side work*\")",
+            "description(glob:\"base*\")",
+            "-m",
+            "mega merge",
+        ],
+    );
+    // Edit in the side workspace; its snapshot rebases the merge and
+    // strands the default workspace's checkout on the old tree.
+    write(&side, "side.txt", "side-work\nside-more\n");
+    jj(&side, &["log", "-r", "@", "-T", "\"\""]);
+    (root, side)
+}
+
 /// Two workspaces with the default one holding a mega merge of the other's
 /// working copy — the setup where snapshotting used to corrupt history.
 /// Editing in the side workspace amends its `@`, auto-rebasing the merge and
@@ -442,38 +475,9 @@ fn secondary_workspace_resolves_and_labels() {
 #[test]
 #[ignore = "shells out to the jj CLI"]
 fn stale_workspace_snapshot_recovers_instead_of_reverting_the_rebase() {
-    let build = |test: &str| {
-        let root = scratch_repo(test);
-        let side = root.parent().expect("scratch parent").join(format!(
-            "{}-side",
-            root.file_name().unwrap().to_str().unwrap()
-        ));
-        let _ = std::fs::remove_dir_all(&side);
-        write(&root, "shared.txt", "base\n");
-        jj(&root, &["commit", "-m", "base"]);
-        jj(&root, &["workspace", "add", side.to_str().unwrap()]);
-        write(&side, "side.txt", "side-work\n");
-        jj(&side, &["describe", "-m", "side work"]);
-        jj(
-            &root,
-            &[
-                "new",
-                "description(glob:\"side work*\")",
-                "description(glob:\"base*\")",
-                "-m",
-                "mega merge",
-            ],
-        );
-        // Edit in the side workspace; its snapshot rebases the merge and
-        // strands the default workspace's checkout on the old tree.
-        write(&side, "side.txt", "side-work\nside-more\n");
-        jj(&side, &["log", "-r", "@", "-T", "\"\""]);
-        (root, side)
-    };
-
     // Clean default workspace: recovery is seamless — the merge follows the
     // rebase, stays empty, and the disk materializes the side edit.
-    let (root, _side) = build("stale-ws-clean");
+    let (root, _side) = stale_workspace_pair("stale-ws-clean");
     block_on(load_jj_repository_snapshot(repository(&root))).expect("snapshot recovers");
     assert_eq!(
         jj(
@@ -509,7 +513,7 @@ fn stale_workspace_snapshot_recovers_instead_of_reverting_the_rebase() {
     // Unsnapshotted local edits in the stale workspace: jj-CLI recovery
     // parity — the edit survives in the op graph (as a divergent copy of
     // the merge change) rather than being clobbered or smuggled.
-    let (root, _side) = build("stale-ws-dirty");
+    let (root, _side) = stale_workspace_pair("stale-ws-dirty");
     write(&root, "shared.txt", "base\nlocal-edit\n");
     block_on(load_jj_repository_snapshot(repository(&root))).expect("snapshot recovers");
     assert_eq!(
@@ -534,6 +538,57 @@ fn stale_workspace_snapshot_recovers_instead_of_reverting_the_rebase() {
         preserved.contains("+local-edit"),
         "the local edit must survive somewhere visible:\n{preserved}"
     );
+}
+
+/// The same stale checkout, reached through a *mutation* instead of a refresh.
+/// Snapshots are deferred while a mutation runs, so a mutation can be the first
+/// thing to touch a stale workspace. Folding the disk into `@` without the
+/// freshness check rewrites the rebased merge with the pre-rebase tree, which
+/// reverts the side workspace's edit inside it; the mutation has to recover
+/// like `jj workspace update-stale` first and apply on top of that.
+#[test]
+#[ignore = "shells out to the jj CLI"]
+fn stale_workspace_mutation_recovers_instead_of_reverting_the_rebase() {
+    let (root, _side) = stale_workspace_pair("stale-ws-mutation");
+
+    run(
+        &root,
+        MutationOp::Describe {
+            target: RevisionSelection::WorkingCopy,
+            description: "described merge".to_owned(),
+        },
+    );
+
+    assert_eq!(
+        jj(&root, &["file", "show", "-r", "@", "side.txt"]),
+        "side-work\nside-more\n",
+        "the merge keeps the side workspace's edit instead of reverting it"
+    );
+    assert_eq!(
+        jj(&root, &["diff", "-r", "@", "--summary"]),
+        "",
+        "@ lands on the rebased merge, still free of smuggled changes"
+    );
+    assert_eq!(
+        jj(
+            &root,
+            &["log", "--no-graph", "-r", "@", "-T", "description"]
+        ),
+        "described merge",
+        "the mutation applies after the recovery, not instead of it"
+    );
+    let flags = jj(
+        &root,
+        &[
+            "log",
+            "--no-graph",
+            "-r",
+            "all()",
+            "-T",
+            "if(divergent, \"divergent \")",
+        ],
+    );
+    assert_eq!(flags, "", "a clean recovery must not diverge anything");
 }
 
 /// The source browser's two backends against a real repo: the working copy
