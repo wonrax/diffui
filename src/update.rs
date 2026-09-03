@@ -2387,13 +2387,19 @@ impl Diffui {
                     m.activate(path);
                 }
             }
-            Message::Menu(MenuMessage::Select(path)) => {
-                let Some(open) = self.menu.as_ref() else {
+            Message::Menu(MenuMessage::Select(path, button)) => {
+                let Some(open) = self.menu.as_mut() else {
                     return Task::none();
                 };
+                // The opening press's own release picks nothing: the menu was
+                // drawn under a cursor that never pressed anything inside it, so
+                // running the row it happens to cover would fire an action the
+                // user only asked to *see*. A later press-release picks.
                 // Only a leaf picks; a release on a submenu/disabled/separator
                 // row leaves the (already hover-opened) menu as it is.
-                if let Some(menu::MenuEntry::Item { action, .. }) = open.entry_at(&path) {
+                if !open.opening_release(button)
+                    && let Some(menu::MenuEntry::Item { action, .. }) = open.entry_at(&path)
+                {
                     let action = action.clone();
                     let selection = open.selection.clone();
                     self.menu = None;
@@ -2412,15 +2418,15 @@ impl Diffui {
             Message::Menu(MenuMessage::Dismiss) => {
                 self.menu = None;
             }
-            Message::Menu(MenuMessage::ScrimRelease) => {
+            Message::Menu(MenuMessage::ScrimRelease(button)) => {
                 if let Some(menu) = self.menu.as_mut() {
-                    // The opening left-click's release lands here first; swallow
-                    // it (arm) and keep the menu open. A later release — or one
-                    // after the cursor has dragged into the menu — dismisses.
-                    if menu.armed || menu.entered {
+                    // Same gate the row `Select` uses, on the other half of the
+                    // window: the opening press's release lands here when the
+                    // cursor sits outside the cards — swallow it and keep the
+                    // menu open. A later release — or one after the cursor has
+                    // dragged into the menu — dismisses.
+                    if !menu.opening_release(button) || menu.entered {
                         self.menu = None;
-                    } else {
-                        menu.armed = true;
                     }
                 }
             }

@@ -696,7 +696,11 @@ impl Diffui {
         if tree.is_empty() {
             return Task::none();
         }
-        let mut overlay = menu::OverlayMenu::new(tree, menu::AnchorSpec::At(cursor), false);
+        let mut overlay = menu::OverlayMenu::new(
+            tree,
+            menu::AnchorSpec::At(cursor),
+            Some(iced::mouse::Button::Right),
+        );
         overlay.glow = Some(row_rect);
         self.activity_popover_open = false;
         self.menu = Some(overlay);
@@ -741,10 +745,14 @@ impl Diffui {
         cursor: iced::Point,
     ) -> Task<Message> {
         let tree = self.revision_menu_tree(&selection);
-        // `armed: false` so the right-button release that opened the menu is
-        // swallowed (kept open) rather than treated as a pick/dismiss — the
-        // cursor sits in the card's corner padding, not on a row, at open.
-        let mut overlay = menu::OverlayMenu::new(tree, menu::AnchorSpec::At(cursor), false);
+        // Opened by the right button: its release is the one that opened the
+        // menu, so it neither picks a row nor dismisses (see
+        // `OverlayMenu::opening_release`).
+        let mut overlay = menu::OverlayMenu::new(
+            tree,
+            menu::AnchorSpec::At(cursor),
+            Some(iced::mouse::Button::Right),
+        );
         overlay.selection = Some(selection);
         overlay.glow = Some(row_rect);
         self.activity_popover_open = false;
@@ -821,10 +829,12 @@ impl Diffui {
             ToolbarMenu::FetchBranches => self.fetch_menu_entries(),
             ToolbarMenu::RevsetPresets => self.revset_menu_entry_tree(),
         };
+        // `AnchorArea` fires on a left press, so that press's release is the
+        // opening one — swallowed rather than treated as a pick/dismiss.
         self.menu = Some(menu::OverlayMenu::new(
             root,
             menu::AnchorSpec::Below(anchor),
-            false,
+            Some(iced::mouse::Button::Left),
         ));
         Task::none()
     }
