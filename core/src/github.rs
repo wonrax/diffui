@@ -8,7 +8,6 @@
 use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
-use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
@@ -16,12 +15,11 @@ use jj_lib::graph::GraphEdge;
 
 use crate::diff_parse::DiffStreamParser;
 use crate::graph::assign_lanes;
-use crate::graph_layout::{GraphLayout, GraphLayoutBuilder};
+
 use crate::model::{
-    CommitStore, CommitStoreBuilder, CommitSummary, DiffDocument, DiffFile, DiffFileStatus,
-    RevisionDetails, RevisionSelection, SignatureInfo,
+    CommitSummary, DiffDocument, DiffFile, DiffFileStatus, RevisionDetails, SignatureInfo,
+    StreamRow,
 };
-use crate::source::{DiffSource, DiffTarget};
 
 /// GitHub's REST API caps `per_page` at 100; we always request the max and
 /// page until a short page signals the end. Used both in the request URL and
@@ -29,7 +27,7 @@ use crate::source::{DiffSource, DiffTarget};
 const GITHUB_API_PAGE_SIZE: usize = 100;
 
 /// A pull-request reference: `owner/repo#number`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PrSpec {
     pub owner: String,
     pub repo: String,
@@ -101,62 +99,6 @@ impl PrSpec {
     /// Short display label: `repo#number`.
     pub fn label(&self) -> String {
         format!("{}#{}", self.repo, self.number)
-    }
-}
-
-/// A [`DiffSource`] over a GitHub pull request — the first graph-less source.
-/// `WorkingCopy` targets the PR's "all changes" diff; `Commit(oid)` one of its
-/// commits. No `RevisionGraph` capability (interactive frontends stream the
-/// commit list/diff via [`stream_pr_diff`] + [`pr_commit_store`] instead) and
-/// no `Mutable` — a PR is read-only here.
-pub struct PrSource {
-    spec: PrSpec,
-}
-
-impl PrSource {
-    pub fn new(spec: PrSpec) -> Self {
-        Self { spec }
-    }
-
-    pub fn spec(&self) -> &PrSpec {
-        &self.spec
-    }
-}
-
-#[async_trait]
-impl DiffSource for PrSource {
-    fn describe(&self) -> Option<String> {
-        Some(format!("{}/{}", self.spec.owner, self.spec.label()))
-    }
-
-    async fn load_diff(
-        &self,
-        target: &DiffTarget,
-    ) -> Result<(DiffDocument, Option<RevisionDetails>), String> {
-        match target {
-            DiffTarget::Revision(RevisionSelection::Commit(oid)) => {
-                load_pr_commit_diff(&self.spec, oid).await
-            }
-            // The whole-PR diff, collected. Interactive frontends prefer the
-            // streaming [`stream_pr_diff`] (progressive paint); this atomic
-            // form keeps the universal capability complete.
-            DiffTarget::Revision(RevisionSelection::WorkingCopy) => {
-                let mut files = Vec::new();
-                stream_pr_diff(&self.spec, |file| files.push(file))
-                    .await
-                    .map_err(|error| format!("{error:#}"))?;
-                let total_additions = files.iter().map(|file| file.additions).sum();
-                let total_deletions = files.iter().map(|file| file.deletions).sum();
-                Ok((
-                    DiffDocument {
-                        files,
-                        total_additions,
-                        total_deletions,
-                    },
-                    None,
-                ))
-            }
-        }
     }
 }
 
@@ -281,7 +223,7 @@ pub async fn fetch_pr_commits(spec: &PrSpec) -> Result<Vec<PrCommit>> {
 /// existing `RevisionSelection::WorkingCopy` selection — the tab's default —
 /// means "the whole PR diff" and clicking it brings the full diff back after
 /// viewing an individual commit.
-pub fn pr_commit_store(commits: &[PrCommit]) -> (CommitStore, GraphLayout) {
+pub fn pr_commit_rows(commits: &[PrCommit]) -> Vec<StreamRow> {
     let mut rows = Vec::with_capacity(commits.len() + 1);
     rows.push(CommitSummary {
         change_id: "pr".to_owned(),
@@ -334,16 +276,10 @@ pub fn pr_commit_store(commits: &[PrCommit]) -> (CommitStore, GraphLayout) {
         (row.commit_id.clone(), edges)
     });
     let frames = assign_lanes(lane_inputs);
-    let mut graph = GraphLayoutBuilder::new();
-    for frame in &frames {
-        graph.push(frame, &[]);
-    }
-
-    let mut builder = CommitStoreBuilder::with_capacity(rows.len());
-    for row in rows {
-        builder.push(row);
-    }
-    (builder.finish(), graph.finish())
+    rows.into_iter()
+        .zip(frames)
+        .map(|(summary, frame)| StreamRow { summary, frame })
+        .collect()
 }
 
 /// Wire shape of `GET /repos/{owner}/{repo}/commits/{sha}` — the same

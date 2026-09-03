@@ -2,7 +2,6 @@
 name = "diffui-core"
 version = "0.1.0"
 edition = "2024"
-
 [features]
 default = ["watcher"]
 # Adds back every arborium grammar the curated set below leaves out. Parse
@@ -101,7 +100,10 @@ jj-lib = "0.40.0"
 # files-API fallback (per-file JSON entries with embedded patches).
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1.44", features = ["fs", "process", "time", "rt", "sync"] }
+tokio = { version = "1.44", features = ["fs", "macros", "process", "time", "rt", "sync"] }
+# Structured logging for the repository actor: one span per command, so a
+# stuck or slow operation is attributable without an `eprintln!` trail.
+tracing = "0.1"
 notify = { version = "8", optional = true }
 # Syntax highlighting; the grammar list is curated for size (see `lang-all`
 # above). CMake and HCL sit alongside the languages proper because C and

@@ -819,9 +819,9 @@ pub struct BackendOutput {
 
 /// One commit emitted by the streaming loader: the data for the compact store
 /// plus the row's lane frame for the graph fold. The UI appends a batch of
-/// these into its live `CommitStore` + `GraphLayout` per `CommitsBatch`
-/// message, so the sidebar paints after the first batch instead of waiting for
-/// the whole (up to ~1M-row) history to load.
+/// these into its live `CommitStore` + `GraphLayout` per `Batch` event, so the
+/// sidebar paints after the first batch instead of waiting for the whole (up to
+/// ~1M-row) history to load.
 #[derive(Debug, Clone)]
 pub struct StreamRow {
     pub summary: CommitSummary,

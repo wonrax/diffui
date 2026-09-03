@@ -206,12 +206,10 @@ impl Diffui {
             active,
             no_tab,
             next_tab_id,
-            next_load_version: 0,
             next_document_id: 0,
             open_repo_dialog: None,
             recent_repos,
             next_activity_id: 0,
-            mutation_queue: diffui_core::session::MutationQueue::default(),
             menu: None,
             confirm: None,
             activity_popover_open: false,
@@ -228,644 +226,311 @@ impl Diffui {
         (app, Task::batch([load_task, theme_task]))
     }
 
-    /// Handle a completed full backend load (graph + diff + snapshot) for `tab`.
-    /// See [`Message::BackendLoaded`]. Routed to the owning tab so a load that
-    /// finishes while the tab is backgrounded still lands; on a failed targeted
-    /// reload it falls back once to the working copy.
-    fn on_backend_loaded(
+    /// Fold one repository event into the tab that asked for it.
+    ///
+    /// Routing is by job: a job belongs to exactly one tab's slot, so a result
+    /// that outlives a tab switch still lands on its own tab, and one that
+    /// outlives its tab entirely is dropped. The jobless events (the actor's
+    /// handshake, an operation head moving, a working-tree edit) go to every
+    /// tab on that repository.
+    fn on_repo_event(&mut self, event: diffui_core::Event) -> Task<Message> {
+        use diffui_core::Payload;
+
+        if let Payload::Ready {
+            handle,
+            capabilities,
+        } = event.payload
+        {
+            let mut tasks = Vec::new();
+            for index in 0..self.tabs.len() {
+                if self.tabs[index].repo_id().as_ref() != Some(&event.repo) {
+                    continue;
+                }
+                let id = self.tabs[index].id;
+                let state = &mut self.tabs[index].state;
+                // The scope is per tab (a repo opened at a subdirectory), so
+                // narrow the shared handle rather than using it verbatim.
+                let scope = state
+                    .repository
+                    .as_ref()
+                    .map(|repository| repository.scope.clone())
+                    .unwrap_or_default();
+                state.handle = Some(handle.with_scope(scope));
+                state.session.repo = Some(event.repo.clone());
+                state.session.capabilities = capabilities;
+                // Only the tab on screen loads now; the rest load when they are
+                // first activated, as they always have. Their actors are up
+                // either way, so the switch is instant.
+                if self.is_active(id) {
+                    tasks.push(self.start_tab_load(id));
+                }
+            }
+            return Task::batch(tasks);
+        }
+
+        let Some(tab) = self.route_event(&event) else {
+            return Task::none();
+        };
+        // A job can be both the frontend's and the projection's — a mutation
+        // owns an activity row *and* a slot — so the two run in order rather
+        // than one short-circuiting the other.
+        let own = self.take_own_job(tab, &event).unwrap_or_else(Task::none);
+        // Read the draft's destination off the store this event is about to
+        // replace, so it can be re-found by commit id afterwards.
+        let candidate = self.draft_candidate_commit(tab);
+        let Some(target) = self.tab_mut(tab) else {
+            return own;
+        };
+        let effects = target.session.apply(event);
+        let replaced = effects
+            .iter()
+            .any(|effect| matches!(effect, diffui_core::Effect::GraphReplaced));
+        let folded = self.run_effects(tab, effects);
+        if replaced {
+            self.rearm_draft_candidate(tab, candidate);
+        }
+        Task::batch([own, folded, self.drain_queued_mutation(tab)])
+    }
+
+    /// The commit id under `tab`'s draft destination candidate, if it has one.
+    /// Read before a graph swap so the candidate can survive it.
+    fn draft_candidate_commit(&self, tab: TabId) -> Option<String> {
+        let state = self.tabs.iter().find(|candidate| candidate.id == tab)?;
+        let index = state.state.op_draft.as_ref()?.draft.candidate?;
+        Some(
+            state
+                .state
+                .session
+                .commits
+                .row(index)
+                .commit_id()
+                .to_owned(),
+        )
+    }
+
+    /// Re-find the draft's destination in the replaced graph. A candidate whose
+    /// commit is no longer in the loaded set stays dropped: the draft is still
+    /// live, but its destination has to be picked again rather than silently
+    /// becoming whatever row now sits at that index.
+    fn rearm_draft_candidate(&mut self, tab: TabId, commit_id: Option<String>) {
+        let Some(commit_id) = commit_id else { return };
+        let Some(state) = self.tab_mut(tab) else {
+            return;
+        };
+        let Some(index) = state
+            .session
+            .commits
+            .iter()
+            .position(|row| row.commit_id() == commit_id)
+        else {
+            return;
+        };
+        if let Some(ui) = state.op_draft.as_mut() {
+            ui.draft.candidate = Some(index);
+        }
+    }
+
+    /// Which tab an event belongs to. A job names one tab; a jobless event
+    /// belongs to whichever tab views that repository (the first, since the
+    /// open path keeps one tab per root).
+    fn route_event(&self, event: &diffui_core::Event) -> Option<TabId> {
+        match event.job() {
+            Some(job) => self
+                .tabs
+                .iter()
+                .find(|tab| tab.state.session.owns_job(job) || tab.state.jobs.owns(job))
+                .map(|tab| tab.id),
+            None => self
+                .tabs
+                .iter()
+                .find(|tab| tab.repo_id().as_ref() == Some(&event.repo))
+                .map(|tab| tab.id),
+        }
+    }
+
+    /// Handle the results the projection has no state to fold: previews, the
+    /// source browser, fetches, mutations and file pairs. Returns `None` when
+    /// the event isn't one of those, so the caller hands it to `Session::apply`.
+    fn take_own_job(&mut self, tab: TabId, event: &diffui_core::Event) -> Option<Task<Message>> {
+        use diffui_core::Payload;
+
+        let job = event.job()?;
+        let target = self.tab_mut(tab)?;
+        let owns = target.jobs.owns(job)
+            || target
+                .pending_detail_copy
+                .as_ref()
+                .is_some_and(|(id, ..)| *id == job);
+        if !owns {
+            return None;
+        }
+        Some(match &event.payload {
+            Payload::PreviewDone { simulation, .. } => {
+                self.tab_mut(tab)?.jobs.preview = None;
+                self.apply_draft_preview(tab, Ok(simulation.clone()))
+            }
+            Payload::TreeListed {
+                revision, entries, ..
+            } => self.apply_source_tree(tab, revision.clone(), Ok(entries.clone())),
+            Payload::FileRead { path, file, .. } => {
+                self.apply_source_file(tab, path.clone(), Ok(file.clone()))
+            }
+            Payload::FetchDone { output, .. } => self.finish_fetch(tab, Ok(output.clone())),
+            Payload::MutationDone { outcome, .. } => self.finish_mutation(tab, Ok(outcome.clone())),
+            Payload::BookmarkChecked { backwards, .. } => {
+                self.apply_bookmark_check(tab, Ok(*backwards))
+            }
+            Payload::FilePairRead { old, new, .. } => {
+                self.apply_file_pair(tab, job, old.clone(), new.clone())
+            }
+            Payload::DetailsLoaded { details, .. } => {
+                let field = self
+                    .tab_mut(tab)
+                    .and_then(|state| state.pending_detail_copy.take());
+                match field {
+                    Some((_, field, fallback)) => Task::done(Message::CopyToClipboard(
+                        format_detail(details, field).unwrap_or(fallback),
+                    )),
+                    None => Task::none(),
+                }
+            }
+            Payload::Failed { error, .. } => self.fail_own_job(tab, job, error.clone()),
+            Payload::Cancelled { .. } => {
+                self.tab_mut(tab)?.jobs.clear(job);
+                Task::none()
+            }
+            // A job this tab owns can't produce anything else.
+            _ => Task::none(),
+        })
+    }
+
+    /// A frontend-routed job failed. Each kind has its own recovery — an
+    /// immutable rejection re-raises the confirmation, a preview just vanishes
+    /// — so they can't share the projection's generic failure path.
+    fn fail_own_job(
         &mut self,
         tab: TabId,
-        revision: RevisionSelection,
-        result: Box<Result<diffui_core::BackendOutput, String>>,
+        job: diffui_core::JobId,
+        error: diffui_core::RepoError,
     ) -> Task<Message> {
-        // Routed to the owning tab so a revset eval / git load / focus reload
-        // that completes while its tab is backgrounded still lands — without
-        // the tab routing, two tabs both pending on `@` would pass the revision
-        // check and swap repos' contents.
-        let is_active = self.is_active(tab);
-        match *result {
-            Ok(output) => {
-                let document_id = self.allocate_document_id();
-                let Some(target) = self.tab_mut(tab) else {
-                    return Task::none();
-                };
-                if target.session.pending_revision.as_ref() != Some(&revision) {
-                    return Task::none();
-                }
-
-                let revision_changed = target.session.selected_revision != revision;
-                target.session.selected_revision = revision;
-                target.session.pending_revision = None;
-                target.session.loading_since = None;
-                target.session.status = LoadStatus::Loaded;
-                target.set_document(output.document, document_id);
-                target.session.commits = output.commits;
-                target.session.graph = output.graph;
-                // A refresh swaps the graph atomically; if a cold stream was
-                // somehow still in flight, supersede it so its late batches
-                // (which assume the now-replaced row indices) are dropped.
-                target.session.load = None;
-                target.session.commits_version = target.session.commits_version.wrapping_add(1);
-                target.session.repository_snapshot = Some(output.snapshot);
-                target.session.branch_status = output.branch_status;
-                target.session.bookmarks = output.bookmarks;
-                target.session.revision_details = output.details;
-                target.selected_file = if revision_changed {
-                    0
-                } else {
-                    target
-                        .selected_file
-                        .min(target.session.document.files.len().saturating_sub(1))
-                };
-                // If this load was triggered by the palette, the
-                // sidebar didn't yet know the new selected_revision
-                // when the user accepted; bump the reveal token now
-                // that it's been written so the *next* render scrolls
-                // the correct row into view.
-                if target.pending_revision_reveal {
-                    target.pending_revision_reveal = false;
-                    target.revision_reveal_token = target.revision_reveal_token.wrapping_add(1);
-                }
-                // Recompute the on-demand sidebar index (lane fold, prefix
-                // lengths, selected-row index) for the new graph. If the
-                // selected commit isn't in the new graph, `selected_commit_index`
-                // is `None` — but that's *not* a fall-back trigger: the diff
-                // loaded, so the commit still exists, it's just outside the
-                // current revset (e.g. a palette jump to an off-view commit,
-                // or an abandoned-but-not-yet-GC'd commit). We keep showing
-                // it rather than yanking the user to `@`. Only a *failed*
-                // resolve (the `Err` arm) means the commit is truly gone.
-                target.session.rebuild_sidebar_index();
-                target.finish_load_activity(activity::ActivityStatus::Done, None);
-                // The paint version, the empty-status pass and the coalesced
-                // refresh are all active-only; a backgrounded tab runs them on
-                // its next activation.
-                let highlights = self.spawn_highlights(document_id);
-                if is_active {
-                    self.document_version = self.document_version.wrapping_add(1);
-                    let empty = self.resolve_empty_status(tab);
-                    return Task::batch([highlights, empty, self.take_pending_refresh(tab)]);
-                }
-                return highlights;
-            }
-            Err(error) => {
-                let Some(target) = self.tab_mut(tab) else {
-                    return Task::none();
-                };
-                if target.session.pending_revision.as_ref() != Some(&revision) {
-                    return Task::none();
-                }
-
-                target.session.pending_revision = None;
-                target.session.loading_since = None;
-                // A reload targeting a specific commit that's since vanished
-                // (abandoned *and* GC'd) can't resolve it, failing the whole
-                // walk. Retry once against the working copy rather than
-                // stranding the tab on an error screen. Guarded on the
-                // revision being a commit, so a genuine `@` failure (or a
-                // failure of this very retry) still surfaces.
-                if !matches!(revision, RevisionSelection::WorkingCopy)
-                    && let Some(source) = target.session.source.clone()
-                {
-                    eprintln!(
-                        "diffui: reload of {revision:?} failed ({error}); \
-                             falling back to the working copy"
-                    );
-                    let fallback = RevisionSelection::WorkingCopy;
-                    target.session.selected_revision = fallback.clone();
-                    target.selected_file = 0;
-                    target.session.pending_revision = Some(fallback.clone());
-                    target.pending_revision_reveal = true;
-                    target.session.loading_since = Some(Instant::now());
-                    let revset = target.session.revset.clone();
-                    let progress = target.session.commit_progress.clone();
-                    // The diff pane belongs at the top of the replacement
-                    // document; a backgrounded tab's stale offset is clamped
-                    // against the new content when it's restored.
-                    target.diff_scroll_offset = 0.0;
-                    return Task::perform(
-                        source.load(fallback.clone(), revset, progress),
-                        move |result| Message::BackendLoaded(tab, fallback, Box::new(result)),
-                    );
-                }
-                target.session.status = LoadStatus::Failed(error.clone());
-                target.finish_load_activity(activity::ActivityStatus::Error, Some(error));
-            }
+        let Some(target) = self.tab_mut(tab) else {
+            return Task::none();
+        };
+        let jobs = &mut target.jobs;
+        if jobs.preview == Some(job) {
+            jobs.preview = None;
+            return self.apply_draft_preview(tab, Err(error.to_string()));
+        }
+        if jobs.tree.as_ref().is_some_and(|(id, _)| *id == job) {
+            let revision = jobs.tree.take().map(|(_, revision)| revision);
+            return match revision {
+                Some(revision) => self.apply_source_tree(tab, revision, Err(error.to_string())),
+                None => Task::none(),
+            };
+        }
+        if jobs.file.as_ref().is_some_and(|(id, _)| *id == job) {
+            let path = jobs.file.take().map(|(_, path)| path);
+            return match path {
+                Some(path) => self.apply_source_file(tab, path, Err(error.to_string())),
+                None => Task::none(),
+            };
+        }
+        if jobs.fetch.as_ref().is_some_and(|(id, ..)| *id == job) {
+            return self.finish_fetch(tab, Err(error.to_string()));
+        }
+        if jobs
+            .bookmark_check
+            .as_ref()
+            .is_some_and(|(id, _)| *id == job)
+        {
+            // The ancestry check failed, so we can't tell a backwards move from
+            // a fast-forward. Run it: this is where the guard did not exist.
+            return self.apply_bookmark_check(tab, Err(error.to_string()));
+        }
+        if jobs.mutation.as_ref().is_some_and(|(id, _)| *id == job) {
+            return self.finish_mutation(tab, Err(error));
+        }
+        // A file-pair read that failed leaves its file unhighlighted, but the
+        // queue must still advance — otherwise two failures wedge it at the
+        // concurrency limit and nothing else is ever highlighted.
+        if let Some((document_id, _)) = jobs.file_pairs.remove(&job) {
+            target.session.highlight_in_flight =
+                target.session.highlight_in_flight.saturating_sub(1);
+            return self.spawn_highlights(document_id);
         }
         Task::none()
     }
 
-    pub(crate) fn update(&mut self, message: Message) -> Task<Message> {
-        match message {
-            Message::BackendLoaded(tab, revision, result) => {
-                return self.on_backend_loaded(tab, revision, result);
-            }
-            Message::CommitsBatch(version, rows) => {
-                // Route to whichever tab owns this stream, on screen or not, so
-                // a tab switch doesn't discard a half-done walk. Take the cursor
-                // out so the appends below borrow the session fields freely;
-                // `take_if` re-asserts the version the router already matched.
-                let Some((_, target)) = self.load_target_mut(version) else {
-                    return Task::none();
-                };
-                let Some(mut cursor) = target.session.load.take_if(|c| c.version == version) else {
-                    return Task::none();
-                };
-                let selecting_wc = matches!(
-                    target.session.selected_revision,
-                    RevisionSelection::WorkingCopy
-                );
-                // Fold the batch into the growing store/graph via the core
-                // engine, then apply the UI-side bits it reports back.
-                let fold = diffui_core::session::fold_cold_batch(
-                    &mut target.session.commits,
-                    &mut target.session.graph,
-                    &mut cursor,
-                    rows,
-                    selecting_wc,
-                );
-                target.session.sidebar_prefix_lens.extend(fold.prefix_lens);
-                if let Some(index) = fold.working_copy_index {
-                    target.session.selected_commit_index = Some(index);
-                }
-                target.session.load = Some(cursor);
-                // First batch on screen: lift the full-window loading indicator
-                // and reveal the (still-growing) sidebar.
-                if matches!(target.session.status, LoadStatus::Loading) {
-                    target.session.status = LoadStatus::Loaded;
-                    target.session.loading_since = None;
-                }
-            }
-            Message::CommitsFinished(version, result) => {
-                let Some((tab, target)) = self.load_target_mut(version) else {
-                    return Task::none();
-                };
-                target.session.load = None;
-                match *result {
-                    Ok(tail) => {
-                        target.session.repository_snapshot = Some(tail.snapshot);
-                        target.session.branch_status = tail.branch_status;
-                        target.session.bookmarks = tail.bookmarks;
-                        // Apply the single-parent emptiness resolved in the
-                        // loader's final pass, caching each so reloads skip it.
-                        for (index, empty) in tail.empty_updates {
-                            // Defensive: a superseded/shorter store must never
-                            // index past its end (`set_is_empty` already guards
-                            // with `get_mut`; the row read did not).
-                            if index >= target.session.commits.len() {
-                                continue;
-                            }
-                            let commit_id =
-                                target.session.commits.row(index).commit_id().to_owned();
-                            target.session.empty_cache.insert(commit_id, empty);
-                            target.session.commits.set_is_empty(index, empty);
-                        }
-                        target.session.commits_version =
-                            target.session.commits_version.wrapping_add(1);
-                        target.session.selected_commit_index =
-                            target.session.find_selected_commit_index();
-                        target.finish_load_activity(activity::ActivityStatus::Done, None);
-                        // Fill in the merges/roots the loader left unknown, then
-                        // run any refresh coalesced during the cold load — but
-                        // only for the active tab: a backgrounded tab runs both
-                        // on activation instead (`ensure_active_loaded`).
-                        if self.is_active(tab) {
-                            let empty = self.resolve_empty_status(tab);
-                            return Task::batch([empty, self.take_pending_refresh(tab)]);
-                        }
-                    }
-                    Err(error) => {
-                        target.session.status = LoadStatus::Failed(error.clone());
-                        target.session.loading_since = None;
-                        target.finish_load_activity(activity::ActivityStatus::Error, Some(error));
+    /// Carry out what the projection asked for. Commands go straight down the
+    /// actor's channel — the answer comes back through the subscription — so
+    /// most effects produce no `Task` at all.
+    fn run_effects(&mut self, tab: TabId, effects: Vec<diffui_core::Effect>) -> Task<Message> {
+        use diffui_core::{Effect, session::Activity};
+
+        let is_active = self.is_active(tab);
+        let mut tasks = Vec::new();
+        for effect in effects {
+            match effect {
+                Effect::Send(command) => {
+                    if let Some(handle) = self.tab_mut(tab).and_then(|t| t.handle.clone()) {
+                        handle.send(command);
                     }
                 }
-            }
-            Message::InitialDiff(version, result) => {
-                // Routed by stream version like `CommitsBatch`. Apply only
-                // while the owning tab is still on the working copy — a
-                // palette jump mid-load supersedes this initial @ diff. Leaves
-                // `status` as `Loading` so the sidebar stays empty until the
-                // first commit batch; loading feedback is in the toolbar.
-                let document_id = self.allocate_document_id();
-                let Some((tab, target)) = self.load_target_mut(version) else {
-                    return Task::none();
-                };
-                let on_working_copy = matches!(
-                    target.session.selected_revision,
-                    RevisionSelection::WorkingCopy
-                ) && target
-                    .session
-                    .pending_revision
-                    .as_ref()
-                    .is_none_or(|pending| matches!(pending, RevisionSelection::WorkingCopy));
-                if !on_working_copy {
-                    return Task::none();
-                }
-                target.session.pending_revision = None;
-                match *result {
-                    Ok((document, details)) => {
-                        target.set_document(document, document_id);
-                        target.session.revision_details = details;
-                        target.selected_file = 0;
-                        // The shaped-paragraph cache keys map to the replaced
-                        // text — drop it. A backgrounded tab gets the same bump
-                        // when it's next activated.
-                        if self.is_active(tab) {
-                            self.document_version = self.document_version.wrapping_add(1);
-                        }
-                        return self.spawn_highlights(document_id);
-                    }
-                    Err(error) => {
-                        eprintln!("diffui: working-copy diff failed during load: {error}");
-                    }
-                }
-            }
-            Message::PrMetaLoaded(version, result) => {
-                // Routed by stream version like `CommitsBatch` — the PR
-                // stream reuses the `session.load` cursor purely as its
-                // guard (interner/fold stay unused); globally monotonic
-                // versions make it tab-unique.
-                let Some((_, target)) = self.load_target_mut(version) else {
-                    return Task::none();
-                };
-                match *result {
-                    Ok(info) => {
-                        // The PR header's totals are authoritative: the
-                        // files-API fallback zeroes per-file counts on
-                        // oversized blobs, so summing parsed files can
-                        // undercount (react#36173: 73k summed vs 123k real).
-                        target.session.authoritative_totals =
-                            Some((info.additions, info.deletions));
-                        target.session.revision_details = Some(github::pr_revision_details(&info));
-                    }
-                    Err(error) => {
-                        // Header metadata is cosmetic; the diff stream decides
-                        // the tab's fate. Log and move on.
-                        eprintln!("diffui: gh pr view failed: {error}");
-                    }
-                }
-            }
-            Message::PrCommitsLoaded(version, result) => {
-                let Some((_, target)) = self.load_target_mut(version) else {
-                    return Task::none();
-                };
-                match *result {
-                    Ok(commits) => {
-                        let (store, graph) = github::pr_commit_store(&commits);
-                        target.session.commits = store;
-                        target.session.graph = graph;
-                        target.session.commits_version =
-                            target.session.commits_version.wrapping_add(1);
-                        target.session.rebuild_sidebar_index();
-                    }
-                    Err(error) => {
-                        // The sidebar list is an enhancement; the diff stands
-                        // alone without it.
-                        eprintln!("diffui: gh pr view --json commits failed: {error}");
-                    }
-                }
-            }
-            Message::PrFilesBatch(version, files) => {
-                let Some((_, target)) = self.load_target_mut(version) else {
-                    return Task::none();
-                };
-                // Append without bumping `document_version`: the existing
-                // (file, hunk, line) cache keys still map to the same text,
-                // so visible rows don't re-shape on every batch of a
-                // million-line stream.
-                let appended_from = target.session.document.files.len();
-                for file in &files {
-                    target.session.document.total_additions += file.additions;
-                    target.session.document.total_deletions += file.deletions;
-                }
-                target.session.document.files.extend(files);
-                // First batch on screen: lift the loading indicator and show
-                // the (still-growing) diff.
-                if matches!(target.session.status, LoadStatus::Loading) {
-                    target.session.status = LoadStatus::Loaded;
-                    target.session.loading_since = None;
-                }
-                // Queue the new tail for background highlighting (appends keep
-                // the document id, so results for earlier files stay valid).
-                let document_id = target.session.document_id;
-                target.session.enqueue_unhighlighted(appended_from);
-                return self.spawn_highlights(document_id);
-            }
-            Message::PrFinished(version, result) => {
-                let Some((_, target)) = self.load_target_mut(version) else {
-                    return Task::none();
-                };
-                target.session.load = None;
-                target.session.loading_since = None;
-                match *result {
-                    Ok(()) => {
-                        // An empty PR never sends a batch — the stream ending
-                        // is what lifts the loading screen then.
-                        target.session.status = LoadStatus::Loaded;
-                        // GitHub's files API stops listing at 3,000 files;
-                        // say so rather than looking complete.
-                        let (loaded, total) = target.session.commit_progress.snapshot();
-                        let note = (total > 0 && loaded < total).then(|| {
-                            format!(
-                                "Streamed {loaded} of {total} files \
-                                 (GitHub's files API caps the listing)"
-                            )
-                        });
-                        target.finish_load_activity(activity::ActivityStatus::Done, note);
-                    }
-                    Err(error) => {
-                        // Keep a partially-streamed diff on screen (the error
-                        // lands in the activity log); fail the tab only when
-                        // nothing rendered at all.
-                        if target.session.document.files.is_empty() {
-                            target.session.status = LoadStatus::Failed(error.clone());
-                        }
-                        target.finish_load_activity(activity::ActivityStatus::Error, Some(error));
-                    }
-                }
-            }
-            Message::DiffLoaded(tab, revision, result) => match *result {
-                Ok((document, details)) => {
-                    // Routed to the owning tab; see `BackendLoaded`.
+                Effect::RepaintDocument => {
                     let document_id = self.allocate_document_id();
-                    let is_active = self.is_active(tab);
-                    let Some(target) = self.tab_mut(tab) else {
-                        return Task::none();
-                    };
-                    if target.session.pending_revision.as_ref() != Some(&revision) {
-                        return Task::none();
-                    }
-
-                    // A working-copy diff is the definitive emptiness signal for
-                    // @ (files present ⇒ not empty) — capture it before
-                    // `document` moves so a watcher-refresh edit toggles the @
-                    // "empty" chip without a graph re-walk. Synthesized
-                    // conflict entries don't count: jj calls a conflicted
-                    // merge whose tree is exactly its parents' merge "empty",
-                    // and the chip should agree with the graph walk.
-                    let wc_empty = matches!(revision, RevisionSelection::WorkingCopy).then(|| {
-                        document
-                            .files
-                            .iter()
-                            .all(|file| file.status == diffui_core::DiffFileStatus::Conflicted)
-                    });
-
-                    // PR tab: park the outgoing document under the key it was
-                    // shown for, so flipping back ("All changes" ↔ a commit)
-                    // is an in-memory move instead of a re-download.
-                    if target.session.repository.is_none() {
-                        let outgoing_key = match &target.session.selected_revision {
-                            RevisionSelection::WorkingCopy => String::new(),
-                            RevisionSelection::Commit(oid) => oid.clone(),
-                        };
-                        let outgoing = diffui_core::session::CachedDiff {
-                            document: std::mem::take(&mut target.session.document),
-                            totals: target.session.authoritative_totals.take(),
-                            details: target.session.revision_details.take(),
-                        };
-                        target.session.pr_diffs.insert(outgoing_key, outgoing);
-                        // Commit diffs are small; the one big entry is the
-                        // whole-PR document. Past the cap, drop the commit
-                        // entries but keep it.
-                        if target.session.pr_diffs.len() > 16 {
-                            target.session.pr_diffs.retain(|key, _| key.is_empty());
-                        }
-                    }
-
-                    let revision_changed = target.session.selected_revision != revision;
-                    target.session.selected_revision = revision.clone();
-                    target.session.pending_revision = None;
-                    target.session.loading_since = None;
-                    target.session.status = LoadStatus::Loaded;
-                    target.set_document(document, document_id);
-                    target.session.revision_details = details;
-                    // The graph is unchanged on a diff-only load; just relocate
-                    // the selected row.
-                    target.session.selected_commit_index =
-                        target.session.find_selected_commit_index();
-                    if let Some(empty) = wc_empty
-                        && target.session.repository.is_some()
-                        && let Some(index) = target.session.selected_commit_index
-                    {
-                        target.session.commits.set_is_empty(index, empty);
-                        target.session.commits_version =
-                            target.session.commits_version.wrapping_add(1);
-                    }
-                    target.selected_file = if revision_changed {
-                        0
-                    } else {
-                        target
+                    if let Some(target) = self.tab_mut(tab) {
+                        target.session.reset_highlights(document_id);
+                        target.selected_file = target
                             .selected_file
-                            .min(target.session.document.files.len().saturating_sub(1))
-                    };
-                    if target.pending_revision_reveal {
-                        target.pending_revision_reveal = false;
-                        target.revision_reveal_token = target.revision_reveal_token.wrapping_add(1);
-                    }
-                    // A context-menu "Edit description" waiting on this exact
-                    // revision opens now that its diff is in the detail pane —
-                    // on the tab that asked, and only while it's on screen (the
-                    // editor is a visible, focused control).
-                    let open_description_editor =
-                        target.pending_description_edit.as_ref() == Some(&revision);
-                    if open_description_editor {
-                        target.pending_description_edit = None;
+                            .min(target.session.document.files.len().saturating_sub(1));
                     }
                     if is_active {
                         self.document_version = self.document_version.wrapping_add(1);
                     }
-                    // Drain a refresh coalesced while this diff load was in
-                    // flight (e.g. an op-log signal during a watcher reload) —
-                    // this arm returns early, so it would otherwise wait for
-                    // the next unrelated message to hit the fall-through.
-                    let pending = self.take_pending_refresh(tab);
-                    return Task::batch([
-                        self.spawn_highlights(document_id),
-                        pending,
-                        if open_description_editor && is_active {
-                            Task::done(Message::DescriptionEdit)
-                        } else {
-                            Task::none()
-                        },
-                    ]);
+                    tasks.push(self.spawn_highlights(document_id));
                 }
-                Err(error) => {
-                    let Some(target) = self.tab_mut(tab) else {
-                        return Task::none();
+                Effect::GraphReplaced => {
+                    // Every row index is stale. Drop the draft's destination
+                    // candidate; the event path re-finds it by commit id when
+                    // the commit is still in the new graph.
+                    if let Some(ui) = self.tab_mut(tab).and_then(|t| t.op_draft.as_mut()) {
+                        ui.draft.candidate = None;
+                        ui.hover_spot = None;
+                        ui.preview = DraftPreviewState::Idle;
+                        ui.preview_request = None;
+                    }
+                }
+                Effect::RevealSelection => {
+                    if let Some(target) = self.tab_mut(tab) {
+                        target.revision_reveal_token = target.revision_reveal_token.wrapping_add(1);
+                    }
+                }
+                Effect::Activity(Activity::LoadFinished { ok, detail }) => {
+                    let status = if ok {
+                        activity::ActivityStatus::Done
+                    } else {
+                        activity::ActivityStatus::Error
                     };
-                    if target.pending_description_edit.as_ref() == Some(&revision) {
-                        target.pending_description_edit = None;
+                    if let Some(target) = self.tab_mut(tab) {
+                        target.finish_load_activity(status, detail);
                     }
-                    if target.session.pending_revision.as_ref() != Some(&revision) {
-                        return Task::none();
+                }
+                Effect::Activity(Activity::Toast { title, body, .. }) => {
+                    self.push_error_toast(title, &body);
+                }
+                Effect::Activity(Activity::Note(note)) => {
+                    if let Some(log) = self.activity_log_for(tab) {
+                        log.note(note);
                     }
+                }
+            }
+        }
+        Task::batch(tasks)
+    }
 
-                    target.session.pending_revision = None;
-                    target.session.loading_since = None;
-                    if target.session.repository.is_none() {
-                        // A PR commit fetch failed — keep the current document
-                        // on screen rather than failing the whole tab.
-                        eprintln!("diffui: PR commit diff failed: {error}");
-                    } else {
-                        target.session.status = LoadStatus::Failed(error);
-                    }
-                }
-            },
-            Message::RepositorySnapshotLoaded(tab, origin, Ok(snapshot)) => {
-                // Routed to the tab that asked for it, like every other
-                // completion: a snapshot that lands while its tab is
-                // backgrounded still reconciles that tab. The activity id
-                // counter is global while the log this arm writes is the tab's,
-                // so split the borrow rather than re-resolving the tab midway.
-                let Diffui {
-                    tabs,
-                    next_activity_id,
-                    ..
-                } = self;
-                let Some(target) = tabs
-                    .iter_mut()
-                    .find(|candidate| candidate.id == tab)
-                    .map(|candidate| &mut candidate.state)
-                else {
-                    return Task::none();
-                };
-                target.session.snapshot_pending = false;
-                let changed = target
-                    .session
-                    .repository_snapshot
-                    .as_ref()
-                    .map(|reflected| reflected.fingerprint.as_str())
-                    != Some(snapshot.fingerprint.as_str());
-                if changed
-                    && target.session.pending_revision.is_none()
-                    && let Some(source) = target.session.source.clone()
-                {
-                    // Escalate a watcher (diff-only) refresh to a full reload
-                    // when ops other than our own snapshot landed since the
-                    // graph was walked: the snapshot's parent op should be
-                    // exactly the op the graph reflects. A CLI `jj edit` /
-                    // `jj rebase` fires worktree + op-log signals in one
-                    // debounce window; the worktree signal wins the race and
-                    // this snapshot advances the fingerprint *past* the
-                    // external op — without the escalation, that swallowed the
-                    // topology change and the graph stayed stale.
-                    let external_op = match (
-                        target.session.repository_snapshot.as_ref(),
-                        snapshot.parent_fingerprint.as_deref(),
-                    ) {
-                        (Some(reflected), Some(parent)) => reflected.fingerprint != parent,
-                        _ => false,
-                    };
-                    let origin = if external_op {
-                        RefreshOrigin::Focus
-                    } else {
-                        origin
-                    };
-                    match origin {
-                        RefreshOrigin::Watcher => {
-                            // A working-tree edit moved @'s tree but not the
-                            // graph topology, so skip the (up to ~1M-commit)
-                            // re-walk and just reload @'s diff if it's on screen
-                            // (the wc snapshot already ran in
-                            // `load_repository_snapshot`, so `load_diff` sees the
-                            // edit; `DiffLoaded` re-syncs @'s empty chip).
-                            // Viewing another commit ⇒ its diff is unchanged.
-                            //
-                            // Advance `repository_snapshot` to this op: external
-                            // ops are now caught live by the op-log watcher, so a
-                            // later focus-regain no longer has to conservatively
-                            // re-walk just because our own snapshot moved the op
-                            // — that's what kept focus expensive on big repos.
-                            // (The narrow race where an external op lands in the
-                            // same instant as an edit and is absorbed into this
-                            // snapshot self-heals on the next op change.)
-                            target.session.repository_snapshot = Some(snapshot.clone());
-                            // Keep @'s sidebar "empty" chip live even when the
-                            // diff pane is showing another revision: the wc
-                            // snapshot just rewrote @'s tree, so its empty↔
-                            // non-empty state may have flipped. (When @ *is*
-                            // selected the reload below refreshes it too —
-                            // redundant but consistent.)
-                            target.apply_working_copy_empty(snapshot.working_copy_empty);
-                            if matches!(
-                                target.session.selected_revision,
-                                RevisionSelection::WorkingCopy
-                            ) {
-                                let revision = target.session.selected_revision.clone();
-                                target.session.pending_revision = Some(revision.clone());
-                                target.session.loading_since = Some(Instant::now());
-                                return Task::perform(
-                                    source.diff(revision.clone()),
-                                    move |result| {
-                                        Message::DiffLoaded(tab, revision, Box::new(result))
-                                    },
-                                );
-                            }
-                        }
-                        RefreshOrigin::Focus => {
-                            // A real topology change (an external op caught by the
-                            // op-log watcher, a mutation, a fetch): full reload.
-                            // Surface the walk as an activity so a multi-second
-                            // graph walk on a big repo doesn't look like a freeze;
-                            // `BackendLoaded` records the snapshot and finishes it.
-                            let revision = target.session.selected_revision.clone();
-                            target.session.pending_revision = Some(revision.clone());
-                            target.session.loading_since = Some(Instant::now());
-                            let revset = target.session.revset.clone();
-                            let progress = if target.pending_load_activity.is_none() {
-                                let id = activity::ActivityId(*next_activity_id);
-                                *next_activity_id = next_activity_id.wrapping_add(1);
-                                target.pending_load_activity = Some(id);
-                                target.activities.start(id, "Refresh repository", true)
-                            } else {
-                                LoadProgress::default()
-                            };
-                            target.session.commit_progress = progress.clone();
-                            return Task::perform(
-                                source.load(revision.clone(), revset, progress),
-                                move |result| {
-                                    Message::BackendLoaded(tab, revision, Box::new(result))
-                                },
-                            );
-                        }
-                    }
-                }
-                // We reach here only when no reload was kicked (snapshot
-                // unchanged, or viewing a non-@ revision on a watcher tick). A
-                // toolbar Refresh still wants its activity resolved — there was
-                // simply nothing to reload.
-                target.finish_load_activity(
-                    activity::ActivityStatus::Done,
-                    Some("Already up to date".to_owned()),
-                );
-            }
-            Message::RepositorySnapshotLoaded(tab, _, Err(error)) => {
-                let Some(target) = self.tab_mut(tab) else {
-                    return Task::none();
-                };
-                target.session.snapshot_pending = false;
-                target.finish_load_activity(activity::ActivityStatus::Error, Some(error.clone()));
-                target.session.status = LoadStatus::Failed(error);
-            }
-            Message::EmptyStatusComputed(tab, version, updates) => {
-                // Drop results computed against a graph that's since been
-                // replaced — their row indices would no longer line up. The
-                // version alone isn't unique across tabs (each session counts
-                // its own), which is why the routing is by tab first.
-                let Some(target) = self.tab_mut(tab) else {
-                    return Task::none();
-                };
-                if version != target.session.commits_version || updates.is_empty() {
-                    return Task::none();
-                }
-                for &(index, empty) in &updates {
-                    let commit_id = target.session.commits.row(index).commit_id().to_owned();
-                    target.session.empty_cache.insert(commit_id, empty);
-                    target.session.commits.set_is_empty(index, empty);
-                }
-                target.session.commits_version = target.session.commits_version.wrapping_add(1);
-            }
+    pub(crate) fn update(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::Repo(event) => return self.on_repo_event(*event),
             Message::SelectFile(index) => {
                 if index < self.active().session.document.files.len() {
                     self.active_mut().selected_file = index;
@@ -946,12 +611,7 @@ impl Diffui {
                 // revision, consumed by the context menu's batch items.
                 // jj-gated like every mutation entry point.
                 if (self.modifiers.command() || self.modifiers.shift())
-                    && self
-                        .active_mut()
-                        .session
-                        .repository
-                        .as_ref()
-                        .is_some_and(|repo| matches!(repo.vcs, Vcs::Jj))
+                    && self.active().session.capabilities.mutate
                 {
                     let commit_id = match &selection {
                         RevisionSelection::WorkingCopy => self
@@ -1022,24 +682,11 @@ impl Diffui {
                 // next.
                 if target.session.selected_revision == selection {
                     target.file_list_expanded = !target.file_list_expanded;
-                } else if target.session.pending_revision.as_ref() == Some(&selection) {
+                } else if target.session.diff_pending() == Some(&selection) {
                     // Already loading this revision — let it land.
                 } else if let Some(tab) = self.active_tab_id() {
-                    // Graph-less (PR) sources go through the cache-aware
-                    // switcher: parked documents swap back in for free, and a
-                    // live stream blocks the switch.
-                    if self.active_pr_spec().is_some() {
-                        return self.select_pr_revision(tab, selection);
-                    }
-                    let target = self.active_mut();
-                    if let Some(source) = target.session.source.clone() {
-                        target.session.pending_revision = Some(selection.clone());
-                        target.session.loading_since = Some(Instant::now());
-                        let revision = selection.clone();
-                        return Task::perform(source.diff(selection), move |result| {
-                            Message::DiffLoaded(tab, revision, Box::new(result))
-                        });
-                    }
+                    let effects = self.active_mut().session.load_diff(selection);
+                    return self.run_effects(tab, effects);
                 }
             }
             Message::MultiSelectClear => {
@@ -1091,7 +738,7 @@ impl Diffui {
                 // else instead" — drop the draft rather than nesting modes.
                 let target = self.active_mut();
                 target.op_draft = None;
-                let Some(repository) = target.session.repository.clone() else {
+                let Some(repository) = target.repository.clone() else {
                     return Task::none();
                 };
                 // jj-only for now — the mutations are jj-lib transactions.
@@ -1141,11 +788,7 @@ impl Diffui {
                 let Some(details) = target.session.revision_details.as_ref() else {
                     return Task::none();
                 };
-                let editable = target
-                    .session
-                    .repository
-                    .as_ref()
-                    .is_some_and(|repo| matches!(repo.vcs, Vcs::Jj));
+                let editable = target.session.capabilities.mutate;
                 if !editable {
                     return Task::none();
                 }
@@ -1197,214 +840,25 @@ impl Diffui {
                 if editor.saving_activity.is_some() || !editor.is_dirty() {
                     return Task::none();
                 }
-                let Some(repository) = target.session.repository.clone() else {
-                    return Task::none();
-                };
                 let op = mutations::MutationOp::Describe {
                     target: editor.target.clone(),
                     description: editor.text().trim_end().to_owned(),
                 };
-                let (activity_id, progress) =
-                    self.begin_activity(tab_id, "Update description", false);
+                let (activity_id, _) = self.begin_activity(tab_id, "Update description", false);
                 if let Some(editor) = self.active_mut().description_editor.as_mut() {
                     editor.saving_activity = Some(activity_id);
                     editor.switch_blocked = false;
                 }
-                return self.enqueue_or_run_mutation(PendingMutation {
-                    repository,
+                return self.run_mutation(PendingMutation {
                     op,
                     tab_id,
                     activity_id,
-                    progress,
                     allow_immutable: false,
-                });
-            }
-            Message::MutationCompleted(pending, result) => {
-                // Everything here belongs to the tab the mutation ran against,
-                // not to whichever tab is on screen when it lands.
-                let (tab_id, id) = (pending.tab_id, pending.activity_id);
-                let description_save = self.tab_mut(tab_id).is_some_and(|target| {
-                    target
-                        .description_editor
-                        .as_ref()
-                        .is_some_and(|editor| editor.saving_activity == Some(id))
-                });
-                match *result {
-                    Ok(outcome) => {
-                        if let Some(log) = self.activity_log_for(tab_id) {
-                            if !outcome.output.is_empty() {
-                                log.extend_output(id, outcome.output);
-                            }
-                            log.finish(
-                                id,
-                                activity::ActivityStatus::Done,
-                                Some(outcome.message.clone()),
-                            );
-                            // Arm the row's one-click "Undo" with the op this
-                            // mutation committed.
-                            if let Some(operation_id) = outcome.operation_id.clone() {
-                                log.set_undo_op(id, operation_id);
-                            }
-                        }
-                        // Only snap the selection back to `@` when the op
-                        // actually moved it (new/edit/abandon); bookmark ops
-                        // leave it put. The reload itself happens once the queue
-                        // drains, in `advance_mutation_queue`.
-                        if let Some(target) = self.tab_mut(tab_id) {
-                            if outcome.moved_working_copy {
-                                target.session.selected_revision = RevisionSelection::WorkingCopy;
-                            } else if let Some(commit_id) = outcome.rewritten_commit {
-                                target.session.selected_revision =
-                                    RevisionSelection::Commit(commit_id);
-                            }
-                            if description_save {
-                                target.description_editor = None;
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        // An immutable-commit rejection isn't a dead end: the
-                        // pre-flight can only see directly-addressed rows, so a
-                        // computed-set member (a rebase's descendant, an
-                        // insert-after target's child, a parent-squash's
-                        // destination) surfaces here instead. Same dialog, op
-                        // intact, override armed — accept reruns it. The queue
-                        // still advances so ops behind it aren't stranded.
-                        if let Some(target) = error.immutable_target.clone() {
-                            let dialog = self.confirm_immutable(*pending, &[target], true);
-                            return Task::batch([dialog, self.advance_mutation_queue(tab_id)]);
-                        }
-                        // Surface the failure in the activity log rather than
-                        // failing the whole view — a rejected push shouldn't
-                        // blank the panes.
-                        let error = error.message;
-                        let mut toast_title = "Operation failed".to_owned();
-                        if let Some(log) = self.activity_log_for(tab_id) {
-                            if let Some(label) = log.label(id) {
-                                toast_title = format!("{label} failed");
-                            }
-                            log.append_output(id, error.clone());
-                            log.finish(id, activity::ActivityStatus::Error, Some(error.clone()));
-                        }
-                        // The log is durable but easy to miss — float the
-                        // failure too.
-                        self.push_error_toast(toast_title, &error);
-                        if description_save
-                            && let Some(editor) = self
-                                .tab_mut(tab_id)
-                                .and_then(|target| target.description_editor.as_mut())
-                        {
-                            editor.saving_activity = None;
-                        }
-                    }
-                }
-                // Run the next queued mutation, or reload once the batch is
-                // done. Unconditional so a failure can't strand the queue.
-                return self.advance_mutation_queue(tab_id);
-            }
-            Message::BookmarkMoveChecked(pending, result) => {
-                let backwards = match *result {
-                    Ok(backwards) => backwards,
-                    Err(error) => {
-                        // Couldn't determine ancestry — run the move like
-                        // before the guard existed; the mutation path
-                        // surfaces any real failure.
-                        eprintln!("diffui: bookmark ancestry check failed: {error}");
-                        false
-                    }
-                };
-                let mutations::MutationOp::MoveBookmark {
-                    name,
-                    to,
-                    push_remote,
-                } = &pending.op
-                else {
-                    return self.enqueue_or_run_mutation(*pending);
-                };
-                if !backwards {
-                    return self.enqueue_or_run_mutation(*pending);
-                }
-                let target = match to {
-                    RevisionSelection::WorkingCopy => "The working copy".to_owned(),
-                    RevisionSelection::Commit(hex) => self
-                        .active_mut()
-                        .session
-                        .commits
-                        .find_by_commit_id(hex)
-                        .map(|c| {
-                            let len = c.shortest_change_id_len().unwrap_or(8).max(8);
-                            let mut id: String = c.change_id().chars().take(len).collect();
-                            // Divergent/hidden copies read as `changeid/N`,
-                            // like the sidebar and jj log.
-                            if let Some(offset) = c.change_offset() {
-                                id.push('/');
-                                id.push_str(&offset.to_string());
-                            }
-                            id
-                        })
-                        .unwrap_or_else(|| hex.chars().take(12).collect()),
-                };
-                // A conflicted bookmark also lands here (it has no single
-                // commit to be "a descendant of"), but there the move *is*
-                // the fix — the dialog explains the resolution rather than
-                // warning about a backwards move that isn't the story.
-                let conflicted_sides = self
-                    .active_mut()
-                    .session
-                    .bookmarks
-                    .bookmarks
-                    .iter()
-                    .find(|b| b.name == *name)
-                    .filter(|b| b.is_conflicted())
-                    .map(|b| b.local_targets.len());
-                let (title, mut body) = match conflicted_sides {
-                    Some(sides) => (
-                        format!("Resolve conflicted bookmark \u{201c}{name}\u{201d}?"),
-                        format!(
-                            "\u{201c}{name}\u{201d} is conflicted — it points at {sides} \
-                             commits at once (concurrent moves, or a force-pushed \
-                             remote). Moving it to {target} picks that side and \
-                             resolves the conflict."
-                        ),
-                    ),
-                    None => (
-                        format!("Move bookmark \u{201c}{name}\u{201d} backwards?"),
-                        format!(
-                            "{target} is not a descendant of the commit \u{201c}{name}\u{201d} \
-                             points at, so this is a backwards or sideways move — the jj CLI \
-                             refuses it without --allow-backwards."
-                        ),
-                    ),
-                };
-                // A move that also pushes rewrites the remote branch — say so
-                // before the user commits to it.
-                let confirm_label = match (push_remote, conflicted_sides) {
-                    (Some(remote), None) => {
-                        body.push_str(&format!(
-                            " The bookmark is then pushed, moving it backwards on \
-                             \u{201c}{remote}\u{201d} too."
-                        ));
-                        "Move & push anyway".to_owned()
-                    }
-                    (Some(remote), Some(_)) => {
-                        body.push_str(&format!(
-                            " The bookmark is then pushed to \u{201c}{remote}\u{201d}."
-                        ));
-                        "Move, resolve & push".to_owned()
-                    }
-                    (None, Some(_)) => "Move & resolve".to_owned(),
-                    (None, None) => "Move anyway".to_owned(),
-                };
-                self.confirm = Some(ConfirmDialog {
-                    title,
-                    body,
-                    confirm_label,
-                    pending: *pending,
                 });
             }
             Message::ConfirmAccept => {
                 if let Some(dialog) = self.confirm.take() {
-                    return self.enqueue_or_run_mutation(dialog.pending);
+                    return self.run_mutation(dialog.pending);
                 }
             }
             Message::ConfirmCancel => {
@@ -1429,13 +883,7 @@ impl Diffui {
             Message::ConfirmNoOp => {}
             Message::DraftStart(kind, source) => {
                 // jj-only, like every mutation.
-                if !self
-                    .active_mut()
-                    .session
-                    .repository
-                    .as_ref()
-                    .is_some_and(|repo| matches!(repo.vcs, Vcs::Jj))
-                {
+                if !self.active().session.capabilities.mutate {
                     return Task::none();
                 }
                 let Some(draft_source) = self.draft_source_for(&source) else {
@@ -1579,9 +1027,6 @@ impl Diffui {
                 // The debounce timer fired: run the simulation that was
                 // parked at kick time, unless a newer kick (or an Idle
                 // transition, which clears the request) superseded it.
-                let Some(repository) = self.active_mut().session.repository.clone() else {
-                    return Task::none();
-                };
                 let Some(ui) = self.active_mut().op_draft.as_mut() else {
                     return Task::none();
                 };
@@ -1591,60 +1036,42 @@ impl Diffui {
                 let Some(request) = ui.preview_request.take() else {
                     return Task::none();
                 };
-                return Task::perform(
-                    async move {
-                        match request.kind {
-                            mutations::DraftKind::Rebase { mode } => mutations::run_rebase_preview(
-                                repository,
-                                mode,
-                                request.sources,
-                                request.destination,
-                            )
-                            .await
-                            .map(mutations::DraftSimulation::Rebase),
-                            mutations::DraftKind::Merge => {
-                                // The merge's second parent is the
-                                // destination's anchor (gap drops resolve to
-                                // the parent side, like the confirm path).
-                                let anchor = request.destination.anchor().clone();
-                                let parents: Vec<RevisionSelection> =
-                                    request.sources.into_iter().chain([anchor]).collect();
-                                mutations::run_merge_preview(repository, parents)
-                                    .await
-                                    .map(mutations::DraftSimulation::Merge)
-                            }
-                            // Filtered out before the request was parked.
-                            mutations::DraftKind::Squash => {
-                                Err("squash has no simulation".to_owned())
-                            }
-                        }
+                let draft = match request.kind {
+                    mutations::DraftKind::Rebase { mode } => diffui_core::PreviewRequest::Rebase {
+                        mode,
+                        sources: request.sources,
+                        destination: request.destination,
                     },
-                    move |result| Message::DraftPreview(version, Box::new(result)),
-                );
-            }
-            Message::DraftPreview(version, result) => {
-                if let Some(ui) = self.active_mut().op_draft.as_mut()
-                    && ui.preview_version == version
-                {
-                    ui.preview = match *result {
-                        Ok(preview) => {
-                            // Refresh the whole-moved-set wash (branch mode's
-                            // "which branch is this?" answer); non-rebase
-                            // simulations and failures drop it.
-                            ui.moved_highlight = match &preview {
-                                diffui_core::DraftSimulation::Rebase(rebase) => {
-                                    rebase.moved_commit_ids.iter().cloned().collect()
-                                }
-                                diffui_core::DraftSimulation::Merge(_) => HashSet::new(),
-                            };
-                            DraftPreviewState::Ready(preview)
+                    mutations::DraftKind::Merge => {
+                        // The merge's second parent is the destination's anchor
+                        // (gap drops resolve to the parent side, like the
+                        // confirm path).
+                        let anchor = request.destination.anchor().clone();
+                        diffui_core::PreviewRequest::Merge {
+                            parents: request.sources.into_iter().chain([anchor]).collect(),
                         }
-                        Err(error) => {
-                            ui.moved_highlight = HashSet::new();
-                            DraftPreviewState::Failed(error)
-                        }
-                    };
+                    }
+                    // Filtered out before the request was parked.
+                    mutations::DraftKind::Squash => return Task::none(),
+                };
+                let Some(tab) = self.active_tab_id() else {
+                    return Task::none();
+                };
+                let Some(state) = self.tab_mut(tab) else {
+                    return Task::none();
+                };
+                // A superseded simulation is cancelled rather than left to
+                // finish against a candidate the user has already left.
+                let mut effects = Vec::new();
+                if let Some(previous) = state.jobs.preview.take() {
+                    effects.push(diffui_core::Effect::Send(diffui_core::Command::Cancel {
+                        job: previous,
+                    }));
                 }
+                let (job, preview) = state.session.preview(draft);
+                state.jobs.preview = Some(job);
+                effects.extend(preview);
+                return self.run_effects(tab, effects);
             }
             Message::RevisionDragStart(index) => {
                 // A drag that activates right after a confirm-on-press (the
@@ -1831,65 +1258,6 @@ impl Diffui {
 
                 if gained_focus && let Some(tab) = self.active_tab_id() {
                     return self.start_repository_snapshot(tab, RefreshOrigin::Focus);
-                }
-            }
-            Message::RefreshRepository => {
-                // Hold off the (frequent, uncontrolled) watcher snapshot while a
-                // mutation is running or queued — both take jj's wc lock, and
-                // the post-batch reload re-snapshots, so nothing is lost.
-                if self.app_focused
-                    && !self.mutation_busy()
-                    && let Some(tab) = self.active_tab_id()
-                {
-                    return self.start_repository_snapshot(tab, RefreshOrigin::Watcher);
-                }
-            }
-            Message::OpLogChanged => {
-                // An op landed. Read the head cheaply (off-thread, no wc lock)
-                // and let `OpHeadChecked` decide; while a snapshot/load is
-                // already in flight, coalesce instead of dropping — the
-                // deferred snapshot's parent-op check catches an external op
-                // that landed mid-work (dropping used to lose ops that raced a
-                // cold load). Mid-mutation stays a plain skip (the post-batch
-                // reload re-snapshots). Gated on focus like the watcher
-                // refresh — ops that land while unfocused are caught by the
-                // focus-regain reload.
-                if self.app_focused
-                    && !self.mutation_busy()
-                    && let Some(tab) = self.active_tab_id()
-                {
-                    let target = self.active_mut();
-                    if target.session.busy() {
-                        target.session.pending_refresh = Some(coalesce_refresh(
-                            target.session.pending_refresh,
-                            RefreshOrigin::Watcher,
-                        ));
-                    } else if let Some(source) = target.session.source.clone() {
-                        return Task::perform(source.op_head(), move |result| {
-                            Message::OpHeadChecked(tab, Box::new(result))
-                        });
-                    }
-                }
-            }
-            Message::OpHeadChecked(tab, result) => {
-                let Some(target) = self.tab_mut(tab) else {
-                    return Task::none();
-                };
-                // Reload only when the on-disk op differs from the one the graph
-                // reflects — i.e. it was an *external* op, not our own wc
-                // snapshot / mutation (whose op is already recorded in
-                // `repository_snapshot`). That dedup is what keeps our own writes
-                // from each triggering a full re-walk. Errors are swallowed: a
-                // failed cheap read just means we wait for the next signal.
-                if let Ok(Some(on_disk)) = *result {
-                    let reflects = target
-                        .session
-                        .repository_snapshot
-                        .as_ref()
-                        .map(|snapshot| snapshot.fingerprint.as_str());
-                    if reflects != Some(on_disk.as_str()) {
-                        return self.start_repository_snapshot(tab, RefreshOrigin::Focus);
-                    }
                 }
             }
             Message::LoadingTick => {}
@@ -2355,22 +1723,6 @@ impl Diffui {
             Message::Fetch(target) => {
                 return self.start_fetch(target);
             }
-            Message::FetchCompleted(tab_id, id, target, result) => {
-                // "Up to date" when the remote sent nothing back; otherwise
-                // name the fetched target (the title may be ellipsized, the
-                // subtitle shows it in full).
-                let summary = match result.as_ref() {
-                    Err(_) => None,
-                    Ok(lines) if lines.is_empty() => Some("Fetched · up to date".to_owned()),
-                    Ok(_) => Some(match &target {
-                        FetchTarget::AllRemotes => "Fetched all remotes".to_owned(),
-                        FetchTarget::RemoteBranch { remote, branch } => {
-                            format!("Fetched {remote}/{branch}")
-                        }
-                    }),
-                };
-                return self.finish_remote_op(tab_id, id, *result, summary);
-            }
             Message::Undo => {
                 return self.start_undo();
             }
@@ -2572,73 +1924,6 @@ impl Diffui {
                 let path = file.path.clone();
                 return self.open_source_browser(revision, Some(path));
             }
-            Message::SourceTreeLoaded(tab, version, result) => {
-                let is_active_tab = self.is_active(tab);
-                let Some(state) = self.tab_mut(tab).map(|target| &mut target.source) else {
-                    return Task::none();
-                };
-                if state.version != version {
-                    return Task::none();
-                }
-                match *result {
-                    Ok(entries) => {
-                        state.tree = Some(entries);
-                        state.tree_epoch = state.tree_epoch.wrapping_add(1);
-                        state.tree_error = None;
-                        // A jump scheduled before the listing arrived had no
-                        // row to reveal yet — re-arm it now that the selected
-                        // path has one. One-shot, so periodic wc re-lists
-                        // don't yank the scroll back to the selection.
-                        let rearm = state.reveal_pending && state.selected.is_some();
-                        state.reveal_pending = false;
-                        if rearm {
-                            state.reveal_token = state.reveal_token.wrapping_add(1);
-                            if is_active_tab {
-                                self.aim_tree_scroll_at_selected();
-                            }
-                        }
-                    }
-                    // Keep a previously-listed tree usable under the error
-                    // banner (a wc re-list that failed shouldn't blank the
-                    // pane).
-                    Err(error) => state.tree_error = Some(error),
-                }
-            }
-            Message::SourceFileLoaded(tab, version, path, result) => {
-                // Allocated up front — the lookup below borrows self.
-                let doc_id = self.allocate_document_id();
-                let is_active_tab = self.is_active(tab);
-                let Some(state) = self.tab_mut(tab).map(|target| &mut target.source) else {
-                    return Task::none();
-                };
-                // Stale guards: a superseded browse (version) or a selection
-                // that moved on (path) drops the result.
-                if state.version != version || state.selected.as_deref() != Some(path.as_str()) {
-                    return Task::none();
-                }
-                state.loading = None;
-                match *result {
-                    Ok(load) => {
-                        state.file = Some(SourceFileView {
-                            file: load.file,
-                            line_count: load.line_count,
-                            byte_len: load.byte_len,
-                            binary: load.binary,
-                            too_large: load.too_large,
-                            doc_id,
-                        });
-                        state.file_error = None;
-                    }
-                    Err(error) => {
-                        state.file = None;
-                        state.file_error = Some(error);
-                    }
-                }
-                // Repaint the (shared) code widget with the new document.
-                if is_active_tab {
-                    self.document_version = self.document_version.wrapping_add(1);
-                }
-            }
             Message::SourceSidebarRow(display_index) => {
                 let (entries, rows) = self.source_entries_and_rows();
                 match rows.get(display_index).cloned() {
@@ -2651,7 +1936,7 @@ impl Diffui {
                                 return Task::none();
                             };
                             self.active_mut().source.expanded.insert(path.clone());
-                            return self.kick_ignored_dir_load(tab, path);
+                            return self.list_ignored_dir(tab, path);
                         }
                         let expanded = &mut self.active_mut().source.expanded;
                         if !expanded.remove(&path) {
@@ -2665,26 +1950,6 @@ impl Diffui {
                         }
                     }
                     None => {}
-                }
-            }
-            Message::SourceDirLoaded(tab, version, dir, result) => {
-                let Some(state) = self.tab_mut(tab).map(|target| &mut target.source) else {
-                    return Task::none();
-                };
-                if state.version != version {
-                    return Task::none();
-                }
-                match *result {
-                    Ok(entries) => {
-                        state.dir_children.insert(dir, entries);
-                        state.tree_epoch = state.tree_epoch.wrapping_add(1);
-                    }
-                    // Surface a failed readdir in the tree banner; the row
-                    // stays unlisted so the click can retry.
-                    Err(error) => {
-                        state.expanded.remove(&dir);
-                        state.tree_error = Some(error);
-                    }
                 }
             }
             Message::SourceHeaderClicked => {}
@@ -2721,7 +1986,13 @@ impl Diffui {
         // if the active tab coalesced a refresh while busy and it's now idle,
         // run it. A no-op when nothing's pending (the common case).
         match self.active_tab_id() {
-            Some(tab) => self.take_pending_refresh(tab),
+            Some(tab) => {
+                let effects = match self.tab_mut(tab) {
+                    Some(target) => target.session.take_pending_refresh(),
+                    None => Vec::new(),
+                };
+                self.run_effects(tab, effects)
+            }
             None => Task::none(),
         }
     }
@@ -2730,6 +2001,391 @@ impl Diffui {
     /// to `jump` — the entry point behind the toolbar switcher, the revision
     /// context menu, file-tree right-clicks, and the diff view's per-file
     /// browse button. Repo tabs only; a PR tab has no tree to browse.
+    /// Fold a finished draft simulation into the active draft.
+    fn apply_draft_preview(
+        &mut self,
+        tab: TabId,
+        result: Result<mutations::DraftSimulation, String>,
+    ) -> Task<Message> {
+        let Some(ui) = self
+            .tab_mut(tab)
+            .and_then(|target| target.op_draft.as_mut())
+        else {
+            return Task::none();
+        };
+        ui.preview = match result {
+            Ok(preview) => {
+                // Refresh the whole-moved-set wash (branch mode's "which
+                // branch is this?" answer); merge simulations and failures
+                // drop it.
+                ui.moved_highlight = match &preview {
+                    diffui_core::DraftSimulation::Rebase(rebase) => {
+                        rebase.moved_commit_ids.iter().cloned().collect()
+                    }
+                    diffui_core::DraftSimulation::Merge(_) => HashSet::new(),
+                };
+                DraftPreviewState::Ready(preview)
+            }
+            Err(error) => {
+                ui.moved_highlight = HashSet::new();
+                DraftPreviewState::Failed(error)
+            }
+        };
+        Task::none()
+    }
+
+    /// Fold a source-browser listing in. A failed re-list leaves the previous
+    /// tree usable under the error banner rather than blanking the pane.
+    fn apply_source_tree(
+        &mut self,
+        tab: TabId,
+        revision: RevisionSelection,
+        result: Result<Vec<diffui_core::SourceEntry>, String>,
+    ) -> Task<Message> {
+        let is_active_tab = self.is_active(tab);
+        let Some(target) = self.tab_mut(tab) else {
+            return Task::none();
+        };
+        // A listing for a revision the browser has since left is stale.
+        if source_panel::browsed_revision(&target.source) != revision {
+            target.jobs.tree = None;
+            return Task::none();
+        }
+        target.jobs.tree = None;
+        let state = &mut target.source;
+        match result {
+            Ok(entries) => {
+                state.tree = Some(entries);
+                state.tree_epoch = state.tree_epoch.wrapping_add(1);
+                state.tree_error = None;
+                // A jump scheduled before the listing arrived had no row to
+                // reveal yet — re-arm it now that the selected path has one.
+                // One-shot, so periodic wc re-lists don't yank the scroll back.
+                let rearm = state.reveal_pending && state.selected.is_some();
+                state.reveal_pending = false;
+                if rearm {
+                    state.reveal_token = state.reveal_token.wrapping_add(1);
+                    if is_active_tab {
+                        self.aim_tree_scroll_at_selected();
+                    }
+                }
+            }
+            Err(error) => state.tree_error = Some(error),
+        }
+        Task::none()
+    }
+
+    fn apply_source_file(
+        &mut self,
+        tab: TabId,
+        path: String,
+        result: Result<diffui_core::SourceFileLoad, String>,
+    ) -> Task<Message> {
+        // Allocated up front — the lookup below borrows self.
+        let doc_id = self.allocate_document_id();
+        let is_active_tab = self.is_active(tab);
+        let Some(target) = self.tab_mut(tab) else {
+            return Task::none();
+        };
+        target.jobs.file = None;
+        let state = &mut target.source;
+        // A selection that has since moved on drops the result.
+        if state.selected.as_deref() != Some(path.as_str()) {
+            return Task::none();
+        }
+        state.loading = None;
+        match result {
+            Ok(load) => {
+                state.file = Some(SourceFileView {
+                    file: load.file,
+                    line_count: load.line_count,
+                    byte_len: load.byte_len,
+                    binary: load.binary,
+                    too_large: load.too_large,
+                    doc_id,
+                });
+                state.file_error = None;
+            }
+            Err(error) => {
+                state.file = None;
+                state.file_error = Some(error);
+            }
+        }
+        // Repaint the (shared) code widget with the new document.
+        if is_active_tab {
+            self.document_version = self.document_version.wrapping_add(1);
+        }
+        Task::none()
+    }
+
+    /// Full file sources for one background highlight job: hand them to the
+    /// tree-sitter parse, which is seconds of CPU on a large file and so stays
+    /// off the actor's thread.
+    fn apply_file_pair(
+        &mut self,
+        tab: TabId,
+        job: diffui_core::JobId,
+        old: Option<String>,
+        new: Option<String>,
+    ) -> Task<Message> {
+        let Some(target) = self.tab_mut(tab) else {
+            return Task::none();
+        };
+        let Some((document_id, file_index)) = target.jobs.file_pairs.remove(&job) else {
+            return Task::none();
+        };
+        if target.session.document_id != document_id {
+            return Task::none();
+        }
+        let Some(file) = target.session.document.files.get(file_index).cloned() else {
+            return Task::none();
+        };
+        // The parse is seconds of CPU on a large file, which is exactly why it
+        // isn't on the UI thread — and why it isn't on the actor's either.
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    diffui_core::syntax::highlight_file(file, old.as_deref(), new.as_deref())
+                })
+                .await
+                .unwrap_or_default()
+            },
+            move |spans| Message::FileHighlighted(document_id, file_index, spans),
+        )
+    }
+
+    /// A fetch finished. "Up to date" when the remote sent nothing back;
+    /// otherwise name the fetched target (the activity title may be
+    /// ellipsized, the subtitle shows it in full).
+    fn finish_fetch(&mut self, tab: TabId, result: Result<Vec<String>, String>) -> Task<Message> {
+        let Some((_, activity_id, target)) =
+            self.tab_mut(tab).and_then(|state| state.jobs.fetch.take())
+        else {
+            return Task::none();
+        };
+        let summary = match result.as_ref() {
+            Err(_) => None,
+            Ok(lines) if lines.is_empty() => Some("Fetched \u{b7} up to date".to_owned()),
+            Ok(_) => Some(match &target {
+                FetchTarget::AllRemotes => "Fetched all remotes".to_owned(),
+                FetchTarget::RemoteBranch { remote, branch } => {
+                    format!("Fetched {remote}/{branch}")
+                }
+            }),
+        };
+        let ok = result.is_ok();
+        let mut tasks = vec![self.finish_activity_row(tab, activity_id, result, summary)];
+        if ok {
+            let effects = match self.tab_mut(tab) {
+                Some(state) => state.session.snapshot(RefreshOrigin::Focus),
+                None => Vec::new(),
+            };
+            tasks.push(self.run_effects(tab, effects));
+        }
+        Task::batch(tasks)
+    }
+
+    /// A mutation finished. Success resolves its activity and arms the row's
+    /// one-click undo; an immutable rejection re-raises the confirmation with
+    /// the op intact and the override armed, because the pre-flight can only
+    /// see rows the UI directly addressed — a computed-set member (a rebase's
+    /// descendant, an insert-after target's child) surfaces only here.
+    fn finish_mutation(
+        &mut self,
+        tab: TabId,
+        result: Result<mutations::MutationOutcome, diffui_core::RepoError>,
+    ) -> Task<Message> {
+        let Some((_, pending)) = self
+            .tab_mut(tab)
+            .and_then(|state| state.jobs.mutation.take())
+        else {
+            return Task::none();
+        };
+        let activity_id = pending.activity_id;
+        let description_save = self.tab_mut(tab).is_some_and(|target| {
+            target
+                .description_editor
+                .as_ref()
+                .is_some_and(|editor| editor.saving_activity == Some(activity_id))
+        });
+        match result {
+            Ok(outcome) => {
+                if let Some(log) = self.activity_log_for(tab) {
+                    if !outcome.output.is_empty() {
+                        log.extend_output(activity_id, outcome.output.clone());
+                    }
+                    log.finish(
+                        activity_id,
+                        activity::ActivityStatus::Done,
+                        Some(outcome.message.clone()),
+                    );
+                    if let Some(operation_id) = outcome.operation_id.clone() {
+                        log.set_undo_op(activity_id, operation_id);
+                    }
+                }
+                if description_save && let Some(target) = self.tab_mut(tab) {
+                    target.description_editor = None;
+                }
+                Task::none()
+            }
+            Err(diffui_core::RepoError::Immutable { short_id }) => {
+                self.confirm_immutable(pending, &[short_id], true)
+            }
+            Err(error) => {
+                let error = error.to_string();
+                if description_save
+                    && let Some(editor) = self
+                        .tab_mut(tab)
+                        .and_then(|target| target.description_editor.as_mut())
+                {
+                    editor.saving_activity = None;
+                }
+                self.finish_activity_row(tab, activity_id, Err(error), None)
+            }
+        }
+    }
+
+    /// Send the next mutation `tab` is holding, once the one before it has
+    /// reported. Called after the projection has folded the completion in, so
+    /// its slot is genuinely free by then.
+    fn drain_queued_mutation(&mut self, tab: TabId) -> Task<Message> {
+        let Some(state) = self.tab_mut(tab) else {
+            return Task::none();
+        };
+        if state.jobs.mutation.is_some() || state.session.mutation_in_flight() {
+            return Task::none();
+        }
+        match state.queued_mutations.pop_front() {
+            Some(next) => self.dispatch_mutation(next),
+            None => Task::none(),
+        }
+    }
+
+    /// The backwards-bookmark-move check resolved: run the move, or raise the
+    /// confirmation the jj CLI's `--allow-backwards` stands for.
+    fn apply_bookmark_check(&mut self, tab: TabId, result: Result<bool, String>) -> Task<Message> {
+        let Some((_, pending)) = self
+            .tab_mut(tab)
+            .and_then(|state| state.jobs.bookmark_check.take())
+        else {
+            return Task::none();
+        };
+        // A check that failed can't tell a backwards move from a fast-forward;
+        // run it, as it ran before the guard existed. The mutation path still
+        // surfaces any real failure.
+        let backwards = result.unwrap_or(false);
+        let mutations::MutationOp::MoveBookmark {
+            name,
+            to,
+            push_remote,
+        } = &pending.op
+        else {
+            return self.run_mutation(pending);
+        };
+        if !backwards {
+            return self.run_mutation(pending);
+        }
+        let target = match to {
+            RevisionSelection::WorkingCopy => "The working copy".to_owned(),
+            RevisionSelection::Commit(hex) => {
+                let _ = hex;
+                self.revision_short_label(to)
+            }
+        };
+        // A conflicted bookmark also lands here (it has no single commit to be
+        // "a descendant of"), but there the move *is* the fix — the dialog
+        // explains the resolution rather than warning about a backwards move
+        // that isn't the story.
+        let conflicted_sides = self
+            .active()
+            .session
+            .bookmarks
+            .bookmarks
+            .iter()
+            .find(|b| b.name == *name)
+            .filter(|b| b.is_conflicted())
+            .map(|b| b.local_targets.len());
+        let (title, mut body) = match conflicted_sides {
+            Some(sides) => (
+                format!("Resolve conflicted bookmark \u{201c}{name}\u{201d}?"),
+                format!(
+                    "\u{201c}{name}\u{201d} is conflicted — it points at {sides} \
+                     commits at once (concurrent moves, or a force-pushed \
+                     remote). Moving it to {target} picks that side and \
+                     resolves the conflict."
+                ),
+            ),
+            None => (
+                format!("Move bookmark \u{201c}{name}\u{201d} backwards?"),
+                format!(
+                    "{target} is not a descendant of the commit \u{201c}{name}\u{201d} \
+                     points at, so this is a backwards or sideways move — the jj CLI \
+                     refuses it without --allow-backwards."
+                ),
+            ),
+        };
+        // A move that also pushes rewrites the remote branch — say so before
+        // the user commits to it.
+        let confirm_label = match (push_remote, conflicted_sides) {
+            (Some(remote), None) => {
+                body.push_str(&format!(
+                    " The bookmark is then pushed, moving it backwards on \
+                     \u{201c}{remote}\u{201d} too."
+                ));
+                "Move & push anyway".to_owned()
+            }
+            (Some(remote), Some(_)) => {
+                body.push_str(&format!(
+                    " The bookmark is then pushed to \u{201c}{remote}\u{201d}."
+                ));
+                "Move, resolve & push".to_owned()
+            }
+            (None, Some(_)) => "Move & resolve".to_owned(),
+            (None, None) => "Move anyway".to_owned(),
+        };
+        self.confirm = Some(ConfirmDialog {
+            title,
+            body,
+            confirm_label,
+            pending,
+        });
+        Task::none()
+    }
+
+    /// Record an operation's result on `tab`'s log, toasting a failure so it is
+    /// impossible to miss. The projection reports what happened to the *view*;
+    /// the activity row belongs to whoever minted its id.
+    fn finish_activity_row(
+        &mut self,
+        tab: TabId,
+        activity_id: activity::ActivityId,
+        result: Result<Vec<String>, String>,
+        summary: Option<String>,
+    ) -> Task<Message> {
+        let mut failure: Option<(String, String)> = None;
+        if let Some(log) = self.activity_log_for(tab) {
+            match result {
+                Ok(lines) => {
+                    log.extend_output(activity_id, lines);
+                    log.finish(activity_id, activity::ActivityStatus::Done, summary);
+                }
+                Err(error) => {
+                    let title = log
+                        .label(activity_id)
+                        .map(|label| format!("{label} failed"))
+                        .unwrap_or_else(|| "Operation failed".to_owned());
+                    failure = Some((title, error.clone()));
+                    log.append_output(activity_id, error.clone());
+                    log.finish(activity_id, activity::ActivityStatus::Error, Some(error));
+                }
+            }
+        }
+        if let Some((title, error)) = failure {
+            self.push_error_toast(title, &error);
+        }
+        Task::none()
+    }
+
     pub(crate) fn open_source_browser(
         &mut self,
         revision: RevisionSelection,
@@ -2739,7 +2395,7 @@ impl Diffui {
             return Task::none();
         };
         let target = self.active_mut();
-        if target.session.repository.is_none() {
+        if target.repository.is_none() {
             return Task::none();
         }
         target.main_view = MainView::Source;
@@ -2915,42 +2571,41 @@ impl Diffui {
         self.kick_source_file_load(tab)
     }
 
-    /// Spawn the tree listing for `tab`'s browsed revision under its current
-    /// browse version.
+    /// Ask for the tree listing of `tab`'s browsed revision.
     fn kick_source_tree_load(&mut self, tab: TabId) -> Task<Message> {
         let Some(target) = self.tab_mut(tab) else {
             return Task::none();
         };
-        let Some(repository) = target.session.repository.clone() else {
+        if !target.session.capabilities.browse {
             return Task::none();
-        };
+        }
         let revision = source_panel::browsed_revision(&target.source);
-        let version = target.source.version;
-        Task::perform(
-            diffui_core::list_source_tree(repository, revision),
-            move |result| Message::SourceTreeLoaded(tab, version, Box::new(result)),
-        )
+        let job = target.session.next_job();
+        target.jobs.tree = Some((job, revision.clone()));
+        self.send(tab, diffui_core::Command::ListTree { job, revision })
     }
 
-    /// Spawn the content load for `tab`'s browser selection.
+    /// Ask for the contents of `tab`'s browser selection.
     fn kick_source_file_load(&mut self, tab: TabId) -> Task<Message> {
         let Some(target) = self.tab_mut(tab) else {
             return Task::none();
         };
-        let Some(repository) = target.session.repository.clone() else {
+        if !target.session.capabilities.browse {
             return Task::none();
-        };
+        }
         let Some(path) = target.source.selected.clone() else {
             return Task::none();
         };
         target.source.loading = Some(path.clone());
         let revision = source_panel::browsed_revision(&target.source);
-        let version = target.source.version;
-        let result_path = path.clone();
-        Task::perform(
-            diffui_core::load_source_file(repository, revision, path),
-            move |result| {
-                Message::SourceFileLoaded(tab, version, result_path.clone(), Box::new(result))
+        let job = target.session.next_job();
+        target.jobs.file = Some((job, path.clone()));
+        self.send(
+            tab,
+            diffui_core::Command::ReadFile {
+                job,
+                revision,
+                path,
             },
         )
     }
@@ -2967,7 +2622,6 @@ impl Diffui {
         {
             return Task::none();
         }
-        target.source.version = target.source.version.wrapping_add(1);
         let reload_file = target.source.selected.is_some();
         // Previously-expanded ignored dirs re-list too, so an open `target/`
         // exploration tracks the disk like the rest of the tree.
@@ -2977,9 +2631,19 @@ impl Diffui {
             tasks.push(self.kick_source_file_load(tab));
         }
         for dir in dirs {
-            tasks.push(self.kick_ignored_dir_load(tab, dir));
+            tasks.push(self.list_ignored_dir(tab, dir));
         }
         Task::batch(tasks)
+    }
+
+    /// Hand one command to `tab`'s actor. Returns a `Task` only so call sites
+    /// read like the other kickers; commands travel down the channel, not
+    /// through the runtime.
+    pub(crate) fn send(&mut self, tab: TabId, command: diffui_core::Command) -> Task<Message> {
+        if let Some(handle) = self.tab_mut(tab).and_then(|target| target.handle.clone()) {
+            handle.send(command);
+        }
+        Task::none()
     }
 
     /// The composed source entries + their flattened display rows for the
@@ -2998,22 +2662,29 @@ impl Diffui {
             .entries_and_rows(&tab.source)
     }
 
-    /// Spawn the lazy one-level listing of an unenumerated ignored dir.
-    fn kick_ignored_dir_load(&mut self, tab: TabId, dir: String) -> Task<Message> {
+    /// List one level of an unenumerated ignored directory. Ignored content
+    /// exists only on disk, so this reads the filesystem directly rather than
+    /// going through the actor's tree.
+    fn list_ignored_dir(&mut self, tab: TabId, dir: String) -> Task<Message> {
         let Some(target) = self.tab_mut(tab) else {
             return Task::none();
         };
-        let Some(repository) = target.session.repository.clone() else {
+        let Some(repository) = target.repository.clone() else {
             return Task::none();
         };
-        let version = target.source.version;
-        let result_dir = dir.clone();
-        Task::perform(
-            diffui_core::list_ignored_dir(repository, dir),
-            move |result| {
-                Message::SourceDirLoaded(tab, version, result_dir.clone(), Box::new(result))
-            },
-        )
+        match diffui_core::list_ignored_dir(&repository, &dir) {
+            Ok(entries) => {
+                target.source.dir_children.insert(dir, entries);
+                target.source.tree_epoch = target.source.tree_epoch.wrapping_add(1);
+            }
+            // Surface a failed readdir in the tree banner; the row stays
+            // unlisted so the click can retry.
+            Err(error) => {
+                target.source.expanded.remove(&dir);
+                target.source.tree_error = Some(format!("{error:#}"));
+            }
+        }
+        Task::none()
     }
 
     /// Recompute find matches immediately (no debounce). Used by toggle
@@ -3248,7 +2919,6 @@ impl Diffui {
         let Some(tab) = self.active_tab_id() else {
             return Task::none();
         };
-        let is_pr = self.active_pr_spec().is_some();
         let state = self.active_mut();
 
         // Already current — no load, no async wait, bump the token now so
@@ -3258,30 +2928,16 @@ impl Diffui {
             return Task::none();
         }
 
-        // A load is already in flight for the same revision; piggyback so
-        // the eventual `BackendLoaded` bumps the token for us.
-        if state.session.pending_revision.as_ref() == Some(&selection) {
+        // A load is already in flight for the same revision; piggyback so the
+        // eventual `DiffLoaded` bumps the token for us.
+        if state.session.diff_pending() == Some(&selection) {
             state.pending_revision_reveal = true;
             return Task::none();
         }
-
-        // PR tabs switch through the cache-aware switcher (parked documents,
-        // live-stream guard) — a palette jump lands on its commits too.
-        if is_pr {
-            state.pending_revision_reveal = true;
-            return self.select_pr_revision(tab, selection);
-        }
-        let Some(source) = state.session.source.clone() else {
-            return Task::none();
-        };
-        state.session.pending_revision = Some(selection.clone());
-        state.session.loading_since = Some(Instant::now());
-        // Deferred bump — see comment on `pending_revision_reveal`.
+        // Deferred bump — see the comment on `pending_revision_reveal`.
         state.pending_revision_reveal = true;
-        let revision = selection.clone();
-        Task::perform(source.diff(selection), move |result| {
-            Message::DiffLoaded(tab, revision, Box::new(result))
-        })
+        let effects = state.session.load_diff(selection);
+        self.run_effects(tab, effects)
     }
 
     pub(crate) fn jump_to_file_path(&mut self, path: &str) {
@@ -3320,98 +2976,22 @@ impl Diffui {
     /// post-mutation reload), so it's also where a working-copy source browse
     /// re-syncs with the disk. Those loads are read-only and version-guarded,
     /// so they ride alongside the snapshot without contending for jj's wc lock.
+    /// Fold `tab`'s working copy into `@`. The projection decides whether to
+    /// run now or coalesce behind work already in flight; the browser re-lists
+    /// alongside it so a browsed working copy tracks the disk.
     pub(crate) fn start_repository_snapshot(
         &mut self,
         tab: TabId,
         origin: RefreshOrigin,
     ) -> Task<Message> {
         let source_refresh = self.refresh_source_if_working_copy(tab);
-        Task::batch([source_refresh, self.start_snapshot_inner(tab, origin)])
+        let effects = match self.tab_mut(tab) {
+            Some(target) => target.session.snapshot(origin),
+            None => Vec::new(),
+        };
+        Task::batch([source_refresh, self.run_effects(tab, effects)])
     }
 
-    fn start_snapshot_inner(&mut self, tab: TabId, origin: RefreshOrigin) -> Task<Message> {
-        let Some(target) = self.tab_mut(tab) else {
-            return Task::none();
-        };
-        // A snapshot or reload is already in flight (the snapshot phase, a cold
-        // stream still appending, or a graph walk holding `pending_revision`).
-        // Coalesce rather than race it: a second snapshot thrashes the wc lock,
-        // and a snapshot landing mid-walk is dropped by `RepositorySnapshotLoaded`
-        // anyway. The in-flight load's terminal kicks the coalesced refresh via
-        // `take_pending_refresh`, so a change that lands mid-reload isn't lost.
-        if target.session.busy() {
-            target.session.pending_refresh =
-                Some(coalesce_refresh(target.session.pending_refresh, origin));
-            return Task::none();
-        }
-
-        // Only graph-backed sources have a working copy to snapshot; a PR
-        // tab's `source` would just error.
-        if target.session.repository.is_none() {
-            return Task::none();
-        }
-        let Some(source) = target.session.source.clone() else {
-            return Task::none();
-        };
-
-        target.session.snapshot_pending = true;
-        Task::perform(source.snapshot(), move |result| {
-            Message::RepositorySnapshotLoaded(tab, origin, result)
-        })
-    }
-
-    /// Run a refresh `tab` coalesced while it was busy, now that it's idle. The
-    /// idle check mirrors `start_repository_snapshot`'s coalesce condition, and
-    /// taking the origin before dispatching keeps a no-op snapshot (op
-    /// unchanged) from re-arming itself into a loop.
-    pub(crate) fn take_pending_refresh(&mut self, tab: TabId) -> Task<Message> {
-        let Some(target) = self.tab_mut(tab) else {
-            return Task::none();
-        };
-        if target.session.busy() {
-            return Task::none();
-        }
-        match target.session.pending_refresh.take() {
-            Some(origin) => self.start_repository_snapshot(tab, origin),
-            None => Task::none(),
-        }
-    }
-
-    /// Resolve the merge/root commits `tab`'s loader left with unknown empty
-    /// status: apply any cached results immediately, and spawn a background
-    /// task for the rest (single-parent commits were already decided cheaply
-    /// during load).
-    pub(crate) fn resolve_empty_status(&mut self, tab: TabId) -> Task<Message> {
-        let Some(target) = self.tab_mut(tab) else {
-            return Task::none();
-        };
-        let Some(source) = target.session.source.clone() else {
-            return Task::none();
-        };
-
-        // Each background resolution is an ~8ms parent-tree merge, so on a repo
-        // with hundreds of thousands of merge commits (nixpkgs) computing them
-        // all would burn tens of minutes of CPU. Cap how many we resolve per
-        // load; beyond that, merges simply keep no "empty" chip. Cached results
-        // still apply to every row, so this only bounds *new* work. The gather +
-        // cache-apply is core engine logic (`Session::take_empty_status_targets`);
-        // here we just spawn the async resolution for what's left.
-        const EMPTY_STATUS_LIMIT: usize = 5_000;
-        let targets = target.session.take_empty_status_targets(EMPTY_STATUS_LIMIT);
-        if targets.is_empty() {
-            return Task::none();
-        }
-
-        let version = target.session.commits_version;
-        Task::perform(source.empty_status(targets), move |updates| {
-            Message::EmptyStatusComputed(tab, version, updates)
-        })
-    }
-
-    /// Stable-sort `items` in place so each item's target commit (via
-    /// `target_of`) sits nearest-first to `reference` in the loaded log. Items
-    /// whose target — or the reference — isn't loaded sink to the bottom, where
-    /// the caller's prior ordering (e.g. an alphabetical pre-sort) breaks ties.
     pub(crate) fn sort_by_proximity<T>(
         &self,
         items: &mut [T],
@@ -3458,232 +3038,116 @@ impl Diffui {
     /// cold load for jj, a one-shot load for git. Resets the per-repo view
     /// fields first, so a re-kick (after returning to a tab whose load was
     /// abandoned while it sat in the background) starts from a clean slate.
-    pub(crate) fn kick_initial_load(&mut self) -> Task<Message> {
-        self.kick_load(None)
-    }
-
     /// Hand out the next document identity (monotonic across every tab).
     pub(crate) fn allocate_document_id(&mut self) -> u64 {
         self.next_document_id = self.next_document_id.wrapping_add(1);
         self.next_document_id
     }
 
-    /// Drain the highlight queue of document `id`, keeping a couple of jobs
-    /// in flight. Each job clones one file (memory bounded by the concurrency
-    /// window, not the document) and reports back as `FileHighlighted` — for
-    /// a backgrounded tab too, so highlighting keeps progressing off-screen.
+    /// Drain the highlight queue of document `id`, keeping a couple of reads in
+    /// flight. Each asks the actor for the file's full old/new sources — one
+    /// command on a repository that is already open, where every highlight used
+    /// to open a workspace of its own.
     pub(crate) fn spawn_highlights(&mut self, document_id: u64) -> Task<Message> {
         const HIGHLIGHT_CONCURRENCY: usize = 2;
-        let Some((_, target)) = self.document_target_mut(document_id) else {
+
+        let Some((tab, _)) = self.document_target_mut(document_id) else {
             return Task::none();
         };
-        let session = &mut target.session;
-        let repository = session.repository.clone();
-        let revision = session.selected_revision.clone();
-        let mut tasks = Vec::new();
-        while session.highlight_in_flight < HIGHLIGHT_CONCURRENCY {
-            let Some(file_index) = session.highlight_pending.pop_front() else {
+        let Some(target) = self.tab_mut(tab) else {
+            return Task::none();
+        };
+        let Some(handle) = target.handle.clone() else {
+            return Task::none();
+        };
+        let revision = target.session.selected_revision.clone();
+        let mut commands = Vec::new();
+        while target.session.highlight_in_flight < HIGHLIGHT_CONCURRENCY {
+            let Some(file_index) = target.session.highlight_pending.pop_front() else {
                 break;
             };
-            let Some(file) = session.document.files.get(file_index).cloned() else {
+            let Some(file) = target.session.document.files.get(file_index) else {
                 continue;
             };
-            session.highlight_in_flight += 1;
-            let repository = repository.clone();
-            let revision = revision.clone();
-            tasks.push(Task::perform(
-                diffui_core::highlight_file(repository, revision, file),
-                move |spans| Message::FileHighlighted(document_id, file_index, spans),
-            ));
+            let (path, old_path) = (file.path.clone(), file.old_path.clone());
+            target.session.highlight_in_flight += 1;
+            let job = target.session.next_job();
+            target
+                .jobs
+                .file_pairs
+                .insert(job, (document_id, file_index));
+            commands.push(diffui_core::Command::FilePair {
+                job,
+                revision: revision.clone(),
+                path,
+                old_path,
+            });
         }
-        Task::batch(tasks)
+        for command in commands {
+            handle.send(command);
+        }
+        Task::none()
     }
 
-    /// (Re)start the streaming load for a GitHub-PR tab: reset the per-tab
-    /// view state, then run `gh pr view` + `gh pr diff` concurrently (see
-    /// [`stream_github_pr_load`]). The `session.load` cursor carries the
-    /// version guard exactly like a jj cold stream; the commit graph stays
-    /// empty (a PR tab has no revision sidebar yet).
-    pub(crate) fn kick_pr_load(&mut self, spec: github::PrSpec) -> Task<Message> {
-        let Some(tab) = self.active_tab_id() else {
+    /// Start (or restart) the load for `tab` once its actor is up.
+    ///
+    /// A never-loaded tab streams its graph progressively — there is nothing on
+    /// screen to preserve. A tab that already has one gets a snapshot instead,
+    /// whose op-fingerprint dedup makes it free when nothing changed and a full
+    /// reload when an external operation actually landed.
+    pub(crate) fn start_tab_load(&mut self, tab: TabId) -> Task<Message> {
+        let Some(target) = self.tab_mut(tab) else {
             return Task::none();
         };
-        let label = format!("Load {}/{}", spec.owner, spec.label());
+        if matches!(target.session.status, LoadStatus::Loaded) {
+            return self.start_repository_snapshot(tab, RefreshOrigin::Focus);
+        }
+        if target.session.streaming() {
+            return Task::none();
+        }
+        let label = target
+            .repository
+            .as_ref()
+            .map(|repository| format!("Load {}", repo_label(&repository.root).1))
+            .unwrap_or_else(|| "Load pull request".to_owned());
         let (activity_id, progress) = self.begin_activity(tab, label, true);
-        let version = self.allocate_load_version();
-        let document_id = self.allocate_document_id();
-        let target = self.active_mut();
-        // A previous load's activity is superseded by this one — resolve it so
-        // it doesn't spin forever.
+        let Some(target) = self.tab_mut(tab) else {
+            return Task::none();
+        };
         target.finish_load_activity(activity::ActivityStatus::Done, None);
-        target.session.status = LoadStatus::Loading;
-        target.session.loading_since = Some(Instant::now());
-        target.session.selected_revision = RevisionSelection::WorkingCopy;
-        target.session.pending_revision = None;
-        target.pending_revision_reveal = false;
-        target.selected_file = 0;
-        target.sidebar_scroll_offset = 0.0;
-        target.diff_scroll_offset = 0.0;
-        target.set_document(DiffDocument::default(), document_id);
-        target.session.authoritative_totals = None;
-        target.session.commits = CommitStore::default();
-        target.session.graph = graph_layout::GraphLayout::default();
-        target.session.sidebar_prefix_lens.clear();
-        target.session.selected_commit_index = None;
-        target.session.revision_details = None;
-        target.session.repository_snapshot = None;
-        target.session.snapshot_pending = false;
-        target.session.pending_refresh = None;
         target.pending_load_activity = Some(activity_id);
-        target.session.commit_progress = progress.clone();
-        target.session.commits_version = version;
-        target.session.load = Some(diffui_core::session::ColdCursor::new(version));
-        target.session.pr_diffs.clear();
-        self.document_version = self.document_version.wrapping_add(1);
-        stream_github_pr_load(spec, progress, version)
-    }
-
-    /// Switch a PR tab's view between "All changes" (`WorkingCopy`) and one of
-    /// its commits. Documents the tab has already shown swap back in from
-    /// [`Session::pr_diffs`] without a re-download; unseen commits fetch
-    /// through the commits REST endpoint and land as a `DiffLoaded`.
-    pub(crate) fn select_pr_revision(
-        &mut self,
-        tab: TabId,
-        selection: RevisionSelection,
-    ) -> Task<Message> {
-        let document_id = self.allocate_document_id();
-        let target = self.active_mut();
-        // A live stream still appends into the displayed document — switching
-        // it out from under the batches would scatter PR files into a commit
-        // diff. The sidebar unlocks once the stream finishes.
-        if target.session.load.is_some() {
-            return Task::none();
-        }
-
-        let key = match &selection {
-            RevisionSelection::WorkingCopy => String::new(),
-            RevisionSelection::Commit(oid) => oid.clone(),
-        };
-        if let Some(cached) = target.session.pr_diffs.remove(&key) {
-            // Park the outgoing document, then move the cached one in — two
-            // moves, no clone, no network.
-            let outgoing_key = match &target.session.selected_revision {
-                RevisionSelection::WorkingCopy => String::new(),
-                RevisionSelection::Commit(oid) => oid.clone(),
-            };
-            let outgoing = diffui_core::session::CachedDiff {
-                document: std::mem::take(&mut target.session.document),
-                totals: target.session.authoritative_totals.take(),
-                details: target.session.revision_details.take(),
-            };
-            target.session.pr_diffs.insert(outgoing_key, outgoing);
-            target.set_document(cached.document, document_id);
-            target.session.authoritative_totals = cached.totals;
-            target.session.revision_details = cached.details;
-            target.session.selected_revision = selection;
-            target.session.selected_commit_index = target.session.find_selected_commit_index();
-            target.selected_file = 0;
-            // An instant swap never lands a `DiffLoaded`, so honor a deferred
-            // reveal (palette jump) here.
-            if target.pending_revision_reveal {
-                target.pending_revision_reveal = false;
-                target.revision_reveal_token = target.revision_reveal_token.wrapping_add(1);
-            }
-            self.document_version = self.document_version.wrapping_add(1);
-            // The parked document kept the spans it had earned; resume
-            // highlighting whatever was still pending when it was parked.
-            return self.spawn_highlights(document_id);
-        }
-
-        let Some(source) = target.session.source.clone() else {
-            return Task::none();
-        };
-        target.session.pending_revision = Some(selection.clone());
-        target.session.loading_since = Some(Instant::now());
-        let revision = selection.clone();
-        Task::perform(source.diff(selection), move |result| {
-            Message::DiffLoaded(tab, revision, Box::new(result))
-        })
-    }
-
-    /// As [`kick_initial_load`], with an optional activity label (defaults to
-    /// "Load <repo>"). This is the **streaming cold load** — it clears the graph
-    /// and regrows it as batches arrive, for the initial open / tab activation
-    /// where there's nothing on screen to preserve. A revset switch instead uses
-    /// the atomic-swap load in [`evaluate_revset`] to avoid flashing.
-    pub(crate) fn kick_load(&mut self, activity_label: Option<String>) -> Task<Message> {
-        let Some(tab) = self.active_tab_id() else {
-            return Task::none();
-        };
-        let Some(repository) = self.active().session.repository.clone() else {
-            return Task::none();
-        };
-        // Wrap the load in a determinate activity; its progress handle is what
-        // the loader bumps, so the toolbar progress line + popover track it.
-        let label =
-            activity_label.unwrap_or_else(|| format!("Load {}", repo_label(&repository.root).1));
-        let (activity_id, progress) = self.begin_activity(tab, label, true);
-        // Fresh version so a superseded load's late batches are dropped.
-        let version = self.allocate_load_version();
-        let document_id = self.allocate_document_id();
-
-        let target = self.active_mut();
-        // A previous load's activity is being superseded by this (re)load —
-        // resolve it so it doesn't spin forever.
-        target.finish_load_activity(activity::ActivityStatus::Done, None);
-        target.session.status = LoadStatus::Loading;
-        target.session.loading_since = Some(Instant::now());
+        target.session.commit_progress = progress;
         target.session.selected_revision = RevisionSelection::WorkingCopy;
-        target.session.pending_revision = Some(RevisionSelection::WorkingCopy);
-        target.pending_revision_reveal = false;
         target.selected_file = 0;
         // The cold load clears the graph + diff, so both views belong at the
-        // top. Keep the mirrors in step with the cleared content; the widgets
-        // restore from these on the next activation.
+        // top; the widgets restore from these on the next activation.
         target.sidebar_scroll_offset = 0.0;
         target.diff_scroll_offset = 0.0;
-        target.set_document(DiffDocument::default(), document_id);
-        target.session.authoritative_totals = None;
-        target.session.commits = CommitStore::default();
-        target.session.graph = graph_layout::GraphLayout::default();
-        target.session.sidebar_prefix_lens.clear();
-        target.session.selected_commit_index = None;
-        target.session.repository_snapshot = None;
-        target.session.snapshot_pending = false;
-        // A full cold reload supersedes any coalesced refresh for the old state.
         target.session.pending_refresh = None;
-        target.pending_load_activity = Some(activity_id);
-        target.session.commit_progress = progress.clone();
-        target.session.commits_version = version;
-        let revset = target.session.revset.clone();
-        let source = target.session.source.clone();
-        let is_jj = matches!(repository.vcs, Vcs::Jj);
-        target.session.load = is_jj.then(|| diffui_core::session::ColdCursor::new(version));
-        self.document_version = self.document_version.wrapping_add(1);
 
-        if is_jj {
-            return stream_jj_initial_load(repository, revset, progress, version);
-        }
-        let Some(source) = source else {
+        // The actor answers these in order on its own thread, so the snapshot
+        // lands before the walk reads the repo — the ordering the cold load
+        // used to get by calling them in sequence.
+        let mut effects = target.session.snapshot(RefreshOrigin::Focus);
+        effects.extend(target.session.load_diff(RevisionSelection::WorkingCopy));
+        effects.extend(target.session.load_graph(true));
+        self.run_effects(tab, effects)
+    }
+
+    /// Toolbar "Refresh" and the revset input's Enter: re-walk the graph
+    /// without clearing what's on screen, so the switch never flashes empty.
+    pub(crate) fn reload_graph(&mut self, tab: TabId, label: String) -> Task<Message> {
+        let (activity_id, progress) = self.begin_activity(tab, label, true);
+        let Some(target) = self.tab_mut(tab) else {
             return Task::none();
         };
-        let revision = RevisionSelection::WorkingCopy;
-        Task::perform(
-            source.load(revision.clone(), revset, progress),
-            move |result| Message::BackendLoaded(tab, revision, Box::new(result)),
-        )
+        target.finish_load_activity(activity::ActivityStatus::Done, None);
+        target.pending_load_activity = Some(activity_id);
+        target.session.commit_progress = progress;
+        let effects = target.session.load_graph(false);
+        self.run_effects(tab, effects)
     }
 
-    /// Hand out the next streaming-load version. Monotonic across every tab
-    /// and reload, so a backgrounded load's late batches never collide with
-    /// the active tab's cursor.
-    pub(crate) fn allocate_load_version(&mut self) -> u64 {
-        self.next_load_version = self.next_load_version.wrapping_add(1);
-        self.next_load_version
-    }
-
-    /// Hand out the next activity id (monotonic across every tab).
     pub(crate) fn allocate_activity_id(&mut self) -> activity::ActivityId {
         let id = activity::ActivityId(self.next_activity_id);
         self.next_activity_id = self.next_activity_id.wrapping_add(1);
@@ -3708,12 +3172,12 @@ impl Diffui {
         (id, progress)
     }
 
-    /// Whether one of our own mutations is running or waiting to. Background
-    /// snapshots check this so the watcher doesn't fire a working-copy snapshot
-    /// into the middle of a mutation (both take jj's wc lock); the post-batch
-    /// reload in [`advance_mutation_queue`] catches anything missed meanwhile.
+    /// Whether a mutation of ours is running. The actor serializes them on its
+    /// own thread, so this only decides what the UI shows, not what may start.
     pub(crate) fn mutation_busy(&self) -> bool {
-        self.mutation_queue.is_busy()
+        self.tabs
+            .iter()
+            .any(|tab| tab.state.session.mutation_in_flight())
     }
 
     /// Whether `target` resolves to one of the active draft's source commits.
@@ -3861,7 +3325,7 @@ impl Diffui {
     /// destination (keyboard candidate + placement, or the live drag spot).
     /// Version-guarded: a newer candidate supersedes the in-flight preview.
     pub(crate) fn kick_draft_preview(&mut self) -> Task<Message> {
-        if self.active_mut().session.repository.is_none() {
+        if self.active_mut().repository.is_none() {
             return Task::none();
         }
         // Destination from the drag spot when one is live, else the keyboard
@@ -3963,105 +3427,84 @@ impl Diffui {
         })
     }
 
-    /// Run a mutation now, or queue it behind one already in flight. Two of our
-    /// mutations running at once would contend on jj's working-copy lock and
-    /// serialize opaquely; queuing keeps them in order and visible (the queued
-    /// entry shows in the activity log until it starts).
+    /// Send `pending` to the repository actor.
     ///
-    /// The single chokepoint every mutation flows through, so the immutable
-    /// pre-flight lives here: an op whose known targets are marked immutable in
-    /// the loaded graph raises the confirmation dialog instead of dispatching
+    /// The actor is single-threaded, so mutations serialize there — the
+    /// frontend queue that used to keep them from contending on jj's
+    /// working-copy lock is gone. What is left here is the immutable
+    /// pre-flight: an op whose known targets are marked immutable in the
+    /// loaded graph raises the confirmation dialog instead of dispatching
     /// (unless the dialog's accept already armed the override).
-    pub(crate) fn enqueue_or_run_mutation(&mut self, pending: PendingMutation) -> Task<Message> {
+    pub(crate) fn run_mutation(&mut self, pending: PendingMutation) -> Task<Message> {
         if !pending.allow_immutable {
             let immutable = self.immutable_op_targets(&pending.op);
             if !immutable.is_empty() {
                 return self.confirm_immutable(pending, &immutable, false);
             }
         }
-        let (tab_id, activity_id) = (pending.tab_id, pending.activity_id);
-        match self.mutation_queue.enqueue(pending) {
-            diffui_core::QueueAction::Queued => {
-                if let Some(log) = self.activity_log_for(tab_id) {
-                    log.set_status(activity_id, activity::ActivityStatus::Queued);
-                }
-                Task::none()
+        let tab = pending.tab_id;
+        // One mutation slot per tab, so the second has to wait for the first to
+        // report rather than overwrite it — an overwritten slot means nobody
+        // owns the first completion, and its activity row spins forever. The
+        // actor serializes the work either way; this is what keeps the queued
+        // one visible, which is what the activity log shows.
+        if self
+            .tab_mut(tab)
+            .is_some_and(|state| state.jobs.mutation.is_some())
+        {
+            if let Some(log) = self.activity_log_for(tab) {
+                log.set_status(pending.activity_id, activity::ActivityStatus::Queued);
             }
-            diffui_core::QueueAction::Run(pending) => self.run_mutation_now(pending),
+            if let Some(state) = self.tab_mut(tab) {
+                state.queued_mutations.push_back(pending);
+            }
+            return Task::none();
         }
+        self.dispatch_mutation(pending)
     }
 
-    /// Dispatch `pending` off the runtime and mark a mutation in flight. The
-    /// status flip to `Running` is idempotent — harmless for the first run,
-    /// and what un-queues an entry pulled off the queue by
-    /// [`advance_mutation_queue`].
-    pub(crate) fn run_mutation_now(&mut self, pending: PendingMutation) -> Task<Message> {
-        if let Some(log) = self.activity_log_for(pending.tab_id) {
+    /// Send `pending` now. The caller has already established that the tab's
+    /// mutation slot is free.
+    fn dispatch_mutation(&mut self, pending: PendingMutation) -> Task<Message> {
+        let tab = pending.tab_id;
+        if let Some(log) = self.activity_log_for(tab) {
             log.set_status(pending.activity_id, activity::ActivityStatus::Running);
         }
-        let echo = Box::new(pending.clone());
-        let PendingMutation {
-            repository,
-            op,
-            progress,
-            allow_immutable,
-            ..
-        } = pending;
-        Task::perform(
-            mutations::run_mutation(repository, op, progress, allow_immutable),
-            move |result| Message::MutationCompleted(echo.clone(), Box::new(result)),
-        )
+        let Some(state) = self.tab_mut(tab) else {
+            return Task::none();
+        };
+        let (job, effects) = state
+            .session
+            .mutate(pending.op.clone(), pending.allow_immutable);
+        // The projection owns the job; the frontend keeps its twin so the
+        // activity row and an immutable retry can find their way back to the op
+        // that started them.
+        state.jobs.mutation = Some((job, pending));
+        self.run_effects(tab, effects)
     }
 
-    /// The short display labels (change-id prefix, `/N`-suffixed for divergent
-    /// copies) of `op`'s rewrite targets that the loaded graph marks immutable.
-    /// Only rows the UI directly addresses are caught here — computed sets (a
-    /// rebase's descendants, an insert-after target's other children, a
-    /// parent-squash's destination) stay the backend guard's job, whose typed
-    /// rejection re-raises the same dialog after the fact.
+    /// The short display labels of `op`'s rewrite targets that the loaded graph
+    /// marks immutable.
+    ///
+    /// The target set comes from [`diffui_core::rewritten_targets`], the same
+    /// list the actor's guard reads, so the dialog can't name a different set
+    /// from the one that will actually be refused. Only rows the UI directly
+    /// addresses are caught here — computed sets (a rebase's descendants, an
+    /// insert-after target's other children, a parent-squash's destination)
+    /// stay the backend guard's job, whose typed rejection re-raises the same
+    /// dialog after the fact.
     fn immutable_op_targets(&self, op: &mutations::MutationOp) -> Vec<String> {
-        use mutations::{Destination, MutationOp, SquashTarget};
-        let mut selections: Vec<&RevisionSelection> = Vec::new();
-        match op {
-            MutationOp::Describe { target, .. } | MutationOp::Edit { target } => {
-                selections.push(target);
-            }
-            MutationOp::Abandon { targets } => selections.extend(targets),
-            MutationOp::Rebase {
-                sources,
-                destination,
-                ..
-            } => {
-                selections.extend(sources);
-                match destination {
-                    // The target itself gains a parent (is rewritten).
-                    Destination::Before(target) => selections.push(target),
-                    // The gap's child side gains a parent.
-                    Destination::Between { child, .. } => selections.push(child),
-                    // Onto rewrites only the sources; After rewrites the
-                    // target's children, which the UI can't enumerate.
-                    Destination::Onto(_) | Destination::After(_) => {}
-                }
-            }
-            MutationOp::Squash { from, into } => {
-                selections.extend(from);
-                if let SquashTarget::Revision(target) = into {
-                    selections.push(target);
-                }
-            }
-            MutationOp::Absorb { from } => selections.push(from),
-            // New/Merge/Duplicate only create commits; bookmark and undo ops
-            // don't rewrite anything the graph shows as immutable.
-            _ => {}
-        }
-
+        let session = &self.active().session;
+        let targets = diffui_core::rewritten_targets(
+            op,
+            &session.selected_revision,
+            session.root_commit_id.as_deref(),
+        );
         let mut labels: Vec<String> = Vec::new();
-        for selection in selections {
+        for selection in &targets {
             let row = match selection {
-                RevisionSelection::WorkingCopy => self.active().session.commits.working_copy(),
-                RevisionSelection::Commit(hex) => {
-                    self.active().session.commits.find_by_commit_id(hex)
-                }
+                RevisionSelection::WorkingCopy => session.commits.working_copy(),
+                RevisionSelection::Commit(hex) => session.commits.find_by_commit_id(hex.as_str()),
             };
             if let Some(row) = row
                 && row.is_immutable()
@@ -4153,78 +3596,18 @@ impl Diffui {
         }
     }
 
-    /// A mutation on `tab` finished: start the next queued one, or — when the
-    /// queue is empty — reload once so the graph reflects the whole batch.
-    /// Called on success *and* failure, so a failed mutation never strands the
-    /// ones queued behind it. The reload targets the tab the mutation ran
-    /// against, not whichever one is on screen when it lands. (A reload when
-    /// nothing actually changed is a no-op: the snapshot fingerprint compares
-    /// equal.)
-    pub(crate) fn advance_mutation_queue(&mut self, tab: TabId) -> Task<Message> {
-        match self.mutation_queue.advance() {
-            Some(next) => self.run_mutation_now(next),
-            None => self.start_repository_snapshot(tab, RefreshOrigin::Focus),
-        }
-    }
-
     /// The activity log for `tab_id`, or `None` if the tab has since closed.
     pub(crate) fn activity_log_for(&mut self, tab_id: TabId) -> Option<&mut activity::ActivityLog> {
         self.tab_mut(tab_id).map(|target| &mut target.activities)
     }
 
-    /// Finish a remote op's activity (fetch / undo) on its tab, recording the
-    /// captured output or error — `success_result` becomes the row's subtitle
-    /// summary on success — then, if it's still the active tab, reload so the
-    /// new commits/state appear.
-    pub(crate) fn finish_remote_op(
-        &mut self,
-        tab_id: TabId,
-        id: activity::ActivityId,
-        result: Result<Vec<String>, String>,
-        success_result: Option<String>,
-    ) -> Task<Message> {
-        let ok = result.is_ok();
-        let mut failure: Option<(String, String)> = None;
-        if let Some(log) = self.activity_log_for(tab_id) {
-            match result {
-                Ok(lines) => {
-                    log.extend_output(id, lines);
-                    log.finish(id, activity::ActivityStatus::Done, success_result);
-                }
-                Err(error) => {
-                    let title = log
-                        .label(id)
-                        .map(|label| format!("{label} failed"))
-                        .unwrap_or_else(|| "Operation failed".to_owned());
-                    failure = Some((title, error.clone()));
-                    log.append_output(id, error.clone());
-                    log.finish(id, activity::ActivityStatus::Error, Some(error));
-                }
-            }
-        }
-        if let Some((title, error)) = failure {
-            self.push_error_toast(title, &error);
-        }
-        if ok && self.is_active(tab_id) {
-            self.start_repository_snapshot(tab_id, RefreshOrigin::Focus)
-        } else {
-            Task::none()
-        }
-    }
-
-    /// Toolbar "Refresh": a full reload (working-copy snapshot + graph re-walk).
-    /// No-op while a load is already in flight. The walk itself is surfaced as an
-    /// activity by the `Focus` reload path (so every reload trigger logs it the
-    /// same way); an up-to-date refresh that finds nothing changed is silent.
+    /// Toolbar "Refresh": fold the working copy in and reload if anything
+    /// moved. An up-to-date refresh that finds nothing changed is silent.
     pub(crate) fn toolbar_refresh(&mut self) -> Task<Message> {
         let Some(tab) = self.active_tab_id() else {
             return Task::none();
         };
-        let target = self.active();
-        if target.session.repository.is_none()
-            || target.session.snapshot_pending
-            || target.session.load.is_some()
-        {
+        if !self.active().session.capabilities.graph {
             return Task::none();
         }
         self.start_repository_snapshot(tab, RefreshOrigin::Focus)
@@ -4232,66 +3615,46 @@ impl Diffui {
 
     /// Toolbar "Fetch": fetch the given target (all remotes / one branch),
     /// surfaced as an activity whose expanded output shows the remote messages.
-    /// On success `finish_remote_op` reloads so new commits appear.
+    /// The actor runs it inside the same working-copy lock every other write
+    /// takes, so it can no longer overlap a mutation.
     pub(crate) fn start_fetch(&mut self, target: FetchTarget) -> Task<Message> {
-        // Capability-gated: graph-less sources (PR tabs) have nothing to
-        // fetch from, so the toolbar action stays a silent no-op there.
-        let Some(source) = self
-            .active_mut()
-            .session
-            .source
-            .clone()
-            .filter(|source| source.as_revision_graph().is_some())
-        else {
+        let Some(tab) = self.active_tab_id() else {
             return Task::none();
         };
-        let Some(tab_id) = self.active_tab_id() else {
+        if !self.active().session.capabilities.fetch {
             return Task::none();
-        };
+        }
         self.menu = None;
         let label = match &target {
             FetchTarget::AllRemotes => "Fetching all remotes".to_owned(),
             FetchTarget::RemoteBranch { remote, branch } => format!("Fetching {remote}/{branch}"),
         };
-        let (id, progress) = self.begin_activity(tab_id, label, true);
-        let fetched = target.clone();
-        Task::perform(source.fetch(target, progress), move |result| {
-            Message::FetchCompleted(tab_id, id, fetched.clone(), Box::new(result))
-        })
-    }
-
-    /// Toolbar "Undo": revert the latest meaningful operation. Capability-gated
-    /// (jj repos only today) and routed through the mutation queue like every
-    /// other mutation, so it serializes behind in-flight ops and gets the
-    /// snapshot-before-mutate discipline.
-    pub(crate) fn start_undo(&mut self) -> Task<Message> {
-        let Some(source) = self.active_mut().session.source.clone() else {
+        let (activity_id, _) = self.begin_activity(tab, label, true);
+        let Some(state) = self.tab_mut(tab) else {
             return Task::none();
         };
-        if source.as_mutable().is_none() {
+        let (job, effects) = state.session.fetch(target.clone());
+        state.jobs.fetch = Some((job, activity_id, target));
+        self.run_effects(tab, effects)
+    }
+
+    /// Toolbar "Undo": revert the latest meaningful operation. Routed through
+    /// the mutation path like everything else, so it gets the
+    /// snapshot-before-mutate discipline and the same activity treatment.
+    pub(crate) fn start_undo(&mut self) -> Task<Message> {
+        if !self.active().session.capabilities.mutate {
             return Task::none();
         }
         self.start_mutation_op(mutations::MutationOp::Undo { operation_id: None })
     }
 
-    /// Re-evaluate the log against the current `self.active_mut().session.revset` (Enter in the
-    /// revset input, or a preset pick), surfaced as an activity, persisting the
-    /// filter for this repo.
-    ///
-    /// Uses the **atomic-swap** load (`load_backend` → `BackendLoaded`) rather
-    /// than the streaming cold load: the current graph/diff stay on screen the
-    /// whole time and are replaced in one shot when the new walk is ready, so
-    /// switching revsets doesn't flash an empty sidebar. The selection is kept
-    /// (it just won't be highlighted if it falls outside the new set).
     /// The revset preset menu entries as `(label, expression)`: the active
     /// repo's "Default" (its `revsets.log`) first when there is one, then the
-    /// built-in presets. Owned so the dynamic default can sit alongside the
-    /// `'static` presets, and shared by the iced and native menus so they stay
-    /// in sync. The default is read from the [`Self::default_revset`] cache, so
-    /// building the menu never touches the config files.
+    /// built-in presets. The default is read from the [`TabState::default_revset`]
+    /// cache, so building the menu never touches the config files.
     pub(crate) fn revset_menu_entries(&self) -> Vec<(String, String)> {
         let tab = self.active();
-        let presets = revset_presets(tab.session.repository.as_ref().map(|r| r.vcs));
+        let presets = revset_presets(tab.repository.as_ref().map(|r| r.vcs));
         let mut entries = Vec::with_capacity(presets.len() + 1);
         if !tab.default_revset.is_empty() {
             entries.push(("Default".to_owned(), tab.default_revset.clone()));
@@ -4304,51 +3667,30 @@ impl Diffui {
         entries
     }
 
+    /// Re-evaluate the log against the tab's current revset (Enter in the
+    /// revset input, or a preset pick), persisting the filter for this repo.
+    ///
+    /// Double-buffered: the current graph stays on screen the whole time and is
+    /// replaced in one shot when the new walk is ready, so switching revsets
+    /// doesn't flash an empty sidebar. The selection is kept (it just won't be
+    /// highlighted if it falls outside the new set).
     pub(crate) fn evaluate_revset(&mut self) -> Task<Message> {
-        // Silent no-op for graph-less sources (a PR tab has no revset),
-        // matching the capability rather than erroring through the load.
-        let Some(source) = self
-            .active_mut()
-            .session
-            .source
-            .clone()
-            .filter(|source| source.as_revision_graph().is_some())
-        else {
-            return Task::none();
-        };
-        self.menu = None;
-        // Persist the new filter (debounced) for this repo.
-        self.mark_geometry_dirty();
         let Some(tab) = self.active_tab_id() else {
             return Task::none();
         };
-        // Supersede any prior in-flight load (cold stream or a previous eval) so
-        // its results/activity don't linger.
-        let target = self.active_mut();
-        target.finish_load_activity(activity::ActivityStatus::Done, None);
-        target.session.load = None;
-
-        let shown = target.session.revset.trim();
+        if !self.active().session.capabilities.graph {
+            return Task::none();
+        }
+        self.menu = None;
+        // Persist the new filter (debounced) for this repo.
+        self.mark_geometry_dirty();
+        let shown = self.active().session.revset.trim();
         let label = if shown.is_empty() {
             "Evaluate revset: all()".to_owned()
         } else {
             format!("Evaluate revset: {shown}")
         };
-        let (id, progress) = self.begin_activity(tab, label, true);
-        let target = self.active_mut();
-        target.pending_load_activity = Some(id);
-        target.session.commit_progress = progress.clone();
-
-        // Keep the current view; only `pending_revision` is set, which lights
-        // the toolbar progress line. `BackendLoaded` swaps the graph atomically.
-        let revision = target.session.selected_revision.clone();
-        target.session.pending_revision = Some(revision.clone());
-        target.session.loading_since = Some(Instant::now());
-        let revset = target.session.revset.clone();
-        Task::perform(
-            source.load(revision.clone(), revset, progress),
-            move |result| Message::BackendLoaded(tab, revision, Box::new(result)),
-        )
+        self.reload_graph(tab, label)
     }
 
     pub(crate) fn view(&self) -> Element<'_, Message> {
@@ -4761,12 +4103,15 @@ impl Diffui {
         });
         // Watch the working tree for changes instead of polling. The
         // subscription identity is keyed on the repo root, so the watcher
-        // starts once and persists; `RefreshRepository` itself is gated on
-        // focus, so edits made while unfocused are picked up on focus-regain.
-        let refresh = match &self.active().session.repository {
-            Some(repository) => Subscription::run_with(repository.root.clone(), watch_repository),
-            None => Subscription::none(),
-        };
+        // One actor per open repository. Spawning it inside the subscription
+        // ties its life to the tab set: iced keeps the subscription while a tab
+        // names it and drops it when the last one closes, which shuts the actor
+        // — its thread, its workspace, its watcher — down with it.
+        let repositories = Subscription::batch(
+            self.tabs
+                .iter()
+                .map(|tab| Subscription::run_with(tab.open_spec(), open_repository)),
+        );
 
         // Per-frame ticks during a palette push/pop animation. iced's
         // `Animation::interpolate_with` is read-only — to actually drive
@@ -4790,7 +4135,7 @@ impl Diffui {
         // spinner animate and reflect live progress.
         let active = self.active();
         let work_in_flight = active.session.loading_since.is_some()
-            || active.session.pending_revision.is_some()
+            || active.session.diff_in_flight()
             || active.activities.any_running();
         let loading_tick = if work_in_flight {
             time::every(Duration::from_millis(120)).map(|_| Message::LoadingTick)
@@ -4854,7 +4199,7 @@ impl Diffui {
             keyboard,
             modifier_events,
             window_events,
-            refresh,
+            repositories,
             palette_tick,
             loading_tick,
             menu_tick,

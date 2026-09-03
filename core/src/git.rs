@@ -7,9 +7,8 @@ use tokio::process::Command;
 use crate::FetchTarget;
 use crate::diff_parse::parse_unified_diff;
 use crate::graph::assign_lanes;
-use crate::graph_layout::{GraphLayout, GraphLayoutBuilder};
 use crate::model::{
-    CommitSummary, DiffDocument, RevisionDetails, RevisionSelection, SignatureInfo,
+    CommitSummary, DiffDocument, RevisionDetails, RevisionSelection, SignatureInfo, StreamRow,
 };
 use crate::repository::{Repository, RepositorySnapshot};
 use crate::source_browse::{SourceEntry, SourceEntryStatus};
@@ -34,7 +33,7 @@ pub async fn load_git_diff(
 pub async fn load_git_commits(
     repository: &Repository,
     revision_range: &str,
-) -> Result<(Vec<CommitSummary>, GraphLayout)> {
+) -> Result<Vec<StreamRow>> {
     // The revision range is the git analog of the jj revset: extra `git log`
     // arguments (e.g. `--all`, `main..HEAD`). Empty keeps the default (the
     // current branch's history).
@@ -566,7 +565,7 @@ fn parse_commit_log_rows(output: &str) -> Vec<ParsedCommitRow> {
         .collect()
 }
 
-fn build_commit_summaries(rows: Vec<ParsedCommitRow>) -> (Vec<CommitSummary>, GraphLayout) {
+fn build_commit_summaries(rows: Vec<ParsedCommitRow>) -> Vec<StreamRow> {
     // Walk the rows in their existing topo order and assign lanes from
     // parent edges. Parents not present in the listing (shallow clone, etc.)
     // become Missing edges so the renderer can draw a stub.
@@ -588,34 +587,29 @@ fn build_commit_summaries(rows: Vec<ParsedCommitRow>) -> (Vec<CommitSummary>, Gr
     });
     let lane_frames = assign_lanes(lane_inputs);
 
-    // Git carries no bookmarks, so the lane fold sees empty labels everywhere.
-    let mut graph_builder = GraphLayoutBuilder::new();
-    for frame in &lane_frames {
-        graph_builder.push(frame, &[]);
-    }
-
-    let summaries = rows
-        .into_iter()
+    rows.into_iter()
         .zip(lane_frames)
-        .map(|(row, _frame)| CommitSummary {
-            change_id: row.change_id,
-            commit_id: row.commit_id,
-            shortest_change_id_len: None,
-            description: row.description,
-            author: row.author,
-            has_description: row.has_description,
-            is_empty: row.is_empty,
-            has_conflict: false,
-            is_divergent: false,
-            is_hidden: false,
-            change_offset: None,
-            is_working_copy: row.is_working_copy,
-            is_immutable: false,
-            bookmarks: Vec::new(),
-            parent_ids: row.parents,
+        .map(|(row, frame)| StreamRow {
+            frame,
+            summary: CommitSummary {
+                change_id: row.change_id,
+                commit_id: row.commit_id,
+                shortest_change_id_len: None,
+                description: row.description,
+                author: row.author,
+                has_description: row.has_description,
+                is_empty: row.is_empty,
+                has_conflict: false,
+                is_divergent: false,
+                is_hidden: false,
+                change_offset: None,
+                is_working_copy: row.is_working_copy,
+                is_immutable: false,
+                bookmarks: Vec::new(),
+                parent_ids: row.parents,
+            },
         })
-        .collect();
-    (summaries, graph_builder.finish())
+        .collect()
 }
 
 fn parse_optional_bool(value: &str) -> Option<bool> {
@@ -633,11 +627,18 @@ mod tests {
     use std::path::PathBuf;
 
     fn parse_commit_log(output: &str) -> Vec<CommitSummary> {
-        build_commit_summaries(parse_commit_log_rows(output)).0
+        build_commit_summaries(parse_commit_log_rows(output))
+            .into_iter()
+            .map(|row| row.summary)
+            .collect()
     }
 
-    fn parse_commit_log_graph(output: &str) -> GraphLayout {
-        build_commit_summaries(parse_commit_log_rows(output)).1
+    fn parse_commit_log_graph(output: &str) -> crate::graph_layout::GraphLayout {
+        let mut graph = crate::graph_layout::GraphLayoutBuilder::new();
+        for row in build_commit_summaries(parse_commit_log_rows(output)) {
+            graph.push(&row.frame, &[]);
+        }
+        graph.finish()
     }
 
     #[test]

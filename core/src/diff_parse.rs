@@ -110,7 +110,7 @@ impl DiffStreamParser {
         flush_current_hunk(&mut file, &mut self.current_hunk);
         // No highlighting here: tree-sitter over whole documents is seconds of
         // CPU on big files, so it runs in the background after the document is
-        // already on screen (see `source::highlight_file`).
+        // already on screen (see `syntax::highlight_file`).
         Some(file)
     }
 }

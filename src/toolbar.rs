@@ -55,7 +55,7 @@ pub fn build_toolbar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     }
     let font = ui.config.ui_font;
     let is_jj = matches!(
-        ui.active().session.repository.as_ref().map(|r| r.vcs),
+        ui.active().repository.as_ref().map(|r| r.vcs),
         Some(Vcs::Jj)
     );
 
@@ -65,7 +65,7 @@ pub fn build_toolbar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     let mut actions = row![].spacing(6).align_y(alignment::Vertical::Center);
     // Diff ↔ Source view switcher, leftmost so the "what am I looking at"
     // control leads the bar. Repo tabs only — a PR has no tree to browse.
-    let is_repo = ui.active().session.repository.is_some();
+    let is_repo = ui.active().repository.is_some();
     let in_source = is_repo && ui.active().main_view == MainView::Source;
     if is_repo {
         actions = actions.push(view_switcher(ui, theme, font));

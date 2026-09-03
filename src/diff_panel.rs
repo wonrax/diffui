@@ -79,12 +79,7 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
             .collect::<Vec<_>>();
 
         let bookmark_color = selected_lane_color(ui, theme);
-        let editable_description = ui
-            .active()
-            .session
-            .repository
-            .as_ref()
-            .is_some_and(|repo| matches!(repo.vcs, crate::repository::Vcs::Jj));
+        let editable_description = ui.active().session.capabilities.mutate;
         let editing_description = ui
             .active()
             .description_editor
@@ -139,7 +134,7 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
 
         // Per-file "browse source" affordance — repo tabs only (a PR tab has
         // no local tree to browse).
-        if ui.active().session.repository.is_some() {
+        if ui.active().repository.is_some() {
             dv = dv.on_browse_file(Message::BrowseFileFromDiff);
         }
 
@@ -438,14 +433,11 @@ impl<'a> From<ScrollTranslate<'a>> for Element<'a, Message> {
 /// stays focused on the revision list and the totals sit next to the
 /// content they describe.
 fn build_stats_bar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
-    // Prefer source-reported totals (a PR's header counts) over the summed
-    // files — the GitHub files API zeroes counts on oversized blobs, so the
-    // sum can undercount what the PR page shows.
     let session = &ui.active().session;
-    let (additions, deletions) = session.authoritative_totals.unwrap_or((
+    let (additions, deletions) = (
         session.document.total_additions,
         session.document.total_deletions,
-    ));
+    );
     let bar = row![
         text(format!("+{additions}"))
             .size(STATS_TEXT_SIZE)

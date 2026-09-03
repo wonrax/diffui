@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     pin::Pin,
     time::{Duration, Instant},
@@ -39,7 +39,9 @@ mod window_state;
 // Domain logic now lives in the headless `diffui-core` crate. Re-export the
 // modules the app still reaches into by path (`crate::graph`, `crate::jj`,
 // `crate::mutations`, …) so those call sites stay unchanged.
-pub(crate) use diffui_core::{FetchTarget, github, graph, graph_layout, jj, mutations, repository};
+pub(crate) use diffui_core::{
+    FetchTarget, JobId, RepoHandle, github, graph, graph_layout, jj, mutations, repository,
+};
 pub(crate) use message::Message;
 
 /// Profiling-only global allocator (enabled by the `track-alloc` feature). It
@@ -115,11 +117,10 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use clap::Parser;
 use config::AppConfig;
 use diffui_core::{
-    CommitStore, CommitsTail, DiffDocument, DiffFile, LoadProgress, RevisionDetails,
-    RevisionSelection, RowView, SignatureInfo, StreamRow,
+    DiffFile, LoadProgress, RevisionDetails, RevisionSelection, RowView, SignatureInfo,
 };
 use find::FindState;
-use futures::{SinkExt, Stream, StreamExt};
+use futures::{Stream, StreamExt};
 use iced::theme as iced_theme;
 use iced::{
     Element, Length, Padding, Point, Size, Subscription, Task, Theme, alignment,
@@ -239,18 +240,15 @@ struct Cli {
     diff_args: Vec<PathBuf>,
 }
 
-/// A revision-context-menu mutation captured for serial execution. Mutations
-/// take jj's working-copy lock, so we run at most one of our own at a time and
-/// queue the rest (see [`Diffui::enqueue_or_run_mutation`]). `progress` is the
-/// handle the worker reports through, allocated alongside the activity up front
-/// so a queued entry is fully wired before it ever starts.
+/// A revision mutation on its way to the repository actor. The actor is
+/// single-threaded, so mutations serialize there rather than in a queue here;
+/// this only carries what the *frontend* has to remember about one — which tab
+/// asked, and which activity row is showing it.
 #[derive(Debug, Clone)]
 pub(crate) struct PendingMutation {
-    repository: Repository,
     op: mutations::MutationOp,
     tab_id: TabId,
     activity_id: activity::ActivityId,
-    progress: LoadProgress,
     /// Run with the immutable-commit guards off (jj's `--ignore-immutable`).
     /// Only ever set by the confirm dialog's accept — never at op creation —
     /// so a mutation can't skip the guards without the user saying so.
@@ -355,10 +353,6 @@ pub(crate) struct Diffui {
     /// Monotonic source of `TabId`s, so a tab keeps a stable identity even as
     /// its index shifts when other tabs open/close.
     pub(crate) next_tab_id: u64,
-    /// Monotonic source of streaming-load `version`s. Each (re)load gets a
-    /// fresh value so late batches from a superseded or backgrounded load are
-    /// dropped by the version guard rather than corrupting the active tab.
-    pub(crate) next_load_version: u64,
     /// Monotonic source of document identities (`Session::document_id`),
     /// stamped on every document replacement across every tab. Background
     /// per-file work (syntax highlighting) routes its results by this id.
@@ -372,12 +366,6 @@ pub(crate) struct Diffui {
     // ── Toolbar / activity / revset ─────────────────────────────────────
     /// Monotonic source of `ActivityId`s across every tab.
     pub(crate) next_activity_id: u64,
-    /// Serial mutation execution (the core `MutationQueue`): at most one
-    /// revision-menu mutation runs at a time (they contend on jj's working-copy
-    /// lock); the rest drain in order. Global rather than per-tab — a
-    /// `PendingMutation` carries its own repo/tab/activity, so cross-tab
-    /// serialization costs nothing and every completion still routes home.
-    pub(crate) mutation_queue: diffui_core::session::MutationQueue<PendingMutation>,
     /// Open popup menu (toolbar fetch/revset dropdown or revision right-click),
     /// if any. macOS uses native `NSMenu`s instead and leaves this `None`.
     pub(crate) menu: Option<menu::OverlayMenu>,
@@ -630,6 +618,21 @@ pub(crate) struct ZoomAnim {
 #[derive(Debug)]
 pub(crate) struct TabState {
     pub(crate) session: Session,
+    /// The repository this tab views, or `None` for a GitHub-PR tab. Held by
+    /// the frontend (not the session) because it is what names the tab, keys
+    /// persistence, and builds the subscription that owns the actor.
+    pub(crate) repository: Option<Repository>,
+    /// The command sender for this tab's repository, handed over by the
+    /// actor's first event. `None` for the brief window before that lands, and
+    /// for the no-tab empty state.
+    pub(crate) handle: Option<RepoHandle>,
+    /// Jobs this tab issued whose results it routes itself, because the
+    /// projection has no state to fold them into.
+    pub(crate) jobs: PendingJobs,
+    /// Mutations waiting for [`PendingJobs::mutation`] to free up. The actor
+    /// serializes the work; this keeps the ones behind it addressable, so each
+    /// completion still finds the activity row that started it.
+    pub(crate) queued_mutations: VecDeque<PendingMutation>,
     /// This repo's default revset (its `revsets.log`, or jj's default) — what
     /// the "Default" preset in the revset menu applies. Read from jj's config
     /// on disk once, when the tab is created, so neither a render nor a tab
@@ -652,8 +655,8 @@ pub(crate) struct TabState {
     /// True while a palette-initiated revision load is in flight. We can't bump
     /// `revision_reveal_token` at the moment the user accepts the result — at
     /// that point `selected_revision` is still the old value, so the sidebar
-    /// would scroll the wrong row into view. The `BackendLoaded` handler reads
-    /// this flag once the new revision has actually been written into
+    /// would scroll the wrong row into view. The diff's completion reads this
+    /// flag once the new revision has actually been written into
     /// `selected_revision`, *then* bumps the token.
     pub(crate) pending_revision_reveal: bool,
     /// Last-known scroll offsets of the sidebar (content-space px) and diff
@@ -689,6 +692,9 @@ pub(crate) struct TabState {
     /// `WorkingCopy` matches every tab, so a global one opened the editor on
     /// whichever tab produced the next `@` diff.
     pub(crate) pending_description_edit: Option<RevisionSelection>,
+    /// A `Copy → Author / Committer / Description` waiting on the revision
+    /// header it reads from. Per tab, like every other routed job.
+    pub(crate) pending_detail_copy: Option<(JobId, DetailField, String)>,
     /// Active target-mode draft (rebase/squash destination picking), or `None`
     /// outside target mode. A draft's sources are rows of this tab, so it lives
     /// and dies with it.
@@ -710,7 +716,11 @@ impl TabState {
         let default_revset = repository.as_ref().map(default_revset).unwrap_or_default();
         let revset = revset.unwrap_or_else(|| default_revset.clone());
         Self {
-            session: Session::unloaded(repository, revset),
+            session: Session::unloaded(revset),
+            repository,
+            handle: None,
+            jobs: PendingJobs::default(),
+            queued_mutations: VecDeque::new(),
             default_revset,
             file_list_expanded: true,
             collapsed_dirs: HashSet::new(),
@@ -728,6 +738,7 @@ impl TabState {
             description_editor: None,
             pending_description_edit: None,
             op_draft: None,
+            pending_detail_copy: None,
             revision_multi_selection: Vec::new(),
         }
     }
@@ -735,13 +746,8 @@ impl TabState {
     /// A never-loaded GitHub-PR tab: a `Session` whose source is the PR. No
     /// local repository, so the watcher/snapshot/mutation machinery stays off
     /// and `ensure_active_loaded` routes to the streaming PR load.
-    fn unloaded_pr(spec: &github::PrSpec) -> Self {
-        Self {
-            session: Session::for_source(diffui_core::SourceHandle::new(github::PrSource::new(
-                spec.clone(),
-            ))),
-            ..Self::unloaded(None, Some(String::new()))
-        }
+    fn unloaded_pr() -> Self {
+        Self::unloaded(None, Some(String::new()))
     }
 
     /// The state shown when no repository is open at all. `Session::empty` is
@@ -752,18 +758,6 @@ impl TabState {
             session: Session::empty(),
             ..Self::unloaded(None, Some(String::new()))
         }
-    }
-
-    /// Replace this tab's shown diff under a freshly-allocated `document_id`
-    /// (which restarts highlight bookkeeping — see
-    /// [`Session::reset_highlights`]). Every write to a tab's
-    /// `session.document` goes through here; a missed one leaves the diff view
-    /// rendering another revision's — or another repo's — stale highlighted
-    /// text. The caller bumps [`Diffui::document_version`] when the tab is on
-    /// screen, so the shaped-paragraph cache is dropped with it.
-    pub(crate) fn set_document(&mut self, document: DiffDocument, document_id: u64) {
-        self.session.document = document;
-        self.session.reset_highlights(document_id);
     }
 
     /// Finish the activity wrapping this tab's in-flight graph (re)load, if one
@@ -791,23 +785,6 @@ impl TabState {
                 .map(|view| std::slice::from_ref(&view.file))
                 .unwrap_or(&[]),
         }
-    }
-
-    /// Refresh the working-copy (`@`) row's "empty" chip from a snapshot's
-    /// `working_copy_empty`, without touching the diff pane or re-walking the
-    /// graph. A no-op when the value is unknown (git), @ isn't in the loaded
-    /// graph, or the chip already matches — so it won't needlessly bump
-    /// `commits_version` (which would invalidate the sidebar's shaped-row cache).
-    pub(crate) fn apply_working_copy_empty(&mut self, empty: Option<bool>) {
-        let Some(empty) = empty else { return };
-        let Some(index) = self.session.commits.working_copy_index() else {
-            return;
-        };
-        if self.session.commits.row(index).is_empty() == Some(empty) {
-            return;
-        }
-        self.session.commits.set_is_empty(index, empty);
-        self.session.commits_version = self.session.commits_version.wrapping_add(1);
     }
 }
 
@@ -880,6 +857,81 @@ impl Tab {
             TabSource::GitHubPr(_) => None,
         }
     }
+
+    /// How this tab addresses its repository actor — the subscription key, and
+    /// what the actor's events are attributed to.
+    pub(crate) fn open_spec(&self) -> diffui_core::OpenSpec {
+        match &self.source {
+            TabSource::Repo { root, .. } => diffui_core::OpenSpec::Local {
+                root: root.clone(),
+                scope: self
+                    .state
+                    .repository
+                    .as_ref()
+                    .map(|repository| repository.scope.clone())
+                    .unwrap_or_default(),
+            },
+            TabSource::GitHubPr(spec) => diffui_core::OpenSpec::GitHubPr(spec.clone()),
+        }
+    }
+
+    pub(crate) fn repo_id(&self) -> Option<diffui_core::RepoId> {
+        Some(diffui_core::repo::repo_id(&self.open_spec()))
+    }
+}
+
+/// The jobs a tab issued whose results it routes itself. The projection owns
+/// the graph/diff/snapshot/mutation slots; these are the ones with nowhere in
+/// the session to fold into — a preview, a source-browser read, a fetch. Each
+/// is one slot, so a superseded result is dropped by the same comparison.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PendingJobs {
+    /// The draft simulation in flight, if any.
+    pub(crate) preview: Option<JobId>,
+    /// The source browser's tree listing, and which revision it lists.
+    pub(crate) tree: Option<(JobId, RevisionSelection)>,
+    /// The source browser's file read, and which path it reads.
+    pub(crate) file: Option<(JobId, String)>,
+    /// A fetch, with the activity row showing it and the target it names.
+    pub(crate) fetch: Option<(JobId, activity::ActivityId, FetchTarget)>,
+    /// The mutation the actor is running, with everything the frontend must
+    /// remember to finish (or retry) it.
+    pub(crate) mutation: Option<(JobId, PendingMutation)>,
+    /// A backwards-bookmark-move check, holding the mutation it gates.
+    pub(crate) bookmark_check: Option<(JobId, PendingMutation)>,
+    /// Full file sources requested for background syntax highlighting, keyed
+    /// by job: `(document id, file index)`.
+    pub(crate) file_pairs: HashMap<JobId, (u64, usize)>,
+}
+
+impl PendingJobs {
+    /// Whether one of these slots is waiting on `job`.
+    pub(crate) fn owns(&self, job: JobId) -> bool {
+        self.preview == Some(job)
+            || self.tree.as_ref().is_some_and(|(id, _)| *id == job)
+            || self.file.as_ref().is_some_and(|(id, _)| *id == job)
+            || self.fetch.as_ref().is_some_and(|(id, ..)| *id == job)
+            || self.mutation.as_ref().is_some_and(|(id, _)| *id == job)
+            || self
+                .bookmark_check
+                .as_ref()
+                .is_some_and(|(id, _)| *id == job)
+            || self.file_pairs.contains_key(&job)
+    }
+
+    /// Release whichever slot `job` holds — the cancelled-job path, where
+    /// there is no result to apply but the slot must not stay stuck.
+    pub(crate) fn clear(&mut self, job: JobId) {
+        if self.preview == Some(job) {
+            self.preview = None;
+        }
+        self.tree.take_if(|(id, _)| *id == job);
+        self.file.take_if(|(id, _)| *id == job);
+        self.fetch.take_if(|(id, ..)| *id == job);
+        self.mutation.take_if(|(id, _)| *id == job);
+        self.bookmark_check.take_if(|(id, _)| *id == job);
+        self.file_pairs.remove(&job);
+    }
 }
 
 /// Transient state of the open-repository path dialog.
@@ -895,7 +947,7 @@ pub(crate) struct OpenRepoDialog {
 // engine — the streaming cold-load state (`ColdCursor`) + fold, the serial
 // mutation queue, refresh coalescing, `RefreshOrigin`, `LoadStatus`, and the
 // whole per-repo `Session`. Re-export so the app refers to them unqualified.
-pub(crate) use diffui_core::session::{RefreshOrigin, coalesce_refresh};
+pub(crate) use diffui_core::session::RefreshOrigin;
 pub(crate) use diffui_core::{LoadStatus, Session};
 
 /// Reveal the keyboard-selected file's row in the sidebar tree. Bumps the
@@ -1296,203 +1348,19 @@ fn current_file_diff_text(ui: &Diffui) -> Option<String> {
     Some(out)
 }
 
-/// Streaming cold load for a jj repo: snapshot the working copy, emit the
-/// working-copy diff, then walk the graph emitting `CommitsBatch` messages so
-/// the sidebar paints after the first batch instead of after the whole (up to
-/// ~1M-row) history.
+/// One repository's actor and its event stream.
 ///
-/// Mirrors `watch_repository`'s bridge: the heavy walk runs on a blocking task
-/// and emits through an unbounded tokio channel; a forwarder relays to iced
-/// with backpressure. Every message carries `version` so a superseded load's
-/// batches are dropped (see `LoadCursor`).
-fn stream_jj_initial_load(
-    repository: Repository,
-    revset: String,
-    progress: LoadProgress,
-    version: u64,
-) -> Task<Message> {
-    // First batch ships after this many commits — small enough that the first
-    // screenful paints quickly, large enough that ~1M commits don't flood the
-    // update loop with batch messages.
-    const COMMIT_BATCH_SIZE: usize = 256;
-
-    Task::stream(iced::stream::channel(
-        16,
-        async move |mut output: futures::channel::mpsc::Sender<Message>| {
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
-
-            let worker = tokio::task::spawn_blocking(move || {
-                let handle = tokio::runtime::Handle::current();
-                handle.block_on(async move {
-                    // `load_jj_cold` snapshots the working copy first (so the
-                    // graph + diff reflect on-disk state), then reuses that one
-                    // loaded repo for the diff + walk. `emit_diff` fires the
-                    // working-copy diff (this doesn't lift the loading screen —
-                    // the first `CommitsBatch` does); `emit_batch` fires per
-                    // commit batch.
-                    let tx_diff = tx.clone();
-                    let mut emit_diff = move |diff| {
-                        let _ = tx_diff.send(Message::InitialDiff(version, Box::new(diff)));
-                    };
-                    let tx_batches = tx.clone();
-                    let mut emit_batch = move |batch: Vec<StreamRow>| {
-                        let _ = tx_batches.send(Message::CommitsBatch(version, batch));
-                    };
-                    let finished = crate::jj::load_jj_cold(
-                        repository,
-                        revset,
-                        progress,
-                        COMMIT_BATCH_SIZE,
-                        &mut emit_diff,
-                        &mut emit_batch,
-                    )
-                    .await
-                    .map(
-                        |(snapshot, branch_status, empty_updates, bookmarks)| CommitsTail {
-                            snapshot,
-                            empty_updates,
-                            branch_status,
-                            bookmarks,
-                        },
-                    )
-                    .map_err(|error| format!("{error:#}"));
-                    let _ = tx.send(Message::CommitsFinished(version, Box::new(finished)));
-                });
-            });
-
-            // Relay worker messages to iced, honoring its backpressure.
-            while let Some(message) = rx.recv().await {
-                if output.send(message).await.is_err() {
-                    break;
-                }
-            }
-            let _ = worker.await;
-        },
-    ))
-}
-
-/// Streaming load for a GitHub-PR tab: fetch the header metadata and stream
-/// the diff concurrently (`gh pr view` + `gh pr diff`), batching completed
-/// files so a huge PR paints progressively while it downloads. Mirrors
-/// [`stream_jj_initial_load`]'s channel bridge; every message carries
-/// `version` so a superseded load's output is dropped by the cursor guard.
-fn stream_github_pr_load(
-    spec: github::PrSpec,
-    progress: LoadProgress,
-    version: u64,
-) -> Task<Message> {
-    /// Flush the pending file batch once it holds this many diff lines (always
-    /// flushing on stream end). Small enough that the first screenful paints
-    /// quickly; large enough that a million-line PR doesn't flood the update
-    /// loop with per-file messages.
-    const BATCH_LINE_LIMIT: usize = 4_096;
-
-    Task::stream(iced::stream::channel(
-        16,
-        async move |mut output: futures::channel::mpsc::Sender<Message>| {
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
-
-            // Header metadata rides alongside the diff; its `changedFiles`
-            // count is what turns the activity's progress determinate.
-            let meta_tx = tx.clone();
-            let meta_spec = spec.clone();
-            let meta_progress = progress.clone();
-            let meta_task = tokio::spawn(async move {
-                let result = github::fetch_pr_info(&meta_spec)
-                    .await
-                    .map_err(|error| format!("{error:#}"));
-                if let Ok(info) = &result {
-                    meta_progress.set_total(info.changed_files);
-                }
-                let _ = meta_tx.send(Message::PrMetaLoaded(version, Box::new(result)));
-            });
-
-            // The commit list fills the sidebar; independent of the diff.
-            let commits_tx = tx.clone();
-            let commits_spec = spec.clone();
-            let commits_task = tokio::spawn(async move {
-                let result = github::fetch_pr_commits(&commits_spec)
-                    .await
-                    .map_err(|error| format!("{error:#}"));
-                let _ = commits_tx.send(Message::PrCommitsLoaded(version, Box::new(result)));
-            });
-
-            let diff_tx = tx;
-            let diff_task = tokio::spawn(async move {
-                let mut batch: Vec<DiffFile> = Vec::new();
-                let mut batch_lines = 0usize;
-                let result = github::stream_pr_diff(&spec, |file| {
-                    progress.increment();
-                    batch_lines += file
-                        .hunks
-                        .iter()
-                        .map(|hunk| hunk.lines.len())
-                        .sum::<usize>();
-                    batch.push(file);
-                    if batch_lines >= BATCH_LINE_LIMIT {
-                        let _ = diff_tx
-                            .send(Message::PrFilesBatch(version, std::mem::take(&mut batch)));
-                        batch_lines = 0;
-                    }
-                })
-                .await
-                .map_err(|error| format!("{error:#}"));
-                if !batch.is_empty() {
-                    let _ = diff_tx.send(Message::PrFilesBatch(version, batch));
-                }
-                let _ = diff_tx.send(Message::PrFinished(version, Box::new(result)));
-            });
-
-            // Relay worker messages to iced, honoring its backpressure. The
-            // loop ends once all workers finished and dropped their senders.
-            while let Some(message) = rx.recv().await {
-                if output.send(message).await.is_err() {
-                    break;
-                }
-            }
-            let _ = tokio::join!(meta_task, commits_task, diff_task);
-        },
-    ))
-}
-
-/// Filesystem-watch subscription. The watcher mechanism — `notify` backend, path
-/// classification, debounce — lives in [`diffui_core::watcher`]; here we only map
-/// its coalesced batches onto messages, honoring iced's backpressure:
-///
-/// - a **working-tree** edit → `RefreshRepository` (snapshot + reload @'s diff).
-/// - a write under **`.jj/repo/op_heads`** → `OpLogChanged`, which an op-id dedup
-///   turns into a reload only when the op was *external*.
-// `&PathBuf` (not `&Path`) is required: `Subscription::run_with` keys on
-// `D = PathBuf` and hands the builder a `fn(&D)`.
+/// Spawning the actor *inside* the subscription is what bounds its lifetime:
+/// iced keeps the subscription alive while a tab names it and drops it when the
+/// last one closes, and dropping the stream shuts the actor down with it. The
+/// first event carries the command sender back to the app.
+// `&OpenSpec` (not `OpenSpec`) is required: `Subscription::run_with` keys on
+// `D = OpenSpec` and hands the builder a `fn(&D)`.
 #[allow(clippy::ptr_arg)]
-fn watch_repository(root: &PathBuf) -> Pin<Box<dyn Stream<Item = Message> + Send>> {
-    let root = root.clone();
-    iced::stream::channel(
-        8,
-        async move |mut output: futures::channel::mpsc::Sender<Message>| {
-            let mut watcher = match diffui_core::watcher::RepoWatcher::start(&root) {
-                Ok(watcher) => watcher,
-                Err(error) => {
-                    eprintln!(
-                        "diffui: filesystem watcher unavailable for {}, auto-refresh disabled: {error}",
-                        root.display()
-                    );
-                    return;
-                }
-            };
-            // `next_batch` holds the watcher and applies the debounce; the loop
-            // ends when the watch is dropped or iced closes the channel.
-            while let Some(batch) = watcher.next_batch().await {
-                if batch.worktree && output.send(Message::RefreshRepository).await.is_err() {
-                    break;
-                }
-                if batch.op_log && output.send(Message::OpLogChanged).await.is_err() {
-                    break;
-                }
-            }
-        },
-    )
-    .boxed()
+fn open_repository(spec: &diffui_core::OpenSpec) -> Pin<Box<dyn Stream<Item = Message> + Send>> {
+    diffui_core::repo::open(spec.clone())
+        .map(|event| Message::Repo(Box::new(event)))
+        .boxed()
 }
 
 #[cfg(test)]
@@ -1569,13 +1437,23 @@ mod mem_profile {
         let baseline = CURRENT.load(Relaxed);
         PEAK.store(baseline, Relaxed);
 
-        let (store, graph, _branch_status, _bookmarks) = runtime
-            .block_on(diffui_core::jj::load_jj_commits(
-                repo.clone().into(),
-                "all()".to_owned(),
-                progress,
-            ))
-            .expect("load commits");
+        let mut store = diffui_core::CommitStore::default();
+        let mut graph = diffui_core::graph_layout::GraphLayout::default();
+        let mut cursor = diffui_core::ColdCursor::default();
+        {
+            let mut emit = |rows: Vec<diffui_core::StreamRow>| {
+                diffui_core::fold_cold_batch(&mut store, &mut graph, &mut cursor, rows, false);
+            };
+            runtime
+                .block_on(diffui_core::jj::walk_jj_commits(
+                    repo.clone().into(),
+                    "all()".to_owned(),
+                    progress,
+                    4096,
+                    &mut emit,
+                ))
+                .expect("walk commits");
+        }
 
         let peak = PEAK.load(Relaxed).saturating_sub(baseline);
         let live = CURRENT.load(Relaxed).saturating_sub(baseline);

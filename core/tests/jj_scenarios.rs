@@ -11,17 +11,18 @@
 //! repos are left behind afterwards for inspection.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::Command as Process;
 
-use diffui_core::jj::{
-    load_jj_commits, load_jj_diff, load_jj_repository_snapshot, read_jj_op_head,
-};
+use diffui_core::jj::read_jj_op_head;
+use diffui_core::repo::{Command, JobId, OpenSpec, Payload, RepoError};
 use diffui_core::{
-    Destination, DiffFileStatus, DiffLineKind, LoadProgress, MutationOp, RebaseSourceMode,
-    Repository, RevisionSelection, SquashTarget, Vcs, list_ignored_dir, list_source_tree,
-    load_source_file,
+    BookmarksInfo, BranchStatus, CommitStore, Destination, DiffDocument, DiffFileStatus,
+    DiffLineKind, LoadProgress, MutationOp, MutationOutcome, PreviewRequest, RebaseSourceMode,
+    Repository, RepositorySnapshot, RevisionDetails, RevisionSelection, SourceEntry,
+    SourceFileLoad, SquashTarget, Vcs, list_ignored_dir,
 };
 use diffui_core::{SourceEntryStatus, mutations};
+use futures::StreamExt;
 
 fn block_on<F: Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
@@ -55,7 +56,7 @@ fn jj_config_sandbox() -> PathBuf {
 /// would otherwise prompt (or hang) on every scratch-repo commit. The XDG
 /// override keeps the run hermetic — see [`jj_config_sandbox`].
 fn jj(dir: &Path, args: &[&str]) -> String {
-    let output = Command::new("jj")
+    let output = Process::new("jj")
         .current_dir(dir)
         .args(["--config", "signing.behavior=keep"])
         .args(args)
@@ -70,6 +71,187 @@ fn jj(dir: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Run one command against a freshly-opened actor for `root` and return every
+/// event of its job, terminal one last.
+///
+/// A new actor per call is deliberate: each scenario reads the repository from
+/// scratch, exactly as reopening the tab would, so nothing a previous command
+/// cached can mask a bug.
+async fn run_one(root: &Path, make: impl FnOnce(JobId) -> Command) -> Vec<Payload> {
+    let mut events = Box::pin(diffui_core::repo::open(OpenSpec::Local {
+        root: root.to_owned(),
+        scope: PathBuf::new(),
+    }));
+    let handle = match events.next().await.map(|event| event.payload) {
+        Some(Payload::Ready { handle, .. }) => handle,
+        other => panic!("expected the actor's Ready event, got {other:?}"),
+    };
+    let job = JobId(1);
+    handle.send(make(job));
+    let mut collected = Vec::new();
+    while let Some(event) = events.next().await {
+        if event.job() != Some(job) {
+            continue;
+        }
+        let terminal = event.payload.is_terminal();
+        collected.push(event.payload);
+        if terminal {
+            break;
+        }
+    }
+    collected
+}
+
+/// Walk the graph and fold it into the compact store the sidebar renders —
+/// what the projection does with the actor's batches.
+async fn load_jj_commits(
+    root: PathBuf,
+    revset: String,
+    _progress: LoadProgress,
+) -> anyhow::Result<(
+    CommitStore,
+    diffui_core::graph_layout::GraphLayout,
+    Option<BranchStatus>,
+    BookmarksInfo,
+)> {
+    let events = run_one(&root, |job| Command::LoadGraph { job, revset }).await;
+    let mut store = CommitStore::default();
+    let mut graph = diffui_core::graph_layout::GraphLayout::default();
+    let mut cursor = diffui_core::ColdCursor::default();
+    let mut tail = None;
+    for payload in events {
+        match payload {
+            Payload::Batch { rows, .. } => {
+                diffui_core::fold_cold_batch(&mut store, &mut graph, &mut cursor, rows, false);
+            }
+            Payload::GraphLoaded { tail: loaded, .. } => tail = Some(loaded),
+            Payload::Progress { .. } => {}
+            Payload::Failed { error, .. } => anyhow::bail!("{error}"),
+            other => panic!("unexpected event during a graph load: {other:?}"),
+        }
+    }
+    let tail = tail.expect("the walk must end with GraphLoaded");
+    for (index, empty) in tail.empty_updates {
+        store.set_is_empty(index, empty);
+    }
+    Ok((store, graph, tail.branch_status, tail.bookmarks))
+}
+
+async fn load_jj_diff(
+    repository: Repository,
+    revision: RevisionSelection,
+) -> anyhow::Result<(DiffDocument, Option<RevisionDetails>)> {
+    let events = run_one(&repository.root, |job| Command::LoadDiff { job, revision }).await;
+    match events.into_iter().next_back() {
+        Some(Payload::DiffLoaded {
+            document, details, ..
+        }) => Ok((document, details)),
+        Some(Payload::Failed { error, .. }) => anyhow::bail!("{error}"),
+        other => panic!("expected DiffLoaded, got {other:?}"),
+    }
+}
+
+async fn load_jj_repository_snapshot(repository: Repository) -> anyhow::Result<RepositorySnapshot> {
+    let events = run_one(&repository.root, |job| Command::Snapshot {
+        job,
+        origin: diffui_core::RefreshOrigin::Focus,
+    })
+    .await;
+    match events.into_iter().next_back() {
+        Some(Payload::SnapshotDone { snapshot, .. }) => Ok(snapshot),
+        Some(Payload::Failed { error, .. }) => anyhow::bail!("{error}"),
+        other => panic!("expected SnapshotDone, got {other:?}"),
+    }
+}
+
+async fn list_source_tree(
+    repository: Repository,
+    revision: RevisionSelection,
+) -> Result<Vec<SourceEntry>, String> {
+    let events = run_one(&repository.root, |job| Command::ListTree { job, revision }).await;
+    match events.into_iter().next_back() {
+        Some(Payload::TreeListed { entries, .. }) => Ok(entries),
+        Some(Payload::Failed { error, .. }) => Err(error.to_string()),
+        other => panic!("expected TreeListed, got {other:?}"),
+    }
+}
+
+async fn load_source_file(
+    repository: Repository,
+    revision: RevisionSelection,
+    path: String,
+) -> Result<SourceFileLoad, String> {
+    let events = run_one(&repository.root, |job| Command::ReadFile {
+        job,
+        revision,
+        path,
+    })
+    .await;
+    match events.into_iter().next_back() {
+        Some(Payload::FileRead { file, .. }) => Ok(file),
+        Some(Payload::Failed { error, .. }) => Err(error.to_string()),
+        other => panic!("expected FileRead, got {other:?}"),
+    }
+}
+
+async fn run_mutation(
+    repository: Repository,
+    op: MutationOp,
+    _progress: LoadProgress,
+    allow_immutable: bool,
+) -> Result<MutationOutcome, RepoError> {
+    let events = run_one(&repository.root, |job| Command::Mutate {
+        job,
+        op,
+        allow_immutable,
+    })
+    .await;
+    match events.into_iter().next_back() {
+        Some(Payload::MutationDone { outcome, .. }) => Ok(outcome),
+        Some(Payload::Failed { error, .. }) => Err(error),
+        other => panic!("expected a mutation result, got {other:?}"),
+    }
+}
+
+async fn run_rebase_preview(
+    repository: Repository,
+    mode: RebaseSourceMode,
+    sources: Vec<RevisionSelection>,
+    destination: Destination,
+) -> Result<diffui_core::RebasePreview, String> {
+    let draft = PreviewRequest::Rebase {
+        mode,
+        sources,
+        destination,
+    };
+    match preview(&repository.root, draft).await? {
+        diffui_core::DraftSimulation::Rebase(preview) => Ok(preview),
+        other => panic!("expected a rebase preview, got {other:?}"),
+    }
+}
+
+async fn run_merge_preview(
+    repository: Repository,
+    parents: Vec<RevisionSelection>,
+) -> Result<diffui_core::MergePreview, String> {
+    match preview(&repository.root, PreviewRequest::Merge { parents }).await? {
+        diffui_core::DraftSimulation::Merge(preview) => Ok(preview),
+        other => panic!("expected a merge preview, got {other:?}"),
+    }
+}
+
+async fn preview(
+    root: &Path,
+    draft: PreviewRequest,
+) -> Result<diffui_core::DraftSimulation, String> {
+    let events = run_one(root, |job| Command::Preview { job, draft }).await;
+    match events.into_iter().next_back() {
+        Some(Payload::PreviewDone { simulation, .. }) => Ok(simulation),
+        Some(Payload::Failed { error, .. }) => Err(error.to_string()),
+        other => panic!("expected PreviewDone, got {other:?}"),
+    }
 }
 
 fn write(dir: &Path, name: &str, contents: &str) {
@@ -127,7 +309,7 @@ fn parent_ids(dir: &Path, revset: &str) -> Vec<String> {
 }
 
 fn run(root: &Path, op: MutationOp) -> mutations::MutationOutcome {
-    block_on(mutations::run_mutation(
+    block_on(run_mutation(
         repository(root),
         op,
         LoadProgress::default(),
@@ -339,7 +521,7 @@ fn describe_mutation_replaces_the_full_message_without_moving_working_copy() {
     let working_copy_change = change_id(&root, "@");
     let description = "subject\n\nmultiline body";
 
-    let outcome = block_on(diffui_core::mutations::run_mutation(
+    let outcome = block_on(run_mutation(
         repository(&root),
         MutationOp::Describe {
             target: RevisionSelection::Commit(target.clone()),
@@ -656,17 +838,13 @@ fn source_browser_lists_and_reads_working_copy_and_commits() {
 
     // Lazily listing the ignored dir returns one level: a nested dir marker
     // (expandable in turn) — its contents stay unenumerated.
-    let children = block_on(list_ignored_dir(repository(&root), "target".to_owned()))
-        .expect("list ignored dir");
+    let children = list_ignored_dir(&repository(&root), "target").expect("list ignored dir");
     assert_eq!(children.len(), 1, "one level only: {children:#?}");
     assert_eq!(children[0].path, "target/debug");
     assert!(children[0].is_dir);
     assert_eq!(children[0].status, SourceEntryStatus::Ignored);
-    let nested = block_on(list_ignored_dir(
-        repository(&root),
-        "target/debug".to_owned(),
-    ))
-    .expect("list nested ignored dir");
+    let nested =
+        list_ignored_dir(&repository(&root), "target/debug").expect("list nested ignored dir");
     assert_eq!(nested.len(), 1);
     assert_eq!(nested[0].path, "target/debug/junk.bin");
     assert!(!nested[0].is_dir);
@@ -868,7 +1046,7 @@ fn rebase_branch_moves_the_whole_branch_from_its_fork_point() {
     // The preview resolves and names the branch: entry point = the fork
     // root (f1), moved set = the whole branch — even though the *head* was
     // picked. That's what the op bar shows and the sidebar washes.
-    let preview = block_on(mutations::run_rebase_preview(
+    let preview = block_on(run_rebase_preview(
         repository(&root),
         RebaseSourceMode::Branch,
         vec![RevisionSelection::Commit(f2.clone())],
@@ -903,7 +1081,7 @@ fn rebase_branch_moves_the_whole_branch_from_its_fork_point() {
     // reads calmly, not as a failure)…
     let base_sel = commit_id(&root, "description(exact:\"base\\n\")");
     let dest = commit_id(&root, &f2_change);
-    let empty = block_on(mutations::run_rebase_preview(
+    let empty = block_on(run_rebase_preview(
         repository(&root),
         RebaseSourceMode::Branch,
         vec![RevisionSelection::Commit(base_sel.clone())],
@@ -1068,7 +1246,7 @@ fn squash_multiple_sources_into_one_destination() {
     );
 
     // Parent target + several sources is ambiguous and refused.
-    let result = block_on(mutations::run_mutation(
+    let result = block_on(run_mutation(
         repository(&root),
         MutationOp::Squash {
             from: vec![
@@ -1082,7 +1260,7 @@ fn squash_multiple_sources_into_one_destination() {
     ));
     let error = result.expect_err("multi-source parent squash must fail");
     assert!(
-        error.message.contains("explicit destination"),
+        error.to_string().contains("explicit destination"),
         "got: {error}"
     );
 }
@@ -1126,7 +1304,7 @@ fn merge_creates_a_child_of_both_parents() {
     );
 
     // A merge with one distinct parent is refused.
-    let result = block_on(mutations::run_mutation(
+    let result = block_on(run_mutation(
         repository(&root),
         MutationOp::Merge {
             parents: vec![
@@ -1139,7 +1317,7 @@ fn merge_creates_a_child_of_both_parents() {
     ));
     let error = result.expect_err("self-merge must fail");
     assert!(
-        error.message.contains("two distinct parents"),
+        error.to_string().contains("two distinct parents"),
         "got: {error}"
     );
 
@@ -1186,7 +1364,7 @@ fn merge_preview_lists_conflicting_paths() {
     let head_before = block_on(diffui_core::jj::read_jj_op_head(repository(&root)))
         .expect("read op head before preview");
 
-    let preview = block_on(mutations::run_merge_preview(
+    let preview = block_on(run_merge_preview(
         repository(&root),
         vec![
             RevisionSelection::Commit(side_a),
@@ -1197,7 +1375,7 @@ fn merge_preview_lists_conflicting_paths() {
     assert_eq!(preview.conflicts, vec!["file.txt".to_owned()]);
     assert!(!preview.truncated);
 
-    let clean = block_on(mutations::run_merge_preview(
+    let clean = block_on(run_merge_preview(
         repository(&root),
         vec![
             RevisionSelection::Commit(base),
@@ -1480,7 +1658,7 @@ fn immutable_commits_refuse_rebase() {
     let protected = commit_id(&root, "description(glob:\"protected*\")");
     let wc = commit_id(&root, "@");
 
-    let result = block_on(mutations::run_mutation(
+    let result = block_on(run_mutation(
         repository(&root),
         MutationOp::Rebase {
             mode: RebaseSourceMode::Revisions,
@@ -1493,15 +1671,15 @@ fn immutable_commits_refuse_rebase() {
 
     let error = result.expect_err("rebasing an immutable commit must fail");
     assert!(
-        error.message.contains("immutable"),
+        matches!(&error, RepoError::Immutable { .. }),
         "error names immutability: {error}"
     );
     // The rejection is typed, naming the refused commit — that's what lets
     // the frontend raise its confirm-and-rerun dialog instead of a dead end.
-    let short = error
-        .immutable_target
-        .expect("immutable rejection carries the target");
-    assert!(!short.is_empty());
+    let RepoError::Immutable { short_id } = error else {
+        unreachable!("just asserted");
+    };
+    assert!(!short_id.is_empty());
 }
 
 /// Describe and abandon refuse immutable targets like the CLI does (they used
@@ -1522,7 +1700,7 @@ fn immutable_guard_covers_describe_and_honors_override() {
     let protected = commit_id(&root, "description(glob:\"protected*\")");
 
     let describe = |allow: bool| {
-        block_on(mutations::run_mutation(
+        block_on(run_mutation(
             repository(&root),
             MutationOp::Describe {
                 target: RevisionSelection::Commit(protected.clone()),
@@ -1535,7 +1713,7 @@ fn immutable_guard_covers_describe_and_honors_override() {
 
     let error = describe(false).expect_err("describing an immutable commit must fail");
     assert!(
-        error.immutable_target.is_some(),
+        matches!(&error, RepoError::Immutable { .. }),
         "typed rejection expected: {error}"
     );
     // Nothing was rewritten by the refused attempt.
@@ -1554,7 +1732,7 @@ fn immutable_guard_covers_describe_and_honors_override() {
         "protected base\n"
     );
 
-    let abandon = block_on(mutations::run_mutation(
+    let abandon = block_on(run_mutation(
         repository(&root),
         MutationOp::Abandon {
             targets: vec![RevisionSelection::Commit(protected.clone())],
@@ -1562,12 +1740,10 @@ fn immutable_guard_covers_describe_and_honors_override() {
         LoadProgress::default(),
         false,
     ));
-    assert!(
-        abandon
-            .expect_err("abandoning an immutable commit must fail")
-            .immutable_target
-            .is_some()
-    );
+    assert!(matches!(
+        abandon.expect_err("abandoning an immutable commit must fail"),
+        RepoError::Immutable { .. }
+    ));
 
     describe(true).expect("override rewrites the immutable commit");
     assert_eq!(
@@ -1758,7 +1934,7 @@ fn rebase_preview_predicts_conflicts_without_mutating() {
     let head_before = block_on(diffui_core::jj::read_jj_op_head(repository(&root)))
         .expect("read op head before preview");
 
-    let preview = block_on(mutations::run_rebase_preview(
+    let preview = block_on(run_rebase_preview(
         repository(&root),
         RebaseSourceMode::Revisions,
         vec![RevisionSelection::Commit(side_b.clone())],
@@ -1772,7 +1948,7 @@ fn rebase_preview_predicts_conflicts_without_mutating() {
     assert_eq!(preview.new_conflicts, vec![expected_short]);
 
     // A non-conflicting placement predicts none.
-    let clean = block_on(mutations::run_rebase_preview(
+    let clean = block_on(run_rebase_preview(
         repository(&root),
         RebaseSourceMode::Revisions,
         vec![RevisionSelection::Commit(side_b)],
@@ -1801,8 +1977,7 @@ fn snapshot_parent_fingerprint_detects_external_ops() {
     jj(&root, &["commit", "-m", "base"]);
 
     // Quiet tree: the snapshot writes no op and is its own base.
-    let (first, _repo, _wc, _ws) =
-        block_on(load_jj_repository_snapshot(repository(&root))).expect("first snapshot");
+    let first = block_on(load_jj_repository_snapshot(repository(&root))).expect("first snapshot");
     assert_eq!(
         first.parent_fingerprint.as_deref(),
         Some(first.fingerprint.as_str()),
@@ -1814,8 +1989,7 @@ fn snapshot_parent_fingerprint_detects_external_ops() {
     jj(&root, &["new", "-m", "external op"]);
     write(&root, "file.txt", "hello edited\n");
 
-    let (second, _repo, _wc, _ws) =
-        block_on(load_jj_repository_snapshot(repository(&root))).expect("second snapshot");
+    let second = block_on(load_jj_repository_snapshot(repository(&root))).expect("second snapshot");
     assert_ne!(
         second.parent_fingerprint.as_deref(),
         Some(first.fingerprint.as_str()),
@@ -1897,7 +2071,7 @@ fn move_bookmark_with_push_updates_the_remote() {
     // A bare git repo on disk is a perfectly good `jj git push` remote.
     let remote = std::env::temp_dir().join("diffui-core-scenario-move-push-remote.git");
     let _ = std::fs::remove_dir_all(&remote);
-    let status = Command::new("git")
+    let status = Process::new("git")
         .args(["init", "--bare"])
         .arg(&remote)
         .status()
@@ -1937,7 +2111,7 @@ fn move_bookmark_with_push_updates_the_remote() {
         target,
         "remote-tracking ref follows the push"
     );
-    let on_remote = Command::new("git")
+    let on_remote = Process::new("git")
         .current_dir(&remote)
         .args(["rev-parse", "refs/heads/main"])
         .output()

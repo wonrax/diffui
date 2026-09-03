@@ -1,12 +1,11 @@
 //! Revision mutations — `new`, `edit`, `abandon`, `rebase`, `squash`, ….
 //!
-//! Only the op types and the off-runtime dispatch live here. The jj-lib
-//! execution is [`crate::jj::apply_mutation`], which reuses the working-copy
-//! snapshot/checkout machinery in `jj.rs` so a mutation that moves `@` also
-//! updates the files on disk (and doesn't lose uncommitted work).
+//! Only the op types and the drafts that build them live here; the jj-lib
+//! execution belongs to the repository actor, which runs it inside the one
+//! working-copy lock so a mutation that moves `@` also updates the files on
+//! disk (and doesn't lose uncommitted work).
 
-use crate::model::{LoadProgress, RevisionSelection};
-use crate::repository::Repository;
+use crate::model::RevisionSelection;
 
 /// Which commits a rebase moves, relative to the picked source revisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,61 +151,6 @@ pub struct MutationOutcome {
     pub operation_id: Option<String>,
 }
 
-/// A failed mutation. The immutable-commit rejection travels as data (not
-/// just prose) so a frontend can offer "rewrite anyway" — a rerun with
-/// `allow_immutable` — instead of a dead-end error.
-#[derive(Debug, Clone)]
-pub struct MutationError {
-    pub message: String,
-    /// Short change id of the immutable commit the op refused to touch, when
-    /// that's why it failed. `None` for every other kind of failure.
-    pub immutable_target: Option<String>,
-}
-
-impl std::fmt::Display for MutationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl MutationError {
-    fn other(message: String) -> Self {
-        Self {
-            message,
-            immutable_target: None,
-        }
-    }
-}
-
-/// Run `op` off the iced runtime. jj-lib holds `!Send` state, so the work runs
-/// on `spawn_blocking + block_on`, mirroring the read path in `jj.rs`.
-/// `allow_immutable` skips the immutable-commit guards — pass it only after
-/// the user has confirmed the rewrite (the jj CLI's `--ignore-immutable`).
-pub async fn run_mutation(
-    repository: Repository,
-    op: MutationOp,
-    progress: LoadProgress,
-    allow_immutable: bool,
-) -> Result<MutationOutcome, MutationError> {
-    let handle = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || {
-        handle.block_on(crate::jj::apply_mutation(
-            repository,
-            op,
-            progress,
-            allow_immutable,
-        ))
-    })
-    .await
-    .map_err(|e| MutationError::other(format!("mutation task panicked: {e}")))?
-    .map_err(|e| MutationError {
-        immutable_target: e
-            .downcast_ref::<crate::jj::ImmutableRewriteError>()
-            .map(|immutable| immutable.short_id.clone()),
-        message: format!("{e:#}"),
-    })
-}
-
 /// What a draft simulation produced — the op bar renders the kind-specific
 /// summary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,43 +192,6 @@ pub struct RebasePreview {
     /// `false` when the affected set was too large to simulate — the counts
     /// are then estimates and `new_conflicts` is unknown, not empty.
     pub simulated: bool,
-}
-
-/// Simulate a rebase off the iced runtime (same `!Send` dance as
-/// [`run_mutation`]). Never mutates the repo's visible state.
-pub async fn run_rebase_preview(
-    repository: Repository,
-    mode: RebaseSourceMode,
-    sources: Vec<RevisionSelection>,
-    destination: Destination,
-) -> Result<RebasePreview, String> {
-    let handle = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || {
-        handle.block_on(crate::jj::preview_rebase(
-            repository,
-            mode,
-            sources,
-            destination,
-        ))
-    })
-    .await
-    .map_err(|e| format!("preview task panicked: {e}"))?
-    .map_err(|e| format!("{e:#}"))
-}
-
-/// Simulate a merge's tree off the iced runtime — which paths would
-/// conflict. Never mutates the repo's visible state.
-pub async fn run_merge_preview(
-    repository: Repository,
-    parents: Vec<RevisionSelection>,
-) -> Result<MergePreview, String> {
-    let handle = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || {
-        handle.block_on(crate::jj::preview_merge(repository, parents))
-    })
-    .await
-    .map_err(|e| format!("preview task panicked: {e}"))?
-    .map_err(|e| format!("{e:#}"))
 }
 
 // ── Target-mode drafts ──────────────────────────────────────────────────

@@ -13,9 +13,9 @@ pub mod graph_layout;
 pub mod jj;
 pub mod model;
 pub mod mutations;
+pub mod repo;
 pub mod repository;
 pub mod session;
-pub mod source;
 pub mod source_browse;
 pub mod syntax;
 #[cfg(feature = "watcher")]
@@ -25,20 +25,19 @@ pub mod watcher;
 pub use diff_parse::{DiffStreamParser, format_hunk_header, parse_unified_diff};
 pub use model::*;
 pub use mutations::{
-    Destination, DraftKind, DraftSimulation, DraftSource, MergePreview, MutationError, MutationOp,
+    Destination, DraftKind, DraftSimulation, DraftSource, MergePreview, MutationOp,
     MutationOutcome, OpDraft, PlacementKind, RebasePreview, RebaseSourceMode, SquashTarget,
+};
+pub use repo::{
+    Capabilities, Command, Event, JobId, OpenSpec, Payload, PreviewRequest, RepoError, RepoHandle,
+    RepoId, canonical_selection, rewritten_targets,
 };
 pub use repository::{FetchTarget, Repository, RepositorySnapshot, Vcs, prepare_repository};
 pub use session::{
-    ColdBatchFold, ColdCursor, LoadStatus, LoadVersion, MutationQueue, QueueAction, RefreshOrigin,
-    Session, coalesce_refresh, fold_cold_batch,
-};
-pub use source::{DiffSource, DiffTarget, Mutable, RepoSource, RevisionGraph, SourceHandle};
-pub use source::{
-    compute_empty_status, fetch, highlight_file, load_backend, load_diff, load_repository_snapshot,
-    load_revision_details, read_op_head,
+    ColdBatchFold, ColdCursor, Effect, LoadStatus, RefreshOrigin, Session, coalesce_refresh,
+    fold_cold_batch,
 };
 pub use source_browse::{
-    SourceEntry, SourceEntryStatus, SourceFileLoad, SourceTreeRow, list_ignored_dir,
-    list_source_tree, load_source_file, source_tree_rows,
+    SourceEntry, SourceEntryStatus, SourceFileLoad, SourceTreeRow, build_source_file,
+    list_ignored_dir, sort_source_entries, source_tree_rows,
 };

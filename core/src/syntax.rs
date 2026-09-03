@@ -398,6 +398,33 @@ fn normalize_syntax_spans(mut spans: Vec<SyntaxSpan>) -> Vec<SyntaxSpan> {
     normalized
 }
 
+/// Highlight one diff file against its full old/new sources and return the
+/// per-line spans sparsely as `(hunk, line, spans)`; empty when the language is
+/// unknown.
+///
+/// Sparse because the caller applies these into a document it still owns —
+/// shipping the whole file back would copy every line for the handful that
+/// gained colour. Seconds of CPU on a large file, so callers run it off their
+/// UI thread.
+pub fn highlight_file(
+    mut file: DiffFile,
+    old_source: Option<&str>,
+    new_source: Option<&str>,
+) -> Vec<(usize, usize, Vec<SyntaxSpan>)> {
+    apply_syntax_highlighting_with_sources(&mut file, old_source, new_source);
+    file.hunks
+        .into_iter()
+        .enumerate()
+        .flat_map(|(hunk_index, hunk)| {
+            hunk.lines
+                .into_iter()
+                .enumerate()
+                .filter(|(_, line)| !line.syntax.is_empty())
+                .map(move |(line_index, line)| (hunk_index, line_index, line.syntax))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

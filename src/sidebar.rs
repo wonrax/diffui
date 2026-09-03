@@ -760,7 +760,7 @@ pub const REVSET_INPUT_ID: &str = "revset-input";
 /// sidebar, with a caret that opens the presets menu. Submitting (Enter) or
 /// picking a preset re-evaluates the log.
 fn build_revset_filter(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
-    let placeholder = match ui.active().session.repository.as_ref().map(|r| r.vcs) {
+    let placeholder = match ui.active().repository.as_ref().map(|r| r.vcs) {
         Some(Vcs::Git) => "revision range — e.g. --all, main..@",
         _ => "revset — e.g. all(), mine()",
     };
@@ -1083,13 +1083,7 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
     .on_context_menu(Message::RevisionContextMenu)
     .on_file_context_menu(Message::SidebarFileContextMenu);
     // Drag-to-rebase, for mutable (local jj) repos only.
-    if ui
-        .active()
-        .session
-        .repository
-        .as_ref()
-        .is_some_and(|repo| matches!(repo.vcs, Vcs::Jj))
-    {
+    if ui.active().session.capabilities.mutate {
         list = list
             .on_drag(revision_list::DragHooks {
                 start: Message::RevisionDragStart,

@@ -148,6 +148,37 @@ impl ActivityLog {
         progress
     }
 
+    /// Record a standalone note — a warning the backend surfaced in passing
+    /// (a snapshot that skipped an oversized file) that belongs to no
+    /// particular operation. Lands as a finished row so it is visible in the
+    /// popover without pretending anything is still running.
+    pub fn note(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        // Reuse the newest row when the same note repeats; a watcher tick that
+        // re-skips the same file every second would otherwise fill the log.
+        if self
+            .activities
+            .last()
+            .is_some_and(|activity| activity.label == text)
+        {
+            return;
+        }
+        self.activities.push(Activity {
+            id: ActivityId(u64::MAX),
+            label: text,
+            status: ActivityStatus::Done,
+            progress: LoadProgress::default(),
+            determinate: false,
+            detail: Vec::new(),
+            result: None,
+            started: Instant::now(),
+            duration: Some(std::time::Duration::ZERO),
+            expanded: false,
+            detail_editor: None,
+            undo_op: None,
+        });
+    }
+
     pub fn append_output(&mut self, id: ActivityId, line: impl Into<String>) {
         if let Some(activity) = self.get_mut(id) {
             activity.detail.push(line.into());

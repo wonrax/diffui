@@ -4,58 +4,18 @@
 
 use iced::{Point, Size, theme as iced_theme, widget::text_editor};
 
-use diffui_core::{
-    BackendOutput, CommitsTail, DiffDocument, DiffFile, FetchTarget, RepositorySnapshot,
-    RevisionDetails, RevisionSelection, StreamRow, SyntaxSpan, github,
-};
+use diffui_core::{FetchTarget, RevisionSelection, SyntaxSpan};
 
 use crate::theme::ThemePreference;
-use crate::{
-    HoverTarget, MainView, PendingMutation, RefreshOrigin, TabId, ToolbarMenu, activity, mutations,
-    revision_list,
-};
+use crate::{HoverTarget, MainView, TabId, ToolbarMenu, activity, mutations, revision_list};
 
 #[derive(Debug, Clone)]
 pub(crate) enum Message {
-    /// Atomic graph reload finished. Tab-addressed (like every per-tab load
-    /// completion): a result landing after a tab switch is dropped instead of
-    /// applying to whichever tab is now active — most dangerously, two tabs
-    /// both pending on `@` would otherwise pass the revision guard and show
-    /// one repo's diff in the other's view.
-    BackendLoaded(TabId, RevisionSelection, Box<Result<BackendOutput, String>>),
-    /// One batch of commits from a streaming cold load, tagged with the
-    /// `commits_version` the stream was started under. Appended into the live
-    /// `commits` / `graph` so the sidebar grows as the walk progresses.
-    CommitsBatch(u64, Vec<StreamRow>),
-    /// End of a streaming cold load: the snapshot fingerprint + single-parent
-    /// emptiness updates, or an error. Finalizes the stream (clears the load
-    /// cursor, kicks off background empty-status resolution for merges).
-    CommitsFinished(u64, Box<Result<CommitsTail, String>>),
-    /// Working-copy diff for a streaming cold load, tagged with the stream's
-    /// `commits_version`. Sets the diff pane *without* flipping `status` to
-    /// `Loaded` — that's the first `CommitsBatch`'s job, so the sidebar never
-    /// flashes empty while the graph walk loads the index.
-    InitialDiff(
-        u64,
-        Box<Result<(DiffDocument, Option<RevisionDetails>), String>>,
-    ),
-    /// Diff-only load for a revision switch — carries just the document and
-    /// header details, leaving the commit graph and snapshot untouched.
-    /// Tab-addressed; see [`Message::BackendLoaded`].
-    DiffLoaded(
-        TabId,
-        RevisionSelection,
-        Box<Result<(DiffDocument, Option<RevisionDetails>), String>>,
-    ),
-    /// Tab-addressed; see [`Message::BackendLoaded`] — an unguarded snapshot
-    /// completing after a tab switch would write the old repo's op fingerprint
-    /// into the new tab's session.
-    RepositorySnapshotLoaded(TabId, RefreshOrigin, Result<RepositorySnapshot, String>),
-    /// Background-resolved empty status for the merge/root commits the loader
-    /// left unknown, tagged with the `commits_version` it was computed against
-    /// so results from a superseded load are dropped. Tab-addressed because
-    /// `commits_version` alone is not unique across tabs.
-    EmptyStatusComputed(TabId, u64, Vec<(usize, bool)>),
+    /// One event from a repository actor. Everything the projection owns —
+    /// graph batches, diffs, snapshots, mutations — arrives here and is folded
+    /// in by [`diffui_core::Session::apply`]; the rest is routed by job to the
+    /// tab that asked.
+    Repo(Box<diffui_core::Event>),
     SelectFile(usize),
     SelectRowKey(revision_list::RowSelectionKey),
     /// Drop the sidebar's multi-selection marks (Esc with no overlay open,
@@ -74,15 +34,6 @@ pub(crate) enum Message {
     DescriptionAction(text_editor::Action),
     DescriptionSave,
     DescriptionCancel,
-    /// A context-menu mutation (new/edit/abandon/bookmark/push) finished.
-    /// Carries its whole `PendingMutation` (which addresses the tab + activity)
-    /// so an immutable-commit rejection can offer a rerun with the override
-    /// armed, without reconstructing the op.
-    MutationCompleted(
-        Box<PendingMutation>,
-        Box<Result<mutations::MutationOutcome, mutations::MutationError>>,
-    ),
-
     // ── Target-mode drafts (rebase / squash destination picking) ────────
     /// Start a draft for the given source revision and enter target mode.
     DraftStart(mutations::DraftKind, RevisionSelection),
@@ -102,8 +53,6 @@ pub(crate) enum Message {
     DraftConfirm,
     /// Esc / the op bar's ✕: leave target mode without running anything.
     DraftCancel,
-    /// Debounced draft simulation finished (rebase or merge), guarded by the
-    /// draft's preview version so a superseded candidate's result is dropped.
     /// Target mode: plain hover crossed onto a commit row (`Some`) or left
     /// the rows (`None`). Arms the row as the draft candidate — the mouse
     /// equivalent of `j`/`k`, honoring the armed placement.
@@ -111,7 +60,6 @@ pub(crate) enum Message {
     /// The preview debounce timer fired for this version — run the parked
     /// simulation if the version is still current.
     DraftPreviewKick(u64),
-    DraftPreview(u64, Box<Result<mutations::DraftSimulation, String>>),
 
     // ── Revision drag & drop (sidebar) ──────────────────────────────────
     /// A drag crossed the activation threshold on this commit row: start a
@@ -154,16 +102,6 @@ pub(crate) enum Message {
     /// window appearance — see [`crate::chrome::system_appearance`].
     PollSystemTheme,
     WindowFocusChanged(bool),
-    RefreshRepository,
-    /// The fs watcher saw a write under `.jj/repo/op_heads` — an operation
-    /// landed (ours: a wc snapshot / mutation, or external: a CLI `jj` command).
-    /// Triggers a cheap op-head read to decide whether it's worth reloading.
-    OpLogChanged,
-    /// Result of the op-head read kicked by [`Message::OpLogChanged`]. `None` for
-    /// git (no op log). Reloads only if the head differs from the one the graph
-    /// already reflects (so our own writes don't cause a redundant walk).
-    /// Tab-addressed; see [`Message::BackendLoaded`].
-    OpHeadChecked(TabId, Box<Result<Option<String>, String>>),
     /// Periodic tick while a load is in flight. No-op handler — it exists only
     /// to keep `view()` re-running so the loading indicator can appear after
     /// its grace period and animate.
@@ -238,15 +176,6 @@ pub(crate) enum Message {
     ToolbarRefresh,
     /// Toolbar "Fetch" (main button or a caret-menu item).
     Fetch(FetchTarget),
-    /// A fetch finished: captured output lines, or an error. Tab-addressed so a
-    /// fetch that completes after a tab switch resolves against the right log.
-    /// Carries the target so the activity's result summary can name it.
-    FetchCompleted(
-        TabId,
-        activity::ActivityId,
-        FetchTarget,
-        Box<Result<Vec<String>, String>>,
-    ),
     /// Toolbar "Undo": revert the latest jj operation.
     Undo,
     /// Revset input edited.
@@ -258,11 +187,6 @@ pub(crate) enum Message {
     OpenToolbarMenu(ToolbarMenu, iced::Rectangle),
     /// Popup-menu messages — see [`crate::menu::MenuMessage`].
     Menu(crate::menu::MenuMessage),
-    /// Ancestry check for a bookmark move resolved: `true` = backwards or
-    /// sideways (the jj CLI would refuse without `--allow-backwards`) → raise
-    /// the confirmation dialog; `false` (or check failure) → run it. Carries
-    /// the fully-wired mutation either way.
-    BookmarkMoveChecked(Box<crate::PendingMutation>, Box<Result<bool, String>>),
     /// Confirmation dialog: run the held mutation.
     ConfirmAccept,
     /// Confirmation dialog: dismiss, resolving the held activity as canceled.
@@ -286,16 +210,6 @@ pub(crate) enum Message {
     SetHover(Option<HoverTarget>),
 
     // ── GitHub PR tabs ──────────────────────────────────────────────────
-    /// PR header metadata (`gh pr view`) for the streaming PR load tagged with
-    /// its version (the `session.load` cursor guard, like `CommitsBatch`).
-    PrMetaLoaded(u64, Box<Result<github::PrInfo, String>>),
-    /// One batch of completed files off the PR diff stream.
-    PrFilesBatch(u64, Vec<DiffFile>),
-    /// The PR's commit list (`gh pr view --json commits`), for the sidebar.
-    PrCommitsLoaded(u64, Box<Result<Vec<github::PrCommit>, String>>),
-    /// The PR diff stream ended — every file was emitted, or it failed.
-    PrFinished(u64, Box<Result<(), String>>),
-
     /// Background syntax highlighting finished for one file: sparse
     /// `(hunk, line, spans)` for the document identified by the leading
     /// `document_id` (routed to whichever tab still shows it, on screen or
@@ -312,29 +226,6 @@ pub(crate) enum Message {
     /// the widget callback can't capture the revision; the context-menu
     /// entry points dispatch through `MenuAction::BrowseSource` instead).
     BrowseFileFromDiff(usize),
-    /// The browsed revision's file listing finished. Tab-addressed and
-    /// version-guarded (`SourceState::version`) like every per-tab load.
-    SourceTreeLoaded(
-        TabId,
-        u64,
-        Box<Result<Vec<diffui_core::SourceEntry>, String>>,
-    ),
-    /// One file's contents finished loading for the source browser. Carries
-    /// the path so a result for a superseded selection is dropped.
-    SourceFileLoaded(
-        TabId,
-        u64,
-        String,
-        Box<Result<diffui_core::SourceFileLoad, String>>,
-    ),
-    /// A lazy one-level listing of an ignored directory finished (the user
-    /// expanded its unenumerated row). Carries the dir path it lists.
-    SourceDirLoaded(
-        TabId,
-        u64,
-        String,
-        Box<Result<Vec<diffui_core::SourceEntry>, String>>,
-    ),
     /// Click on a row of the source sidebar's file tree, by display index:
     /// files load into the viewer, directories toggle their collapse.
     SourceSidebarRow(usize),

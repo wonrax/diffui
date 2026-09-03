@@ -38,7 +38,7 @@ pub struct RowLaneData {
 /// [`LaneFrame`] + bookmarks and returns that row's [`RowLaneData`], mutating
 /// the carried label/segment state for the next row. This is the single source
 /// of truth for the fold; both the batch [`GraphLayoutBuilder`] and the
-/// streaming loader (carrying one across `CommitsBatch` messages) drive it
+/// streaming loader (carrying one across the actor's `Batch` events) drive it
 /// through [`GraphLayout::push`], so they can never diverge.
 #[derive(Default, Clone, Debug)]
 pub struct LaneFoldState {
@@ -307,7 +307,7 @@ impl GraphLayout {
     /// Append one row in graph order: drive the carried `fold` for this row's
     /// `frame` + `bookmarks`, then run-length encode the result. Holds no more
     /// than one row plus the fold state, so it composes with the streaming
-    /// loader (each `CommitsBatch` appends) and never materializes the dense
+    /// loader (each `Batch` event appends) and never materializes the dense
     /// per-row arrays. The batch [`GraphLayoutBuilder`] is a thin wrapper over
     /// this so the two paths can't diverge.
     pub fn push(&mut self, frame: &LaneFrame, bookmarks: &[String], fold: &mut LaneFoldState) {

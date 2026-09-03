@@ -16,8 +16,8 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 
 use crate::model::{DiffFile, DiffFileStatus, DiffHunkView, DiffLine, DiffLineKind};
-use crate::repository::{Repository, Vcs};
-use crate::{RevisionSelection, syntax};
+use crate::repository::Repository;
+use crate::syntax;
 
 /// How a listed path relates to the revision's tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,90 +89,41 @@ pub const MAX_SOURCE_FILE_BYTES: usize = 8 * 1024 * 1024;
 /// would cost more than the colors are worth.
 const MAX_HIGHLIGHT_BYTES: usize = 2 * 1024 * 1024;
 
-/// List every path at `revision`. Commits list their tree; the working copy
-/// walks the directory (see module docs). Entries are sorted by path.
-pub async fn list_source_tree(
-    repository: Repository,
-    revision: RevisionSelection,
-) -> Result<Vec<SourceEntry>, String> {
-    let result = match repository.vcs {
-        Vcs::Jj => {
-            let handle = tokio::runtime::Handle::current();
-            tokio::task::spawn_blocking(move || {
-                handle.block_on(crate::jj::list_jj_source_tree(repository, revision))
-            })
-            .await
-            .map_err(|error| format!("jj source-tree task failed: {error}"))?
-        }
-        Vcs::Git => crate::git::list_git_source_tree(&repository, &revision).await,
-    };
-    result
-        .map(|mut entries| {
-            entries.sort_by(|a, b| a.path.cmp(&b.path));
-            entries
-        })
-        .map_err(|error| format!("{error:#}"))
+/// Sort a backend's raw listing the way the tree renders it.
+pub fn sort_source_entries(mut entries: Vec<SourceEntry>) -> Vec<SourceEntry> {
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    entries
 }
 
-/// Read `path` at `revision` and synthesize the displayable document —
-/// including the (potentially seconds-long, hence off-thread) syntax parse.
-pub async fn load_source_file(
-    repository: Repository,
-    revision: RevisionSelection,
-    path: String,
-) -> Result<SourceFileLoad, String> {
-    let data = match repository.vcs {
-        Vcs::Jj => {
-            let handle = tokio::runtime::Handle::current();
-            let repository = repository.clone();
-            let revision = revision.clone();
-            let path = path.clone();
-            tokio::task::spawn_blocking(move || {
-                handle.block_on(crate::jj::read_jj_source_file(repository, revision, path))
-            })
-            .await
-            .map_err(|error| format!("jj source read task failed: {error}"))?
-        }
-        Vcs::Git => crate::git::read_git_source_file(&repository, &revision, &path).await,
-    }
-    .map_err(|error| format!("{error:#}"))?;
-
+/// Turn one backend read into the displayable document, including the
+/// (potentially seconds-long) syntax parse. Synchronous: the repository actor
+/// runs it on its own thread, where it serializes behind nothing but the next
+/// command for the same repository.
+pub fn build_source_file(path: &str, data: SourceFileData) -> SourceFileLoad {
     let byte_len = data.byte_len;
     let (binary, too_large) = (data.binary, data.too_large);
     let Some(content) = data.content else {
-        return Ok(SourceFileLoad {
-            file: empty_source_file(&path),
+        return SourceFileLoad {
+            file: empty_source_file(path),
             line_count: 0,
             binary,
             too_large,
             byte_len,
-        });
+        };
     };
 
-    // Synthesis + tree-sitter run off-thread: a parse of a large file is
-    // seconds of CPU, exactly like the diff highlighter's rationale.
-    let joined = tokio::task::spawn_blocking(move || {
-        let mut file = synthesize_source_file(&path, &content);
-        if content.len() <= MAX_HIGHLIGHT_BYTES {
-            syntax::apply_syntax_highlighting_with_sources(&mut file, None, Some(&content));
-        }
-        file
-    })
-    .await
-    .map_err(|error| format!("source synthesis task failed: {error}"))?;
-
-    let line_count = joined
-        .hunks
-        .first()
-        .map(|hunk| hunk.lines.len())
-        .unwrap_or(0);
-    Ok(SourceFileLoad {
-        file: joined,
+    let mut file = synthesize_source_file(path, &content);
+    if content.len() <= MAX_HIGHLIGHT_BYTES {
+        syntax::apply_syntax_highlighting_with_sources(&mut file, None, Some(&content));
+    }
+    let line_count = file.hunks.first().map(|hunk| hunk.lines.len()).unwrap_or(0);
+    SourceFileLoad {
+        file,
         line_count,
         binary: false,
         too_large: false,
         byte_len,
-    })
+    }
 }
 
 /// Wrap full file contents as a single-hunk, all-context [`DiffFile`] with
@@ -388,14 +339,7 @@ pub const MAX_IGNORED_DIR_ENTRIES: usize = 2_000;
 /// unenumerated marker because nothing tracked lives beneath it, so
 /// everything inside is ignored by inheritance. Subdirectories arrive as
 /// unenumerated markers themselves, expanding level by level.
-pub async fn list_ignored_dir(
-    repository: Repository,
-    dir: String,
-) -> Result<Vec<SourceEntry>, String> {
-    list_ignored_dir_inner(&repository, &dir).map_err(|error| format!("{error:#}"))
-}
-
-fn list_ignored_dir_inner(repository: &Repository, dir: &str) -> Result<Vec<SourceEntry>> {
+pub fn list_ignored_dir(repository: &Repository, dir: &str) -> Result<Vec<SourceEntry>> {
     if dir.is_empty()
         || Path::new(dir)
             .components()

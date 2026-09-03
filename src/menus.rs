@@ -491,21 +491,27 @@ impl Diffui {
                 return self.update(Message::DraftStart(kind, source));
             }
             // Author / committer / full description aren't kept in the graph, so
-            // read the revision off-thread, format the field, and copy — falling
-            // back to the in-memory value on failure.
+            // ask the actor for the revision's header and copy from that,
+            // falling back to the in-memory value.
             MenuAction::CopyDetail { field, fallback } => {
-                let (Some(source), Some(selection)) =
-                    (self.active_mut().session.source.clone(), selection)
-                else {
+                let (Some(tab), Some(selection)) = (self.active_tab_id(), selection) else {
                     return Task::none();
                 };
-                return Task::perform(source.details(selection), move |result| {
-                    let text = result
-                        .ok()
-                        .and_then(|details| format_detail(&details, field))
-                        .unwrap_or(fallback);
-                    Message::CopyToClipboard(text)
-                });
+                let Some(state) = self.tab_mut(tab) else {
+                    return Task::none();
+                };
+                if !state.session.capabilities.details {
+                    return Task::done(Message::CopyToClipboard(fallback));
+                }
+                let job = state.session.next_job();
+                state.pending_detail_copy = Some((job, field, fallback));
+                return self.send(
+                    tab,
+                    diffui_core::Command::RevisionDetails {
+                        job,
+                        revision: selection,
+                    },
+                );
             }
             MenuAction::ClearMultiSelection => {
                 self.active_mut().revision_multi_selection.clear();
@@ -521,17 +527,17 @@ impl Diffui {
         self.start_mutation_op(op)
     }
 
-    /// Wrap `op` in an activity and run it through the serial mutation queue.
-    /// Every mutation entry point — context menu, target-mode confirm, drag &
-    /// drop — funnels through here so labels and guards can't drift apart.
+    /// Wrap `op` in an activity and send it to the repository actor. Every
+    /// mutation entry point — context menu, target-mode confirm, drag & drop —
+    /// funnels through here so labels and guards can't drift apart.
     pub(crate) fn start_mutation_op(&mut self, op: mutations::MutationOp) -> Task<Message> {
         use mutations::MutationOp;
-        let Some(repository) = self.active_mut().session.repository.clone() else {
-            return Task::none();
-        };
         let Some(tab_id) = self.active_tab_id() else {
             return Task::none();
         };
+        if !self.active().session.capabilities.mutate {
+            return Task::none();
+        }
         // Surface the mutation as an activity (push captures its remote output).
         let label = match &op {
             MutationOp::New { .. } => "New change".to_owned(),
@@ -576,33 +582,34 @@ impl Diffui {
                     ..
                 }
         );
-        let (activity_id, progress) = self.begin_activity(tab_id, label, determinate);
+        let (activity_id, _) = self.begin_activity(tab_id, label, determinate);
         let pending = PendingMutation {
-            repository,
             op,
             tab_id,
             activity_id,
-            progress,
             allow_immutable: false,
         };
         // jj CLI parity: `jj bookmark set` refuses a backwards/sideways move
-        // without `--allow-backwards`. Check ancestry off-thread first — the
-        // result either runs the move directly (fast-forward) or raises a
-        // confirmation dialog. The activity sits Queued meanwhile so the
+        // without `--allow-backwards`. Check ancestry first — the result either
+        // runs the move directly (fast-forward) or raises a confirmation
+        // dialog. The activity sits Queued meanwhile so the
         // action stays visible (and is resolved on cancel).
         if let MutationOp::MoveBookmark { name, to, .. } = &pending.op {
             if let Some(log) = self.activity_log_for(pending.tab_id) {
                 log.set_status(pending.activity_id, activity::ActivityStatus::Queued);
             }
-            let repository = pending.repository.clone();
             let (name, to) = (name.clone(), to.clone());
-            let pending = Box::new(pending);
-            return Task::perform(
-                crate::jj::bookmark_move_is_backwards(repository, name, to),
-                move |result| Message::BookmarkMoveChecked(pending, Box::new(result)),
+            let Some(state) = self.tab_mut(tab_id) else {
+                return Task::none();
+            };
+            let job = state.session.next_job();
+            state.jobs.bookmark_check = Some((job, pending));
+            return self.send(
+                tab_id,
+                diffui_core::Command::BookmarkCheck { job, name, to },
             );
         }
-        self.enqueue_or_run_mutation(pending)
+        self.run_mutation(pending)
     }
 
     /// Context-menu tree for a file-tree row (`display_index` into the
@@ -655,7 +662,7 @@ impl Diffui {
         let mut items = Vec::new();
         if is_file
             && self.active().main_view == MainView::Diff
-            && self.active().session.repository.is_some()
+            && self.active().repository.is_some()
         {
             items.push(MenuEntry::item(
                 "Browse source at this revision",
@@ -670,7 +677,7 @@ impl Diffui {
             "Copy path",
             MenuAction::CopyText(path.clone()),
         ));
-        if let Some(repository) = &self.active().session.repository {
+        if let Some(repository) = &self.active().repository {
             items.push(MenuEntry::item(
                 "Copy absolute path",
                 MenuAction::CopyText(repository.root.join(&path).display().to_string()),

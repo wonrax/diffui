@@ -46,20 +46,6 @@ impl Diffui {
         self.active_tab_id() == Some(tab)
     }
 
-    /// The tab whose live streaming cursor is `version`, with its state.
-    /// Streaming results are routed by version rather than by tab id (the
-    /// worker is spawned before anything addresses a tab), so a cold walk / PR
-    /// stream keeps its progress while its tab is backgrounded. `None` means
-    /// the load was superseded — its tab re-kicked, or closed — and the result
-    /// must be discarded. The id comes back with the state so the caller can
-    /// gate its active-only follow-ups without a second lookup.
-    pub(crate) fn load_target_mut(&mut self, version: u64) -> Option<(TabId, &mut TabState)> {
-        self.tabs
-            .iter_mut()
-            .find(|tab| tab.state.session.load.as_ref().map(|c| c.version) == Some(version))
-            .map(|tab| (tab.id, &mut tab.state))
-    }
-
     /// The tab displaying document `id`, with its state. Background per-file
     /// work (syntax highlighting) routes its results through this; `None` means
     /// the document is gone and the result must be dropped.
@@ -126,60 +112,25 @@ impl Diffui {
         self.document_version = self.document_version.wrapping_add(1);
     }
 
-    /// Kick a load for the active tab when activating it. A tab that has never
-    /// loaded — or whose load was abandoned while backgrounded — has
-    /// `status != Loaded`, so activating it (re)starts the streaming load. An
-    /// already-loaded tab instead gets a cheap freshness re-check: the fs/op-log
-    /// watcher follows only the *active* repo, so external ops/edits to a
-    /// backgrounded tab go unseen until we return to it. A `Focus` snapshot
-    /// reconciles that — its op-fingerprint dedup in `RepositorySnapshotLoaded`
-    /// makes it a no-op (no graph re-walk) when nothing changed, and a full
-    /// reload only when an external op actually landed.
+    /// Bring the active tab up to date on activation.
+    ///
+    /// A tab that has never loaded — or whose load was abandoned while
+    /// backgrounded — restarts it. An already-loaded tab gets a freshness
+    /// re-check instead: its actor keeps watching while the tab is off screen,
+    /// but a `Focus` snapshot reconciles anything the projection coalesced
+    /// while nothing was rendering. Its op-fingerprint dedup makes that a
+    /// no-op when nothing changed.
     pub(crate) fn ensure_active_loaded(&mut self) -> Task<Message> {
         let Some(tab) = self.active_tab_id() else {
             return Task::none();
         };
-        // A streaming load that kept running while this tab was backgrounded
-        // (batches route by version) is still the live load — re-kicking would
-        // double it and discard its progress.
-        let streaming = self.active().session.load.is_some();
-        // A GitHub-PR tab has no local repository: (re)stream it when it
-        // hasn't loaded and isn't mid-stream; a loaded one has no
-        // watcher/snapshot machinery to re-arm.
-        if let Some(spec) = self.active_pr_spec().cloned() {
-            return if streaming || matches!(self.active().session.status, LoadStatus::Loaded) {
-                Task::none()
-            } else {
-                self.kick_pr_load(spec)
-            };
-        }
-        if self.active().session.repository.is_none() {
+        // The actor hands the handle over on its first event; until then there
+        // is nothing to send to, and that event kicks the load itself.
+        if self.active().handle.is_none() {
             return Task::none();
         }
-        if matches!(self.active().session.status, LoadStatus::Loaded) {
-            // The Focus snapshot subsumes any refresh coalesced while the tab
-            // was backgrounded; clear it so it can't fire a redundant one
-            // later. The empty-status pass re-runs here because a load that
-            // finished off-screen skipped it (its results are active-only).
-            self.active_mut().session.pending_refresh = None;
-            Task::batch([
-                self.start_repository_snapshot(tab, RefreshOrigin::Focus),
-                self.resolve_empty_status(tab),
-            ])
-        } else if streaming {
-            Task::none()
-        } else {
-            self.kick_initial_load()
-        }
-    }
-
-    /// The active tab's PR spec, or `None` when it views a local repository
-    /// (or no tab is open).
-    pub(crate) fn active_pr_spec(&self) -> Option<&github::PrSpec> {
-        match &self.tabs.get(self.active)?.source {
-            TabSource::GitHubPr(spec) => Some(spec),
-            TabSource::Repo { .. } => None,
-        }
+        self.active_mut().session.pending_refresh = None;
+        self.start_tab_load(tab)
     }
 
     /// Close the tab `id`. Closing an inactive tab just drops it — and with it
@@ -273,7 +224,7 @@ impl Diffui {
 
     /// Open `spec` as a GitHub-PR tab (or focus it if already open). The diff
     /// streams from the `gh` CLI; the tab has no local repository, so the
-    /// graph/watcher/mutation machinery stays disabled (`session.repository`
+    /// graph/watcher/mutation machinery stays disabled (`repository`
     /// is `None`) and only the streamed document renders.
     pub(crate) fn open_github_pr(&mut self, spec: github::PrSpec) -> Task<Message> {
         self.open_repo_dialog = None;
@@ -285,7 +236,7 @@ impl Diffui {
         }
         let owner = spec.owner.clone();
         let name = spec.label();
-        let state = TabState::unloaded_pr(&spec);
+        let state = TabState::unloaded_pr();
         self.push_tab(owner, name, source, state)
     }
 
@@ -360,12 +311,10 @@ mod tests {
             active: 0,
             no_tab: TabState::empty(),
             next_tab_id: 0,
-            next_load_version: 0,
             next_document_id: 0,
             open_repo_dialog: None,
             recent_repos: Vec::new(),
             next_activity_id: 0,
-            mutation_queue: Default::default(),
             menu: None,
             confirm: None,
             activity_popover_open: false,
@@ -422,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn diff_loaded_for_a_background_tab_leaves_the_active_one_alone() {
+    fn a_diff_landing_for_a_background_tab_leaves_the_active_one_alone() {
         let mut ui = app();
         let first = push_tab(&mut ui, "/tmp/first");
         let second = push_tab(&mut ui, "/tmp/second");
@@ -430,14 +379,29 @@ mod tests {
         assert_eq!(ui.active_tab_id(), Some(second));
 
         // The backgrounded tab is mid-switch to a commit; its diff lands while
-        // the other tab is on screen.
+        // the other tab is on screen. Routing is by job, and the job belongs to
+        // that tab's slot — two tabs both pending on `@` can no longer swap
+        // each other's contents.
         let revision = RevisionSelection::Commit("abc".to_owned());
-        ui.tab_mut(first).unwrap().session.pending_revision = Some(revision.clone());
-        let _ = ui.update(Message::DiffLoaded(
-            first,
-            revision.clone(),
-            Box::new(Ok((document("a.rs"), None))),
-        ));
+        let effects = ui
+            .tab_mut(first)
+            .unwrap()
+            .session
+            .load_diff(revision.clone());
+        let job = match effects.first() {
+            Some(diffui_core::Effect::Send(diffui_core::Command::LoadDiff { job, .. })) => *job,
+            other => panic!("expected a diff load, got {other:?}"),
+        };
+        let repo = ui.tabs[0].repo_id().expect("a repo tab has an id");
+        let _ = ui.update(Message::Repo(Box::new(diffui_core::Event::new(
+            repo,
+            diffui_core::Payload::DiffLoaded {
+                job,
+                revision: revision.clone(),
+                document: document("a.rs"),
+                details: None,
+            },
+        ))));
 
         let background = ui.tab_mut(first).unwrap();
         assert_eq!(background.session.selected_revision, revision);
@@ -476,8 +440,69 @@ mod tests {
         assert!(ui.active().revision_multi_selection.is_empty());
     }
 
+    /// Two mutations from one tab: the second waits rather than overwriting
+    /// the first's slot, because an overwritten slot leaves the first
+    /// completion with no owner — its activity row spins forever and the
+    /// reload that should follow it never fires.
     #[test]
-    fn mutation_completing_for_a_background_tab_writes_that_tabs_selection() {
+    fn a_second_mutation_waits_instead_of_displacing_the_first() {
+        let mut ui = app();
+        let tab = push_tab(&mut ui, "/tmp/only");
+
+        let describe = |ui: &mut Diffui, text: &str| {
+            let (activity_id, _) = ui.begin_activity(tab, "Describe", false);
+            ui.run_mutation(PendingMutation {
+                op: mutations::MutationOp::Describe {
+                    target: RevisionSelection::WorkingCopy,
+                    description: text.to_owned(),
+                },
+                tab_id: tab,
+                activity_id,
+                allow_immutable: false,
+            })
+        };
+        let _ = describe(&mut ui, "first");
+        let first_job = ui.tab_mut(tab).unwrap().jobs.mutation.as_ref().unwrap().0;
+        let _ = describe(&mut ui, "second");
+
+        let state = ui.tab_mut(tab).unwrap();
+        assert_eq!(
+            state.jobs.mutation.as_ref().map(|(job, _)| *job),
+            Some(first_job),
+            "the first mutation still owns the slot"
+        );
+        assert_eq!(state.queued_mutations.len(), 1);
+
+        // The first reports; the second takes the slot it just freed.
+        let repo = ui.tabs[0].repo_id().expect("a repo tab has an id");
+        let _ = ui.update(Message::Repo(Box::new(diffui_core::Event::new(
+            repo,
+            diffui_core::Payload::MutationDone {
+                job: first_job,
+                outcome: mutations::MutationOutcome {
+                    message: "Described".to_owned(),
+                    moved_working_copy: false,
+                    rewritten_commit: None,
+                    output: Vec::new(),
+                    operation_id: None,
+                },
+            },
+        ))));
+
+        let state = ui.tab_mut(tab).unwrap();
+        assert!(state.queued_mutations.is_empty(), "the queue drained");
+        assert!(
+            state
+                .jobs
+                .mutation
+                .as_ref()
+                .is_some_and(|(job, _)| *job != first_job),
+            "the second mutation is now in flight"
+        );
+    }
+
+    #[test]
+    fn a_mutation_completing_for_a_background_tab_writes_that_tabs_selection() {
         let mut ui = app();
         let first = push_tab(&mut ui, "/tmp/first");
         let second = push_tab(&mut ui, "/tmp/second");
@@ -485,29 +510,28 @@ mod tests {
 
         let on_a_commit = RevisionSelection::Commit("abc".to_owned());
         ui.tab_mut(first).unwrap().session.selected_revision = on_a_commit.clone();
-        ui.tab_mut(second).unwrap().session.selected_revision = on_a_commit.clone();
+        ui.tab_mut(second).unwrap().session.selected_revision = on_a_commit;
 
-        let (activity_id, progress) = ui.begin_activity(first, "Abandon", false);
-        let pending = PendingMutation {
-            repository: repository("/tmp/first"),
-            op: mutations::MutationOp::Abandon {
-                targets: vec![on_a_commit],
+        let (job, _effects) = ui.tab_mut(first).unwrap().session.mutate(
+            mutations::MutationOp::Abandon {
+                targets: vec![RevisionSelection::Commit("abc".to_owned())],
             },
-            tab_id: first,
-            activity_id,
-            progress,
-            allow_immutable: false,
-        };
-        let _ = ui.update(Message::MutationCompleted(
-            Box::new(pending),
-            Box::new(Ok(mutations::MutationOutcome {
-                message: "Abandoned".to_owned(),
-                moved_working_copy: true,
-                rewritten_commit: None,
-                output: Vec::new(),
-                operation_id: None,
-            })),
-        ));
+            false,
+        );
+        let repo = ui.tabs[0].repo_id().expect("a repo tab has an id");
+        let _ = ui.update(Message::Repo(Box::new(diffui_core::Event::new(
+            repo,
+            diffui_core::Payload::MutationDone {
+                job,
+                outcome: mutations::MutationOutcome {
+                    message: "Abandoned".to_owned(),
+                    moved_working_copy: true,
+                    rewritten_commit: None,
+                    output: Vec::new(),
+                    operation_id: None,
+                },
+            },
+        ))));
 
         assert_eq!(
             ui.tab_mut(first).unwrap().session.selected_revision,
