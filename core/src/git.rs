@@ -38,7 +38,7 @@ pub async fn load_git_commits(
     // The revision range is the git analog of the jj revset: extra `git log`
     // arguments (e.g. `--all`, `main..HEAD`). Empty keeps the default (the
     // current branch's history).
-    let mut args = vec![OsString::from("log"), OsString::from("--topo-order")];
+    let mut args = git_args(&["log", "--topo-order", "--no-color"]);
     args.extend(revision_range.split_whitespace().map(OsString::from));
     args.push(OsString::from(
         "--pretty=format:%h%x09%H%x09%P%x09%an%x09%x09%s",
@@ -72,12 +72,12 @@ pub async fn load_git_repository_snapshot(repository_root: &Path) -> Result<Repo
     let output = run_command(
         repository_root,
         "git",
-        vec![
-            OsString::from("status"),
-            OsString::from("--porcelain=v1"),
-            OsString::from("--branch"),
-            OsString::from("--untracked-files=normal"),
-        ],
+        git_args(&[
+            "status",
+            "--porcelain=v1",
+            "--branch",
+            "--untracked-files=normal",
+        ]),
     )
     .await?;
     Ok(RepositorySnapshot {
@@ -88,6 +88,38 @@ pub async fn load_git_repository_snapshot(repository_root: &Path) -> Result<Repo
     })
 }
 
+/// Global git flags prepended to every invocation we read the output of.
+///
+/// The user's own config otherwise reshapes that output under the parser:
+/// `core.quotePath` decides whether a non-ASCII path arrives C-quoted,
+/// `diff.noprefix` and `diff.mnemonicPrefix` replace the `a/`/`b/` the header
+/// parser strips, `diff.suppressBlankEmpty` drops the leading space from an
+/// empty context line, and `color.ui=always` wraps every line in escape
+/// codes. `--no-optional-locks` keeps the watcher's polling off the user's
+/// `index.lock` — git only takes that lock to write back a refreshed index,
+/// so it is inert for the commands that don't.
+const PINNED_GIT_ARGS: &[&str] = &[
+    "-c",
+    "core.quotePath=false",
+    "-c",
+    "diff.noprefix=false",
+    "-c",
+    "diff.mnemonicPrefix=false",
+    "-c",
+    "diff.suppressBlankEmpty=false",
+    "-c",
+    "color.ui=never",
+    "--no-optional-locks",
+];
+
+fn git_args(args: &[&str]) -> Vec<OsString> {
+    PINNED_GIT_ARGS
+        .iter()
+        .chain(args)
+        .map(OsString::from)
+        .collect()
+}
+
 fn git_backend_command(repository: &Repository, revision: &RevisionSelection) -> Vec<OsString> {
     let mut args: Vec<OsString> = match revision {
         RevisionSelection::WorkingCopy => {
@@ -95,22 +127,26 @@ fn git_backend_command(repository: &Repository, revision: &RevisionSelection) ->
             // against the last committed state — the closest analog to
             // jj's @ working-copy diff. Untracked files are not included
             // (git diff only walks tracked paths).
-            ["diff", "HEAD", "--no-ext-diff", "--no-color", "--"]
-                .into_iter()
-                .map(OsString::from)
-                .collect()
+            git_args(&["diff", "HEAD", "--no-ext-diff", "--no-color"])
         }
         RevisionSelection::Commit(revision) => {
-            vec![
-                OsString::from("show"),
-                OsString::from("--format="),
-                OsString::from("--no-ext-diff"),
-                OsString::from("--no-color"),
-                OsString::from(revision),
-                OsString::from("--"),
-            ]
+            // `-m --first-parent`: `git show` defaults to a `--cc` combined
+            // diff on a merge, which carries no `diff --git` headers, so the
+            // parser sees nothing and the commit renders empty. The diff we
+            // mean is the one against the first parent.
+            let mut args = git_args(&[
+                "show",
+                "--format=",
+                "--no-ext-diff",
+                "--no-color",
+                "-m",
+                "--first-parent",
+            ]);
+            args.push(OsString::from(revision));
+            args
         }
     };
+    args.push(OsString::from("--"));
 
     if !repository.scope.as_os_str().is_empty() {
         args.push(repository.scope.as_os_str().to_owned());
@@ -174,7 +210,11 @@ async fn run_command_lines(
     Ok(lines)
 }
 
-async fn run_command(current_dir: &Path, program: &str, args: Vec<OsString>) -> Result<String> {
+async fn run_command_bytes(
+    current_dir: &Path,
+    program: &str,
+    args: Vec<OsString>,
+) -> Result<Vec<u8>> {
     let output = Command::new(program)
         .args(args)
         .current_dir(current_dir)
@@ -188,14 +228,45 @@ async fn run_command(current_dir: &Path, program: &str, args: Vec<OsString>) -> 
         bail!("{program} exited with {}: {}", output.status, stderr.trim());
     }
 
-    String::from_utf8(output.stdout).with_context(|| format!("{program} emitted non-utf8 output"))
+    Ok(output.stdout)
+}
+
+/// Run a command and decode its stdout as text. git speaks bytes: a single
+/// latin-1 line in a diff, or one non-UTF-8 filename in a listing, used to
+/// fail the whole load, so the decode is lossy. Output that sniffs binary is
+/// still refused rather than mangled into text — the same NUL sniff
+/// [`crate::source_browse::classify_disk_bytes`] uses — so `git show` of a
+/// binary blob doesn't reach a parser expecting lines.
+async fn run_command(current_dir: &Path, program: &str, args: Vec<OsString>) -> Result<String> {
+    let stdout = run_command_bytes(current_dir, program, args).await?;
+    if stdout[..stdout.len().min(8 * 1024)].contains(&0) {
+        bail!("{program} emitted binary output");
+    }
+    Ok(decode_lossy(stdout))
+}
+
+/// Run a git command whose output is NUL-separated (`-z`) and return its
+/// non-empty fields. Separate from [`run_command`] because that one's binary
+/// sniff would reject this shape outright; `-z` also means git never quotes
+/// the paths, so they need no unquoting here.
+async fn run_command_fields(current_dir: &Path, args: Vec<OsString>) -> Result<Vec<String>> {
+    let stdout = run_command_bytes(current_dir, "git", args).await?;
+    Ok(stdout
+        .split(|&byte| byte == 0)
+        .filter(|field| !field.is_empty())
+        .map(|field| String::from_utf8_lossy(field).into_owned())
+        .collect())
+}
+
+fn decode_lossy(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes)
+        .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
 }
 
 /// Read the full old/new contents of one file at `revision`, for full-context
 /// syntax highlighting. Best-effort: a side that doesn't resolve (added or
-/// deleted file, root commit's parent, binary/non-UTF-8 content, oversized)
-/// comes back `None` and the caller falls back to the diff-only
-/// reconstruction.
+/// deleted file, root commit's parent, binary content, oversized) comes back
+/// `None` and the caller falls back to the diff-only reconstruction.
 pub async fn read_git_file_pair(
     repository: &Repository,
     revision: &RevisionSelection,
@@ -243,23 +314,12 @@ pub async fn list_git_source_tree(
     revision: &RevisionSelection,
 ) -> Result<Vec<SourceEntry>> {
     // NUL-separated so paths with spaces/newlines split cleanly.
-    let list = |args: &[&str]| {
-        let args: Vec<OsString> = args.iter().map(OsString::from).collect();
-        run_command(&repository.root, "git", args)
-    };
-    let split = |output: String| -> Vec<String> {
-        output
-            .split('\0')
-            .filter(|path| !path.is_empty())
-            .map(str::to_owned)
-            .collect()
-    };
+    let list = |args: &[&str]| run_command_fields(&repository.root, git_args(args));
 
     let mut entries = Vec::new();
     match revision {
         RevisionSelection::Commit(id) => {
-            let output = list(&["ls-tree", "-r", "-z", "--name-only", id]).await?;
-            for path in split(output) {
+            for path in list(&["ls-tree", "-r", "-z", "--name-only", id.as_str()]).await? {
                 entries.push(SourceEntry::new(path, false, SourceEntryStatus::Tracked));
             }
         }
@@ -279,17 +339,17 @@ pub async fn list_git_source_tree(
             // Tracked entries reflect the index; a file deleted on disk but
             // still in the index is skipped so the browser mirrors the
             // directory like the jj walk does.
-            for path in split(tracked) {
+            for path in tracked {
                 if repository.root.join(&path).symlink_metadata().is_ok() {
                     let mut entry = SourceEntry::new(path, false, SourceEntryStatus::Tracked);
                     entry.change = changes.get(&entry.path).copied();
                     entries.push(entry);
                 }
             }
-            for path in split(untracked) {
+            for path in untracked {
                 entries.push(SourceEntry::new(path, false, SourceEntryStatus::Untracked));
             }
-            for path in split(ignored) {
+            for path in ignored {
                 let (path, is_dir) = match path.strip_suffix('/') {
                     Some(dir) => (dir.to_owned(), true),
                     None => (path, false),
@@ -309,16 +369,12 @@ async fn git_change_statuses(
     repository: &Repository,
 ) -> Result<std::collections::HashMap<String, crate::DiffFileStatus>> {
     use crate::DiffFileStatus;
-    let output = run_command(
+    let fields = run_command_fields(
         &repository.root,
-        "git",
-        ["diff", "--name-status", "-z", "HEAD"]
-            .iter()
-            .map(OsString::from)
-            .collect(),
+        git_args(&["diff", "--name-status", "-z", "HEAD"]),
     )
     .await?;
-    let mut fields = output.split('\0').filter(|field| !field.is_empty());
+    let mut fields = fields.into_iter();
     let mut changes = std::collections::HashMap::new();
     while let Some(status) = fields.next() {
         let Some(kind) = status.chars().next() else {
@@ -327,18 +383,18 @@ async fn git_change_statuses(
         let Some(path) = fields.next() else { break };
         match kind {
             'A' => {
-                changes.insert(path.to_owned(), DiffFileStatus::Added);
+                changes.insert(path, DiffFileStatus::Added);
             }
             'M' | 'T' => {
-                changes.insert(path.to_owned(), DiffFileStatus::Modified);
+                changes.insert(path, DiffFileStatus::Modified);
             }
             'U' => {
-                changes.insert(path.to_owned(), DiffFileStatus::Conflicted);
+                changes.insert(path, DiffFileStatus::Conflicted);
             }
             // Renames/copies carry a second (destination) path field.
             'R' | 'C' => {
                 let Some(new_path) = fields.next() else { break };
-                changes.insert(new_path.to_owned(), DiffFileStatus::Renamed);
+                changes.insert(new_path, DiffFileStatus::Renamed);
             }
             _ => {}
         }
@@ -367,30 +423,23 @@ pub async fn read_git_source_file(
             Ok(crate::source_browse::classify_disk_bytes(bytes))
         }
         RevisionSelection::Commit(id) => {
-            let output = Command::new("git")
-                .args([
+            let bytes = run_command_bytes(
+                &repository.root,
+                "git",
+                vec![
                     OsString::from("show"),
                     OsString::from(format!("{id}:{path}")),
-                ])
-                .current_dir(&repository.root)
-                .stdin(Stdio::null())
-                .output()
-                .await
-                .context("failed to execute git")?;
-            if !output.status.success() {
-                bail!(
-                    "git show exited with {}: {}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
-            }
-            Ok(crate::source_browse::classify_disk_bytes(output.stdout))
+                ],
+            )
+            .await?;
+            Ok(crate::source_browse::classify_disk_bytes(bytes))
         }
     }
 }
 
 /// `git show <rev>:<path>`, `None` on any failure (missing path, bad rev,
-/// non-UTF-8 output — `run_command` rejects those).
+/// binary content — `run_command`'s sniff rejects that). Non-UTF-8 text
+/// decodes lossily, matching the diff the spans are mapped onto.
 async fn git_show_file(repository_root: &Path, spec: &str) -> Option<String> {
     run_command(
         repository_root,
@@ -404,12 +453,7 @@ async fn git_show_file(repository_root: &Path, spec: &str) -> Option<String> {
 async fn git_has_uncommitted_changes(repository_root: &Path) -> Result<bool> {
     // `git status --porcelain` prints one line per change (staged, unstaged,
     // or untracked) and nothing on a clean tree.
-    let output = run_command(
-        repository_root,
-        "git",
-        vec![OsString::from("status"), OsString::from("--porcelain")],
-    )
-    .await?;
+    let output = run_command(repository_root, "git", git_args(&["status", "--porcelain"])).await?;
     Ok(!output.trim().is_empty())
 }
 
@@ -426,17 +470,10 @@ async fn load_git_revision_details(
         RevisionSelection::Commit(id) => id.clone(),
     };
     let format = format!("%H{SEP}%an{SEP}%ae{SEP}%aI{SEP}%cn{SEP}%ce{SEP}%cI{SEP}%D{SEP}%B");
-    let output = run_command(
-        &repository.root,
-        "git",
-        vec![
-            OsString::from("show"),
-            OsString::from("--no-patch"),
-            OsString::from(format!("--format={format}")),
-            OsString::from(target),
-        ],
-    )
-    .await?;
+    let mut args = git_args(&["show", "--no-patch"]);
+    args.push(OsString::from(format!("--format={format}")));
+    args.push(OsString::from(target));
+    let output = run_command(&repository.root, "git", args).await?;
 
     let mut parts = output.splitn(9, '\x1f');
     let commit_id = parts.next().unwrap_or("").trim().to_owned();
@@ -617,6 +654,52 @@ mod tests {
         assert!(args.contains(&OsString::from("show")));
         assert!(args.contains(&OsString::from("abc123")));
         assert_eq!(args.last(), Some(&OsString::from("--")));
+        // `git show` on a merge otherwise emits a `--cc` combined diff, which
+        // the parser drops whole.
+        assert!(args.contains(&OsString::from("--first-parent")));
+        assert!(args.contains(&OsString::from("-m")));
+    }
+
+    #[test]
+    fn git_diff_commands_pin_the_parser_visible_config() {
+        let repository = Repository {
+            root: PathBuf::from("/repo"),
+            vcs: Vcs::Git,
+            scope: PathBuf::new(),
+        };
+
+        for revision in [
+            RevisionSelection::WorkingCopy,
+            RevisionSelection::Commit("abc123".to_owned()),
+        ] {
+            let args = git_backend_command(&repository, &revision);
+            let rendered: Vec<&str> = args.iter().filter_map(|arg| arg.to_str()).collect();
+
+            for pinned in [
+                "core.quotePath=false",
+                "diff.noprefix=false",
+                "diff.mnemonicPrefix=false",
+                "diff.suppressBlankEmpty=false",
+                "color.ui=never",
+                "--no-optional-locks",
+                "--no-color",
+            ] {
+                assert!(
+                    rendered.contains(&pinned),
+                    "{pinned} missing from {rendered:?}"
+                );
+            }
+            // git only accepts `-c` and friends before the subcommand.
+            let subcommand = rendered
+                .iter()
+                .position(|arg| ["diff", "show"].contains(arg))
+                .expect("a subcommand");
+            let last_global = rendered
+                .iter()
+                .rposition(|arg| *arg == "--no-optional-locks")
+                .expect("the lock flag");
+            assert!(last_global < subcommand, "globals after {rendered:?}");
+        }
     }
 
     #[test]

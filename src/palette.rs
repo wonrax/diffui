@@ -732,7 +732,7 @@ fn push_revision_candidates(out: &mut Vec<Candidate>, ui: &Diffui) {
         item: ResultRef::WorkingCopy,
         haystack: "working copy @".to_owned(),
     });
-    for commit in ui.session.commits.iter() {
+    for commit in ui.active().session.commits.iter() {
         let mut haystack = String::with_capacity(
             commit.change_id().len() + commit.description().len() + commit.author().len() + 32,
         );
@@ -765,14 +765,14 @@ fn push_bookmark_candidates(out: &mut Vec<Candidate>, ui: &Diffui) {
     // to the top, which is what the user wants when typing "main" or a feature
     // branch. Sorted by row so the empty-query order is stable (the index is a
     // HashMap).
-    let mut rows: Vec<(usize, &[String])> = ui.session.commits.bookmarked_rows().collect();
+    let mut rows: Vec<(usize, &[String])> = ui.active().session.commits.bookmarked_rows().collect();
     rows.sort_by_key(|(index, _)| *index);
     // A conflicted bookmark's `name??` chip sits on every side; one candidate
     // is enough (the first displayed row — the same side `find_by_bookmark`
     // resolves a pick to).
     let mut seen_labels: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (index, bookmarks) in rows {
-        let commit = ui.session.commits.row(index);
+        let commit = ui.active().session.commits.row(index);
         for bookmark in bookmarks {
             if !seen_labels.insert(bookmark.as_str()) {
                 continue;
@@ -793,7 +793,7 @@ fn push_bookmark_candidates(out: &mut Vec<Candidate>, ui: &Diffui) {
 }
 
 fn push_file_candidates(out: &mut Vec<Candidate>, ui: &Diffui) {
-    for file in &ui.session.document.files {
+    for file in &ui.active().session.document.files {
         out.push(Candidate {
             item: ResultRef::File(file.path.clone()),
             haystack: file.path.clone(),
@@ -1178,7 +1178,11 @@ fn result_row_body<'a>(
         .align_y(alignment::Vertical::Center)
         .into(),
         ResultRef::Commit(change_id) => {
-            let commit = ui.session.commits.find_by_change_id(change_id.as_str());
+            let commit = ui
+                .active()
+                .session
+                .commits
+                .find_by_change_id(change_id.as_str());
             let prefix = commit
                 .map(|c| {
                     let len = c.shortest_change_id_len().unwrap_or(8).max(8);
@@ -1217,7 +1221,7 @@ fn result_row_body<'a>(
             // the tail. Bookmarks without a matching commit (stale data
             // races between snapshots) still render — the tail just goes
             // empty.
-            let commit = ui.session.commits.find_by_bookmark(name);
+            let commit = ui.active().session.commits.find_by_bookmark(name);
             let tail = commit
                 .map(|c| {
                     if c.has_description() {
@@ -1310,6 +1314,7 @@ fn target_label(target: &ResultRef, ui: &Diffui) -> String {
     match target {
         ResultRef::WorkingCopy => "Working copy".to_owned(),
         ResultRef::Commit(change_id) => ui
+            .active()
             .session
             .commits
             .find_by_change_id(change_id.as_str())
@@ -1338,11 +1343,13 @@ pub fn revision_selection(item: &ResultRef, ui: &Diffui) -> Option<RevisionSelec
     match item {
         ResultRef::WorkingCopy => Some(RevisionSelection::WorkingCopy),
         ResultRef::Commit(change_id) => ui
+            .active()
             .session
             .commits
             .find_by_change_id(change_id.as_str())
             .map(|c| RevisionSelection::Commit(c.commit_id().to_owned())),
         ResultRef::Bookmark(name) => ui
+            .active()
             .session
             .commits
             .find_by_bookmark(name)
@@ -1359,11 +1366,13 @@ pub fn change_id_for_recents(item: &ResultRef, ui: &Diffui) -> Option<String> {
     match item {
         ResultRef::Commit(change_id) => Some(change_id.0.clone()),
         ResultRef::Bookmark(name) => ui
+            .active()
             .session
             .commits
             .find_by_bookmark(name)
             .map(|c| c.change_id().to_owned()),
         ResultRef::WorkingCopy => ui
+            .active()
             .session
             .commits
             .working_copy()

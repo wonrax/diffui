@@ -10,10 +10,14 @@
 //! card per level with `pin` at absolute window coordinates so flyouts sit
 //! beside their parent row.
 //!
-//! Interaction mirrors AppKit/web menus: press the trigger, drag over items,
-//! release to pick (`mouse_area::on_release` fires on any mouse-up over a row,
-//! regardless of where the press began). A plain click also works — the menu
-//! stays open after the opening click's release and a later click selects.
+//! Interaction is click-to-open, click-to-pick: the press that opens the menu
+//! keeps it open, and a *later* press-release on a row picks it.
+//! `mouse_area::on_release` fires on any mouse-up over a row regardless of where
+//! the press began, so the opening press's own release is swallowed
+//! ([`OverlayMenu::opening_release`]) — without that, a right-click near the
+//! window's bottom edge would open the menu and run the row it landed on in the
+//! same gesture. Drag-over-and-release from the opening press therefore does not
+//! pick; every release after it does.
 
 use std::time::Instant;
 
@@ -46,8 +50,10 @@ pub enum MenuMessage {
     /// Cursor moved while a menu is open (window coords) — drives the submenu
     /// trajectory guard and keeps the app underneath inert.
     MouseMoved(iced::Point),
-    /// Released over a row: pick it (if a leaf).
-    Select(Vec<usize>),
+    /// Released over a row with this button: pick it (if a leaf). The button
+    /// travels with the message so the opening gesture's release can be told
+    /// apart from a later one (see [`OverlayMenu::opening_release`]).
+    Select(Vec<usize>, mouse::Button),
     /// A press inside the card — swallowed so it doesn't dismiss.
     CapturePress,
     /// A card scrolled: `(depth, y offset)`. Recorded so flyout placement —
@@ -56,8 +62,9 @@ pub enum MenuMessage {
     CardScrolled(usize, f32),
     /// Dismiss the open menu (press outside, or Esc).
     Dismiss,
-    /// A release on the dismiss scrim — arms/dismisses outside-dismiss.
-    ScrimRelease,
+    /// A release of this button on the dismiss scrim — dismisses, unless it is
+    /// the opening gesture's own release.
+    ScrimRelease(mouse::Button),
     /// No-op tick that keeps `view` re-running so the right-click glow pulses.
     Tick,
 }
@@ -165,10 +172,10 @@ pub(crate) struct OverlayMenu {
     pub open_path: Vec<usize>,
     /// Path of the currently highlighted row, if any.
     pub highlight: Option<Vec<usize>>,
-    /// Whether an outside press/release dismisses. Starts `false` for a
-    /// left-click trigger (so the opening click's release is swallowed instead
-    /// of closing) and `true` for a right-click (no opening left-click to eat).
-    pub armed: bool,
+    /// The button whose press opened the menu, until that press's release has
+    /// been seen — see [`Self::opening_release`]. `None` once it has, or when
+    /// the menu was opened by something other than a mouse press.
+    pub opened_by: Option<mouse::Button>,
     /// Whether the cursor has entered the menu at least once — lets a
     /// drag-out-and-release dismiss while a click-in-place stays open.
     pub entered: bool,
@@ -217,13 +224,17 @@ impl OverlayMenu {
     // Constructed only for the non-macOS iced overlay menu; macOS uses a native
     // `NSMenu` and never builds an `OverlayMenu`.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
-    pub(crate) fn new(root: Vec<MenuEntry>, anchor: AnchorSpec, armed: bool) -> Self {
+    pub(crate) fn new(
+        root: Vec<MenuEntry>,
+        anchor: AnchorSpec,
+        opened_by: Option<mouse::Button>,
+    ) -> Self {
         OverlayMenu {
             root,
             anchor,
             open_path: Vec::new(),
             highlight: None,
-            armed,
+            opened_by,
             entered: false,
             cursor: None,
             flyout_origin: None,
@@ -235,6 +246,23 @@ impl OverlayMenu {
             glow: None,
             opened_at: Instant::now(),
             scrolls: Vec::new(),
+        }
+    }
+
+    /// Whether `button`'s release is the mouse-up of the very press that opened
+    /// the menu, and consumes it — every later release answers `false`. That
+    /// first release belongs to the opening gesture, not to whatever the menu
+    /// drew under the cursor, so callers must let it pass without picking a row
+    /// or dismissing: `mouse_area` publishes a release on any button-up over a
+    /// row without tracking where the press began, so a right-click low in the
+    /// window would otherwise open the context menu and run the row that landed
+    /// under the cursor — Abandon, Edit — on the way back up.
+    pub(crate) fn opening_release(&mut self, button: mouse::Button) -> bool {
+        if self.opened_by == Some(button) {
+            self.opened_by = None;
+            true
+        } else {
+            false
         }
     }
 
@@ -357,7 +385,7 @@ pub(crate) fn build_overlay(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
     let mut layers: Vec<Element<'_, Message>> = vec![
         Backdrop {
             on_press: Message::Menu(MenuMessage::Dismiss),
-            on_release: Message::Menu(MenuMessage::ScrimRelease),
+            on_release: |b| Message::Menu(MenuMessage::ScrimRelease(b)),
             on_move: |p| Message::Menu(MenuMessage::MouseMoved(p)),
         }
         .into(),
@@ -505,28 +533,21 @@ fn card_rects(ui: &Diffui, menu: &OverlayMenu) -> Vec<(Vec<usize>, Rectangle)> {
     let max_h = menu_max_height(ui);
     let mut out: Vec<(Vec<usize>, Rectangle)> = Vec::new();
     let mut prefix: Vec<usize> = Vec::new();
-    let (mut x, mut y) = match menu.anchor {
-        AnchorSpec::Below(r) => (r.x, r.y + r.height + MENU_ANCHOR_GAP),
-        AnchorSpec::At(p) => (p.x, p.y),
+    // A right-click anchors on the bare cursor point; a toolbar caret on its
+    // trigger rect, held off by [`MENU_ANCHOR_GAP`] on whichever side the card
+    // ends up.
+    let (mut anchor, mut gap) = match menu.anchor {
+        AnchorSpec::Below(r) => (r, MENU_ANCHOR_GAP),
+        AnchorSpec::At(p) => (Rectangle::new(p, Size::ZERO), 0.0),
     };
 
     loop {
         let Some(entries) = entries_at(&menu.root, &prefix) else {
             break;
         };
-        let width = card_width(ui, entries);
-        let height = card_outer_height(entries, max_h);
-        let px = x.min((win.width - width).max(0.0)).max(0.0);
-        let py = y.min((win.height - height).max(0.0)).max(0.0);
-        out.push((
-            prefix.clone(),
-            Rectangle {
-                x: px,
-                y: py,
-                width,
-                height,
-            },
-        ));
+        let size = Size::new(card_width(ui, entries), card_outer_height(entries, max_h));
+        let rect = card_rect(win, anchor, gap, size);
+        out.push((prefix.clone(), rect));
 
         let level = prefix.len();
         let Some(&idx) = menu.open_path.get(level) else {
@@ -538,17 +559,45 @@ fn card_rects(ui: &Diffui, menu: &OverlayMenu) -> Vec<(Vec<usize>, Rectangle)> {
         let flyout_w = card_width(ui, items);
         // Open to the right, tucked under the parent's edge; flip left when
         // there's no room.
-        x = if px + width - MENU_FLYOUT_OVERLAP + flyout_w <= win.width {
-            px + width - MENU_FLYOUT_OVERLAP
+        let x = if rect.x + rect.width - MENU_FLYOUT_OVERLAP + flyout_w <= win.width {
+            rect.x + rect.width - MENU_FLYOUT_OVERLAP
         } else {
-            (px - flyout_w + MENU_FLYOUT_OVERLAP).max(0.0)
+            (rect.x - flyout_w + MENU_FLYOUT_OVERLAP).max(0.0)
         };
-        // Align the flyout's first row with its parent row, *as drawn*: a
-        // scrolled parent card has slid its rows up by its scroll offset.
-        y = py + row_top_offset(entries, idx) - menu.card_scroll(level);
+        // The parent row *as drawn* — a scrolled parent card has slid its rows
+        // up by its scroll offset — as a zero-height anchor, so the flyout's
+        // first row lines up with it, or its last row does when it has to flip.
+        let row_y = rect.y + row_top_offset(entries, idx) - menu.card_scroll(level);
+        anchor = Rectangle::new(Point::new(x, row_y), Size::ZERO);
+        gap = 0.0;
         prefix.push(idx);
     }
     out
+}
+
+/// Where a card of `size` lands in a `win` window: left-aligned with `anchor`
+/// and dropped `gap` below it, or — when that would run off the bottom — flipped
+/// so its bottom edge sits `gap` above the anchor's top. Sliding it up to fit
+/// instead would drag the card over the anchor, which for a right-click means
+/// putting a row under the cursor that the same click's release then runs.
+fn card_rect(win: Size, anchor: Rectangle, gap: f32, size: Size) -> Rectangle {
+    let below = anchor.y + anchor.height + gap;
+    let above = anchor.y - gap - size.height;
+    let y = if below + size.height <= win.height {
+        below
+    } else if above >= 0.0 {
+        above
+    } else {
+        // Too tall for either side (a full-window menu, or an anchor with no
+        // room above or below): sit on the bottom edge and let the card scroll.
+        (win.height - size.height).max(0.0)
+    };
+    Rectangle {
+        x: anchor.x.min((win.width - size.width).max(0.0)).max(0.0),
+        y,
+        width: size.width,
+        height: size.height,
+    }
 }
 
 /// The deepest open flyout's rect, if a submenu is open.
@@ -870,15 +919,21 @@ fn build_row<'a>(
             ..container::Style::default()
         });
 
-    // Hover highlights / opens; a release of *either* button selects (so a
-    // left-click works and a right-press-drag-release off the right-click that
-    // opened the menu does too). No `on_press` — presses fall through to the
-    // card's capture so they don't reach the dismiss backdrop, while a
-    // press-started-on-the-trigger drag still releases onto the row.
+    // Hover highlights / opens; a release of *either* button selects, so the
+    // right-click menu is picked from with either hand. Which button released
+    // is carried along — the opening gesture's own release is dropped by the
+    // update side. No `on_press` — presses fall through to the card's capture so
+    // they don't reach the dismiss backdrop.
     mouse_area(styled)
         .on_enter(Message::Menu(MenuMessage::Hover(path.clone())))
-        .on_release(Message::Menu(MenuMessage::Select(path.clone())))
-        .on_right_release(Message::Menu(MenuMessage::Select(path)))
+        .on_release(Message::Menu(MenuMessage::Select(
+            path.clone(),
+            mouse::Button::Left,
+        )))
+        .on_right_release(Message::Menu(MenuMessage::Select(
+            path,
+            mouse::Button::Right,
+        )))
         .interaction(mouse::Interaction::Pointer)
         .into()
 }
@@ -1091,7 +1146,7 @@ impl<'a, Message: 'a> From<AnchorArea<'a, Message>> for Element<'a, Message, The
 /// app underneath the open menu never hovers, tooltips, or scrolls.
 struct Backdrop {
     on_press: Message,
-    on_release: Message,
+    on_release: fn(mouse::Button) -> Message,
     on_move: fn(Point) -> Message,
 }
 
@@ -1133,8 +1188,8 @@ impl Widget<Message, Theme, iced::Renderer> for Backdrop {
                 shell.publish(self.on_press.clone());
                 shell.capture_event();
             }
-            Event::Mouse(mouse::Event::ButtonReleased(_)) => {
-                shell.publish(self.on_release.clone());
+            Event::Mouse(mouse::Event::ButtonReleased(button)) => {
+                shell.publish((self.on_release)(*button));
                 shell.capture_event();
             }
             Event::Mouse(mouse::Event::CursorMoved { position }) => {
@@ -1164,5 +1219,110 @@ impl Widget<Message, Theme, iced::Renderer> for Backdrop {
 impl<'a> From<Backdrop> for Element<'a, Message, Theme> {
     fn from(backdrop: Backdrop) -> Self {
         Element::new(backdrop)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WIN: Size = Size {
+        width: 1200.0,
+        height: 900.0,
+    };
+
+    /// A zero-height anchor — a right-click cursor, or a flyout's parent row.
+    fn at(x: f32, y: f32) -> Rectangle {
+        Rectangle::new(Point::new(x, y), Size::ZERO)
+    }
+
+    fn card(width: f32, height: f32) -> Size {
+        Size::new(width, height)
+    }
+
+    fn opened_by(button: mouse::Button) -> OverlayMenu {
+        OverlayMenu::new(Vec::new(), AnchorSpec::At(Point::ORIGIN), Some(button))
+    }
+
+    #[test]
+    fn card_drops_below_an_anchor_it_fits_under() {
+        let rect = card_rect(WIN, at(100.0, 200.0), 0.0, card(220.0, 300.0));
+        assert_eq!((rect.x, rect.y), (100.0, 200.0));
+    }
+
+    #[test]
+    fn card_flips_above_a_cursor_it_would_overflow_under() {
+        // The right-click bug: 900px window, cursor at y=700, 300px of menu.
+        // The card belongs above the cursor — sliding it up to fit would park a
+        // row under the pointer for the same click's release to run.
+        let rect = card_rect(WIN, at(100.0, 700.0), 0.0, card(220.0, 300.0));
+        assert_eq!(rect.y, 400.0);
+        assert!(rect.y + rect.height <= 700.0);
+    }
+
+    #[test]
+    fn flipped_dropdown_keeps_its_gap_off_the_trigger() {
+        let trigger = Rectangle {
+            x: 40.0,
+            y: 820.0,
+            width: 90.0,
+            height: 24.0,
+        };
+        let below = card_rect(WIN, trigger, MENU_ANCHOR_GAP, card(220.0, 30.0));
+        assert_eq!(below.y, 820.0 + 24.0 + MENU_ANCHOR_GAP);
+        // Too tall to drop: the same gap now sits between the card's bottom and
+        // the trigger's top.
+        let above = card_rect(WIN, trigger, MENU_ANCHOR_GAP, card(220.0, 300.0));
+        assert_eq!(above.y + above.height, 820.0 - MENU_ANCHOR_GAP);
+    }
+
+    #[test]
+    fn card_clamps_only_when_neither_side_fits() {
+        // Window-tall card: no room either way, so it fills the window and
+        // scrolls.
+        let rect = card_rect(WIN, at(0.0, 500.0), 0.0, card(220.0, 900.0));
+        assert_eq!(rect.y, 0.0);
+        // An anchor tall enough to leave room on neither side: bottom-aligned.
+        let tall = Rectangle {
+            x: 0.0,
+            y: 40.0,
+            width: 10.0,
+            height: 800.0,
+        };
+        let rect = card_rect(WIN, tall, 0.0, card(220.0, 300.0));
+        assert_eq!(rect.y, 600.0);
+    }
+
+    #[test]
+    fn card_x_stays_inside_the_window() {
+        let rect = card_rect(WIN, at(1100.0, 10.0), 0.0, card(220.0, 100.0));
+        assert_eq!(rect.x, 980.0);
+        // Wider than the window itself: pinned to the left edge, not negative.
+        let rect = card_rect(WIN, at(1100.0, 10.0), 0.0, card(1400.0, 100.0));
+        assert_eq!(rect.x, 0.0);
+    }
+
+    #[test]
+    fn the_opening_release_is_swallowed_exactly_once() {
+        let mut menu = opened_by(mouse::Button::Right);
+        assert!(menu.opening_release(mouse::Button::Right));
+        // Spent: the next right-release is a click of its own and picks.
+        assert!(!menu.opening_release(mouse::Button::Right));
+    }
+
+    #[test]
+    fn the_other_button_picks_without_waiting() {
+        // A left-click on a row of a right-click menu is a whole press-release
+        // of its own, so it selects at once...
+        let mut menu = opened_by(mouse::Button::Right);
+        assert!(!menu.opening_release(mouse::Button::Left));
+        // ...and leaves the right button still owing its opening release.
+        assert!(menu.opening_release(mouse::Button::Right));
+    }
+
+    #[test]
+    fn a_menu_with_no_opening_press_picks_on_the_first_release() {
+        let mut menu = OverlayMenu::new(Vec::new(), AnchorSpec::At(Point::ORIGIN), None);
+        assert!(!menu.opening_release(mouse::Button::Left));
     }
 }

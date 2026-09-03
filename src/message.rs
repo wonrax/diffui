@@ -62,7 +62,7 @@ pub(crate) enum Message {
     /// or the batch menu's "Clear selection").
     MultiSelectClear,
     /// The sidebar / diff view reported a new scroll offset. Mirrored into the
-    /// active tab's state so it can be stashed and restored on tab switch.
+    /// active tab's state so its position is restored on the next switch back.
     SidebarScrolled(f64),
     DiffScrolled(f32),
     /// Right-click on a revision row — opens the context menu. Carries the row's
@@ -298,8 +298,8 @@ pub(crate) enum Message {
 
     /// Background syntax highlighting finished for one file: sparse
     /// `(hunk, line, spans)` for the document identified by the leading
-    /// `document_id` (routed to whichever session still shows it — active or
-    /// stashed — and dropped once that document is gone).
+    /// `document_id` (routed to whichever tab still shows it, on screen or
+    /// not, and dropped once that document is gone).
     FileHighlighted(u64, usize, Vec<(usize, usize, Vec<SyntaxSpan>)>),
 
     // ── Source browser ──────────────────────────────────────────────────
@@ -345,8 +345,9 @@ pub(crate) enum Message {
     SourceFilterChanged(String),
     /// Enter in the file-search box: open the best match.
     SourceFilterSubmit,
-    /// Source view / source tree scroll offsets, mirrored for stash/restore
-    /// like [`Message::DiffScrolled`] / [`Message::SidebarScrolled`].
+    /// Source view / source tree scroll offsets, mirrored per tab for the
+    /// switch-back restore like [`Message::DiffScrolled`] /
+    /// [`Message::SidebarScrolled`].
     SourceScrolled(f32),
     SourceTreeScrolled(f64),
     /// Right-click on a file row in either sidebar tree (diff or source

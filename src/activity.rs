@@ -113,8 +113,7 @@ impl Activity {
     }
 }
 
-/// The per-tab activity list. Held inline on `Diffui` for the active tab and in
-/// each `RepoState` stash for the rest.
+/// The per-tab activity list; one lives in every tab's [`crate::TabState`].
 #[derive(Debug, Clone, Default)]
 pub struct ActivityLog {
     activities: Vec<Activity>,
@@ -296,10 +295,11 @@ fn spinner_glyph(started: Instant) -> &'static str {
 /// "Activity" affordance otherwise. Click → open/close the popover.
 pub fn activity_indicator(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     let mono = ui.config.mono_font;
-    let running = ui.activities.running_count();
-    let queued = ui.activities.queued_count();
+    let activities = &ui.active().activities;
+    let running = activities.running_count();
+    let queued = activities.queued_count();
 
-    let body: Element<'_, Message> = if let Some(active) = ui.activities.first_running_visible() {
+    let body: Element<'_, Message> = if let Some(active) = activities.first_running_visible() {
         let mut chips = row![
             text(spinner_glyph(active.started))
                 .size(text_size::UI)
@@ -340,7 +340,7 @@ pub fn activity_indicator(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message>
     } else {
         // Idle: a muted glyph that still opens the popover so finished entries
         // remain reachable.
-        let glyph = if ui.activities.is_empty() {
+        let glyph = if ui.active().activities.is_empty() {
             icons::CIRCLE // no activity yet
         } else {
             icons::CHECK // idle — everything finished
@@ -378,8 +378,9 @@ pub fn activity_progress_line(ui: &Diffui, theme: ThemeSpec) -> Element<'static,
     // Both visuals are held back until the work has run past the display delay,
     // so short ops don't flash. `loading_since` times the (un-logged)
     // revision-switch diff load the same way an activity's `started` does.
-    let active = ui.activities.first_running_visible();
+    let active = ui.active().activities.first_running_visible();
     let diff_loading = ui
+        .active()
         .session
         .loading_since
         .is_some_and(|since| since.elapsed() >= ACTIVITY_DISPLAY_DELAY);
@@ -455,7 +456,7 @@ pub fn activity_popover(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     .spacing(8);
 
     let mut list = column![].spacing(2);
-    if ui.activities.is_empty() {
+    if ui.active().activities.is_empty() {
         list = list.push(
             container(
                 text("No activity yet.")
@@ -467,7 +468,7 @@ pub fn activity_popover(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         );
     } else {
         // Newest first so the latest op is on top.
-        for activity in ui.activities.activities.iter().rev() {
+        for activity in ui.active().activities.activities.iter().rev() {
             list = list.push(activity_row(ui, theme, activity));
         }
     }
@@ -884,6 +885,7 @@ fn detail_urls(detail: &[String]) -> Vec<String> {
 
 fn clear_button(ui: &Diffui, theme: ThemeSpec) -> Element<'static, Message> {
     let enabled = ui
+        .active()
         .activities
         .activities
         .iter()

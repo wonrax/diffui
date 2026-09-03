@@ -632,13 +632,18 @@ async fn stream_pr_diff_gh(spec: &PrSpec, mut on_file: impl FnMut(DiffFile)) -> 
     });
 
     let mut parser = DiffStreamParser::default();
-    let mut lines = BufReader::with_capacity(256 * 1024, stdout).lines();
-    while let Some(line) = lines
-        .next_line()
+    // Split on bytes and decode each line lossily: `lines()` validates UTF-8
+    // and would abort the stream halfway through the first PR touching a
+    // latin-1 file. The trailing `\r` is dropped the way `str::lines` does it,
+    // so a CRLF diff parses like any other.
+    let mut lines = BufReader::with_capacity(256 * 1024, stdout).split(b'\n');
+    while let Some(raw) = lines
+        .next_segment()
         .await
         .context("failed to read gh pr diff output")?
     {
-        if let Some(file) = parser.push_line(&line) {
+        let raw = raw.strip_suffix(b"\r").unwrap_or(&raw);
+        if let Some(file) = parser.push_line(&String::from_utf8_lossy(raw)) {
             on_file(file);
         }
     }

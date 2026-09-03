@@ -9,6 +9,10 @@ resolver = "3"
 
 [features]
 iced-debug = ["iced/debug"]
+# Restores every tree-sitter grammar arborium ships. The default build carries
+# only the languages a diff is likely to contain, because the rest of the parse
+# tables cost more than half the binary; enable this if your repos are wider.
+lang-all = ["diffui-core/lang-all"]
 # Profiling-only: swaps in a global allocator that tracks current/peak bytes.
 # Adds atomic bookkeeping to every alloc, so never enable it for normal builds.
 track-alloc = ["diffui-core/track-alloc"]
@@ -20,7 +24,9 @@ trajectory-debug = []
 anyhow = "1.0"
 diffui-core = { path = "core" }
 clap = { version = "4.5", features = ["derive"] }
-iced = { git = "https://github.com/iced-rs/iced.git", features = ["advanced", "tokio", "debug", "canvas", "svg"] }
+# Pinned to a rev, not a branch: without one `cargo update` walks us onto iced
+# master, and 0.15 is still unreleased and still breaking its API weekly.
+iced = { git = "https://github.com/iced-rs/iced.git", rev = "4255f613b887c3362214edd128acb8d2722bd0de", features = ["advanced", "tokio", "debug", "canvas", "svg"] }
 jj-lib = "0.40.0"
 mimalloc = "0.1"
 futures = "0.3"
@@ -74,6 +80,14 @@ objc2-core-graphics = { version = "0.3", features = ["CGColor"] }
 [profile.dev]
 debug = 1
 
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+
 [profile.profiling]
 inherits = "release"
 debug = true
+# Undo the release profile's `strip`, or every frame in a profile comes back as
+# a bare address and the build is useless for what it exists to do.
+strip = false

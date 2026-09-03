@@ -149,20 +149,50 @@ fn flush_current_hunk(file: &mut DiffFile, current_hunk: &mut Option<PendingHunk
 
 fn update_file_metadata(file: &mut DiffFile, line: &str) {
     if let Some(path) = line.strip_prefix("rename from ") {
-        file.old_path = Some(path.to_owned());
+        file.old_path = Some(unquote_git_path(path));
         file.status = DiffFileStatus::Renamed;
     } else if let Some(path) = line.strip_prefix("rename to ") {
-        file.path = path.to_owned();
+        file.path = unquote_git_path(path);
         file.status = DiffFileStatus::Renamed;
     } else if line.starts_with("new file mode ") || line == "--- /dev/null" {
         file.status = DiffFileStatus::Added;
     } else if line.starts_with("deleted file mode ") || line == "+++ /dev/null" {
         file.status = DiffFileStatus::Deleted;
-    } else if let Some(path) = line.strip_prefix("--- a/") {
-        file.old_path = Some(path.to_owned());
-    } else if let Some(path) = line.strip_prefix("+++ b/") {
-        file.path = path.to_owned();
+    } else if let Some(path) = line
+        .strip_prefix("--- ")
+        .and_then(|rest| side_path(rest, "a/"))
+    {
+        file.old_path = Some(path);
+    } else if let Some(path) = line
+        .strip_prefix("+++ ")
+        .and_then(|rest| side_path(rest, "b/"))
+    {
+        file.path = path;
+    } else if line.starts_with("Binary files ") && line.ends_with(" differ") {
+        // git prints this instead of hunks and the file would otherwise render
+        // as an empty Modified. One header-only hunk, the shape the jj backend
+        // gives a binary change (see `jj::load_jj_diff`), so both backends and
+        // the PR path show the same row.
+        file.hunks.push(binary_hunk());
     }
+}
+
+/// One header-only hunk standing in for content the diff can't show.
+fn binary_hunk() -> DiffHunkView {
+    DiffHunkView {
+        header: "binary files differ".to_owned(),
+        lines: Vec::new(),
+    }
+}
+
+/// The path out of a `--- a/name` / `+++ b/name` line. git appends a tab after
+/// a name containing a space (GNU patch compatibility) and C-quotes names
+/// holding a quote, a backslash or a control character, so neither the tail
+/// nor the prefix survives a plain `strip_prefix`. `None` for `/dev/null` and
+/// for any other prefix, leaving the path as the `diff --git` header set it.
+fn side_path(rest: &str, prefix: &str) -> Option<String> {
+    let path = unquote_git_path(rest.trim_end_matches('\t'));
+    path.strip_prefix(prefix).map(str::to_owned)
 }
 
 fn push_hunk_row(file: &mut DiffFile, hunk: &mut PendingHunk, line: &str) {
@@ -191,12 +221,17 @@ fn push_hunk_row(file: &mut DiffFile, hunk: &mut PendingHunk, line: &str) {
             });
             hunk.next_old_line += 1;
         }
-        Some(' ') => {
+        // An empty line is a context line that lost its leading space —
+        // `diff.suppressBlankEmpty`, or a diff that went through a
+        // whitespace-stripping pipe. As a numberless Note it would shift the
+        // line numbers, and the full-source highlight mapping with them, for
+        // the rest of the hunk.
+        Some(' ') | None => {
             hunk.rows.push(DiffLine {
                 kind: DiffLineKind::Context,
                 old_line: Some(hunk.next_old_line),
                 new_line: Some(hunk.next_new_line),
-                content: line[1..].to_owned(),
+                content: line.get(1..).unwrap_or_default().to_owned(),
                 syntax: Vec::new(),
                 emphasis: Vec::new(),
             });
@@ -240,10 +275,9 @@ fn is_conflict_marker(line: &str) -> bool {
 }
 
 fn parse_diff_git_paths(paths: &str) -> (Option<String>, String) {
-    let mut parts = paths.split_whitespace();
-    let old_path = parts.next().map(clean_git_diff_path);
-    let path = parts
-        .next()
+    let (old, new) = split_diff_git_paths(paths);
+    let old_path = (!old.is_empty()).then(|| clean_git_diff_path(old));
+    let path = new
         .map(clean_git_diff_path)
         .or_else(|| old_path.clone())
         .unwrap_or_else(|| "<unknown>".to_owned());
@@ -251,11 +285,119 @@ fn parse_diff_git_paths(paths: &str) -> (Option<String>, String) {
     (old_path, path)
 }
 
+/// Split the two names in a `diff --git ` header.
+///
+/// Whitespace is not a separator: git only quotes a name that holds a quote,
+/// a backslash or a control character (non-ASCII too, unless the caller pins
+/// `core.quotePath=false`), so `a/mode only.sh b/mode only.sh` arrives with
+/// three spaces and used to read as a rename of `mode` to `only.sh`. Use
+/// `git apply`'s rule — the split is the whitespace where both sides, minus
+/// their `a/`/`b/` prefix, spell the same name — plus the unambiguous case of
+/// a quote opening the second name. A rename's two names differ, so nothing
+/// matches and the first whitespace is the fallback; its real names arrive on
+/// the `rename from`/`rename to` lines.
+fn split_diff_git_paths(paths: &str) -> (&str, Option<&str>) {
+    if paths.starts_with('"')
+        && let Some(end) = quoted_path_end(paths)
+    {
+        let rest = paths[end..].trim_start();
+        return (&paths[..end], (!rest.is_empty()).then_some(rest));
+    }
+
+    for (index, _) in paths.match_indices([' ', '\t']) {
+        let (left, right) = (&paths[..index], &paths[index + 1..]);
+        if right.starts_with('"') || strip_path_prefix(left) == strip_path_prefix(right) {
+            return (left, Some(right));
+        }
+    }
+
+    match paths.split_once([' ', '\t']) {
+        Some((left, right)) => (left, Some(right)),
+        None => (paths, None),
+    }
+}
+
+/// Byte offset just past the closing quote of a C-quoted name, honouring
+/// backslash escapes so a name ending in `\"` doesn't close early.
+fn quoted_path_end(paths: &str) -> Option<usize> {
+    let mut escaped = false;
+    for (index, byte) in paths.bytes().enumerate().skip(1) {
+        match byte {
+            _ if escaped => escaped = false,
+            b'\\' => escaped = true,
+            b'"' => return Some(index + 1),
+            _ => {}
+        }
+    }
+    None
+}
+
 fn clean_git_diff_path(path: &str) -> String {
+    strip_path_prefix(&unquote_git_path(path)).to_owned()
+}
+
+fn strip_path_prefix(path: &str) -> &str {
     path.strip_prefix("a/")
         .or_else(|| path.strip_prefix("b/"))
         .unwrap_or(path)
-        .to_owned()
+}
+
+/// Undo git's C-style path quoting (`"caf\303\251.txt"`). The escapes carry
+/// bytes, not characters, so they are collected as bytes and decoded lossily —
+/// a latin-1 filename then still names something, where the old raw form
+/// showed `caf\303\251.txt` and lost syntax highlighting with it.
+fn unquote_git_path(path: &str) -> String {
+    let Some(inner) = path
+        .strip_prefix('"')
+        .and_then(|path| path.strip_suffix('"'))
+    else {
+        return path.to_owned();
+    };
+
+    let raw = inner.as_bytes();
+    let mut bytes = Vec::with_capacity(raw.len());
+    let mut index = 0;
+    while index < raw.len() {
+        let byte = raw[index];
+        index += 1;
+        if byte != b'\\' {
+            bytes.push(byte);
+            continue;
+        }
+        let Some(&escape) = raw.get(index) else {
+            bytes.push(b'\\');
+            break;
+        };
+        index += 1;
+        match escape {
+            b'a' => bytes.push(0x07),
+            b'b' => bytes.push(0x08),
+            b't' => bytes.push(b'\t'),
+            b'n' => bytes.push(b'\n'),
+            b'v' => bytes.push(0x0b),
+            b'f' => bytes.push(0x0c),
+            b'r' => bytes.push(b'\r'),
+            b'"' | b'\\' => bytes.push(escape),
+            b'0'..=b'7' => {
+                let mut value = escape - b'0';
+                for _ in 0..2 {
+                    match raw.get(index) {
+                        Some(digit @ b'0'..=b'7') => {
+                            value = value.wrapping_mul(8).wrapping_add(digit - b'0');
+                            index += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                bytes.push(value);
+            }
+            // Not an escape git emits: keep both bytes so the name still
+            // resembles what's on disk.
+            _ => bytes.extend_from_slice(&[b'\\', escape]),
+        }
+    }
+
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 fn parse_hunk_header(header: &str) -> (usize, usize) {
@@ -537,6 +679,100 @@ mod tests {
         assert_eq!(file.status, DiffFileStatus::Renamed);
         assert_eq!(file.old_path.as_deref(), Some("src/old.rs"));
         assert_eq!(file.path, "src/new.rs");
+    }
+
+    /// A mode-only change: no `---`/`+++` lines to correct the header, and
+    /// three spaces in it. Splitting on whitespace read this as a rename of
+    /// `mode` to `only.sh`.
+    #[test]
+    fn parses_spaced_path_in_a_mode_only_change() {
+        let document = parse_unified_diff(
+            "diff --git a/mode only.sh b/mode only.sh\nold mode 100644\nnew mode 100755\n",
+        );
+
+        let file = &document.files[0];
+        assert_eq!(file.path, "mode only.sh");
+        assert_eq!(file.old_path.as_deref(), Some("mode only.sh"));
+        assert_eq!(file.status, DiffFileStatus::Modified);
+    }
+
+    /// A spaced path again, this time with the tab git appends to the
+    /// `---`/`+++` lines for GNU patch — and a context line that lost its
+    /// leading space (`diff.suppressBlankEmpty`), which must not shift the
+    /// numbering of the lines below it.
+    #[test]
+    fn parses_spaced_path_headers_and_unprefixed_blank_lines() {
+        let document = parse_unified_diff(
+            "diff --git a/space name.txt b/space name.txt\nindex a1a53b5..bc8fe6d 100644\n--- a/space name.txt\t\n+++ b/space name.txt\t\n@@ -1,3 +1,3 @@\n a\n\n-b\n+c\n",
+        );
+
+        let file = &document.files[0];
+        assert_eq!(file.path, "space name.txt");
+        assert_eq!(file.old_path.as_deref(), Some("space name.txt"));
+        let lines = &file.hunks[0].lines;
+        assert_eq!(lines[1].kind, DiffLineKind::Context);
+        assert_eq!(lines[1].content, "");
+        assert_eq!(lines[1].old_line, Some(2));
+        assert_eq!(lines[1].new_line, Some(2));
+        assert_eq!(lines[2].kind, DiffLineKind::Deletion);
+        assert_eq!(lines[2].old_line, Some(3));
+        assert_eq!(lines[3].new_line, Some(3));
+    }
+
+    /// A C-quoted non-ASCII path — what a PR diff or a repo we don't control
+    /// the config of still sends. Unquoted it names a real file (and gets
+    /// highlighting); raw it read as a rename to `b/caf\303\251.txt`.
+    #[test]
+    fn unquotes_non_ascii_paths() {
+        let document = parse_unified_diff(
+            "diff --git \"a/caf\\303\\251.txt\" \"b/caf\\303\\251.txt\"\n--- \"a/caf\\303\\251.txt\"\n+++ \"b/caf\\303\\251.txt\"\n@@ -1 +1 @@\n-héllo\n+héllo2\n",
+        );
+
+        let file = &document.files[0];
+        assert_eq!(file.path, "café.txt");
+        assert_eq!(file.old_path.as_deref(), Some("café.txt"));
+        assert_eq!(file.status, DiffFileStatus::Modified);
+    }
+
+    /// Quoting survives `core.quotePath=false` when the name holds a quote,
+    /// and only one side of this rename is quoted.
+    #[test]
+    fn parses_rename_with_a_quoted_old_path() {
+        let document = parse_unified_diff(
+            "diff --git \"a/has\\\"quote.txt\" b/renamed file.txt\nsimilarity index 100%\nrename from \"has\\\"quote.txt\"\nrename to renamed file.txt\n",
+        );
+
+        let file = &document.files[0];
+        assert_eq!(file.status, DiffFileStatus::Renamed);
+        assert_eq!(file.old_path.as_deref(), Some("has\"quote.txt"));
+        assert_eq!(file.path, "renamed file.txt");
+    }
+
+    #[test]
+    fn binary_file_gets_the_shared_binary_hunk() {
+        let document = parse_unified_diff(
+            "diff --git a/blob.bin b/blob.bin\nindex 20f982d..ac09f6c 100644\nBinary files a/blob.bin and b/blob.bin differ\n",
+        );
+
+        let file = &document.files[0];
+        assert_eq!(file.path, "blob.bin");
+        assert_eq!(file.hunks.len(), 1);
+        assert_eq!(file.hunks[0].header, "binary files differ");
+        assert!(file.hunks[0].lines.is_empty());
+        assert_eq!(document.total_additions, 0);
+    }
+
+    /// A stream cut mid-hunk (a killed `gh pr diff`, a truncated read) still
+    /// yields the file with the rows that did arrive.
+    #[test]
+    fn truncated_hunk_still_yields_its_file() {
+        let document =
+            parse_unified_diff("diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n a\n-b");
+
+        let file = &document.files[0];
+        assert_eq!(file.hunks[0].lines.len(), 2);
+        assert_eq!(file.hunks[0].lines[1].kind, DiffLineKind::Deletion);
+        assert_eq!(document.total_deletions, 1);
     }
 
     #[test]

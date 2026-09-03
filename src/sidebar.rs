@@ -93,7 +93,7 @@ pub fn build_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     body = body.push(build_revset_filter(ui, theme));
     // Load failures no longer have a header to live under — surface them as a
     // soft alert card above the list rather than bare red text.
-    if let LoadStatus::Failed(error) = &ui.session.status {
+    if let LoadStatus::Failed(error) = &ui.active().session.status {
         body = body.push(
             container(
                 container(
@@ -121,12 +121,12 @@ pub fn build_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     body = body.push(revision_list);
     // Target mode: the op bar floats between the list and the footer while a
     // rebase/squash draft is picking its destination.
-    if ui.op_draft.is_some() {
+    if ui.active().op_draft.is_some() {
         body = body.push(build_op_bar(ui, theme));
     }
     body = body.push(build_footer(ui, theme));
 
-    let draft_active = ui.op_draft.is_some();
+    let draft_active = ui.active().op_draft.is_some();
     container(body)
         .width(Length::Fixed(ui.sidebar_width))
         .height(Length::Fill)
@@ -160,12 +160,12 @@ fn commit_list_summary(commits: &[String]) -> String {
 /// (rebase only), the live preview line, and the key hints.
 fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     use diffui_core::{DraftKind, PlacementKind};
-    let Some(draft_ui) = ui.op_draft.as_ref() else {
+    let Some(draft_ui) = ui.active().op_draft.as_ref() else {
         return Space::new().into();
     };
     let draft = &draft_ui.draft;
     // Row-index helpers against the loaded graph.
-    let commits = &ui.session.commits;
+    let commits = &ui.active().session.commits;
     let len = commits.len();
     let short_id = |index: usize| -> Option<String> {
         (index < len).then(|| {
@@ -760,7 +760,7 @@ pub const REVSET_INPUT_ID: &str = "revset-input";
 /// sidebar, with a caret that opens the presets menu. Submitting (Enter) or
 /// picking a preset re-evaluates the log.
 fn build_revset_filter(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
-    let placeholder = match ui.session.repository.as_ref().map(|r| r.vcs) {
+    let placeholder = match ui.active().session.repository.as_ref().map(|r| r.vcs) {
         Some(Vcs::Git) => "revision range — e.g. --all, main..@",
         _ => "revset — e.g. all(), mine()",
     };
@@ -770,7 +770,7 @@ fn build_revset_filter(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         crate::field::FilterField {
             id: REVSET_INPUT_ID,
             placeholder,
-            value: &ui.session.revset,
+            value: &ui.active().session.revset,
             on_input: Message::RevsetChanged,
             on_submit: Some(Message::RevsetSubmit),
             caret: Some(crate::field::FilterCaret {
@@ -793,7 +793,7 @@ fn build_footer(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     let font = ui.config.mono_font;
     let dim = theme.subtle_text;
 
-    let left: Element<'_, Message> = match &ui.session.branch_status {
+    let left: Element<'_, Message> = match &ui.active().session.branch_status {
         Some(status) => {
             // Branch glyph + name; the tracked upstream rides along as a tooltip.
             let name = row![
@@ -867,10 +867,13 @@ fn build_footer(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         None => row![].into(),
     };
 
-    let right = text(format!("{} changes", thousands(ui.session.commits.len())))
-        .size(FOOTER_TEXT_SIZE)
-        .font(font)
-        .color(dim);
+    let right = text(format!(
+        "{} changes",
+        thousands(ui.active().session.commits.len())
+    ))
+    .size(FOOTER_TEXT_SIZE)
+    .font(font)
+    .color(dim);
 
     let bar = row![left, Space::new().width(Length::Fill), right]
         .align_y(alignment::Vertical::Center)
@@ -918,9 +921,10 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
 
     // Files show under the selected commit, only while its inline list is open.
     let expanded_index = ui
+        .active()
         .session
         .selected_commit_index
-        .filter(|_| ui.file_list_expanded);
+        .filter(|_| ui.active().file_list_expanded);
 
     // Stat-column widths and the flattened file tree are derived purely from the
     // document (and, for the tree, the collapse set) — never from the scroll
@@ -932,15 +936,15 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
     // grow the set under a stable id) so a rebuild that didn't change the file
     // set is free; templates themselves are built lazily per visible row below.
     let (tree_rows, additions_w, deletions_w, file_badge_width) = if expanded_index.is_some()
-        && matches!(ui.session.status, LoadStatus::Loaded)
-        && !ui.session.document.files.is_empty()
+        && matches!(ui.active().session.status, LoadStatus::Loaded)
+        && !ui.active().session.document.files.is_empty()
     {
-        let files = &ui.session.document.files;
-        let document_id = ui.session.document_id;
+        let files = &ui.active().session.document.files;
+        let document_id = ui.active().session.document_id;
         let count = files.len();
         let mut cache = ui.sidebar_file_cache.borrow_mut();
         let widths = cache.stat_widths(document_id, count, ui.config, files);
-        let tree_rows = cache.tree_rows(document_id, count, &ui.collapsed_dirs, files);
+        let tree_rows = cache.tree_rows(document_id, count, &ui.active().collapsed_dirs, files);
         (tree_rows, widths.additions, widths.deletions, widths.badge)
     } else {
         (Rc::new(Vec::new()), 0.0, 0.0, 0.0)
@@ -961,7 +965,7 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
         tree_rows
             .iter()
             .position(|row| {
-                matches!(row, FileTreeRow::File { file_index, .. } if *file_index == ui.selected_file)
+                matches!(row, FileTreeRow::File { file_index, .. } if *file_index == ui.active().selected_file)
             })
             .map(|display| files_start + display)
     });
@@ -969,6 +973,7 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
     // the file-reveal token, and the target row wins over the file row while
     // a draft is active.
     let reveal_file_flat = ui
+        .active()
         .op_draft
         .as_ref()
         .and_then(|draft| draft.draft.candidate)
@@ -981,14 +986,15 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
     // The per-row lane fold + prefix lengths are precomputed once and held in
     // `Diffui`; the closures below build a single visible row's view from them
     // on demand, so the widget never materializes all ~N rows.
-    let graph = &ui.session.graph;
-    let prefix_lens = &ui.session.sidebar_prefix_lens;
-    let commits = &ui.session.commits;
-    let selected = &ui.session.selected_revision;
-    let multi_selection = ui.revision_multi_selection.as_slice();
-    let file_list_expanded = ui.file_list_expanded;
+    let tab = ui.active();
+    let graph = &tab.session.graph;
+    let prefix_lens = &tab.session.sidebar_prefix_lens;
+    let commits = &tab.session.commits;
+    let selected = &tab.session.selected_revision;
+    let multi_selection = tab.revision_multi_selection.as_slice();
+    let file_list_expanded = tab.file_list_expanded;
     let config = ui.config;
-    let draft = ui.op_draft.as_ref();
+    let draft = tab.op_draft.as_ref();
     let build_revision = Box::new(move |index: usize| {
         build_revision_row(
             commits,
@@ -1009,14 +1015,14 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
     // continuation lane state (the post-trim snapshot of that row's fold).
     let (continuation, continuation_columns) = expanded_index
         .map(|index| {
-            let frame = ui.session.graph.frame(index, usize::MAX);
+            let frame = ui.active().session.graph.frame(index, usize::MAX);
             let columns = frame.display_columns();
             (frame.after, columns)
         })
         .unwrap_or_default();
     let (continuation_labels, continuation_segments) = expanded_index
         .map(|index| {
-            let lane = ui.session.graph.fold(index, usize::MAX);
+            let lane = ui.active().session.graph.fold(index, usize::MAX);
             (lane.continuation_labels, lane.continuation_segments)
         })
         .unwrap_or_default();
@@ -1027,7 +1033,7 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
     let continuation_columns: Rc<[Option<usize>]> = continuation_columns.into();
     let continuation_labels: Rc<[Vec<String>]> = continuation_labels.into();
     let continuation_segments: Rc<[Option<usize>]> = continuation_segments.into();
-    let files = &ui.session.document.files;
+    let files = &ui.active().session.document.files;
     let build_file = Box::new(move |row_index: usize| {
         let template = file_row_template(
             &tree_rows[row_index],
@@ -1046,7 +1052,7 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
         )
     });
 
-    let selected_row = match &ui.session.selected_revision {
+    let selected_row = match &ui.active().session.selected_revision {
         RevisionSelection::WorkingCopy => Some(RowSelectionKey::WorkingCopy),
         RevisionSelection::Commit(id) => Some(RowSelectionKey::Commit(id.clone())),
     };
@@ -1054,30 +1060,31 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
     // The widget fills its own background, so the target-mode wash has to
     // reach it too — a tinted container alone would be painted over.
     let mut list_style = revision_list_style(theme, ui.config, file_badge_width);
-    if ui.op_draft.is_some() {
+    if ui.active().op_draft.is_some() {
         list_style.background = draft_panel_background(theme);
     }
     let mut list = RevisionList::new(
-        ui.session.commits.len(),
+        ui.active().session.commits.len(),
         expanded,
         build_revision,
         build_file,
         selected_row,
-        Some(ui.selected_file),
-        ui.session.selected_commit_index,
+        Some(ui.active().selected_file),
+        ui.active().session.selected_commit_index,
         list_style,
         Message::SelectRowKey,
         Message::SidebarFileRow,
     )
     .width(Length::Fill)
-    .reveal_selected(ui.revision_reveal_token)
+    .reveal_selected(ui.active().revision_reveal_token)
     .reveal_file(ui.sidebar_file_reveal_token, reveal_file_flat)
     .on_scroll(Message::SidebarScrolled)
-    .restore_scroll(ui.sidebar_scroll_offset, ui.scroll_restore_token)
+    .restore_scroll(ui.active().sidebar_scroll_offset, ui.scroll_restore_token)
     .on_context_menu(Message::RevisionContextMenu)
     .on_file_context_menu(Message::SidebarFileContextMenu);
     // Drag-to-rebase, for mutable (local jj) repos only.
     if ui
+        .active()
         .session
         .repository
         .as_ref()
@@ -1090,9 +1097,9 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
                 drop: Message::RevisionDragDrop,
             })
             .gap_edges(Box::new(|index| {
-                ui.session.commits.row(index).next_row_is_parent()
+                ui.active().session.commits.row(index).next_row_is_parent()
             }));
-        if ui.op_draft.is_some() {
+        if ui.active().op_draft.is_some() {
             list = list.on_target_hover(Message::DraftHoverCandidate);
         }
     }
