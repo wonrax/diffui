@@ -44,20 +44,24 @@ impl Diffui {
     pub(crate) fn new(cli: Cli, saved: WindowState) -> (Self, Task<Message>) {
         let config = AppConfig::load();
         let sidebar_min_width = sidebar::min_width(config);
-        // Restore the persisted sidebar split and window geometry. The sidebar
-        // is clamped to its min so a stale width from a narrower font config
-        // can't leave it unusable. The window size/position seed the in-memory
-        // tracking; the compositor's `Opened` event overwrites them with the
-        // real values a frame later, but seeding keeps them correct in between.
-        let sidebar_width = saved
-            .sidebar_width
-            .filter(|w| w.is_finite() && *w > 0.0)
-            .unwrap_or(sidebar::DEFAULT_WIDTH)
-            .max(sidebar_min_width);
+        // Restore the persisted sidebar split and window geometry. The window
+        // size/position seed the in-memory tracking; the compositor's `Opened`
+        // event overwrites them with the real values a frame later, but seeding
+        // keeps them correct in between. The sidebar is clamped to that size, so
+        // a stale width — from a narrower font config, or from the wider display
+        // the file was written on — can't reopen with an unusable split.
         let window_size = saved
             .size()
             .map(|(w, h)| Size::new(w, h))
             .unwrap_or_else(|| window::Settings::default().size);
+        let sidebar_width = resize_handle::clamp_width(
+            saved
+                .sidebar_width
+                .filter(|w| w.is_finite() && *w > 0.0)
+                .unwrap_or(sidebar::DEFAULT_WIDTH),
+            sidebar_min_width,
+            window_size.width,
+        );
         let window_position = saved.position().map(|(x, y)| Point::new(x, y));
 
         // Launch precedence: explicit `--path` args win; else restore last
@@ -1899,7 +1903,11 @@ impl Diffui {
                 return iced::clipboard::write(text).discard();
             }
             Message::SidebarWidthChanged(width) => {
-                let clamped = width.max(self.sidebar_min_width);
+                let clamped = resize_handle::clamp_width(
+                    width,
+                    self.sidebar_min_width,
+                    self.window_size.width,
+                );
                 if clamped != self.sidebar_width {
                     self.sidebar_width = clamped;
                     self.mark_geometry_dirty();
@@ -1925,6 +1933,14 @@ impl Diffui {
             Message::WindowResized(size) => {
                 if self.window_size != size {
                     self.window_size = size;
+                    // Shrinking the window can push the split past the diff
+                    // pane's minimum, so re-clamp rather than persist a width
+                    // the new size can't show.
+                    self.sidebar_width = resize_handle::clamp_width(
+                        self.sidebar_width,
+                        self.sidebar_min_width,
+                        size.width,
+                    );
                     self.mark_geometry_dirty();
                 }
                 // The native resize observer (armed on open) re-centers the
@@ -1950,6 +1966,15 @@ impl Diffui {
                     self.geometry_dirty_since = None;
                     self.current_window_state().save();
                 }
+            }
+            Message::WindowCloseRequested => {
+                // The app owns the close (`exit_on_close_request(false)`) so
+                // the debounced write can't be cut off by the process going
+                // away — ⌘Q and the close button raise no `Unfocused`, so
+                // without this the last resize, tab or revset is lost.
+                self.geometry_dirty_since = None;
+                self.current_window_state().save();
+                return iced::exit();
             }
             Message::SelectTab(id) => {
                 return self.activate_tab(id);
@@ -4780,6 +4805,7 @@ impl Diffui {
             Event::Window(window::Event::Opened { position, size, .. }) => {
                 Some(Message::WindowOpened(position, size))
             }
+            Event::Window(window::Event::CloseRequested) => Some(Message::WindowCloseRequested),
             Event::Window(window::Event::Resized(size)) => Some(Message::WindowResized(size)),
             Event::Window(window::Event::Moved(position)) => Some(Message::WindowMoved(position)),
             _ => None,

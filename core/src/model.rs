@@ -2,11 +2,13 @@
 //! and the per-revision metadata the loaders produce. Pure data — no `iced`.
 
 use std::{
+    cell::RefCell,
     collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use crate::graph::LaneFrame;
@@ -193,6 +195,56 @@ pub struct CommitStore {
     /// The previous pushed row's parent ids, held only between two `push`
     /// calls to derive `NEXT_ROW_IS_PARENT` — never retained per row.
     pending_parent_ids: Vec<String>,
+    /// Lazily-built lookup orders for the two commit-id kinds; see [`IdOrder`].
+    /// Interior mutability because the lookups are called from the frontend's
+    /// `view`, which only ever holds a `&CommitStore`.
+    id_order: RefCell<IdOrder>,
+}
+
+/// How long the store has to go without a `push` before a lookup will build
+/// [`IdOrder`]. A cold load streams rows in batches, so a shorter window would
+/// re-sort the whole store mid-load; a longer one leaves the first lookups
+/// after a load scanning.
+const INDEX_IDLE: Duration = Duration::from_millis(250);
+
+/// Row indices sorted by the id they carry, so `find_by_change_id` /
+/// `find_by_commit_id` binary-search rather than scan the whole store — the
+/// palette does one change-id lookup per displayed row per `view`, and the
+/// source browser one commit-id lookup per frame.
+///
+/// Two `u32` lanes is 8 bytes per row on top of the store; a
+/// `HashMap<String, usize>` per kind would hold every id's text a second time
+/// plus table overhead, which the store (deliberately compact, sized for a
+/// million rows) can't afford. Rows fit in `u32` for the same reason the arena
+/// offsets do — see [`CommitStore::intern_text`].
+#[derive(Debug, Clone, Default)]
+struct IdOrder {
+    /// Row count the lanes were built at; any other length means they're stale
+    /// (only `push` changes it, and a row's ids never change afterwards).
+    built_at: Option<usize>,
+    by_change_id: Vec<u32>,
+    by_commit_id: Vec<u32>,
+    /// When the last row landed. Rows arrive 256 at a time during a streaming
+    /// cold load (`session::fold_cold_batch`), so lookups keep scanning until
+    /// the store has been quiet for [`INDEX_IDLE`] — which is the load having
+    /// finished — instead of re-sorting once per batch.
+    last_push: Option<Instant>,
+}
+
+impl IdOrder {
+    fn lane(&self, kind: IdKind) -> &[u32] {
+        match kind {
+            IdKind::Change => &self.by_change_id,
+            IdKind::Commit => &self.by_commit_id,
+        }
+    }
+}
+
+/// Which of a row's two ids a lookup addresses.
+#[derive(Debug, Clone, Copy)]
+enum IdKind {
+    Change,
+    Commit,
 }
 
 impl CommitStore {
@@ -226,11 +278,57 @@ impl CommitStore {
     }
 
     pub fn find_by_change_id(&self, change_id: &str) -> Option<RowView<'_>> {
-        self.iter().find(|row| row.change_id() == change_id)
+        self.find_by_id(IdKind::Change, change_id)
     }
 
     pub fn find_by_commit_id(&self, commit_id: &str) -> Option<RowView<'_>> {
-        self.iter().find(|row| row.commit_id() == commit_id)
+        self.find_by_id(IdKind::Commit, commit_id)
+    }
+
+    /// Resolve an id to its row through [`IdOrder`], falling back to a scan
+    /// while a load is still streaming rows in — the order is only built once
+    /// the store settles, and a stale one would miss the rows just added.
+    fn find_by_id(&self, kind: IdKind, needle: &str) -> Option<RowView<'_>> {
+        let mut order = self.id_order.borrow_mut();
+        if order.built_at != Some(self.len())
+            && order.last_push.is_none_or(|at| at.elapsed() >= INDEX_IDLE)
+        {
+            self.build_id_order(&mut order);
+        }
+
+        let index = if order.built_at == Some(self.len()) {
+            let lane = order.lane(kind);
+            let at = lane.partition_point(|&row| self.id(kind, row as usize) < needle);
+            lane.get(at)
+                .map(|&row| row as usize)
+                .filter(|&row| self.id(kind, row) == needle)
+        } else {
+            (0..self.len()).find(|&row| self.id(kind, row) == needle)
+        };
+        index.map(|index| self.row(index))
+    }
+
+    fn build_id_order(&self, order: &mut IdOrder) {
+        for kind in [IdKind::Change, IdKind::Commit] {
+            let mut rows: Vec<u32> = (0..self.len() as u32).collect();
+            // A stable sort keeps equal ids in row order, so a lookup lands on
+            // the first row carrying one — matching the scan this replaced,
+            // which matters for a divergent change id sitting on several rows.
+            rows.sort_by(|&a, &b| self.id(kind, a as usize).cmp(self.id(kind, b as usize)));
+            match kind {
+                IdKind::Change => order.by_change_id = rows,
+                IdKind::Commit => order.by_commit_id = rows,
+            }
+        }
+        order.built_at = Some(self.len());
+    }
+
+    fn id(&self, kind: IdKind, index: usize) -> &str {
+        let spans = self.spans[index];
+        self.slice(match kind {
+            IdKind::Change => spans.change_id,
+            IdKind::Commit => spans.commit_id,
+        })
     }
 
     /// Row owning bookmark `name`, resolved through the reverse index (O(1))
@@ -320,6 +418,9 @@ impl CommitStore {
     /// [`CommitStoreBuilder`] is a thin wrapper over this.
     pub fn push(&mut self, commit: CommitSummary, author_interner: &mut HashMap<String, u32>) {
         let index = self.spans.len();
+        // Stamps the store as still growing, which is what holds `IdOrder` off
+        // until the rows stop arriving.
+        self.id_order.get_mut().last_push = Some(Instant::now());
         // Rows arrive in display order, so "is this row a parent of the row
         // above it" resolves right here against the previous push's parents.
         if index > 0
@@ -393,19 +494,16 @@ impl CommitStore {
 
     fn intern_text(&mut self, text: &str) -> Span {
         // The arena addresses every interned string with `u32` offsets, so the
-        // total interned text must stay under 4 GiB. That ceiling is far beyond
-        // any real log/diff payload; the assert turns a silent truncation (and
-        // the corrupted slices it would yield) into a loud debug-build failure.
-        debug_assert!(
-            self.text.len() + text.len() <= u32::MAX as usize,
-            "CommitStore text arena exceeded u32 addressing range"
-        );
-        let start = self.text.len() as u32;
+        // total interned text must stay under 4 GiB — a ceiling far beyond any
+        // real log/diff payload. Past it an `as u32` would wrap and hand out
+        // spans slicing unrelated bytes, so this is an invariant worth failing
+        // on in release builds too, not a debug-only assert.
+        const OVERFLOW: &str = "CommitStore text arena exceeded u32 addressing range";
+        let start = u32::try_from(self.text.len()).expect(OVERFLOW);
+        let len = u32::try_from(text.len()).expect(OVERFLOW);
+        start.checked_add(len).expect(OVERFLOW);
         self.text.push_str(text);
-        Span {
-            start,
-            len: text.len() as u32,
-        }
+        Span { start, len }
     }
 
     fn slice(&self, span: Span) -> &str {
@@ -432,6 +530,8 @@ impl CommitStore {
         }
         total += self.bookmarks.capacity() * (size_of::<usize>() + size_of::<Vec<String>>());
         total += self.change_offsets.capacity() * (size_of::<usize>() + size_of::<u32>());
+        let order = self.id_order.borrow();
+        total += (order.by_change_id.capacity() + order.by_commit_id.capacity()) * size_of::<u32>();
         total
     }
 }
@@ -938,6 +1038,121 @@ mod tests {
         assert!(
             !store.row(3).next_row_is_parent(),
             "the last row has no next row"
+        );
+    }
+
+    /// A row carrying nothing but the two ids the lookups index.
+    fn ids(change_id: &str, commit_id: &str) -> CommitSummary {
+        CommitSummary {
+            change_id: change_id.to_owned(),
+            commit_id: commit_id.to_owned(),
+            shortest_change_id_len: None,
+            description: String::new(),
+            author: String::new(),
+            has_description: false,
+            is_empty: None,
+            has_conflict: false,
+            is_divergent: false,
+            is_hidden: false,
+            change_offset: None,
+            is_working_copy: false,
+            is_immutable: false,
+            bookmarks: Vec::new(),
+            parent_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn id_lookups_resolve_through_the_sorted_order() {
+        let mut store = CommitStore::default();
+        let mut interner = HashMap::new();
+        for (change_id, commit_id) in [("zc", "z0"), ("ac", "a0"), ("mc", "m0")] {
+            store.push(ids(change_id, commit_id), &mut interner);
+        }
+        // Stand in for "the load finished a while ago" without sleeping out
+        // the idle window.
+        store.id_order.get_mut().last_push = None;
+
+        assert_eq!(
+            store.find_by_change_id("ac").map(|row| row.commit_id()),
+            Some("a0")
+        );
+        assert_eq!(
+            store.find_by_change_id("zc").map(|row| row.commit_id()),
+            Some("z0")
+        );
+        assert_eq!(
+            store.find_by_commit_id("m0").map(|row| row.change_id()),
+            Some("mc")
+        );
+        assert!(
+            store.id_order.borrow().built_at == Some(3),
+            "the order is built once the store settles"
+        );
+
+        // Misses on either side of the sorted lane, and one interleaved with it.
+        assert!(store.find_by_change_id("aa").is_none());
+        assert!(store.find_by_change_id("zz").is_none());
+        assert!(store.find_by_change_id("bc").is_none());
+        assert!(store.find_by_commit_id("a0x").is_none());
+        assert!(CommitStore::default().find_by_change_id("ac").is_none());
+    }
+
+    #[test]
+    fn id_lookups_stay_correct_while_the_store_grows() {
+        let mut store = CommitStore::default();
+        let mut interner = HashMap::new();
+        store.push(ids("ac", "a0"), &mut interner);
+        store.id_order.get_mut().last_push = None;
+        assert!(store.find_by_change_id("ac").is_some());
+
+        // A streaming load appends 256 rows at a time; a lookup between two
+        // batches must see the new rows without re-sorting the store per batch.
+        store.push(ids("bc", "b0"), &mut interner);
+        store.id_order.get_mut().last_push = Some(Instant::now());
+        assert_eq!(
+            store.find_by_change_id("bc").map(|row| row.commit_id()),
+            Some("b0")
+        );
+        assert_eq!(
+            store.find_by_commit_id("a0").map(|row| row.change_id()),
+            Some("ac")
+        );
+        assert!(store.find_by_change_id("cc").is_none());
+        assert_eq!(
+            store.id_order.borrow().built_at,
+            Some(1),
+            "the stale order is left alone while rows are still arriving"
+        );
+
+        // Once it settles, the next lookup rebuilds over every row.
+        store.id_order.get_mut().last_push = None;
+        assert_eq!(
+            store.find_by_change_id("bc").map(|row| row.commit_id()),
+            Some("b0")
+        );
+        assert_eq!(store.id_order.borrow().built_at, Some(2));
+    }
+
+    #[test]
+    fn duplicate_change_id_resolves_to_the_first_row() {
+        // A divergent change sits on several rows; both the scan and the
+        // sorted order must answer with the first one displayed.
+        let mut store = CommitStore::default();
+        let mut interner = HashMap::new();
+        store.push(ids("dup", "first"), &mut interner);
+        store.push(ids("dup", "second"), &mut interner);
+
+        store.id_order.get_mut().last_push = Some(Instant::now());
+        assert_eq!(
+            store.find_by_change_id("dup").map(|row| row.commit_id()),
+            Some("first")
+        );
+
+        store.id_order.get_mut().last_push = None;
+        assert_eq!(
+            store.find_by_change_id("dup").map(|row| row.commit_id()),
+            Some("first")
         );
     }
 

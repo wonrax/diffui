@@ -213,6 +213,10 @@ fn main() -> iced::Result {
     .title("diffui")
     .font(icons::ICON_FONT_BYTES)
     .window(window_settings)
+    // The close is ours to perform: `Message::WindowCloseRequested` flushes the
+    // pending window state before exiting, which winit gives us no other chance
+    // to do (⌘Q and the close button raise no `Unfocused`).
+    .exit_on_close_request(false)
     .subscription(Diffui::subscription)
     .theme(Diffui::theme)
     .run()
@@ -1166,10 +1170,14 @@ fn open_url(url: &str) {
         c.arg(url);
         c
     };
+    // Not `cmd /C start`: the URL comes from a remote's output (a forge's
+    // "create a pull request" line), and handing it to a shell would let `&`
+    // or `|` in it run a command. `rundll32` takes the URL as an argument and
+    // hands it to the registered protocol handler, no shell involved.
     #[cfg(target_os = "windows")]
     let mut command = {
-        let mut c = std::process::Command::new("cmd");
-        c.args(["/C", "start", "", url]);
+        let mut c = std::process::Command::new("rundll32.exe");
+        c.args(["url.dll,FileProtocolHandler", url]);
         c
     };
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]

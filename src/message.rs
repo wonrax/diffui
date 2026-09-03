@@ -185,6 +185,10 @@ pub(crate) enum Message {
     /// Debounce tick: persist the window geometry + sidebar width once the
     /// changes have settled. Subscribed only while a change is pending.
     PersistWindowState,
+    /// The user asked to close the window (⌘Q, the close button). winit sends
+    /// no `Unfocused` for either, so this is the only chance to flush what the
+    /// debounce is still holding; the handler writes, then exits.
+    WindowCloseRequested,
     // ── Multi-repo ──────────────────────────────────────────────────────
     /// Activate the tab with this id (clicking a tab).
     SelectTab(TabId),

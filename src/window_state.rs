@@ -8,9 +8,11 @@
 //!   * macOS:   `~/Library/Application Support/diffui/window.toml`
 //!   * Windows: `%LOCALAPPDATA%\diffui\window.toml`   (else `%APPDATA%\...`)
 //!
-//! Persistence is best-effort, mirroring `Recents`: any I/O or parse failure
-//! silently degrades to defaults. Geometry is convenience state, never
-//! load-bearing, so we never surface an error or block the UI on it.
+//! Persistence is best-effort, mirroring `Recents`: any I/O failure degrades
+//! to defaults, and a parse failure says so on stderr before it does. The file
+//! now carries the session (open repos, the active one, per-repo revsets and
+//! recents), so losing it silently would look like the app forgot which
+//! repositories were open — but it still never blocks the UI.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -72,12 +74,26 @@ pub struct WindowState {
 
 impl WindowState {
     /// Load persisted state. A missing file or unparseable contents both yield
-    /// `WindowState::default()` (everything `None`).
+    /// `WindowState::default()` (everything `None`); the unparseable case is
+    /// reported first, because it drops the whole session with it and the user
+    /// would otherwise only see the tabs silently gone.
     pub fn load() -> Self {
-        state_path()
-            .and_then(|path| std::fs::read_to_string(&path).ok())
-            .and_then(|raw| toml::from_str(&raw).ok())
-            .unwrap_or_default()
+        let Some(path) = state_path() else {
+            return Self::default();
+        };
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return Self::default();
+        };
+        match toml::from_str(&raw) {
+            Ok(state) => state,
+            Err(error) => {
+                eprintln!(
+                    "diffui: ignoring unreadable window state at {}: {error}",
+                    path.display()
+                );
+                Self::default()
+            }
+        }
     }
 
     /// Write the current state to disk, creating the directory if needed.
@@ -87,8 +103,22 @@ impl WindowState {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Ok(raw) = toml::to_string(self) {
-            let _ = std::fs::write(&path, raw);
+        let Ok(raw) = toml::to_string(self) else {
+            return;
+        };
+        // Write beside the file and rename over it rather than truncating in
+        // place: a save that dies part-way (a quit mid-write, a full disk)
+        // would otherwise leave a truncated file, and since the session lives
+        // here that costs the user their open tabs, not just the geometry.
+        // Rename is atomic on the platforms we ship, so a reader sees either
+        // the whole old file or the whole new one.
+        let temp = path.with_extension("toml.new");
+        if std::fs::write(&temp, raw).is_err() {
+            let _ = std::fs::remove_file(&temp);
+            return;
+        }
+        if std::fs::rename(&temp, &path).is_err() {
+            let _ = std::fs::remove_file(&temp);
         }
     }
 

@@ -17,6 +17,22 @@ use iced::advanced::{
 };
 use iced::{Element, Event, Length, Rectangle, Size, Theme};
 
+/// How much of the window the diff pane keeps when the sidebar is dragged
+/// wide. Roughly the width of a narrow hunk plus its gutter — enough that the
+/// pane is still readable rather than a sliver.
+pub const MIN_DIFF_PANE_WIDTH: f32 = 240.0;
+
+/// Clamp a sidebar width to what the window can actually show: at least
+/// `min_width`, and never so wide that the diff pane drops below
+/// [`MIN_DIFF_PANE_WIDTH`]. Without the ceiling an overshooting drag (or
+/// reopening on a smaller display) leaves the diff pane at zero width with the
+/// grab band off-screen, and that width is what gets persisted. The floor wins
+/// on a window too narrow to honour both.
+pub fn clamp_width(width: f32, min_width: f32, window_width: f32) -> f32 {
+    let max_width = (window_width - MIN_DIFF_PANE_WIDTH).max(min_width);
+    width.clamp(min_width, max_width)
+}
+
 pub struct ResizeHandle<Message> {
     handle_x: f32,
     min_width: f32,
@@ -121,7 +137,10 @@ where
                     return;
                 };
                 let delta = position.x - drag.start_cursor_x;
-                let new_width = (drag.start_handle_x + delta).max(self.min_width);
+                // The overlay spans the whole body, so its bounds are the room
+                // the split has to divide.
+                let new_width =
+                    clamp_width(drag.start_handle_x + delta, self.min_width, bounds.width);
                 if (new_width - self.handle_x).abs() > f32::EPSILON {
                     shell.publish((self.on_resize)(new_width));
                 }

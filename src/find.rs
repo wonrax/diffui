@@ -101,6 +101,14 @@ pub fn compute_matches(state: &FindState, files: &[DiffFile]) -> (Vec<FindMatch>
         for (hunk_index, hunk) in file.hunks.iter().enumerate() {
             for (line_index, line) in hunk.lines.iter().enumerate() {
                 for m in matcher.find_iter(&line.content) {
+                    // A zero-width pattern (`x*`, `^`, `\b`) matches at every
+                    // position in the line, which highlights nothing, reports a
+                    // count in the millions, and makes the painter's per-row
+                    // match scan O(rows × bytes). The iterator already steps
+                    // past an empty match, so dropping them is enough.
+                    if m.end == m.start {
+                        continue;
+                    }
                     out.push(FindMatch {
                         file_index,
                         hunk_index,
@@ -387,4 +395,65 @@ fn nav_button<'a>(glyph: &'static str, theme: ThemeSpec) -> button::Button<'a, M
     button(container(icons::icon(glyph, 13.0, theme.muted_text)).padding(Padding::from([2, 4])))
         .padding(0)
         .style(move |_, status| ghost_button_style(theme, status))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use diffui_core::{DiffFileStatus, DiffHunkView, DiffLine, DiffLineKind};
+
+    fn file(lines: &[&str]) -> DiffFile {
+        DiffFile {
+            path: "f.rs".to_owned(),
+            old_path: None,
+            status: DiffFileStatus::Modified,
+            hunks: vec![DiffHunkView {
+                header: "@@".to_owned(),
+                lines: lines
+                    .iter()
+                    .map(|content| DiffLine {
+                        kind: DiffLineKind::Context,
+                        old_line: None,
+                        new_line: None,
+                        content: (*content).to_owned(),
+                        syntax: Vec::new(),
+                        emphasis: Vec::new(),
+                    })
+                    .collect(),
+            }],
+            additions: 0,
+            deletions: 0,
+        }
+    }
+
+    fn matches(query: &str, regex: bool, files: &[DiffFile]) -> Vec<(usize, usize)> {
+        let state = FindState {
+            query: query.to_owned(),
+            regex,
+            ..Default::default()
+        };
+        let (found, error) = compute_matches(&state, files);
+        assert_eq!(error, None);
+        found.iter().map(|m| (m.byte_start, m.byte_end)).collect()
+    }
+
+    #[test]
+    fn zero_width_regex_matches_are_dropped() {
+        let files = vec![file(&["alpha", "beta"])];
+        // `x*`, `^` and `\b` all match at positions where they consume
+        // nothing: keeping those would report a hit per byte, highlight none
+        // of them, and drag the painter down with the count.
+        assert!(matches("x*", true, &files).is_empty());
+        assert!(matches("^", true, &files).is_empty());
+        assert!(matches(r"\b", true, &files).is_empty());
+        // A pattern that can match empty still reports the non-empty hits.
+        assert_eq!(matches("a*", true, &files), vec![(0, 1), (4, 5), (3, 4)]);
+    }
+
+    #[test]
+    fn literal_and_regex_matches_are_found() {
+        let files = vec![file(&["alpha alpha", "beta"])];
+        assert_eq!(matches("alpha", false, &files), vec![(0, 5), (6, 11)]);
+        assert_eq!(matches("a.pha", true, &files), vec![(0, 5), (6, 11)]);
+    }
 }
