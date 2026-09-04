@@ -36,7 +36,8 @@ pub fn line_bounds(content: &str, size: f32, font: Font) -> Size {
 }
 
 /// [`line_width`] with an explicit shaping strategy, for callers that must
-/// match a renderer path that draws with `Shaping::Basic` (the diff grid).
+/// match a renderer path shaping differently from UI text (the diff grid,
+/// which shapes `Shaping::Auto`).
 pub fn line_width_shaped(content: &str, size: f32, font: Font, shaping: Shaping) -> f32 {
     if content.is_empty() {
         return 0.0;
@@ -44,16 +45,25 @@ pub fn line_width_shaped(content: &str, size: f32, font: Font, shaping: Shaping)
     one_line(content, size, font, shaping).min_width()
 }
 
-/// Shape `content` exactly the way the diff grid draws a wrapped code line —
-/// same font/size, absolute `line_height` box, `Shaping::Basic`, word-first
-/// wrapping (`WordOrGlyph`: break at word boundaries, split only words wider
-/// than the whole line) — bounded to `max_width`.
-fn wrapped_code_line(
+/// Shape `content` exactly the way the diff grid draws a code line — same
+/// font/size, absolute `line_height` box, `Shaping::Auto`, and the caller's
+/// `wrapping` — bounded to `max_width`.
+///
+/// `Shaping::Auto` keeps the cheap `Basic` path for ASCII and switches to
+/// full shaping (with font fallback) for anything else, so CJK, Cyrillic,
+/// emoji and arrows measure as the glyphs they are instead of as the tofu
+/// `Basic` produces when the primary font has no coverage.
+///
+/// The height bound is infinite on purpose: cosmic stops laying out lines
+/// once they pass the box, so a finite height would hide the very overflow
+/// the caller is measuring.
+pub fn code_paragraph(
     content: &str,
     size: f32,
     font: Font,
     line_height: f32,
     max_width: f32,
+    wrapping: text::Wrapping,
 ) -> Paragraph {
     Paragraph::with_text(Text {
         content,
@@ -63,8 +73,8 @@ fn wrapped_code_line(
         font,
         align_x: text::Alignment::Left,
         align_y: alignment::Vertical::Top,
-        shaping: Shaping::Basic,
-        wrapping: text::Wrapping::WordOrGlyph,
+        shaping: Shaping::Auto,
+        wrapping,
         ellipsis: text::Ellipsis::None,
         hint_factor: None,
     })
@@ -80,20 +90,27 @@ pub fn wrapped_line_count(
     line_height: f32,
     max_width: f32,
 ) -> usize {
-    let paragraph = wrapped_code_line(content, size, font, line_height, max_width);
+    let paragraph = code_paragraph(
+        content,
+        size,
+        font,
+        line_height,
+        max_width,
+        text::Wrapping::WordOrGlyph,
+    );
     let lines = (paragraph.min_bounds().height / line_height.max(1.0)).round() as usize;
     lines.max(1)
 }
 
-/// Char offset at which each visual line of word-wrapped `content` starts:
+/// Byte offset at which each visual line of word-wrapped `content` starts:
 /// index 0 is always present (and 0); one entry means no wrapping. The break
 /// points come from hit-testing the shaped paragraph itself, so consumers
 /// slicing the line for hit tests or highlight rects agree with the renderer
-/// char-for-char.
+/// byte-for-byte.
 ///
-/// May hold *fewer* entries than [`wrapped_line_count`]: at extreme widths
-/// cosmic can lay out trailing line boxes that start no new character (they
-/// paint nothing selectable), and the table stops at the last advancing one.
+/// May hold *fewer* entries than [`wrapped_line_count`]: cosmic can lay out
+/// trailing line boxes that start no new character (they paint nothing
+/// selectable), and the table stops at the last advancing one.
 /// Consumers clamp their visual-row index into the table, so clicks on such
 /// a phantom row resolve to the final real range.
 pub fn wrapped_line_starts(
@@ -104,7 +121,14 @@ pub fn wrapped_line_starts(
     max_width: f32,
 ) -> Vec<usize> {
     let line_height = line_height.max(1.0);
-    let paragraph = wrapped_code_line(content, size, font, line_height, max_width);
+    let paragraph = code_paragraph(
+        content,
+        size,
+        font,
+        line_height,
+        max_width,
+        text::Wrapping::WordOrGlyph,
+    );
     let lines = ((paragraph.min_bounds().height / line_height).round() as usize).max(1);
     let mut starts = Vec::with_capacity(lines);
     starts.push(0);
@@ -116,13 +140,13 @@ pub fn wrapped_line_starts(
             break;
         };
         let byte = hit.cursor().min(content.len());
-        let chars = content[..byte].chars().count();
-        // A non-advancing hit means the remaining line boxes start no new
-        // character — the table ends at the last real break (see the doc).
-        if chars <= starts.last().copied().unwrap_or(0) {
+        // A hit that doesn't advance, or that lands on the end of the text,
+        // means the remaining line boxes start no new character — the table
+        // ends at the last real break (see the doc).
+        if byte <= starts.last().copied().unwrap_or(0) || byte >= content.len() {
             break;
         }
-        starts.push(chars);
+        starts.push(byte);
     }
     starts
 }
@@ -217,9 +241,8 @@ mod tests {
                     starts.windows(2).all(|pair| pair[0] < pair[1]),
                     "non-monotonic starts for {content:?} at {width_chars} chars: {starts:?}"
                 );
-                let total = content.chars().count();
                 assert!(
-                    starts.last().copied().unwrap_or(0) <= total,
+                    starts.last().copied().unwrap_or(0) <= content.len(),
                     "start past the content for {content:?}: {starts:?}"
                 );
             }

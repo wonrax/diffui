@@ -1,9 +1,11 @@
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::Instant;
 
 use iced::advanced::{
     Layout, Shell, Widget,
     graphics::geometry::{self, Frame, LineCap, Path, Stroke},
+    graphics::text::Paragraph as ShapedParagraph,
     layout, mouse, renderer, text,
     widget::{Tree, tree},
 };
@@ -13,6 +15,7 @@ use iced::{
 };
 
 use crate::chip::{self, Chip};
+use crate::find::FindMatch;
 use crate::icons;
 use crate::measure;
 use crate::scrollbar::{self, ScrollbarState, ScrollbarStyle};
@@ -353,6 +356,327 @@ impl LayoutMetrics {
     }
 }
 
+/// One logical line's layout at one wrap width: where the engine breaks it,
+/// and how a byte offset maps to a column (and back).
+///
+/// Everything that must land on the glyphs the renderer painted — the height
+/// index, hit-testing, selection, find and emphasis rectangles, the no-wrap
+/// horizontal extent — reads its geometry from here, so one shaping pass
+/// decides both the break points and the columns. They used to come from
+/// different places: the engine broke the line, a chars × char-width grid
+/// placed the columns, and the two disagreed on every tab (the engine jumps
+/// one to the next eight-column stop, the grid counted it as a single
+/// column) and on every glyph wider than a cell.
+///
+/// Columns are in units of the monospace advance, measured from the start of
+/// the visual line the byte sits on — which is what the painter offsets from.
+struct LineGeometry {
+    /// Byte offset each visual line starts at. Always begins with 0; a
+    /// single entry means the line doesn't wrap.
+    starts: Vec<usize>,
+    /// Byte length of the line this was measured from.
+    len: usize,
+    columns: Columns,
+    /// Widest visual line, in columns.
+    width_columns: f32,
+}
+
+/// How a byte offset inside a visual line maps to its column.
+enum Columns {
+    /// Printable ASCII without tabs: one byte, one char, one column — the
+    /// byte offset inside a visual line *is* its column, so the common case
+    /// needs neither a table nor a shaping pass.
+    Monospace,
+    /// `(byte, column)` at every glyph boundary, per visual line, each
+    /// line's table closed by a terminator at its trailing edge so a
+    /// selection running to the end of a line has a column to stop at.
+    Table(Vec<Vec<(u32, f32)>>),
+}
+
+/// Columns `content` occupies unwrapped when the plain monospace grid can
+/// answer on its own: printable ASCII advances exactly one column per byte,
+/// and a byte is a char. Tabs and non-ASCII go to [`column_bound`].
+fn monospace_columns(content: &str) -> Option<f32> {
+    content
+        .bytes()
+        .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+        .then_some(content.len() as f32)
+}
+
+/// Tab stops the text engine advances a tab to, in columns: cosmic-text
+/// gives a tab the width of eight spaces rounded up to the next multiple of
+/// itself, and a space is one column in a monospace font.
+/// `geometry_puts_tabs_on_eight_column_stops` pins that against the engine.
+const TAB_COLUMNS: f32 = 8.0;
+
+/// Column budget for one non-ASCII char in [`column_bound`]. A monospace
+/// advance is half an em to 0.6 em, so three columns buys at least 1.5 em —
+/// above the widest glyph a fallback hands back for a single char (a
+/// full-width ideograph is one em, a colour emoji around 1.25). The budget
+/// has to sit above them, never below: see [`column_bound`].
+const MAX_COLUMNS_PER_CHAR: f32 = 3.0;
+
+/// Upper bound on the columns `content` occupies unwrapped, without asking
+/// the text engine — exact for printable ASCII, tabs included.
+///
+/// The height index walks every line of the document, and all it needs from
+/// most of them is whether they fit on one visual line. Shaping each one to
+/// find out costs hundreds of milliseconds on a tab-indented or non-Latin
+/// diff, once per sidebar-drag frame while wrapping. A bound that only ever
+/// errs high answers the question outright: a line that clears the width
+/// cannot wrap, and one that doesn't clear it goes to the engine, which is
+/// the only thing that knows where a line actually breaks.
+///
+/// Erring high is the whole safety property. Under-counting would reserve a
+/// row too few, and cosmic, bounded to the reserved height, would cull the
+/// text that overflowed. Tab stops keep that direction: the stop a tab lands
+/// on rises with the width in front of it, so an over-counted prefix can
+/// only push it further right.
+fn column_bound(content: &str) -> f32 {
+    if let Some(columns) = monospace_columns(content) {
+        return columns;
+    }
+    let mut columns = 0.0_f32;
+    for ch in content.chars() {
+        columns = match ch {
+            '\t' => ((columns / TAB_COLUMNS).floor() + 1.0) * TAB_COLUMNS,
+            ch if ch.is_ascii_graphic() || ch == ' ' => columns + 1.0,
+            _ => columns + MAX_COLUMNS_PER_CHAR,
+        };
+    }
+    columns
+}
+
+impl LineGeometry {
+    /// Measure `content` the way the painter will draw it. Shapes only when
+    /// it has to: a printable-ASCII line that fits the width is one visual
+    /// line on the plain grid, which is the overwhelming majority of a diff
+    /// and the reason a million-line document can be laid out at all.
+    fn measure(content: &str, params: GeometryParams) -> Self {
+        if let Some(columns) = monospace_columns(content) {
+            if columns * params.char_width <= params.wrap_width {
+                return Self {
+                    starts: vec![0],
+                    len: content.len(),
+                    columns: Columns::Monospace,
+                    width_columns: columns,
+                };
+            }
+            // Still on the plain grid, only broken across visual lines: the
+            // engine says where, and the columns keep following the bytes.
+            let starts = measure::wrapped_line_starts(
+                content,
+                params.size,
+                params.font,
+                params.row_height,
+                params.wrap_width,
+            );
+            let mut geometry = Self {
+                starts,
+                len: content.len(),
+                columns: Columns::Monospace,
+                width_columns: 0.0,
+            };
+            geometry.width_columns = (0..geometry.visual_lines())
+                .fold(0.0_f32, |widest, visual| {
+                    widest.max(geometry.column_at(visual, geometry.len))
+                });
+            return geometry;
+        }
+        let paragraph = measure::code_paragraph(
+            content,
+            params.size,
+            params.font,
+            params.row_height,
+            params.wrap_width,
+            params.wrapping(),
+        );
+        Self::from_paragraph(&paragraph, content, params.char_width)
+    }
+
+    /// Read the break points and per-glyph columns straight off a shaped
+    /// paragraph, one entry per glyph plus a terminator at the run's trailing
+    /// edge. Glyphs run left to right, as code text does — a right-to-left
+    /// line would map columns back to the wrong bytes, which is the same
+    /// assumption the monospace grid this widget draws on already makes.
+    ///
+    /// Runs carrying no glyph are trailing line boxes the layout produced
+    /// with nothing in them; they'd reserve a blank row and push everything
+    /// below it down, so only advancing runs count.
+    fn from_paragraph(paragraph: &ShapedParagraph, content: &str, char_width: f32) -> Self {
+        use iced::advanced::text::Paragraph as _;
+
+        // Layout coordinates are pre-scaled when the paragraph is hinted.
+        let scale = paragraph.hint_factor().unwrap_or(1.0) * char_width.max(1.0);
+        let mut starts: Vec<usize> = Vec::new();
+        let mut table: Vec<Vec<(u32, f32)>> = Vec::new();
+        for run in paragraph.buffer().layout_runs() {
+            let (Some(first), Some(last)) = (run.glyphs.first(), run.glyphs.last()) else {
+                continue;
+            };
+            // The first run starts the line even if its first glyph doesn't
+            // report byte zero; later ones must advance to count.
+            let start = match starts.last() {
+                None => 0,
+                Some(&previous) if first.start > previous => first.start.min(content.len()),
+                Some(_) => continue,
+            };
+            let mut entries: Vec<(u32, f32)> = run
+                .glyphs
+                .iter()
+                .map(|glyph| (glyph.start as u32, glyph.x / scale))
+                .collect();
+            entries.push((last.end as u32, (last.x + last.w) / scale));
+            starts.push(start);
+            table.push(entries);
+        }
+        // An empty line lays out one box holding no glyph at all.
+        if starts.is_empty() {
+            starts.push(0);
+            table.push(vec![(0, 0.0)]);
+        }
+        let width_columns = table
+            .iter()
+            .filter_map(|line| line.last())
+            .fold(0.0_f32, |widest, &(_, column)| widest.max(column));
+        Self {
+            starts,
+            len: content.len(),
+            columns: Columns::Table(table),
+            width_columns,
+        }
+    }
+
+    fn visual_lines(&self) -> usize {
+        self.starts.len()
+    }
+
+    /// Byte range of visual line `visual`. The end is the next line's start —
+    /// a word break's trailing blank hangs on the line it ends — or the
+    /// line's own end for the last one.
+    fn line_range(&self, visual: usize) -> (usize, usize) {
+        let start = self.starts.get(visual).copied().unwrap_or(self.len);
+        let end = self
+            .starts
+            .get(visual + 1)
+            .copied()
+            .unwrap_or(self.len)
+            .max(start);
+        (start, end)
+    }
+
+    /// The visual line the byte at `byte` is painted on.
+    fn visual_line_of(&self, byte: usize) -> usize {
+        self.starts
+            .partition_point(|&start| start <= byte)
+            .saturating_sub(1)
+    }
+
+    /// Column of `byte`, measured from the start of visual line `visual`.
+    fn column_at(&self, visual: usize, byte: usize) -> f32 {
+        let (start, end) = self.line_range(visual);
+        let byte = byte.clamp(start, end);
+        match &self.columns {
+            Columns::Monospace => (byte - start) as f32,
+            Columns::Table(table) => {
+                let Some(entries) = table.get(visual) else {
+                    return 0.0;
+                };
+                let at = entries
+                    .partition_point(|&(boundary, _)| boundary as usize <= byte)
+                    .saturating_sub(1);
+                entries.get(at).map_or(0.0, |&(_, column)| column)
+            }
+        }
+    }
+
+    /// Byte offset nearest `column` on visual line `visual` — the inverse of
+    /// [`Self::column_at`], rounded to the closest glyph boundary so a click
+    /// past the middle of a glyph puts the caret after it.
+    fn byte_at(&self, visual: usize, column: f32) -> usize {
+        let (start, end) = self.line_range(visual);
+        match &self.columns {
+            Columns::Monospace => {
+                let offset = column.max(0.0).round() as usize;
+                (start + offset).min(end)
+            }
+            Columns::Table(table) => {
+                let Some(entries) = table.get(visual) else {
+                    return start;
+                };
+                let past = entries.partition_point(|&(_, boundary)| boundary <= column);
+                let before = past.saturating_sub(1);
+                let after = past.min(entries.len().saturating_sub(1));
+                let nearest = if column - entries[before].1 <= entries[after].1 - column {
+                    before
+                } else {
+                    after
+                };
+                (entries[nearest].0 as usize).clamp(start, end)
+            }
+        }
+    }
+}
+
+/// What one geometry measurement needs from the widget: the diff typography,
+/// and the width a line wraps at.
+#[derive(Debug, Clone, Copy)]
+struct GeometryParams {
+    size: f32,
+    font: Font,
+    row_height: f32,
+    char_width: f32,
+    /// The width one visual line may occupy, or `f32::INFINITY` with
+    /// wrapping off — where the painter also shapes unbounded and clips, so
+    /// the geometry has to see the whole line to scroll across it.
+    wrap_width: f32,
+}
+
+impl GeometryParams {
+    fn wrapping(&self) -> text::Wrapping {
+        wrapping_for(self.wrap_width)
+    }
+}
+
+/// How code text laid out against `wrap_width` breaks: at word boundaries,
+/// splitting only words wider than the line, or not at all when the width is
+/// unbounded. Unified rows, split rows and the geometry all read this one
+/// rule; they used to disagree, and a painter breaking a line somewhere the
+/// measurement didn't put every rectangle on the row a few columns off.
+fn wrapping_for(wrap_width: f32) -> text::Wrapping {
+    if wrap_width.is_finite() {
+        text::Wrapping::WordOrGlyph
+    } else {
+        text::Wrapping::None
+    }
+}
+
+/// Cache key for a memoized [`LineGeometry`]: which diff row, at which wrap
+/// width, in which glyph advance (a font or size change moves every column).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct GeometryKey {
+    file_index: u32,
+    hunk_index: u32,
+    line_index: u32,
+    wrap_width_bits: u32,
+    char_width_bits: u32,
+}
+
+/// Per-(line, width) [`LineGeometry`], held in widget `State` so a visible
+/// wrapped row is shaped once per width rather than once per frame — the
+/// height index, the hit test, and every selection / find / emphasis
+/// rectangle used to re-derive the same break table independently.
+///
+/// Bounded, because a height-index rebuild streams the whole document
+/// through it: past [`GEOMETRY_MEMO_CAP`] entries it is dropped wholesale
+/// instead of growing to the document's size. The cap is two orders of
+/// magnitude past a viewport's worth of rows, so what is on screen survives
+/// the sweep and is re-measured at most once after it.
+#[derive(Default)]
+struct GeometryMemo(std::collections::HashMap<GeometryKey, Rc<LineGeometry>>);
+
+const GEOMETRY_MEMO_CAP: usize = 4_096;
+
 /// Cache key for per-line shaped `Paragraph`s. The `(file, hunk, line)`
 /// triple maps to stable line content under a fixed `revision_key`
 /// (`diff()` clears the cache when that changes). `content_width_bits`
@@ -377,15 +701,20 @@ struct ParagraphKey {
 /// lines themselves.
 #[derive(Debug, Default)]
 struct HeightIndex {
-    /// Rebuild key: `(layout_version, files.len(), header.len(),
-    /// content_width bits)`. The file/header counts are part of the key
-    /// because streaming PR loads *append* files (and the header appears when
-    /// `gh pr view` lands) without replacing the document — appends leave
-    /// existing rows in place, but they extend the layout. Keyed on the
-    /// layout id, NOT the paint `content_version`: highlight merges bump the
-    /// latter to re-shape paint without moving anything. The wrap and
-    /// side-by-side flags are in the key because toggling either moves
-    /// every row.
+    /// Rebuild key: `(layout_version, files.len(), header height bits, wrap
+    /// width bits, wrap, side_by_side)`. The file/header counts are part of
+    /// the key because streaming PR loads *append* files (and the header
+    /// appears when `gh pr view` lands) without replacing the document —
+    /// appends leave existing rows in place, but they extend the layout.
+    /// Keyed on the layout id, NOT the paint `content_version`: highlight
+    /// merges bump the latter to re-shape paint without moving anything. The
+    /// wrap and side-by-side flags are in the key because toggling either
+    /// moves every row.
+    ///
+    /// The width component is [`WIDTH_AGNOSTIC`] with wrapping off: every row
+    /// is then exactly one line tall no matter how wide the pane is, so a
+    /// sidebar drag (which changes the pane width on every frame of the
+    /// gesture) must not spend an O(document) rebuild per frame proving it.
     key: Option<(u64, usize, usize, u32, bool, bool)>,
     /// Content-space y of each file's header top, plus one trailing sentinel
     /// holding the content end. `file_tops[0]` equals the revision-header
@@ -397,6 +726,10 @@ struct HeightIndex {
     hunk_ids: Vec<(u32, u32)>,
     /// Content-space y of each diff row, in document order.
     row_tops: Vec<f32>,
+    /// Height of each `row_tops` entry. Stored rather than re-derived: a
+    /// wrapped row's height costs a shaping pass, and `draw` asks for every
+    /// visible row's height on every frame.
+    row_heights: Vec<f32>,
     /// `(file, hunk, line)` of each `row_tops` entry. Document order makes
     /// this lexicographically sorted, so a row is also findable *by id*. In
     /// side-by-side mode the line component is the pair's *first* member
@@ -412,15 +745,10 @@ struct HeightIndex {
     /// has nothing to mirror, so splitting it would waste half the pane on
     /// padding. Empty in unified mode.
     full_width_files: Vec<bool>,
-    /// Wrap width of one split column's text area; what split-file rows were
-    /// measured against. Equals `unified_text_width` in unified mode.
-    split_text_width: f32,
-    /// Wrap width of the whole text area; what unified-mode and full-width
-    /// rows were measured against.
-    unified_text_width: f32,
-    /// Longest line of the document in chars — the horizontal extent the
-    /// no-wrap mode can scroll across. (Wrap mode never scrolls sideways.)
-    max_line_chars: usize,
+    /// Widest line of the document in columns — the horizontal extent the
+    /// no-wrap mode can scroll across. Left at zero while wrapping, which
+    /// never scrolls sideways.
+    max_columns: f32,
     /// Total content height (revision header + every file).
     total_height: f32,
 }
@@ -428,20 +756,14 @@ struct HeightIndex {
 /// `pair_lines` sentinel: this side of the row has no line (padding).
 const NO_LINE: u32 = u32::MAX;
 
+/// [`HeightIndex::key`] width component for a layout that doesn't depend on
+/// the pane width (no-wrap mode).
+const WIDTH_AGNOSTIC: u32 = u32::MAX;
+
 impl HeightIndex {
     /// True when `file` renders as one full-width column despite split mode.
     fn is_full_width(&self, file: usize) -> bool {
         self.full_width_files.get(file).copied().unwrap_or(false)
-    }
-
-    /// The wrap width `file`'s rows were measured against: one split column
-    /// for split files, the whole text area for unified/full-width ones.
-    fn text_width_for_file(&self, file: usize) -> f32 {
-        if self.is_full_width(file) {
-            self.unified_text_width
-        } else {
-            self.split_text_width
-        }
     }
 
     /// Index into `row_tops`/`row_ids` of the last row starting at or above
@@ -597,6 +919,9 @@ struct State<Paragraph> {
     /// `draw`/`mouse_interaction` only get `&State` but must be able to
     /// (re)build it lazily; borrows are short and never overlap.
     height_index: RefCell<HeightIndex>,
+    /// Memoized per-line geometry (see [`GeometryMemo`]). Same `RefCell`
+    /// reasoning as `height_index`.
+    geometry: RefCell<GeometryMemo>,
 }
 
 /// Stable cursor position inside the diff document. We index by
@@ -635,6 +960,23 @@ fn header_position(line_index: usize, byte: usize) -> TextPosition {
         hunk_index: 0,
         line_index,
         byte,
+    }
+}
+
+/// [`GeometryKey`] of a diff body line at `wrap_width`.
+fn body_geometry_key(
+    file_index: usize,
+    hunk_index: usize,
+    line_index: usize,
+    wrap_width: f32,
+    char_width: f32,
+) -> GeometryKey {
+    GeometryKey {
+        file_index: file_index as u32,
+        hunk_index: hunk_index as u32,
+        line_index: line_index as u32,
+        wrap_width_bits: wrap_width.to_bits(),
+        char_width_bits: char_width.to_bits(),
     }
 }
 
@@ -703,7 +1045,7 @@ struct VisibleRow {
 
 /// One column of the side-by-side layout, or the whole text area in unified
 /// mode (`None`). Selection/find/emphasis passes iterate per lane.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SplitSide {
     Left,
     Right,
@@ -720,6 +1062,20 @@ impl VisibleRow {
             (Some(SplitSide::Left), Some((left, _))) if left != NO_LINE => Some(left as usize),
             (Some(SplitSide::Right), Some((_, right))) if right != NO_LINE => Some(right as usize),
             _ => None,
+        }
+    }
+
+    /// Lowest and highest line index this row shows. A split row's two
+    /// members straddle a range of the hunk's lines, so bracketing a
+    /// document-ordered list against the visible window needs both ends.
+    fn line_bounds(&self) -> (usize, usize) {
+        match self.pair {
+            None => (self.line_index, self.line_index),
+            Some((left, right)) => {
+                let low = left.min(right) as usize;
+                let high = if right == NO_LINE { left } else { right } as usize;
+                (low.min(high), high)
+            }
         }
     }
 }
@@ -1010,8 +1366,7 @@ impl<'a, Message> DiffView<'a, Message> {
         renderer: &mut Renderer,
         line_index: usize,
         text: &str,
-        origin_x: f32,
-        y: f32,
+        origin: Point,
         selection: Option<(TextPosition, TextPosition)>,
     ) where
         Renderer: renderer::Renderer,
@@ -1034,15 +1389,15 @@ impl<'a, Message> DiffView<'a, Message> {
         } else {
             text.len()
         };
-        let start_chars = char_count_at_byte(text, start_byte);
-        let end_chars = char_count_at_byte(text, end_byte);
-        if end_chars > start_chars {
+        if end_byte > start_byte {
+            let geometry = self.measure_line(text, f32::INFINITY);
+            let start_column = geometry.column_at(0, start_byte);
             let cw = self.metrics.char_width;
             self.draw_background(
                 renderer,
-                origin_x + start_chars as f32 * cw,
-                y,
-                (end_chars - start_chars) as f32 * cw,
+                origin.x + start_column * cw,
+                origin.y,
+                (geometry.column_at(0, end_byte) - start_column) * cw,
                 self.metrics.row_height,
                 self.palette.selection,
             );
@@ -1100,14 +1455,25 @@ impl<'a, Message> DiffView<'a, Message> {
     /// Rebuild `cell`'s [`HeightIndex`] if the content shape or wrap width
     /// changed since it was built. One O(total lines) pass per change — every
     /// per-frame query then reads prefix sums instead of re-walking.
-    fn ensure_height_index(&self, cell: &RefCell<HeightIndex>, width: f32) {
+    fn ensure_height_index(
+        &self,
+        cell: &RefCell<HeightIndex>,
+        memo: &RefCell<GeometryMemo>,
+        width: f32,
+    ) {
         // Keyed on the viewport width (not a derived text width): split and
         // full-width rows wrap against different widths, both functions of it.
+        // With wrapping off the layout doesn't depend on the width at all —
+        // see [`WIDTH_AGNOSTIC`].
         let key = Some((
             self.layout_version,
             self.files.len(),
             self.header_height().to_bits() as usize,
-            width.to_bits(),
+            if self.wrap {
+                width.to_bits()
+            } else {
+                WIDTH_AGNOSTIC
+            },
             self.wrap,
             self.side_by_side,
         ));
@@ -1132,20 +1498,22 @@ impl<'a, Message> DiffView<'a, Message> {
         index.hunk_ids.clear();
         index.row_tops.clear();
         index.row_tops.reserve(row_count);
+        index.row_heights.clear();
+        index.row_heights.reserve(row_count);
         index.row_ids.clear();
         index.row_ids.reserve(row_count);
         index.pair_lines.clear();
         if self.side_by_side {
             index.pair_lines.reserve(row_count);
         }
-        index.max_line_chars = 0;
-        index.unified_text_width = self.content_width(width);
-        index.split_text_width = self.effective_text_width(width);
+        index.max_columns = 0.0;
         index.full_width_files = if self.side_by_side {
             self.files.iter().map(Self::file_is_single_sided).collect()
         } else {
             Vec::new()
         };
+        let unified_width = self.wrap_width(self.content_width(width));
+        let split_width = self.wrap_width(self.effective_text_width(width));
 
         let mut y = self.header_height();
         for (file_index, file) in self.files.iter().enumerate() {
@@ -1157,19 +1525,26 @@ impl<'a, Message> DiffView<'a, Message> {
                 index.hunk_ids.push((file_index as u32, hunk_index as u32));
                 y += self.metrics.hunk_header_height;
                 if split_file {
-                    let split_width = index.split_text_width;
                     y = self.push_split_rows(
                         &mut index,
-                        file_index,
-                        hunk_index,
+                        memo,
+                        (file_index, hunk_index),
                         hunk,
                         y,
                         split_width,
                     );
                 } else {
-                    let unified_width = index.unified_text_width;
                     for (line_index, line) in hunk.lines.iter().enumerate() {
+                        let key = body_geometry_key(
+                            file_index,
+                            hunk_index,
+                            line_index,
+                            unified_width,
+                            self.metrics.char_width,
+                        );
+                        let height = self.row_height(memo, key, line, unified_width);
                         index.row_tops.push(y);
+                        index.row_heights.push(height);
                         index.row_ids.push((
                             file_index as u32,
                             hunk_index as u32,
@@ -1183,9 +1558,8 @@ impl<'a, Message> DiffView<'a, Message> {
                                 .pair_lines
                                 .push((line_index as u32, line_index as u32));
                         }
-                        let chars = line.content.chars().count();
-                        index.max_line_chars = index.max_line_chars.max(chars);
-                        y += self.row_height_for_content(&line.content, unified_width);
+                        index.max_columns = index.max_columns.max(self.line_columns(&line.content));
+                        y += height;
                     }
                 }
             }
@@ -1203,8 +1577,8 @@ impl<'a, Message> DiffView<'a, Message> {
     fn push_split_rows(
         &self,
         index: &mut HeightIndex,
-        file_index: usize,
-        hunk_index: usize,
+        memo: &RefCell<GeometryMemo>,
+        (file_index, hunk_index): (usize, usize),
         hunk: &DiffHunkView,
         mut y: f32,
         content_width: f32,
@@ -1212,16 +1586,24 @@ impl<'a, Message> DiffView<'a, Message> {
         let lines = &hunk.lines;
         let mut push = |index: &mut HeightIndex, rep: usize, pair: (u32, u32), height: f32| {
             index.row_tops.push(y);
+            index.row_heights.push(height);
             index
                 .row_ids
                 .push((file_index as u32, hunk_index as u32, rep as u32));
             index.pair_lines.push(pair);
             y += height;
         };
-        let mut max_chars = 0usize;
-        let mut height_of = |this: &Self, line: &DiffLine| {
-            max_chars = max_chars.max(line.content.chars().count());
-            this.row_height_for_content(&line.content, content_width)
+        let mut max_columns = 0.0_f32;
+        let mut height_of = |this: &Self, line_index: usize, line: &DiffLine| {
+            let key = body_geometry_key(
+                file_index,
+                hunk_index,
+                line_index,
+                content_width,
+                this.metrics.char_width,
+            );
+            max_columns = max_columns.max(this.line_columns(&line.content));
+            this.row_height(memo, key, line, content_width)
         };
         let mut i = 0;
         while i < lines.len() {
@@ -1229,13 +1611,13 @@ impl<'a, Message> DiffView<'a, Message> {
                 // An addition run with no deletion run in front of it (those
                 // are consumed below as pairs): new lines only — they belong
                 // to the right column, the left side is padding.
-                let height = height_of(self, &lines[i]);
+                let height = height_of(self, i, &lines[i]);
                 push(&mut *index, i, (NO_LINE, i as u32), height);
                 i += 1;
                 continue;
             }
             if lines[i].kind != DiffLineKind::Deletion {
-                let height = height_of(self, &lines[i]);
+                let height = height_of(self, i, &lines[i]);
                 push(&mut *index, i, (i as u32, i as u32), height);
                 i += 1;
                 continue;
@@ -1257,8 +1639,8 @@ impl<'a, Message> DiffView<'a, Message> {
                 let height = [left, right]
                     .into_iter()
                     .flatten()
-                    .filter_map(|line| lines.get(line))
-                    .map(|line| height_of(self, line))
+                    .filter_map(|line_index| Some((line_index, lines.get(line_index)?)))
+                    .map(|(line_index, line)| height_of(self, line_index, line))
                     .fold(self.metrics.row_height, f32::max);
                 push(
                     &mut *index,
@@ -1271,21 +1653,27 @@ impl<'a, Message> DiffView<'a, Message> {
                 );
             }
         }
-        index.max_line_chars = index.max_line_chars.max(max_chars);
+        index.max_columns = index.max_columns.max(max_columns);
         y
     }
 
     /// True when every line of `file` sits on one side of the diff — all
-    /// additions or all deletions (context and notes appear on both sides,
-    /// so their presence makes the file two-sided). Such a file renders as
-    /// a single full-width column in split mode: there is nothing to mirror,
-    /// and splitting it would waste half the pane on padding.
+    /// additions or all deletions (context appears on both sides, so its
+    /// presence makes the file two-sided). Such a file renders as a single
+    /// full-width column in split mode: there is nothing to mirror, and
+    /// splitting it would waste half the pane on padding.
+    ///
+    /// `Note` lines are skipped rather than counted: `\ No newline at end of
+    /// file` belongs to the line above it, not to a side, and counting it
+    /// made every new file that lacks a trailing newline render split with
+    /// one column fully hatched.
     fn file_is_single_sided(file: &DiffFileView<'_>) -> bool {
         let mut kinds = file
             .hunks
             .iter()
             .flat_map(|hunk| hunk.lines.iter())
-            .map(|line| line.kind);
+            .map(|line| line.kind)
+            .filter(|kind| *kind != DiffLineKind::Note);
         let Some(first) = kinds.next() else {
             return false;
         };
@@ -1349,87 +1737,129 @@ impl<'a, Message> DiffView<'a, Message> {
         }
     }
 
-    fn row_height(&self, line: &DiffLine, content_width: f32) -> f32 {
-        self.row_height_for_content(&line.content, content_width)
+    /// The width a line wraps at: the pane's text width while wrapping,
+    /// unbounded otherwise. The painter shapes a no-wrap line whole and
+    /// clips it, so the geometry has to see all of it too — bounding it here
+    /// would put the break points somewhere the renderer never breaks.
+    fn wrap_width(&self, text_width: f32) -> f32 {
+        if self.wrap { text_width } else { f32::INFINITY }
     }
 
-    fn row_height_for_content(&self, content: &str, content_width: f32) -> f32 {
-        self.wrapped_row_lines(content, content_width) as f32 * self.metrics.row_height
+    /// The width `file`'s rows are laid out against: one split column for a
+    /// split file, the whole text area for unified and full-width ones.
+    fn text_width_for_file(&self, index: &HeightIndex, file: usize, viewport_width: f32) -> f32 {
+        if index.is_full_width(file) {
+            self.content_width(viewport_width)
+        } else {
+            self.effective_text_width(viewport_width)
+        }
     }
 
-    /// Visual lines `content` spans at `content_width`. The fast path — no
-    /// wrapping, or few enough chars to fit — needs no shaping; a line that
-    /// could wrap is measured with the exact shaping the renderer draws with
-    /// (word-first breaks), so reserved heights match painted pixels.
-    fn wrapped_row_lines(&self, content: &str, content_width: f32) -> usize {
-        if !self.wrap
-            || content.chars().count()
-                <= chars_per_visual_line(content_width, self.metrics.char_width)
-        {
+    /// [`LineGeometry`] for one diff row, memoized per (row, width) in
+    /// widget state. Every consumer goes through here, so a row is shaped
+    /// once per width no matter how many of them ask.
+    fn geometry(
+        &self,
+        memo: &RefCell<GeometryMemo>,
+        key: GeometryKey,
+        content: &str,
+        wrap_width: f32,
+    ) -> Rc<LineGeometry> {
+        if let Some(hit) = memo.borrow().0.get(&key) {
+            return Rc::clone(hit);
+        }
+        let geometry = Rc::new(self.measure_line(content, wrap_width));
+        let mut memo = memo.borrow_mut();
+        if memo.0.len() >= GEOMETRY_MEMO_CAP {
+            memo.0.clear();
+        }
+        memo.0.insert(key, Rc::clone(&geometry));
+        geometry
+    }
+
+    /// [`LineGeometry`] for a line the memo doesn't hold: the revision
+    /// header's field values and description. Nothing keys those stably —
+    /// opening the description editor prepends a spacer and renumbers every
+    /// header line — and there are only ever a handful on screen, none of
+    /// which wraps, so they are measured where they are used. An ASCII one
+    /// costs no shaping at all.
+    fn measure_line(&self, content: &str, wrap_width: f32) -> LineGeometry {
+        LineGeometry::measure(
+            content,
+            GeometryParams {
+                size: self.typography.size,
+                font: self.font,
+                row_height: self.metrics.row_height,
+                char_width: self.metrics.char_width,
+                wrap_width,
+            },
+        )
+    }
+
+    /// Visual lines `content` spans at `wrap_width`. A line the cheap
+    /// [`column_bound`] already fits inside the width cannot wrap, so only
+    /// the ones that might are shaped.
+    fn visual_rows(
+        &self,
+        memo: &RefCell<GeometryMemo>,
+        key: GeometryKey,
+        content: &str,
+        wrap_width: f32,
+    ) -> usize {
+        if column_bound(content) * self.metrics.char_width <= wrap_width {
             return 1;
         }
-        measure::wrapped_line_count(
-            content,
-            self.typography.size,
-            self.font,
-            self.metrics.row_height,
-            content_width,
-        )
+        self.geometry(memo, key, content, wrap_width).visual_lines()
     }
 
-    /// Char offset each of `content`'s visual lines starts at (`[0]` when it
-    /// doesn't wrap) — the oracle hit-testing, scroll targets, and highlight
-    /// rects share so their slicing agrees with the renderer's word-first
-    /// break points char-for-char.
-    fn wrap_starts(&self, content: &str, content_width: f32) -> Vec<usize> {
-        if !self.wrap
-            || content.chars().count()
-                <= chars_per_visual_line(content_width, self.metrics.char_width)
-        {
-            return vec![0];
+    fn row_height(
+        &self,
+        memo: &RefCell<GeometryMemo>,
+        key: GeometryKey,
+        line: &DiffLine,
+        wrap_width: f32,
+    ) -> f32 {
+        self.visual_rows(memo, key, &line.content, wrap_width) as f32 * self.metrics.row_height
+    }
+
+    /// Columns `content` occupies unwrapped — the extent the no-wrap mode
+    /// must be able to scroll across. Zero while wrapping, which never
+    /// scrolls sideways, so a wrapped document never pays for it.
+    ///
+    /// [`column_bound`] rather than the engine, because this runs over every
+    /// line of the document. It is exact for ASCII; a line of wide glyphs
+    /// reports a few columns more than it paints, which leaves a little
+    /// empty room past the right end of the longest such line. Measuring
+    /// them exactly would mean shaping a whole document for one number.
+    fn line_columns(&self, content: &str) -> f32 {
+        if self.wrap {
+            return 0.0;
         }
-        measure::wrapped_line_starts(
-            content,
-            self.typography.size,
-            self.font,
-            self.metrics.row_height,
-            content_width,
-        )
+        column_bound(content)
     }
 
-    /// How far the no-wrap mode can scroll sideways: the longest line's
-    /// width beyond the visible text area (plus one char of breathing
+    /// How far the no-wrap mode can scroll sideways: the widest line's
+    /// extent beyond the visible text area (plus one column of breathing
     /// room), zero while wrapping.
     fn max_horizontal(&self, index: &HeightIndex, viewport_width: f32) -> f32 {
         if self.wrap {
             return 0.0;
         }
         let text_width = self.effective_text_width(viewport_width);
-        let content = (index.max_line_chars as f32 + 1.0) * self.metrics.char_width;
+        let content = (index.max_columns + 1.0) * self.metrics.char_width;
         (content - text_width).max(0.0)
     }
 
-    /// Height of index row `row`: the single line's height in unified mode,
-    /// the taller member's in side-by-side. The wrap width comes from the
-    /// index — split columns and full-width files measure differently.
+    /// Height of index row `row` — the taller member's in side-by-side.
+    /// Read off the index rather than re-measured: this is asked for every
+    /// visible row on every frame, and a wrapped row's height costs a
+    /// shaping pass.
     fn index_row_height(&self, index: &HeightIndex, row: usize) -> f32 {
-        let Some(&(file, hunk, line)) = index.row_ids.get(row) else {
-            return self.metrics.row_height;
-        };
-        let content_width = index.text_width_for_file(file as usize);
-        let lines = &self.files[file as usize].hunks[hunk as usize].lines;
-        match index.pair_lines.get(row) {
-            Some(&(left, right)) => [left, right]
-                .into_iter()
-                .filter(|&l| l != NO_LINE)
-                .filter_map(|l| lines.get(l as usize))
-                .map(|line| self.row_height(line, content_width))
-                .fold(self.metrics.row_height, f32::max),
-            None => lines
-                .get(line as usize)
-                .map(|line| self.row_height(line, content_width))
-                .unwrap_or(self.metrics.row_height),
-        }
+        index
+            .row_heights
+            .get(row)
+            .copied()
+            .unwrap_or(self.metrics.row_height)
     }
 
     /// Y position (in content space, before viewport scroll) of the visual
@@ -1439,10 +1869,9 @@ impl<'a, Message> DiffView<'a, Message> {
     fn match_target_y(
         &self,
         index: &HeightIndex,
-        file_idx: usize,
-        hunk_idx: usize,
-        line_idx: usize,
-        byte_offset: usize,
+        memo: &RefCell<GeometryMemo>,
+        viewport_width: f32,
+        (file_idx, hunk_idx, line_idx, byte_offset): (usize, usize, usize, usize),
     ) -> Option<f32> {
         let line = self
             .files
@@ -1457,11 +1886,16 @@ impl<'a, Message> DiffView<'a, Message> {
         // Offset within the wrapped row: figure out which visual line the
         // byte sits on so a match on the 5th wrap row of a 200-char line
         // doesn't scroll to the row top and leave the match off-screen.
-        let content_width = index.text_width_for_file(file_idx);
-        let char_offset = char_count_at_byte(&line.content, byte_offset);
-        let starts = self.wrap_starts(&line.content, content_width);
-        let visual_idx = starts.partition_point(|&start| start <= char_offset) - 1;
-        y += visual_idx as f32 * self.metrics.row_height;
+        let wrap_width = self.wrap_width(self.text_width_for_file(index, file_idx, viewport_width));
+        let key = body_geometry_key(
+            file_idx,
+            hunk_idx,
+            line_idx,
+            wrap_width,
+            self.metrics.char_width,
+        );
+        let geometry = self.geometry(memo, key, &line.content, wrap_width);
+        y += geometry.visual_line_of(byte_offset) as f32 * self.metrics.row_height;
         Some(y)
     }
 
@@ -1470,12 +1904,6 @@ impl<'a, Message> DiffView<'a, Message> {
     /// text area. Returns `None` for clicks on the gutter, file/hunk
     /// headers, or empty space below the last row.
     ///
-    /// Hit-testing assumes a monospace font (see `char_width`); this is
-    /// fine for code text in Menlo/Cascadia Code, but tab characters and
-    /// wide glyphs (CJK, emoji) will land slightly off. We accept that
-    /// trade-off because real glyph hit-testing would require keeping a
-    /// `Paragraph` per visible row alive across the event loop, which iced
-    /// doesn't make easy from a custom widget.
     /// Locate the document position under `point`. Unlike a normal
     /// "click to put cursor here" hit-test this clamps to the nearest valid
     /// row even when the click is in the chrome / below the last row, so
@@ -1488,6 +1916,7 @@ impl<'a, Message> DiffView<'a, Message> {
     fn position_at_point(
         &self,
         index: &HeightIndex,
+        memo: &RefCell<GeometryMemo>,
         point: Point,
         bounds: Rectangle,
         vertical_offset: f32,
@@ -1511,17 +1940,15 @@ impl<'a, Message> DiffView<'a, Message> {
             let line_index = self.header_line_at_y(target_y)?;
             let text = self.header_selectable_text(line_index)?;
             let origin_x = self.header_text_origin_x(line_index, bounds);
-            let char_count = text.chars().count();
-            let relative_x = (point.x - origin_x).max(0.0);
-            let char_offset =
-                ((relative_x / self.metrics.char_width + 0.5).floor() as usize).min(char_count);
+            let geometry = self.measure_line(text, f32::INFINITY);
+            let column = (point.x - origin_x).max(0.0) / self.metrics.char_width;
             return Some((
                 TextPosition {
                     region: Region::Header,
                     file_index: 0,
                     hunk_index: 0,
                     line_index,
-                    byte: byte_offset_for_char(text, char_offset),
+                    byte: geometry.byte_at(0, column),
                 },
                 None,
             ));
@@ -1575,36 +2002,31 @@ impl<'a, Message> DiffView<'a, Message> {
             }
             let line = &self.files[file_index].hunks[hunk_index].lines[line_index];
             let row_top = index.row_tops[row];
-            let content_width = index.text_width_for_file(file_index);
+            let wrap_width =
+                self.wrap_width(self.text_width_for_file(index, file_index, bounds.width));
             let height = self.index_row_height(index, row);
             if target_y < row_top + height {
                 // Each row may span multiple wrapped visual lines. Figure out
-                // which visual line the click lands on, then translate the
-                // horizontal click into a char offset within that visual
-                // line's slice of the source content (its bounds come from
-                // the renderer's own word-first break points).
-                let char_count = line.content.chars().count();
-                let cw = self.metrics.char_width;
-                let starts = self.wrap_starts(&line.content, content_width);
+                // which visual line the click lands on, then ask the geometry
+                // which byte of the source sits at that column — the same
+                // geometry the glyphs were painted from, so the caret lands
+                // where the user aimed even across tabs and wide glyphs.
+                let key = body_geometry_key(
+                    file_index,
+                    hunk_index,
+                    line_index,
+                    wrap_width,
+                    self.metrics.char_width,
+                );
+                let geometry = self.geometry(memo, key, &line.content, wrap_width);
                 let visual_idx = (((target_y - row_top) / self.metrics.row_height).floor()
                     as usize)
-                    .min(starts.len() - 1);
-                let line_char_start = starts[visual_idx];
-                let line_char_end = starts
-                    .get(visual_idx + 1)
-                    .copied()
-                    .unwrap_or(char_count)
-                    .max(line_char_start);
+                    .min(geometry.visual_lines() - 1);
                 // The text is drawn shifted left by the horizontal scroll;
-                // shift the cursor the other way to land on the same char.
-                let relative_x = (point.x - text_x + horizontal_offset).max(0.0);
-                let local_char = (relative_x / cw + 0.5).floor() as usize;
-                // Clamp into this visual line so overshooting its trailing
-                // edge selects to its end, not into the line below.
-                let char_offset = (line_char_start + local_char)
-                    .min(line_char_end)
-                    .min(char_count);
-                let byte = byte_offset_for_char(&line.content, char_offset);
+                // shift the cursor the other way to land on the same glyph.
+                let column =
+                    (point.x - text_x + horizontal_offset).max(0.0) / self.metrics.char_width;
+                let byte = geometry.byte_at(visual_idx, column);
                 return Some((
                     TextPosition {
                         region: Region::Body,
@@ -1781,36 +2203,21 @@ impl<'a, Message> DiffView<'a, Message> {
                 - render.horizontal_offset,
             render.y + self.metrics.text_y_pad,
         );
+        let wrap_width = self.wrap_width(render.content_width);
 
-        // Glyph wrapping (hard column break) instead of `WordOrGlyph`
-        // so the renderer's wrap points match our chars-per-line column
-        // math exactly. Word-aware wrapping breaks at spaces, which means
-        // each visual line ends at a different column than the math
-        // predicts — and that's what made selection rectangles on wrapped
-        // code drift before/after the true text on the last visual line.
-        // For monospaced source code, glyph wrapping is also visually
-        // tighter (no ragged whitespace gaps on the right edge). With wrap
-        // off, rows are one visual line and clip at the pane edge instead.
         self.draw_code_text(
             renderer,
             line,
             TextRenderParams {
                 // No-wrap shaping must not be bounded by the pane, or the
-                // scrolled-into tail of a long line would never be laid out.
-                width: if self.wrap {
-                    render.content_width
-                } else {
-                    f32::INFINITY
-                },
+                // scrolled-into tail of a long line would never be laid out —
+                // which is why the geometry measures against the same width.
+                width: wrap_width,
                 height: render.height,
                 position,
                 color: text_color,
                 clip_bounds: render.content_clip_bounds,
-                wrapping: if self.wrap {
-                    text::Wrapping::WordOrGlyph
-                } else {
-                    text::Wrapping::None
-                },
+                wrapping: wrapping_for(wrap_width),
             },
             cache_key,
             paragraph_cache,
@@ -1825,35 +2232,50 @@ impl<'a, Message> DiffView<'a, Message> {
         &self,
         renderer: &mut Renderer,
         find: &FindOverlay<'_>,
+        memo: &RefCell<GeometryMemo>,
         visible_rows: &[VisibleRow],
-        bounds: Rectangle,
-        split: Option<&SplitLayout>,
-        horizontal_offset: f32,
+        lanes: &[(HighlightGeometry, Option<SplitSide>)],
     ) where
         Renderer: renderer::Renderer,
     {
-        if find.matches.is_empty() {
+        // Matches arrive in document order, so the ones that can land on the
+        // visible rows are one contiguous slice. Bracketing it once turns the
+        // pass from lanes × rows × *every* match in the document (a `\w`
+        // regex over a large diff runs to hundreds of thousands) into lanes ×
+        // rows × the handful actually on screen.
+        let (Some(first), Some(last)) = (visible_rows.first(), visible_rows.last()) else {
+            return;
+        };
+        let window = matches_between(
+            find.matches,
+            (first.file_index, first.hunk_index, first.line_bounds().0),
+            (last.file_index, last.hunk_index, last.line_bounds().1),
+        );
+        let visible = &find.matches[window.clone()];
+        if visible.is_empty() {
             return;
         }
 
-        // Single pass over visible rows; for each, find matches landing on
-        // it. With small numbers of matches per row this is fine; for
-        // pathological cases (e.g. a `\w` regex with thousands of hits) we
-        // could pre-sort matches by row and binary-search, but typical
-        // queries match a few dozen times max.
-        for (geometry, lane) in self.lane_geometries(bounds, split, horizontal_offset) {
+        for (lane_geometry, lane) in lanes {
             for row in visible_rows {
-                let Some(line_index) = row.line_in_lane(lane) else {
+                let Some(line_index) = row.line_in_lane(*lane) else {
                     continue;
                 };
                 let line = &self.files[row.file_index].hunks[row.hunk_index].lines[line_index];
-                for (match_idx, m) in find.matches.iter().enumerate() {
-                    if m.file_index != row.file_index
-                        || m.hunk_index != row.hunk_index
-                        || m.line_index != line_index
-                    {
-                        continue;
-                    }
+                let (offset, hits) =
+                    matches_on_line(visible, (row.file_index, row.hunk_index, line_index));
+                if hits.is_empty() {
+                    continue;
+                }
+                let key = body_geometry_key(
+                    row.file_index,
+                    row.hunk_index,
+                    line_index,
+                    lane_geometry.wrap_width,
+                    lane_geometry.char_width,
+                );
+                let geometry = self.geometry(memo, key, &line.content, lane_geometry.wrap_width);
+                for (i, m) in hits.iter().enumerate() {
                     if !line.content.is_char_boundary(m.byte_start)
                         || !line
                             .content
@@ -1861,20 +2283,21 @@ impl<'a, Message> DiffView<'a, Message> {
                     {
                         continue;
                     }
-                    let color = if find.active == Some(match_idx) {
+                    let color = if find.active == Some(window.start + offset + i) {
                         find.active_highlight
                     } else {
                         find.highlight
                     };
                     self.draw_byte_range_highlight(
                         renderer,
-                        &line.content,
+                        &geometry,
                         row.y,
                         m.byte_start,
                         m.byte_end,
                         color,
                         EMPHASIS_CORNER_RADIUS,
-                        &geometry,
+                        0.0,
+                        lane_geometry,
                     );
                 }
             }
@@ -1887,16 +2310,15 @@ impl<'a, Message> DiffView<'a, Message> {
     fn draw_emphasis_highlights<Renderer>(
         &self,
         renderer: &mut Renderer,
+        memo: &RefCell<GeometryMemo>,
         visible_rows: &[VisibleRow],
-        bounds: Rectangle,
-        split: Option<&SplitLayout>,
-        horizontal_offset: f32,
+        lanes: &[(HighlightGeometry, Option<SplitSide>)],
     ) where
         Renderer: renderer::Renderer,
     {
-        for (geometry, lane) in self.lane_geometries(bounds, split, horizontal_offset) {
+        for (lane_geometry, lane) in lanes {
             for row in visible_rows {
-                let Some(line_index) = row.line_in_lane(lane) else {
+                let Some(line_index) = row.line_in_lane(*lane) else {
                     continue;
                 };
                 let line = &self.files[row.file_index].hunks[row.hunk_index].lines[line_index];
@@ -1908,16 +2330,25 @@ impl<'a, Message> DiffView<'a, Message> {
                     DiffLineKind::Deletion => self.palette.deletion_emphasis,
                     _ => continue,
                 };
+                let key = body_geometry_key(
+                    row.file_index,
+                    row.hunk_index,
+                    line_index,
+                    lane_geometry.wrap_width,
+                    lane_geometry.char_width,
+                );
+                let geometry = self.geometry(memo, key, &line.content, lane_geometry.wrap_width);
                 for &(byte_start, byte_end) in &line.emphasis {
                     self.draw_byte_range_highlight(
                         renderer,
-                        &line.content,
+                        &geometry,
                         row.y,
                         byte_start,
                         byte_end,
                         color,
                         EMPHASIS_CORNER_RADIUS,
-                        &geometry,
+                        0.0,
+                        lane_geometry,
                     );
                 }
             }
@@ -1939,7 +2370,7 @@ impl<'a, Message> DiffView<'a, Message> {
         let unified = (
             HighlightGeometry {
                 char_width: self.metrics.char_width,
-                content_width: self.content_width(bounds.width),
+                wrap_width: self.wrap_width(self.content_width(bounds.width)),
                 text_x: bounds.x + self.metrics.gutter_width + PREFIX_WIDTH + TEXT_X_PADDING
                     - horizontal_offset,
                 clip_left: bounds.x + self.metrics.gutter_width + PREFIX_WIDTH,
@@ -1953,7 +2384,7 @@ impl<'a, Message> DiffView<'a, Message> {
         };
         let lane = |text_x: f32, clip_left: f32, clip_right: f32| HighlightGeometry {
             char_width: self.metrics.char_width,
-            content_width: split.text_width,
+            wrap_width: self.wrap_width(split.text_width),
             text_x,
             clip_left,
             clip_right,
@@ -2099,6 +2530,7 @@ impl<'a, Message> DiffView<'a, Message> {
         Renderer: text::Renderer<Font = Font>,
     {
         let content_width_bits = content_width.to_bits();
+        let wrap_width = self.wrap_width(content_width);
         let lines = &self.files[row.file_index].hunks[row.hunk_index].lines;
         let sides = [
             (
@@ -2173,11 +2605,7 @@ impl<'a, Message> DiffView<'a, Message> {
                 line,
                 TextRenderParams {
                     // See `draw_row`: unbounded shaping in no-wrap mode.
-                    width: if self.wrap {
-                        content_width
-                    } else {
-                        f32::INFINITY
-                    },
+                    width: wrap_width,
                     height: row.height,
                     position: Point::new(
                         bounds.x + text_x - horizontal_offset,
@@ -2185,11 +2613,7 @@ impl<'a, Message> DiffView<'a, Message> {
                     ),
                     color: text_color,
                     clip_bounds: clip,
-                    wrapping: if self.wrap {
-                        text::Wrapping::Glyph
-                    } else {
-                        text::Wrapping::None
-                    },
+                    wrapping: wrapping_for(wrap_width),
                 },
                 ParagraphKey {
                     file_index: row.file_index as u32,
@@ -2203,64 +2627,65 @@ impl<'a, Message> DiffView<'a, Message> {
         }
     }
 
-    /// Paint translucent rectangles behind `content[byte_start..byte_end]`,
-    /// one per visual sub-line the range crosses on a wrapped row. The char
-    /// math mirrors `row_height`/hit-testing (glyph wrapping at a fixed
-    /// column), which is what keeps the rects glued to the glyphs.
+    /// Paint translucent rectangles behind `[byte_start, byte_end)` of a
+    /// line, one per visual sub-line the range crosses on a wrapped row.
+    /// Columns come from the row's [`LineGeometry`] — the measurement the
+    /// glyphs themselves were laid out from — which is what keeps the rects
+    /// glued to the text across tabs and glyphs wider than a cell.
+    ///
+    /// `tail` widens the row's last rectangle: the "selected through the end
+    /// of the line" cue a selection spanning the whole row draws, and which
+    /// belongs on the trailing visual line only.
     #[allow(clippy::too_many_arguments)]
     fn draw_byte_range_highlight<Renderer>(
         &self,
         renderer: &mut Renderer,
-        content: &str,
+        line: &LineGeometry,
         row_y: f32,
         byte_start: usize,
         byte_end: usize,
         color: Color,
         corner_radius: f32,
-        geometry: &HighlightGeometry,
+        tail: f32,
+        lane: &HighlightGeometry,
     ) where
         Renderer: renderer::Renderer,
     {
-        let start_chars = char_count_at_byte(content, byte_start);
-        let end_chars = char_count_at_byte(content, byte_end.min(content.len()));
-        if start_chars >= end_chars {
+        if byte_start >= byte_end {
             return;
         }
-        let total_chars = content.chars().count();
-        let starts = self.wrap_starts(content, geometry.content_width);
-        for visual_idx in 0..starts.len() {
-            let vline_start = starts[visual_idx];
-            let vline_end = starts
-                .get(visual_idx + 1)
-                .copied()
-                .unwrap_or(total_chars)
-                .max(vline_start);
-            let seg_start = start_chars.max(vline_start);
-            let seg_end = end_chars.min(vline_end);
+        for visual_idx in 0..line.visual_lines() {
+            let (vline_start, vline_end) = line.line_range(visual_idx);
+            let seg_start = byte_start.max(vline_start);
+            let seg_end = byte_end.min(vline_end);
             if seg_start >= seg_end {
                 continue;
             }
-            let mut x = geometry.text_x + (seg_start - vline_start) as f32 * geometry.char_width;
-            let mut width = (seg_end - seg_start) as f32 * geometry.char_width;
-            if x < geometry.clip_left {
-                let trim = geometry.clip_left - x;
-                x = geometry.clip_left;
+            let start_column = line.column_at(visual_idx, seg_start);
+            let mut x = lane.text_x + start_column * lane.char_width;
+            let mut width = (line.column_at(visual_idx, seg_end) - start_column) * lane.char_width;
+            if visual_idx + 1 == line.visual_lines() {
+                width += tail;
+            }
+            if x < lane.clip_left {
+                let trim = lane.clip_left - x;
+                x = lane.clip_left;
                 width = (width - trim).max(0.0);
             }
-            if x + width > geometry.clip_right {
-                width = (geometry.clip_right - x).max(0.0);
+            if x + width > lane.clip_right {
+                width = (lane.clip_right - x).max(0.0);
             }
             if width <= 0.0 {
                 continue;
             }
-            let y = row_y + visual_idx as f32 * geometry.row_height;
+            let y = row_y + visual_idx as f32 * lane.row_height;
             renderer.fill_quad(
                 renderer::Quad {
                     bounds: Rectangle {
                         x,
                         y,
                         width,
-                        height: geometry.row_height,
+                        height: lane.row_height,
                     },
                     border: Border {
                         radius: corner_radius.into(),
@@ -2279,7 +2704,6 @@ impl<'a, Message> DiffView<'a, Message> {
         renderer: &mut Renderer,
         bounds: Rectangle,
         visible_top: f32,
-        header_height: f32,
         selection: Option<(TextPosition, TextPosition)>,
         show_description_edit: bool,
     ) where
@@ -2287,6 +2711,7 @@ impl<'a, Message> DiffView<'a, Message> {
     {
         // Header occupies content_y in `[0, header_height)`. Translate to
         // screen coords for the section that intersects the viewport.
+        let header_height = self.header_height();
         let header_screen_y = bounds.y - visible_top;
 
         // Tint the strip so the header reads as distinct chrome.
@@ -2346,7 +2771,11 @@ impl<'a, Message> DiffView<'a, Message> {
                         },
                     );
                     self.draw_header_value_selection(
-                        renderer, line_index, value, value_x, y, selection,
+                        renderer,
+                        line_index,
+                        value,
+                        Point::new(value_x, y),
+                        selection,
                     );
                     self.draw_text(
                         renderer,
@@ -2395,7 +2824,11 @@ impl<'a, Message> DiffView<'a, Message> {
                     // the hit-test/selection origin line up.
                     let desc_x = left_x + HEADER_DESCRIPTION_INDENT * self.metrics.char_width;
                     self.draw_header_value_selection(
-                        renderer, line_index, line, desc_x, y, selection,
+                        renderer,
+                        line_index,
+                        line,
+                        Point::new(desc_x, y),
+                        selection,
                     );
                     self.draw_text(
                         renderer,
@@ -2492,6 +2925,7 @@ where
             hovered_browse: None,
             hovered_description: false,
             height_index: RefCell::new(HeightIndex::default()),
+            geometry: RefCell::new(GeometryMemo::default()),
         })
     }
 
@@ -2525,6 +2959,7 @@ where
         if self.content_version != state.last_content_version {
             state.last_content_version = self.content_version;
             state.paragraph_cache.borrow_mut().clear();
+            state.geometry.borrow_mut().0.clear();
         }
 
         // Theme switch: the cached paragraphs carry the old theme's span
@@ -2562,6 +2997,7 @@ where
             // Cache entries are keyed by (file, hunk, line) which now
             // points at different content.
             state.paragraph_cache.borrow_mut().clear();
+            state.geometry.borrow_mut().0.clear();
             return;
         }
 
@@ -2613,7 +3049,7 @@ where
         let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
         // (Re)build the layout index up front: every height/position read this
         // pass — and the following `draw` — is a prefix-sum lookup against it.
-        self.ensure_height_index(&state.height_index, bounds.width);
+        self.ensure_height_index(&state.height_index, &state.geometry, bounds.width);
         let content_height = state.height_index.borrow().total_height;
         // Offset on entry; compared on the way out so any change this pass
         // (wheel, scrollbar, file jump, find, restore, clamp) is reported once
@@ -2631,11 +3067,12 @@ where
             shell.request_redraw();
         }
 
-        if let Some(file_index) = state
-            .pending_file_jump
-            .take()
-            .or_else(|| (state.selected_file != self.selected_file).then_some(self.selected_file))
-        {
+        // `diff()` already schedules the jump when the caller's selected file
+        // moves. Re-deriving it here from `self.selected_file` snapped the
+        // viewport back to a file header whenever a scroll and a selection
+        // landed in the same batch — the scroll had already published the new
+        // file, but this pass still saw the old `state.selected_file`.
+        if let Some(file_index) = state.pending_file_jump.take() {
             // For file 0, scroll to the very top so the revision header stays
             // visible — `file_offset(0)` equals `header_height()`, which would
             // park the file's content header right at the top and hide the
@@ -2653,7 +3090,12 @@ where
         if let Some((file_idx, hunk_idx, line_idx, byte_offset)) = state.pending_find_scroll.take()
             && let Some(target) = {
                 let index = state.height_index.borrow();
-                self.match_target_y(&index, file_idx, hunk_idx, line_idx, byte_offset)
+                self.match_target_y(
+                    &index,
+                    &state.geometry,
+                    bounds.width,
+                    (file_idx, hunk_idx, line_idx, byte_offset),
+                )
             }
         {
             // Center the row in the viewport when there's room; clamp
@@ -2671,8 +3113,17 @@ where
                     .and_then(|file| file.hunks.get(hunk_idx))
                     .and_then(|hunk| hunk.lines.get(line_idx))
             {
-                let match_x =
-                    char_count_at_byte(&line.content, byte_offset) as f32 * self.metrics.char_width;
+                let key = body_geometry_key(
+                    file_idx,
+                    hunk_idx,
+                    line_idx,
+                    f32::INFINITY,
+                    self.metrics.char_width,
+                );
+                let match_x = self
+                    .geometry(&state.geometry, key, &line.content, f32::INFINITY)
+                    .column_at(0, byte_offset)
+                    * self.metrics.char_width;
                 let text_width = self.effective_text_width(bounds.width);
                 let off_screen = match_x < state.horizontal_offset
                     || match_x > state.horizontal_offset + text_width - self.metrics.char_width;
@@ -2894,6 +3345,7 @@ where
                     let index = state.height_index.borrow();
                     self.position_at_point(
                         &index,
+                        &state.geometry,
                         point,
                         bounds,
                         state.vertical_offset,
@@ -3081,7 +3533,7 @@ where
         let split = self.side_by_side.then(|| self.split_layout(bounds.width));
         // Normally a no-op — `update` ran first and built it — but draw must
         // not rely on event ordering for correctness.
-        self.ensure_height_index(&state.height_index, bounds.width);
+        self.ensure_height_index(&state.height_index, &state.geometry, bounds.width);
         let height_index = state.height_index.borrow();
         // Keys touched this frame; entries not in this set get evicted
         // at the end so the cache doesn't grow unbounded as the user
@@ -3346,13 +3798,10 @@ where
                 self.draw_split_row_tints(renderer, &visible_rows, split, bounds);
             }
 
-            self.draw_emphasis_highlights(
-                renderer,
-                &visible_rows,
-                bounds,
-                split.as_ref(),
-                horizontal_offset,
-            );
+            // One lane list for the frame: the emphasis, selection and find
+            // passes all walk the same columns.
+            let lanes = self.lane_geometries(bounds, split.as_ref(), horizontal_offset);
+            self.draw_emphasis_highlights(renderer, &state.geometry, &visible_rows, &lanes);
 
             let selection_range = match (state.selection_anchor, state.selection_focus) {
                 (Some(anchor), Some(focus)) if anchor != focus => Some(ordered(anchor, focus)),
@@ -3364,7 +3813,6 @@ where
                     renderer,
                     bounds,
                     visible_top,
-                    header_height,
                     selection_range,
                     state.hovered_description,
                 );
@@ -3426,21 +3874,18 @@ where
             if let (Some(anchor), Some(focus)) = (state.selection_anchor, state.selection_focus) {
                 let (sel_start, sel_end) = ordered(anchor, focus);
                 if sel_start != sel_end {
-                    let visual_line_height = self.metrics.row_height;
-                    for (geometry, lane) in
-                        self.lane_geometries(bounds, split.as_ref(), horizontal_offset)
-                    {
+                    for (lane_geometry, lane) in &lanes {
                         // A side-by-side selection lives in one column; the
                         // mirror column shows no highlight even where it
                         // carries the same (context) line.
-                        if let (Some(sel_lane), Some(lane_side)) = (state.selection_lane, lane)
+                        if let (Some(sel_lane), Some(lane_side)) = (state.selection_lane, *lane)
                             && sel_lane != lane_side
                         {
                             continue;
                         }
-                        let cw = geometry.char_width;
+                        let cw = lane_geometry.char_width;
                         for row in &visible_rows {
-                            let Some(line_index) = row.line_in_lane(lane) else {
+                            let Some(line_index) = row.line_in_lane(*lane) else {
                                 continue;
                             };
                             let line =
@@ -3467,76 +3912,41 @@ where
                             } else {
                                 line.content.len()
                             };
-                            let start_chars = char_count_at_byte(&line.content, line_start_byte);
-                            let end_chars = char_count_at_byte(&line.content, line_end_byte);
-                            let total_chars = line.content.chars().count();
+                            // A row selected end to end shows a short tail
+                            // past its last glyph — the usual cue that the
+                            // line break is part of the selection.
                             let is_full_line = sel_start <= row_pos_start && row_pos_end < sel_end;
-
-                            // Walk each visual sub-line the row contains and
-                            // intersect the selection char range with it. Without
-                            // this loop a wrapped row would render a single full-
-                            // width rectangle across every visual line, ignoring
-                            // where the selection actually starts and ends. The
-                            // sub-line bounds come from the renderer's own
-                            // word-first break points.
-                            let starts = self.wrap_starts(&line.content, geometry.content_width);
-                            let visual_lines = starts.len();
-                            for visual_idx in 0..visual_lines {
-                                let vline_start = starts[visual_idx];
-                                let vline_end = starts
-                                    .get(visual_idx + 1)
-                                    .copied()
-                                    .unwrap_or(total_chars)
-                                    .max(vline_start);
-                                let seg_start = start_chars.max(vline_start);
-                                let seg_end = end_chars.min(vline_end);
-                                if seg_start >= seg_end {
-                                    continue;
-                                }
-                                let mut x = geometry.text_x + (seg_start - vline_start) as f32 * cw;
-                                let mut width = (seg_end - seg_start) as f32 * cw;
-                                // The "select through end-of-line" tail only
-                                // belongs on the trailing visual line of a full
-                                // logical row, not on every wrapped segment.
-                                let is_trailing_visual = visual_idx + 1 == visual_lines;
-                                if is_full_line && is_trailing_visual {
-                                    width += cw * 0.6;
-                                }
-                                if x < geometry.clip_left {
-                                    let trim = geometry.clip_left - x;
-                                    x = geometry.clip_left;
-                                    width = (width - trim).max(0.0);
-                                }
-                                if x + width > geometry.clip_right {
-                                    width = (geometry.clip_right - x).max(0.0);
-                                }
-                                if width <= 0.0 {
-                                    continue;
-                                }
-                                let y = row.y + visual_idx as f32 * visual_line_height;
-                                self.draw_background(
-                                    renderer,
-                                    x,
-                                    y,
-                                    width,
-                                    visual_line_height,
-                                    self.palette.selection,
-                                );
-                            }
+                            let key = body_geometry_key(
+                                row.file_index,
+                                row.hunk_index,
+                                line_index,
+                                lane_geometry.wrap_width,
+                                cw,
+                            );
+                            let geometry = self.geometry(
+                                &state.geometry,
+                                key,
+                                &line.content,
+                                lane_geometry.wrap_width,
+                            );
+                            self.draw_byte_range_highlight(
+                                renderer,
+                                &geometry,
+                                row.y,
+                                line_start_byte,
+                                line_end_byte,
+                                self.palette.selection,
+                                0.0,
+                                if is_full_line { cw * 0.6 } else { 0.0 },
+                                lane_geometry,
+                            );
                         }
                     }
                 }
             }
 
             if let Some(find) = &self.find {
-                self.draw_find_highlights(
-                    renderer,
-                    find,
-                    &visible_rows,
-                    bounds,
-                    split.as_ref(),
-                    horizontal_offset,
-                );
+                self.draw_find_highlights(renderer, find, &state.geometry, &visible_rows, &lanes);
             }
 
             let unified_width_bits = unified_width.to_bits();
@@ -3633,7 +4043,7 @@ where
             return mouse::Interaction::None;
         };
         let state = tree.state.downcast_ref::<State<Renderer::Paragraph>>();
-        self.ensure_height_index(&state.height_index, bounds.width);
+        self.ensure_height_index(&state.height_index, &state.geometry, bounds.width);
         let content_height = state.height_index.borrow().total_height;
         if scrollbar::is_dragging(&state.scrollbar)
             || scrollbar::hits_container(bounds, point, content_height)
@@ -3822,6 +4232,7 @@ impl<Message> DiffView<'_, Message> {
             let index = state.height_index.borrow();
             self.position_at_point(
                 &index,
+                &state.geometry,
                 cursor_pos,
                 bounds,
                 state.vertical_offset,
@@ -3882,7 +4293,11 @@ impl<Message> DiffView<'_, Message> {
             font: self.font,
             align_x: text::Alignment::Left,
             align_y: alignment::Vertical::Top,
-            shaping: text::Shaping::Basic,
+            // `Auto` keeps the cheap `Basic` path for ASCII and shapes
+            // anything else with font fallback. Under `Basic` a line of CJK,
+            // Cyrillic, emoji or box-drawing arrows rendered as a row of
+            // tofu, because the code font alone has no coverage for it.
+            shaping: text::Shaping::Auto,
             wrapping,
             ellipsis: text::Ellipsis::None,
             hint_factor: None,
@@ -4211,7 +4626,9 @@ impl<Message> DiffView<'_, Message> {
                 font: self.font,
                 align_x: text::Alignment::Left,
                 align_y: alignment::Vertical::Top,
-                shaping: text::Shaping::Basic,
+                // See `make_text`: `Basic` renders anything the code font
+                // doesn't cover as tofu.
+                shaping: text::Shaping::Auto,
                 wrapping: render.wrapping,
                 ellipsis: text::Ellipsis::None,
                 hint_factor: None,
@@ -4290,13 +4707,6 @@ impl<Message> DiffView<'_, Message> {
     }
 }
 
-/// How many characters fit on one visual line at the current monospace
-/// glyph advance. Mirrors `row_height`'s wrap-count math so hit-tests and
-/// selection geometry stay consistent with the way rows are laid out.
-fn chars_per_visual_line(content_width: f32, cw: f32) -> usize {
-    (content_width / cw.max(1.0)).floor().max(1.0) as usize
-}
-
 /// Per-column x-offsets of the side-by-side layout, relative to the pane's
 /// left edge. See `DiffView::split_layout`. (The left gutter sits at 0.)
 struct SplitLayout {
@@ -4313,13 +4723,39 @@ struct SplitLayout {
 /// row to screen rectangles.
 struct HighlightGeometry {
     char_width: f32,
-    /// Wrap width the lane's rows were measured against — what
-    /// `draw_wrapped_highlight` derives each line's break points from.
-    content_width: f32,
+    /// Wrap width the lane's rows were laid out against — the key their
+    /// [`LineGeometry`] is measured and memoized under.
+    wrap_width: f32,
     text_x: f32,
     clip_left: f32,
     clip_right: f32,
     row_height: f32,
+}
+
+/// A find match's position in document order.
+fn match_id(m: &FindMatch) -> (usize, usize, usize) {
+    (m.file_index, m.hunk_index, m.line_index)
+}
+
+/// The slice of document-ordered `matches` that can land on the lines
+/// `first..=last` — the visible window, found by two binary searches instead
+/// of a scan over every match in the diff.
+fn matches_between(
+    matches: &[FindMatch],
+    first: (usize, usize, usize),
+    last: (usize, usize, usize),
+) -> std::ops::Range<usize> {
+    let start = matches.partition_point(|m| match_id(m) < first);
+    let end = matches.partition_point(|m| match_id(m) <= last);
+    start..end.max(start)
+}
+
+/// The run of `matches` sitting on exactly `line`, and where in `matches` it
+/// starts (the caller needs the index back to spot the active match).
+fn matches_on_line(matches: &[FindMatch], line: (usize, usize, usize)) -> (usize, &[FindMatch]) {
+    let start = matches.partition_point(|m| match_id(m) < line);
+    let end = start + matches[start..].partition_point(|m| match_id(m) == line);
+    (start, &matches[start..end])
 }
 
 fn push_visible_band(bands: &mut Vec<VisibleBand>, kind: DiffLineKind, y: f32, height: f32) {
@@ -4406,34 +4842,8 @@ fn compute_gutter_digit_count(files: &[DiffFileView<'_>]) -> usize {
     digits(max_line).max(3)
 }
 
-fn char_count_at_byte(content: &str, byte: usize) -> usize {
-    let cap = byte.min(content.len());
-    content
-        .char_indices()
-        .take_while(|(idx, _)| *idx < cap)
-        .count()
-}
-
 fn ordered(a: TextPosition, b: TextPosition) -> (TextPosition, TextPosition) {
     if a <= b { (a, b) } else { (b, a) }
-}
-
-/// Translate a character index inside `content` to a byte offset, clamped
-/// to the string length. Used so the click-to-position logic can store
-/// byte offsets (cheap to slice) while the hit-test math operates in chars
-/// (which is what monospace `x / char_width` gives us).
-fn byte_offset_for_char(content: &str, char_index: usize) -> usize {
-    if char_index == 0 {
-        return 0;
-    }
-    let mut bytes = 0;
-    for (i, ch) in content.chars().enumerate() {
-        if i == char_index {
-            return bytes;
-        }
-        bytes += ch.len_utf8();
-    }
-    bytes.min(content.len())
 }
 
 fn is_copy_shortcut(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> bool {
@@ -4551,9 +4961,9 @@ fn measure_char_advance_cached(font: Font, text_size: f32) -> f32 {
 fn measure_char_advance(font: Font, text_size: f32) -> f32 {
     // "M" is a stable choice for monospace measurement: it dominates hinting
     // noise at small sizes. For monospace fonts the width of one char *is*
-    // the advance, which is what we cache here. `Shaping::Basic` matches how
+    // the advance, which is what we cache here. `Shaping::Auto` matches how
     // the grid draws its rows.
-    measure::line_width_shaped("M", text_size, font, text::Shaping::Basic)
+    measure::line_width_shaped("M", text_size, font, text::Shaping::Auto)
 }
 
 fn digits(n: usize) -> usize {
@@ -4738,24 +5148,47 @@ mod tests {
         )
     }
 
+    /// The two caches the widget keeps in its `State`, so a headless test
+    /// can drive the layout the way `update`/`draw` do.
+    #[derive(Default)]
+    pub(super) struct TestCaches {
+        pub(super) index: RefCell<HeightIndex>,
+        pub(super) geometry: RefCell<GeometryMemo>,
+    }
+
     /// Brute-force row walk mirroring the pre-index geometry, used as the
     /// oracle the prefix sums must agree with.
-    fn brute_force_tops(view: &DiffView<'_, ()>, content_width: f32) -> (Vec<f32>, Vec<f32>, f32) {
+    fn brute_force_tops(
+        view: &DiffView<'_, ()>,
+        content_width: f32,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>, f32) {
+        let memo = RefCell::new(GeometryMemo::default());
+        let wrap_width = view.wrap_width(content_width);
         let mut file_tops = Vec::new();
         let mut row_tops = Vec::new();
+        let mut row_heights = Vec::new();
         let mut y = view.header_height();
-        for file in &view.files {
+        for (file_index, file) in view.files.iter().enumerate() {
             file_tops.push(y);
             y += view.metrics.file_header_height;
-            for hunk in file.hunks {
+            for (hunk_index, hunk) in file.hunks.iter().enumerate() {
                 y += view.metrics.hunk_header_height;
-                for l in &hunk.lines {
+                for (line_index, l) in hunk.lines.iter().enumerate() {
+                    let key = body_geometry_key(
+                        file_index,
+                        hunk_index,
+                        line_index,
+                        wrap_width,
+                        view.metrics.char_width,
+                    );
+                    let height = view.row_height(&memo, key, l, wrap_width);
                     row_tops.push(y);
-                    y += view.row_height(l, content_width);
+                    row_heights.push(height);
+                    y += height;
                 }
             }
         }
-        (file_tops, row_tops, y)
+        (file_tops, row_tops, row_heights, y)
     }
 
     #[test]
@@ -4765,14 +5198,15 @@ mod tests {
         let width = 400.0;
         let content_width = view.content_width(width);
 
-        let cell = RefCell::new(HeightIndex::default());
-        view.ensure_height_index(&cell, width);
-        let index = cell.borrow();
+        let cells = TestCaches::default();
+        view.ensure_height_index(&cells.index, &cells.geometry, width);
+        let index = cells.index.borrow();
 
-        let (file_tops, row_tops, total) = brute_force_tops(&view, content_width);
+        let (file_tops, row_tops, row_heights, total) = brute_force_tops(&view, content_width);
         assert_eq!(&index.file_tops[..file_tops.len()], file_tops.as_slice());
         assert_eq!(index.file_tops.last().copied(), Some(total));
         assert_eq!(index.row_tops, row_tops);
+        assert_eq!(index.row_heights, row_heights);
         assert_eq!(index.total_height, total);
         // The long line wraps: its row is taller than one row height, so the
         // following row's top reflects the wrap.
@@ -4789,7 +5223,12 @@ mod tests {
         // Row lookup by id and by y agree with the walk.
         for (i, &(f, h, l)) in index.row_ids.iter().enumerate() {
             assert_eq!(
-                view.match_target_y(&index, f as usize, h as usize, l as usize, 0),
+                view.match_target_y(
+                    &index,
+                    &cells.geometry,
+                    width,
+                    (f as usize, h as usize, l as usize, 0)
+                ),
                 Some(index.row_tops[i]),
             );
             assert_eq!(index.row_at(index.row_tops[i] + 0.5), Some(i));
@@ -4803,27 +5242,37 @@ mod tests {
     fn height_index_rebuilds_on_shape_or_width_change() {
         let hunks = test_hunks();
         let mut view = test_view(&hunks);
-        let cell = RefCell::new(HeightIndex::default());
+        let cells = TestCaches::default();
 
-        view.ensure_height_index(&cell, 400.0);
-        let narrow_total = cell.borrow().total_height;
-        let narrow_key = cell.borrow().key;
+        view.ensure_height_index(&cells.index, &cells.geometry, 400.0);
+        let narrow_total = cells.index.borrow().total_height;
+        let narrow_key = cells.index.borrow().key;
 
         // Wider viewport: the 500-char line wraps fewer times, so the total
         // shrinks and the key changes.
-        view.ensure_height_index(&cell, 4000.0);
-        assert_ne!(cell.borrow().key, narrow_key);
-        assert!(cell.borrow().total_height < narrow_total);
+        view.ensure_height_index(&cells.index, &cells.geometry, 4000.0);
+        assert_ne!(cells.index.borrow().key, narrow_key);
+        assert!(cells.index.borrow().total_height < narrow_total);
 
         // Same shape + width: cache hit, key stable.
-        let key = cell.borrow().key;
-        view.ensure_height_index(&cell, 4000.0);
-        assert_eq!(cell.borrow().key, key);
+        let key = cells.index.borrow().key;
+        view.ensure_height_index(&cells.index, &cells.geometry, 4000.0);
+        assert_eq!(cells.index.borrow().key, key);
 
         // A replaced document (new layout id) must rebuild.
         view.layout_version = 7;
-        view.ensure_height_index(&cell, 4000.0);
-        assert_ne!(cell.borrow().key, key);
+        view.ensure_height_index(&cells.index, &cells.geometry, 4000.0);
+        assert_ne!(cells.index.borrow().key, key);
+
+        // With wrapping off nothing in the layout depends on the width, so
+        // dragging the sidebar (a new width every frame) must not rebuild.
+        view.wrap = false;
+        view.ensure_height_index(&cells.index, &cells.geometry, 4000.0);
+        let no_wrap_key = cells.index.borrow().key;
+        let no_wrap_total = cells.index.borrow().total_height;
+        view.ensure_height_index(&cells.index, &cells.geometry, 900.0);
+        assert_eq!(cells.index.borrow().key, no_wrap_key);
+        assert_eq!(cells.index.borrow().total_height, no_wrap_total);
     }
 
     #[test]
@@ -4865,10 +5314,10 @@ mod tests {
         }]];
         let mut view = test_view(&hunks);
         view.side_by_side = true;
-        let cell = RefCell::new(HeightIndex::default());
-        view.ensure_height_index(&cell, 800.0);
+        let cells = TestCaches::default();
+        view.ensure_height_index(&cells.index, &cells.geometry, 800.0);
 
-        let index = cell.borrow();
+        let index = cells.index.borrow();
         // ctx + 3 pairs (2 del × 3 add) + tail.
         assert_eq!(index.row_tops.len(), 5);
         assert_eq!(
@@ -4902,10 +5351,10 @@ mod tests {
         }]];
         let mut view = test_view(&hunks);
         view.side_by_side = true;
-        let cell = RefCell::new(HeightIndex::default());
-        view.ensure_height_index(&cell, 800.0);
+        let cells = TestCaches::default();
+        view.ensure_height_index(&cells.index, &cells.geometry, 800.0);
 
-        let index = cell.borrow();
+        let index = cells.index.borrow();
         assert_eq!(
             index.pair_lines,
             vec![(0, 0), (NO_LINE, 1), (NO_LINE, 2), (3, 3)]
@@ -4936,25 +5385,26 @@ mod tests {
         ];
         let mut view = test_view(&hunks);
         view.side_by_side = true;
-        let cell = RefCell::new(HeightIndex::default());
-        view.ensure_height_index(&cell, 800.0);
+        let cells = TestCaches::default();
+        view.ensure_height_index(&cells.index, &cells.geometry, 800.0);
 
-        let index = cell.borrow();
+        let index = cells.index.borrow();
+        let unified_width = view.content_width(800.0);
+        let split_width = view.effective_text_width(800.0);
         assert_eq!(index.full_width_files, vec![true, false]);
         // Full-width rows keep `pair_lines` aligned via identity pairs; the
         // mixed file still pairs its deletion/addition run.
         assert_eq!(index.pair_lines, vec![(0, 0), (1, 1), (0, 0), (1, 2)]);
         // Full-width rows measure against the whole text area, not a column:
         // the long line wraps less (or not at all) compared to a split row.
-        assert!(index.unified_text_width > index.split_text_width);
-        assert_eq!(
-            view.index_row_height(&index, 1),
-            view.row_height_for_content(&long, index.unified_text_width)
-        );
-        assert!(
-            view.row_height_for_content(&long, index.split_text_width)
-                > view.index_row_height(&index, 1)
-        );
+        assert!(unified_width > split_width);
+        let long_height = |wrap_width: f32| {
+            let memo = RefCell::new(GeometryMemo::default());
+            let key = body_geometry_key(0, 0, 1, wrap_width, view.metrics.char_width);
+            view.visual_rows(&memo, key, &long, wrap_width) as f32 * view.metrics.row_height
+        };
+        assert_eq!(view.index_row_height(&index, 1), long_height(unified_width));
+        assert!(long_height(split_width) > view.index_row_height(&index, 1));
     }
 
     #[test]
@@ -4991,20 +5441,20 @@ mod tests {
     fn no_wrap_makes_rows_uniform_height() {
         let hunks = test_hunks();
         let mut view = test_view(&hunks);
-        let cell = RefCell::new(HeightIndex::default());
+        let cells = TestCaches::default();
 
         // Narrow viewport: the 500-char line wraps, so heights are mixed.
-        view.ensure_height_index(&cell, 400.0);
-        let wrapped_key = cell.borrow().key;
-        let wrapped_total = cell.borrow().total_height;
+        view.ensure_height_index(&cells.index, &cells.geometry, 400.0);
+        let wrapped_key = cells.index.borrow().key;
+        let wrapped_total = cells.index.borrow().total_height;
 
         // Wrap off: same width, new key, every row exactly one line tall.
         view.wrap = false;
-        view.ensure_height_index(&cell, 400.0);
-        assert_ne!(cell.borrow().key, wrapped_key);
-        assert!(cell.borrow().total_height < wrapped_total);
+        view.ensure_height_index(&cells.index, &cells.geometry, 400.0);
+        assert_ne!(cells.index.borrow().key, wrapped_key);
+        assert!(cells.index.borrow().total_height < wrapped_total);
         {
-            let index = cell.borrow();
+            let index = cells.index.borrow();
             let row_count = index.row_tops.len();
             for i in 1..row_count {
                 let delta = index.row_tops[i] - index.row_tops[i - 1];
@@ -5015,11 +5465,364 @@ mod tests {
                         || delta > view.metrics.row_height
                 );
             }
-            let line = &view.files[0].hunks[0].lines[0];
             assert!(
-                (view.row_height(line, view.content_width(400.0)) - view.metrics.row_height).abs()
-                    < 0.01
+                index
+                    .row_heights
+                    .iter()
+                    .all(|height| (height - view.metrics.row_height).abs() < 0.01)
             );
+        }
+    }
+
+    /// The break points the geometry hands the painter must be the ones the
+    /// headless oracle in `measure` reads off the same shaping — they are two
+    /// derivations of one thing (glyph runs against hit tests), and the
+    /// selection, find and emphasis rectangles all sit on their agreement.
+    #[test]
+    fn geometry_starts_match_the_measure_oracle() {
+        let hunks = test_hunks();
+        let view = test_view(&hunks);
+        let memo = RefCell::new(GeometryMemo::default());
+        let cw = view.metrics.char_width;
+        let corpus = [
+            "\tif err != nil {\n".trim_end_matches('\n'),
+            "\t\treturn fmt.Errorf(\"read %q: %w\", path, err) // a long tail",
+            "日本語のテキストが折り返される場合の折り返し位置を確かめる",
+            "мешанина of Cyrillic and ASCII words wrapping somewhere",
+            &"x".repeat(200),
+            "one two three four five six seven eight nine ten eleven twelve",
+        ];
+        for (line_index, content) in corpus.iter().enumerate() {
+            for columns in [8, 13, 21, 34, 55] {
+                let wrap_width = cw * columns as f32;
+                let key = body_geometry_key(0, 0, line_index, wrap_width, cw);
+                let geometry = view.geometry(&memo, key, content, wrap_width);
+                let oracle = measure::wrapped_line_starts(
+                    content,
+                    view.typography.size,
+                    view.font,
+                    view.metrics.row_height,
+                    wrap_width,
+                );
+                assert_eq!(
+                    geometry.starts, oracle,
+                    "break points disagree for {content:?} at {columns} columns"
+                );
+            }
+        }
+    }
+
+    /// A tab lands on the next eight-column stop, which is what the text
+    /// engine does and what the old chars × char-width grid got wrong: it
+    /// counted a tab as one column, so highlights sat seven columns left of
+    /// the glyphs and a tab-indented line reserved too little height.
+    #[test]
+    fn geometry_puts_tabs_on_eight_column_stops() {
+        let hunks = test_hunks();
+        let view = test_view(&hunks);
+        let memo = RefCell::new(GeometryMemo::default());
+        let content = "\tab\tcd\t.";
+        let key = body_geometry_key(0, 0, 0, f32::INFINITY, view.metrics.char_width);
+        let geometry = view.geometry(&memo, key, content, f32::INFINITY);
+        assert_eq!(geometry.visual_lines(), 1);
+        // byte:      0=\t 1=a 2=b 3=\t 4=c 5=d 6=\t 7=.
+        for (byte, column) in [
+            (0, 0.0),
+            (1, 8.0),
+            (2, 9.0),
+            (3, 10.0),
+            (4, 16.0),
+            (5, 17.0),
+            (6, 18.0),
+            (7, 24.0),
+            (8, 25.0),
+        ] {
+            assert!(
+                (geometry.column_at(0, byte) - column).abs() < 0.01,
+                "byte {byte} sits at column {}, expected {column}",
+                geometry.column_at(0, byte)
+            );
+        }
+        assert!((geometry.width_columns - 25.0).abs() < 0.01);
+        // And back: a click inside a tab's run resolves to the tab itself,
+        // one past its stop to the glyph that follows.
+        assert_eq!(geometry.byte_at(0, 3.0), 0);
+        assert_eq!(geometry.byte_at(0, 8.0), 1);
+        assert_eq!(geometry.byte_at(0, 19.0), 6);
+    }
+
+    /// A tab-indented line that wraps has to reserve every visual row it
+    /// paints. Counting a tab as one column (what the chars × char-width
+    /// grid did) under-reserved the row, and cosmic — bounded to the
+    /// reserved height — then culled the lines that didn't fit, so the tail
+    /// of the line simply vanished.
+    #[test]
+    fn a_tab_indented_wrapped_row_reserves_its_full_height() {
+        let content = "\t\treturn some_function(argument_one, argument_two, argument_three)";
+        let hunks = vec![vec![DiffHunkView {
+            header: "@@".to_owned(),
+            lines: vec![line(DiffLineKind::Context, content, 1)],
+        }]];
+        let view = test_view(&hunks);
+        let cells = TestCaches::default();
+        view.ensure_height_index(&cells.index, &cells.geometry, 420.0);
+
+        let cw = view.metrics.char_width;
+        let wrap_width = view.content_width(420.0);
+        let rows = |line_index: usize, content: &str| {
+            let key = body_geometry_key(0, 0, line_index, wrap_width, cw);
+            view.geometry(&cells.geometry, key, content, wrap_width)
+                .visual_lines()
+        };
+        let wrapped = rows(0, content);
+        assert!(
+            wrapped > 1,
+            "the line has to wrap at this width or the test proves nothing"
+        );
+        assert_eq!(
+            cells.index.borrow().row_heights[0],
+            wrapped as f32 * view.metrics.row_height
+        );
+        assert!(
+            rows(1, &content.replace('\t', " ")) < wrapped,
+            "a tab occupying one column would have reserved fewer rows"
+        );
+    }
+
+    /// The height index walks the whole document, so it asks `column_bound`
+    /// whether a line fits rather than shaping it. A short tab-indented or
+    /// CJK line must therefore never reach the text engine during a rebuild:
+    /// shaping them there cost ~180 ms per rebuild on 20k tab-indented
+    /// lines, once per frame of a sidebar drag.
+    #[test]
+    fn short_wide_lines_are_not_shaped_during_an_index_rebuild() {
+        let hunks = vec![vec![DiffHunkView {
+            header: "@@".to_owned(),
+            lines: vec![
+                line(DiffLineKind::Context, "\t\tif err != nil {", 1),
+                line(DiffLineKind::Context, "    // мешанина", 2),
+                line(DiffLineKind::Context, "\t日本語のコメント", 3),
+                line(DiffLineKind::Context, "    plain ascii", 4),
+            ],
+        }]];
+        let mut view = test_view(&hunks);
+        for wrap in [true, false] {
+            view.wrap = wrap;
+            let cells = TestCaches::default();
+            view.ensure_height_index(&cells.index, &cells.geometry, 1200.0);
+            assert!(
+                cells.geometry.borrow().0.is_empty(),
+                "a rebuild shaped a line that fits (wrap: {wrap})"
+            );
+            assert!(
+                cells
+                    .index
+                    .borrow()
+                    .row_heights
+                    .iter()
+                    .all(|height| *height == view.metrics.row_height)
+            );
+        }
+    }
+
+    /// `column_bound` may only ever err high. Under-counting would reserve a
+    /// row too few and cosmic, bounded to the reserved height, would cull
+    /// the overflow — the bug this whole seam exists to prevent. Tabs are
+    /// the case it has to get exactly right, since a tab-indented line that
+    /// fits is decided by the bound alone and never reaches the engine.
+    #[test]
+    fn column_bound_never_undercounts_the_engine() {
+        let hunks = test_hunks();
+        let view = test_view(&hunks);
+        let memo = RefCell::new(GeometryMemo::default());
+        let corpus = [
+            "\tif err != nil {",
+            "\t\treturn fmt.Errorf(\"read %q: %w\", path, err)",
+            "a\tb\tc\td",
+            "\t\t\t\t\t\t\t\tdeep",
+            "日本語 mixed with ASCII",
+            "\t// мешанина of Cyrillic and ASCII",
+            "→ ← ↔ ✓ ✗",
+            "plain ascii, no surprises",
+            "",
+        ];
+        for (line_index, content) in corpus.iter().enumerate() {
+            let key = body_geometry_key(0, 0, line_index, f32::INFINITY, view.metrics.char_width);
+            let measured = view
+                .geometry(&memo, key, content, f32::INFINITY)
+                .width_columns;
+            let bound = column_bound(content);
+            assert!(
+                bound >= measured - 0.01,
+                "bound {bound} undercounts the engine's {measured} for {content:?}"
+            );
+            if content.is_ascii() {
+                assert!(
+                    (bound - measured).abs() < 0.01,
+                    "bound {bound} is not exact for the ASCII line {content:?} ({measured})"
+                );
+            }
+        }
+    }
+
+    /// `column_at` and `byte_at` invert each other on multi-byte text, so a
+    /// click lands on a char boundary and the highlight painted from it
+    /// covers the glyph the user pointed at.
+    #[test]
+    fn columns_and_bytes_round_trip_on_multibyte_text() {
+        let hunks = test_hunks();
+        let view = test_view(&hunks);
+        let memo = RefCell::new(GeometryMemo::default());
+        for (line_index, content) in ["日本語 mixed with ASCII", "Ελληνικά + \tтабы"]
+            .iter()
+            .enumerate()
+        {
+            let key = body_geometry_key(0, 0, line_index, f32::INFINITY, view.metrics.char_width);
+            let geometry = view.geometry(&memo, key, content, f32::INFINITY);
+            let mut last_column = -1.0_f32;
+            for (byte, _) in content
+                .char_indices()
+                .chain(std::iter::once((content.len(), ' ')))
+            {
+                let column = geometry.column_at(0, byte);
+                assert!(
+                    column > last_column,
+                    "columns must advance across {content:?}: byte {byte} at {column}"
+                );
+                last_column = column;
+                assert_eq!(
+                    geometry.byte_at(0, column),
+                    byte,
+                    "column {column} of {content:?} resolves away from byte {byte}"
+                );
+            }
+        }
+    }
+
+    /// A click in the right column of a split row resolves to that column's
+    /// line and lane — the two used to be painted and hit-tested through
+    /// different wrapping modes, which put clicks on the wrong side.
+    #[test]
+    fn split_row_hit_test_lands_in_the_clicked_column() {
+        let hunks = vec![vec![DiffHunkView {
+            header: "@@".to_owned(),
+            lines: vec![
+                line(DiffLineKind::Deletion, "old text here", 2),
+                line(DiffLineKind::Addition, "new text here", 2),
+            ],
+        }]];
+        let mut view = test_view(&hunks);
+        view.side_by_side = true;
+        let cells = TestCaches::default();
+        let bounds = Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 900.0,
+            height: 600.0,
+        };
+        view.ensure_height_index(&cells.index, &cells.geometry, bounds.width);
+        let index = cells.index.borrow();
+        let split = view.split_layout(bounds.width);
+        let row_top = index.row_tops[0];
+        // Four columns into each side's text, on the row's only visual line.
+        let probe = |text_x: f32| {
+            view.position_at_point(
+                &index,
+                &cells.geometry,
+                Point::new(text_x + 4.0 * view.metrics.char_width, row_top + 1.0),
+                bounds,
+                0.0,
+                0.0,
+                None,
+            )
+        };
+        let (left, left_lane) = probe(split.left_text_x).expect("a hit in the left column");
+        assert_eq!(left_lane, Some(SplitSide::Left));
+        assert_eq!((left.line_index, left.byte), (0, 4));
+        let (right, right_lane) = probe(split.right_text_x).expect("a hit in the right column");
+        assert_eq!(right_lane, Some(SplitSide::Right));
+        assert_eq!((right.line_index, right.byte), (1, 4));
+    }
+
+    /// `\ No newline at end of file` belongs to the line above it, not to a
+    /// side: counting it made a new file without a trailing newline render
+    /// split, with one column entirely hatched padding.
+    #[test]
+    fn a_trailing_note_leaves_a_new_file_single_sided() {
+        let note = DiffLine {
+            kind: DiffLineKind::Note,
+            old_line: None,
+            new_line: None,
+            content: "\\ No newline at end of file".to_owned(),
+            syntax: Vec::new(),
+            emphasis: Vec::new(),
+        };
+        let hunks = vec![vec![DiffHunkView {
+            header: "@@".to_owned(),
+            lines: vec![line(DiffLineKind::Addition, "fn main() {}", 1), note],
+        }]];
+        let mut view = test_view(&hunks);
+        view.side_by_side = true;
+        assert!(DiffView::<()>::file_is_single_sided(&view.files[0]));
+        let cells = TestCaches::default();
+        view.ensure_height_index(&cells.index, &cells.geometry, 800.0);
+        assert_eq!(cells.index.borrow().full_width_files, vec![true]);
+    }
+
+    /// Bucketing the document-ordered match list into the visible window
+    /// must find exactly what a scan over every match would have.
+    #[test]
+    fn find_matches_bucket_by_row() {
+        let matches: Vec<FindMatch> = [
+            (0, 0, 0),
+            (0, 0, 3),
+            (0, 0, 3),
+            (0, 1, 0),
+            (1, 0, 2),
+            (1, 0, 9),
+        ]
+        .into_iter()
+        .map(|(file_index, hunk_index, line_index)| FindMatch {
+            file_index,
+            hunk_index,
+            line_index,
+            byte_start: 0,
+            byte_end: 1,
+        })
+        .collect();
+
+        for first in [(0, 0, 0), (0, 0, 3), (0, 1, 0), (1, 0, 0), (2, 0, 0)] {
+            for last in [(0, 0, 2), (0, 0, 3), (0, 1, 5), (1, 0, 9), (9, 9, 9)] {
+                if last < first {
+                    continue;
+                }
+                let window = matches_between(&matches, first, last);
+                let brute: Vec<usize> = matches
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, m)| (first..=last).contains(&match_id(m)))
+                    .map(|(i, _)| i)
+                    .collect();
+                assert_eq!(
+                    window.clone().collect::<Vec<_>>(),
+                    brute,
+                    "window {first:?}..={last:?}"
+                );
+                // And within the window, one row's run is the same run the
+                // scan would have found, at the same global indices.
+                for line in [(0, 0, 3), (0, 1, 0), (1, 0, 9), (0, 0, 7)] {
+                    let (offset, hits) = matches_on_line(&matches[window.clone()], line);
+                    let brute: Vec<usize> = matches
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, m)| window.contains(i) && match_id(m) == line)
+                        .map(|(i, _)| i)
+                        .collect();
+                    let found: Vec<usize> =
+                        (0..hits.len()).map(|i| window.start + offset + i).collect();
+                    assert_eq!(found, brute, "line {line:?} in window {first:?}..={last:?}");
+                }
+            }
         }
     }
 
@@ -5115,12 +5918,12 @@ mod height_profile {
             |_| (),
         );
 
-        let cell = RefCell::new(HeightIndex::default());
+        let cells = tests::TestCaches::default();
         let t = std::time::Instant::now();
-        view.ensure_height_index(&cell, 1200.0);
+        view.ensure_height_index(&cells.index, &cells.geometry, 1200.0);
         let build = t.elapsed();
 
-        let index = cell.borrow();
+        let index = cells.index.borrow();
         let t = std::time::Instant::now();
         let mut acc = 0usize;
         for i in 0..10_000 {

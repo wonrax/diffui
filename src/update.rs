@@ -521,6 +521,7 @@ impl Diffui {
                             .selected_file
                             .min(target.session.document.files.len().saturating_sub(1));
                     }
+                    self.refind_tab(tab);
                     if is_active {
                         self.document_version = self.document_version.wrapping_add(1);
                     }
@@ -3050,6 +3051,35 @@ impl Diffui {
         Task::none()
     }
 
+    /// Recompute `tab`'s find matches against the document it now holds.
+    /// A document replacement — a reload, a working-copy edit, a PR tab
+    /// swapping in its cached diff — leaves the old matches indexing text
+    /// that is gone: their byte ranges paint highlights over unrelated code
+    /// and the count lies until the user's next keystroke.
+    ///
+    /// The active match keeps its position (clamped) and `scroll_token` is
+    /// deliberately left alone: the user didn't ask to jump, and a repaint
+    /// can land while they are reading somewhere else entirely.
+    fn refind_tab(&mut self, tab: TabId) {
+        let Some(target) = self.tab_mut(tab) else {
+            return;
+        };
+        let Some(state) = target.find() else {
+            return;
+        };
+        if state.query.is_empty() {
+            return;
+        }
+        let (matches, error) = find::compute_matches(state, target.find_files());
+        let Some(state) = target.find_mut() else {
+            return;
+        };
+        let active = state.active.unwrap_or(0);
+        state.active = (!matches.is_empty()).then(|| active.min(matches.len() - 1));
+        state.matches = matches;
+        state.error = error;
+    }
+
     pub(crate) fn find_advance(&mut self, delta: i32) {
         let Some(state) = self.active_mut().find_mut() else {
             return;
@@ -4397,6 +4427,90 @@ mod tests {
         let _ = ui.palette_accept_current();
         assert_eq!(ui.selected_theme, ThemePreference::HighContrast);
         assert!(ui.palette().is_none(), "accepting closes the palette");
+    }
+
+    /// A replaced document leaves the find bar's matches indexing text that
+    /// is gone. The repaint the projection already asks for is the signal to
+    /// recompute them; they used to stay stale until the next keystroke.
+    #[test]
+    fn a_replaced_document_recomputes_find_matches() {
+        use crate::find::{FindMatch, FindState};
+        use crate::modes::TabMode;
+        use diffui_core::{
+            DiffDocument, DiffFile, DiffFileStatus, DiffHunkView, DiffLine, DiffLineKind,
+        };
+
+        let document = |lines: &[&str]| DiffDocument {
+            files: vec![DiffFile {
+                path: "f.rs".to_owned(),
+                old_path: None,
+                status: DiffFileStatus::Modified,
+                additions: 0,
+                deletions: 0,
+                hunks: vec![DiffHunkView {
+                    header: "@@".to_owned(),
+                    lines: lines
+                        .iter()
+                        .map(|content| DiffLine {
+                            kind: DiffLineKind::Context,
+                            old_line: None,
+                            new_line: None,
+                            content: (*content).to_owned(),
+                            syntax: Vec::new(),
+                            emphasis: Vec::new(),
+                        })
+                        .collect(),
+                }],
+            }],
+            total_additions: 0,
+            total_deletions: 0,
+        };
+
+        let mut ui = app();
+        let tab = push_tab(&mut ui, "/tmp/repo");
+        ui.active_mut().push_mode(TabMode::Find(FindState {
+            query: "needle".to_owned(),
+            // Matches against the document being replaced: they point at a
+            // file that isn't even in the incoming one.
+            matches: vec![FindMatch {
+                file_index: 9,
+                hunk_index: 9,
+                line_index: 9,
+                byte_start: 0,
+                byte_end: 6,
+            }],
+            active: Some(0),
+            ..FindState::default()
+        }));
+
+        let revision = RevisionSelection::Commit("abc".to_owned());
+        let effects = ui.tab_mut(tab).unwrap().session.load_diff(revision.clone());
+        let job = match effects.first() {
+            Some(diffui_core::Effect::Send(diffui_core::Command::LoadDiff { job, .. })) => *job,
+            other => panic!("expected a diff load, got {other:?}"),
+        };
+        let repo = ui.tabs[0].repo_id().expect("a repo tab has an id");
+        let _ = ui.update(Message::Repo(Box::new(diffui_core::Event::new(
+            repo,
+            diffui_core::Payload::DiffLoaded {
+                job,
+                revision,
+                document: document(&["no hits here", "a needle and a needle"]),
+                details: None,
+            },
+        ))));
+
+        let state = ui.active().find().expect("the find bar is still open");
+        assert_eq!(
+            state
+                .matches
+                .iter()
+                .map(|m| (m.line_index, m.byte_start))
+                .collect::<Vec<_>>(),
+            vec![(1, 2), (1, 15)],
+            "matches must index the document that just landed"
+        );
+        assert_eq!(state.active, Some(0));
     }
 
     #[test]
