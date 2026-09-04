@@ -14,7 +14,13 @@ use iced::widget::column;
 
 impl Diffui {
     pub(crate) fn new(cli: Cli, saved: WindowState) -> (Self, Task<Message>) {
-        let config = AppConfig::load();
+        let (config, raw_keys) = AppConfig::load();
+        // A keymap problem is never fatal: a config written against another
+        // build still opens the app, having said once what it had to skip.
+        let (keymap, problems) = Keymap::build(&raw_keys);
+        for problem in problems {
+            eprintln!("diffui: {problem}");
+        }
         let sidebar_min_width = sidebar::min_width(config);
         // Restore the persisted sidebar split and window geometry. The window
         // size/position seed the in-memory tracking; the compositor's `Opened`
@@ -196,7 +202,8 @@ impl Diffui {
             zoom_anim: None,
             zoom_restore: None,
             config,
-            palette: None,
+            keymap,
+            modes: Vec::new(),
             recents: Recents::load(),
             sidebar_file_reveal_token: 0,
             scroll_restore_token: 0,
@@ -207,19 +214,16 @@ impl Diffui {
             no_tab,
             next_tab_id,
             next_document_id: 0,
-            open_repo_dialog: None,
             recent_repos,
             next_activity_id: 0,
-            menu: None,
-            confirm: None,
-            activity_popover_open: false,
             hovered: None,
             modifiers: keyboard::Modifiers::default(),
             toasts: Vec::new(),
             next_toast_id: 0,
         };
 
-        let theme_task = system::theme().map(Message::SystemThemeChanged);
+        let theme_task =
+            system::theme().map(|mode| Message::Window(WindowEvent::SystemThemeChanged(mode)));
         // Kicks the streaming load for whatever the active tab is — a repo
         // walk, a PR stream, or nothing when no tab opened.
         let load_task = app.ensure_active_loaded();
@@ -296,7 +300,7 @@ impl Diffui {
     /// Read before a graph swap so the candidate can survive it.
     fn draft_candidate_commit(&self, tab: TabId) -> Option<String> {
         let state = self.tabs.iter().find(|candidate| candidate.id == tab)?;
-        let index = state.state.op_draft.as_ref()?.draft.candidate?;
+        let index = state.state.op_draft()?.draft.candidate?;
         Some(
             state
                 .state
@@ -325,8 +329,8 @@ impl Diffui {
         else {
             return;
         };
-        if let Some(ui) = state.op_draft.as_mut() {
-            ui.draft.candidate = Some(index);
+        if let Some(draft) = state.op_draft_mut() {
+            draft.draft.candidate = Some(index);
         }
     }
 
@@ -388,14 +392,47 @@ impl Diffui {
                     .tab_mut(tab)
                     .and_then(|state| state.pending_detail_copy.take());
                 match field {
-                    Some((_, field, fallback)) => Task::done(Message::CopyToClipboard(
-                        format_detail(details, field).unwrap_or(fallback),
-                    )),
+                    Some((_, field, fallback)) => {
+                        iced::clipboard::write(format_detail(details, field).unwrap_or(fallback))
+                            .discard()
+                    }
                     None => Task::none(),
                 }
             }
             Payload::Failed { error, .. } => self.fail_own_job(tab, job, error.clone()),
             Payload::Cancelled { .. } => {
+                // Resolve whatever row was showing the job before releasing
+                // its slot: a cancelled fetch or mutation left "Running" spins
+                // in the log forever, and calling it "Done" would claim work
+                // that never happened.
+                let activity = self.tab_mut(tab).and_then(|state| {
+                    let jobs = &state.jobs;
+                    jobs.fetch
+                        .as_ref()
+                        .filter(|(id, ..)| *id == job)
+                        .map(|(_, activity, _)| *activity)
+                        .or_else(|| {
+                            jobs.mutation
+                                .as_ref()
+                                .filter(|(id, _)| *id == job)
+                                .map(|(_, pending)| pending.activity_id)
+                        })
+                        .or_else(|| {
+                            jobs.bookmark_check
+                                .as_ref()
+                                .filter(|(id, _)| *id == job)
+                                .map(|(_, pending)| pending.activity_id)
+                        })
+                });
+                if let Some(activity_id) = activity
+                    && let Some(log) = self.activity_log_for(tab)
+                {
+                    log.finish(
+                        activity_id,
+                        activity::ActivityStatus::Cancelled,
+                        Some("Canceled".to_owned()),
+                    );
+                }
                 self.tab_mut(tab)?.jobs.clear(job);
                 Task::none()
             }
@@ -493,11 +530,11 @@ impl Diffui {
                     // Every row index is stale. Drop the draft's destination
                     // candidate; the event path re-finds it by commit id when
                     // the commit is still in the new graph.
-                    if let Some(ui) = self.tab_mut(tab).and_then(|t| t.op_draft.as_mut()) {
-                        ui.draft.candidate = None;
-                        ui.hover_spot = None;
-                        ui.preview = DraftPreviewState::Idle;
-                        ui.preview_request = None;
+                    if let Some(draft) = self.tab_mut(tab).and_then(|t| t.op_draft_mut()) {
+                        draft.draft.candidate = None;
+                        draft.hover_spot = None;
+                        draft.preview = DraftPreviewState::Idle;
+                        draft.preview_request = None;
                     }
                 }
                 Effect::RevealSelection => {
@@ -528,17 +565,411 @@ impl Diffui {
         Task::batch(tasks)
     }
 
+    /// The reducer. Five kinds of message, five shapes of handling: a user
+    /// intent, a repository actor reporting, widget plumbing, the platform, and
+    /// each overlay's own chatter.
     pub(crate) fn update(&mut self, message: Message) -> Task<Message> {
-        match message {
-            Message::Repo(event) => return self.on_repo_event(*event),
-            Message::SelectFile(index) => {
+        let task = match message {
+            Message::Action(action) => self.perform(action),
+            Message::Repo(event) => self.on_repo_event(*event),
+            Message::Ui(event) => self.on_ui_event(event),
+            Message::Window(event) => self.on_window_event(event),
+            Message::Palette(message) => self.on_palette_message(message),
+            Message::Find(message) => self.on_find_message(message),
+            Message::Menu(message) => self.on_menu_message(message),
+        };
+        // A mode that isn't on screen must not keep the keyboard.
+        self.prune_stale_modes();
+        // Chokepoint: if the active tab coalesced a refresh while busy and it's
+        // now idle, run it. A no-op when nothing's pending (the common case).
+        let refresh = match self.active_tab_id() {
+            Some(tab) => {
+                let effects = match self.tab_mut(tab) {
+                    Some(target) => target.session.take_pending_refresh(),
+                    None => Vec::new(),
+                };
+                self.run_effects(tab, effects)
+            }
+            None => Task::none(),
+        };
+        Task::batch([task, refresh])
+    }
+
+    /// Carry out one user intent, whichever producer resolved it.
+    ///
+    /// This is the only place an intent is executed. Nothing in here re-enters
+    /// `update` or re-emits a `Message` at itself: a handler that needs another
+    /// intent's work calls the helper both of them share, so a fix lands once.
+    pub(crate) fn perform(&mut self, action: Action) -> Task<Message> {
+        match action {
+            // ── Revisions ───────────────────────────────────────────────
+            Action::SelectRevision(selection) => self.select_revision(selection),
+            Action::JumpToResult(item) => {
+                if let Some(change_id) = change_id_for_recents(&item, self) {
+                    self.recents.push_revision(change_id);
+                    self.recents.save();
+                }
+                self.jump_to_revision_ref(&item)
+            }
+            Action::ClearMultiSelection => {
+                self.active_mut().revision_multi_selection.clear();
+                Task::none()
+            }
+            Action::Mutate(op) => self.start_mutation_op(op),
+            Action::StartDraft { kind, source } => self.start_draft(kind, source),
+            Action::EditDescription { target } => {
+                let target =
+                    target.unwrap_or_else(|| self.active().session.selected_revision.clone());
+                self.edit_description(target)
+            }
+            Action::SaveDescription => self.save_description(),
+            Action::CancelDescription => {
+                if self
+                    .active()
+                    .description_editor()
+                    .is_some_and(|editor| editor.saving_activity.is_none())
+                {
+                    self.active_mut().pop_mode(ModeKind::Description);
+                    self.active_mut().pending_description_edit = None;
+                }
+                Task::none()
+            }
+            Action::BrowseSource { revision, path } => self.open_source_browser(revision, path),
+
+            // ── Files ───────────────────────────────────────────────────
+            Action::SelectFile(index) => {
                 if index < self.active().session.document.files.len() {
                     self.active_mut().selected_file = index;
                     self.reveal_selected_file_in_tree();
                     return scroll_sidebar_to_file(self);
                 }
+                Task::none()
             }
-            Message::SidebarFileRow(display_index) => {
+            Action::SelectNextFile => {
+                if self.active().main_view == MainView::Source {
+                    return self.source_select_neighbor(1);
+                }
+                let target = self.active_mut();
+                if !target.session.document.files.is_empty() {
+                    target.selected_file = (target.selected_file + 1)
+                        .min(target.session.document.files.len().saturating_sub(1));
+                    self.reveal_selected_file_in_tree();
+                    return scroll_sidebar_to_file(self);
+                }
+                Task::none()
+            }
+            Action::SelectPreviousFile => {
+                if self.active().main_view == MainView::Source {
+                    return self.source_select_neighbor(-1);
+                }
+                let target = self.active_mut();
+                let previous = target.selected_file.saturating_sub(1);
+                if previous != target.selected_file {
+                    target.selected_file = previous;
+                    self.reveal_selected_file_in_tree();
+                    return scroll_sidebar_to_file(self);
+                }
+                Task::none()
+            }
+            Action::JumpToFile(path) => {
+                self.jump_to_file_path(&path);
+                Task::none()
+            }
+
+            // ── Target mode ─────────────────────────────────────────────
+            Action::DraftCandidate(delta) => self.move_draft_candidate(delta),
+            Action::DraftPlacement(placement) => self.set_draft_placement(placement),
+            Action::DraftApplyPlacement(placement) => {
+                // With a keyboard candidate armed, `o`/`a`/`b` applies right
+                // away (jjui's flow); before that they just flip the toggle.
+                let candidate = self.active().op_draft().and_then(|ui| ui.draft.candidate);
+                match candidate.and_then(|index| self.selection_at_index(index)) {
+                    Some(target) => self.confirm_draft_on(target, Some(placement)),
+                    None => self.set_draft_placement(placement),
+                }
+            }
+            Action::DraftConfirm => {
+                if let Some(op) = self
+                    .active()
+                    .op_draft()
+                    .and_then(|ui| ui.draft.op_from_sources())
+                {
+                    self.active_mut().pop_mode(ModeKind::Draft);
+                    return self.start_mutation_op(op);
+                }
+                let Some(target) = self
+                    .active()
+                    .op_draft()
+                    .and_then(|ui| ui.draft.candidate)
+                    .and_then(|index| self.selection_at_index(index))
+                else {
+                    return Task::none();
+                };
+                self.confirm_draft_on(target, None)
+            }
+            Action::DraftCancel => {
+                self.active_mut().pop_mode(ModeKind::Draft);
+                Task::none()
+            }
+            Action::DraftToggleSource => {
+                let Some(target) = self
+                    .active()
+                    .op_draft()
+                    .and_then(|ui| ui.draft.candidate)
+                    .and_then(|index| self.selection_at_index(index))
+                else {
+                    return Task::none();
+                };
+                self.draft_toggle_source(target)
+            }
+
+            // ── Overlays ────────────────────────────────────────────────
+            Action::OpenPalette => self.open_palette(),
+            Action::ClosePalette => {
+                self.pop_mode(ModeKind::Palette);
+                Task::none()
+            }
+            Action::TogglePalette => {
+                if self.palette().is_some() {
+                    self.pop_mode(ModeKind::Palette);
+                    Task::none()
+                } else {
+                    self.open_palette()
+                }
+            }
+            Action::PalettePop => {
+                let popped = self.palette_mut().map(|state| state.pop());
+                match popped {
+                    Some(true) => {
+                        widget::operation::focus(iced::widget::Id::new(palette::PALETTE_INPUT_ID))
+                    }
+                    Some(false) => {
+                        self.pop_mode(ModeKind::Palette);
+                        Task::none()
+                    }
+                    None => Task::none(),
+                }
+            }
+            Action::PaletteMove(delta) => self.palette_move(delta),
+            Action::PaletteActions => {
+                let Some(mut state) = self.take_palette() else {
+                    return Task::none();
+                };
+                let pushed = state.push_actions(self);
+                self.push_mode(Mode::Palette(state));
+                if pushed {
+                    return widget::operation::focus(palette::PALETTE_INPUT_ID);
+                }
+                Task::none()
+            }
+            Action::OpenFind => self.open_find(),
+            Action::CloseFind => {
+                self.active_mut().pop_mode(ModeKind::Find);
+                Task::none()
+            }
+            Action::FindNext => {
+                self.find_advance(1);
+                Task::none()
+            }
+            Action::FindPrevious => {
+                self.find_advance(-1);
+                Task::none()
+            }
+            Action::OpenRepoDialog => {
+                // Mutually exclusive with the other overlays: they share one
+                // keyboard, and stacking them makes each look broken.
+                self.pop_mode(ModeKind::Palette);
+                self.active_mut().pop_mode(ModeKind::Find);
+                self.push_mode(Mode::OpenRepo(OpenRepoDialog::default()));
+                widget::operation::focus(tab_bar::OPEN_REPO_INPUT_ID)
+            }
+            Action::CloseRepoDialog => {
+                self.pop_mode(ModeKind::OpenRepo);
+                Task::none()
+            }
+            Action::SubmitRepoDialog => {
+                let path = self
+                    .open_repo_dialog()
+                    .map(|dialog| dialog.path.clone())
+                    .unwrap_or_default();
+                self.open_repository(&path)
+            }
+            Action::OpenRepo(path) => self.open_repository(&path),
+            Action::ToggleActivityPopover => {
+                if self.activity_popover_open() {
+                    self.pop_mode(ModeKind::ActivityPopover);
+                } else {
+                    self.pop_mode(ModeKind::Menu);
+                    self.push_mode(Mode::ActivityPopover);
+                }
+                Task::none()
+            }
+            Action::CloseActivityPopover => {
+                self.pop_mode(ModeKind::ActivityPopover);
+                Task::none()
+            }
+            Action::ClearActivities => {
+                self.active_mut().activities.clear_finished();
+                Task::none()
+            }
+            Action::DismissMenu => {
+                self.pop_mode(ModeKind::Menu);
+                Task::none()
+            }
+            Action::ConfirmAccept => {
+                let Some(Mode::Confirm(dialog)) = self.pop_mode(ModeKind::Confirm) else {
+                    return Task::none();
+                };
+                self.run_mutation(dialog.pending)
+            }
+            Action::ConfirmCancel => {
+                let Some(Mode::Confirm(dialog)) = self.pop_mode(ModeKind::Confirm) else {
+                    return Task::none();
+                };
+                // Resolve the held activity so it doesn't sit queued forever,
+                // and as *cancelled* — a row that reads "Done" for something
+                // that never ran is a lie the log can't be trusted after.
+                if let Some(log) = self.activity_log_for(dialog.pending.tab_id) {
+                    log.finish(
+                        dialog.pending.activity_id,
+                        activity::ActivityStatus::Cancelled,
+                        Some("Canceled".to_owned()),
+                    );
+                }
+                // A canceled describe-on-immutable leaves its editor open
+                // and editable again (it was parked as "Saving…").
+                if let Some(editor) = self.active_mut().description_editor_mut()
+                    && editor.saving_activity == Some(dialog.pending.activity_id)
+                {
+                    editor.saving_activity = None;
+                }
+                Task::none()
+            }
+
+            // ── Repository ──────────────────────────────────────────────
+            Action::Refresh => {
+                let Some(tab) = self.active_tab_id() else {
+                    return Task::none();
+                };
+                if !self.active().session.capabilities.graph {
+                    return Task::none();
+                }
+                // A manual refresh is a full reload: the user may have run an
+                // external jj op since the last load. An up-to-date refresh
+                // that finds nothing changed is silent.
+                self.start_repository_snapshot(tab, RefreshOrigin::Focus)
+            }
+            Action::Fetch(target) => self.start_fetch(target),
+            Action::Undo => self.start_undo(),
+            Action::UndoOperation(activity_id, operation_id) => {
+                let Some(tab_id) = self.active_tab_id() else {
+                    return Task::none();
+                };
+                // One-shot: clear the button so a second click can't
+                // double-revert the same operation.
+                if let Some(log) = self.activity_log_for(tab_id) {
+                    log.clear_undo_op(activity_id);
+                }
+                self.start_mutation_op(mutations::MutationOp::Undo {
+                    operation_id: Some(operation_id),
+                })
+            }
+            Action::SetRevset(expr) => {
+                self.active_mut().session.revset = expr;
+                self.evaluate_revset()
+            }
+            Action::SubmitRevset => self.evaluate_revset(),
+
+            // ── View ────────────────────────────────────────────────────
+            Action::ToggleWrap => {
+                self.diff_wrap = !self.diff_wrap;
+                // Wrap changes shaping, so drop the paragraph cache; the
+                // height index re-keys off the flag itself. Persist with the
+                // usual geometry debounce.
+                self.document_version = self.document_version.wrapping_add(1);
+                self.mark_geometry_dirty();
+                Task::none()
+            }
+            Action::ToggleSplit => {
+                self.diff_split = !self.diff_split;
+                // Same cache discipline as the wrap toggle: column widths
+                // change shaping, the height index re-keys off the flag.
+                self.document_version = self.document_version.wrapping_add(1);
+                self.mark_geometry_dirty();
+                Task::none()
+            }
+            Action::SetTheme(theme) => {
+                self.selected_theme = theme;
+                // Switching to System: sync to the live OS appearance now rather
+                // than render one stale frame until the first poll tick lands.
+                if theme == ThemePreference::System {
+                    let current = chrome::system_appearance();
+                    if current != iced_theme::Mode::None {
+                        self.system_theme = current;
+                    }
+                }
+                Task::none()
+            }
+            Action::SetMainView(mode) => self.set_main_view(mode),
+
+            // ── Tabs ────────────────────────────────────────────────────
+            Action::SelectTab(id) => self.activate_tab(id),
+            Action::SelectTabIndex(index) => match self.tabs.get(index) {
+                Some(tab) => {
+                    let id = tab.id;
+                    self.activate_tab(id)
+                }
+                None => Task::none(),
+            },
+            Action::CloseTab(id) => self.close_tab(id),
+            Action::CloseActiveTab => match self.tabs.get(self.active) {
+                Some(tab) => {
+                    let id = tab.id;
+                    self.close_tab(id)
+                }
+                None => Task::none(),
+            },
+
+            // ── Clipboard ───────────────────────────────────────────────
+            Action::Copy(text) => iced::clipboard::write(text).discard(),
+            Action::CopyDetail {
+                revision,
+                field,
+                fallback,
+            } => {
+                // Author / committer / full description aren't kept in the
+                // graph, so ask the actor for the revision's header and copy
+                // from that, falling back to the in-memory value.
+                let Some(tab) = self.active_tab_id() else {
+                    return Task::none();
+                };
+                let Some(state) = self.tab_mut(tab) else {
+                    return Task::none();
+                };
+                if !state.session.capabilities.details {
+                    return iced::clipboard::write(fallback).discard();
+                }
+                let job = state.session.next_job();
+                state.pending_detail_copy = Some((job, field, fallback));
+                self.send(tab, diffui_core::Command::RevisionDetails { job, revision })
+            }
+            Action::CopyFileDiff => match current_file_diff_text(self) {
+                Some(text) => iced::clipboard::write(text).discard(),
+                None => Task::none(),
+            },
+            Action::OpenUrl(url) => {
+                open_url(&url);
+                Task::none()
+            }
+        }
+    }
+
+    /// Widget plumbing: positions, hovers, ticks, and the clicks whose meaning
+    /// depends on state the widget can't see.
+    fn on_ui_event(&mut self, event: UiEvent) -> Task<Message> {
+        match event {
+            UiEvent::SelectRowKey(key) => return self.on_revision_row_click(key),
+            UiEvent::SidebarFileRow(display_index) => {
                 let target = self.active_mut();
                 let rows = diffui_core::file_tree_rows(
                     &target.session.document.files,
@@ -558,454 +989,141 @@ impl Diffui {
                     None => {}
                 }
             }
-            Message::SidebarScrolled(offset) => {
+            UiEvent::SidebarScrolled(offset) => {
                 self.active_mut().sidebar_scroll_offset = offset;
             }
-            Message::DiffScrolled(offset) => {
+            UiEvent::DiffScrolled(offset) => {
                 self.active_mut().diff_scroll_offset = offset;
             }
-            Message::SelectRowKey(key) => {
-                let selection = match key {
-                    revision_list::RowSelectionKey::WorkingCopy => RevisionSelection::WorkingCopy,
-                    revision_list::RowSelectionKey::Commit(id) => RevisionSelection::Commit(id),
-                };
-                // Target mode: a plain click *arms* the row as the destination
-                // candidate (same as hover / j-k); the Apply button, ↵, or a
-                // drop executes. One-click execution was too easy to fire by
-                // accident once hover started arming rows. ⌘-click toggles the
-                // row as a draft *source* and stays in the mode — stack extra
-                // merge parents / revisions to rebase / squash sources, or
-                // un-stack them.
-                if self.active_mut().op_draft.is_some() {
-                    if self.modifiers.command() {
-                        return self.draft_toggle_source(selection);
-                    }
-                    let index = match &selection {
-                        RevisionSelection::WorkingCopy => {
-                            self.active_mut().session.commits.working_copy_index()
-                        }
-                        RevisionSelection::Commit(id) => self
-                            .active_mut()
-                            .session
-                            .commits
-                            .iter()
-                            .position(|row| row.commit_id() == id),
-                    };
-                    let Some(index) = index else {
-                        return Task::none();
-                    };
-                    let Some(ui) = self.active_mut().op_draft.as_mut() else {
-                        return Task::none();
-                    };
-                    if ui.draft.candidate == Some(index) {
-                        return Task::none();
-                    }
-                    ui.draft.candidate = Some(index);
-                    ui.hover_spot = None;
-                    return self.kick_draft_preview();
-                }
-                // Outside target mode, ⌘-click marks/unmarks the row for a
-                // batch action and ⇧-click marks the visible range between
-                // the browsed row and the clicked one. Neither navigates —
-                // the marked set is a separate axis from the browsed
-                // revision, consumed by the context menu's batch items.
-                // jj-gated like every mutation entry point.
-                if (self.modifiers.command() || self.modifiers.shift())
-                    && self.active().session.capabilities.mutate
-                {
-                    let commit_id = match &selection {
-                        RevisionSelection::WorkingCopy => self
-                            .active_mut()
-                            .session
-                            .commits
-                            .working_copy()
-                            .map(|row| row.commit_id().to_owned()),
-                        RevisionSelection::Commit(id) => Some(id.clone()),
-                    };
-                    let Some(commit_id) = commit_id else {
-                        return Task::none();
-                    };
-                    if self.modifiers.shift() {
-                        let clicked = self
-                            .active_mut()
-                            .session
-                            .commits
-                            .iter()
-                            .position(|row| row.commit_id() == commit_id);
-                        // Anchor on the browsed row, Finder-style; replaces
-                        // any previous marks.
-                        if let (Some(clicked), Some(anchor)) =
-                            (clicked, self.active_mut().session.selected_commit_index)
-                        {
-                            let (lo, hi) = (clicked.min(anchor), clicked.max(anchor));
-                            self.active_mut().revision_multi_selection = (lo..=hi)
-                                .map(|index| {
-                                    self.active_mut()
-                                        .session
-                                        .commits
-                                        .row(index)
-                                        .commit_id()
-                                        .to_owned()
-                                })
-                                .collect();
-                            return Task::none();
-                        }
-                        // No anchor to span from — fall through to a toggle.
-                    }
-                    if let Some(found) = self
-                        .active_mut()
-                        .revision_multi_selection
-                        .iter()
-                        .position(|id| *id == commit_id)
-                    {
-                        self.active_mut().revision_multi_selection.remove(found);
-                    } else {
-                        self.active_mut().revision_multi_selection.push(commit_id);
-                    }
-                    return Task::none();
-                }
-                let target = self.active_mut();
-                target.revision_multi_selection.clear();
-                if target.session.selected_revision != selection {
-                    if let Some(editor) = target.description_editor.as_mut()
-                        && editor.is_dirty()
-                    {
-                        editor.switch_blocked = true;
-                        return Task::none();
-                    }
-                    target.description_editor = None;
-                }
-                // Re-clicking the already-selected revision toggles its file
-                // list without re-running the backend or changing the diff.
-                // The toggled value persists across revision switches, so
-                // collapsing once stays collapsed wherever the user moves
-                // next.
-                if target.session.selected_revision == selection {
-                    target.file_list_expanded = !target.file_list_expanded;
-                } else if target.session.diff_pending() == Some(&selection) {
-                    // Already loading this revision — let it land.
-                } else if let Some(tab) = self.active_tab_id() {
-                    let effects = self.active_mut().session.load_diff(selection);
-                    return self.run_effects(tab, effects);
-                }
+            UiEvent::SourceScrolled(offset) => {
+                self.active_mut().source.scroll_offset = offset;
             }
-            Message::MultiSelectClear => {
-                self.active_mut().revision_multi_selection.clear();
+            UiEvent::SourceTreeScrolled(offset) => {
+                self.active_mut().source.tree_scroll_offset = offset;
             }
-            Message::SelectTheme(theme) => {
-                self.selected_theme = theme;
-                // Switching to System: sync to the live OS appearance now rather
-                // than render one stale frame until the first poll tick lands.
-                if theme == ThemePreference::System {
-                    let current = chrome::system_appearance();
-                    if current != iced_theme::Mode::None {
-                        self.system_theme = current;
-                    }
-                }
+            UiEvent::SetHover(target) => self.hovered = target,
+            UiEvent::ToastDismiss(id) => self.toasts.retain(|toast| toast.id != id),
+            UiEvent::ToastTick => self.toasts.retain(|toast| toast.born.elapsed() < TOAST_TTL),
+            UiEvent::LoadingTick => {}
+            UiEvent::RevisionContextMenu(key, row_rect, cursor) => {
+                return self.open_revision_menu(key, row_rect, cursor);
             }
-            Message::ToggleDiffWrap => {
-                self.diff_wrap = !self.diff_wrap;
-                // Wrap changes shaping, so drop the paragraph cache; the
-                // height index re-keys off the flag itself. Persist with the
-                // usual geometry debounce.
-                self.document_version = self.document_version.wrapping_add(1);
-                self.mark_geometry_dirty();
+            UiEvent::SidebarFileContextMenu(display_index, row_rect, cursor) => {
+                return self.open_file_context_menu(display_index, row_rect, cursor);
             }
-            Message::ToggleDiffSplit => {
-                self.diff_split = !self.diff_split;
-                // Same cache discipline as the wrap toggle: column widths
-                // change shaping, the height index re-keys off the flag.
-                self.document_version = self.document_version.wrapping_add(1);
-                self.mark_geometry_dirty();
+            UiEvent::OpenToolbarMenu(which, anchor) => {
+                self.pop_mode(ModeKind::ActivityPopover);
+                return self.open_toolbar_menu(which, anchor);
             }
-            Message::SystemThemeChanged(theme) => {
-                self.system_theme = theme;
-            }
-            Message::PollSystemTheme => {
-                // iced pins the window's NSAppearance to our resolved theme,
-                // which makes winit stop reporting OS appearance changes (it
-                // ignores them once a window has an explicit appearance). So
-                // while following the OS we read the live application appearance
-                // ourselves and re-resolve on a change. `Mode::None` means
-                // "undeterminable" — leave the last known value untouched.
-                let current = chrome::system_appearance();
-                if current != iced_theme::Mode::None && current != self.system_theme {
-                    self.system_theme = current;
-                }
-            }
-            Message::RevisionContextMenu(key, row_rect, cursor) => {
-                // Right-clicking during target mode reads as "do something
-                // else instead" — drop the draft rather than nesting modes.
-                let target = self.active_mut();
-                target.op_draft = None;
-                let Some(repository) = target.repository.clone() else {
-                    return Task::none();
-                };
-                // jj-only for now — the mutations are jj-lib transactions.
-                if !matches!(repository.vcs, Vcs::Jj) {
-                    return Task::none();
-                }
-                // Right-click inside the marked set keeps it (the menu shows
-                // the batch actions); outside it re-targets the clicked row
-                // alone, Finder-style.
-                if !self.active_mut().revision_multi_selection.is_empty() {
-                    let clicked_id = match &key {
-                        revision_list::RowSelectionKey::WorkingCopy => self
-                            .active_mut()
-                            .session
-                            .commits
-                            .working_copy()
-                            .map(|row| row.commit_id().to_owned()),
-                        revision_list::RowSelectionKey::Commit(id) => Some(id.clone()),
-                    };
-                    let inside = clicked_id
-                        .is_some_and(|id| self.active_mut().revision_multi_selection.contains(&id));
-                    if !inside {
-                        self.active_mut().revision_multi_selection.clear();
-                    }
-                }
-                // macOS pops the native menu (blocking) with a pulsing glow over
-                // `row_rect`; every other platform opens the iced overlay at the
-                // cursor. Either way the chosen action dispatches the same way.
-                return self.open_revision_context_menu(
-                    repository,
-                    selection_from_key(&key),
-                    row_rect,
-                    cursor,
-                );
-            }
-            Message::DescriptionEdit => {
-                let target = self.active_mut();
-                if target
-                    .description_editor
-                    .as_ref()
-                    .is_some_and(|editor| editor.target == target.session.selected_revision)
-                {
-                    return iced::widget::operation::focus(iced::widget::Id::new(
-                        diff_panel::DESCRIPTION_EDITOR_ID,
-                    ));
-                }
-                let Some(details) = target.session.revision_details.as_ref() else {
-                    return Task::none();
-                };
-                let editable = target.session.capabilities.mutate;
-                if !editable {
-                    return Task::none();
-                }
-                // The editor occupies the description's slot in the scrollable
-                // revision header. Reveal it before focusing when editing was
-                // triggered from farther down a diff.
-                target.diff_scroll_offset = 0.0;
-                target.find = None;
-                let description = details.description.clone();
-                target.description_editor = Some(DescriptionEditor {
-                    target: target.session.selected_revision.clone(),
-                    original: description.clone(),
-                    content: widget::text_editor::Content::with_text(&description),
-                    saving_activity: None,
-                    switch_blocked: false,
-                });
-                self.scroll_restore_token = self.scroll_restore_token.wrapping_add(1);
-                return iced::widget::operation::focus(iced::widget::Id::new(
-                    diff_panel::DESCRIPTION_EDITOR_ID,
-                ));
-            }
-            Message::DescriptionAction(action) => {
-                if let Some(editor) = self.active_mut().description_editor.as_mut()
+            UiEvent::DescriptionAction(action) => {
+                if let Some(editor) = self.active_mut().description_editor_mut()
                     && editor.saving_activity.is_none()
                 {
                     editor.content.perform(action);
                     editor.switch_blocked = false;
                 }
             }
-            Message::DescriptionCancel => {
-                if self
-                    .active_mut()
-                    .description_editor
-                    .as_ref()
-                    .is_some_and(|editor| editor.saving_activity.is_none())
+            UiEvent::ActivityExpand(id) => self.active_mut().activities.toggle_expand(id),
+            UiEvent::ActivityDetailAction(id, action) => {
+                // Selection/caret/scroll only — the log drops edit actions,
+                // keeping the output buffer read-only.
+                self.active_mut()
+                    .activities
+                    .perform_detail_action(id, action);
+            }
+            UiEvent::ActivityNoOp | UiEvent::ConfirmNoOp | UiEvent::OpenRepoNoOp => {}
+            UiEvent::OpenRepoPathChanged(path) => {
+                if let Some(dialog) = self.open_repo_dialog_mut() {
+                    dialog.path = path;
+                    // Clear a stale error as soon as the user edits the path.
+                    dialog.error = None;
+                }
+            }
+            UiEvent::RevsetChanged(value) => self.active_mut().session.revset = value,
+            UiEvent::SidebarWidthChanged(width) => {
+                let clamped = resize_handle::clamp_width(
+                    width,
+                    self.sidebar_min_width,
+                    self.window_size.width,
+                );
+                if clamped != self.sidebar_width {
+                    self.sidebar_width = clamped;
+                    self.mark_geometry_dirty();
+                }
+            }
+            UiEvent::SourceSidebarRow(display_index) => {
+                let (entries, rows) = self.source_entries_and_rows();
+                match rows.get(display_index).cloned() {
+                    Some(diffui_core::SourceTreeRow::Dir { path, unlisted, .. }) => {
+                        if unlisted {
+                            // Unenumerated ignored dir: expanding it is a
+                            // lazy disk listing. Mark it expanded now so the
+                            // arriving children render straight away.
+                            let Some(tab) = self.active_tab_id() else {
+                                return Task::none();
+                            };
+                            self.active_mut().source.expanded.insert(path.clone());
+                            return self.list_ignored_dir(tab, path);
+                        }
+                        let expanded = &mut self.active_mut().source.expanded;
+                        if !expanded.remove(&path) {
+                            expanded.insert(path);
+                        }
+                    }
+                    Some(diffui_core::SourceTreeRow::File { entry_index, .. }) => {
+                        let path = entries.get(entry_index).map(|entry| entry.path.clone());
+                        if let Some(path) = path {
+                            return self.select_source_file(path);
+                        }
+                    }
+                    None => {}
+                }
+            }
+            UiEvent::SourceHeaderClicked => {}
+            UiEvent::SourceFilterChanged(query) => {
+                self.active_mut().source.filter = query;
+                // New result set — jump the list back to the top. The code
+                // pane's restore re-applies its own live offset, so only the
+                // sidebar actually moves.
+                self.active_mut().source.tree_scroll_offset = 0.0;
+                self.scroll_restore_token = self.scroll_restore_token.wrapping_add(1);
+            }
+            UiEvent::SourceFilterSubmit => {
+                // Open the best match (the ranked list's first row). A no-op
+                // when the box is empty — the first tree row is a directory.
+                let (entries, rows) = self.source_entries_and_rows();
+                if let Some(diffui_core::SourceTreeRow::File { entry_index, .. }) = rows.first()
+                    && let Some(path) = entries.get(*entry_index).map(|entry| entry.path.clone())
                 {
-                    self.active_mut().description_editor = None;
-                    self.active_mut().pending_description_edit = None;
+                    return self.select_source_file(path);
                 }
             }
-            Message::DescriptionSave => {
-                let Some(tab_id) = self.active_tab_id() else {
-                    return Task::none();
-                };
-                let target = self.active_mut();
-                let Some(editor) = target.description_editor.as_ref() else {
-                    return Task::none();
-                };
-                if editor.saving_activity.is_some() || !editor.is_dirty() {
-                    return Task::none();
-                }
-                let op = mutations::MutationOp::Describe {
-                    target: editor.target.clone(),
-                    description: editor.text().trim_end().to_owned(),
-                };
-                let (activity_id, _) = self.begin_activity(tab_id, "Update description", false);
-                if let Some(editor) = self.active_mut().description_editor.as_mut() {
-                    editor.saving_activity = Some(activity_id);
-                    editor.switch_blocked = false;
-                }
-                return self.run_mutation(PendingMutation {
-                    op,
-                    tab_id,
-                    activity_id,
-                    allow_immutable: false,
-                });
-            }
-            Message::ConfirmAccept => {
-                if let Some(dialog) = self.confirm.take() {
-                    return self.run_mutation(dialog.pending);
-                }
-            }
-            Message::ConfirmCancel => {
-                if let Some(dialog) = self.confirm.take() {
-                    // Resolve the held activity so it doesn't sit queued forever.
-                    if let Some(log) = self.activity_log_for(dialog.pending.tab_id) {
-                        log.finish(
-                            dialog.pending.activity_id,
-                            activity::ActivityStatus::Done,
-                            Some("Canceled".to_owned()),
-                        );
-                    }
-                    // A canceled describe-on-immutable leaves its editor open
-                    // and editable again (it was parked as "Saving…").
-                    if let Some(editor) = self.active_mut().description_editor.as_mut()
-                        && editor.saving_activity == Some(dialog.pending.activity_id)
-                    {
-                        editor.saving_activity = None;
-                    }
-                }
-            }
-            Message::ConfirmNoOp => {}
-            Message::DraftStart(kind, source) => {
-                // jj-only, like every mutation.
-                if !self.active().session.capabilities.mutate {
-                    return Task::none();
-                }
-                let Some(draft_source) = self.draft_source_for(&source) else {
-                    return Task::none();
-                };
-                let draft = match kind {
-                    mutations::DraftKind::Rebase { mode } => {
-                        diffui_core::OpDraft::rebase(mode, vec![draft_source])
-                    }
-                    mutations::DraftKind::Squash => diffui_core::OpDraft::squash(draft_source),
-                    mutations::DraftKind::Merge => diffui_core::OpDraft::merge(draft_source),
-                };
-                // Two marked-row languages at once would be unreadable — the
-                // draft's source wash takes over from the multi-select marks.
-                let target = self.active_mut();
-                target.revision_multi_selection.clear();
-                target.op_draft = Some(DraftUi::new(draft));
-                self.activity_popover_open = false;
-                self.menu = None;
-            }
-            Message::DraftStartKey(kind) => {
-                let source = self.active_mut().session.selected_revision.clone();
-                return self.update(Message::DraftStart(kind, source));
-            }
-            Message::DraftPlacement(placement) => {
-                if let Some(ui) = self.active_mut().op_draft.as_mut() {
-                    ui.draft.placement = placement;
-                    ui.hover_spot = None;
-                }
-                return self.kick_draft_preview();
-            }
-            Message::DraftPlacementKey(placement) => {
-                // With a keyboard candidate armed, `o`/`a`/`b` applies right
-                // away (jjui's flow); before that they just flip the toggle.
-                let candidate = self
-                    .active_mut()
-                    .op_draft
-                    .as_ref()
-                    .and_then(|ui| ui.draft.candidate);
-                match candidate.and_then(|index| self.selection_at_index(index)) {
-                    Some(target) => return self.confirm_draft_on(target, Some(placement)),
-                    None => return self.update(Message::DraftPlacement(placement)),
-                }
-            }
-            Message::DraftCandidate(delta) => {
+            UiEvent::BrowseFileFromDiff(file_index) => {
                 let target = self.active();
-                let len = target.session.commits.len();
-                let Some(ui) = target.op_draft.as_ref() else {
+                let Some(file) = target.session.document.files.get(file_index) else {
                     return Task::none();
                 };
-                if len == 0 {
+                let revision = target.session.selected_revision.clone();
+                let path = file.path.clone();
+                return self.open_source_browser(revision, Some(path));
+            }
+            UiEvent::RevisionDragStart(index) => return self.on_drag_start(index),
+            UiEvent::RevisionDragHover(spot) => {
+                let Some(draft) = self.active_mut().op_draft_mut() else {
+                    return Task::none();
+                };
+                if draft.hover_spot == spot {
                     return Task::none();
                 }
-                // Walk from the current candidate in `delta`'s direction to
-                // the next non-source row. The first move anchors on the
-                // *draft source's* row (the revision being moved) — a
-                // context-menu draft can start on a row that isn't the
-                // selection, and starting from the stale selection made the
-                // first j/k land somewhere unrelated. One O(n) scan, only on
-                // a draft's first nav.
-                let session = &target.session;
-                let start = ui
-                    .draft
-                    .candidate
-                    .or_else(|| {
-                        session
-                            .commits
-                            .iter()
-                            .position(|row| ui.draft.is_source(row.commit_id()))
-                    })
-                    .or(session.selected_commit_index)
-                    .map(|index| index as i64 + delta as i64)
-                    .unwrap_or(if delta >= 0 { 0 } else { len as i64 - 1 });
-                let step = if delta >= 0 { 1 } else { -1 };
-                let mut next = start;
-                let found = loop {
-                    if next < 0 || next >= len as i64 {
-                        break None;
-                    }
-                    let row = session.commits.row(next as usize);
-                    if ui.draft.target_valid(row.commit_id()) {
-                        break Some(next as usize);
-                    }
-                    next += step;
+                draft.hover_spot = spot;
+                draft.draft.candidate = match spot {
+                    Some(revision_list::DropSpot::OnRow(index)) => Some(index),
+                    _ => None,
                 };
-                let Some(found) = found else {
-                    return Task::none();
-                };
-                if let Some(ui) = self.active_mut().op_draft.as_mut() {
-                    ui.draft.candidate = Some(found);
-                    ui.hover_spot = None;
-                }
-                // Reveal the candidate row (the sidebar routes the file-reveal
-                // token at a draft candidate while target mode is active).
-                self.sidebar_file_reveal_token = self.sidebar_file_reveal_token.wrapping_add(1);
                 return self.kick_draft_preview();
             }
-            Message::DraftConfirm => {
-                if let Some(op) = self
-                    .active_mut()
-                    .op_draft
-                    .as_ref()
-                    .and_then(|ui| ui.draft.op_from_sources())
-                {
-                    self.active_mut().op_draft = None;
-                    return self.start_mutation_op(op);
-                }
-                let Some(target) = self
-                    .active_mut()
-                    .op_draft
-                    .as_ref()
-                    .and_then(|ui| ui.draft.candidate)
-                    .and_then(|index| self.selection_at_index(index))
-                else {
-                    return Task::none();
-                };
-                return self.confirm_draft_on(target, None);
-            }
-            Message::DraftCancel => {
-                self.active_mut().op_draft = None;
-            }
-            Message::DraftHoverCandidate(index) => {
+            UiEvent::RevisionDragDrop(spot) => return self.on_drag_drop(spot),
+            UiEvent::DraftHoverCandidate(index) => {
                 // Mouse-hover targeting: arm the hovered row as the candidate,
                 // exactly like j/k. Leaving the rows (`None`) keeps the last
                 // candidate armed — same persistence the keyboard gets.
@@ -1014,206 +1132,17 @@ impl Diffui {
                 };
                 let target = self.active_mut();
                 let commits = target.session.commits.len();
-                let Some(ui) = target.op_draft.as_mut() else {
+                let Some(draft) = target.op_draft_mut() else {
                     return Task::none();
                 };
-                if ui.draft.candidate == Some(index) || index >= commits {
+                if draft.draft.candidate == Some(index) || index >= commits {
                     return Task::none();
                 }
-                ui.draft.candidate = Some(index);
+                draft.draft.candidate = Some(index);
                 return self.kick_draft_preview();
             }
-            Message::DraftPreviewKick(version) => {
-                // The debounce timer fired: run the simulation that was
-                // parked at kick time, unless a newer kick (or an Idle
-                // transition, which clears the request) superseded it.
-                let Some(ui) = self.active_mut().op_draft.as_mut() else {
-                    return Task::none();
-                };
-                if ui.preview_version != version {
-                    return Task::none();
-                }
-                let Some(request) = ui.preview_request.take() else {
-                    return Task::none();
-                };
-                let draft = match request.kind {
-                    mutations::DraftKind::Rebase { mode } => diffui_core::PreviewRequest::Rebase {
-                        mode,
-                        sources: request.sources,
-                        destination: request.destination,
-                    },
-                    mutations::DraftKind::Merge => {
-                        // The merge's second parent is the destination's anchor
-                        // (gap drops resolve to the parent side, like the
-                        // confirm path).
-                        let anchor = request.destination.anchor().clone();
-                        diffui_core::PreviewRequest::Merge {
-                            parents: request.sources.into_iter().chain([anchor]).collect(),
-                        }
-                    }
-                    // Filtered out before the request was parked.
-                    mutations::DraftKind::Squash => return Task::none(),
-                };
-                let Some(tab) = self.active_tab_id() else {
-                    return Task::none();
-                };
-                let Some(state) = self.tab_mut(tab) else {
-                    return Task::none();
-                };
-                // A superseded simulation is cancelled rather than left to
-                // finish against a candidate the user has already left.
-                let mut effects = Vec::new();
-                if let Some(previous) = state.jobs.preview.take() {
-                    effects.push(diffui_core::Effect::Send(diffui_core::Command::Cancel {
-                        job: previous,
-                    }));
-                }
-                let (job, preview) = state.session.preview(draft);
-                state.jobs.preview = Some(job);
-                effects.extend(preview);
-                return self.run_effects(tab, effects);
-            }
-            Message::RevisionDragStart(index) => {
-                // A drag that activates right after a confirm-on-press (the
-                // press ran the draft, the move crossed the threshold) must
-                // not spawn a phantom draft on the mutation's target.
-                if self.mutation_busy() {
-                    return Task::none();
-                }
-                // Dragging a row that's already a source of the active draft
-                // *continues* that draft — kind, mode, and stacked sources
-                // intact. Without this, starting "Whole branch onto…" (or a
-                // squash/merge) and then dragging the row to its target
-                // silently downgraded the draft to a plain single-revision
-                // rebase, so the panel never previewed the resolved branch.
-                let target = self.active();
-                if let Some(ui) = target.op_draft.as_ref()
-                    && index < target.session.commits.len()
-                    && ui
-                        .draft
-                        .is_source(target.session.commits.row(index).commit_id())
-                {
-                    return Task::none();
-                }
-                let Some(source) = self.selection_at_index(index) else {
-                    return Task::none();
-                };
-                // ⌥ at drag start opts into moving the whole subtree.
-                let mode = if self.modifiers.alt() {
-                    mutations::RebaseSourceMode::WithDescendants
-                } else {
-                    mutations::RebaseSourceMode::Revisions
-                };
-                return self.update(Message::DraftStart(
-                    mutations::DraftKind::Rebase { mode },
-                    source,
-                ));
-            }
-            Message::RevisionDragHover(spot) => {
-                let Some(ui) = self.active_mut().op_draft.as_mut() else {
-                    return Task::none();
-                };
-                if ui.hover_spot == spot {
-                    return Task::none();
-                }
-                ui.hover_spot = spot;
-                ui.draft.candidate = match spot {
-                    Some(revision_list::DropSpot::OnRow(index)) => Some(index),
-                    _ => None,
-                };
-                return self.kick_draft_preview();
-            }
-            Message::RevisionDragDrop(spot) => {
-                let Some(spot) = spot else {
-                    // Released outside any spot: stay in target mode so the
-                    // op bar keeps offering click / keyboard picking.
-                    if let Some(ui) = self.active_mut().op_draft.as_mut() {
-                        ui.hover_spot = None;
-                    }
-                    return Task::none();
-                };
-                let Some(ui) = self.active_mut().op_draft.as_ref() else {
-                    return Task::none();
-                };
-                let mut draft = ui.draft.clone();
-                // ⌥ held at drop upgrades the move to "with descendants".
-                if self.modifiers.alt()
-                    && let mutations::DraftKind::Rebase { mode } = &mut draft.kind
-                {
-                    *mode = mutations::RebaseSourceMode::WithDescendants;
-                }
-                // Targets resolve through the graph before the lowering's own
-                // check: `op_for`'s guard only sees the `Commit` variant, so
-                // a `WorkingCopy` selection naming a source commit would slip
-                // through it.
-                let op = match spot {
-                    revision_list::DropSpot::OnRow(index) => self
-                        .selection_at_index(index)
-                        .filter(|target| !self.draft_blocks_target(target))
-                        .and_then(|target| draft.op_for(target, mutations::PlacementKind::Onto)),
-                    revision_list::DropSpot::Gap { above, below } => {
-                        match (
-                            self.selection_at_index(below),
-                            self.selection_at_index(above),
-                        ) {
-                            (Some(parent), Some(child))
-                                if !self.draft_blocks_target(&parent)
-                                    && !self.draft_blocks_target(&child) =>
-                            {
-                                draft.op_for_gap(parent, child)
-                            }
-                            _ => None,
-                        }
-                    }
-                };
-                match op {
-                    Some(op) => {
-                        self.active_mut().op_draft = None;
-                        return self.start_mutation_op(op);
-                    }
-                    // Dropped on a source / vanished row: keep target mode.
-                    None => {
-                        if let Some(ui) = self.active_mut().op_draft.as_mut() {
-                            ui.hover_spot = None;
-                        }
-                    }
-                }
-            }
-            Message::UndoActivityOp(activity_id, operation_id) => {
-                let Some(tab_id) = self.active_tab_id() else {
-                    return Task::none();
-                };
-                // One-shot: clear the button so a second click can't
-                // double-revert the same operation.
-                if let Some(log) = self.activity_log_for(tab_id) {
-                    log.clear_undo_op(activity_id);
-                }
-                return self.start_mutation_op(mutations::MutationOp::Undo {
-                    operation_id: Some(operation_id),
-                });
-            }
-            Message::ModifiersChanged(modifiers) => {
-                self.modifiers = modifiers;
-            }
-            Message::DraftToggleSource => {
-                let Some(target) = self
-                    .active_mut()
-                    .op_draft
-                    .as_ref()
-                    .and_then(|ui| ui.draft.candidate)
-                    .and_then(|index| self.selection_at_index(index))
-                else {
-                    return Task::none();
-                };
-                return self.draft_toggle_source(target);
-            }
-            Message::ToastDismiss(id) => {
-                self.toasts.retain(|toast| toast.id != id);
-            }
-            Message::ToastTick => {
-                self.toasts.retain(|toast| toast.born.elapsed() < TOAST_TTL);
-            }
-            Message::FileHighlighted(document_id, file_index, spans) => {
+            UiEvent::DraftPreviewKick(version) => return self.run_parked_preview(version),
+            UiEvent::FileHighlighted(document_id, file_index, spans) => {
                 let Some((tab, target)) = self.document_target_mut(document_id) else {
                     // The document was replaced; this result highlighted a
                     // dead snapshot.
@@ -1243,7 +1172,34 @@ impl Diffui {
                 }
                 return self.spawn_highlights(document_id);
             }
-            Message::WindowFocusChanged(focused) => {
+        }
+        Task::none()
+    }
+
+    /// The platform half: window geometry and lifecycle, modifiers, the OS
+    /// appearance, and the raw key presses the keymap resolves.
+    fn on_window_event(&mut self, event: WindowEvent) -> Task<Message> {
+        match event {
+            WindowEvent::KeyPressed {
+                key,
+                modifiers,
+                consumed,
+            } => return self.on_key_pressed(&key, modifiers, consumed),
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers,
+            WindowEvent::SystemThemeChanged(theme) => self.system_theme = theme,
+            WindowEvent::PollSystemTheme => {
+                // iced pins the window's NSAppearance to our resolved theme,
+                // which makes winit stop reporting OS appearance changes (it
+                // ignores them once a window has an explicit appearance). So
+                // while following the OS we read the live application appearance
+                // ourselves and re-resolve on a change. `Mode::None` means
+                // "undeterminable" — leave the last known value untouched.
+                let current = chrome::system_appearance();
+                if current != iced_theme::Mode::None && current != self.system_theme {
+                    self.system_theme = current;
+                }
+            }
+            WindowEvent::FocusChanged(focused) => {
                 let gained_focus = focused && !self.app_focused;
                 let lost_focus = !focused && self.app_focused;
                 self.app_focused = focused;
@@ -1260,46 +1216,7 @@ impl Diffui {
                     return self.start_repository_snapshot(tab, RefreshOrigin::Focus);
                 }
             }
-            Message::LoadingTick => {}
-            Message::SelectNextFile => {
-                if self.active_mut().main_view == MainView::Source {
-                    return self.source_select_neighbor(1);
-                }
-                let target = self.active_mut();
-                if !target.session.document.files.is_empty() {
-                    target.selected_file = (target.selected_file + 1)
-                        .min(target.session.document.files.len().saturating_sub(1));
-                    self.reveal_selected_file_in_tree();
-                    return scroll_sidebar_to_file(self);
-                }
-            }
-            Message::SelectPreviousFile => {
-                if self.active_mut().main_view == MainView::Source {
-                    return self.source_select_neighbor(-1);
-                }
-                let target = self.active_mut();
-                let previous = target.selected_file.saturating_sub(1);
-                if previous != target.selected_file {
-                    target.selected_file = previous;
-                    self.reveal_selected_file_in_tree();
-                    return scroll_sidebar_to_file(self);
-                }
-            }
-            Message::CopyToClipboard(text) => {
-                return iced::clipboard::write(text).discard();
-            }
-            Message::SidebarWidthChanged(width) => {
-                let clamped = resize_handle::clamp_width(
-                    width,
-                    self.sidebar_min_width,
-                    self.window_size.width,
-                );
-                if clamped != self.sidebar_width {
-                    self.sidebar_width = clamped;
-                    self.mark_geometry_dirty();
-                }
-            }
-            Message::WindowOpened(position, size) => {
+            WindowEvent::Opened(position, size) => {
                 // Seed tracking from the real window without marking dirty: the
                 // geometry we'd persist already matches what's on disk.
                 self.window_size = size;
@@ -1316,7 +1233,7 @@ impl Diffui {
                     self.configure_custom_titlebar(),
                 ]);
             }
-            Message::WindowResized(size) => {
+            WindowEvent::Resized(size) => {
                 if self.window_size != size {
                     self.window_size = size;
                     // Shrinking the window can push the split past the diff
@@ -1336,13 +1253,13 @@ impl Diffui {
                 // already set, so it can't reintroduce the jump.
                 return self.reposition_window_controls();
             }
-            Message::WindowMoved(position) => {
+            WindowEvent::Moved(position) => {
                 if self.window_position != Some(position) {
                     self.window_position = Some(position);
                     self.mark_geometry_dirty();
                 }
             }
-            Message::PersistWindowState => {
+            WindowEvent::PersistState => {
                 // Only write once the changes have settled — a drag keeps
                 // bumping `geometry_dirty_since`, so the elapsed check holds the
                 // write back until the burst stops.
@@ -1353,7 +1270,7 @@ impl Diffui {
                     self.current_window_state().save();
                 }
             }
-            Message::WindowCloseRequested => {
+            WindowEvent::CloseRequested => {
                 // The app owns the close (`exit_on_close_request(false)`) so
                 // the debounced write can't be cut off by the process going
                 // away — ⌘Q and the close button raise no `Unfocused`, so
@@ -1362,59 +1279,12 @@ impl Diffui {
                 self.current_window_state().save();
                 return iced::exit();
             }
-            Message::SelectTab(id) => {
-                return self.activate_tab(id);
-            }
-            Message::SelectTabIndex(index) => {
-                if let Some(tab) = self.tabs.get(index) {
-                    let id = tab.id;
-                    return self.activate_tab(id);
-                }
-            }
-            Message::CloseTab(id) => {
-                return self.close_tab(id);
-            }
-            Message::CloseActiveTab => {
-                if let Some(tab) = self.tabs.get(self.active) {
-                    let id = tab.id;
-                    return self.close_tab(id);
-                }
-            }
-            Message::OpenRepoDialogOpen => {
-                // Mutually exclusive with the other overlays.
-                self.palette = None;
-                self.active_mut().find = None;
-                self.open_repo_dialog = Some(OpenRepoDialog::default());
-                return widget::operation::focus(tab_bar::OPEN_REPO_INPUT_ID);
-            }
-            Message::OpenRepoDialogClose => {
-                self.open_repo_dialog = None;
-            }
-            Message::OpenRepoPathChanged(path) => {
-                if let Some(dialog) = self.open_repo_dialog.as_mut() {
-                    dialog.path = path;
-                    // Clear a stale error as soon as the user edits the path.
-                    dialog.error = None;
-                }
-            }
-            Message::OpenRepoSubmit => {
-                let path = self
-                    .open_repo_dialog
-                    .as_ref()
-                    .map(|dialog| dialog.path.clone())
-                    .unwrap_or_default();
-                return self.open_repository(&path);
-            }
-            Message::OpenRecentRepo(path) => {
-                return self.open_repository(&path);
-            }
-            Message::OpenRepoNoOp => {}
-            Message::TitleBarDrag => {
+            WindowEvent::TitleBarDrag => {
                 // Resolve the (single) window and begin an interactive drag.
                 // No-op if the window id isn't available yet.
                 return window::latest().then(|id| id.map_or_else(Task::none, window::drag));
             }
-            Message::TitleBarDoubleClick => {
+            WindowEvent::TitleBarDoubleClick => {
                 // A native title bar runs the system double-click action for free;
                 // our custom strip has to resolve it. Read the window frame, its
                 // screen's visible frame, and the configured action on the main
@@ -1432,15 +1302,15 @@ impl Diffui {
                         })
                     })
                     .map(|(current, visible, action, duration)| {
-                        Message::TitleBarDoubleClickPlan {
+                        Message::Window(WindowEvent::TitleBarDoubleClickPlan {
                             current,
                             visible,
                             action,
                             duration,
-                        }
+                        })
                     });
             }
-            Message::TitleBarDoubleClickPlan {
+            WindowEvent::TitleBarDoubleClickPlan {
                 current,
                 visible,
                 action,
@@ -1483,7 +1353,7 @@ impl Diffui {
                     }
                 }
             }
-            Message::ZoomAnimTick => {
+            WindowEvent::ZoomAnimTick => {
                 let Some(anim) = self.zoom_anim else {
                     return Task::none();
                 };
@@ -1518,26 +1388,60 @@ impl Diffui {
                     })
                     .discard();
             }
-            Message::Palette(PaletteMessage::Open) => {
-                if self.palette.is_none() {
-                    // Mutually exclusive with the find bar / open-repo dialog:
-                    // opening the palette pulls keyboard focus and the others
-                    // would sit behind the modal anyway.
-                    self.active_mut().find = None;
-                    self.open_repo_dialog = None;
-                    self.palette = Some(PaletteState::open(self));
-                    return widget::operation::focus(palette::PALETTE_INPUT_ID);
-                }
+        }
+        Task::none()
+    }
+
+    /// Resolve a key press through the keymap and run whatever it names.
+    ///
+    /// `consumed` is iced's "a focused widget already took this key". The
+    /// revset box is an inline text input with no mode of its own, so without
+    /// that check its typing would also drive file navigation.
+    fn on_key_pressed(
+        &mut self,
+        key: &keyboard::Key,
+        modifiers: keyboard::Modifiers,
+        consumed: bool,
+    ) -> Task<Message> {
+        let Some(chord) = Chord::from_event(key, modifiers) else {
+            return Task::none();
+        };
+        let context = self.key_context();
+        let Some(id) = self.resolve_chord(context, &chord, consumed) else {
+            return Task::none();
+        };
+        self.run_command(id, CommandArg::None)
+    }
+
+    /// The command a chord names in `context`, falling back to the base context
+    /// only where the mode allows it (see [`crate::modes::passes_through`]).
+    fn resolve_chord(
+        &self,
+        context: Context,
+        chord: &Chord,
+        consumed: bool,
+    ) -> Option<commands::CommandId> {
+        let claim = |context: Context| {
+            if consumed && modes::needs_unconsumed(context, chord) {
+                return None;
             }
-            Message::Palette(PaletteMessage::Close) => {
-                self.palette = None;
-            }
-            Message::Palette(PaletteMessage::QueryChanged(query)) => {
+            self.keymap.resolve(context, chord)
+        };
+        claim(context).or_else(|| {
+            modes::passes_through(context, chord)
+                .then(|| claim(Context::Base))
+                .flatten()
+        })
+    }
+
+    fn on_palette_message(&mut self, message: PaletteMessage) -> Task<Message> {
+        match message {
+            PaletteMessage::QueryChanged(query) => {
                 // Take the palette out of `self` so the matcher can borrow
                 // `&self` (commits / files / recents) directly. Previously
                 // this cloned the entire app per keystroke; on a 40k-commit
                 // repo that deep clone was the bulk of the typing latency.
-                let Some(mut state) = self.palette.take() else {
+                let Some(mut state) = self.take_palette() else {
                     return Task::none();
                 };
                 let depth = state.stack.len().saturating_sub(1);
@@ -1562,11 +1466,11 @@ impl Diffui {
                         },
                     );
                 }
-                self.palette = Some(state);
-                return task;
+                self.push_mode(Mode::Palette(state));
+                task
             }
-            Message::Palette(PaletteMessage::Recompute(depth, version)) => {
-                let Some(mut state) = self.palette.take() else {
+            PaletteMessage::Recompute(depth, version) => {
+                let Some(mut state) = self.take_palette() else {
                     return Task::none();
                 };
                 let mut task = Task::none();
@@ -1584,88 +1488,46 @@ impl Diffui {
                         iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
                     );
                 }
-                self.palette = Some(state);
-                return task;
+                self.push_mode(Mode::Palette(state));
+                task
             }
-            Message::Palette(PaletteMessage::MoveSelection(delta)) => {
-                if let Some(state) = self.palette.as_mut()
-                    && let Some(column) = state.top_mut()
-                    && !column.matches.is_empty()
-                {
-                    let len = column.matches.len() as i32;
-                    let next = (column.selected as i32 + delta).rem_euclid(len);
-                    column.selected = next as usize;
-                    let depth = state.stack.len().saturating_sub(1);
-                    let column = state.stack.last_mut().expect("top column");
-                    if column.ensure_selected_visible() {
-                        return widget::operation::scroll_to(
-                            palette::results_scrollable_id(depth),
-                            iced::widget::scrollable::AbsoluteOffset {
-                                x: 0.0,
-                                y: column.scroll_y,
-                            },
-                        );
-                    }
-                }
-            }
-            Message::Palette(PaletteMessage::SelectIndex(index)) => {
-                if let Some(state) = self.palette.as_mut()
-                    && let Some(column) = state.top_mut()
+            PaletteMessage::SelectIndex(depth, index) => {
+                if let Some(state) = self.palette_mut()
+                    && state.stack.len() == depth + 1
+                    && let Some(column) = state.stack.get_mut(depth)
                     && index < column.matches.len()
                 {
                     column.selected = index;
                 }
+                Task::none()
             }
-            Message::Palette(PaletteMessage::Accept) => {
-                return self.palette_submit();
-            }
-            Message::Palette(PaletteMessage::AcceptIndex(index)) => {
-                if let Some(state) = self.palette.as_mut()
-                    && let Some(column) = state.top_mut()
-                    && index < column.matches.len()
-                {
-                    column.selected = index;
-                }
-                return self.palette_accept_current();
-            }
-            Message::Palette(PaletteMessage::PushActions) => {
-                let Some(mut state) = self.palette.take() else {
+            PaletteMessage::Accept => self.palette_submit(),
+            PaletteMessage::AcceptIndex(depth, index) => {
+                // The click carries the column it was drawn in: a push or pop
+                // between the press and its delivery must not run whatever row
+                // now sits at that index in a different column.
+                let addressed = self
+                    .palette_mut()
+                    .is_some_and(|state| state.stack.len() == depth + 1);
+                if !addressed {
                     return Task::none();
-                };
-                let pushed = state.push_actions(self);
-                self.palette = Some(state);
-                if pushed {
-                    return widget::operation::focus(palette::PALETTE_INPUT_ID);
                 }
-            }
-            Message::Palette(PaletteMessage::NoOp) => {}
-            Message::Palette(PaletteMessage::Tick) => {}
-            Message::Palette(PaletteMessage::PopColumn) => {
-                if let Some(state) = self.palette.as_mut() {
-                    if state.pop() {
-                        return widget::operation::focus(palette::PALETTE_INPUT_ID);
-                    } else {
-                        self.palette = None;
-                    }
+                if let Some(state) = self.palette_mut()
+                    && let Some(column) = state.stack.get_mut(depth)
+                    && index < column.matches.len()
+                {
+                    column.selected = index;
                 }
+                self.palette_accept_current()
             }
-            Message::Find(FindMessage::Open) => {
-                // Mutually exclusive with the palette / open-repo dialog: same
-                // keyboard focus arbiter, and stacking overlays makes the find
-                // bar look broken.
-                self.palette = None;
-                self.open_repo_dialog = None;
-                let target = self.active_mut();
-                if target.find.is_none() {
-                    target.find = Some(FindState::default());
-                }
-                return widget::operation::focus(find::FIND_INPUT_ID);
-            }
-            Message::Find(FindMessage::Close) => {
-                self.active_mut().find = None;
-            }
-            Message::Find(FindMessage::QueryChanged(query)) => {
-                if let Some(state) = self.active_mut().find.as_mut() {
+            PaletteMessage::NoOp | PaletteMessage::Tick => Task::none(),
+        }
+    }
+
+    fn on_find_message(&mut self, message: FindMessage) -> Task<Message> {
+        match message {
+            FindMessage::QueryChanged(query) => {
+                if let Some(state) = self.active_mut().find_mut() {
                     state.query = query;
                     state.error = None;
                     state.query_version = state.query_version.wrapping_add(1);
@@ -1679,13 +1541,13 @@ impl Diffui {
                     );
                 }
             }
-            Message::Find(FindMessage::Recompute(version)) => {
+            FindMessage::Recompute(version) => {
                 let target = self.active_mut();
-                if let Some(state) = target.find.as_ref()
+                if let Some(state) = target.find()
                     && state.query_version == version
                 {
                     let (matches, error) = find::compute_matches(state, target.find_files());
-                    if let Some(state) = self.active_mut().find.as_mut() {
+                    if let Some(state) = self.active_mut().find_mut() {
                         state.matches = matches;
                         state.error = error;
                         state.active = if state.matches.is_empty() {
@@ -1697,46 +1559,25 @@ impl Diffui {
                     }
                 }
             }
-            Message::Find(FindMessage::ToggleCase) => {
-                if let Some(state) = self.active_mut().find.as_mut() {
+            FindMessage::ToggleCase => {
+                if let Some(state) = self.active_mut().find_mut() {
                     state.case_sensitive = !state.case_sensitive;
                     return self.refind_now();
                 }
             }
-            Message::Find(FindMessage::ToggleRegex) => {
-                if let Some(state) = self.active_mut().find.as_mut() {
+            FindMessage::ToggleRegex => {
+                if let Some(state) = self.active_mut().find_mut() {
                     state.regex = !state.regex;
                     return self.refind_now();
                 }
             }
-            Message::Find(FindMessage::Next) => {
-                self.find_advance(1);
-            }
-            Message::Find(FindMessage::Prev) => {
-                self.find_advance(-1);
-            }
+        }
+        Task::none()
+    }
 
-            // ── Toolbar / activity / revset ─────────────────────────────
-            Message::ToolbarRefresh => {
-                return self.toolbar_refresh();
-            }
-            Message::Fetch(target) => {
-                return self.start_fetch(target);
-            }
-            Message::Undo => {
-                return self.start_undo();
-            }
-            Message::RevsetChanged(value) => {
-                self.active_mut().session.revset = value;
-            }
-            Message::RevsetSubmit => {
-                return self.evaluate_revset();
-            }
-            Message::OpenToolbarMenu(which, anchor) => {
-                self.activity_popover_open = false;
-                return self.open_toolbar_menu(which, anchor);
-            }
-            Message::Menu(MenuMessage::Hover(path)) => {
+    fn on_menu_message(&mut self, message: MenuMessage) -> Task<Message> {
+        match message {
+            MenuMessage::Hover(path) => {
                 // Hover is `on_enter`-driven (geometry-free, can't mis-hit). On
                 // the open branch (or with no flyout open) it commits at once.
                 // An off-branch row while a flyout is open is held as *pending*
@@ -1744,7 +1585,7 @@ impl Diffui {
                 // a row is aim, not transit, and commits directly. A pending row
                 // commits once the cursor veers out of the trajectory wedge
                 // (MenuMouseMoved) or the sweep stalls (MenuTick).
-                let Some(m) = self.menu.as_mut() else {
+                let Some(m) = self.menu_mut() else {
                     return Task::none();
                 };
                 m.entered = true;
@@ -1754,8 +1595,8 @@ impl Diffui {
                     m.pending_row = Some(path);
                 }
             }
-            Message::Menu(MenuMessage::MouseMoved(pos)) => {
-                if self.menu.is_none() {
+            MenuMessage::MouseMoved(pos) => {
+                if self.menu().is_none() {
                     return Task::none();
                 }
                 // Off-branch sweep pending: commit the row the moment the cursor
@@ -1767,7 +1608,7 @@ impl Diffui {
                 // the tick's job). A not-yet-set apex (submenu only just opened)
                 // holds the row pending rather than stealing it.
                 let commit = {
-                    let m = self.menu.as_ref().unwrap();
+                    let m = self.menu().expect("just checked");
                     m.pending_row.as_ref().map(|_| {
                         match (m.flyout_origin, menu::flyout_rect(self, m)) {
                             (Some(apex), Some(fly)) => !menu::heading_to_flyout(apex, pos, fly),
@@ -1775,7 +1616,7 @@ impl Diffui {
                         }
                     })
                 };
-                let m = self.menu.as_mut().unwrap();
+                let m = self.menu_mut().expect("just checked");
                 m.note_cursor_move(pos);
                 m.entered = true;
                 if commit == Some(true)
@@ -1784,8 +1625,8 @@ impl Diffui {
                     m.activate(path);
                 }
             }
-            Message::Menu(MenuMessage::Select(path, button)) => {
-                let Some(open) = self.menu.as_mut() else {
+            MenuMessage::Select(path, button) => {
+                let Some(open) = self.menu_mut() else {
                     return Task::none();
                 };
                 // The opening press's own release picks nothing: the menu was
@@ -1795,35 +1636,34 @@ impl Diffui {
                 // Only a leaf picks; a release on a submenu/disabled/separator
                 // row leaves the (already hover-opened) menu as it is.
                 if !open.opening_release(button)
-                    && let Some(menu::MenuEntry::Item { action, .. }) = open.entry_at(&path)
+                    && let Some(menu::MenuEntry::Item { command, arg, .. }) = open.entry_at(&path)
                 {
-                    let action = action.clone();
-                    let selection = open.selection.clone();
-                    self.menu = None;
-                    return self.dispatch_menu_action(action, selection);
+                    let (command, arg) = (*command, arg.clone());
+                    self.pop_mode(ModeKind::Menu);
+                    return self.run_command(command, arg);
                 }
             }
-            Message::Menu(MenuMessage::CapturePress) => {}
-            Message::Menu(MenuMessage::CardScrolled(depth, offset)) => {
-                if let Some(m) = self.menu.as_mut() {
+            MenuMessage::CapturePress => {}
+            MenuMessage::CardScrolled(depth, offset) => {
+                if let Some(m) = self.menu_mut() {
                     if m.scrolls.len() <= depth {
                         m.scrolls.resize(depth + 1, 0.0);
                     }
                     m.scrolls[depth] = offset;
                 }
             }
-            Message::Menu(MenuMessage::Dismiss) => {
-                self.menu = None;
+            MenuMessage::Dismiss => {
+                self.pop_mode(ModeKind::Menu);
             }
-            Message::Menu(MenuMessage::ScrimRelease(button)) => {
-                if let Some(menu) = self.menu.as_mut() {
+            MenuMessage::ScrimRelease(button) => {
+                if let Some(menu) = self.menu_mut() {
                     // Same gate the row `Select` uses, on the other half of the
                     // window: the opening press's release lands here when the
                     // cursor sits outside the cards — swallow it and keep the
                     // menu open. A later release — or one after the cursor has
                     // dragged into the menu — dismisses.
                     if !menu.opening_release(button) || menu.entered {
-                        self.menu = None;
+                        self.pop_mode(ModeKind::Menu);
                     }
                 }
             }
@@ -1834,8 +1674,8 @@ impl Diffui {
             // velocity-proportional amount during a sweep yet catch up when the
             // cursor idles. Frozen while a row is pending so the wedge keeps a
             // stable upstream origin mid-sweep.
-            Message::Menu(MenuMessage::Tick) => {
-                if let Some(m) = self.menu.as_mut() {
+            MenuMessage::Tick => {
+                if let Some(m) = self.menu_mut() {
                     if m.pending_row.is_none() {
                         if let Some(cursor) = m.cursor {
                             m.flyout_origin = Some(menu::ease_apex(m.flyout_origin, cursor));
@@ -1851,149 +1691,640 @@ impl Diffui {
                     }
                 }
             }
-            Message::ActivityToggle => {
-                self.activity_popover_open = !self.activity_popover_open;
-                self.menu = None;
-            }
-            Message::ActivityExpand(id) => {
-                self.active_mut().activities.toggle_expand(id);
-            }
-            Message::ActivityDetailAction(id, action) => {
-                // Selection/caret/scroll only — the log drops edit actions,
-                // keeping the output buffer read-only.
-                self.active_mut()
-                    .activities
-                    .perform_detail_action(id, action);
-            }
-            Message::ActivityClear => {
-                self.active_mut().activities.clear_finished();
-            }
-            Message::ActivityNoOp => {}
-            Message::OpenUrl(url) => {
-                open_url(&url);
-            }
-            Message::SetHover(target) => {
-                self.hovered = target;
-            }
+        }
+        Task::none()
+    }
 
-            // ── Source browser ──────────────────────────────────────────
-            Message::SetMainView(mode) => {
-                if mode != self.active().main_view {
-                    match mode {
-                        MainView::Diff => {
-                            self.active_mut().main_view = MainView::Diff;
-                            // The shared code widget swaps documents: restore
-                            // this view's saved scroll and drop the other
-                            // view's shaped-paragraph cache.
-                            self.scroll_restore_token = self.scroll_restore_token.wrapping_add(1);
-                            self.document_version = self.document_version.wrapping_add(1);
-                        }
-                        MainView::Source => {
-                            // First open browses the selected revision jumped
-                            // to the diff's selected file; later toggles
-                            // return to whatever was being browsed.
-                            let tab = self.active();
-                            let revision = tab
-                                .source
-                                .revision
-                                .clone()
-                                .unwrap_or_else(|| tab.session.selected_revision.clone());
-                            let jump = tab
-                                .source
-                                .revision
-                                .is_none()
-                                .then(|| {
-                                    tab.session
-                                        .document
-                                        .files
-                                        .get(tab.selected_file)
-                                        .map(|file| file.path.clone())
-                                })
-                                .flatten();
-                            return self.open_source_browser(revision, jump);
-                        }
-                    }
+    /// Open the palette. It shares one keyboard with the find bar and the
+    /// open-repo dialog, so those close rather than sit behind the modal.
+    fn open_palette(&mut self) -> Task<Message> {
+        self.active_mut().pop_mode(ModeKind::Find);
+        self.pop_mode(ModeKind::OpenRepo);
+        let state = PaletteState::open(self);
+        self.push_mode(Mode::Palette(state));
+        widget::operation::focus(palette::PALETTE_INPUT_ID)
+    }
+
+    /// Lift the palette out of the mode stack so the matcher can borrow `&self`
+    /// — the commits, files and recents it ranks against. The caller must push
+    /// it back.
+    fn take_palette(&mut self) -> Option<PaletteState> {
+        match self.pop_mode(ModeKind::Palette) {
+            Some(Mode::Palette(state)) => Some(state),
+            _ => None,
+        }
+    }
+
+    /// Move the palette's highlighted row, scrolling it back into view when the
+    /// move pushed it out.
+    fn palette_move(&mut self, delta: i32) -> Task<Message> {
+        let Some(state) = self.palette_mut() else {
+            return Task::none();
+        };
+        let depth = state.stack.len().saturating_sub(1);
+        let Some(column) = state.top_mut() else {
+            return Task::none();
+        };
+        if column.matches.is_empty() {
+            return Task::none();
+        }
+        let len = column.matches.len() as i32;
+        column.selected = (column.selected as i32 + delta).rem_euclid(len) as usize;
+        if column.ensure_selected_visible() {
+            let y = column.scroll_y;
+            return widget::operation::scroll_to(
+                palette::results_scrollable_id(depth),
+                iced::widget::scrollable::AbsoluteOffset { x: 0.0, y },
+            );
+        }
+        Task::none()
+    }
+
+    /// Open the find bar, closing the overlays that share its keyboard.
+    fn open_find(&mut self) -> Task<Message> {
+        self.pop_mode(ModeKind::Palette);
+        self.pop_mode(ModeKind::OpenRepo);
+        if self.active().find().is_none() {
+            self.active_mut()
+                .push_mode(TabMode::Find(FindState::default()));
+        }
+        widget::operation::focus(find::FIND_INPUT_ID)
+    }
+
+    /// Browse `selection`: the plain-click / palette-jump path. Re-selecting
+    /// the revision already shown toggles its inline file list instead of
+    /// re-running the backend.
+    fn select_revision(&mut self, selection: RevisionSelection) -> Task<Message> {
+        let target = self.active_mut();
+        target.revision_multi_selection.clear();
+        if target.session.selected_revision != selection {
+            if let Some(editor) = target.description_editor_mut()
+                && editor.is_dirty()
+            {
+                editor.switch_blocked = true;
+                return Task::none();
+            }
+            target.pop_mode(ModeKind::Description);
+        }
+        // Re-clicking the already-selected revision toggles its file
+        // list without re-running the backend or changing the diff.
+        // The toggled value persists across revision switches, so
+        // collapsing once stays collapsed wherever the user moves
+        // next.
+        if target.session.selected_revision == selection {
+            target.file_list_expanded = !target.file_list_expanded;
+        } else if target.session.diff_pending() == Some(&selection) {
+            // Already loading this revision — let it land.
+        } else if let Some(tab) = self.active_tab_id() {
+            let effects = self.active_mut().session.load_diff(selection);
+            return self.run_effects(tab, effects);
+        }
+        Task::none()
+    }
+
+    /// A click on a revision row. What it means depends on the modifiers held
+    /// and on whether a draft is picking a destination, neither of which the
+    /// widget can see — so the row publishes the click and this resolves it.
+    fn on_revision_row_click(&mut self, key: revision_list::RowSelectionKey) -> Task<Message> {
+        let selection = selection_from_key(&key);
+        // Target mode: a plain click *arms* the row as the destination
+        // candidate (same as hover / j-k); the Apply button, ↵, or a
+        // drop executes. One-click execution was too easy to fire by
+        // accident once hover started arming rows. ⌘-click toggles the
+        // row as a draft *source* and stays in the mode — stack extra
+        // merge parents / revisions to rebase / squash sources, or
+        // un-stack them.
+        if self.active().op_draft().is_some() {
+            if self.modifiers.command() {
+                return self.draft_toggle_source(selection);
+            }
+            let index = match &selection {
+                RevisionSelection::WorkingCopy => {
+                    self.active().session.commits.working_copy_index()
                 }
+                RevisionSelection::Commit(id) => self
+                    .active()
+                    .session
+                    .commits
+                    .iter()
+                    .position(|row| row.commit_id() == id),
+            };
+            let Some(index) = index else {
+                return Task::none();
+            };
+            let Some(draft) = self.active_mut().op_draft_mut() else {
+                return Task::none();
+            };
+            if draft.draft.candidate == Some(index) {
+                return Task::none();
             }
-            Message::BrowseFileFromDiff(file_index) => {
-                let target = self.active();
-                let Some(file) = target.session.document.files.get(file_index) else {
-                    return Task::none();
-                };
-                let revision = target.session.selected_revision.clone();
-                let path = file.path.clone();
-                return self.open_source_browser(revision, Some(path));
-            }
-            Message::SourceSidebarRow(display_index) => {
-                let (entries, rows) = self.source_entries_and_rows();
-                match rows.get(display_index).cloned() {
-                    Some(diffui_core::SourceTreeRow::Dir { path, unlisted, .. }) => {
-                        if unlisted {
-                            // Unenumerated ignored dir: expanding it is a
-                            // lazy disk listing. Mark it expanded now so the
-                            // arriving children render straight away.
-                            let Some(tab) = self.active_tab_id() else {
-                                return Task::none();
-                            };
-                            self.active_mut().source.expanded.insert(path.clone());
-                            return self.list_ignored_dir(tab, path);
-                        }
-                        let expanded = &mut self.active_mut().source.expanded;
-                        if !expanded.remove(&path) {
-                            expanded.insert(path);
-                        }
-                    }
-                    Some(diffui_core::SourceTreeRow::File { entry_index, .. }) => {
-                        let path = entries.get(entry_index).map(|entry| entry.path.clone());
-                        if let Some(path) = path {
-                            return self.select_source_file(path);
-                        }
-                    }
-                    None => {}
-                }
-            }
-            Message::SourceHeaderClicked => {}
-            Message::SourceFilterChanged(query) => {
-                self.active_mut().source.filter = query;
-                // New result set — jump the list back to the top. The code
-                // pane's restore re-applies its own live offset, so only the
-                // sidebar actually moves.
-                self.active_mut().source.tree_scroll_offset = 0.0;
-                self.scroll_restore_token = self.scroll_restore_token.wrapping_add(1);
-            }
-            Message::SourceFilterSubmit => {
-                // Open the best match (the ranked list's first row). A no-op
-                // when the box is empty — the first tree row is a directory.
-                let (entries, rows) = self.source_entries_and_rows();
-                if let Some(diffui_core::SourceTreeRow::File { entry_index, .. }) = rows.first()
-                    && let Some(path) = entries.get(*entry_index).map(|entry| entry.path.clone())
+            draft.draft.candidate = Some(index);
+            draft.hover_spot = None;
+            return self.kick_draft_preview();
+        }
+        // Outside target mode, ⌘-click marks/unmarks the row for a
+        // batch action and ⇧-click marks the visible range between
+        // the browsed row and the clicked one. Neither navigates —
+        // the marked set is a separate axis from the browsed
+        // revision, consumed by the context menu's batch items.
+        // jj-gated like every mutation entry point.
+        if (self.modifiers.command() || self.modifiers.shift())
+            && self.active().session.capabilities.mutate
+        {
+            let commit_id = match &selection {
+                RevisionSelection::WorkingCopy => self
+                    .active()
+                    .session
+                    .commits
+                    .working_copy()
+                    .map(|row| row.commit_id().to_owned()),
+                RevisionSelection::Commit(id) => Some(id.clone()),
+            };
+            let Some(commit_id) = commit_id else {
+                return Task::none();
+            };
+            if self.modifiers.shift() {
+                let clicked = self
+                    .active()
+                    .session
+                    .commits
+                    .iter()
+                    .position(|row| row.commit_id() == commit_id);
+                // Anchor on the browsed row, Finder-style; replaces
+                // any previous marks.
+                if let (Some(clicked), Some(anchor)) =
+                    (clicked, self.active().session.selected_commit_index)
                 {
-                    return self.select_source_file(path);
+                    let (lo, hi) = (clicked.min(anchor), clicked.max(anchor));
+                    self.active_mut().revision_multi_selection = (lo..=hi)
+                        .map(|index| {
+                            self.active()
+                                .session
+                                .commits
+                                .row(index)
+                                .commit_id()
+                                .to_owned()
+                        })
+                        .collect();
+                    return Task::none();
                 }
+                // No anchor to span from — fall through to a toggle.
             }
-            Message::SourceScrolled(offset) => {
-                self.active_mut().source.scroll_offset = offset;
+            if let Some(found) = self
+                .active()
+                .revision_multi_selection
+                .iter()
+                .position(|id| *id == commit_id)
+            {
+                self.active_mut().revision_multi_selection.remove(found);
+            } else {
+                self.active_mut().revision_multi_selection.push(commit_id);
             }
-            Message::SourceTreeScrolled(offset) => {
-                self.active_mut().source.tree_scroll_offset = offset;
-            }
-            Message::SidebarFileContextMenu(display_index, row_rect, cursor) => {
-                return self.open_file_context_menu(display_index, row_rect, cursor);
+            return Task::none();
+        }
+        self.select_revision(selection)
+    }
+
+    /// Right-click on a revision row: retarget the marks if needed, then pop
+    /// the context menu.
+    fn open_revision_menu(
+        &mut self,
+        key: revision_list::RowSelectionKey,
+        row_rect: iced::Rectangle,
+        cursor: iced::Point,
+    ) -> Task<Message> {
+        // Right-clicking during target mode reads as "do something
+        // else instead" — drop the draft rather than nesting modes.
+        self.active_mut().pop_mode(ModeKind::Draft);
+        let Some(repository) = self.active().repository.clone() else {
+            return Task::none();
+        };
+        // jj-only for now — the mutations are jj-lib transactions.
+        if !matches!(repository.vcs, Vcs::Jj) {
+            return Task::none();
+        }
+        // Right-click inside the marked set keeps it (the menu shows
+        // the batch actions); outside it re-targets the clicked row
+        // alone, Finder-style.
+        if !self.active().revision_multi_selection.is_empty() {
+            let clicked_id = match &key {
+                revision_list::RowSelectionKey::WorkingCopy => self
+                    .active()
+                    .session
+                    .commits
+                    .working_copy()
+                    .map(|row| row.commit_id().to_owned()),
+                revision_list::RowSelectionKey::Commit(id) => Some(id.clone()),
+            };
+            let inside =
+                clicked_id.is_some_and(|id| self.active().revision_multi_selection.contains(&id));
+            if !inside {
+                self.active_mut().revision_multi_selection.clear();
             }
         }
+        // macOS pops the native menu (blocking) with a pulsing glow over
+        // `row_rect`; every other platform opens the iced overlay at the
+        // cursor. Either way the chosen command dispatches the same way.
+        self.open_revision_context_menu(repository, selection_from_key(&key), row_rect, cursor)
+    }
 
-        // Fall-through chokepoint for every arm that didn't return its own task:
-        // if the active tab coalesced a refresh while busy and it's now idle,
-        // run it. A no-op when nothing's pending (the common case).
-        match self.active_tab_id() {
-            Some(tab) => {
-                let effects = match self.tab_mut(tab) {
-                    Some(target) => target.session.take_pending_refresh(),
-                    None => Vec::new(),
-                };
-                self.run_effects(tab, effects)
+    /// Turn the selected revision's description strip into its inline editor.
+    fn open_description_editor(&mut self) -> Task<Message> {
+        let target = self.active_mut();
+        if target
+            .description_editor()
+            .is_some_and(|editor| editor.target == target.session.selected_revision)
+        {
+            return iced::widget::operation::focus(iced::widget::Id::new(
+                diff_panel::DESCRIPTION_EDITOR_ID,
+            ));
+        }
+        if !target.session.capabilities.mutate {
+            return Task::none();
+        }
+        let Some(description) = target
+            .session
+            .revision_details
+            .as_ref()
+            .map(|details| details.description.clone())
+        else {
+            return Task::none();
+        };
+        // The editor occupies the description's slot in the scrollable
+        // revision header. Reveal it before focusing when editing was
+        // triggered from farther down a diff.
+        target.diff_scroll_offset = 0.0;
+        target.pop_mode(ModeKind::Find);
+        let editor = DescriptionEditor {
+            target: target.session.selected_revision.clone(),
+            original: description.clone(),
+            content: widget::text_editor::Content::with_text(&description),
+            saving_activity: None,
+            switch_blocked: false,
+        };
+        target.push_mode(TabMode::Description(editor));
+        self.scroll_restore_token = self.scroll_restore_token.wrapping_add(1);
+        iced::widget::operation::focus(iced::widget::Id::new(diff_panel::DESCRIPTION_EDITOR_ID))
+    }
+
+    /// Open the description editor on `target`, browsing to it first when it
+    /// isn't the revision on screen.
+    fn edit_description(&mut self, target: RevisionSelection) -> Task<Message> {
+        if self.active().session.selected_revision == target {
+            return self.open_description_editor();
+        }
+        if let Some(editor) = self.active_mut().description_editor_mut()
+            && (editor.is_dirty() || editor.saving_activity.is_some())
+        {
+            editor.switch_blocked = true;
+            return Task::none();
+        }
+        self.active_mut().pending_description_edit = Some(target.clone());
+        self.select_revision(target)
+    }
+
+    fn save_description(&mut self) -> Task<Message> {
+        let Some(tab_id) = self.active_tab_id() else {
+            return Task::none();
+        };
+        let Some(editor) = self.active().description_editor() else {
+            return Task::none();
+        };
+        if editor.saving_activity.is_some() || !editor.is_dirty() {
+            return Task::none();
+        }
+        let op = mutations::MutationOp::Describe {
+            target: editor.target.clone(),
+            description: editor.text().trim_end().to_owned(),
+        };
+        let (activity_id, _) = self.begin_activity(tab_id, "Update description", false);
+        if let Some(editor) = self.active_mut().description_editor_mut() {
+            editor.saving_activity = Some(activity_id);
+            editor.switch_blocked = false;
+        }
+        self.run_mutation(PendingMutation {
+            op,
+            tab_id,
+            activity_id,
+            allow_immutable: false,
+        })
+    }
+
+    /// Enter target mode with `source` as the draft's first source.
+    pub(crate) fn start_draft(
+        &mut self,
+        kind: mutations::DraftKind,
+        source: RevisionSelection,
+    ) -> Task<Message> {
+        // jj-only, like every mutation.
+        if !self.active().session.capabilities.mutate {
+            return Task::none();
+        }
+        let Some(draft_source) = self.draft_source_for(&source) else {
+            return Task::none();
+        };
+        // Target mode's plain keys and a half-written description can't both
+        // own the keyboard. An unsaved edit wins and says so, the same way it
+        // blocks a revision or tab switch; a clean editor just closes.
+        if let Some(editor) = self.active_mut().description_editor_mut() {
+            if editor.is_dirty() || editor.saving_activity.is_some() {
+                editor.switch_blocked = true;
+                return Task::none();
             }
-            None => Task::none(),
+            self.active_mut().pop_mode(ModeKind::Description);
+        }
+        let draft = match kind {
+            mutations::DraftKind::Rebase { mode } => {
+                diffui_core::OpDraft::rebase(mode, vec![draft_source])
+            }
+            mutations::DraftKind::Squash => diffui_core::OpDraft::squash(draft_source),
+            mutations::DraftKind::Merge => diffui_core::OpDraft::merge(draft_source),
+        };
+        // Two marked-row languages at once would be unreadable — the
+        // draft's source wash takes over from the multi-select marks.
+        let target = self.active_mut();
+        target.revision_multi_selection.clear();
+        target.push_mode(TabMode::Draft(DraftUi::new(draft)));
+        self.pop_mode(ModeKind::ActivityPopover);
+        self.pop_mode(ModeKind::Menu);
+        Task::none()
+    }
+
+    /// Arm a placement on the active draft, re-previewing the result.
+    fn set_draft_placement(&mut self, placement: mutations::PlacementKind) -> Task<Message> {
+        if let Some(draft) = self.active_mut().op_draft_mut() {
+            draft.draft.placement = placement;
+            draft.hover_spot = None;
+        }
+        self.kick_draft_preview()
+    }
+
+    /// Walk the destination candidate `delta` rows, skipping draft sources.
+    fn move_draft_candidate(&mut self, delta: i32) -> Task<Message> {
+        let target = self.active();
+        let len = target.session.commits.len();
+        let Some(draft) = target.op_draft() else {
+            return Task::none();
+        };
+        if len == 0 {
+            return Task::none();
+        }
+        // Walk from the current candidate in `delta`'s direction to
+        // the next non-source row. The first move anchors on the
+        // *draft source's* row (the revision being moved) — a
+        // context-menu draft can start on a row that isn't the
+        // selection, and starting from the stale selection made the
+        // first j/k land somewhere unrelated. One O(n) scan, only on
+        // a draft's first nav.
+        let session = &target.session;
+        let start = draft
+            .draft
+            .candidate
+            .or_else(|| {
+                session
+                    .commits
+                    .iter()
+                    .position(|row| draft.draft.is_source(row.commit_id()))
+            })
+            .or(session.selected_commit_index)
+            .map(|index| index as i64 + delta as i64)
+            .unwrap_or(if delta >= 0 { 0 } else { len as i64 - 1 });
+        let step = if delta >= 0 { 1 } else { -1 };
+        let mut next = start;
+        let found = loop {
+            if next < 0 || next >= len as i64 {
+                break None;
+            }
+            let row = session.commits.row(next as usize);
+            if draft.draft.target_valid(row.commit_id()) {
+                break Some(next as usize);
+            }
+            next += step;
+        };
+        let Some(found) = found else {
+            return Task::none();
+        };
+        if let Some(draft) = self.active_mut().op_draft_mut() {
+            draft.draft.candidate = Some(found);
+            draft.hover_spot = None;
+        }
+        // Reveal the candidate row (the sidebar routes the file-reveal
+        // token at a draft candidate while target mode is active).
+        self.sidebar_file_reveal_token = self.sidebar_file_reveal_token.wrapping_add(1);
+        self.kick_draft_preview()
+    }
+
+    /// A drag crossed the activation threshold on a commit row.
+    fn on_drag_start(&mut self, index: usize) -> Task<Message> {
+        // A drag that activates right after a confirm-on-press (the
+        // press ran the draft, the move crossed the threshold) must
+        // not spawn a phantom draft on the mutation's target.
+        if self.mutation_busy() {
+            return Task::none();
+        }
+        // Dragging a row that's already a source of the active draft
+        // *continues* that draft — kind, mode, and stacked sources
+        // intact. Without this, starting "Whole branch onto…" (or a
+        // squash/merge) and then dragging the row to its target
+        // silently downgraded the draft to a plain single-revision
+        // rebase, so the panel never previewed the resolved branch.
+        let target = self.active();
+        if let Some(draft) = target.op_draft()
+            && index < target.session.commits.len()
+            && draft
+                .draft
+                .is_source(target.session.commits.row(index).commit_id())
+        {
+            return Task::none();
+        }
+        let Some(source) = self.selection_at_index(index) else {
+            return Task::none();
+        };
+        // ⌥ at drag start opts into moving the whole subtree.
+        let mode = if self.modifiers.alt() {
+            mutations::RebaseSourceMode::WithDescendants
+        } else {
+            mutations::RebaseSourceMode::Revisions
+        };
+        self.start_draft(mutations::DraftKind::Rebase { mode }, source)
+    }
+
+    /// A drag released: execute the draft on the spot, or keep target mode.
+    fn on_drag_drop(&mut self, spot: Option<revision_list::DropSpot>) -> Task<Message> {
+        let Some(spot) = spot else {
+            // Released outside any spot: stay in target mode so the
+            // op bar keeps offering click / keyboard picking.
+            if let Some(draft) = self.active_mut().op_draft_mut() {
+                draft.hover_spot = None;
+            }
+            return Task::none();
+        };
+        let Some(ui) = self.active().op_draft() else {
+            return Task::none();
+        };
+        let mut draft = ui.draft.clone();
+        // ⌥ held at drop upgrades the move to "with descendants".
+        if self.modifiers.alt()
+            && let mutations::DraftKind::Rebase { mode } = &mut draft.kind
+        {
+            *mode = mutations::RebaseSourceMode::WithDescendants;
+        }
+        // Targets resolve through the graph before the lowering's own
+        // check: `op_for`'s guard only sees the `Commit` variant, so
+        // a `WorkingCopy` selection naming a source commit would slip
+        // through it.
+        let op = match spot {
+            revision_list::DropSpot::OnRow(index) => self
+                .selection_at_index(index)
+                .filter(|target| !self.draft_blocks_target(target))
+                .and_then(|target| draft.op_for(target, mutations::PlacementKind::Onto)),
+            revision_list::DropSpot::Gap { above, below } => {
+                match (
+                    self.selection_at_index(below),
+                    self.selection_at_index(above),
+                ) {
+                    (Some(parent), Some(child))
+                        if !self.draft_blocks_target(&parent)
+                            && !self.draft_blocks_target(&child) =>
+                    {
+                        draft.op_for_gap(parent, child)
+                    }
+                    _ => None,
+                }
+            }
+        };
+        match op {
+            Some(op) => {
+                self.active_mut().pop_mode(ModeKind::Draft);
+                self.start_mutation_op(op)
+            }
+            // Dropped on a source / vanished row: keep target mode.
+            None => {
+                if let Some(draft) = self.active_mut().op_draft_mut() {
+                    draft.hover_spot = None;
+                }
+                Task::none()
+            }
+        }
+    }
+
+    /// The preview debounce timer fired: run the simulation that was parked at
+    /// kick time, unless a newer kick (or an Idle transition, which clears the
+    /// request) superseded it.
+    fn run_parked_preview(&mut self, version: u64) -> Task<Message> {
+        let Some(draft) = self.active_mut().op_draft_mut() else {
+            return Task::none();
+        };
+        if draft.preview_version != version {
+            return Task::none();
+        }
+        let Some(request) = draft.preview_request.take() else {
+            return Task::none();
+        };
+        let draft = match request.kind {
+            mutations::DraftKind::Rebase { mode } => diffui_core::PreviewRequest::Rebase {
+                mode,
+                sources: request.sources,
+                destination: request.destination,
+            },
+            mutations::DraftKind::Merge => {
+                // The merge's second parent is the destination's anchor
+                // (gap drops resolve to the parent side, like the
+                // confirm path).
+                let anchor = request.destination.anchor().clone();
+                diffui_core::PreviewRequest::Merge {
+                    parents: request.sources.into_iter().chain([anchor]).collect(),
+                }
+            }
+            // Filtered out before the request was parked.
+            mutations::DraftKind::Squash => return Task::none(),
+        };
+        let Some(tab) = self.active_tab_id() else {
+            return Task::none();
+        };
+        let Some(state) = self.tab_mut(tab) else {
+            return Task::none();
+        };
+        // A superseded simulation is cancelled rather than left to
+        // finish against a candidate the user has already left.
+        let mut effects = Vec::new();
+        if let Some(previous) = state.jobs.preview.take() {
+            effects.push(diffui_core::Effect::Send(diffui_core::Command::Cancel {
+                job: previous,
+            }));
+        }
+        let (job, preview) = state.session.preview(draft);
+        state.jobs.preview = Some(job);
+        effects.extend(preview);
+        self.run_effects(tab, effects)
+    }
+
+    /// Toolbar view switcher: show the diff or the source browser.
+    fn set_main_view(&mut self, mode: MainView) -> Task<Message> {
+        if mode == self.active().main_view {
+            return Task::none();
+        }
+        match mode {
+            MainView::Diff => {
+                self.active_mut().main_view = MainView::Diff;
+                // The shared code widget swaps documents: restore
+                // this view's saved scroll and drop the other
+                // view's shaped-paragraph cache.
+                self.scroll_restore_token = self.scroll_restore_token.wrapping_add(1);
+                self.document_version = self.document_version.wrapping_add(1);
+                Task::none()
+            }
+            MainView::Source => {
+                // First open browses the selected revision jumped
+                // to the diff's selected file; later toggles
+                // return to whatever was being browsed.
+                let tab = self.active();
+                let revision = tab
+                    .source
+                    .revision
+                    .clone()
+                    .unwrap_or_else(|| tab.session.selected_revision.clone());
+                let jump = tab
+                    .source
+                    .revision
+                    .is_none()
+                    .then(|| {
+                        tab.session
+                            .document
+                            .files
+                            .get(tab.selected_file)
+                            .map(|file| file.path.clone())
+                    })
+                    .flatten();
+                self.open_source_browser(revision, jump)
+            }
+        }
+    }
+
+    /// Drop any mode the window is no longer showing.
+    ///
+    /// The description editor is the one that bites: it renders inside the
+    /// revision header of the diff view, so a view switch, a palette jump, or
+    /// any other move off its target leaves it invisible — and, before it was a
+    /// mode, still swallowing every keystroke including Esc. Popping it here
+    /// means "not on screen" and "not holding the keyboard" cannot come apart.
+    fn prune_stale_modes(&mut self) {
+        // With no repository open, `view` renders the welcome screen and the
+        // open-repo dialog and nothing else — so every other mode would be
+        // holding the keyboard from behind a surface that never draws it.
+        if self.tabs.is_empty() {
+            self.modes.retain(|mode| mode.kind() == ModeKind::OpenRepo);
+            self.no_tab.modes.clear();
+            return;
+        }
+        let stale = {
+            let tab = self.active();
+            tab.description_editor().is_some_and(|editor| {
+                tab.main_view != MainView::Diff || editor.target != tab.session.selected_revision
+            })
+        };
+        if stale {
+            self.active_mut().pop_mode(ModeKind::Description);
         }
     }
 
@@ -2007,10 +2338,7 @@ impl Diffui {
         tab: TabId,
         result: Result<mutations::DraftSimulation, String>,
     ) -> Task<Message> {
-        let Some(ui) = self
-            .tab_mut(tab)
-            .and_then(|target| target.op_draft.as_mut())
-        else {
+        let Some(ui) = self.tab_mut(tab).and_then(|target| target.op_draft_mut()) else {
             return Task::none();
         };
         ui.preview = match result {
@@ -2150,7 +2478,7 @@ impl Diffui {
                 .await
                 .unwrap_or_default()
             },
-            move |spans| Message::FileHighlighted(document_id, file_index, spans),
+            move |spans| Message::Ui(UiEvent::FileHighlighted(document_id, file_index, spans)),
         )
     }
 
@@ -2204,7 +2532,7 @@ impl Diffui {
         let activity_id = pending.activity_id;
         let description_save = self.tab_mut(tab).is_some_and(|target| {
             target
-                .description_editor
+                .description_editor()
                 .as_ref()
                 .is_some_and(|editor| editor.saving_activity == Some(activity_id))
         });
@@ -2224,7 +2552,7 @@ impl Diffui {
                     }
                 }
                 if description_save && let Some(target) = self.tab_mut(tab) {
-                    target.description_editor = None;
+                    target.pop_mode(ModeKind::Description);
                 }
                 Task::none()
             }
@@ -2236,7 +2564,7 @@ impl Diffui {
                 if description_save
                     && let Some(editor) = self
                         .tab_mut(tab)
-                        .and_then(|target| target.description_editor.as_mut())
+                        .and_then(|target| target.description_editor_mut())
                 {
                     editor.saving_activity = None;
                 }
@@ -2343,12 +2671,12 @@ impl Diffui {
             (None, Some(_)) => "Move & resolve".to_owned(),
             (None, None) => "Move anyway".to_owned(),
         };
-        self.confirm = Some(ConfirmDialog {
+        self.push_mode(Mode::Confirm(ConfirmDialog {
             title,
             body,
             confirm_label,
             pending,
-        });
+        }));
         Task::none()
     }
 
@@ -2398,6 +2726,17 @@ impl Diffui {
         if target.repository.is_none() {
             return Task::none();
         }
+        // The description editor lives in the diff view's revision header, so
+        // leaving that view closes it. An unsaved edit blocks the move instead,
+        // the same way it blocks a revision or tab switch.
+        if let Some(editor) = target.description_editor_mut() {
+            if editor.is_dirty() || editor.saving_activity.is_some() {
+                editor.switch_blocked = true;
+                return Task::none();
+            }
+            self.active_mut().pop_mode(ModeKind::Description);
+        }
+        let target = self.active_mut();
         target.main_view = MainView::Source;
 
         let changed = target.source.revision.as_ref() != Some(&revision);
@@ -2691,14 +3030,14 @@ impl Diffui {
     /// presses where the user's intent is immediate.
     pub(crate) fn refind_now(&mut self) -> Task<Message> {
         let target = self.active_mut();
-        if let Some(state) = target.find.as_mut() {
+        if let Some(state) = target.find_mut() {
             state.query_version = state.query_version.wrapping_add(1);
         }
-        let Some(state) = target.find.as_ref() else {
+        let Some(state) = target.find() else {
             return Task::none();
         };
         let (matches, error) = find::compute_matches(state, target.find_files());
-        if let Some(state) = self.active_mut().find.as_mut() {
+        if let Some(state) = self.active_mut().find_mut() {
             state.matches = matches;
             state.error = error;
             state.active = if state.matches.is_empty() {
@@ -2712,7 +3051,7 @@ impl Diffui {
     }
 
     pub(crate) fn find_advance(&mut self, delta: i32) {
-        let Some(state) = self.active_mut().find.as_mut() else {
+        let Some(state) = self.active_mut().find_mut() else {
             return;
         };
         if state.matches.is_empty() {
@@ -2730,7 +3069,7 @@ impl Diffui {
     /// the first ⏎ runs the scan and shows results; once searched, ⏎ accepts the
     /// highlighted row like any other mode.
     pub(crate) fn palette_submit(&mut self) -> Task<Message> {
-        let Some(mut state) = self.palette.take() else {
+        let Some(mut state) = self.take_palette() else {
             return Task::none();
         };
         let trigger_search = state.top().is_some_and(|column| {
@@ -2749,25 +3088,58 @@ impl Diffui {
                 // Invalidate the pending debounced recompute so it can't wipe
                 // the results we're about to compute.
                 column.query_version = column.query_version.wrapping_add(1);
-                // `self.palette` is `None` here (taken above), so this borrows
-                // `self` cleanly while mutating the detached column.
+                // The palette is out of the mode stack here (taken above), so
+                // this borrows `self` cleanly while mutating the detached
+                // column.
                 palette::recompute_matches(column, self, true);
             }
-            self.palette = Some(state);
+            self.push_mode(Mode::Palette(state));
             return widget::operation::scroll_to(
                 palette::results_scrollable_id(depth),
                 iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
             );
         }
-        self.palette = Some(state);
+        self.push_mode(Mode::Palette(state));
         self.palette_accept_current()
+    }
+
+    /// Re-run the matcher now if the top column's rows are for an older query.
+    ///
+    /// Matching is debounced, so between the last keystroke and its recompute
+    /// the visible rows belong to a query the user has already typed past.
+    /// Accepting then runs whatever happened to be highlighted — for a stale
+    /// list that is a different command from the one on screen. Recomputing
+    /// synchronously costs one match pass on the accept keystroke and makes the
+    /// row that runs the row the user is looking at.
+    fn palette_recompute_if_dirty(&mut self) {
+        let dirty = self
+            .palette()
+            .and_then(|state| state.top())
+            .is_some_and(|column| column.dirty);
+        if !dirty {
+            return;
+        }
+        let Some(mut state) = self.take_palette() else {
+            return;
+        };
+        if let Some(column) = state.top_mut() {
+            column.dirty = false;
+            column.selected = 0;
+            column.scroll_y = 0.0;
+            // Drop the debounced recompute still in flight; it would land on
+            // a closed palette or re-sort what we just settled.
+            column.query_version = column.query_version.wrapping_add(1);
+            palette::recompute_matches(column, self, false);
+        }
+        self.push_mode(Mode::Palette(state));
     }
 
     /// Execute the highlighted result in the rightmost column. Returns the
     /// `Task` chain that performs the corresponding action plus any
     /// followup state (closing the palette, focusing input, etc.).
     pub(crate) fn palette_accept_current(&mut self) -> Task<Message> {
-        let Some(state) = self.palette.as_ref() else {
+        self.palette_recompute_if_dirty();
+        let Some(state) = self.palette() else {
             return Task::none();
         };
         let Some(top) = state.top() else {
@@ -2779,135 +3151,38 @@ impl Diffui {
         let item = selected.item.clone();
         let target = match &top.source {
             ColumnSource::Root => None,
-            ColumnSource::Actions(t) => Some(t.clone()),
+            ColumnSource::Actions(target) => Some(target.clone()),
         };
 
-        match (&top.source, &item) {
+        match (target, &item) {
             // Top-level: command rows run directly; revision/file rows
             // primary-action without going through the Actions column.
-            (ColumnSource::Root, ResultRef::Command(cmd)) => {
-                self.recents.push_command(*cmd);
+            (None, ResultRef::Command(id)) => {
+                let id = *id;
+                self.recents.push_command(id);
                 self.recents.save();
-                self.palette = None;
-                self.run_palette_command(*cmd, None)
+                self.pop_mode(ModeKind::Palette);
+                self.run_command(id, CommandArg::None)
             }
-            (
-                ColumnSource::Root,
-                ResultRef::WorkingCopy | ResultRef::Commit(_) | ResultRef::Bookmark(_),
-            ) => {
-                if let Some(change_id) = change_id_for_recents(&item, self) {
-                    self.recents.push_revision(change_id);
-                    self.recents.save();
-                }
-                self.palette = None;
-                self.jump_to_revision_ref(&item)
+            (None, ResultRef::WorkingCopy | ResultRef::Commit { .. } | ResultRef::Bookmark(_)) => {
+                self.pop_mode(ModeKind::Palette);
+                self.perform(Action::JumpToResult(item))
             }
-            (ColumnSource::Root, ResultRef::File(path)) => {
-                self.palette = None;
-                self.jump_to_file_path(path);
-                Task::none()
+            (None, ResultRef::File(path)) => {
+                let path = path.clone();
+                self.pop_mode(ModeKind::Palette);
+                self.perform(Action::JumpToFile(path))
             }
             // Actions column: the row is always a Command — run it against
             // the column's target.
-            (ColumnSource::Actions(_), ResultRef::Command(cmd)) => {
-                self.recents.push_command(*cmd);
+            (Some(target), ResultRef::Command(id)) => {
+                let id = *id;
+                self.recents.push_command(id);
                 self.recents.save();
-                self.palette = None;
-                self.run_palette_command(*cmd, target)
+                self.pop_mode(ModeKind::Palette);
+                self.run_command(id, CommandArg::Result(target))
             }
             _ => Task::none(),
-        }
-    }
-
-    pub(crate) fn run_palette_command(
-        &mut self,
-        cmd: PaletteCommand,
-        target: Option<ResultRef>,
-    ) -> Task<Message> {
-        match cmd {
-            PaletteCommand::RefreshRepository => {
-                if self.app_focused
-                    && let Some(tab) = self.active_tab_id()
-                {
-                    // Manual refresh = full reload (the user may have run an
-                    // external jj op since the last load).
-                    return self.start_repository_snapshot(tab, RefreshOrigin::Focus);
-                }
-                Task::none()
-            }
-            PaletteCommand::SelectNextFile => Task::done(Message::SelectNextFile),
-            PaletteCommand::SelectPreviousFile => Task::done(Message::SelectPreviousFile),
-            PaletteCommand::ThemeSystem => {
-                Task::done(Message::SelectTheme(ThemePreference::System))
-            }
-            PaletteCommand::ThemeLight => Task::done(Message::SelectTheme(ThemePreference::Light)),
-            PaletteCommand::ThemeDark => Task::done(Message::SelectTheme(ThemePreference::Dark)),
-            PaletteCommand::ThemeHighContrast => {
-                Task::done(Message::SelectTheme(ThemePreference::HighContrast))
-            }
-            PaletteCommand::CopyFileDiff => {
-                if let Some(text) = current_file_diff_text(self) {
-                    Task::done(Message::CopyToClipboard(text))
-                } else {
-                    Task::none()
-                }
-            }
-            PaletteCommand::OpenFind => Task::done(Message::Find(FindMessage::Open)),
-            PaletteCommand::JumpToRevision => {
-                if let Some(t) = target.as_ref() {
-                    if let Some(change_id) = change_id_for_recents(t, self) {
-                        self.recents.push_revision(change_id);
-                        self.recents.save();
-                    }
-                    self.jump_to_revision_ref(t)
-                } else {
-                    Task::none()
-                }
-            }
-            PaletteCommand::CopyChangeId => {
-                // Resolve through the unified helper so bookmarks /
-                // working-copy / explicit commits all surface their
-                // change-id consistently.
-                let payload = target.and_then(|t| change_id_for_recents(&t, self));
-                payload
-                    .map(|t| Task::done(Message::CopyToClipboard(t)))
-                    .unwrap_or_else(Task::none)
-            }
-            PaletteCommand::CopyCommitMessage => {
-                let payload = target.and_then(|t| commit_for_ref(self, &t)).map(|c| {
-                    if c.has_description() {
-                        c.description().to_owned()
-                    } else {
-                        String::new()
-                    }
-                });
-                payload
-                    .filter(|s| !s.is_empty())
-                    .map(|t| Task::done(Message::CopyToClipboard(t)))
-                    .unwrap_or_else(Task::none)
-            }
-            PaletteCommand::CopyAuthor => {
-                let payload = target
-                    .and_then(|t| commit_for_ref(self, &t))
-                    .map(|c| c.author().to_owned());
-                payload
-                    .filter(|s| !s.is_empty())
-                    .map(|t| Task::done(Message::CopyToClipboard(t)))
-                    .unwrap_or_else(Task::none)
-            }
-            PaletteCommand::OpenFile => {
-                if let Some(ResultRef::File(path)) = target.as_ref() {
-                    self.jump_to_file_path(path);
-                }
-                Task::none()
-            }
-            PaletteCommand::CopyFilePath => {
-                if let Some(ResultRef::File(path)) = target.as_ref() {
-                    Task::done(Message::CopyToClipboard(path.clone()))
-                } else {
-                    Task::none()
-                }
-            }
         }
     }
 
@@ -2919,6 +3194,18 @@ impl Diffui {
         let Some(tab) = self.active_tab_id() else {
             return Task::none();
         };
+        let state = self.active_mut();
+        // An unsaved description edit blocks a jump exactly as it blocks a row
+        // click: the editor is bound to the revision on screen, so moving off
+        // it would either drop the text or leave the editor open over someone
+        // else's diff.
+        if state.session.selected_revision != selection
+            && let Some(editor) = state.description_editor_mut()
+            && (editor.is_dirty() || editor.saving_activity.is_some())
+        {
+            editor.switch_blocked = true;
+            return Task::none();
+        }
         let state = self.active_mut();
 
         // Already current — no load, no async wait, bump the token now so
@@ -3185,7 +3472,7 @@ impl Diffui {
     /// naming a source commit is caught too — the core-side `op_for` guard
     /// only inspects the `Commit` variant.
     pub(crate) fn draft_blocks_target(&self, target: &RevisionSelection) -> bool {
-        let Some(ui) = self.active().op_draft.as_ref() else {
+        let Some(ui) = self.active().op_draft() else {
             return false;
         };
         self.draft_source_for(target)
@@ -3236,14 +3523,14 @@ impl Diffui {
         if self.draft_blocks_target(&target) {
             return Task::none();
         }
-        let Some(ui) = self.active_mut().op_draft.as_ref() else {
+        let Some(ui) = self.active().op_draft() else {
             return Task::none();
         };
         let placement = placement_override.unwrap_or(ui.draft.placement);
         let Some(op) = ui.draft.op_for(target, placement) else {
             return Task::none();
         };
-        self.active_mut().op_draft = None;
+        self.active_mut().pop_mode(ModeKind::Draft);
         self.start_mutation_op(op)
     }
 
@@ -3261,12 +3548,12 @@ impl Diffui {
         // invalid row.
         let candidate_now_source = self
             .active_mut()
-            .op_draft
+            .op_draft()
             .as_ref()
             .and_then(|ui| ui.draft.candidate)
             .and_then(|index| self.selection_at_index(index))
             .is_some_and(|candidate| candidate == selection);
-        let Some(ui) = self.active_mut().op_draft.as_mut() else {
+        let Some(ui) = self.active_mut().op_draft_mut() else {
             return Task::none();
         };
         if let Some(position) = ui
@@ -3330,20 +3617,19 @@ impl Diffui {
         }
         // Destination from the drag spot when one is live, else the keyboard
         // candidate + placement. Resolved before borrowing the draft mutably.
-        let (spot, candidate, placement, selected_merge_target) =
-            match self.active_mut().op_draft.as_ref() {
-                Some(ui) => (
-                    ui.hover_spot,
-                    ui.draft.candidate,
-                    ui.draft.placement,
-                    matches!(ui.draft.kind, mutations::DraftKind::Merge)
-                        .then(|| ui.draft.sources.last())
-                        .flatten()
-                        .filter(|_| ui.draft.sources.len() >= 2)
-                        .map(|source| source.selection.clone()),
-                ),
-                None => return Task::none(),
-            };
+        let (spot, candidate, placement, selected_merge_target) = match self.active().op_draft() {
+            Some(ui) => (
+                ui.hover_spot,
+                ui.draft.candidate,
+                ui.draft.placement,
+                matches!(ui.draft.kind, mutations::DraftKind::Merge)
+                    .then(|| ui.draft.sources.last())
+                    .flatten()
+                    .filter(|_| ui.draft.sources.len() >= 2)
+                    .map(|source| source.selection.clone()),
+            ),
+            None => return Task::none(),
+        };
         // A merge with enough selected parents previews that exact set. Feed
         // its final source through the request's destination slot so the
         // shared debounce request stays destination-shaped for rebases.
@@ -3379,7 +3665,7 @@ impl Diffui {
             && destination
                 .as_ref()
                 .is_some_and(|destination| self.draft_blocks_target(destination.anchor()));
-        let Some(ui) = self.active_mut().op_draft.as_mut() else {
+        let Some(ui) = self.active_mut().op_draft_mut() else {
             return Task::none();
         };
         // The Idle paths must also drop any parked request: they don't bump
@@ -3423,7 +3709,7 @@ impl Diffui {
         // spawns the parked simulation iff the version is still current, so
         // rapid j/j/j candidate hops expire without touching the backend.
         Task::perform(tokio::time::sleep(Duration::from_millis(250)), move |()| {
-            Message::DraftPreviewKick(version)
+            Message::Ui(UiEvent::DraftPreviewKick(version))
         })
     }
 
@@ -3563,12 +3849,16 @@ impl Diffui {
         if matches!(pending.op, MutationOp::Edit { .. }) {
             body.push_str(" Editing it makes further working-copy changes amend it in place.");
         }
-        self.confirm = Some(ConfirmDialog {
+        // Stacking rather than replacing: a second guarded mutation raised
+        // while a dialog is open (a background tab's op being refused) waits
+        // under it and surfaces when that one resolves, instead of silently
+        // taking over the buttons the user was about to press.
+        self.push_mode(Mode::Confirm(ConfirmDialog {
             title: format!("{verb} immutable {noun}?"),
             body,
             confirm_label: confirm_label.to_owned(),
             pending,
-        });
+        }));
         Task::none()
     }
 
@@ -3601,18 +3891,6 @@ impl Diffui {
         self.tab_mut(tab_id).map(|target| &mut target.activities)
     }
 
-    /// Toolbar "Refresh": fold the working copy in and reload if anything
-    /// moved. An up-to-date refresh that finds nothing changed is silent.
-    pub(crate) fn toolbar_refresh(&mut self) -> Task<Message> {
-        let Some(tab) = self.active_tab_id() else {
-            return Task::none();
-        };
-        if !self.active().session.capabilities.graph {
-            return Task::none();
-        }
-        self.start_repository_snapshot(tab, RefreshOrigin::Focus)
-    }
-
     /// Toolbar "Fetch": fetch the given target (all remotes / one branch),
     /// surfaced as an activity whose expanded output shows the remote messages.
     /// The actor runs it inside the same working-copy lock every other write
@@ -3624,7 +3902,7 @@ impl Diffui {
         if !self.active().session.capabilities.fetch {
             return Task::none();
         }
-        self.menu = None;
+        self.pop_mode(ModeKind::Menu);
         let label = match &target {
             FetchTarget::AllRemotes => "Fetching all remotes".to_owned(),
             FetchTarget::RemoteBranch { remote, branch } => format!("Fetching {remote}/{branch}"),
@@ -3681,7 +3959,7 @@ impl Diffui {
         if !self.active().session.capabilities.graph {
             return Task::none();
         }
-        self.menu = None;
+        self.pop_mode(ModeKind::Menu);
         // Persist the new filter (debounced) for this repo.
         self.mark_geometry_dirty();
         let shown = self.active().session.revset.trim();
@@ -3743,7 +4021,7 @@ impl Diffui {
             self.sidebar_width,
             self.sidebar_min_width,
             sidebar::RESIZE_HIT_PADDING,
-            Message::SidebarWidthChanged,
+            |width| Message::Ui(UiEvent::SidebarWidthChanged(width)),
         );
         let palette_overlay = palette::build_overlay(self, theme);
         let body: Element<'_, Message> = stack![panels, resize_overlay, palette_overlay]
@@ -3782,325 +4060,53 @@ impl Diffui {
     }
 
     pub(crate) fn subscription(&self) -> Subscription<Message> {
-        // Three-track keyboard handling:
-        //   * global: owns ⌘K / ⌘F (overlay entry) and j/k/arrow file nav
-        //     when nothing is open
-        //   * palette track: ↑/↓/Tab/Esc when the palette is open
-        //   * find track: Enter/Shift+Enter/Esc when the find bar is open
-        // The text input still consumes character keys when focused, so
-        // typing inside an overlay never falls through to file nav.
+        // Key presses are published raw and resolved in `update`, against the
+        // mode stack and the keymap. Resolving here instead would mean handing
+        // the whole keymap and the open modes through `Subscription::with` —
+        // and that value becomes part of the subscription's identity, so every
+        // mode change would tear the listener down and build a new one.
+        //
         // We *must* see Esc even when an iced text_input is focused —
         // text_input captures Esc to clear focus, and `keyboard::listen()`
-        // only fires for `Status::Ignored` events, so we'd lose Esc to
-        // the input and force the user to press Esc twice (once to
-        // unfocus, once to close). `event::listen_with` ignores the
-        // capture status and gives us every event, so the palette / find
-        // overlays close on the first Esc regardless of focus.
-        //
-        // Subscription closures must be non-capturing, so we hand the
-        // open/closed flags in through `Subscription::with`, which
-        // becomes part of the subscription identity and arrives as a
-        // tuple alongside each event.
-        let flags = (
-            self.palette.is_some(),
-            self.active().find.is_some(),
-            self.open_repo_dialog.is_some(),
-            self.menu.is_some(),
-            self.activity_popover_open,
-            self.confirm.is_some(),
-            self.active().description_editor.is_some(),
-            self.active().op_draft.is_some(),
-        );
-
+        // only fires for `Status::Ignored` events, so we'd lose Esc to the
+        // input and force the user to press Esc twice (once to unfocus, once
+        // to close). `event::listen_with` ignores the capture status and gives
+        // us every event; the `consumed` flag it carries is what keeps the
+        // revset box's typing out of the plain-key bindings.
         let keyboard = event::listen_with(|event, status, _window| match event {
             Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
-                // `ignored` = no focused widget consumed it. The revset input is
-                // inline (not behind an overlay flag), so we use this to keep its
-                // keystrokes from leaking into the global j/k file nav.
-                Some((key, modifiers, matches!(status, event::Status::Ignored)))
+                Some(Message::Window(WindowEvent::KeyPressed {
+                    key,
+                    modifiers,
+                    consumed: !matches!(status, event::Status::Ignored),
+                }))
             }
             _ => None,
-        })
-        .with(flags)
-        .filter_map(
-            |(
-                (
-                    palette_open,
-                    find_open,
-                    dialog_open,
-                    menu_open,
-                    popover_open,
-                    confirm_open,
-                    description_editor_open,
-                    draft_open,
-                ),
-                (key, modifiers, ignored),
-            )| {
-                // A confirmation dialog owns the keyboard: Esc cancels (there
-                // is deliberately no Enter-accept — the confirm gates a
-                // mutation jj itself refuses), everything else is swallowed.
-                if confirm_open {
-                    return match key.as_ref() {
-                        keyboard::Key::Named(keyboard::key::Named::Escape) => {
-                            Some(Message::ConfirmCancel)
-                        }
-                        _ => None,
-                    };
-                }
-
-                if description_editor_open {
-                    return match key.as_ref() {
-                        keyboard::Key::Named(keyboard::key::Named::Escape) => {
-                            Some(Message::DescriptionCancel)
-                        }
-                        keyboard::Key::Named(keyboard::key::Named::Enter)
-                            if modifiers.command() =>
-                        {
-                            Some(Message::DescriptionSave)
-                        }
-                        _ => None,
-                    };
-                }
-
-                // A toolbar dropdown / activity popover is open: Esc dismisses it
-                // and other keys are swallowed so they don't reach file nav.
-                if menu_open || popover_open {
-                    return match key.as_ref() {
-                        keyboard::Key::Named(keyboard::key::Named::Escape) => Some(if menu_open {
-                            Message::Menu(MenuMessage::Dismiss)
-                        } else {
-                            Message::ActivityToggle
-                        }),
-                        _ => None,
-                    };
-                }
-
-                // Cmd/Ctrl+K opens (or toggles closed) the palette.
-                if modifiers.command()
-                    && matches!(
-                        key.as_ref(),
-                        keyboard::Key::Character("k") | keyboard::Key::Character("K")
-                    )
-                {
-                    return Some(if palette_open {
-                        Message::Palette(PaletteMessage::Close)
-                    } else {
-                        Message::Palette(PaletteMessage::Open)
-                    });
-                }
-
-                // Cmd/Ctrl+F opens the in-diff find bar. No toggle; Esc
-                // closes.
-                if modifiers.command()
-                    && matches!(
-                        key.as_ref(),
-                        keyboard::Key::Character("f") | keyboard::Key::Character("F")
-                    )
-                {
-                    return Some(Message::Find(FindMessage::Open));
-                }
-
-                // Open-repo dialog owns the keyboard: Esc dismisses, everything
-                // else falls through to its text input. (Enter is handled by the
-                // input's `on_submit`.)
-                if dialog_open {
-                    return match key.as_ref() {
-                        keyboard::Key::Named(keyboard::key::Named::Escape) => {
-                            Some(Message::OpenRepoDialogClose)
-                        }
-                        _ => None,
-                    };
-                }
-
-                if palette_open {
-                    return match key.as_ref() {
-                        keyboard::Key::Named(keyboard::key::Named::Escape) => {
-                            Some(Message::Palette(PaletteMessage::PopColumn))
-                        }
-                        keyboard::Key::Named(keyboard::key::Named::ArrowDown) => {
-                            Some(Message::Palette(PaletteMessage::MoveSelection(1)))
-                        }
-                        keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
-                            Some(Message::Palette(PaletteMessage::MoveSelection(-1)))
-                        }
-                        keyboard::Key::Named(keyboard::key::Named::Tab) => {
-                            Some(Message::Palette(PaletteMessage::PushActions))
-                        }
-                        _ => None,
-                    };
-                }
-
-                if find_open {
-                    return match key.as_ref() {
-                        keyboard::Key::Named(keyboard::key::Named::Escape) => {
-                            Some(Message::Find(FindMessage::Close))
-                        }
-                        // Enter / Shift+Enter — handle both here since
-                        // text_input intentionally has no on_submit (it
-                        // would route every Enter to FindNext and swallow
-                        // Shift+Enter on the way).
-                        keyboard::Key::Named(keyboard::key::Named::Enter) => {
-                            Some(if modifiers.shift() {
-                                Message::Find(FindMessage::Prev)
-                            } else {
-                                Message::Find(FindMessage::Next)
-                            })
-                        }
-                        _ => None,
-                    };
-                }
-
-                // Target mode owns the plain keys: arrows/j/k move the
-                // destination candidate, o/a/b pick a placement, Enter
-                // applies, Esc leaves. Unhandled plain keys are swallowed so
-                // they can't fall through to file nav; ⌘/⌥/⌃ combos still
-                // pass (tab switching, wrap toggle, …).
-                if draft_open && !modifiers.command() && !modifiers.alt() && !modifiers.control() {
-                    if matches!(
-                        key.as_ref(),
-                        keyboard::Key::Named(keyboard::key::Named::Escape)
-                    ) {
-                        return Some(Message::DraftCancel);
-                    }
-                    // A focused text input (the revset box) owns everything
-                    // but Esc — don't hijack typed characters as draft keys.
-                    if !ignored {
-                        return None;
-                    }
-                    return match key.as_ref() {
-                        keyboard::Key::Named(keyboard::key::Named::Enter) => {
-                            Some(Message::DraftConfirm)
-                        }
-                        keyboard::Key::Named(keyboard::key::Named::ArrowDown)
-                        | keyboard::Key::Character("j") => Some(Message::DraftCandidate(1)),
-                        keyboard::Key::Named(keyboard::key::Named::ArrowUp)
-                        | keyboard::Key::Character("k") => Some(Message::DraftCandidate(-1)),
-                        keyboard::Key::Character("o") => {
-                            Some(Message::DraftPlacementKey(diffui_core::PlacementKind::Onto))
-                        }
-                        keyboard::Key::Character("a") => Some(Message::DraftPlacementKey(
-                            diffui_core::PlacementKind::After,
-                        )),
-                        keyboard::Key::Character("b") => Some(Message::DraftPlacementKey(
-                            diffui_core::PlacementKind::Before,
-                        )),
-                        // Toggle the candidate as a draft source (merge
-                        // parent / rebase revision / squash source).
-                        keyboard::Key::Named(keyboard::key::Named::Space) => {
-                            Some(Message::DraftToggleSource)
-                        }
-                        _ => None,
-                    };
-                }
-
-                // Tab management — only with no overlay holding the keyboard, so
-                // these never steal keystrokes from a focused text input. ⌘W
-                // closes the active tab, ⌘O opens the path dialog, ⌘1–9 jump to a
-                // tab by position.
-                if modifiers.command() && !modifiers.shift() && !modifiers.alt() {
-                    match key.as_ref() {
-                        keyboard::Key::Character("w") | keyboard::Key::Character("W") => {
-                            return Some(Message::CloseActiveTab);
-                        }
-                        keyboard::Key::Character("o") | keyboard::Key::Character("O") => {
-                            return Some(Message::OpenRepoDialogOpen);
-                        }
-                        keyboard::Key::Character(c) => {
-                            if let Some(digit) = c.chars().next().and_then(|c| c.to_digit(10))
-                                && (1..=9).contains(&digit)
-                            {
-                                return Some(Message::SelectTabIndex((digit - 1) as usize));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-
-                // ⌥Z toggles diff line-wrap (the editor-world convention).
-                // macOS composes ⌥Z into "Ω", so match that form too.
-                if modifiers.alt()
-                    && !modifiers.command()
-                    && !modifiers.control()
-                    && let keyboard::Key::Character(c) = key.as_ref()
-                    && matches!(c, "z" | "Z" | "Ω" | "ω")
-                {
-                    return Some(Message::ToggleDiffWrap);
-                }
-
-                // No overlay — global j/k/arrow file shortcuts apply. Only
-                // fire when no modifier is held, otherwise ⌘J / ⌘K combos
-                // would also trigger file nav.
-                if modifiers.command() || modifiers.alt() || modifiers.control() {
-                    return None;
-                }
-                // A focused widget (the revset input) consumed this key — don't also
-                // route it to file nav.
-                if !ignored {
-                    return None;
-                }
-                match key.as_ref() {
-                    keyboard::Key::Named(keyboard::key::Named::ArrowDown)
-                    | keyboard::Key::Character("j") => Some(Message::SelectNextFile),
-                    keyboard::Key::Named(keyboard::key::Named::ArrowUp)
-                    | keyboard::Key::Character("k") => Some(Message::SelectPreviousFile),
-                    // With nothing else holding the keyboard, Esc drops the
-                    // sidebar's multi-selection marks (a no-op when empty).
-                    keyboard::Key::Named(keyboard::key::Named::Escape) => {
-                        Some(Message::MultiSelectClear)
-                    }
-                    // Target-mode entry points on the selected revision:
-                    // `r` = rebase it, `R` = rebase it with descendants,
-                    // `s` = squash it into a picked destination.
-                    keyboard::Key::Character("r") => {
-                        Some(Message::DraftStartKey(diffui_core::DraftKind::Rebase {
-                            mode: diffui_core::RebaseSourceMode::Revisions,
-                        }))
-                    }
-                    keyboard::Key::Character("R") => {
-                        Some(Message::DraftStartKey(diffui_core::DraftKind::Rebase {
-                            mode: diffui_core::RebaseSourceMode::WithDescendants,
-                        }))
-                    }
-                    keyboard::Key::Character("s") | keyboard::Key::Character("S") => {
-                        Some(Message::DraftStartKey(diffui_core::DraftKind::Squash))
-                    }
-                    // `m` = merge the selected revision with a picked one.
-                    keyboard::Key::Character("m") | keyboard::Key::Character("M") => {
-                        Some(Message::DraftStartKey(diffui_core::DraftKind::Merge))
-                    }
-                    // `b` = rebase the whole branch the selected revision is
-                    // on (fork-point roots resolve against the destination).
-                    keyboard::Key::Character("b") | keyboard::Key::Character("B") => {
-                        Some(Message::DraftStartKey(diffui_core::DraftKind::Rebase {
-                            mode: diffui_core::RebaseSourceMode::Branch,
-                        }))
-                    }
-                    _ => None,
-                }
-            },
-        );
+        });
 
         // Modifier tracking for pointer gestures (⌥-drop = move with
         // descendants). Separate from the key listener: `ModifiersChanged`
         // is its own event kind.
         let modifier_events = event::listen_with(|event, _status, _window| match event {
             Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
-                Some(Message::ModifiersChanged(modifiers))
+                Some(Message::Window(WindowEvent::ModifiersChanged(modifiers)))
             }
             _ => None,
         });
 
-        let window_events = event::listen().filter_map(|event| match event {
-            Event::Window(window::Event::Focused) => Some(Message::WindowFocusChanged(true)),
-            Event::Window(window::Event::Unfocused) => Some(Message::WindowFocusChanged(false)),
-            Event::Window(window::Event::Opened { position, size, .. }) => {
-                Some(Message::WindowOpened(position, size))
-            }
-            Event::Window(window::Event::CloseRequested) => Some(Message::WindowCloseRequested),
-            Event::Window(window::Event::Resized(size)) => Some(Message::WindowResized(size)),
-            Event::Window(window::Event::Moved(position)) => Some(Message::WindowMoved(position)),
-            _ => None,
-        });
+        let window_events = event::listen()
+            .filter_map(|event| match event {
+                Event::Window(window::Event::Focused) => Some(WindowEvent::FocusChanged(true)),
+                Event::Window(window::Event::Unfocused) => Some(WindowEvent::FocusChanged(false)),
+                Event::Window(window::Event::Opened { position, size, .. }) => {
+                    Some(WindowEvent::Opened(position, size))
+                }
+                Event::Window(window::Event::CloseRequested) => Some(WindowEvent::CloseRequested),
+                Event::Window(window::Event::Resized(size)) => Some(WindowEvent::Resized(size)),
+                Event::Window(window::Event::Moved(position)) => Some(WindowEvent::Moved(position)),
+                _ => None,
+            })
+            .map(Message::Window);
         // Watch the working tree for changes instead of polling. The
         // subscription identity is keyed on the repo root, so the watcher
         // One actor per open repository. Spawning it inside the subscription
@@ -4120,8 +4126,7 @@ impl Diffui {
         // is in progress keeps the view function re-running; the handler
         // is a no-op, the side effect is the render itself.
         let palette_animating = self
-            .palette
-            .as_ref()
+            .palette()
             .map(|p| p.is_animating(std::time::Instant::now()))
             .unwrap_or(false);
         let palette_tick = if palette_animating {
@@ -4138,7 +4143,7 @@ impl Diffui {
             || active.session.diff_in_flight()
             || active.activities.any_running();
         let loading_tick = if work_in_flight {
-            time::every(Duration::from_millis(120)).map(|_| Message::LoadingTick)
+            time::every(Duration::from_millis(120)).map(|_| Message::Ui(UiEvent::LoadingTick))
         } else {
             Subscription::none()
         };
@@ -4147,7 +4152,7 @@ impl Diffui {
         // pending; the handler writes once the changes settle, then clears the
         // dirty flag, which tears this subscription back down.
         let window_state_tick = if self.geometry_dirty_since.is_some() {
-            time::every(WINDOW_STATE_DEBOUNCE).map(|_| Message::PersistWindowState)
+            time::every(WINDOW_STATE_DEBOUNCE).map(|_| Message::Window(WindowEvent::PersistState))
         } else {
             Subscription::none()
         };
@@ -4157,8 +4162,7 @@ impl Diffui {
         // animates natively) or while a submenu is open (so the trajectory apex
         // eases toward the cursor / catches up when it idles).
         let menu_ticking = self
-            .menu
-            .as_ref()
+            .menu()
             .is_some_and(|m| m.glow.is_some() || !m.open_path.is_empty());
         let menu_tick = if menu_ticking {
             time::every(Duration::from_millis(16)).map(|_| Message::Menu(MenuMessage::Tick))
@@ -4174,7 +4178,8 @@ impl Diffui {
         // System mode; explicit themes don't care what the OS does.
         let system_theme_poll =
             if cfg!(target_os = "macos") && self.selected_theme == ThemePreference::System {
-                time::every(Duration::from_secs(1)).map(|_| Message::PollSystemTheme)
+                time::every(Duration::from_secs(1))
+                    .map(|_| Message::Window(WindowEvent::PollSystemTheme))
             } else {
                 Subscription::none()
             };
@@ -4183,7 +4188,8 @@ impl Diffui {
         // tick at ~60fps so each frame steps the window toward its target. Tears
         // itself down the moment the animation completes.
         let zoom_tick = if self.zoom_anim.is_some() {
-            time::every(Duration::from_millis(16)).map(|_| Message::ZoomAnimTick)
+            time::every(Duration::from_millis(16))
+                .map(|_| Message::Window(WindowEvent::ZoomAnimTick))
         } else {
             Subscription::none()
         };
@@ -4192,7 +4198,7 @@ impl Diffui {
         let toast_tick = if self.toasts.is_empty() {
             Subscription::none()
         } else {
-            time::every(Duration::from_millis(500)).map(|_| Message::ToastTick)
+            time::every(Duration::from_millis(500)).map(|_| Message::Ui(UiEvent::ToastTick))
         };
 
         Subscription::batch([
@@ -4207,7 +4213,8 @@ impl Diffui {
             system_theme_poll,
             zoom_tick,
             toast_tick,
-            system::theme_changes().map(Message::SystemThemeChanged),
+            system::theme_changes()
+                .map(|mode| Message::Window(WindowEvent::SystemThemeChanged(mode))),
         ])
     }
 
@@ -4336,5 +4343,161 @@ impl Diffui {
 
     pub(crate) fn resolved_theme(&self) -> ResolvedTheme {
         self.selected_theme.active(self.system_theme)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::Context;
+    use crate::modes::{Mode, ModeKind};
+    use crate::palette::PaletteMessage;
+    use crate::tabs::tests::{app, push_tab};
+
+    fn press(ui: &mut Diffui, chord: &str) {
+        let chord = Chord::parse(chord).expect("a parsable chord");
+        let id = ui
+            .resolve_chord(ui.key_context(), &chord, false)
+            .unwrap_or_else(|| panic!("{chord:?} is bound to nothing"));
+        let _ = ui.run_command(id, CommandArg::None);
+    }
+
+    /// Matching is debounced, so between a keystroke and its recompute the
+    /// visible rows belong to a query the user has already typed past.
+    /// Accepting has to run what the query names, not what the stale list left
+    /// highlighted.
+    #[test]
+    fn accepting_a_dirty_palette_runs_what_the_query_names() {
+        let mut ui = app();
+        // The palette only renders with a repository open, so it only stays
+        // open with one — see `prune_stale_modes`.
+        push_tab(&mut ui, "/tmp/repo");
+        let _ = ui.perform(Action::OpenPalette);
+        let stale = ui
+            .palette()
+            .and_then(|state| state.top())
+            .and_then(|column| column.matches.first())
+            .map(|m| m.item.clone())
+            .expect("the empty query lists the root commands");
+        assert!(
+            !matches!(&stale, ResultRef::Command(id) if *id == "theme.contrast"),
+            "the stale highlight must differ from the answer, or the test proves nothing"
+        );
+
+        let _ = ui.update(Message::Palette(PaletteMessage::QueryChanged(
+            ">high contrast".to_owned(),
+        )));
+        assert!(
+            ui.palette()
+                .and_then(|state| state.top())
+                .is_some_and(|column| column.dirty),
+            "the debounced recompute has not run yet"
+        );
+
+        let _ = ui.palette_accept_current();
+        assert_eq!(ui.selected_theme, ThemePreference::HighContrast);
+        assert!(ui.palette().is_none(), "accepting closes the palette");
+    }
+
+    #[test]
+    fn a_confirmation_swallows_every_key_but_its_own() {
+        let mut ui = app();
+        ui.push_mode(Mode::Confirm(ConfirmDialog {
+            title: "Rewrite?".to_owned(),
+            body: String::new(),
+            confirm_label: "Rewrite anyway".to_owned(),
+            pending: PendingMutation {
+                op: mutations::MutationOp::Undo { operation_id: None },
+                tab_id: TabId(0),
+                activity_id: activity::ActivityId(0),
+                allow_immutable: false,
+            },
+        }));
+        let context = ui.key_context();
+        assert_eq!(context, Context::Confirm);
+        for chord in ["cmd+k", "cmd+w", "j", "alt+z"] {
+            let chord = Chord::parse(chord).expect("a parsable chord");
+            assert_eq!(
+                ui.resolve_chord(context, &chord, false),
+                None,
+                "{chord:?} reached past the dialog"
+            );
+        }
+        let esc = Chord::parse("esc").expect("a parsable chord");
+        assert_eq!(
+            ui.resolve_chord(context, &esc, false),
+            Some("confirm.cancel")
+        );
+    }
+
+    /// The base context's plain keys belong to whatever has focus — the revset
+    /// box types `j` rather than moving the file selection — but its chords
+    /// with a modifier are the window's regardless.
+    #[test]
+    fn a_focused_input_keeps_the_plain_keys_it_is_typing() {
+        let ui = app();
+        let plain = Chord::parse("j").expect("a parsable chord");
+        assert_eq!(
+            ui.resolve_chord(Context::Base, &plain, false),
+            Some("file.next")
+        );
+        assert_eq!(ui.resolve_chord(Context::Base, &plain, true), None);
+        let combo = Chord::parse("cmd+k").expect("a parsable chord");
+        assert_eq!(
+            ui.resolve_chord(Context::Base, &combo, true),
+            Some("palette.toggle")
+        );
+    }
+
+    /// Target mode owns the plain keys and hands the modifier combos back, so
+    /// `j` picks a destination while ⌘K still opens the palette.
+    #[test]
+    fn target_mode_keeps_the_plain_keys_and_passes_the_combos_down() {
+        let ui = app();
+        let j = Chord::parse("j").expect("a parsable chord");
+        assert_eq!(
+            ui.resolve_chord(Context::Draft, &j, false),
+            Some("draft.candidate.next")
+        );
+        let combo = Chord::parse("cmd+k").expect("a parsable chord");
+        assert_eq!(
+            ui.resolve_chord(Context::Draft, &combo, false),
+            Some("palette.toggle")
+        );
+        // Nothing in target mode binds ⌘W, so the base context answers it.
+        let close = Chord::parse("cmd+w").expect("a parsable chord");
+        assert_eq!(
+            ui.resolve_chord(Context::Draft, &close, false),
+            Some("tab.close")
+        );
+    }
+
+    #[test]
+    fn the_palette_chord_toggles_the_palette_from_inside_it() {
+        let mut ui = app();
+        push_tab(&mut ui, "/tmp/repo");
+        press(&mut ui, "cmd+k");
+        assert!(ui.palette().is_some());
+        assert_eq!(ui.key_context(), Context::Palette);
+        press(&mut ui, "cmd+k");
+        assert!(ui.palette().is_none());
+        assert_eq!(ui.key_context(), Context::Base);
+    }
+
+    /// A menu built before a graph reload names rows by commit id. `enabled`
+    /// is re-checked when the row is picked, so one the reload dropped can no
+    /// longer run its mutation.
+    #[test]
+    fn a_stale_menu_row_cannot_act_on_a_commit_the_graph_no_longer_has() {
+        let mut ui = app();
+        ui.push_mode(Mode::ActivityPopover);
+        let gone = RevisionSelection::Commit("deadbeef".to_owned());
+        let _ = ui.run_command("revision.abandon", CommandArg::Revision(gone));
+        // Nothing was queued and nothing was logged: the command refused
+        // before it could mint an activity.
+        assert!(ui.active().activities.is_empty());
+        assert!(ui.active().queued_mutations.is_empty());
+        // The popover is still up — the pick was a no-op, not a dismissal.
+        assert!(ui.mode(ModeKind::ActivityPopover).is_some());
     }
 }

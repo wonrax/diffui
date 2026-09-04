@@ -11,7 +11,7 @@ use iced::{
 use crate::input::text_input;
 
 use crate::theme::{self, ThemeSpec};
-use crate::{HoverTarget, Message, ToolbarMenu};
+use crate::{HoverTarget, Message, ToolbarMenu, UiEvent};
 
 /// Fixed height of the field well; the caret square derives from it.
 pub const FIELD_HEIGHT: f32 = 28.0;
@@ -85,8 +85,8 @@ pub(crate) fn filter_field(
                     crate::toolbar::caret_hover_style(theme, caret.hovered, theme::radius::CONTROL)
                 }),
         )
-        .on_enter(Message::SetHover(Some(caret.target)))
-        .on_exit(Message::SetHover(None))
+        .on_enter(Message::Ui(UiEvent::SetHover(Some(caret.target))))
+        .on_exit(Message::Ui(UiEvent::SetHover(None)))
         .interaction(mouse::Interaction::Pointer);
         bar = bar
             .push(caret_el)
@@ -109,9 +109,10 @@ pub(crate) fn filter_field(
     match menu {
         // The AnchorArea wraps the whole field so the presets menu anchors
         // edge-to-edge below it.
-        Some(menu) => {
-            crate::menu::anchor_area(field, move |rect| Message::OpenToolbarMenu(menu, rect)).into()
-        }
+        Some(menu) => crate::menu::anchor_area(field, move |rect| {
+            Message::Ui(UiEvent::OpenToolbarMenu(menu, rect))
+        })
+        .into(),
         None => field.into(),
     }
 }

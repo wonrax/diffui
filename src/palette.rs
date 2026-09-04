@@ -31,31 +31,26 @@ use iced::{
 };
 use nucleo_matcher::{Config, Matcher, Utf32String};
 
+use crate::commands::{self, CommandArg, CommandId, PaletteScope};
 use crate::icons;
 use crate::theme::{self, ThemeSpec, text_size};
-use crate::{Diffui, Message};
+use crate::{Action, Diffui, Message};
 use diffui_core::RevisionSelection;
 
 /// Messages from the command palette, nested under [`Message::Palette`].
 #[derive(Debug, Clone)]
 pub enum PaletteMessage {
-    Open,
-    Close,
     QueryChanged(String),
     /// `(column depth, query version)` — drops a recompute the user typed past.
     Recompute(usize, u64),
-    /// Move the highlighted result by `±1`.
-    MoveSelection(i32),
-    /// Set the highlighted index (used by hover).
-    SelectIndex(usize),
+    /// Set the highlighted index (used by hover). Carries the column's depth:
+    /// a hover published just before a push/pop would otherwise land on
+    /// whichever column happens to be on top when it arrives.
+    SelectIndex(usize, usize),
     /// Enter / on_submit: act on the highlighted row.
     Accept,
-    /// Click a specific row — explicit index against re-render races.
-    AcceptIndex(usize),
-    /// Tab: push an actions column for the highlighted result.
-    PushActions,
-    /// Esc / Backspace at empty: pop the rightmost column.
-    PopColumn,
+    /// Click a specific row — explicit `(depth, index)` against re-render races.
+    AcceptIndex(usize, usize),
     /// Captured-but-inert (e.g. scroll ticks on the palette scrim).
     NoOp,
     /// Per-frame tick driving the column push/pop slide animation.
@@ -206,11 +201,18 @@ impl ChangeId {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ResultRef {
-    /// `@` / working copy. Modelled separately from `Commit(_)` because it
+    /// `@` / working copy. Modelled separately from `Commit` because it
     /// doesn't have a stable change-id.
     WorkingCopy,
-    /// A revision, identified by its change-id.
-    Commit(ChangeId),
+    /// A revision. Carries both ids on purpose: the change-id is what recents
+    /// key on (it survives rewrites), while the commit-id is what *addresses*
+    /// the row. A divergent change has several commits under one change-id, so
+    /// a change-id alone would collapse every copy onto whichever one the index
+    /// answers with — the row would say `abc/2` and jump to `abc/1`.
+    Commit {
+        change: ChangeId,
+        commit: String,
+    },
     /// A bookmark, identified by its name. Resolves to the revision that
     /// owns it at accept time so the rest of the action pipeline can
     /// treat it as a regular revision jump.
@@ -225,80 +227,6 @@ pub struct PaletteMatch {
     pub item: ResultRef,
     pub score: u32,
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum CommandId {
-    RefreshRepository,
-    SelectNextFile,
-    SelectPreviousFile,
-    ThemeSystem,
-    ThemeLight,
-    ThemeDark,
-    ThemeHighContrast,
-    CopyFileDiff,
-    OpenFind,
-    // Tab-action targets (filled per result type by `push_action_candidates`):
-    JumpToRevision,
-    CopyChangeId,
-    CopyCommitMessage,
-    CopyAuthor,
-    OpenFile,
-    CopyFilePath,
-}
-
-impl CommandId {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::RefreshRepository => "Refresh repository",
-            Self::SelectNextFile => "Select next file",
-            Self::SelectPreviousFile => "Select previous file",
-            Self::ThemeSystem => "Theme: System",
-            Self::ThemeLight => "Theme: Light",
-            Self::ThemeDark => "Theme: Dark",
-            Self::ThemeHighContrast => "Theme: High contrast",
-            Self::CopyFileDiff => "Copy current file diff",
-            Self::OpenFind => "Find in current diff",
-            Self::JumpToRevision => "Jump to revision",
-            Self::CopyChangeId => "Copy change-id",
-            Self::CopyCommitMessage => "Copy commit message",
-            Self::CopyAuthor => "Copy author",
-            Self::OpenFile => "Open file",
-            Self::CopyFilePath => "Copy file path",
-        }
-    }
-
-    pub fn hint(self) -> &'static str {
-        match self {
-            Self::RefreshRepository => "Re-read the repository state",
-            Self::SelectNextFile | Self::SelectPreviousFile => "Move between files in current diff",
-            Self::ThemeSystem => "Follow OS appearance",
-            Self::ThemeLight | Self::ThemeDark | Self::ThemeHighContrast => "Set palette theme",
-            Self::CopyFileDiff => "Copy the selected file's diff text",
-            Self::OpenFind => "In-diff search across all files",
-            Self::JumpToRevision => "Show this revision in the diff view",
-            Self::CopyChangeId => "Copy the revision's change-id",
-            Self::CopyCommitMessage => "Copy the commit message",
-            Self::CopyAuthor => "Copy author name and email",
-            Self::OpenFile => "Scroll the diff to this file",
-            Self::CopyFilePath => "Copy the file's path",
-        }
-    }
-}
-
-/// Top-level commands shown when the user enters the palette with no
-/// context. Tab-action commands are appended only inside `Actions(_)`
-/// columns by `push_action_candidates`.
-const ROOT_COMMANDS: &[CommandId] = &[
-    CommandId::RefreshRepository,
-    CommandId::OpenFind,
-    CommandId::SelectNextFile,
-    CommandId::SelectPreviousFile,
-    CommandId::ThemeSystem,
-    CommandId::ThemeDark,
-    CommandId::ThemeLight,
-    CommandId::ThemeHighContrast,
-    CommandId::CopyFileDiff,
-];
 
 /// In-memory MRU bookkeeping. Two tracks: recently-jumped revisions and
 /// recently-run commands. Surfaces a tapered score bump in mixed-mode
@@ -375,10 +303,12 @@ impl Recents {
 
     fn from_persisted(p: PersistedRecents) -> Self {
         let mut revisions: VecDeque<String> = p.revisions.into_iter().collect();
+        // A recents file written by another build can name a command this one
+        // no longer has; drop those rather than carrying dead ids around.
         let mut commands: VecDeque<CommandId> = p
             .commands
             .into_iter()
-            .filter_map(|name| CommandId::from_persist_name(&name))
+            .filter_map(|name| commands::command(&name).map(|command| command.id))
             .collect();
         if revisions.len() > RECENTS_CAPACITY {
             revisions.truncate(RECENTS_CAPACITY);
@@ -405,58 +335,8 @@ impl From<&Recents> for PersistedRecents {
     fn from(r: &Recents) -> Self {
         Self {
             revisions: r.revisions.iter().cloned().collect(),
-            commands: r
-                .commands
-                .iter()
-                .map(|c| c.persist_name().to_owned())
-                .collect(),
+            commands: r.commands.iter().map(|id| (*id).to_owned()).collect(),
         }
-    }
-}
-
-impl CommandId {
-    /// Stable string used in the on-disk recents file. Keep this separate
-    /// from the user-visible `label()` so renaming a label doesn't
-    /// invalidate persisted MRU entries.
-    fn persist_name(self) -> &'static str {
-        match self {
-            Self::RefreshRepository => "refresh-repository",
-            Self::SelectNextFile => "select-next-file",
-            Self::SelectPreviousFile => "select-previous-file",
-            Self::ThemeSystem => "theme-system",
-            Self::ThemeLight => "theme-light",
-            Self::ThemeDark => "theme-dark",
-            Self::ThemeHighContrast => "theme-high-contrast",
-            Self::CopyFileDiff => "copy-file-diff",
-            Self::OpenFind => "open-find",
-            Self::JumpToRevision => "jump-to-revision",
-            Self::CopyChangeId => "copy-change-id",
-            Self::CopyCommitMessage => "copy-commit-message",
-            Self::CopyAuthor => "copy-author",
-            Self::OpenFile => "open-file",
-            Self::CopyFilePath => "copy-file-path",
-        }
-    }
-
-    fn from_persist_name(name: &str) -> Option<Self> {
-        Some(match name {
-            "refresh-repository" => Self::RefreshRepository,
-            "select-next-file" => Self::SelectNextFile,
-            "select-previous-file" => Self::SelectPreviousFile,
-            "theme-system" => Self::ThemeSystem,
-            "theme-light" => Self::ThemeLight,
-            "theme-dark" => Self::ThemeDark,
-            "theme-high-contrast" => Self::ThemeHighContrast,
-            "copy-file-diff" => Self::CopyFileDiff,
-            "open-find" => Self::OpenFind,
-            "jump-to-revision" => Self::JumpToRevision,
-            "copy-change-id" => Self::CopyChangeId,
-            "copy-commit-message" => Self::CopyCommitMessage,
-            "copy-author" => Self::CopyAuthor,
-            "open-file" => Self::OpenFile,
-            "copy-file-path" => Self::CopyFilePath,
-            _ => return None,
-        })
     }
 }
 
@@ -660,7 +540,7 @@ pub fn recompute_matches(column: &mut PaletteColumn, ui: &Diffui, search_revisio
     match &column.source {
         ColumnSource::Root => {
             if mode == Mode::Mixed || mode == Mode::Commands {
-                push_command_candidates(&mut candidates);
+                push_command_candidates(&mut candidates, ui, PaletteScope::Root, &CommandArg::None);
             }
             if mode == Mode::Mixed {
                 // Commits are NOT searched here — that's `:` mode (below), kept
@@ -674,7 +554,7 @@ pub fn recompute_matches(column: &mut PaletteColumn, ui: &Diffui, search_revisio
             }
         }
         ColumnSource::Actions(target) => {
-            push_action_candidates(&mut candidates, target);
+            push_action_candidates(&mut candidates, ui, target);
         }
     }
 
@@ -689,8 +569,8 @@ pub fn recompute_matches(column: &mut PaletteColumn, ui: &Diffui, search_revisio
         let Some(raw_score) = score else { continue };
 
         let bonus = match &candidate.item {
-            ResultRef::Commit(id) => ui.recents.revision_bonus(id.as_str()),
-            ResultRef::Command(id) => ui.recents.command_bonus(*id),
+            ResultRef::Commit { change, .. } => ui.recents.revision_bonus(change.as_str()),
+            ResultRef::Command(id) => ui.recents.command_bonus(id),
             ResultRef::WorkingCopy | ResultRef::Bookmark(_) | ResultRef::File(_) => 0,
         };
         // Category gets a stable tie-break, but the fuzzy score is the
@@ -701,7 +581,7 @@ pub fn recompute_matches(column: &mut PaletteColumn, ui: &Diffui, search_revisio
         // to mention the same word.
         let category_tiebreak = match &candidate.item {
             ResultRef::Bookmark(_) => 4,
-            ResultRef::WorkingCopy | ResultRef::Commit(_) => 3,
+            ResultRef::WorkingCopy | ResultRef::Commit { .. } => 3,
             ResultRef::File(_) => 2,
             ResultRef::Command(_) => 1,
         };
@@ -750,7 +630,10 @@ fn push_revision_candidates(out: &mut Vec<Candidate>, ui: &Diffui) {
             haystack.push_str(bookmark);
         }
         out.push(Candidate {
-            item: ResultRef::Commit(ChangeId(commit.change_id().to_owned())),
+            item: ResultRef::Commit {
+                change: ChangeId(commit.change_id().to_owned()),
+                commit: commit.commit_id().to_owned(),
+            },
             haystack,
         });
     }
@@ -801,41 +684,41 @@ fn push_file_candidates(out: &mut Vec<Candidate>, ui: &Diffui) {
     }
 }
 
-fn push_command_candidates(out: &mut Vec<Candidate>) {
-    for cmd in ROOT_COMMANDS {
+/// The registry's commands for `scope`, filtered by their `enabled` predicate
+/// against the argument they would run with — a row the palette offers is a
+/// row that will actually do something when accepted.
+fn push_command_candidates(
+    out: &mut Vec<Candidate>,
+    ui: &Diffui,
+    scope: PaletteScope,
+    arg: &CommandArg,
+) {
+    for command in commands::palette_commands(ui, scope, arg) {
         out.push(Candidate {
-            item: ResultRef::Command(*cmd),
-            haystack: format!("{} {}", cmd.label(), cmd.hint()),
+            item: ResultRef::Command(command.id),
+            haystack: format!("{} {}", command.label, command.hint),
         });
     }
 }
 
-fn push_action_candidates(out: &mut Vec<Candidate>, target: &ResultRef) {
-    let actions: &[CommandId] = match target {
-        // Bookmarks share the revision action menu; the bookmark just
-        // points at a commit, so "Copy change-id" / "Copy author" etc.
-        // resolve through the owning revision.
-        ResultRef::WorkingCopy | ResultRef::Commit(_) | ResultRef::Bookmark(_) => &[
-            CommandId::JumpToRevision,
-            CommandId::CopyChangeId,
-            CommandId::CopyCommitMessage,
-            CommandId::CopyAuthor,
-        ],
-        ResultRef::File(_) => &[CommandId::OpenFile, CommandId::CopyFilePath],
-        ResultRef::Command(_) => &[],
+fn push_action_candidates(out: &mut Vec<Candidate>, ui: &Diffui, target: &ResultRef) {
+    // Bookmarks share the revision action list; the bookmark just points at a
+    // commit, so "Copy change-id" / "Copy author" resolve through the owning
+    // revision. A command row is its own terminal action and has none.
+    let scope = match target {
+        ResultRef::WorkingCopy | ResultRef::Commit { .. } | ResultRef::Bookmark(_) => {
+            PaletteScope::Revision
+        }
+        ResultRef::File(_) => PaletteScope::File,
+        ResultRef::Command(_) => return,
     };
-    for cmd in actions {
-        out.push(Candidate {
-            item: ResultRef::Command(*cmd),
-            haystack: format!("{} {}", cmd.label(), cmd.hint()),
-        });
-    }
+    push_command_candidates(out, ui, scope, &CommandArg::Result(target.clone()));
 }
 
 /// Build the palette overlay. Returns an empty placeholder when closed so
 /// the caller can stack it unconditionally into the top-level view.
 pub fn build_overlay<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
-    let Some(state) = &ui.palette else {
+    let Some(state) = ui.palette() else {
         return Space::new().into();
     };
 
@@ -845,7 +728,7 @@ pub fn build_overlay<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Messag
             .height(Length::Fill)
             .style(|_| theme::scrim_style()),
     )
-    .on_press(Message::Palette(PaletteMessage::Close));
+    .on_press(Message::Action(Action::ClosePalette));
 
     // Layout strategy: every column is pinned at an absolute X inside a
     // clipping `Stack`. We can't use a row-of-columns inside a container —
@@ -1068,7 +951,7 @@ fn build_results<'a>(
 
     let mut list = column![].spacing(0);
     for (index, m) in column_state.matches.iter().enumerate() {
-        list = list.push(build_result_row(ui, theme, column_state, index, m));
+        list = list.push(build_result_row(ui, theme, column_state, depth, index, m));
     }
 
     let scrollable_list = scrollable(list)
@@ -1109,6 +992,7 @@ fn build_result_row<'a>(
     ui: &'a Diffui,
     theme: ThemeSpec,
     column_state: &'a PaletteColumn,
+    depth: usize,
     index: usize,
     m: &'a PaletteMatch,
 ) -> Element<'a, Message> {
@@ -1142,8 +1026,8 @@ fn build_result_row<'a>(
         });
 
     mouse_area(row_el)
-        .on_press(Message::Palette(PaletteMessage::AcceptIndex(index)))
-        .on_enter(Message::Palette(PaletteMessage::SelectIndex(index)))
+        .on_press(Message::Palette(PaletteMessage::AcceptIndex(depth, index)))
+        .on_enter(Message::Palette(PaletteMessage::SelectIndex(depth, index)))
         .into()
 }
 
@@ -1177,18 +1061,9 @@ fn result_row_body<'a>(
         .spacing(0)
         .align_y(alignment::Vertical::Center)
         .into(),
-        ResultRef::Commit(change_id) => {
-            let commit = ui
-                .active()
-                .session
-                .commits
-                .find_by_change_id(change_id.as_str());
-            let prefix = commit
-                .map(|c| {
-                    let len = c.shortest_change_id_len().unwrap_or(8).max(8);
-                    c.change_id().chars().take(len).collect::<String>()
-                })
-                .unwrap_or_else(|| change_id.as_str().chars().take(8).collect::<String>());
+        ResultRef::Commit { change, commit } => {
+            let commit = ui.active().session.commits.find_by_commit_id(commit);
+            let prefix = revision_prefix(commit.as_ref(), change);
             let description = commit
                 .map(|c| {
                     if c.has_description() {
@@ -1258,15 +1133,15 @@ fn result_row_body<'a>(
         .spacing(0)
         .align_y(alignment::Vertical::Center)
         .into(),
-        ResultRef::Command(cmd) => row![
+        ResultRef::Command(id) => row![
             text(">")
                 .size(text_size::BODY)
                 .font(ui.config.mono_font)
                 .color(theme.modified_token),
             Space::new().width(Length::Fixed(10.0)),
-            primary_label(ui, primary, cmd.label().to_owned()),
+            primary_label(ui, primary, command_label(id)),
             Space::new().width(Length::Fixed(8.0)),
-            text(cmd.hint())
+            text(command_hint(id))
                 .size(text_size::CAPTION)
                 .font(ui.config.ui_font)
                 .color(muted),
@@ -1313,20 +1188,48 @@ fn mono_primary_label<'a>(
 fn target_label(target: &ResultRef, ui: &Diffui) -> String {
     match target {
         ResultRef::WorkingCopy => "Working copy".to_owned(),
-        ResultRef::Commit(change_id) => ui
-            .active()
-            .session
-            .commits
-            .find_by_change_id(change_id.as_str())
-            .map(|c| {
-                let len = c.shortest_change_id_len().unwrap_or(8).max(8);
-                c.change_id().chars().take(len).collect()
-            })
-            .unwrap_or_else(|| change_id.as_str().chars().take(8).collect()),
+        ResultRef::Commit { change, commit } => revision_prefix(
+            ui.active()
+                .session
+                .commits
+                .find_by_commit_id(commit)
+                .as_ref(),
+            change,
+        ),
         ResultRef::Bookmark(name) => name.clone(),
         ResultRef::File(path) => path.clone(),
-        ResultRef::Command(cmd) => cmd.label().to_owned(),
+        ResultRef::Command(id) => command_label(id),
     }
+}
+
+/// A registry command's label / hint for a palette row. A row can only exist
+/// for a command that is in the registry, so the fallbacks never render.
+fn command_label(id: CommandId) -> String {
+    commands::command(id)
+        .map(|command| command.label.to_owned())
+        .unwrap_or_default()
+}
+
+fn command_hint(id: CommandId) -> &'static str {
+    commands::command(id)
+        .map(|command| command.hint)
+        .unwrap_or_default()
+}
+
+/// The short change-id a revision row shows: the unique prefix (min 8 chars),
+/// `/N`-suffixed for a divergent or hidden copy so two rows of one change read
+/// apart. Falls back to a bare 8-char prefix for a row that has left the graph.
+fn revision_prefix(row: Option<&diffui_core::RowView<'_>>, change: &ChangeId) -> String {
+    let Some(row) = row else {
+        return change.as_str().chars().take(8).collect();
+    };
+    let len = row.shortest_change_id_len().unwrap_or(8).max(8);
+    let mut prefix: String = row.change_id().chars().take(len).collect();
+    if let Some(offset) = row.change_offset() {
+        prefix.push('/');
+        prefix.push_str(&offset.to_string());
+    }
+    prefix
 }
 
 /// Translate a result row to the revision selection it represents.
@@ -1342,11 +1245,14 @@ fn target_label(target: &ResultRef, ui: &Diffui) -> String {
 pub fn revision_selection(item: &ResultRef, ui: &Diffui) -> Option<RevisionSelection> {
     match item {
         ResultRef::WorkingCopy => Some(RevisionSelection::WorkingCopy),
-        ResultRef::Commit(change_id) => ui
+        // Resolved through the store rather than trusted: a commit-id from a
+        // persisted recent, or from a graph the reload has since replaced,
+        // must not flow into a mutation.
+        ResultRef::Commit { commit, .. } => ui
             .active()
             .session
             .commits
-            .find_by_change_id(change_id.as_str())
+            .find_by_commit_id(commit)
             .map(|c| RevisionSelection::Commit(c.commit_id().to_owned())),
         ResultRef::Bookmark(name) => ui
             .active()
@@ -1364,7 +1270,7 @@ pub fn revision_selection(item: &ResultRef, ui: &Diffui) -> Option<RevisionSelec
 /// flagged as the WC right now.
 pub fn change_id_for_recents(item: &ResultRef, ui: &Diffui) -> Option<String> {
     match item {
-        ResultRef::Commit(change_id) => Some(change_id.0.clone()),
+        ResultRef::Commit { change, .. } => Some(change.0.clone()),
         ResultRef::Bookmark(name) => ui
             .active()
             .session

@@ -1,11 +1,51 @@
 //! Menu construction for [`Diffui`]: the revision context-menu tree, the
-//! toolbar fetch/revset dropdowns, menu-action dispatch, and lowering to the
-//! macOS native `NSMenu`. Split out of `update.rs`; these read only
+//! toolbar fetch/revset dropdowns, running a picked command, and lowering to
+//! the macOS native `NSMenu`. Split out of `update.rs`; these read only
 //! already-loaded `Session` state, so menus open instantly with no repo I/O.
+//!
+//! A menu row names a registry command and the argument to run it with. The
+//! label and the chord hint come from the registry unless the row is one of a
+//! generated set (a bookmark name, a remote branch) that the registry cannot
+//! know. Nothing here decides *what* a pick does — [`Diffui::run_command`]
+//! re-checks the command's `enabled` at pick time and performs its
+//! [`crate::Action`].
 
 use super::*;
+use crate::commands::{self, CommandId};
 
 impl Diffui {
+    /// A menu row for `command`, labelled and chord-hinted from the registry.
+    pub(crate) fn menu_item(&self, command: CommandId, arg: CommandArg) -> menu::MenuEntry {
+        let entry = commands::command(command);
+        menu::MenuEntry::Item {
+            label: entry.map(|c| c.label.to_owned()).unwrap_or_default(),
+            detail: self
+                .keymap
+                .chord_for(Context::Base, command)
+                .map(Chord::display),
+            emphasized: false,
+            command,
+            arg,
+        }
+    }
+
+    /// A menu row for `command` under a label the registry can't supply — one
+    /// of a generated set (a bookmark, a remote branch, a preset).
+    pub(crate) fn menu_row(
+        &self,
+        label: impl Into<String>,
+        command: CommandId,
+        arg: CommandArg,
+    ) -> menu::MenuEntry {
+        menu::MenuEntry::Item {
+            label: label.into(),
+            detail: None,
+            emphasized: false,
+            command,
+            arg,
+        }
+    }
+
     /// Build the revision context menu's entry tree from the already-loaded
     /// bookmarks / commit graph (so it opens instantly, no repo read).
     /// Shared by the macOS native popup and the iced overlay; author/committer/
@@ -13,7 +53,6 @@ impl Diffui {
     /// read on demand when picked.
     pub(crate) fn revision_menu_tree(&self, selection: &RevisionSelection) -> Vec<menu::MenuEntry> {
         use menu::MenuEntry;
-        use mutations::MutationOp;
 
         // A live multi-selection (several marked rows, the clicked one among
         // them) swaps the per-revision menu for the batch menu — marking rows
@@ -44,40 +83,27 @@ impl Diffui {
         };
         if marked.len() > 1 && clicked_id.as_deref().is_some_and(|id| marked.contains(&id)) {
             return vec![
-                MenuEntry::item(
+                self.menu_row(
                     format!("Abandon {} revisions", marked.len()),
-                    MenuAction::Mutate(MutationOp::Abandon {
-                        targets: marked
+                    "revision.abandon",
+                    CommandArg::Revisions(
+                        marked
                             .iter()
                             .map(|id| RevisionSelection::Commit((*id).to_owned()))
                             .collect(),
-                    }),
+                    ),
                 ),
                 MenuEntry::Separator,
-                MenuEntry::item("Clear selection", MenuAction::ClearMultiSelection),
+                self.menu_item("selection.clear", CommandArg::None),
             ];
         }
 
+        let on = || CommandArg::Revision(selection.clone());
         let mut top = vec![
-            MenuEntry::item(
-                "Edit description…",
-                MenuAction::EditDescription {
-                    target: selection.clone(),
-                },
-            ),
+            self.menu_item("revision.edit-description", on()),
             MenuEntry::Separator,
-            MenuEntry::item(
-                "New child",
-                MenuAction::Mutate(MutationOp::New {
-                    parent: selection.clone(),
-                }),
-            ),
-            MenuEntry::item(
-                "Edit",
-                MenuAction::Mutate(MutationOp::Edit {
-                    target: selection.clone(),
-                }),
-            ),
+            self.menu_item("revision.new-child", on()),
+            self.menu_item("revision.edit", on()),
             MenuEntry::Separator,
             // History surgery, grouped: multi-variant ops fold into submenus;
             // the "…" leaves enter target mode (pick the destination on the
@@ -85,83 +111,26 @@ impl Diffui {
             MenuEntry::Submenu {
                 label: "Rebase".to_owned(),
                 items: vec![
-                    MenuEntry::item(
-                        "Onto\u{2026}",
-                        MenuAction::StartDraft {
-                            kind: mutations::DraftKind::Rebase {
-                                mode: mutations::RebaseSourceMode::Revisions,
-                            },
-                            source: selection.clone(),
-                        },
-                    ),
-                    MenuEntry::item(
-                        "With descendants onto\u{2026}",
-                        MenuAction::StartDraft {
-                            kind: mutations::DraftKind::Rebase {
-                                mode: mutations::RebaseSourceMode::WithDescendants,
-                            },
-                            source: selection.clone(),
-                        },
-                    ),
-                    MenuEntry::item(
-                        "Whole branch onto\u{2026}",
-                        MenuAction::StartDraft {
-                            kind: mutations::DraftKind::Rebase {
-                                mode: mutations::RebaseSourceMode::Branch,
-                            },
-                            source: selection.clone(),
-                        },
-                    ),
+                    self.menu_item("revision.rebase.start", on()),
+                    self.menu_item("revision.rebase.descendants.start", on()),
+                    self.menu_item("revision.rebase.branch.start", on()),
                 ],
             },
             MenuEntry::Submenu {
                 label: "Squash".to_owned(),
                 items: vec![
-                    MenuEntry::item(
-                        "Into parent",
-                        MenuAction::Mutate(MutationOp::Squash {
-                            from: vec![selection.clone()],
-                            into: mutations::SquashTarget::Parent,
-                        }),
-                    ),
-                    MenuEntry::item(
-                        "Into\u{2026}",
-                        MenuAction::StartDraft {
-                            kind: mutations::DraftKind::Squash,
-                            source: selection.clone(),
-                        },
-                    ),
+                    self.menu_item("revision.squash-into-parent", on()),
+                    self.menu_item("revision.squash.start", on()),
                 ],
             },
-            MenuEntry::item(
-                "Merge with\u{2026}",
-                MenuAction::StartDraft {
-                    kind: mutations::DraftKind::Merge,
-                    source: selection.clone(),
-                },
-            ),
-            MenuEntry::item(
-                "Duplicate",
-                MenuAction::Mutate(MutationOp::Duplicate {
-                    target: selection.clone(),
-                }),
-            ),
-            MenuEntry::item(
-                "Absorb into ancestors",
-                MenuAction::Mutate(MutationOp::Absorb {
-                    from: selection.clone(),
-                }),
-            ),
-            MenuEntry::item(
-                "Abandon",
-                MenuAction::Mutate(MutationOp::Abandon {
-                    targets: vec![selection.clone()],
-                }),
-            ),
+            self.menu_item("revision.merge.start", on()),
+            self.menu_item("revision.duplicate", on()),
+            self.menu_item("revision.absorb", on()),
+            self.menu_item("revision.abandon", on()),
             MenuEntry::Separator,
-            MenuEntry::item(
-                "Browse source",
-                MenuAction::BrowseSource {
+            self.menu_item(
+                "revision.browse-source",
+                CommandArg::Browse {
                     revision: selection.clone(),
                     path: None,
                 },
@@ -187,22 +156,31 @@ impl Diffui {
             })
         };
         if let Some((change_id, commit_id, description, author, bookmarks)) = copy_fields {
+            let copy_text = |label: &str, value: String| {
+                self.menu_row(label, "revision.copy-text", CommandArg::Text(value))
+            };
+            let copy_detail = |label: &str, field: DetailField, fallback: String| {
+                self.menu_row(
+                    label,
+                    "revision.copy-detail",
+                    CommandArg::Detail {
+                        revision: selection.clone(),
+                        field,
+                        fallback,
+                    },
+                )
+            };
             let mut copy_items = vec![
-                MenuEntry::item("Revision ID", MenuAction::CopyText(change_id)),
-                MenuEntry::item("Commit hash", MenuAction::CopyText(commit_id)),
+                copy_text("Revision ID", change_id),
+                copy_text("Commit hash", commit_id),
             ];
             match bookmarks.len() {
                 0 => {}
-                1 => copy_items.push(MenuEntry::item(
-                    "Bookmark",
-                    MenuAction::CopyText(bookmarks[0].clone()),
-                )),
+                1 => copy_items.push(copy_text("Bookmark", bookmarks[0].clone())),
                 _ => {
                     let subs = bookmarks
                         .iter()
-                        .map(|name| {
-                            MenuEntry::item(name.clone(), MenuAction::CopyText(name.clone()))
-                        })
+                        .map(|name| copy_text(name, name.clone()))
                         .collect();
                     copy_items.push(MenuEntry::Submenu {
                         label: "Bookmark".to_owned(),
@@ -211,28 +189,14 @@ impl Diffui {
                 }
             }
             if !description.is_empty() {
-                copy_items.push(MenuEntry::item(
+                copy_items.push(copy_detail(
                     "Description",
-                    MenuAction::CopyDetail {
-                        field: DetailField::Description,
-                        fallback: description,
-                    },
+                    DetailField::Description,
+                    description,
                 ));
             }
-            copy_items.push(MenuEntry::item(
-                "Author",
-                MenuAction::CopyDetail {
-                    field: DetailField::Author,
-                    fallback: author.clone(),
-                },
-            ));
-            copy_items.push(MenuEntry::item(
-                "Committer",
-                MenuAction::CopyDetail {
-                    field: DetailField::Committer,
-                    fallback: author,
-                },
-            ));
+            copy_items.push(copy_detail("Author", DetailField::Author, author.clone()));
+            copy_items.push(copy_detail("Committer", DetailField::Committer, author));
             top.push(MenuEntry::Separator);
             top.push(MenuEntry::Submenu {
                 label: "Copy".to_owned(),
@@ -273,13 +237,14 @@ impl Diffui {
                 } else {
                     name.clone()
                 };
-                MenuEntry::item(
+                self.menu_row(
                     label,
-                    MenuAction::Mutate(MutationOp::MoveBookmark {
+                    "bookmark.move",
+                    CommandArg::Bookmark {
                         name: name.clone(),
-                        to: selection.clone(),
-                        push_remote: None,
-                    }),
+                        remote: None,
+                        to: Some(selection.clone()),
+                    },
                 )
             })
             .collect();
@@ -308,15 +273,16 @@ impl Diffui {
                 // The remote rides in the detail column rather than an arrow
                 // glyph in the label: `\u{2192}` renders as a fallback-font
                 // blob in plenty of UI fonts.
-                Some(MenuEntry::Item {
+                Some(menu::MenuEntry::Item {
                     label: name.clone(),
                     detail: Some(remote.to_owned()),
                     emphasized: false,
-                    action: MenuAction::Mutate(MutationOp::MoveBookmark {
+                    command: "bookmark.move",
+                    arg: CommandArg::Bookmark {
                         name: name.clone(),
-                        to: selection.clone(),
-                        push_remote: Some(remote.to_owned()),
-                    }),
+                        remote: Some(remote.to_owned()),
+                        to: Some(selection.clone()),
+                    },
                 })
             })
             .collect();
@@ -359,28 +325,33 @@ impl Diffui {
                         // jj refuses to push a conflicted bookmark; what it
                         // wants is a resolution — `jj bookmark set` onto one
                         // side — so that's the action offered in its place.
-                        sub.push(MenuEntry::item(
+                        sub.push(self.menu_row(
                             "Set here (resolve conflict)",
-                            MenuAction::Mutate(MutationOp::MoveBookmark {
+                            "bookmark.move",
+                            CommandArg::Bookmark {
                                 name: entry.name.clone(),
-                                to: RevisionSelection::Commit(hex.to_owned()),
-                                push_remote: None,
-                            }),
+                                remote: None,
+                                to: Some(RevisionSelection::Commit(hex.to_owned())),
+                            },
                         ));
                     } else if let Some(remote) = entry.tracked_remote() {
-                        sub.push(MenuEntry::item(
+                        sub.push(self.menu_row(
                             format!("Push to {remote}"),
-                            MenuAction::Mutate(MutationOp::PushBookmark {
+                            "bookmark.push",
+                            CommandArg::Bookmark {
                                 name: entry.name.clone(),
-                                remote: remote.to_owned(),
-                            }),
+                                remote: Some(remote.to_owned()),
+                                to: None,
+                            },
                         ));
                     }
-                    sub.push(MenuEntry::item(
-                        "Delete",
-                        MenuAction::Mutate(MutationOp::DeleteBookmark {
+                    sub.push(self.menu_item(
+                        "bookmark.delete",
+                        CommandArg::Bookmark {
                             name: entry.name.clone(),
-                        }),
+                            remote: None,
+                            to: None,
+                        },
                     ));
                     let label = if entry.is_conflicted() {
                         format!("{}??", entry.name)
@@ -393,12 +364,13 @@ impl Diffui {
                     if remote_ref.target.as_str() == hex && !remote_ref.tracked {
                         bookmark_items.push(MenuEntry::Submenu {
                             label: format!("{}@{}", entry.name, remote_ref.remote),
-                            items: vec![MenuEntry::item(
-                                "Track",
-                                MenuAction::Mutate(MutationOp::TrackBookmark {
+                            items: vec![self.menu_item(
+                                "bookmark.track",
+                                CommandArg::Bookmark {
                                     name: entry.name.clone(),
-                                    remote: remote_ref.remote.clone(),
-                                }),
+                                    remote: Some(remote_ref.remote.clone()),
+                                    to: None,
+                                },
                             )],
                         });
                     }
@@ -424,15 +396,17 @@ impl Diffui {
             label: "Fetch all remotes".to_owned(),
             detail: None,
             emphasized: true,
-            action: MenuAction::Fetch(FetchTarget::AllRemotes),
+            command: "repo.fetch",
+            arg: CommandArg::Fetch(FetchTarget::AllRemotes),
         }];
         let branches = self.remote_branches_by_proximity();
         if !branches.is_empty() {
             items.push(MenuEntry::Separator);
             for (branch, remote) in branches {
-                items.push(MenuEntry::item(
+                items.push(self.menu_row(
                     format!("{branch}@{remote}"),
-                    MenuAction::Fetch(FetchTarget::RemoteBranch { remote, branch }),
+                    "repo.fetch",
+                    CommandArg::Fetch(FetchTarget::RemoteBranch { remote, branch }),
                 ));
             }
         }
@@ -450,81 +424,28 @@ impl Diffui {
                 label,
                 detail: Some(expr.clone()),
                 emphasized: false,
-                action: MenuAction::SetRevset(expr),
+                command: "repo.set-revset",
+                arg: CommandArg::Revset(expr),
             })
             .collect()
     }
 
-    /// Run a picked menu action. `selection` is the right-clicked revision (for
-    /// the on-demand author/committer/description reads), `None` for the toolbar
-    /// menus. Shared by the native and iced menus.
-    pub(crate) fn dispatch_menu_action(
-        &mut self,
-        action: MenuAction,
-        selection: Option<RevisionSelection>,
-    ) -> Task<Message> {
-        let op = match action {
-            MenuAction::Fetch(target) => return self.start_fetch(target),
-            MenuAction::SetRevset(expr) => {
-                self.active_mut().session.revset = expr;
-                return self.evaluate_revset();
-            }
-            // Ready-to-paste values write to the clipboard immediately.
-            MenuAction::CopyText(text) => return iced::clipboard::write(text).discard(),
-            MenuAction::BrowseSource { revision, path } => {
-                return self.open_source_browser(revision, path);
-            }
-            MenuAction::EditDescription { target } => {
-                if self.active_mut().session.selected_revision == target {
-                    return Task::done(Message::DescriptionEdit);
-                }
-                if let Some(editor) = self.active_mut().description_editor.as_mut()
-                    && (editor.is_dirty() || editor.saving_activity.is_some())
-                {
-                    editor.switch_blocked = true;
-                    return Task::none();
-                }
-                self.active_mut().pending_description_edit = Some(target.clone());
-                return self.update(Message::SelectRowKey(selection_key(&target)));
-            }
-            MenuAction::StartDraft { kind, source } => {
-                return self.update(Message::DraftStart(kind, source));
-            }
-            // Author / committer / full description aren't kept in the graph, so
-            // ask the actor for the revision's header and copy from that,
-            // falling back to the in-memory value.
-            MenuAction::CopyDetail { field, fallback } => {
-                let (Some(tab), Some(selection)) = (self.active_tab_id(), selection) else {
-                    return Task::none();
-                };
-                let Some(state) = self.tab_mut(tab) else {
-                    return Task::none();
-                };
-                if !state.session.capabilities.details {
-                    return Task::done(Message::CopyToClipboard(fallback));
-                }
-                let job = state.session.next_job();
-                state.pending_detail_copy = Some((job, field, fallback));
-                return self.send(
-                    tab,
-                    diffui_core::Command::RevisionDetails {
-                        job,
-                        revision: selection,
-                    },
-                );
-            }
-            MenuAction::ClearMultiSelection => {
-                self.active_mut().revision_multi_selection.clear();
-                return Task::none();
-            }
-            MenuAction::Mutate(op) => op,
+    /// Run the registry command `id` with `arg`.
+    ///
+    /// The single funnel every non-keyboard producer goes through. `enabled` is
+    /// evaluated *here*, not when the surface was built, so a menu that has been
+    /// open across a graph reload can no longer act on a row that reload hid.
+    pub(crate) fn run_command(&mut self, id: CommandId, arg: CommandArg) -> Task<Message> {
+        let Some(command) = commands::command(id) else {
+            return Task::none();
         };
-        // A batch abandon consumes the marked rows — the marks (and their
-        // wash) mustn't outlive the pick.
-        if matches!(&op, mutations::MutationOp::Abandon { targets } if targets.len() > 1) {
-            self.active_mut().revision_multi_selection.clear();
+        if !(command.enabled)(self, &arg) {
+            return Task::none();
         }
-        self.start_mutation_op(op)
+        match (command.build)(self, arg) {
+            Some(action) => self.perform(action),
+            None => Task::none(),
+        }
     }
 
     /// Wrap `op` in an activity and send it to the repository actor. Every
@@ -582,6 +503,11 @@ impl Diffui {
                     ..
                 }
         );
+        // A batch abandon consumes the marked rows — the marks (and their
+        // wash) mustn't outlive the pick.
+        if matches!(&op, MutationOp::Abandon { targets } if targets.len() > 1) {
+            self.active_mut().revision_multi_selection.clear();
+        }
         let (activity_id, _) = self.begin_activity(tab_id, label, determinate);
         let pending = PendingMutation {
             op,
@@ -664,24 +590,23 @@ impl Diffui {
             && self.active().main_view == MainView::Diff
             && self.active().repository.is_some()
         {
-            items.push(MenuEntry::item(
+            items.push(self.menu_row(
                 "Browse source at this revision",
-                MenuAction::BrowseSource {
+                "revision.browse-source",
+                CommandArg::Browse {
                     revision: self.active().session.selected_revision.clone(),
                     path: Some(path.clone()),
                 },
             ));
             items.push(MenuEntry::Separator);
         }
-        items.push(MenuEntry::item(
+        items.push(self.menu_row(
             "Copy path",
-            MenuAction::CopyText(path.clone()),
+            "file.copy-path",
+            CommandArg::Path(path.clone()),
         ));
-        if let Some(repository) = &self.active().repository {
-            items.push(MenuEntry::item(
-                "Copy absolute path",
-                MenuAction::CopyText(repository.root.join(&path).display().to_string()),
-            ));
+        if self.active().repository.is_some() {
+            items.push(self.menu_item("file.copy-absolute-path", CommandArg::Path(path)));
         }
         items
     }
@@ -699,8 +624,8 @@ impl Diffui {
         if tree.is_empty() {
             return Task::none();
         }
-        let mut actions: Vec<MenuAction> = Vec::new();
-        let items = lower_menu_to_native(&tree, &mut actions);
+        let mut picks: Vec<(CommandId, CommandArg)> = Vec::new();
+        let items = lower_menu_to_native(&tree, &mut picks);
         let glow = macos_native::GlowRect {
             x: row_rect.x,
             y: row_rect.y,
@@ -710,10 +635,10 @@ impl Diffui {
         let Some(chosen) = macos_native::popup_menu(&items, Some(glow)) else {
             return Task::none();
         };
-        let Some(action) = actions.get(chosen as usize).cloned() else {
+        let Some((command, arg)) = picks.get(chosen as usize).cloned() else {
             return Task::none();
         };
-        self.dispatch_menu_action(action, None)
+        self.run_command(command, arg)
     }
 
     /// Non-macOS: open the file context menu as the iced overlay at the
@@ -735,8 +660,8 @@ impl Diffui {
             Some(iced::mouse::Button::Right),
         );
         overlay.glow = Some(row_rect);
-        self.activity_popover_open = false;
-        self.menu = Some(overlay);
+        self.pop_mode(ModeKind::ActivityPopover);
+        self.push_mode(Mode::Menu(overlay));
         Task::none()
     }
 
@@ -751,8 +676,8 @@ impl Diffui {
         _cursor: iced::Point,
     ) -> Task<Message> {
         let tree = self.revision_menu_tree(&selection);
-        let mut actions: Vec<MenuAction> = Vec::new();
-        let items = lower_menu_to_native(&tree, &mut actions);
+        let mut picks: Vec<(CommandId, CommandArg)> = Vec::new();
+        let items = lower_menu_to_native(&tree, &mut picks);
         let glow = macos_native::GlowRect {
             x: row_rect.x,
             y: row_rect.y,
@@ -762,10 +687,10 @@ impl Diffui {
         let Some(chosen) = macos_native::popup_menu(&items, Some(glow)) else {
             return Task::none();
         };
-        let Some(action) = actions.get(chosen as usize).cloned() else {
+        let Some((command, arg)) = picks.get(chosen as usize).cloned() else {
             return Task::none();
         };
-        self.dispatch_menu_action(action, Some(selection))
+        self.run_command(command, arg)
     }
 
     /// Non-macOS: open the iced overlay menu at the cursor, pulsing `row_rect`.
@@ -786,10 +711,9 @@ impl Diffui {
             menu::AnchorSpec::At(cursor),
             Some(iced::mouse::Button::Right),
         );
-        overlay.selection = Some(selection);
         overlay.glow = Some(row_rect);
-        self.activity_popover_open = false;
-        self.menu = Some(overlay);
+        self.pop_mode(ModeKind::ActivityPopover);
+        self.push_mode(Mode::Menu(overlay));
         Task::none()
     }
 
@@ -827,7 +751,7 @@ impl Diffui {
                 let Some(target) = targets.get(chosen as usize).cloned() else {
                     return Task::none();
                 };
-                self.start_fetch(target)
+                self.run_command("repo.fetch", CommandArg::Fetch(target))
             }
             ToolbarMenu::RevsetPresets => {
                 let entries = self.revset_menu_entries();
@@ -835,7 +759,7 @@ impl Diffui {
                     .iter()
                     .enumerate()
                     .map(|(index, (label, expr))| {
-                        MenuItem::entry(format!("{label}  ·  {expr}"), index as u32)
+                        MenuItem::entry(format!("{label}  \u{b7}  {expr}"), index as u32)
                     })
                     .collect();
                 let Some(chosen) = macos_native::popup_menu(&items, None) else {
@@ -844,8 +768,7 @@ impl Diffui {
                 let Some((_, expr)) = entries.get(chosen as usize) else {
                     return Task::none();
                 };
-                self.active_mut().session.revset = expr.clone();
-                self.evaluate_revset()
+                self.run_command("repo.set-revset", CommandArg::Revset(expr.clone()))
             }
         }
     }
@@ -864,11 +787,11 @@ impl Diffui {
         };
         // `AnchorArea` fires on a left press, so that press's release is the
         // opening one — swallowed rather than treated as a pick/dismiss.
-        self.menu = Some(menu::OverlayMenu::new(
+        self.push_mode(Mode::Menu(menu::OverlayMenu::new(
             root,
             menu::AnchorSpec::Below(anchor),
             Some(iced::mouse::Button::Left),
-        ));
+        )));
         Task::none()
     }
 }

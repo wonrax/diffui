@@ -5,9 +5,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod action;
 mod activity;
 mod chip;
 mod chrome;
+mod commands;
 mod config;
 mod diff_panel;
 mod diff_view;
@@ -17,12 +19,14 @@ mod find;
 mod graph_view;
 mod icons;
 mod input;
+mod keymap;
 #[cfg(target_os = "macos")]
 mod macos_native;
 mod measure;
 mod menu;
 mod menus;
 mod message;
+mod modes;
 mod palette;
 mod resize_handle;
 mod revision_list;
@@ -39,10 +43,11 @@ mod window_state;
 // Domain logic now lives in the headless `diffui-core` crate. Re-export the
 // modules the app still reaches into by path (`crate::graph`, `crate::jj`,
 // `crate::mutations`, …) so those call sites stay unchanged.
+pub(crate) use action::Action;
 pub(crate) use diffui_core::{
     FetchTarget, JobId, RepoHandle, github, graph, graph_layout, jj, mutations, repository,
 };
-pub(crate) use message::Message;
+pub(crate) use message::{Message, UiEvent, WindowEvent};
 
 /// Profiling-only global allocator (enabled by the `track-alloc` feature). It
 /// forwards every request to the system allocator while tracking the live byte
@@ -115,10 +120,9 @@ static GLOBAL: track_alloc::Tracking = track_alloc::Tracking;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use clap::Parser;
+use commands::{CommandArg, Context};
 use config::AppConfig;
-use diffui_core::{
-    DiffFile, LoadProgress, RevisionDetails, RevisionSelection, RowView, SignatureInfo,
-};
+use diffui_core::{DiffFile, LoadProgress, RevisionDetails, RevisionSelection, SignatureInfo};
 use find::FindState;
 use futures::{Stream, StreamExt};
 use iced::theme as iced_theme;
@@ -130,9 +134,10 @@ use iced::{
     widget::{self, button, column, container, row, stack, text},
     window,
 };
+use keymap::{Chord, Keymap};
+use modes::{Mode, ModeKind, TabMode};
 use palette::{
-    ColumnSource, CommandId as PaletteCommand, PaletteState, Recents, ResultRef,
-    change_id_for_recents, revision_selection,
+    ColumnSource, PaletteState, Recents, ResultRef, change_id_for_recents, revision_selection,
 };
 use repository::{Repository, Vcs, prepare_repository};
 use resize_handle::ResizeHandle;
@@ -308,8 +313,13 @@ pub(crate) struct Diffui {
     /// state.
     pub(crate) zoom_restore: Option<([f64; 4], f64)>,
     pub(crate) config: AppConfig,
-    /// `None` when closed; a non-empty column stack when open.
-    pub(crate) palette: Option<PaletteState>,
+    /// Chord → command id per context, built from the registry's defaults
+    /// with the `[keys]` section of `config.toml` layered on top.
+    pub(crate) keymap: Keymap,
+    /// Window-level modes, innermost last. The top of this stack (or, when it
+    /// is empty, the top of the active tab's) owns the keyboard — see
+    /// [`crate::modes`].
+    pub(crate) modes: Vec<Mode>,
     /// In-session recents (revisions + commands) used to score palette
     /// matches. Persisted to the XDG data dir between sessions.
     pub(crate) recents: Recents,
@@ -357,8 +367,6 @@ pub(crate) struct Diffui {
     /// stamped on every document replacement across every tab. Background
     /// per-file work (syntax highlighting) routes its results by this id.
     pub(crate) next_document_id: u64,
-    /// `Some` while the "open repository" path dialog is showing.
-    pub(crate) open_repo_dialog: Option<OpenRepoDialog>,
     /// Most-recently-opened repo roots (newest first), surfaced as quick-pick
     /// rows in the open dialog. Seeded from / persisted to `WindowState`.
     pub(crate) recent_repos: Vec<String>,
@@ -366,14 +374,6 @@ pub(crate) struct Diffui {
     // ── Toolbar / activity / revset ─────────────────────────────────────
     /// Monotonic source of `ActivityId`s across every tab.
     pub(crate) next_activity_id: u64,
-    /// Open popup menu (toolbar fetch/revset dropdown or revision right-click),
-    /// if any. macOS uses native `NSMenu`s instead and leaves this `None`.
-    pub(crate) menu: Option<menu::OverlayMenu>,
-    /// Modal confirmation for a guarded mutation (backwards bookmark move),
-    /// or `None` when closed.
-    pub(crate) confirm: Option<ConfirmDialog>,
-    /// Whether the activity popover is showing.
-    pub(crate) activity_popover_open: bool,
     /// The caret control the cursor is currently over, if any — drives the
     /// hover highlight that `mouse_area` (unlike `button`) doesn't provide.
     pub(crate) hovered: Option<HoverTarget>,
@@ -681,12 +681,11 @@ pub(crate) struct TabState {
     /// one shared cache let a tab render — and click through to — another tab's
     /// tree.
     pub(crate) source_tree_cache: std::cell::RefCell<source_panel::SourceTreeCache>,
-    /// `None` when the in-diff find bar is closed. Per-tab: the match list
-    /// indexes this tab's document, and would point into the wrong text after a
-    /// switch.
-    pub(crate) find: Option<FindState>,
-    /// Inline editor for the selected jj revision's full description.
-    pub(crate) description_editor: Option<DescriptionEditor>,
+    /// This tab's mode stack (find bar, description editor, target-mode
+    /// draft), innermost last. Per-tab because each names rows, files or text
+    /// belonging to *this* document; the keyboard only ever reads the active
+    /// tab's, so a switch cannot leave an off-screen mode holding the keys.
+    pub(crate) modes: Vec<TabMode>,
     /// A context-menu edit requested for a row that is still loading into the
     /// detail pane. The editor opens when that revision's diff lands. Per-tab:
     /// `WorkingCopy` matches every tab, so a global one opened the editor on
@@ -695,10 +694,6 @@ pub(crate) struct TabState {
     /// A `Copy → Author / Committer / Description` waiting on the revision
     /// header it reads from. Per tab, like every other routed job.
     pub(crate) pending_detail_copy: Option<(JobId, DetailField, String)>,
-    /// Active target-mode draft (rebase/squash destination picking), or `None`
-    /// outside target mode. A draft's sources are rows of this tab, so it lives
-    /// and dies with it.
-    pub(crate) op_draft: Option<DraftUi>,
     /// Commit ids marked via ⌘-click / ⇧-click for a batch action (the context
     /// menu's "Abandon N revisions"), in mark order. A separate axis from
     /// `session.selected_revision` — marking never changes which diff is shown.
@@ -722,6 +717,7 @@ impl TabState {
             jobs: PendingJobs::default(),
             queued_mutations: VecDeque::new(),
             default_revset,
+            modes: Vec::new(),
             file_list_expanded: true,
             collapsed_dirs: HashSet::new(),
             selected_file: 0,
@@ -734,10 +730,7 @@ impl TabState {
             main_view: MainView::default(),
             source: SourceState::default(),
             source_tree_cache: Default::default(),
-            find: None,
-            description_editor: None,
             pending_description_edit: None,
-            op_draft: None,
             pending_detail_copy: None,
             revision_multi_selection: Vec::new(),
         }
@@ -968,13 +961,6 @@ fn selection_from_key(key: &revision_list::RowSelectionKey) -> RevisionSelection
     }
 }
 
-fn selection_key(selection: &RevisionSelection) -> revision_list::RowSelectionKey {
-    match selection {
-        RevisionSelection::WorkingCopy => revision_list::RowSelectionKey::WorkingCopy,
-        RevisionSelection::Commit(id) => revision_list::RowSelectionKey::Commit(id.clone()),
-    }
-}
-
 /// Welcome screen shown whenever no repository is open: a fresh launch with
 /// nothing to restore (including from the macOS/Spotlight launcher, where cwd is
 /// `/`), or after the last tab is closed. It's the "select a repo" entry point —
@@ -1034,7 +1020,7 @@ fn empty_state<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
                 .font(ui.config.ui_font),
         )
         .padding(Padding::from([9, 20]))
-        .on_press(Message::OpenRepoDialogOpen)
+        .on_press(Message::Action(Action::OpenRepoDialog))
         .style(move |_, _| primary_button_style(theme)),
     );
 
@@ -1095,49 +1081,6 @@ fn empty_state<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
 /// and an emphasized `name` (the directory name) for the tab label, e.g.
 /// `/Users/me/code/diffui` → (`code`, `diffui`). The owner is empty when the
 /// root has no usable parent.
-/// One entry in the revision context menu's action table. The native popup
-/// returns the chosen leaf's index into a `Vec<MenuAction>`; this records what
-/// to do with that choice.
-#[derive(Debug, Clone)]
-pub(crate) enum MenuAction {
-    /// A jj mutation (new / edit / abandon / bookmark op).
-    Mutate(mutations::MutationOp),
-    /// Copy a value already in hand (revision id, commit hash, a bookmark name).
-    CopyText(String),
-    /// Open the source browser at a revision, optionally jumped to a file
-    /// (the revision context menu and file-tree right-clicks).
-    BrowseSource {
-        revision: RevisionSelection,
-        path: Option<String>,
-    },
-    /// Select the target revision and open its inline description editor.
-    EditDescription { target: RevisionSelection },
-    /// Enter target mode: pick a destination for a rebase/squash of `source`.
-    StartDraft {
-        kind: mutations::DraftKind,
-        source: RevisionSelection,
-    },
-    /// Copy author / committer / the full description — read on demand. The
-    /// in-memory graph keeps only the description's first line and no dates, so
-    /// these need a fresh read; `fallback` is copied if that read fails.
-    CopyDetail {
-        field: DetailField,
-        fallback: String,
-    },
-    /// Run a fetch (toolbar fetch menu). Constructed only by the non-macOS iced
-    /// overlay menu; macOS dispatches fetch through the native `NSMenu` path
-    /// (`start_fetch` directly), so this variant is unused on macOS.
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
-    Fetch(FetchTarget),
-    /// Replace the revset and re-evaluate (toolbar revset menu). Non-macOS only,
-    /// for the same reason as `Fetch`.
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
-    SetRevset(String),
-    /// Drop the sidebar's multi-selection marks (the batch menu's escape
-    /// hatch; Esc and a plain row click do the same).
-    ClearMultiSelection,
-}
-
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum DetailField {
     Author,
@@ -1146,13 +1089,14 @@ pub(crate) enum DetailField {
 }
 
 /// Lower a shared [`menu::MenuEntry`] tree to a native `NSMenu` tree, assigning
-/// each actionable leaf the next index into `actions` (what `popup_menu` returns
-/// when it's picked). A revset row folds its expression into the label; an empty
-/// submenu becomes a disabled row.
+/// each actionable leaf the next index into `picks` (what `popup_menu` returns
+/// when it's picked). A row's detail — a revset expression, a push remote, the
+/// command's chord — folds into the label; an empty submenu becomes a disabled
+/// row.
 #[cfg(target_os = "macos")]
 fn lower_menu_to_native(
     entries: &[menu::MenuEntry],
-    actions: &mut Vec<MenuAction>,
+    picks: &mut Vec<(commands::CommandId, CommandArg)>,
 ) -> Vec<macos_native::MenuItem> {
     use macos_native::MenuItem;
     use menu::MenuEntry;
@@ -1169,11 +1113,12 @@ fn lower_menu_to_native(
             MenuEntry::Item {
                 label,
                 detail,
-                action,
+                command,
+                arg,
                 ..
             } => {
-                let id = actions.len() as u32;
-                actions.push(action.clone());
+                let id = picks.len() as u32;
+                picks.push((*command, arg.clone()));
                 let label = match detail {
                     Some(detail) => format!("{label}  ·  {detail}"),
                     None => label.clone(),
@@ -1181,7 +1126,7 @@ fn lower_menu_to_native(
                 MenuItem::entry(label, id)
             }
             MenuEntry::Submenu { label, items } => {
-                MenuItem::submenu(label.clone(), lower_menu_to_native(items, actions))
+                MenuItem::submenu(label.clone(), lower_menu_to_native(items, picks))
             }
         })
         .collect()
@@ -1301,18 +1246,6 @@ fn proximity_key(
     match (index_of.get(target), reference_index) {
         (Some(&target_index), Some(reference_index)) => target_index.abs_diff(reference_index),
         _ => usize::MAX,
-    }
-}
-
-fn commit_for_ref<'a>(ui: &'a Diffui, item: &ResultRef) -> Option<RowView<'a>> {
-    let commits = &ui.active().session.commits;
-    match item {
-        ResultRef::Commit(id) => commits.find_by_change_id(id.as_str()),
-        ResultRef::Bookmark(name) => commits
-            .iter()
-            .find(|c| c.bookmarks().iter().any(|b| b == name)),
-        ResultRef::WorkingCopy => commits.working_copy(),
-        _ => None,
     }
 }
 

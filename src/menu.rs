@@ -35,11 +35,11 @@ use iced::{
     },
 };
 
+use crate::commands::{CommandArg, CommandId};
 use crate::icons;
 use crate::measure;
 use crate::theme::{self, ThemeSpec, emphasis_font, popover_style, text_size};
-use crate::{Diffui, MenuAction, Message};
-use diffui_core::RevisionSelection;
+use crate::{Diffui, Message};
 
 /// Messages from an open popup menu, nested under [`Message::Menu`].
 #[derive(Debug, Clone)]
@@ -111,14 +111,16 @@ const GLOW_PULSE_SPEED: f32 = 5.0;
 /// One node of a popup menu.
 #[derive(Debug, Clone)]
 pub(crate) enum MenuEntry {
-    /// A selectable leaf. `detail` is right-aligned mono (a revset expression, a
-    /// push remote);
-    /// `emphasized` bumps the label weight (the fetch menu's header row).
+    /// A selectable leaf naming a registry command and the argument to run it
+    /// with. `detail` is right-aligned mono (a revset expression, a push
+    /// remote, the command's chord); `emphasized` bumps the label weight (the
+    /// fetch menu's header row).
     Item {
         label: String,
         detail: Option<String>,
         emphasized: bool,
-        action: MenuAction,
+        command: CommandId,
+        arg: CommandArg,
     },
     /// A parent row whose children open in a flyout beside it.
     Submenu {
@@ -133,15 +135,6 @@ pub(crate) enum MenuEntry {
 }
 
 impl MenuEntry {
-    pub(crate) fn item(label: impl Into<String>, action: MenuAction) -> Self {
-        MenuEntry::Item {
-            label: label.into(),
-            detail: None,
-            emphasized: false,
-            action,
-        }
-    }
-
     fn height(&self) -> f32 {
         match self {
             MenuEntry::Separator => MENU_SEP_HEIGHT,
@@ -205,9 +198,6 @@ pub(crate) struct OverlayMenu {
     /// sweep has stalled — the pointer is idle or crawling — and the row under
     /// it wins. Only moves refresh it, so a fully idle cursor stalls too.
     pub last_fast_at: Option<Instant>,
-    /// Revision selection backing the menu, for actions read on demand
-    /// (author/committer/description copies).
-    pub selection: Option<RevisionSelection>,
     /// Row to pulse-highlight while open (the right-clicked revision).
     pub glow: Option<Rectangle>,
     /// When the menu opened — drives the glow pulse phase.
@@ -242,7 +232,6 @@ impl OverlayMenu {
             speed: 0.0,
             last_move_at: None,
             last_fast_at: None,
-            selection: None,
             glow: None,
             opened_at: Instant::now(),
             scrolls: Vec::new(),
@@ -373,7 +362,7 @@ fn row_active(menu: &OverlayMenu, path: &[usize]) -> bool {
 /// The whole popup overlay (scrim + glow + cards), or an empty `Space` when no
 /// menu is open. Stacked over the app shell in `view`.
 pub(crate) fn build_overlay(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
-    let Some(menu) = ui.menu.as_ref() else {
+    let Some(menu) = ui.menu() else {
         return Space::new().into();
     };
 

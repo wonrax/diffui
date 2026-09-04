@@ -29,7 +29,7 @@ use crate::theme::{
     ThemeSpec, chip_background, emphasis_font, ghost_button_style, iced_scrollable_style,
     popover_style, text_size,
 };
-use crate::{Diffui, Message};
+use crate::{Action, Diffui, Message, UiEvent};
 use diffui_core::LoadProgress;
 
 /// Frames for the running spinner. Braille-dot frames read as a smooth orbit
@@ -61,6 +61,11 @@ pub enum ActivityStatus {
     Queued,
     Running,
     Done,
+    /// The operation never ran: a confirmation dialog was dismissed, or the
+    /// job was superseded and cancelled. Distinct from `Done` because a log
+    /// that reports work it didn't do is a log you can't check anything
+    /// against.
+    Cancelled,
     Error,
 }
 
@@ -393,7 +398,7 @@ pub fn activity_indicator(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message>
 
     button(body)
         .padding(Padding::from([5, 10]))
-        .on_press(Message::ActivityToggle)
+        .on_press(Message::Action(Action::ToggleActivityPopover))
         .style(move |_, status| ghost_button_style(theme, status))
         .into()
 }
@@ -464,7 +469,7 @@ pub fn activity_progress_line(ui: &Diffui, theme: ThemeSpec) -> Element<'static,
 /// The activity popover: a scrim + a top-right card listing every entry. Empty
 /// `Space` when closed.
 pub fn activity_popover(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
-    if !ui.activity_popover_open {
+    if !ui.activity_popover_open() {
         return Space::new().into();
     }
 
@@ -473,7 +478,7 @@ pub fn activity_popover(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             .width(Length::Fill)
             .height(Length::Fill),
     )
-    .on_press(Message::ActivityToggle);
+    .on_press(Message::Action(Action::ToggleActivityPopover));
 
     let header = row![
         text("Activity")
@@ -538,7 +543,7 @@ pub fn activity_popover(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             .width(Length::Fixed(420.0))
             .style(move |_| popover_style(theme)),
     )
-    .on_press(Message::ActivityNoOp);
+    .on_press(Message::Ui(UiEvent::ActivityNoOp));
 
     // Anchor under the toolbar's right edge.
     let anchored = container(card)
@@ -584,7 +589,7 @@ pub fn toast_layer(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
                     .width(Length::Fill),
                 button(icons::icon(icons::CLOSE, 13.0, theme.muted_text))
                     .padding(Padding::from([2, 4]))
-                    .on_press(Message::ToastDismiss(toast.id))
+                    .on_press(Message::Ui(UiEvent::ToastDismiss(toast.id)))
                     .style(move |_, status| ghost_button_style(theme, status)),
             ]
             .spacing(8)
@@ -683,7 +688,10 @@ fn activity_row<'a>(
                         .color(theme.accent),
                 )
                 .padding(Padding::from([1, 7]))
-                .on_press(Message::UndoActivityOp(activity.id, operation_id))
+                .on_press(Message::Action(Action::UndoOperation(
+                    activity.id,
+                    operation_id,
+                )))
                 .style(move |_, status| ghost_button_style(theme, status)),
             );
         }
@@ -763,7 +771,9 @@ fn activity_row<'a>(
     );
     // Only rows with captured output expand on click.
     let header_area: Element<'a, Message> = if expandable {
-        header_area.on_press(Message::ActivityExpand(id)).into()
+        header_area
+            .on_press(Message::Ui(UiEvent::ActivityExpand(id)))
+            .into()
     } else {
         header_area.into()
     };
@@ -790,7 +800,7 @@ fn activity_row<'a>(
             .font(mono)
             .padding(0)
             .wrapping(text::Wrapping::WordOrGlyph)
-            .on_action(move |action| Message::ActivityDetailAction(id, action))
+            .on_action(move |action| Message::Ui(UiEvent::ActivityDetailAction(id, action)))
             .style(move |_, _| text_editor::Style {
                 background: Background::Color(Color::TRANSPARENT),
                 border: Border {
@@ -806,7 +816,7 @@ fn activity_row<'a>(
                 },
             }),
         0,
-        move |action| Message::ActivityDetailAction(id, action),
+        move |action| Message::Ui(UiEvent::ActivityDetailAction(id, action)),
     ),]
     .spacing(6);
     let urls = detail_urls(&activity.detail);
@@ -821,7 +831,7 @@ fn activity_row<'a>(
                         .color(theme.info),
                 )
                 .padding(0)
-                .on_press(Message::OpenUrl(url))
+                .on_press(Message::Action(Action::OpenUrl(url)))
                 .style(move |_, _| button::Style {
                     background: None,
                     text_color: theme.info,
@@ -864,6 +874,7 @@ fn status_icon<'a>(
         ActivityStatus::Queued => mono_glyph("\u{2026}", mono, theme.subtle_text), // … waiting
         ActivityStatus::Running => mono_glyph(spinner_glyph(activity.started), mono, theme.accent),
         ActivityStatus::Done => icons::icon(icons::CHECK, STATUS_ICON_BOX, theme.added_text),
+        ActivityStatus::Cancelled => mono_glyph("\u{2298}", mono, theme.subtle_text),
         ActivityStatus::Error => icons::icon(icons::CLOSE, STATUS_ICON_BOX, theme.removed_text),
     }
 }
@@ -915,12 +926,12 @@ fn detail_urls(detail: &[String]) -> Vec<String> {
 }
 
 fn clear_button(ui: &Diffui, theme: ThemeSpec) -> Element<'static, Message> {
-    let enabled = ui
-        .active()
-        .activities
-        .activities
-        .iter()
-        .any(|a| matches!(a.status, ActivityStatus::Done | ActivityStatus::Error));
+    let enabled = ui.active().activities.activities.iter().any(|a| {
+        matches!(
+            a.status,
+            ActivityStatus::Done | ActivityStatus::Cancelled | ActivityStatus::Error
+        )
+    });
     let label = text("Clear")
         .size(text_size::UI)
         .font(ui.config.ui_font)
@@ -933,7 +944,7 @@ fn clear_button(ui: &Diffui, theme: ThemeSpec) -> Element<'static, Message> {
         .padding(Padding::from([2, 8]))
         .style(move |_, status| ghost_button_style(theme, status));
     if enabled {
-        b = b.on_press(Message::ActivityClear);
+        b = b.on_press(Message::Action(Action::ClearActivities));
     }
     b.into()
 }

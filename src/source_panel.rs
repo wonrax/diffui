@@ -24,7 +24,7 @@ use crate::sidebar;
 use crate::theme::{
     ThemeSpec, chip_background, diff_palette, diff_panel_style, sidebar_panel_style, text_size,
 };
-use crate::{Diffui, Message, SourceState};
+use crate::{Action, Diffui, Message, SourceState, UiEvent};
 use diffui_core::{
     DiffFileStatus, RevisionSelection, SourceEntry, SourceEntryStatus, SourceTreeRow,
     source_tree_rows,
@@ -173,13 +173,13 @@ pub(crate) fn browsed_revision(source: &SourceState) -> RevisionSelection {
 }
 
 fn header_clicked(_key: RowSelectionKey) -> Message {
-    Message::SourceHeaderClicked
+    Message::Ui(UiEvent::SourceHeaderClicked)
 }
 
 fn source_view_file_changed(_index: usize) -> Message {
     // The source document is a single file; the diff view's scroll-driven
     // file tracking has nothing to report.
-    Message::SourceHeaderClicked
+    Message::Ui(UiEvent::SourceHeaderClicked)
 }
 
 /// Focus target id for the sidebar's file-search input.
@@ -198,8 +198,8 @@ fn build_source_filter(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             id: SOURCE_FILTER_INPUT_ID,
             placeholder: "search files — fuzzy",
             value: &ui.active().source.filter,
-            on_input: Message::SourceFilterChanged,
-            on_submit: Some(Message::SourceFilterSubmit),
+            on_input: |query| Message::Ui(UiEvent::SourceFilterChanged(query)),
+            on_submit: Some(Message::Ui(UiEvent::SourceFilterSubmit)),
             caret: None,
         },
     )
@@ -286,15 +286,17 @@ pub fn build_source_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
         None,
         sidebar::revision_list_style(theme, ui.config, badge_width),
         header_clicked,
-        Message::SourceSidebarRow,
+        |row| Message::Ui(UiEvent::SourceSidebarRow(row)),
     )
     .source_tree_slot()
     .width(Length::Fill)
     .reveal_file(source.reveal_token, reveal_file_flat)
-    .on_scroll(Message::SourceTreeScrolled)
+    .on_scroll(|offset| Message::Ui(UiEvent::SourceTreeScrolled(offset)))
     .restore_scroll(source.tree_scroll_offset, ui.scroll_restore_token)
-    .on_context_menu(Message::RevisionContextMenu)
-    .on_file_context_menu(Message::SidebarFileContextMenu);
+    .on_context_menu(|key, rect, point| Message::Ui(UiEvent::RevisionContextMenu(key, rect, point)))
+    .on_file_context_menu(|row, rect, point| {
+        Message::Ui(UiEvent::SidebarFileContextMenu(row, rect, point))
+    });
 
     body = body.push(list);
 
@@ -509,13 +511,13 @@ pub fn build_source_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, M
             )
             .plain(true)
             .wrap(ui.diff_wrap)
-            .on_copy(Message::CopyToClipboard)
-            .on_scroll(Message::SourceScrolled)
+            .on_copy(|text| Message::Action(Action::Copy(text)))
+            .on_scroll(|offset| Message::Ui(UiEvent::SourceScrolled(offset)))
             .restore_scroll(source.scroll_offset, ui.scroll_restore_token)
             .content_version(ui.document_version)
             .layout_version(view.doc_id);
 
-            if let Some(find_state) = &ui.active().find {
+            if let Some(find_state) = ui.active().find() {
                 code = code.with_find(crate::diff_view::FindOverlay {
                     matches: &find_state.matches,
                     active: find_state.active,

@@ -19,6 +19,19 @@
 //!   code_baseline_offset — px nudge of code text within its row; positive
 //!                          moves it down. Defaults to 0.
 //!
+//! Keyboard bindings live in a `[keys]` section; see [`crate::keymap`] for the
+//! chord syntax and the per-context tables. Example:
+//!
+//! ```toml
+//! [keys]
+//! # applies in every context the command is valid in
+//! "palette.toggle" = ["cmd+p", "f1"]
+//!
+//! [keys.base]
+//! "file.next" = "n"          # replaces the default j / ↓
+//! "selection.clear" = "none" # unbind
+//! ```
+//!
 //! Kerning and OpenType feature toggles (ligatures, stylistic sets) aren't
 //! configurable: the text stack (iced/cosmic-text) exposes no per-run feature
 //! or letter-spacing control today.
@@ -28,6 +41,7 @@ use std::{env, path::PathBuf};
 use iced::Font;
 use serde::Deserialize;
 
+use crate::keymap::RawKeys;
 use crate::theme::ThemePreference;
 
 /// Default row-height factor of the code grid — 1.85 × the font size gives
@@ -67,10 +81,13 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
-    pub fn load() -> Self {
+    /// Read the config file, returning the resolved settings and the raw
+    /// `[keys]` section for [`crate::keymap::Keymap::build`] to layer over the
+    /// registry's defaults.
+    pub fn load() -> (Self, RawKeys) {
         let raw = read_config_file().unwrap_or_default();
         let defaults = CodeTypography::default();
-        Self {
+        let config = Self {
             ui_font: raw
                 .ui_font
                 .as_deref()
@@ -103,7 +120,8 @@ impl AppConfig {
                     .map(|px| px.clamp(-8.0, 8.0))
                     .unwrap_or(defaults.baseline_offset),
             },
-        }
+        };
+        (config, raw.keys)
     }
 }
 
@@ -116,6 +134,8 @@ struct RawConfig {
     code_font_size: Option<f32>,
     code_line_height: Option<f32>,
     code_baseline_offset: Option<f32>,
+    #[serde(default)]
+    keys: RawKeys,
 }
 
 /// Parse a config `theme` value. Case-insensitive; `Contrast` maps to the

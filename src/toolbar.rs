@@ -18,7 +18,7 @@ use crate::sidebar;
 use crate::theme::{
     self, ThemeSpec, chip_background, ghost_button_style, radius, text_size, well_fill,
 };
-use crate::{Diffui, FetchTarget, HoverTarget, MainView, Message, ToolbarMenu};
+use crate::{Action, Diffui, FetchTarget, HoverTarget, MainView, Message, ToolbarMenu, UiEvent};
 use diffui_core::RevisionSelection;
 
 /// Toolbar icon size. Slightly larger than the 12px labels so the Lucide marks
@@ -78,7 +78,7 @@ pub fn build_toolbar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         actions = actions.push(toolbar_button(
             icons::REFRESH,
             "Refresh",
-            Message::ToolbarRefresh,
+            Message::Action(Action::Refresh),
             theme,
             font,
         ));
@@ -88,7 +88,7 @@ pub fn build_toolbar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             actions = actions.push(toolbar_button(
                 icons::UNDO,
                 "Undo",
-                Message::Undo,
+                Message::Action(Action::Undo),
                 theme,
                 font,
             ));
@@ -103,7 +103,7 @@ pub fn build_toolbar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         icons::WRAP,
         "Wrap lines",
         ui.diff_wrap,
-        Message::ToggleDiffWrap,
+        Message::Action(Action::ToggleWrap),
         theme,
         font,
     ));
@@ -114,7 +114,7 @@ pub fn build_toolbar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             icons::SPLIT,
             "Side-by-side diff",
             ui.diff_split,
-            Message::ToggleDiffSplit,
+            Message::Action(Action::ToggleSplit),
             theme,
             font,
         ));
@@ -183,7 +183,7 @@ fn view_switcher(ui: &Diffui, theme: ThemeSpec, font: iced::Font) -> Element<'st
         )
         .height(Length::Fixed(SEGMENT_HEIGHT))
         .padding(Padding::from([0, 11]))
-        .on_press(Message::SetMainView(view))
+        .on_press(Message::Action(Action::SetMainView(view)))
         .style(move |_, _| button::Style {
             // Only the active segment carries a fill — inactive segments
             // stay quiet even under the cursor; the pointer + label color
@@ -412,7 +412,7 @@ fn fetch_split_button(
         .align_y(alignment::Vertical::Center),
     )
     .padding(Padding::from([5, 10]))
-    .on_press(Message::Fetch(FetchTarget::AllRemotes))
+    .on_press(Message::Action(Action::Fetch(FetchTarget::AllRemotes)))
     .style(move |_, status| ghost_button_style(theme, status));
 
     // A `mouse_area` (not a `button`) with no press handler: the press falls
@@ -429,8 +429,10 @@ fn fetch_split_button(
             .align_y(alignment::Vertical::Center)
             .style(move |_| caret_hover_style(theme, caret_hovered, radius::BUTTON)),
     )
-    .on_enter(Message::SetHover(Some(HoverTarget::FetchCaret)))
-    .on_exit(Message::SetHover(None))
+    .on_enter(Message::Ui(UiEvent::SetHover(Some(
+        HoverTarget::FetchCaret,
+    ))))
+    .on_exit(Message::Ui(UiEvent::SetHover(None)))
     .interaction(mouse::Interaction::Pointer);
 
     let divider = container(Space::new())
@@ -446,7 +448,7 @@ fn fetch_split_button(
         .align_y(alignment::Vertical::Center);
 
     crate::menu::anchor_area(split, |rect| {
-        Message::OpenToolbarMenu(ToolbarMenu::FetchBranches, rect)
+        Message::Ui(UiEvent::OpenToolbarMenu(ToolbarMenu::FetchBranches, rect))
     })
     .into()
 }

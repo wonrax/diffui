@@ -62,15 +62,15 @@ impl Diffui {
     /// popup menu, and a description editor whose block on the switch the caller
     /// has already cleared.
     fn leave_active_tab(&mut self) {
-        self.menu = None;
-        self.active_mut().description_editor = None;
+        self.pop_mode(ModeKind::Menu);
+        self.active_mut().pop_mode(ModeKind::Description);
     }
 
     /// Whether the active tab's description editor refuses to let go — an
     /// unsaved edit or an in-flight save. Flags itself in the UI and blocks the
     /// switch/close so the text isn't silently dropped.
     fn description_editor_blocks_switch(&mut self) -> bool {
-        match self.active_mut().description_editor.as_mut() {
+        match self.active_mut().description_editor_mut() {
             Some(editor) if editor.is_dirty() || editor.saving_activity.is_some() => {
                 editor.switch_blocked = true;
                 true
@@ -188,7 +188,7 @@ impl Diffui {
         }
         match prepare_repository(&expand_user_path(trimmed)) {
             Ok(repository) => {
-                self.open_repo_dialog = None;
+                self.pop_mode(ModeKind::OpenRepo);
                 self.push_recent_repo(&repository.root);
                 // Re-persist the session with the newly-opened repo.
                 self.mark_geometry_dirty();
@@ -214,7 +214,7 @@ impl Diffui {
             }
             Err(error) => {
                 let message = format!("{error:#}");
-                if let Some(dialog) = self.open_repo_dialog.as_mut() {
+                if let Some(dialog) = self.open_repo_dialog_mut() {
                     dialog.error = Some(message);
                 }
                 Task::none()
@@ -227,7 +227,7 @@ impl Diffui {
     /// graph/watcher/mutation machinery stays disabled (`repository`
     /// is `None`) and only the streamed document renders.
     pub(crate) fn open_github_pr(&mut self, spec: github::PrSpec) -> Task<Message> {
-        self.open_repo_dialog = None;
+        self.pop_mode(ModeKind::OpenRepo);
         self.mark_geometry_dirty();
         let source = TabSource::GitHubPr(spec.clone());
         if let Some(existing) = self.tabs.iter().find(|tab| tab.source == source) {
@@ -271,7 +271,7 @@ impl Diffui {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::{AppConfig, CodeTypography};
     use crate::theme::ThemePreference;
@@ -280,7 +280,7 @@ mod tests {
     /// A blank app with no tabs. Built field-by-field rather than through
     /// [`Diffui::new`], which reads the config file and the saved session and
     /// measures fonts through a renderer this headless run doesn't have.
-    fn app() -> Diffui {
+    pub(crate) fn app() -> Diffui {
         Diffui {
             app_focused: true,
             selected_theme: ThemePreference::System,
@@ -302,7 +302,8 @@ mod tests {
                 theme: ThemePreference::System,
                 code_type: CodeTypography::default(),
             },
-            palette: None,
+            keymap: Keymap::build(&Default::default()).0,
+            modes: Vec::new(),
             recents: Recents::default(),
             sidebar_file_reveal_token: 0,
             scroll_restore_token: 0,
@@ -312,12 +313,8 @@ mod tests {
             no_tab: TabState::empty(),
             next_tab_id: 0,
             next_document_id: 0,
-            open_repo_dialog: None,
             recent_repos: Vec::new(),
             next_activity_id: 0,
-            menu: None,
-            confirm: None,
-            activity_popover_open: false,
             hovered: None,
             toasts: Vec::new(),
             next_toast_id: 0,
@@ -338,7 +335,7 @@ mod tests {
     /// Append a loaded-enough tab for `root` and return its id. Bypasses
     /// `push_tab` so no load is kicked and the caller controls which tab ends
     /// up active.
-    fn push_tab(ui: &mut Diffui, root: &str) -> TabId {
+    pub(crate) fn push_tab(ui: &mut Diffui, root: &str) -> TabId {
         let repository = repository(root);
         let id = TabId(ui.next_tab_id);
         ui.next_tab_id += 1;
@@ -428,7 +425,7 @@ mod tests {
             label: "abc".to_owned(),
         });
         let state = ui.tab_mut(second).unwrap();
-        state.op_draft = Some(DraftUi::new(draft));
+        state.push_mode(TabMode::Draft(DraftUi::new(draft)));
         state.revision_multi_selection = vec!["abc".to_owned()];
 
         let _ = ui.close_tab(second);
@@ -436,7 +433,7 @@ mod tests {
         // The draft named rows of the closed tab; the neighbour inherits none
         // of it — there is no shared slot for it to be left in.
         assert_eq!(ui.active_tab_id(), Some(first));
-        assert!(ui.active().op_draft.is_none());
+        assert!(ui.active().op_draft().is_none());
         assert!(ui.active().revision_multi_selection.is_empty());
     }
 

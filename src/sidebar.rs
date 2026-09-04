@@ -16,7 +16,7 @@ use crate::revision_list::{
 use crate::theme::{
     self, ThemeSpec, chip_background, emphasis_font, file_status_color, sidebar_panel_style,
 };
-use crate::{Diffui, HoverTarget, LoadStatus, Message, ToolbarMenu};
+use crate::{Action, Diffui, HoverTarget, LoadStatus, Message, ToolbarMenu, UiEvent};
 use diffui_core::{CommitStore, DiffFile, FileTreeRow, RevisionSelection, RowView, file_tree_rows};
 use jj_lib::graph::GraphEdgeType;
 use std::collections::HashSet;
@@ -121,12 +121,12 @@ pub fn build_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     body = body.push(revision_list);
     // Target mode: the op bar floats between the list and the footer while a
     // rebase/squash draft is picking its destination.
-    if ui.active().op_draft.is_some() {
+    if ui.active().op_draft().is_some() {
         body = body.push(build_op_bar(ui, theme));
     }
     body = body.push(build_footer(ui, theme));
 
-    let draft_active = ui.active().op_draft.is_some();
+    let draft_active = ui.active().op_draft().is_some();
     container(body)
         .width(Length::Fixed(ui.sidebar_width))
         .height(Length::Fill)
@@ -160,7 +160,7 @@ fn commit_list_summary(commits: &[String]) -> String {
 /// (rebase only), the live preview line, and the key hints.
 fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     use diffui_core::{DraftKind, PlacementKind};
-    let Some(draft_ui) = ui.active().op_draft.as_ref() else {
+    let Some(draft_ui) = ui.active().op_draft() else {
         return Space::new().into();
     };
     let draft = &draft_ui.draft;
@@ -291,7 +291,7 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     operation = operation.push(Space::new().width(Length::Fill)).push(
         iced::widget::button(icons::icon(icons::CLOSE, 14.0, theme.muted_text))
             .padding([2, 6])
-            .on_press(Message::DraftCancel)
+            .on_press(Message::Action(Action::DraftCancel))
             .style(move |_, status| theme::ghost_button_style(theme, status)),
     );
     let mut headline = column![operation].spacing(2).width(Length::Fill);
@@ -480,7 +480,7 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
                     Some(key),
                     tone(placement),
                     describe(placement),
-                    Some(Message::DraftPlacement(placement)),
+                    Some(Message::Action(Action::DraftPlacement(placement))),
                 ));
             }
             // A drag over a gap is its own, transient way to land: exactly
@@ -667,7 +667,7 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         .align_y(alignment::Vertical::Center),
     )
     .padding([4, 12])
-    .on_press_maybe(can_apply.then_some(Message::DraftConfirm))
+    .on_press_maybe(can_apply.then_some(Message::Action(Action::DraftConfirm)))
     .style(move |_, _| {
         if can_apply {
             theme::primary_button_style(theme)
@@ -771,8 +771,8 @@ fn build_revset_filter(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             id: REVSET_INPUT_ID,
             placeholder,
             value: &ui.active().session.revset,
-            on_input: Message::RevsetChanged,
-            on_submit: Some(Message::RevsetSubmit),
+            on_input: |value| Message::Ui(UiEvent::RevsetChanged(value)),
+            on_submit: Some(Message::Action(Action::SubmitRevset)),
             caret: Some(crate::field::FilterCaret {
                 hovered: ui.hovered == Some(HoverTarget::RevsetCaret),
                 target: HoverTarget::RevsetCaret,
@@ -974,7 +974,7 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
     // a draft is active.
     let reveal_file_flat = ui
         .active()
-        .op_draft
+        .op_draft()
         .as_ref()
         .and_then(|draft| draft.draft.candidate)
         .map(|candidate| match expanded {
@@ -994,7 +994,7 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
     let multi_selection = tab.revision_multi_selection.as_slice();
     let file_list_expanded = tab.file_list_expanded;
     let config = ui.config;
-    let draft = tab.op_draft.as_ref();
+    let draft = tab.op_draft();
     let build_revision = Box::new(move |index: usize| {
         build_revision_row(
             commits,
@@ -1060,7 +1060,7 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
     // The widget fills its own background, so the target-mode wash has to
     // reach it too — a tinted container alone would be painted over.
     let mut list_style = revision_list_style(theme, ui.config, file_badge_width);
-    if ui.active().op_draft.is_some() {
+    if ui.active().op_draft().is_some() {
         list_style.background = draft_panel_background(theme);
     }
     let mut list = RevisionList::new(
@@ -1072,29 +1072,31 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
         Some(ui.active().selected_file),
         ui.active().session.selected_commit_index,
         list_style,
-        Message::SelectRowKey,
-        Message::SidebarFileRow,
+        |key| Message::Ui(UiEvent::SelectRowKey(key)),
+        |row| Message::Ui(UiEvent::SidebarFileRow(row)),
     )
     .width(Length::Fill)
     .reveal_selected(ui.active().revision_reveal_token)
     .reveal_file(ui.sidebar_file_reveal_token, reveal_file_flat)
-    .on_scroll(Message::SidebarScrolled)
+    .on_scroll(|offset| Message::Ui(UiEvent::SidebarScrolled(offset)))
     .restore_scroll(ui.active().sidebar_scroll_offset, ui.scroll_restore_token)
-    .on_context_menu(Message::RevisionContextMenu)
-    .on_file_context_menu(Message::SidebarFileContextMenu);
+    .on_context_menu(|key, rect, point| Message::Ui(UiEvent::RevisionContextMenu(key, rect, point)))
+    .on_file_context_menu(|row, rect, point| {
+        Message::Ui(UiEvent::SidebarFileContextMenu(row, rect, point))
+    });
     // Drag-to-rebase, for mutable (local jj) repos only.
     if ui.active().session.capabilities.mutate {
         list = list
             .on_drag(revision_list::DragHooks {
-                start: Message::RevisionDragStart,
-                hover: Message::RevisionDragHover,
-                drop: Message::RevisionDragDrop,
+                start: |index| Message::Ui(UiEvent::RevisionDragStart(index)),
+                hover: |spot| Message::Ui(UiEvent::RevisionDragHover(spot)),
+                drop: |spot| Message::Ui(UiEvent::RevisionDragDrop(spot)),
             })
             .gap_edges(Box::new(|index| {
                 ui.active().session.commits.row(index).next_row_is_parent()
             }));
-        if ui.active().op_draft.is_some() {
-            list = list.on_target_hover(Message::DraftHoverCandidate);
+        if ui.active().op_draft().is_some() {
+            list = list.on_target_hover(|index| Message::Ui(UiEvent::DraftHoverCandidate(index)));
         }
     }
     list.into()

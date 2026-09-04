@@ -22,7 +22,7 @@ use regex::{Regex, RegexBuilder};
 
 use crate::icons;
 use crate::theme::{ThemeSpec, ghost_button_style, popover_style, text_size};
-use crate::{Diffui, Message};
+use crate::{Action, Diffui, Message};
 use diffui_core::DiffFile;
 
 pub const FIND_INPUT_ID: &str = "find-input";
@@ -35,18 +35,11 @@ pub const DEBOUNCE: Duration = Duration::from_millis(50);
 /// Messages from the in-diff find bar, nested under [`Message::Find`].
 #[derive(Debug, Clone)]
 pub enum FindMessage {
-    /// Open the find bar (⌘F / Ctrl+F).
-    Open,
-    Close,
     QueryChanged(String),
     /// Fired after the debounce delay; the version cookie drops stale results.
     Recompute(u64),
     ToggleCase,
     ToggleRegex,
-    /// Enter: advance to the next match (wraps around).
-    Next,
-    /// Shift+Enter: advance to the previous match.
-    Prev,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -241,7 +234,7 @@ fn build_matcher(query: &str, case_sensitive: bool, regex: bool) -> Result<Match
 /// Returns an empty placeholder when `find` is `None` so it can be
 /// unconditionally stacked into the diff panel.
 pub fn build_overlay<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
-    let Some(state) = &ui.active().find else {
+    let Some(state) = ui.active().find() else {
         return Space::new().into();
     };
 
@@ -281,10 +274,10 @@ pub fn build_overlay<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Messag
         .on_press(Message::Find(FindMessage::ToggleRegex));
 
     let prev_button =
-        nav_button(icons::CHEVRON_UP, theme).on_press(Message::Find(FindMessage::Prev));
+        nav_button(icons::CHEVRON_UP, theme).on_press(Message::Action(Action::FindPrevious));
     let next_button =
-        nav_button(icons::CHEVRON_DOWN, theme).on_press(Message::Find(FindMessage::Next));
-    let close_button = nav_button(icons::CLOSE, theme).on_press(Message::Find(FindMessage::Close));
+        nav_button(icons::CHEVRON_DOWN, theme).on_press(Message::Action(Action::FindNext));
+    let close_button = nav_button(icons::CLOSE, theme).on_press(Message::Action(Action::CloseFind));
 
     // Each row item is wrapped in a container that asks for
     // `Length::Shrink` height + centered Y. iced's `Row::align_y` only

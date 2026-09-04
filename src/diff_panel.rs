@@ -15,7 +15,7 @@ use crate::theme::{
     ThemeSpec, chip_background, diff_palette, diff_panel_style, file_status_color,
     primary_button_style, raised_button_style, text_size,
 };
-use crate::{Diffui, LoadStatus, Message};
+use crate::{Action, Diffui, LoadStatus, Message, UiEvent};
 use diffui_core::{RevisionDetails, SignatureInfo};
 
 const EMPTY_STATE_TEXT_SIZE: f32 = text_size::BODY_LG;
@@ -82,7 +82,7 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
         let editable_description = ui.active().session.capabilities.mutate;
         let editing_description = ui
             .active()
-            .description_editor
+            .description_editor()
             .as_ref()
             .is_some_and(|editor| editor.target == ui.active().session.selected_revision);
         let description_editor_height = if editing_description {
@@ -117,11 +117,11 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
             ui.config.mono_font,
             ui.config.code_type,
             ui.config.multi_click_ms,
-            Message::SelectFile,
+            |index| Message::Action(Action::SelectFile(index)),
         )
         .with_header(header_lines)
-        .on_copy(Message::CopyToClipboard)
-        .on_scroll(Message::DiffScrolled)
+        .on_copy(|text| Message::Action(Action::Copy(text)))
+        .on_scroll(|offset| Message::Ui(UiEvent::DiffScrolled(offset)))
         .restore_scroll(ui.active().diff_scroll_offset, ui.scroll_restore_token)
         .content_version(ui.document_version)
         .layout_version(ui.active().session.document_id)
@@ -129,16 +129,17 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
         .side_by_side(ui.diff_split);
 
         if editable_description && !editing_description {
-            dv = dv.on_edit_description(|| Message::DescriptionEdit);
+            dv = dv
+                .on_edit_description(|| Message::Action(Action::EditDescription { target: None }));
         }
 
         // Per-file "browse source" affordance — repo tabs only (a PR tab has
         // no local tree to browse).
         if ui.active().repository.is_some() {
-            dv = dv.on_browse_file(Message::BrowseFileFromDiff);
+            dv = dv.on_browse_file(|index| Message::Ui(UiEvent::BrowseFileFromDiff(index)));
         }
 
-        if let Some(find_state) = &ui.active().find {
+        if let Some(find_state) = ui.active().find() {
             dv = dv.with_find(diff_view::FindOverlay {
                 matches: &find_state.matches,
                 active: find_state.active,
@@ -186,7 +187,7 @@ fn build_description_editor<'a>(
     theme: ThemeSpec,
     block_height: f32,
 ) -> Element<'a, Message> {
-    if let Some(editor) = ui.active().description_editor.as_ref()
+    if let Some(editor) = ui.active().description_editor()
         && editor.target == ui.active().session.selected_revision
     {
         let saving = editor.saving_activity.is_some();
@@ -219,27 +220,29 @@ fn build_description_editor<'a>(
                 },
             });
         if !saving {
-            input = input.on_action(Message::DescriptionAction);
+            input = input.on_action(|action| Message::Ui(UiEvent::DescriptionAction(action)));
         }
         // Wrapped so double/triple-click drags extend by word/line. Bare while
         // saving — the editor drops actions then, and the wrapper must too.
         let input: Element<'_, Message> = if saving {
             input.into()
         } else {
-            crate::editor_drag::editor_drag_area(input, input_padding, Message::DescriptionAction)
-                .into()
+            crate::editor_drag::editor_drag_area(input, input_padding, |action| {
+                Message::Ui(UiEvent::DescriptionAction(action))
+            })
+            .into()
         };
 
         let cancel = button(text("Cancel").size(text_size::UI).font(ui.config.ui_font))
             .padding(Padding::from([6, 12]))
-            .on_press_maybe((!saving).then_some(Message::DescriptionCancel))
+            .on_press_maybe((!saving).then_some(Message::Action(Action::CancelDescription)))
             .style(move |_, status| raised_button_style(theme, status));
 
         let save_enabled = !saving && editor.is_dirty();
         let save_label = if saving { "Saving…" } else { "Save" };
         let save = button(text(save_label).size(text_size::UI).font(ui.config.ui_font))
             .padding(Padding::from([6, 14]))
-            .on_press_maybe(save_enabled.then_some(Message::DescriptionSave))
+            .on_press_maybe(save_enabled.then_some(Message::Action(Action::SaveDescription)))
             .style(move |_, _| primary_button_style(theme));
 
         let hint = if editor.switch_blocked {
@@ -285,7 +288,7 @@ fn build_description_editor<'a>(
 }
 
 fn description_editor_height(ui: &Diffui) -> f32 {
-    let Some(editor) = ui.active().description_editor.as_ref() else {
+    let Some(editor) = ui.active().description_editor() else {
         return 0.0;
     };
     let available_width = (ui.window_size.width

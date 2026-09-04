@@ -26,14 +26,13 @@ use iced::{
 
 use crate::chrome;
 use crate::icons;
-use crate::palette::PaletteMessage;
 use crate::repository::Vcs;
 use crate::theme::{
     ThemeSpec, chip_background, destructive_button_style, dialog_button_style, emphasis_font,
     ghost_button_style, input_style, modal_style, primary_button_style, radius, scrim_style,
     text_size, well_fill,
 };
-use crate::{Diffui, HoverTarget, Message};
+use crate::{Action, Diffui, HoverTarget, Message, UiEvent, WindowEvent};
 
 /// Focus target id for the open-repository dialog's path field.
 pub const OPEN_REPO_INPUT_ID: &str = "open-repo-input";
@@ -127,8 +126,8 @@ pub fn build_tab_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     // title bar (the native double-click handling is lost with the title bar).
     if chrome::drag_region() {
         mouse_area(bar)
-            .on_press(Message::TitleBarDrag)
-            .on_double_click(Message::TitleBarDoubleClick)
+            .on_press(Message::Window(WindowEvent::TitleBarDrag))
+            .on_double_click(Message::Window(WindowEvent::TitleBarDoubleClick))
             .into()
     } else {
         bar.into()
@@ -206,7 +205,7 @@ fn tab_widget<'a>(
         // target a square that fills the tab's text line height. The old
         // asymmetric padding (0 vertical, 4 horizontal) left it short and wide.
         .padding(Padding::from([2, 2]))
-        .on_press(Message::CloseTab(id))
+        .on_press(Message::Action(Action::CloseTab(id)))
         .style(move |_, status| ghost_button_style(theme, status));
 
     let inner = row![label, close]
@@ -256,10 +255,10 @@ fn tab_widget<'a>(
     // over the tab, so the one-frame flicker that `on_enter`/`on_exit` race
     // into when crossing between adjacent tabs is immediately corrected.
     let interactive = mouse_area(body)
-        .on_press(Message::SelectTab(id))
-        .on_enter(Message::SetHover(Some(HoverTarget::Tab(id))))
-        .on_move(move |_| Message::SetHover(Some(HoverTarget::Tab(id))))
-        .on_exit(Message::SetHover(None))
+        .on_press(Message::Action(Action::SelectTab(id)))
+        .on_enter(Message::Ui(UiEvent::SetHover(Some(HoverTarget::Tab(id)))))
+        .on_move(move |_| Message::Ui(UiEvent::SetHover(Some(HoverTarget::Tab(id)))))
+        .on_exit(Message::Ui(UiEvent::SetHover(None)))
         .interaction(mouse::Interaction::Pointer);
 
     interactive.into()
@@ -478,7 +477,7 @@ fn add_button(theme: ThemeSpec) -> Element<'static, Message> {
             .width(Length::Fixed(side))
             .height(Length::Fixed(side))
             .padding(0)
-            .on_press(Message::OpenRepoDialogOpen)
+            .on_press(Message::Action(Action::OpenRepoDialog))
             .style(move |_, status| ghost_button_style(theme, status)),
     )
     .height(Length::Fixed(TAB_HEIGHT))
@@ -510,7 +509,7 @@ fn palette_hint(theme: ThemeSpec, mono: iced::Font) -> Element<'static, Message>
 
     button(chip)
         .padding(Padding::from([2, 4]))
-        .on_press(Message::Palette(PaletteMessage::Open))
+        .on_press(Message::Action(Action::OpenPalette))
         .style(move |_, _| button::Style {
             background: None,
             text_color: theme.muted_text,
@@ -529,7 +528,7 @@ fn palette_hint(theme: ThemeSpec, mono: iced::Font) -> Element<'static, Message>
 /// Returns an empty `Space` when closed. Lives here because it mirrors the
 /// open-repository modal's scrim + card construction exactly.
 pub fn build_confirm_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
-    let Some(dialog) = &ui.confirm else {
+    let Some(dialog) = ui.confirm() else {
         return Space::new().into();
     };
 
@@ -539,7 +538,7 @@ pub fn build_confirm_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
             .height(Length::Fill)
             .style(|_| scrim_style()),
     )
-    .on_press(Message::ConfirmCancel);
+    .on_press(Message::Action(Action::ConfirmCancel));
 
     let cancel = button(
         text("Cancel")
@@ -548,7 +547,7 @@ pub fn build_confirm_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
             .font(ui.config.ui_font),
     )
     .padding(Padding::from([7, 16]))
-    .on_press(Message::ConfirmCancel)
+    .on_press(Message::Action(Action::ConfirmCancel))
     .style(move |_, status| dialog_button_style(theme, status));
 
     // Red fill: the confirm runs a mutation the jj CLI refuses by default.
@@ -559,7 +558,7 @@ pub fn build_confirm_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
             .font(ui.config.ui_font),
     )
     .padding(Padding::from([7, 16]))
-    .on_press(Message::ConfirmAccept)
+    .on_press(Message::Action(Action::ConfirmAccept))
     .style(move |_, _| destructive_button_style(theme));
 
     let body = column![
@@ -583,7 +582,7 @@ pub fn build_confirm_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
             .padding(Padding::from([20, 22]))
             .style(move |_| modal_style(theme)),
     )
-    .on_press(Message::ConfirmNoOp);
+    .on_press(Message::Ui(UiEvent::ConfirmNoOp));
 
     let centered = container(card)
         .width(Length::Fill)
@@ -655,7 +654,7 @@ pub(crate) fn recent_repo_row<'a>(
     button(content)
         .width(Length::Fill)
         .padding(Padding::from([6, 8]))
-        .on_press(Message::OpenRecentRepo(root.to_owned()))
+        .on_press(Message::Action(Action::OpenRepo(root.to_owned())))
         .style(move |_, status| button::Style {
             background: match status {
                 button::Status::Hovered | button::Status::Pressed => {
@@ -679,7 +678,7 @@ pub(crate) fn recent_repo_row<'a>(
 /// `Space` when the dialog is closed. Mirrors the palette's scrim + card
 /// construction so click-outside dismisses and the card itself doesn't.
 pub fn build_open_repo_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
-    let Some(dialog) = &ui.open_repo_dialog else {
+    let Some(dialog) = ui.open_repo_dialog() else {
         return Space::new().into();
     };
 
@@ -689,15 +688,15 @@ pub fn build_open_repo_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Mess
             .height(Length::Fill)
             .style(|_| scrim_style()),
     )
-    .on_press(Message::OpenRepoDialogClose);
+    .on_press(Message::Action(Action::CloseRepoDialog));
 
     let input = crate::input::text_input("~/code/your-repo or a GitHub PR URL", &dialog.path)
         .id(OPEN_REPO_INPUT_ID)
         .padding(Padding::from([8, 10]))
         .size(text_size::BODY)
         .font(ui.config.mono_font)
-        .on_input(Message::OpenRepoPathChanged)
-        .on_submit(Message::OpenRepoSubmit)
+        .on_input(|path| Message::Ui(UiEvent::OpenRepoPathChanged(path)))
+        .on_submit(Message::Action(Action::SubmitRepoDialog))
         .style(move |_, _| crate::input::Style {
             // Recessed into the elevated card, otherwise identical to the
             // shared input identity.
@@ -761,7 +760,7 @@ pub fn build_open_repo_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Mess
             .font(ui.config.ui_font),
     )
     .padding(Padding::from([7, 16]))
-    .on_press(Message::OpenRepoDialogClose)
+    .on_press(Message::Action(Action::CloseRepoDialog))
     .style(move |_, status| dialog_button_style(theme, status));
 
     let open = button(
@@ -771,7 +770,7 @@ pub fn build_open_repo_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Mess
             .font(ui.config.ui_font),
     )
     .padding(Padding::from([7, 16]))
-    .on_press(Message::OpenRepoSubmit)
+    .on_press(Message::Action(Action::SubmitRepoDialog))
     .style(move |_, _| primary_button_style(theme));
 
     body = body.push(
@@ -788,7 +787,7 @@ pub fn build_open_repo_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Mess
             .padding(Padding::from([20, 22]))
             .style(move |_| modal_style(theme)),
     )
-    .on_press(Message::OpenRepoNoOp);
+    .on_press(Message::Ui(UiEvent::OpenRepoNoOp));
 
     let centered = container(card)
         .width(Length::Fill)
