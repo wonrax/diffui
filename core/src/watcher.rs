@@ -267,6 +267,14 @@ impl RepoWatcher {
     /// platform. Both shapes work over inotify, so this is how the one macOS
     /// takes gets exercised somewhere tests actually run.
     pub fn start_with(root: &Path, per_directory: bool) -> notify::Result<Self> {
+        // Classification strips the root off each event path, and the
+        // backends report canonical paths: FSEvents resolves symlinks, so a
+        // checkout under `/tmp` or `/var` on macOS comes back as `/private/…`
+        // and a root left as given would strip nothing and drop every
+        // worktree edit. Resolve it once so the prefix is the one the events
+        // carry; the op store is already resolved the same way.
+        let canonical = root.canonicalize().unwrap_or_else(|_| root.to_owned());
+        let root = canonical.as_path();
         let targets = WatchTargets::resolve(root);
         let (ignores, directories) = survey(root, &targets, per_directory);
         let scope = Arc::new(WatchScope {

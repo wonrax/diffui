@@ -32,7 +32,10 @@ use crate::{ConfirmDialog, DescriptionEditor, Diffui, DraftUi, OpenRepoDialog, T
 pub(crate) enum Mode {
     Palette(PaletteState),
     /// A popup menu (toolbar dropdown or right-click). Non-macOS only; macOS
-    /// pops a native `NSMenu`, which owns the keyboard itself while it runs.
+    /// pops a native `NSMenu`, which owns the keyboard itself while it runs,
+    /// so nothing there constructs this variant and the dead-code lint would
+    /// otherwise fail a macOS build with warnings denied.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     Menu(OverlayMenu),
     Confirm(ConfirmDialog),
     OpenRepo(OpenRepoDialog),

@@ -379,6 +379,11 @@ struct LineGeometry {
     columns: Columns,
     /// Widest visual line, in columns.
     width_columns: f32,
+    /// How the painter must shape this line to land on these columns.
+    /// `Auto` unless the fallback face `Auto` picked reported unusable
+    /// metrics, in which case the line was measured `Basic` and has to be
+    /// drawn `Basic` too — see [`LineGeometry::measure`].
+    shaping: text::Shaping,
 }
 
 /// How a byte offset inside a visual line maps to its column.
@@ -460,6 +465,7 @@ impl LineGeometry {
                     len: content.len(),
                     columns: Columns::Monospace,
                     width_columns: columns,
+                    shaping: text::Shaping::Auto,
                 };
             }
             // Still on the plain grid, only broken across visual lines: the
@@ -476,6 +482,7 @@ impl LineGeometry {
                 len: content.len(),
                 columns: Columns::Monospace,
                 width_columns: 0.0,
+                shaping: text::Shaping::Auto,
             };
             geometry.width_columns = (0..geometry.visual_lines())
                 .fold(0.0_f32, |widest, visual| {
@@ -483,7 +490,11 @@ impl LineGeometry {
                 });
             return geometry;
         }
-        let paragraph = measure::code_paragraph(
+        // `measure` decides the shaping — `Auto`, or `Basic` when the
+        // fallback face `Auto` reached reports no usable metrics — and the
+        // painter is told the same answer, so the glyphs on screen sit on
+        // the columns measured here. See `measure::code_paragraph`.
+        let (paragraph, shaping) = measure::code_paragraph(
             content,
             params.size,
             params.font,
@@ -491,7 +502,15 @@ impl LineGeometry {
             params.wrap_width,
             params.wrapping(),
         );
-        Self::from_paragraph(&paragraph, content, params.char_width)
+        Self::from_paragraph(&paragraph, content, params.char_width, shaping).unwrap_or_else(|| {
+            Self {
+                starts: vec![0],
+                len: content.len(),
+                columns: Columns::Monospace,
+                width_columns: column_bound(content),
+                shaping,
+            }
+        })
     }
 
     /// Read the break points and per-glyph columns straight off a shaped
@@ -503,7 +522,16 @@ impl LineGeometry {
     /// Runs carrying no glyph are trailing line boxes the layout produced
     /// with nothing in them; they'd reserve a blank row and push everything
     /// below it down, so only advancing runs count.
-    fn from_paragraph(paragraph: &ShapedParagraph, content: &str, char_width: f32) -> Self {
+    ///
+    /// `None` when any column came back non-finite: a face with broken
+    /// metrics puts a glyph at infinity and every column after it, and
+    /// nothing downstream can place a rectangle there.
+    fn from_paragraph(
+        paragraph: &ShapedParagraph,
+        content: &str,
+        char_width: f32,
+        shaping: text::Shaping,
+    ) -> Option<Self> {
         use iced::advanced::text::Paragraph as _;
 
         // Layout coordinates are pre-scaled when the paragraph is hinted.
@@ -539,12 +567,21 @@ impl LineGeometry {
             .iter()
             .filter_map(|line| line.last())
             .fold(0.0_f32, |widest, &(_, column)| widest.max(column));
-        Self {
+        if !width_columns.is_finite()
+            || table
+                .iter()
+                .flatten()
+                .any(|&(_, column)| !column.is_finite())
+        {
+            return None;
+        }
+        Some(Self {
             starts,
             len: content.len(),
             columns: Columns::Table(table),
             width_columns,
-        }
+            shaping,
+        })
     }
 
     fn visual_lines(&self) -> usize {
@@ -2146,6 +2183,7 @@ impl<'a, Message> DiffView<'a, Message> {
         renderer: &mut Renderer,
         line: &DiffLine,
         render: RowRenderParams,
+        memo: &RefCell<GeometryMemo>,
         cache_key: ParagraphKey,
         paragraph_cache: &RefCell<std::collections::HashMap<ParagraphKey, Renderer::Paragraph>>,
         paragraph_seen: &mut std::collections::HashSet<ParagraphKey>,
@@ -2204,10 +2242,24 @@ impl<'a, Message> DiffView<'a, Message> {
             render.y + self.metrics.text_y_pad,
         );
         let wrap_width = self.wrap_width(render.content_width);
+        // The geometry decided how this line shapes; paint it the same way.
+        let geometry = self.geometry(
+            memo,
+            body_geometry_key(
+                cache_key.file_index as usize,
+                cache_key.hunk_index as usize,
+                cache_key.line_index as usize,
+                wrap_width,
+                self.metrics.char_width,
+            ),
+            &line.content,
+            wrap_width,
+        );
 
         self.draw_code_text(
             renderer,
             line,
+            geometry.shaping,
             TextRenderParams {
                 // No-wrap shaping must not be bounded by the pane, or the
                 // scrolled-into tail of a long line would never be laid out —
@@ -2524,6 +2576,7 @@ impl<'a, Message> DiffView<'a, Message> {
         bounds: Rectangle,
         content_width: f32,
         horizontal_offset: f32,
+        memo: &RefCell<GeometryMemo>,
         paragraph_cache: &RefCell<std::collections::HashMap<ParagraphKey, Renderer::Paragraph>>,
         paragraph_seen: &mut std::collections::HashSet<ParagraphKey>,
     ) where
@@ -2570,6 +2623,19 @@ impl<'a, Message> DiffView<'a, Message> {
                 None => String::new(),
             };
             let text_color = self.line_text_color(line.kind);
+            // See `draw_row`: the geometry's shaping is the painter's.
+            let geometry = self.geometry(
+                memo,
+                body_geometry_key(
+                    row.file_index,
+                    row.hunk_index,
+                    line_index,
+                    wrap_width,
+                    self.metrics.char_width,
+                ),
+                &line.content,
+                wrap_width,
+            );
             self.draw_text(
                 renderer,
                 &gutter,
@@ -2603,6 +2669,7 @@ impl<'a, Message> DiffView<'a, Message> {
             self.draw_code_text(
                 renderer,
                 line,
+                geometry.shaping,
                 TextRenderParams {
                     // See `draw_row`: unbounded shaping in no-wrap mode.
                     width: wrap_width,
@@ -3959,6 +4026,7 @@ where
                         bounds,
                         content_width,
                         horizontal_offset,
+                        &state.geometry,
                         &state.paragraph_cache,
                         &mut paragraph_seen,
                     );
@@ -3984,6 +4052,7 @@ where
                         content_width: unified_width,
                         horizontal_offset,
                     },
+                    &state.geometry,
                     key,
                     &state.paragraph_cache,
                     &mut paragraph_seen,
@@ -4284,6 +4353,7 @@ impl<Message> DiffView<'_, Message> {
         width: f32,
         height: f32,
         wrapping: text::Wrapping,
+        shaping: text::Shaping,
     ) -> text::Text<String, Font> {
         text::Text {
             content: content.to_owned(),
@@ -4296,8 +4366,10 @@ impl<Message> DiffView<'_, Message> {
             // `Auto` keeps the cheap `Basic` path for ASCII and shapes
             // anything else with font fallback. Under `Basic` a line of CJK,
             // Cyrillic, emoji or box-drawing arrows rendered as a row of
-            // tofu, because the code font alone has no coverage for it.
-            shaping: text::Shaping::Auto,
+            // tofu, because the code font alone has no coverage for it. A
+            // code line whose geometry had to fall back to `Basic` passes
+            // that in, so paint and geometry agree.
+            shaping,
             wrapping,
             ellipsis: text::Ellipsis::None,
             hint_factor: None,
@@ -4528,8 +4600,28 @@ impl<Message> DiffView<'_, Message> {
     where
         Renderer: text::Renderer<Font = Font>,
     {
+        self.draw_text_shaped(renderer, content, render, text::Shaping::Auto);
+    }
+
+    /// [`draw_text`](Self::draw_text) with the shaping named: what a code
+    /// line's geometry decided, so paint and geometry agree on every column.
+    fn draw_text_shaped<Renderer>(
+        &self,
+        renderer: &mut Renderer,
+        content: &str,
+        render: TextRenderParams,
+        shaping: text::Shaping,
+    ) where
+        Renderer: text::Renderer<Font = Font>,
+    {
         renderer.fill_text(
-            self.make_text(content, render.width, render.height, render.wrapping),
+            self.make_text(
+                content,
+                render.width,
+                render.height,
+                render.wrapping,
+                shaping,
+            ),
             render.position,
             render.color,
             render.clip_bounds,
@@ -4591,10 +4683,12 @@ impl<Message> DiffView<'_, Message> {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_code_text<Renderer>(
         &self,
         renderer: &mut Renderer,
         line: &DiffLine,
+        shaping: text::Shaping,
         render: TextRenderParams,
         cache_key: ParagraphKey,
         paragraph_cache: &RefCell<std::collections::HashMap<ParagraphKey, Renderer::Paragraph>>,
@@ -4603,13 +4697,13 @@ impl<Message> DiffView<'_, Message> {
         Renderer: text::Renderer<Font = Font>,
     {
         if line.syntax.is_empty() {
-            self.draw_text(renderer, &line.content, render);
+            self.draw_text_shaped(renderer, &line.content, render, shaping);
             return;
         }
 
         let spans = self.syntax_spans(&line.content, &line.syntax);
         if spans.is_empty() {
-            self.draw_text(renderer, &line.content, render);
+            self.draw_text_shaped(renderer, &line.content, render, shaping);
             return;
         }
 
@@ -4626,9 +4720,9 @@ impl<Message> DiffView<'_, Message> {
                 font: self.font,
                 align_x: text::Alignment::Left,
                 align_y: alignment::Vertical::Top,
-                // See `make_text`: `Basic` renders anything the code font
-                // doesn't cover as tofu.
-                shaping: text::Shaping::Auto,
+                // See `make_text`; the geometry's shaping, so the painted
+                // glyphs sit on the columns it measured.
+                shaping,
                 wrapping: render.wrapping,
                 ellipsis: text::Ellipsis::None,
                 hint_factor: None,

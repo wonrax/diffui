@@ -46,13 +46,16 @@ pub fn line_width_shaped(content: &str, size: f32, font: Font, shaping: Shaping)
 }
 
 /// Shape `content` exactly the way the diff grid draws a code line — same
-/// font/size, absolute `line_height` box, `Shaping::Auto`, and the caller's
-/// `wrapping` — bounded to `max_width`.
+/// font/size, absolute `line_height` box, and the caller's `wrapping` —
+/// bounded to `max_width`, and say which shaping it took.
 ///
 /// `Shaping::Auto` keeps the cheap `Basic` path for ASCII and switches to
 /// full shaping (with font fallback) for anything else, so CJK, Cyrillic,
 /// emoji and arrows measure as the glyphs they are instead of as the tofu
-/// `Basic` produces when the primary font has no coverage.
+/// `Basic` produces when the primary font has no coverage. When the fallback
+/// face `Auto` reaches reports no usable metrics the line is shaped `Basic`
+/// instead (see the body), and the returned shaping is what the painter has
+/// to use so its glyphs sit on the columns measured here.
 ///
 /// The height bound is infinite on purpose: cosmic stops laying out lines
 /// once they pass the box, so a finite height would hide the very overflow
@@ -64,6 +67,56 @@ pub fn code_paragraph(
     line_height: f32,
     max_width: f32,
     wrapping: text::Wrapping,
+) -> (Paragraph, Shaping) {
+    let auto = code_paragraph_shaped(
+        content,
+        size,
+        font,
+        line_height,
+        max_width,
+        wrapping,
+        Shaping::Auto,
+    );
+    if metrics_are_finite(&auto) {
+        return (auto, Shaping::Auto);
+    }
+    // `Auto` reached a fallback face that reports no usable advance. macOS
+    // ships one, GB18030 Bitmap: once it is picked for a CJK char its glyph
+    // has an infinite advance and every glyph after it sits at infinity, so
+    // nothing downstream can place a break, a column or a rectangle. Shape
+    // the line `Basic` instead — tofu where the code font has no glyph, every
+    // column finite — and tell the caller, so the painter draws it the same
+    // way and the glyphs land on the columns that were measured.
+    let basic = code_paragraph_shaped(
+        content,
+        size,
+        font,
+        line_height,
+        max_width,
+        wrapping,
+        Shaping::Basic,
+    );
+    (basic, Shaping::Basic)
+}
+
+/// Whether every glyph the layout placed has a finite position and advance.
+fn metrics_are_finite(paragraph: &Paragraph) -> bool {
+    paragraph.buffer().layout_runs().all(|run| {
+        run.glyphs
+            .iter()
+            .all(|glyph| glyph.x.is_finite() && glyph.w.is_finite())
+    })
+}
+
+/// [`code_paragraph`] with the shaping named, and no fallback.
+pub fn code_paragraph_shaped(
+    content: &str,
+    size: f32,
+    font: Font,
+    line_height: f32,
+    max_width: f32,
+    wrapping: text::Wrapping,
+    shaping: Shaping,
 ) -> Paragraph {
     Paragraph::with_text(Text {
         content,
@@ -73,7 +126,7 @@ pub fn code_paragraph(
         font,
         align_x: text::Alignment::Left,
         align_y: alignment::Vertical::Top,
-        shaping: Shaping::Auto,
+        shaping,
         wrapping,
         ellipsis: text::Ellipsis::None,
         hint_factor: None,
@@ -90,7 +143,7 @@ pub fn wrapped_line_count(
     line_height: f32,
     max_width: f32,
 ) -> usize {
-    let paragraph = code_paragraph(
+    let (paragraph, _) = code_paragraph(
         content,
         size,
         font,
@@ -121,7 +174,7 @@ pub fn wrapped_line_starts(
     max_width: f32,
 ) -> Vec<usize> {
     let line_height = line_height.max(1.0);
-    let paragraph = code_paragraph(
+    let (paragraph, _) = code_paragraph(
         content,
         size,
         font,
