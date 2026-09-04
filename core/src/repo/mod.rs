@@ -203,10 +203,42 @@ fn is_jj(root: &Path) -> bool {
     root.join(".jj").is_dir()
 }
 
+/// Where a jj actor's configuration comes from.
+///
+/// The actor loads jj's layered config on its own thread, from the process
+/// environment. That is what the app wants and what a test must not get: a
+/// developer with `signing.behavior = "own"` and an SSH agent had every commit
+/// a fixture wrote through the actor block on a signing prompt, because the
+/// fixture's own settings stopped at the jj-lib calls it made directly and
+/// never reached the actor. A test hands its settings over instead.
+#[derive(Clone, Default)]
+pub enum SettingsSource {
+    /// jj's real config: defaults, the user's files, the repo's, `JJ_*`.
+    #[default]
+    Layered,
+    /// Exactly these settings; nothing is read from the environment.
+    Fixed(Box<jj_lib::settings::UserSettings>),
+}
+
+impl std::fmt::Debug for SettingsSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Layered => f.write_str("Layered"),
+            Self::Fixed(_) => f.write_str("Fixed(..)"),
+        }
+    }
+}
+
 /// Spawn the actor for `spec` and return its event stream. The first event is
 /// [`Payload::Ready`], which carries the command sender — everything else the
 /// frontend needs travels as protocol data.
 pub fn open(spec: OpenSpec) -> RepoEvents {
+    open_with(spec, SettingsSource::Layered)
+}
+
+/// [`open`], with the jj configuration named rather than discovered. Only a
+/// test needs this; see [`SettingsSource`].
+pub fn open_with(spec: OpenSpec, settings: SettingsSource) -> RepoEvents {
     let id = repo_id(&spec);
     let capabilities = capabilities_for(&spec);
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Envelope>();
@@ -243,7 +275,7 @@ pub fn open(spec: OpenSpec) -> RepoEvents {
 
     match spec {
         OpenSpec::Local { root, .. } if is_jj(&root) => {
-            jj_actor::spawn(id, root, cmd_rx, cmd_tx.clone(), event_tx);
+            jj_actor::spawn(id, root, settings, cmd_rx, cmd_tx.clone(), event_tx);
         }
         OpenSpec::Local { root, .. } => git_actor::spawn(id, root, cmd_rx, event_tx),
         OpenSpec::GitHubPr(pr) => pr_actor::spawn(id, pr, cmd_rx, event_tx),

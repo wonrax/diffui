@@ -152,7 +152,13 @@ fn non_utf8_filename_does_not_take_the_listing_down() {
 
     let root = scratch_repo("non-utf8-filename");
     let name = std::ffi::OsStr::from_bytes(b"caf\xe9.txt");
-    std::fs::write(root.join(name), b"one\n").expect("write scratch file");
+    // Not every filesystem accepts a name that isn't valid UTF-8 — APFS
+    // answers EILSEQ — and there is nothing to test where the name can't
+    // exist. Skip rather than fail on the developer's machine.
+    if std::fs::write(root.join(name), b"one\n").is_err() {
+        eprintln!("skipping: the filesystem refuses a non-UTF-8 filename");
+        return;
+    }
     write(&root, "plain.txt", b"plain\n");
     commit(&root, "add a latin-1 name");
     std::fs::write(root.join(name), b"two\n").expect("write scratch file");

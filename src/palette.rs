@@ -308,7 +308,10 @@ impl Recents {
         let mut commands: VecDeque<CommandId> = p
             .commands
             .into_iter()
-            .filter_map(|name| commands::command(&name).map(|command| command.id))
+            .filter_map(|name| {
+                let name = renamed_command(&name).unwrap_or(&name);
+                commands::command(name).map(|command| command.id)
+            })
             .collect();
         if revisions.len() > RECENTS_CAPACITY {
             revisions.truncate(RECENTS_CAPACITY);
@@ -321,6 +324,35 @@ impl Recents {
             commands,
         }
     }
+}
+
+/// The id a pre-registry recents file called this command, when it called it
+/// something else.
+///
+/// Command ids used to be a `CommandId` enum with its own kebab-case persist
+/// names; the registry replaced them with dotted ids. Left alone, every user's
+/// most-recent commands are silently dropped the first time the new build
+/// reads the file — the palette forgets what they use, once, for no reason
+/// they can see.
+fn renamed_command(persisted: &str) -> Option<&'static str> {
+    Some(match persisted {
+        "refresh-repository" => "repo.refresh",
+        "select-next-file" => "file.next",
+        "select-previous-file" => "file.previous",
+        "theme-system" => "theme.system",
+        "theme-light" => "theme.light",
+        "theme-dark" => "theme.dark",
+        "theme-high-contrast" => "theme.contrast",
+        "copy-file-diff" => "file.copy-diff",
+        "open-find" => "find.open",
+        "jump-to-revision" => "revision.select",
+        "copy-change-id" => "revision.copy-change-id",
+        "copy-commit-message" => "revision.copy-commit-message",
+        "copy-author" => "revision.copy-author",
+        "open-file" => "file.open",
+        "copy-file-path" => "file.copy-path",
+        _ => return None,
+    })
 }
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -1290,6 +1322,58 @@ pub fn change_id_for_recents(item: &ResultRef, ui: &Diffui) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pre-registry names in a recents file written by an older build all
+    /// resolve, so an upgrade doesn't quietly empty the palette's MRU.
+    #[test]
+    fn recents_written_before_the_registry_still_resolve() {
+        let persisted = PersistedRecents {
+            revisions: Vec::new(),
+            commands: vec![
+                "refresh-repository".to_owned(),
+                "copy-change-id".to_owned(),
+                "theme-high-contrast".to_owned(),
+                "a-command-no-build-ever-had".to_owned(),
+            ],
+        };
+        let recents = Recents::from_persisted(persisted);
+        assert_eq!(
+            recents.commands.iter().copied().collect::<Vec<_>>(),
+            vec!["repo.refresh", "revision.copy-change-id", "theme.contrast"],
+            "known names map, the unknown one is dropped"
+        );
+    }
+
+    /// Every name the old build could have written maps to a command this one
+    /// still has — a typo in the table reads as "that command was removed" and
+    /// drops the entry.
+    #[test]
+    fn every_renamed_command_still_exists() {
+        for persisted in [
+            "refresh-repository",
+            "select-next-file",
+            "select-previous-file",
+            "theme-system",
+            "theme-light",
+            "theme-dark",
+            "theme-high-contrast",
+            "copy-file-diff",
+            "open-find",
+            "jump-to-revision",
+            "copy-change-id",
+            "copy-commit-message",
+            "copy-author",
+            "open-file",
+            "copy-file-path",
+        ] {
+            let id = renamed_command(persisted)
+                .unwrap_or_else(|| panic!("{persisted} should map to a current id"));
+            assert!(
+                commands::command(id).is_some(),
+                "{persisted} maps to {id}, which no longer exists"
+            );
+        }
+    }
 
     #[test]
     fn query_prefixes_select_modes() {

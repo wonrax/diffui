@@ -98,8 +98,7 @@ impl Diffui {
         // Persist the new active tab so it's re-focused next launch.
         self.mark_geometry_dirty();
         self.active = target;
-        self.on_active_tab_changed();
-        self.ensure_active_loaded()
+        Task::batch([self.on_active_tab_changed(), self.ensure_active_loaded()])
     }
 
     /// Shared tail of every path that changes which tab is on screen. The
@@ -107,9 +106,17 @@ impl Diffui {
     /// shared across tabs, so push the new tab's saved positions back in and
     /// drop the cache the previous tab populated — its `(file, hunk, line)` keys
     /// map to that tab's text, not this one's.
-    fn on_active_tab_changed(&mut self) {
+    ///
+    /// It is also where a description edit deferred while its tab was off
+    /// screen finally opens: the diff it was waiting for has already landed,
+    /// so the editor has details to show and the keyboard is now this tab's.
+    fn on_active_tab_changed(&mut self) -> Task<Message> {
         self.scroll_restore_token = self.scroll_restore_token.wrapping_add(1);
         self.document_version = self.document_version.wrapping_add(1);
+        match self.active_tab_id() {
+            Some(tab) => self.open_pending_description_edit(tab),
+            None => Task::none(),
+        }
     }
 
     /// Bring the active tab up to date on activation.
@@ -170,8 +177,7 @@ impl Diffui {
             // stint there (a failed `--path`, say) doesn't resurface behind it.
             self.no_tab = TabState::empty();
         }
-        self.on_active_tab_changed();
-        self.ensure_active_loaded()
+        Task::batch([self.on_active_tab_changed(), self.ensure_active_loaded()])
     }
 
     /// Resolve `raw` to a repository — or a GitHub PR reference — and open it
@@ -262,8 +268,7 @@ impl Diffui {
         if was_empty {
             // No active tab to switch from — the new one is simply it.
             self.active = 0;
-            self.on_active_tab_changed();
-            self.ensure_active_loaded()
+            Task::batch([self.on_active_tab_changed(), self.ensure_active_loaded()])
         } else {
             self.activate_tab(id)
         }
@@ -410,6 +415,113 @@ pub(crate) mod tests {
             RevisionSelection::WorkingCopy
         );
         assert!(ui.active().session.document.files.is_empty());
+    }
+
+    fn details(description: &str) -> diffui_core::RevisionDetails {
+        diffui_core::RevisionDetails {
+            commit_id: "abc".to_owned(),
+            change_id: None,
+            bookmarks: Vec::new(),
+            author: Default::default(),
+            committer: None,
+            signature: None,
+            description: description.to_owned(),
+        }
+    }
+
+    /// Land the diff `tab` is waiting on for `revision`, the way the actor
+    /// reports it.
+    fn land_diff(ui: &mut Diffui, tab: TabId, revision: &RevisionSelection) {
+        let effects = ui.tab_mut(tab).unwrap().session.load_diff(revision.clone());
+        let job = effects
+            .iter()
+            .find_map(|effect| match effect {
+                diffui_core::Effect::Send(diffui_core::Command::LoadDiff { job, .. }) => Some(*job),
+                _ => None,
+            })
+            .expect("a diff load");
+        let index = ui.tabs.iter().position(|candidate| candidate.id == tab);
+        let repo = ui.tabs[index.expect("the tab is open")]
+            .repo_id()
+            .expect("a repo tab has an id");
+        let _ = ui.update(Message::Repo(Box::new(diffui_core::Event::new(
+            repo,
+            diffui_core::Payload::DiffLoaded {
+                job,
+                revision: revision.clone(),
+                document: document("a.rs"),
+                details: Some(details("first line")),
+            },
+        ))));
+    }
+
+    /// "Edit description" on a row that isn't selected browses to it first and
+    /// only then opens the editor. Nothing else re-reads that pending target,
+    /// so if the diff-landing path drops it the menu command silently does
+    /// nothing.
+    #[test]
+    fn editing_the_description_of_another_revision_opens_once_its_diff_lands() {
+        let mut ui = app();
+        let tab = push_tab(&mut ui, "/tmp/only");
+        ui.tab_mut(tab).unwrap().session.capabilities.mutate = true;
+
+        let revision = RevisionSelection::Commit("abc".to_owned());
+        let _ = ui.perform(Action::EditDescription {
+            target: Some(revision.clone()),
+        });
+        assert_eq!(
+            ui.active().pending_description_edit.as_ref(),
+            Some(&revision),
+            "the edit waits for the revision it named"
+        );
+        assert!(ui.active().description_editor().is_none());
+
+        land_diff(&mut ui, tab, &revision);
+
+        let state = ui.active();
+        assert_eq!(state.pending_description_edit, None);
+        let editor = state
+            .description_editor()
+            .expect("the editor opened over the revision that landed");
+        assert_eq!(editor.target, revision);
+        assert_eq!(editor.text(), "first line");
+    }
+
+    /// The same edit, but its diff lands while another tab is on screen. The
+    /// editor is a focused control, so it must not open under the visible tab
+    /// — and the pending edit must survive to open on activation instead.
+    #[test]
+    fn a_deferred_description_edit_opens_when_its_tab_comes_back() {
+        let mut ui = app();
+        let first = push_tab(&mut ui, "/tmp/first");
+        let _second = push_tab(&mut ui, "/tmp/second");
+        ui.tab_mut(first).unwrap().session.capabilities.mutate = true;
+
+        let revision = RevisionSelection::Commit("abc".to_owned());
+        ui.tab_mut(first).unwrap().pending_description_edit = Some(revision.clone());
+        ui.active = 1;
+        land_diff(&mut ui, first, &revision);
+
+        assert!(
+            ui.active().description_editor().is_none(),
+            "the tab on screen keeps the keyboard"
+        );
+        assert_eq!(
+            ui.tab_mut(first).unwrap().pending_description_edit.as_ref(),
+            Some(&revision),
+            "the edit is held, not dropped"
+        );
+
+        let _ = ui.activate_tab(first);
+
+        assert_eq!(ui.active().pending_description_edit, None);
+        assert_eq!(
+            ui.active()
+                .description_editor()
+                .expect("the editor opened on activation")
+                .target,
+            revision
+        );
     }
 
     #[test]

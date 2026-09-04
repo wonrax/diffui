@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-use diffui_core::repo::{self, Command, JobId, OpenSpec, Payload, RepoHandle};
+use diffui_core::repo::{self, Command, JobId, OpenSpec, Payload, RepoHandle, SettingsSource};
 use diffui_core::{Repository, RevisionSelection, Vcs};
 use futures::StreamExt;
 
@@ -38,9 +38,28 @@ pub fn scratch_repo(test: &str) -> PathBuf {
     root
 }
 
+/// The settings a fixture's repository is read and written with: the identity
+/// and signing-off of [`test_settings`], plus the scratch repo's own
+/// `.jj/repo/config.toml` when a scenario wrote one (an `immutable_heads()`
+/// override, say). Layered the way jj layers them, minus every file that
+/// belongs to whoever is running the tests.
+pub fn test_settings_for(root: &Path) -> jj_lib::settings::UserSettings {
+    let mut config = test_config();
+    if let Ok(text) = std::fs::read_to_string(repo_dir(root).join("config.toml")) {
+        let layer = jj_lib::config::ConfigLayer::parse(jj_lib::config::ConfigSource::Repo, &text)
+            .expect("parse the scratch repo's config");
+        config.add_layer(layer);
+    }
+    jj_lib::settings::UserSettings::from_config(config).expect("build test settings")
+}
+
 /// Settings with an identity and signing off, so a commit written here never
 /// reaches for the user's real config or a signing agent.
 pub fn test_settings() -> jj_lib::settings::UserSettings {
+    jj_lib::settings::UserSettings::from_config(test_config()).expect("build test settings")
+}
+
+fn test_config() -> jj_lib::config::StackedConfig {
     let mut config = jj_lib::config::StackedConfig::with_defaults();
     let layer = jj_lib::config::ConfigLayer::parse(
         jj_lib::config::ConfigSource::User,
@@ -57,7 +76,7 @@ username = "test"
     )
     .expect("parse test config");
     config.add_layer(layer);
-    jj_lib::settings::UserSettings::from_config(config).expect("build test settings")
+    config
 }
 
 pub fn write(dir: &Path, name: &str, contents: &str) {
@@ -71,7 +90,7 @@ pub fn write(dir: &Path, name: &str, contents: &str) {
 /// Commit ids of the repo's visible heads' ancestry, newest first — enough for
 /// a test to name a revision without shelling out to `jj log`.
 pub fn commit_ids(root: &Path) -> Vec<String> {
-    let settings = test_settings();
+    let settings = test_settings_for(root);
     block_on(async {
         let workspace = jj_lib::workspace::Workspace::load(
             &settings,
@@ -121,10 +140,17 @@ impl TestRepo {
             .enable_all()
             .build()
             .expect("build tokio runtime");
-        let mut events = Box::pin(repo::open(OpenSpec::Local {
-            root: root.to_owned(),
-            scope: PathBuf::new(),
-        }));
+        // The actor gets the fixture's settings, not the developer's: with
+        // `signing.behavior = "own"` in a real `~/.config/jj/config.toml`,
+        // every commit the actor writes would block on a signing agent and the
+        // scenario would time out at its first mutation.
+        let mut events = Box::pin(repo::open_with(
+            OpenSpec::Local {
+                root: root.to_owned(),
+                scope: PathBuf::new(),
+            },
+            SettingsSource::Fixed(Box::new(test_settings_for(root))),
+        ));
         let handle = runtime.block_on(async {
             match events.next().await.map(|event| event.payload) {
                 Some(Payload::Ready { handle, .. }) => handle,
@@ -269,7 +295,7 @@ impl TestRepo {
 /// have to reach past the protocol to set something up.
 pub fn load_workspace(root: &Path) -> jj_lib::workspace::Workspace {
     jj_lib::workspace::Workspace::load(
-        &test_settings(),
+        &test_settings_for(root),
         root,
         &jj_lib::repo::StoreFactories::default(),
         &jj_lib::workspace::default_working_copy_factories(),
@@ -386,4 +412,289 @@ pub fn commit_file(repo: &mut TestRepo, name: &str, contents: &str, description:
         parent: RevisionSelection::WorkingCopy,
     })
     .expect("start a new change");
+}
+
+// ── Fixture primitives the protocol has no command for ─────────────────────
+//
+// Everything a scenario can build through `TestRepo` (a snapshot, a describe,
+// a new change) it builds that way. What is left is the handful of shapes the
+// protocol deliberately cannot express — a commit `@` does not move onto,
+// two operations written concurrently, a git remote — plus the byte-exact
+// reads an assertion needs. All of it goes through jj-lib, so the scenarios
+// run with no `jj` on PATH.
+
+/// Load the repo at head, run `body`, and return what it produced.
+fn at_head<T>(
+    root: &Path,
+    body: impl AsyncFnOnce(jj_lib::repo::RepoLoader, std::sync::Arc<jj_lib::repo::ReadonlyRepo>) -> T,
+) -> T {
+    block_on(async {
+        let workspace = load_workspace(root);
+        let loader = workspace.repo_loader().clone();
+        let repo = loader.load_at_head().await.expect("load repo at head");
+        body(loader, repo).await
+    })
+}
+
+async fn commit_at(
+    repo: &std::sync::Arc<jj_lib::repo::ReadonlyRepo>,
+    commit_id: &str,
+) -> jj_lib::commit::Commit {
+    let id = jj_lib::backend::CommitId::try_from_hex(commit_id)
+        .unwrap_or_else(|| panic!("{commit_id} is not a commit id"));
+    jj_lib::repo::Repo::store(repo.as_ref())
+        .get_commit_async(&id)
+        .await
+        .unwrap_or_else(|err| panic!("load commit {commit_id}: {err}"))
+}
+
+/// `jj new --no-edit`: a childless commit on `parents` that `@` does not move
+/// onto. The protocol's `New` always takes the working copy with it, and a
+/// scenario that needs a sibling leaf must not disturb `@`.
+pub fn new_commit(root: &Path, parents: &[String], description: &str) -> String {
+    use jj_lib::object_id::ObjectId as _;
+
+    at_head(root, async |_loader, repo| {
+        let mut parent_commits = Vec::new();
+        for id in parents {
+            parent_commits.push(commit_at(&repo, id).await);
+        }
+        let mut tx = repo.start_transaction();
+        let tree = jj_lib::rewrite::merge_commit_trees(tx.repo(), &parent_commits)
+            .await
+            .expect("merge the new commit's parent trees");
+        let written = tx
+            .repo_mut()
+            .new_commit(
+                parent_commits.iter().map(|c| c.id().clone()).collect(),
+                tree,
+            )
+            .set_description(description)
+            .write()
+            .await
+            .expect("write the new commit");
+        let id = written.id().hex();
+        tx.commit("test: new commit").await.expect("commit the op");
+        id
+    })
+}
+
+/// Which operation a fixture transaction starts from.
+pub enum OpBase {
+    /// The current head — an ordinary, sequential operation.
+    Head,
+    /// The head's parent, so the operation written here and the head are
+    /// concurrent. Reloading merges them, which is what makes a change
+    /// divergent or a bookmark conflicted — states no single command reaches.
+    ParentOfHead,
+}
+
+fn start_transaction(
+    loader: &jj_lib::repo::RepoLoader,
+    repo: &std::sync::Arc<jj_lib::repo::ReadonlyRepo>,
+    base: &OpBase,
+) -> impl Future<Output = jj_lib::transaction::Transaction> {
+    let loader = loader.clone();
+    let repo = repo.clone();
+    let parent = matches!(base, OpBase::ParentOfHead);
+    async move {
+        if !parent {
+            return repo.start_transaction();
+        }
+        let parents = repo
+            .operation()
+            .parents()
+            .await
+            .expect("read the head operation's parents");
+        let parent = parents.first().expect("the head operation has a parent");
+        loader
+            .load_at(parent)
+            .await
+            .expect("load the repo at the head's parent operation")
+            .start_transaction()
+    }
+}
+
+/// `jj describe -r <commit>`, written from `base`. Descendants are rebased, as
+/// the CLI does, so the rest of the graph follows the rewrite.
+pub fn describe(root: &Path, base: OpBase, commit_id: &str, description: &str) {
+    at_head(root, async |loader, repo| {
+        let target = commit_at(&repo, commit_id).await;
+        let mut tx = start_transaction(&loader, &repo, &base).await;
+        tx.repo_mut()
+            .rewrite_commit(&target)
+            .set_description(description)
+            .write()
+            .await
+            .expect("rewrite the commit");
+        tx.repo_mut()
+            .rebase_descendants()
+            .await
+            .expect("rebase descendants");
+        tx.commit("test: describe").await.expect("commit the op");
+    })
+}
+
+/// `jj bookmark set <name> -r <commit>`, written from `base`.
+pub fn set_bookmark(root: &Path, base: OpBase, name: &str, commit_id: &str) {
+    at_head(root, async |loader, repo| {
+        let target = commit_at(&repo, commit_id).await;
+        let mut tx = start_transaction(&loader, &repo, &base).await;
+        tx.repo_mut().set_local_bookmark_target(
+            jj_lib::ref_name::RefName::new(name),
+            jj_lib::op_store::RefTarget::normal(target.id().clone()),
+        );
+        tx.commit("test: set bookmark")
+            .await
+            .expect("commit the op");
+    })
+}
+
+/// The full description of `commit_id`. The sidebar's rows keep only the first
+/// line, so a multi-line message has to be read from the commit itself.
+pub fn full_description(root: &Path, commit_id: &str) -> String {
+    at_head(root, async |_loader, repo| {
+        commit_at(&repo, commit_id).await.description().to_owned()
+    })
+}
+
+/// `jj file show -r <commit> <path>`, byte-exact — including the trailing
+/// newline the source browser's line model drops.
+pub fn file_at(root: &Path, commit_id: &str, path: &str) -> String {
+    at_head(root, async |_loader, repo| {
+        let tree = commit_at(&repo, commit_id).await.tree();
+        materialize(repo.as_ref(), tree, path).await
+    })
+}
+
+/// [`file_at`] for a path that may not exist in the revision at all, which is
+/// how a scenario sweeps the graph looking for where an edit ended up.
+pub fn file_at_or_absent(root: &Path, commit_id: &str, path: &str) -> String {
+    at_head(root, async |_loader, repo| {
+        let tree = commit_at(&repo, commit_id).await.tree();
+        let repo_path = jj_lib::repo_path::RepoPathBuf::from_internal_string(path.to_owned())
+            .expect("a repo path");
+        match tree.path_value(&repo_path).await {
+            Ok(value) if value.is_absent() => String::new(),
+            Ok(_) => materialize(repo.as_ref(), tree, path).await,
+            Err(_) => String::new(),
+        }
+    })
+}
+
+/// The same read at a past operation, against that operation's working-copy
+/// commit — how a scenario proves an edit stayed reachable through the op log.
+pub fn file_at_operation(root: &Path, operation_id: &str, path: &str) -> String {
+    block_on(async {
+        let workspace = load_workspace(root);
+        let loader = workspace.repo_loader().clone();
+        let id = jj_lib::op_store::OperationId::try_from_hex(operation_id)
+            .expect("an operation id in hex");
+        let operation = loader
+            .load_operation(&id)
+            .await
+            .expect("load the named operation");
+        let repo = loader
+            .load_at(&operation)
+            .await
+            .expect("load the repo at that operation");
+        let wc = jj_lib::repo::Repo::view(repo.as_ref())
+            .get_wc_commit_id(workspace.workspace_name())
+            .expect("a working-copy commit at that operation")
+            .clone();
+        let tree = jj_lib::repo::Repo::store(repo.as_ref())
+            .get_commit_async(&wc)
+            .await
+            .expect("load the working-copy commit")
+            .tree();
+        materialize(repo.as_ref(), tree, path).await
+    })
+}
+
+async fn materialize(
+    repo: &jj_lib::repo::ReadonlyRepo,
+    tree: jj_lib::merged_tree::MergedTree,
+    path: &str,
+) -> String {
+    let repo_path =
+        jj_lib::repo_path::RepoPathBuf::from_internal_string(path.to_owned()).expect("a repo path");
+    let value = tree
+        .path_value(&repo_path)
+        .await
+        .unwrap_or_else(|err| panic!("look up {path}: {err}"));
+    let materialized = jj_lib::conflicts::materialize_tree_value(
+        jj_lib::repo::Repo::store(repo),
+        &repo_path,
+        value,
+        tree.labels(),
+    )
+    .await
+    .unwrap_or_else(|err| panic!("materialize {path}: {err}"));
+    let jj_lib::conflicts::MaterializedTreeValue::File(mut file) = materialized else {
+        panic!("{path} is not a plain file at this revision");
+    };
+    let bytes = file
+        .read_all(&repo_path)
+        .await
+        .unwrap_or_else(|err| panic!("read {path}: {err}"));
+    String::from_utf8(bytes).expect("scratch files are UTF-8")
+}
+
+/// `(description, id)` of every operation, newest first.
+pub fn operation_log(root: &Path) -> Vec<(String, String)> {
+    use futures::TryStreamExt as _;
+    use jj_lib::object_id::ObjectId as _;
+
+    at_head(root, async |_loader, repo| {
+        let head = repo.operation().clone();
+        jj_lib::op_walk::walk_ancestors(std::slice::from_ref(&head))
+            .map_ok(|op| (op.metadata().description.clone(), op.id().hex()))
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("walk the operation log")
+    })
+}
+
+/// A bare git repository at `path`, and `name` pointing at it from `root`'s
+/// internal git store — a local path is a perfectly good `jj git push` remote.
+/// Both go through the `git` CLI, which the push itself needs anyway (jj-lib
+/// shells out to `git push`).
+pub fn init_git_remote(root: &Path, name: &str, path: &Path) {
+    let _ = std::fs::remove_dir_all(path);
+    run_git(Path::new("."), &["init", "--bare", &path.to_string_lossy()]);
+    let git_dir = repo_dir(root).join("store").join("git");
+    run_git(
+        root,
+        &[
+            "--git-dir",
+            &git_dir.to_string_lossy(),
+            "remote",
+            "add",
+            name,
+            &path.to_string_lossy(),
+        ],
+    );
+}
+
+/// Run `git` in `dir` and return its stdout, panicking with stderr on failure.
+pub fn run_git(dir: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Whether the `git` CLI is usable — the scenarios that push skip without it.
+pub fn git_available() -> bool {
+    std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
 }

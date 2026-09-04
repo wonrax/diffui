@@ -33,6 +33,7 @@ use crate::icons;
 use crate::measure::{self, LINE_HEIGHT_MULTIPLIER};
 use crate::scrollbar::{self, ScrollbarState, ScrollbarStyle};
 use crate::theme::chip_background;
+use crate::width_memo::WidthMemo;
 
 const LINE_SCROLL_ROWS: f32 = 1.5;
 const PIXEL_SCROLL_SCALE: f32 = 0.65;
@@ -740,6 +741,10 @@ struct State {
     /// so plain mouse moves don't re-publish the same row). Reset around
     /// drags and when target mode ends so the next hover re-publishes.
     target_hover: Option<usize>,
+    /// Shaped text widths, kept across frames. A row measures eight to fifteen
+    /// strings to lay itself out, and they are the same strings every frame —
+    /// see [`WidthMemo`].
+    widths: WidthMemo,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -773,6 +778,7 @@ impl State {
             drag: None,
             pending_click: None,
             target_hover: None,
+            widths: WidthMemo::default(),
         }
     }
 }
@@ -849,6 +855,9 @@ where
         // Offset on entry; compared on the way out so any change this pass
         // (wheel, scrollbar, reveal, restore, clamp) is reported once via
         // `on_scroll`. `fn` pointers are `Copy`, so this borrows nothing.
+        //
+        // The comparison is the whole mechanism, so nothing below may leave
+        // `update` without reaching it — see the `'event` block.
         let prev_offset = state.vertical_offset;
         let max_vertical = (self.content_height() - bounds.height as f64).max(0.0);
         if state.vertical_offset > max_vertical {
@@ -954,308 +963,306 @@ where
         // and any offset it produces is widened back to `f64` before storage.
         let content_height = self.content_height() as f32;
 
-        match event {
-            Event::Mouse(mouse::Event::CursorMoved { position }) => {
-                if scrollbar::is_dragging(&state.scrollbar) {
-                    if let scrollbar::ScrollbarEvent::OffsetChanged(new_offset) =
-                        scrollbar::on_cursor_moved(
-                            &mut state.scrollbar,
-                            *position,
-                            bounds,
-                            content_height,
-                        )
+        // A labelled block, not bare arms: several of these paths bail early,
+        // and the offset they may already have changed above still has to reach
+        // the app. Left as `return`s, a reveal-then-click published nothing and
+        // the app's mirror went stale — the next restore then jumped the sidebar
+        // back to where it thought it was.
+        'event: {
+            match event {
+                Event::Mouse(mouse::Event::CursorMoved { position }) => {
+                    if scrollbar::is_dragging(&state.scrollbar) {
+                        if let scrollbar::ScrollbarEvent::OffsetChanged(new_offset) =
+                            scrollbar::on_cursor_moved(
+                                &mut state.scrollbar,
+                                *position,
+                                bounds,
+                                content_height,
+                            )
+                        {
+                            state.vertical_offset = (new_offset as f64).clamp(0.0, max_vertical);
+                            shell.capture_event();
+                            shell.request_redraw();
+                        }
+                        state.cursor_position = None;
+                        let had_hover = state.hovered_file_item.take().is_some()
+                            || state.hovered_revision_item.take().is_some()
+                            || state.hovered_lane.take().is_some();
+                        if had_hover {
+                            shell.request_redraw();
+                        }
+                        break 'event;
+                    }
+                    // Drag-to-rebase tracking: past a small threshold the press
+                    // becomes a drag; from then on the widget owns the cursor
+                    // (no hover washes) and mirrors spot changes to the app.
+                    if self.on_drag.is_some()
+                        && let Some(drag) = state.drag.as_mut()
                     {
-                        state.vertical_offset = (new_offset as f64).clamp(0.0, max_vertical);
-                        shell.capture_event();
+                        let offset = state.vertical_offset;
+                        drag.cursor = *position;
+                        if !drag.active {
+                            let dx = position.x - drag.origin.x;
+                            let dy = position.y - drag.origin.y;
+                            if (dx * dx + dy * dy).sqrt() >= 6.0 {
+                                drag.active = true;
+                                // The drag owns spot publishing from here; reset
+                                // the plain-hover dedupe so the first post-drag
+                                // hover re-publishes whatever it lands on.
+                                state.target_hover = None;
+                                if let Some(hooks) = &self.on_drag {
+                                    shell.publish((hooks.start)(drag.source_commit));
+                                }
+                            }
+                        }
+                        if drag.active {
+                            let spot = if bounds.contains(*position) {
+                                let local_y = (position.y - bounds.y) as f64 + offset;
+                                self.drop_spot_at(local_y)
+                            } else {
+                                None
+                            };
+                            if spot != drag.spot {
+                                drag.spot = spot;
+                                if let Some(hooks) = &self.on_drag {
+                                    shell.publish((hooks.hover)(spot));
+                                }
+                            }
+                            state.cursor_position = None;
+                            state.hovered_file_item = None;
+                            state.hovered_revision_item = None;
+                            state.hovered_lane = None;
+                            shell.capture_event();
+                            shell.request_redraw();
+                            break 'event;
+                        }
+                    }
+                    // Target mode without a live drag: mirror the hovered commit
+                    // row to the app so mouse users get the destination hint +
+                    // preview without dragging. File rows resolve to their
+                    // revision, matching drop semantics.
+                    if let Some(on_target_hover) = self.on_target_hover {
+                        let hovered = if bounds.contains(*position) {
+                            let local_y = (position.y - bounds.y) as f64 + state.vertical_offset;
+                            self.row_at_offset(local_y)
+                                .and_then(|flat| self.drop_commit_of(flat))
+                        } else {
+                            None
+                        };
+                        if state.target_hover != hovered {
+                            state.target_hover = hovered;
+                            shell.publish(on_target_hover(hovered));
+                        }
+                    } else {
+                        state.target_hover = None;
+                    }
+                    if bounds.contains(*position) {
+                        state.cursor_position = Some(*position);
+                    } else {
+                        state.cursor_position = None;
+                    }
+                    let prev_file = state.hovered_file_item;
+                    let prev_revision = state.hovered_revision_item;
+                    let prev_lane = state.hovered_lane;
+                    recompute_hover(state, self);
+                    if state.hovered_file_item != prev_file
+                        || state.hovered_revision_item != prev_revision
+                        || state.hovered_lane != prev_lane
+                    {
                         shell.request_redraw();
                     }
+                }
+                Event::Mouse(mouse::Event::CursorLeft) => {
                     state.cursor_position = None;
+                    if state.target_hover.take().is_some()
+                        && let Some(on_target_hover) = self.on_target_hover
+                    {
+                        shell.publish(on_target_hover(None));
+                    }
                     let had_hover = state.hovered_file_item.take().is_some()
                         || state.hovered_revision_item.take().is_some()
                         || state.hovered_lane.take().is_some();
                     if had_hover {
                         shell.request_redraw();
                     }
-                    if state.vertical_offset != prev_offset
-                        && let Some(cb) = on_scroll
-                    {
-                        shell.publish(cb(state.vertical_offset));
-                    }
-                    return;
                 }
-                // Drag-to-rebase tracking: past a small threshold the press
-                // becomes a drag; from then on the widget owns the cursor
-                // (no hover washes) and mirrors spot changes to the app.
-                if self.on_drag.is_some()
-                    && let Some(drag) = state.drag.as_mut()
-                {
-                    let offset = state.vertical_offset;
-                    drag.cursor = *position;
-                    if !drag.active {
-                        let dx = position.x - drag.origin.x;
-                        let dy = position.y - drag.origin.y;
-                        if (dx * dx + dy * dy).sqrt() >= 6.0 {
-                            drag.active = true;
-                            // The drag owns spot publishing from here; reset
-                            // the plain-hover dedupe so the first post-drag
-                            // hover re-publishes whatever it lands on.
-                            state.target_hover = None;
-                            if let Some(hooks) = &self.on_drag {
-                                shell.publish((hooks.start)(drag.source_commit));
-                            }
-                        }
+                Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
+                    if cursor.position_over(bounds).is_none() {
+                        break 'event;
                     }
-                    if drag.active {
-                        let spot = if bounds.contains(*position) {
-                            let local_y = (position.y - bounds.y) as f64 + offset;
-                            self.drop_spot_at(local_y)
-                        } else {
-                            None
-                        };
-                        if spot != drag.spot {
-                            drag.spot = spot;
-                            if let Some(hooks) = &self.on_drag {
-                                shell.publish((hooks.hover)(spot));
-                            }
+                    let movement = match *delta {
+                        mouse::ScrollDelta::Lines { x: _, y } => {
+                            Vector::new(0.0, -y * REVISION_ROW_HEIGHT * LINE_SCROLL_ROWS)
                         }
-                        state.cursor_position = None;
-                        state.hovered_file_item = None;
-                        state.hovered_revision_item = None;
-                        state.hovered_lane = None;
-                        shell.capture_event();
-                        shell.request_redraw();
-                        return;
-                    }
-                }
-                // Target mode without a live drag: mirror the hovered commit
-                // row to the app so mouse users get the destination hint +
-                // preview without dragging. File rows resolve to their
-                // revision, matching drop semantics.
-                if let Some(on_target_hover) = self.on_target_hover {
-                    let hovered = if bounds.contains(*position) {
-                        let local_y = (position.y - bounds.y) as f64 + state.vertical_offset;
-                        self.row_at_offset(local_y)
-                            .and_then(|flat| self.drop_commit_of(flat))
-                    } else {
-                        None
+                        mouse::ScrollDelta::Pixels { x: _, y } => {
+                            Vector::new(0.0, -y * PIXEL_SCROLL_SCALE)
+                        }
                     };
-                    if state.target_hover != hovered {
-                        state.target_hover = hovered;
-                        shell.publish(on_target_hover(hovered));
-                    }
-                } else {
-                    state.target_hover = None;
-                }
-                if bounds.contains(*position) {
-                    state.cursor_position = Some(*position);
-                } else {
-                    state.cursor_position = None;
-                }
-                let prev_file = state.hovered_file_item;
-                let prev_revision = state.hovered_revision_item;
-                let prev_lane = state.hovered_lane;
-                recompute_hover(state, self);
-                if state.hovered_file_item != prev_file
-                    || state.hovered_revision_item != prev_revision
-                    || state.hovered_lane != prev_lane
-                {
-                    shell.request_redraw();
-                }
-            }
-            Event::Mouse(mouse::Event::CursorLeft) => {
-                state.cursor_position = None;
-                if state.target_hover.take().is_some()
-                    && let Some(on_target_hover) = self.on_target_hover
-                {
-                    shell.publish(on_target_hover(None));
-                }
-                let had_hover = state.hovered_file_item.take().is_some()
-                    || state.hovered_revision_item.take().is_some()
-                    || state.hovered_lane.take().is_some();
-                if had_hover {
-                    shell.request_redraw();
-                }
-            }
-            Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
-                if cursor.position_over(bounds).is_none() {
-                    return;
-                }
-                let movement = match *delta {
-                    mouse::ScrollDelta::Lines { x: _, y } => {
-                        Vector::new(0.0, -y * REVISION_ROW_HEIGHT * LINE_SCROLL_ROWS)
-                    }
-                    mouse::ScrollDelta::Pixels { x: _, y } => {
-                        Vector::new(0.0, -y * PIXEL_SCROLL_SCALE)
-                    }
-                };
-                if movement.y != 0.0 {
-                    state.vertical_offset =
-                        (state.vertical_offset + movement.y as f64).clamp(0.0, max_vertical);
-                    let prev = state.hovered_file_item;
-                    recompute_hover(state, self);
-                    shell.capture_event();
-                    shell.request_redraw();
-                    let _ = prev;
-                }
-            }
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                let Some(cursor_pos) = cursor.position_over(bounds) else {
-                    return;
-                };
-                match scrollbar::on_button_pressed(
-                    &mut state.scrollbar,
-                    cursor_pos,
-                    bounds,
-                    content_height,
-                    state.vertical_offset as f32,
-                ) {
-                    scrollbar::ScrollbarEvent::OffsetChanged(new_offset) => {
-                        state.vertical_offset = (new_offset as f64).clamp(0.0, max_vertical);
+                    if movement.y != 0.0 {
+                        state.vertical_offset =
+                            (state.vertical_offset + movement.y as f64).clamp(0.0, max_vertical);
+                        let prev = state.hovered_file_item;
+                        recompute_hover(state, self);
                         shell.capture_event();
                         shell.request_redraw();
-                        if state.vertical_offset != prev_offset
-                            && let Some(cb) = on_scroll
-                        {
-                            shell.publish(cb(state.vertical_offset));
-                        }
-                        return;
+                        let _ = prev;
                     }
-                    scrollbar::ScrollbarEvent::Captured => {
-                        shell.capture_event();
-                        return;
-                    }
-                    scrollbar::ScrollbarEvent::None => {}
                 }
-                let local_y = (cursor_pos.y - bounds.y) as f64 + state.vertical_offset;
-                if let Some(row_idx) = self.row_at_offset(local_y) {
-                    match self.row_kind(row_idx) {
-                        RowKind::Revision(commit) => {
-                            // Arm a potential drag; it only activates past the
-                            // movement threshold, so plain clicks stay clicks.
-                            if self.on_drag.is_some() {
-                                state.drag = Some(DragState {
-                                    source_commit: commit,
-                                    origin: cursor_pos,
-                                    active: false,
-                                    spot: None,
-                                    cursor: cursor_pos,
-                                });
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                    let Some(cursor_pos) = cursor.position_over(bounds) else {
+                        break 'event;
+                    };
+                    match scrollbar::on_button_pressed(
+                        &mut state.scrollbar,
+                        cursor_pos,
+                        bounds,
+                        content_height,
+                        state.vertical_offset as f32,
+                    ) {
+                        scrollbar::ScrollbarEvent::OffsetChanged(new_offset) => {
+                            state.vertical_offset = (new_offset as f64).clamp(0.0, max_vertical);
+                            shell.capture_event();
+                            shell.request_redraw();
+                            break 'event;
+                        }
+                        scrollbar::ScrollbarEvent::Captured => {
+                            shell.capture_event();
+                            break 'event;
+                        }
+                        scrollbar::ScrollbarEvent::None => {}
+                    }
+                    let local_y = (cursor_pos.y - bounds.y) as f64 + state.vertical_offset;
+                    if let Some(row_idx) = self.row_at_offset(local_y) {
+                        match self.row_kind(row_idx) {
+                            RowKind::Revision(commit) => {
+                                // Arm a potential drag; it only activates past the
+                                // movement threshold, so plain clicks stay clicks.
+                                if self.on_drag.is_some() {
+                                    state.drag = Some(DragState {
+                                        source_commit: commit,
+                                        origin: cursor_pos,
+                                        active: false,
+                                        spot: None,
+                                        cursor: cursor_pos,
+                                    });
+                                }
+                                // The select fires on *release* (same row, no
+                                // drag): publishing on press meant starting a
+                                // drag on the selected row toggled its file list
+                                // before the drag ever armed.
+                                if let Item::Revision(rev) = self.item_at(row_idx) {
+                                    state.pending_click = Some((row_idx, rev.selection_key));
+                                }
+                                shell.capture_event();
                             }
-                            // The select fires on *release* (same row, no
-                            // drag): publishing on press meant starting a
-                            // drag on the selected row toggled its file list
-                            // before the drag ever armed.
-                            if let Item::Revision(rev) = self.item_at(row_idx) {
-                                state.pending_click = Some((row_idx, rev.selection_key));
+                            // The callback wants the *display* row index into the
+                            // file tree (directories toggle their collapse state
+                            // by position), not `FileRowView::file_index` — which
+                            // is the document index and `usize::MAX` for dirs.
+                            // File rows never drag, so their click stays on press.
+                            RowKind::File(display_index) => {
+                                state.pending_click = None;
+                                shell.publish((self.on_select_file)(display_index));
+                                shell.capture_event();
                             }
-                            shell.capture_event();
-                        }
-                        // The callback wants the *display* row index into the
-                        // file tree (directories toggle their collapse state
-                        // by position), not `FileRowView::file_index` — which
-                        // is the document index and `usize::MAX` for dirs.
-                        // File rows never drag, so their click stays on press.
-                        RowKind::File(display_index) => {
-                            state.pending_click = None;
-                            shell.publish((self.on_select_file)(display_index));
-                            shell.capture_event();
                         }
                     }
                 }
-            }
-            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-                let pending_click = state.pending_click.take();
-                if let Some(drag) = state.drag.take()
-                    && drag.active
-                {
-                    state.target_hover = None;
-                    if let Some(hooks) = &self.on_drag {
-                        shell.publish((hooks.drop)(drag.spot));
-                    }
-                    shell.capture_event();
-                    shell.request_redraw();
-                } else if let Some((pressed_flat, key)) = pending_click {
-                    // A click completes only when the release lands on the
-                    // row it pressed (button semantics) — releasing after
-                    // drifting off the row aborts instead of mis-selecting.
-                    let released_on_same_row = cursor
-                        .position_over(bounds)
-                        .and_then(|pos| {
-                            let local_y = (pos.y - bounds.y) as f64 + state.vertical_offset;
-                            self.row_at_offset(local_y)
-                        })
-                        .is_some_and(|flat| flat == pressed_flat);
-                    if released_on_same_row {
-                        shell.publish((self.on_select_revision)(key));
-                        shell.capture_event();
-                    }
-                }
-                if let scrollbar::ScrollbarEvent::Captured =
-                    scrollbar::on_button_released(&mut state.scrollbar)
-                {
-                    shell.capture_event();
-                }
-            }
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
-                let Some(cursor_pos) = cursor.position_over(bounds) else {
-                    return;
-                };
-                let local_y = (cursor_pos.y - bounds.y) as f64 + state.vertical_offset;
-                let Some(row_idx) = self.row_at_offset(local_y) else {
-                    return;
-                };
-                // The row's on-screen rect (window-content points) anchors
-                // the native highlight drawn while the menu is open.
-                let row_h = row_height_of(self.row_kind(row_idx));
-                let screen_y = bounds.y + (self.row_top(row_idx) - state.vertical_offset) as f32;
-                let row_rect = Rectangle {
-                    x: bounds.x,
-                    y: screen_y,
-                    width: bounds.width,
-                    height: row_h,
-                };
-                match self.row_kind(row_idx) {
-                    RowKind::Revision(_) => {
-                        let Some(callback) = self.on_context_menu else {
-                            return;
-                        };
-                        if let Item::Revision(rev) = self.item_at(row_idx) {
-                            shell.publish(callback(rev.selection_key, row_rect, cursor_pos));
-                            shell.capture_event();
-                        }
-                    }
-                    RowKind::File(display_index) => {
-                        let Some(callback) = self.on_file_context_menu else {
-                            return;
-                        };
-                        shell.publish(callback(display_index, row_rect, cursor_pos));
-                        shell.capture_event();
-                    }
-                }
-            }
-            Event::Keyboard(iced::keyboard::Event::KeyPressed { key, .. }) => {
-                // Esc abandons an active drag visually; the app's own Esc
-                // handling (the draft cancel) rides the same event through
-                // the subscription.
-                if matches!(
-                    key,
-                    iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape)
-                ) && let Some(drag) = state.drag.take()
-                {
-                    state.pending_click = None;
-                    if drag.active
-                        && let Some(hooks) = &self.on_drag
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                    let pending_click = state.pending_click.take();
+                    if let Some(drag) = state.drag.take()
+                        && drag.active
                     {
-                        shell.publish((hooks.hover)(None));
+                        state.target_hover = None;
+                        if let Some(hooks) = &self.on_drag {
+                            shell.publish((hooks.drop)(drag.spot));
+                        }
+                        shell.capture_event();
+                        shell.request_redraw();
+                    } else if let Some((pressed_flat, key)) = pending_click {
+                        // A click completes only when the release lands on the
+                        // row it pressed (button semantics) — releasing after
+                        // drifting off the row aborts instead of mis-selecting.
+                        let released_on_same_row = cursor
+                            .position_over(bounds)
+                            .and_then(|pos| {
+                                let local_y = (pos.y - bounds.y) as f64 + state.vertical_offset;
+                                self.row_at_offset(local_y)
+                            })
+                            .is_some_and(|flat| flat == pressed_flat);
+                        if released_on_same_row {
+                            shell.publish((self.on_select_revision)(key));
+                            shell.capture_event();
+                        }
                     }
-                    shell.request_redraw();
+                    if let scrollbar::ScrollbarEvent::Captured =
+                        scrollbar::on_button_released(&mut state.scrollbar)
+                    {
+                        shell.capture_event();
+                    }
                 }
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
+                    let Some(cursor_pos) = cursor.position_over(bounds) else {
+                        break 'event;
+                    };
+                    let local_y = (cursor_pos.y - bounds.y) as f64 + state.vertical_offset;
+                    let Some(row_idx) = self.row_at_offset(local_y) else {
+                        break 'event;
+                    };
+                    // The row's on-screen rect (window-content points) anchors
+                    // the native highlight drawn while the menu is open.
+                    let row_h = row_height_of(self.row_kind(row_idx));
+                    let screen_y =
+                        bounds.y + (self.row_top(row_idx) - state.vertical_offset) as f32;
+                    let row_rect = Rectangle {
+                        x: bounds.x,
+                        y: screen_y,
+                        width: bounds.width,
+                        height: row_h,
+                    };
+                    match self.row_kind(row_idx) {
+                        RowKind::Revision(_) => {
+                            let Some(callback) = self.on_context_menu else {
+                                break 'event;
+                            };
+                            if let Item::Revision(rev) = self.item_at(row_idx) {
+                                shell.publish(callback(rev.selection_key, row_rect, cursor_pos));
+                                shell.capture_event();
+                            }
+                        }
+                        RowKind::File(display_index) => {
+                            let Some(callback) = self.on_file_context_menu else {
+                                break 'event;
+                            };
+                            shell.publish(callback(display_index, row_rect, cursor_pos));
+                            shell.capture_event();
+                        }
+                    }
+                }
+                Event::Keyboard(iced::keyboard::Event::KeyPressed { key, .. }) => {
+                    // Esc abandons an active drag visually; the app's own Esc
+                    // handling (the draft cancel) rides the same event through
+                    // the subscription.
+                    if matches!(
+                        key,
+                        iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape)
+                    ) && let Some(drag) = state.drag.take()
+                    {
+                        state.pending_click = None;
+                        if drag.active
+                            && let Some(hooks) = &self.on_drag
+                        {
+                            shell.publish((hooks.hover)(None));
+                        }
+                        shell.request_redraw();
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         }
 
-        // Report any offset change from this pass (wheel, reveal, restore,
-        // clamp) once. The scrollbar early-returns above publish on their own.
+        // Report any offset change from this pass — wheel, scrollbar, reveal,
+        // restore, clamp — exactly once, whichever path produced it.
         if state.vertical_offset != prev_offset
             && let Some(cb) = on_scroll
         {
@@ -1474,6 +1481,7 @@ where
                     Item::Revision(rev) => {
                         self.draw_revision(
                             renderer,
+                            &state.widths,
                             row_bounds,
                             &rev,
                             gutter_total,
@@ -1491,6 +1499,7 @@ where
                             .map(|(level, ..)| level);
                         self.draw_file(
                             renderer,
+                            &state.widths,
                             row_bounds,
                             &f,
                             gutter_total,
@@ -1653,6 +1662,7 @@ impl<'a, Message> RevisionList<'a, Message> {
     fn draw_revision<R>(
         &self,
         renderer: &mut R,
+        widths: &WidthMemo,
         row_bounds: Rectangle,
         rev: &RevisionRowView,
         gutter_total: f32,
@@ -1754,9 +1764,9 @@ impl<'a, Message> RevisionList<'a, Message> {
         let title_mid_y = stack_top + id_size / 2.0;
         let desc_mid_y = stack_top + id_size + line_gap + desc_size / 2.0;
 
-        let prefix_w = measure::line_width(&rev.change_id_prefix, id_size, self.style.mono_font);
-        let suffix_w = measure::line_width(&rev.change_id_suffix, id_size, self.style.mono_font);
-        let commit_w = measure::line_width(&rev.commit_id_short, id_size, self.style.mono_font);
+        let prefix_w = widths.width(&rev.change_id_prefix, id_size, self.style.mono_font);
+        let suffix_w = widths.width(&rev.change_id_suffix, id_size, self.style.mono_font);
+        let commit_w = widths.width(&rev.commit_id_short, id_size, self.style.mono_font);
 
         // === Measurements ===
         let id_gap = 8.0;
@@ -1764,22 +1774,22 @@ impl<'a, Message> RevisionList<'a, Message> {
         let at_marker = matches!(rev.selection_key, RowSelectionKey::WorkingCopy);
         let at_gap = 4.0;
         let at_w = if at_marker {
-            measure::line_width("@", id_size, self.style.mono_font)
+            widths.width("@", id_size, self.style.mono_font)
         } else {
             0.0
         };
-        let author_full_w = measure::line_width(&rev.author, id_size, self.style.primary_font);
-        let ellipsis_w = measure::line_width("…", id_size, self.style.mono_font);
+        let author_full_w = widths.width(&rev.author, id_size, self.style.primary_font);
+        let ellipsis_w = widths.width("…", id_size, self.style.mono_font);
 
         let bm_widths: Vec<f32> = rev
             .bookmark_chips
             .iter()
-            .map(|c| chip::width(&c.label, c.icon, c.font))
+            .map(|c| chip::width_memoized(widths, &c.label, c.icon, c.font))
             .collect();
         let status_widths: Vec<f32> = rev
             .status_chips
             .iter()
-            .map(|c| chip::width(&c.label, c.icon, c.font))
+            .map(|c| chip::width_memoized(widths, &c.label, c.icon, c.font))
             .collect();
         let status_total: f32 = status_widths.iter().sum::<f32>()
             + chip_gap * status_widths.len().saturating_sub(1) as f32;
@@ -1826,8 +1836,12 @@ impl<'a, Message> RevisionList<'a, Message> {
                     let remaining = rev.bookmark_chips.len() - i - 1;
                     let need_overflow = remaining > 0;
                     let overflow_label = format!("+{}", remaining.max(1));
-                    let overflow_chip_w =
-                        chip::width(&overflow_label, None, self.style.primary_font);
+                    let overflow_chip_w = chip::width_memoized(
+                        widths,
+                        &overflow_label,
+                        None,
+                        self.style.primary_font,
+                    );
                     let plus_overflow = if need_overflow {
                         chip_gap + overflow_chip_w
                     } else {
@@ -1843,7 +1857,8 @@ impl<'a, Message> RevisionList<'a, Message> {
                 if visible_bookmarks < rev.bookmark_chips.len() {
                     overflow_count = rev.bookmark_chips.len() - visible_bookmarks;
                     let label = format!("+{overflow_count}");
-                    overflow_w = chip::width(&label, None, self.style.primary_font);
+                    overflow_w =
+                        chip::width_memoized(widths, &label, None, self.style.primary_font);
                 }
                 acc + if overflow_count > 0 {
                     chip_gap + overflow_w
@@ -2002,7 +2017,7 @@ impl<'a, Message> RevisionList<'a, Message> {
             .zip(bm_widths.iter())
             .take(visible_bookmarks)
         {
-            chip::draw(renderer, c, chip_x, title_mid_y, row_clip);
+            chip::draw_memoized(renderer, c, widths, chip_x, title_mid_y, row_clip);
             chip_x += bw + chip_gap;
         }
         if overflow_count > 0 {
@@ -2015,11 +2030,18 @@ impl<'a, Message> RevisionList<'a, Message> {
                 border_dashed: false,
                 icon: None,
             };
-            chip::draw(renderer, &overflow_chip, chip_x, title_mid_y, row_clip);
+            chip::draw_memoized(
+                renderer,
+                &overflow_chip,
+                widths,
+                chip_x,
+                title_mid_y,
+                row_clip,
+            );
             chip_x += overflow_w + chip_gap;
         }
         for (i, c) in rev.status_chips.iter().enumerate() {
-            chip::draw(renderer, c, chip_x, title_mid_y, row_clip);
+            chip::draw_memoized(renderer, c, widths, chip_x, title_mid_y, row_clip);
             chip_x += status_widths[i] + chip_gap;
         }
 
@@ -2037,7 +2059,7 @@ impl<'a, Message> RevisionList<'a, Message> {
         });
         let chevron_size = CHEVRON_TEXT_SIZE;
         let chevron_width = chevron_glyph
-            .map(|glyph| measure::line_width(glyph, chevron_size, icons::ICON_FONT))
+            .map(|glyph| widths.width(glyph, chevron_size, icons::ICON_FONT))
             .unwrap_or(0.0);
         let chevron_gap = if chevron_glyph.is_some() { 6.0 } else { 0.0 };
         let description_width = (content_width - chevron_width - chevron_gap).max(1.0);
@@ -2136,6 +2158,7 @@ impl<'a, Message> RevisionList<'a, Message> {
     fn draw_file<R>(
         &self,
         renderer: &mut R,
+        widths: &WidthMemo,
         row_bounds: Rectangle,
         f: &FileRowView,
         gutter_total: f32,
@@ -2295,10 +2318,11 @@ impl<'a, Message> RevisionList<'a, Message> {
                 border_dashed: false,
                 icon: None,
             };
-            let chip_w = chip::width(&f.status_label, None, self.style.mono_font);
-            chip::draw(
+            let chip_w = chip::width_memoized(widths, &f.status_label, None, self.style.mono_font);
+            chip::draw_memoized(
                 renderer,
                 &status_chip,
+                widths,
                 chip_left + ((chip_col - chip_w) / 2.0).max(0.0),
                 row_mid_y,
                 row_clip,

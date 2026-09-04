@@ -89,9 +89,13 @@ track-alloc = []
 # source — drops the `notify` dependency.
 watcher = ["dep:notify"]
 
+[dev-dependencies]
+# `tokio::time::pause`, so the watcher's debounce is tested against a virtual
+# clock rather than by sleeping through it.
+tokio = { version = "1.44", features = ["test-util"] }
+
 [dependencies]
 anyhow = "1.0"
-async-trait = "0.1"
 bstr = "1.12"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 futures = "0.3"
