@@ -196,6 +196,7 @@ fn build_source_filter(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         ui.config.mono_font,
         crate::field::FilterField {
             id: SOURCE_FILTER_INPUT_ID,
+            leading_icon: Some(icons::SEARCH),
             placeholder: "search files — fuzzy",
             value: &ui.active().source.filter,
             on_input: |query| Message::Ui(UiEvent::SourceFilterChanged(query)),
@@ -324,7 +325,7 @@ pub fn build_source_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
 
 /// A blank [`RevisionRowView`] for the files-only source list's revision
 /// builder slot — never rendered (the list has zero revision rows).
-fn empty_revision_row(theme: ThemeSpec) -> RevisionRowView {
+pub(crate) fn empty_revision_row(theme: ThemeSpec) -> RevisionRowView {
     let frame = diffui_core::graph::LaneFrame::solo();
     let columns = frame.display_columns();
     RevisionRowView {

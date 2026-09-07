@@ -29,13 +29,23 @@ pub const MIN_DIFF_PANE_WIDTH: f32 = 240.0;
 /// grab band off-screen, and that width is what gets persisted. The floor wins
 /// on a window too narrow to honour both.
 pub fn clamp_width(width: f32, min_width: f32, window_width: f32) -> f32 {
-    let max_width = (window_width - MIN_DIFF_PANE_WIDTH).max(min_width);
+    clamp_width_with_reserve(width, min_width, window_width, MIN_DIFF_PANE_WIDTH)
+}
+
+pub fn clamp_width_with_reserve(
+    width: f32,
+    min_width: f32,
+    window_width: f32,
+    right_reserve: f32,
+) -> f32 {
+    let max_width = (window_width - right_reserve).max(min_width);
     width.clamp(min_width, max_width)
 }
 
 pub struct ResizeHandle<Message> {
     handle_x: f32,
     min_width: f32,
+    right_reserve: f32,
     hit_padding: f32,
     on_resize: fn(f32) -> Message,
 }
@@ -50,9 +60,15 @@ impl<Message> ResizeHandle<Message> {
         Self {
             handle_x,
             min_width,
+            right_reserve: MIN_DIFF_PANE_WIDTH,
             hit_padding,
             on_resize,
         }
+    }
+
+    pub fn right_reserve(mut self, width: f32) -> Self {
+        self.right_reserve = width;
+        self
     }
 
     fn hit_band(&self, bounds: Rectangle) -> Rectangle {
@@ -139,8 +155,12 @@ where
                 let delta = position.x - drag.start_cursor_x;
                 // The overlay spans the whole body, so its bounds are the room
                 // the split has to divide.
-                let new_width =
-                    clamp_width(drag.start_handle_x + delta, self.min_width, bounds.width);
+                let new_width = clamp_width_with_reserve(
+                    drag.start_handle_x + delta,
+                    self.min_width,
+                    bounds.width,
+                    self.right_reserve,
+                );
                 if (new_width - self.handle_x).abs() > f32::EPSILON {
                     shell.publish((self.on_resize)(new_width));
                 }

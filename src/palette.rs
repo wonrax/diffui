@@ -24,7 +24,7 @@ use iced::{
     border,
     font::Weight,
     widget::{
-        Space, column, container, mouse_area, opaque, pin, responsive, row, scrollable,
+        Space, button, column, container, mouse_area, opaque, pin, responsive, row, scrollable,
         scrollable::{Direction, Scrollbar},
         stack, text,
     },
@@ -848,32 +848,69 @@ fn column_header<'a>(
     theme: ThemeSpec,
     column_state: &'a PaletteColumn,
 ) -> Element<'a, Message> {
-    let label = match &column_state.source {
-        ColumnSource::Root => "Search".to_owned(),
-        ColumnSource::Actions(target) => format!("Actions · {}", target_label(target, ui)),
-    };
-    container(
-        text(label)
+    let content: Element<'_, Message> = match &column_state.source {
+        ColumnSource::Root => {
+            let active_prefix = column_state
+                .query
+                .chars()
+                .next()
+                .filter(|c| ">@:".contains(*c));
+            let mut scopes = row![].spacing(theme::space::XS);
+            for (label, prefix) in [
+                ("All", None),
+                ("Commands", Some('>')),
+                ("Files", Some('@')),
+                ("Commits", Some(':')),
+            ] {
+                let active = active_prefix == prefix;
+                scopes = scopes.push(
+                    button(text(label).size(text_size::CAPTION).font(ui.config.ui_font))
+                        .padding([3, 7])
+                        .on_press(Message::Palette(PaletteMessage::QueryChanged(
+                            prefix.map(|value| value.to_string()).unwrap_or_default(),
+                        )))
+                        .style(move |_, status| {
+                            let mut style = theme::ghost_button_style(theme, status);
+                            if active {
+                                style.background = Some(Background::Color(theme.selected_file));
+                                style.text_color = theme.text;
+                            } else {
+                                style.text_color = theme.muted_text;
+                            }
+                            style
+                        }),
+                );
+            }
+            row![
+                text("Search")
+                    .size(text_size::CAPTION)
+                    .font(theme::emphasis_font(ui.config.ui_font, Weight::Medium))
+                    .color(theme.subtle_text),
+                Space::new().width(Length::Fill),
+                scopes,
+            ]
+            .align_y(alignment::Vertical::Center)
+            .into()
+        }
+        ColumnSource::Actions(target) => text(format!("Actions · {}", target_label(target, ui)))
             .size(text_size::CAPTION)
-            // `emphasis_font` is a no-op on the default UI font (generic
-            // sans-serif) — see its docs for why. On macOS the generic
-            // family won't resolve to a Medium-weight face and we'd
-            // render tofu boxes instead of letters.
             .font(theme::emphasis_font(ui.config.ui_font, Weight::Medium))
-            .color(theme.subtle_text),
-    )
-    .padding([10, 16])
-    .width(Length::Fill)
-    .style(move |_| container::Style {
-        background: Some(Background::Color(theme.panel_background)),
-        border: Border {
-            width: 0.0,
-            color: Color::TRANSPARENT,
-            radius: border::Radius::default().top(theme::radius::SURFACE - 1.0),
-        },
-        ..container::Style::default()
-    })
-    .into()
+            .color(theme.subtle_text)
+            .into(),
+    };
+    container(content)
+        .padding([theme::space::MD, theme::space::XL])
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(theme.panel_background)),
+            border: Border {
+                width: 0.0,
+                color: Color::TRANSPARENT,
+                radius: border::Radius::default().top(theme::radius::SURFACE - 1.0),
+            },
+            ..container::Style::default()
+        })
+        .into()
 }
 
 fn build_input<'a>(

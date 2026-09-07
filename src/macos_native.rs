@@ -17,13 +17,36 @@ use std::cell::Cell;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
-use objc2_app_kit::{NSApplication, NSEvent, NSMenu, NSMenuItem};
+use objc2_app_kit::{NSApplication, NSEvent, NSMenu, NSMenuItem, NSModalResponseOK, NSOpenPanel};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_core_graphics::CGColor;
 use objc2_foundation::{
     MainThreadMarker, NSNumber, NSObject, NSObjectProtocol, NSString, ns_string,
 };
 use objc2_quartz_core::{CABasicAnimation, CALayer, CAMediaTiming, CATransaction};
+
+/// Show the system directory picker and return the selected working-copy path.
+pub fn choose_repository_folder() -> Option<String> {
+    let mtm = MainThreadMarker::new()?;
+    let panel = NSOpenPanel::openPanel(mtm);
+    panel.setCanChooseDirectories(true);
+    panel.setCanChooseFiles(false);
+    panel.setAllowsMultipleSelection(false);
+    panel.setResolvesAliases(true);
+    panel.setPrompt(Some(ns_string!("Open repository")));
+    panel.setMessage(Some(ns_string!(
+        "Choose a folder containing a jj or Git working copy."
+    )));
+
+    if panel.runModal() != NSModalResponseOK {
+        return None;
+    }
+    panel
+        .URLs()
+        .firstObject()?
+        .path()
+        .map(|path| path.to_string())
+}
 
 /// A node in a native popup menu. Leaves carry a caller-chosen `id` that
 /// `popup_menu` returns when that leaf is picked (across any submenu depth).

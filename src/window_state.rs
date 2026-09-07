@@ -1,4 +1,4 @@
-//! Persisted window geometry + sidebar width, restored on the next launch.
+//! Persisted window geometry + navigation-pane widths, restored on launch.
 //!
 //! Window position/size and the sidebar split are *state* rather than
 //! configuration — per-machine UI layout that should survive a restart but
@@ -44,6 +44,16 @@ pub struct WindowState {
     pub y: Option<f32>,
     #[serde(default)]
     pub sidebar_width: Option<f32>,
+    /// Last expanded width of the changed-files tree.
+    #[serde(default)]
+    pub file_nav_width: Option<f32>,
+    /// Per-repository panel visibility. Maps keep the layout each tab had
+    /// instead of forcing every restored repository into the active tab's
+    /// arrangement.
+    #[serde(default)]
+    pub history_panel_collapsed: BTreeMap<String, bool>,
+    #[serde(default)]
+    pub files_panel_collapsed: BTreeMap<String, bool>,
     /// Whether the diff pane wraps long lines. `None` (older state files)
     /// falls back to wrapping on.
     #[serde(default)]
@@ -252,6 +262,12 @@ mod tests {
             x: Some(100.0),
             y: Some(50.0),
             sidebar_width: Some(280.0),
+            file_nav_width: Some(220.0),
+            history_panel_collapsed: BTreeMap::from([
+                ("/a/repo".to_owned(), true),
+                ("/b/repo".to_owned(), false),
+            ]),
+            files_panel_collapsed: BTreeMap::from([("/b/repo".to_owned(), true)]),
             diff_wrap: Some(false),
             diff_split: Some(true),
             open_repos: vec!["/a/repo".to_owned(), "/b/repo".to_owned()],
@@ -267,6 +283,9 @@ mod tests {
         assert_eq!(parsed.size(), Some((1200.0, 800.0)));
         assert_eq!(parsed.position(), Some((100.0, 50.0)));
         assert_eq!(parsed.sidebar_width, Some(280.0));
+        assert_eq!(parsed.file_nav_width, Some(220.0));
+        assert_eq!(parsed.history_panel_collapsed.get("/a/repo"), Some(&true));
+        assert_eq!(parsed.files_panel_collapsed.get("/b/repo"), Some(&true));
         assert_eq!(parsed.diff_wrap, Some(false));
         assert_eq!(parsed.diff_split, Some(true));
         assert_eq!(
@@ -292,6 +311,9 @@ mod tests {
         assert_eq!(empty.size(), None);
         assert_eq!(empty.position(), None);
         assert_eq!(empty.sidebar_width, None);
+        assert_eq!(empty.file_nav_width, None);
+        assert!(empty.history_panel_collapsed.is_empty());
+        assert!(empty.files_panel_collapsed.is_empty());
 
         // A file with only the sidebar width keeps it and leaves geometry unset.
         let partial: WindowState =

@@ -58,11 +58,12 @@ const FILE_CHEVRON_COL: f32 = 14.0;
 const FILE_ICON_COL: f32 = 18.0;
 /// Glyph size of the file/folder icon.
 const FILE_ICON_SIZE: f32 = 12.0;
+const FILE_NAME_TEXT_SIZE: f32 = crate::theme::text_size::BODY;
 pub const GUTTER_LEFT_PADDING: f32 = 8.0;
 pub const GUTTER_PADDING: f32 = 8.0;
 const CONTENT_PADDING: f32 = 12.0;
 const SMALL_TEXT_SIZE: f32 = crate::theme::text_size::BODY_LG;
-const CAPTION_TEXT_SIZE: f32 = crate::theme::text_size::BODY;
+const CAPTION_TEXT_SIZE: f32 = crate::theme::text_size::CAPTION;
 /// Text size for the collapse/expand chevron on the selected revision row. The
 /// old `▾` triangle needed an oversize bump to stay legible (it shrank to ~5px
 /// of actual ink); the Lucide glyph fills its box, so a near-text size reads
@@ -1753,7 +1754,9 @@ impl<'a, Message> RevisionList<'a, Message> {
         let row_clip = row_bounds;
         let content_width = (row_bounds.width - gutter_total - content_right_pad).max(1.0);
 
-        // Two-line stack: ids/author/chips on top, description below.
+        // Two-line stack: human-readable description first, identifiers and
+        // status second. History is scanned by intent; ids remain close by for
+        // disambiguation and copy workflows.
         // Sizes use cap-height for stack math rather than the rendered
         // line-box so the gap stays visually tight.
         let id_size = CAPTION_TEXT_SIZE;
@@ -1761,8 +1764,8 @@ impl<'a, Message> RevisionList<'a, Message> {
         let line_gap = 4.0;
         let stack_height = id_size + line_gap + desc_size;
         let stack_top = row_bounds.y + ((row_bounds.height - stack_height) / 2.0).max(0.0);
-        let title_mid_y = stack_top + id_size / 2.0;
-        let desc_mid_y = stack_top + id_size + line_gap + desc_size / 2.0;
+        let desc_mid_y = stack_top + desc_size / 2.0;
+        let title_mid_y = stack_top + desc_size + line_gap + id_size / 2.0;
 
         let prefix_w = widths.width(&rev.change_id_prefix, id_size, self.style.mono_font);
         let suffix_w = widths.width(&rev.change_id_suffix, id_size, self.style.mono_font);
@@ -2299,7 +2302,7 @@ impl<'a, Message> RevisionList<'a, Message> {
             path_x,
             row_mid_y,
             path_w,
-            CAPTION_TEXT_SIZE,
+            FILE_NAME_TEXT_SIZE,
             f.primary_color,
             self.style.primary_font,
             row_clip,

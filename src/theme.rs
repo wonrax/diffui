@@ -1,5 +1,5 @@
 use iced::{
-    Background, Border, Color, Element, Font, Length, Shadow, Theme, Vector, border,
+    Background, Border, Color, Element, Font, Length, Padding, Shadow, Theme, Vector, border,
     font::{Family, Weight},
     theme,
     widget::{button, container, scrollable, text, text_input},
@@ -39,6 +39,7 @@ pub fn emphasis_font(base: Font, weight: Weight) -> Font {
 /// `DiffView`.
 pub const SCROLLBAR_WIDTH: f32 = 8.0;
 pub const SCROLLBAR_MARGIN: f32 = 2.0;
+pub const COLLAPSED_PANEL_WIDTH: f32 = 36.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThemePreference {
@@ -74,7 +75,7 @@ impl ResolvedTheme {
         match self {
             // Dark-first warm ink with a coral accent. Tokens mirror the
             // Diffui v2 design system: `bg-canvas`, `bg-pane`, `bg-elev`,
-            // `bg-active`, `ink-100..300`, `accent #FF7A59`. The trunk lane
+            // `bg-active`, `ink-100..300`, and a vivid coral accent. The trunk lane
             // is intentionally decoupled from the accent — the accent is
             // reserved for the working copy, selection, and focus, while
             // the graph rides on a violet base so coral doesn't fight the
@@ -83,32 +84,32 @@ impl ResolvedTheme {
                 background: Color::from_rgb(0.043, 0.051, 0.071),
                 panel_background: Color::from_rgb(0.067, 0.078, 0.106),
                 panel_background_elevated: Color::from_rgb(0.094, 0.110, 0.145),
-                selected_file: Color::from_rgb(0.153, 0.176, 0.231),
+                selected_file: Color::from_rgb(0.160, 0.178, 0.255),
                 text: Color::from_rgb(0.902, 0.910, 0.933),
                 muted_text: Color::from_rgb(0.690, 0.710, 0.761),
                 subtle_text: Color::from_rgb(0.563, 0.584, 0.643),
-                accent: Color::from_rgb(1.000, 0.478, 0.349),
-                added_line: Color::from_rgba(0.357, 0.773, 0.478, 0.07),
-                removed_line: Color::from_rgba(0.936, 0.487, 0.424, 0.07),
-                added_text: Color::from_rgb(0.357, 0.773, 0.478),
-                removed_text: Color::from_rgb(0.936, 0.487, 0.424),
-                modified_token: Color::from_rgb(0.961, 0.706, 0.345),
-                info: Color::from_rgb(0.416, 0.659, 1.000),
+                accent: Color::from_rgb(1.000, 0.400, 0.245),
+                added_line: Color::from_rgba(0.263, 0.843, 0.463, 0.11),
+                removed_line: Color::from_rgba(1.000, 0.408, 0.349, 0.10),
+                added_text: Color::from_rgb(0.263, 0.843, 0.463),
+                removed_text: Color::from_rgb(1.000, 0.408, 0.349),
+                modified_token: Color::from_rgb(1.000, 0.706, 0.220),
+                info: Color::from_rgb(0.310, 0.655, 1.000),
                 // A step *lighter* than the elevated code surface so the
                 // strip reads as a raised header rather than a hole cut
                 // into the scroll body.
                 file_header: Color::from_rgb(0.122, 0.141, 0.184),
-                hunk_header: Color::from_rgba(0.416, 0.659, 1.000, 0.08),
-                conflict_marker: Color::from_rgb(0.958, 0.469, 0.469),
+                hunk_header: Color::from_rgba(0.310, 0.655, 1.000, 0.12),
+                conflict_marker: Color::from_rgb(1.000, 0.408, 0.443),
                 border: Color::from_rgb(0.137, 0.153, 0.196),
-                note_background: Color::from_rgba(0.961, 0.706, 0.345, 0.14),
-                note_text: Color::from_rgb(0.961, 0.706, 0.345),
-                lane_base: Color::from_rgb(0.655, 0.545, 0.980),
-                syntax_keyword: Color::from_rgb(0.729, 0.624, 0.996),
-                syntax_type: Color::from_rgb(0.337, 0.788, 0.745),
-                syntax_function: Color::from_rgb(0.541, 0.729, 1.000),
-                syntax_literal: Color::from_rgb(0.961, 0.706, 0.345),
-                syntax_property: Color::from_rgb(0.557, 0.812, 0.902),
+                note_background: Color::from_rgba(1.000, 0.706, 0.220, 0.17),
+                note_text: Color::from_rgb(1.000, 0.706, 0.220),
+                lane_base: Color::from_rgb(0.690, 0.510, 1.000),
+                syntax_keyword: Color::from_rgb(0.760, 0.610, 1.000),
+                syntax_type: Color::from_rgb(0.260, 0.840, 0.755),
+                syntax_function: Color::from_rgb(0.480, 0.725, 1.000),
+                syntax_literal: Color::from_rgb(1.000, 0.706, 0.220),
+                syntax_property: Color::from_rgb(0.460, 0.820, 0.930),
             },
             // Neutral whites — panes are pure white, canvas is a faint
             // gray so the panes still read as elevated. Coral accent stays
@@ -126,33 +127,33 @@ impl ResolvedTheme {
                 background: Color::from_rgb(0.957, 0.957, 0.961),
                 panel_background: Color::from_rgb(1.000, 1.000, 1.000),
                 panel_background_elevated: Color::from_rgb(0.976, 0.976, 0.980),
-                selected_file: Color::from_rgb(0.910, 0.918, 0.933),
+                selected_file: Color::from_rgb(0.923, 0.910, 0.957),
                 text: Color::from_rgb(0.106, 0.114, 0.133),
                 muted_text: Color::from_rgb(0.314, 0.337, 0.380),
                 subtle_text: Color::from_rgb(0.392, 0.410, 0.451),
-                accent: Color::from_rgb(0.632, 0.204, 0.091),
-                added_line: Color::from_rgba(0.120, 0.405, 0.238, 0.06),
-                removed_line: Color::from_rgba(0.642, 0.198, 0.148, 0.05),
-                added_text: Color::from_rgb(0.120, 0.405, 0.238),
-                removed_text: Color::from_rgb(0.642, 0.198, 0.148),
-                modified_token: Color::from_rgb(0.488, 0.327, 0.084),
-                info: Color::from_rgb(0.119, 0.345, 0.702),
+                accent: Color::from_rgb(0.690, 0.160, 0.055),
+                added_line: Color::from_rgba(0.020, 0.410, 0.190, 0.10),
+                removed_line: Color::from_rgba(0.670, 0.130, 0.105, 0.09),
+                added_text: Color::from_rgb(0.020, 0.410, 0.190),
+                removed_text: Color::from_rgb(0.670, 0.130, 0.105),
+                modified_token: Color::from_rgb(0.490, 0.290, 0.000),
+                info: Color::from_rgb(0.050, 0.310, 0.700),
                 // Same role as in the dark theme: distinct from the white
                 // code surface so file headers stand out as the scroll
                 // body slides past, but not so dark that it overpowers
                 // the body content.
                 file_header: Color::from_rgb(0.949, 0.953, 0.961),
-                hunk_header: Color::from_rgba(0.119, 0.345, 0.702, 0.06),
-                conflict_marker: Color::from_rgb(0.642, 0.198, 0.148),
+                hunk_header: Color::from_rgba(0.050, 0.310, 0.700, 0.09),
+                conflict_marker: Color::from_rgb(0.690, 0.115, 0.150),
                 border: Color::from_rgb(0.882, 0.886, 0.898),
-                note_background: Color::from_rgba(0.488, 0.327, 0.084, 0.14),
-                note_text: Color::from_rgb(0.500, 0.320, 0.045),
-                lane_base: Color::from_rgb(0.486, 0.357, 0.910),
-                syntax_keyword: Color::from_rgb(0.399, 0.202, 0.839),
-                syntax_type: Color::from_rgb(0.038, 0.402, 0.377),
-                syntax_function: Color::from_rgb(0.134, 0.346, 0.673),
-                syntax_literal: Color::from_rgb(0.502, 0.320, 0.057),
-                syntax_property: Color::from_rgb(0.110, 0.378, 0.521),
+                note_background: Color::from_rgba(0.490, 0.290, 0.000, 0.17),
+                note_text: Color::from_rgb(0.490, 0.290, 0.000),
+                lane_base: Color::from_rgb(0.430, 0.235, 0.890),
+                syntax_keyword: Color::from_rgb(0.420, 0.145, 0.850),
+                syntax_type: Color::from_rgb(0.000, 0.405, 0.350),
+                syntax_function: Color::from_rgb(0.070, 0.315, 0.690),
+                syntax_literal: Color::from_rgb(0.490, 0.290, 0.000),
+                syntax_property: Color::from_rgb(0.000, 0.365, 0.540),
             },
             Self::HighContrast => ThemeSpec {
                 background: Color::BLACK,
@@ -261,11 +262,11 @@ pub fn diff_palette(theme: ThemeSpec) -> Palette {
         // wash of the add/del *text* color tracks both light and dark themes
         // without growing the theme spec.
         addition_emphasis: Color {
-            a: 0.28,
+            a: 0.32,
             ..theme.added_text
         },
         deletion_emphasis: Color {
-            a: 0.28,
+            a: 0.32,
             ..theme.removed_text
         },
         note_background: theme.note_background,
@@ -273,11 +274,11 @@ pub fn diff_palette(theme: ThemeSpec) -> Palette {
         border: theme.border,
         // Translucent accent so the underlying syntax-highlighted text and
         // line-change tints stay readable under the selection. Alpha tuned
-        // to match the design's `--accent-soft` token — strong enough to
+        // to match the design's accent wash — strong enough to
         // clearly mark the selection, soft enough to keep the diff colors
         // legible behind it.
         selection: Color {
-            a: 0.18,
+            a: 0.20,
             ..theme.accent
         },
         scrollbar: scrollbar_style(theme),
@@ -385,12 +386,10 @@ pub fn diff_panel_style(theme: ThemeSpec) -> container::Style {
 /// the chip reads independently of whether the row is selected — its visual
 /// frame comes from the tint rather than from the row's solid background.
 ///
-/// Alpha picked to match the design system's `--*-soft` tokens (e.g.
-/// `--accent-soft: rgba(..,..,..,.14)`, `--add-soft: rgba(..,..,..,.13)`).
-/// The previous 0.20 made the chip dominate the row; .14 keeps it as a
-/// quiet tint that lets the colored glyph carry the signal.
+/// The tint stays translucent enough for selected rows to read through it,
+/// while carrying enough chroma to make status easy to scan.
 pub fn chip_background(color: Color) -> Color {
-    Color { a: 0.14, ..color }
+    Color { a: 0.18, ..color }
 }
 
 /// Saturated color for a file's status letter chip. Mapping follows the
@@ -427,6 +426,63 @@ pub mod text_size {
     pub const TITLE: f32 = 15.0;
     /// The welcome screen's app heading.
     pub const DISPLAY: f32 = 22.0;
+}
+
+/// Shared spatial rhythm. Components can make small optical corrections, but
+/// their structural gaps and insets should come from this scale.
+pub mod space {
+    pub const XXS: f32 = 2.0;
+    pub const XS: f32 = 4.0;
+    pub const SM: f32 = 6.0;
+    pub const MD: f32 = 8.0;
+    pub const LG: f32 = 12.0;
+    pub const XL: f32 = 16.0;
+    pub const XXL: f32 = 24.0;
+}
+
+/// App-wide control geometry. Fixed heights keep adjacent controls aligned
+/// even when their labels use different fonts.
+pub mod control {
+    pub const COMPACT: f32 = 28.0;
+    pub const STANDARD: f32 = 32.0;
+}
+
+/// Centers the visible ink of text and icon-font glyphs inside a fixed-height
+/// control. Their line boxes are mathematically centered but carry a little
+/// more space below the baseline, so a 1px top inset produces a half-point
+/// optical correction without changing the control's measured size.
+pub fn centered_control_content<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    container(content)
+        .height(Length::Fill)
+        .padding(Padding {
+            top: 1.0,
+            right: 0.0,
+            bottom: 0.0,
+            left: 0.0,
+        })
+        .center_y(Length::Fill)
+        .into()
+}
+
+/// Optical centering for a control whose outer button/container has an
+/// explicit width. Unlike [`centered_control_content`], this intentionally
+/// fills the available width so icon-only controls center horizontally too.
+pub fn centered_control_content_fill<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    container(content)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(Padding {
+            top: 1.0,
+            right: 0.0,
+            bottom: 0.0,
+            left: 0.0,
+        })
+        .center(Length::Fill)
+        .into()
 }
 
 /// Corner radii shared across the chrome. Chips keep their own tighter
@@ -481,19 +537,6 @@ pub(crate) fn mix(a: Color, b: Color, t: f32) -> Color {
     }
 }
 
-/// Whisper of a drop shadow shared by the raised/primary/destructive
-/// buttons — just enough to lift them off the bar, nowhere near a card.
-fn button_shadow() -> Shadow {
-    Shadow {
-        color: Color {
-            a: 0.15,
-            ..Color::BLACK
-        },
-        offset: Vector::new(0.0, 1.0),
-        blur_radius: 2.0,
-    }
-}
-
 /// Fill for [`raised_button_style`] at rest: a flat step from the toolbar
 /// surface toward the selection tone, so the button separates from the
 /// (also elevated) bar it sits on. Lighter on dark themes, darker on
@@ -511,14 +554,13 @@ pub fn well_fill(theme: ThemeSpec) -> Color {
 }
 
 /// The standard button: a flat fill one step above its surface, a crisp
-/// 1px border, and a whisper of drop shadow — visible at rest without any
-/// skeuomorphic shading. Hover deepens the fill; pressing deepens it
-/// further and drops the shadow so the button reads as pushed in.
+/// 1px border. Hover and press states deepen the fill without moving the
+/// control or adding elevation.
 pub fn raised_button_style(theme: ThemeSpec, status: button::Status) -> button::Style {
-    let (fill, shadow) = match status {
-        button::Status::Pressed => (raised_fill(theme, 0.9), Shadow::default()),
-        button::Status::Hovered => (raised_fill(theme, 0.65), button_shadow()),
-        _ => (raised_fill(theme, 0.35), button_shadow()),
+    let fill = match status {
+        button::Status::Pressed => raised_fill(theme, 0.9),
+        button::Status::Hovered => raised_fill(theme, 0.65),
+        _ => raised_fill(theme, 0.35),
     };
     button::Style {
         background: Some(Background::Color(fill)),
@@ -528,24 +570,42 @@ pub fn raised_button_style(theme: ThemeSpec, status: button::Status) -> button::
             color: theme.border,
             radius: radius::BUTTON.into(),
         },
-        shadow,
+        shadow: Shadow::default(),
         snap: true,
     }
 }
 
-/// Primary call-to-action: flat accent fill with the raised buttons\'
-/// whisper of shadow, inverted label. The one loudest action on a
-/// surface (the welcome screen\'s "Open repository…").
-pub fn primary_button_style(theme: ThemeSpec) -> button::Style {
+/// Primary call-to-action: informational blue fill with an inverted label.
+/// Keeping actions blue leaves coral
+/// for selection and working-copy state, away from destructive red.
+pub fn primary_button_style(theme: ThemeSpec, status: button::Status) -> button::Style {
+    if matches!(status, button::Status::Disabled) {
+        return button::Style {
+            background: Some(Background::Color(raised_fill(theme, 0.2))),
+            text_color: theme.subtle_text,
+            border: Border {
+                width: 1.0,
+                color: theme.border,
+                radius: radius::BUTTON.into(),
+            },
+            shadow: Shadow::default(),
+            snap: true,
+        };
+    }
+    let fill = match status {
+        button::Status::Hovered => mix(theme.info, theme.text, 0.08),
+        button::Status::Pressed => mix(theme.info, theme.background, 0.12),
+        _ => theme.info,
+    };
     button::Style {
-        background: Some(Background::Color(theme.accent)),
+        background: Some(Background::Color(fill)),
         text_color: theme.background,
         border: Border {
             width: 0.0,
             color: Color::TRANSPARENT,
             radius: radius::BUTTON.into(),
         },
-        shadow: button_shadow(),
+        shadow: Shadow::default(),
         snap: true,
     }
 }
@@ -561,7 +621,7 @@ pub fn destructive_button_style(theme: ThemeSpec) -> button::Style {
             color: Color::TRANSPARENT,
             radius: radius::BUTTON.into(),
         },
-        shadow: button_shadow(),
+        shadow: Shadow::default(),
         snap: true,
     }
 }
@@ -748,7 +808,7 @@ mod tests {
             over(spec.hunk_header, code),
             over(
                 Color {
-                    a: 0.18,
+                    a: 0.20,
                     ..spec.accent
                 },
                 code,
@@ -794,7 +854,7 @@ mod tests {
             TEXT,
         ));
         // Inverted labels on a filled button.
-        pairs.push(("primary button label", spec.background, spec.accent, TEXT));
+        pairs.push(("primary button label", spec.background, spec.info, TEXT));
         pairs.push((
             "destructive button label",
             spec.background,

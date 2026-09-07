@@ -5,19 +5,58 @@
 
 use iced::{
     Background, Border, Color, Element, Font, Length, Padding, alignment, mouse,
-    widget::{Space, container, mouse_area, row},
+    widget::{Space, button, container, mouse_area, row, text, tooltip},
 };
 
 use crate::input::text_input;
 
 use crate::theme::{self, ThemeSpec};
-use crate::{HoverTarget, Message, ToolbarMenu, UiEvent};
+use crate::{Action, HoverTarget, Message, ToolbarMenu, UiEvent};
 
 /// Fixed height of the field well; the caret square derives from it.
-pub const FIELD_HEIGHT: f32 = 28.0;
+pub const FIELD_HEIGHT: f32 = theme::control::COMPACT;
+/// Equal breathing room around panel collapse buttons. Panel headers use this
+/// on all four sides so the square hover wash sits optically centered between
+/// the surrounding content and panel edges.
+pub const PANEL_TOGGLE_INSET: f32 = theme::space::XS;
 /// Gap between the caret square and the field's top/right/bottom edges —
 /// equal on all three sides so the caret reads as a centered inset button.
 const CARET_MARGIN: f32 = 3.0;
+
+pub(crate) fn panel_toggle_button<'a>(
+    font: Font,
+    theme: ThemeSpec,
+    glyph: &'static str,
+    label: &'static str,
+    action: Action,
+) -> Element<'a, Message> {
+    tooltip(
+        panel_toggle_button_bare(theme, glyph, action),
+        container(text(label).size(theme::text_size::UI).font(font))
+            .padding([4, 8])
+            .style(move |_| theme::tooltip_style(theme)),
+        tooltip::Position::Right,
+    )
+    .gap(6)
+    .into()
+}
+
+/// The same collapse control without a tooltip. Used when hovering the control
+/// opens a self-labeling preview, where a second floating label would overlap
+/// the preview and add noise.
+pub(crate) fn panel_toggle_button_bare<'a>(
+    theme: ThemeSpec,
+    glyph: &'static str,
+    action: Action,
+) -> Element<'a, Message> {
+    button(crate::icons::icon(glyph, 13.0, theme.muted_text))
+        .width(Length::Fixed(theme::control::COMPACT))
+        .height(Length::Fixed(theme::control::COMPACT))
+        .padding(0)
+        .on_press(Message::Action(action))
+        .style(move |_, status| theme::ghost_button_style(theme, status))
+        .into()
+}
 
 /// The trailing in-field caret of a [`filter_field`]: opens `menu` on press,
 /// with its hover wash driven by app-tracked state (`hovered` / `target`).
@@ -31,6 +70,7 @@ pub(crate) struct FilterCaret {
 /// wiring, plus the optional in-field presets caret.
 pub(crate) struct FilterField<'a> {
     pub id: &'static str,
+    pub leading_icon: Option<&'static str>,
     pub placeholder: &'a str,
     pub value: &'a str,
     pub on_input: fn(String) -> Message,
@@ -67,7 +107,18 @@ pub(crate) fn filter_field(
     }
 
     let menu = spec.caret.as_ref().map(|caret| caret.menu);
-    let mut bar = row![input].align_y(alignment::Vertical::Center);
+    let mut bar = row![].align_y(alignment::Vertical::Center);
+    if let Some(icon) = spec.leading_icon {
+        bar = bar.push(
+            container(crate::icons::icon(icon, 13.0, theme.subtle_text)).padding(Padding {
+                top: 0.0,
+                right: 0.0,
+                bottom: 0.0,
+                left: 9.0,
+            }),
+        );
+    }
+    bar = bar.push(input);
     if let Some(caret) = spec.caret {
         // `mouse_area` (not `button`) so the presets menu opens on
         // mouse-*down* while held — required for the native NSMenu's
@@ -127,6 +178,6 @@ pub(crate) fn sidebar_filter_field(
 ) -> Element<'_, Message> {
     container(filter_field(theme, font, spec))
         .width(Length::Fill)
-        .padding(Padding::from([6, 8]))
+        .padding(Padding::from([theme::space::XXS, theme::space::MD]))
         .into()
 }

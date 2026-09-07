@@ -28,6 +28,7 @@ mod menus;
 mod message;
 mod modes;
 mod palette;
+mod pointer;
 mod resize_handle;
 mod revision_list;
 mod scrollbar;
@@ -266,7 +267,10 @@ pub(crate) struct Diffui {
     pub(crate) app_focused: bool,
     pub(crate) selected_theme: ThemePreference,
     pub(crate) system_theme: iced_theme::Mode,
+    /// Last usable widths for the two resizable navigation panes. Collapsing a
+    /// pane keeps its width here so reopening restores the user's split.
     pub(crate) sidebar_width: f32,
+    pub(crate) file_nav_width: f32,
     /// Whether the diff pane wraps long lines (default) or clips them at the
     /// pane edge. Global across tabs, persisted with the window state.
     pub(crate) diff_wrap: bool,
@@ -378,6 +382,12 @@ pub(crate) struct Diffui {
     /// The caret control the cursor is currently over, if any — drives the
     /// hover highlight that `mouse_area` (unlike `button`) doesn't provide.
     pub(crate) hovered: Option<HoverTarget>,
+    /// Whether the collapsed changed-files rail is exposing its temporary tree.
+    /// The generation invalidates delayed closes while the pointer crosses the
+    /// small gap between the rail and the floating tree.
+    pub(crate) changed_files_peek_open: bool,
+    pub(crate) changed_files_trigger_hovered: bool,
+    pub(crate) changed_files_popup_hovered: bool,
     /// Transient error toasts (failed mutation/fetch/undo), newest last.
     /// The activity log keeps the durable record; these only make a failure
     /// impossible to miss. Auto-pruned after a few seconds, click to dismiss.
@@ -639,12 +649,9 @@ pub(crate) struct TabState {
     /// on disk once, when the tab is created, so neither a render nor a tab
     /// switch does config-file I/O on the UI thread.
     pub(crate) default_revset: String,
-    /// Sticky inline-file-list preference. Always reflects whether the
-    /// *selected* revision's file list is shown; the user toggles it by
-    /// re-clicking the selected row, and the value persists across revision
-    /// switches so collapsing once stays collapsed for whatever revision the
-    /// user moves to next.
-    pub(crate) file_list_expanded: bool,
+    /// Per-tab pane visibility so a focused review layout survives tab hops.
+    pub(crate) history_panel_collapsed: bool,
+    pub(crate) files_panel_collapsed: bool,
     /// Collapsed directories of the sidebar file tree, by full path prefix.
     pub(crate) collapsed_dirs: HashSet<String>,
     pub(crate) selected_file: usize,
@@ -666,6 +673,7 @@ pub(crate) struct TabState {
     /// mirroring it per tab lets an activation push this tab's position back in
     /// via `scroll_restore_token`.
     pub(crate) sidebar_scroll_offset: f64,
+    pub(crate) file_tree_scroll_offset: f64,
     pub(crate) diff_scroll_offset: f32,
     /// This tab's activity log (long-running ops: load, refresh, revset eval,
     /// fetch, undo, push).
@@ -719,12 +727,14 @@ impl TabState {
             queued_mutations: VecDeque::new(),
             default_revset,
             modes: Vec::new(),
-            file_list_expanded: true,
+            history_panel_collapsed: false,
+            files_panel_collapsed: false,
             collapsed_dirs: HashSet::new(),
             selected_file: 0,
             revision_reveal_token: 0,
             pending_revision_reveal: false,
             sidebar_scroll_offset: 0.0,
+            file_tree_scroll_offset: 0.0,
             diff_scroll_offset: 0.0,
             activities: activity::ActivityLog::default(),
             pending_load_activity: None,
@@ -1022,7 +1032,7 @@ fn empty_state<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
         )
         .padding(Padding::from([9, 20]))
         .on_press(Message::Action(Action::OpenRepoDialog))
-        .style(move |_, _| primary_button_style(theme)),
+        .style(move |_, status| primary_button_style(theme, status)),
     );
 
     // Click-to-reopen recents — reuses the open dialog's row builder so both

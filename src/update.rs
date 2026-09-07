@@ -32,13 +32,24 @@ impl Diffui {
             .size()
             .map(|(w, h)| Size::new(w, h))
             .unwrap_or_else(|| window::Settings::default().size);
-        let sidebar_width = resize_handle::clamp_width(
-            saved
-                .sidebar_width
-                .filter(|w| w.is_finite() && *w > 0.0)
-                .unwrap_or(sidebar::DEFAULT_WIDTH),
+        let requested_sidebar_width = saved
+            .sidebar_width
+            .filter(|w| w.is_finite() && *w > 0.0)
+            .unwrap_or(sidebar::DEFAULT_WIDTH);
+        let requested_file_nav_width = saved
+            .file_nav_width
+            .filter(|w| w.is_finite() && *w > 0.0)
+            .unwrap_or(diff_panel::DEFAULT_FILE_NAV_WIDTH);
+        let sidebar_width = resize_handle::clamp_width_with_reserve(
+            requested_sidebar_width,
             sidebar_min_width,
             window_size.width,
+            requested_file_nav_width + 2.0 + resize_handle::MIN_DIFF_PANE_WIDTH,
+        );
+        let file_nav_width = resize_handle::clamp_width(
+            requested_file_nav_width,
+            diff_panel::MIN_FILE_NAV_WIDTH,
+            (window_size.width - sidebar_width - 2.0).max(diff_panel::MIN_FILE_NAV_WIDTH),
         );
         let window_position = saved.position().map(|(x, y)| Point::new(x, y));
 
@@ -138,8 +149,19 @@ impl Diffui {
                         vcs: repository.vcs,
                         root: repository.root.clone(),
                     };
-                    let state =
+                    let key = repository.root.to_string_lossy().into_owned();
+                    let mut state =
                         TabState::unloaded(Some(repository.clone()), revset_for(repository));
+                    state.history_panel_collapsed = saved
+                        .history_panel_collapsed
+                        .get(&key)
+                        .copied()
+                        .unwrap_or(false);
+                    state.files_panel_collapsed = saved
+                        .files_panel_collapsed
+                        .get(&key)
+                        .copied()
+                        .unwrap_or(false);
                     (owner, name, source, state)
                 }
                 BootTarget::Pr(spec) => (
@@ -193,6 +215,7 @@ impl Diffui {
             selected_theme: config.theme,
             system_theme: iced_theme::Mode::None,
             sidebar_width,
+            file_nav_width,
             diff_wrap: saved.diff_wrap.unwrap_or(true),
             diff_split: saved.diff_split.unwrap_or(false),
             sidebar_min_width,
@@ -217,6 +240,9 @@ impl Diffui {
             recent_repos,
             next_activity_id: 0,
             hovered: None,
+            changed_files_peek_open: false,
+            changed_files_trigger_hovered: false,
+            changed_files_popup_hovered: false,
             modifiers: keyboard::Modifiers::default(),
             toasts: Vec::new(),
             next_toast_id: 0,
@@ -822,6 +848,13 @@ impl Diffui {
                 self.pop_mode(ModeKind::OpenRepo);
                 Task::none()
             }
+            Action::ChooseRepoFolder => {
+                #[cfg(target_os = "macos")]
+                if let Some(path) = crate::macos_native::choose_repository_folder() {
+                    return self.open_repository(&path);
+                }
+                Task::none()
+            }
             Action::SubmitRepoDialog => {
                 let path = self
                     .open_repo_dialog()
@@ -830,6 +863,16 @@ impl Diffui {
                 self.open_repository(&path)
             }
             Action::OpenRepo(path) => self.open_repository(&path),
+            Action::RemoveRecentRepo(path) => {
+                self.recent_repos.retain(|recent| recent != &path);
+                self.mark_geometry_dirty();
+                Task::none()
+            }
+            Action::ClearRecentRepos => {
+                self.recent_repos.clear();
+                self.mark_geometry_dirty();
+                Task::none()
+            }
             Action::ToggleActivityPopover => {
                 if self.activity_popover_open() {
                     self.pop_mode(ModeKind::ActivityPopover);
@@ -933,6 +976,21 @@ impl Diffui {
                 self.mark_geometry_dirty();
                 Task::none()
             }
+            Action::ToggleHistoryPanel => {
+                let target = self.active_mut();
+                target.history_panel_collapsed = !target.history_panel_collapsed;
+                self.mark_geometry_dirty();
+                Task::none()
+            }
+            Action::ToggleFilesPanel => {
+                let target = self.active_mut();
+                target.files_panel_collapsed = !target.files_panel_collapsed;
+                self.changed_files_peek_open = false;
+                self.changed_files_trigger_hovered = false;
+                self.changed_files_popup_hovered = false;
+                self.mark_geometry_dirty();
+                Task::none()
+            }
             Action::SetTheme(theme) => {
                 self.selected_theme = theme;
                 // Switching to System: sync to the live OS appearance now rather
@@ -1023,9 +1081,15 @@ impl Diffui {
                     }
                     None => {}
                 }
+                self.changed_files_peek_open = false;
+                self.changed_files_trigger_hovered = false;
+                self.changed_files_popup_hovered = false;
             }
             UiEvent::SidebarScrolled(offset) => {
                 self.active_mut().sidebar_scroll_offset = offset;
+            }
+            UiEvent::ChangedFilesScrolled(offset) => {
+                self.active_mut().file_tree_scroll_offset = offset;
             }
             UiEvent::DiffScrolled(offset) => {
                 self.active_mut().diff_scroll_offset = offset;
@@ -1037,6 +1101,31 @@ impl Diffui {
                 self.active_mut().source.tree_scroll_offset = offset;
             }
             UiEvent::SetHover(target) => self.hovered = target,
+            UiEvent::ChangedFilesTriggerEntered => {
+                self.changed_files_trigger_hovered = true;
+                self.changed_files_peek_open = true;
+            }
+            UiEvent::ChangedFilesPopupEntered => {
+                self.changed_files_popup_hovered = true;
+                self.changed_files_peek_open = true;
+            }
+            UiEvent::ChangedFilesTriggerExited => {
+                self.changed_files_trigger_hovered = false;
+                return Task::perform(tokio::time::sleep(Duration::from_millis(140)), |()| {
+                    Message::Ui(UiEvent::CloseChangedFilesPeek)
+                });
+            }
+            UiEvent::ChangedFilesPopupExited => {
+                self.changed_files_popup_hovered = false;
+                return Task::perform(tokio::time::sleep(Duration::from_millis(140)), |()| {
+                    Message::Ui(UiEvent::CloseChangedFilesPeek)
+                });
+            }
+            UiEvent::CloseChangedFilesPeek => {
+                if !self.changed_files_trigger_hovered && !self.changed_files_popup_hovered {
+                    self.changed_files_peek_open = false;
+                }
+            }
             UiEvent::ToastDismiss(id) => self.toasts.retain(|toast| toast.id != id),
             UiEvent::ToastTick => self.toasts.retain(|toast| toast.born.elapsed() < TOAST_TTL),
             UiEvent::LoadingTick => {}
@@ -1076,13 +1165,48 @@ impl Diffui {
             }
             UiEvent::RevsetChanged(value) => self.active_mut().session.revset = value,
             UiEvent::SidebarWidthChanged(width) => {
-                let clamped = resize_handle::clamp_width(
+                if width <= self.sidebar_min_width + f32::EPSILON {
+                    self.active_mut().history_panel_collapsed = true;
+                    self.mark_geometry_dirty();
+                    return Task::none();
+                }
+                let files_width = if self.active().session.document.files.is_empty() {
+                    0.0
+                } else if self.active().files_panel_collapsed {
+                    crate::theme::COLLAPSED_PANEL_WIDTH
+                } else {
+                    self.file_nav_width
+                };
+                let dividers = if files_width == 0.0 { 1.0 } else { 2.0 };
+                let clamped = resize_handle::clamp_width_with_reserve(
                     width,
                     self.sidebar_min_width,
                     self.window_size.width,
+                    files_width + dividers + resize_handle::MIN_DIFF_PANE_WIDTH,
                 );
                 if clamped != self.sidebar_width {
                     self.sidebar_width = clamped;
+                    self.mark_geometry_dirty();
+                }
+            }
+            UiEvent::ChangedFilesWidthChanged(handle_x) => {
+                let history_width = if self.active().history_panel_collapsed {
+                    crate::theme::COLLAPSED_PANEL_WIDTH
+                } else {
+                    self.sidebar_width
+                };
+                let width = handle_x - history_width - 1.0;
+                if width <= diff_panel::MIN_FILE_NAV_WIDTH + f32::EPSILON {
+                    self.active_mut().files_panel_collapsed = true;
+                    self.mark_geometry_dirty();
+                    return Task::none();
+                }
+                let available = (self.window_size.width - history_width - 2.0)
+                    .max(diff_panel::MIN_FILE_NAV_WIDTH);
+                let clamped =
+                    resize_handle::clamp_width(width, diff_panel::MIN_FILE_NAV_WIDTH, available);
+                if clamped != self.file_nav_width {
+                    self.file_nav_width = clamped;
                     self.mark_geometry_dirty();
                 }
             }
@@ -1263,10 +1387,30 @@ impl Diffui {
                 // display unplugged since the last run — gives a narrower
                 // window, and without this the split stays where it was and
                 // the diff pane opens below its minimum.
-                self.sidebar_width = resize_handle::clamp_width(
+                let files_width = if self.active().session.document.files.is_empty() {
+                    0.0
+                } else if self.active().files_panel_collapsed {
+                    crate::theme::COLLAPSED_PANEL_WIDTH
+                } else {
+                    self.file_nav_width
+                };
+                self.sidebar_width = resize_handle::clamp_width_with_reserve(
                     self.sidebar_width,
                     self.sidebar_min_width,
                     size.width,
+                    files_width
+                        + if files_width == 0.0 { 1.0 } else { 2.0 }
+                        + resize_handle::MIN_DIFF_PANE_WIDTH,
+                );
+                let history_width = if self.active().history_panel_collapsed {
+                    crate::theme::COLLAPSED_PANEL_WIDTH
+                } else {
+                    self.sidebar_width
+                };
+                self.file_nav_width = resize_handle::clamp_width(
+                    self.file_nav_width,
+                    diff_panel::MIN_FILE_NAV_WIDTH,
+                    (size.width - history_width - 2.0).max(diff_panel::MIN_FILE_NAV_WIDTH),
                 );
                 // Center the native window controls on the tab strip, and arm
                 // the native resize observer that keeps them centered without a
@@ -1284,10 +1428,30 @@ impl Diffui {
                     // Shrinking the window can push the split past the diff
                     // pane's minimum, so re-clamp rather than persist a width
                     // the new size can't show.
-                    self.sidebar_width = resize_handle::clamp_width(
+                    let files_width = if self.active().session.document.files.is_empty() {
+                        0.0
+                    } else if self.active().files_panel_collapsed {
+                        crate::theme::COLLAPSED_PANEL_WIDTH
+                    } else {
+                        self.file_nav_width
+                    };
+                    self.sidebar_width = resize_handle::clamp_width_with_reserve(
                         self.sidebar_width,
                         self.sidebar_min_width,
                         size.width,
+                        files_width
+                            + if files_width == 0.0 { 1.0 } else { 2.0 }
+                            + resize_handle::MIN_DIFF_PANE_WIDTH,
+                    );
+                    let history_width = if self.active().history_panel_collapsed {
+                        crate::theme::COLLAPSED_PANEL_WIDTH
+                    } else {
+                        self.sidebar_width
+                    };
+                    self.file_nav_width = resize_handle::clamp_width(
+                        self.file_nav_width,
+                        diff_panel::MIN_FILE_NAV_WIDTH,
+                        (size.width - history_width - 2.0).max(diff_panel::MIN_FILE_NAV_WIDTH),
                     );
                     self.mark_geometry_dirty();
                 }
@@ -1796,9 +1960,7 @@ impl Diffui {
         widget::operation::focus(find::FIND_INPUT_ID)
     }
 
-    /// Browse `selection`: the plain-click / palette-jump path. Re-selecting
-    /// the revision already shown toggles its inline file list instead of
-    /// re-running the backend.
+    /// Browse `selection`: the plain-click / palette-jump path.
     fn select_revision(&mut self, selection: RevisionSelection) -> Task<Message> {
         let target = self.active_mut();
         target.revision_multi_selection.clear();
@@ -1811,13 +1973,8 @@ impl Diffui {
             }
             target.pop_mode(ModeKind::Description);
         }
-        // Re-clicking the already-selected revision toggles its file
-        // list without re-running the backend or changing the diff.
-        // The toggled value persists across revision switches, so
-        // collapsing once stays collapsed wherever the user moves
-        // next.
         if target.session.selected_revision == selection {
-            target.file_list_expanded = !target.file_list_expanded;
+            // The selected row remains stable; files live in the review pane.
         } else if target.session.diff_pending() == Some(&selection) {
             // Already loading this revision — let it land.
         } else if let Some(tab) = self.active_tab_id() {
@@ -4078,34 +4235,142 @@ impl Diffui {
         // switch keeps the prior diff until `DiffLoaded` replaces it.
         // The source browser swaps in its own pair: a file-tree-only sidebar
         // and the plain code pane.
-        let (sidebar, diff_pane) = match self.active().main_view {
-            MainView::Diff => (
-                sidebar::build_sidebar(self, theme),
-                diff_panel::build_diff_panel(self, theme),
-            ),
-            MainView::Source => (
+        let panels: Element<'_, Message> = match self.active().main_view {
+            MainView::Diff => {
+                let sidebar = if self.active().history_panel_collapsed {
+                    sidebar::build_collapsed_sidebar(self, theme)
+                } else {
+                    sidebar::build_sidebar(self, theme)
+                };
+                let diff_pane = diff_panel::build_diff_panel(self, theme);
+                if !self.active().session.document.files.is_empty() {
+                    let file_navigator = if self.active().files_panel_collapsed {
+                        diff_panel::build_collapsed_file_navigator(theme)
+                    } else {
+                        diff_panel::build_file_navigator(self, theme)
+                    };
+                    row![
+                        sidebar,
+                        vertical_divider(theme),
+                        file_navigator,
+                        vertical_divider(theme),
+                        diff_pane,
+                    ]
+                    .spacing(0)
+                    .height(Length::Fill)
+                    .into()
+                } else {
+                    row![sidebar, vertical_divider(theme), diff_pane]
+                        .spacing(0)
+                        .height(Length::Fill)
+                        .into()
+                }
+            }
+            MainView::Source => row![
                 source_panel::build_source_sidebar(self, theme),
+                vertical_divider(theme),
                 source_panel::build_source_panel(self, theme),
-            ),
-        };
-        let panels = row![sidebar, vertical_divider(theme), diff_pane]
+            ]
             .spacing(0)
-            .height(Length::Fill);
-        let resize_overlay = ResizeHandle::new(
-            self.sidebar_width,
-            self.sidebar_min_width,
-            sidebar::RESIZE_HIT_PADDING,
-            |width| Message::Ui(UiEvent::SidebarWidthChanged(width)),
-        );
+            .height(Length::Fill)
+            .into(),
+        };
+        let history_width = if self.active().history_panel_collapsed {
+            crate::theme::COLLAPSED_PANEL_WIDTH
+        } else {
+            self.sidebar_width
+        };
+        let files_width = if self.active().session.document.files.is_empty() {
+            0.0
+        } else if self.active().files_panel_collapsed {
+            crate::theme::COLLAPSED_PANEL_WIDTH
+        } else {
+            self.file_nav_width
+        };
+        let history_resize_overlay: Element<'_, Message> = if self.active().history_panel_collapsed
+        {
+            iced::widget::Space::new().into()
+        } else {
+            ResizeHandle::new(
+                self.sidebar_width,
+                self.sidebar_min_width,
+                sidebar::RESIZE_HIT_PADDING,
+                |width| Message::Ui(UiEvent::SidebarWidthChanged(width)),
+            )
+            .right_reserve(
+                files_width
+                    + if files_width == 0.0 { 1.0 } else { 2.0 }
+                    + resize_handle::MIN_DIFF_PANE_WIDTH,
+            )
+            .into()
+        };
+        let files_resize_overlay: Element<'_, Message> = if self.active().main_view
+            != MainView::Diff
+            || self.active().session.document.files.is_empty()
+            || self.active().files_panel_collapsed
+        {
+            iced::widget::Space::new().into()
+        } else {
+            let handle_x = history_width + 1.0 + self.file_nav_width;
+            ResizeHandle::new(
+                handle_x,
+                history_width + 1.0 + diff_panel::MIN_FILE_NAV_WIDTH,
+                sidebar::RESIZE_HIT_PADDING,
+                |position| Message::Ui(UiEvent::ChangedFilesWidthChanged(position)),
+            )
+            .right_reserve(1.0 + resize_handle::MIN_DIFF_PANE_WIDTH)
+            .into()
+        };
+        let changed_files_peek: Element<'_, Message> = if self.active().main_view == MainView::Diff
+            && self.active().files_panel_collapsed
+            && self.changed_files_peek_open
+            && !self.active().session.document.files.is_empty()
+        {
+            let left = history_width + 2.0 + crate::theme::COLLAPSED_PANEL_WIDTH;
+            container(diff_panel::build_file_navigator_peek(self, theme))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .padding(Padding {
+                    top: crate::field::PANEL_TOGGLE_INSET,
+                    right: 0.0,
+                    bottom: crate::field::PANEL_TOGGLE_INSET,
+                    left,
+                })
+                .align_x(alignment::Horizontal::Left)
+                .into()
+        } else {
+            iced::widget::Space::new().into()
+        };
         let palette_overlay = palette::build_overlay(self, theme);
-        let body: Element<'_, Message> = stack![panels, resize_overlay, palette_overlay]
+        let base_panels: Element<'_, Message> =
+            stack![panels, history_resize_overlay, files_resize_overlay,]
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
+        let base_panels = if self.mode(ModeKind::Palette).is_some() {
+            crate::pointer::suppress(base_panels)
+        } else {
+            base_panels
+        };
+        let body: Element<'_, Message> = stack![base_panels, changed_files_peek, palette_overlay]
             .width(Length::Fill)
             .height(Length::Fill)
             .into();
 
-        let shell = column![tab_bar, toolbar, horizontal_divider(theme), body]
-            .width(Length::Fill)
-            .height(Length::Fill);
+        let shell: Element<'_, Message> =
+            column![tab_bar, toolbar, horizontal_divider(theme), body]
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
+        let shell = if self.mode(ModeKind::ActivityPopover).is_some()
+            || self.mode(ModeKind::Menu).is_some()
+            || self.mode(ModeKind::OpenRepo).is_some()
+            || self.mode(ModeKind::Confirm).is_some()
+        {
+            crate::pointer::suppress(shell)
+        } else {
+            shell
+        };
 
         // Overlays float above the whole shell. Each returns an empty `Space`
         // when inactive, so they can always be stacked.
@@ -4387,6 +4652,7 @@ impl Diffui {
             x: self.window_position.map(|p| p.x),
             y: self.window_position.map(|p| p.y),
             sidebar_width: Some(self.sidebar_width),
+            file_nav_width: Some(self.file_nav_width),
             diff_wrap: Some(self.diff_wrap),
             diff_split: Some(self.diff_split),
             // GitHub-PR tabs are session-only (no local root to restore from),
@@ -4401,6 +4667,10 @@ impl Diffui {
                 .get(self.active)
                 .and_then(|tab| Some(tab.root()?.to_string_lossy().into_owned())),
             revsets: self.collect_revsets(),
+            history_panel_collapsed: self
+                .collect_panel_collapse_state(|state| state.history_panel_collapsed),
+            files_panel_collapsed: self
+                .collect_panel_collapse_state(|state| state.files_panel_collapsed),
             recent_repos: self.recent_repos.clone(),
         }
     }
@@ -4423,6 +4693,21 @@ impl Diffui {
         revsets
     }
 
+    fn collect_panel_collapse_state(
+        &self,
+        collapsed: impl Fn(&TabState) -> bool,
+    ) -> BTreeMap<String, bool> {
+        self.tabs
+            .iter()
+            .filter_map(|tab| {
+                Some((
+                    tab.root()?.to_string_lossy().into_owned(),
+                    collapsed(&tab.state),
+                ))
+            })
+            .collect()
+    }
+
     pub(crate) fn resolved_theme(&self) -> ResolvedTheme {
         self.selected_theme.active(self.system_theme)
     }
@@ -4435,6 +4720,73 @@ mod tests {
     use crate::modes::{Mode, ModeKind};
     use crate::palette::PaletteMessage;
     use crate::tabs::tests::{app, push_tab};
+
+    #[test]
+    fn dragging_history_to_its_minimum_collapses_and_keeps_its_width() {
+        let mut ui = app();
+        ui.sidebar_min_width = 220.0;
+        ui.sidebar_width = 340.0;
+
+        let _ = ui.update(Message::Ui(UiEvent::SidebarWidthChanged(220.0)));
+
+        assert!(ui.active().history_panel_collapsed);
+        assert_eq!(ui.sidebar_width, 340.0);
+    }
+
+    #[test]
+    fn changed_files_resize_and_minimum_collapse_keep_the_last_width() {
+        let mut ui = app();
+        ui.sidebar_width = 340.0;
+        ui.file_nav_width = diff_panel::DEFAULT_FILE_NAV_WIDTH;
+        let prefix = ui.sidebar_width + 1.0;
+
+        let _ = ui.update(Message::Ui(UiEvent::ChangedFilesWidthChanged(
+            prefix + 280.0,
+        )));
+        assert_eq!(ui.file_nav_width, 280.0);
+        assert!(!ui.active().files_panel_collapsed);
+
+        let _ = ui.update(Message::Ui(UiEvent::ChangedFilesWidthChanged(
+            prefix + diff_panel::MIN_FILE_NAV_WIDTH,
+        )));
+        assert!(ui.active().files_panel_collapsed);
+        assert_eq!(ui.file_nav_width, 280.0);
+    }
+
+    #[test]
+    fn changed_files_peek_survives_trigger_exit_after_popup_entry() {
+        let mut ui = app();
+
+        let _ = ui.on_ui_event(UiEvent::ChangedFilesTriggerEntered);
+        let _ = ui.on_ui_event(UiEvent::ChangedFilesPopupEntered);
+        // The rail exit can arrive after the popup enter at their shared seam.
+        ui.changed_files_trigger_hovered = false;
+        let _ = ui.on_ui_event(UiEvent::CloseChangedFilesPeek);
+        assert!(ui.changed_files_peek_open);
+
+        ui.changed_files_popup_hovered = false;
+        let _ = ui.on_ui_event(UiEvent::CloseChangedFilesPeek);
+        assert!(!ui.changed_files_peek_open);
+    }
+
+    #[test]
+    fn window_state_keeps_each_repositories_panel_visibility() {
+        let mut ui = app();
+        push_tab(&mut ui, "/tmp/first");
+        push_tab(&mut ui, "/tmp/second");
+        ui.tabs[0].state.history_panel_collapsed = true;
+        ui.tabs[1].state.files_panel_collapsed = true;
+
+        let saved = ui.current_window_state();
+
+        assert_eq!(saved.history_panel_collapsed.get("/tmp/first"), Some(&true));
+        assert_eq!(saved.files_panel_collapsed.get("/tmp/first"), Some(&false));
+        assert_eq!(
+            saved.history_panel_collapsed.get("/tmp/second"),
+            Some(&false)
+        );
+        assert_eq!(saved.files_panel_collapsed.get("/tmp/second"), Some(&true));
+    }
 
     fn press(ui: &mut Diffui, chord: &str) {
         let chord = Chord::parse(chord).expect("a parsable chord");

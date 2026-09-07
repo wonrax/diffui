@@ -62,7 +62,9 @@ pub fn build_toolbar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     let caret_hovered = ui.hovered == Some(HoverTarget::FetchCaret);
     // 6px between actions — the same rhythm the tab strip uses between tabs, so
     // both title-bar bands share one consistent item spacing.
-    let mut actions = row![].spacing(6).align_y(alignment::Vertical::Center);
+    let mut actions = row![]
+        .spacing(theme::space::SM)
+        .align_y(alignment::Vertical::Center);
     // Diff ↔ Source view switcher, leftmost so the "what am I looking at"
     // control leads the bar. Repo tabs only — a PR has no tree to browse.
     let is_repo = ui.active().repository.is_some();
@@ -98,7 +100,9 @@ pub fn build_toolbar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     // Display toggles live at the far right edge, past the activity
     // indicator, so actions (left) and view options (right) read as two
     // separate groups.
-    let mut toggles = row![].spacing(6).align_y(alignment::Vertical::Center);
+    let mut toggles = row![]
+        .spacing(theme::space::SM)
+        .align_y(alignment::Vertical::Center);
     toggles = toggles.push(toolbar_toggle_button(
         icons::WRAP,
         "Wrap lines",
@@ -127,8 +131,8 @@ pub fn build_toolbar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         toggles,
     ]
     .align_y(alignment::Vertical::Center)
-    .spacing(6)
-    .padding(Padding::from([6, 10]));
+    .spacing(theme::space::SM)
+    .padding(Padding::from([theme::space::SM, 10.0]));
 
     column![
         container(bar)
@@ -157,7 +161,7 @@ fn view_switcher(ui: &Diffui, theme: ThemeSpec, font: iced::Font) -> Element<'st
     // = 15.6px), the pill fill snapped a pixel unevenly (more gap above
     // than below). 24px inner + the well's 1px inset ≈ the ghost buttons'
     // height beside it.
-    const SEGMENT_HEIGHT: f32 = 24.0;
+    const SEGMENT_HEIGHT: f32 = theme::control::COMPACT - 4.0;
     let segment = |icon: &'static str, label: &str, view: MainView| {
         let active = ui.active().main_view == view;
         let icon_color = if active {
@@ -211,7 +215,7 @@ fn view_switcher(ui: &Diffui, theme: ThemeSpec, font: iced::Font) -> Element<'st
             segment(icons::FILE_DIFF, "Diff", MainView::Diff),
             segment(icons::CODE, "Source", MainView::Source),
         ]
-        .spacing(2)
+        .spacing(theme::space::XXS)
         .align_y(alignment::Vertical::Center),
     )
     .padding(1)

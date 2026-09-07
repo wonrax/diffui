@@ -1,5 +1,5 @@
 use iced::{
-    Background, Border, Color, Element, Font, Length, alignment,
+    Background, Border, Color, Element, Length, alignment,
     widget::{Space, column, container, row, text, tooltip},
 };
 
@@ -13,12 +13,9 @@ use crate::repository::Vcs;
 use crate::revision_list::{
     self, FileRowView, RevisionList, RevisionListStyle, RevisionRowView, RowSelectionKey,
 };
-use crate::theme::{
-    self, ThemeSpec, chip_background, emphasis_font, file_status_color, sidebar_panel_style,
-};
+use crate::theme::{self, ThemeSpec, chip_background, emphasis_font, sidebar_panel_style};
 use crate::{Action, Diffui, HoverTarget, LoadStatus, Message, ToolbarMenu, UiEvent};
 use diffui_core::{CommitStore, DiffFile, FileTreeRow, RevisionSelection, RowView, file_tree_rows};
-use jj_lib::graph::GraphEdgeType;
 use std::collections::HashSet;
 use std::rc::Rc;
 
@@ -27,7 +24,7 @@ use std::rc::Rc;
 // configured UI font at runtime by `min_width(...)` so it scales when the
 // user picks a larger font in the future. There's no upper cap — users can
 // drag the sidebar as wide as the window allows.
-pub const DEFAULT_WIDTH: f32 = 380.0;
+pub const DEFAULT_WIDTH: f32 = 340.0;
 pub const RESIZE_HIT_PADDING: f32 = 2.0;
 
 /// Minimum sidebar width for the current font config. Picked so the top
@@ -73,13 +70,9 @@ pub fn min_width(config: AppConfig) -> f32 {
 /// without exposing the constant through `revision_list`.
 const REVISION_CONTENT_RIGHT_PAD: f32 = 12.0;
 
-const CAPTION_TEXT_SIZE: f32 = theme::text_size::BODY;
-pub(crate) const REVISION_ID_CHARS: usize = 12;
-pub(crate) const COMMIT_ID_CHARS: usize = 12;
-
-// Horizontal padding flanking the `+N` / `-N` numeric columns.
-const FILE_STAT_HORIZONTAL_PADDING: f32 = 4.0;
-const FILE_STAT_MIN_WIDTH: f32 = 24.0;
+const CAPTION_TEXT_SIZE: f32 = theme::text_size::CAPTION;
+pub(crate) const REVISION_ID_CHARS: usize = 8;
+pub(crate) const COMMIT_ID_CHARS: usize = 8;
 
 pub fn build_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     // The "Changes" header is gone; the list starts flush at the top of the
@@ -90,7 +83,24 @@ pub fn build_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
 
     let mut body = column![].spacing(0);
     // The revset / revision-range filter sits at the very top of the pane.
-    body = body.push(build_revset_filter(ui, theme));
+    body = body.push(
+        container(
+            row![
+                build_revset_filter(ui, theme),
+                crate::field::panel_toggle_button(
+                    ui.config.ui_font,
+                    theme,
+                    icons::MINUS,
+                    "Hide revision history",
+                    Action::ToggleHistoryPanel,
+                ),
+            ]
+            .spacing(crate::field::PANEL_TOGGLE_INSET)
+            .align_y(alignment::Vertical::Center),
+        )
+        .width(Length::Fill)
+        .padding(crate::field::PANEL_TOGGLE_INSET),
+    );
     // Load failures no longer have a header to live under — surface them as a
     // soft alert card above the list rather than bare red text.
     if let LoadStatus::Failed(error) = &ui.active().session.status {
@@ -138,6 +148,21 @@ pub fn build_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             }
         })
         .into()
+}
+
+pub fn build_collapsed_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
+    container(crate::field::panel_toggle_button(
+        ui.config.ui_font,
+        theme,
+        icons::GIT_BRANCH,
+        "Show revision history",
+        Action::ToggleHistoryPanel,
+    ))
+    .width(Length::Fixed(crate::theme::COLLAPSED_PANEL_WIDTH))
+    .height(Length::Fill)
+    .padding([theme::space::XXS, theme::space::XS])
+    .style(move |_| sidebar_panel_style(theme))
+    .into()
 }
 
 /// The sidebar's whole-pane wash while target mode is on: a light accent
@@ -668,9 +693,9 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     )
     .padding([4, 12])
     .on_press_maybe(can_apply.then_some(Message::Action(Action::DraftConfirm)))
-    .style(move |_, _| {
+    .style(move |_, status| {
         if can_apply {
-            theme::primary_button_style(theme)
+            theme::primary_button_style(theme, status)
         } else {
             iced::widget::button::Style {
                 background: Some(Background::Color(chip_background(theme.subtle_text))),
@@ -764,11 +789,12 @@ fn build_revset_filter(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         Some(Vcs::Git) => "revision range — e.g. --all, main..@",
         _ => "revset — e.g. all(), mine()",
     };
-    crate::field::sidebar_filter_field(
+    crate::field::filter_field(
         theme,
         ui.config.mono_font,
         crate::field::FilterField {
             id: REVSET_INPUT_ID,
+            leading_icon: Some(icons::GIT_BRANCH),
             placeholder,
             value: &ui.active().session.revset,
             on_input: |value| Message::Ui(UiEvent::RevsetChanged(value)),
@@ -918,70 +944,11 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
         lane_base_color: theme.lane_base,
         missing_color: theme.subtle_text,
     };
-
-    // Files show under the selected commit, only while its inline list is open.
-    let expanded_index = ui
-        .active()
-        .session
-        .selected_commit_index
-        .filter(|_| ui.active().file_list_expanded);
-
-    // Stat-column widths and the flattened file tree are derived purely from the
-    // document (and, for the tree, the collapse set) — never from the scroll
-    // position. But `view()` re-runs on every diff-scroll file-boundary crossing
-    // (the diff view publishes `SelectFile`, the only thing that forces an iced
-    // tree rebuild), so recomputing them here re-shaped ~5·N strings per crossing
-    // and tanked the frame rate on large PRs. Memoize on document identity
-    // (`document_id` + count — the count also catches streaming `extend`s that
-    // grow the set under a stable id) so a rebuild that didn't change the file
-    // set is free; templates themselves are built lazily per visible row below.
-    let (tree_rows, additions_w, deletions_w, file_badge_width) = if expanded_index.is_some()
-        && matches!(ui.active().session.status, LoadStatus::Loaded)
-        && !ui.active().session.document.files.is_empty()
-    {
-        let files = &ui.active().session.document.files;
-        let document_id = ui.active().session.document_id;
-        let count = files.len();
-        let mut cache = ui.sidebar_file_cache.borrow_mut();
-        let widths = cache.stat_widths(document_id, count, ui.config, files);
-        let tree_rows = cache.tree_rows(document_id, count, &ui.active().collapsed_dirs, files);
-        (tree_rows, widths.additions, widths.deletions, widths.badge)
-    } else {
-        (Rc::new(Vec::new()), 0.0, 0.0, 0.0)
-    };
-
-    let file_count = tree_rows.len();
-    // The widget wants the flat index where the file block *starts*: right
-    // after the expanded commit's own row.
-    let expanded = expanded_index
-        .filter(|_| file_count > 0)
-        .map(|index| (index + 1, file_count));
-
-    // Flat sidebar row of the selected file, for the keyboard-nav reveal: the
-    // expanded commit's row, then its file rows in tree-display order. `None`
-    // when the file list is closed or the file isn't currently shown, which
-    // tells the widget to schedule no scroll.
-    let reveal_file_flat = expanded.and_then(|(files_start, _)| {
-        tree_rows
-            .iter()
-            .position(|row| {
-                matches!(row, FileTreeRow::File { file_index, .. } if *file_index == ui.active().selected_file)
-            })
-            .map(|display| files_start + display)
-    });
-    // Target mode rides the same explicit-row reveal: candidate moves bump
-    // the file-reveal token, and the target row wins over the file row while
-    // a draft is active.
-    let reveal_file_flat = ui
+    let reveal_target = ui
         .active()
         .op_draft()
         .as_ref()
-        .and_then(|draft| draft.draft.candidate)
-        .map(|candidate| match expanded {
-            Some((files_start, files)) if candidate >= files_start => candidate + files,
-            _ => candidate,
-        })
-        .or(reveal_file_flat);
+        .and_then(|draft| draft.draft.candidate);
 
     // The per-row lane fold + prefix lengths are precomputed once and held in
     // `Diffui`; the closures below build a single visible row's view from them
@@ -990,9 +957,7 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
     let graph = &tab.session.graph;
     let prefix_lens = &tab.session.sidebar_prefix_lens;
     let commits = &tab.session.commits;
-    let selected = &tab.session.selected_revision;
     let multi_selection = tab.revision_multi_selection.as_slice();
-    let file_list_expanded = tab.file_list_expanded;
     let config = ui.config;
     let draft = tab.op_draft();
     let build_revision = Box::new(move |index: usize| {
@@ -1003,54 +968,13 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
             theme,
             config,
             &graph_style,
-            selected,
             multi_selection,
-            file_list_expanded,
             draft,
             index,
         )
     });
-
-    // File rows render under the expanded commit, so they share its
-    // continuation lane state (the post-trim snapshot of that row's fold).
-    let (continuation, continuation_columns) = expanded_index
-        .map(|index| {
-            let frame = ui.active().session.graph.frame(index, usize::MAX);
-            let columns = frame.display_columns();
-            (frame.after, columns)
-        })
-        .unwrap_or_default();
-    let (continuation_labels, continuation_segments) = expanded_index
-        .map(|index| {
-            let lane = ui.active().session.graph.fold(index, usize::MAX);
-            (lane.continuation_labels, lane.continuation_segments)
-        })
-        .unwrap_or_default();
-    // Every file row shares the parent's continuation state, so build it into
-    // `Rc`s once and hand each row a cheap refcount clone instead of deep-copying
-    // four Vecs per row on every rebuild.
-    let continuation: Rc<[Option<GraphEdgeType>]> = continuation.into();
-    let continuation_columns: Rc<[Option<usize>]> = continuation_columns.into();
-    let continuation_labels: Rc<[Vec<String>]> = continuation_labels.into();
-    let continuation_segments: Rc<[Option<usize>]> = continuation_segments.into();
-    let files = &ui.active().session.document.files;
-    let build_file = Box::new(move |row_index: usize| {
-        let template = file_row_template(
-            &tree_rows[row_index],
-            files,
-            additions_w,
-            deletions_w,
-            theme,
-        );
-        build_file_row(
-            template,
-            continuation.clone(),
-            continuation_columns.clone(),
-            continuation_labels.clone(),
-            continuation_segments.clone(),
-            theme,
-        )
-    });
+    let build_file: Box<dyn Fn(usize) -> FileRowView> =
+        Box::new(|_| unreachable!("history does not contain file rows"));
 
     let selected_row = match &ui.active().session.selected_revision {
         RevisionSelection::WorkingCopy => Some(RowSelectionKey::WorkingCopy),
@@ -1059,17 +983,17 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
 
     // The widget fills its own background, so the target-mode wash has to
     // reach it too — a tinted container alone would be painted over.
-    let mut list_style = revision_list_style(theme, ui.config, file_badge_width);
+    let mut list_style = revision_list_style(theme, ui.config, 0.0);
     if ui.active().op_draft().is_some() {
         list_style.background = draft_panel_background(theme);
     }
     let mut list = RevisionList::new(
         ui.active().session.commits.len(),
-        expanded,
+        None,
         build_revision,
         build_file,
         selected_row,
-        Some(ui.active().selected_file),
+        None,
         ui.active().session.selected_commit_index,
         list_style,
         |key| Message::Ui(UiEvent::SelectRowKey(key)),
@@ -1077,7 +1001,7 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
     )
     .width(Length::Fill)
     .reveal_selected(ui.active().revision_reveal_token)
-    .reveal_file(ui.sidebar_file_reveal_token, reveal_file_flat)
+    .reveal_file(ui.sidebar_file_reveal_token, reveal_target)
     .on_scroll(|offset| Message::Ui(UiEvent::SidebarScrolled(offset)))
     .restore_scroll(ui.active().sidebar_scroll_offset, ui.scroll_restore_token)
     .on_context_menu(|key, rect, point| Message::Ui(UiEvent::RevisionContextMenu(key, rect, point)))
@@ -1112,9 +1036,7 @@ fn build_revision_row(
     theme: ThemeSpec,
     config: AppConfig,
     graph_style: &RevisionGraphStyle,
-    selected: &RevisionSelection,
     multi_selection: &[String],
-    file_list_expanded: bool,
     draft: Option<&crate::DraftUi>,
     index: usize,
 ) -> RevisionRowView {
@@ -1154,11 +1076,6 @@ fn build_revision_row(
         RowSelectionKey::WorkingCopy
     } else {
         RowSelectionKey::Commit(commit.commit_id().to_owned())
-    };
-    let is_expanded = is_expanded_commit(selected, file_list_expanded, commit);
-    let is_selected = match selected {
-        RevisionSelection::WorkingCopy => commit.is_working_copy(),
-        RevisionSelection::Commit(id) => !commit.is_working_copy() && id == commit.commit_id(),
     };
     let multi_selected = multi_selection.iter().any(|id| id == commit.commit_id());
 
@@ -1290,8 +1207,7 @@ fn build_revision_row(
         lane_labels: lane.labels,
         lane_segments_before: lane.segments_before,
         lane_segments_after: lane.segments_after,
-        // The collapse/expand chevron shows only on the selected row.
-        collapse_chevron: is_selected.then_some(is_expanded),
+        collapse_chevron: None,
         draft_source,
         multi_selected,
         draft_marker,
@@ -1397,90 +1313,11 @@ pub(crate) fn status_chips_for(commit: RowView, theme: ThemeSpec, config: AppCon
     status_chips
 }
 
-/// Build the display view for one file row under the expanded commit.
-fn build_file_row(
-    template: FileRowTemplate,
-    continuation: Rc<[Option<GraphEdgeType>]>,
-    continuation_columns: Rc<[Option<usize>]>,
-    continuation_labels: Rc<[Vec<String>]>,
-    continuation_segments: Rc<[Option<usize>]>,
-    theme: ThemeSpec,
-) -> FileRowView {
-    FileRowView {
-        primary: template.label,
-        raw_path: template.raw_path,
-        status_label: template.status_label,
-        status_background: chip_background(template.status_color),
-        status_text: template.status_color,
-        additions: template.additions,
-        deletions: template.deletions,
-        additions_text: theme.added_text,
-        deletions_text: theme.removed_text,
-        continuation,
-        columns: continuation_columns,
-        additions_width: template.additions_width,
-        deletions_width: template.deletions_width,
-        primary_color: theme.text,
-        icon_color: theme.subtle_text,
-        indent: template.indent,
-        chevron: template.chevron,
-        file_index: template.file_index,
-        lane_labels: continuation_labels,
-        lane_segments: continuation_segments,
-    }
-}
-
-struct FileRowTemplate {
-    label: String,
-    raw_path: String,
-    status_label: String,
-    /// Saturated color for the file's status (e.g., green for Added).
-    /// The chip background is derived from this via `chip_background`
-    /// at draw-row construction time so the chip reads as a tint of
-    /// the same hue as its glyph — matching the design system's
-    /// "soft tint + colored text" badge pattern.
-    status_color: Color,
-    additions: usize,
-    deletions: usize,
-    file_index: usize,
-    additions_width: f32,
-    deletions_width: f32,
-    indent: f32,
-    chevron: Option<bool>,
-}
-
-/// View-time memo for the file list's document-derived layout: the stat-column
-/// widths and the flattened file tree. The sidebar is rebuilt on every `view()`,
-/// and `view()` re-runs on every diff-scroll *file-boundary crossing* (the diff
-/// view publishes `SelectFile`, the only thing that forces an iced widget-tree
-/// rebuild — a plain redraw doesn't). Recomputing these there re-shaped ~5·N
-/// strings through `cosmic_text` per crossing, which tanked the frame rate when
-/// the list was expanded over a large PR. Neither value depends on the scroll
-/// position, so we key them on document identity and reuse across rebuilds that
-/// didn't change the file set.
+/// View-time memo for the changed-files tree. The tree is rebuilt only when the
+/// document or directory-collapse set changes, rather than on every diff scroll.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SidebarFileCache {
-    widths: Option<(DocKey, FileStatWidths)>,
     tree: Option<(TreeKey, Rc<Vec<FileTreeRow>>)>,
-}
-
-/// Identity of the file set a cached value was computed against. `document_id`
-/// is stamped fresh on every document *replacement*, but a streaming PR load
-/// `extend`s the existing document in place (same id, growing length), so the
-/// count is part of the key too. `font` invalidates on a config font change,
-/// which would re-shape the stat strings to a different width.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct DocKey {
-    document_id: u64,
-    file_count: usize,
-    font: Font,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct FileStatWidths {
-    additions: f32,
-    deletions: f32,
-    badge: f32,
 }
 
 /// The tree folds in the collapse set (it prunes collapsed dirs) but, unlike the
@@ -1493,29 +1330,7 @@ struct TreeKey {
 }
 
 impl SidebarFileCache {
-    fn stat_widths(
-        &mut self,
-        document_id: u64,
-        file_count: usize,
-        config: AppConfig,
-        files: &[DiffFile],
-    ) -> FileStatWidths {
-        let key = DocKey {
-            document_id,
-            file_count,
-            font: config.ui_font,
-        };
-        if let Some((cached_key, widths)) = &self.widths
-            && *cached_key == key
-        {
-            return *widths;
-        }
-        let widths = compute_stat_widths(files, config);
-        self.widths = Some((key, widths));
-        widths
-    }
-
-    fn tree_rows(
+    pub(crate) fn tree_rows(
         &mut self,
         document_id: u64,
         file_count: usize,
@@ -1539,74 +1354,6 @@ impl SidebarFileCache {
             Rc::clone(&rows),
         ));
         rows
-    }
-}
-
-/// Stat-column widths for the file list, measured once per document. The widest
-/// rendered `+N` / `−N` is the file with the most additions / deletions — more
-/// digits ⇒ a wider string in the UI font's near-tabular figures — so we shape
-/// one string per column. The old form measured every file's stat through a
-/// `max_by` whose comparator shaped *both* sides, i.e. ~2·N `cosmic_text` shapes
-/// per column.
-fn compute_stat_widths(files: &[DiffFile], config: AppConfig) -> FileStatWidths {
-    let max_additions = files.iter().map(|file| file.additions).max().unwrap_or(0);
-    let max_deletions = files.iter().map(|file| file.deletions).max().unwrap_or(0);
-    FileStatWidths {
-        additions: file_stat_width(&format!("+{max_additions}"), config.ui_font),
-        deletions: file_stat_width(&format!("-{max_deletions}"), config.ui_font),
-        badge: file_badge_width(files, config.mono_font),
-    }
-}
-
-/// Build one file-list row template from a flattened tree row. Called lazily,
-/// per *visible* row, by the `RevisionList` virtualization closure — the full
-/// set is never materialized (only ~a screenful exist at once).
-fn file_row_template(
-    row: &FileTreeRow,
-    files: &[DiffFile],
-    additions_width: f32,
-    deletions_width: f32,
-    theme: ThemeSpec,
-) -> FileRowTemplate {
-    match row {
-        FileTreeRow::Dir {
-            label,
-            path,
-            depth,
-            collapsed,
-        } => FileRowTemplate {
-            label: label.clone(),
-            raw_path: path.clone(),
-            status_label: String::new(),
-            status_color: theme.subtle_text,
-            additions: 0,
-            deletions: 0,
-            file_index: usize::MAX,
-            additions_width,
-            deletions_width,
-            indent: *depth as f32 * revision_list::FILE_TREE_INDENT,
-            chevron: Some(*collapsed),
-        },
-        FileTreeRow::File {
-            file_index,
-            label,
-            depth,
-        } => {
-            let file = &files[*file_index];
-            FileRowTemplate {
-                label: label.clone(),
-                raw_path: file.path.clone(),
-                status_label: file.status.short_label().to_owned(),
-                status_color: file_status_color(file.status, theme),
-                additions: file.additions,
-                deletions: file.deletions,
-                file_index: *file_index,
-                additions_width,
-                deletions_width,
-                indent: *depth as f32 * revision_list::FILE_TREE_INDENT,
-                chevron: None,
-            }
-        }
     }
 }
 
@@ -1643,21 +1390,6 @@ pub(crate) fn revision_list_style(
     }
 }
 
-/// True when `commit` is the selected revision and the user hasn't
-/// collapsed the inline file list. The collapse/expand preference is
-/// global rather than per-revision (see `Diffui::file_list_expanded`),
-/// so flipping it once carries across whatever revision the user picks
-/// next.
-fn is_expanded_commit(selected: &RevisionSelection, expanded: bool, commit: RowView) -> bool {
-    if !expanded {
-        return false;
-    }
-    match selected {
-        RevisionSelection::WorkingCopy => commit.is_working_copy(),
-        RevisionSelection::Commit(id) => !commit.is_working_copy() && id == commit.commit_id(),
-    }
-}
-
 pub(crate) fn revision_id_display_len(unique_len: usize, revision_id: &str) -> usize {
     REVISION_ID_CHARS
         .max(unique_len)
@@ -1678,28 +1410,6 @@ fn commit_description_color(commit: RowView, theme: ThemeSpec) -> Color {
         Some(false) => theme.note_text,
         None => theme.note_text,
     }
-}
-
-fn file_stat_width(text: &str, ui_font: Font) -> f32 {
-    (measure::line_width(text, CAPTION_TEXT_SIZE, ui_font) + FILE_STAT_HORIZONTAL_PADDING * 2.0)
-        .max(FILE_STAT_MIN_WIDTH)
-}
-
-/// Width of the status badge column ("M", "A", "D", "R", …). A diff has only
-/// a handful of distinct status labels, so we shape each distinct one once
-/// rather than re-shaping every file's (the scan itself stays O(files), but
-/// the expensive `cosmic_text` measure runs at most a few times).
-fn file_badge_width(files: &[DiffFile], mono_font: iced::Font) -> f32 {
-    let mut seen: Vec<&str> = Vec::new();
-    let mut widest = 0.0_f32;
-    for file in files {
-        let label = file.status.short_label();
-        if !seen.contains(&label) {
-            seen.push(label);
-            widest = widest.max(chip::width(label, None, mono_font));
-        }
-    }
-    widest
 }
 
 #[cfg(test)]

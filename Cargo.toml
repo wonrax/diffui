@@ -60,6 +60,8 @@ objc2-app-kit = { version = "0.3", features = [
     "NSApplication",
     "NSView",
     "NSWindow",
+    "NSOpenPanel",
+    "NSSavePanel",
 ] }
 # Core Animation for the right-clicked-row glow: a CALayer animates on the
 # window server (a separate process), so its pulse keeps running even while the

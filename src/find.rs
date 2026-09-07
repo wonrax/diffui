@@ -259,6 +259,7 @@ pub fn build_overlay<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Messag
         ui.config.ui_font,
         crate::field::FilterField {
             id: FIND_INPUT_ID,
+            leading_icon: Some(icons::SEARCH),
             placeholder: "Find in diff",
             value: &state.query,
             on_input: |q| Message::Find(FindMessage::QueryChanged(q)),

@@ -59,6 +59,13 @@ pub(crate) enum UiEvent {
     SourceTreeScrolled(f64),
     /// Cursor entered/left a caret control — drives its hover highlight.
     SetHover(Option<HoverTarget>),
+    /// Hovering the collapsed changed-files rail temporarily exposes the full
+    /// file tree without changing the saved panel layout.
+    ChangedFilesTriggerEntered,
+    ChangedFilesTriggerExited,
+    ChangedFilesPopupEntered,
+    ChangedFilesPopupExited,
+    CloseChangedFilesPeek,
     /// Click on an error toast — dismiss it.
     ToastDismiss(u64),
     /// Periodic prune of expired toasts; subscribed only while any are up.
@@ -93,6 +100,8 @@ pub(crate) enum UiEvent {
     /// Revset input edited.
     RevsetChanged(String),
     SidebarWidthChanged(f32),
+    ChangedFilesWidthChanged(f32),
+    ChangedFilesScrolled(f64),
     /// Click on a row of the source sidebar's file tree, by display index:
     /// files load into the viewer, directories toggle their collapse.
     SourceSidebarRow(usize),

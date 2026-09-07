@@ -84,10 +84,15 @@ pub(crate) enum Action {
     FindPrevious,
     OpenRepoDialog,
     CloseRepoDialog,
+    /// Pick a local working-copy directory with the native folder chooser.
+    ChooseRepoFolder,
     /// Resolve the dialog's path and open it as a tab.
     SubmitRepoDialog,
     /// Open a repository (or PR) by path/reference.
     OpenRepo(String),
+    /// Remove one path from the persisted recent-repository list.
+    RemoveRecentRepo(String),
+    ClearRecentRepos,
     ToggleActivityPopover,
     CloseActivityPopover,
     ClearActivities,
@@ -109,6 +114,10 @@ pub(crate) enum Action {
     // ── View ────────────────────────────────────────────────────────────
     ToggleWrap,
     ToggleSplit,
+    /// Collapse or restore the revision history pane.
+    ToggleHistoryPanel,
+    /// Collapse or restore the changed-files pane.
+    ToggleFilesPanel,
     SetTheme(ThemePreference),
     SetMainView(MainView),
 
