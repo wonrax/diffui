@@ -624,6 +624,11 @@ impl Session {
         if !self.capabilities.graph {
             self.park_displayed_document();
         }
+        // Every backend's document lands here, so this is the one place that
+        // makes file order mean the same thing to the diff view, the tree and
+        // next/previous file.
+        let mut document = document;
+        document.sort_in_tree_order();
         self.selected_revision = revision;
         self.status = LoadStatus::Loaded;
         self.document = document;
@@ -1092,6 +1097,60 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The diff view walks `document.files` and the changed-files tree lists
+    /// directories first, so a document left in the backend's path order reads
+    /// differently in the two panes — and "next file" skips around the tree.
+    #[test]
+    fn a_landed_diff_is_in_the_order_the_file_tree_lists_it() {
+        let file = |path: &str| crate::model::DiffFile {
+            path: path.to_owned(),
+            old_path: None,
+            status: crate::model::DiffFileStatus::Modified,
+            hunks: Vec::new(),
+            additions: 1,
+            deletions: 0,
+        };
+        let mut session = Session::unloaded(String::new());
+        let job = session
+            .load_diff(RevisionSelection::WorkingCopy)
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::Send(Command::LoadDiff { job, .. }) => Some(job),
+                _ => None,
+            })
+            .expect("a diff load");
+
+        let repo = crate::repo::repo_id(&crate::repo::OpenSpec::Local {
+            root: "/tmp/ordering".into(),
+            scope: Default::default(),
+        });
+        session.apply(Event::new(
+            repo,
+            Payload::DiffLoaded {
+                job,
+                revision: RevisionSelection::WorkingCopy,
+                document: DiffDocument {
+                    files: vec![
+                        file("README.md"),
+                        file("src/main.rs"),
+                        file("src/nested/deep.rs"),
+                    ],
+                    total_additions: 3,
+                    total_deletions: 0,
+                },
+                details: None,
+            },
+        ));
+
+        let paths: Vec<&str> = session
+            .document
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        assert_eq!(paths, ["src/nested/deep.rs", "src/main.rs", "README.md"]);
     }
 
     /// The graph's identity and the repaint stamp are separate. One counter

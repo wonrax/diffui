@@ -77,6 +77,37 @@ pub struct DiffDocument {
     pub total_deletions: usize,
 }
 
+impl DiffDocument {
+    /// Put `files` in the order the changed-files tree lists them: directories
+    /// before files at every level. Backends emit plain path order, which
+    /// interleaves the two (`src/main.rs` sorts ahead of `src/nested/…`), so
+    /// the diff would read in a different order than the tree beside it and
+    /// "next file" would jump around that tree instead of walking down it.
+    ///
+    /// The order is read off [`file_tree_rows`] rather than restated as a
+    /// comparator that would have to be kept in step with it.
+    pub fn sort_in_tree_order(&mut self) {
+        let order: Vec<usize> = file_tree_rows(&self.files, &Default::default())
+            .into_iter()
+            .filter_map(|row| match row {
+                FileTreeRow::File { file_index, .. } => Some(file_index),
+                FileTreeRow::Dir { .. } => None,
+            })
+            .collect();
+        let mut files: Vec<Option<DiffFile>> = std::mem::take(&mut self.files)
+            .into_iter()
+            .map(Some)
+            .collect();
+        self.files = order
+            .into_iter()
+            .filter_map(|index| files[index].take())
+            .collect();
+        // The tree keeps one row per path, so a path the diff carried twice
+        // has an entry left over. It stays in the document, after the rest.
+        self.files.extend(files.into_iter().flatten());
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DiffFile {
     pub path: String,
@@ -1202,6 +1233,54 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn a_document_sorts_into_the_order_the_tree_lists_its_files() {
+        let mut document = DiffDocument {
+            // Path order, as the backends emit it.
+            files: vec![
+                file("README.md"),
+                file("src/a.rs"),
+                file("src/deep/only/child.rs"),
+                file("src/main.rs"),
+                file("src/nested/deep.rs"),
+            ],
+            ..Default::default()
+        };
+        document.sort_in_tree_order();
+
+        let paths: Vec<&str> = document.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "src/deep/only/child.rs",
+                "src/nested/deep.rs",
+                "src/a.rs",
+                "src/main.rs",
+                "README.md",
+            ]
+        );
+        // Which is exactly the tree's own top-to-bottom file order.
+        let listed: Vec<usize> = file_tree_rows(&document.files, &HashSet::new())
+            .into_iter()
+            .filter_map(|row| match row {
+                FileTreeRow::File { file_index, .. } => Some(file_index),
+                FileTreeRow::Dir { .. } => None,
+            })
+            .collect();
+        assert_eq!(listed, [0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn sorting_a_document_keeps_a_path_it_carries_twice() {
+        let mut document = DiffDocument {
+            files: vec![file("src/a.rs"), file("b.rs"), file("src/a.rs")],
+            ..Default::default()
+        };
+        document.sort_in_tree_order();
+        assert_eq!(document.files.len(), 3);
+        assert_eq!(document.files[1].path, "b.rs");
     }
 
     #[test]
