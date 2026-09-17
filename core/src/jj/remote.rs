@@ -63,6 +63,7 @@ pub(super) fn push_bookmark(
         .context("failed to read git subprocess options")?;
     let targets = GitPushRefTargets {
         bookmarks: vec![(RefNameBuf::from(name), Diff { before, after })],
+        tags: Vec::new(),
     };
     // Collect the remote sideband (GitHub's "create a pull request" hint + URL)
     // for the activity log, and forward git's transfer progress to the bar.
@@ -219,8 +220,8 @@ async fn fetch_locked(
     let git_settings =
         GitSettings::from_settings(settings).context("failed to read git settings")?;
     let import_options = GitImportOptions {
-        auto_local_bookmark: git_settings.auto_local_bookmark,
         abandon_unreachable_commits: git_settings.abandon_unreachable_commits,
+        record_synthetic_predecessors: git_settings.record_synthetic_predecessors,
         remote_auto_track_bookmarks: HashMap::new(),
     };
 
@@ -280,7 +281,7 @@ async fn fetch_locked(
             let refspecs = expand_fetch_refspecs(remote, ref_expr)
                 .context("failed to expand fetch refspecs")?;
             fetcher
-                .fetch(remote, refspecs, &mut callback, None, None)
+                .fetch(remote, refspecs, &mut callback, None)
                 .with_context(|| format!("failed to fetch from {}", remote.as_str()))?;
         }
         fetcher

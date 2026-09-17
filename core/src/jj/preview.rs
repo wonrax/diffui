@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use futures::{StreamExt, TryStreamExt};
 use jj_lib::{
     backend::CommitId,
     commit::Commit,
@@ -147,14 +148,17 @@ pub(crate) async fn preview_rebase(
     // whole-branch wash.
     let moved_ids: Vec<CommitId> = match &target {
         MoveCommitsTarget::Commits(ids) => ids.clone(),
-        MoveCommitsTarget::Roots(ids) => RevsetExpression::commits(ids.clone())
-            .descendants()
-            .evaluate(tx.repo())
-            .context("failed to enumerate the moved set")?
-            .iter()
-            .take(REBASE_PREVIEW_SIMULATION_CAP + 1)
-            .map(|entry| entry.context("failed to walk the moved set"))
-            .collect::<Result<_>>()?,
+        MoveCommitsTarget::Roots(ids) => {
+            RevsetExpression::commits(ids.clone())
+                .descendants()
+                .evaluate(tx.repo())
+                .context("failed to enumerate the moved set")?
+                .stream()
+                .take(REBASE_PREVIEW_SIMULATION_CAP + 1)
+                .map(|entry| entry.context("failed to walk the moved set"))
+                .try_collect()
+                .await?
+        }
     };
     if moved_ids.len() > REBASE_PREVIEW_SIMULATION_CAP {
         return Ok(crate::mutations::RebasePreview {

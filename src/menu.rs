@@ -530,10 +530,7 @@ fn card_rects(ui: &Diffui, menu: &OverlayMenu) -> Vec<(Vec<usize>, Rectangle)> {
         AnchorSpec::At(p) => (Rectangle::new(p, Size::ZERO), 0.0),
     };
 
-    loop {
-        let Some(entries) = entries_at(&menu.root, &prefix) else {
-            break;
-        };
+    while let Some(entries) = entries_at(&menu.root, &prefix) {
         let size = Size::new(card_width(ui, entries), card_outer_height(entries, max_h));
         let rect = card_rect(win, anchor, gap, size);
         out.push((prefix.clone(), rect));
@@ -795,7 +792,7 @@ fn build_card<'a>(
     mouse_area(
         container(body)
             .width(Length::Fixed(width))
-            .max_height(max_h)
+            .height(Length::Fit.max(max_h))
             .padding(Padding::from([MENU_CARD_PAD, MENU_CARD_PAD]))
             .style(move |_| popover_style(theme)),
     )
@@ -994,20 +991,12 @@ pub(crate) fn anchor_area<'a, Message>(
 }
 
 impl<Message> Widget<Message, Theme, iced::Renderer> for AnchorArea<'_, Message> {
-    fn children(&self) -> Vec<Tree> {
-        vec![Tree::new(&self.content)]
-    }
-
-    fn diff(&self, tree: &mut Tree) {
-        tree.diff_children(std::slice::from_ref(&self.content));
+    fn diff(&mut self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_mut(&mut self.content));
     }
 
     fn size(&self) -> Size<Length> {
         self.content.as_widget().size()
-    }
-
-    fn size_hint(&self) -> Size<Length> {
-        self.content.as_widget().size_hint()
     }
 
     fn layout(
@@ -1025,12 +1014,17 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for AnchorArea<'_, Message>
         &mut self,
         tree: &mut Tree,
         layout: Layout<'_>,
+        viewport: &Rectangle,
         renderer: &iced::Renderer,
         operation: &mut dyn Operation,
     ) {
-        self.content
-            .as_widget_mut()
-            .operate(&mut tree.children[0], layout, renderer, operation);
+        self.content.as_widget_mut().operate(
+            &mut tree.children[0],
+            layout,
+            viewport,
+            renderer,
+            operation,
+        );
     }
 
     fn update(
@@ -1110,7 +1104,7 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for AnchorArea<'_, Message>
         renderer: &iced::Renderer,
         viewport: &Rectangle,
         translation: iced::Vector,
-    ) -> Option<overlay::Element<'b, Message, Theme, iced::Renderer>> {
+    ) -> Vec<overlay::Element<'b, Message, Theme, iced::Renderer>> {
         self.content.as_widget_mut().overlay(
             &mut tree.children[0],
             layout,

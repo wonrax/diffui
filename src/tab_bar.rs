@@ -272,11 +272,7 @@ struct TabStrip<'a> {
 }
 
 impl Widget<Message, Theme, iced::Renderer> for TabStrip<'_> {
-    fn children(&self) -> Vec<Tree> {
-        self.row.children()
-    }
-
-    fn diff(&self, tree: &mut Tree) {
+    fn diff(&mut self, tree: &mut Tree) {
         self.row.diff(tree);
     }
 
@@ -297,10 +293,12 @@ impl Widget<Message, Theme, iced::Renderer> for TabStrip<'_> {
         &mut self,
         tree: &mut Tree,
         layout: Layout<'_>,
+        viewport: &Rectangle,
         renderer: &iced::Renderer,
         operation: &mut dyn Operation,
     ) {
-        self.row.operate(tree, layout, renderer, operation);
+        self.row
+            .operate(tree, layout, viewport, renderer, operation);
     }
 
     fn update(
@@ -355,7 +353,7 @@ impl Widget<Message, Theme, iced::Renderer> for TabStrip<'_> {
         renderer: &iced::Renderer,
         viewport: &Rectangle,
         translation: Vector,
-    ) -> Option<overlay::Element<'b, Message, Theme, iced::Renderer>> {
+    ) -> Vec<overlay::Element<'b, Message, Theme, iced::Renderer>> {
         self.row
             .overlay(tree, layout, renderer, viewport, translation)
     }
@@ -743,7 +741,7 @@ pub fn build_open_repo_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Mess
     )
     .on_press(Message::Action(Action::CloseRepoDialog));
 
-    let input = crate::input::text_input(
+    let input = iced::widget::text_input(
         "~/code/project, a GitHub PR URL, or owner/repo#123",
         &dialog.path,
     )
@@ -753,7 +751,7 @@ pub fn build_open_repo_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Mess
     .font(ui.config.mono_font)
     .on_input(|path| Message::Ui(UiEvent::OpenRepoPathChanged(path)))
     .on_submit(Message::Action(Action::SubmitRepoDialog))
-    .style(move |_, _| crate::input::Style {
+    .style(move |_, _| iced::widget::text_input::Style {
         // Recessed into the elevated card, otherwise identical to the
         // shared input identity.
         background: Background::Color(theme.background),
@@ -795,7 +793,9 @@ pub fn build_open_repo_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Mess
         .size(text_size::UI)
         .color(theme.text)
         .font(emphasis_font(ui.config.ui_font, Weight::Medium));
-    let mut input_row = row![input].spacing(8).align_y(alignment::Vertical::Center);
+    let mut input_row = row![crate::input::single_line(input)]
+        .spacing(8)
+        .align_y(alignment::Vertical::Center);
     #[cfg(target_os = "macos")]
     {
         let choose_folder = button(centered_control_content(

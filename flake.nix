@@ -28,7 +28,7 @@
             vulkan-loader
           ];
 
-          darwinBuildInputs = [ pkgs.apple-sdk_15 ];
+          darwinBuildInputs = [ pkgs.apple-sdk_26 ];
 
           version = "0.1.0";
 
@@ -66,11 +66,14 @@
               allowBuiltinFetchGit = true;
             };
 
-            nativeBuildInputs = [ pkgs.pkg-config ] ++ lib.optionals pkgs.stdenv.isLinux [ pkgs.makeWrapper ];
+            nativeBuildInputs = [
+              pkgs.pkg-config
+            ]
+            ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.makeWrapper ];
 
             buildInputs =
-              lib.optionals pkgs.stdenv.isLinux (linuxRuntimeLibs ++ [ pkgs.fontconfig ])
-              ++ lib.optionals pkgs.stdenv.isDarwin darwinBuildInputs;
+              lib.optionals pkgs.stdenv.hostPlatform.isLinux (linuxRuntimeLibs ++ [ pkgs.fontconfig ])
+              ++ lib.optionals pkgs.stdenv.hostPlatform.isDarwin darwinBuildInputs;
 
             doCheck = false;
 
@@ -84,7 +87,7 @@
             # (app grid / Spotlight / Dock), the CLI, and `nix run` off a single
             # binary — the convention alacritty / kitty / wezterm follow.
             postInstall =
-              lib.optionalString pkgs.stdenv.isLinux ''
+              lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
                 wrapProgram $out/bin/diffui \
                   --prefix LD_LIBRARY_PATH : "${lib.makeLibraryPath linuxRuntimeLibs}"
 
@@ -95,7 +98,7 @@
                     "$out/share/icons/hicolor/scalable/apps/diffui.svg"
                 ''}
               ''
-              + lib.optionalString pkgs.stdenv.isDarwin ''
+              + lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
                 app="$out/Applications/Diffui.app"
                 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
                 cp ${infoPlist} "$app/Contents/Info.plist"
@@ -226,7 +229,7 @@
                 rustc
                 rustfmt
               ]
-              ++ lib.optionals stdenv.isLinux (
+              ++ lib.optionals stdenv.hostPlatform.isLinux (
                 [
                   pkg-config
                   fontconfig
@@ -234,12 +237,12 @@
                 ++ linuxRuntimeLibs
               );
 
-            buildInputs = lib.optionals pkgs.stdenv.isDarwin darwinBuildInputs;
+            buildInputs = lib.optionals pkgs.stdenv.hostPlatform.isDarwin darwinBuildInputs;
 
             RUST_BACKTRACE = "1";
 
             shellHook =
-              lib.optionalString pkgs.stdenv.isLinux ''
+              lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
                 diffui_runtime_libs="${pkgs.lib.makeLibraryPath linuxRuntimeLibs}"
                 existing_ld_library_path="''${LD_LIBRARY_PATH#:}"
 

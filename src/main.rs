@@ -219,7 +219,10 @@ fn main() -> iced::Result {
         Diffui::view,
     )
     .title("diffui")
-    .font(icons::ICON_FONT_BYTES)
+    .fonts([icons::ICON_FONT_BYTES])
+    // iced's default moved to 1.375; the layout (toolbar fills, icon boxes) is
+    // measured against 1.3 line boxes.
+    .line_height(iced::widget::text::LineHeight::Relative(1.3))
     .window(window_settings)
     // The close is ours to perform: `Message::WindowCloseRequested` flushes the
     // pending window state before exiting, which winit gives us no other chance

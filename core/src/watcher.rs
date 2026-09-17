@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use jj_lib::gitignore::GitIgnoreFile;
+use jj_lib::repo_path::{RepoPathBuf, RepoPathComponent};
 use notify::Watcher as _;
 use tokio::sync::mpsc::{Receiver, channel};
 
@@ -191,17 +192,11 @@ impl WatchScope {
     /// noise here for the same reason: the refresh it would trigger reads the
     /// same tree and finds nothing changed.
     fn is_ignored(&self, relative: &Path, is_dir: bool) -> bool {
-        let Some(text) = relative.to_str() else {
+        // A path jj can't name (non-UTF-8) is one no ignore rule can match.
+        let Ok(path) = RepoPathBuf::from_relative_path(relative) else {
             return false;
         };
-        if text.is_empty() {
-            return false;
-        }
-        if is_dir {
-            self.ignores.matches(&format!("{text}/"))
-        } else {
-            self.ignores.matches(text)
-        }
+        crate::jj::settings::is_ignored(&self.ignores, &path, is_dir)
     }
 
     /// Whether `path` is under the repo's `op_heads` — i.e. an operation landed
@@ -413,7 +408,7 @@ fn survey(
     });
 
     let mut directories = Vec::new();
-    let mut level = vec![(root.to_owned(), String::new())];
+    let mut level = vec![(root.to_owned(), RepoPathBuf::root())];
     while !level.is_empty() {
         let mut next = Vec::new();
         for (dir, prefix) in level {
@@ -439,8 +434,13 @@ fn survey(
                 if name == ".git" || name == ".jj" {
                     continue;
                 }
-                let child_prefix = format!("{prefix}{}/", name.to_string_lossy());
-                if ignores.matches(&child_prefix)
+                let name = name.to_string_lossy();
+                let Ok(component) = RepoPathComponent::new(&name) else {
+                    continue;
+                };
+                let child_prefix = prefix.join(component);
+                // Exact match is enough: the walk never enters an ignored parent.
+                if ignores.matches_dir(&child_prefix)
                     || targets
                         .external_repo_dir
                         .as_ref()
@@ -522,6 +522,7 @@ const NO_SPACE: i32 = 28;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jj_lib::repo_path::RepoPath;
     use tokio::sync::mpsc::channel;
 
     fn scope(root: &str) -> WatchScope {
@@ -581,7 +582,11 @@ mod tests {
     #[test]
     fn an_ignored_path_is_not_a_worktree_signal() {
         let ignores = GitIgnoreFile::empty()
-            .chain("", Path::new("/repo/.gitignore"), b"/target/\n")
+            .chain(
+                RepoPath::root(),
+                Path::new("/repo/.gitignore"),
+                b"/target/\n",
+            )
             .expect("parse the test ignore rules");
         let scope = WatchScope {
             root: PathBuf::from("/repo"),

@@ -388,7 +388,7 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
                 ]
                 .spacing(10)
                 .align_x(alignment::Horizontal::Center)
-                .max_width(440),
+                .width(Length::Fit.max(440)),
             )
             .width(Length::Fill)
             .height(Length::Fill)

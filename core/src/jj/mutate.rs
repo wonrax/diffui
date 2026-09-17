@@ -4,6 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use futures::{StreamExt, TryStreamExt};
 use jj_lib::{
     absorb::{AbsorbSource, absorb_hunks, split_hunks_to_trees},
     backend::{ChangeId, CommitId},
@@ -60,6 +61,7 @@ pub(crate) async fn check_bookmark_move_backwards(
     let forward = repo
         .index()
         .is_ancestor(current, &new_target)
+        .await
         .context("failed to check bookmark ancestry")?;
     Ok(!forward)
 }
@@ -180,6 +182,7 @@ async fn apply_view_only(
             let symbol = RefName::new(name).to_remote_symbol(RemoteName::new(remote));
             tx.repo_mut()
                 .track_remote_bookmark(symbol)
+                .await
                 .with_context(|| format!("failed to track {name}@{remote}"))?;
             format!("Tracking {name}@{remote}")
         }
@@ -913,9 +916,10 @@ pub(super) async fn resolve_rebase_location(
                 .children()
                 .evaluate(repo)
                 .context("failed to resolve the target's children")?
-                .iter()
+                .stream()
                 .map(|entry| entry.context("failed to walk the target's children"))
-                .collect::<Result<Vec<CommitId>>>()?;
+                .try_collect::<Vec<CommitId>>()
+                .await?;
             (vec![anchor.id().clone()], children, anchor)
         }
         Destination::Before(target) => {
@@ -944,9 +948,10 @@ pub(super) async fn reverse_topo_order(
     RevsetExpression::commits(ids.to_vec())
         .evaluate(repo)
         .context("failed to order rebase sources")?
-        .iter()
+        .stream()
         .map(|entry| entry.context("failed to walk rebase sources"))
-        .collect()
+        .try_collect()
+        .await
 }
 
 /// Lower a rebase mode + picked sources into jj-lib's move target. Branch
@@ -974,9 +979,10 @@ pub(super) async fn resolve_move_target(
                 .roots()
                 .evaluate(repo)
                 .context("failed to resolve the branch's fork-point roots")?
-                .iter()
+                .stream()
                 .map(|entry| entry.context("failed to walk the branch roots"))
-                .collect::<Result<_>>()?;
+                .try_collect()
+                .await?;
             if roots.is_empty() {
                 return Ok(None);
             }
@@ -1044,8 +1050,9 @@ pub(super) async fn ensure_rewritable(
     let first = check
         .evaluate(repo)
         .context("failed to evaluate immutable()")?
-        .iter()
+        .stream()
         .next()
+        .await
         .transpose()
         .context("failed to check immutability")?;
     if let Some(id) = first {

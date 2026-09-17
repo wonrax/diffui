@@ -15,8 +15,9 @@ use jj_lib::{
     },
     gitignore::GitIgnoreFile,
     matchers::Matcher,
-    repo_path::RepoPathUiConverter,
+    repo_path::RepoPath,
     settings::{HumanByteSize, UserSettings},
+    ui_path::RepoPathUiConverter,
 };
 
 // Fallback used only when the user has not configured `snapshot.max-new-file-size`.
@@ -317,18 +318,34 @@ pub(super) fn snapshot_base_ignores_with_env(
 
     if let Some(excludes) = git_excludes_file(repo_root, git_dir.as_deref(), env) {
         ignores = ignores
-            .chain_with_file("", excludes.clone())
+            .chain_with_file(RepoPath::root(), excludes.clone())
             .with_context(|| format!("failed to read git excludes {}", excludes.display()))?;
     }
 
     if let Some(git_dir) = &git_dir {
         let info_exclude = git_dir.join("info").join("exclude");
         ignores = ignores
-            .chain_with_file("", info_exclude.clone())
+            .chain_with_file(RepoPath::root(), info_exclude.clone())
             .with_context(|| format!("failed to read {}", info_exclude.display()))?;
     }
 
     Ok(ignores)
+}
+
+/// Whether `path` is ignored, either itself or through an ignored ancestor.
+///
+/// jj-lib's `matches_file`/`matches_dir` test the exact path only and leave
+/// parent recursion to the caller, because its snapshotter never descends into
+/// an ignored directory. Callers here hold arbitrary paths — a watcher event
+/// from deep inside `target/`, an entry of an ignored directory that still has
+/// tracked files — so the ancestors are walked for them.
+pub(crate) fn is_ignored(ignores: &GitIgnoreFile, path: &RepoPath, is_dir: bool) -> bool {
+    let matched = if is_dir {
+        ignores.matches_dir(path)
+    } else {
+        ignores.matches_file(path)
+    };
+    matched || path.ancestors().skip(1).any(|dir| ignores.matches_dir(dir))
 }
 
 /// The git dir behind a jj repo. `.jj/repo/store/git_target` holds the path
@@ -520,6 +537,10 @@ mod config_layering_tests {
         path
     }
 
+    fn repo_path(value: &str) -> &RepoPath {
+        RepoPath::from_internal_string(value).expect("valid repo path")
+    }
+
     /// An environment holding only what the test puts in it: no home, no
     /// hostname, and none of the variables the test runner happens to carry.
     fn test_env(vars: &[(&str, &str)]) -> JjEnv {
@@ -647,8 +668,11 @@ mod config_layering_tests {
         };
         let ignores = snapshot_base_ignores_with_env(&root, &env).expect("base ignores");
 
-        assert!(ignores.matches("build.tmp"), "excludesFile patterns apply");
-        assert!(!ignores.matches("build.rs"));
+        assert!(
+            ignores.matches_file(repo_path("build.tmp")),
+            "excludesFile patterns apply"
+        );
+        assert!(!ignores.matches_file(repo_path("build.rs")));
     }
 
     /// With `core.excludesFile` unset, git falls back to
@@ -668,8 +692,8 @@ mod config_layering_tests {
         ]);
         let ignores = snapshot_base_ignores_with_env(&root, &env).expect("base ignores");
 
-        assert!(ignores.matches("run.log"));
-        assert!(!ignores.matches("run.rs"));
+        assert!(ignores.matches_file(repo_path("run.log")));
+        assert!(!ignores.matches_file(repo_path("run.rs")));
     }
 
     /// `info/exclude` has to come from the git dir `store/git_target` names,
@@ -697,8 +721,14 @@ mod config_layering_tests {
             );
 
             let ignores = snapshot_base_ignores_with_env(&root, &env).expect("base ignores");
-            assert!(ignores.matches("token.secret"), "{name} layout");
-            assert!(!ignores.matches("token.rs"), "{name} layout");
+            assert!(
+                ignores.matches_file(repo_path("token.secret")),
+                "{name} layout"
+            );
+            assert!(
+                !ignores.matches_file(repo_path("token.rs")),
+                "{name} layout"
+            );
         }
     }
 

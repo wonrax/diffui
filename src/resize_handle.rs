@@ -166,6 +166,8 @@ where
                 }
                 shell.capture_event();
             }
+            // `take()` mutates, so it stays out of a match guard.
+            #[allow(clippy::collapsible_match)]
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                 if state.drag.take().is_some() {
                     shell.capture_event();

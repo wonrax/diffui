@@ -2188,7 +2188,7 @@ impl<'a, Message> DiffView<'a, Message> {
         paragraph_cache: &RefCell<std::collections::HashMap<ParagraphKey, Renderer::Paragraph>>,
         paragraph_seen: &mut std::collections::HashSet<ParagraphKey>,
     ) where
-        Renderer: text::Renderer<Font = Font>,
+        Renderer: text::Renderer,
     {
         let text_color = self.line_text_color(line.kind);
         // Plain source documents have one side, so a single right-aligned
@@ -2580,7 +2580,7 @@ impl<'a, Message> DiffView<'a, Message> {
         paragraph_cache: &RefCell<std::collections::HashMap<ParagraphKey, Renderer::Paragraph>>,
         paragraph_seen: &mut std::collections::HashSet<ParagraphKey>,
     ) where
-        Renderer: text::Renderer<Font = Font>,
+        Renderer: text::Renderer,
     {
         let content_width_bits = content_width.to_bits();
         let wrap_width = self.wrap_width(content_width);
@@ -2774,7 +2774,7 @@ impl<'a, Message> DiffView<'a, Message> {
         selection: Option<(TextPosition, TextPosition)>,
         show_description_edit: bool,
     ) where
-        Renderer: text::Renderer<Font = Font> + geometry::Renderer,
+        Renderer: text::Renderer + geometry::Renderer,
     {
         // Header occupies content_y in `[0, header_height)`. Translate to
         // screen coords for the section that intersects the viewport.
@@ -2952,7 +2952,7 @@ impl<'a, Message> DiffView<'a, Message> {
 
 impl<'a, Message, Renderer> Widget<Message, Theme, Renderer> for DiffView<'a, Message>
 where
-    Renderer: text::Renderer<Font = Font> + geometry::Renderer,
+    Renderer: text::Renderer + geometry::Renderer,
 {
     fn tag(&self) -> tree::Tag {
         tree::Tag::of::<State<Renderer::Paragraph>>()
@@ -2996,7 +2996,7 @@ where
         })
     }
 
-    fn diff(&self, tree: &mut Tree) {
+    fn diff(&mut self, tree: &mut Tree) {
         let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
 
         let header_height_bits = self.header_height().to_bits();
@@ -4354,7 +4354,7 @@ impl<Message> DiffView<'_, Message> {
         height: f32,
         wrapping: text::Wrapping,
         shaping: text::Shaping,
-    ) -> text::Text<String, Font> {
+    ) -> text::Text<String> {
         text::Text {
             content: content.to_owned(),
             bounds: Size::new(width.max(1.0), height.max(1.0)),
@@ -4414,7 +4414,7 @@ impl<Message> DiffView<'_, Message> {
         bounds: Rectangle,
         browse_hovered: bool,
     ) where
-        Renderer: text::Renderer<Font = Font> + geometry::Renderer,
+        Renderer: text::Renderer + geometry::Renderer,
     {
         let file = &self.files[file_index];
         let (additions, deletions, hunk_label, summary_width) =
@@ -4598,7 +4598,7 @@ impl<Message> DiffView<'_, Message> {
 
     fn draw_text<Renderer>(&self, renderer: &mut Renderer, content: &str, render: TextRenderParams)
     where
-        Renderer: text::Renderer<Font = Font>,
+        Renderer: text::Renderer,
     {
         self.draw_text_shaped(renderer, content, render, text::Shaping::Auto);
     }
@@ -4612,7 +4612,7 @@ impl<Message> DiffView<'_, Message> {
         render: TextRenderParams,
         shaping: text::Shaping,
     ) where
-        Renderer: text::Renderer<Font = Font>,
+        Renderer: text::Renderer,
     {
         renderer.fill_text(
             self.make_text(
@@ -4634,7 +4634,7 @@ impl<Message> DiffView<'_, Message> {
         bounds: Rectangle,
         clip_bounds: Rectangle,
     ) where
-        Renderer: text::Renderer<Font = Font>,
+        Renderer: text::Renderer,
     {
         let label = "Edit";
         let label_width = measure::line_width(label, HEADER_EDIT_LABEL_SIZE, self.font);
@@ -4694,7 +4694,7 @@ impl<Message> DiffView<'_, Message> {
         paragraph_cache: &RefCell<std::collections::HashMap<ParagraphKey, Renderer::Paragraph>>,
         paragraph_seen: &mut std::collections::HashSet<ParagraphKey>,
     ) where
-        Renderer: text::Renderer<Font = Font>,
+        Renderer: text::Renderer,
     {
         if line.syntax.is_empty() {
             self.draw_text_shaped(renderer, &line.content, render, shaping);
@@ -4736,7 +4736,7 @@ impl<Message> DiffView<'_, Message> {
         &self,
         content: &'a str,
         syntax: &'a [SyntaxSpan],
-    ) -> Vec<text::Span<'a, (), Font>> {
+    ) -> Vec<text::Span<'a, ()>> {
         let mut spans = Vec::with_capacity(syntax.len().saturating_mul(2).saturating_add(1));
         let mut cursor = 0;
 
@@ -5090,7 +5090,7 @@ fn prefix_for_kind(kind: DiffLineKind) -> &'static str {
 impl<'a, Message, Renderer> From<DiffView<'a, Message>> for Element<'a, Message, Theme, Renderer>
 where
     Message: 'a,
-    Renderer: text::Renderer<Font = Font> + geometry::Renderer + 'a,
+    Renderer: text::Renderer + geometry::Renderer + 'a,
 {
     fn from(diff_view: DiffView<'a, Message>) -> Self {
         Element::new(diff_view)

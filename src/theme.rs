@@ -703,7 +703,6 @@ pub fn input_style(theme: ThemeSpec) -> text_input::Style {
             color: theme.border,
             radius: radius::CONTROL.into(),
         },
-        icon: theme.muted_text,
         placeholder: theme.subtle_text,
         value: theme.text,
         selection: Color {

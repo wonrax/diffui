@@ -99,12 +99,12 @@ anyhow = "1.0"
 bstr = "1.12"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 futures = "0.3"
-jj-lib = "0.40.0"
+jj-lib = "0.45.1"
 # Both already in the tree transitively via jj-lib; used by the GitHub
 # files-API fallback (per-file JSON entries with embedded patches).
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1.44", features = ["fs", "macros", "process", "time", "rt", "sync"] }
+tokio = { version = "1.44", features = ["fs", "io-util", "macros", "process", "time", "rt", "sync"] }
 # Structured logging for the repository actor: one span per command, so a
 # stuck or slow operation is attributable without an `eprintln!` trail.
 tracing = "0.1"

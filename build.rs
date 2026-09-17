@@ -56,6 +56,7 @@ fn download(url: &str) -> Vec<u8> {
     });
     let mut bytes = Vec::with_capacity(LUCIDE_SIZE as usize);
     response
+        .into_body()
         .into_reader()
         .read_to_end(&mut bytes)
         .expect("read the Lucide font response body");

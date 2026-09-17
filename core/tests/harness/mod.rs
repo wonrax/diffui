@@ -31,7 +31,8 @@ pub fn scratch_repo(test: &str) -> PathBuf {
     std::fs::create_dir_all(&root).expect("create scratch dir");
     let settings = test_settings();
     block_on(async {
-        jj_lib::workspace::Workspace::init_internal_git(&settings, &root)
+        // The default object hash is SHA-1, what every real repo uses.
+        jj_lib::workspace::Workspace::init_internal_git(&settings, &root, Default::default())
             .await
             .expect("init jj workspace");
     });
@@ -95,8 +96,8 @@ pub fn commit_ids(root: &Path) -> Vec<String> {
         let workspace = jj_lib::workspace::Workspace::load(
             &settings,
             root,
-            &jj_lib::repo::StoreFactories::default(),
-            &jj_lib::workspace::default_working_copy_factories(),
+            &jj_lib::default_backend_factories::default_backend_factories(),
+            &jj_lib::default_backend_factories::default_working_copy_factories(),
         )
         .expect("load workspace");
         let repo = workspace
@@ -115,12 +116,13 @@ pub fn commit_ids(root: &Path) -> Vec<String> {
         resolved
             .evaluate(repo.as_ref())
             .expect("evaluate all()")
-            .iter()
+            .stream()
             .map(|entry| {
                 use jj_lib::object_id::ObjectId;
                 entry.expect("walk all()").hex()
             })
             .collect()
+            .await
     })
 }
 
@@ -297,8 +299,8 @@ pub fn load_workspace(root: &Path) -> jj_lib::workspace::Workspace {
     jj_lib::workspace::Workspace::load(
         &test_settings_for(root),
         root,
-        &jj_lib::repo::StoreFactories::default(),
-        &jj_lib::workspace::default_working_copy_factories(),
+        &jj_lib::default_backend_factories::default_backend_factories(),
+        &jj_lib::default_backend_factories::default_working_copy_factories(),
     )
     .expect("load workspace")
 }
@@ -374,7 +376,7 @@ pub fn add_workspace(root: &Path, name: &str) -> PathBuf {
             .load_at_head()
             .await
             .expect("load repo at head");
-        let factories = jj_lib::workspace::default_working_copy_factories();
+        let factories = jj_lib::default_backend_factories::default_working_copy_factories();
         let factory = factories
             .get(jj_lib::working_copy::WorkingCopy::name(
                 workspace.working_copy(),

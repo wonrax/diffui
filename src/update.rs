@@ -1074,6 +1074,8 @@ impl Diffui {
                             target.selected_file = *file_index;
                         }
                     }
+                    // `remove()` mutates, so it stays out of a match guard.
+                    #[allow(clippy::collapsible_match)]
                     Some(diffui_core::FileTreeRow::Dir { path, .. }) => {
                         if !target.collapsed_dirs.remove(path) {
                             target.collapsed_dirs.insert(path.clone());

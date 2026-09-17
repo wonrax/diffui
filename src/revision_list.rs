@@ -786,7 +786,7 @@ impl State {
 
 impl<'a, Message, Renderer> Widget<Message, Theme, Renderer> for RevisionList<'a, Message>
 where
-    Renderer: text::Renderer<Font = Font> + iced::advanced::graphics::geometry::Renderer,
+    Renderer: text::Renderer + iced::advanced::graphics::geometry::Renderer,
 {
     fn tag(&self) -> tree::Tag {
         match self.slot {
@@ -806,7 +806,7 @@ where
         }
     }
 
-    fn diff(&self, tree: &mut Tree) {
+    fn diff(&mut self, tree: &mut Tree) {
         let state = tree.state.downcast_mut::<State>();
         if self.reveal_token != state.last_reveal_token {
             state.last_reveal_token = self.reveal_token;
@@ -1278,78 +1278,11 @@ where
         _renderer: &Renderer,
         _viewport: &Rectangle,
         translation: Vector,
-    ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
-        let state = tree.state.downcast_ref::<State>();
-        let cursor_pos = state.cursor_position?;
-        let bounds = layout.bounds();
-
-        // Lane tooltip wins over the file path tooltip when both could
-        // fire at the same time — the cursor is in the gutter, which
-        // is mutually exclusive with the content area anyway.
-        if let Some((item_idx, lane, _half)) = state.hovered_lane {
-            if item_idx >= self.row_count() {
-                return None;
-            }
-            let item = self.item_at(item_idx);
-            let labels = item_lane_labels(&item, lane);
-            if labels.is_empty() {
-                return None;
-            }
-            let text = labels.join(", ");
-            let row_top = self.row_top(item_idx) - state.vertical_offset;
-            let row_screen_y = bounds.y + row_top as f32;
-            let row_height = self.row_height(&item);
-            let gutter_total = self.item_gutter_width(&item);
-            let text_size = measure::line_bounds(&text, CAPTION_TEXT_SIZE, self.style.primary_font);
-            return Some(overlay::Element::new(Box::new(TooltipOverlay {
-                text,
-                cursor: cursor_pos + translation,
-                // Anchor just past the gutter so the tip sits next to
-                // the stroke rather than at the far right edge.
-                row_anchor_x: bounds.x + gutter_total + translation.x,
-                row_anchor_y: row_screen_y + translation.y,
-                row_height,
-                style: self.style,
-                text_size,
-            })));
-        }
-
-        let item_idx = state.hovered_file_item?;
-        if item_idx >= self.row_count() {
-            return None;
-        }
-        let item = self.item_at(item_idx);
-        let gutter_total = self.item_gutter_width(&item);
-        let Item::File(file) = item else {
-            return None;
-        };
-
-        // Only show the path tooltip when the name is actually ellipsized —
-        // same column math as `draw_file`'s `fill_text_truncated` call.
-        let path_w = self
-            .file_row_columns(bounds.x, bounds.width, gutter_total, &file)
-            .path_w;
-        let name_width =
-            measure::line_bounds(&file.primary, CAPTION_TEXT_SIZE, self.style.primary_font).width;
-        if name_width <= path_w {
-            return None;
-        }
-        let row_top = self.row_top(item_idx) - state.vertical_offset;
-        let row_screen_y = bounds.y + row_top as f32;
-        let row_height = FILE_ROW_HEIGHT;
-
-        let text_size =
-            measure::line_bounds(&file.raw_path, CAPTION_TEXT_SIZE, self.style.primary_font);
-
-        Some(overlay::Element::new(Box::new(TooltipOverlay {
-            text: file.raw_path,
-            cursor: cursor_pos + translation,
-            row_anchor_x: bounds.x + bounds.width + translation.x,
-            row_anchor_y: row_screen_y + translation.y,
-            row_height,
-            style: self.style,
-            text_size,
-        })))
+    ) -> Vec<overlay::Element<'b, Message, Theme, Renderer>> {
+        self.tooltip(tree, layout, translation)
+            .map(|tooltip| overlay::Element::new(Box::new(tooltip)))
+            .into_iter()
+            .collect()
     }
 
     fn mouse_interaction(
@@ -1626,6 +1559,87 @@ where
 }
 
 impl<'a, Message> RevisionList<'a, Message> {
+    /// The hover tooltip due this frame, if any: a lane's labels, or the full
+    /// path of a file row whose name is ellipsized.
+    fn tooltip(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        translation: Vector,
+    ) -> Option<TooltipOverlay> {
+        let state = tree.state.downcast_ref::<State>();
+        let cursor_pos = state.cursor_position?;
+        let bounds = layout.bounds();
+
+        // Lane tooltip wins over the file path tooltip when both could
+        // fire at the same time — the cursor is in the gutter, which
+        // is mutually exclusive with the content area anyway.
+        if let Some((item_idx, lane, _half)) = state.hovered_lane {
+            if item_idx >= self.row_count() {
+                return None;
+            }
+            let item = self.item_at(item_idx);
+            let labels = item_lane_labels(&item, lane);
+            if labels.is_empty() {
+                return None;
+            }
+            let text = labels.join(", ");
+            let row_top = self.row_top(item_idx) - state.vertical_offset;
+            let row_screen_y = bounds.y + row_top as f32;
+            let row_height = self.row_height(&item);
+            let gutter_total = self.item_gutter_width(&item);
+            let text_size = measure::line_bounds(&text, CAPTION_TEXT_SIZE, self.style.primary_font);
+            return Some(TooltipOverlay {
+                text,
+                cursor: cursor_pos + translation,
+                // Anchor just past the gutter so the tip sits next to
+                // the stroke rather than at the far right edge.
+                row_anchor_x: bounds.x + gutter_total + translation.x,
+                row_anchor_y: row_screen_y + translation.y,
+                row_height,
+                style: self.style,
+                text_size,
+            });
+        }
+
+        let item_idx = state.hovered_file_item?;
+        if item_idx >= self.row_count() {
+            return None;
+        }
+        let item = self.item_at(item_idx);
+        let gutter_total = self.item_gutter_width(&item);
+        let Item::File(file) = item else {
+            return None;
+        };
+
+        // Only show the path tooltip when the name is actually ellipsized —
+        // same column math as `draw_file`'s `fill_text_truncated` call.
+        let path_w = self
+            .file_row_columns(bounds.x, bounds.width, gutter_total, &file)
+            .path_w;
+        let name_width =
+            measure::line_bounds(&file.primary, CAPTION_TEXT_SIZE, self.style.primary_font).width;
+        if name_width <= path_w {
+            return None;
+        }
+        let row_top = self.row_top(item_idx) - state.vertical_offset;
+        let row_screen_y = bounds.y + row_top as f32;
+        let row_height = FILE_ROW_HEIGHT;
+
+        let text_size =
+            measure::line_bounds(&file.raw_path, CAPTION_TEXT_SIZE, self.style.primary_font);
+
+        Some(TooltipOverlay {
+            text: file.raw_path,
+            cursor: cursor_pos + translation,
+            row_anchor_x: bounds.x + bounds.width + translation.x,
+            row_anchor_y: row_screen_y + translation.y,
+            row_height,
+            style: self.style,
+            text_size,
+        })
+    }
+
     /// Horizontal layout of a file row's content columns:
     /// [indent][chevron][icon] name … [+N] [-N] [status chip] pad.
     /// Shared between `draw_file` (which end-ellipsizes the name into
@@ -1671,7 +1685,7 @@ impl<'a, Message> RevisionList<'a, Message> {
         emphasized_lane_after: Option<usize>,
         hovered: bool,
     ) where
-        R: text::Renderer<Font = Font> + iced::advanced::graphics::geometry::Renderer,
+        R: text::Renderer + iced::advanced::graphics::geometry::Renderer,
     {
         let selected = self
             .selected_row
@@ -2169,7 +2183,7 @@ impl<'a, Message> RevisionList<'a, Message> {
         emphasized_guide: Option<usize>,
         hovered: bool,
     ) where
-        R: text::Renderer<Font = Font> + iced::advanced::graphics::geometry::Renderer,
+        R: text::Renderer + iced::advanced::graphics::geometry::Renderer,
     {
         let selected = self
             .selected_file
@@ -2588,7 +2602,7 @@ fn fill_gradient_rounded<R: renderer::Renderer>(
 /// want an end-ellipsis. Centering goes through `align_y: Center` so all
 /// rows in this widget share the same y-positioning model.
 #[allow(clippy::too_many_arguments)]
-fn fill_text_truncated<R: text::Renderer<Font = Font>>(
+fn fill_text_truncated<R: text::Renderer>(
     renderer: &mut R,
     content: &str,
     x: f32,
@@ -2629,7 +2643,7 @@ fn fill_text_truncated<R: text::Renderer<Font = Font>>(
 /// `align_y` placement, and it owns its `String` so we don't have to manage
 /// paragraph lifetimes.
 #[allow(clippy::too_many_arguments)]
-fn fill_text_centered_y<R: text::Renderer<Font = Font>>(
+fn fill_text_centered_y<R: text::Renderer>(
     renderer: &mut R,
     content: &str,
     x: f32,
@@ -2697,7 +2711,7 @@ impl TooltipOverlay {
 
 impl<Message, Renderer> overlay::Overlay<Message, Theme, Renderer> for TooltipOverlay
 where
-    Renderer: text::Renderer<Font = Font>,
+    Renderer: text::Renderer,
 {
     fn layout(&mut self, _renderer: &Renderer, viewport: Size) -> layout::Node {
         let size = self.box_size();
@@ -2764,7 +2778,7 @@ where
 impl<'a, Message: 'a, Renderer> From<RevisionList<'a, Message>>
     for Element<'a, Message, Theme, Renderer>
 where
-    Renderer: text::Renderer<Font = Font> + iced::advanced::graphics::geometry::Renderer + 'a,
+    Renderer: text::Renderer + iced::advanced::graphics::geometry::Renderer + 'a,
 {
     fn from(widget: RevisionList<'a, Message>) -> Self {
         Element::new(widget)

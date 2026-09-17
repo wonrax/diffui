@@ -5,10 +5,8 @@
 
 use iced::{
     Background, Border, Color, Element, Font, Length, Padding, alignment, mouse,
-    widget::{Space, button, container, mouse_area, row, text, tooltip},
+    widget::{Space, button, container, mouse_area, row, text, text_input, tooltip},
 };
-
-use crate::input::text_input;
 
 use crate::theme::{self, ThemeSpec};
 use crate::{Action, HoverTarget, Message, ToolbarMenu, UiEvent};
@@ -118,7 +116,7 @@ pub(crate) fn filter_field(
             }),
         );
     }
-    bar = bar.push(input);
+    bar = bar.push(crate::input::single_line(input));
     if let Some(caret) = spec.caret {
         // `mouse_area` (not `button`) so the presets menu opens on
         // mouse-*down* while held — required for the native NSMenu's

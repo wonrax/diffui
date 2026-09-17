@@ -94,7 +94,7 @@ pub fn width_memoized(memo: &WidthMemo, label: &str, icon: Option<&str>, font: F
 /// Returns the chip's width so rails can advance to the next chip.
 pub fn draw<R>(renderer: &mut R, chip: &Chip, x: f32, center_y: f32, clip: Rectangle) -> f32
 where
-    R: text::Renderer<Font = Font> + geometry::Renderer,
+    R: text::Renderer + geometry::Renderer,
 {
     draw_memoized(renderer, chip, &WidthMemo::default(), x, center_y, clip)
 }
@@ -110,7 +110,7 @@ pub fn draw_memoized<R>(
     clip: Rectangle,
 ) -> f32
 where
-    R: text::Renderer<Font = Font> + geometry::Renderer,
+    R: text::Renderer + geometry::Renderer,
 {
     let label_w = memo.width(&chip.label, TEXT_SIZE, chip.font);
     let icon_block = chip

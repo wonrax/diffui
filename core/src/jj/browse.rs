@@ -17,7 +17,7 @@ use jj_lib::{
     object_id::ObjectId,
     ref_name::WorkspaceName,
     repo::{ReadonlyRepo, Repo},
-    repo_path::RepoPathBuf,
+    repo_path::{RepoPath, RepoPathBuf},
     tree_merge::MergeOptions,
 };
 
@@ -222,8 +222,10 @@ pub(super) fn walk_working_copy_dir(
     } else {
         format!("{dir_rel}/")
     };
+    let dir_path = RepoPath::from_internal_string(dir_rel)
+        .with_context(|| format!("invalid repo directory {dir_rel:?}"))?;
     let ignores = ignores
-        .chain_with_file(&prefix, disk_dir.join(".gitignore"))
+        .chain_with_file(dir_path, disk_dir.join(".gitignore"))
         .with_context(|| format!("failed to read {}/.gitignore", disk_dir.display()))?;
 
     let mut names: Vec<(String, std::fs::FileType)> = Vec::new();
@@ -244,11 +246,12 @@ pub(super) fn walk_working_copy_dir(
 
     for (name, file_type) in names {
         let rel = format!("{prefix}{name}");
+        let rel_path = RepoPath::from_internal_string(&rel)
+            .with_context(|| format!("invalid repo path {rel:?}"))?;
         // Symlinks list as leaf entries — following them risks cycles, and
         // jj tracks them as entries, not trees.
         if file_type.is_dir() && !file_type.is_symlink() {
-            let dir_ignored = ignores.matches(&format!("{rel}/"));
-            if dir_ignored && !tracked_dirs.contains(&rel) {
+            if is_ignored(&ignores, rel_path, true) && !tracked_dirs.contains(&rel) {
                 out.push(SourceEntry::new(rel, true, SourceEntryStatus::Ignored));
             } else {
                 walk_working_copy_dir(root, &rel, &ignores, tracked, tracked_dirs, out)?;
@@ -257,7 +260,7 @@ pub(super) fn walk_working_copy_dir(
         }
         let status = if tracked.contains(&rel) {
             SourceEntryStatus::Tracked
-        } else if ignores.matches(&rel) {
+        } else if is_ignored(&ignores, rel_path, false) {
             SourceEntryStatus::Ignored
         } else {
             SourceEntryStatus::Untracked

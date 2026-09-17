@@ -1,24 +1,25 @@
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 use anyhow::{Context, Result};
+use futures::StreamExt;
 use jj_lib::{
     backend::{CommitId, TreeId},
     config::{ConfigLayer, ConfigSource},
     fileset::FilesetAliasesMap,
     git::REMOTE_NAME_FOR_LOCAL_GIT_REPO,
-    graph::TopoGroupedGraphIterator,
+    graph::TopoGroupedGraph,
     merge::Merge,
     object_id::ObjectId,
     op_store::LocalRemoteRefTarget,
     ref_name::WorkspaceName,
     repo::{ReadonlyRepo, Repo},
-    repo_path::RepoPathUiConverter,
     revset::{
         RevsetAliasesMap, RevsetDiagnostics, RevsetExpression, RevsetExtensions,
         RevsetParseContext, RevsetWorkspaceContext, SymbolResolver, UserRevsetExpression,
         parse as parse_revset,
     },
     settings::UserSettings,
+    ui_path::RepoPathUiConverter,
 };
 
 use super::settings::*;
@@ -36,8 +37,8 @@ use crate::repo::CancelFlag;
 /// ("Function `trunk` doesn't exist"). This is a verbatim copy of jj's
 /// `cli/src/config/revsets.toml` `[revset-aliases]` table; keep it in sync when
 /// bumping jj-lib. The alias *bodies* only reference real jj-lib builtins
-/// (`remote_bookmarks`, `tags`, `untracked_remote_bookmarks`, `visible_heads`,
-/// `root`), so they resolve once seeded.
+/// (`remote_bookmarks`, `tags`, `untracked_remote_bookmarks`,
+/// `untracked_remote_tags`, `visible_heads`, `root`), so they resolve once seeded.
 pub(super) const DEFAULT_REVSET_ALIASES: &str = r#"
 [revset-aliases]
 # trunk() can be overridden as '<bookmark>@<remote>'.
@@ -52,10 +53,20 @@ latest(
   root()
 )
 '''
-'builtin_immutable_heads()' = 'trunk() | tags() | untracked_remote_bookmarks()'
+
+# The default set of revisions shown by `jj log` if no revisions or paths are
+# specified.
+'builtin_log()' = 'present(@) | ancestors(immutable_heads().., 2) | trunk()'
+
+# If immutable_heads() failed to evaluate, many jj commands wouldn't work. Use
+# present(expr) if symbols in expr might not always exist.
+'builtin_immutable_heads()' = '''
+trunk() | tags() | untracked_remote_bookmarks() | untracked_remote_tags()
+'''
 'immutable_heads()' = 'builtin_immutable_heads()'
 'immutable()' = '::(immutable_heads() | root())'
 'mutable()' = '~immutable()'
+
 'visible()' = '::visible_heads()'
 'hidden()' = '~visible()'
 "#;
@@ -82,7 +93,7 @@ pub(super) fn revset_aliases_map(settings: &UserSettings) -> Result<RevsetAliase
                 eprintln!("diffui: ignoring revset-alias `{decl}`: expected a string value");
                 continue;
             };
-            if let Err(err) = map.insert(decl, defn) {
+            if let Err(err) = map.insert(decl, defn, None) {
                 eprintln!("diffui: ignoring invalid revset-alias `{decl}`: {err}");
             }
         }
@@ -93,6 +104,8 @@ pub(super) fn revset_aliases_map(settings: &UserSettings) -> Result<RevsetAliase
 /// jj-cli's default `revsets.log` — the revset `jj log` displays. Like the
 /// alias defaults above it ships in jj-**cli**'s embedded config rather than
 /// jj-lib, so we re-embed it as the fallback when the user hasn't set their own.
+/// Upstream spells it `builtin_log()`; this is that alias's body, because the
+/// string lands in the revset field, where the expansion is the editable form.
 pub(super) const DEFAULT_LOG_REVSET: &str =
     "present(@) | ancestors(immutable_heads().., 2) | trunk()";
 
@@ -143,7 +156,6 @@ pub(super) fn parse_user_revset(
         date_pattern_context: chrono::Local::now().into(),
         default_ignored_remote: Some(REMOTE_NAME_FOR_LOCAL_GIT_REPO),
         fileset_aliases_map: &fileset_aliases,
-        use_glob_by_default: true,
         extensions: &extensions,
         workspace: Some(workspace_ctx),
     };
@@ -186,8 +198,8 @@ pub async fn walk_jj_commits(
     let workspace = jj_lib::workspace::Workspace::load(
         &settings,
         &repository_root,
-        &jj_lib::repo::StoreFactories::default(),
-        &jj_lib::workspace::default_working_copy_factories(),
+        &jj_lib::default_backend_factories::default_backend_factories(),
+        &jj_lib::default_backend_factories::default_working_copy_factories(),
     )
     .context("failed to load jj workspace")?;
     let workspace_name = workspace.workspace_name();
@@ -324,21 +336,22 @@ pub async fn walk_jj_with_repo(
     let mut single_parents: Vec<Option<CommitId>> = Vec::new();
     let mut batch: Vec<StreamRow> = Vec::with_capacity(batch_size);
 
-    // Scope the topo iterator so its borrow of `revset` ends before the empty
-    // pass; the iterator is pulled lazily (no up-front `collect`), so the first
+    // Scope the topo stream so its borrow of `revset` ends before the empty
+    // pass; the stream is pulled lazily (no up-front `collect`), so the first
     // batch ships after only `batch_size` commits are walked.
     {
-        let mut topo = TopoGroupedGraphIterator::new(revset.iter_graph(), |id: &CommitId| id);
+        let mut topo = TopoGroupedGraph::new(revset.stream_graph(), |id: &CommitId| id);
         // Prioritize `@` only when the revset actually contains it. A revset that
         // excludes the working copy (e.g. `mine()` when `@` isn't yours,
-        // `conflicts()`, a narrow range) has no such node, and the topo iterator
+        // `conflicts()`, a narrow range) has no such node, and the topo stream
         // panics ("parent or prioritized node should exist") on a prioritized
         // node missing from its input. jj-cli guards `jj log` the same way.
         let has_commit = revset.containing_fn();
-        if has_commit(wc_commit_id).unwrap_or(false) {
+        if has_commit(wc_commit_id).await.unwrap_or(false) {
             topo.prioritize_branch(wc_commit_id.clone());
         }
-        for node in topo {
+        let mut nodes = std::pin::pin!(topo.stream());
+        while let Some(node) = nodes.next().await {
             // Advance the lane state for every node in topo order. The assigner
             // is stateful, so this must run once per node — keep it first.
             let (id, edges) = node.context("failed to walk jj revset graph")?;
@@ -357,6 +370,7 @@ pub async fn walk_jj_with_repo(
             let description = commit.description().lines().next().unwrap_or("").trim();
             let shortest_change_id_len = repo
                 .shortest_unique_change_id_prefix_len(commit.change_id())
+                .await
                 .with_context(|| {
                     format!(
                         "failed to resolve shortest unique jj change id for {}",
@@ -376,6 +390,7 @@ pub async fn walk_jj_with_repo(
             // a plain visible commit.
             let (is_divergent, is_hidden, change_offset) = repo
                 .resolve_change_id(commit.change_id())
+                .await
                 .ok()
                 .flatten()
                 .map(|targets| {
@@ -387,6 +402,10 @@ pub async fn walk_jj_with_repo(
                     (divergent, hidden, offset)
                 })
                 .unwrap_or((false, false, None));
+            let is_immutable = match &is_immutable_fn {
+                Some(contains) => contains(&id).await.unwrap_or(false),
+                None => false,
+            };
             let summary = CommitSummary {
                 change_id: commit.change_id().to_string(),
                 commit_id: id.hex(),
@@ -404,9 +423,7 @@ pub async fn walk_jj_with_repo(
                 is_hidden,
                 change_offset,
                 is_working_copy: id == *wc_commit_id,
-                is_immutable: is_immutable_fn
-                    .as_ref()
-                    .is_some_and(|contains| contains(&id).unwrap_or(false)),
+                is_immutable,
                 bookmarks,
                 parent_ids: commit.parent_ids().iter().map(|id| id.hex()).collect(),
             };
@@ -454,7 +471,7 @@ pub async fn walk_jj_with_repo(
 
     // Branch summary for the sidebar footer — reuses the already-loaded repo so
     // it costs a few small revset evals, not another index load.
-    let branch_status = compute_branch_status(repo, wc_commit_id);
+    let branch_status = compute_branch_status(repo, wc_commit_id).await;
     // Repo-wide bookmark table for the revision context menu (move/track/
     // delete/push) — a single bookmarks() walk on the same repo.
     let bookmarks = compute_bookmarks_info(repo, wc_commit_id);
@@ -620,11 +637,11 @@ pub(super) fn compute_bookmarks_info(
 /// behind `@`, its tracked upstream, and `@`'s ahead/behind counts vs that
 /// upstream. Best-effort — any failure (or no local bookmark in `@`'s
 /// ancestry) yields `None`, so the footer falls back to the change count.
-pub(super) fn compute_branch_status(
+pub(super) async fn compute_branch_status(
     repo: &ReadonlyRepo,
     wc_commit_id: &CommitId,
 ) -> Option<BranchStatus> {
-    match branch_status_inner(repo, wc_commit_id) {
+    match branch_status_inner(repo, wc_commit_id).await {
         Ok(status) => status,
         Err(error) => {
             eprintln!("diffui: failed to compute branch status: {error:#}");
@@ -633,7 +650,7 @@ pub(super) fn compute_branch_status(
     }
 }
 
-pub(super) fn branch_status_inner(
+pub(super) async fn branch_status_inner(
     repo: &ReadonlyRepo,
     wc_commit_id: &CommitId,
 ) -> Result<Option<BranchStatus>> {
@@ -689,7 +706,7 @@ pub(super) fn branch_status_inner(
         let revset = resolved
             .evaluate(repo)
             .context("failed to evaluate nearest-bookmark revset")?;
-        match revset.iter().next() {
+        match revset.stream().next().await {
             Some(result) => result.context("failed to read nearest bookmark commit")?,
             None => return Ok(None),
         }
@@ -722,8 +739,10 @@ pub(super) fn branch_status_inner(
     let remote = RevsetExpression::commit(remote_id);
     // ahead = remote..@ (reachable from @, not the remote); behind = @..remote.
     let ahead = count_revset(repo, &symbol_resolver, &remote.range(&at))
+        .await
         .context("failed to count ahead commits")?;
     let behind = count_revset(repo, &symbol_resolver, &at.range(&remote))
+        .await
         .context("failed to count behind commits")?;
 
     Ok(Some(BranchStatus {
@@ -735,9 +754,9 @@ pub(super) fn branch_status_inner(
 }
 
 /// Evaluate `expr` and count the commits it yields.
-pub(super) fn count_revset(
+pub(super) async fn count_revset(
     repo: &ReadonlyRepo,
-    symbol_resolver: &SymbolResolver,
+    symbol_resolver: &SymbolResolver<'_>,
     expr: &Arc<UserRevsetExpression>,
 ) -> Result<usize> {
     let resolved = expr
@@ -747,7 +766,8 @@ pub(super) fn count_revset(
         .evaluate(repo)
         .context("failed to evaluate count revset")?;
     let mut count = 0usize;
-    for result in revset.iter() {
+    let mut ids = revset.stream();
+    while let Some(result) = ids.next().await {
         result.context("failed to read commit while counting revset")?;
         count += 1;
     }

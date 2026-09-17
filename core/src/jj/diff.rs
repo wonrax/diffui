@@ -17,7 +17,7 @@ use jj_lib::{
     merge::{Diff, SameChange},
     object_id::ObjectId,
     repo::{ReadonlyRepo, Repo},
-    repo_path::{RepoPath, RepoPathBuf},
+    repo_path::RepoPath,
     tree_merge::MergeOptions,
 };
 
@@ -349,7 +349,7 @@ pub(super) fn repo_scope_matcher(repository: &Repository) -> Result<Box<dyn Matc
     }
 
     let repo_path =
-        RepoPathBuf::parse_fs_path(&repository.root, &repository.root, &repository.scope)
+        jj_lib::ui_path::parse_fs_path(&repository.root, &repository.root, &repository.scope)
             .with_context(|| format!("failed to parse jj path {}", repository.scope.display()))?;
     Ok(Box::new(PrefixMatcher::new([repo_path])))
 }

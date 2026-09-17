@@ -580,7 +580,7 @@ pub fn activity_popover(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
                 .height(Length::Shrink)
                 .style(move |_, s| iced_scrollable_style(theme, s)),
         )
-        .max_height(520.0)
+        .height(Length::Fit.max(520.0))
         .padding(Padding {
             top: 6.0,
             right: 8.0,

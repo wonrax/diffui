@@ -624,7 +624,7 @@ pub fn recompute_matches(column: &mut PaletteColumn, ui: &Diffui, search_revisio
         });
     }
 
-    matches.sort_by(|a, b| b.score.cmp(&a.score));
+    matches.sort_by_key(|entry| std::cmp::Reverse(entry.score));
     matches.truncate(MAX_RESULT_ROWS);
 
     column.matches = matches;
@@ -799,7 +799,6 @@ pub fn build_overlay<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Messag
             .clip(true)
             .width(Length::Fill)
             .height(Length::Fill)
-            .into()
     });
 
     // Wrap the entire stacked overlay in a mouse_area that captures any
@@ -924,7 +923,7 @@ fn build_input<'a>(
         ColumnSource::Actions(_) => "Filter actions",
     };
 
-    let mut input = crate::input::text_input(placeholder, &column_state.query)
+    let mut input = iced::widget::text_input(placeholder, &column_state.query)
         .id(PALETTE_INPUT_ID)
         .padding(Padding::from([10, 14]))
         .size(text_size::TITLE)
@@ -950,7 +949,7 @@ fn build_input<'a>(
             .on_submit(Message::Palette(PaletteMessage::Accept));
     }
 
-    container(input)
+    container(crate::input::single_line(input))
         .padding([4, 4])
         .height(Length::Fixed(INPUT_HEIGHT + 8.0))
         .width(Length::Fill)

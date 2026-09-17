@@ -5,16 +5,17 @@ use anyhow::{Context, Result, bail};
 use jj_lib::{
     backend::CommitId,
     commit::Commit,
+    default_backend_factories::{default_backend_factories, default_working_copy_factories},
     gitignore::GitIgnoreFile,
     matchers::{Matcher, NothingMatcher},
     merged_tree::MergedTree,
     object_id::ObjectId,
     op_store::OperationId,
     ref_name::WorkspaceName,
-    repo::{ReadonlyRepo, Repo, RepoLoader, StoreFactories},
+    repo::{ReadonlyRepo, Repo, RepoLoader},
     settings::{HumanByteSize, UserSettings},
     working_copy::{SnapshotOptions, SnapshotStats, UntrackedReason, WorkingCopyFreshness},
-    workspace::{LockedWorkspace, Workspace, default_working_copy_factories},
+    workspace::{LockedWorkspace, Workspace},
 };
 
 use super::settings::*;
@@ -130,6 +131,7 @@ pub(crate) async fn lock_working_copy<'a>(
     // resolver presents as a divergent change.
     let mut locked_ws = workspace
         .start_working_copy_mutation()
+        .await
         .context("failed to lock jj working copy")?;
 
     let base_repo = repo_loader
@@ -350,6 +352,7 @@ pub(crate) async fn resolve_revision(
         .with_context(|| format!("failed to load jj commit {}", commit_id.hex()))?;
     if commit
         .is_hidden(repo)
+        .await
         .context("failed to check whether the commit is still visible")?
     {
         bail!("{} is no longer in the repository", commit_id.hex());
@@ -392,7 +395,7 @@ pub(crate) fn load_workspace(settings: &UserSettings, root: &Path) -> Result<Wor
     Workspace::load(
         settings,
         root,
-        &StoreFactories::default(),
+        &default_backend_factories(),
         &default_working_copy_factories(),
     )
     .context("failed to load jj workspace")
@@ -540,8 +543,9 @@ pub(crate) async fn read_op_head_with(settings: &UserSettings, root: &Path) -> R
     // Resolve through the `.jj/repo` pointer file so a secondary workspace
     // (whose op store lives in the primary repo) reads the right heads.
     let repo_dir = crate::repository::resolve_jj_repo_dir(root)?;
-    let loader = RepoLoader::init_from_file_system(settings, &repo_dir, &StoreFactories::default())
-        .context("failed to init jj repo loader for op-head read")?;
+    let loader =
+        RepoLoader::init_from_file_system(settings, &repo_dir, &default_backend_factories())
+            .context("failed to init jj repo loader for op-head read")?;
     let mut heads: Vec<String> = loader
         .op_heads_store()
         .get_op_heads()
