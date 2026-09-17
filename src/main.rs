@@ -386,10 +386,12 @@ pub(crate) struct Diffui {
     /// hover highlight that `mouse_area` (unlike `button`) doesn't provide.
     pub(crate) hovered: Option<HoverTarget>,
     /// Whether the collapsed changed-files rail is exposing its temporary tree.
-    /// The generation invalidates delayed closes while the pointer crosses the
-    /// small gap between the rail and the floating tree.
+    /// Only the rail's icon opens it; the hover flags keep a delayed close from
+    /// landing while the pointer is still on the icon, the rail or the tree, or
+    /// crossing between them.
     pub(crate) changed_files_peek_open: bool,
     pub(crate) changed_files_trigger_hovered: bool,
+    pub(crate) changed_files_rail_hovered: bool,
     pub(crate) changed_files_popup_hovered: bool,
     /// Transient error toasts (failed mutation/fetch/undo), newest last.
     /// The activity log keeps the durable record; these only make a failure

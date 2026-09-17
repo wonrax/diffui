@@ -59,10 +59,13 @@ pub(crate) enum UiEvent {
     SourceTreeScrolled(f64),
     /// Cursor entered/left a caret control — drives its hover highlight.
     SetHover(Option<HoverTarget>),
-    /// Hovering the collapsed changed-files rail temporarily exposes the full
-    /// file tree without changing the saved panel layout.
+    /// Hovering the icon on the collapsed changed-files rail temporarily
+    /// exposes the full file tree without changing the saved panel layout.
     ChangedFilesTriggerEntered,
     ChangedFilesTriggerExited,
+    /// The rail around the icon: never opens the tree, only holds it open.
+    ChangedFilesRailEntered,
+    ChangedFilesRailExited,
     ChangedFilesPopupEntered,
     ChangedFilesPopupExited,
     CloseChangedFilesPeek,

@@ -324,6 +324,7 @@ pub(crate) mod tests {
             hovered: None,
             changed_files_peek_open: false,
             changed_files_trigger_hovered: false,
+            changed_files_rail_hovered: false,
             changed_files_popup_hovered: false,
             toasts: Vec::new(),
             next_toast_id: 0,

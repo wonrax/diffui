@@ -242,6 +242,7 @@ impl Diffui {
             hovered: None,
             changed_files_peek_open: false,
             changed_files_trigger_hovered: false,
+            changed_files_rail_hovered: false,
             changed_files_popup_hovered: false,
             modifiers: keyboard::Modifiers::default(),
             toasts: Vec::new(),
@@ -985,9 +986,7 @@ impl Diffui {
             Action::ToggleFilesPanel => {
                 let target = self.active_mut();
                 target.files_panel_collapsed = !target.files_panel_collapsed;
-                self.changed_files_peek_open = false;
-                self.changed_files_trigger_hovered = false;
-                self.changed_files_popup_hovered = false;
+                self.close_changed_files_peek();
                 self.mark_geometry_dirty();
                 Task::none()
             }
@@ -1083,9 +1082,7 @@ impl Diffui {
                     }
                     None => {}
                 }
-                self.changed_files_peek_open = false;
-                self.changed_files_trigger_hovered = false;
-                self.changed_files_popup_hovered = false;
+                self.close_changed_files_peek();
             }
             UiEvent::SidebarScrolled(offset) => {
                 self.active_mut().sidebar_scroll_offset = offset;
@@ -1111,20 +1108,24 @@ impl Diffui {
                 self.changed_files_popup_hovered = true;
                 self.changed_files_peek_open = true;
             }
+            UiEvent::ChangedFilesRailEntered => self.changed_files_rail_hovered = true,
             UiEvent::ChangedFilesTriggerExited => {
                 self.changed_files_trigger_hovered = false;
-                return Task::perform(tokio::time::sleep(Duration::from_millis(140)), |()| {
-                    Message::Ui(UiEvent::CloseChangedFilesPeek)
-                });
+                return Self::close_changed_files_peek_later();
+            }
+            UiEvent::ChangedFilesRailExited => {
+                self.changed_files_rail_hovered = false;
+                return Self::close_changed_files_peek_later();
             }
             UiEvent::ChangedFilesPopupExited => {
                 self.changed_files_popup_hovered = false;
-                return Task::perform(tokio::time::sleep(Duration::from_millis(140)), |()| {
-                    Message::Ui(UiEvent::CloseChangedFilesPeek)
-                });
+                return Self::close_changed_files_peek_later();
             }
             UiEvent::CloseChangedFilesPeek => {
-                if !self.changed_files_trigger_hovered && !self.changed_files_popup_hovered {
+                if !self.changed_files_trigger_hovered
+                    && !self.changed_files_rail_hovered
+                    && !self.changed_files_popup_hovered
+                {
                     self.changed_files_peek_open = false;
                 }
             }
@@ -1335,6 +1336,25 @@ impl Diffui {
             }
         }
         Task::none()
+    }
+
+    /// Drop the changed-files peek along with every hover flag holding it
+    /// open. The widgets reporting those hovers may be gone by the next frame
+    /// (the rail, once the panel expands), and a widget that is gone never
+    /// reports its exit.
+    fn close_changed_files_peek(&mut self) {
+        self.changed_files_peek_open = false;
+        self.changed_files_trigger_hovered = false;
+        self.changed_files_rail_hovered = false;
+        self.changed_files_popup_hovered = false;
+    }
+
+    /// Re-check the peek once the pointer has had time to reach whichever of
+    /// the icon, the rail or the tree it was heading for.
+    fn close_changed_files_peek_later() -> Task<Message> {
+        Task::perform(tokio::time::sleep(Duration::from_millis(140)), |()| {
+            Message::Ui(UiEvent::CloseChangedFilesPeek)
+        })
     }
 
     /// The platform half: window geometry and lifecycle, modifiers, the OS
@@ -4767,6 +4787,30 @@ mod tests {
         assert!(ui.changed_files_peek_open);
 
         ui.changed_files_popup_hovered = false;
+        let _ = ui.on_ui_event(UiEvent::CloseChangedFilesPeek);
+        assert!(!ui.changed_files_peek_open);
+    }
+
+    /// The rail is a corridor, not a trigger: crossing it on the way somewhere
+    /// else opens nothing, but it holds a peek the icon already opened.
+    #[test]
+    fn the_changed_files_rail_holds_a_peek_but_never_opens_one() {
+        let mut ui = app();
+
+        let _ = ui.on_ui_event(UiEvent::ChangedFilesRailEntered);
+        let _ = ui.on_ui_event(UiEvent::CloseChangedFilesPeek);
+        assert!(!ui.changed_files_peek_open);
+
+        let _ = ui.on_ui_event(UiEvent::ChangedFilesTriggerEntered);
+        assert!(ui.changed_files_peek_open);
+        // Off the icon but still on the rail, heading for a file far down the
+        // tree. (The exit events themselves arm a tokio timer, which needs a
+        // runtime this test doesn't have.)
+        ui.changed_files_trigger_hovered = false;
+        let _ = ui.on_ui_event(UiEvent::CloseChangedFilesPeek);
+        assert!(ui.changed_files_peek_open);
+
+        ui.changed_files_rail_hovered = false;
         let _ = ui.on_ui_event(UiEvent::CloseChangedFilesPeek);
         assert!(!ui.changed_files_peek_open);
     }

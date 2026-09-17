@@ -244,19 +244,27 @@ fn changed_file_row(
 }
 
 pub fn build_collapsed_file_navigator(theme: ThemeSpec) -> Element<'static, Message> {
-    mouse_area(
-        container(crate::field::panel_toggle_button_bare(
-            theme,
-            icons::FILE_DIFF,
-            Action::ToggleFilesPanel,
-        ))
-        .width(Length::Fixed(crate::theme::COLLAPSED_PANEL_WIDTH))
-        .height(Length::Fill)
-        .padding([crate::theme::space::XXS, crate::theme::space::XS])
-        .style(move |_| container::Style::default().background(theme.panel_background)),
-    )
+    // Only the icon opens the peek: the rail runs the full height of the
+    // window, so as a trigger it would fire on every pass between the history
+    // and the diff. It still holds a peek that is already open, because a
+    // diagonal move from the icon to a file far down the tree spends longer
+    // crossing the rail than the close delay allows.
+    let trigger = mouse_area(crate::field::panel_toggle_button_bare(
+        theme,
+        icons::FILE_DIFF,
+        Action::ToggleFilesPanel,
+    ))
     .on_enter(Message::Ui(UiEvent::ChangedFilesTriggerEntered))
-    .on_exit(Message::Ui(UiEvent::ChangedFilesTriggerExited))
+    .on_exit(Message::Ui(UiEvent::ChangedFilesTriggerExited));
+    mouse_area(
+        container(trigger)
+            .width(Length::Fixed(crate::theme::COLLAPSED_PANEL_WIDTH))
+            .height(Length::Fill)
+            .padding([crate::theme::space::XXS, crate::theme::space::XS])
+            .style(move |_| container::Style::default().background(theme.panel_background)),
+    )
+    .on_enter(Message::Ui(UiEvent::ChangedFilesRailEntered))
+    .on_exit(Message::Ui(UiEvent::ChangedFilesRailExited))
     .into()
 }
 
