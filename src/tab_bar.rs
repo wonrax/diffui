@@ -5,23 +5,26 @@
 //! with the owner dimmed, an optional uncommitted-changes dot, and a close
 //! `×`), a `+` button that opens the path dialog, and — pinned right — a
 //! `⌘K` control that opens the command palette (the design's repo-search
-//! `⌘P` is folded into our existing palette per the spec).
+//! `⌘P` is folded into our existing palette per the spec). Dragging a tab
+//! along the strip reorders it — see [`TabStrip`].
 //!
 //! The strip and the path dialog both read straight off `&Diffui`, mirroring
 //! `sidebar` / `palette` / `find`, so there is no intermediate view model to
 //! keep in sync.
 
 use iced::{
-    Background, Border, Color, Element, Event, Length, Padding, Rectangle, Shadow, Size, Theme,
-    Vector,
+    Alignment, Background, Border, Color, Element, Event, Length, Padding, Point, Rectangle,
+    Shadow, Size, Theme, Vector,
     advanced::{
         Layout, Renderer as _, Shell, Widget, layout, mouse as advanced_mouse, overlay, renderer,
-        widget::{Operation, Tree},
+        widget::{Operation, Tree, tree},
     },
     alignment,
     font::Weight,
-    mouse,
-    widget::{Row, Space, button, column, container, mouse_area, opaque, row, stack, text},
+    keyboard, mouse,
+    time::Instant,
+    widget::{Space, button, column, container, mouse_area, opaque, row, stack, text},
+    window,
 };
 
 use crate::chrome;
@@ -32,7 +35,7 @@ use crate::theme::{
     destructive_button_style, dialog_button_style, emphasis_font, ghost_button_style, input_style,
     modal_style, primary_button_style, radius, scrim_style, text_size, well_fill,
 };
-use crate::{Action, Diffui, HoverTarget, Message, UiEvent, WindowEvent};
+use crate::{Action, Diffui, HoverTarget, Message, TabId, UiEvent, WindowEvent};
 
 /// Focus target id for the open-repository dialog's path field.
 pub const OPEN_REPO_INPUT_ID: &str = "open-repo-input";
@@ -56,6 +59,22 @@ const TAB_GAP: f32 = 3.0;
 /// Label padding inside a tab's fill / hover wash.
 const LABEL_PAD_X: f32 = 8.0;
 
+/// Horizontal travel before a press on a tab becomes a drag — the revision
+/// list's threshold, so a click that wobbles stays a click in both places.
+/// Vertical travel never counts: the strip only reorders along its own axis.
+const DRAG_THRESHOLD: f32 = 6.0;
+
+/// How far past a neighbor's center the dragged tab's leading edge has to go
+/// before the two swap. Without it the swap point going right and the one
+/// coming back sit a `TAB_GAP` apart, and a hand resting there flips the pair
+/// on every tremor.
+const SWAP_HYSTERESIS: f32 = 4.0;
+
+/// Time constant of the slide that carries a displaced (or dropped) tab to
+/// its slot: each `SLIDE_TAU` closes ~63% of the remaining distance, so a
+/// slide is visually done in about three of them.
+const SLIDE_TAU: f32 = 0.05;
+
 /// Both modal cards (confirm, open-repo) hang at the same distance below the
 /// top edge, like the command palette — anchored rather than centered, so
 /// they don't jump when their content grows (error lines, recents).
@@ -69,16 +88,15 @@ pub fn build_tab_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         return Space::new().into();
     }
 
-    let mut tabs = Vec::with_capacity(ui.tabs.len() + 1);
+    let mut children = Vec::with_capacity(ui.tabs.len() + 1);
     for (index, tab) in ui.tabs.iter().enumerate() {
         let active = index == ui.active;
-        tabs.push(tab_widget(ui, theme, tab, active));
+        children.push(tab_widget(ui, theme, tab, active));
     }
-    tabs.push(add_button(theme));
+    children.push(add_button(theme));
     let tabs_row = TabStrip {
-        row: Row::with_children(tabs)
-            .spacing(TAB_GAP)
-            .align_y(alignment::Vertical::Center),
+        children,
+        tab_ids: ui.tabs.iter().map(|tab| tab.id).collect(),
         active: ui.active,
         theme,
     };
@@ -151,8 +169,9 @@ fn bar_style(theme: ThemeSpec) -> container::Style {
     }
 }
 
-/// One repo tab. The label area selects the tab; the trailing `×` closes it
-/// (kept as a separate widget so the two clicks never fight over the event).
+/// One repo tab. The trailing `×` closes it; a press anywhere else selects it
+/// and arms a reorder drag, both of which [`TabStrip`] handles — a drag has to
+/// keep tracking the cursor after it leaves the tab that started it.
 fn tab_widget<'a>(
     ui: &'a Diffui,
     theme: ThemeSpec,
@@ -250,13 +269,10 @@ fn tab_widget<'a>(
             ..container::Style::default()
         });
 
-    // The close `×` captures its own press first (iced dispatches to children
-    // before the parent), so hitting `×` closes rather than selects. Hover is
-    // tracked in app state; `on_move` re-asserts it every frame the cursor is
-    // over the tab, so the one-frame flicker that `on_enter`/`on_exit` race
-    // into when crossing between adjacent tabs is immediately corrected.
+    // Hover is tracked in app state; `on_move` re-asserts it every frame the
+    // cursor is over the tab, so the one-frame flicker that `on_enter`/`on_exit`
+    // race into when crossing between adjacent tabs is immediately corrected.
     let interactive = mouse_area(body)
-        .on_press(Message::Action(Action::SelectTab(id)))
         .on_enter(Message::Ui(UiEvent::SetHover(Some(HoverTarget::Tab(id)))))
         .on_move(move |_| Message::Ui(UiEvent::SetHover(Some(HoverTarget::Tab(id)))))
         .on_exit(Message::Ui(UiEvent::SetHover(None)))
@@ -265,19 +281,183 @@ fn tab_widget<'a>(
     interactive.into()
 }
 
+/// The tabs plus the trailing `+`, laid out as a row — and the owner of the
+/// press on a tab, which selects it and may grow into a reorder drag.
+///
+/// The order itself lives in the app: a drag publishes [`Action::MoveTab`] each
+/// time the dragged tab crosses a neighbor, so the strip is re-laid out around
+/// it while it is still in the air. Everything that makes that look like motion
+/// is widget-local — the dragged tab following the cursor, and the slide that
+/// carries a displaced tab from where it was drawn to where its slot now is.
 struct TabStrip<'a> {
-    row: Row<'a, Message>,
+    /// One element per tab, in tab order, then the add button.
+    children: Vec<Element<'a, Message>>,
+    /// Identity of each leading child, so a drag names its tab by id and
+    /// survives the reorders it causes.
+    tab_ids: Vec<TabId>,
     active: usize,
     theme: ThemeSpec,
 }
 
+#[derive(Default)]
+struct StripState {
+    /// Armed on a tab press, active past [`DRAG_THRESHOLD`].
+    drag: Option<TabDrag>,
+    /// How far each tab is drawn from its slot, easing to zero. Tabs at rest
+    /// have no entry.
+    slides: Vec<(TabId, f32)>,
+    /// Each tab's slot (x within the strip) as of the last layout — what a
+    /// reorder is measured against to start the slides above.
+    slots: Vec<(TabId, f32)>,
+    /// The tab a drop left in the air. Drawn above its neighbors until the
+    /// slides settle, like the drag it just ended.
+    settling: Option<TabId>,
+    /// When the slides were last stepped.
+    last_frame: Option<Instant>,
+}
+
+struct TabDrag {
+    id: TabId,
+    /// Where the press landed — the activation threshold anchor.
+    origin_x: f32,
+    /// How far into the tab the cursor sits, so the tab stays under it the
+    /// way it was picked up. Taken when the drag activates, not at the press.
+    grab: f32,
+    /// The slot the tab was picked up from, where Esc puts it back.
+    home: usize,
+    /// Whether the threshold was crossed (a plain click never activates).
+    active: bool,
+    cursor_x: f32,
+}
+
+impl StripState {
+    fn dragged(&self) -> Option<&TabDrag> {
+        self.drag.as_ref().filter(|drag| drag.active)
+    }
+
+    fn add_slide(&mut self, id: TabId, offset: f32) {
+        match self.slides.iter_mut().find(|(tab, _)| *tab == id) {
+            Some((_, current)) => *current += offset,
+            None => self.slides.push((id, offset)),
+        }
+    }
+}
+
+/// The slot a dragged tab belongs in, given `widths` in strip order, the
+/// dragged tab's current `index` with its slot starting at `slot`, and the
+/// position `x` its left edge has been dragged to.
+///
+/// It trades places with a neighbor once its leading edge is
+/// [`SWAP_HYSTERESIS`] past that neighbor's center, however wide either tab
+/// is — center against center would have a wide tab cover a narrow one
+/// completely before they swapped. A fast drag can cross several neighbors
+/// between two events, so this walks until the next one holds.
+fn drop_index(widths: &[f32], index: usize, slot: f32, x: f32) -> usize {
+    let mut widths = widths.to_vec();
+    let (mut index, mut slot) = (index, slot);
+    // Rightward: its right edge against the next tab's center.
+    while let Some(next) = widths.get(index + 1).copied() {
+        let center = slot + widths[index] + TAB_GAP + next / 2.0;
+        if x + widths[index] <= center + SWAP_HYSTERESIS {
+            break;
+        }
+        slot += next + TAB_GAP;
+        widths.swap(index, index + 1);
+        index += 1;
+    }
+    // Leftward: its left edge against the previous tab's center.
+    while index > 0 {
+        let previous = widths[index - 1];
+        let center = slot - TAB_GAP - previous / 2.0;
+        if x >= center - SWAP_HYSTERESIS {
+            break;
+        }
+        slot -= previous + TAB_GAP;
+        widths.swap(index, index - 1);
+        index -= 1;
+    }
+    index
+}
+
+impl TabStrip<'_> {
+    /// Where an active drag puts its tab's left edge: under the cursor, held
+    /// within the run of tabs so it can't be dragged over the `+` or off the
+    /// strip.
+    fn dragged_x(&self, drag: &TabDrag, layout: Layout<'_>, index: usize) -> f32 {
+        let first = layout.child(0).bounds();
+        let last = layout.child(self.tab_ids.len() - 1).bounds();
+        let width = layout.child(index).bounds().width;
+        let max_x = (last.x + last.width - width).max(first.x);
+        (drag.cursor_x - drag.grab).clamp(first.x, max_x)
+    }
+
+    /// How far child `index` is drawn — and hit-tested — from its slot.
+    fn offset(&self, state: &StripState, layout: Layout<'_>, index: usize) -> f32 {
+        let Some(id) = self.tab_ids.get(index).copied() else {
+            return 0.0;
+        };
+        match state.dragged() {
+            Some(drag) if drag.id == id => {
+                self.dragged_x(drag, layout, index) - layout.child(index).bounds().x
+            }
+            // Whole pixels: a tab at rest keeps the exact position the layout
+            // gave it, and one in motion doesn't shimmer between them.
+            _ => state
+                .slides
+                .iter()
+                .find(|(tab, _)| *tab == id)
+                .map_or(0.0, |(_, offset)| offset.round()),
+        }
+    }
+
+    fn child_layout<'l>(&self, state: &StripState, layout: Layout<'l>, index: usize) -> Layout<'l> {
+        shifted(layout.child(index), self.offset(state, layout, index))
+    }
+
+    /// Let go of an active drag: the tab slides into its slot from wherever
+    /// the cursor left it.
+    fn drop_tab(&self, state: &mut StripState, drag: &TabDrag, layout: Layout<'_>) {
+        if let Some(index) = self.tab_ids.iter().position(|id| *id == drag.id) {
+            let offset = self.dragged_x(drag, layout, index) - layout.child(index).bounds().x;
+            state.add_slide(drag.id, offset);
+            state.settling = Some(drag.id);
+        }
+    }
+}
+
+fn shifted(layout: Layout<'_>, offset: f32) -> Layout<'_> {
+    if offset == 0.0 {
+        return layout;
+    }
+    let position = layout.position();
+    layout.move_to(Point::new(position.x + offset, position.y))
+}
+
 impl Widget<Message, Theme, iced::Renderer> for TabStrip<'_> {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<StripState>()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::new(StripState::default())
+    }
+
     fn diff(&mut self, tree: &mut Tree) {
-        self.row.diff(tree);
+        tree.diff_children(&mut self.children);
+        // A tab can close under a drag (⌘W needs no pointer).
+        let state = tree.state.downcast_mut::<StripState>();
+        if state
+            .drag
+            .as_ref()
+            .is_some_and(|drag| !self.tab_ids.contains(&drag.id))
+        {
+            state.drag = None;
+        }
+        state.slides.retain(|(id, _)| self.tab_ids.contains(id));
     }
 
     fn size(&self) -> Size<Length> {
-        self.row.size()
+        Size::new(Length::Fit, Length::Fit)
     }
 
     fn layout(
@@ -286,7 +466,44 @@ impl Widget<Message, Theme, iced::Renderer> for TabStrip<'_> {
         renderer: &iced::Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        self.row.layout(tree, renderer, limits)
+        let node = layout::flex::resolve(
+            layout::flex::Axis::Horizontal,
+            renderer,
+            limits,
+            Length::Fit,
+            Length::Fit,
+            Padding::ZERO,
+            TAB_GAP,
+            Alignment::Center,
+            &mut self.children,
+            &mut tree.children,
+        );
+
+        // A reorder lands here as tabs whose slots moved. Each one keeps being
+        // drawn where it was and slides to the new slot from there — all but
+        // the dragged tab, which is wherever the cursor is.
+        let state = tree.state.downcast_mut::<StripState>();
+        let slots: Vec<(TabId, f32)> = self
+            .tab_ids
+            .iter()
+            .zip(node.children())
+            .map(|(id, child)| (*id, child.bounds().x))
+            .collect();
+        if state.dragged().is_some() || state.settling.is_some() {
+            let dragged = state.dragged().map(|drag| drag.id);
+            for (id, x) in &slots {
+                let previous = state.slots.iter().find(|(tab, _)| tab == id);
+                if let Some((_, previous)) = previous
+                    && Some(*id) != dragged
+                    && (previous - x).abs() > 0.5
+                {
+                    state.add_slide(*id, previous - x);
+                }
+            }
+        }
+        state.slots = slots;
+
+        node
     }
 
     fn operate(
@@ -297,8 +514,18 @@ impl Widget<Message, Theme, iced::Renderer> for TabStrip<'_> {
         renderer: &iced::Renderer,
         operation: &mut dyn Operation,
     ) {
-        self.row
-            .operate(tree, layout, viewport, renderer, operation);
+        operation.container(None, layout.bounds(), viewport);
+        operation.traverse(&mut |operation| {
+            self.children
+                .iter_mut()
+                .zip(&mut tree.children)
+                .zip(layout.children())
+                .for_each(|((child, state), layout)| {
+                    child
+                        .as_widget_mut()
+                        .operate(state, layout, viewport, renderer, operation);
+                });
+        });
     }
 
     fn update(
@@ -311,8 +538,170 @@ impl Widget<Message, Theme, iced::Renderer> for TabStrip<'_> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        self.row
-            .update(tree, event, layout, cursor, renderer, shell, viewport);
+        let Tree {
+            state, children, ..
+        } = tree;
+        let state = state.downcast_mut::<StripState>();
+
+        // An active drag owns the cursor: no hover washes, no `×` presses.
+        let child_cursor = if state.dragged().is_some() {
+            advanced_mouse::Cursor::Unavailable
+        } else {
+            cursor
+        };
+        let offsets: Vec<f32> = (0..self.children.len())
+            .map(|index| self.offset(state, layout, index))
+            .collect();
+        for (((child, tree), child_layout), offset) in self
+            .children
+            .iter_mut()
+            .zip(children)
+            .zip(layout.children())
+            .zip(offsets)
+        {
+            child.as_widget_mut().update(
+                tree,
+                event,
+                shifted(child_layout, offset),
+                child_cursor,
+                renderer,
+                shell,
+                viewport,
+            );
+        }
+
+        match event {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                // A release that never arrived must not leave a tab stuck to
+                // the cursor past the next press.
+                state.drag = None;
+                // The `×` and the `+` are buttons and have taken theirs.
+                if shell.is_event_captured() {
+                    return;
+                }
+                let Some(position) = cursor.position() else {
+                    return;
+                };
+                let pressed = (0..self.tab_ids.len()).find(|index| {
+                    self.child_layout(state, layout, *index)
+                        .bounds()
+                        .contains(position)
+                });
+                let Some(index) = pressed else {
+                    return;
+                };
+                let id = self.tab_ids[index];
+                shell.publish(Message::Action(Action::SelectTab(id)));
+                shell.capture_event();
+                // A lone tab has nowhere to go.
+                if self.tab_ids.len() > 1 {
+                    state.drag = Some(TabDrag {
+                        id,
+                        origin_x: position.x,
+                        grab: 0.0,
+                        home: index,
+                        active: false,
+                        cursor_x: position.x,
+                    });
+                }
+            }
+            Event::Mouse(mouse::Event::CursorMoved { position }) => {
+                let Some(armed) = state.drag.as_ref() else {
+                    return;
+                };
+                let (id, activating) = (armed.id, !armed.active);
+                if activating && (position.x - armed.origin_x).abs() < DRAG_THRESHOLD {
+                    return;
+                }
+                let Some(index) = self.tab_ids.iter().position(|tab| *tab == id) else {
+                    return;
+                };
+                // Take hold of the tab where it is drawn right now, not where
+                // the press landed: anchored to the press it would jump the
+                // threshold's worth the moment it came loose. From here the
+                // cursor places it, so any slide it was in ends.
+                let grab = activating
+                    .then(|| position.x - self.child_layout(state, layout, index).bounds().x);
+                if activating {
+                    state.slides.retain(|(tab, _)| *tab != id);
+                }
+                let Some(drag) = state.drag.as_mut() else {
+                    return;
+                };
+                if let Some(grab) = grab {
+                    drag.active = true;
+                    drag.grab = grab;
+                }
+                drag.cursor_x = position.x;
+                let widths: Vec<f32> = (0..self.tab_ids.len())
+                    .map(|tab| layout.child(tab).bounds().width)
+                    .collect();
+                let target = drop_index(
+                    &widths,
+                    index,
+                    layout.child(index).bounds().x,
+                    self.dragged_x(drag, layout, index),
+                );
+                if target != index {
+                    shell.publish(Message::Action(Action::MoveTab {
+                        id: drag.id,
+                        to: target,
+                    }));
+                }
+                shell.capture_event();
+                shell.request_redraw();
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+            | Event::Window(window::Event::Unfocused) => {
+                let Some(drag) = state.drag.take() else {
+                    return;
+                };
+                if !drag.active {
+                    return;
+                }
+                self.drop_tab(state, &drag, layout);
+                shell.capture_event();
+                shell.request_redraw();
+            }
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                ..
+            }) => {
+                // Esc abandons the drag and puts the tab back where it was
+                // picked up. The app's own Esc handling rides the same event
+                // through the subscription, as it does for a revision drag.
+                let Some(drag) = state.drag.take() else {
+                    return;
+                };
+                if !drag.active {
+                    return;
+                }
+                self.drop_tab(state, &drag, layout);
+                shell.publish(Message::Action(Action::MoveTab {
+                    id: drag.id,
+                    to: drag.home,
+                }));
+                shell.request_redraw();
+            }
+            Event::Window(window::Event::RedrawRequested(now)) => {
+                if state.slides.is_empty() {
+                    state.settling = None;
+                    state.last_frame = None;
+                    return;
+                }
+                let elapsed = state
+                    .last_frame
+                    .map_or(0.0, |last| now.duration_since(last).as_secs_f32());
+                state.last_frame = Some(*now);
+                let remaining = (-elapsed / SLIDE_TAU).exp();
+                for (_, offset) in &mut state.slides {
+                    *offset *= remaining;
+                }
+                state.slides.retain(|(_, offset)| offset.abs() >= 0.5);
+                shell.request_redraw();
+            }
+            _ => {}
+        }
     }
 
     fn mouse_interaction(
@@ -323,8 +712,25 @@ impl Widget<Message, Theme, iced::Renderer> for TabStrip<'_> {
         viewport: &Rectangle,
         renderer: &iced::Renderer,
     ) -> advanced_mouse::Interaction {
-        self.row
-            .mouse_interaction(tree, layout, cursor, viewport, renderer)
+        let state = tree.state.downcast_ref::<StripState>();
+        if state.dragged().is_some() {
+            return advanced_mouse::Interaction::Grabbing;
+        }
+        self.children
+            .iter()
+            .zip(&tree.children)
+            .enumerate()
+            .map(|(index, (child, tree))| {
+                child.as_widget().mouse_interaction(
+                    tree,
+                    self.child_layout(state, layout, index),
+                    cursor,
+                    viewport,
+                    renderer,
+                )
+            })
+            .max()
+            .unwrap_or_default()
     }
 
     fn draw(
@@ -337,13 +743,68 @@ impl Widget<Message, Theme, iced::Renderer> for TabStrip<'_> {
         cursor: advanced_mouse::Cursor,
         viewport: &Rectangle,
     ) {
-        let active_bounds = layout.children().nth(self.active).map(|tab| tab.bounds());
-        if let Some(bounds) = active_bounds {
+        let state = tree.state.downcast_ref::<StripState>();
+        let cursor = if state.dragged().is_some() {
+            advanced_mouse::Cursor::Unavailable
+        } else {
+            cursor
+        };
+        // Drawn above the rest: the tab being dragged, or the one a drop is
+        // still settling.
+        let raised = state
+            .dragged()
+            .map(|drag| drag.id)
+            .or(state.settling)
+            .and_then(|id| self.tab_ids.iter().position(|tab| *tab == id));
+
+        if raised != Some(self.active) && self.active < self.tab_ids.len() {
+            let bounds = self.child_layout(state, layout, self.active).bounds();
             draw_join_fillet(renderer, self.theme, bounds, true);
             draw_join_fillet(renderer, self.theme, bounds, false);
         }
-        self.row
-            .draw(tree, renderer, theme, style, layout, cursor, viewport);
+        for (index, (child, tree)) in self.children.iter().zip(&tree.children).enumerate() {
+            if raised == Some(index) {
+                continue;
+            }
+            let layout = self.child_layout(state, layout, index);
+            child
+                .as_widget()
+                .draw(tree, renderer, theme, style, layout, cursor, viewport);
+        }
+
+        // The tab in the air goes in a layer of its own. Drawing it last isn't
+        // enough: within a layer text lands above every quad, so the labels it
+        // passes over would show through its fill.
+        let Some(index) = raised else {
+            return;
+        };
+        renderer.with_layer(*viewport, |renderer| {
+            let layout = self.child_layout(state, layout, index);
+            if index == self.active {
+                // A join's cover quad is twice the join's size and only
+                // disappears against the bare strip. Over a neighbor it would
+                // blank the corner of its label, so in the air each join is
+                // clipped to its own square, which sits below the text.
+                for left in [true, false] {
+                    renderer.with_layer(join_bounds(layout.bounds(), left), |renderer| {
+                        draw_join_fillet(renderer, self.theme, layout.bounds(), left);
+                    });
+                }
+            } else {
+                // Only the active tab has a fill to hide what it passes over;
+                // a background one (its activation was refused) gets a stand-in.
+                draw_lifted_backing(renderer, self.theme, layout.bounds());
+            }
+            self.children[index].as_widget().draw(
+                &tree.children[index],
+                renderer,
+                theme,
+                style,
+                layout,
+                cursor,
+                viewport,
+            );
+        });
     }
 
     fn overlay<'b>(
@@ -354,8 +815,14 @@ impl Widget<Message, Theme, iced::Renderer> for TabStrip<'_> {
         viewport: &Rectangle,
         translation: Vector,
     ) -> Vec<overlay::Element<'b, Message, Theme, iced::Renderer>> {
-        self.row
-            .overlay(tree, layout, renderer, viewport, translation)
+        overlay::from_children(
+            &mut self.children,
+            tree,
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
     }
 }
 
@@ -365,8 +832,35 @@ impl<'a> From<TabStrip<'a>> for Element<'a, Message> {
     }
 }
 
-fn draw_join_fillet(renderer: &mut iced::Renderer, theme: ThemeSpec, tab: Rectangle, left: bool) {
-    let panel_bounds = Rectangle {
+/// Stand-in body for a dragged tab that isn't the active one: the strip's own
+/// color so the labels it passes over don't show through, under the wash an
+/// inactive tab wears on hover.
+fn draw_lifted_backing(renderer: &mut iced::Renderer, theme: ThemeSpec, tab: Rectangle) {
+    let wash = Rectangle {
+        height: tab.height - WASH_BOTTOM_GAP,
+        ..tab
+    };
+    for fill in [well_fill(theme), chip_background(theme.muted_text)] {
+        renderer.fill_quad(
+            renderer::Quad {
+                bounds: wash,
+                border: Border {
+                    width: 0.0,
+                    color: Color::TRANSPARENT,
+                    radius: radius::BUTTON.into(),
+                },
+                shadow: Shadow::default(),
+                snap: true,
+            },
+            fill,
+        );
+    }
+}
+
+/// The square outside one of the active tab's bottom corners that its concave
+/// join to the toolbar band fills.
+fn join_bounds(tab: Rectangle, left: bool) -> Rectangle {
+    Rectangle {
         x: if left {
             tab.x - radius::BUTTON
         } else {
@@ -375,10 +869,13 @@ fn draw_join_fillet(renderer: &mut iced::Renderer, theme: ThemeSpec, tab: Rectan
         y: tab.y + tab.height - radius::BUTTON,
         width: radius::BUTTON,
         height: radius::BUTTON,
-    };
+    }
+}
+
+fn draw_join_fillet(renderer: &mut iced::Renderer, theme: ThemeSpec, tab: Rectangle, left: bool) {
     renderer.fill_quad(
         renderer::Quad {
-            bounds: panel_bounds,
+            bounds: join_bounds(tab, left),
             border: Border::default(),
             shadow: Shadow::default(),
             snap: true,
@@ -978,4 +1475,74 @@ pub fn build_open_repo_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Mess
     // `opaque` keeps wheel events and the cursor from bleeding through to the
     // shell below the modal (see `activity_popover` for the mechanics).
     opaque(stack![scrim, centered])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Where tab `index`'s slot starts in a strip that begins at 0.
+    fn slot(widths: &[f32], index: usize) -> f32 {
+        widths[..index].iter().map(|width| width + TAB_GAP).sum()
+    }
+
+    #[test]
+    fn a_tab_at_rest_belongs_where_it_is() {
+        let widths = [120.0, 40.0, 90.0];
+        for index in 0..widths.len() {
+            let at_rest = slot(&widths, index);
+            assert_eq!(drop_index(&widths, index, at_rest, at_rest), index);
+        }
+    }
+
+    #[test]
+    fn a_tab_swaps_once_its_leading_edge_clears_the_neighbors_center() {
+        let widths = [100.0, 60.0, 80.0];
+        // The neighbor spans 103..163, so its center is 133; the dragged tab's
+        // right edge is `x + 100`.
+        let swap_at = 133.0 + SWAP_HYSTERESIS - 100.0;
+        assert_eq!(drop_index(&widths, 0, 0.0, swap_at), 0);
+        assert_eq!(drop_index(&widths, 0, 0.0, swap_at + 1.0), 1);
+    }
+
+    /// The reason for the hysteresis: right after a swap the dragged tab must
+    /// not already be on the far side of the way back, or a resting hand flips
+    /// the pair on every tremor.
+    #[test]
+    fn a_swap_holds_until_the_tab_retreats_past_the_way_back() {
+        // The strip after the swap above, the dragged tab now second.
+        let widths = [60.0, 100.0, 80.0];
+        let dragged_slot = slot(&widths, 1);
+        let swapped_at = 133.0 + SWAP_HYSTERESIS - 100.0 + 1.0;
+        assert_eq!(drop_index(&widths, 1, dragged_slot, swapped_at), 1);
+
+        // The neighbor now spans 0..60: back across its center, less the margin.
+        let back_at = 30.0 - SWAP_HYSTERESIS;
+        assert_eq!(drop_index(&widths, 1, dragged_slot, back_at), 1);
+        assert_eq!(drop_index(&widths, 1, dragged_slot, back_at - 1.0), 0);
+        assert!(swapped_at - back_at > 2.0 * SWAP_HYSTERESIS);
+    }
+
+    #[test]
+    fn a_fast_drag_crosses_several_tabs_in_one_step() {
+        let widths = [50.0; 4];
+        assert_eq!(drop_index(&widths, 0, 0.0, slot(&widths, 3)), 3);
+        assert_eq!(drop_index(&widths, 3, slot(&widths, 3), 0.0), 0);
+        assert_eq!(
+            drop_index(&widths, 1, slot(&widths, 1), slot(&widths, 2) + 1.0),
+            2
+        );
+    }
+
+    /// The dragged tab is held inside the run of tabs, so both end slots have
+    /// to be reachable from inside it — even for a wide tab next to a narrow one.
+    #[test]
+    fn both_ends_of_the_strip_are_reachable_within_the_clamp() {
+        let widths = [200.0, 40.0, 40.0];
+        let run: f32 = widths.iter().sum::<f32>() + 2.0 * TAB_GAP;
+        assert_eq!(drop_index(&widths, 0, 0.0, run - 200.0), 2);
+
+        let widths = [40.0, 40.0, 200.0];
+        assert_eq!(drop_index(&widths, 2, slot(&widths, 2), 0.0), 0);
+    }
 }

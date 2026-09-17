@@ -180,6 +180,29 @@ impl Diffui {
         Task::batch([self.on_active_tab_changed(), self.ensure_active_loaded()])
     }
 
+    /// Move the tab `id` to position `to` (clamped to the strip), shifting the
+    /// tabs between to fill its old slot. Purely an ordering change: the same
+    /// tab stays active, and nothing a tab owns moves with respect to it —
+    /// tabs are addressed by [`TabId`] everywhere but `active`, which is
+    /// re-resolved here.
+    pub(crate) fn move_tab(&mut self, id: TabId, to: usize) {
+        let Some(from) = self.tabs.iter().position(|tab| tab.id == id) else {
+            return;
+        };
+        let to = to.min(self.tabs.len() - 1);
+        if from == to {
+            return;
+        }
+        let active = self.active_tab_id();
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        if let Some(index) = self.tabs.iter().position(|tab| Some(tab.id) == active) {
+            self.active = index;
+        }
+        // The open-tab order is part of the persisted session.
+        self.mark_geometry_dirty();
+    }
+
     /// Resolve `raw` to a repository — or a GitHub PR reference — and open it
     /// as a tab (or focus it if it's already open). On failure the dialog
     /// stays open with the reason shown.
@@ -526,6 +549,55 @@ pub(crate) mod tests {
                 .expect("the editor opened on activation")
                 .target,
             revision
+        );
+    }
+
+    #[test]
+    fn moving_a_tab_reorders_the_strip_without_changing_which_is_active() {
+        let mut ui = app();
+        let first = push_tab(&mut ui, "/tmp/first");
+        let second = push_tab(&mut ui, "/tmp/second");
+        let third = push_tab(&mut ui, "/tmp/third");
+        ui.active = 1;
+        let order = |ui: &Diffui| ui.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>();
+
+        // The active tab dragged to the end of the strip.
+        ui.move_tab(second, 2);
+        assert_eq!(order(&ui), [first, third, second]);
+        assert_eq!(ui.active_tab_id(), Some(second));
+
+        // A background tab crossing the active one: `active` is an index, so
+        // it has to follow the tab it named.
+        ui.move_tab(first, 2);
+        assert_eq!(order(&ui), [third, second, first]);
+        assert_eq!(ui.active_tab_id(), Some(second));
+
+        // Past the end clamps to the last slot.
+        ui.move_tab(third, 9);
+        assert_eq!(order(&ui), [second, first, third]);
+        assert_eq!(ui.active_tab_id(), Some(second));
+
+        // The next launch restores the strip in this order.
+        assert!(ui.geometry_dirty_since.is_some());
+        assert_eq!(
+            ui.current_window_state().open_repos,
+            ["/tmp/second", "/tmp/first", "/tmp/third"]
+        );
+    }
+
+    #[test]
+    fn moving_a_tab_onto_its_own_slot_changes_nothing() {
+        let mut ui = app();
+        let first = push_tab(&mut ui, "/tmp/first");
+        let _second = push_tab(&mut ui, "/tmp/second");
+
+        ui.move_tab(first, 0);
+        ui.move_tab(TabId(99), 1);
+
+        assert_eq!(ui.tabs[0].id, first);
+        assert!(
+            ui.geometry_dirty_since.is_none(),
+            "nothing moved, so there is nothing to persist"
         );
     }
 

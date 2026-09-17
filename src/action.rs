@@ -127,6 +127,12 @@ pub(crate) enum Action {
     SelectTabIndex(usize),
     CloseTab(TabId),
     CloseActiveTab,
+    /// Reorder: put this tab at position `to`. Which tab is active is
+    /// untouched. Dragging a tab along the strip emits one per slot crossed.
+    MoveTab {
+        id: TabId,
+        to: usize,
+    },
 
     // ── Clipboard ───────────────────────────────────────────────────────
     /// Copy a value already in hand.

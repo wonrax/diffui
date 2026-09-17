@@ -1021,6 +1021,10 @@ impl Diffui {
                 }
                 None => Task::none(),
             },
+            Action::MoveTab { id, to } => {
+                self.move_tab(id, to);
+                Task::none()
+            }
 
             // ── Clipboard ───────────────────────────────────────────────
             Action::Copy(text) => iced::clipboard::write(text).discard(),
