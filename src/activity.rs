@@ -377,6 +377,9 @@ fn spinner_glyph(started: Instant) -> &'static str {
     SPINNER_FRAMES[frame]
 }
 
+/// Height of [`activity_progress_line`], which the toolbar always reserves.
+pub const PROGRESS_LINE_HEIGHT: f32 = 2.0;
+
 /// The right-edge toolbar control: a clickable chip that shows the first
 /// running task (spinner + label + `+N`) while work is in flight, or a quiet
 /// "Activity" affordance otherwise. Click → open/close the popover.
@@ -433,10 +436,7 @@ pub fn activity_indicator(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message>
             icons::CHECK // idle — everything finished
         };
         row![
-            text(glyph)
-                .size(text_size::UI)
-                .font(icons::ICON_FONT)
-                .color(theme.subtle_text),
+            icons::icon(glyph, crate::ui::ICON_SIZE, theme.subtle_text),
             text("Activity")
                 .size(text_size::UI)
                 .font(ui.config.ui_font)
@@ -447,11 +447,14 @@ pub fn activity_indicator(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message>
         .into()
     };
 
-    button(body)
-        .padding(Padding::from([5, 10]))
-        .on_press(Message::Action(Action::ToggleActivityPopover))
-        .style(move |_, status| ghost_button_style(theme, status))
-        .into()
+    crate::ui::button(
+        body,
+        crate::ui::Variant::Ghost,
+        crate::ui::Size::Compact,
+        theme,
+    )
+    .on_press(Message::Action(Action::ToggleActivityPopover))
+    .into()
 }
 
 /// The thin progress line drawn along the toolbar's bottom edge. Tracks the
@@ -460,8 +463,6 @@ pub fn activity_indicator(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message>
 /// diff load that isn't a logged activity. A fixed 2px height keeps the toolbar
 /// from shifting when idle.
 pub fn activity_progress_line(ui: &Diffui, theme: ThemeSpec) -> Element<'static, Message> {
-    const HEIGHT: f32 = 2.0;
-
     // Both visuals are held back until the work has run past the display delay,
     // so short ops don't flash. `loading_since` times the (un-logged)
     // revision-switch diff load the same way an activity's `started` does.
@@ -480,12 +481,12 @@ pub fn activity_progress_line(ui: &Diffui, theme: ThemeSpec) -> Element<'static,
             let fill = (fraction * 1000.0) as u16;
             let rest = 1000u16.saturating_sub(fill);
             let accent = theme.accent;
-            let mut bar = row![].height(Length::Fixed(HEIGHT));
+            let mut bar = row![].height(Length::Fixed(PROGRESS_LINE_HEIGHT));
             if fill > 0 {
                 bar = bar.push(
                     container(Space::new())
                         .width(Length::FillPortion(fill))
-                        .height(Length::Fixed(HEIGHT))
+                        .height(Length::Fixed(PROGRESS_LINE_HEIGHT))
                         .style(move |_| solid(accent)),
                 );
             }
@@ -508,13 +509,15 @@ pub fn activity_progress_line(ui: &Diffui, theme: ThemeSpec) -> Element<'static,
         };
         return container(Space::new())
             .width(Length::Fill)
-            .height(Length::Fixed(HEIGHT))
+            .height(Length::Fixed(PROGRESS_LINE_HEIGHT))
             .style(move |_| solid(color))
             .into();
     }
 
     // Idle: an invisible spacer so the toolbar height is stable.
-    Space::new().height(Length::Fixed(HEIGHT)).into()
+    Space::new()
+        .height(Length::Fixed(PROGRESS_LINE_HEIGHT))
+        .into()
 }
 
 /// The activity popover: a scrim + a top-right card listing every entry. Empty
@@ -562,13 +565,14 @@ pub fn activity_popover(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
 
     // The card carries no padding of its own so the divider can run edge to
     // edge; the header/list insets are chosen so the rows' status icons (list
-    // pad 8 + row pad 8) sit exactly under the header text (pad 16), and the
-    // Clear label's right edge (pad 8 + button pad 8) over the durations.
+    // pad 8 + row pad 8) sit exactly under the header text (pad 16). The
+    // header row is one control step tall for the Clear button, whose label
+    // (pad 6 + button pad 10) ends over the durations.
     let body = column![
         container(header).width(Length::Fill).padding(Padding {
-            top: 12.0,
-            right: 8.0,
-            bottom: 10.0,
+            top: 8.0,
+            right: 6.0,
+            bottom: 8.0,
             left: 16.0,
         }),
         container(Space::new())
@@ -596,14 +600,15 @@ pub fn activity_popover(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     )
     .on_press(Message::Ui(UiEvent::ActivityNoOp));
 
-    // Anchor under the toolbar's right edge.
+    // Hang just under the toolbar, its right edge on the toolbar's own edge
+    // inset so the card lines up under the controls that opened it.
     let anchored = container(card)
         .width(Length::Fill)
         .height(Length::Fill)
         .align_x(alignment::Horizontal::Right)
         .padding(Padding {
-            top: 78.0,
-            right: 8.0,
+            top: crate::toolbar::chrome_bottom() + crate::theme::space::XS,
+            right: crate::theme::space::MD,
             bottom: 0.0,
             left: 0.0,
         });
@@ -638,10 +643,13 @@ pub fn toast_layer(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
                     .font(emphasis_font(ui.config.ui_font, Weight::Semibold))
                     .color(theme.removed_text)
                     .width(Length::Fill),
-                button(icons::icon(icons::CLOSE, 13.0, theme.muted_text))
-                    .padding(Padding::from([2, 4]))
-                    .on_press(Message::Ui(UiEvent::ToastDismiss(toast.id)))
-                    .style(move |_, status| ghost_button_style(theme, status)),
+                crate::ui::icon_button(
+                    icons::CLOSE,
+                    theme.muted_text,
+                    crate::ui::Size::Compact,
+                    theme,
+                )
+                .on_press(Message::Ui(UiEvent::ToastDismiss(toast.id))),
             ]
             .spacing(8)
             .align_y(alignment::Vertical::Center),
@@ -652,13 +660,22 @@ pub fn toast_layer(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         ]
         .spacing(5);
         cards = cards.push(
+            // The title row is one control step tall for the close button, so
+            // the top and right insets give up the margin its wash keeps around
+            // the glyph: the warning glyph and the close glyph both sit 14px
+            // in from their card edges.
             container(body)
                 .width(Length::Fill)
-                .padding(Padding::from([12, 14]))
+                .padding(Padding {
+                    top: 7.0,
+                    right: 7.0,
+                    bottom: 12.0,
+                    left: 14.0,
+                })
                 .style(move |_| popover_style(theme)),
         );
     }
-    // Anchored bottom-right, floating above the status bar. Only the card
+    // Anchored bottom-right, an even inset from both window edges. Only the card
     // stack is `opaque` — it must own the cursor and wheel over its area
     // (without it the diff view's I-beam and scrolling bled through, like
     // the activity popover once did) — while the full-size aligning wrapper
@@ -670,8 +687,8 @@ pub fn toast_layer(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         .align_y(alignment::Vertical::Bottom)
         .padding(Padding {
             top: 0.0,
-            right: 14.0,
-            bottom: 46.0,
+            right: crate::theme::space::LG,
+            bottom: crate::theme::space::LG,
             left: 0.0,
         })
         .into()
@@ -973,9 +990,12 @@ fn clear_button(ui: &Diffui, theme: ThemeSpec) -> Element<'static, Message> {
         } else {
             theme.subtle_text
         });
-    let mut b = button(label)
-        .padding(Padding::from([2, 8]))
-        .style(move |_, status| ghost_button_style(theme, status));
+    let mut b = crate::ui::button(
+        label,
+        crate::ui::Variant::Ghost,
+        crate::ui::Size::Compact,
+        theme,
+    );
     if enabled {
         b = b.on_press(Message::Action(Action::ClearActivities));
     }

@@ -14,14 +14,14 @@
 use std::time::Duration;
 
 use iced::{
-    Background, Border, Color, Element, Length, Padding, Shadow, alignment,
+    Background, Element, Length, Padding, alignment,
     font::Weight,
     widget::{Space, button, column, container, row, text},
 };
 use regex::{Regex, RegexBuilder};
 
 use crate::icons;
-use crate::theme::{ThemeSpec, ghost_button_style, popover_style, text_size};
+use crate::theme::{self, ThemeSpec, popover_style, text_size};
 use crate::{Action, Diffui, Message};
 use diffui_core::DiffFile;
 
@@ -267,51 +267,41 @@ pub fn build_overlay<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Messag
             caret: None,
         },
     ))
-    .width(Length::Fixed(220.0));
+    .width(Length::Fill);
 
     let case_button = toggle_button("Aa", state.case_sensitive, theme, ui.config.ui_font)
         .on_press(Message::Find(FindMessage::ToggleCase));
     let regex_button = toggle_button(".*", state.regex, theme, ui.config.mono_font)
         .on_press(Message::Find(FindMessage::ToggleRegex));
 
-    let prev_button =
-        nav_button(icons::CHEVRON_UP, theme).on_press(Message::Action(Action::FindPrevious));
-    let next_button =
-        nav_button(icons::CHEVRON_DOWN, theme).on_press(Message::Action(Action::FindNext));
-    let close_button = nav_button(icons::CLOSE, theme).on_press(Message::Action(Action::CloseFind));
+    let nav = |glyph| crate::ui::icon_button(glyph, theme.muted_text, CONTROL, theme);
+    let prev_button = nav(icons::CHEVRON_UP).on_press(Message::Action(Action::FindPrevious));
+    let next_button = nav(icons::CHEVRON_DOWN).on_press(Message::Action(Action::FindNext));
+    let close_button = nav(icons::CLOSE).on_press(Message::Action(Action::CloseFind));
 
-    // Each row item is wrapped in a container that asks for
-    // `Length::Shrink` height + centered Y. iced's `Row::align_y` only
-    // applies to children that *don't* fight back with their own height,
-    // and `text_input` defaults to Length::Fill height, which pulls the
-    // row to its full available height and leaves the buttons stuck at
-    // the top. Wrapping forces a known, content-sized cell.
+    // Every control is one step tall, so the row centers them without help;
+    // the count gets a fixed slot so stepping through matches doesn't nudge
+    // the arrows sideways as its digits change.
     let bar = row![
-        centered_cell(input.into()),
-        Space::new().width(Length::Fixed(6.0)),
-        centered_cell(case_button.into()),
-        centered_cell(regex_button.into()),
-        Space::new().width(Length::Fixed(10.0)),
-        centered_cell(
-            text(count_label)
-                .size(text_size::CAPTION)
-                .color(theme.subtle_text)
-                .font(ui.config.ui_font)
-                .into(),
-        ),
-        Space::new().width(Length::Fixed(10.0)),
-        centered_cell(prev_button.into()),
-        centered_cell(next_button.into()),
-        Space::new().width(Length::Fixed(4.0)),
-        centered_cell(close_button.into()),
+        input,
+        row![case_button, regex_button].spacing(theme::space::XXS),
+        text(count_label)
+            .size(text_size::CAPTION)
+            .color(theme.subtle_text)
+            .font(ui.config.ui_font)
+            .width(Length::Fixed(COUNT_WIDTH))
+            .align_x(alignment::Horizontal::Center),
+        row![prev_button, next_button, close_button].spacing(theme::space::XXS),
     ]
-    .spacing(4)
+    .spacing(theme::space::SM)
+    .width(Length::Fill)
+    .height(Length::Fixed(CONTROL.height()))
     .align_y(alignment::Vertical::Center);
 
     // Floating rounded card hovering over the diff's top-right corner —
     // shares the popover elevation language so it reads as a transient
     // control, not as pane chrome. A regex error joins inside the card.
-    let mut card_body = column![bar].spacing(4);
+    let mut card_body = column![bar].spacing(theme::space::XS);
     if let Some(err) = &state.error {
         card_body = card_body.push(
             text(format!("Regex error: {err}"))
@@ -320,45 +310,42 @@ pub fn build_overlay<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Messag
                 .font(ui.config.ui_font),
         );
     }
+    // The field flexes, so the card narrows with the pane instead of
+    // clipping its trailing buttons.
     let bar_card = container(card_body)
-        .padding(Padding::from([6, 8]))
+        .width(Length::Fill.max(CARD_MAX_WIDTH))
+        .padding(theme::space::SM)
         .style(move |_| popover_style(theme));
 
-    // Hover a small gap in from the pane's top-right corner.
+    // Inset from the pane's top-right corner like the diff's own headers,
+    // which also keeps the card clear of the overlay scrollbar.
     container(bar_card)
         .width(Length::Fill)
         .align_x(alignment::Horizontal::Right)
         .padding(Padding {
-            top: 8.0,
-            right: 12.0,
+            top: theme::space::MD,
+            right: crate::diff_view::HEADER_HORIZONTAL_PADDING,
             bottom: 0.0,
-            left: 0.0,
+            left: crate::diff_view::HEADER_HORIZONTAL_PADDING,
         })
         .into()
 }
 
-fn centered_cell<'a>(element: Element<'a, Message>) -> Element<'a, Message> {
-    container(element)
-        .align_y(alignment::Vertical::Center)
-        .height(Length::Shrink)
-        .into()
-}
+/// Find-bar control height.
+const CONTROL: crate::ui::Size = crate::ui::Size::Compact;
+/// Fits "999 of 999" without the arrows beside it moving.
+const COUNT_WIDTH: f32 = 56.0;
+const CARD_MAX_WIDTH: f32 = 460.0;
 
+/// A match-option toggle: the toolbar toggles' look — quiet at rest, an
+/// accent wash and accent label while on.
 fn toggle_button<'a>(
     label: &'a str,
     on: bool,
     theme: ThemeSpec,
     font: iced::Font,
 ) -> button::Button<'a, Message> {
-    let bg = if on {
-        Color {
-            a: 0.18,
-            ..theme.accent
-        }
-    } else {
-        theme.panel_background
-    };
-    let txt_color = if on { theme.accent } else { theme.muted_text };
+    let side = CONTROL.height();
     button(
         container(
             text(label)
@@ -366,29 +353,22 @@ fn toggle_button<'a>(
                 // See `emphasis_font` doc — Medium is only applied on
                 // explicitly-named families so the generic default
                 // doesn't end up rendering tofu on macOS.
-                .font(crate::theme::emphasis_font(font, Weight::Medium))
-                .color(txt_color),
+                .font(theme::emphasis_font(font, Weight::Medium))
+                .color(if on { theme.accent } else { theme.muted_text }),
         )
-        .padding(Padding::from([3, 6])),
+        .center_x(Length::Fill)
+        .center_y(Length::Fill),
     )
+    .width(Length::Fixed(side))
+    .height(Length::Fixed(side))
     .padding(0)
-    .style(move |_, _| button::Style {
-        background: Some(Background::Color(bg)),
-        text_color: txt_color,
-        border: Border {
-            width: 1.0,
-            color: if on { theme.accent } else { theme.border },
-            radius: crate::theme::radius::BUTTON.into(),
-        },
-        shadow: Shadow::default(),
-        snap: true,
+    .style(move |_, status| {
+        let mut style = theme::ghost_button_style(theme, status);
+        if on {
+            style.background = Some(Background::Color(theme::chip_background(theme.accent)));
+        }
+        style
     })
-}
-
-fn nav_button<'a>(glyph: &'static str, theme: ThemeSpec) -> button::Button<'a, Message> {
-    button(container(icons::icon(glyph, 13.0, theme.muted_text)).padding(Padding::from([2, 4])))
-        .padding(0)
-        .style(move |_, status| ghost_button_style(theme, status))
 }
 
 #[cfg(test)]

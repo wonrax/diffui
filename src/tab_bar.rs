@@ -31,10 +31,10 @@ use crate::chrome;
 use crate::icons;
 use crate::repository::Vcs;
 use crate::theme::{
-    ThemeSpec, centered_control_content, centered_control_content_fill, chip_background,
-    destructive_button_style, dialog_button_style, emphasis_font, ghost_button_style, input_style,
-    modal_style, primary_button_style, radius, scrim_style, text_size, well_fill,
+    self, ThemeSpec, centered_control_content_fill, chip_background, emphasis_font,
+    ghost_button_style, input_style, modal_style, radius, scrim_style, text_size, well_fill,
 };
+use crate::ui;
 use crate::{Action, Diffui, HoverTarget, Message, TabId, UiEvent, WindowEvent};
 
 /// Focus target id for the open-repository dialog's path field.
@@ -59,6 +59,9 @@ const TAB_GAP: f32 = 3.0;
 /// Label padding inside a tab's fill / hover wash.
 const LABEL_PAD_X: f32 = 8.0;
 
+/// The close button's square, which also holds the dirty dot.
+const CLOSE_SIDE: f32 = 18.0;
+
 /// Horizontal travel before a press on a tab becomes a drag — the revision
 /// list's threshold, so a click that wobbles stays a click in both places.
 /// Vertical travel never counts: the strip only reorders along its own axis.
@@ -75,11 +78,34 @@ const SWAP_HYSTERESIS: f32 = 4.0;
 /// slide is visually done in about three of them.
 const SLIDE_TAU: f32 = 0.05;
 
-/// Both modal cards (confirm, open-repo) hang at the same distance below the
-/// top edge, like the command palette — anchored rather than centered, so
-/// they don't jump when their content grows (error lines, recents).
-const DIALOG_TOP_OFFSET: f32 = 80.0;
-const OPEN_DIALOG_WIDTH: f32 = 560.0;
+/// The open-repo card, sized and inset like a palette column.
+const OPEN_DIALOG_WIDTH: f32 = 520.0;
+/// Height of the card's input band.
+const OPEN_INPUT_BAND: f32 = 52.0;
+/// Shared left edge of the input text, the section label and row glyphs.
+const OPEN_CONTENT_X: f32 = theme::space::XL;
+/// Inset of the recent list's hover washes inside the card.
+const OPEN_LIST_INSET: f32 = theme::space::XS;
+const OPEN_SECTION_HEIGHT: f32 = 28.0;
+const OPEN_SECTION_PILL: f32 = 22.0;
+const OPEN_SECTION_PILL_PAD_X: f32 = theme::space::SM;
+const OPEN_ROW_HEIGHT: f32 = 34.0;
+const OPEN_GLYPH_BOX: f32 = 16.0;
+const OPEN_GLYPH_GAP: f32 = 10.0;
+const OPEN_REMOVE_SIDE: f32 = 24.0;
+/// Inner padding of both modal cards (confirm, open-repo).
+const DIALOG_PADDING: f32 = theme::space::XL + theme::space::XS;
+/// Gap between neighbouring dialog buttons (and the field beside its button).
+const DIALOG_BUTTON_GAP: f32 = theme::space::MD;
+
+/// The strip's height: the title-bar height where it stands in for one,
+/// otherwise its top padding plus the tabs.
+pub fn height() -> f32 {
+    chrome::title_bar_height().unwrap_or(STRIP_TOP_PAD + TAB_HEIGHT)
+}
+
+/// Top padding of the strip where it sizes to its own content.
+const STRIP_TOP_PAD: f32 = 6.0;
 
 /// Build the title-bar tab strip. Returns an empty `Space` when no repos are
 /// open (the empty-state view owns the window in that case).
@@ -108,7 +134,11 @@ pub fn build_tab_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     // centered on the full strip (see `chrome::position_window_controls`),
     // like a native browser window.
     let titlebar_height = chrome::title_bar_height();
-    let v_pad = if titlebar_height.is_some() { 0.0 } else { 6.0 };
+    let v_pad = if titlebar_height.is_some() {
+        0.0
+    } else {
+        STRIP_TOP_PAD
+    };
     let mut strip = row![]
         .align_y(alignment::Vertical::Center)
         .spacing(6)
@@ -203,33 +233,38 @@ fn tab_widget<'a>(
             .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
     );
 
-    let mut label = row![badge, repo_label]
+    let label = row![badge, repo_label]
         .spacing(6)
         .align_y(alignment::Vertical::Center);
-    // Always reserve the dot's slot (a transparent placeholder when clean) so a
-    // tab's width doesn't jump as its dirty status changes — e.g. when a revset
-    // that excludes `@` makes the working copy drop out of the loaded set.
-    label = label.push(if tab_is_dirty(tab) {
-        dirty_dot(theme)
-    } else {
-        Space::new()
-            .width(Length::Fixed(6.0))
-            .height(Length::Fixed(6.0))
-            .into()
-    });
 
     let id = tab.id;
+    let hovered = ui.hovered == Some(HoverTarget::Tab(id));
 
-    let close = button(icons::icon(icons::CLOSE, 13.0, theme.subtle_text))
-        // Symmetric padding around the fixed-size icon box makes the hover
-        // target a square that fills the tab's text line height. The old
-        // asymmetric padding (0 vertical, 4 horizontal) left it short and wide.
-        .padding(Padding::from([2, 2]))
+    // The uncommitted-changes dot lives in the close button's slot and gives
+    // way to the `×` under the cursor, as in editor tabs: every tab keeps one
+    // trailing slot, so the gap after the name is the same whether or not a
+    // repo is dirty, and the tab's width never jumps as that changes.
+    let trailing: Element<'a, Message> = if tab_is_dirty(tab) && !hovered {
+        container(dirty_dot(theme))
+            .center_x(Length::Fixed(CLOSE_SIDE))
+            .center_y(Length::Fixed(CLOSE_SIDE))
+            .into()
+    } else {
+        button(
+            container(icons::icon(icons::CLOSE, 13.0, theme.subtle_text))
+                .center_x(Length::Fill)
+                .center_y(Length::Fill),
+        )
+        .width(Length::Fixed(CLOSE_SIDE))
+        .height(Length::Fixed(CLOSE_SIDE))
+        .padding(0)
         .on_press(Message::Action(Action::CloseTab(id)))
-        .style(move |_, status| ghost_button_style(theme, status));
+        .style(move |_, status| ghost_button_style(theme, status))
+        .into()
+    };
 
-    let inner = row![label, close]
-        .spacing(4)
+    let inner = row![label, trailing]
+        .spacing(theme::space::XS)
         .align_y(alignment::Vertical::Center);
 
     // Browser-style tab: the active tab is a top-rounded block filled with the
@@ -240,7 +275,6 @@ fn tab_widget<'a>(
     // Inactive tabs stay quiet; hovering one paints a floating wash over the
     // same box minus `WASH_BOTTOM_GAP`. The label centers in the same
     // top-anchored box in every state, so nothing shifts on hover or selection.
-    let hovered = ui.hovered == Some(HoverTarget::Tab(id));
     let wash_fill = (!active && hovered).then(|| chip_background(theme.muted_text));
     let wash = container(inner)
         .padding(Padding::from([0.0, LABEL_PAD_X]))
@@ -1036,26 +1070,26 @@ pub fn build_confirm_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
     )
     .on_press(Message::Action(Action::ConfirmCancel));
 
-    let cancel = button(
-        text("Cancel")
-            .size(text_size::BODY)
-            .color(theme.text)
-            .font(ui.config.ui_font),
+    let cancel = ui::text_button(
+        None,
+        "Cancel",
+        ui::Variant::Raised,
+        ui::Size::Standard,
+        ui.config.ui_font,
+        theme,
     )
-    .padding(Padding::from([7, 16]))
-    .on_press(Message::Action(Action::ConfirmCancel))
-    .style(move |_, status| dialog_button_style(theme, status));
+    .on_press(Message::Action(Action::ConfirmCancel));
 
     // Red fill: the confirm runs a mutation the jj CLI refuses by default.
-    let accept = button(
-        text(dialog.confirm_label.as_str())
-            .size(text_size::BODY)
-            .color(theme.background)
-            .font(ui.config.ui_font),
+    let accept = ui::text_button(
+        None,
+        dialog.confirm_label.as_str(),
+        ui::Variant::Destructive,
+        ui::Size::Standard,
+        ui.config.ui_font,
+        theme,
     )
-    .padding(Padding::from([7, 16]))
-    .on_press(Message::Action(Action::ConfirmAccept))
-    .style(move |_, _| destructive_button_style(theme));
+    .on_press(Message::Action(Action::ConfirmAccept));
 
     let body = column![
         text(dialog.title.as_str())
@@ -1067,7 +1101,7 @@ pub fn build_confirm_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
             .color(theme.muted_text)
             .font(ui.config.ui_font),
         row![Space::new().width(Length::Fill), cancel, accept]
-            .spacing(8)
+            .spacing(DIALOG_BUTTON_GAP)
             .align_y(alignment::Vertical::Center),
     ]
     .spacing(12);
@@ -1075,7 +1109,7 @@ pub fn build_confirm_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
     let card = mouse_area(
         container(body)
             .width(Length::Fixed(460.0))
-            .padding(Padding::from([20, 22]))
+            .padding(DIALOG_PADDING)
             .style(move |_| modal_style(theme)),
     )
     .on_press(Message::Ui(UiEvent::ConfirmNoOp));
@@ -1085,7 +1119,7 @@ pub fn build_confirm_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
         .height(Length::Fill)
         .align_x(alignment::Horizontal::Center)
         .padding(Padding {
-            top: DIALOG_TOP_OFFSET,
+            top: crate::theme::modal_top(),
             right: 0.0,
             bottom: 0.0,
             left: 0.0,
@@ -1113,118 +1147,9 @@ fn tab_is_dirty(tab: &crate::Tab) -> bool {
         == Some(false)
 }
 
-/// One quick-pick row in the open dialog's recent list: `owner/name` over the
-/// home-contracted path, clicking it reopens that repo. Shared with the welcome
-/// screen (`empty_state`) so both recent lists render identically.
-pub(crate) fn recent_repo_row<'a>(
-    ui: &'a Diffui,
-    theme: ThemeSpec,
-    root: &'a str,
-) -> Element<'a, Message> {
-    let (owner, name) = crate::repo_label(std::path::Path::new(root));
-    let display_path = crate::contract_user_path(root);
-    let mut label = row![].spacing(0).align_y(alignment::Vertical::Center);
-    if !owner.is_empty() {
-        label = label.push(
-            text(format!("{owner}/"))
-                .size(text_size::UI)
-                .color(theme.subtle_text)
-                .font(ui.config.ui_font),
-        );
-    }
-    label = label.push(
-        text(name)
-            .size(text_size::UI)
-            .color(theme.text)
-            .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
-    );
-
-    let identity = container(
-        column![
-            label,
-            text(display_path)
-                .size(text_size::CAPTION)
-                .color(theme.subtle_text)
-                .font(ui.config.mono_font)
-                .wrapping(text::Wrapping::None),
-        ]
-        .spacing(2),
-    )
-    .width(Length::Fill)
-    .clip(true);
-    let folder = container(icons::icon(icons::FOLDER, 15.0, theme.info))
-        .width(Length::Fixed(32.0))
-        .height(Length::Fixed(32.0))
-        .center(Length::Fixed(32.0))
-        .style(move |_| container::Style {
-            background: Some(Background::Color(chip_background(theme.info))),
-            border: Border {
-                radius: radius::PUSH.into(),
-                ..Border::default()
-            },
-            ..container::Style::default()
-        });
-    let disclosure = container(centered_control_content_fill(icons::icon(
-        icons::CHEVRON_RIGHT,
-        13.0,
-        theme.subtle_text,
-    )))
-    .width(Length::Fixed(36.0))
-    .height(Length::Fixed(36.0));
-    let content = row![folder, identity, disclosure]
-        .spacing(10)
-        .align_y(alignment::Vertical::Center);
-
-    let repo_button = button(
-        container(content)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_y(Length::Fill),
-    )
-    .width(Length::Fill)
-    .height(Length::Fixed(52.0))
-    .padding(Padding::from([0, 10]))
-    .on_press(Message::Action(Action::OpenRepo(root.to_owned())))
-    .style(move |_, status| button::Style {
-        background: match status {
-            button::Status::Hovered | button::Status::Pressed => {
-                Some(Background::Color(theme.selected_file))
-            }
-            _ => None,
-        },
-        text_color: theme.text,
-        border: Border {
-            width: 0.0,
-            color: Color::TRANSPARENT,
-            radius: radius::BUTTON.into(),
-        },
-        shadow: Default::default(),
-        snap: true,
-    });
-    let remove = button(centered_control_content_fill(icons::icon(
-        icons::CLOSE,
-        13.0,
-        theme.subtle_text,
-    )))
-    .width(Length::Fixed(36.0))
-    .height(Length::Fixed(52.0))
-    .padding(0)
-    .on_press(Message::Action(Action::RemoveRecentRepo(root.to_owned())))
-    .style(move |_, status| {
-        let mut style = ghost_button_style(theme, status);
-        style.border.radius = radius::BUTTON.into();
-        style
-    });
-
-    row![repo_button, remove]
-        .spacing(2)
-        .align_y(alignment::Vertical::Center)
-        .into()
-}
-
 /// Modal overlay for opening a repository from a path. Returns an empty
-/// `Space` when the dialog is closed. Mirrors the palette's scrim + card
-/// construction so click-outside dismisses and the card itself doesn't.
+/// `Space` when the dialog is closed. Click-outside and Esc cancel, so the
+/// card has no Cancel button.
 pub fn build_open_repo_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     let Some(dialog) = ui.open_repo_dialog() else {
         return Space::new().into();
@@ -1238,95 +1163,111 @@ pub fn build_open_repo_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Mess
     )
     .on_press(Message::Action(Action::CloseRepoDialog));
 
-    let input = iced::widget::text_input(
-        "~/code/project, a GitHub PR URL, or owner/repo#123",
-        &dialog.path,
-    )
-    .id(OPEN_REPO_INPUT_ID)
-    .padding(Padding::from([9, 11]))
-    .size(text_size::BODY)
-    .font(ui.config.mono_font)
-    .on_input(|path| Message::Ui(UiEvent::OpenRepoPathChanged(path)))
-    .on_submit(Message::Action(Action::SubmitRepoDialog))
-    .style(move |_, _| iced::widget::text_input::Style {
-        // Recessed into the elevated card, otherwise identical to the
-        // shared input identity.
-        background: Background::Color(theme.background),
-        ..input_style(theme)
-    });
+    // Catch clicks on the card so they don't fall through to the scrim and
+    // dismiss the dialog while the user is interacting with it.
+    let card =
+        mouse_area(open_repo_card(ui, theme, dialog)).on_press(Message::Ui(UiEvent::OpenRepoNoOp));
 
-    let mark = container(centered_control_content(icons::icon(
-        icons::FOLDER_OPEN,
-        18.0,
-        theme.info,
-    )))
-    .width(Length::Fixed(40.0))
-    .height(Length::Fixed(40.0))
-    .center(Length::Fixed(40.0))
-    .style(move |_| container::Style {
-        background: Some(Background::Color(chip_background(theme.info))),
-        border: Border {
-            radius: radius::SURFACE.into(),
-            ..Border::default()
-        },
-        ..container::Style::default()
-    });
-    let intro = column![
-        text("Open a repository")
-            .size(text_size::TITLE)
-            .color(theme.text)
-            .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
-        text("Open a local jj or Git working copy, or review a GitHub pull request.")
-            .size(text_size::UI)
-            .color(theme.muted_text)
-            .font(ui.config.ui_font),
-    ]
-    .spacing(3);
-    let header = row![mark, intro]
-        .spacing(12)
-        .align_y(alignment::Vertical::Center);
+    let centered = container(card)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(alignment::Horizontal::Center)
+        .padding(Padding {
+            top: crate::theme::modal_top(),
+            right: 0.0,
+            bottom: 0.0,
+            left: 0.0,
+        });
 
-    let input_label = text("Repository path or pull request")
-        .size(text_size::UI)
-        .color(theme.text)
-        .font(emphasis_font(ui.config.ui_font, Weight::Medium));
-    let mut input_row = row![crate::input::single_line(input)]
-        .spacing(8)
+    // `opaque` keeps wheel events and the cursor from bleeding through to the
+    // shell below the modal (see `activity_popover` for the mechanics).
+    opaque(stack![scrim, centered])
+}
+
+/// The open prompt itself, shared by the modal and the welcome screen: a
+/// palette-family card with one input band (path, folder picker, Open), an
+/// error line when the last open failed, then the recent repositories.
+pub(crate) fn open_repo_card<'a>(
+    ui: &'a Diffui,
+    theme: ThemeSpec,
+    dialog: &'a crate::OpenRepoDialog,
+) -> Element<'a, Message> {
+    let input = iced::widget::text_input("Path, owner/repo#123, or PR URL", &dialog.path)
+        .id(OPEN_REPO_INPUT_ID)
+        .padding(Padding {
+            top: theme::space::MD,
+            right: theme::space::MD,
+            bottom: theme::space::MD,
+            left: OPEN_CONTENT_X,
+        })
+        .size(text_size::BODY_LG)
+        .font(ui.config.mono_font)
+        .on_input(|path| Message::Ui(UiEvent::OpenRepoPathChanged(path)))
+        .on_submit(Message::Action(Action::SubmitRepoDialog))
+        .style(move |_, _| iced::widget::text_input::Style {
+            // Bare: the card is the field.
+            background: Background::Color(Color::TRANSPARENT),
+            border: Border::default(),
+            ..input_style(theme)
+        });
+
+    let mut trailing = row![]
+        .spacing(theme::space::XS)
         .align_y(alignment::Vertical::Center);
     #[cfg(target_os = "macos")]
     {
-        let choose_folder = button(centered_control_content(
-            row![
-                icons::icon(icons::FOLDER, 14.0, theme.muted_text),
-                text("Choose folder")
-                    .size(text_size::UI)
-                    .font(ui.config.ui_font),
-            ]
-            .spacing(6)
-            .align_y(alignment::Vertical::Center),
-        ))
-        .height(Length::Fixed(36.0))
-        .padding([0, 12])
-        .on_press(Message::Action(Action::ChooseRepoFolder))
-        .style(move |_, status| dialog_button_style(theme, status));
-        input_row = input_row.push(choose_folder);
+        trailing = trailing.push(ui::tooltip(
+            ui::icon_button(
+                icons::FOLDER_OPEN,
+                theme.muted_text,
+                ui::Size::Compact,
+                theme,
+            )
+            .on_press(Message::Action(Action::ChooseRepoFolder)),
+            "Choose folder…",
+            iced::widget::tooltip::Position::Bottom,
+            ui.config.ui_font,
+            theme,
+        ));
     }
+    let mut open = ui::text_button(
+        None,
+        "Open",
+        ui::Variant::Primary,
+        ui::Size::Compact,
+        ui.config.ui_font,
+        theme,
+    );
+    if !dialog.path.trim().is_empty() {
+        open = open.on_press(Message::Action(Action::SubmitRepoDialog));
+    }
+    trailing = trailing.push(open);
 
-    let mut body = column![
-        header,
-        container(Space::new())
-            .width(Length::Fill)
-            .height(Length::Fixed(1.0))
-            .style(move |_| container::Style::default().background(theme.border)),
-        column![input_label, input_row].spacing(6),
-    ]
-    .spacing(16);
+    // The trailing controls sit as far in from the right edge as from the
+    // band's top and bottom.
+    let band_inset = (OPEN_INPUT_BAND - ui::Size::Compact.height()) / 2.0;
+    let band = container(
+        row![
+            crate::input::single_line(input, &dialog.path, ui.config.mono_font),
+            trailing,
+        ]
+        .align_y(alignment::Vertical::Center),
+    )
+    .width(Length::Fill)
+    .height(Length::Fixed(OPEN_INPUT_BAND))
+    .center_y(Length::Fixed(OPEN_INPUT_BAND))
+    .padding(Padding {
+        right: band_inset,
+        ..Padding::ZERO
+    });
+
+    let mut body = column![band].spacing(0);
 
     if let Some(error) = &dialog.error {
         body = body.push(
             container(
                 row![
-                    icons::icon(icons::ALERT_TRIANGLE, 14.0, theme.removed_text),
+                    icons::icon(icons::ALERT_TRIANGLE, ui::ICON_SIZE, theme.removed_text),
                     text(error.as_str())
                         .size(text_size::UI)
                         .color(theme.removed_text)
@@ -1334,24 +1275,20 @@ pub fn build_open_repo_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Mess
                         .width(Length::Fill)
                         .wrapping(text::Wrapping::Word),
                 ]
-                .spacing(8)
+                .spacing(theme::space::MD)
                 .align_y(alignment::Vertical::Center),
             )
             .width(Length::Fill)
-            .padding([8, 10])
-            .style(move |_| container::Style {
-                background: Some(Background::Color(chip_background(theme.removed_text))),
-                border: Border {
-                    radius: radius::PUSH.into(),
-                    ..Border::default()
-                },
-                ..container::Style::default()
+            .padding(Padding {
+                top: 0.0,
+                right: OPEN_CONTENT_X,
+                bottom: theme::space::LG,
+                left: OPEN_CONTENT_X,
             }),
         );
     }
 
-    // Recent repositories quick-pick: anything in the MRU that isn't already
-    // open. One click reopens it (no need to retype the path).
+    // Anything in the MRU that isn't already open; one click reopens it.
     let open_roots: Vec<&str> = ui
         .tabs
         .iter()
@@ -1364,117 +1301,157 @@ pub fn build_open_repo_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Mess
         .take(5)
         .collect();
     if !recents.is_empty() {
-        let clear = button(centered_control_content(
+        let clear = ui::button(
             text("Clear")
                 .size(text_size::CAPTION)
                 .color(theme.subtle_text)
                 .font(ui.config.ui_font),
-        ))
-        .height(Length::Fill)
-        .padding([0, 7])
-        .on_press(Message::Action(Action::ClearRecentRepos))
-        .style(move |_, status| ghost_button_style(theme, status));
-        let recent_header = row![
-            text("Recent repositories")
-                .size(text_size::CAPTION)
-                .color(theme.text)
-                .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
-            Space::new().width(Length::Fill),
-            clear,
-        ]
-        .height(Length::Fixed(32.0))
-        .align_y(alignment::Vertical::Center);
-        let mut list = column![].spacing(1);
+            ui::Variant::Ghost,
+            ui::Size::Compact,
+            theme,
+        )
+        .height(Length::Fixed(OPEN_SECTION_PILL))
+        .padding([0.0, OPEN_SECTION_PILL_PAD_X])
+        .on_press(Message::Action(Action::ClearRecentRepos));
+        let section = container(
+            row![
+                text("Recent")
+                    .size(text_size::CAPTION)
+                    .color(theme.subtle_text)
+                    .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
+                Space::new().width(Length::Fill),
+                clear,
+            ]
+            .align_y(alignment::Vertical::Center),
+        )
+        // "Clear"'s label, not its wash, ends on the content edge.
+        .padding(Padding {
+            right: OPEN_CONTENT_X - OPEN_SECTION_PILL_PAD_X,
+            ..Padding::from([0.0, OPEN_CONTENT_X])
+        })
+        .width(Length::Fill)
+        .height(Length::Fixed(OPEN_SECTION_HEIGHT))
+        .center_y(Length::Fixed(OPEN_SECTION_HEIGHT));
+
+        let mut list = column![].spacing(0);
         for root in recents {
-            list = list.push(recent_repo_row(ui, theme, root));
+            list = list.push(recent_repo_compact_row(ui, theme, root));
         }
         body = body.push(
-            column![
-                recent_header,
-                container(list)
-                    .width(Length::Fill)
-                    .padding(4)
-                    .style(move |_| container::Style {
-                        background: Some(Background::Color(theme.panel_background)),
-                        border: Border {
-                            width: 1.0,
-                            color: theme.border,
-                            radius: radius::SURFACE.into(),
-                        },
-                        ..container::Style::default()
-                    }),
-            ]
-            .spacing(6),
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fixed(1.0))
+                .style(move |_| container::Style::default().background(theme.border)),
         );
+        body = body.push(section);
+        body = body.push(container(list).width(Length::Fill).padding(Padding {
+            top: 0.0,
+            ..Padding::from(OPEN_LIST_INSET)
+        }));
     }
 
-    let cancel = button(centered_control_content(
-        text("Cancel")
-            .size(text_size::BODY)
-            .color(theme.text)
-            .font(ui.config.ui_font),
-    ))
-    .height(Length::Fixed(34.0))
-    .padding(Padding::from([0, 16]))
-    .on_press(Message::Action(Action::CloseRepoDialog))
-    .style(move |_, status| dialog_button_style(theme, status));
+    container(body)
+        .width(Length::Fixed(OPEN_DIALOG_WIDTH))
+        .style(move |_| modal_style(theme))
+        .into()
+}
 
-    let can_open = !dialog.path.trim().is_empty();
-    let mut open = button(centered_control_content(
-        text("Open")
-            .size(text_size::BODY)
-            .color(if can_open {
-                theme.background
-            } else {
-                theme.subtle_text
-            })
-            .font(ui.config.ui_font),
-    ))
-    .height(Length::Fixed(34.0))
-    .padding(Padding::from([0, 18]))
-    .style(move |_, status| primary_button_style(theme, status));
-    if can_open {
-        open = open.on_press(Message::Action(Action::SubmitRepoDialog));
-    }
-
-    body = body.push(
-        row![
-            text(format!("{} to open anytime", crate::chrome::cmd_label("O")))
-                .size(text_size::CAPTION)
+/// One line of the open prompt's recent list, laid out like a palette row:
+/// glyph · `owner/name` · the home-contracted path, with a remove `×` that
+/// floats over the row's right end.
+fn recent_repo_compact_row<'a>(
+    ui: &'a Diffui,
+    theme: ThemeSpec,
+    root: &'a str,
+) -> Element<'a, Message> {
+    let (owner, name) = crate::repo_label(std::path::Path::new(root));
+    let mut label = row![].spacing(0).align_y(alignment::Vertical::Center);
+    if !owner.is_empty() {
+        label = label.push(
+            text(format!("{owner}/"))
+                .size(text_size::BODY)
                 .color(theme.subtle_text)
                 .font(ui.config.ui_font),
-            Space::new().width(Length::Fill),
-            cancel,
-            open,
-        ]
-        .spacing(8)
-        .align_y(alignment::Vertical::Center),
+        );
+    }
+    label = label.push(
+        text(name)
+            .size(text_size::BODY)
+            .color(theme.text)
+            .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
     );
+    let content = row![
+        container(icons::icon(icons::FOLDER, ui::ICON_SIZE, theme.subtle_text))
+            .width(Length::Fixed(OPEN_GLYPH_BOX))
+            .center_x(Length::Fixed(OPEN_GLYPH_BOX)),
+        Space::new().width(Length::Fixed(OPEN_GLYPH_GAP)),
+        label,
+        Space::new().width(Length::Fixed(theme::space::MD)),
+        // Middle-ellipsized: a path's ends (where it lives, what it's
+        // called) say more than its middle.
+        text(crate::contract_user_path(root))
+            .size(text_size::CAPTION)
+            .color(theme.subtle_text)
+            .font(ui.config.mono_font)
+            .width(Length::Fill)
+            .wrapping(text::Wrapping::None)
+            .ellipsis(text::Ellipsis::Middle),
+        // Keeps the path clear of the floating `×`.
+        Space::new().width(Length::Fixed(OPEN_REMOVE_SIDE)),
+    ]
+    .align_y(alignment::Vertical::Center);
 
-    // Catch clicks on the card so they don't fall through to the scrim and
-    // dismiss the dialog while the user is interacting with it.
-    let card = mouse_area(
-        container(body)
-            .width(Length::Fixed(OPEN_DIALOG_WIDTH))
-            .padding(Padding::from([22, 24]))
-            .style(move |_| modal_style(theme)),
-    )
-    .on_press(Message::Ui(UiEvent::OpenRepoNoOp));
-
-    let centered = container(card)
+    let row_button = button(content)
         .width(Length::Fill)
-        .height(Length::Fill)
-        .align_x(alignment::Horizontal::Center)
-        .padding(Padding {
-            top: DIALOG_TOP_OFFSET,
-            right: 0.0,
-            bottom: 0.0,
-            left: 0.0,
+        .height(Length::Fixed(OPEN_ROW_HEIGHT))
+        .padding(Padding::from([0.0, OPEN_CONTENT_X - OPEN_LIST_INSET]))
+        .on_press(Message::Action(Action::OpenRepo(root.to_owned())))
+        .style(move |_, status| button::Style {
+            background: match status {
+                button::Status::Hovered | button::Status::Pressed => {
+                    Some(Background::Color(theme.selected_file))
+                }
+                _ => None,
+            },
+            text_color: theme.text,
+            border: Border {
+                width: 0.0,
+                color: Color::TRANSPARENT,
+                radius: radius::CONTROL.into(),
+            },
+            shadow: Default::default(),
+            snap: true,
         });
+    // Inset from the row's end as far as from its top and bottom.
+    let remove_inset = (OPEN_ROW_HEIGHT - OPEN_REMOVE_SIDE) / 2.0;
+    let remove = button(centered_control_content_fill(icons::icon(
+        icons::CLOSE,
+        13.0,
+        theme.subtle_text,
+    )))
+    .width(Length::Fixed(OPEN_REMOVE_SIDE))
+    .height(Length::Fixed(OPEN_REMOVE_SIDE))
+    .padding(0)
+    .on_press(Message::Action(Action::RemoveRecentRepo(root.to_owned())))
+    .style(move |_, status| {
+        let mut style = ghost_button_style(theme, status);
+        style.border.radius = radius::CONTROL.into();
+        style
+    });
 
-    // `opaque` keeps wheel events and the cursor from bleeding through to the
-    // shell below the modal (see `activity_popover` for the mechanics).
-    opaque(stack![scrim, centered])
+    stack![
+        row_button,
+        container(remove)
+            .width(Length::Fill)
+            .height(Length::Fixed(OPEN_ROW_HEIGHT))
+            .align_x(alignment::Horizontal::Right)
+            .center_y(Length::Fixed(OPEN_ROW_HEIGHT))
+            .padding(Padding {
+                right: remove_inset,
+                ..Padding::ZERO
+            }),
+    ]
+    .into()
 }
 
 #[cfg(test)]

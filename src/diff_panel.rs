@@ -1,6 +1,6 @@
 use iced::{
     Background, Border, Color, Element, Length, Padding, alignment,
-    widget::{Space, button, column, container, mouse_area, row, stack, text, text_editor},
+    widget::{Space, column, container, mouse_area, row, stack, text, text_editor},
 };
 
 use crate::diff_view::{self, DiffFileView, DiffView, HeaderLine};
@@ -9,8 +9,9 @@ use crate::icons;
 use crate::revision_list::{FileRowView, RevisionList};
 use crate::theme::{
     ThemeSpec, centered_control_content, chip_background, diff_palette, diff_panel_style,
-    file_status_color, primary_button_style, raised_button_style, text_size,
+    file_status_color, text_size,
 };
+use crate::ui;
 use crate::{Action, Diffui, LoadStatus, Message, UiEvent};
 use diffui_core::{FileTreeRow, SignatureInfo};
 use jj_lib::graph::GraphEdgeType;
@@ -85,6 +86,9 @@ fn build_file_navigator_surface<'a>(
         Space::new().width(Length::Fill),
         trailing,
     ]
+    // Toggle-row height even without the toggle (the peek), so the label
+    // sits on the same line as the other panels' headers.
+    .height(Length::Fixed(crate::theme::control::COMPACT))
     .align_y(alignment::Vertical::Center);
 
     let tree_rows = ui.sidebar_file_cache.borrow_mut().tree_rows(
@@ -99,8 +103,8 @@ fn build_file_navigator_surface<'a>(
     });
     let max_additions = files.iter().map(|file| file.additions).max().unwrap_or(0);
     let max_deletions = files.iter().map(|file| file.deletions).max().unwrap_or(0);
-    let additions_width = changed_file_stat_width(max_additions, ui.config.ui_font);
-    let deletions_width = changed_file_stat_width(max_deletions, ui.config.ui_font);
+    let additions_width = changed_file_stat_width('+', max_additions, ui.config.ui_font);
+    let deletions_width = changed_file_stat_width('\u{2212}', max_deletions, ui.config.ui_font);
     let badge_width = crate::chip::width("M", None, ui.config.mono_font);
     let rows_for_files = Rc::clone(&tree_rows);
     let lanes = EmptyFileTreeLanes::default();
@@ -139,7 +143,13 @@ fn build_file_navigator_surface<'a>(
         column![
             container(header).padding(Padding {
                 top: crate::field::PANEL_TOGGLE_INSET,
-                right: crate::field::PANEL_TOGGLE_INSET,
+                // The toggle keeps its square inset; a bare count (the peek)
+                // mirrors the label's inset instead.
+                right: if show_collapse {
+                    crate::field::PANEL_TOGGLE_INSET
+                } else {
+                    crate::theme::space::LG
+                },
                 bottom: crate::field::PANEL_TOGGLE_INSET,
                 left: crate::theme::space::LG,
             }),
@@ -153,8 +163,17 @@ fn build_file_navigator_surface<'a>(
     .into()
 }
 
-fn changed_file_stat_width(value: usize, font: iced::Font) -> f32 {
-    (crate::measure::line_width(&format!("+{value}"), text_size::CAPTION, font) + 8.0).max(24.0)
+/// A `+N` / `−N` count wears its add/del color only when it counts
+/// something: a `+0` beside a `−5` reads as noise, not as a signal.
+pub(crate) fn stat_color(count: usize, color: Color, theme: ThemeSpec) -> Color {
+    if count == 0 { theme.subtle_text } else { color }
+}
+
+/// A stat column exactly as wide as its widest count. The counts are drawn
+/// right-aligned in it, so the even gaps between the columns come from the
+/// row's own gap, not from padding baked in here.
+fn changed_file_stat_width(sign: char, value: usize, font: iced::Font) -> f32 {
+    crate::measure::line_width(&format!("{sign}{value}"), text_size::CAPTION, font).ceil()
 }
 
 #[derive(Default)]
@@ -227,8 +246,8 @@ fn changed_file_row(
         status_text: status_color,
         additions,
         deletions,
-        additions_text: theme.added_text,
-        deletions_text: theme.removed_text,
+        additions_text: stat_color(additions, theme.added_text, theme),
+        deletions_text: stat_color(deletions, theme.removed_text, theme),
         continuation: Rc::clone(&lanes.continuation),
         columns: Rc::clone(&lanes.columns),
         additions_width,
@@ -260,7 +279,7 @@ pub fn build_collapsed_file_navigator(theme: ThemeSpec) -> Element<'static, Mess
         container(trigger)
             .width(Length::Fixed(crate::theme::COLLAPSED_PANEL_WIDTH))
             .height(Length::Fill)
-            .padding([crate::theme::space::XXS, crate::theme::space::XS])
+            .padding(crate::field::COLLAPSED_RAIL_PADDING)
             .style(move |_| container::Style::default().background(theme.panel_background)),
     )
     .on_enter(Message::Ui(UiEvent::ChangedFilesRailEntered))
@@ -328,35 +347,40 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
             let mut actions = row![].spacing(8).align_y(alignment::Vertical::Center);
             if ui.active().repository.is_some() {
                 actions = actions.push(
-                    button(centered_control_content(
-                        row![
-                            icons::icon(icons::CODE, 14.0, theme.muted_text),
-                            text("Browse source")
-                                .size(text_size::UI)
-                                .font(ui.config.ui_font),
-                        ]
-                        .spacing(6)
-                        .align_y(alignment::Vertical::Center),
-                    ))
-                    .height(Length::Fixed(crate::theme::control::STANDARD))
-                    .padding([0, 11])
+                    ui::text_button(
+                        Some((icons::CODE, theme.muted_text)),
+                        "Browse source",
+                        ui::Variant::Raised,
+                        ui::Size::Standard,
+                        ui.config.ui_font,
+                        theme,
+                    )
                     .on_press(Message::Action(Action::SetMainView(
                         crate::MainView::Source,
-                    )))
-                    .style(move |_, status| raised_button_style(theme, status)),
+                    ))),
                 );
             }
-            if editable_description {
+            // Offered only while there is no description, and not while the
+            // editor above is already open for it.
+            let describable = editable_description
+                && ui.active().description_editor().is_none()
+                && ui
+                    .active()
+                    .session
+                    .revision_details
+                    .as_ref()
+                    .is_some_and(|details| details.description.trim().is_empty());
+            if describable {
                 actions = actions.push(
-                    button(centered_control_content(
-                        text("Add description")
-                            .size(text_size::UI)
-                            .font(ui.config.ui_font),
-                    ))
-                    .height(Length::Fixed(crate::theme::control::STANDARD))
-                    .padding([0, 11])
-                    .on_press(Message::Action(Action::EditDescription { target: None }))
-                    .style(move |_, status| raised_button_style(theme, status)),
+                    ui::text_button(
+                        None,
+                        "Add description",
+                        ui::Variant::Raised,
+                        ui::Size::Standard,
+                        ui.config.ui_font,
+                        theme,
+                    )
+                    .on_press(Message::Action(Action::EditDescription { target: None })),
                 );
             }
             let empty = container(
@@ -366,35 +390,29 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
                         22.0,
                         theme.added_text,
                     )))
-                        .width(Length::Fixed(42.0))
-                        .height(Length::Fixed(42.0))
-                        .align_x(alignment::Horizontal::Center)
-                        .align_y(alignment::Vertical::Center)
-                        .style(move |_| container::Style {
-                            background: Some(Background::Color(chip_background(theme.added_text))),
-                            border: Border {
-                                radius: crate::theme::radius::SURFACE.into(),
-                                ..Default::default()
-                            },
+                    .width(Length::Fixed(42.0))
+                    .height(Length::Fixed(42.0))
+                    .align_x(alignment::Horizontal::Center)
+                    .align_y(alignment::Vertical::Center)
+                    .style(move |_| container::Style {
+                        background: Some(Background::Color(chip_background(theme.added_text))),
+                        border: Border {
+                            radius: crate::theme::radius::SURFACE.into(),
                             ..Default::default()
-                        }),
-                    text("No file changes")
+                        },
+                        ..Default::default()
+                    }),
+                    text("No changes")
                         .size(text_size::TITLE)
                         .font(crate::theme::emphasis_font(
                             ui.config.ui_font,
                             iced::font::Weight::Medium,
                         ))
                         .color(theme.text),
-                    text("This revision matches its parent. You can still edit its description or browse the snapshot.")
-                        .size(text_size::BODY)
-                        .font(ui.config.ui_font)
-                        .color(theme.subtle_text)
-                        .width(Length::Fill)
-                        .align_x(alignment::Horizontal::Center)
-                        .wrapping(text::Wrapping::Word),
+                    Space::new().height(Length::Fixed(crate::theme::space::XS)),
                     actions,
                 ]
-                .spacing(10)
+                .spacing(crate::theme::space::LG)
                 .align_x(alignment::Horizontal::Center)
                 .width(Length::Fit.max(440)),
             )
@@ -523,36 +541,53 @@ fn build_description_editor<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a,
             .into()
         };
 
-        let cancel = button(text("Cancel").size(text_size::UI).font(ui.config.ui_font))
-            .padding(Padding::from([6, 12]))
-            .on_press_maybe((!saving).then_some(Message::Action(Action::CancelDescription)))
-            .style(move |_, status| raised_button_style(theme, status));
+        let cancel = ui::text_button(
+            None,
+            "Cancel",
+            ui::Variant::Raised,
+            ui::Size::Compact,
+            ui.config.ui_font,
+            theme,
+        )
+        .on_press_maybe((!saving).then_some(Message::Action(Action::CancelDescription)));
 
         let save_enabled = !saving && editor.is_dirty();
         let save_label = if saving { "Saving…" } else { "Save" };
-        let save = button(text(save_label).size(text_size::UI).font(ui.config.ui_font))
-            .padding(Padding::from([6, 14]))
-            .on_press_maybe(save_enabled.then_some(Message::Action(Action::SaveDescription)))
-            .style(move |_, status| primary_button_style(theme, status));
+        let save = ui::text_button(
+            None,
+            save_label,
+            ui::Variant::Primary,
+            ui::Size::Compact,
+            ui.config.ui_font,
+            theme,
+        )
+        .on_press_maybe(save_enabled.then_some(Message::Action(Action::SaveDescription)));
 
-        let hint = if editor.switch_blocked {
-            "save or cancel before switching revisions"
+        // The keys live in the buttons' tooltips; the strip only speaks up
+        // when the editor is holding a revision switch back.
+        let hint: Element<'_, Message> = if editor.switch_blocked {
+            text("Save or cancel before switching revisions")
+                .size(text_size::UI)
+                .font(ui.config.ui_font)
+                .color(theme.note_text)
+                .into()
         } else {
-            "⌘↵ save · esc cancel"
+            Space::new().into()
         };
-        let hint_color = if editor.switch_blocked {
-            theme.note_text
-        } else {
-            theme.subtle_text
+        let keyed = |button, key: &'static str| {
+            ui::tooltip(
+                button,
+                key,
+                iced::widget::tooltip::Position::Bottom,
+                ui.config.ui_font,
+                theme,
+            )
         };
         let actions = row![
-            text(hint)
-                .size(text_size::CAPTION)
-                .font(ui.config.mono_font)
-                .color(hint_color),
+            hint,
             Space::new().width(Length::Fill),
-            cancel,
-            save,
+            keyed(cancel, "Esc"),
+            keyed(save, "\u{2318}\u{21b5}"),
         ]
         .spacing(8)
         .align_y(alignment::Vertical::Center);
@@ -627,11 +662,11 @@ fn build_revision_summary<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, M
         text(format!("+{additions}"))
             .size(text_size::UI)
             .font(ui.config.ui_font)
-            .color(theme.added_text),
+            .color(stat_color(additions, theme.added_text, theme)),
         text(format!("−{deletions}"))
             .size(text_size::UI)
             .font(ui.config.ui_font)
-            .color(theme.removed_text),
+            .color(stat_color(deletions, theme.removed_text, theme)),
         text(format_file_count(session.document.files.len()))
             .size(text_size::UI)
             .font(ui.config.ui_font)
@@ -643,7 +678,9 @@ fn build_revision_summary<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, M
     let Some(details) = session.revision_details.as_ref() else {
         return container(stats)
             .width(Length::Fill)
-            .padding([9, 16])
+            .height(Length::Fixed(crate::field::PANEL_HEADER_HEIGHT))
+            .padding([0.0, crate::theme::space::XL])
+            .center_y(Length::Fixed(crate::field::PANEL_HEADER_HEIGHT))
             .style(move |_| container::Style::default().background(theme.panel_background))
             .into();
     };
@@ -652,16 +689,7 @@ fn build_revision_summary<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, M
     let title = description
         .lines()
         .find(|line| !line.trim().is_empty())
-        .unwrap_or(
-            if matches!(
-                session.selected_revision,
-                diffui_core::RevisionSelection::WorkingCopy
-            ) {
-                "Untitled working copy"
-            } else {
-                "Untitled revision"
-            },
-        );
+        .unwrap_or("No description");
     let short_id = details
         .change_id
         .as_deref()
@@ -681,6 +709,12 @@ fn build_revision_summary<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, M
         format!("{author}  ·  {timestamp}  ·  {short_id}")
     };
 
+    // Counts of nothing say nothing; the empty state below says it better.
+    let stats: Element<'_, Message> = if session.document.files.is_empty() {
+        Space::new().into()
+    } else {
+        stats.into()
+    };
     let title_stack = stack![
         column![
             stats,
@@ -691,7 +725,7 @@ fn build_revision_summary<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, M
                     iced::font::Weight::Medium,
                 ))
                 .color(if description.is_empty() {
-                    theme.note_text
+                    theme.subtle_text
                 } else {
                     theme.text
                 })
@@ -710,14 +744,14 @@ fn build_revision_summary<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, M
 
     let mut actions = row![].spacing(6).align_y(alignment::Vertical::Center);
     if session.capabilities.mutate {
-        actions = actions.push(
-            button(icons::icon(icons::PENCIL, 13.0, theme.muted_text))
-                .width(Length::Fixed(crate::theme::control::COMPACT))
-                .height(Length::Fixed(crate::theme::control::COMPACT))
-                .padding(0)
-                .on_press(Message::Action(Action::EditDescription { target: None }))
-                .style(move |_, status| crate::theme::ghost_button_style(theme, status)),
-        );
+        actions = actions.push(ui::tooltip(
+            ui::icon_button(icons::PENCIL, theme.muted_text, ui::Size::Compact, theme)
+                .on_press(Message::Action(Action::EditDescription { target: None })),
+            "Edit description",
+            iced::widget::tooltip::Position::Left,
+            ui.config.ui_font,
+            theme,
+        ));
     }
 
     let content = column![
@@ -742,14 +776,20 @@ fn build_revision_summary<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, M
         .into()
 }
 
+/// The selectable block atop the diff: the description's body and the
+/// identity fields. The subject is left out — the header above already
+/// shows it as the title — along with the blank lines that set it apart.
 fn revision_header_lines(details: &diffui_core::RevisionDetails) -> Vec<HeaderLine> {
-    let mut lines = details
-        .description
-        .trim_end()
+    let description = details.description.trim();
+    let body = description
+        .split_once('\n')
+        .map_or("", |(_, body)| body)
+        .trim();
+    let mut lines = body
         .lines()
         .map(HeaderLine::description)
         .collect::<Vec<_>>();
-    if !details.description.trim_end().is_empty() {
+    if !body.is_empty() {
         lines.push(HeaderLine::blank());
     }
     if let Some(change_id) = &details.change_id {
@@ -766,7 +806,11 @@ fn revision_header_lines(details: &diffui_core::RevisionDetails) -> Vec<HeaderLi
         "author",
         &format_signature_line(&details.author),
     ));
-    if let Some(committer) = &details.committer {
+    // Only when someone else committed it: the same person again, a few
+    // minutes later, is noise.
+    if let Some(committer) = details.committer.as_ref().filter(|committer| {
+        committer.name != details.author.name || committer.email != details.author.email
+    }) {
         lines.push(HeaderLine::field(
             "committer",
             &format_signature_line(committer),
@@ -843,8 +887,6 @@ mod tests {
         assert_eq!(
             rendered,
             [
-                "description:subject",
-                "description:",
                 "description:body",
                 "blank",
                 "change   zyxwvut98765",

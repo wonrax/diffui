@@ -197,7 +197,7 @@ fn build_source_filter(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         crate::field::FilterField {
             id: SOURCE_FILTER_INPUT_ID,
             leading_icon: Some(icons::SEARCH),
-            placeholder: "search files — fuzzy",
+            placeholder: "Search files",
             value: &ui.active().source.filter,
             on_input: |query| Message::Ui(UiEvent::SourceFilterChanged(query)),
             on_submit: Some(Message::Ui(UiEvent::SourceFilterSubmit)),
@@ -290,6 +290,7 @@ pub fn build_source_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
         |row| Message::Ui(UiEvent::SourceSidebarRow(row)),
     )
     .source_tree_slot()
+    .at_window_edge()
     .width(Length::Fill)
     .reveal_file(source.reveal_token, reveal_file_flat)
     .on_scroll(|offset| Message::Ui(UiEvent::SourceTreeScrolled(offset)))
@@ -568,33 +569,34 @@ fn centered_note<'a>(message: String, color: Color) -> Element<'a, Message> {
         .into()
 }
 
-/// The strip above the code: browse glyph + revision label + selected path on
-/// the left, line/byte counts (and an ignored/untracked marker) on the right.
+/// The strip above the code: the selected path on the left (directory
+/// dimmed, like a diff file header), line/byte counts and an
+/// ignored/untracked marker on the right. The browsed revision is already
+/// in the toolbar, so it isn't repeated here.
 fn build_info_bar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
     let source = &ui.active().source;
     let mono = ui.config.mono_font;
 
-    let revision_label = match browsed_revision(source) {
-        RevisionSelection::WorkingCopy => "@ working copy".to_owned(),
-        RevisionSelection::Commit(hex) => sidebar::truncate_end(&hex, sidebar::COMMIT_ID_CHARS),
-    };
-
-    let mut bar = row![
-        icons::icon(icons::CODE, BAR_TEXT_SIZE, theme.accent),
-        text(revision_label)
-            .size(BAR_TEXT_SIZE)
-            .font(mono)
-            .color(theme.muted_text),
-    ]
-    .spacing(8)
-    .align_y(alignment::Vertical::Center);
+    let mut bar = row![].spacing(8).align_y(alignment::Vertical::Center);
 
     if let Some(path) = &source.selected {
+        let (dir, name) = match path.rfind('/') {
+            Some(slash) => path.split_at(slash + 1),
+            None => ("", path.as_str()),
+        };
+        bar = bar.push(icons::icon(icons::FILE, BAR_TEXT_SIZE, theme.subtle_text));
         bar = bar.push(
-            text(path.clone())
-                .size(BAR_TEXT_SIZE)
-                .font(mono)
-                .color(theme.text),
+            row![
+                text(dir.to_owned())
+                    .size(BAR_TEXT_SIZE)
+                    .font(mono)
+                    .color(theme.subtle_text),
+                text(name.to_owned())
+                    .size(BAR_TEXT_SIZE)
+                    .font(mono)
+                    .color(theme.text),
+            ]
+            .spacing(0),
         );
     }
 
@@ -648,7 +650,9 @@ fn build_info_bar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> 
 
     container(bar)
         .width(Length::Fill)
-        .padding([9, 16])
+        .height(Length::Fixed(crate::field::PANEL_HEADER_HEIGHT))
+        .padding([0.0, crate::diff_view::HEADER_HORIZONTAL_PADDING])
+        .center_y(Length::Fixed(crate::field::PANEL_HEADER_HEIGHT))
         .style(move |_| container::Style {
             background: Some(Background::Color(theme.panel_background)),
             ..container::Style::default()

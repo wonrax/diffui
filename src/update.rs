@@ -254,7 +254,8 @@ impl Diffui {
         // Kicks the streaming load for whatever the active tab is — a repo
         // walk, a PR stream, or nothing when no tab opened.
         let load_task = app.ensure_active_loaded();
-        (app, Task::batch([load_task, theme_task]))
+        let welcome = app.ensure_welcome_prompt();
+        (app, Task::batch([load_task, theme_task, welcome]))
     }
 
     /// Fold one repository event into the tab that asked for it.
@@ -642,6 +643,7 @@ impl Diffui {
         };
         // A mode that isn't on screen must not keep the keyboard.
         self.prune_stale_modes();
+        let welcome = self.ensure_welcome_prompt();
         // Chokepoint: if the active tab coalesced a refresh while busy and it's
         // now idle, run it. A no-op when nothing's pending (the common case).
         let refresh = match self.active_tab_id() {
@@ -654,7 +656,18 @@ impl Diffui {
             }
             None => Task::none(),
         };
-        Task::batch([task, refresh])
+        Task::batch([task, refresh, welcome])
+    }
+
+    /// With no repository open the welcome screen *is* the open prompt, so
+    /// its state has to exist whenever there are no tabs — and the field
+    /// takes the keyboard the moment the screen appears.
+    pub(crate) fn ensure_welcome_prompt(&mut self) -> Task<Message> {
+        if !self.tabs.is_empty() || self.open_repo_dialog().is_some() {
+            return Task::none();
+        }
+        self.push_mode(Mode::OpenRepo(OpenRepoDialog::default()));
+        widget::operation::focus(tab_bar::OPEN_REPO_INPUT_ID)
     }
 
     /// Carry out one user intent, whichever producer resolved it.
@@ -837,6 +850,10 @@ impl Diffui {
                 self.find_advance(-1);
                 Task::none()
             }
+            Action::OpenRepoDialog if self.tabs.is_empty() => {
+                // The welcome screen already shows the prompt inline.
+                widget::operation::focus(tab_bar::OPEN_REPO_INPUT_ID)
+            }
             Action::OpenRepoDialog => {
                 // Mutually exclusive with the other overlays: they share one
                 // keyboard, and stacking them makes each look broken.
@@ -846,7 +863,11 @@ impl Diffui {
                 widget::operation::focus(tab_bar::OPEN_REPO_INPUT_ID)
             }
             Action::CloseRepoDialog => {
-                self.pop_mode(ModeKind::OpenRepo);
+                // On the welcome screen the prompt is the page, not a dialog:
+                // there is nothing behind it to return to.
+                if !self.tabs.is_empty() {
+                    self.pop_mode(ModeKind::OpenRepo);
+                }
                 Task::none()
             }
             Action::ChooseRepoFolder => {
@@ -4231,20 +4252,10 @@ impl Diffui {
     pub(crate) fn view(&self) -> Element<'_, Message> {
         let theme = self.resolved_theme().spec();
 
-        // No repositories open: the empty state owns the whole window. The
-        // open-repo dialog still has to be stacked on top here — it's the only
-        // way in from this state (⌘O and the empty-state button both summon it),
-        // and the main `stack!` that normally carries the overlay is below the
-        // early return. Without this the dialog would never render with no tabs
-        // open, so ⌘O would look dead and there'd be no visible path forward.
+        // No repositories open: the welcome screen owns the whole window, with
+        // the open prompt inline rather than as a modal over it.
         if self.tabs.is_empty() {
-            let content = stack![
-                empty_state(self, theme),
-                tab_bar::build_open_repo_dialog(self, theme),
-            ]
-            .width(Length::Fill)
-            .height(Length::Fill);
-            return container(content)
+            return container(empty_state(self, theme))
                 .height(Length::Fill)
                 .width(Length::Fill)
                 .style(move |_| app_shell_style(theme))
@@ -4367,18 +4378,12 @@ impl Diffui {
         } else {
             iced::widget::Space::new().into()
         };
-        let palette_overlay = palette::build_overlay(self, theme);
         let base_panels: Element<'_, Message> =
             stack![panels, history_resize_overlay, files_resize_overlay,]
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into();
-        let base_panels = if self.mode(ModeKind::Palette).is_some() {
-            crate::pointer::suppress(base_panels)
-        } else {
-            base_panels
-        };
-        let body: Element<'_, Message> = stack![base_panels, changed_files_peek, palette_overlay]
+        let body: Element<'_, Message> = stack![base_panels, changed_files_peek]
             .width(Length::Fill)
             .height(Length::Fill)
             .into();
@@ -4389,6 +4394,7 @@ impl Diffui {
                 .height(Length::Fill)
                 .into();
         let shell = if self.mode(ModeKind::ActivityPopover).is_some()
+            || self.mode(ModeKind::Palette).is_some()
             || self.mode(ModeKind::Menu).is_some()
             || self.mode(ModeKind::OpenRepo).is_some()
             || self.mode(ModeKind::Confirm).is_some()
@@ -4402,6 +4408,7 @@ impl Diffui {
         // when inactive, so they can always be stacked.
         let content: Element<'_, Message> = stack![
             shell,
+            palette::build_overlay(self, theme),
             activity::activity_popover(self, theme),
             menu::build_overlay(self, theme),
             tab_bar::build_open_repo_dialog(self, theme),

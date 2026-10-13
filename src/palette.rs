@@ -74,9 +74,14 @@ pub fn results_scrollable_id(depth: usize) -> String {
 /// when keyboard navigation has pushed the highlighted row out of view.
 /// Doesn't need to be exact — the worst case of a too-small estimate is
 /// an extra scroll-to that doesn't move the offset, which is invisible to
-/// the user. Computed as: column height − header − input − results-pane
-/// padding (top + bottom).
-const RESULTS_VIEWPORT_HEIGHT: f32 = COLUMN_HEIGHT - 36.0 - INPUT_HEIGHT - 8.0 - 8.0;
+/// the user. Computed as: column height − input band − rule − results-pane
+/// padding (top + bottom) − rule − footer.
+const RESULTS_VIEWPORT_HEIGHT: f32 = COLUMN_HEIGHT
+    - (INPUT_HEIGHT + 2.0 * RESULTS_INSET)
+    - 1.0
+    - 2.0 * RESULTS_INSET
+    - 1.0
+    - FOOTER_HEIGHT;
 
 /// Fixed width per column. The stack lays columns out in a horizontal row;
 /// the rightmost is centered in the viewport and earlier columns shift left,
@@ -84,12 +89,22 @@ const RESULTS_VIEWPORT_HEIGHT: f32 = COLUMN_HEIGHT - 36.0 - INPUT_HEIGHT - 8.0 -
 const COLUMN_WIDTH: f32 = 520.0;
 const COLUMN_HEIGHT: f32 = 460.0;
 const COLUMN_HORIZONTAL_GAP: f32 = 16.0;
-/// Top offset of the palette stack from the viewport top. Anchoring near
-/// the top (rather than centered) mirrors VS Code / Raycast and keeps the
-/// input at a predictable Y as columns push/pop.
-const TOP_OFFSET: f32 = 96.0;
 const INPUT_HEIGHT: f32 = 48.0;
 const ROW_HEIGHT: f32 = 34.0;
+const FOOTER_HEIGHT: f32 = 36.0;
+/// Inset of the results list inside the card. A result row pads its content
+/// by `CONTENT_X - RESULTS_INSET`, so row glyphs, the input text and the
+/// header label all start on the one [`CONTENT_X`] edge.
+const RESULTS_INSET: f32 = theme::space::XS;
+const CONTENT_X: f32 = theme::space::XL;
+/// Fixed box for a row's leading glyph, so icon and `@` rows start their
+/// labels at the same x.
+const GLYPH_BOX: f32 = 16.0;
+const GLYPH_GAP: f32 = 10.0;
+const GLYPH_ICON_SIZE: f32 = 14.0;
+/// The footer's scope pills (All / Commands / Files / Commits).
+const SCOPE_HEIGHT: f32 = 24.0;
+const SCOPE_PAD_X: f32 = 8.0;
 
 /// Cap on rows rendered per column. Beyond this the column would still
 /// scroll, but for big repos (10k+ commits) capping keeps the layout pass
@@ -789,11 +804,20 @@ pub fn build_overlay<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Messag
         let last_index = column_count.saturating_sub(1);
         for (index, column_state) in state.stack.iter().enumerate() {
             let is_focused = index == last_index;
-            let column_el = build_column(ui, theme, column_state, index, is_focused);
+            let column_el = build_column(
+                ui,
+                theme,
+                column_state,
+                index,
+                is_focused,
+                is_focused && column_count > 1,
+            );
             let baseline_x = (viewport_w - COLUMN_WIDTH) / 2.0
                 - (column_count - 1 - index) as f32 * (COLUMN_WIDTH + COLUMN_HORIZONTAL_GAP);
             let target_x = baseline_x + anim_offset;
-            layers.push(pin(column_el).x(target_x).y(TOP_OFFSET).into());
+            // Anchored near the top (rather than centered), like VS Code /
+            // Raycast, so the input keeps its Y as columns push/pop.
+            layers.push(pin(column_el).x(target_x).y(theme::modal_top()).into());
         }
         stack(layers)
             .clip(true)
@@ -822,19 +846,27 @@ fn build_column<'a>(
     column_state: &'a PaletteColumn,
     depth: usize,
     is_focused: bool,
+    // Only worth marking when there are columns to tell apart.
+    outline_focus: bool,
 ) -> Element<'a, Message> {
-    let header = column_header(ui, theme, column_state);
     let input = build_input(ui, theme, column_state, is_focused);
     let results = build_results(ui, theme, column_state, depth);
+    let footer = column_footer(ui, theme, column_state);
 
-    let body = column![header, input, results].spacing(0);
+    let rule = || {
+        container(Space::new())
+            .width(Length::Fill)
+            .height(Length::Fixed(1.0))
+            .style(move |_| container::Style::default().background(theme.border))
+    };
+    let body = column![input, rule(), results, rule(), footer].spacing(0);
 
     container(body)
         .width(Length::Fixed(COLUMN_WIDTH))
         .height(Length::Fixed(COLUMN_HEIGHT))
         .style(move |_| {
             let mut style = theme::modal_style(theme);
-            if is_focused {
+            if outline_focus {
                 style.border.color = theme.accent;
             }
             style
@@ -842,19 +874,36 @@ fn build_column<'a>(
         .into()
 }
 
-fn column_header<'a>(
+/// The strip under the results: on the root column the scope pills (All /
+/// Commands / Files / Commits) and the keys that act on the highlight; on an
+/// actions column, what the actions are for.
+fn column_footer<'a>(
     ui: &'a Diffui,
     theme: ThemeSpec,
     column_state: &'a PaletteColumn,
 ) -> Element<'a, Message> {
-    let content: Element<'_, Message> = match &column_state.source {
+    let key_hint = |key: &'static str, label: &'static str| {
+        row![
+            text(key)
+                .size(text_size::CAPTION)
+                .font(ui.config.ui_font)
+                .color(theme.muted_text),
+            text(label)
+                .size(text_size::CAPTION)
+                .font(ui.config.ui_font)
+                .color(theme.subtle_text),
+        ]
+        .spacing(theme::space::XS)
+        .align_y(alignment::Vertical::Center)
+    };
+    let (lead, hints, lead_inset): (Element<'_, Message>, _, f32) = match &column_state.source {
         ColumnSource::Root => {
             let active_prefix = column_state
                 .query
                 .chars()
                 .next()
                 .filter(|c| ">@:".contains(*c));
-            let mut scopes = row![].spacing(theme::space::XS);
+            let mut scopes = row![].spacing(theme::space::XXS);
             for (label, prefix) in [
                 ("All", None),
                 ("Commands", Some('>')),
@@ -863,53 +912,74 @@ fn column_header<'a>(
             ] {
                 let active = active_prefix == prefix;
                 scopes = scopes.push(
-                    button(text(label).size(text_size::CAPTION).font(ui.config.ui_font))
-                        .padding([3, 7])
-                        .on_press(Message::Palette(PaletteMessage::QueryChanged(
-                            prefix.map(|value| value.to_string()).unwrap_or_default(),
-                        )))
-                        .style(move |_, status| {
-                            let mut style = theme::ghost_button_style(theme, status);
-                            if active {
-                                style.background = Some(Background::Color(theme.selected_file));
-                                style.text_color = theme.text;
-                            } else {
-                                style.text_color = theme.muted_text;
-                            }
-                            style
-                        }),
+                    button(theme::centered_control_content(
+                        text(label).size(text_size::CAPTION).font(ui.config.ui_font),
+                    ))
+                    .height(Length::Fixed(SCOPE_HEIGHT))
+                    .padding([0.0, SCOPE_PAD_X])
+                    .on_press(Message::Palette(PaletteMessage::QueryChanged(
+                        prefix.map(|value| value.to_string()).unwrap_or_default(),
+                    )))
+                    .style(move |_, status| {
+                        let mut style = theme::ghost_button_style(theme, status);
+                        if active {
+                            style.background = Some(Background::Color(theme.selected_file));
+                            style.text_color = theme.text;
+                        } else {
+                            style.text_color = theme.subtle_text;
+                        }
+                        style
+                    }),
                 );
             }
-            row![
-                text("Search")
-                    .size(text_size::CAPTION)
-                    .font(theme::emphasis_font(ui.config.ui_font, Weight::Medium))
-                    .color(theme.subtle_text),
-                Space::new().width(Length::Fill),
-                scopes,
-            ]
-            .align_y(alignment::Vertical::Center)
-            .into()
+            (
+                scopes.into(),
+                row![
+                    key_hint("\u{21e5}", "Actions"),
+                    key_hint("\u{21b5}", "Open")
+                ],
+                // The first pill's label, not its wash, starts on the edge.
+                CONTENT_X - SCOPE_PAD_X,
+            )
         }
-        ColumnSource::Actions(target) => text(format!("Actions · {}", target_label(target, ui)))
-            .size(text_size::CAPTION)
-            .font(theme::emphasis_font(ui.config.ui_font, Weight::Medium))
-            .color(theme.subtle_text)
-            .into(),
+        ColumnSource::Actions(target) => (
+            text(target_label(target, ui))
+                .size(text_size::CAPTION)
+                .font(theme::emphasis_font(ui.config.ui_font, Weight::Medium))
+                .color(theme.subtle_text)
+                .width(Length::Fill)
+                .wrapping(Wrapping::None)
+                .ellipsis(Ellipsis::End)
+                .into(),
+            row![key_hint("esc", "Back"), key_hint("\u{21b5}", "Run")],
+            CONTENT_X,
+        ),
     };
-    container(content)
-        .padding([theme::space::MD, theme::space::XL])
-        .width(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(Background::Color(theme.panel_background)),
-            border: Border {
-                width: 0.0,
-                color: Color::TRANSPARENT,
-                radius: border::Radius::default().top(theme::radius::SURFACE - 1.0),
-            },
-            ..container::Style::default()
-        })
-        .into()
+    container(
+        row![
+            lead,
+            Space::new().width(Length::Fill),
+            hints.spacing(theme::space::LG)
+        ]
+        .align_y(alignment::Vertical::Center),
+    )
+    .padding(Padding {
+        left: lead_inset,
+        ..Padding::from([0.0, CONTENT_X])
+    })
+    .width(Length::Fill)
+    .height(Length::Fixed(FOOTER_HEIGHT))
+    .center_y(Length::Fixed(FOOTER_HEIGHT))
+    .style(move |_| container::Style {
+        background: Some(Background::Color(theme.panel_background)),
+        border: Border {
+            width: 0.0,
+            color: Color::TRANSPARENT,
+            radius: border::Radius::default().bottom(theme::radius::SURFACE - 1.0),
+        },
+        ..container::Style::default()
+    })
+    .into()
 }
 
 fn build_input<'a>(
@@ -919,20 +989,20 @@ fn build_input<'a>(
     is_focused: bool,
 ) -> Element<'a, Message> {
     let placeholder = match &column_state.source {
-        ColumnSource::Root => "Search bookmarks, files, commands  (>cmd  @file  :commit)",
-        ColumnSource::Actions(_) => "Filter actions",
+        ColumnSource::Root => "Search commands, files, commits\u{2026}",
+        ColumnSource::Actions(_) => "Filter actions\u{2026}",
     };
 
     let mut input = iced::widget::text_input(placeholder, &column_state.query)
         .id(PALETTE_INPUT_ID)
-        .padding(Padding::from([10, 14]))
+        .padding(Padding::from([10.0, CONTENT_X - RESULTS_INSET]))
         .size(text_size::TITLE)
         .font(ui.config.ui_font)
         .style(move |_, _status| {
             // Borderless variant: the input is embedded in the column card,
             // which already frames it — keep the shared identity colors.
             let mut style = theme::input_style(theme);
-            style.background = Background::Color(theme.panel_background_elevated);
+            style.background = Background::Color(Color::TRANSPARENT);
             style.border = Border {
                 width: 0.0,
                 color: Color::TRANSPARENT,
@@ -949,20 +1019,16 @@ fn build_input<'a>(
             .on_submit(Message::Palette(PaletteMessage::Accept));
     }
 
-    container(crate::input::single_line(input))
-        .padding([4, 4])
-        .height(Length::Fixed(INPUT_HEIGHT + 8.0))
-        .width(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(Background::Color(theme.panel_background_elevated)),
-            border: Border {
-                width: 0.0,
-                color: Color::TRANSPARENT,
-                radius: 0.0.into(),
-            },
-            ..container::Style::default()
-        })
-        .into()
+    container(crate::input::single_line(
+        input,
+        &column_state.query,
+        ui.config.ui_font,
+    ))
+    .padding(RESULTS_INSET)
+    .height(Length::Fixed(INPUT_HEIGHT + 2.0 * RESULTS_INSET))
+    .width(Length::Fill)
+    .center_y(Length::Fixed(INPUT_HEIGHT + 2.0 * RESULTS_INSET))
+    .into()
 }
 
 fn build_results<'a>(
@@ -1010,7 +1076,7 @@ fn build_results<'a>(
                 border: Border {
                     width: 0.0,
                     color: Color::TRANSPARENT,
-                    radius: border::Radius::default().bottom(theme::radius::SURFACE - 1.0),
+                    radius: 0.0.into(),
                 },
                 ..container::Style::default()
             })
@@ -1043,16 +1109,7 @@ fn build_results<'a>(
     container(scrollable_list)
         .width(Length::Fill)
         .height(Length::Fill)
-        .padding(Padding::from([4, 4]))
-        .style(move |_| container::Style {
-            background: Some(Background::Color(theme.panel_background_elevated)),
-            border: Border {
-                width: 0.0,
-                color: Color::TRANSPARENT,
-                radius: border::Radius::default().bottom(theme::radius::SURFACE - 1.0),
-            },
-            ..container::Style::default()
-        })
+        .padding(RESULTS_INSET)
         .into()
 }
 
@@ -1074,7 +1131,7 @@ fn build_result_row<'a>(
     let body = result_row_body(ui, theme, &m.item);
 
     let row_el = container(body)
-        .padding([6, 12])
+        .padding([0.0, CONTENT_X - RESULTS_INSET])
         .width(Length::Fill)
         .height(Length::Fixed(ROW_HEIGHT))
         // Center the body row inside the fixed-height container. The
@@ -1112,23 +1169,23 @@ fn result_row_body<'a>(
     // wrapping disabled + ellipsis so long commit messages truncate
     // cleanly instead of wrapping into the next row or shoving the tail
     // off-screen.
-    match item {
-        ResultRef::WorkingCopy => row![
-            text("@")
-                .size(text_size::BODY)
-                .font(ui.config.mono_font)
-                .color(theme.accent),
-            Space::new().width(Length::Fixed(10.0)),
+    let tail = |value: String| {
+        text(value)
+            .size(text_size::CAPTION)
+            .font(ui.config.ui_font)
+            .color(muted)
+    };
+    let (lead, label, tail): (Element<'a, Message>, Element<'a, Message>, _) = match item {
+        ResultRef::WorkingCopy => (
+            glyph_box(
+                text("@")
+                    .size(text_size::BODY)
+                    .font(ui.config.mono_font)
+                    .color(theme.accent),
+            ),
             primary_label(ui, primary, "Working copy"),
-            Space::new().width(Length::Fixed(8.0)),
-            text("revision")
-                .size(text_size::CAPTION)
-                .font(ui.config.ui_font)
-                .color(muted),
-        ]
-        .spacing(0)
-        .align_y(alignment::Vertical::Center)
-        .into(),
+            tail(String::new()),
+        ),
         ResultRef::Commit { change, commit } => {
             let commit = ui.active().session.commits.find_by_commit_id(commit);
             let prefix = revision_prefix(commit.as_ref(), change);
@@ -1142,22 +1199,15 @@ fn result_row_body<'a>(
                 })
                 .unwrap_or_default();
             let author = commit.map(|c| c.author().to_owned()).unwrap_or_default();
-            row![
+            (
                 text(prefix)
                     .size(text_size::BODY)
                     .font(ui.config.mono_font)
-                    .color(theme.accent),
-                Space::new().width(Length::Fixed(10.0)),
+                    .color(theme.accent)
+                    .into(),
                 primary_label(ui, primary, description),
-                Space::new().width(Length::Fixed(8.0)),
-                text(author)
-                    .size(text_size::CAPTION)
-                    .font(ui.config.ui_font)
-                    .color(muted),
-            ]
-            .spacing(0)
-            .align_y(alignment::Vertical::Center)
-            .into()
+                tail(author),
+            )
         }
         ResultRef::Bookmark(name) => {
             // Find the owning commit so we can show the destination in
@@ -1165,7 +1215,7 @@ fn result_row_body<'a>(
             // races between snapshots) still render — the tail just goes
             // empty.
             let commit = ui.active().session.commits.find_by_bookmark(name);
-            let tail = commit
+            let destination = commit
                 .map(|c| {
                     if c.has_description() {
                         c.description().lines().next().unwrap_or("").to_owned()
@@ -1174,50 +1224,56 @@ fn result_row_body<'a>(
                     }
                 })
                 .unwrap_or_default();
-            row![
-                icons::icon(icons::HASH, 13.0, theme.modified_token),
-                Space::new().width(Length::Fixed(10.0)),
+            (
+                glyph_box(icons::icon(
+                    icons::HASH,
+                    GLYPH_ICON_SIZE,
+                    theme.modified_token,
+                )),
                 mono_primary_label(ui, primary, name.clone()),
-                Space::new().width(Length::Fixed(8.0)),
-                text(tail)
-                    .size(text_size::CAPTION)
-                    .font(ui.config.ui_font)
-                    .color(muted),
-            ]
-            .spacing(0)
-            .align_y(alignment::Vertical::Center)
-            .into()
+                tail(destination),
+            )
         }
-        ResultRef::File(path) => row![
-            icons::icon(icons::FILE, 13.0, theme.info),
-            Space::new().width(Length::Fixed(10.0)),
+        ResultRef::File(path) => (
+            glyph_box(icons::icon(icons::FILE, GLYPH_ICON_SIZE, theme.info)),
             mono_primary_label(ui, primary, path.clone()),
-            Space::new().width(Length::Fixed(8.0)),
-            text("file")
-                .size(text_size::CAPTION)
-                .font(ui.config.ui_font)
-                .color(muted),
-        ]
-        .spacing(0)
-        .align_y(alignment::Vertical::Center)
-        .into(),
-        ResultRef::Command(id) => row![
-            text(">")
-                .size(text_size::BODY)
-                .font(ui.config.mono_font)
-                .color(theme.modified_token),
-            Space::new().width(Length::Fixed(10.0)),
+            // The glyph already says "file".
+            tail(String::new()),
+        ),
+        ResultRef::Command(id) => (
+            glyph_box(icons::icon(
+                icons::CHEVRON_RIGHT,
+                GLYPH_ICON_SIZE,
+                theme.modified_token,
+            )),
             primary_label(ui, primary, command_label(id)),
-            Space::new().width(Length::Fixed(8.0)),
-            text(command_hint(id))
-                .size(text_size::CAPTION)
-                .font(ui.config.ui_font)
-                .color(muted),
-        ]
-        .spacing(0)
-        .align_y(alignment::Vertical::Center)
-        .into(),
-    }
+            // The shortcut, where there is one: what the palette teaches.
+            tail(
+                ui.keymap
+                    .chord_for(commands::Context::Base, id)
+                    .map(crate::keymap::Chord::display)
+                    .unwrap_or_default(),
+            ),
+        ),
+    };
+    row![
+        lead,
+        Space::new().width(Length::Fixed(GLYPH_GAP)),
+        label,
+        Space::new().width(Length::Fixed(theme::space::MD)),
+        tail,
+    ]
+    .spacing(0)
+    .align_y(alignment::Vertical::Center)
+    .into()
+}
+
+/// Center a row's leading glyph in the shared [`GLYPH_BOX`] column.
+fn glyph_box<'a>(glyph: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    container(glyph)
+        .width(Length::Fixed(GLYPH_BOX))
+        .center_x(Length::Fixed(GLYPH_BOX))
+        .into()
 }
 
 /// Single-line truncating label that takes the row's flexible space.
@@ -1238,13 +1294,16 @@ fn primary_label<'a>(
         .into()
 }
 
+/// [`primary_label`] in the mono font, a step smaller: mono faces run wide
+/// and tall, so at the same size a path reads louder than the sans labels
+/// in the rows around it.
 fn mono_primary_label<'a>(
     ui: &'a Diffui,
     color: Color,
     label: impl Into<String>,
 ) -> Element<'a, Message> {
     text(label.into())
-        .size(text_size::BODY_LG)
+        .size(text_size::BODY)
         .font(ui.config.mono_font)
         .color(color)
         .width(Length::Fill)
@@ -1270,17 +1329,11 @@ fn target_label(target: &ResultRef, ui: &Diffui) -> String {
     }
 }
 
-/// A registry command's label / hint for a palette row. A row can only exist
-/// for a command that is in the registry, so the fallbacks never render.
+/// A registry command's label for a palette row. A row can only exist for a
+/// command that is in the registry, so the fallback never renders.
 fn command_label(id: CommandId) -> String {
     commands::command(id)
         .map(|command| command.label.to_owned())
-        .unwrap_or_default()
-}
-
-fn command_hint(id: CommandId) -> &'static str {
-    commands::command(id)
-        .map(|command| command.hint)
         .unwrap_or_default()
 }
 

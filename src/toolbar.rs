@@ -15,20 +15,30 @@ use crate::activity;
 use crate::icons;
 use crate::repository::Vcs;
 use crate::sidebar;
-use crate::theme::{
-    self, ThemeSpec, chip_background, ghost_button_style, radius, text_size, well_fill,
-};
+use crate::theme::{self, ThemeSpec, chip_background, radius, text_size, well_fill};
+use crate::ui;
 use crate::{Action, Diffui, FetchTarget, HoverTarget, MainView, Message, ToolbarMenu, UiEvent};
 use diffui_core::RevisionSelection;
 
-/// Toolbar icon size. Slightly larger than the 12px labels so the Lucide marks
-/// (which carry ~2px of internal padding in their 24px grid) read as balanced
-/// next to the text rather than visually smaller.
-const ICON_SIZE: f32 = 14.0;
+/// Every control in the bar is one [`ui::Size::Compact`] step tall.
+const CONTROL: ui::Size = ui::Size::Compact;
+
+/// The bar's own height, without the progress line and the rule under it.
+pub const HEIGHT: f32 = theme::control::COMPACT + 2.0 * theme::space::SM;
+
+/// Where the window chrome (tab strip, toolbar, progress line, rule) ends and
+/// the panels begin — what floating surfaces anchored under the toolbar hang
+/// from.
+pub fn chrome_bottom() -> f32 {
+    crate::tab_bar::height() + HEIGHT + activity::PROGRESS_LINE_HEIGHT + 1.0
+}
 
 /// Size of the dropdown carets (fetch split button, revset presets). A touch
 /// smaller than the action icons so the caret reads as a subordinate affordance.
 const CARET_ICON_SIZE: f32 = 12.0;
+
+/// Width of the fetch split button's caret half.
+const CARET_WIDTH: f32 = 24.0;
 
 /// Char budget for the browsed revision's description line in the toolbar.
 const DESCRIPTION_MAX_CHARS: usize = 72;
@@ -60,8 +70,6 @@ pub fn build_toolbar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     );
 
     let caret_hovered = ui.hovered == Some(HoverTarget::FetchCaret);
-    // 6px between actions — the same rhythm the tab strip uses between tabs, so
-    // both title-bar bands share one consistent item spacing.
     let mut actions = row![]
         .spacing(theme::space::SM)
         .align_y(alignment::Vertical::Center);
@@ -132,7 +140,10 @@ pub fn build_toolbar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     ]
     .align_y(alignment::Vertical::Center)
     .spacing(theme::space::SM)
-    .padding(Padding::from([theme::space::SM, 10.0]));
+    .height(Length::Fixed(HEIGHT))
+    // The same 8px edge inset as the tab strip above and the panel headers
+    // below, so the bar's first and last controls line up with both.
+    .padding(Padding::from([theme::space::SM, theme::space::MD]));
 
     column![
         container(bar)
@@ -156,12 +167,10 @@ fn bar_style(theme: ThemeSpec) -> container::Style {
 /// fetch split button: this switches what the window shows, so it reads as
 /// tabs, not as an action.
 fn view_switcher(ui: &Diffui, theme: ThemeSpec, font: iced::Font) -> Element<'static, Message> {
-    // Integral, fixed segment height with the label centered inside via a
-    // Fill container — sized off the text's fractional line box (12 × 1.3
-    // = 15.6px), the pill fill snapped a pixel unevenly (more gap above
-    // than below). 24px inner + the well's 1px inset ≈ the ghost buttons'
-    // height beside it.
-    const SEGMENT_HEIGHT: f32 = theme::control::COMPACT - 4.0;
+    // The well is one control step tall; the raised pill sits inside it on
+    // an even 2px inset, so its corners stay concentric with the well's.
+    const INSET: f32 = 2.0;
+    const SEGMENT_HEIGHT: f32 = theme::control::COMPACT - 2.0 * INSET;
     let segment = |icon: &'static str, label: &str, view: MainView| {
         let active = ui.active().main_view == view;
         let icon_color = if active {
@@ -170,23 +179,19 @@ fn view_switcher(ui: &Diffui, theme: ThemeSpec, font: iced::Font) -> Element<'st
             theme.subtle_text
         };
         let text_color = if active { theme.text } else { theme.muted_text };
-        button(
-            container(
-                row![
-                    icons::icon(icon, ICON_SIZE, icon_color),
-                    text(label.to_owned())
-                        .size(text_size::UI)
-                        .color(text_color)
-                        .font(font),
-                ]
-                .spacing(5)
-                .align_y(alignment::Vertical::Center),
-            )
-            .height(Length::Fill)
+        button(theme::centered_control_content(
+            row![
+                icons::icon(icon, ui::ICON_SIZE, icon_color),
+                text(label.to_owned())
+                    .size(text_size::UI)
+                    .color(text_color)
+                    .font(font),
+            ]
+            .spacing(6)
             .align_y(alignment::Vertical::Center),
-        )
+        ))
         .height(Length::Fixed(SEGMENT_HEIGHT))
-        .padding(Padding::from([0, 11]))
+        .padding(Padding::from([0.0, 10.0 - INSET]))
         .on_press(Message::Action(Action::SetMainView(view)))
         .style(move |_, _| button::Style {
             // Only the active segment carries a fill — inactive segments
@@ -201,9 +206,7 @@ fn view_switcher(ui: &Diffui, theme: ThemeSpec, font: iced::Font) -> Element<'st
                 } else {
                     Color::TRANSPARENT
                 },
-                // Concentric with the well's BUTTON radius across its 1px
-                // inset.
-                radius: (radius::BUTTON - 1.0).into(),
+                radius: (radius::BUTTON - INSET).into(),
             },
             shadow: iced::Shadow::default(),
             snap: true,
@@ -218,7 +221,7 @@ fn view_switcher(ui: &Diffui, theme: ThemeSpec, font: iced::Font) -> Element<'st
         .spacing(theme::space::XXS)
         .align_y(alignment::Vertical::Center),
     )
-    .padding(1)
+    .padding(INSET)
     .style(move |_| container::Style {
         background: Some(Background::Color(well_fill(theme))),
         border: Border {
@@ -240,20 +243,16 @@ fn toolbar_button(
     theme: ThemeSpec,
     font: iced::Font,
 ) -> Element<'static, Message> {
-    let content = row![
-        icons::icon(icon, ICON_SIZE, theme.muted_text),
-        text(label.to_owned())
-            .size(text_size::UI)
-            .color(theme.text)
-            .font(font),
-    ]
-    .spacing(5)
-    .align_y(alignment::Vertical::Center);
-    button(content)
-        .padding(Padding::from([5, 10]))
-        .on_press(message)
-        .style(move |_, status| ghost_button_style(theme, status))
-        .into()
+    ui::text_button(
+        Some((icon, theme.muted_text)),
+        label.to_owned(),
+        ui::Variant::Ghost,
+        CONTROL,
+        font,
+        theme,
+    )
+    .on_press(message)
+    .into()
 }
 
 /// A toolbar toggle: an icon-only [`toolbar_button`] with a persistent accent
@@ -273,31 +272,16 @@ fn toolbar_toggle_button(
     } else {
         theme.muted_text
     };
-    // Square, sized to the labeled ghost buttons' exact height (their size-12
-    // line box plus 5px vertical padding) so the icon-only toggles sit flush
-    // with the rest of the bar.
-    let side = text_size::UI * 1.3 + 10.0;
-    let btn = button(container(icons::icon(icon, ICON_SIZE, icon_color)).center(Length::Fill))
-        .width(Length::Fixed(side))
-        .height(Length::Fixed(side))
-        .padding(0)
+    let btn = ui::icon_button(icon, icon_color, CONTROL, theme)
         .on_press(message)
         .style(move |_, status| {
-            let mut style = ghost_button_style(theme, status);
+            let mut style = theme::ghost_button_style(theme, status);
             if active {
                 style.background = Some(Background::Color(chip_background(theme.accent)));
             }
             style
         });
-    tooltip(
-        btn,
-        container(text(label).size(text_size::UI).font(font).color(theme.text))
-            .padding([3, 9])
-            .style(move |_| theme::tooltip_style(theme)),
-        tooltip::Position::Bottom,
-    )
-    .gap(4)
-    .into()
+    ui::tooltip(btn, label, tooltip::Position::Bottom, font, theme)
 }
 
 /// What the source browser is looking at, in the toolbar slot the diff view's
@@ -316,11 +300,10 @@ fn browsed_revision_label(ui: &Diffui, theme: ThemeSpec, is_jj: bool) -> Element
     };
 
     let mut label = row![]
-        .spacing(8)
+        .spacing(theme::space::MD)
+        .height(Length::Fixed(CONTROL.height()))
         .align_y(alignment::Vertical::Center)
-        // Match toolbar_button's padding so the label sits on the same
-        // baseline rhythm as the actions it replaces.
-        .padding(Padding::from([5, 4]));
+        .padding(Padding::from([0.0, theme::space::XS]));
 
     if working_copy {
         label = label.push(
@@ -363,12 +346,14 @@ fn browsed_revision_label(ui: &Diffui, theme: ThemeSpec, is_jj: bool) -> Element
         );
     }
 
-    if let Some(row) = commit {
+    // Git's working copy is synthesized and its "description" is just the
+    // words the chip already says.
+    if let Some(row) = commit.filter(|_| is_jj || !working_copy) {
         let (line, color) = if row.has_description() {
             let first = row.description().lines().next().unwrap_or("").to_owned();
             (ellipsize(&first, DESCRIPTION_MAX_CHARS), theme.text)
         } else {
-            ("(no description)".to_owned(), theme.note_text)
+            ("No description".to_owned(), theme.subtle_text)
         };
         label = label.push(
             text(line)
@@ -404,20 +389,15 @@ fn fetch_split_button(
 ) -> Element<'static, Message> {
     // `button` highlights its own half on hover (its `Hovered` status) and shows
     // the pointer cursor automatically.
-    let main = button(
-        row![
-            icons::icon(icons::FETCH, ICON_SIZE, theme.muted_text),
-            text("Fetch")
-                .size(text_size::UI)
-                .color(theme.text)
-                .font(font),
-        ]
-        .spacing(5)
-        .align_y(alignment::Vertical::Center),
+    let main = ui::text_button(
+        Some((icons::FETCH, theme.muted_text)),
+        "Fetch",
+        ui::Variant::Ghost,
+        CONTROL,
+        font,
+        theme,
     )
-    .padding(Padding::from([5, 10]))
-    .on_press(Message::Action(Action::Fetch(FetchTarget::AllRemotes)))
-    .style(move |_, status| ghost_button_style(theme, status));
+    .on_press(Message::Action(Action::Fetch(FetchTarget::AllRemotes)));
 
     // A `mouse_area` (not a `button`) with no press handler: the press falls
     // through to the wrapping `AnchorArea` (the main "Fetch" `button` captures
@@ -425,12 +405,9 @@ fn fetch_split_button(
     // the whole split button's rect so the dropdown anchors edge-to-edge below
     // it. Hover + cursor are set manually since mouse_area has neither.
     let caret = mouse_area(
-        // Box height = the main half's size-12 text line box, and the same
-        // vertical padding (5) — so the caret's hover fill is exactly as tall as
-        // the "Fetch" half rather than hugging the small glyph.
-        container(caret_glyph(theme.muted_text, text_size::UI * 1.3))
-            .padding(Padding::from([5, 7]))
-            .align_y(alignment::Vertical::Center)
+        container(caret_glyph(theme.muted_text, CONTROL.height()))
+            .width(Length::Fixed(CARET_WIDTH))
+            .center_x(Length::Fixed(CARET_WIDTH))
             .style(move |_| caret_hover_style(theme, caret_hovered, radius::BUTTON)),
     )
     .on_enter(Message::Ui(UiEvent::SetHover(Some(
@@ -439,9 +416,10 @@ fn fetch_split_button(
     .on_exit(Message::Ui(UiEvent::SetHover(None)))
     .interaction(mouse::Interaction::Pointer);
 
+    // As tall as the glyphs beside it.
     let divider = container(Space::new())
         .width(Length::Fixed(1.0))
-        .height(Length::Fixed(14.0))
+        .height(Length::Fixed(ui::ICON_SIZE))
         .style(move |_| container::Style {
             background: Some(Background::Color(theme.border)),
             ..container::Style::default()

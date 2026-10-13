@@ -29,6 +29,8 @@ pub const LANE_WIDTH: f32 = 10.0;
 const LINE_THICKNESS: f32 = 1.5;
 const LINE_THICKNESS_EMPHASIZED: f32 = 2.75;
 const NODE_RADIUS: f32 = 4.0;
+/// The working copy's "you are here" halo around its disc.
+const HALO_RADIUS: f32 = NODE_RADIUS + 2.5;
 
 /// Geometry of the elided-ancestry squiggle (jj log's `~`): drawn below a
 /// node whose parent(s) sit outside the loaded set — the bottom of a
@@ -327,9 +329,11 @@ pub fn draw_revision_row<R>(
         .copied()
         .flatten()
         .max();
+    // Plus the halo's overhang: it is wider than half a lane, so in the
+    // rightmost lane it would otherwise lose its right edge to the frame.
     let frame_width = rightmost_lane.map_or(bounds.width, |lane| {
         bounds.width.max(lane_strip_width(lane + 1))
-    });
+    }) + (HALO_RADIUS - LANE_WIDTH / 2.0).max(0.0);
     let mut frame = Frame::new(renderer, Size::new(bounds.x + frame_width, bot));
 
     // Incoming edges (top half). Each lane enters at the column it occupied
@@ -451,7 +455,7 @@ pub fn draw_revision_row<R>(
     // The working copy (the only override caller) gets a soft halo behind
     // its disc so "you are here" reads even at a glance across the gutter.
     if node_color_override.is_some() {
-        let halo = Path::new(|b| b.circle(Point::new(x_node, mid), NODE_RADIUS + 2.5));
+        let halo = Path::new(|b| b.circle(Point::new(x_node, mid), HALO_RADIUS));
         frame.fill(
             &halo,
             Color {

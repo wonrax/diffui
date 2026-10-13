@@ -5,7 +5,7 @@
 
 use iced::{
     Background, Border, Color, Element, Font, Length, Padding, alignment, mouse,
-    widget::{Space, button, container, mouse_area, row, text, text_input, tooltip},
+    widget::{Space, container, mouse_area, row, text_input, tooltip},
 };
 
 use crate::theme::{self, ThemeSpec};
@@ -17,6 +17,29 @@ pub const FIELD_HEIGHT: f32 = theme::control::COMPACT;
 /// on all four sides so the square hover wash sits optically centered between
 /// the surrounding content and panel edges.
 pub const PANEL_TOGGLE_INSET: f32 = theme::space::XS;
+
+/// Inset of a panel header's leading content (a filter field's left edge) —
+/// the toolbar's edge inset, so the header's field lines up under the
+/// toolbar's first control.
+pub const PANEL_HEADER_LEAD: f32 = theme::space::MD;
+
+/// Padding of a panel header whose trailing element is a collapse toggle:
+/// the toggle's square inset on top/right/bottom, the lead on the left.
+pub const PANEL_HEADER_PADDING: Padding = Padding {
+    top: PANEL_TOGGLE_INSET,
+    right: PANEL_TOGGLE_INSET,
+    bottom: PANEL_TOGGLE_INSET,
+    left: PANEL_HEADER_LEAD,
+};
+
+/// Height of a panel header row: one control step and its toggle inset
+/// above and below. Strips that sit beside panel headers (the source
+/// browser's info bar) take the same height so their text shares a line.
+pub const PANEL_HEADER_HEIGHT: f32 = theme::control::COMPACT + 2.0 * PANEL_TOGGLE_INSET;
+
+/// Padding of a collapsed panel's rail, which holds only its toggle: the
+/// toggle sits exactly where the expanded header's toggle row does.
+pub const COLLAPSED_RAIL_PADDING: f32 = PANEL_TOGGLE_INSET;
 /// Gap between the caret square and the field's top/right/bottom edges —
 /// equal on all three sides so the caret reads as a centered inset button.
 const CARET_MARGIN: f32 = 3.0;
@@ -28,15 +51,13 @@ pub(crate) fn panel_toggle_button<'a>(
     label: &'static str,
     action: Action,
 ) -> Element<'a, Message> {
-    tooltip(
+    crate::ui::tooltip(
         panel_toggle_button_bare(theme, glyph, action),
-        container(text(label).size(theme::text_size::UI).font(font))
-            .padding([4, 8])
-            .style(move |_| theme::tooltip_style(theme)),
+        label,
         tooltip::Position::Right,
+        font,
+        theme,
     )
-    .gap(6)
-    .into()
 }
 
 /// The same collapse control without a tooltip. Used when hovering the control
@@ -47,12 +68,8 @@ pub(crate) fn panel_toggle_button_bare<'a>(
     glyph: &'static str,
     action: Action,
 ) -> Element<'a, Message> {
-    button(crate::icons::icon(glyph, 13.0, theme.muted_text))
-        .width(Length::Fixed(theme::control::COMPACT))
-        .height(Length::Fixed(theme::control::COMPACT))
-        .padding(0)
+    crate::ui::icon_button(glyph, theme.muted_text, crate::ui::Size::Compact, theme)
         .on_press(Message::Action(action))
-        .style(move |_, status| theme::ghost_button_style(theme, status))
         .into()
 }
 
@@ -116,7 +133,7 @@ pub(crate) fn filter_field(
             }),
         );
     }
-    bar = bar.push(crate::input::single_line(input));
+    bar = bar.push(crate::input::single_line(input, spec.value, font));
     if let Some(caret) = spec.caret {
         // `mouse_area` (not `button`) so the presets menu opens on
         // mouse-*down* while held — required for the native NSMenu's
@@ -166,9 +183,10 @@ pub(crate) fn filter_field(
     }
 }
 
-/// A [`filter_field`] wrapped in the sidebar top-bar inset, shared by both
-/// sidebars so their top bars are identical. No rule under the field — its
-/// bordered well already separates it from the list below.
+/// A [`filter_field`] alone in a panel header (the source browser's file
+/// search): the same row geometry as the diff sidebar's field + toggle
+/// header, with the lead inset mirrored on the right. No rule under the
+/// field — its bordered well already separates it from the list below.
 pub(crate) fn sidebar_filter_field(
     theme: ThemeSpec,
     font: Font,
@@ -176,6 +194,9 @@ pub(crate) fn sidebar_filter_field(
 ) -> Element<'_, Message> {
     container(filter_field(theme, font, spec))
         .width(Length::Fill)
-        .padding(Padding::from([theme::space::XXS, theme::space::MD]))
+        .padding(Padding {
+            right: PANEL_HEADER_LEAD,
+            ..PANEL_HEADER_PADDING
+        })
         .into()
 }

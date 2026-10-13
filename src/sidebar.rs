@@ -99,7 +99,7 @@ pub fn build_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             .align_y(alignment::Vertical::Center),
         )
         .width(Length::Fill)
-        .padding(crate::field::PANEL_TOGGLE_INSET),
+        .padding(crate::field::PANEL_HEADER_PADDING),
     );
     // Load failures no longer have a header to live under — surface them as a
     // soft alert card above the list rather than bare red text.
@@ -160,7 +160,7 @@ pub fn build_collapsed_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Mes
     ))
     .width(Length::Fixed(crate::theme::COLLAPSED_PANEL_WIDTH))
     .height(Length::Fill)
-    .padding([theme::space::XXS, theme::space::XS])
+    .padding(crate::field::COLLAPSED_RAIL_PADDING)
     .style(move |_| sidebar_panel_style(theme))
     .into()
 }
@@ -272,20 +272,10 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         ) => Some("+ descendants".to_owned()),
         _ => None,
     };
-    let state_hint: Option<(&'static str, Color)> = if armed_invalid || gap_invalid {
-        Some(("Can't target the revision being moved", theme.removed_text))
-    } else if !merge_ready && target.is_none() && gap_sides.is_none() {
-        Some((
-            match draft.kind {
-                DraftKind::Rebase { .. } => "Pick the destination",
-                DraftKind::Squash => "Pick the revision to fold into",
-                DraftKind::Merge => "Pick the other parent",
-            },
-            theme.muted_text,
-        ))
-    } else {
-        None
-    };
+    // The idle instruction lives in the verdict band below; the headline
+    // only speaks up to refuse a target.
+    let state_hint: Option<(&'static str, Color)> = (armed_invalid || gap_invalid)
+        .then_some(("Can't target the revision being moved", theme.removed_text));
     let mut operation = row![
         icons::icon(glyph, 15.0, theme.accent),
         text(verb)
@@ -314,10 +304,13 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         );
     }
     operation = operation.push(Space::new().width(Length::Fill)).push(
-        iced::widget::button(icons::icon(icons::CLOSE, 14.0, theme.muted_text))
-            .padding([2, 6])
-            .on_press(Message::Action(Action::DraftCancel))
-            .style(move |_, status| theme::ghost_button_style(theme, status)),
+        crate::ui::icon_button(
+            icons::CLOSE,
+            theme.muted_text,
+            crate::ui::Size::Compact,
+            theme,
+        )
+        .on_press(Message::Action(Action::DraftCancel)),
     );
     let mut headline = column![operation].spacing(2).width(Length::Fill);
     if let Some((hint, color)) = state_hint {
@@ -554,17 +547,16 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         crate::DraftPreviewState::Idle => (
             None,
             match draft.kind {
-                DraftKind::Squash => {
-                    "no simulation for squash — descriptions combine on apply".to_owned()
-                }
-                _ if is_branch => "hover or ↑↓ a destination to resolve the branch".to_owned(),
-                _ => "hover or ↑↓ to preview the result".to_owned(),
+                DraftKind::Squash => "Pick the revision to fold into".to_owned(),
+                DraftKind::Merge => "Pick the other parent".to_owned(),
+                _ if is_branch => "Pick a destination to resolve the branch".to_owned(),
+                _ => "Pick the destination".to_owned(),
             },
             theme.subtle_text,
             None,
         ),
         crate::DraftPreviewState::Loading => {
-            (None, "simulating…".to_owned(), theme.subtle_text, None)
+            (None, "Simulating…".to_owned(), theme.subtle_text, None)
         }
         crate::DraftPreviewState::Ready(diffui_core::DraftSimulation::Rebase(preview)) => {
             // The candidate sits inside the branch itself (a descendant of
@@ -572,7 +564,7 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             if is_branch && preview.simulated && preview.moved == 0 {
                 (
                     None,
-                    "nothing to move — this destination already contains the branch".to_owned(),
+                    "Nothing to move — the branch is already there".to_owned(),
                     theme.muted_text,
                     None,
                 )
@@ -580,14 +572,14 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
                 let total = preview.moved + preview.descendants;
                 let mut counts = if is_branch && !preview.entry_points.is_empty() {
                     format!(
-                        "moves the branch from {} · {} revision{}",
+                        "Moves the branch from {} · {} revision{}",
                         commit_list_summary(&preview.entry_points),
                         preview.moved,
                         if preview.moved == 1 { "" } else { "s" },
                     )
                 } else {
                     format!(
-                        "rebases {total} commit{}",
+                        "Rebases {total} commit{}",
                         if total == 1 { "" } else { "s" }
                     )
                 };
@@ -597,14 +589,14 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
                 if !preview.simulated {
                     (
                         None,
-                        "too large to simulate conflicts".to_owned(),
+                        "Too large to simulate conflicts".to_owned(),
                         theme.muted_text,
                         Some(counts),
                     )
                 } else if preview.new_conflicts.is_empty() {
                     (
                         Some(icons::CHECK),
-                        "no new conflicts".to_owned(),
+                        "No new conflicts".to_owned(),
                         theme.added_text,
                         Some(counts),
                     )
@@ -612,7 +604,7 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
                     (
                         Some(icons::ALERT_TRIANGLE),
                         format!(
-                            "conflicts in {}",
+                            "Conflicts in {}",
                             commit_list_summary(&preview.new_conflicts)
                         ),
                         theme.conflict_marker,
@@ -623,16 +615,16 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         }
         crate::DraftPreviewState::Ready(diffui_core::DraftSimulation::Merge(preview)) => {
             let parents = draft.sources.len() + usize::from(!merge_ready);
-            let counts = format!("merges {parents} parents");
+            let counts = format!("Merges {parents} parents");
             if preview.conflicts.is_empty() {
                 (
                     Some(icons::CHECK),
-                    "clean merge".to_owned(),
+                    "Clean merge".to_owned(),
                     theme.added_text,
                     Some(counts),
                 )
             } else {
-                let mut status = format!("will conflict in {}", preview.conflicts.join(", "));
+                let mut status = format!("Will conflict in {}", preview.conflicts.join(", "));
                 if preview.truncated {
                     status.push_str(", …");
                 }
@@ -646,7 +638,7 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         }
         crate::DraftPreviewState::Failed(error) => (
             Some(icons::ALERT_TRIANGLE),
-            format!("preview failed: {error}"),
+            format!("Preview failed: {error}"),
             theme.removed_text,
             None,
         ),
@@ -680,42 +672,26 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     } else {
         theme.subtle_text
     };
-    let apply = iced::widget::button(
+    let apply = crate::ui::button(
         row![
             text("Apply")
                 .size(theme::text_size::UI)
-                .font(emphasis_font(ui_font, iced::font::Weight::Medium))
-                .color(apply_color),
+                .font(emphasis_font(ui_font, iced::font::Weight::Medium)),
             icons::icon(icons::ENTER, 12.0, apply_color),
         ]
         .spacing(6)
         .align_y(alignment::Vertical::Center),
+        crate::ui::Variant::Primary,
+        crate::ui::Size::Compact,
+        theme,
     )
-    .padding([4, 12])
-    .on_press_maybe(can_apply.then_some(Message::Action(Action::DraftConfirm)))
-    .style(move |_, status| {
-        if can_apply {
-            theme::primary_button_style(theme, status)
-        } else {
-            iced::widget::button::Style {
-                background: Some(Background::Color(chip_background(theme.subtle_text))),
-                text_color: theme.subtle_text,
-                border: Border {
-                    width: 0.0,
-                    color: Color::TRANSPARENT,
-                    radius: theme::radius::BUTTON.into(),
-                },
-                shadow: Default::default(),
-                snap: true,
-            }
-        }
-    });
+    .on_press_maybe(can_apply.then_some(Message::Action(Action::DraftConfirm)));
 
+    // Only the keys nothing on screen already shows: the rows carry their
+    // own keycaps and Apply its ↵.
     let hints = text(match draft.kind {
-        DraftKind::Merge => {
-            "click / ↑↓ = target · space/⌘click toggles a parent · ↵ apply · esc cancels"
-        }
-        _ => "click / ↑↓ = target · space/⌘click toggles a source · ↵ apply · esc cancels",
+        DraftKind::Merge => "Space toggles a parent · Esc cancels",
+        _ => "Space toggles a source · Esc cancels",
     })
     .size(theme::text_size::CAPTION)
     .font(ui_font)
@@ -786,8 +762,8 @@ pub const REVSET_INPUT_ID: &str = "revset-input";
 /// picking a preset re-evaluates the log.
 fn build_revset_filter(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     let placeholder = match ui.active().repository.as_ref().map(|r| r.vcs) {
-        Some(Vcs::Git) => "revision range — e.g. --all, main..@",
-        _ => "revset — e.g. all(), mine()",
+        Some(Vcs::Git) => "Revisions, e.g. --all",
+        _ => "Revset, e.g. all()",
     };
     crate::field::filter_field(
         theme,
@@ -809,6 +785,8 @@ fn build_revset_filter(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
 }
 
 const FOOTER_TEXT_SIZE: f32 = theme::text_size::UI;
+/// One control step, so the footer is as tall as the header above the list.
+const FOOTER_HEIGHT: f32 = theme::control::COMPACT;
 
 /// Thin status bar pinned to the bottom of the commit-log pane: the working
 /// copy's branch + ahead/behind on the left, the total change count on the
@@ -832,20 +810,9 @@ fn build_footer(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             .spacing(5)
             .align_y(alignment::Vertical::Center);
             let name: Element<'_, Message> = match &status.upstream {
-                Some(upstream) => tooltip(
-                    name,
-                    container(
-                        text(upstream)
-                            .size(FOOTER_TEXT_SIZE)
-                            .font(font)
-                            .color(theme.text),
-                    )
-                    .padding([3, 9])
-                    .style(move |_| theme::tooltip_style(theme)),
-                    tooltip::Position::Top,
-                )
-                .gap(4)
-                .into(),
+                Some(upstream) => {
+                    crate::ui::tooltip(name, upstream, tooltip::Position::Top, font, theme)
+                }
                 None => name.into(),
             };
 
@@ -893,8 +860,13 @@ fn build_footer(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         None => row![].into(),
     };
 
+    // jj counts changes; git has only commits.
+    let noun = match ui.active().repository.as_ref().map(|r| r.vcs) {
+        Some(Vcs::Git) => "commits",
+        _ => "changes",
+    };
     let right = text(format!(
-        "{} changes",
+        "{} {noun}",
         thousands(ui.active().session.commits.len())
     ))
     .size(FOOTER_TEXT_SIZE)
@@ -919,7 +891,9 @@ fn build_footer(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         hairline,
         container(bar)
             .width(Length::Fill)
-            .padding([6, 12])
+            .height(Length::Fixed(FOOTER_HEIGHT))
+            .padding([0.0, theme::space::LG])
+            .center_y(Length::Fixed(FOOTER_HEIGHT))
             .style(move |_| container::Style::default().background(theme.panel_background)),
     ]
     .into()
@@ -999,6 +973,7 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
         |key| Message::Ui(UiEvent::SelectRowKey(key)),
         |row| Message::Ui(UiEvent::SidebarFileRow(row)),
     )
+    .at_window_edge()
     .width(Length::Fill)
     .reveal_selected(ui.active().revision_reveal_token)
     .reveal_file(ui.sidebar_file_reveal_token, reveal_target)
@@ -1066,7 +1041,21 @@ fn build_revision_row(
         id_suffix.push('/');
         id_suffix.push_str(&offset.to_string());
     }
-    let commit_id_short = truncate_end(commit.commit_id(), COMMIT_ID_CHARS);
+    // Git has no change ids: its rows carry the commit hash in both slots, and
+    // its synthesized working copy a placeholder in both. Show the hash once,
+    // and nothing but the `@` marker on the working copy.
+    let single_id =
+        commit.commit_id().starts_with(change_id) || change_id.starts_with(commit.commit_id());
+    let (id_prefix, id_suffix) = if single_id && commit.is_working_copy() {
+        (String::new(), String::new())
+    } else {
+        (id_prefix, id_suffix)
+    };
+    let commit_id_short = if single_id {
+        String::new()
+    } else {
+        truncate_end(commit.commit_id(), COMMIT_ID_CHARS)
+    };
 
     let lane_color = graph_style.lane_color(lane_frame.node_lane);
     let bookmark_chips = bookmark_chips_for(bookmarks, lane_color, theme, config);

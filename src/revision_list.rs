@@ -333,6 +333,9 @@ pub struct RevisionList<'a, Message> {
     on_target_hover: Option<fn(Option<usize>) -> Message>,
     /// Which sidebar slot this list occupies — see [`ListSlot`].
     slot: ListSlot,
+    /// Extra leading inset for the row cards — see
+    /// [`RevisionList::at_window_edge`].
+    leading_edge: f32,
 }
 
 /// Callbacks for the drag-to-rebase gesture. All `fn` pointers, like the
@@ -384,6 +387,7 @@ impl<'a, Message> RevisionList<'a, Message> {
             gap_edge: None,
             on_target_hover: None,
             slot: ListSlot::Revisions,
+            leading_edge: 0.0,
         }
     }
 
@@ -392,6 +396,25 @@ impl<'a, Message> RevisionList<'a, Message> {
     pub fn source_tree_slot(mut self) -> Self {
         self.slot = ListSlot::SourceTree;
         self
+    }
+
+    /// The list's leading edge is the window's: push the row cards in by the
+    /// width the OS border covers, so their margin there matches the one
+    /// against the divider on the other side.
+    pub fn at_window_edge(mut self) -> Self {
+        self.leading_edge = crate::chrome::window_border();
+        self
+    }
+
+    /// A row's selection/hover card: inset from the row on every side.
+    fn card_bounds(&self, row_bounds: Rectangle) -> Rectangle {
+        let left = ROW_CARD_INSET_X + self.leading_edge;
+        Rectangle {
+            x: row_bounds.x + left,
+            y: row_bounds.y + ROW_CARD_INSET_Y,
+            width: (row_bounds.width - left - ROW_CARD_INSET_X).max(0.0),
+            height: (row_bounds.height - ROW_CARD_INSET_Y * 2.0).max(0.0),
+        }
     }
 
     /// Report the hovered commit row while an op draft is picking a
@@ -1699,12 +1722,7 @@ impl<'a, Message> RevisionList<'a, Message> {
         // (rows separate by whitespace — there is no per-row hairline).
         // The graph is drawn last in this method so its lines & node still
         // sit visually above any chrome.
-        let card_bounds = Rectangle {
-            x: row_bounds.x + ROW_CARD_INSET_X,
-            y: row_bounds.y + ROW_CARD_INSET_Y,
-            width: (row_bounds.width - ROW_CARD_INSET_X * 2.0).max(0.0),
-            height: (row_bounds.height - ROW_CARD_INSET_Y * 2.0).max(0.0),
-        };
+        let card_bounds = self.card_bounds(row_bounds);
         // Working-copy rows get a left→right gradient with a fixed light
         // accent on the left fading into the row's base color on the
         // right (panel background normally, the selected gray when
@@ -1828,7 +1846,8 @@ impl<'a, Message> RevisionList<'a, Message> {
 
         // === Priority: commit_id > bookmark chips > author ===
         // 1. commit_id (with leading id_gap).
-        let show_commit_id = commit_w + id_gap <= budget;
+        let has_commit_id = !rev.commit_id_short.is_empty();
+        let show_commit_id = has_commit_id && commit_w + id_gap <= budget;
         if show_commit_id {
             budget -= commit_w + id_gap;
         }
@@ -1896,7 +1915,8 @@ impl<'a, Message> RevisionList<'a, Message> {
         };
 
         // Ellipsis indicator when commit_id or author got dropped entirely.
-        let need_ellipsis = (!show_commit_id) || (!show_author && !rev.author.is_empty());
+        let need_ellipsis =
+            (has_commit_id && !show_commit_id) || (!show_author && !rev.author.is_empty());
 
         // === Color selection ===
         let (col_at, col_id_prefix, col_id_suffix, col_commit, col_author, col_ellipsis) = (
@@ -2192,12 +2212,7 @@ impl<'a, Message> RevisionList<'a, Message> {
 
         // Same inset rounded card as revision rows, so every selectable row
         // shares one selection language.
-        let card_bounds = Rectangle {
-            x: row_bounds.x + ROW_CARD_INSET_X,
-            y: row_bounds.y + ROW_CARD_INSET_Y,
-            width: (row_bounds.width - ROW_CARD_INSET_X * 2.0).max(0.0),
-            height: (row_bounds.height - ROW_CARD_INSET_Y * 2.0).max(0.0),
-        };
+        let card_bounds = self.card_bounds(row_bounds);
         if selected {
             fill_rounded(
                 renderer,
@@ -2350,30 +2365,32 @@ impl<'a, Message> RevisionList<'a, Message> {
         // tree) skip them too.
         if f.chevron.is_none() && f.additions_width > 0.0 {
             let plus = format!("+{}", f.additions);
-            let minus = format!("-{}", f.deletions);
+            let minus = format!("\u{2212}{}", f.deletions);
+            // Right-aligned, so the digits of rows stacked above each other
+            // line up like a table column. The anchor is the right edge.
             fill_text_centered_y(
                 renderer,
                 &plus,
-                plus_x,
+                plus_x + f.additions_width,
                 row_mid_y,
                 f.additions_width,
                 CAPTION_TEXT_SIZE,
                 f.additions_text,
                 self.style.primary_font,
                 row_clip,
-                text::Alignment::Left,
+                text::Alignment::Right,
             );
             fill_text_centered_y(
                 renderer,
                 &minus,
-                minus_x,
+                minus_x + f.deletions_width,
                 row_mid_y,
                 f.deletions_width,
                 CAPTION_TEXT_SIZE,
                 f.deletions_text,
                 self.style.primary_font,
                 row_clip,
-                text::Alignment::Left,
+                text::Alignment::Right,
             );
         }
 

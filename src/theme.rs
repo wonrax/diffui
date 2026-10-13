@@ -424,8 +424,8 @@ pub mod text_size {
     pub const BODY_LG: f32 = 14.0;
     /// Dialog and palette titles.
     pub const TITLE: f32 = 15.0;
-    /// The welcome screen's app heading.
-    pub const DISPLAY: f32 = 22.0;
+    /// The welcome screen's wordmark.
+    pub const DISPLAY: f32 = 40.0;
 }
 
 /// Shared spatial rhythm. Components can make small optical corrections, but
@@ -483,6 +483,14 @@ pub fn centered_control_content_fill<'a, Message: 'a>(
         })
         .center(Length::Fill)
         .into()
+}
+
+/// Where every modal surface (command palette, open-repo and confirm
+/// dialogs) hangs from: a fixed distance under the window chrome rather than
+/// centered, so a card doesn't jump as its content grows and stacked
+/// takeovers line up with one another.
+pub fn modal_top() -> f32 {
+    crate::toolbar::chrome_bottom() + space::XXL * 2.0
 }
 
 /// Corner radii shared across the chrome. Chips keep their own tighter
@@ -624,11 +632,6 @@ pub fn destructive_button_style(theme: ThemeSpec) -> button::Style {
         shadow: Shadow::default(),
         snap: true,
     }
-}
-
-/// Push button for dialog footers — the shared raised chrome.
-pub fn dialog_button_style(theme: ThemeSpec, status: button::Status) -> button::Style {
-    raised_button_style(theme, status)
 }
 
 /// Floating card anchored to a trigger with nothing dimming the content

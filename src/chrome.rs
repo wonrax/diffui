@@ -35,6 +35,14 @@ pub fn leading_inset() -> f32 {
     }
 }
 
+/// How much of the content's outer edge the OS window border covers. macOS
+/// draws its 1pt hairline over our pixels, so an inset measured from the
+/// window edge reads that much smaller than the same inset against one of
+/// our own dividers.
+pub fn window_border() -> f32 {
+    if cfg!(target_os = "macos") { 1.0 } else { 0.0 }
+}
+
 /// Whether the strip's empty area should act as a window-drag handle. True on
 /// platforms where we've hidden/replaced the native title bar so the OS no
 /// longer offers a drag surface — macOS today; an undecorated Linux WM is the

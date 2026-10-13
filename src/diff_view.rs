@@ -2802,7 +2802,12 @@ impl<'a, Message> DiffView<'a, Message> {
             self.palette.border,
         );
 
-        let clip = bounds;
+        // Unwrapped header values stop at the header's right inset instead of
+        // running on under the overlay scrollbar to the pane edge.
+        let clip = Rectangle {
+            width: (bounds.width - HEADER_HORIZONTAL_PADDING).max(0.0),
+            ..bounds
+        };
         let label_color = self.palette.text_muted;
         let value_color = self.palette.text;
         // Measure the label column once. All field labels are padded to the
@@ -4180,12 +4185,12 @@ impl<Message> DiffView<'_, Message> {
         bounds: Rectangle,
     ) -> (String, String, String, f32) {
         let hunk_label = if file.hunks.len() == 1 {
-            "1 Hunk".to_owned()
+            "1 hunk".to_owned()
         } else {
-            format!("{} Hunks", file.hunks.len())
+            format!("{} hunks", file.hunks.len())
         };
         let additions = format!("+{}", file.additions);
-        let deletions = format!("-{}", file.deletions);
+        let deletions = format!("\u{2212}{}", file.deletions);
         let mono_width = |content: &str| content.chars().count() as f32 * self.metrics.char_width;
         let gap = self.metrics.char_width;
         let summary_width = (mono_width(&additions)
@@ -4193,8 +4198,16 @@ impl<Message> DiffView<'_, Message> {
             + mono_width(&deletions)
             + 2.0 * gap
             + mono_width(&hunk_label))
-        .min((bounds.width - 24.0).max(1.0));
+        .min((bounds.width - 2.0 * HEADER_HORIZONTAL_PADDING).max(1.0));
         (additions, deletions, hunk_label, summary_width)
+    }
+
+    /// Left edge of a file header's right-aligned summary. Inset like the
+    /// header's leading chip, which also keeps the summary clear of the
+    /// overlay scrollbar riding the pane's right edge.
+    fn file_header_summary_x(summary_width: f32, bounds: Rectangle) -> f32 {
+        (bounds.x + bounds.width - HEADER_HORIZONTAL_PADDING - summary_width)
+            .max(bounds.x + HEADER_HORIZONTAL_PADDING)
     }
 
     /// Screen rect of a file header's browse button when the header is drawn
@@ -4211,7 +4224,7 @@ impl<Message> DiffView<'_, Message> {
         }
         let file = self.files.get(file_index)?;
         let (_, _, _, summary_width) = self.file_header_summary(file, bounds);
-        let summary_x = (bounds.x + bounds.width - summary_width - 8.0).max(bounds.x + 12.0);
+        let summary_x = Self::file_header_summary_x(summary_width, bounds);
         let size = BROWSE_BUTTON_SIZE;
         let x = summary_x - 10.0 - size;
         let y = header_y + (self.metrics.file_header_height - size) / 2.0;
@@ -4457,7 +4470,7 @@ impl<Message> DiffView<'_, Message> {
         let chip_w = chip::draw(
             renderer,
             &status_chip,
-            bounds.x + 12.0,
+            bounds.x + HEADER_HORIZONTAL_PADDING,
             y + self.metrics.file_header_height / 2.0,
             bounds,
         );
@@ -4468,9 +4481,14 @@ impl<Message> DiffView<'_, Message> {
         } else {
             0.0
         };
-        let title_x = bounds.x + 12.0 + chip_w + 8.0;
-        let title_width =
-            (bounds.width - (title_x - bounds.x) - summary_width - 16.0 - browse_reserve).max(1.0);
+        let title_x = bounds.x + HEADER_HORIZONTAL_PADDING + chip_w + 8.0;
+        let title_width = (bounds.x + bounds.width
+            - HEADER_HORIZONTAL_PADDING
+            - summary_width
+            - 16.0
+            - browse_reserve
+            - title_x)
+            .max(1.0);
         // Dim the directory prefix so the basename carries the header —
         // the path tail is what distinguishes files at a glance. Renames
         // ("old -> new") and squeezed headers fall back to one plain run.
@@ -4564,17 +4582,26 @@ impl<Message> DiffView<'_, Message> {
             );
         }
 
-        let summary_x = (bounds.x + bounds.width - summary_width - 8.0).max(bounds.x + 12.0);
+        let summary_x = Self::file_header_summary_x(summary_width, bounds);
         let segments = [
+            // Zero counts go quiet, like the changed-files list's.
             (
                 additions.as_str(),
                 additions_width,
-                self.palette.addition_text,
+                if file.additions == 0 {
+                    self.palette.text_muted
+                } else {
+                    self.palette.addition_text
+                },
             ),
             (
                 deletions.as_str(),
                 deletions_width,
-                self.palette.deletion_text,
+                if file.deletions == 0 {
+                    self.palette.text_muted
+                } else {
+                    self.palette.deletion_text
+                },
             ),
             (hunk_label.as_str(), hunk_width, self.palette.text_muted),
         ];

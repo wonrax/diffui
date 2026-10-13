@@ -598,8 +598,10 @@ async fn load_git_revision_details(
         RevisionSelection::WorkingCopy => "HEAD".to_owned(),
         RevisionSelection::Commit(id) => id.clone(),
     };
-    let format = format!("%H{SEP}%an{SEP}%ae{SEP}%aI{SEP}%cn{SEP}%ce{SEP}%cI{SEP}%D{SEP}%B");
-    let mut args = git_args(&["show", "--no-patch"]);
+    let format = format!("%H{SEP}%an{SEP}%ae{SEP}%ad{SEP}%cn{SEP}%ce{SEP}%cd{SEP}%D{SEP}%B");
+    // The same shape jj's details carry, so a timestamp reads the same in
+    // either kind of repository.
+    let mut args = git_args(&["show", "--no-patch", "--date=format:%Y-%m-%d %H:%M:%S %z"]);
     args.push(OsString::from(format!("--format={format}")));
     args.push(OsString::from(target));
     let output = run_command(&repository.root, "git", args).await?;

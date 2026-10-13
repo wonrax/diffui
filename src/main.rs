@@ -38,6 +38,7 @@ mod tab_bar;
 mod tabs;
 mod theme;
 mod toolbar;
+mod ui;
 mod update;
 mod width_memo;
 mod window_state;
@@ -133,7 +134,7 @@ use iced::{
     event::{self, Event},
     font::Weight,
     keyboard, system, time,
-    widget::{self, button, column, container, row, stack, text},
+    widget::{self, column, container, row, stack, text},
     window,
 };
 use keymap::{Chord, Keymap};
@@ -145,7 +146,7 @@ use repository::{Repository, Vcs, prepare_repository};
 use resize_handle::ResizeHandle;
 use theme::{
     ResolvedTheme, ThemePreference, ThemeSpec, app_shell_style, emphasis_font, horizontal_divider,
-    primary_button_style, text_size, vertical_divider,
+    text_size, vertical_divider,
 };
 use window_state::WindowState;
 
@@ -979,43 +980,19 @@ fn selection_from_key(key: &revision_list::RowSelectionKey) -> RevisionSelection
 
 /// Welcome screen shown whenever no repository is open: a fresh launch with
 /// nothing to restore (including from the macOS/Spotlight launcher, where cwd is
-/// `/`), or after the last tab is closed. It's the "select a repo" entry point —
-/// a primary open button (the strip's `+` isn't here) plus a click-to-reopen
-/// list of recents. Only an explicit `--path` that failed to resolve surfaces an
-/// error; the session and cwd fallbacks resolve silently to this screen instead.
+/// `/`), or after the last tab is closed. It is the open prompt itself — the
+/// same card ⌘O raises over a tab, inline and focused — under the wordmark.
+/// Only an explicit `--path` that failed to resolve surfaces an error; the
+/// session and cwd fallbacks resolve silently to this screen instead.
 fn empty_state<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
-    // App mark: the diff glyph in a soft accent-tinted rounded square, so
-    // the empty window opens on an identity rather than bare text.
-    let mark = container(icons::icon(icons::FILE_DIFF, 30.0, theme.accent))
-        .width(Length::Fixed(64.0))
-        .height(Length::Fixed(64.0))
-        .center_x(Length::Fixed(64.0))
-        .center_y(Length::Fixed(64.0))
-        .style(move |_| container::Style {
-            background: Some(iced::Background::Color(theme::chip_background(
-                theme.accent,
-            ))),
-            border: iced::Border {
-                width: 0.0,
-                color: iced::Color::TRANSPARENT,
-                radius: 16.0.into(),
-            },
-            ..container::Style::default()
-        });
-
-    let mut body = column![
-        mark,
-        text("Diffui")
-            .size(text_size::DISPLAY)
-            .color(theme.text)
-            .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
-        text("Browse revisions and review changes in jj and git repositories.")
-            .size(text_size::BODY)
-            .color(theme.muted_text)
-            .font(ui.config.ui_font),
-    ]
-    .spacing(14)
-    .align_x(alignment::Horizontal::Center);
+    // The wordmark alone is the identity: big enough to anchor the page.
+    let identity = text("Diffui")
+        .size(text_size::DISPLAY)
+        .color(theme.text)
+        .font(emphasis_font(ui.config.ui_font, Weight::Semibold));
+    let mut body = column![identity]
+        .spacing(theme::space::XXL)
+        .align_x(alignment::Horizontal::Center);
 
     // A `Failed` status can now only come from an explicit `--path` (the session
     // and cwd fallbacks resolve silently), so it's always worth surfacing.
@@ -1028,68 +1005,21 @@ fn empty_state<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
         );
     }
 
-    body = body.push(
-        button(
-            text("Open repository\u{2026}")
-                .size(text_size::BODY)
-                .color(theme.background)
-                .font(ui.config.ui_font),
-        )
-        .padding(Padding::from([9, 20]))
-        .on_press(Message::Action(Action::OpenRepoDialog))
-        .style(move |_, status| primary_button_style(theme, status)),
-    );
-
-    // Click-to-reopen recents — reuses the open dialog's row builder so both
-    // entry points look identical, wrapped in a quiet card so the list reads
-    // as one unit against the canvas. `tabs` is empty in this state, so
-    // (unlike the dialog) there's nothing already-open to filter out.
-    let recents: Vec<&String> = ui.recent_repos.iter().take(6).collect();
-    if !recents.is_empty() {
-        let mut list = column![
-            container(
-                text("Recent")
-                    .size(text_size::CAPTION)
-                    .color(theme.subtle_text)
-                    .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
-            )
-            .padding(Padding {
-                top: 2.0,
-                right: 8.0,
-                bottom: 4.0,
-                left: 8.0,
-            }),
-        ]
-        .spacing(2);
-        for root in recents {
-            list = list.push(tab_bar::recent_repo_row(ui, theme, root));
-        }
-        body = body.push(
-            container(list)
-                .width(Length::Fixed(340.0))
-                .padding(6)
-                .style(move |_| container::Style {
-                    background: Some(iced::Background::Color(theme.panel_background)),
-                    border: iced::Border {
-                        width: 1.0,
-                        color: theme.border,
-                        radius: theme::radius::SURFACE.into(),
-                    },
-                    ..container::Style::default()
-                }),
-        );
+    // `update` keeps the prompt's state alive whenever no tab is open.
+    if let Some(dialog) = ui.open_repo_dialog() {
+        body = body.push(tab_bar::open_repo_card(ui, theme, dialog));
     }
 
-    body = body.push(
-        text(format!("or press {}", chrome::cmd_label("O")))
-            .size(text_size::UI)
-            .color(theme.muted_text)
-            .font(ui.config.ui_font),
-    );
-
+    // Optically centered: a touch above the true middle, where a centered
+    // block reads as centered rather than as sinking.
     container(body)
         .center_x(Length::Fill)
-        .center_y(Length::Fill)
+        .height(Length::Fill)
+        .align_y(alignment::Vertical::Center)
+        .padding(Padding {
+            bottom: theme::space::XXL * 3.0,
+            ..Padding::ZERO
+        })
         .into()
 }
 
