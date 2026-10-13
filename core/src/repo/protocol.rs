@@ -342,6 +342,9 @@ pub enum Payload {
     /// projection asks for a snapshot rather than a walk. Separate from
     /// `OpHeadChanged` because a plain edit writes no operation at all.
     WorkingCopyChanged,
+    /// Git refs, worktree HEADs, or working-copy status may have changed.
+    /// Git's synthetic working-copy row requires a graph refresh too.
+    RepositoryChanged,
     Failed {
         job: JobId,
         error: RepoError,
@@ -370,7 +373,10 @@ impl Payload {
             | Self::Progress { job, .. }
             | Self::Failed { job, .. }
             | Self::Cancelled { job, .. } => Some(*job),
-            Self::Ready { .. } | Self::OpHeadChanged { .. } | Self::WorkingCopyChanged => None,
+            Self::Ready { .. }
+            | Self::OpHeadChanged { .. }
+            | Self::WorkingCopyChanged
+            | Self::RepositoryChanged => None,
         }
     }
 
@@ -385,6 +391,7 @@ impl Payload {
                 | Self::Ready { .. }
                 | Self::OpHeadChanged { .. }
                 | Self::WorkingCopyChanged
+                | Self::RepositoryChanged
         )
     }
 }

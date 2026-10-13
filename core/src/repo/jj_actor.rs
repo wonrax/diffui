@@ -65,7 +65,7 @@ pub(super) fn spawn(
                     return;
                 }
             };
-            watch(watch_root, poke);
+            super::watch(watch_root, poke);
             runtime.block_on(async move {
                 // Two futures on one thread: one reads the command channel so a
                 // cancel lands while its job is still running, the other runs
@@ -92,50 +92,6 @@ pub(super) fn spawn(
         });
     if let Err(error) = spawned {
         tracing::error!(%error, "failed to spawn the repository actor thread");
-    }
-}
-
-/// Turn the filesystem watch into a poke on the actor's own channel, so the
-/// actor decides what a change means (dedup on the op head, never snapshot
-/// mid-mutation) rather than the frontend guessing from the outside.
-fn watch(root: PathBuf, poke: mpsc::UnboundedSender<Envelope>) {
-    let spawned = std::thread::Builder::new()
-        .name("diffui-repo-watch".to_owned())
-        .spawn(move || {
-            let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build()
-            else {
-                return;
-            };
-            runtime.block_on(async move {
-                let mut watcher = match crate::watcher::RepoWatcher::start(&root) {
-                    Ok(watcher) => watcher,
-                    Err(error) => {
-                        tracing::warn!(
-                            root = %root.display(),
-                            %error,
-                            "filesystem watcher unavailable; auto-refresh is off for this repository"
-                        );
-                        return;
-                    }
-                };
-                loop {
-                    tokio::select! {
-                        batch = watcher.next_batch() => match batch {
-                            Some(batch) => {
-                                if poke.send(Envelope::Watch(batch)).is_err() {
-                                    return;
-                                }
-                            }
-                            None => return,
-                        },
-                        // The actor shut down; stop watching with it.
-                        () = poke.closed() => return,
-                    }
-                }
-            });
-        });
-    if let Err(error) = spawned {
-        tracing::warn!(%error, "failed to spawn the repository watcher thread");
     }
 }
 

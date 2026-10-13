@@ -1,4 +1,10 @@
-use std::{ffi::OsString, path::Path, process::Stdio};
+use std::{
+    collections::HashMap,
+    ffi::OsString,
+    hash::{Hash, Hasher},
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 
 use anyhow::{Context, Result, bail};
 use jj_lib::graph::GraphEdge;
@@ -34,11 +40,21 @@ pub async fn load_git_commits(
     repository: &Repository,
     revision_range: &str,
 ) -> Result<Vec<StreamRow>> {
-    // The revision range is the git analog of the jj revset: extra `git log`
-    // arguments (e.g. `--all`, `main..HEAD`). Empty keeps the default (the
-    // current branch's history).
+    let worktree_output = run_command_bytes(
+        &repository.root,
+        "git",
+        git_args(&["worktree", "list", "--porcelain", "-z"]),
+    )
+    .await?;
+    let worktrees = parse_git_worktrees(&worktree_output);
+    // Explicit log arguments filter as supplied. The default includes other
+    // worktree tips, including detached HEADs outside the current ancestry.
     let mut args = git_args(&["log", "--topo-order", "--no-color"]);
     args.extend(revision_range.split_whitespace().map(OsString::from));
+    if revision_range.trim().is_empty() {
+        args.push(OsString::from("HEAD"));
+        args.extend(worktrees.iter().map(|tree| OsString::from(&tree.head)));
+    }
     args.push(OsString::from(
         "--pretty=format:%h%x09%H%x09%P%x09%an%x09%x09%s",
     ));
@@ -49,7 +65,10 @@ pub async fn load_git_commits(
     // the top whenever the tree differs from HEAD. The row's parent
     // is HEAD so the graph keeps a continuous lane.
     if !rows.is_empty() && git_has_uncommitted_changes(&repository.root).await? {
-        let head_id = rows[0].commit_id.clone();
+        let head_id = run_command(&repository.root, "git", git_args(&["rev-parse", "HEAD"]))
+            .await?
+            .trim()
+            .to_owned();
         rows.insert(
             0,
             ParsedCommitRow {
@@ -64,7 +83,82 @@ pub async fn load_git_commits(
             },
         );
     }
-    Ok(build_commit_summaries(rows))
+    let root = repository.root.canonicalize()?;
+    let mut labels: HashMap<String, Vec<String>> = HashMap::new();
+    for tree in &worktrees {
+        if tree
+            .path
+            .canonicalize()
+            .unwrap_or_else(|_| tree.path.clone())
+            == root
+        {
+            continue;
+        }
+        let name = tree.path.file_name().unwrap_or(tree.path.as_os_str());
+        let duplicate = worktrees
+            .iter()
+            .filter(|other| other.path.file_name() == Some(name))
+            .count()
+            > 1;
+        let label = if duplicate {
+            tree.path.to_string_lossy().into_owned()
+        } else {
+            name.to_string_lossy().into_owned()
+        };
+        labels
+            .entry(tree.head.clone())
+            .or_default()
+            .push(format!("{label}@"));
+    }
+    let mut summaries = build_commit_summaries(rows);
+    for row in &mut summaries {
+        row.summary.bookmarks = labels.remove(&row.summary.commit_id).unwrap_or_default();
+    }
+    Ok(summaries)
+}
+
+#[derive(Debug)]
+struct GitWorktree {
+    path: PathBuf,
+    head: String,
+}
+
+fn parse_git_worktrees(output: &[u8]) -> Vec<GitWorktree> {
+    let mut trees = Vec::new();
+    let mut path = None;
+    let mut head = String::new();
+    let mut skip = false;
+    for field in output.split(|&byte| byte == 0) {
+        if field.is_empty() {
+            if let Some(path) = path.take()
+                && !skip
+                && !head.is_empty()
+                && !head.bytes().all(|b| b == b'0')
+            {
+                trees.push(GitWorktree {
+                    path,
+                    head: std::mem::take(&mut head),
+                });
+            }
+            head.clear();
+            skip = false;
+        } else if let Some(value) = field.strip_prefix(b"worktree ") {
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt as _;
+                path = Some(PathBuf::from(std::ffi::OsStr::from_bytes(value)));
+            }
+            #[cfg(not(unix))]
+            {
+                path = Some(PathBuf::from(String::from_utf8_lossy(value).into_owned()));
+            }
+        } else if let Some(value) = field.strip_prefix(b"HEAD ") {
+            head = String::from_utf8_lossy(value).into_owned();
+        } else if field == b"bare" || field.starts_with(b"prunable") {
+            skip = true;
+        }
+    }
+    trees
 }
 
 pub async fn load_git_repository_snapshot(repository_root: &Path) -> Result<RepositorySnapshot> {
@@ -79,8 +173,44 @@ pub async fn load_git_repository_snapshot(repository_root: &Path) -> Result<Repo
         ]),
     )
     .await?;
+    let head = run_command(
+        repository_root,
+        "git",
+        git_args(&["rev-parse", "--verify", "HEAD"]),
+    )
+    .await
+    .unwrap_or_default();
+    let refs = run_command(
+        repository_root,
+        "git",
+        git_args(&["for-each-ref", "--format=%(refname) %(objectname)"]),
+    )
+    .await?;
+    let worktrees = run_command_bytes(
+        repository_root,
+        "git",
+        git_args(&["worktree", "list", "--porcelain", "-z"]),
+    )
+    .await?;
+    // Status stays "M" across consecutive edits; include diff contents so the
+    // second save refreshes too. Hash bytes to keep large diffs out of state.
+    let diff_base = if head.is_empty() { "--cached" } else { "HEAD" };
+    let diff = run_command_bytes(
+        repository_root,
+        "git",
+        git_args(&[
+            "diff",
+            diff_base,
+            "--no-ext-diff",
+            "--no-textconv",
+            "--binary",
+        ]),
+    )
+    .await?;
+    let mut fingerprint = std::collections::hash_map::DefaultHasher::new();
+    (output, head, refs, worktrees, diff).hash(&mut fingerprint);
     Ok(RepositorySnapshot {
-        fingerprint: output,
+        fingerprint: format!("{:016x}", fingerprint.finish()),
         working_copy_empty: None,
         // Git has no op log — the external-op escalation never applies.
         parent_fingerprint: None,
@@ -625,6 +755,16 @@ mod tests {
     use super::*;
     use crate::repository::Vcs;
     use std::path::PathBuf;
+
+    #[test]
+    fn worktree_porcelain_preserves_paths_and_skips_non_checkouts() {
+        let trees = parse_git_worktrees(b"worktree /repos/bare\0bare\0\0worktree /repos/with spaces\0HEAD abc123\0branch refs/heads/main\0\0worktree /repos/with\nnewline\0HEAD def456\0detached\0locked a reason\0\0worktree /repos/missing\0HEAD abc123\0prunable gone\0\0worktree /repos/unborn\0HEAD 000000\0branch refs/heads/new\0\0");
+        assert_eq!(trees.len(), 2);
+        assert_eq!(trees[0].path, PathBuf::from("/repos/with spaces"));
+        assert_eq!(trees[0].head, "abc123");
+        assert_eq!(trees[1].path, PathBuf::from("/repos/with\nnewline"));
+        assert_eq!(trees[1].head, "def456");
+    }
 
     fn parse_commit_log(output: &str) -> Vec<CommitSummary> {
         build_commit_summaries(parse_commit_log_rows(output))

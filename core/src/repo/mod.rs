@@ -41,6 +41,48 @@ pub use protocol::{
 use crate::repository::{Repository, Vcs};
 use crate::watcher::WatchBatch;
 
+/// Feed watch events through the actor's command queue so they serialize with
+/// repository operations and the watch ends when its actor shuts down.
+fn watch(root: PathBuf, poke: mpsc::UnboundedSender<Envelope>) {
+    let spawned = std::thread::Builder::new()
+        .name("diffui-repo-watch".to_owned())
+        .spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build()
+            else {
+                return;
+            };
+            runtime.block_on(async move {
+                let mut watcher = match crate::watcher::RepoWatcher::start(&root) {
+                    Ok(watcher) => watcher,
+                    Err(error) => {
+                        tracing::warn!(
+                            root = %root.display(),
+                            %error,
+                            "filesystem watcher unavailable; auto-refresh is off for this repository"
+                        );
+                        return;
+                    }
+                };
+                loop {
+                    tokio::select! {
+                        batch = watcher.next_batch() => match batch {
+                            Some(batch) => {
+                                if poke.send(Envelope::Watch(batch)).is_err() {
+                                    return;
+                                }
+                            }
+                            None => return,
+                        },
+                        () = poke.closed() => return,
+                    }
+                }
+            });
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(%error, "failed to spawn the repository watcher thread");
+    }
+}
+
 /// What travels down the command channel. `Watch` and `Shutdown` are the
 /// actor's own control traffic and never leave this module — the protocol
 /// proper is [`Command`].
@@ -277,7 +319,9 @@ pub fn open_with(spec: OpenSpec, settings: SettingsSource) -> RepoEvents {
         OpenSpec::Local { root, .. } if is_jj(&root) => {
             jj_actor::spawn(id, root, settings, cmd_rx, cmd_tx.clone(), event_tx);
         }
-        OpenSpec::Local { root, .. } => git_actor::spawn(id, root, cmd_rx, event_tx),
+        OpenSpec::Local { root, .. } => {
+            git_actor::spawn(id, root, cmd_rx, cmd_tx.clone(), event_tx)
+        }
         OpenSpec::GitHubPr(pr) => pr_actor::spawn(id, pr, cmd_rx, event_tx),
     }
 

@@ -494,6 +494,7 @@ impl Session {
                 Vec::new()
             }
             Payload::WorkingCopyChanged => self.snapshot(RefreshOrigin::Watcher),
+            Payload::RepositoryChanged => self.snapshot(RefreshOrigin::Focus),
             Payload::OpHeadChanged { fingerprint } => self.on_op_head(&fingerprint),
             Payload::Failed { job, error } => self.on_failed(repo, job, error),
             Payload::Cancelled { job } => {

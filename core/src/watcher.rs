@@ -1,11 +1,10 @@
 //! Filesystem watcher for a repository checkout.
 //!
 //! Classifies raw `notify` events into working-tree edits vs jj op-head
-//! writes, debounces bursts, and hands the frontend coalesced [`WatchBatch`]es to
-//! turn into refreshes. The rest of `.git`/`.jj` is ignored: watching it would
-//! feed our own snapshot writes back as a refresh loop and bury real edits under
-//! VCS churn. `op_heads` is the one exception, and an op-id dedup (the
-//! frontend's job) is what keeps it loop-free.
+//! writes and Git HEAD/index/ref changes, debounces bursts, and hands the
+//! frontend coalesced [`WatchBatch`]es to turn into refreshes. Other VCS
+//! internals are ignored to keep object writes and locks from burying edits.
+//! The frontend dedups snapshots to avoid redundant reloads.
 //!
 //! The watch skips what the repository's ignore rules skip: a write a build
 //! makes under `target/` or `node_modules/` would otherwise be a worktree
@@ -76,6 +75,7 @@ const SIGNAL_QUEUE: usize = 256;
 enum WatchSignal {
     Worktree,
     OpLog,
+    GitMetadata,
 }
 
 /// What the `notify` handler forwards to the watch task.
@@ -87,6 +87,7 @@ enum WatchEvent {
     /// than being done in the handler. Never sent under a recursive watch,
     /// where the backend has already picked the directory up.
     NewDirectory(PathBuf),
+    NewGitMetadataDirectory(PathBuf),
 }
 
 /// The kinds of change that arrived during one debounce window. Both flags can
@@ -101,17 +102,20 @@ pub struct WatchBatch {
     /// should read the op head and reload only if it differs from the one it
     /// already reflects (so its own writes don't trigger a redundant walk).
     pub op_log: bool,
+    /// This checkout's HEAD/index or the repository's shared refs changed.
+    pub git_metadata: bool,
 }
 
 impl WatchBatch {
     pub fn is_empty(&self) -> bool {
-        !self.worktree && !self.op_log
+        !self.worktree && !self.op_log && !self.git_metadata
     }
 
     fn apply(&mut self, signal: WatchSignal) {
         match signal {
             WatchSignal::Worktree => self.worktree = true,
             WatchSignal::OpLog => self.op_log = true,
+            WatchSignal::GitMetadata => self.git_metadata = true,
         }
     }
 }
@@ -127,21 +131,25 @@ struct WatchTargets {
     external_repo_dir: Option<PathBuf>,
     /// `<repo>/op_heads` — writes under it signal "an operation landed".
     op_heads_dir: Option<PathBuf>,
+    git_dirs: Option<crate::repository::GitDirectories>,
 }
 
 impl WatchTargets {
     fn resolve(root: &Path) -> Self {
-        // Best-effort: a git repo (or an unreadable pointer) simply keeps the
-        // component-based classification below.
+        if !root.join(".jj").is_dir() {
+            return Self {
+                git_dirs: crate::repository::resolve_git_dirs(root).ok(),
+                ..Self::default()
+            };
+        }
+        // An unreadable pointer keeps the component-based classification.
         let Ok(repo_dir) = crate::repository::resolve_jj_repo_dir(root) else {
             return Self::default();
         };
         Self {
             external_repo_dir: (!repo_dir.starts_with(root)).then(|| repo_dir.clone()),
-            // Only when it is really there: `resolve_jj_repo_dir` answers with
-            // the conventional path for a repository that has no `.jj` at all
-            // (a plain git checkout), and watching that fails outright.
             op_heads_dir: Some(repo_dir.join("op_heads")).filter(|dir| dir.is_dir()),
+            git_dirs: None,
         }
     }
 }
@@ -164,6 +172,32 @@ impl WatchScope {
     /// more specific signal, and for an external (primary-repo) op store the
     /// path may not contain a `.jj` component at all.
     fn classify(&self, path: &Path, is_dir: bool) -> Option<WatchSignal> {
+        if let Some(dirs) = &self.targets.git_dirs {
+            let local = path.strip_prefix(&dirs.git_dir).ok();
+            let shared = path.strip_prefix(&dirs.common_dir).ok();
+            if local.is_some_and(|p| p == Path::new("HEAD") || p == Path::new("index"))
+                || shared.is_some_and(|p| {
+                    p == Path::new("HEAD")
+                        || p == Path::new("packed-refs")
+                        || (p.starts_with("refs")
+                            && !p.as_os_str().to_string_lossy().ends_with(".lock"))
+                        || (p.starts_with("worktrees")
+                            && (p.components().count() <= 2
+                                || (p.components().count() == 3
+                                    && p.file_name().is_some_and(|name| {
+                                        name == "HEAD" || name == "gitdir" || name == "commondir"
+                                    }))))
+                })
+            {
+                return Some(WatchSignal::GitMetadata);
+            }
+            if [&dirs.git_dir, &dirs.common_dir]
+                .into_iter()
+                .any(|dir| !self.root.starts_with(dir) && path.starts_with(dir))
+            {
+                return None;
+            }
+        }
         if self.touches_op_log(path) {
             return Some(WatchSignal::OpLog);
         }
@@ -299,6 +333,19 @@ impl RepoWatcher {
                             return;
                         }
                     }
+                    if is_dir
+                        && matches!(event.kind, notify::EventKind::Create(_))
+                        && handler_scope.targets.git_dirs.as_ref().is_some_and(|dirs| {
+                            (per_directory || !dirs.common_dir.starts_with(&handler_scope.root))
+                                && (path == &dirs.common_dir.join("worktrees")
+                                    || path == &dirs.common_dir.join("refs"))
+                        })
+                        && tx
+                            .blocking_send(WatchEvent::NewGitMetadataDirectory(path.clone()))
+                            .is_err()
+                    {
+                        return;
+                    }
                     if per_directory
                         && is_dir
                         && handler_scope.is_watchable_dir(path)
@@ -319,6 +366,25 @@ impl RepoWatcher {
             && (per_directory || !op_heads.starts_with(root))
         {
             watcher.watch(op_heads, notify::RecursiveMode::Recursive)?;
+        }
+        if let Some(dirs) = &scope.targets.git_dirs {
+            let mut metadata_dirs = vec![&dirs.git_dir];
+            if dirs.common_dir != dirs.git_dir {
+                metadata_dirs.push(&dirs.common_dir);
+            }
+            for dir in metadata_dirs {
+                if per_directory || !dir.starts_with(root) {
+                    watcher.watch(dir, notify::RecursiveMode::NonRecursive)?;
+                }
+            }
+            let refs = dirs.common_dir.join("refs");
+            if refs.is_dir() && (per_directory || !refs.starts_with(root)) {
+                watcher.watch(&refs, notify::RecursiveMode::Recursive)?;
+            }
+            let worktrees = dirs.common_dir.join("worktrees");
+            if worktrees.is_dir() && (per_directory || !worktrees.starts_with(root)) {
+                watcher.watch(&worktrees, notify::RecursiveMode::Recursive)?;
+            }
         }
         if per_directory {
             watch_directories(&mut watcher, &scope, directories);
@@ -345,6 +411,11 @@ impl RepoWatcher {
             // worktree edit too, but the handler classified it as one before
             // sending this, so there is nothing to fold in here.
             WatchEvent::NewDirectory(path) => watch_subtree(watcher, scope, &path),
+            WatchEvent::NewGitMetadataDirectory(path) => {
+                if let Err(error) = watcher.watch(&path, notify::RecursiveMode::Recursive) {
+                    tracing::warn!(%error, "failed to watch git worktree metadata");
+                }
+            }
         })
         .await
     }
@@ -542,6 +613,50 @@ mod tests {
     }
 
     #[test]
+    fn git_metadata_is_scoped_to_its_checkout_and_shared_refs() {
+        let scope = WatchScope {
+            root: PathBuf::from("/linked"),
+            targets: WatchTargets {
+                git_dirs: Some(crate::repository::GitDirectories {
+                    git_dir: PathBuf::from("/main/.git/worktrees/linked"),
+                    common_dir: PathBuf::from("/main/.git"),
+                }),
+                ..WatchTargets::default()
+            },
+            ignores: GitIgnoreFile::empty(),
+        };
+        for path in [
+            "/main/.git/HEAD",
+            "/main/.git/worktrees/linked/HEAD",
+            "/main/.git/worktrees/linked/index",
+            "/main/.git/worktrees/other/HEAD",
+            "/main/.git/refs/heads/main",
+            "/main/.git/packed-refs",
+            "/main/.git/worktrees/other",
+        ] {
+            assert_eq!(
+                scope.classify(Path::new(path), false),
+                Some(WatchSignal::GitMetadata),
+                "{path}"
+            );
+        }
+        for path in [
+            "/main/.git/worktrees/other/index",
+            "/main/.git/worktrees/other/logs/HEAD",
+            "/main/.git/worktrees/linked/index.lock",
+            "/main/.git/refs/heads/main.lock",
+            "/main/.git/objects/ab/cd",
+            "/main/src/main.rs",
+        ] {
+            assert_eq!(scope.classify(Path::new(path), false), None, "{path}");
+        }
+        assert_eq!(
+            scope.classify(Path::new("/linked/file.txt"), false),
+            Some(WatchSignal::Worktree)
+        );
+    }
+
+    #[test]
     fn op_head_write_classifies_as_op_log() {
         assert_eq!(
             scope("/repo").classify(Path::new("/repo/.jj/repo/op_heads/heads/abc123"), false),
@@ -615,6 +730,7 @@ mod tests {
             targets: WatchTargets {
                 external_repo_dir: Some(PathBuf::from("/elsewhere/store")),
                 op_heads_dir: Some(PathBuf::from("/elsewhere/store/op_heads")),
+                ..WatchTargets::default()
             },
             ignores: GitIgnoreFile::empty(),
         };

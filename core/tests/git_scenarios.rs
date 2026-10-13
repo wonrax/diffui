@@ -14,7 +14,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use diffui_core::git::{list_git_source_tree, load_git_diff};
+use diffui_core::git::{
+    list_git_source_tree, load_git_commits, load_git_diff, load_git_repository_snapshot,
+};
 use diffui_core::{DiffFileStatus, DiffLineKind, Repository, RevisionSelection, Vcs};
 
 fn block_on<F: Future>(future: F) -> F::Output {
@@ -107,6 +109,272 @@ fn repository(root: &Path) -> Repository {
 
 fn write(dir: &Path, name: &str, contents: &[u8]) {
     std::fs::write(dir.join(name), contents).expect("write scratch file");
+}
+
+fn add_worktree(root: &Path, name: &str, detached: bool) -> PathBuf {
+    let path = root.with_file_name(format!(
+        "{}-{name}",
+        root.file_name().unwrap().to_string_lossy()
+    ));
+    let _ = std::fs::remove_dir_all(&path);
+    let path_text = path.to_str().unwrap();
+    if detached {
+        git(root, &["worktree", "add", "--detach", path_text, "HEAD"]);
+    } else {
+        git(root, &["worktree", "add", "-b", name, path_text, "HEAD"]);
+    }
+    path
+}
+
+#[test]
+#[ignore]
+fn worktree_heads_are_labeled_in_the_shared_graph() {
+    if !git_present() {
+        return;
+    }
+    let root = scratch_repo("worktree-labels");
+    write(&root, "file.txt", b"base\n");
+    commit(&root, "base");
+    let base = head(&root);
+    let linked = add_worktree(&root, "linked", false);
+    let detached = add_worktree(&root, "detached", true);
+    write(&linked, "file.txt", b"linked\n");
+    commit(&linked, "linked commit");
+    let linked_head = head(&linked);
+    write(&detached, "file.txt", b"detached\n");
+    commit(&detached, "detached commit");
+    let detached_head = head(&detached);
+
+    for current in [&root, &linked, &detached] {
+        let repo = diffui_core::prepare_repository(current).expect("discover worktree");
+        assert_eq!(repo.root, current.canonicalize().unwrap());
+        assert_eq!(repo.vcs, Vcs::Git);
+        let rows = block_on(load_git_commits(&repo, "")).expect("load worktree graph");
+        for (path, id) in [
+            (&root, &base),
+            (&linked, &linked_head),
+            (&detached, &detached_head),
+        ] {
+            let row = rows
+                .iter()
+                .find(|row| &row.summary.commit_id == id)
+                .expect("all worktree tips are visible");
+            let label = format!("{}@", path.file_name().unwrap().to_string_lossy());
+            assert_eq!(row.summary.bookmarks.contains(&label), path != current);
+        }
+    }
+
+    write(&root, "file.txt", b"dirty main\n");
+    let repo = diffui_core::prepare_repository(&root).unwrap();
+    let rows = block_on(load_git_commits(&repo, "--all")).unwrap();
+    assert!(rows[0].summary.is_working_copy);
+    assert_eq!(rows[0].summary.parent_ids, vec![base.clone()]);
+    let scoped = diffui_core::prepare_repository(&linked.join("file.txt")).unwrap();
+    assert_eq!(scoped.scope, PathBuf::from("file.txt"));
+    let (diff, _) = block_on(load_git_diff(&scoped, &RevisionSelection::WorkingCopy)).unwrap();
+    assert!(
+        diff.files.is_empty(),
+        "main's dirty files must not leak into the linked checkout"
+    );
+
+    let before = block_on(load_git_repository_snapshot(&root)).unwrap();
+    write(&root, "file.txt", b"another dirty main edit\n");
+    let edited = block_on(load_git_repository_snapshot(&root)).unwrap();
+    assert_ne!(
+        before.fingerprint, edited.fingerprint,
+        "consecutive dirty edits must refresh"
+    );
+    git(
+        &detached,
+        &["commit", "--allow-empty", "-m", "move detached HEAD"],
+    );
+    let after = block_on(load_git_repository_snapshot(&root)).unwrap();
+    assert_ne!(edited.fingerprint, after.fingerprint);
+    let rows = block_on(load_git_commits(&repo, "")).unwrap();
+    let label = format!("{}@", detached.file_name().unwrap().to_string_lossy());
+    assert_eq!(
+        rows.iter()
+            .find(|row| row.summary.bookmarks.contains(&label))
+            .unwrap()
+            .summary
+            .commit_id,
+        head(&detached)
+    );
+    let filtered = block_on(load_git_commits(&repo, "HEAD")).unwrap();
+    assert!(
+        !filtered
+            .iter()
+            .any(|row| row.summary.commit_id == linked_head)
+    );
+}
+
+#[test]
+#[ignore]
+fn worktree_metadata_refreshes_in_both_watch_shapes() {
+    if !git_present() {
+        return;
+    }
+    use diffui_core::watcher::RepoWatcher;
+    use std::time::Duration;
+    for (shape, per_directory) in [("per-directory", true), ("recursive", false)] {
+        let root = scratch_repo(&format!("worktree-watch-{shape}"));
+        write(&root, "file.txt", b"base\n");
+        commit(&root, "base");
+        let base = head(&root);
+        let linked = add_worktree(&root, "linked", false);
+        let admin = git(&linked, &["rev-parse", "--absolute-git-dir"]);
+        let admin_name = Path::new(admin.trim())
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
+        std::fs::write(
+            linked.join(".git"),
+            format!(
+                "gitdir: ../{}/.git/worktrees/{admin_name}\n",
+                root.file_name().unwrap().to_string_lossy()
+            ),
+        )
+        .unwrap();
+        block_on(async {
+            let mut watcher = RepoWatcher::start_with(&linked, per_directory).unwrap();
+            git(
+                &linked,
+                &["commit", "--allow-empty", "-m", "move linked HEAD"],
+            );
+            let batch = tokio::time::timeout(Duration::from_secs(5), watcher.next_batch())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(batch.git_metadata, "{shape}: linked HEAD must refresh");
+            git(
+                &root,
+                &["commit", "--allow-empty", "-m", "move shared branch"],
+            );
+            let batch = tokio::time::timeout(Duration::from_secs(5), watcher.next_batch())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(batch.git_metadata, "{shape}: shared refs must refresh");
+            git(&root, &["checkout", "--detach", &base]);
+            let batch = tokio::time::timeout(Duration::from_secs(5), watcher.next_batch())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                batch.git_metadata,
+                "{shape}: the main worktree's detached HEAD must refresh"
+            );
+            write(&linked, "file.txt", b"edit\n");
+            let batch = tokio::time::timeout(Duration::from_secs(5), watcher.next_batch())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(batch.worktree, "{shape}: linked files must refresh");
+        });
+        block_on(async {
+            let mut watcher = RepoWatcher::start_with(&root, per_directory).unwrap();
+            git(
+                &linked,
+                &["commit", "--allow-empty", "-m", "move other HEAD"],
+            );
+            let batch = tokio::time::timeout(Duration::from_secs(5), watcher.next_batch())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                batch.git_metadata,
+                "{shape}: another worktree's HEAD must refresh"
+            );
+        });
+    }
+}
+
+#[test]
+#[ignore]
+fn the_git_actor_starts_and_forwards_its_watch() {
+    if !git_present() {
+        return;
+    }
+    use diffui_core::repo::{self, OpenSpec, Payload};
+    use futures::StreamExt;
+    use std::time::Duration;
+    let root = scratch_repo("worktree-actor-watch");
+    write(&root, "file.txt", b"base\n");
+    commit(&root, "base");
+    block_on(async {
+        let mut events = Box::pin(repo::open(OpenSpec::Local {
+            root: root.clone(),
+            scope: PathBuf::new(),
+        }));
+        assert!(matches!(
+            events.next().await.unwrap().payload,
+            Payload::Ready { .. }
+        ));
+        // Ready precedes watch registration. Keep saving until the watch is
+        // live rather than depending on a fixed thread-startup delay.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                write(&root, "file.txt", b"edit\n");
+                tokio::select! {
+                    event = events.next() => {
+                        assert!(matches!(event.unwrap().payload, Payload::RepositoryChanged));
+                        break;
+                    }
+                    () = tokio::time::sleep(Duration::from_millis(100)) => {}
+                }
+            }
+        })
+        .await
+        .expect("the Git actor must forward filesystem changes");
+    });
+}
+
+#[test]
+#[ignore]
+fn the_first_worktree_added_after_open_is_watched() {
+    if !git_present() {
+        return;
+    }
+    use diffui_core::watcher::RepoWatcher;
+    use std::time::Duration;
+    for (shape, per_directory) in [("per-directory", true), ("recursive", false)] {
+        let root = scratch_repo(&format!("worktree-add-{shape}"));
+        write(&root, "file.txt", b"base\n");
+        commit(&root, "base");
+        block_on(async {
+            let mut watcher = RepoWatcher::start_with(&root, per_directory).unwrap();
+            let linked = add_worktree(&root, "detached", true);
+            let batch = tokio::time::timeout(Duration::from_secs(5), watcher.next_batch())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                batch.git_metadata,
+                "{shape}: adding a worktree must refresh"
+            );
+            git(
+                &linked,
+                &["commit", "--allow-empty", "-m", "move detached HEAD"],
+            );
+            let batch = tokio::time::timeout(Duration::from_secs(5), watcher.next_batch())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                batch.git_metadata,
+                "{shape}: new worktree must stay watched"
+            );
+            git(&root, &["worktree", "remove", linked.to_str().unwrap()]);
+            let batch = tokio::time::timeout(Duration::from_secs(5), watcher.next_batch())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                batch.git_metadata,
+                "{shape}: removing a worktree must refresh"
+            );
+        });
+    }
 }
 
 /// Non-UTF-8 file content used to fail the whole load: `git diff` output was

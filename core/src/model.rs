@@ -154,7 +154,7 @@ pub struct CommitSummary {
     /// concept (git, PR listings).
     pub is_immutable: bool,
     /// Ref labels pointing at this commit. Other workspaces' working
-    /// copies come first as `name@` (jj only; matches jj log's
+    /// copies (or Git worktree HEADs) come first as `name@` (matches jj log's
     /// `working_copies`-before-`bookmarks` order), then bookmarks as in
     /// `jj show`'s "Bookmarks:" line — bare local names first, then
     /// remote-tracking `name@remote`.

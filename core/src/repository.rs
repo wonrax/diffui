@@ -89,6 +89,52 @@ fn normalize_input_path(input: &Path) -> Result<PathBuf> {
         .with_context(|| format!("failed to resolve {}", input.display()))
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct GitDirectories {
+    pub git_dir: PathBuf,
+    pub common_dir: PathBuf,
+}
+
+pub(crate) fn resolve_git_dirs(root: &Path) -> Result<GitDirectories> {
+    let entry = root.join(".git");
+    let git_dir = if entry.is_file() {
+        let bytes = std::fs::read(&entry).context("failed to read gitdir pointer")?;
+        let pointer = bytes
+            .strip_prefix(b"gitdir: ")
+            .context("invalid gitdir pointer")?;
+        root.join(git_pointer_path(pointer))
+    } else {
+        entry
+    }
+    .canonicalize()
+    .context("failed to resolve git directory")?;
+    let common_entry = git_dir.join("commondir");
+    let common_dir = if common_entry.is_file() {
+        let pointer = std::fs::read(&common_entry).context("failed to read commondir pointer")?;
+        git_dir
+            .join(git_pointer_path(&pointer))
+            .canonicalize()
+            .context("failed to resolve common git directory")?
+    } else {
+        git_dir.clone()
+    };
+    Ok(GitDirectories {
+        git_dir,
+        common_dir,
+    })
+}
+
+fn git_pointer_path(bytes: &[u8]) -> PathBuf {
+    let bytes = bytes.trim_ascii_end();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+    }
+    #[cfg(not(unix))]
+    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+}
+
 /// The directory holding the jj repo backing `root`'s workspace: `.jj/repo`
 /// itself, or — for a secondary workspace created by `jj workspace add`, whose
 /// `.jj/repo` is a *file* — the directory it points at (contents are a path

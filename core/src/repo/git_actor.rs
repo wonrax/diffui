@@ -15,10 +15,12 @@ use crate::repository::Repository;
 
 pub(super) fn spawn(
     id: RepoId,
-    _root: std::path::PathBuf,
+    root: std::path::PathBuf,
     commands: mpsc::UnboundedReceiver<Envelope>,
+    poke: mpsc::UnboundedSender<Envelope>,
     events: mpsc::UnboundedSender<Event>,
 ) {
+    super::watch(root, poke);
     // The reader runs as its own task so a cancel is applied while the job it
     // names is still running, rather than after it (see `route_commands`).
     let jobs: Jobs = Jobs::default();
@@ -28,11 +30,9 @@ pub(super) fn spawn(
         while let Some(envelope) = work.recv().await {
             match envelope {
                 Envelope::Shutdown => return,
-                // git has no operation log, so there is nothing to dedup and
-                // nothing to report but the edit itself.
                 Envelope::Watch(batch) => {
-                    if batch.worktree {
-                        let _ = events.send(Event::new(id.clone(), Payload::WorkingCopyChanged));
+                    if batch.worktree || batch.git_metadata {
+                        let _ = events.send(Event::new(id.clone(), Payload::RepositoryChanged));
                     }
                 }
                 Envelope::Run {
