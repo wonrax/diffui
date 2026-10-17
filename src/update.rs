@@ -878,12 +878,40 @@ impl Diffui {
                 Task::none()
             }
             Action::SubmitRepoDialog => {
-                let path = self
-                    .open_repo_dialog()
-                    .map(|dialog| dialog.path.clone())
-                    .unwrap_or_default();
-                self.open_repository(&path)
+                let Some(dialog) = self.open_repo_dialog() else {
+                    return Task::none();
+                };
+                match dialog.selected {
+                    Some(row) => self.pick_open_repo_suggestion(row),
+                    None => {
+                        let path = dialog.path.clone();
+                        self.open_repository(&path)
+                    }
+                }
             }
+            Action::OpenRepoMove(delta) => {
+                if let Some(dialog) = self.open_repo_dialog_mut() {
+                    let len = dialog.suggestions().map_or(0, |(_, rows)| rows.len());
+                    dialog.selected = (len > 0).then(|| match dialog.selected {
+                        Some(row) => (row as i32 + delta).rem_euclid(len as i32) as usize,
+                        None if delta < 0 => len - 1,
+                        None => 0,
+                    });
+                }
+                Task::none()
+            }
+            Action::OpenRepoComplete => {
+                let completed = self.open_repo_dialog().and_then(|dialog| {
+                    let (query, rows) = dialog.suggestions()?;
+                    let entry = rows.get(dialog.selected.unwrap_or(0))?;
+                    Some(query.complete(entry))
+                });
+                match completed {
+                    Some(path) => self.browse_open_repo_path(path),
+                    None => Task::none(),
+                }
+            }
+            Action::OpenRepoPick(row) => self.pick_open_repo_suggestion(row),
             Action::OpenRepo(path) => self.open_repository(&path),
             Action::RemoveRecentRepo(path) => {
                 self.recent_repos.retain(|recent| recent != &path);
@@ -1184,11 +1212,19 @@ impl Diffui {
                     .perform_detail_action(id, action);
             }
             UiEvent::ActivityNoOp | UiEvent::ConfirmNoOp | UiEvent::OpenRepoNoOp => {}
-            UiEvent::OpenRepoPathChanged(path) => {
+            UiEvent::OpenRepoPathChanged(path) => return self.set_open_repo_path(path),
+            UiEvent::OpenRepoListed(listing) => {
                 if let Some(dialog) = self.open_repo_dialog_mut() {
-                    dialog.path = path;
-                    // Clear a stale error as soon as the user edits the path.
-                    dialog.error = None;
+                    if dialog.listing_pending.as_ref() == Some(&listing.dir) {
+                        dialog.listing_pending = None;
+                    }
+                    // A read for a folder the path has since left is
+                    // dropped, so the rows on screen stay up.
+                    let query = crate::path_browse::Query::parse(&dialog.path);
+                    if let Some(query) = query.filter(|query| query.dir == listing.dir) {
+                        dialog.listing = Some(listing);
+                        dialog.listed_query = Some(query);
+                    }
                 }
             }
             UiEvent::RevsetChanged(value) => self.active_mut().session.revset = value,

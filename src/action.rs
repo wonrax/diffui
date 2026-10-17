@@ -86,8 +86,16 @@ pub(crate) enum Action {
     CloseRepoDialog,
     /// Pick a local working-copy directory with the native folder chooser.
     ChooseRepoFolder,
-    /// Resolve the dialog's path and open it as a tab.
+    /// Resolve the dialog's path and open it as a tab — or, with a folder
+    /// suggestion highlighted, act on that row as a click would.
     SubmitRepoDialog,
+    /// Move the highlighted folder suggestion by `±1`.
+    OpenRepoMove(i32),
+    /// Tab: complete the path into the highlighted (else first) suggestion.
+    OpenRepoComplete,
+    /// A folder suggestion, by row: a repository opens, anything else is
+    /// browsed into.
+    OpenRepoPick(usize),
     /// Open a repository (or PR) by path/reference.
     OpenRepo(String),
     /// Remove one path from the persisted recent-repository list.

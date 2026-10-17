@@ -1288,7 +1288,43 @@ pub(crate) fn open_repo_card<'a>(
         );
     }
 
-    // Anything in the MRU that isn't already open; one click reopens it.
+    // A path being typed lists the folders it can continue into; anything
+    // else shows the recents.
+    let section = match dialog.suggestions() {
+        Some((query, rows)) => folder_section(ui, theme, dialog, query, rows),
+        None => recents_section(ui, theme),
+    };
+    if let Some((header, list)) = section {
+        body = body.push(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fixed(1.0))
+                .style(move |_| container::Style::default().background(theme.border)),
+        );
+        body = body.push(
+            container(header)
+                .width(Length::Fill)
+                .height(Length::Fixed(OPEN_SECTION_HEIGHT))
+                .center_y(Length::Fixed(OPEN_SECTION_HEIGHT)),
+        );
+        body = body.push(container(list).width(Length::Fill).padding(Padding {
+            top: 0.0,
+            ..Padding::from(OPEN_LIST_INSET)
+        }));
+    }
+
+    container(body)
+        .width(Length::Fixed(OPEN_DIALOG_WIDTH))
+        .style(move |_| modal_style(theme))
+        .into()
+}
+
+/// The open prompt's recent list: anything in the MRU that isn't already
+/// open; one click reopens it. `None` when there is nothing to list.
+fn recents_section<'a>(
+    ui: &'a Diffui,
+    theme: ThemeSpec,
+) -> Option<(Element<'a, Message>, Element<'a, Message>)> {
     let open_roots: Vec<&str> = ui
         .tabs
         .iter()
@@ -1300,59 +1336,126 @@ pub(crate) fn open_repo_card<'a>(
         .filter(|root| !open_roots.contains(&root.as_str()))
         .take(5)
         .collect();
-    if !recents.is_empty() {
-        let clear = ui::button(
-            text("Clear")
+    if recents.is_empty() {
+        return None;
+    }
+    let clear = ui::button(
+        text("Clear")
+            .size(text_size::CAPTION)
+            .color(theme.subtle_text)
+            .font(ui.config.ui_font),
+        ui::Variant::Ghost,
+        ui::Size::Compact,
+        theme,
+    )
+    .height(Length::Fixed(OPEN_SECTION_PILL))
+    .padding([0.0, OPEN_SECTION_PILL_PAD_X])
+    .on_press(Message::Action(Action::ClearRecentRepos));
+    let header = container(
+        row![
+            text("Recent")
                 .size(text_size::CAPTION)
                 .color(theme.subtle_text)
-                .font(ui.config.ui_font),
-            ui::Variant::Ghost,
-            ui::Size::Compact,
-            theme,
-        )
-        .height(Length::Fixed(OPEN_SECTION_PILL))
-        .padding([0.0, OPEN_SECTION_PILL_PAD_X])
-        .on_press(Message::Action(Action::ClearRecentRepos));
-        let section = container(
-            row![
-                text("Recent")
-                    .size(text_size::CAPTION)
-                    .color(theme.subtle_text)
-                    .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
-                Space::new().width(Length::Fill),
-                clear,
-            ]
-            .align_y(alignment::Vertical::Center),
-        )
-        // "Clear"'s label, not its wash, ends on the content edge.
-        .padding(Padding {
-            right: OPEN_CONTENT_X - OPEN_SECTION_PILL_PAD_X,
-            ..Padding::from([0.0, OPEN_CONTENT_X])
-        })
-        .width(Length::Fill)
-        .height(Length::Fixed(OPEN_SECTION_HEIGHT))
-        .center_y(Length::Fixed(OPEN_SECTION_HEIGHT));
+                .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
+            Space::new().width(Length::Fill),
+            clear,
+        ]
+        .align_y(alignment::Vertical::Center),
+    )
+    // "Clear"'s label, not its wash, ends on the content edge.
+    .padding(Padding {
+        right: OPEN_CONTENT_X - OPEN_SECTION_PILL_PAD_X,
+        ..Padding::from([0.0, OPEN_CONTENT_X])
+    });
 
-        let mut list = column![].spacing(0);
-        for root in recents {
-            list = list.push(recent_repo_compact_row(ui, theme, root));
-        }
-        body = body.push(
-            container(Space::new())
-                .width(Length::Fill)
-                .height(Length::Fixed(1.0))
-                .style(move |_| container::Style::default().background(theme.border)),
-        );
-        body = body.push(section);
-        body = body.push(container(list).width(Length::Fill).padding(Padding {
-            top: 0.0,
-            ..Padding::from(OPEN_LIST_INSET)
-        }));
+    let mut list = column![].spacing(0);
+    for root in recents {
+        list = list.push(recent_repo_compact_row(ui, theme, root));
+    }
+    Some((header.into(), list.into()))
+}
+
+/// The folders under the typed path, headed by the folder being browsed.
+/// `None` when nothing matches (or the folder is still being read).
+fn folder_section<'a>(
+    ui: &'a Diffui,
+    theme: ThemeSpec,
+    dialog: &'a crate::OpenRepoDialog,
+    query: crate::path_browse::Query,
+    rows: Vec<&'a crate::path_browse::Entry>,
+) -> Option<(Element<'a, Message>, Element<'a, Message>)> {
+    if rows.is_empty() {
+        return None;
+    }
+    let header = container(
+        text(query.typed_dir)
+            .size(text_size::CAPTION)
+            .color(theme.subtle_text)
+            .font(ui.config.mono_font)
+            .width(Length::Fill)
+            .wrapping(text::Wrapping::None)
+            .ellipsis(text::Ellipsis::Middle),
+    )
+    .padding([0.0, OPEN_CONTENT_X]);
+
+    let mut list = column![].spacing(0);
+    for (index, entry) in rows.into_iter().enumerate() {
+        list = list.push(folder_row(
+            ui,
+            theme,
+            entry,
+            index,
+            dialog.selected == Some(index),
+        ));
+    }
+    Some((header.into(), list.into()))
+}
+
+/// One folder suggestion: glyph · name · a jj/git chip when the folder is a
+/// repository (which a click opens rather than browses into).
+fn folder_row<'a>(
+    ui: &'a Diffui,
+    theme: ThemeSpec,
+    entry: &'a crate::path_browse::Entry,
+    index: usize,
+    selected: bool,
+) -> Element<'a, Message> {
+    let mut content = row![
+        container(icons::icon(icons::FOLDER, ui::ICON_SIZE, theme.subtle_text))
+            .width(Length::Fixed(OPEN_GLYPH_BOX))
+            .center_x(Length::Fixed(OPEN_GLYPH_BOX)),
+        Space::new().width(Length::Fixed(OPEN_GLYPH_GAP)),
+        text(entry.name.as_str())
+            .size(text_size::BODY)
+            .color(theme.text)
+            .font(ui.config.ui_font)
+            .width(Length::Fill)
+            .wrapping(text::Wrapping::None)
+            .ellipsis(text::Ellipsis::End),
+    ]
+    .align_y(alignment::Vertical::Center);
+    if let Some(vcs) = entry.vcs {
+        content = content.push(vcs_badge(vcs, theme, ui.config.mono_font));
     }
 
-    container(body)
-        .width(Length::Fixed(OPEN_DIALOG_WIDTH))
-        .style(move |_| modal_style(theme))
+    button(content)
+        .width(Length::Fill)
+        .height(Length::Fixed(OPEN_ROW_HEIGHT))
+        .padding(Padding::from([0.0, OPEN_CONTENT_X - OPEN_LIST_INSET]))
+        .on_press(Message::Action(Action::OpenRepoPick(index)))
+        .style(move |_, status| button::Style {
+            background: (selected
+                || matches!(status, button::Status::Hovered | button::Status::Pressed))
+            .then_some(Background::Color(theme.selected_file)),
+            text_color: theme.text,
+            border: Border {
+                width: 0.0,
+                color: Color::TRANSPARENT,
+                radius: radius::CONTROL.into(),
+            },
+            shadow: Default::default(),
+            snap: true,
+        })
         .into()
 }
 

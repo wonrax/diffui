@@ -100,6 +100,8 @@ pub(crate) enum UiEvent {
     /// Swallow clicks on the open-repo card so they don't dismiss it.
     OpenRepoNoOp,
     OpenRepoPathChanged(String),
+    /// A folder the open-repo prompt is browsing finished reading.
+    OpenRepoListed(crate::path_browse::Listing),
     /// Revset input edited.
     RevsetChanged(String),
     SidebarWidthChanged(f32),

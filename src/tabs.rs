@@ -251,6 +251,78 @@ impl Diffui {
         }
     }
 
+    /// The open-repo prompt's path changed: drop the stale error and
+    /// highlight, and read the folder it now points into unless that listing
+    /// is already here or on its way.
+    pub(crate) fn set_open_repo_path(&mut self, path: String) -> Task<Message> {
+        let Some(dialog) = self.open_repo_dialog_mut() else {
+            return Task::none();
+        };
+        dialog.path = path;
+        dialog.error = None;
+        dialog.selected = None;
+        let Some(query) = path_browse::Query::parse(&dialog.path) else {
+            return Task::none();
+        };
+        if dialog
+            .listing
+            .as_ref()
+            .is_some_and(|listing| listing.dir == query.dir)
+        {
+            dialog.listed_query = Some(query);
+            return Task::none();
+        }
+        let dir = query.dir;
+        if dialog.listing_pending.as_ref() == Some(&dir) {
+            return Task::none();
+        }
+        dialog.listing_pending = Some(dir.clone());
+        // A folder can be slow to read (a network mount, a huge directory),
+        // and each entry is stat'ed to spot repositories.
+        Task::perform(
+            async move {
+                let fallback = dir.clone();
+                tokio::task::spawn_blocking(move || path_browse::list(dir))
+                    .await
+                    .unwrap_or_else(|_| path_browse::Listing {
+                        dir: fallback,
+                        entries: Vec::new(),
+                    })
+            },
+            |listing| Message::Ui(UiEvent::OpenRepoListed(listing)),
+        )
+    }
+
+    /// Replace the prompt's path from outside the field (a completion, a
+    /// clicked folder), keeping the field focused with the caret at the end.
+    pub(crate) fn browse_open_repo_path(&mut self, path: String) -> Task<Message> {
+        let list = self.set_open_repo_path(path);
+        Task::batch([
+            list,
+            widget::operation::focus(tab_bar::OPEN_REPO_INPUT_ID).chain(
+                widget::operation::move_cursor_to_end(tab_bar::OPEN_REPO_INPUT_ID),
+            ),
+        ])
+    }
+
+    /// Act on folder suggestion `row`: open it when it is a repository,
+    /// otherwise browse into it.
+    pub(crate) fn pick_open_repo_suggestion(&mut self, row: usize) -> Task<Message> {
+        let picked = self.open_repo_dialog().and_then(|dialog| {
+            let (query, rows) = dialog.suggestions()?;
+            let entry = rows.get(row)?;
+            Some(match entry.vcs {
+                Some(_) => Ok(query.path_of(entry)),
+                None => Err(query.complete(entry)),
+            })
+        });
+        match picked {
+            Some(Ok(repository)) => self.open_repository(&repository),
+            Some(Err(folder)) => self.browse_open_repo_path(folder),
+            None => Task::none(),
+        }
+    }
+
     /// Open `spec` as a GitHub-PR tab (or focus it if already open). The diff
     /// streams from the `gh` CLI; the tab has no local repository, so the
     /// graph/watcher/mutation machinery stays disabled (`repository`

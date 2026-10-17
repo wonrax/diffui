@@ -28,6 +28,7 @@ mod menus;
 mod message;
 mod modes;
 mod palette;
+mod path_browse;
 mod pointer;
 mod resize_handle;
 mod revision_list;
@@ -951,6 +952,34 @@ pub(crate) struct OpenRepoDialog {
     /// Populated when the last submit failed to resolve a repository, so the
     /// dialog stays open with the reason shown.
     pub(crate) error: Option<String>,
+    /// The subdirectories of the folder the path is in, once read. May lag
+    /// the path for a beat after it moves to another folder.
+    pub(crate) listing: Option<path_browse::Listing>,
+    /// The last path typed inside `listing`'s folder, so its rows stay up
+    /// while another folder is read instead of the list flashing empty.
+    pub(crate) listed_query: Option<path_browse::Query>,
+    /// The folder a read is in flight for, so typing within it doesn't
+    /// queue another.
+    pub(crate) listing_pending: Option<PathBuf>,
+    /// The highlighted suggestion; `None` until the arrows pick one, so a
+    /// plain Enter still opens what was typed.
+    pub(crate) selected: Option<usize>,
+}
+
+impl OpenRepoDialog {
+    /// The folders offered under the path, or `None` when the path doesn't
+    /// browse (empty, a PR reference, relative) or no folder has been read
+    /// yet, and the recents show instead.
+    pub(crate) fn suggestions(&self) -> Option<(path_browse::Query, Vec<&path_browse::Entry>)> {
+        let query = path_browse::Query::parse(&self.path)?;
+        let listing = self.listing.as_ref()?;
+        if listing.dir == query.dir {
+            let matches = query.matches(listing);
+            return Some((query, matches));
+        }
+        let listed = self.listed_query.as_ref()?;
+        Some((listed.clone(), listed.matches(listing)))
+    }
 }
 
 // Domain + orchestration types now live in `diffui-core`'s orchestration
@@ -1137,7 +1166,7 @@ pub(crate) fn contract_user_path(path: &str) -> String {
 /// Expand a leading `~` / `~/` to `$HOME` so the open-repo dialog accepts the
 /// shell-style paths users type. Everything else is passed through verbatim;
 /// `prepare_repository` canonicalizes from there.
-fn expand_user_path(input: &str) -> PathBuf {
+pub(crate) fn expand_user_path(input: &str) -> PathBuf {
     if input == "~" {
         if let Some(home) = std::env::var_os("HOME") {
             return PathBuf::from(home);

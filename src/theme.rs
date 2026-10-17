@@ -497,15 +497,15 @@ pub fn modal_top() -> f32 {
 /// rounding ([`crate::chip::RADIUS`]).
 pub mod radius {
     /// Inputs, hover washes, list/menu rows.
-    pub const CONTROL: f32 = 5.0;
+    pub const CONTROL: f32 = 7.0;
     /// Every button-shaped control (ghost, raised, primary, dialog) and
     /// the toolbar's segmented well — one rounding for everything that
     /// reads as a button.
     pub const BUTTON: f32 = 7.0;
     /// Inset row cards (revision/file selection).
-    pub const PUSH: f32 = 6.0;
+    pub const PUSH: f32 = 8.0;
     /// Floating cards: popovers, modals, and tooltips.
-    pub const SURFACE: f32 = 10.0;
+    pub const SURFACE: f32 = 12.0;
 }
 
 /// Ghost button: invisible at rest, translucent wash on hover/press. The
