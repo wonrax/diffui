@@ -50,14 +50,18 @@ pub async fn load_git_commits(
     // Explicit log arguments filter as supplied. The default includes other
     // worktree tips, including detached HEADs outside the current ancestry.
     let mut args = git_args(&["log", "--topo-order", "--no-color"]);
-    args.extend(revision_range.split_whitespace().map(OsString::from));
-    if revision_range.trim().is_empty() {
-        args.push(OsString::from("HEAD"));
-        args.extend(worktrees.iter().map(|tree| OsString::from(&tree.head)));
-    }
     args.push(OsString::from(
         "--pretty=format:%h%x09%H%x09%P%x09%an%x09%x09%s",
     ));
+    let user_args = log_range_args(revision_range)?;
+    if user_args.is_empty() {
+        args.push(OsString::from("HEAD"));
+        args.extend(worktrees.iter().map(|tree| OsString::from(&tree.head)));
+    } else {
+        args.extend(user_args);
+    }
+    // Everything above is revisions; never let a typo be read as a path.
+    args.push(OsString::from("--"));
     let output = run_command(&repository.root, "git", args).await?;
 
     let mut rows = parse_commit_log_rows(&output);
@@ -115,6 +119,77 @@ pub async fn load_git_commits(
         row.summary.bookmarks = labels.remove(&row.summary.commit_id).unwrap_or_default();
     }
     Ok(summaries)
+}
+
+/// `git log` options the revision field may carry, as `--name` or
+/// `--name=value`: revision selection and filtering only. Anything else —
+/// `--output=<file>` writes a file, `-p`/`--format` reshape what the parser
+/// reads — is refused rather than handed to git.
+const LOG_OPTIONS: &[&str] = &[
+    "--all",
+    "--branches",
+    "--tags",
+    "--remotes",
+    "--glob",
+    "--exclude",
+    "--not",
+    "--first-parent",
+    "--merges",
+    "--no-merges",
+    "--min-parents",
+    "--max-parents",
+    "--ancestry-path",
+    "--simplify-by-decoration",
+    "--author",
+    "--committer",
+    "--grep",
+    "--since",
+    "--after",
+    "--until",
+    "--before",
+    "--max-count",
+    "--skip",
+];
+
+/// Split the revision field into `git log` arguments, refusing any option not
+/// in [`LOG_OPTIONS`]. Order is kept: `--not` and the `--all`/`--branches`
+/// pseudo-revisions apply to what follows them, so options and revisions
+/// can't be separated by `--end-of-options`. A ref can never begin with `-`,
+/// so a leading dash always means an option. `-n N`, `-nN` and `-N` become
+/// `--max-count=N`.
+fn log_range_args(input: &str) -> Result<Vec<OsString>> {
+    let mut args = Vec::new();
+    let mut tokens = input.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if !token.starts_with('-') {
+            args.push(OsString::from(token));
+            continue;
+        }
+        let count = match token {
+            "-n" => Some(tokens.next().unwrap_or_default()),
+            _ => token
+                .strip_prefix("-n")
+                .or_else(|| token.strip_prefix('-'))
+                .filter(|count| !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit())),
+        };
+        if let Some(count) = count {
+            if count.is_empty() || !count.bytes().all(|b| b.is_ascii_digit()) {
+                bail!("`-n` needs a number");
+            }
+            args.push(OsString::from(format!("--max-count={count}")));
+            continue;
+        }
+        let name = token.split_once('=').map_or(token, |(name, _)| name);
+        if !LOG_OPTIONS.contains(&name) {
+            bail!(
+                "unsupported git log option `{token}`; the revision field takes revisions \
+                 and {}",
+                LOG_OPTIONS.join(", ")
+            );
+        }
+        args.push(OsString::from(token));
+    }
+    Ok(args)
 }
 
 #[derive(Debug)]
@@ -842,6 +917,37 @@ mod tests {
                 .rposition(|arg| *arg == "--no-optional-locks")
                 .expect("the lock flag");
             assert!(last_global < subcommand, "globals after {rendered:?}");
+        }
+    }
+
+    #[test]
+    fn the_revision_field_cannot_smuggle_options_into_git_log() {
+        let args = |input: &str| {
+            log_range_args(input).map(|args| {
+                args.into_iter()
+                    .map(|arg| arg.into_string().unwrap())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(
+            args("--all --not origin/main").unwrap(),
+            ["--all", "--not", "origin/main"]
+        );
+        assert_eq!(
+            args("main --author=me -n 20").unwrap(),
+            ["main", "--author=me", "--max-count=20"]
+        );
+        assert_eq!(args("-5 -n7").unwrap(), ["--max-count=5", "--max-count=7"]);
+        assert!(args("").unwrap().is_empty());
+        for hostile in [
+            "--output=/tmp/x",
+            "-p",
+            "--format=%H",
+            "-c",
+            "--exec=sh",
+            "-n x",
+        ] {
+            assert!(args(hostile).is_err(), "{hostile} must be refused");
         }
     }
 
