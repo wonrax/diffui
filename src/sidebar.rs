@@ -282,8 +282,9 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     };
     // The idle instruction lives in the verdict band below; the headline
     // only speaks up to refuse a target.
-    let state_hint: Option<(&'static str, Color)> = (armed_invalid || gap_invalid)
-        .then_some(("Can't target the revision being moved", theme.removed_text));
+    let state_hint: Option<(&'static str, Color)> = ((armed_invalid || gap_invalid)
+        && !matches!(draft.kind, DraftKind::Parallelize))
+    .then_some(("Can't target the revision being moved", theme.removed_text));
     let mut operation = row![
         icons::icon(glyph, 15.0, theme.accent),
         text(verb)

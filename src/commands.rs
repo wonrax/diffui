@@ -20,6 +20,7 @@ use diffui_core::{FetchTarget, RevisionSelection};
 
 use crate::action::Action;
 use crate::palette::{self, ResultRef};
+use crate::revops::{self, RevopsAction};
 use crate::theme::ThemePreference;
 use crate::{DetailField, Diffui, MainView, mutations};
 
@@ -225,7 +226,7 @@ fn row_present(ui: &Diffui, selection: &RevisionSelection) -> bool {
 
 /// A mutation is offered when the backend supports one (jj only) and every
 /// revision the command names is still on screen.
-fn can_mutate(ui: &Diffui, arg: &CommandArg) -> bool {
+pub(crate) fn can_mutate(ui: &Diffui, arg: &CommandArg) -> bool {
     if !ui.active().session.capabilities.mutate {
         return false;
     }
@@ -266,7 +267,7 @@ fn has_selected_file(ui: &Diffui, _: &CommandArg) -> bool {
 
 /// The revision a command acts on: the one its producer named, the one a
 /// palette result resolves to, or — for a bare chord — whatever is selected.
-fn target_revision(ui: &Diffui, arg: &CommandArg) -> Option<RevisionSelection> {
+pub(crate) fn target_revision(ui: &Diffui, arg: &CommandArg) -> Option<RevisionSelection> {
     match arg {
         CommandArg::Result(item) => palette::revision_selection(item, ui),
         _ => match arg.revision() {
@@ -825,6 +826,293 @@ pub(crate) static REGISTRY: &[Command] = &[
         enabled: always,
         build: |_ui, _arg| Some(Action::ClearMultiSelection),
         palette: PaletteScope::Hidden,
+    },
+    // ── Whole-revision ops: commit, new -A/-B, duplicate placement,
+    // divergent changes, author metadata, and the marked-set batch verbs ──
+    Command {
+        id: "revision.commit",
+        label: "Commit\u{2026}",
+        hint: "Describe the working copy and start a new change on top",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: revops::can_commit,
+        build: |_ui, _arg| Some(Action::Revops(RevopsAction::BeginCommit)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "revision.new-after",
+        label: "Insert new change after",
+        hint: "New change between this revision and its children",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: can_mutate,
+        build: |ui, arg| revops::insert_new_change(ui, arg, mutations::PlacementKind::After),
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "revision.new-before",
+        label: "Insert new change before",
+        hint: "New change between this revision and its parents",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: can_mutate,
+        build: |ui, arg| revops::insert_new_change(ui, arg, mutations::PlacementKind::Before),
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "revision.new.start",
+        label: "New change at\u{2026}",
+        hint: "Pick where a new change goes: onto, after or before a revision",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: can_mutate,
+        build: |ui, arg| revops::new_change_at(ui, arg, mutations::PlacementKind::Onto),
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "revision.duplicate.start",
+        label: "Duplicate onto\u{2026}",
+        hint: "Pick where a copy of this revision lands",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: can_mutate,
+        build: |ui, arg| draft(ui, arg, mutations::DraftKind::Duplicate),
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "revision.divergent.keep",
+        label: "Keep this divergent copy",
+        hint: "Abandon the change's other visible copies, ending the divergence",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: revops::is_divergent_target,
+        build: |ui, arg| {
+            target_revision(ui, &arg)
+                .map(|keep| Action::Mutate(mutations::MutationOp::KeepDivergent { keep }))
+        },
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "revision.divergent.abandon",
+        label: "Abandon this divergent copy",
+        hint: "Drop this copy of a divergent change, keeping the others",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: revops::is_divergent_target,
+        build: |ui, arg| {
+            target_revision(ui, &arg).map(|target| {
+                Action::Mutate(mutations::MutationOp::Abandon {
+                    targets: vec![target],
+                })
+            })
+        },
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "revision.reset-author",
+        label: "Reset author to me",
+        hint: "Set the author to the configured user (jj metaedit --update-author)",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: can_mutate,
+        build: |ui, arg| revops::metaedit(ui, arg, true, false),
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "revision.update-author-timestamp",
+        label: "Update author date to now",
+        hint: "jj metaedit --update-author-timestamp",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: can_mutate,
+        build: |ui, arg| revops::metaedit(ui, arg, false, true),
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "revision.parallelize.start",
+        label: "Parallelize with\u{2026}",
+        hint: "Pick revisions to make siblings of this one (space adds the candidate)",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: can_mutate,
+        build: |ui, arg| draft(ui, arg, mutations::DraftKind::Parallelize),
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "selection.toggle",
+        label: "Mark or unmark revision",
+        hint: "Add the revision to (or drop it from) the batch selection",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: can_mutate,
+        build: |ui, arg| {
+            target_revision(ui, &arg).map(|target| Action::Revops(RevopsAction::ToggleMark(target)))
+        },
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "selection.rebase.start",
+        label: "Rebase marked revisions onto\u{2026}",
+        hint: "Pick a destination for every marked revision",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: revops::batch_of_one,
+        build: |ui, arg| {
+            revops::batch_draft(
+                ui,
+                &arg,
+                mutations::DraftKind::Rebase {
+                    mode: mutations::RebaseSourceMode::Revisions,
+                },
+            )
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "selection.rebase.descendants.start",
+        label: "Rebase marked revisions with descendants onto\u{2026}",
+        hint: "Move every marked revision and everything under it",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: revops::batch_of_one,
+        build: |ui, arg| {
+            revops::batch_draft(
+                ui,
+                &arg,
+                mutations::DraftKind::Rebase {
+                    mode: mutations::RebaseSourceMode::WithDescendants,
+                },
+            )
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "selection.squash.start",
+        label: "Squash marked revisions into\u{2026}",
+        hint: "Fold every marked revision into a picked one",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: revops::batch_of_one,
+        build: |ui, arg| revops::batch_draft(ui, &arg, mutations::DraftKind::Squash),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "selection.duplicate",
+        label: "Duplicate marked revisions",
+        hint: "Copy every marked revision onto its own parents",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: revops::batch_of_one,
+        build: |ui, arg| {
+            Some(Action::Mutate(mutations::MutationOp::DuplicateTo {
+                targets: revops::batch(ui, &arg),
+                destination: None,
+            }))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "selection.duplicate.start",
+        label: "Duplicate marked revisions onto\u{2026}",
+        hint: "Pick where copies of the marked revisions land",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: revops::batch_of_one,
+        build: |ui, arg| revops::batch_draft(ui, &arg, mutations::DraftKind::Duplicate),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "selection.new-merge",
+        label: "New change on marked revisions",
+        hint: "A merge commit with every marked revision as a parent",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: revops::batch_of_two,
+        build: |ui, arg| {
+            Some(Action::Mutate(mutations::MutationOp::Merge {
+                parents: revops::batch(ui, &arg),
+            }))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "selection.parallelize",
+        label: "Parallelize marked revisions\u{2026}",
+        hint: "Make the marked revisions siblings, previewing new conflicts",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: revops::batch_of_two,
+        build: |ui, arg| revops::batch_draft(ui, &arg, mutations::DraftKind::Parallelize),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "selection.abandon",
+        label: "Abandon marked revisions",
+        hint: "Drop every marked revision, keeping their descendants",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: revops::batch_of_one,
+        build: |ui, arg| {
+            Some(Action::Mutate(mutations::MutationOp::Abandon {
+                targets: revops::batch(ui, &arg),
+            }))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "selection.reset-author",
+        label: "Reset author to me on marked revisions",
+        hint: "jj metaedit --update-author on every marked revision",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: revops::batch_of_one,
+        build: |ui, arg| {
+            revops::metaedit(
+                ui,
+                CommandArg::Revisions(revops::batch(ui, &arg)),
+                true,
+                false,
+            )
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "selection.update-author-timestamp",
+        label: "Update author date on marked revisions",
+        hint: "jj metaedit --update-author-timestamp on every marked revision",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: revops::batch_of_one,
+        build: |ui, arg| {
+            revops::metaedit(
+                ui,
+                CommandArg::Revisions(revops::batch(ui, &arg)),
+                false,
+                true,
+            )
+        },
+        palette: PaletteScope::Root,
     },
     // ── Bookmarks ───────────────────────────────────────────────────────
     Command {

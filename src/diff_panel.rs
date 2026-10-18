@@ -504,7 +504,11 @@ fn build_description_editor<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a,
         let input_padding = Padding::from([DESCRIPTION_EDITOR_PADDING_Y, 12.0]);
         let mut input = text_editor(&editor.content)
             .id(iced::widget::Id::new(DESCRIPTION_EDITOR_ID))
-            .placeholder("Describe this revision…")
+            .placeholder(if editor.commit {
+                "Describe the change you are committing…"
+            } else {
+                "Describe this revision…"
+            })
             .size(ui.config.code_type.size)
             .font(ui.config.mono_font)
             .line_height(text::LineHeight::Relative(
@@ -551,8 +555,14 @@ fn build_description_editor<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a,
         )
         .on_press_maybe((!saving).then_some(Message::Action(Action::CancelDescription)));
 
-        let save_enabled = !saving && editor.is_dirty();
-        let save_label = if saving { "Saving…" } else { "Save" };
+        // A commit may keep the description as it stands.
+        let save_enabled = !saving && (editor.is_dirty() || editor.commit);
+        let save_label = match (saving, editor.commit) {
+            (true, true) => "Committing…",
+            (true, false) => "Saving…",
+            (false, true) => "Commit",
+            (false, false) => "Save",
+        };
         let save = ui::text_button(
             None,
             save_label,
@@ -570,6 +580,12 @@ fn build_description_editor<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a,
                 .size(text_size::UI)
                 .font(ui.config.ui_font)
                 .color(theme.note_text)
+                .into()
+        } else if editor.commit {
+            text("Then starts a new change on top")
+                .size(text_size::UI)
+                .font(ui.config.ui_font)
+                .color(theme.subtle_text)
                 .into()
         } else {
             Space::new().into()

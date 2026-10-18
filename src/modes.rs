@@ -460,6 +460,7 @@ mod stack_tests {
                 content: iced::widget::text_editor::Content::new(),
                 saving_activity: None,
                 switch_blocked: false,
+                commit: false,
             }));
 
         let _ = ui.activate_tab(second);

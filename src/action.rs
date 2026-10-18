@@ -158,4 +158,7 @@ pub(crate) enum Action {
 
     /// Open a URL (from an activity's captured remote output) in the browser.
     OpenUrl(String),
+
+    /// Commit, placed new / duplicate, batch drafts — see [`crate::revops`].
+    Revops(crate::revops::RevopsAction),
 }

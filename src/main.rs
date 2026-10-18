@@ -492,6 +492,9 @@ pub(crate) struct DescriptionEditor {
     /// draft is editable.
     pub(crate) saving_activity: Option<activity::ActivityId>,
     pub(crate) switch_blocked: bool,
+    /// Commit mode ("Commit…"): saving runs `jj commit` — describe `@` and
+    /// start a new change on top — instead of a plain describe.
+    pub(crate) commit: bool,
 }
 
 impl DescriptionEditor {
@@ -717,6 +720,9 @@ pub(crate) struct TabState {
     /// Cleared on plain click, Esc, and draft start; ids whose rows left the
     /// loaded graph are ignored at use rather than eagerly pruned.
     pub(crate) revision_multi_selection: Vec<String>,
+    /// The pending description edit is a "Commit…" — the editor opens in
+    /// commit mode.
+    pub(crate) pending_commit: bool,
 }
 
 impl TabState {
@@ -752,6 +758,7 @@ impl TabState {
             pending_description_edit: None,
             pending_detail_copy: None,
             revision_multi_selection: Vec::new(),
+            pending_commit: false,
         }
     }
 

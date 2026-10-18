@@ -352,7 +352,12 @@ impl Diffui {
             return Task::none();
         }
         self.active_mut().pending_description_edit = None;
-        self.open_description_editor()
+        let commit = std::mem::take(&mut self.active_mut().pending_commit);
+        let task = self.open_description_editor();
+        if commit && let Some(editor) = self.active_mut().description_editor_mut() {
+            editor.commit = true;
+        }
+        task
     }
 
     /// The commit id under `tab`'s draft destination candidate, if it has one.
@@ -1106,6 +1111,7 @@ impl Diffui {
                 open_url(&url);
                 Task::none()
             }
+            Action::Revops(action) => self.perform_revops(action),
         }
     }
 
@@ -2044,7 +2050,7 @@ impl Diffui {
     }
 
     /// Browse `selection`: the plain-click / palette-jump path.
-    fn select_revision(&mut self, selection: RevisionSelection) -> Task<Message> {
+    pub(crate) fn select_revision(&mut self, selection: RevisionSelection) -> Task<Message> {
         let target = self.active_mut();
         target.revision_multi_selection.clear();
         if target.session.selected_revision != selection {
@@ -2214,7 +2220,7 @@ impl Diffui {
     }
 
     /// Turn the selected revision's description strip into its inline editor.
-    fn open_description_editor(&mut self) -> Task<Message> {
+    pub(crate) fn open_description_editor(&mut self) -> Task<Message> {
         let target = self.active_mut();
         if target
             .description_editor()
@@ -2246,6 +2252,7 @@ impl Diffui {
             content: widget::text_editor::Content::with_text(&description),
             saving_activity: None,
             switch_blocked: false,
+            commit: false,
         };
         target.push_mode(TabMode::Description(editor));
         self.scroll_restore_token = self.scroll_restore_token.wrapping_add(1);
@@ -2255,6 +2262,7 @@ impl Diffui {
     /// Open the description editor on `target`, browsing to it first when it
     /// isn't the revision on screen.
     fn edit_description(&mut self, target: RevisionSelection) -> Task<Message> {
+        self.active_mut().pending_commit = false;
         if self.active().session.selected_revision == target {
             return self.open_description_editor();
         }
@@ -2275,14 +2283,12 @@ impl Diffui {
         let Some(editor) = self.active().description_editor() else {
             return Task::none();
         };
-        if editor.saving_activity.is_some() || !editor.is_dirty() {
+        // A commit may keep the description as it stands.
+        if editor.saving_activity.is_some() || !(editor.is_dirty() || editor.commit) {
             return Task::none();
         }
-        let op = mutations::MutationOp::Describe {
-            target: editor.target.clone(),
-            description: editor.text().trim_end().to_owned(),
-        };
-        let (activity_id, _) = self.begin_activity(tab_id, "Update description", false);
+        let (op, label) = crate::revops::description_save_op(editor);
+        let (activity_id, _) = self.begin_activity(tab_id, label, false);
         if let Some(editor) = self.active_mut().description_editor_mut() {
             editor.saving_activity = Some(activity_id);
             editor.switch_blocked = false;
@@ -3836,6 +3842,14 @@ impl Diffui {
     /// removed — a sourceless draft means nothing; esc is the way out. The
     /// destination still arrives via the normal confirm.
     pub(crate) fn draft_toggle_source(&mut self, selection: RevisionSelection) -> Task<Message> {
+        // A new change has no sources to stack.
+        if self
+            .active()
+            .op_draft()
+            .is_some_and(|ui| ui.draft.kind == mutations::DraftKind::New)
+        {
+            return Task::none();
+        }
         let Some(source) = self.draft_source_for(&selection) else {
             return Task::none();
         };

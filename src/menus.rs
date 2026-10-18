@@ -82,20 +82,7 @@ impl Diffui {
             RevisionSelection::Commit(hex) => Some(hex.clone()),
         };
         if marked.len() > 1 && clicked_id.as_deref().is_some_and(|id| marked.contains(&id)) {
-            return vec![
-                self.menu_row(
-                    format!("Abandon {} revisions", marked.len()),
-                    "revision.abandon",
-                    CommandArg::Revisions(
-                        marked
-                            .iter()
-                            .map(|id| RevisionSelection::Commit((*id).to_owned()))
-                            .collect(),
-                    ),
-                ),
-                MenuEntry::Separator,
-                self.menu_item("selection.clear", CommandArg::None),
-            ];
+            return self.batch_menu_tree(crate::revops::marked_selections(self));
         }
 
         let on = || CommandArg::Revision(selection.clone());
@@ -104,6 +91,9 @@ impl Diffui {
             MenuEntry::Separator,
             self.menu_item("revision.new-child", on()),
             self.menu_item("revision.edit", on()),
+        ];
+        top.extend(self.revops_menu_rows(selection));
+        top.extend([
             MenuEntry::Separator,
             // History surgery, grouped: multi-variant ops fold into submenus;
             // the "…" leaves enter target mode (pick the destination on the
@@ -124,7 +114,10 @@ impl Diffui {
                 ],
             },
             self.menu_item("revision.merge.start", on()),
-            self.menu_item("revision.duplicate", on()),
+            self.menu_item("revision.parallelize.start", on()),
+        ]);
+        top.extend(self.revops_surgery_rows(selection));
+        top.extend([
             self.menu_item("revision.absorb", on()),
             self.menu_item("revision.abandon", on()),
             MenuEntry::Separator,
@@ -135,7 +128,7 @@ impl Diffui {
                     path: None,
                 },
             ),
-        ];
+        ]);
 
         // Copy revision metadata — values come from the loaded graph row.
         let copy_fields = {
@@ -516,7 +509,7 @@ impl Diffui {
         );
         // A batch abandon consumes the marked rows — the marks (and their
         // wash) mustn't outlive the pick.
-        if matches!(&op, MutationOp::Abandon { targets } if targets.len() > 1) {
+        if crate::revops::consumes_marks(self, &op) {
             self.active_mut().revision_multi_selection.clear();
         }
         let (activity_id, _) = self.begin_activity(tab_id, label, determinate);
