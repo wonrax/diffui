@@ -53,22 +53,25 @@ impl Diffui {
         );
         let window_position = saved.position().map(|(x, y)| Point::new(x, y));
 
-        // Launch precedence: explicit `--path` args win; else restore last
-        // session; else fall back to the current directory *only if it's a
-        // repo* (the `cd repo && diffui` terminal flow). A `--path` arg is a
-        // GitHub PR reference (URL / `owner/repo#123`) or a repository path;
-        // session and cwd entries are always local repos (PR tabs are
-        // session-only and never persisted). Only `--path` failures surface
-        // an error — the user named those this launch. A vanished session
-        // repo or a non-repo cwd (e.g. `/` from the Spotlight/Dock launcher)
-        // is silently skipped, leaving zero tabs and the welcome screen
-        // rather than a "not inside a repository" error.
+        // Launch precedence: paths named on the command line (`diffui .`,
+        // `--path`) win; else restore the last session, plus the current
+        // directory when it is inside a repository (the `cd repo && diffui`
+        // terminal flow), which is added if the session lacks it and
+        // focused either way. A named path is a GitHub PR reference (URL /
+        // `owner/repo#123`) or a repository path; session and cwd entries are
+        // always local repos (PR tabs are session-only and never persisted).
+        // Only named-path failures surface an error — the user named those
+        // this launch. A vanished session repo or a non-repo cwd (e.g. `/`
+        // from the Finder/Dock launcher) is silently skipped, leaving the
+        // session or the welcome screen rather than a "not inside a
+        // repository" error.
         enum BootTarget {
             Repo(Repository),
             Pr(github::PrSpec),
         }
         let mut targets: Vec<BootTarget> = Vec::new();
         let mut first_error = None;
+        let mut cwd_root = None;
         // Two `--path`s (or two saved entries) can resolve to the same root —
         // a plain repeat, or two spellings of one path. Opening it twice would
         // give the repo two tabs racing the same working copy, so keep the
@@ -82,8 +85,8 @@ impl Diffui {
                 targets.push(BootTarget::Repo(repository));
             }
         }
-        if !cli.paths.is_empty() {
-            for path in &cli.paths {
+        if cli.requested_paths().next().is_some() {
+            for path in cli.requested_paths() {
                 if let Some(spec) = github::PrSpec::parse(&path.to_string_lossy()) {
                     if !targets
                         .iter()
@@ -108,19 +111,22 @@ impl Diffui {
                     push_repo(&mut targets, repository);
                 }
             }
-            if targets.is_empty()
-                && let Ok(cwd) = std::env::current_dir()
+            // A Finder/Dock launch starts in `/`, which is never what the user
+            // meant to open.
+            if let Ok(cwd) = std::env::current_dir()
+                && cwd.parent().is_some()
                 && let Ok(repository) = prepare_repository(&cwd)
             {
+                cwd_root = Some(repository.root.to_string_lossy().into_owned());
                 push_repo(&mut targets, repository);
             }
         }
 
-        // Re-focus the tab that was active last session (matched by repo root),
-        // falling back to the first.
-        let active_index = saved
-            .active_repo
+        // Focus the repository the terminal is in, else the tab that was
+        // active last session (matched by repo root), else the first.
+        let active_index = cwd_root
             .as_deref()
+            .or(saved.active_repo.as_deref())
             .and_then(|active| {
                 targets.iter().position(|target| match target {
                     BootTarget::Repo(repository) => repository.root.to_string_lossy() == active,

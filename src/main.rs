@@ -195,19 +195,6 @@ fn main() -> iced::Result {
         tracing::info!("{repair}");
     }
 
-    // Positional paths are reserved for a future file-diff mode
-    // (`diffui SIDE_1 SIDE_2`) and aren't implemented yet. Reject them up front
-    // with a pointer to `--path`, so the pre-existing `diffui <repo>` muscle
-    // memory gets a clear nudge instead of silently doing nothing.
-    if !cli.diff_args.is_empty() {
-        eprintln!(
-            "diffui: file diff (diffui <side1> <side2>) isn't supported yet — \
-             positional paths are reserved for it."
-        );
-        eprintln!("        to open a repository, use: diffui --path <repo>");
-        std::process::exit(2);
-    }
-
     // Restore the last window geometry before the window is created. The
     // sidebar split lives in app state, so it's restored later in
     // `Diffui::new`; `saved` is handed to the boot closure for that.
@@ -246,18 +233,23 @@ fn main() -> iced::Result {
 #[derive(Debug, Clone, Parser)]
 #[command(version, about = "Native GUI diff viewer for jj and git")]
 struct Cli {
-    /// Repository path to open as a tab; repeat to open several. When omitted,
-    /// diffui restores your last session, falls back to the current directory
-    /// if it's a repository, and otherwise opens the welcome screen.
+    /// Repository path (or GitHub PR reference) to open as a tab; repeat to
+    /// open several. Same as passing it positionally.
     #[arg(short = 'p', long = "path", value_name = "REPO")]
     paths: Vec<PathBuf>,
 
-    /// Reserved for a future file/dir diff mode (`diffui SIDE_1 SIDE_2`); not
-    /// wired up yet. Kept as a positional (hidden from `--help`) so the old
-    /// `diffui <repo>` habit gets a clear pointer to `--path` rather than
-    /// silently opening the wrong thing — see the guard in `main`.
-    #[arg(value_name = "PATH", hide = true)]
-    diff_args: Vec<PathBuf>,
+    /// Repositories (or GitHub PR references) to open, e.g. `diffui .`. With
+    /// none, diffui restores your last session and, when started inside a
+    /// repository, opens and focuses that one too.
+    #[arg(value_name = "REPO")]
+    repos: Vec<PathBuf>,
+}
+
+impl Cli {
+    /// Everything named on the command line, flag or positional, in order.
+    fn requested_paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.paths.iter().chain(&self.repos)
+    }
 }
 
 /// A revision mutation on its way to the repository actor. The actor is
