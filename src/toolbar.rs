@@ -102,6 +102,13 @@ pub fn build_toolbar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
                 theme,
                 font,
             ));
+            actions = actions.push(toolbar_button(
+                icons::REDO,
+                "Redo",
+                Message::Action(Action::Redo),
+                theme,
+                font,
+            ));
         }
     }
 

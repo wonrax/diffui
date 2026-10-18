@@ -125,8 +125,16 @@ impl Chord {
         let mut mods = Mods::from_modifiers(modifiers);
         let key = match key.as_ref() {
             keyboard::Key::Character(c) => {
+                // Shift lives in the character. Some ⌘-combos arrive with the
+                // unshifted letter (⌘⇧Z as `z` + shift); fold the shift in so
+                // they don't resolve as the unshifted chord.
+                let c = if mods.shift && c.chars().all(|c| c.is_ascii_lowercase()) {
+                    c.to_ascii_uppercase()
+                } else {
+                    c.to_owned()
+                };
                 mods.shift = false;
-                ChordKey::Char(c.to_owned())
+                ChordKey::Char(c)
             }
             keyboard::Key::Named(named) => ChordKey::Named(named),
             keyboard::Key::Unidentified => return None,
@@ -572,6 +580,25 @@ mod tests {
                 &event(keyboard::Modifiers::COMMAND | keyboard::Modifiers::ALT)
             ),
             None
+        );
+    }
+
+    /// ⌘⇧Z can arrive as the unshifted `z` plus shift; it must still be redo,
+    /// not fall back to ⌘Z's undo.
+    #[test]
+    fn a_shifted_letter_resolves_as_its_capital() {
+        let map = Keymap::build(&RawKeys::default()).0;
+        let z = keyboard::Key::Character("z".into());
+        let resolve = |modifiers| {
+            map.resolve(
+                Context::Base,
+                &Chord::from_event(&z, modifiers).expect("a bindable key"),
+            )
+        };
+        assert_eq!(resolve(keyboard::Modifiers::COMMAND), Some("repo.undo"));
+        assert_eq!(
+            resolve(keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT),
+            Some("repo.redo")
         );
     }
 

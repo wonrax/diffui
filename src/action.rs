@@ -112,7 +112,8 @@ pub(crate) enum Action {
     Refresh,
     Fetch(FetchTarget),
     Undo,
-    /// Revert exactly this jj operation (an activity row's "Undo").
+    Redo,
+    /// Revert exactly this jj operation (an activity row's "Revert").
     UndoOperation(activity::ActivityId, String),
     /// Replace the revset and re-evaluate.
     SetRevset(String),

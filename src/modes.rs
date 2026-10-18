@@ -138,13 +138,23 @@ pub(crate) fn passes_through(context: Context, chord: &Chord) -> bool {
 /// exempt in target mode: leaving the mode has to work from inside that box.
 pub(crate) fn needs_unconsumed(context: Context, chord: &Chord) -> bool {
     match context {
-        Context::Base => !chord.mods.any_command_like(),
+        Context::Base => !chord.mods.any_command_like() || is_text_undo(chord),
         Context::Draft => {
-            !chord.mods.any_command_like()
-                && !matches!(chord.key, ChordKey::Named(keyboard::key::Named::Escape))
+            (!chord.mods.any_command_like()
+                && !matches!(chord.key, ChordKey::Named(keyboard::key::Named::Escape)))
+                || is_text_undo(chord)
         }
         _ => false,
     }
+}
+
+/// ⌘Z / ⌘⇧Z: a focused text field (the revset box) takes them as its own
+/// undo/redo and reports the key consumed, and they must not also undo a jj
+/// operation behind the user's back.
+fn is_text_undo(chord: &Chord) -> bool {
+    chord.mods.command
+        && !chord.mods.alt
+        && matches!(&chord.key, ChordKey::Char(c) if c.eq_ignore_ascii_case("z"))
 }
 
 impl Diffui {

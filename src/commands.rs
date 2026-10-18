@@ -446,13 +446,28 @@ pub(crate) static REGISTRY: &[Command] = &[
     Command {
         id: "repo.undo",
         label: "Undo",
-        hint: "Revert the latest jj operation",
+        hint: "Step back one jj operation (jj undo); file saves are kept",
+        // Target mode hands ⌘-chords down to the base context, so ⌘Z there
+        // undoes too. A focused text field keeps ⌘Z for its own text — see
+        // `modes::needs_unconsumed`.
         contexts: &[Context::Base],
-        chords: &[],
+        chords: &["cmd+z"],
         mac_chords: &[],
         enabled: can_mutate,
         build: |_ui, _arg| Some(Action::Undo),
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "repo.redo",
+        label: "Redo",
+        hint: "Re-apply what the last undo took back (jj redo)",
+        contexts: &[Context::Base],
+        // ⇧ lives in the character: ⌘⇧Z arrives as `cmd+Z`.
+        chords: &["cmd+Z"],
+        mac_chords: &[],
+        enabled: can_mutate,
+        build: |_ui, _arg| Some(Action::Redo),
+        palette: PaletteScope::Root,
     },
     Command {
         id: "repo.set-revset",

@@ -989,6 +989,7 @@ impl Diffui {
             }
             Action::Fetch(target) => self.start_fetch(target),
             Action::Undo => self.start_undo(),
+            Action::Redo => self.start_redo(),
             Action::UndoOperation(activity_id, operation_id) => {
                 let Some(tab_id) = self.active_tab_id() else {
                     return Task::none();
@@ -4238,6 +4239,14 @@ impl Diffui {
             return Task::none();
         }
         self.start_mutation_op(mutations::MutationOp::Undo { operation_id: None })
+    }
+
+    /// Toolbar "Redo": re-apply what the latest undo took back (`jj redo`).
+    pub(crate) fn start_redo(&mut self) -> Task<Message> {
+        if !self.active().session.capabilities.mutate {
+            return Task::none();
+        }
+        self.start_mutation_op(mutations::MutationOp::Redo)
     }
 
     /// The revset preset menu entries as `(label, expression)`: the active

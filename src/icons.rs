@@ -76,6 +76,7 @@ pub fn svg_icon<'a, Message: 'a>(
 
 pub const REFRESH: &str = "\u{e145}"; // refresh-cw
 pub const UNDO: &str = "\u{e2a1}"; // undo-2
+pub const REDO: &str = "\u{e2a0}"; // redo-2
 pub const WRAP: &str = "\u{e248}"; // wrap-text
 pub const SPLIT: &str = "\u{e098}"; // columns-2
 pub const FETCH: &str = "\u{e0b2}"; // download
