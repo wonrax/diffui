@@ -727,7 +727,8 @@ pub fn rewritten_targets(
         | MutationOp::DeleteBookmark { .. }
         | MutationOp::TrackBookmark { .. }
         | MutationOp::PushBookmark { .. }
-        | MutationOp::Undo { .. } => {}
+        | MutationOp::Undo { .. }
+        | MutationOp::Redo => {}
     }
     targets
 }

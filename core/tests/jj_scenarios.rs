@@ -1941,3 +1941,170 @@ fn move_bookmark_with_push_updates_the_remote() {
         "the remote itself received the new position"
     );
 }
+
+fn try_run(root: &Path, op: MutationOp) -> Result<mutations::MutationOutcome, RepoError> {
+    block_on(run_mutation(
+        repository(root),
+        op,
+        LoadProgress::default(),
+        false,
+    ))
+}
+
+fn wc_description(root: &Path) -> String {
+    harness::full_description(root, &commit_id(root, "@"))
+}
+
+const UNDO: MutationOp = MutationOp::Undo { operation_id: None };
+
+/// jj 0.45's undo walks back one operation per press and redo walks forward
+/// again, and both write jj's own descriptions, so the CLI continues the same
+/// stack. diffui's undo used to undo the undo instead (a redo), nesting
+/// "Undid: diffui: Undid: …" descriptions as it went.
+#[test]
+fn undo_walks_back_and_redo_walks_forward() {
+    let root = scratch_repo("undo-redo-stack");
+    write(&root, "file.txt", "one\n");
+    snapshot(&root);
+    run(
+        &root,
+        MutationOp::Describe {
+            target: RevisionSelection::WorkingCopy,
+            description: "first\n".to_owned(),
+        },
+    );
+    run(
+        &root,
+        MutationOp::Describe {
+            target: RevisionSelection::WorkingCopy,
+            description: "second\n".to_owned(),
+        },
+    );
+
+    let outcome = run(&root, UNDO);
+    assert!(
+        outcome
+            .message
+            .starts_with("Undid: Updated description for"),
+        "names the undone operation without diffui's tag: {}",
+        outcome.message
+    );
+    assert_eq!(wc_description(&root), "first\n");
+    run(&root, UNDO);
+    assert_eq!(
+        wc_description(&root),
+        "",
+        "a second undo steps further back"
+    );
+
+    let log = harness::operation_log(&root);
+    let (head, _) = &log[0];
+    assert!(
+        head.starts_with("undo: restore to operation "),
+        "jj's own description, so `jj undo` continues the stack: {head:?}"
+    );
+    assert!(
+        log.iter()
+            .all(|(description, _)| !description.contains("Undid")),
+        "nothing nests: {log:?}"
+    );
+
+    run(&root, MutationOp::Redo);
+    assert_eq!(wc_description(&root), "first\n");
+    run(&root, MutationOp::Redo);
+    assert_eq!(wc_description(&root), "second\n");
+    let error = try_run(&root, MutationOp::Redo).expect_err("the stack is exhausted");
+    assert!(
+        error.to_string().contains("nothing to redo"),
+        "unexpected error: {error}"
+    );
+    assert!(!any_divergent(&root, "all()"));
+
+    // A real operation on top ends the redo stack, as in jj.
+    run(&root, UNDO);
+    run(
+        &root,
+        MutationOp::Describe {
+            target: RevisionSelection::WorkingCopy,
+            description: "third\n".to_owned(),
+        },
+    );
+    assert!(try_run(&root, MutationOp::Redo).is_err());
+}
+
+/// diffui snapshots on every save, and the CLI's undo would undo the latest
+/// snapshot — the save. Undo skips snapshot operations and carries the edits
+/// they recorded onto the restored `@`.
+#[test]
+fn undo_skips_file_saves_and_keeps_their_edits() {
+    let root = scratch_repo("undo-skips-saves");
+    write(&root, "file.txt", "base\n");
+    snapshot(&root);
+    run(
+        &root,
+        MutationOp::Describe {
+            target: RevisionSelection::WorkingCopy,
+            description: "described\n".to_owned(),
+        },
+    );
+    // Two saves, each its own snapshot op, and one still unsnapshotted.
+    write(&root, "file.txt", "base\nsaved\n");
+    snapshot(&root);
+    write(&root, "other.txt", "saved too\n");
+    snapshot(&root);
+    write(&root, "late.txt", "not yet snapshotted\n");
+
+    let outcome = run(&root, UNDO);
+    assert!(
+        outcome.message.starts_with("Undid: Updated description"),
+        "the describe is what's undone, not a save: {}",
+        outcome.message
+    );
+    assert_eq!(wc_description(&root), "", "the describe was undone");
+    let paths = diff_paths(&root, RevisionSelection::WorkingCopy);
+    for path in ["file.txt", "other.txt", "late.txt"] {
+        assert!(paths.iter().any(|p| p == path), "{path} kept: {paths:?}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.join("file.txt")).expect("read"),
+        "base\nsaved\n"
+    );
+    assert!(!any_divergent(&root, "all()"));
+
+    // And redo brings the description back, still keeping the edits.
+    run(&root, MutationOp::Redo);
+    assert_eq!(wc_description(&root), "described\n");
+    let paths = diff_paths(&root, RevisionSelection::WorkingCopy);
+    assert!(paths.iter().any(|p| p == "late.txt"), "{paths:?}");
+}
+
+/// Undoing a `new` after typing into the new change puts `@` back where it
+/// was — with the edits carried along rather than left behind in a commit
+/// that just disappeared from the graph.
+#[test]
+fn undoing_new_carries_the_edits_back() {
+    let root = scratch_repo("undo-new-carries");
+    write(&root, "file.txt", "base\n");
+    commit(&root, "base");
+    let before = change_id(&root, "@");
+    run(
+        &root,
+        MutationOp::New {
+            parent: RevisionSelection::WorkingCopy,
+        },
+    );
+    write(&root, "file.txt", "base\ntyped after new\n");
+    snapshot(&root);
+
+    run(&root, UNDO);
+    assert_eq!(
+        change_id(&root, "@"),
+        before,
+        "`@` is back on its old change"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("file.txt")).expect("read"),
+        "base\ntyped after new\n"
+    );
+    assert!(!any_divergent(&root, "all()"));
+}

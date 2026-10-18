@@ -13,6 +13,7 @@ pub(crate) mod mutate;
 pub(crate) mod preview;
 pub(crate) mod remote;
 pub(crate) mod settings;
+pub(crate) mod undo;
 pub(crate) mod walk;
 pub(crate) mod workspace;
 

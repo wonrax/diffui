@@ -120,13 +120,23 @@ pub enum MutationOp {
     TrackBookmark { name: String, remote: String },
     /// Push local bookmark `name` to `remote` (`jj git push -b <name>`).
     PushBookmark { name: String, remote: String },
-    /// Revert what one operation did (`jj undo [<op>]`): the given operation
-    /// id, or — when `None` — the latest meaningful op (background snapshot
-    /// ops are skipped). Routed through the same mutation pipeline as
-    /// everything else so it serializes behind the queue and gets the
-    /// snapshot-before-mutate discipline (an undo that moves `@` must not
-    /// clobber unsnapshotted on-disk edits).
+    /// `None`: `jj undo` — step back one operation, walking further back on
+    /// each repeat (jj 0.45's undo stack, recorded in the op descriptions so
+    /// the CLI and diffui share it). Snapshot ops are skipped, and file edits
+    /// they recorded since the undone op are carried onto the restored `@`.
+    ///
+    /// `Some(op)`: `jj op revert <op>` — undo exactly that operation and keep
+    /// everything since (an activity row's per-operation Undo).
+    ///
+    /// Routed through the same mutation pipeline as everything else so it
+    /// serializes behind the queue and gets the snapshot-before-mutate
+    /// discipline (an undo that moves `@` must not clobber unsnapshotted
+    /// on-disk edits).
     Undo { operation_id: Option<String> },
+    /// `jj redo`: re-apply what the latest undo took back; repeated, walk
+    /// forward through earlier undos. Fails with "nothing to redo" once a real
+    /// operation has landed on top of the undos.
+    Redo,
 }
 
 /// User-facing summary of a successful mutation — becomes the status message.

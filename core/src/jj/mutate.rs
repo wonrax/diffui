@@ -279,14 +279,19 @@ async fn mutate_locked(
     let new_tree = locked.tree.clone();
     let workspace_name = workspace_name.to_owned();
 
-    // An undo has to know its target *before* the pre-undo fold is committed:
-    // resolving it can fail (a merge operation has no single parent to undo
-    // to), and bailing after the fold left a snapshot op in the log with the
-    // lock unfinished — `@` divergent, and the user staring at an error.
-    let undo_target = match op {
-        MutationOp::Undo { operation_id } => Some(
-            resolve_undo_target(&repo_loader.clone(), &base_repo, operation_id.as_deref()).await?,
-        ),
+    // An undo, redo or revert has to know its target *before* the pre-op fold
+    // is committed: resolving it can fail (a merge operation has no single
+    // parent to undo to, there may be nothing to redo), and bailing after the
+    // fold left a snapshot op in the log with the lock unfinished — `@`
+    // divergent, and the user staring at an error.
+    let op_plan = match op {
+        MutationOp::Undo {
+            operation_id: Some(hex),
+        } => Some(super::undo::plan_revert(repo_loader, &base_repo, hex).await?),
+        MutationOp::Undo { operation_id: None } => {
+            Some(super::undo::plan_undo(repo_loader, base_repo.operation()).await?)
+        }
+        MutationOp::Redo => Some(super::undo::plan_redo(repo_loader, base_repo.operation()).await?),
         _ => None,
     };
 
@@ -295,10 +300,11 @@ async fn mutate_locked(
     // Fold any uncommitted on-disk changes into `@` first so moving off it
     // doesn't lose them. The fold normally rides inside the mutation's own
     // transaction (one op per action; the folded commit stays referenced by
-    // the resulting view) — but an *undo* removes commits from the view, so a
+    // the resulting view) — but an *undo* (or redo) replaces the view, so a
     // same-tx fold could end up referenced by no operation at all and be
-    // unrecoverable from the op log. For undo the fold is committed as its
-    // own snapshot op first, mirroring the CLI's snapshot-before-command.
+    // unrecoverable from the op log. For those the fold is committed as its
+    // own snapshot op first, mirroring the CLI's snapshot-before-command; the
+    // undo then carries the edit over onto the `@` it restores.
     if new_tree.tree_ids_and_labels() != wc_commit.tree().tree_ids_and_labels() {
         let rewritten = tx
             .repo_mut()
@@ -314,7 +320,7 @@ async fn mutate_locked(
             .rebase_descendants()
             .await
             .context("failed to rebase descendants after working-copy fold")?;
-        if matches!(op, MutationOp::Undo { .. }) {
+        if op_plan.is_some() {
             tx.set_is_snapshot(true);
             let snapped = tx
                 .commit("snapshot working copy")
@@ -722,30 +728,12 @@ async fn mutate_locked(
         | MutationOp::PushBookmark { .. } => {
             bail!("bookmark ops do not take the working-copy lock")
         }
-        MutationOp::Undo { .. } => {
-            let UndoTarget {
-                operation,
-                parent,
-                description,
-            } = undo_target.expect("an undo resolves its target before the fold");
-            // Merge `(parent(op) - op)` onto the current view through jj's own
-            // op-merge machinery (exactly what `jj undo <op>` does), so
-            // unrelated later work — including this transaction's working-copy
-            // fold above — is preserved rather than wiped the way an op
-            // *restore* would.
-            let op_repo = repo_loader
-                .load_at(&operation)
-                .await
-                .context("failed to load the repo at the operation to undo")?;
-            let parent_repo = repo_loader
-                .load_at(&parent)
-                .await
-                .context("failed to load the repo before the operation to undo")?;
-            tx.repo_mut()
-                .merge(&op_repo, &parent_repo)
-                .await
-                .context("failed to merge the undo into the current view")?;
-            format!("Undid: {description}")
+        MutationOp::Undo { .. } | MutationOp::Redo => {
+            let plan = op_plan
+                .as_ref()
+                .expect("an undo resolves its plan before the fold");
+            plan.apply(&mut tx, repo_loader, &workspace_name).await?;
+            plan.message.clone()
         }
     };
 
@@ -763,8 +751,14 @@ async fn mutate_locked(
     // it, so only a hard backend error is propagated.
     export_refs(tx.repo_mut()).context("failed to export bookmarks to the git backend")?;
 
+    // Undo and redo are described exactly as jj describes them: the next
+    // `jj undo` (or ours) reads the description to walk the stack.
+    let description = match &op_plan {
+        Some(plan) => plan.op_description.clone(),
+        None => format!("diffui: {message}"),
+    };
     let new_repo = tx
-        .commit(format!("diffui: {message}"))
+        .commit(description)
         .await
         .context("failed to commit mutation transaction")?;
 
@@ -793,19 +787,22 @@ async fn mutate_locked(
     ))
 }
 
-/// The operation an undo reverts, resolved before anything has been written.
-struct UndoTarget {
-    operation: Operation,
-    parent: Operation,
-    description: String,
+/// The operation a revert targets, resolved before anything has been written.
+pub(super) struct UndoTarget {
+    pub(super) operation: Operation,
+    pub(super) parent: Operation,
+    pub(super) description: String,
 }
 
-/// Pick the operation `jj undo` would revert, and check that it *can* be
-/// reverted. Deliberately called before the pre-undo working-copy fold is
-/// committed: both failures here ("nothing to undo", "can't undo a merge
-/// operation") used to surface only after that fold had already landed as its
-/// own operation, with the lock left unfinished behind it.
-async fn resolve_undo_target(
+/// Pick the operation `jj op revert` would revert — `operation_id`, or with
+/// `None` the latest operation that isn't a working-copy snapshot — and check
+/// that it *can* be reverted. Deliberately called before the pre-op
+/// working-copy fold is committed: both failures here ("nothing to undo",
+/// "can't undo a merge operation") used to surface only after that fold had
+/// already landed as its own operation, with the lock left unfinished behind
+/// it. (The toolbar's step-back undo walks jj's undo stack instead; see
+/// [`super::undo`].)
+pub(super) async fn resolve_undo_target(
     repo_loader: &RepoLoader,
     base_repo: &ReadonlyRepo,
     operation_id: Option<&str>,
@@ -822,10 +819,6 @@ async fn resolve_undo_target(
             Operation::new(repo_loader.op_store().clone(), op_id, data)
         }
         None => {
-            // diffui auto-snapshots the working copy on focus/refresh, so the
-            // head op is often a pure snapshot; walk past those so Undo targets
-            // the user's last real operation. Repeated Undo toggles
-            // (undo-the-undo = redo) rather than walking an undo stack.
             let mut op = base_repo.operation().clone();
             while op.metadata().is_snapshot {
                 let parents = op
