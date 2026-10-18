@@ -626,16 +626,38 @@ impl Diffui {
         items
     }
 
-    /// The diff-view file menu's partial-change rows: restore / move /
-    /// split / select.
+    /// The diff-view file menu's partial-change rows: resolve actions for a
+    /// conflicted file, then restore / move / split / select.
     fn file_change_menu_items(&self, path: &str) -> Vec<menu::MenuEntry> {
         let arg = || CommandArg::Path(path.to_owned());
-        vec![
+        let mut items = Vec::new();
+        if let Some(conflict) = crate::conflicts::conflict_at(self, path) {
+            if conflict.pickable {
+                for (index, id) in [(0, "conflict.take-side-1"), (1, "conflict.take-side-2")] {
+                    if let Some(side) = conflict.sides.get(index) {
+                        items.push(self.menu_row(
+                            format!("Resolve: take side {} ({})", index + 1, side.label),
+                            id,
+                            arg(),
+                        ));
+                    }
+                }
+                if !conflict.bases.is_empty() {
+                    items.push(self.menu_item("conflict.take-base", arg()));
+                }
+            }
+            if conflict.merge_tool_blocker.is_none() {
+                items.push(self.menu_item("conflict.merge-tool", arg()));
+            }
+            items.push(menu::MenuEntry::Separator);
+        }
+        items.extend([
             self.menu_item("file.restore", arg()),
             self.menu_item("file.move-into", arg()),
             self.menu_item("file.split", arg()),
             self.menu_item("changes.toggle-file", arg()),
-        ]
+        ]);
+        items
     }
 
     /// macOS: pop the file context menu natively (blocking, glowing over the

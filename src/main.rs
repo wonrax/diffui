@@ -12,6 +12,7 @@ mod chip;
 mod chrome;
 mod commands;
 mod config;
+mod conflicts;
 mod diff_panel;
 mod diff_view;
 mod editor_drag;

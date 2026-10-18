@@ -303,6 +303,9 @@ impl Diffui {
         let Some(tab) = self.route_event(&event) else {
             return Task::none();
         };
+        if let Some(task) = self.take_conflict_job(tab, &event) {
+            return task;
+        }
         // A job can be both the frontend's and the projection's — a mutation
         // owns an activity row *and* a slot — so the two run in order rather
         // than one short-circuiting the other.
@@ -408,7 +411,11 @@ impl Diffui {
                 .tabs
                 .iter()
                 .filter(on_this_repo)
-                .find(|tab| tab.state.session.owns_job(job) || tab.state.jobs.owns(job))
+                .find(|tab| {
+                    tab.state.session.owns_job(job)
+                        || tab.state.jobs.owns(job)
+                        || tab.state.changes.conflicts.owns(job)
+                })
                 .map(|tab| tab.id),
             None => self.tabs.iter().find(on_this_repo).map(|tab| tab.id),
         }
@@ -645,6 +652,7 @@ impl Diffui {
         // A mode that isn't on screen must not keep the keyboard.
         self.prune_stale_modes();
         let welcome = self.ensure_welcome_prompt();
+        let conflicts = self.sync_conflicts();
         // Chokepoint: if the active tab coalesced a refresh while busy and it's
         // now idle, run it. A no-op when nothing's pending (the common case).
         let refresh = match self.active_tab_id() {
@@ -657,7 +665,7 @@ impl Diffui {
             }
             None => Task::none(),
         };
-        Task::batch([task, refresh, welcome])
+        Task::batch([task, refresh, welcome, conflicts])
     }
 
     /// With no repository open the welcome screen *is* the open prompt, so

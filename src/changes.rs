@@ -54,6 +54,8 @@ pub(crate) enum ChangesMsg {
     MoveFile(String),
     /// Split this file's changes off into a new change.
     SplitFile(String),
+    /// Conflict resolution — see [`crate::conflicts`].
+    Conflict(crate::conflicts::ConflictMsg),
 }
 
 /// One file's pick.
@@ -83,6 +85,7 @@ pub(crate) struct ChangesState {
     revision: Option<RevisionSelection>,
     picks: BTreeMap<String, Pick>,
     split: Option<SplitPrompt>,
+    pub(crate) conflicts: crate::conflicts::ConflictsState,
 }
 
 impl ChangesState {
@@ -325,7 +328,8 @@ pub(crate) fn diff_marks(ui: &Diffui, theme: ThemeSpec) -> Option<ChangeMarks<Me
         .iter()
         .map(|file| {
             let pick = picks.and_then(|picks| picks.get(&file.path));
-            let hunks = if !hunk_pickable(file, false) {
+            let conflicted = crate::conflicts::is_conflicted(tab, &file.path);
+            let hunks = if !hunk_pickable(file, conflicted) {
                 HunkMarks::None
             } else {
                 match pick {
@@ -531,6 +535,7 @@ impl Diffui {
                 );
                 Task::none()
             }
+            ChangesMsg::Conflict(message) => self.on_conflict(message),
         }
     }
 

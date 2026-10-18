@@ -498,7 +498,10 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
         }
         let diff_with_find: Element<'a, Message> = layers.into();
 
-        column![summary, diff_with_find].spacing(0).into()
+        match crate::conflicts::conflict_banner(ui, theme) {
+            Some(banner) => column![summary, banner, diff_with_find].spacing(0).into(),
+            None => column![summary, diff_with_find].spacing(0).into(),
+        }
     };
 
     container(body)
