@@ -203,8 +203,9 @@ pub enum DraftKind {
         mode: RebaseSourceMode,
     },
     Squash,
-    /// `jj new A B`: the source is the first parent, the picked target the
-    /// second. (Octopus merges want multi-select — future work.)
+    /// `jj new A B …`: the sources are the parents in pick order, and a picked
+    /// target joins as the last one. Toggling extra sources builds an octopus
+    /// merge, which [`OpDraft::op_from_sources`] lowers without a target.
     Merge,
 }
 
