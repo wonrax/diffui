@@ -899,6 +899,28 @@ pub struct BookmarksInfo {
     /// `@`'s commit id (hex), so a working-copy right-click can resolve the
     /// bookmarks sitting on it.
     pub working_copy_commit: Option<String>,
+    /// Every configured git remote, sorted — where a new bookmark can go.
+    pub remotes: Vec<String>,
+    /// The `git.push` setting, when configured.
+    pub git_push: Option<String>,
+}
+
+impl BookmarksInfo {
+    /// The remote `jj git push` picks without `--remote`: `git.push`, else the
+    /// only remote, else `origin` — `None` when that names no real remote
+    /// (several remotes, none of them `origin`), and the caller has to ask.
+    pub fn default_push_remote(&self) -> Option<&str> {
+        let pick = match (&self.git_push, self.remotes.as_slice()) {
+            (Some(configured), _) => configured.as_str(),
+            (None, [only]) => only.as_str(),
+            (None, _) => "origin",
+        };
+        self.remotes.iter().any(|r| r == pick).then_some(pick)
+    }
+
+    pub fn entry(&self, name: &str) -> Option<&BookmarkEntry> {
+        self.bookmarks.iter().find(|b| b.name == name)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -923,6 +945,16 @@ pub struct RemoteBookmarkRef {
 }
 
 impl BookmarkEntry {
+    /// Whether `remote` has a tracked copy of this bookmark.
+    pub fn tracks(&self, remote: &str) -> bool {
+        self.remotes.iter().any(|r| r.tracked && r.remote == remote)
+    }
+
+    /// Whether any remote tracks this bookmark.
+    pub fn is_tracked_anywhere(&self) -> bool {
+        self.remotes.iter().any(|r| r.tracked)
+    }
+
     /// The remote this local bookmark tracks, if any (first tracked remote).
     pub fn tracked_remote(&self) -> Option<&str> {
         self.remotes

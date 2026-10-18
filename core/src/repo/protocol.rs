@@ -89,6 +89,9 @@ pub enum RepoError {
     /// The repository has no such capability (see [`Capabilities`]).
     Unsupported,
     Other(String),
+    /// `jj git push`'s commit checks refused the push; the rejection lists
+    /// each commit and carries the request for a rerun with allowances.
+    PushRejected(Box<crate::push::PushRejection>),
 }
 
 impl fmt::Display for RepoError {
@@ -103,6 +106,7 @@ impl fmt::Display for RepoError {
             Self::Immutable { short_id } => write!(f, "{short_id} is immutable"),
             Self::Unsupported => f.write_str("this repository does not support that operation"),
             Self::Other(message) => write!(f, "{message}"),
+            Self::PushRejected(rejection) => write!(f, "{rejection}"),
         }
     }
 }

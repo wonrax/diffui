@@ -627,9 +627,18 @@ pub(super) fn compute_bookmarks_info(
         });
     }
     bookmarks.sort_by(|a, b| a.name.cmp(&b.name));
+    // Best-effort: a repo whose git config can't be read just offers no
+    // remotes to push a new bookmark to.
+    let mut remotes: Vec<String> = jj_lib::git::get_all_remote_names(repo.store())
+        .map(|names| names.iter().map(|name| name.as_str().to_owned()).collect())
+        .unwrap_or_default();
+    remotes.sort();
+    let git_push = repo.settings().get_string("git.push").ok();
     BookmarksInfo {
         bookmarks,
         working_copy_commit: Some(wc_commit_id.hex()),
+        remotes,
+        git_push,
     }
 }
 

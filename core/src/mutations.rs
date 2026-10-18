@@ -127,6 +127,19 @@ pub enum MutationOp {
     /// snapshot-before-mutate discipline (an undo that moves `@` must not
     /// clobber unsnapshotted on-disk edits).
     Undo { operation_id: Option<String> },
+    /// Create local bookmark `name` at `to` (`jj bookmark create -r <to>
+    /// <name>`). Refuses an existing name — moving one is `MoveBookmark`.
+    CreateBookmark { name: String, to: RevisionSelection },
+    /// `jj bookmark rename <old> <new>`.
+    RenameBookmark { old: String, new: String },
+    /// `jj bookmark forget <name>`: drop it locally and stop tracking its
+    /// remotes, so no later push deletes it there.
+    ForgetBookmark { name: String },
+    /// `jj bookmark untrack <name>@<remote>`.
+    UntrackBookmark { name: String, remote: String },
+    /// `jj git push` with the CLI's checks: new bookmarks, `--change`,
+    /// deletions, and every allowance the user accepted.
+    Push(crate::push::PushRequest),
 }
 
 /// User-facing summary of a successful mutation — becomes the status message.

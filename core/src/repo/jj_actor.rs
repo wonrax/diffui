@@ -594,6 +594,12 @@ pub(super) fn classify(error: anyhow::Error) -> RepoError {
             short_id: immutable.short_id.clone(),
         };
     }
+    if let Some(rejection) = error.downcast_ref::<crate::push::PushRejection>() {
+        return RepoError::PushRejected(Box::new(rejection.clone()));
+    }
+    if let Some(failed) = error.downcast_ref::<jj::push::PushFailed>() {
+        return RepoError::Other(failed.to_string());
+    }
     let message = format!("{error:#}");
     if message.contains("failed to parse revset")
         || message.contains("failed to resolve")
@@ -677,7 +683,12 @@ pub fn rewritten_targets(
         | MutationOp::DeleteBookmark { .. }
         | MutationOp::TrackBookmark { .. }
         | MutationOp::PushBookmark { .. }
-        | MutationOp::Undo { .. } => {}
+        | MutationOp::Undo { .. }
+        | MutationOp::CreateBookmark { .. }
+        | MutationOp::RenameBookmark { .. }
+        | MutationOp::ForgetBookmark { .. }
+        | MutationOp::UntrackBookmark { .. }
+        | MutationOp::Push(_) => {}
     }
     targets
 }

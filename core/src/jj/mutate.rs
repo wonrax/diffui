@@ -26,13 +26,16 @@ use jj_lib::{
     workspace::Workspace,
 };
 
-use super::remote::*;
+use super::push::{
+    PushContext, create_bookmark, forget_bookmark, push_request, rename_bookmark, untrack_bookmark,
+};
 use super::walk::*;
 use super::workspace::{
     LockOutcome, LockedWorkingCopy, SnapshotContext, lock_working_copy, resolve_revision,
 };
 use crate::model::{LoadProgress, RevisionSelection};
 use crate::mutations::{Destination, MutationOp, MutationOutcome, RebaseSourceMode, SquashTarget};
+use crate::push::{PushAllow, PushRequest, PushTarget};
 use crate::repository::Repository;
 
 /// Whether moving local bookmark `name` to `to` is a **backwards or sideways**
@@ -90,7 +93,7 @@ pub(crate) async fn apply_mutation(
     allow_immutable: bool,
 ) -> Result<MutationOutcome> {
     if is_view_only(op) {
-        return apply_view_only(workspace, settings, op, progress).await;
+        return apply_view_only(workspace, settings, &repository.root, op, progress).await;
     }
     // Recovering a stale checkout finishes the lock session the mutation needs,
     // so the attempt reports back without mutating and the retry runs against
@@ -123,6 +126,11 @@ fn is_view_only(op: &MutationOp) -> bool {
             | MutationOp::DeleteBookmark { .. }
             | MutationOp::TrackBookmark { .. }
             | MutationOp::PushBookmark { .. }
+            | MutationOp::CreateBookmark { .. }
+            | MutationOp::RenameBookmark { .. }
+            | MutationOp::ForgetBookmark { .. }
+            | MutationOp::UntrackBookmark { .. }
+            | MutationOp::Push(_)
     )
 }
 
@@ -132,6 +140,7 @@ fn is_view_only(op: &MutationOp) -> bool {
 async fn apply_view_only(
     workspace: &Workspace,
     settings: &UserSettings,
+    repo_root: &Path,
     op: &MutationOp,
     progress: &LoadProgress,
 ) -> Result<MutationOutcome> {
@@ -149,6 +158,13 @@ async fn apply_view_only(
 
     let mut tx = base_repo.start_transaction();
     let mut output: Vec<String> = Vec::new();
+    let mut partial_failure: Option<String> = None;
+    let push_context = PushContext {
+        settings,
+        repo_root,
+        workspace_name: &workspace_name,
+        wc_commit_id: &wc_commit_id,
+    };
     let message = match op {
         MutationOp::MoveBookmark {
             name,
@@ -163,12 +179,26 @@ async fn apply_view_only(
             );
             match push_remote {
                 // The push reads the bookmark's target back out of this
-                // transaction's view, so it pushes the position set above.
+                // transaction's view, so it pushes the position set above —
+                // through the same checks `jj git push -b` runs.
                 Some(remote) => {
-                    let (push_message, remote_output) =
-                        push_bookmark(settings, tx.repo_mut(), name, remote, progress)?;
-                    output = remote_output;
-                    format!("Moved bookmark {name} to {short} \u{b7} {push_message}")
+                    let request = PushRequest {
+                        remote: remote.clone(),
+                        // `SetBookmark`, not `Bookmark`: a refused push rolls
+                        // the move back, so the rejection's request has to
+                        // carry the move for a rerun with allowances.
+                        targets: vec![PushTarget::SetBookmark {
+                            name: name.clone(),
+                            to: to.clone(),
+                        }],
+                        allow: PushAllow::default(),
+                        confirm: false,
+                    };
+                    let pushed =
+                        push_request(&push_context, tx.repo_mut(), &request, progress).await?;
+                    output = pushed.output;
+                    partial_failure = pushed.partial_failure;
+                    format!("Moved bookmark {name} to {short} \u{b7} {}", pushed.message)
                 }
                 None => format!("Moved bookmark {name} to {short}"),
             }
@@ -187,10 +217,39 @@ async fn apply_view_only(
             format!("Tracking {name}@{remote}")
         }
         MutationOp::PushBookmark { name, remote } => {
-            let (message, remote_output) =
-                push_bookmark(settings, tx.repo_mut(), name, remote, progress)?;
-            output = remote_output;
-            message
+            let request = PushRequest {
+                remote: remote.clone(),
+                targets: vec![PushTarget::Bookmark(name.clone())],
+                allow: PushAllow::default(),
+                confirm: false,
+            };
+            let pushed = push_request(&push_context, tx.repo_mut(), &request, progress).await?;
+            output = pushed.output;
+            partial_failure = pushed.partial_failure;
+            pushed.message
+        }
+        MutationOp::Push(request) => {
+            let pushed = push_request(&push_context, tx.repo_mut(), request, progress).await?;
+            output = pushed.output;
+            partial_failure = pushed.partial_failure;
+            pushed.message
+        }
+        MutationOp::CreateBookmark { name, to } => {
+            let commit = resolve_mutation_target(tx.repo(), &wc_commit_id, to).await?;
+            create_bookmark(settings, tx.repo_mut(), name, &commit).await?;
+            format!("Created bookmark {name} at {}", short_change_id(&commit))
+        }
+        MutationOp::RenameBookmark { old, new } => {
+            rename_bookmark(tx.repo_mut(), old, new).await?;
+            format!("Renamed bookmark {old} to {new}")
+        }
+        MutationOp::ForgetBookmark { name } => {
+            forget_bookmark(tx.repo_mut(), name)?;
+            format!("Forgot bookmark {name}")
+        }
+        MutationOp::UntrackBookmark { name, remote } => {
+            untrack_bookmark(tx.repo_mut(), name, remote)?;
+            format!("Stopped tracking {name}@{remote}")
         }
         // `is_view_only` gates this function; anything else is a caller bug.
         _ => bail!("not a view-only mutation"),
@@ -203,6 +262,11 @@ async fn apply_view_only(
         .commit(format!("diffui: {message}"))
         .await
         .context("failed to commit bookmark transaction")?;
+    // Some refs reached the remote and some didn't: what did land is recorded
+    // above (as the CLI does), and the refusal is still the outcome.
+    if let Some(failure) = partial_failure {
+        return Err(super::push::PushFailed(failure).into());
+    }
 
     Ok(MutationOutcome {
         message,
@@ -718,7 +782,12 @@ async fn mutate_locked(
         MutationOp::MoveBookmark { .. }
         | MutationOp::DeleteBookmark { .. }
         | MutationOp::TrackBookmark { .. }
-        | MutationOp::PushBookmark { .. } => {
+        | MutationOp::PushBookmark { .. }
+        | MutationOp::CreateBookmark { .. }
+        | MutationOp::RenameBookmark { .. }
+        | MutationOp::ForgetBookmark { .. }
+        | MutationOp::UntrackBookmark { .. }
+        | MutationOp::Push(_) => {
             bail!("bookmark ops do not take the working-copy lock")
         }
         MutationOp::Undo { .. } => {

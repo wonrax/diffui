@@ -13,6 +13,7 @@ pub mod graph_layout;
 pub mod jj;
 pub mod model;
 pub mod mutations;
+pub mod push;
 pub mod repo;
 pub mod repository;
 pub mod session;
@@ -28,6 +29,7 @@ pub use mutations::{
     Destination, DraftKind, DraftSimulation, DraftSource, MergePreview, MutationOp,
     MutationOutcome, OpDraft, PlacementKind, RebasePreview, RebaseSourceMode, SquashTarget,
 };
+pub use push::{PushAllow, PushCheck, PushRejection, PushRequest, PushTarget, RejectedCommit};
 pub use repo::{
     Capabilities, Command, Event, JobId, OpenSpec, Payload, PreviewRequest, RepoError, RepoHandle,
     RepoId, canonical_selection, rewritten_targets,
