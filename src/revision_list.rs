@@ -2322,10 +2322,11 @@ impl<'a, Message> RevisionList<'a, Message> {
         } = self.file_row_columns(row_bounds.x, row_bounds.width, gutter_total, f);
         let chip_col = self.style.file_badge_width;
 
-        // `fill_text_truncated` applies an end-ellipsis at the renderer
-        // level, so a name wider than `path_w` doesn't bleed into the +N /
-        // -N columns; the full path is on the hover tooltip.
-        fill_text_truncated(
+        // Cut in the middle, so a name wider than `path_w` keeps both its
+        // start and its extension (and a compacted `a/b/c` chain its leaf)
+        // without bleeding into the +N / -N columns; the full path is on the
+        // hover tooltip.
+        fill_text_ellipsized(
             renderer,
             &f.primary,
             path_x,
@@ -2335,6 +2336,7 @@ impl<'a, Message> RevisionList<'a, Message> {
             f.primary_color,
             self.style.primary_font,
             row_clip,
+            text::Ellipsis::Middle,
         );
 
         // Status chip, right-aligned in the rightmost column (single-letter
@@ -2630,6 +2632,34 @@ fn fill_text_truncated<R: text::Renderer>(
     font: Font,
     clip: Rectangle,
 ) {
+    fill_text_ellipsized(
+        renderer,
+        content,
+        x,
+        center_y,
+        width,
+        size,
+        color,
+        font,
+        clip,
+        text::Ellipsis::End,
+    );
+}
+
+/// [`fill_text_truncated`] with the cut placed by `ellipsis`.
+#[allow(clippy::too_many_arguments)]
+fn fill_text_ellipsized<R: text::Renderer>(
+    renderer: &mut R,
+    content: &str,
+    x: f32,
+    center_y: f32,
+    width: f32,
+    size: f32,
+    color: Color,
+    font: Font,
+    clip: Rectangle,
+    ellipsis: text::Ellipsis,
+) {
     if content.is_empty() {
         return;
     }
@@ -2645,7 +2675,7 @@ fn fill_text_truncated<R: text::Renderer>(
             align_y: alignment::Vertical::Center,
             shaping: text::Shaping::Advanced,
             wrapping: text::Wrapping::None,
-            ellipsis: text::Ellipsis::End,
+            ellipsis,
             hint_factor: None,
         },
         Point::new(x, center_y),
