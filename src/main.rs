@@ -7,19 +7,29 @@ use std::{
 
 mod action;
 mod activity;
+mod app_menu;
+mod bookmarks;
+mod changes;
 mod chip;
 mod chrome;
 mod commands;
+mod compare;
 mod config;
+mod conflicts;
 mod diff_panel;
 mod diff_view;
 mod editor_drag;
+mod empty_states;
 mod field;
 mod find;
 mod graph_view;
+mod history_panel;
 mod icons;
 mod input;
+mod jj_version;
 mod keymap;
+mod launch_env;
+mod logging;
 #[cfg(target_os = "macos")]
 mod macos_native;
 mod measure;
@@ -32,7 +42,9 @@ mod path_browse;
 mod pointer;
 mod resize_handle;
 mod revision_list;
+mod revops;
 mod scrollbar;
+mod shortcuts;
 mod sidebar;
 mod source_panel;
 mod tab_bar;
@@ -185,19 +197,12 @@ pub(crate) fn zoom_default_restore(visible: [f64; 4]) -> [f64; 4] {
 }
 
 fn main() -> iced::Result {
+    // First, while the process is still single-threaded: it may `set_var`.
+    let path_repair = launch_env::repair_path();
     let cli = Cli::parse();
-
-    // Positional paths are reserved for a future file-diff mode
-    // (`diffui SIDE_1 SIDE_2`) and aren't implemented yet. Reject them up front
-    // with a pointer to `--path`, so the pre-existing `diffui <repo>` muscle
-    // memory gets a clear nudge instead of silently doing nothing.
-    if !cli.diff_args.is_empty() {
-        eprintln!(
-            "diffui: file diff (diffui <side1> <side2>) isn't supported yet — \
-             positional paths are reserved for it."
-        );
-        eprintln!("        to open a repository, use: diffui --path <repo>");
-        std::process::exit(2);
+    logging::init();
+    if let Some(repair) = path_repair {
+        tracing::info!("{repair}");
     }
 
     // Restore the last window geometry before the window is created. The
@@ -207,6 +212,9 @@ fn main() -> iced::Result {
     let mut window_settings = window::Settings::default();
     if let Some((width, height)) = saved.size() {
         window_settings.size = Size::new(width, height);
+    } else if let Some((width, height)) = window_state::default_window_size(screen_visible_size()) {
+        window_settings.size = Size::new(width, height);
+        window_settings.position = window::Position::Centered;
     }
     if let Some((x, y)) = saved.position() {
         window_settings.position = window::Position::Specific(Point::new(x, y));
@@ -235,21 +243,35 @@ fn main() -> iced::Result {
     .run()
 }
 
+/// The primary display's usable size, where the platform can tell us before
+/// the window exists.
+fn screen_visible_size() -> Option<(f32, f32)> {
+    #[cfg(target_os = "macos")]
+    return macos_native::primary_screen_visible_size();
+    #[cfg(not(target_os = "macos"))]
+    None
+}
+
 #[derive(Debug, Clone, Parser)]
 #[command(version, about = "Native GUI diff viewer for jj and git")]
 struct Cli {
-    /// Repository path to open as a tab; repeat to open several. When omitted,
-    /// diffui restores your last session, falls back to the current directory
-    /// if it's a repository, and otherwise opens the welcome screen.
+    /// Repository path (or GitHub PR reference) to open as a tab; repeat to
+    /// open several. Same as passing it positionally.
     #[arg(short = 'p', long = "path", value_name = "REPO")]
     paths: Vec<PathBuf>,
 
-    /// Reserved for a future file/dir diff mode (`diffui SIDE_1 SIDE_2`); not
-    /// wired up yet. Kept as a positional (hidden from `--help`) so the old
-    /// `diffui <repo>` habit gets a clear pointer to `--path` rather than
-    /// silently opening the wrong thing — see the guard in `main`.
-    #[arg(value_name = "PATH", hide = true)]
-    diff_args: Vec<PathBuf>,
+    /// Repositories (or GitHub PR references) to open, e.g. `diffui .`. With
+    /// none, diffui restores your last session and, when started inside a
+    /// repository, opens and focuses that one too.
+    #[arg(value_name = "REPO")]
+    repos: Vec<PathBuf>,
+}
+
+impl Cli {
+    /// Everything named on the command line, flag or positional, in order.
+    fn requested_paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.paths.iter().chain(&self.repos)
+    }
 }
 
 /// A revision mutation on its way to the repository actor. The actor is
@@ -477,6 +499,9 @@ pub(crate) struct Toast {
     /// activity row.
     pub(crate) detail: String,
     pub(crate) born: Instant,
+    /// Stays up until dismissed instead of expiring after [`TOAST_TTL`] — for
+    /// startup problems the user may not be looking at the window for.
+    pub(crate) sticky: bool,
 }
 
 /// How long a toast lingers before the tick prunes it.
@@ -491,6 +516,9 @@ pub(crate) struct DescriptionEditor {
     /// draft is editable.
     pub(crate) saving_activity: Option<activity::ActivityId>,
     pub(crate) switch_blocked: bool,
+    /// Commit mode ("Commit…"): saving runs `jj commit` — describe `@` and
+    /// start a new change on top — instead of a plain describe.
+    pub(crate) commit: bool,
 }
 
 impl DescriptionEditor {
@@ -525,6 +553,8 @@ pub(crate) enum MainView {
     #[default]
     Diff,
     Source,
+    /// The operation log or a revision's evolog (jj only).
+    History,
 }
 
 /// One loaded file in the source browser: the synthesized all-context
@@ -716,6 +746,13 @@ pub(crate) struct TabState {
     /// Cleared on plain click, Esc, and draft start; ids whose rows left the
     /// loaded graph are ignored at use rather than eagerly pruned.
     pub(crate) revision_multi_selection: Vec<String>,
+    /// The pending description edit is a "Commit…" — the editor opens in
+    /// commit mode.
+    pub(crate) pending_commit: bool,
+    /// The diff pane's file/hunk pick and conflict-resolution state.
+    pub(crate) changes: changes::ChangesState,
+    /// The history views: op log, evolog, file filter, annotate.
+    pub(crate) history: history_panel::HistoryState,
 }
 
 impl TabState {
@@ -751,6 +788,9 @@ impl TabState {
             pending_description_edit: None,
             pending_detail_copy: None,
             revision_multi_selection: Vec::new(),
+            pending_commit: false,
+            changes: Default::default(),
+            history: Default::default(),
         }
     }
 
@@ -795,6 +835,7 @@ impl TabState {
                 .as_ref()
                 .map(|view| std::slice::from_ref(&view.file))
                 .unwrap_or(&[]),
+            MainView::History => &[],
         }
     }
 }
@@ -813,19 +854,32 @@ fn default_revset(repository: &Repository) -> String {
     }
 }
 
-/// Built-in revset presets for the caret menu, as `(label, expression)`. jj
-/// uses revset functions; git uses `git log` revision-range shortcuts. Shared
-/// by the native macOS menu and the iced fallback so they stay in sync.
-pub(crate) fn revset_presets(vcs: Option<Vcs>) -> &'static [(&'static str, &'static str)] {
-    match vcs {
+/// Revset presets for the caret menu, as `(label, expression)`. jj uses
+/// revset functions and can be configured with `[[revset_presets]]` (see
+/// [`config`]); git uses `git log` revision-range shortcuts. Shared by the
+/// native macOS menu and the iced fallback so they stay in sync.
+pub(crate) fn revset_presets(vcs: Option<Vcs>) -> Vec<(String, String)> {
+    let builtin: &[(&str, &str)] = match vcs {
         Some(Vcs::Git) => &[("All branches", "--all"), ("Current", "HEAD")],
-        _ => &[
-            ("Everything", "all()"),
-            ("Mine", "mine()"),
-            ("Current line", "ancestors(@)"),
-            ("Conflicts", "conflicts()"),
-        ],
-    }
+        _ => {
+            if let Some(configured) = config::revset_presets() {
+                return configured
+                    .iter()
+                    .map(|preset| (preset.name.clone(), preset.revset.clone()))
+                    .collect();
+            }
+            &[
+                ("Everything", "all()"),
+                ("Mine", "mine()"),
+                ("Current line", "ancestors(@)"),
+                ("Conflicts", "conflicts()"),
+            ]
+        }
+    };
+    builtin
+        .iter()
+        .map(|(label, expr)| ((*label).to_owned(), (*expr).to_owned()))
+        .collect()
 }
 
 /// A stable identity for an open tab, independent of its position in `tabs`.
@@ -1010,7 +1064,8 @@ fn selection_from_key(key: &revision_list::RowSelectionKey) -> RevisionSelection
 /// Welcome screen shown whenever no repository is open: a fresh launch with
 /// nothing to restore (including from the macOS/Spotlight launcher, where cwd is
 /// `/`), or after the last tab is closed. It is the open prompt itself — the
-/// same card ⌘O raises over a tab, inline and focused — under the wordmark.
+/// same card ⌘O raises over a tab, inline and focused, with the recent
+/// repositories — under the wordmark, then a few tips.
 /// Only an explicit `--path` that failed to resolve surfaces an error; the
 /// session and cwd fallbacks resolve silently to this screen instead.
 fn empty_state<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
@@ -1038,6 +1093,7 @@ fn empty_state<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
     if let Some(dialog) = ui.open_repo_dialog() {
         body = body.push(tab_bar::open_repo_card(ui, theme, dialog));
     }
+    body = body.push(shortcuts::welcome_hints(ui, theme));
 
     // Optically centered: a touch above the true middle, where a centered
     // block reads as centered rather than as sinking.

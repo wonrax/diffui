@@ -6,12 +6,13 @@
 //! as `Batch`-shaped work, and the commit list arrives as graph rows.
 
 use tokio::sync::mpsc;
+use tracing::Instrument as _;
 
 use super::cancel::CancelFlag;
 use super::protocol::{Command, Event, GraphTail, JobId, Payload, RepoError, RepoId};
-use super::{Envelope, Jobs, route_commands};
+use super::{Envelope, Jobs, catch_panic, route_commands};
 use crate::github::{self, PrSpec};
-use crate::model::{DiffDocument, DiffFile, RevisionSelection};
+use crate::model::{DiffBase, DiffDocument, DiffFile, RevisionSelection};
 
 /// Flush the pending file batch once it holds this many diff lines. Small
 /// enough that the first screenful paints quickly, large enough that a
@@ -42,8 +43,17 @@ pub(super) fn spawn(
                         Err(_) => CancelFlag::default(),
                     };
                     let span = tracing::info_span!("pr_command", repo = %id, job = job.0);
-                    let _entered = span.enter();
-                    run(&id, &spec, command, &cancel, &events).await;
+                    let work = run(&id, &spec, command, &cancel, &events);
+                    if let Err(message) = catch_panic(work).instrument(span.clone()).await {
+                        span.in_scope(|| tracing::error!("command panicked: {message}"));
+                        let _ = events.send(Event::new(
+                            id.clone(),
+                            Payload::Failed {
+                                job,
+                                error: RepoError::Crashed(message),
+                            },
+                        ));
+                    }
                     if let Ok(mut jobs) = jobs.lock() {
                         jobs.finish(job);
                     }
@@ -85,9 +95,19 @@ async fn run(
                 error: RepoError::Other(format!("{error:#}")),
             }),
         },
-        Command::LoadDiff { job, revision } => {
+        Command::LoadDiff {
+            job,
+            revision,
+            base: DiffBase::Parents,
+            ..
+        } => {
             stream_diff(spec, job, revision, cancel, &emit).await;
         }
+        // A comparison needs two local trees; `Capabilities::compare` is off.
+        Command::LoadDiff { job, .. } => emit(Payload::Failed {
+            job,
+            error: RepoError::Unsupported,
+        }),
         Command::RevisionDetails { job, revision } => match github::fetch_pr_info(spec).await {
             Ok(info) => emit(Payload::DetailsLoaded {
                 job,
@@ -109,7 +129,11 @@ async fn run(
         | Command::ListTree { job, .. }
         | Command::ReadFile { job, .. }
         | Command::FilePair { job, .. }
-        | Command::BookmarkCheck { job, .. } => emit(Payload::Failed {
+        | Command::BookmarkCheck { job, .. }
+        | Command::ConflictInfo { job, .. }
+        | Command::PrepareMergeTool { job, .. }
+        | Command::History { job, .. }
+        | Command::ExpandFile { job, .. } => emit(Payload::Failed {
             job,
             error: RepoError::Unsupported,
         }),

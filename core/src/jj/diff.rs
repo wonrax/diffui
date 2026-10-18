@@ -1,56 +1,156 @@
 use anyhow::{Context, Result};
-use bstr::BStr;
 use futures::StreamExt;
 use jj_lib::{
     backend::CommitId,
+    commit::Commit,
     conflicts::{
         ConflictMarkerStyle, ConflictMaterializeOptions, materialize_tree_value,
         materialized_diff_stream,
     },
     copies::CopyRecords,
-    diff_presentation::{
-        LineCompareMode,
-        unified::{DiffLineType, git_diff_part, unified_diff_hunks},
-    },
+    diff_presentation::unified::{DiffLineType, git_diff_part},
     files::FileMergeHunkLevel,
-    matchers::{EverythingMatcher, Matcher, PrefixMatcher},
+    matchers::{EverythingMatcher, FilesMatcher, Matcher, PrefixMatcher},
     merge::{Diff, SameChange},
+    merged_tree::MergedTree,
     object_id::ObjectId,
+    ref_name::WorkspaceName,
     repo::{ReadonlyRepo, Repo},
-    repo_path::RepoPath,
+    repo_path::{RepoPath, RepoPathBuf},
+    rewrite::rebase_to_dest_parent,
     tree_merge::MergeOptions,
 };
 
+use super::large_diff::{self, DiffLimits, RowBudget};
 use super::walk::*;
+use super::workspace::resolve_revision;
 use crate::diff_parse::format_hunk_header;
 use crate::model::{
-    DiffDocument, DiffFile, DiffFileStatus, DiffHunkView, DiffLine, DiffLineKind, RevisionDetails,
-    SignatureInfo,
+    DiffBase, DiffDocument, DiffFile, DiffFileStatus, DiffHunkView, DiffLine, DiffLineKind,
+    RevisionDetails, SignatureInfo,
 };
 use crate::repository::Repository;
 
-/// Diff `commit_id` against its parents on an already-loaded repo. The actor
-/// keeps that repo between commands, so a diff switch costs a tree walk rather
-/// than another read of the (large) commit index.
+/// What a diff load covers beyond its two trees.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DiffOptions<'a> {
+    pub limits: DiffLimits,
+    /// Paths diffed in full regardless of `limits`.
+    pub expand: &'a [String],
+    /// Diff only this path (expanding one collapsed file).
+    pub only: Option<&'a str>,
+}
+
+/// The "from" side of a diff ([`DiffBase`]), resolved to a commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResolvedBase {
+    Parents,
+    Tree(CommitId),
+    Interdiff(CommitId),
+}
+
+pub(crate) async fn resolve_base(
+    repo: &ReadonlyRepo,
+    workspace_name: &WorkspaceName,
+    base: &DiffBase,
+) -> Result<ResolvedBase> {
+    Ok(match base {
+        DiffBase::Parents => ResolvedBase::Parents,
+        DiffBase::Revision(revision) => {
+            ResolvedBase::Tree(resolve_revision(repo, workspace_name, revision).await?)
+        }
+        DiffBase::Interdiff(revision) => {
+            ResolvedBase::Interdiff(resolve_revision(repo, workspace_name, revision).await?)
+        }
+    })
+}
+
+/// The tree `commit`'s diff is taken from: its parents' merge, another
+/// revision's tree (`jj diff --from`), or another revision's own change
+/// rebased onto `commit`'s parents (`jj interdiff --from`).
+pub(crate) async fn base_tree(
+    repo: &ReadonlyRepo,
+    commit: &Commit,
+    base: &ResolvedBase,
+) -> Result<MergedTree> {
+    match base {
+        ResolvedBase::Parents => commit
+            .parent_tree(repo)
+            .await
+            .with_context(|| format!("failed to load jj parent tree for {}", commit.id().hex())),
+        ResolvedBase::Tree(from) => Ok(load_commit(repo, from).await?.tree()),
+        ResolvedBase::Interdiff(from) => {
+            let from = load_commit(repo, from).await?;
+            rebase_to_dest_parent(repo, std::slice::from_ref(&from), commit)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to rebase {} onto the parents of {}",
+                        from.id().hex(),
+                        commit.id().hex()
+                    )
+                })
+        }
+    }
+}
+
+async fn load_commit(repo: &ReadonlyRepo, commit_id: &CommitId) -> Result<Commit> {
+    repo.store()
+        .get_commit_async(commit_id)
+        .await
+        .with_context(|| format!("failed to load jj commit {}", commit_id.hex()))
+}
+
+/// Diff `commit_id` against `base` (its parents, unless comparing) on an
+/// already-loaded repo. The actor keeps that repo between commands, so a diff
+/// switch costs a tree walk rather than another read of the (large) commit
+/// index.
 pub(crate) async fn diff_jj_with_repo(
     repo: &ReadonlyRepo,
     commit_id: &CommitId,
+    base: &ResolvedBase,
     repository: &Repository,
+    options: &DiffOptions<'_>,
 ) -> Result<(DiffDocument, Option<RevisionDetails>)> {
-    let commit = repo
-        .store()
-        .get_commit_async(commit_id)
-        .await
-        .with_context(|| format!("failed to load jj commit {}", commit_id.hex()))?;
+    let commit = load_commit(repo, commit_id).await?;
     let details = jj_revision_details(repo, &commit);
-    let old_tree = commit
-        .parent_tree(repo)
-        .await
-        .with_context(|| format!("failed to load jj parent tree for {}", commit_id.hex()))?;
-    let new_tree = commit.tree();
-    let matcher = repo_scope_matcher(repository)?;
+    let old_tree = base_tree(repo, &commit, base).await?;
+    let matcher: Box<dyn Matcher> = match options.only {
+        Some(path) => Box::new(FilesMatcher::new([RepoPathBuf::from_internal_string(
+            path.to_owned(),
+        )
+        .with_context(|| format!("invalid repo path {path}"))?])),
+        None => repo_scope_matcher(repository)?,
+    };
+    // A comparison shows only what differs between its two sides, like
+    // `jj diff --from`, so only a diff against the parents lists conflicts.
+    let document = diff_trees(
+        repo,
+        &old_tree,
+        &commit.tree(),
+        matcher.as_ref(),
+        options,
+        *base == ResolvedBase::Parents,
+    )
+    .await?;
+    Ok((document, Some(details)))
+}
+
+/// Diff two trees into a [`DiffDocument`], within `options`' caps, and —
+/// with `surface_conflicts` — list the new side's conflicts. Shared by the
+/// revision diff and the history views' interdiffs, which compare trees that
+/// aren't a commit and its parents.
+pub(crate) async fn diff_trees(
+    repo: &ReadonlyRepo,
+    old_tree: &MergedTree,
+    new_tree: &MergedTree,
+    matcher: &dyn Matcher,
+    options: &DiffOptions<'_>,
+    surface_conflicts: bool,
+) -> Result<DiffDocument> {
+    let mut budget = RowBudget::new(options.limits);
     let copy_records = CopyRecords::default();
-    let tree_diff = old_tree.diff_stream_with_copies(&new_tree, matcher.as_ref(), &copy_records);
+    let tree_diff = old_tree.diff_stream_with_copies(new_tree, matcher, &copy_records);
     let labels = Diff::new(old_tree.labels(), new_tree.labels());
     let mut stream = materialized_diff_stream(repo.store(), tree_diff, labels);
     let materialize_options = ConflictMaterializeOptions {
@@ -110,22 +210,41 @@ pub(crate) async fn diff_jj_with_repo(
             hunks: Vec::new(),
             additions: 0,
             deletions: 0,
+            collapsed: None,
         };
 
-        if before.content.is_binary || after.content.is_binary {
+        let binary = before.content.is_binary || after.content.is_binary;
+        let (before_bytes, after_bytes) = (
+            before.content.contents.as_slice(),
+            after.content.contents.as_slice(),
+        );
+        // Past the caps a file keeps its counts but gets no rows (see
+        // `large_diff`); one the user already expanded is exempt.
+        let collapse = if binary || options.expand.contains(&file.path) {
+            None
+        } else {
+            let (additions, deletions) = large_diff::count_changed_lines(before_bytes, after_bytes);
+            budget
+                .admit(additions + deletions)
+                .err()
+                .map(|reason| (reason, additions, deletions))
+        };
+
+        if binary {
             file.hunks.push(DiffHunkView {
                 header: "binary files differ".to_owned(),
                 lines: Vec::new(),
             });
+        } else if let Some((reason, additions, deletions)) = collapse {
+            file.hunks.push(DiffHunkView {
+                header: large_diff::collapsed_header(reason, additions + deletions),
+                lines: Vec::new(),
+            });
+            file.additions = additions;
+            file.deletions = deletions;
+            file.collapsed = Some(reason);
         } else {
-            let hunks = unified_diff_hunks(
-                Diff::new(
-                    BStr::new(before.content.contents.as_slice()),
-                    BStr::new(after.content.contents.as_slice()),
-                ),
-                3,
-                LineCompareMode::Exact,
-            );
+            let hunks = large_diff::hunks(before_bytes, after_bytes, 3, budget.limits());
             for hunk in hunks {
                 let mut rows = Vec::new();
                 let mut old_line = hunk.left_line_range.start + 1;
@@ -197,11 +316,11 @@ pub(crate) async fn diff_jj_with_repo(
     // conflicted path the stream didn't already cover as a synthetic
     // `Conflicted` entry whose hunks are the materialized conflict regions —
     // `jj resolve --list`, but with content.
-    if new_tree.has_conflict() {
+    if surface_conflicts && new_tree.has_conflict() {
         let covered: std::collections::HashSet<&str> =
             files.iter().map(|file| file.path.as_str()).collect();
         let mut conflict_files = Vec::new();
-        for (repo_path, value) in new_tree.conflicts_matching(matcher.as_ref()) {
+        for (repo_path, value) in new_tree.conflicts_matching(matcher) {
             let path = repo_path_label(&repo_path);
             if covered.contains(path.as_str()) {
                 continue;
@@ -227,6 +346,7 @@ pub(crate) async fn diff_jj_with_repo(
                 hunks: Vec::new(),
                 additions: 0,
                 deletions: 0,
+                collapsed: None,
             };
             if part.content.is_binary {
                 file.hunks.push(DiffHunkView {
@@ -251,14 +371,11 @@ pub(crate) async fn diff_jj_with_repo(
     let total_additions = files.iter().map(|file| file.additions).sum();
     let total_deletions = files.iter().map(|file| file.deletions).sum();
 
-    Ok((
-        DiffDocument {
-            files,
-            total_additions,
-            total_deletions,
-        },
-        Some(details),
-    ))
+    Ok(DiffDocument {
+        files,
+        total_additions,
+        total_deletions,
+    })
 }
 
 pub(crate) fn jj_revision_details(

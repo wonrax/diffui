@@ -573,3 +573,92 @@ fn binary_file_carries_the_binary_hunk() {
     assert_eq!(document.files[0].hunks.len(), 1);
     assert_eq!(document.files[0].hunks[0].header, "binary files differ");
 }
+
+/// A repository with no commits: `git log HEAD` and `git diff HEAD` both exit
+/// 128 on the unborn branch, which used to fail the whole load.
+#[test]
+#[ignore]
+fn an_empty_repository_loads() {
+    if !git_present() {
+        eprintln!("skipping: git is not on PATH");
+        return;
+    }
+    let root = scratch_repo("empty-repo");
+    let repository = repository(&root);
+
+    let rows = block_on(load_git_commits(&repository, "")).expect("load an empty graph");
+    assert!(rows.is_empty(), "nothing committed, nothing changed");
+    block_on(load_git_repository_snapshot(&root)).expect("snapshot an empty repo");
+
+    write(&root, "first.txt", b"hello\n");
+    git(&root, &["add", "first.txt"]);
+    let rows = block_on(load_git_commits(&repository, "")).expect("load the staged state");
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].summary.is_working_copy);
+    assert!(rows[0].summary.parent_ids.is_empty(), "@ is a root here");
+
+    let (document, details) = block_on(load_git_diff(&repository, &RevisionSelection::WorkingCopy))
+        .expect("diff the working copy against the empty tree");
+    assert!(details.is_none());
+    assert_eq!(document.files.len(), 1);
+    assert_eq!(document.files[0].path, "first.txt");
+    assert_eq!(document.files[0].status, DiffFileStatus::Added);
+}
+
+/// The default view used to list the whole history in one `git log`, however
+/// long; it is capped now, and an explicit count in the revision field wins.
+#[test]
+#[ignore]
+fn the_log_is_capped_unless_the_field_names_a_count() {
+    if !git_present() {
+        eprintln!("skipping: git is not on PATH");
+        return;
+    }
+    let root = scratch_repo("log-cap");
+    for index in 0..5 {
+        write(&root, "file.txt", format!("{index}\n").as_bytes());
+        commit(&root, &format!("commit {index}"));
+    }
+    let repository = repository(&root);
+    let rows = block_on(load_git_commits(&repository, "")).expect("load the default view");
+    assert_eq!(rows.len(), 5, "well under the default cap");
+    let rows = block_on(load_git_commits(&repository, "-n 2")).expect("load two");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1].frame.missing_parents, 1, "the cut shows as a stub");
+    let rows = block_on(load_git_commits(&repository, "HEAD~1 --max-count=3"))
+        .expect("load from a revision");
+    assert_eq!(rows.len(), 3);
+    let error = block_on(load_git_commits(&repository, "--output=/tmp/pwned"))
+        .expect_err("an unlisted option is refused");
+    assert!(error.to_string().contains("--output"), "{error:#}");
+}
+
+/// A second save of an already-modified file keeps `git status` identical, so
+/// the snapshot fingerprint has to notice it some other way (it used to hash a
+/// full `git diff HEAD --binary` on every tick).
+#[test]
+#[ignore]
+fn a_second_save_moves_the_snapshot_fingerprint() {
+    if !git_present() {
+        eprintln!("skipping: git is not on PATH");
+        return;
+    }
+    let root = scratch_repo("second-save");
+    write(&root, "file.txt", b"base\n");
+    commit(&root, "base");
+    let fingerprint = || {
+        block_on(load_git_repository_snapshot(&root))
+            .expect("snapshot")
+            .fingerprint
+    };
+    let clean = fingerprint();
+    assert_eq!(fingerprint(), clean, "nothing changed, nothing moves");
+
+    write(&root, "file.txt", b"first edit\n");
+    let first = fingerprint();
+    assert_ne!(first, clean);
+    assert_eq!(fingerprint(), first);
+
+    write(&root, "file.txt", b"second, longer edit\n");
+    assert_ne!(fingerprint(), first, "same status, new contents");
+}

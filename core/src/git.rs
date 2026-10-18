@@ -25,11 +25,21 @@ use crate::source_browse::{SourceEntry, SourceEntryStatus};
 /// with a real hex hash.
 pub const GIT_WORKING_COPY_ID: &str = "wc";
 
+/// How many commits a graph load lists unless the revision field asks for a
+/// count of its own (`-n N`, `--max-count=N`). `git log` of a whole
+/// million-commit history is seconds of git plus a graph nobody scrolls to
+/// the bottom of; the cut-off rows show their parents as stubs.
+pub const DEFAULT_LOG_LIMIT: usize = 10_000;
+
 pub async fn load_git_diff(
     repository: &Repository,
     revision: &RevisionSelection,
 ) -> Result<(DiffDocument, Option<RevisionDetails>)> {
-    let args = git_backend_command(repository, revision);
+    let base = match revision {
+        RevisionSelection::WorkingCopy => working_copy_base(&repository.root).await?,
+        RevisionSelection::Commit(_) => String::new(),
+    };
+    let args = git_backend_command(repository, revision, &base);
     let output = run_command(&repository.root, "git", args).await?;
     let document = parse_unified_diff(&output);
     let details = load_git_revision_details(repository, revision).await.ok();
@@ -50,31 +60,49 @@ pub async fn load_git_commits(
     // Explicit log arguments filter as supplied. The default includes other
     // worktree tips, including detached HEADs outside the current ancestry.
     let mut args = git_args(&["log", "--topo-order", "--no-color"]);
-    args.extend(revision_range.split_whitespace().map(OsString::from));
-    if revision_range.trim().is_empty() {
-        args.push(OsString::from("HEAD"));
-        args.extend(worktrees.iter().map(|tree| OsString::from(&tree.head)));
-    }
     args.push(OsString::from(
         "--pretty=format:%h%x09%H%x09%P%x09%an%x09%x09%s",
     ));
-    let output = run_command(&repository.root, "git", args).await?;
+    // `None` on an unborn branch (a repository with no commits yet), where
+    // `git log HEAD` fails outright.
+    let head = git_head(&repository.root).await;
+    let user_args = log_range_args(revision_range)?;
+    if !user_args
+        .iter()
+        .any(|arg| arg.to_string_lossy().starts_with("--max-count="))
+    {
+        args.push(OsString::from(format!("--max-count={DEFAULT_LOG_LIMIT}")));
+    }
+    let default_view = user_args.is_empty();
+    if default_view {
+        args.extend(head.iter().map(OsString::from));
+        args.extend(worktrees.iter().map(|tree| OsString::from(&tree.head)));
+    } else {
+        args.extend(user_args);
+    }
+    let output = if default_view && head.is_none() && worktrees.is_empty() {
+        // Nothing to walk: with no revisions `git log` would fall back to the
+        // unborn HEAD and fail.
+        String::new()
+    } else {
+        // Everything above is revisions; never let a typo be read as a path.
+        args.push(OsString::from("--"));
+        run_command(&repository.root, "git", args).await?
+    };
 
     let mut rows = parse_commit_log_rows(&output);
     // Git has no native @ commit, so synthesize a working-copy row at
     // the top whenever the tree differs from HEAD. The row's parent
-    // is HEAD so the graph keeps a continuous lane.
-    if !rows.is_empty() && git_has_uncommitted_changes(&repository.root).await? {
-        let head_id = run_command(&repository.root, "git", git_args(&["rev-parse", "HEAD"]))
-            .await?
-            .trim()
-            .to_owned();
+    // is HEAD so the graph keeps a continuous lane; on an unborn branch it
+    // is a root, and the only row.
+    if (!rows.is_empty() || head.is_none()) && git_has_uncommitted_changes(&repository.root).await?
+    {
         rows.insert(
             0,
             ParsedCommitRow {
                 change_id: GIT_WORKING_COPY_ID.to_owned(),
                 commit_id: GIT_WORKING_COPY_ID.to_owned(),
-                parents: vec![head_id],
+                parents: head.into_iter().collect(),
                 author: String::new(),
                 is_empty: None,
                 description: "Working copy".to_owned(),
@@ -115,6 +143,77 @@ pub async fn load_git_commits(
         row.summary.bookmarks = labels.remove(&row.summary.commit_id).unwrap_or_default();
     }
     Ok(summaries)
+}
+
+/// `git log` options the revision field may carry, as `--name` or
+/// `--name=value`: revision selection and filtering only. Anything else —
+/// `--output=<file>` writes a file, `-p`/`--format` reshape what the parser
+/// reads — is refused rather than handed to git.
+const LOG_OPTIONS: &[&str] = &[
+    "--all",
+    "--branches",
+    "--tags",
+    "--remotes",
+    "--glob",
+    "--exclude",
+    "--not",
+    "--first-parent",
+    "--merges",
+    "--no-merges",
+    "--min-parents",
+    "--max-parents",
+    "--ancestry-path",
+    "--simplify-by-decoration",
+    "--author",
+    "--committer",
+    "--grep",
+    "--since",
+    "--after",
+    "--until",
+    "--before",
+    "--max-count",
+    "--skip",
+];
+
+/// Split the revision field into `git log` arguments, refusing any option not
+/// in [`LOG_OPTIONS`]. Order is kept: `--not` and the `--all`/`--branches`
+/// pseudo-revisions apply to what follows them, so options and revisions
+/// can't be separated by `--end-of-options`. A ref can never begin with `-`,
+/// so a leading dash always means an option. `-n N`, `-nN` and `-N` become
+/// `--max-count=N`.
+fn log_range_args(input: &str) -> Result<Vec<OsString>> {
+    let mut args = Vec::new();
+    let mut tokens = input.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if !token.starts_with('-') {
+            args.push(OsString::from(token));
+            continue;
+        }
+        let count = match token {
+            "-n" => Some(tokens.next().unwrap_or_default()),
+            _ => token
+                .strip_prefix("-n")
+                .or_else(|| token.strip_prefix('-'))
+                .filter(|count| !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit())),
+        };
+        if let Some(count) = count {
+            if count.is_empty() || !count.bytes().all(|b| b.is_ascii_digit()) {
+                bail!("`-n` needs a number");
+            }
+            args.push(OsString::from(format!("--max-count={count}")));
+            continue;
+        }
+        let name = token.split_once('=').map_or(token, |(name, _)| name);
+        if !LOG_OPTIONS.contains(&name) {
+            bail!(
+                "unsupported git log option `{token}`; the revision field takes revisions \
+                 and {}",
+                LOG_OPTIONS.join(", ")
+            );
+        }
+        args.push(OsString::from(token));
+    }
+    Ok(args)
 }
 
 #[derive(Debug)]
@@ -162,24 +261,19 @@ fn parse_git_worktrees(output: &[u8]) -> Vec<GitWorktree> {
 }
 
 pub async fn load_git_repository_snapshot(repository_root: &Path) -> Result<RepositorySnapshot> {
-    let output = run_command(
+    let output = run_command_bytes(
         repository_root,
         "git",
         git_args(&[
             "status",
             "--porcelain=v1",
+            "-z",
             "--branch",
             "--untracked-files=normal",
         ]),
     )
     .await?;
-    let head = run_command(
-        repository_root,
-        "git",
-        git_args(&["rev-parse", "--verify", "HEAD"]),
-    )
-    .await
-    .unwrap_or_default();
+    let head = git_head(repository_root).await.unwrap_or_default();
     let refs = run_command(
         repository_root,
         "git",
@@ -192,29 +286,63 @@ pub async fn load_git_repository_snapshot(repository_root: &Path) -> Result<Repo
         git_args(&["worktree", "list", "--porcelain", "-z"]),
     )
     .await?;
-    // Status stays "M" across consecutive edits; include diff contents so the
-    // second save refreshes too. Hash bytes to keep large diffs out of state.
-    let diff_base = if head.is_empty() { "--cached" } else { "HEAD" };
-    let diff = run_command_bytes(
-        repository_root,
-        "git",
-        git_args(&[
-            "diff",
-            diff_base,
-            "--no-ext-diff",
-            "--no-textconv",
-            "--binary",
-        ]),
-    )
-    .await?;
+    // Status stays "M" across consecutive edits, so the second save of a file
+    // needs something else to move the fingerprint. That used to be a full
+    // `git diff HEAD --binary` on every watcher tick — every byte of every
+    // change, re-diffed per save. The size and mtime of each path status
+    // lists move on a save just the same, for a stat per dirty path.
     let mut fingerprint = std::collections::hash_map::DefaultHasher::new();
-    (output, head, refs, worktrees, diff).hash(&mut fingerprint);
+    for path in status_paths(&output) {
+        path.hash(&mut fingerprint);
+        path_stamp(&repository_root.join(path)).hash(&mut fingerprint);
+    }
+    (output, head, refs, worktrees).hash(&mut fingerprint);
     Ok(RepositorySnapshot {
         fingerprint: format!("{:016x}", fingerprint.finish()),
         working_copy_empty: None,
         // Git has no op log — the external-op escalation never applies.
         parent_fingerprint: None,
+        ..RepositorySnapshot::default()
     })
+}
+
+/// The paths in `git status --porcelain=v1 -z` output: each entry is `XY
+/// path`, a rename or copy is followed by its source path as a field of its
+/// own, and `--branch` adds a leading `## ...` field.
+fn status_paths(output: &[u8]) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut fields = output.split(|&byte| byte == 0);
+    while let Some(field) = fields.next() {
+        if field.len() < 4 || field.starts_with(b"## ") {
+            continue;
+        }
+        let (status, path) = field.split_at(3);
+        paths.push(path_from_bytes(path));
+        if matches!(status[0], b'R' | b'C')
+            && let Some(source) = fields.next()
+        {
+            paths.push(path_from_bytes(source));
+        }
+    }
+    paths
+}
+
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
+/// Size and mtime of `path`, or `None` once it's gone — what a save changes.
+fn path_stamp(path: &Path) -> Option<(u64, Option<std::time::SystemTime>)> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()))
 }
 
 /// Global git flags prepended to every invocation we read the output of.
@@ -249,14 +377,51 @@ fn git_args(args: &[&str]) -> Vec<OsString> {
         .collect()
 }
 
-fn git_backend_command(repository: &Repository, revision: &RevisionSelection) -> Vec<OsString> {
+/// The commit `HEAD` names, or `None` on an unborn branch.
+async fn git_head(repository_root: &Path) -> Option<String> {
+    run_command(
+        repository_root,
+        "git",
+        git_args(&["rev-parse", "--verify", "--quiet", "HEAD"]),
+    )
+    .await
+    .ok()
+    .map(|head| head.trim().to_owned())
+    .filter(|head| !head.is_empty())
+}
+
+/// What the working copy diffs against: `HEAD`, or on an unborn branch the
+/// empty tree, so a fresh repository's staged files show as additions. Asked
+/// of git rather than hardcoded because a SHA-256 repository's empty tree has
+/// a different id.
+async fn working_copy_base(repository_root: &Path) -> Result<String> {
+    if git_head(repository_root).await.is_some() {
+        return Ok("HEAD".to_owned());
+    }
+    // stdin is /dev/null, so this hashes an empty tree.
+    let tree = run_command(
+        repository_root,
+        "git",
+        git_args(&["hash-object", "-t", "tree", "--stdin"]),
+    )
+    .await?;
+    Ok(tree.trim().to_owned())
+}
+
+/// The diff command for `revision`. `base` is what the working copy diffs
+/// against (see [`working_copy_base`]); commits ignore it.
+fn git_backend_command(
+    repository: &Repository,
+    revision: &RevisionSelection,
+    base: &str,
+) -> Vec<OsString> {
     let mut args: Vec<OsString> = match revision {
         RevisionSelection::WorkingCopy => {
             // `git diff HEAD` covers both staged and unstaged changes
             // against the last committed state — the closest analog to
             // jj's @ working-copy diff. Untracked files are not included
             // (git diff only walks tracked paths).
-            git_args(&["diff", "HEAD", "--no-ext-diff", "--no-color"])
+            git_args(&["diff", base, "--no-ext-diff", "--no-color"])
         }
         RevisionSelection::Commit(revision) => {
             // `-m --first-parent`: `git show` defaults to a `--cc` combined
@@ -791,8 +956,11 @@ mod tests {
             scope: PathBuf::new(),
         };
 
-        let args =
-            git_backend_command(&repository, &RevisionSelection::Commit("abc123".to_owned()));
+        let args = git_backend_command(
+            &repository,
+            &RevisionSelection::Commit("abc123".to_owned()),
+            "",
+        );
 
         assert!(args.contains(&OsString::from("show")));
         assert!(args.contains(&OsString::from("abc123")));
@@ -815,7 +983,7 @@ mod tests {
             RevisionSelection::WorkingCopy,
             RevisionSelection::Commit("abc123".to_owned()),
         ] {
-            let args = git_backend_command(&repository, &revision);
+            let args = git_backend_command(&repository, &revision, "HEAD");
             let rendered: Vec<&str> = args.iter().filter_map(|arg| arg.to_str()).collect();
 
             for pinned in [
@@ -843,6 +1011,46 @@ mod tests {
                 .expect("the lock flag");
             assert!(last_global < subcommand, "globals after {rendered:?}");
         }
+    }
+
+    #[test]
+    fn the_revision_field_cannot_smuggle_options_into_git_log() {
+        let args = |input: &str| {
+            log_range_args(input).map(|args| {
+                args.into_iter()
+                    .map(|arg| arg.into_string().unwrap())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(
+            args("--all --not origin/main").unwrap(),
+            ["--all", "--not", "origin/main"]
+        );
+        assert_eq!(
+            args("main --author=me -n 20").unwrap(),
+            ["main", "--author=me", "--max-count=20"]
+        );
+        assert_eq!(args("-5 -n7").unwrap(), ["--max-count=5", "--max-count=7"]);
+        assert!(args("").unwrap().is_empty());
+        for hostile in [
+            "--output=/tmp/x",
+            "-p",
+            "--format=%H",
+            "-c",
+            "--exec=sh",
+            "-n x",
+        ] {
+            assert!(args(hostile).is_err(), "{hostile} must be refused");
+        }
+    }
+
+    #[test]
+    fn status_paths_skip_the_branch_line_and_keep_rename_sources() {
+        let output = b"## main...origin/main\0 M src/a.rs\0R  new name.rs\0old name.rs\0?? dir/\0";
+        assert_eq!(
+            status_paths(output),
+            ["src/a.rs", "new name.rs", "old name.rs", "dir/"].map(PathBuf::from)
+        );
     }
 
     #[test]

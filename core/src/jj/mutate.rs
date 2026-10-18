@@ -26,13 +26,17 @@ use jj_lib::{
     workspace::Workspace,
 };
 
-use super::remote::*;
+use super::push::{
+    PushContext, create_bookmark, forget_bookmark, push_request, rename_bookmark, untrack_bookmark,
+};
 use super::walk::*;
 use super::workspace::{
-    LockOutcome, LockedWorkingCopy, SnapshotContext, lock_working_copy, resolve_revision,
+    LockOutcome, LockedWorkingCopy, SnapshotContext, follow_rewritten, lock_working_copy,
+    resolve_revision,
 };
 use crate::model::{LoadProgress, RevisionSelection};
 use crate::mutations::{Destination, MutationOp, MutationOutcome, RebaseSourceMode, SquashTarget};
+use crate::push::{PushAllow, PushRequest, PushTarget};
 use crate::repository::Repository;
 
 /// Whether moving local bookmark `name` to `to` is a **backwards or sideways**
@@ -80,6 +84,9 @@ pub(crate) async fn check_bookmark_move_backwards(
 /// out the resulting `@` so the files on disk match it. Skipping the checkout
 /// would leave the old files in place, and the next snapshot would record them
 /// into the moved-to commit.
+///
+/// The flag beside the outcome says the checkout was stale and had to be
+/// recovered first, which the caller tells the user about.
 pub(crate) async fn apply_mutation(
     workspace: &mut Workspace,
     settings: &UserSettings,
@@ -88,15 +95,18 @@ pub(crate) async fn apply_mutation(
     op: &MutationOp,
     progress: &LoadProgress,
     allow_immutable: bool,
-) -> Result<MutationOutcome> {
+) -> Result<(MutationOutcome, bool)> {
     if is_view_only(op) {
-        return apply_view_only(workspace, settings, op, progress).await;
+        return Ok((
+            apply_view_only(workspace, settings, &repository.root, op, progress).await?,
+            false,
+        ));
     }
     // Recovering a stale checkout finishes the lock session the mutation needs,
     // so the attempt reports back without mutating and the retry runs against
     // the recovered `@`. A second stale report means something outside is still
     // rewriting this workspace's `@`; refuse rather than keep taking the lock.
-    for _ in 0..2 {
+    for attempt in 0..2 {
         if let Some(outcome) = apply_mutation_attempt(
             workspace,
             settings,
@@ -108,7 +118,7 @@ pub(crate) async fn apply_mutation(
         )
         .await?
         {
-            return Ok(outcome);
+            return Ok((outcome, attempt > 0));
         }
     }
     bail!("jj working copy kept going stale while applying the mutation")
@@ -123,6 +133,11 @@ fn is_view_only(op: &MutationOp) -> bool {
             | MutationOp::DeleteBookmark { .. }
             | MutationOp::TrackBookmark { .. }
             | MutationOp::PushBookmark { .. }
+            | MutationOp::CreateBookmark { .. }
+            | MutationOp::RenameBookmark { .. }
+            | MutationOp::ForgetBookmark { .. }
+            | MutationOp::UntrackBookmark { .. }
+            | MutationOp::Push(_)
     )
 }
 
@@ -132,6 +147,7 @@ fn is_view_only(op: &MutationOp) -> bool {
 async fn apply_view_only(
     workspace: &Workspace,
     settings: &UserSettings,
+    repo_root: &Path,
     op: &MutationOp,
     progress: &LoadProgress,
 ) -> Result<MutationOutcome> {
@@ -149,6 +165,13 @@ async fn apply_view_only(
 
     let mut tx = base_repo.start_transaction();
     let mut output: Vec<String> = Vec::new();
+    let mut partial_failure: Option<String> = None;
+    let push_context = PushContext {
+        settings,
+        repo_root,
+        workspace_name: &workspace_name,
+        wc_commit_id: &wc_commit_id,
+    };
     let message = match op {
         MutationOp::MoveBookmark {
             name,
@@ -163,12 +186,26 @@ async fn apply_view_only(
             );
             match push_remote {
                 // The push reads the bookmark's target back out of this
-                // transaction's view, so it pushes the position set above.
+                // transaction's view, so it pushes the position set above —
+                // through the same checks `jj git push -b` runs.
                 Some(remote) => {
-                    let (push_message, remote_output) =
-                        push_bookmark(settings, tx.repo_mut(), name, remote, progress)?;
-                    output = remote_output;
-                    format!("Moved bookmark {name} to {short} \u{b7} {push_message}")
+                    let request = PushRequest {
+                        remote: remote.clone(),
+                        // `SetBookmark`, not `Bookmark`: a refused push rolls
+                        // the move back, so the rejection's request has to
+                        // carry the move for a rerun with allowances.
+                        targets: vec![PushTarget::SetBookmark {
+                            name: name.clone(),
+                            to: to.clone(),
+                        }],
+                        allow: PushAllow::default(),
+                        confirm: false,
+                    };
+                    let pushed =
+                        push_request(&push_context, tx.repo_mut(), &request, progress).await?;
+                    output = pushed.output;
+                    partial_failure = pushed.partial_failure;
+                    format!("Moved bookmark {name} to {short} \u{b7} {}", pushed.message)
                 }
                 None => format!("Moved bookmark {name} to {short}"),
             }
@@ -187,10 +224,39 @@ async fn apply_view_only(
             format!("Tracking {name}@{remote}")
         }
         MutationOp::PushBookmark { name, remote } => {
-            let (message, remote_output) =
-                push_bookmark(settings, tx.repo_mut(), name, remote, progress)?;
-            output = remote_output;
-            message
+            let request = PushRequest {
+                remote: remote.clone(),
+                targets: vec![PushTarget::Bookmark(name.clone())],
+                allow: PushAllow::default(),
+                confirm: false,
+            };
+            let pushed = push_request(&push_context, tx.repo_mut(), &request, progress).await?;
+            output = pushed.output;
+            partial_failure = pushed.partial_failure;
+            pushed.message
+        }
+        MutationOp::Push(request) => {
+            let pushed = push_request(&push_context, tx.repo_mut(), request, progress).await?;
+            output = pushed.output;
+            partial_failure = pushed.partial_failure;
+            pushed.message
+        }
+        MutationOp::CreateBookmark { name, to } => {
+            let commit = resolve_mutation_target(tx.repo(), &wc_commit_id, to).await?;
+            create_bookmark(settings, tx.repo_mut(), name, &commit).await?;
+            format!("Created bookmark {name} at {}", short_change_id(&commit))
+        }
+        MutationOp::RenameBookmark { old, new } => {
+            rename_bookmark(tx.repo_mut(), old, new).await?;
+            format!("Renamed bookmark {old} to {new}")
+        }
+        MutationOp::ForgetBookmark { name } => {
+            forget_bookmark(tx.repo_mut(), name)?;
+            format!("Forgot bookmark {name}")
+        }
+        MutationOp::UntrackBookmark { name, remote } => {
+            untrack_bookmark(tx.repo_mut(), name, remote)?;
+            format!("Stopped tracking {name}@{remote}")
         }
         // `is_view_only` gates this function; anything else is a caller bug.
         _ => bail!("not a view-only mutation"),
@@ -203,6 +269,11 @@ async fn apply_view_only(
         .commit(format!("diffui: {message}"))
         .await
         .context("failed to commit bookmark transaction")?;
+    // Some refs reached the remote and some didn't: what did land is recorded
+    // above (as the CLI does), and the refusal is still the outcome.
+    if let Some(failure) = partial_failure {
+        return Err(super::push::PushFailed(failure).into());
+    }
 
     Ok(MutationOutcome {
         message,
@@ -278,14 +349,31 @@ async fn mutate_locked(
     let new_tree = locked.tree.clone();
     let workspace_name = workspace_name.to_owned();
 
-    // An undo has to know its target *before* the pre-undo fold is committed:
-    // resolving it can fail (a merge operation has no single parent to undo
-    // to), and bailing after the fold left a snapshot op in the log with the
-    // lock unfinished — `@` divergent, and the user staring at an error.
-    let undo_target = match op {
-        MutationOp::Undo { operation_id } => Some(
-            resolve_undo_target(&repo_loader.clone(), &base_repo, operation_id.as_deref()).await?,
-        ),
+    // An undo, redo or revert has to know its target *before* the pre-op fold
+    // is committed: resolving it can fail (a merge operation has no single
+    // parent to undo to, there may be nothing to redo), and bailing after the
+    // fold left a snapshot op in the log with the lock unfinished — `@`
+    // divergent, and the user staring at an error.
+    let op_plan = match op {
+        MutationOp::Undo {
+            operation_id: Some(hex),
+        }
+        | MutationOp::RevertOperation { operation_id: hex } => {
+            Some(super::undo::plan_revert(repo_loader, &base_repo, hex).await?)
+        }
+        MutationOp::Undo { operation_id: None } => {
+            Some(super::undo::plan_undo(repo_loader, base_repo.operation()).await?)
+        }
+        MutationOp::Redo => Some(super::undo::plan_redo(repo_loader, base_repo.operation()).await?),
+        _ => None,
+    };
+    // Same discipline for a restore: an operation from before this workspace
+    // existed has no `@` for it, and finding that out after the fold landed
+    // would strand the lock.
+    let restore_target = match op {
+        MutationOp::RestoreOperation { operation_id } => {
+            Some(super::history::restore_target(repo_loader, operation_id, &workspace_name).await?)
+        }
         _ => None,
     };
 
@@ -294,10 +382,11 @@ async fn mutate_locked(
     // Fold any uncommitted on-disk changes into `@` first so moving off it
     // doesn't lose them. The fold normally rides inside the mutation's own
     // transaction (one op per action; the folded commit stays referenced by
-    // the resulting view) — but an *undo* removes commits from the view, so a
+    // the resulting view) — but an *undo* (or redo) replaces the view, so a
     // same-tx fold could end up referenced by no operation at all and be
-    // unrecoverable from the op log. For undo the fold is committed as its
-    // own snapshot op first, mirroring the CLI's snapshot-before-command.
+    // unrecoverable from the op log. For those the fold is committed as its
+    // own snapshot op first, mirroring the CLI's snapshot-before-command; the
+    // undo then carries the edit over onto the `@` it restores.
     if new_tree.tree_ids_and_labels() != wc_commit.tree().tree_ids_and_labels() {
         let rewritten = tx
             .repo_mut()
@@ -313,7 +402,7 @@ async fn mutate_locked(
             .rebase_descendants()
             .await
             .context("failed to rebase descendants after working-copy fold")?;
-        if matches!(op, MutationOp::Undo { .. }) {
+        if op_plan.is_some() || restore_target.is_some() {
             tx.set_is_snapshot(true);
             let snapped = tx
                 .commit("snapshot working copy")
@@ -714,37 +803,231 @@ async fn mutate_locked(
             let plural = if count == 1 { "" } else { "s" };
             format!("Absorbed {short} into {count} revision{plural}")
         }
+        MutationOp::Commit { .. }
+        | MutationOp::NewAt { .. }
+        | MutationOp::Parallelize { .. }
+        | MutationOp::DuplicateTo { .. }
+        | MutationOp::KeepDivergent { .. }
+        | MutationOp::Metaedit { .. } => {
+            let guard = super::revops::RewriteGuard {
+                repo_root: &repository.root,
+                settings,
+                workspace_name: &workspace_name,
+                allow_immutable,
+            };
+            let outcome =
+                super::revops::apply(tx.repo_mut(), &guard, &workspace_name, &current_wc_id, op)
+                    .await?;
+            rewritten_commit = outcome.rewritten_commit;
+            outcome.message
+        }
         // Routed to `apply_view_only` before the lock was ever taken.
         MutationOp::MoveBookmark { .. }
         | MutationOp::DeleteBookmark { .. }
         | MutationOp::TrackBookmark { .. }
-        | MutationOp::PushBookmark { .. } => {
+        | MutationOp::PushBookmark { .. }
+        | MutationOp::CreateBookmark { .. }
+        | MutationOp::RenameBookmark { .. }
+        | MutationOp::ForgetBookmark { .. }
+        | MutationOp::UntrackBookmark { .. }
+        | MutationOp::Push(_) => {
             bail!("bookmark ops do not take the working-copy lock")
         }
-        MutationOp::Undo { .. } => {
-            let UndoTarget {
-                operation,
-                parent,
-                description,
-            } = undo_target.expect("an undo resolves its target before the fold");
-            // Merge `(parent(op) - op)` onto the current view through jj's own
-            // op-merge machinery (exactly what `jj undo <op>` does), so
-            // unrelated later work — including this transaction's working-copy
-            // fold above — is preserved rather than wiped the way an op
-            // *restore* would.
-            let op_repo = repo_loader
-                .load_at(&operation)
-                .await
-                .context("failed to load the repo at the operation to undo")?;
-            let parent_repo = repo_loader
-                .load_at(&parent)
-                .await
-                .context("failed to load the repo before the operation to undo")?;
+        MutationOp::Undo { .. } | MutationOp::Redo | MutationOp::RevertOperation { .. } => {
+            let plan = op_plan
+                .as_ref()
+                .expect("an undo resolves its plan before the fold");
+            plan.apply(&mut tx, repo_loader, &workspace_name).await?;
+            plan.message.clone()
+        }
+        MutationOp::Split {
+            target,
+            selection,
+            first_description,
+            second_description,
+        } => {
+            let commit = resolve_mutation_target(tx.repo(), &current_wc_id, target).await?;
+            ensure_rewritable(
+                &repository.root,
+                settings,
+                &workspace_name,
+                tx.repo(),
+                &[commit.id().clone()],
+                allow_immutable,
+            )
+            .await?;
+            let (first, second) = super::partial::split(
+                tx.repo_mut(),
+                &commit,
+                selection,
+                first_description.as_deref(),
+                second_description,
+            )
+            .await?;
+            if matches!(target, RevisionSelection::Commit(_)) {
+                rewritten_commit = Some(first.id().hex());
+            }
+            format!(
+                "Split {}: the rest of it is now {}",
+                short_change_id(&first),
+                short_change_id(&second)
+            )
+        }
+        MutationOp::SquashChanges {
+            from,
+            selection,
+            into,
+        } => {
+            let source = resolve_mutation_target(tx.repo(), &current_wc_id, from).await?;
+            let destination = match into {
+                SquashTarget::Parent => {
+                    let parents = source
+                        .parents()
+                        .await
+                        .context("failed to load squash source parents")?;
+                    match parents.as_slice() {
+                        [parent] => parent.clone(),
+                        [] => bail!("{} has no parent to squash into", short_change_id(&source)),
+                        _ => bail!(
+                            "{} is a merge — pick an explicit squash destination",
+                            short_change_id(&source)
+                        ),
+                    }
+                }
+                SquashTarget::Revision(target) => {
+                    resolve_mutation_target(tx.repo(), &current_wc_id, target).await?
+                }
+            };
+            if source.id() == destination.id() {
+                bail!("can't move changes into the revision they come from");
+            }
+            ensure_rewritable(
+                &repository.root,
+                settings,
+                &workspace_name,
+                tx.repo(),
+                &[source.id().clone(), destination.id().clone()],
+                allow_immutable,
+            )
+            .await?;
+            let squashed =
+                super::partial::squash_selection(tx.repo_mut(), &source, &destination, selection)
+                    .await?;
             tx.repo_mut()
-                .merge(&op_repo, &parent_repo)
+                .rebase_descendants()
                 .await
-                .context("failed to merge the undo into the current view")?;
-            format!("Undid: {description}")
+                .context("failed to rebase descendants after the squash")?;
+            // Keep showing the source (the diff the selection was made in)
+            // unless it is gone, in which case follow the changes.
+            if squashed.abandoned_source {
+                rewritten_commit = Some(squashed.destination.id().hex());
+            } else if matches!(from, RevisionSelection::Commit(_)) {
+                rewritten_commit = super::partial::visible_commit_of(tx.repo(), source.change_id())
+                    .await
+                    .map(|id| id.hex());
+            }
+            let mut message = format!(
+                "Moved {} from {} into {}",
+                selection.summary(),
+                short_change_id(&source),
+                short_change_id(&squashed.destination)
+            );
+            if squashed.abandoned_source {
+                message.push_str(" (source emptied, abandoned)");
+            }
+            message
+        }
+        MutationOp::RestoreChanges { target, selection } => {
+            let commit = resolve_mutation_target(tx.repo(), &current_wc_id, target).await?;
+            ensure_rewritable(
+                &repository.root,
+                settings,
+                &workspace_name,
+                tx.repo(),
+                &[commit.id().clone()],
+                allow_immutable,
+            )
+            .await?;
+            let restored =
+                super::partial::restore_selection(tx.repo_mut(), &commit, selection).await?;
+            if matches!(target, RevisionSelection::Commit(_)) {
+                rewritten_commit = Some(restored.id().hex());
+            }
+            format!(
+                "Discarded {} in {}",
+                selection.summary(),
+                short_change_id(&commit)
+            )
+        }
+        MutationOp::ResolveConflict {
+            target,
+            path,
+            resolution,
+        } => {
+            let commit = resolve_mutation_target(tx.repo(), &current_wc_id, target).await?;
+            ensure_rewritable(
+                &repository.root,
+                settings,
+                &workspace_name,
+                tx.repo(),
+                &[commit.id().clone()],
+                allow_immutable,
+            )
+            .await?;
+            // A merge tool may have been open for a while; refuse to resolve a
+            // commit that has been rewritten since (that would resurrect it as
+            // a divergent copy).
+            if let Some(targets) = tx
+                .repo()
+                .resolve_change_id(commit.change_id())
+                .await
+                .context("failed to look up the conflicted revision")?
+                && !targets.has_visible(commit.id())
+            {
+                bail!(
+                    "{} changed while it was being resolved — resolve it again",
+                    short_change_id(&commit)
+                );
+            }
+            let resolved =
+                super::resolve::resolve_conflict(tx.repo_mut(), &commit, path, resolution).await?;
+            if matches!(target, RevisionSelection::Commit(_)) {
+                rewritten_commit = Some(resolved.id().hex());
+            }
+            let how = match resolution {
+                crate::resolve::ConflictResolution::Side(index) => {
+                    format!("took side {}", index + 1)
+                }
+                crate::resolve::ConflictResolution::Base(index) => {
+                    format!("took base {}", index + 1)
+                }
+                crate::resolve::ConflictResolution::Content { .. } => "merged".to_owned(),
+            };
+            let path_conflicted = !resolved
+                .tree()
+                .path_value(&super::partial::repo_path(path)?)
+                .await
+                .context("failed to read the resolved path")?
+                .is_resolved();
+            let still = if path_conflicted {
+                " — still conflicted"
+            } else if resolved.tree().has_conflict() {
+                " (other conflicts remain)"
+            } else {
+                ""
+            };
+            format!(
+                "Resolved {path} in {}: {how}{still}",
+                short_change_id(&commit)
+            )
+        }
+        MutationOp::RestoreOperation { .. } => {
+            let (operation, view) =
+                restore_target.expect("a restore resolves its target before the fold");
+            let restored = super::history::restored_view(&view, tx.base_repo().view().store_view());
+            tx.repo_mut().set_view(restored);
+            let hex = operation.id().hex();
+            format!("Restored to operation {}", &hex[..hex.len().min(12)])
         }
     };
 
@@ -754,16 +1037,20 @@ async fn mutate_locked(
         .context("failed to rebase descendants after mutation")?;
 
     // Mirror jj's own post-operation behavior: export the updated bookmarks to
-    // the colocated git repo so the real git branches (which jj surfaces as
-    // `name@git`) follow the move. Without this the jj bookmark moves but the
-    // git branch stays put, unlike the `jj` CLI. Bookmarks that can't be
-    // represented as a single git ref (e.g. conflicted) come back in
-    // `failed_bookmarks`; that's expected and non-fatal, exactly as jj treats
-    // it, so only a hard backend error is propagated.
-    export_refs(tx.repo_mut()).context("failed to export bookmarks to the git backend")?;
+    // the git repo so the real git branches (which jj surfaces as `name@git`)
+    // follow the move, and — colocated — move this worktree's git HEAD and
+    // index to `@`'s parent, so `git status` agrees with the graph.
+    super::colocate::sync_git_after_transaction(tx.repo_mut(), &workspace_name, &repository.root)
+        .await?;
 
+    // Undo and redo are described exactly as jj describes them: the next
+    // `jj undo` (or ours) reads the description to walk the stack.
+    let description = match &op_plan {
+        Some(plan) => plan.op_description.clone(),
+        None => format!("diffui: {message}"),
+    };
     let new_repo = tx
-        .commit(format!("diffui: {message}"))
+        .commit(description)
         .await
         .context("failed to commit mutation transaction")?;
 
@@ -792,19 +1079,22 @@ async fn mutate_locked(
     ))
 }
 
-/// The operation an undo reverts, resolved before anything has been written.
-struct UndoTarget {
-    operation: Operation,
-    parent: Operation,
-    description: String,
+/// The operation a revert targets, resolved before anything has been written.
+pub(super) struct UndoTarget {
+    pub(super) operation: Operation,
+    pub(super) parent: Operation,
+    pub(super) description: String,
 }
 
-/// Pick the operation `jj undo` would revert, and check that it *can* be
-/// reverted. Deliberately called before the pre-undo working-copy fold is
-/// committed: both failures here ("nothing to undo", "can't undo a merge
-/// operation") used to surface only after that fold had already landed as its
-/// own operation, with the lock left unfinished behind it.
-async fn resolve_undo_target(
+/// Pick the operation `jj op revert` would revert — `operation_id`, or with
+/// `None` the latest operation that isn't a working-copy snapshot — and check
+/// that it *can* be reverted. Deliberately called before the pre-op
+/// working-copy fold is committed: both failures here ("nothing to undo",
+/// "can't undo a merge operation") used to surface only after that fold had
+/// already landed as its own operation, with the lock left unfinished behind
+/// it. (The toolbar's step-back undo walks jj's undo stack instead; see
+/// [`super::undo`].)
+pub(super) async fn resolve_undo_target(
     repo_loader: &RepoLoader,
     base_repo: &ReadonlyRepo,
     operation_id: Option<&str>,
@@ -821,10 +1111,6 @@ async fn resolve_undo_target(
             Operation::new(repo_loader.op_store().clone(), op_id, data)
         }
         None => {
-            // diffui auto-snapshots the working copy on focus/refresh, so the
-            // head op is often a pure snapshot; walk past those so Undo targets
-            // the user's last real operation. Repeated Undo toggles
-            // (undo-the-undo = redo) rather than walking an undo stack.
             let mut op = base_repo.operation().clone();
             while op.metadata().is_snapshot {
                 let parents = op
@@ -1121,7 +1407,9 @@ pub(super) fn combined_squash_description(destination: &Commit, sources: &[Commi
 }
 
 /// Resolve a `RevisionSelection` to a `Commit`. The working-copy case uses
-/// `current_wc_id` (the post-snapshot `@`).
+/// `current_wc_id` (the post-snapshot `@`); a commit the caller still names by
+/// an id that has since been rewritten resolves to its visible successor (see
+/// [`follow_rewritten`]).
 pub(super) async fn resolve_mutation_target(
     repo: &MutableRepo,
     current_wc_id: &CommitId,
@@ -1133,10 +1421,15 @@ pub(super) async fn resolve_mutation_target(
             CommitId::try_from_hex(hex).with_context(|| format!("invalid jj commit id {hex}"))?
         }
     };
-    repo.store()
+    let commit = repo
+        .store()
         .get_commit_async(&commit_id)
         .await
-        .with_context(|| format!("failed to load jj commit {}", commit_id.hex()))
+        .with_context(|| format!("failed to load jj commit {}", commit_id.hex()))?;
+    if matches!(target, RevisionSelection::WorkingCopy) {
+        return Ok(commit);
+    }
+    follow_rewritten(repo, commit).await
 }
 
 pub(super) fn short_change_id(commit: &Commit) -> String {

@@ -1,5 +1,6 @@
 //! GitHub pull-request diff source, shelling out to the `gh` CLI (must be on
-//! PATH and authenticated). The diff **streams**: `gh pr diff` stdout is
+//! PATH and authenticated for the PR's host — github.com or a GitHub
+//! Enterprise Server, see [`PrSpec::host`]). The diff **streams**: `gh pr diff` stdout is
 //! parsed incrementally and each completed file is handed back as soon as its
 //! last hunk is read, so a huge PR paints progressively while the download is
 //! still running. Header metadata (`gh pr view`) is field-separated through
@@ -7,7 +8,7 @@
 
 use std::process::Stdio;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
@@ -26,9 +27,13 @@ use crate::model::{
 /// the `len() < PAGE_SIZE` end-of-pagination check.
 const GITHUB_API_PAGE_SIZE: usize = 100;
 
-/// A pull-request reference: `owner/repo#number`.
+/// A pull-request reference: `[host/]owner/repo#number`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PrSpec {
+    /// The GitHub host for a GitHub Enterprise Server PR (`github.acme.com`),
+    /// read off the URL or the reference. `None` leaves the choice to `gh`:
+    /// `GH_HOST` when set, github.com otherwise.
+    pub host: Option<String>,
     pub owner: String,
     pub repo: String,
     pub number: u64,
@@ -40,29 +45,53 @@ impl PrSpec {
     /// queries tolerated), `o/r#123`, and `o/r/pull/123`. Returns `None` for
     /// anything that doesn't unambiguously name a PR, so a caller (the open
     /// dialog) can fall back to treating the input as a local path.
+    ///
+    /// Any host works, so a GitHub Enterprise URL
+    /// (`https://github.acme.com/o/r/pull/7`) or reference
+    /// (`github.acme.com/o/r#7`) carries its host along. A host without a
+    /// scheme must look like one (contain a dot) so a relative path can't be
+    /// mistaken for it.
     pub fn parse(input: &str) -> Option<Self> {
         let input = input.trim().trim_end_matches('/');
 
-        let rest = input
-            .strip_prefix("https://github.com/")
-            .or_else(|| input.strip_prefix("http://github.com/"))
-            .or_else(|| input.strip_prefix("github.com/"));
-        if let Some(rest) = rest {
-            return Self::parse_path(rest);
+        if let Some(rest) = input
+            .strip_prefix("https://")
+            .or_else(|| input.strip_prefix("http://"))
+        {
+            let (host, path) = rest.split_once('/')?;
+            return Self::parse_path(path).map(|spec| spec.on_host(host));
         }
 
-        // `o/r#123` — exactly one `/` in the slug keeps plain paths (`a/b/c`)
-        // and shell fragments out.
+        // `o/r#123` or `host/o/r#123`. Counting the slugs' slashes keeps
+        // plain paths (`a/b/c`) and shell fragments out.
         if let Some((slug, number)) = input.split_once('#') {
-            let (owner, repo) = slug.split_once('/')?;
-            if owner.is_empty() || repo.is_empty() || repo.contains('/') {
+            let parts: Vec<&str> = slug.split('/').collect();
+            let (host, owner, repo) = match parts.as_slice() {
+                [owner, repo] => (None, *owner, *repo),
+                [host, owner, repo] if looks_like_host(host) => (Some(*host), *owner, *repo),
+                _ => return None,
+            };
+            if owner.is_empty() || repo.is_empty() {
                 return None;
             }
-            return Some(Self {
+            let spec = Self {
+                host: None,
                 owner: owner.to_owned(),
                 repo: repo.to_owned(),
                 number: number.parse().ok()?,
+            };
+            return Some(match host {
+                Some(host) => spec.on_host(host),
+                None => spec,
             });
+        }
+
+        // `host/o/r/pull/123` (URL form without the scheme).
+        if let Some((host, path)) = input.split_once('/')
+            && looks_like_host(host)
+            && let Some(spec) = Self::parse_path(path)
+        {
+            return Some(spec.on_host(host));
         }
 
         // Bare `o/r/pull/123` (URL form without the host).
@@ -70,6 +99,47 @@ impl PrSpec {
             return Self::parse_path(input);
         }
         None
+    }
+
+    /// `self` on `host`, with github.com folded back to `None` so the two
+    /// spellings of a github.com PR are one tab.
+    fn on_host(mut self, host: &str) -> Self {
+        let host = host.to_ascii_lowercase();
+        self.host = (host != "github.com" && host != "www.github.com").then_some(host);
+        self
+    }
+
+    /// The host `gh` is pointed at, for messages: the explicit one, else
+    /// whatever `gh` defaults to.
+    pub fn host_label(&self) -> String {
+        match &self.host {
+            Some(host) => host.clone(),
+            None => std::env::var("GH_HOST")
+                .ok()
+                .filter(|host| !host.is_empty())
+                .unwrap_or_else(|| "github.com".to_owned()),
+        }
+    }
+
+    /// Fill in the host from a local repository's remote: a bare `o/r#123`
+    /// typed while a repo whose remote is `git@github.acme.com:o/r.git` is
+    /// open means the Enterprise PR, not a github.com one.
+    pub fn with_host_from_remotes<'a>(
+        self,
+        remote_urls: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        if self.host.is_some() {
+            return self;
+        }
+        for url in remote_urls {
+            if let Some((host, owner, repo)) = parse_remote_url(url)
+                && owner.eq_ignore_ascii_case(&self.owner)
+                && repo.eq_ignore_ascii_case(&self.repo)
+            {
+                return self.on_host(&host);
+            }
+        }
+        self
     }
 
     /// Parse `owner/repo/pull/number[...]`.
@@ -85,15 +155,36 @@ impl PrSpec {
         let segment = parts.next()?;
         let digits = segment.split(|c: char| !c.is_ascii_digit()).next()?;
         Some(Self {
+            host: None,
             owner: owner.to_owned(),
             repo: repo.to_owned(),
             number: digits.parse().ok()?,
         })
     }
 
-    /// `owner/repo`, the form `gh --repo` takes.
+    /// `owner/repo`, the form the REST paths take.
     pub fn slug(&self) -> String {
         format!("{}/{}", self.owner, self.repo)
+    }
+
+    /// `[host/]owner/repo`, the form `gh --repo` takes.
+    fn repo_arg(&self) -> String {
+        match &self.host {
+            Some(host) => format!("{host}/{}/{}", self.owner, self.repo),
+            None => self.slug(),
+        }
+    }
+
+    /// `gh` with the host applied: `GH_HOST` for the commands that take
+    /// `--repo` (which carries the host too), so `gh api` resolves against
+    /// the same server.
+    fn gh(&self) -> Command {
+        let mut command = Command::new("gh");
+        if let Some(host) = &self.host {
+            command.env("GH_HOST", host);
+        }
+        command.stdin(Stdio::null());
+        command
     }
 
     /// Short display label: `repo#number`.
@@ -102,18 +193,163 @@ impl PrSpec {
     }
 }
 
-/// Run `gh` with `args` and return its stdout. `what` names the invocation
-/// in the non-zero-exit error (e.g. "gh pr view").
-async fn run_gh(args: &[&str], what: &str) -> Result<Vec<u8>> {
-    let output = Command::new("gh")
+/// The remote URLs of the repository at `root` (jj or git), read straight
+/// from its git config — best effort, empty when there is none to read.
+pub fn remote_urls(root: &std::path::Path) -> Vec<String> {
+    let git_dir = if root.join(".jj").is_dir() {
+        crate::jj::settings::backing_git_dir(root)
+    } else {
+        crate::repository::resolve_git_dirs(root)
+            .ok()
+            .map(|dirs| dirs.common_dir)
+    };
+    let Some(config) = git_dir.and_then(|dir| std::fs::read_to_string(dir.join("config")).ok())
+    else {
+        return Vec::new();
+    };
+    remote_urls_in_config(&config)
+}
+
+/// `url` values under `[remote "…"]` sections of a git config file.
+fn remote_urls_in_config(config: &str) -> Vec<String> {
+    let mut in_remote = false;
+    let mut urls = Vec::new();
+    for line in config.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_remote = line.starts_with("[remote ");
+            continue;
+        }
+        if !in_remote {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=')
+            && key.trim().eq_ignore_ascii_case("url")
+        {
+            urls.push(value.trim().trim_matches('"').to_owned());
+        }
+    }
+    urls
+}
+
+fn looks_like_host(segment: &str) -> bool {
+    segment.contains('.') && !segment.starts_with('.') && !segment.contains(['~', ' '])
+}
+
+/// `(host, owner, repo)` of a git remote URL in any of the forms git takes:
+/// `https://host/o/r(.git)`, `ssh://git@host[:port]/o/r`, `git@host:o/r.git`.
+pub fn parse_remote_url(url: &str) -> Option<(String, String, String)> {
+    let url = url.trim();
+    let (host, path) = if let Some((scheme, rest)) = url.split_once("://") {
+        if !matches!(scheme, "https" | "http" | "ssh" | "git") {
+            return None;
+        }
+        let (authority, path) = rest.split_once('/')?;
+        let host = authority.rsplit('@').next()?;
+        let host = host.split(':').next()?;
+        (host, path)
+    } else {
+        // scp-like `[user@]host:path`.
+        let (authority, path) = url.split_once(':')?;
+        if authority.contains('/') {
+            return None;
+        }
+        (authority.rsplit('@').next()?, path)
+    };
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let (owner, repo) = path.split_once('/')?;
+    if host.is_empty() || owner.is_empty() || repo.is_empty() || repo.contains('/') {
+        return None;
+    }
+    Some((host.to_ascii_lowercase(), owner.to_owned(), repo.to_owned()))
+}
+
+/// What to tell the user when `gh` itself couldn't be started.
+fn gh_spawn_error(error: std::io::Error) -> anyhow::Error {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        anyhow::anyhow!(
+            "The GitHub CLI (`gh`) wasn't found. Install it (e.g. `brew install gh`) and run \
+             `gh auth login`. If it is installed: an app opened from Finder or the Dock only \
+             sees the system PATH (/usr/bin:/bin:/usr/sbin:/sbin), so gh in /opt/homebrew/bin \
+             or ~/.local/bin is invisible to it — launch diffui from a terminal, or make gh's \
+             directory part of the launchd PATH."
+        )
+    } else {
+        anyhow::Error::new(error).context("failed to run `gh`")
+    }
+}
+
+/// Turn a failed `gh` invocation's stderr into something actionable, or
+/// `None` to report it as is. gh relays the API's own messages, so this keys
+/// on the phrases gh and GitHub use for the cases that have a fix.
+fn explain_gh_failure(spec: &PrSpec, stderr: &str) -> Option<String> {
+    let host = spec.host_label();
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("gh auth login")
+        || lower.contains("not logged in")
+        || lower.contains("authentication required")
+        || lower.contains("bad credentials")
+        || lower.contains("http 401")
+    {
+        return Some(format!(
+            "gh isn't signed in to {host}. Run `gh auth login --hostname {host}` in a terminal, \
+             then reopen the tab."
+        ));
+    }
+    if lower.contains("rate limit") {
+        return Some(format!(
+            "GitHub's API rate limit on {host} was hit. Wait a few minutes and reopen the tab \
+             (`gh api rate_limit` shows when it resets)."
+        ));
+    }
+    if lower.contains("could not resolve to a pullrequest")
+        || lower.contains("could not resolve to a repository")
+        || lower.contains("http 404")
+    {
+        return Some(format!(
+            "{}#{} wasn't found on {host}, or the account gh is signed in with can't see it. \
+             For a GitHub Enterprise PR, open it by its full URL.",
+            spec.slug(),
+            spec.number
+        ));
+    }
+    if lower.contains("error connecting to")
+        || lower.contains("no such host")
+        || lower.contains("could not resolve host")
+    {
+        return Some(format!(
+            "Couldn't reach {host}. Check the network (and the VPN, for an Enterprise host)."
+        ));
+    }
+    None
+}
+
+/// The error for a `gh` run that exited non-zero.
+fn gh_failure(
+    spec: &PrSpec,
+    what: &str,
+    status: std::process::ExitStatus,
+    stderr: &str,
+) -> anyhow::Error {
+    match explain_gh_failure(spec, stderr) {
+        Some(explained) => anyhow::anyhow!("{explained}\n\n{what}: {}", stderr.trim()),
+        None => anyhow::anyhow!("{what} exited with {status}: {}", stderr.trim()),
+    }
+}
+
+/// Run `gh` against `spec`'s host with `args` and return its stdout. `what`
+/// names the invocation in the error (e.g. "gh pr view").
+async fn run_gh(spec: &PrSpec, args: &[&str], what: &str) -> Result<Vec<u8>> {
+    let output = spec
+        .gh()
         .args(args)
-        .stdin(Stdio::null())
         .output()
         .await
-        .context("failed to run `gh` — is the GitHub CLI installed and on PATH?")?;
+        .map_err(gh_spawn_error)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("{what} exited with {}: {}", output.status, stderr.trim());
+        return Err(gh_failure(spec, what, output.status, &stderr));
     }
     Ok(output.stdout)
 }
@@ -140,12 +376,13 @@ pub struct PrInfo {
 pub async fn fetch_pr_info(spec: &PrSpec) -> Result<PrInfo> {
     const JQ: &str = r#"[(.number|tostring), .title, .author.login, .state, .baseRefName, .headRefName, (.additions|tostring), (.deletions|tostring), (.changedFiles|tostring), .url] | join("\u001f")"#;
     let stdout = run_gh(
+        spec,
         &[
             "pr",
             "view",
             &spec.number.to_string(),
             "--repo",
-            &spec.slug(),
+            &spec.repo_arg(),
             "--json",
             "number,title,author,state,baseRefName,headRefName,additions,deletions,changedFiles,url",
             "--jq",
@@ -186,12 +423,13 @@ pub async fn fetch_pr_commits(spec: &PrSpec) -> Result<Vec<PrCommit>> {
     const JQ: &str =
         r#".commits[] | [.oid, (.authors[0].login // ""), .messageHeadline] | join("\u001f")"#;
     let stdout = run_gh(
+        spec,
         &[
             "pr",
             "view",
             &spec.number.to_string(),
             "--repo",
-            &spec.slug(),
+            &spec.repo_arg(),
             "--json",
             "commits",
             "--jq",
@@ -346,7 +584,7 @@ async fn fetch_pr_commit_diff(
             "repos/{}/commits/{oid}?per_page={GITHUB_API_PAGE_SIZE}&page={page}",
             spec.slug()
         );
-        let stdout = run_gh(&["api", &path], "gh api commit diff").await?;
+        let stdout = run_gh(spec, &["api", &path], "gh api commit diff").await?;
         let commit: ApiCommit =
             serde_json::from_slice(&stdout).context("failed to parse the commit API response")?;
         if details.is_none() {
@@ -481,7 +719,7 @@ async fn stream_pr_files_api(spec: &PrSpec, mut on_file: impl FnMut(DiffFile)) -
             spec.slug(),
             spec.number
         );
-        let stdout = run_gh(&["api", &path], "gh api pull-request files").await?;
+        let stdout = run_gh(spec, &["api", &path], "gh api pull-request files").await?;
         let files: Vec<ApiPrFile> = serde_json::from_slice(&stdout)
             .context("failed to parse the pull-request files API response")?;
         // A short (or empty) page is the last one; GitHub also simply stops
@@ -517,6 +755,7 @@ fn api_file_to_diff_file(file: ApiPrFile) -> DiffFile {
         hunks: Vec::new(),
         additions: 0,
         deletions: 0,
+        collapsed: None,
     });
     match &file.patch {
         Some(patch) => {
@@ -543,19 +782,19 @@ fn api_file_to_diff_file(file: ApiPrFile) -> DiffFile {
 /// The `gh pr diff` path: one process, unified diff streamed off its stdout.
 /// Returns once the stream ends; a non-zero exit fails with captured stderr.
 async fn stream_pr_diff_gh(spec: &PrSpec, mut on_file: impl FnMut(DiffFile)) -> Result<()> {
-    let mut child = Command::new("gh")
+    let mut child = spec
+        .gh()
         .args([
             "pr",
             "diff",
             &spec.number.to_string(),
             "--repo",
-            &spec.slug(),
+            &spec.repo_arg(),
         ])
-        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("failed to run `gh` — is the GitHub CLI installed and on PATH?")?;
+        .map_err(gh_spawn_error)?;
 
     let stdout = child.stdout.take().context("gh stdout unavailable")?;
     let mut stderr = child.stderr.take().context("gh stderr unavailable")?;
@@ -590,7 +829,7 @@ async fn stream_pr_diff_gh(spec: &PrSpec, mut on_file: impl FnMut(DiffFile)) -> 
     let status = child.wait().await.context("failed to await gh")?;
     let stderr_text = stderr_task.await.unwrap_or_default();
     if !status.success() {
-        bail!("gh pr diff exited with {}: {}", status, stderr_text.trim());
+        return Err(gh_failure(spec, "gh pr diff", status, &stderr_text));
     }
     Ok(())
 }
@@ -602,6 +841,7 @@ mod tests {
     #[test]
     fn parses_pr_urls() {
         let expected = Some(PrSpec {
+            host: None,
             owner: "anthropics".to_owned(),
             repo: "claude-code".to_owned(),
             number: 123,
@@ -653,6 +893,104 @@ mod tests {
         assert_eq!(binary.status, DiffFileStatus::Added);
         assert_eq!(binary.hunks.len(), 1);
         assert!(binary.hunks[0].header.contains("diff unavailable"));
+    }
+
+    fn on(host: &str, owner: &str, repo: &str, number: u64) -> Option<PrSpec> {
+        Some(PrSpec {
+            host: Some(host.to_owned()),
+            owner: owner.to_owned(),
+            repo: repo.to_owned(),
+            number,
+        })
+    }
+
+    #[test]
+    fn parses_enterprise_hosts() {
+        let expected = on("github.acme.com", "team", "app", 42);
+        assert_eq!(
+            PrSpec::parse("https://github.acme.com/team/app/pull/42/files"),
+            expected
+        );
+        assert_eq!(PrSpec::parse("github.acme.com/team/app/pull/42"), expected);
+        assert_eq!(PrSpec::parse("github.acme.com/team/app#42"), expected);
+        assert_eq!(PrSpec::parse("GitHub.Acme.com/team/app#42"), expected);
+        // github.com spelled out is the same PR as the shorthand.
+        assert_eq!(
+            PrSpec::parse("https://www.github.com/team/app/pull/42"),
+            PrSpec::parse("team/app#42")
+        );
+        // A relative path with three segments isn't a host reference.
+        assert_eq!(PrSpec::parse("code/team/app#42"), None);
+    }
+
+    #[test]
+    fn parses_remote_urls() {
+        let expected = Some((
+            "github.acme.com".to_owned(),
+            "team".to_owned(),
+            "app".to_owned(),
+        ));
+        assert_eq!(
+            parse_remote_url("git@github.acme.com:team/app.git"),
+            expected
+        );
+        assert_eq!(
+            parse_remote_url("https://github.acme.com/team/app"),
+            expected
+        );
+        assert_eq!(
+            parse_remote_url("ssh://git@github.acme.com:2222/team/app.git"),
+            expected
+        );
+        assert_eq!(parse_remote_url("/srv/git/app.git"), None);
+        assert_eq!(parse_remote_url("file:///srv/git/team/app.git"), None);
+    }
+
+    #[test]
+    fn shorthand_takes_the_host_of_a_matching_remote() {
+        let config = r#"
+[core]
+	bare = false
+[remote "origin"]
+	url = git@github.acme.com:team/app.git
+	fetch = +refs/heads/*:refs/remotes/origin/*
+[remote "fork"]
+	url = https://github.com/me/app.git
+"#;
+        let urls = remote_urls_in_config(config);
+        assert_eq!(urls.len(), 2);
+        let spec = PrSpec::parse("team/app#42")
+            .expect("a reference")
+            .with_host_from_remotes(urls.iter().map(String::as_str));
+        assert_eq!(Some(spec), on("github.acme.com", "team", "app", 42));
+        let spec = PrSpec::parse("me/app#1")
+            .expect("a reference")
+            .with_host_from_remotes(urls.iter().map(String::as_str));
+        assert_eq!(spec.host, None, "github.com stays the default");
+    }
+
+    #[test]
+    fn gh_failures_get_actionable_messages() {
+        let spec = on("github.acme.com", "team", "app", 42).expect("spec");
+        let auth = explain_gh_failure(
+            &spec,
+            "To get started with GitHub CLI, please run:  gh auth login",
+        )
+        .expect("an auth hint");
+        assert!(auth.contains("gh auth login --hostname github.acme.com"));
+        let limited = explain_gh_failure(&spec, "HTTP 403: API rate limit exceeded for user ID 1.")
+            .expect("a rate-limit hint");
+        assert!(limited.contains("rate limit"));
+        assert!(explain_gh_failure(&spec, "HTTP 404: Not Found").is_some());
+        let offline = explain_gh_failure(
+            &spec,
+            "error connecting to github.acme.com\ncheck your internet connection",
+        )
+        .expect("a network hint");
+        assert!(offline.contains("Couldn't reach github.acme.com"));
+        assert!(explain_gh_failure(&spec, "something else").is_none());
+        let missing = gh_spawn_error(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(format!("{missing}").contains("PATH"));
     }
 
     #[test]

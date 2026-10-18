@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use diffui_core::jj::read_jj_op_head;
 use diffui_core::repo::{Command, JobId, OpenSpec, Payload, RepoError, SettingsSource};
 use diffui_core::{
-    BookmarksInfo, BranchStatus, CommitStore, Destination, DiffDocument, DiffFileStatus,
+    BookmarksInfo, BranchStatus, CommitStore, Destination, DiffBase, DiffDocument, DiffFileStatus,
     DiffLineKind, LoadProgress, MutationOp, MutationOutcome, PreviewRequest, RebaseSourceMode,
     Repository, RepositorySnapshot, RevisionDetails, RevisionSelection, SourceEntry,
     SourceFileLoad, SquashTarget, Vcs, list_ignored_dir,
@@ -101,7 +101,21 @@ async fn load_jj_diff(
     repository: Repository,
     revision: RevisionSelection,
 ) -> anyhow::Result<(DiffDocument, Option<RevisionDetails>)> {
-    let events = run_one(&repository.root, |job| Command::LoadDiff { job, revision }).await;
+    load_jj_diff_against(repository, revision, DiffBase::Parents).await
+}
+
+async fn load_jj_diff_against(
+    repository: Repository,
+    revision: RevisionSelection,
+    base: DiffBase,
+) -> anyhow::Result<(DiffDocument, Option<RevisionDetails>)> {
+    let events = run_one(&repository.root, |job| Command::LoadDiff {
+        job,
+        revision,
+        base,
+        expand: Vec::new(),
+    })
+    .await;
     match events.into_iter().next_back() {
         Some(Payload::DiffLoaded {
             document, details, ..
@@ -1190,13 +1204,14 @@ fn squash_multiple_sources_into_one_destination() {
         "dest\n\nsrc a\n\nsrc b\n"
     );
 
-    // Parent target + several sources is ambiguous and refused.
+    // Parent target + several sources is ambiguous and refused. (The
+    // squashed-away sources are gone now, so two visible revisions stand in.)
     let result = block_on(run_mutation(
         repository(&root),
         MutationOp::Squash {
             from: vec![
-                RevisionSelection::Commit(src_a),
-                RevisionSelection::Commit(src_b),
+                RevisionSelection::Commit(base),
+                RevisionSelection::Commit(commit_id(&root, &dest_change)),
             ],
             into: SquashTarget::Parent,
         },
@@ -1939,4 +1954,831 @@ fn move_bookmark_with_push_updates_the_remote() {
         target,
         "the remote itself received the new position"
     );
+}
+
+fn try_run(root: &Path, op: MutationOp) -> Result<mutations::MutationOutcome, RepoError> {
+    block_on(run_mutation(
+        repository(root),
+        op,
+        LoadProgress::default(),
+        false,
+    ))
+}
+
+fn wc_description(root: &Path) -> String {
+    harness::full_description(root, &commit_id(root, "@"))
+}
+
+const UNDO: MutationOp = MutationOp::Undo { operation_id: None };
+
+/// jj 0.45's undo walks back one operation per press and redo walks forward
+/// again, and both write jj's own descriptions, so the CLI continues the same
+/// stack. diffui's undo used to undo the undo instead (a redo), nesting
+/// "Undid: diffui: Undid: …" descriptions as it went.
+#[test]
+fn undo_walks_back_and_redo_walks_forward() {
+    let root = scratch_repo("undo-redo-stack");
+    write(&root, "file.txt", "one\n");
+    snapshot(&root);
+    run(
+        &root,
+        MutationOp::Describe {
+            target: RevisionSelection::WorkingCopy,
+            description: "first\n".to_owned(),
+        },
+    );
+    run(
+        &root,
+        MutationOp::Describe {
+            target: RevisionSelection::WorkingCopy,
+            description: "second\n".to_owned(),
+        },
+    );
+
+    let outcome = run(&root, UNDO);
+    assert!(
+        outcome
+            .message
+            .starts_with("Undid: Updated description for"),
+        "names the undone operation without diffui's tag: {}",
+        outcome.message
+    );
+    assert_eq!(wc_description(&root), "first\n");
+    run(&root, UNDO);
+    assert_eq!(
+        wc_description(&root),
+        "",
+        "a second undo steps further back"
+    );
+
+    let log = harness::operation_log(&root);
+    let (head, _) = &log[0];
+    assert!(
+        head.starts_with("undo: restore to operation "),
+        "jj's own description, so `jj undo` continues the stack: {head:?}"
+    );
+    assert!(
+        log.iter()
+            .all(|(description, _)| !description.contains("Undid")),
+        "nothing nests: {log:?}"
+    );
+
+    run(&root, MutationOp::Redo);
+    assert_eq!(wc_description(&root), "first\n");
+    run(&root, MutationOp::Redo);
+    assert_eq!(wc_description(&root), "second\n");
+    let error = try_run(&root, MutationOp::Redo).expect_err("the stack is exhausted");
+    assert!(
+        error.to_string().contains("nothing to redo"),
+        "unexpected error: {error}"
+    );
+    assert!(!any_divergent(&root, "all()"));
+
+    // A real operation on top ends the redo stack, as in jj.
+    run(&root, UNDO);
+    run(
+        &root,
+        MutationOp::Describe {
+            target: RevisionSelection::WorkingCopy,
+            description: "third\n".to_owned(),
+        },
+    );
+    assert!(try_run(&root, MutationOp::Redo).is_err());
+}
+
+/// diffui snapshots on every save, and the CLI's undo would undo the latest
+/// snapshot — the save. Undo skips snapshot operations and carries the edits
+/// they recorded onto the restored `@`.
+#[test]
+fn undo_skips_file_saves_and_keeps_their_edits() {
+    let root = scratch_repo("undo-skips-saves");
+    write(&root, "file.txt", "base\n");
+    snapshot(&root);
+    run(
+        &root,
+        MutationOp::Describe {
+            target: RevisionSelection::WorkingCopy,
+            description: "described\n".to_owned(),
+        },
+    );
+    // Two saves, each its own snapshot op, and one still unsnapshotted.
+    write(&root, "file.txt", "base\nsaved\n");
+    snapshot(&root);
+    write(&root, "other.txt", "saved too\n");
+    snapshot(&root);
+    write(&root, "late.txt", "not yet snapshotted\n");
+
+    let outcome = run(&root, UNDO);
+    assert!(
+        outcome.message.starts_with("Undid: Updated description"),
+        "the describe is what's undone, not a save: {}",
+        outcome.message
+    );
+    assert_eq!(wc_description(&root), "", "the describe was undone");
+    let paths = diff_paths(&root, RevisionSelection::WorkingCopy);
+    for path in ["file.txt", "other.txt", "late.txt"] {
+        assert!(paths.iter().any(|p| p == path), "{path} kept: {paths:?}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.join("file.txt")).expect("read"),
+        "base\nsaved\n"
+    );
+    assert!(!any_divergent(&root, "all()"));
+
+    // And redo brings the description back, still keeping the edits.
+    run(&root, MutationOp::Redo);
+    assert_eq!(wc_description(&root), "described\n");
+    let paths = diff_paths(&root, RevisionSelection::WorkingCopy);
+    assert!(paths.iter().any(|p| p == "late.txt"), "{paths:?}");
+}
+
+/// Undoing a `new` after typing into the new change puts `@` back where it
+/// was — with the edits carried along rather than left behind in a commit
+/// that just disappeared from the graph.
+#[test]
+fn undoing_new_carries_the_edits_back() {
+    let root = scratch_repo("undo-new-carries");
+    write(&root, "file.txt", "base\n");
+    commit(&root, "base");
+    let before = change_id(&root, "@");
+    run(
+        &root,
+        MutationOp::New {
+            parent: RevisionSelection::WorkingCopy,
+        },
+    );
+    write(&root, "file.txt", "base\ntyped after new\n");
+    snapshot(&root);
+
+    run(&root, UNDO);
+    assert_eq!(
+        change_id(&root, "@"),
+        before,
+        "`@` is back on its old change"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("file.txt")).expect("read"),
+        "base\ntyped after new\n"
+    );
+    assert!(!any_divergent(&root, "all()"));
+}
+
+// ── Whole-revision ops: commit, new -A/-B, parallelize, duplicate placement,
+// divergent resolution, metaedit ─────────────────────────────────────────────
+
+/// `jj commit -m`: the on-disk edit lands in the described commit, and `@`
+/// moves to a fresh empty child of it — one operation, nothing left behind.
+#[test]
+fn commit_describes_the_working_copy_and_starts_an_empty_child() {
+    let root = scratch_repo("revops-commit");
+    write(&root, "file.txt", "hello\n");
+    let wc_change = change_id(&root, "@");
+
+    let outcome = run(
+        &root,
+        MutationOp::Commit {
+            description: "first".to_owned(),
+        },
+    );
+
+    assert!(outcome.moved_working_copy, "@ moves onto the new child");
+    assert_eq!(change_id(&root, "@-"), wc_change, "the old @ is committed");
+    let committed = commit_id(&root, "@-");
+    assert_eq!(harness::full_description(&root, &committed), "first\n");
+    assert_eq!(
+        diff_paths(&root, RevisionSelection::Commit(committed)),
+        vec!["file.txt".to_owned()],
+        "the on-disk edit was folded in before committing"
+    );
+    assert!(
+        diff_paths(&root, RevisionSelection::WorkingCopy).is_empty(),
+        "the new @ is empty"
+    );
+    assert_eq!(harness::full_description(&root, &commit_id(&root, "@")), "");
+}
+
+/// `jj new -A a`: the new change sits between `a` and `a`'s children.
+#[test]
+fn new_after_inserts_between_the_target_and_its_children() {
+    let root = scratch_repo("revops-new-after");
+    write(&root, "file.txt", "a\n");
+    commit(&root, "a");
+    write(&root, "file.txt", "a\nb\n");
+    commit(&root, "b");
+    let a = commit_id(&root, "description(exact:\"a\\n\")");
+    let b = change_id(&root, "description(exact:\"b\\n\")");
+
+    let outcome = run(
+        &root,
+        MutationOp::NewAt {
+            destination: Destination::After(RevisionSelection::Commit(a.clone())),
+        },
+    );
+
+    assert!(outcome.moved_working_copy);
+    assert_eq!(parent_ids(&root, "@"), vec![a]);
+    assert_eq!(parent_ids(&root, &b), vec![commit_id(&root, "@")]);
+    assert!(diff_paths(&root, RevisionSelection::WorkingCopy).is_empty());
+    assert_eq!(
+        harness::file_at(&root, &commit_id(&root, &b), "file.txt"),
+        "a\nb\n",
+        "the rebased child keeps its content"
+    );
+}
+
+/// `jj new -B b`: the new change takes `b`'s parents and `b` moves onto it.
+#[test]
+fn new_before_inserts_between_the_target_and_its_parents() {
+    let root = scratch_repo("revops-new-before");
+    write(&root, "file.txt", "a\n");
+    commit(&root, "a");
+    write(&root, "file.txt", "a\nb\n");
+    commit(&root, "b");
+    let a = commit_id(&root, "description(exact:\"a\\n\")");
+    let b = commit_id(&root, "description(exact:\"b\\n\")");
+    let b_change = change_id(&root, "description(exact:\"b\\n\")");
+
+    run(
+        &root,
+        MutationOp::NewAt {
+            destination: Destination::Before(RevisionSelection::Commit(b)),
+        },
+    );
+
+    assert_eq!(parent_ids(&root, "@"), vec![a]);
+    assert_eq!(parent_ids(&root, &b_change), vec![commit_id(&root, "@")]);
+}
+
+/// The CLI's loop guard: inserting between a commit and its own ancestor is
+/// refused, and nothing is written.
+#[test]
+fn new_between_refuses_to_create_a_loop() {
+    let root = scratch_repo("revops-new-loop");
+    write(&root, "file.txt", "a\n");
+    commit(&root, "a");
+    write(&root, "file.txt", "a\nb\n");
+    commit(&root, "b");
+    let a = commit_id(&root, "description(exact:\"a\\n\")");
+    let b = commit_id(&root, "description(exact:\"b\\n\")");
+    let head_before = block_on(read_jj_op_head(repository(&root))).expect("read op head");
+
+    let result = block_on(run_mutation(
+        repository(&root),
+        MutationOp::NewAt {
+            destination: Destination::Between {
+                parent: RevisionSelection::Commit(b),
+                child: RevisionSelection::Commit(a),
+            },
+        },
+        LoadProgress::default(),
+        false,
+    ));
+
+    let error = result.expect_err("a loop must be refused").to_string();
+    assert!(error.contains("loop"), "unexpected error: {error}");
+    assert_eq!(
+        block_on(read_jj_op_head(repository(&root))).expect("read op head"),
+        head_before
+    );
+}
+
+/// base → a → b → c, parallelize {a, b}: a and b become siblings on base,
+/// and c (b's child) merges both.
+#[test]
+fn parallelize_turns_a_chain_into_siblings() {
+    let root = scratch_repo("revops-parallelize");
+    write(&root, "base.txt", "base\n");
+    commit(&root, "base");
+    write(&root, "a.txt", "a\n");
+    commit(&root, "a");
+    write(&root, "b.txt", "b\n");
+    commit(&root, "b");
+    write(&root, "c.txt", "c\n");
+    commit(&root, "c");
+    let base = commit_id(&root, "description(exact:\"base\\n\")");
+    let a = change_id(&root, "description(exact:\"a\\n\")");
+    let b = change_id(&root, "description(exact:\"b\\n\")");
+    let c = change_id(&root, "description(exact:\"c\\n\")");
+
+    let outcome = run(
+        &root,
+        MutationOp::Parallelize {
+            targets: vec![
+                RevisionSelection::Commit(commit_id(&root, &a)),
+                RevisionSelection::Commit(commit_id(&root, &b)),
+            ],
+        },
+    );
+
+    assert!(
+        outcome.message.starts_with("Parallelized 2 revisions"),
+        "{}",
+        outcome.message
+    );
+    assert_eq!(parent_ids(&root, &a), vec![base.clone()]);
+    assert_eq!(parent_ids(&root, &b), vec![base]);
+    let mut c_parents = parent_ids(&root, &c);
+    c_parents.sort();
+    let mut expected = vec![commit_id(&root, &a), commit_id(&root, &b)];
+    expected.sort();
+    assert_eq!(c_parents, expected, "the head's child merges the siblings");
+    assert!(
+        diff_paths(&root, RevisionSelection::Commit(commit_id(&root, &b)))
+            .contains(&"b.txt".to_owned()),
+        "b keeps its own change"
+    );
+}
+
+/// Parallelizing a commit away from the one whose line it edits conflicts —
+/// the preview names it, and writes nothing.
+#[test]
+fn parallelize_preview_predicts_conflicts_without_mutating() {
+    let root = scratch_repo("revops-parallelize-preview");
+    write(&root, "file.txt", "one\n");
+    commit(&root, "base");
+    write(&root, "file.txt", "two\n");
+    commit(&root, "a");
+    write(&root, "file.txt", "three\n");
+    commit(&root, "b");
+    let a = commit_id(&root, "description(exact:\"a\\n\")");
+    let b = commit_id(&root, "description(exact:\"b\\n\")");
+    let b_change = change_id(&root, "description(exact:\"b\\n\")");
+    let head_before = block_on(read_jj_op_head(repository(&root))).expect("read op head");
+
+    let simulation = block_on(preview(
+        &root,
+        PreviewRequest::Parallelize {
+            targets: vec![
+                RevisionSelection::Commit(a.clone()),
+                RevisionSelection::Commit(b.clone()),
+            ],
+        },
+    ))
+    .expect("preview succeeds");
+    let diffui_core::DraftSimulation::Rebase(preview) = simulation else {
+        panic!("parallelize previews rebase-shaped, got {simulation:?}");
+    };
+
+    assert!(preview.simulated);
+    assert_eq!(preview.moved, 1, "only b's parents change");
+    assert!(preview.descendants >= 1, "@ follows b");
+    let short: String = b_change.chars().take(8).collect();
+    assert!(
+        preview.new_conflicts.contains(&short),
+        "b loses the line it edits: {:?}",
+        preview.new_conflicts
+    );
+    assert_eq!(
+        block_on(read_jj_op_head(repository(&root))).expect("read op head"),
+        head_before
+    );
+    assert_eq!(parent_ids(&root, &b), vec![a], "nothing moved");
+}
+
+/// `jj duplicate top -B mid`: the copy takes mid's parents and mid moves
+/// onto the copy; the original stays put.
+#[test]
+fn duplicate_before_a_target_rebases_it_onto_the_copy() {
+    let root = scratch_repo("revops-duplicate-before");
+    write(&root, "base.txt", "base\n");
+    commit(&root, "base");
+    write(&root, "mid.txt", "mid\n");
+    commit(&root, "mid");
+    write(&root, "top.txt", "top\n");
+    commit(&root, "top");
+    let base = commit_id(&root, "description(exact:\"base\\n\")");
+    let mid = commit_id(&root, "description(exact:\"mid\\n\")");
+    let mid_change = change_id(&root, "description(exact:\"mid\\n\")");
+    let top = commit_id(&root, "description(exact:\"top\\n\")");
+    let top_change = change_id(&root, "description(exact:\"top\\n\")");
+
+    let outcome = run(
+        &root,
+        MutationOp::DuplicateTo {
+            targets: vec![RevisionSelection::Commit(top.clone())],
+            destination: Some(Destination::Before(RevisionSelection::Commit(mid))),
+        },
+    );
+
+    let copy = outcome.rewritten_commit.expect("the copy is reported");
+    assert_eq!(
+        commit_ids(&root, "description(exact:\"top\\n\")").len(),
+        2,
+        "original + copy"
+    );
+    assert_eq!(parent_ids(&root, &copy), vec![base]);
+    assert_eq!(parent_ids(&root, &mid_change), vec![copy]);
+    assert_eq!(
+        parent_ids(&root, &top_change),
+        vec![commit_id(&root, &mid_change)],
+        "the original stays on mid, following it"
+    );
+}
+
+/// Batch duplicate without a destination copies each revision onto its own
+/// parents, as plain `jj duplicate a b` does.
+#[test]
+fn duplicate_several_revisions_onto_their_parents() {
+    let root = scratch_repo("revops-duplicate-many");
+    write(&root, "a.txt", "a\n");
+    commit(&root, "a");
+    write(&root, "b.txt", "b\n");
+    commit(&root, "b");
+    let a = commit_id(&root, "description(exact:\"a\\n\")");
+    let b = commit_id(&root, "description(exact:\"b\\n\")");
+
+    let outcome = run(
+        &root,
+        MutationOp::DuplicateTo {
+            targets: vec![RevisionSelection::Commit(a), RevisionSelection::Commit(b)],
+            destination: None,
+        },
+    );
+
+    assert_eq!(outcome.message, "Duplicated 2 revisions");
+    assert_eq!(commit_ids(&root, "description(exact:\"a\\n\")").len(), 2);
+    assert_eq!(commit_ids(&root, "description(exact:\"b\\n\")").len(), 2);
+}
+
+/// "Keep this copy": every other visible commit of a divergent change is
+/// abandoned, which ends the divergence.
+#[test]
+fn keep_divergent_abandons_the_other_copies() {
+    let root = scratch_repo("revops-keep-divergent");
+    write(&root, "file.txt", "hello\n");
+    commit(&root, "base");
+    let leaf_commit = new_leaf(&root, &[commit_id(&root, "@-")], "leaf");
+    let leaf = change_id(&root, "description(glob:\"leaf*\")");
+    harness::describe(&root, OpBase::Head, &leaf_commit, "leaf d1\n");
+    harness::describe(&root, OpBase::ParentOfHead, &leaf_commit, "leaf d2\n");
+    assert!(any_divergent(&root, "all()"), "fixture is divergent");
+    let keep = commit_id(&root, "description(exact:\"leaf d1\\n\")");
+
+    let outcome = run(
+        &root,
+        MutationOp::KeepDivergent {
+            keep: RevisionSelection::Commit(keep.clone()),
+        },
+    );
+
+    assert!(
+        outcome.message.contains("abandoned 1 other copy"),
+        "{}",
+        outcome.message
+    );
+    assert!(!any_divergent(&root, "all()"));
+    assert_eq!(commit_id(&root, &leaf), keep);
+
+    // Once resolved there is nothing left to keep against.
+    let again = block_on(run_mutation(
+        repository(&root),
+        MutationOp::KeepDivergent {
+            keep: RevisionSelection::Commit(keep),
+        },
+        LoadProgress::default(),
+        false,
+    ));
+    assert!(again.is_err(), "a non-divergent change is refused");
+}
+
+/// `jj metaedit --update-author`: the author becomes the configured user.
+#[test]
+fn metaedit_resets_the_author_to_the_configured_user() {
+    let root = scratch_repo("revops-metaedit");
+    write(&root, "file.txt", "hello\n");
+    commit(&root, "mine");
+    let target = commit_id(&root, "description(exact:\"mine\\n\")");
+    std::fs::write(
+        harness::repo_dir(&root).join("config.toml"),
+        "[user]\nname = \"Someone Else\"\nemail = \"else@example.com\"\n",
+    )
+    .expect("write repo config");
+
+    let outcome = run(
+        &root,
+        MutationOp::Metaedit {
+            targets: vec![RevisionSelection::Commit(target)],
+            update_author: true,
+            update_author_timestamp: false,
+        },
+    );
+
+    let rewritten = outcome.rewritten_commit.expect("the rewrite is reported");
+    let (_document, details) = block_on(load_jj_diff(
+        repository(&root),
+        RevisionSelection::Commit(rewritten),
+    ))
+    .expect("load the rewritten revision");
+    let details = details.expect("revision details");
+    assert_eq!(details.author.name, "Someone Else");
+    assert_eq!(details.author.email, "else@example.com");
+    assert_eq!(details.description, "mine\n");
+}
+
+// ── Comparing two revisions ─────────────────────────────────────────────────
+
+/// `(path, status, additions, deletions)` of `revision`'s diff against `base`.
+fn compare_summary(
+    root: &Path,
+    revision: RevisionSelection,
+    base: DiffBase,
+) -> Vec<(String, DiffFileStatus, usize, usize)> {
+    let (document, _details) = block_on(load_jj_diff_against(repository(root), revision, base))
+        .expect("load the comparison");
+    document
+        .files
+        .into_iter()
+        .map(|file| (file.path, file.status, file.additions, file.deletions))
+        .collect()
+}
+
+/// `jj diff --from A --to B` spans every change between the two trees, not
+/// just B's own, and swapping the sides inverts it.
+#[test]
+fn compare_diffs_two_arbitrary_revisions() {
+    let root = scratch_repo("compare-range");
+    write(&root, "a.txt", "one\n");
+    commit(&root, "first");
+    write(&root, "a.txt", "one\ntwo\n");
+    write(&root, "b.txt", "b\n");
+    commit(&root, "second");
+    write(&root, "a.txt", "one\ntwo\nthree\n");
+    commit(&root, "third");
+    let first = commit_id(&root, "description(glob:\"first*\")");
+    let third = commit_id(&root, "description(glob:\"third*\")");
+
+    let forward = compare_summary(
+        &root,
+        RevisionSelection::Commit(third.clone()),
+        DiffBase::Revision(RevisionSelection::Commit(first.clone())),
+    );
+    assert_eq!(
+        forward,
+        vec![
+            ("a.txt".to_owned(), DiffFileStatus::Modified, 2, 0),
+            ("b.txt".to_owned(), DiffFileStatus::Added, 1, 0),
+        ]
+    );
+
+    let backward = compare_summary(
+        &root,
+        RevisionSelection::Commit(first.clone()),
+        DiffBase::Revision(RevisionSelection::Commit(third.clone())),
+    );
+    assert_eq!(
+        backward,
+        vec![
+            ("a.txt".to_owned(), DiffFileStatus::Modified, 0, 2),
+            ("b.txt".to_owned(), DiffFileStatus::Deleted, 0, 1),
+        ]
+    );
+
+    // A revision against itself is empty.
+    assert!(
+        compare_summary(
+            &root,
+            RevisionSelection::Commit(third.clone()),
+            DiffBase::Revision(RevisionSelection::Commit(third)),
+        )
+        .is_empty()
+    );
+}
+
+/// Comparing against the working copy reads `@`'s tree, edits on disk
+/// included once snapshotted.
+#[test]
+fn compare_with_the_working_copy() {
+    let root = scratch_repo("compare-wc");
+    write(&root, "a.txt", "one\n");
+    commit(&root, "first");
+    write(&root, "a.txt", "one\ntwo\n");
+    snapshot(&root);
+    let first = commit_id(&root, "description(glob:\"first*\")");
+
+    assert_eq!(
+        compare_summary(
+            &root,
+            RevisionSelection::WorkingCopy,
+            DiffBase::Revision(RevisionSelection::Commit(first)),
+        ),
+        vec![("a.txt".to_owned(), DiffFileStatus::Modified, 1, 0)]
+    );
+}
+
+/// `jj interdiff`: two versions of one change on different parents differ
+/// only in what the change itself does, not in what the parents brought.
+#[test]
+fn interdiff_ignores_what_the_parents_changed() {
+    let root = scratch_repo("compare-interdiff");
+    write(&root, "base.txt", "base\n");
+    commit(&root, "base");
+    let base = commit_id(&root, "description(glob:\"base*\")");
+
+    // v1 of the change, straight on base.
+    write(&root, "feature.txt", "feature v1\n");
+    commit(&root, "change v1");
+    let v1 = commit_id(&root, "description(glob:\"change v1*\")");
+
+    // Upstream moves on from base, touching an unrelated file.
+    new_edit(&root, std::slice::from_ref(&base), "upstream");
+    write(&root, "upstream.txt", "upstream\n");
+    snapshot(&root);
+    let upstream = commit_id(&root, "description(glob:\"upstream*\")");
+
+    // v2 of the change, on upstream, with one line more.
+    new_edit(&root, std::slice::from_ref(&upstream), "change v2");
+    write(&root, "feature.txt", "feature v1\nfeature v2\n");
+    snapshot(&root);
+    let v2 = commit_id(&root, "description(glob:\"change v2*\")");
+
+    // A plain comparison drags the upstream file in...
+    let plain = compare_summary(
+        &root,
+        RevisionSelection::Commit(v2.clone()),
+        DiffBase::Revision(RevisionSelection::Commit(v1.clone())),
+    );
+    assert!(plain.iter().any(|(path, ..)| path == "upstream.txt"));
+
+    // ...the interdiff shows only the change's own difference.
+    assert_eq!(
+        compare_summary(
+            &root,
+            RevisionSelection::Commit(v2),
+            DiffBase::Interdiff(RevisionSelection::Commit(v1)),
+        ),
+        vec![("feature.txt".to_owned(), DiffFileStatus::Modified, 1, 0)]
+    );
+}
+
+/// A base that no longer resolves fails the load (the session falls back to
+/// the plain diff on that failure).
+#[test]
+fn compare_against_an_abandoned_base_fails() {
+    let root = scratch_repo("compare-abandoned");
+    write(&root, "a.txt", "one\n");
+    commit(&root, "first");
+    write(&root, "a.txt", "one\ntwo\n");
+    commit(&root, "second");
+    let second = commit_id(&root, "description(glob:\"second*\")");
+    run(
+        &root,
+        MutationOp::Abandon {
+            targets: vec![RevisionSelection::Commit(second.clone())],
+        },
+    );
+    let result = block_on(load_jj_diff_against(
+        repository(&root),
+        RevisionSelection::WorkingCopy,
+        DiffBase::Revision(RevisionSelection::Commit(second)),
+    ));
+    assert!(result.is_err(), "an abandoned base must not resolve");
+}
+
+// ── Size caps ───────────────────────────────────────────────────────────────
+
+fn numbered_lines(count: usize, tag: &str) -> String {
+    (0..count).map(|n| format!("{tag} line {n}\n")).collect()
+}
+
+/// A file past the per-file cap comes back with its counts and a header-only
+/// placeholder; asking for it by path returns every row.
+#[test]
+fn a_huge_file_collapses_and_expands_on_demand() {
+    let root = scratch_repo("caps-large-file");
+    write(&root, "small.txt", "one\n");
+    write(&root, "huge.txt", &numbered_lines(5_000, "huge"));
+    snapshot(&root);
+
+    let (document, _) = block_on(load_jj_diff(
+        repository(&root),
+        RevisionSelection::WorkingCopy,
+    ))
+    .expect("load the diff");
+    let huge = document
+        .files
+        .iter()
+        .find(|file| file.path == "huge.txt")
+        .expect("huge.txt in the diff");
+    assert_eq!(huge.collapsed, Some(diffui_core::DiffCollapse::LargeFile));
+    assert_eq!((huge.additions, huge.deletions), (5_000, 0));
+    assert_eq!(huge.hunks.len(), 1);
+    assert!(huge.hunks[0].lines.is_empty());
+    let small = document
+        .files
+        .iter()
+        .find(|file| file.path == "small.txt")
+        .expect("small.txt in the diff");
+    assert_eq!(small.collapsed, None);
+    assert_eq!(small.hunks[0].lines.len(), 1);
+
+    let events = block_on(run_one(&root, |job| Command::ExpandFile {
+        job,
+        revision: RevisionSelection::WorkingCopy,
+        base: DiffBase::Parents,
+        path: "huge.txt".to_owned(),
+    }));
+    match events.into_iter().next_back() {
+        Some(Payload::FileExpanded {
+            path,
+            file: Some(file),
+            ..
+        }) => {
+            assert_eq!(path, "huge.txt");
+            assert_eq!(file.collapsed, None);
+            assert_eq!(file.additions, 5_000);
+            let rows: usize = file.hunks.iter().map(|hunk| hunk.lines.len()).sum();
+            assert_eq!(rows, 5_000);
+        }
+        other => panic!("expected FileExpanded, got {other:?}"),
+    }
+
+    // A reload that names the path keeps it expanded.
+    let events = block_on(run_one(&root, |job| Command::LoadDiff {
+        job,
+        revision: RevisionSelection::WorkingCopy,
+        base: DiffBase::Parents,
+        expand: vec!["huge.txt".to_owned()],
+    }));
+    match events.into_iter().next_back() {
+        Some(Payload::DiffLoaded { document, .. }) => {
+            let huge = document
+                .files
+                .iter()
+                .find(|file| file.path == "huge.txt")
+                .expect("huge.txt in the diff");
+            assert_eq!(huge.collapsed, None);
+        }
+        other => panic!("expected DiffLoaded, got {other:?}"),
+    }
+}
+
+/// Once the revision has spent its row budget, the remaining files collapse
+/// even though each is small enough on its own.
+#[test]
+fn many_files_collapse_past_the_revision_budget() {
+    let root = scratch_repo("caps-budget");
+    for index in 0..12 {
+        write(
+            &root,
+            &format!("gen/file{index:02}.txt"),
+            &numbered_lines(2_900, &format!("f{index}")),
+        );
+    }
+    snapshot(&root);
+
+    let (document, _) = block_on(load_jj_diff(
+        repository(&root),
+        RevisionSelection::WorkingCopy,
+    ))
+    .expect("load the diff");
+    assert_eq!(document.files.len(), 12);
+    let shown = document
+        .files
+        .iter()
+        .filter(|file| file.collapsed.is_none())
+        .count();
+    assert_eq!(shown, 10, "30,000 rows fit ten 2,900-line files");
+    assert!(
+        document
+            .files
+            .iter()
+            .filter(|file| file.collapsed.is_some())
+            .all(
+                |file| file.collapsed == Some(diffui_core::DiffCollapse::OverBudget)
+                    && file.additions == 2_900
+            )
+    );
+    assert_eq!(document.total_additions, 12 * 2_900);
+}
+
+/// A rewrite past the word-diff size is diffed by line: the rows are all
+/// there, without word emphasis.
+#[test]
+fn a_big_rewrite_skips_word_level_emphasis() {
+    let root = scratch_repo("caps-word-diff");
+    let line = |n: usize, tag: &str| format!("    ({n}, \"{tag}{:0190}\"),\n", n);
+    let before: String = (0..1_400).map(|n| line(n, "a")).collect();
+    write(&root, "table.rs", &before);
+    commit(&root, "table");
+    let after: String = (0..1_400).map(|n| line(n, "b")).collect();
+    write(&root, "table.rs", &after);
+    snapshot(&root);
+
+    let (document, _) = block_on(load_jj_diff(
+        repository(&root),
+        RevisionSelection::WorkingCopy,
+    ))
+    .expect("load the diff");
+    let file = &document.files[0];
+    assert_eq!(file.collapsed, None);
+    assert_eq!((file.additions, file.deletions), (1_400, 1_400));
+    let emphasized = file
+        .hunks
+        .iter()
+        .flat_map(|hunk| &hunk.lines)
+        .any(|line| !line.emphasis.is_empty());
+    // Under the word-diff limit each pair would emphasize its changed
+    // token; past it nothing is.
+    assert!(before.len() + after.len() > 512 * 1024);
+    assert!(!emphasized);
 }

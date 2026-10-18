@@ -28,6 +28,9 @@ pub(crate) enum Action {
     ClearMultiSelection,
     /// Run a jj mutation. Every mutation entry point funnels here.
     Mutate(mutations::MutationOp),
+    /// Ask before running a destructive mutation (a keyboard or palette
+    /// abandon), then run it like [`Action::Mutate`].
+    ConfirmMutation(mutations::MutationOp),
     /// Enter target mode: pick a destination for a rebase/squash/merge.
     StartDraft {
         kind: mutations::DraftKind,
@@ -105,6 +108,9 @@ pub(crate) enum Action {
     CloseActivityPopover,
     ClearActivities,
     DismissMenu,
+    /// Open or close the keyboard-shortcut cheat sheet.
+    ToggleShortcuts,
+    CloseShortcuts,
     ConfirmAccept,
     ConfirmCancel,
 
@@ -112,7 +118,8 @@ pub(crate) enum Action {
     Refresh,
     Fetch(FetchTarget),
     Undo,
-    /// Revert exactly this jj operation (an activity row's "Undo").
+    Redo,
+    /// Revert exactly this jj operation (an activity row's "Revert").
     UndoOperation(activity::ActivityId, String),
     /// Replace the revset and re-evaluate.
     SetRevset(String),
@@ -158,4 +165,31 @@ pub(crate) enum Action {
 
     /// Open a URL (from an activity's captured remote output) in the browser.
     OpenUrl(String),
+
+    /// Bookmark workflow and push — see [`crate::bookmarks`].
+    Bookmark(crate::bookmarks::BookmarkAction),
+
+    /// Commit, placed new / duplicate, batch drafts — see [`crate::revops`].
+    Revops(crate::revops::RevopsAction),
+
+    // ── Partial changes / conflicts ─────────────────────────────────────
+    /// A change-selection or conflict-resolution intent (see
+    /// [`crate::changes`]).
+    Changes(crate::changes::ChangesMsg),
+
+    // ── History ─────────────────────────────────────────────────────────
+    /// Op log, evolog, file history, annotate — see [`crate::history_panel`].
+    History(crate::history_panel::HistoryAction),
+
+    // ── Diagnostics ─────────────────────────────────────────────────────
+    /// Show diffui's log file in the file manager.
+    RevealLogFile,
+    /// Open `config.toml` in a text editor, creating it if missing.
+    OpenConfigFile,
+
+    // ── Comparing ───────────────────────────────────────────────────────
+    /// Diff two revisions against each other (see [`crate::compare`]).
+    Compare(crate::compare::CompareAction),
+    /// Load the full diff of a file (by index) the backend collapsed for size.
+    ExpandFile(usize),
 }

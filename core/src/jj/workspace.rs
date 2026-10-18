@@ -280,6 +280,10 @@ pub(crate) async fn lock_working_copy<'a>(
                 .finish(merged_repo.op_id().clone())
                 .await
                 .context("failed to finish jj working-copy recovery")?;
+            tracing::info!(
+                operation = %merged_repo.op_id().hex(),
+                "working copy was stale (changed by another process); updated it to the latest operation"
+            );
 
             return Ok(LockOutcome::Recovered {
                 repo: merged_repo,
@@ -324,10 +328,12 @@ fn untracked_warnings(stats: &SnapshotStats) -> Vec<String> {
 
 /// Resolve a [`RevisionSelection`] against the repo at head.
 ///
-/// A hex naming a commit that is no longer visible — abandoned, or rewritten
-/// out from under a menu the user left open — is rejected rather than loaded:
-/// the diff would render, the sidebar would have no row for it, and every
-/// follow-up action would address a commit nobody can see.
+/// A hex naming a commit that was rewritten out from under the row (or a menu
+/// the user left open) resolves to its visible successor; one that is gone for
+/// good — abandoned, or split into divergent copies — is rejected rather than
+/// loaded: the diff would render, the sidebar would have no row for it, and
+/// every follow-up action would address a commit nobody can see. See
+/// [`follow_rewritten`].
 pub(crate) async fn resolve_revision(
     repo: &ReadonlyRepo,
     workspace_name: &WorkspaceName,
@@ -350,14 +356,51 @@ pub(crate) async fn resolve_revision(
         .get_commit_async(&commit_id)
         .await
         .with_context(|| format!("failed to load jj commit {}", commit_id.hex()))?;
-    if commit
-        .is_hidden(repo)
+    Ok(follow_rewritten(repo, commit).await?.id().clone())
+}
+
+/// The visible commit a row's cached `commit` stands for.
+///
+/// A row names its commit by id, and a rewrite the row hasn't seen yet — the
+/// watcher's snapshot rebasing the children of an edited `@`, a CLI command,
+/// another workspace — leaves that id pointing at a hidden predecessor.
+/// Acting on it rewrites a commit nobody can see and resurrects it next to its
+/// successor as a divergent change, which is what the user is never asking for:
+/// the row on screen *is* the change. So a hidden commit follows its change id
+/// to the one visible commit carrying it, the way `jj` resolves a change id.
+/// A change that was abandoned or has gone divergent is refused instead,
+/// because there is no single commit the row could mean.
+pub(crate) async fn follow_rewritten(repo: &dyn Repo, commit: Commit) -> Result<Commit> {
+    let targets = repo
+        .resolve_change_id(commit.change_id())
         .await
-        .context("failed to check whether the commit is still visible")?
-    {
-        bail!("{} is no longer in the repository", commit_id.hex());
+        .context("failed to check whether the commit is still visible")?;
+    let Some(targets) = targets else {
+        bail!("{} is no longer in the repository", commit.id().hex());
+    };
+    if targets.has_visible(commit.id()) {
+        return Ok(commit);
     }
-    Ok(commit_id)
+    let visible: Vec<&CommitId> = targets.visible_with_offsets().map(|(_, id)| id).collect();
+    match visible.as_slice() {
+        [only] => {
+            let only = (*only).clone();
+            tracing::debug!(
+                stale = %commit.id().hex(),
+                current = %only.hex(),
+                "following a rewritten commit to its visible successor"
+            );
+            repo.store()
+                .get_commit_async(&only)
+                .await
+                .with_context(|| format!("failed to load jj commit {}", only.hex()))
+        }
+        [] => bail!("{} is no longer in the repository", commit.id().hex()),
+        _ => bail!(
+            "{} was rewritten into several divergent commits; pick one in the refreshed graph",
+            commit.id().hex()
+        ),
+    }
 }
 
 /// Everything the snapshot needs from config, resolved once per workspace
@@ -408,6 +451,9 @@ pub(crate) struct SnapshotOutcome {
     /// diff and walk against it without reading the commit index again.
     pub(crate) repo: Arc<ReadonlyRepo>,
     pub(crate) warnings: Vec<String>,
+    /// The checkout was stale and got updated instead of snapshotted — worth
+    /// telling the user, since files changed on disk under them.
+    pub(crate) recovered_stale: bool,
 }
 
 /// Fold the on-disk tree into `@` and finish the lock.
@@ -421,6 +467,7 @@ pub(crate) async fn snapshot_working_copy(
     context: &SnapshotContext,
 ) -> Result<SnapshotOutcome> {
     let workspace_name = workspace.workspace_name().to_owned();
+    let workspace_root = workspace.workspace_root().to_owned();
     let repo_loader = workspace.repo_loader().clone();
     let options = context.options();
 
@@ -439,16 +486,19 @@ pub(crate) async fn snapshot_working_copy(
                     // the refresh to a full reload — external ops (the rebase
                     // that made us stale, the recovery itself) always landed.
                     parent_fingerprint: Some(repo.op_id().hex()),
+                    working_copy_commit_id: Some(wc_commit.id().hex()),
+                    rewrote_descendants: false,
                 };
                 return Ok(SnapshotOutcome {
                     snapshot,
                     repo,
                     warnings: Vec::new(),
+                    recovered_stale: true,
                 });
             }
         };
 
-    let result = absorb_snapshot(&mut locked, &workspace_name).await;
+    let result = absorb_snapshot(&mut locked, &workspace_name, &workspace_root).await;
     match result {
         Ok(outcome) => Ok(outcome),
         Err(error) => {
@@ -463,6 +513,7 @@ pub(crate) async fn snapshot_working_copy(
 async fn absorb_snapshot(
     locked: &mut LockedWorkingCopy<'_>,
     workspace_name: &WorkspaceName,
+    workspace_root: &Path,
 ) -> Result<SnapshotOutcome> {
     let warnings = std::mem::take(&mut locked.warnings);
     if !locked.tree_changed() {
@@ -478,9 +529,12 @@ async fn absorb_snapshot(
                 working_copy_empty,
                 // No op written: the snapshot *is* its own base.
                 parent_fingerprint: Some(repo.op_id().hex()),
+                working_copy_commit_id: Some(locked.wc_commit.id().hex()),
+                rewrote_descendants: false,
             },
             repo,
             warnings,
+            recovered_stale: false,
         });
     }
 
@@ -502,10 +556,29 @@ async fn absorb_snapshot(
         .context("failed to update jj working-copy pointer")?;
     // `rewrite_commit` records a rewrite that the transaction insists on
     // resolving before commit, even when the wc commit has no descendants.
-    tx.repo_mut()
+    // When it has some (the user is editing a commit mid-stack), every one of
+    // them gets a new commit id, which the projection has to know about.
+    let rebased = tx
+        .repo_mut()
         .rebase_descendants()
         .await
         .context("failed to rebase descendants after jj snapshot")?;
+    // Best-effort, unlike the CLI: this runs on every save, and an IDE
+    // holding git's index lock for a moment must not make the save fail to
+    // land. The next mutation resets the index anyway.
+    if let Err(error) = super::colocate::sync_git_after_snapshot(
+        tx.repo_mut(),
+        workspace_root,
+        &locked.wc_commit.tree(),
+        &locked.tree,
+    )
+    .await
+    {
+        tracing::warn!(
+            error = format!("{error:#}"),
+            "failed to sync the colocated git index after a snapshot"
+        );
+    }
     let new_repo = tx
         .commit("snapshot working copy")
         .await
@@ -519,9 +592,12 @@ async fn absorb_snapshot(
             fingerprint: new_op_id.hex(),
             working_copy_empty,
             parent_fingerprint: Some(base_op_id),
+            working_copy_commit_id: Some(new_commit.id().hex()),
+            rewrote_descendants: rebased > 0,
         },
         repo: new_repo,
         warnings,
+        recovered_stale: false,
     })
 }
 

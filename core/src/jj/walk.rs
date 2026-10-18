@@ -90,11 +90,11 @@ pub(super) fn revset_aliases_map(settings: &UserSettings) -> Result<RevsetAliase
         };
         for (decl, item) in table.iter() {
             let Some(defn) = item.as_str() else {
-                eprintln!("diffui: ignoring revset-alias `{decl}`: expected a string value");
+                tracing::warn!("ignoring revset-alias `{decl}`: expected a string value");
                 continue;
             };
             if let Err(err) = map.insert(decl, defn, None) {
-                eprintln!("diffui: ignoring invalid revset-alias `{decl}`: {err}");
+                tracing::warn!("ignoring invalid revset-alias `{decl}`: {err}");
             }
         }
     }
@@ -326,7 +326,7 @@ pub async fn walk_jj_with_repo(
                     .context("failed to evaluate immutable()")
             });
     if let Err(error) = &immutable_revset {
-        eprintln!("diffui: immutable() unavailable for log flags: {error:#}");
+        tracing::warn!("immutable() unavailable for log flags: {error:#}");
     }
     let is_immutable_fn = immutable_revset.as_ref().ok().map(|rs| rs.containing_fn());
 
@@ -627,9 +627,28 @@ pub(super) fn compute_bookmarks_info(
         });
     }
     bookmarks.sort_by(|a, b| a.name.cmp(&b.name));
+    // Best-effort: a repo whose git config can't be read just offers no
+    // remotes to push a new bookmark to.
+    let mut remotes: Vec<String> = jj_lib::git::get_all_remote_names(repo.store())
+        .map(|names| names.iter().map(|name| name.as_str().to_owned()).collect())
+        .unwrap_or_default();
+    remotes.sort();
+    let git_push = repo.settings().get_string("git.push").ok();
+    // Tags follow the bookmark chip rules (`collect_bookmark_labels`): a
+    // remote tag in sync with the local one is redundant, and `@git` never
+    // shows.
+    let mut tags: HashMap<String, Vec<String>> = HashMap::new();
+    for (name, target) in repo.view().tags() {
+        collect_bookmark_labels(name.as_str(), &target, |id, label| {
+            tags.entry(id.hex()).or_default().push(label);
+        });
+    }
     BookmarksInfo {
         bookmarks,
         working_copy_commit: Some(wc_commit_id.hex()),
+        remotes,
+        git_push,
+        tags,
     }
 }
 
@@ -644,7 +663,7 @@ pub(super) async fn compute_branch_status(
     match branch_status_inner(repo, wc_commit_id).await {
         Ok(status) => status,
         Err(error) => {
-            eprintln!("diffui: failed to compute branch status: {error:#}");
+            tracing::warn!("failed to compute branch status: {error:#}");
             None
         }
     }

@@ -70,6 +70,51 @@ impl RevisionSelection {
     }
 }
 
+/// What a revision's diff is taken against. The revision itself is always the
+/// "to" side; this names the "from" side.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DiffBase {
+    /// `jj diff -r X`: X against its (merged) parents.
+    #[default]
+    Parents,
+    /// `jj diff --from A --to X`: the two trees, whatever lies between them.
+    Revision(RevisionSelection),
+    /// `jj interdiff --from A --to X`: A's own change rebased onto X's
+    /// parents, against X — how two versions of a change differ, without the
+    /// noise of whatever their parents did in between.
+    Interdiff(RevisionSelection),
+}
+
+impl DiffBase {
+    /// The "from" revision, or `None` for a plain parent diff.
+    pub fn revision(&self) -> Option<&RevisionSelection> {
+        match self {
+            Self::Parents => None,
+            Self::Revision(revision) | Self::Interdiff(revision) => Some(revision),
+        }
+    }
+
+    pub fn is_compare(&self) -> bool {
+        !matches!(self, Self::Parents)
+    }
+
+    /// Whether either side of the diff names the working copy, so an edit on
+    /// disk changes it.
+    pub fn involves_working_copy(&self) -> bool {
+        matches!(self.revision(), Some(RevisionSelection::WorkingCopy))
+    }
+
+    /// A key that tells two diffs of the same revision apart when their bases
+    /// differ (the diff view resets its scroll when it changes).
+    pub fn view_key(&self) -> String {
+        match self {
+            Self::Parents => String::new(),
+            Self::Revision(revision) => format!("from:{}", revision.view_key()),
+            Self::Interdiff(revision) => format!("interdiff:{}", revision.view_key()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DiffDocument {
     pub files: Vec<DiffFile>,
@@ -116,6 +161,19 @@ pub struct DiffFile {
     pub hunks: Vec<DiffHunkView>,
     pub additions: usize,
     pub deletions: usize,
+    /// Set when the backend left this file's rows out for size: `hunks` is
+    /// then a single header-only placeholder, the counts are still real, and
+    /// the full diff is one `ExpandFile` away.
+    pub collapsed: Option<DiffCollapse>,
+}
+
+/// Why a file's diff came back without rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffCollapse {
+    /// The file alone changes too many lines.
+    LargeFile,
+    /// The revision as a whole already spent its row budget on other files.
+    OverBudget,
 }
 
 /// One commit's data as produced by a backend loader. This is a transient
@@ -250,8 +308,9 @@ const INDEX_IDLE: Duration = Duration::from_millis(250);
 /// offsets do — see [`CommitStore::intern_text`].
 #[derive(Debug, Clone, Default)]
 struct IdOrder {
-    /// Row count the lanes were built at; any other length means they're stale
-    /// (only `push` changes it, and a row's ids never change afterwards).
+    /// Row count the lanes were built at; any other length means they're stale.
+    /// Only `push` changes it, and the one id that changes in place
+    /// ([`CommitStore::set_commit_id`]) clears it.
     built_at: Option<usize>,
     by_change_id: Vec<u32>,
     by_commit_id: Vec<u32>,
@@ -427,6 +486,19 @@ impl CommitStore {
             };
         }
         lens
+    }
+
+    /// Replace a row's commit id in place: a working-copy snapshot rewrote `@`
+    /// without touching anything else in the graph, so patching the one row is
+    /// all a re-walk would have changed. The old text stays in the arena (a few
+    /// dozen bytes per save, gone at the next reload).
+    pub fn set_commit_id(&mut self, index: usize, commit_id: &str) {
+        if index >= self.len() || self.row(index).commit_id() == commit_id {
+            return;
+        }
+        let span = self.intern_text(commit_id);
+        self.spans[index].commit_id = span;
+        self.id_order.get_mut().built_at = None;
     }
 
     /// Set a row's empty status, used to fill in the merge/root commits left
@@ -899,6 +971,32 @@ pub struct BookmarksInfo {
     /// `@`'s commit id (hex), so a working-copy right-click can resolve the
     /// bookmarks sitting on it.
     pub working_copy_commit: Option<String>,
+    /// Every configured git remote, sorted — where a new bookmark can go.
+    pub remotes: Vec<String>,
+    /// The `git.push` setting, when configured.
+    pub git_push: Option<String>,
+    /// Tag labels by commit id (hex), in jj's `tags` template form (`v1`,
+    /// `v1@origin` for a remote tag elsewhere, `v1??` when conflicted). Read
+    /// only: the graph shows them, nothing acts on them.
+    pub tags: std::collections::HashMap<String, Vec<String>>,
+}
+
+impl BookmarksInfo {
+    /// The remote `jj git push` picks without `--remote`: `git.push`, else the
+    /// only remote, else `origin` — `None` when that names no real remote
+    /// (several remotes, none of them `origin`), and the caller has to ask.
+    pub fn default_push_remote(&self) -> Option<&str> {
+        let pick = match (&self.git_push, self.remotes.as_slice()) {
+            (Some(configured), _) => configured.as_str(),
+            (None, [only]) => only.as_str(),
+            (None, _) => "origin",
+        };
+        self.remotes.iter().any(|r| r == pick).then_some(pick)
+    }
+
+    pub fn entry(&self, name: &str) -> Option<&BookmarkEntry> {
+        self.bookmarks.iter().find(|b| b.name == name)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -923,6 +1021,16 @@ pub struct RemoteBookmarkRef {
 }
 
 impl BookmarkEntry {
+    /// Whether `remote` has a tracked copy of this bookmark.
+    pub fn tracks(&self, remote: &str) -> bool {
+        self.remotes.iter().any(|r| r.tracked && r.remote == remote)
+    }
+
+    /// Whether any remote tracks this bookmark.
+    pub fn is_tracked_anywhere(&self) -> bool {
+        self.remotes.iter().any(|r| r.tracked)
+    }
+
     /// The remote this local bookmark tracks, if any (first tracked remote).
     pub fn tracked_remote(&self) -> Option<&str> {
         self.remotes
@@ -1026,6 +1134,7 @@ mod tests {
             hunks: Vec::new(),
             additions: 0,
             deletions: 0,
+            collapsed: None,
         }
     }
 

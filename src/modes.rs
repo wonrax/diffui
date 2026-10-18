@@ -40,6 +40,10 @@ pub(crate) enum Mode {
     Confirm(ConfirmDialog),
     OpenRepo(OpenRepoDialog),
     ActivityPopover,
+    /// The bookmark-name prompt (create / rename).
+    NamePrompt(crate::bookmarks::NamePrompt),
+    /// The keyboard-shortcut cheat sheet.
+    Shortcuts,
 }
 
 /// A mode bound to one tab: it names rows, files, or text that belong to that
@@ -61,9 +65,11 @@ pub(crate) enum ModeKind {
     Confirm,
     OpenRepo,
     ActivityPopover,
+    Shortcuts,
     Find,
     Description,
     Draft,
+    NamePrompt,
 }
 
 impl Mode {
@@ -74,6 +80,8 @@ impl Mode {
             Mode::Confirm(_) => ModeKind::Confirm,
             Mode::OpenRepo(_) => ModeKind::OpenRepo,
             Mode::ActivityPopover => ModeKind::ActivityPopover,
+            Mode::NamePrompt(_) => ModeKind::NamePrompt,
+            Mode::Shortcuts => ModeKind::Shortcuts,
         }
     }
 
@@ -84,6 +92,8 @@ impl Mode {
             Mode::Confirm(_) => Context::Confirm,
             Mode::OpenRepo(_) => Context::OpenRepo,
             Mode::ActivityPopover => Context::ActivityPopover,
+            Mode::NamePrompt(_) => Context::Prompt,
+            Mode::Shortcuts => Context::Shortcuts,
         }
     }
 }
@@ -138,13 +148,23 @@ pub(crate) fn passes_through(context: Context, chord: &Chord) -> bool {
 /// exempt in target mode: leaving the mode has to work from inside that box.
 pub(crate) fn needs_unconsumed(context: Context, chord: &Chord) -> bool {
     match context {
-        Context::Base => !chord.mods.any_command_like(),
+        Context::Base => !chord.mods.any_command_like() || is_text_undo(chord),
         Context::Draft => {
-            !chord.mods.any_command_like()
-                && !matches!(chord.key, ChordKey::Named(keyboard::key::Named::Escape))
+            (!chord.mods.any_command_like()
+                && !matches!(chord.key, ChordKey::Named(keyboard::key::Named::Escape)))
+                || is_text_undo(chord)
         }
         _ => false,
     }
+}
+
+/// ⌘Z / ⌘⇧Z: a focused text field (the revset box) takes them as its own
+/// undo/redo and reports the key consumed, and they must not also undo a jj
+/// operation behind the user's back.
+fn is_text_undo(chord: &Chord) -> bool {
+    chord.mods.command
+        && !chord.mods.alt
+        && matches!(&chord.key, ChordKey::Char(c) if c.eq_ignore_ascii_case("z"))
 }
 
 impl Diffui {
@@ -460,6 +480,7 @@ mod stack_tests {
                 content: iced::widget::text_editor::Content::new(),
                 saving_activity: None,
                 switch_blocked: false,
+                commit: false,
             }));
 
         let _ = ui.activate_tab(second);

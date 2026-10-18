@@ -6,6 +6,8 @@
 //! disk (and doesn't lose uncommitted work).
 
 use crate::model::RevisionSelection;
+use crate::partial::DiffSelection;
+use crate::resolve::ConflictResolution;
 
 /// Which commits a rebase moves, relative to the picked source revisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,13 +122,111 @@ pub enum MutationOp {
     TrackBookmark { name: String, remote: String },
     /// Push local bookmark `name` to `remote` (`jj git push -b <name>`).
     PushBookmark { name: String, remote: String },
-    /// Revert what one operation did (`jj undo [<op>]`): the given operation
-    /// id, or — when `None` — the latest meaningful op (background snapshot
-    /// ops are skipped). Routed through the same mutation pipeline as
-    /// everything else so it serializes behind the queue and gets the
-    /// snapshot-before-mutate discipline (an undo that moves `@` must not
-    /// clobber unsnapshotted on-disk edits).
+    /// `None`: `jj undo` — step back one operation, walking further back on
+    /// each repeat (jj 0.45's undo stack, recorded in the op descriptions so
+    /// the CLI and diffui share it). Snapshot ops are skipped, and file edits
+    /// they recorded since the undone op are carried onto the restored `@`.
+    ///
+    /// `Some(op)`: `jj op revert <op>` — undo exactly that operation and keep
+    /// everything since (an activity row's per-operation Undo).
+    ///
+    /// Routed through the same mutation pipeline as everything else so it
+    /// serializes behind the queue and gets the snapshot-before-mutate
+    /// discipline (an undo that moves `@` must not clobber unsnapshotted
+    /// on-disk edits).
     Undo { operation_id: Option<String> },
+    /// `jj redo`: re-apply what the latest undo took back; repeated, walk
+    /// forward through earlier undos. Fails with "nothing to redo" once a real
+    /// operation has landed on top of the undos.
+    Redo,
+    /// Create local bookmark `name` at `to` (`jj bookmark create -r <to>
+    /// <name>`). Refuses an existing name — moving one is `MoveBookmark`.
+    CreateBookmark { name: String, to: RevisionSelection },
+    /// `jj bookmark rename <old> <new>`.
+    RenameBookmark { old: String, new: String },
+    /// `jj bookmark forget <name>`: drop it locally and stop tracking its
+    /// remotes, so no later push deletes it there.
+    ForgetBookmark { name: String },
+    /// `jj bookmark untrack <name>@<remote>`.
+    UntrackBookmark { name: String, remote: String },
+    /// `jj git push` with the CLI's checks: new bookmarks, `--change`,
+    /// deletions, and every allowance the user accepted.
+    Push(crate::push::PushRequest),
+    /// Describe `@` and start a new empty child as the new `@`, in one
+    /// operation (`jj commit -m <description>`). The new `@` keeps the
+    /// committed tree, so nothing on disk changes.
+    Commit { description: String },
+    /// A new empty change placed at `destination` with `@` moved onto it
+    /// (`jj new -A/-B`, or `jj new -A x -B y` for a gap). `After` / `Before`
+    /// / `Between` rebase the commits on the far side of the insertion onto
+    /// the new change, like the CLI; `Onto` is a plain `jj new <target>`.
+    NewAt { destination: Destination },
+    /// Make the `targets` siblings instead of a chain (`jj parallelize`):
+    /// each keeps its content, takes its in-set parents' outside parents,
+    /// and the children of the set's heads end up merging them.
+    Parallelize { targets: Vec<RevisionSelection> },
+    /// Copy the `targets` (`jj duplicate`), onto their own parents when
+    /// `destination` is `None`, else at `-d` / `-A` / `-B` of it — in which
+    /// case the commits on the far side of an insertion are rebased onto the
+    /// copies.
+    DuplicateTo {
+        targets: Vec<RevisionSelection>,
+        destination: Option<Destination>,
+    },
+    /// Resolve a divergent change by keeping `keep` and abandoning every
+    /// other visible commit that shares its change id (`jj abandon` of the
+    /// other copies).
+    KeepDivergent { keep: RevisionSelection },
+    /// Rewrite authorship metadata (`jj metaedit --update-author` /
+    /// `--update-author-timestamp`): the author becomes the configured user,
+    /// and/or the author timestamp becomes now.
+    Metaedit {
+        targets: Vec<RevisionSelection>,
+        update_author: bool,
+        update_author_timestamp: bool,
+    },
+    // ── Partial changes and conflict resolution ─────────────────────────
+    /// `jj split` with the changes picked in the diff pane: `selection` stays
+    /// in `target` (same change id, description replaced by
+    /// `first_description` when given), everything else moves into a new
+    /// child described `second_description`. `target`'s descendants follow
+    /// the new child, and a workspace whose `@` was `target` moves onto it.
+    Split {
+        target: RevisionSelection,
+        selection: DiffSelection,
+        first_description: Option<String>,
+        second_description: String,
+    },
+    /// `jj squash --from <from> --into <into> <selection>`: move only the
+    /// picked changes. Like the CLI, the source is abandoned (descriptions
+    /// combined) only when the selection takes all of it.
+    SquashChanges {
+        from: RevisionSelection,
+        selection: DiffSelection,
+        into: SquashTarget,
+    },
+    /// `jj restore --changes-in <target> <selection>`: discard the picked
+    /// changes, putting the parent's content back. Undoable through the op
+    /// log like everything else.
+    RestoreChanges {
+        target: RevisionSelection,
+        selection: DiffSelection,
+    },
+    /// `jj resolve <path>` on `target`, with a side, a base, or a merge
+    /// tool's output.
+    ResolveConflict {
+        target: RevisionSelection,
+        path: String,
+        resolution: ConflictResolution,
+    },
+    /// Put the repository back to how it was at `operation_id`
+    /// (`jj op restore`): heads, bookmarks, tags, remote-tracking refs and
+    /// working-copy pointers as recorded there. The operations since stay in
+    /// the log, so a restore is itself undoable.
+    RestoreOperation { operation_id: String },
+    /// Reverse exactly what `operation_id` did while keeping everything since
+    /// (`jj op revert`).
+    RevertOperation { operation_id: String },
 }
 
 /// User-facing summary of a successful mutation — becomes the status message.
@@ -204,9 +304,33 @@ pub enum DraftKind {
     },
     Squash,
     /// `jj new A B …`: the sources are the parents in pick order, and a picked
-    /// target joins as the last one. Toggling extra sources builds an octopus
-    /// merge, which [`OpDraft::op_from_sources`] lowers without a target.
+    /// target joins as the last one. Stacking extra sources (space / ⌘-click)
+    /// builds an octopus merge, which [`OpDraft::op_from_sources`] lowers
+    /// without a target.
     Merge,
+    /// `jj new` at the picked target with the chosen placement (`-A`/`-B`).
+    /// Has no sources: what lands is a fresh empty change.
+    New,
+    /// `jj duplicate` the sources at the picked target with the chosen
+    /// placement.
+    Duplicate,
+    /// `jj parallelize` the sources. Complete from the sources alone — the
+    /// draft only exists to preview the result and to let space / ⌘-click
+    /// adjust the set.
+    Parallelize,
+}
+
+impl DraftKind {
+    /// Whether the draft lands relative to its target with an
+    /// onto / after / before placement.
+    pub fn uses_placement(self) -> bool {
+        matches!(self, Self::Rebase { .. } | Self::New | Self::Duplicate)
+    }
+
+    /// Whether confirming needs no destination, only the sources.
+    pub fn completes_from_sources(self) -> bool {
+        matches!(self, Self::Merge | Self::Parallelize)
+    }
 }
 
 /// Placement choice while a rebase draft is picking its destination — the op
@@ -244,6 +368,10 @@ pub struct OpDraft {
     /// Keyboard candidate: index into the loaded commit store, or `None`
     /// until the user starts navigating (arrows / j / k).
     pub candidate: Option<usize>,
+    /// Squash drafts only: move just these changes of the (single) source
+    /// rather than all of it — "Move selected into…".
+    /// Boxed: drafts are held in a mode enum that shouldn't grow for this.
+    pub selection: Option<Box<DiffSelection>>,
 }
 
 impl OpDraft {
@@ -253,6 +381,7 @@ impl OpDraft {
             sources,
             placement: PlacementKind::default(),
             candidate: None,
+            selection: None,
         }
     }
 
@@ -262,6 +391,31 @@ impl OpDraft {
             sources: vec![source],
             placement: PlacementKind::default(),
             candidate: None,
+            selection: None,
+        }
+    }
+
+    /// A squash draft that moves only `selection` out of `source`.
+    pub fn squash_changes(source: DraftSource, selection: DiffSelection) -> Self {
+        Self {
+            selection: Some(Box::new(selection)),
+            ..Self::squash(source)
+        }
+    }
+
+    /// The squash-draft op for `target`: the whole sources, or just the
+    /// selection when there is one.
+    fn squash_op(&self, target: RevisionSelection) -> MutationOp {
+        match (&self.selection, self.sources.as_slice()) {
+            (Some(selection), [source, ..]) => MutationOp::SquashChanges {
+                from: source.selection.clone(),
+                selection: (**selection).clone(),
+                into: SquashTarget::Revision(target),
+            },
+            _ => MutationOp::Squash {
+                from: self.sources.iter().map(|s| s.selection.clone()).collect(),
+                into: SquashTarget::Revision(target),
+            },
         }
     }
 
@@ -271,6 +425,18 @@ impl OpDraft {
             sources: vec![source],
             placement: PlacementKind::default(),
             candidate: None,
+            selection: None,
+        }
+    }
+
+    /// A draft of `kind` over `sources` (empty for [`DraftKind::New`]).
+    pub fn with_sources(kind: DraftKind, sources: Vec<DraftSource>) -> Self {
+        Self {
+            kind,
+            sources,
+            placement: PlacementKind::default(),
+            candidate: None,
+            selection: None,
         }
     }
 
@@ -300,8 +466,14 @@ impl OpDraft {
             DraftKind::Rebase {
                 mode: RebaseSourceMode::Branch,
             } => format!("Rebase branch of {names}"),
-            DraftKind::Squash => format!("Squash {names}"),
+            DraftKind::Squash => match &self.selection {
+                Some(selection) => format!("Move {} from {names}", selection.summary()),
+                None => format!("Squash {names}"),
+            },
             DraftKind::Merge => format!("Merge {names}"),
+            DraftKind::New => "New change".to_owned(),
+            DraftKind::Duplicate => format!("Duplicate {names}"),
+            DraftKind::Parallelize => format!("Parallelize {names}"),
         }
     }
 
@@ -316,6 +488,9 @@ impl OpDraft {
                     .iter()
                     .map(|source| source.selection.clone())
                     .collect(),
+            }),
+            DraftKind::Parallelize if self.sources.len() >= 2 => Some(MutationOp::Parallelize {
+                targets: self.sources.iter().map(|s| s.selection.clone()).collect(),
             }),
             _ => None,
         }
@@ -343,10 +518,7 @@ impl OpDraft {
                     PlacementKind::Before => Destination::Before(target),
                 },
             },
-            DraftKind::Squash => MutationOp::Squash {
-                from: self.sources.iter().map(|s| s.selection.clone()).collect(),
-                into: SquashTarget::Revision(target),
-            },
+            DraftKind::Squash => self.squash_op(target),
             DraftKind::Merge => MutationOp::Merge {
                 parents: self
                     .sources
@@ -355,6 +527,15 @@ impl OpDraft {
                     .chain([target])
                     .collect(),
             },
+            DraftKind::New => MutationOp::NewAt {
+                destination: placed(target, placement),
+            },
+            DraftKind::Duplicate => MutationOp::DuplicateTo {
+                targets: self.sources.iter().map(|s| s.selection.clone()).collect(),
+                destination: Some(placed(target, placement)),
+            },
+            // Nothing to aim at: the set itself is the whole op.
+            DraftKind::Parallelize => return self.op_from_sources(),
         })
     }
 
@@ -380,10 +561,7 @@ impl OpDraft {
                 sources: self.sources.iter().map(|s| s.selection.clone()).collect(),
                 destination: Destination::Between { parent, child },
             },
-            DraftKind::Squash => MutationOp::Squash {
-                from: self.sources.iter().map(|s| s.selection.clone()).collect(),
-                into: SquashTarget::Revision(parent),
-            },
+            DraftKind::Squash => self.squash_op(parent),
             // A merge has no between-gesture; the gap resolves to merging
             // with its parent side, like squash.
             DraftKind::Merge => MutationOp::Merge {
@@ -394,7 +572,24 @@ impl OpDraft {
                     .chain([parent])
                     .collect(),
             },
+            DraftKind::New => MutationOp::NewAt {
+                destination: Destination::Between { parent, child },
+            },
+            DraftKind::Duplicate => MutationOp::DuplicateTo {
+                targets: self.sources.iter().map(|s| s.selection.clone()).collect(),
+                destination: Some(Destination::Between { parent, child }),
+            },
+            DraftKind::Parallelize => return self.op_from_sources(),
         })
+    }
+}
+
+/// The [`Destination`] a placement means relative to `target`.
+pub fn placed(target: RevisionSelection, placement: PlacementKind) -> Destination {
+    match placement {
+        PlacementKind::Onto => Destination::Onto(target),
+        PlacementKind::After => Destination::After(target),
+        PlacementKind::Before => Destination::Before(target),
     }
 }
 
@@ -521,6 +716,109 @@ mod tests {
                 ]
             ),
             other => panic!("expected a source-only merge op, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_draft_lowers_each_placement_and_the_gap() {
+        let draft = OpDraft::with_sources(DraftKind::New, Vec::new());
+        let target = RevisionSelection::Commit("bbbb".to_owned());
+        for placement in [
+            PlacementKind::Onto,
+            PlacementKind::After,
+            PlacementKind::Before,
+        ] {
+            match draft.op_for(target.clone(), placement) {
+                Some(MutationOp::NewAt { destination }) => {
+                    assert_eq!(destination, placed(target.clone(), placement))
+                }
+                other => panic!("expected a placed new, got {other:?}"),
+            }
+        }
+        let parent = RevisionSelection::Commit("pppp".to_owned());
+        let child = RevisionSelection::Commit("cccc".to_owned());
+        match draft.op_for_gap(parent.clone(), child.clone()) {
+            Some(MutationOp::NewAt {
+                destination:
+                    Destination::Between {
+                        parent: p,
+                        child: c,
+                    },
+            }) => assert_eq!((p, c), (parent, child)),
+            other => panic!("expected a new between, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_draft_carries_every_source_to_the_destination() {
+        let draft =
+            OpDraft::with_sources(DraftKind::Duplicate, vec![source("aaaa"), source("bbbb")]);
+        let target = RevisionSelection::Commit("cccc".to_owned());
+        match draft.op_for(target.clone(), PlacementKind::After) {
+            Some(MutationOp::DuplicateTo {
+                targets,
+                destination,
+            }) => {
+                assert_eq!(targets.len(), 2);
+                assert_eq!(destination, Some(Destination::After(target)));
+            }
+            other => panic!("expected a placed duplicate, got {other:?}"),
+        }
+        // A source can't be its own destination.
+        assert!(
+            draft
+                .op_for(
+                    RevisionSelection::Commit("aaaa".into()),
+                    PlacementKind::Onto
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn parallelize_draft_completes_from_two_sources() {
+        let mut draft = OpDraft::with_sources(DraftKind::Parallelize, vec![source("aaaa")]);
+        assert!(draft.op_from_sources().is_none(), "one revision is no set");
+        draft.sources.push(source("bbbb"));
+        assert!(matches!(
+            draft.op_from_sources(),
+            Some(MutationOp::Parallelize { targets }) if targets.len() == 2
+        ));
+        // Any target confirms the same op: there is nothing to aim at.
+        assert!(matches!(
+            draft.op_for(
+                RevisionSelection::Commit("cccc".into()),
+                PlacementKind::Onto
+            ),
+            Some(MutationOp::Parallelize { .. })
+        ));
+        assert!(DraftKind::Parallelize.completes_from_sources());
+        assert!(!DraftKind::Parallelize.uses_placement());
+        assert!(DraftKind::New.uses_placement() && DraftKind::Duplicate.uses_placement());
+    }
+
+    #[test]
+    fn squash_draft_with_a_selection_lowers_to_a_partial_squash() {
+        let selection = DiffSelection {
+            files: vec![crate::partial::FileSelection {
+                path: "a.rs".to_owned(),
+                hunks: crate::partial::HunkPick::All,
+            }],
+        };
+        let draft = OpDraft::squash_changes(source("aaaa"), selection.clone());
+        assert_eq!(draft.headline(), "Move a.rs from aaaa");
+        let target = RevisionSelection::Commit("bbbb".to_owned());
+        match draft.op_for(target.clone(), PlacementKind::Onto) {
+            Some(MutationOp::SquashChanges {
+                from,
+                selection: picked,
+                into: SquashTarget::Revision(into),
+            }) => {
+                assert_eq!(from, RevisionSelection::Commit("aaaa".to_owned()));
+                assert_eq!(picked, selection);
+                assert_eq!(into, target);
+            }
+            other => panic!("expected a partial squash, got {other:?}"),
         }
     }
 }

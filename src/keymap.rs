@@ -125,8 +125,16 @@ impl Chord {
         let mut mods = Mods::from_modifiers(modifiers);
         let key = match key.as_ref() {
             keyboard::Key::Character(c) => {
+                // Shift lives in the character. Some ⌘-combos arrive with the
+                // unshifted letter (⌘⇧Z as `z` + shift); fold the shift in so
+                // they don't resolve as the unshifted chord.
+                let c = if mods.shift && c.chars().all(|c| c.is_ascii_lowercase()) {
+                    c.to_ascii_uppercase()
+                } else {
+                    c.to_owned()
+                };
                 mods.shift = false;
-                ChordKey::Char(c.to_owned())
+                ChordKey::Char(c)
             }
             keyboard::Key::Named(named) => ChordKey::Named(named),
             keyboard::Key::Unidentified => return None,
@@ -186,6 +194,11 @@ impl Chord {
             }
         }
         match &self.key {
+            // A bare letter reads as the key you type: `j`, not `J`, which
+            // looks like it needs shift. Once a modifier or shift is in the
+            // chord the platform convention takes over (`⌘K`, `⇧R`), the way
+            // AppKit's own menus print key equivalents.
+            ChordKey::Char(c) if !shifted && !self.mods.any_command_like() => out.push_str(c),
             ChordKey::Char(c) => out.push_str(&c.to_uppercase()),
             ChordKey::Named(named) => out.push_str(named_label(*named)),
         }
@@ -370,18 +383,23 @@ impl Keymap {
     ) {
         self.bindings
             .retain(|(bound, _, bound_id)| *bound != context || *bound_id != id);
+        let mut added = Vec::new();
         for raw in spec.chords() {
             if raw.trim().eq_ignore_ascii_case("none") {
                 continue;
             }
             match Chord::parse(raw) {
-                Some(chord) => self.bindings.push((context, chord, id)),
+                Some(chord) => added.push((context, chord, id)),
                 None => problems.push(format!(
                     "[keys.{}] {id:?}: {raw:?} is not a chord",
                     context.name()
                 )),
             }
         }
+        // Resolution takes the first match, so a user's chord goes in front:
+        // binding a key a default already holds moves the key, rather than
+        // losing to the default.
+        self.bindings.splice(0..0, added);
     }
 
     /// The command `chord` runs in `context`, if any.
@@ -398,6 +416,19 @@ impl Keymap {
             .iter()
             .find(|(bound, bound_chord, _)| *bound == context && bound_chord == chord)
             .map(|(_, _, id)| *id)
+    }
+
+    /// The chords that actually run `id` in `context`, in binding order. A
+    /// chord an earlier binding shadows is left out, so a list built from
+    /// this never advertises a key that does something else.
+    pub(crate) fn live_chords(&self, context: Context, id: CommandId) -> Vec<&Chord> {
+        self.bindings
+            .iter()
+            .filter(|(bound, chord, bound_id)| {
+                *bound == context && *bound_id == id && self.lookup(context, chord) == Some(id)
+            })
+            .map(|(_, chord, _)| chord)
+            .collect()
     }
 
     /// The first chord bound to `id` in `context` — what a menu row shows as
@@ -575,6 +606,25 @@ mod tests {
         );
     }
 
+    /// ⌘⇧Z can arrive as the unshifted `z` plus shift; it must still be redo,
+    /// not fall back to ⌘Z's undo.
+    #[test]
+    fn a_shifted_letter_resolves_as_its_capital() {
+        let map = Keymap::build(&RawKeys::default()).0;
+        let z = keyboard::Key::Character("z".into());
+        let resolve = |modifiers| {
+            map.resolve(
+                Context::Base,
+                &Chord::from_event(&z, modifiers).expect("a bindable key"),
+            )
+        };
+        assert_eq!(resolve(keyboard::Modifiers::COMMAND), Some("repo.undo"));
+        assert_eq!(
+            resolve(keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT),
+            Some("repo.redo")
+        );
+    }
+
     #[test]
     fn shift_does_distinguish_a_named_key() {
         let map = Keymap::build(&RawKeys::default()).0;
@@ -718,7 +768,9 @@ mod tests {
         } else {
             assert_eq!(chord("cmd+k").display(), "Ctrl+K");
         }
-        assert_eq!(chord("r").display(), "R");
+        assert_eq!(chord("r").display(), "r");
+        assert_eq!(chord("j").display(), "j");
+        assert_eq!(chord("?").display(), "?");
     }
 
     /// `r` and `R` start two different rebases and sit next to each other in

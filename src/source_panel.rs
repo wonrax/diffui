@@ -461,6 +461,7 @@ fn source_file_row(
         file_index,
         lane_labels,
         lane_segments,
+        check: None,
     }
 }
 
@@ -518,6 +519,9 @@ pub fn build_source_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, M
             .restore_scroll(source.scroll_offset, ui.scroll_restore_token)
             .content_version(ui.document_version)
             .layout_version(view.doc_id);
+            if let Some(gutter) = crate::history_panel::source_annotations(ui) {
+                code = code.annotations(gutter);
+            }
 
             if let Some(find_state) = ui.active().find() {
                 code = code.with_find(crate::diff_view::FindOverlay {
@@ -623,6 +627,18 @@ fn build_info_bar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> 
         }
         _ => {}
     }
+    if let Some((status, failed)) = crate::history_panel::annotation_status(ui) {
+        bar = bar.push(
+            text(status)
+                .size(text_size::UI)
+                .font(ui.config.ui_font)
+                .color(if failed {
+                    theme.removed_text
+                } else {
+                    theme.subtle_text
+                }),
+        );
+    }
     if let Some(view) = &source.file {
         let detail = if view.binary || view.too_large {
             format_bytes(view.byte_len)
@@ -646,6 +662,9 @@ fn build_info_bar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> 
                 .font(ui.config.ui_font)
                 .color(theme.subtle_text),
         );
+    }
+    if crate::history_panel::can_annotate(ui) {
+        bar = bar.push(crate::history_panel::source_bar_actions(ui, theme));
     }
 
     container(bar)

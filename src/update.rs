@@ -14,12 +14,12 @@ use iced::widget::column;
 
 impl Diffui {
     pub(crate) fn new(cli: Cli, saved: WindowState) -> (Self, Task<Message>) {
-        let (config, raw_keys) = AppConfig::load();
+        let (config, raw_keys, config_error) = AppConfig::load();
         // A keymap problem is never fatal: a config written against another
         // build still opens the app, having said once what it had to skip.
         let (keymap, problems) = Keymap::build(&raw_keys);
-        for problem in problems {
-            eprintln!("diffui: {problem}");
+        for problem in &problems {
+            tracing::warn!("config: {problem}");
         }
         let sidebar_min_width = sidebar::min_width(config);
         // Restore the persisted sidebar split and window geometry. The window
@@ -53,22 +53,25 @@ impl Diffui {
         );
         let window_position = saved.position().map(|(x, y)| Point::new(x, y));
 
-        // Launch precedence: explicit `--path` args win; else restore last
-        // session; else fall back to the current directory *only if it's a
-        // repo* (the `cd repo && diffui` terminal flow). A `--path` arg is a
-        // GitHub PR reference (URL / `owner/repo#123`) or a repository path;
-        // session and cwd entries are always local repos (PR tabs are
-        // session-only and never persisted). Only `--path` failures surface
-        // an error — the user named those this launch. A vanished session
-        // repo or a non-repo cwd (e.g. `/` from the Spotlight/Dock launcher)
-        // is silently skipped, leaving zero tabs and the welcome screen
-        // rather than a "not inside a repository" error.
+        // Launch precedence: paths named on the command line (`diffui .`,
+        // `--path`) win; else restore the last session, plus the current
+        // directory when it is inside a repository (the `cd repo && diffui`
+        // terminal flow), which is added if the session lacks it and
+        // focused either way. A named path is a GitHub PR reference (URL /
+        // `owner/repo#123`) or a repository path; session and cwd entries are
+        // always local repos (PR tabs are session-only and never persisted).
+        // Only named-path failures surface an error — the user named those
+        // this launch. A vanished session repo or a non-repo cwd (e.g. `/`
+        // from the Finder/Dock launcher) is silently skipped, leaving the
+        // session or the welcome screen rather than a "not inside a
+        // repository" error.
         enum BootTarget {
             Repo(Repository),
             Pr(github::PrSpec),
         }
         let mut targets: Vec<BootTarget> = Vec::new();
         let mut first_error = None;
+        let mut cwd_root = None;
         // Two `--path`s (or two saved entries) can resolve to the same root —
         // a plain repeat, or two spellings of one path. Opening it twice would
         // give the repo two tabs racing the same working copy, so keep the
@@ -82,8 +85,8 @@ impl Diffui {
                 targets.push(BootTarget::Repo(repository));
             }
         }
-        if !cli.paths.is_empty() {
-            for path in &cli.paths {
+        if cli.requested_paths().next().is_some() {
+            for path in cli.requested_paths() {
                 if let Some(spec) = github::PrSpec::parse(&path.to_string_lossy()) {
                     if !targets
                         .iter()
@@ -108,19 +111,22 @@ impl Diffui {
                     push_repo(&mut targets, repository);
                 }
             }
-            if targets.is_empty()
-                && let Ok(cwd) = std::env::current_dir()
+            // A Finder/Dock launch starts in `/`, which is never what the user
+            // meant to open.
+            if let Ok(cwd) = std::env::current_dir()
+                && cwd.parent().is_some()
                 && let Ok(repository) = prepare_repository(&cwd)
             {
+                cwd_root = Some(repository.root.to_string_lossy().into_owned());
                 push_repo(&mut targets, repository);
             }
         }
 
-        // Re-focus the tab that was active last session (matched by repo root),
-        // falling back to the first.
-        let active_index = saved
-            .active_repo
+        // Focus the repository the terminal is in, else the tab that was
+        // active last session (matched by repo root), else the first.
+        let active_index = cwd_root
             .as_deref()
+            .or(saved.active_repo.as_deref())
             .and_then(|active| {
                 targets.iter().position(|target| match target {
                     BootTarget::Repo(repository) => repository.root.to_string_lossy() == active,
@@ -249,6 +255,18 @@ impl Diffui {
             next_toast_id: 0,
         };
 
+        if let Some(error) = config_error {
+            app.push_sticky_toast("config.toml ignored, using defaults".to_owned(), &error);
+        } else if let Some(first) = problems.first() {
+            let more = match problems.len() {
+                1 => String::new(),
+                n => format!(" (and {} more; see the log)", n - 1),
+            };
+            app.push_sticky_toast(
+                "Some key bindings were ignored".to_owned(),
+                &format!("{first}{more}"),
+            );
+        }
         let theme_task =
             system::theme().map(|mode| Message::Window(WindowEvent::SystemThemeChanged(mode)));
         // Kicks the streaming load for whatever the active tab is — a repo
@@ -297,12 +315,21 @@ impl Diffui {
                     tasks.push(self.start_tab_load(id));
                 }
             }
+            if capabilities.mutate {
+                tasks.push(crate::jj_version::check_once());
+            }
             return Task::batch(tasks);
         }
 
         let Some(tab) = self.route_event(&event) else {
             return Task::none();
         };
+        if let Some(task) = self.take_conflict_job(tab, &event) {
+            return task;
+        }
+        if let Some(task) = self.history_event(tab, &event) {
+            return task;
+        }
         // A job can be both the frontend's and the projection's — a mutation
         // owns an activity row *and* a slot — so the two run in order rather
         // than one short-circuiting the other.
@@ -352,7 +379,12 @@ impl Diffui {
             return Task::none();
         }
         self.active_mut().pending_description_edit = None;
-        self.open_description_editor()
+        let commit = std::mem::take(&mut self.active_mut().pending_commit);
+        let task = self.open_description_editor();
+        if commit && let Some(editor) = self.active_mut().description_editor_mut() {
+            editor.commit = true;
+        }
+        task
     }
 
     /// The commit id under `tab`'s draft destination candidate, if it has one.
@@ -408,7 +440,12 @@ impl Diffui {
                 .tabs
                 .iter()
                 .filter(on_this_repo)
-                .find(|tab| tab.state.session.owns_job(job) || tab.state.jobs.owns(job))
+                .find(|tab| {
+                    tab.state.session.owns_job(job)
+                        || tab.state.jobs.owns(job)
+                        || tab.state.changes.conflicts.owns(job)
+                        || tab.state.history.owns(job)
+                })
                 .map(|tab| tab.id),
             None => self.tabs.iter().find(on_this_repo).map(|tab| tab.id),
         }
@@ -543,7 +580,7 @@ impl Diffui {
             .is_some_and(|(id, _)| *id == job)
         {
             // The ancestry check failed, so we can't tell a backwards move from
-            // a fast-forward. Run it: this is where the guard did not exist.
+            // a fast-forward; `apply_bookmark_check` refuses the move.
             return self.apply_bookmark_check(tab, Err(error.to_string()));
         }
         if jobs.mutation.as_ref().is_some_and(|(id, _)| *id == job) {
@@ -563,7 +600,11 @@ impl Diffui {
     /// Carry out what the projection asked for. Commands go straight down the
     /// actor's channel — the answer comes back through the subscription — so
     /// most effects produce no `Task` at all.
-    fn run_effects(&mut self, tab: TabId, effects: Vec<diffui_core::Effect>) -> Task<Message> {
+    pub(crate) fn run_effects(
+        &mut self,
+        tab: TabId,
+        effects: Vec<diffui_core::Effect>,
+    ) -> Task<Message> {
         use diffui_core::{Effect, session::Activity};
 
         let is_active = self.is_active(tab);
@@ -634,16 +675,21 @@ impl Diffui {
     pub(crate) fn update(&mut self, message: Message) -> Task<Message> {
         let task = match message {
             Message::Action(action) => self.perform(action),
+            Message::MenuBar(tag) => self.on_menu_bar_pick(tag),
             Message::Repo(event) => self.on_repo_event(*event),
             Message::Ui(event) => self.on_ui_event(event),
             Message::Window(event) => self.on_window_event(event),
             Message::Palette(message) => self.on_palette_message(message),
             Message::Find(message) => self.on_find_message(message),
             Message::Menu(message) => self.on_menu_message(message),
+            Message::Changes(message) => self.on_changes(message),
+            Message::JjCliVersion(version) => self.on_jj_cli_version(version),
         };
         // A mode that isn't on screen must not keep the keyboard.
         self.prune_stale_modes();
         let welcome = self.ensure_welcome_prompt();
+        let conflicts = self.sync_conflicts();
+        let history = self.sync_history();
         // Chokepoint: if the active tab coalesced a refresh while busy and it's
         // now idle, run it. A no-op when nothing's pending (the common case).
         let refresh = match self.active_tab_id() {
@@ -656,7 +702,7 @@ impl Diffui {
             }
             None => Task::none(),
         };
-        Task::batch([task, refresh, welcome])
+        Task::batch([task, refresh, welcome, conflicts, history])
     }
 
     /// With no repository open the welcome screen *is* the open prompt, so
@@ -691,6 +737,7 @@ impl Diffui {
                 Task::none()
             }
             Action::Mutate(op) => self.start_mutation_op(op),
+            Action::ConfirmMutation(op) => self.confirm_mutation_op(op),
             Action::StartDraft { kind, source } => self.start_draft(kind, source),
             Action::EditDescription { target } => {
                 let target =
@@ -944,6 +991,11 @@ impl Diffui {
                 self.pop_mode(ModeKind::Menu);
                 Task::none()
             }
+            Action::ToggleShortcuts => self.toggle_shortcuts(),
+            Action::CloseShortcuts => {
+                self.pop_mode(ModeKind::Shortcuts);
+                Task::none()
+            }
             Action::ConfirmAccept => {
                 let Some(Mode::Confirm(dialog)) = self.pop_mode(ModeKind::Confirm) else {
                     return Task::none();
@@ -989,6 +1041,7 @@ impl Diffui {
             }
             Action::Fetch(target) => self.start_fetch(target),
             Action::Undo => self.start_undo(),
+            Action::Redo => self.start_redo(),
             Action::UndoOperation(activity_id, operation_id) => {
                 let Some(tab_id) = self.active_tab_id() else {
                     return Task::none();
@@ -1106,6 +1159,17 @@ impl Diffui {
                 open_url(&url);
                 Task::none()
             }
+            Action::Bookmark(action) => self.update_bookmark(action),
+            Action::Revops(action) => self.perform_revops(action),
+            Action::Changes(message) => self.on_changes(message),
+            Action::History(action) => self.perform_history(action),
+            Action::RevealLogFile => {
+                crate::logging::reveal_log_file();
+                Task::none()
+            }
+            Action::OpenConfigFile => crate::app_menu::open_config_file(),
+            Action::Compare(action) => self.perform_compare(action),
+            Action::ExpandFile(index) => self.expand_collapsed_file(index),
         }
     }
 
@@ -1183,7 +1247,9 @@ impl Diffui {
                 }
             }
             UiEvent::ToastDismiss(id) => self.toasts.retain(|toast| toast.id != id),
-            UiEvent::ToastTick => self.toasts.retain(|toast| toast.born.elapsed() < TOAST_TTL),
+            UiEvent::ToastTick => self
+                .toasts
+                .retain(|toast| toast.sticky || toast.born.elapsed() < TOAST_TTL),
             UiEvent::LoadingTick => {}
             UiEvent::RevisionContextMenu(key, row_rect, cursor) => {
                 return self.open_revision_menu(key, row_rect, cursor);
@@ -1459,6 +1525,7 @@ impl Diffui {
                 }
             }
             WindowEvent::Opened(position, size) => {
+                crate::app_menu::install(self);
                 // Seed tracking from the real window without marking dirty: the
                 // geometry we'd persist already matches what's on disk.
                 self.window_size = size;
@@ -1699,6 +1766,9 @@ impl Diffui {
             return Task::none();
         };
         let context = self.key_context();
+        // iced's text editors never capture keys, so the split prompt's
+        // description editors claim plain keys here.
+        let consumed = consumed || self.active().changes.owns_keyboard();
         let Some(id) = self.resolve_chord(context, &chord, consumed) else {
             return Task::none();
         };
@@ -2044,7 +2114,7 @@ impl Diffui {
     }
 
     /// Browse `selection`: the plain-click / palette-jump path.
-    fn select_revision(&mut self, selection: RevisionSelection) -> Task<Message> {
+    pub(crate) fn select_revision(&mut self, selection: RevisionSelection) -> Task<Message> {
         let target = self.active_mut();
         target.revision_multi_selection.clear();
         if target.session.selected_revision != selection {
@@ -2214,7 +2284,7 @@ impl Diffui {
     }
 
     /// Turn the selected revision's description strip into its inline editor.
-    fn open_description_editor(&mut self) -> Task<Message> {
+    pub(crate) fn open_description_editor(&mut self) -> Task<Message> {
         let target = self.active_mut();
         if target
             .description_editor()
@@ -2246,6 +2316,7 @@ impl Diffui {
             content: widget::text_editor::Content::with_text(&description),
             saving_activity: None,
             switch_blocked: false,
+            commit: false,
         };
         target.push_mode(TabMode::Description(editor));
         self.scroll_restore_token = self.scroll_restore_token.wrapping_add(1);
@@ -2255,6 +2326,7 @@ impl Diffui {
     /// Open the description editor on `target`, browsing to it first when it
     /// isn't the revision on screen.
     fn edit_description(&mut self, target: RevisionSelection) -> Task<Message> {
+        self.active_mut().pending_commit = false;
         if self.active().session.selected_revision == target {
             return self.open_description_editor();
         }
@@ -2275,14 +2347,12 @@ impl Diffui {
         let Some(editor) = self.active().description_editor() else {
             return Task::none();
         };
-        if editor.saving_activity.is_some() || !editor.is_dirty() {
+        // A commit may keep the description as it stands.
+        if editor.saving_activity.is_some() || !(editor.is_dirty() || editor.commit) {
             return Task::none();
         }
-        let op = mutations::MutationOp::Describe {
-            target: editor.target.clone(),
-            description: editor.text().trim_end().to_owned(),
-        };
-        let (activity_id, _) = self.begin_activity(tab_id, "Update description", false);
+        let (op, label) = crate::revops::description_save_op(editor);
+        let (activity_id, _) = self.begin_activity(tab_id, label, false);
         if let Some(editor) = self.active_mut().description_editor_mut() {
             editor.saving_activity = Some(activity_id);
             editor.switch_blocked = false;
@@ -2295,44 +2365,22 @@ impl Diffui {
         })
     }
 
-    /// Enter target mode with `source` as the draft's first source.
+    /// Enter target mode with `source` as the draft's first source — or, for
+    /// a [`mutations::DraftKind::New`] draft (which has no sources), with
+    /// `source` armed as the destination.
     pub(crate) fn start_draft(
         &mut self,
         kind: mutations::DraftKind,
         source: RevisionSelection,
     ) -> Task<Message> {
-        // jj-only, like every mutation.
-        if !self.active().session.capabilities.mutate {
-            return Task::none();
+        if kind == mutations::DraftKind::New {
+            return self.start_draft_with(
+                kind,
+                Vec::new(),
+                Some((source, mutations::PlacementKind::Onto)),
+            );
         }
-        let Some(draft_source) = self.draft_source_for(&source) else {
-            return Task::none();
-        };
-        // Target mode's plain keys and a half-written description can't both
-        // own the keyboard. An unsaved edit wins and says so, the same way it
-        // blocks a revision or tab switch; a clean editor just closes.
-        if let Some(editor) = self.active_mut().description_editor_mut() {
-            if editor.is_dirty() || editor.saving_activity.is_some() {
-                editor.switch_blocked = true;
-                return Task::none();
-            }
-            self.active_mut().pop_mode(ModeKind::Description);
-        }
-        let draft = match kind {
-            mutations::DraftKind::Rebase { mode } => {
-                diffui_core::OpDraft::rebase(mode, vec![draft_source])
-            }
-            mutations::DraftKind::Squash => diffui_core::OpDraft::squash(draft_source),
-            mutations::DraftKind::Merge => diffui_core::OpDraft::merge(draft_source),
-        };
-        // Two marked-row languages at once would be unreadable — the
-        // draft's source wash takes over from the multi-select marks.
-        let target = self.active_mut();
-        target.revision_multi_selection.clear();
-        target.push_mode(TabMode::Draft(DraftUi::new(draft)));
-        self.pop_mode(ModeKind::ActivityPopover);
-        self.pop_mode(ModeKind::Menu);
-        Task::none()
+        self.start_draft_with(kind, vec![source], None)
     }
 
     /// Arm a placement on the active draft, re-previewing the result.
@@ -2523,6 +2571,10 @@ impl Diffui {
             }
             // Filtered out before the request was parked.
             mutations::DraftKind::Squash => return Task::none(),
+            _ => match crate::revops::parked_preview_request(request) {
+                Some(draft) => draft,
+                None => return Task::none(),
+            },
         };
         let Some(tab) = self.active_tab_id() else {
             return Task::none();
@@ -2583,6 +2635,7 @@ impl Diffui {
                     .flatten();
                 self.open_source_browser(revision, jump)
             }
+            MainView::History => self.enter_history_view(),
         }
     }
 
@@ -2598,7 +2651,8 @@ impl Diffui {
         // open-repo dialog and nothing else — so every other mode would be
         // holding the keyboard from behind a surface that never draws it.
         if self.tabs.is_empty() {
-            self.modes.retain(|mode| mode.kind() == ModeKind::OpenRepo);
+            self.modes
+                .retain(|mode| matches!(mode.kind(), ModeKind::OpenRepo | ModeKind::Shortcuts));
             self.no_tab.modes.clear();
             return;
         }
@@ -2844,6 +2898,9 @@ impl Diffui {
             Err(diffui_core::RepoError::Immutable { short_id }) => {
                 self.confirm_immutable(pending, &[short_id], true)
             }
+            Err(diffui_core::RepoError::PushRejected(rejection)) => {
+                self.push_rejected(pending, *rejection)
+            }
             Err(error) => {
                 let error = error.to_string();
                 if description_save
@@ -2883,10 +2940,23 @@ impl Diffui {
         else {
             return Task::none();
         };
-        // A check that failed can't tell a backwards move from a fast-forward;
-        // run it, as it ran before the guard existed. The mutation path still
-        // surfaces any real failure.
-        let backwards = result.unwrap_or(false);
+        // A check that failed can't tell a backwards move from a fast-forward,
+        // and running it anyway would let a backwards move-and-push rewrite
+        // the remote with no confirmation. Fail closed: report, don't move.
+        let backwards = match result {
+            Ok(backwards) => backwards,
+            Err(error) => {
+                return self.finish_activity_row(
+                    pending.tab_id,
+                    pending.activity_id,
+                    Err(format!(
+                        "couldn't check whether the move is backwards, so nothing was \
+                         moved: {error}"
+                    )),
+                    None,
+                );
+            }
+        };
         let mutations::MutationOp::MoveBookmark {
             name,
             to,
@@ -2896,7 +2966,7 @@ impl Diffui {
             return self.run_mutation(pending);
         };
         if !backwards {
-            return self.run_mutation(pending);
+            return self.run_mutation_checking_wc_push(pending);
         }
         let target = match to {
             RevisionSelection::WorkingCopy => "The working copy".to_owned(),
@@ -2937,6 +3007,9 @@ impl Diffui {
                 ),
             ),
         };
+        if self.publishes_working_copy(&pending.op) {
+            body.push_str(&format!(" {}", crate::bookmarks::WORKING_COPY_PUSH_WARNING));
+        }
         // A move that also pushes rewrites the remote branch — say so before
         // the user commits to it.
         let confirm_label = match (push_remote, conflicted_sides) {
@@ -3662,6 +3735,7 @@ impl Diffui {
             return Task::none();
         };
         let revision = target.session.selected_revision.clone();
+        let base = target.session.document_base.clone();
         let mut commands = Vec::new();
         while target.session.highlight_in_flight < HIGHLIGHT_CONCURRENCY {
             let Some(file_index) = target.session.highlight_pending.pop_front() else {
@@ -3682,6 +3756,7 @@ impl Diffui {
                 revision: revision.clone(),
                 path,
                 old_path,
+                base: base.clone(),
             });
         }
         for command in commands {
@@ -3854,6 +3929,14 @@ impl Diffui {
     /// removed — a sourceless draft means nothing; esc is the way out. The
     /// destination still arrives via the normal confirm.
     pub(crate) fn draft_toggle_source(&mut self, selection: RevisionSelection) -> Task<Message> {
+        // A new change has no sources to stack.
+        if self
+            .active()
+            .op_draft()
+            .is_some_and(|ui| ui.draft.kind == mutations::DraftKind::New)
+        {
+            return Task::none();
+        }
         let Some(source) = self.draft_source_for(&selection) else {
             return Task::none();
         };
@@ -3915,10 +3998,19 @@ impl Diffui {
             title,
             detail,
             born: Instant::now(),
+            sticky: false,
         });
         if self.toasts.len() > MAX_TOASTS {
             let excess = self.toasts.len() - MAX_TOASTS;
             self.toasts.drain(..excess);
+        }
+    }
+
+    /// [`Self::push_error_toast`], but the toast stays up until dismissed.
+    pub(crate) fn push_sticky_toast(&mut self, title: String, error: &str) {
+        self.push_error_toast(title, error);
+        if let Some(toast) = self.toasts.last_mut() {
+            toast.sticky = true;
         }
     }
 
@@ -3928,6 +4020,13 @@ impl Diffui {
     pub(crate) fn kick_draft_preview(&mut self) -> Task<Message> {
         if self.active_mut().repository.is_none() {
             return Task::none();
+        }
+        if self
+            .active()
+            .op_draft()
+            .is_some_and(|ui| ui.draft.kind == mutations::DraftKind::Parallelize)
+        {
+            return self.kick_parallelize_preview();
         }
         // Destination from the drag spot when one is live, else the keyboard
         // candidate + placement. Resolved before borrowing the draft mutably.
@@ -3985,9 +4084,15 @@ impl Diffui {
         // The Idle paths must also drop any parked request: they don't bump
         // the version, so a still-running debounce timer would otherwise
         // pick the stale request up and revive a destination the user left.
-        if matches!(ui.draft.kind, mutations::DraftKind::Squash) {
+        if matches!(
+            ui.draft.kind,
+            mutations::DraftKind::Squash
+                | mutations::DraftKind::New
+                | mutations::DraftKind::Duplicate
+        ) {
             // Squash has no simulation (it rarely conflicts and the op bar
-            // already names the fold target).
+            // already names the fold target); neither does inserting an
+            // empty change, and duplicate's copies are left unsimulated.
             ui.preview = DraftPreviewState::Idle;
             ui.preview_request = None;
             return Task::none();
@@ -4179,7 +4284,7 @@ impl Diffui {
     /// Short display name for a revision, matching the sidebar: unique
     /// change-id prefix (min 8 chars), `/N`-suffixed for divergent/hidden
     /// copies, falling back to a commit-id prefix for rows not in the graph.
-    fn revision_short_label(&self, selection: &RevisionSelection) -> String {
+    pub(crate) fn revision_short_label(&self, selection: &RevisionSelection) -> String {
         let commits = &self.active().session.commits;
         let row = match selection {
             RevisionSelection::WorkingCopy => commits.working_copy(),
@@ -4240,6 +4345,14 @@ impl Diffui {
         self.start_mutation_op(mutations::MutationOp::Undo { operation_id: None })
     }
 
+    /// Toolbar "Redo": re-apply what the latest undo took back (`jj redo`).
+    pub(crate) fn start_redo(&mut self) -> Task<Message> {
+        if !self.active().session.capabilities.mutate {
+            return Task::none();
+        }
+        self.start_mutation_op(mutations::MutationOp::Redo)
+    }
+
     /// The revset preset menu entries as `(label, expression)`: the active
     /// repo's "Default" (its `revsets.log`) first when there is one, then the
     /// built-in presets. The default is read from the [`TabState::default_revset`]
@@ -4251,11 +4364,7 @@ impl Diffui {
         if !tab.default_revset.is_empty() {
             entries.push(("Default".to_owned(), tab.default_revset.clone()));
         }
-        entries.extend(
-            presets
-                .iter()
-                .map(|(label, expr)| ((*label).to_owned(), (*expr).to_owned())),
-        );
+        entries.extend(presets);
         entries
     }
 
@@ -4291,7 +4400,11 @@ impl Diffui {
         // No repositories open: the welcome screen owns the whole window, with
         // the open prompt inline rather than as a modal over it.
         if self.tabs.is_empty() {
-            return container(empty_state(self, theme))
+            let welcome = stack![
+                empty_state(self, theme),
+                crate::shortcuts::build_overlay(self, theme),
+            ];
+            return container(welcome)
                 .height(Length::Fill)
                 .width(Length::Fill)
                 .style(move |_| app_shell_style(theme))
@@ -4343,6 +4456,14 @@ impl Diffui {
                 source_panel::build_source_sidebar(self, theme),
                 vertical_divider(theme),
                 source_panel::build_source_panel(self, theme),
+            ]
+            .spacing(0)
+            .height(Length::Fill)
+            .into(),
+            MainView::History => row![
+                history_panel::build_history_sidebar(self, theme),
+                vertical_divider(theme),
+                history_panel::build_history_panel(self, theme),
             ]
             .spacing(0)
             .height(Length::Fill)
@@ -4434,6 +4555,8 @@ impl Diffui {
             || self.mode(ModeKind::Menu).is_some()
             || self.mode(ModeKind::OpenRepo).is_some()
             || self.mode(ModeKind::Confirm).is_some()
+            || self.mode(ModeKind::NamePrompt).is_some()
+            || self.mode(ModeKind::Shortcuts).is_some()
         {
             crate::pointer::suppress(shell)
         } else {
@@ -4448,7 +4571,9 @@ impl Diffui {
             activity::activity_popover(self, theme),
             menu::build_overlay(self, theme),
             tab_bar::build_open_repo_dialog(self, theme),
+            crate::bookmarks::build_name_prompt(self, theme),
             tab_bar::build_confirm_dialog(self, theme),
+            crate::shortcuts::build_overlay(self, theme),
             activity::toast_layer(self, theme),
         ]
         .width(Length::Fill)
@@ -4631,6 +4756,7 @@ impl Diffui {
             toast_tick,
             system::theme_changes()
                 .map(|mode| Message::Window(WindowEvent::SystemThemeChanged(mode))),
+            crate::app_menu::subscription(),
         ])
     }
 
@@ -4958,6 +5084,7 @@ mod tests {
                         })
                         .collect(),
                 }],
+                collapsed: None,
             }],
             total_additions: 0,
             total_deletions: 0,
@@ -5008,6 +5135,39 @@ mod tests {
             "matches must index the document that just landed"
         );
         assert_eq!(state.active, Some(0));
+    }
+
+    /// A backwards-move check that errors can't say the move is safe, so the
+    /// move (and its push) doesn't run and no confirmation pretends it can.
+    #[test]
+    fn a_failed_backwards_check_refuses_the_move_and_push() {
+        let mut ui = app();
+        let tab = push_tab(&mut ui, "/tmp/repo");
+        let (activity_id, _) = ui.begin_activity(tab, "Move main + push", false);
+        let state = ui.tab_mut(tab).unwrap();
+        let job = state.session.next_job();
+        state.jobs.bookmark_check = Some((
+            job,
+            PendingMutation {
+                op: mutations::MutationOp::MoveBookmark {
+                    name: "main".to_owned(),
+                    to: RevisionSelection::WorkingCopy,
+                    push_remote: Some("origin".to_owned()),
+                },
+                tab_id: tab,
+                activity_id,
+                allow_immutable: false,
+            },
+        ));
+
+        let _ = ui.apply_bookmark_check(tab, Err("index unavailable".to_owned()));
+
+        let state = ui.tab_mut(tab).unwrap();
+        assert!(state.jobs.bookmark_check.is_none());
+        assert!(state.jobs.mutation.is_none(), "nothing was sent");
+        assert!(state.queued_mutations.is_empty(), "nothing was queued");
+        assert!(ui.confirm().is_none());
+        assert!(!ui.active().activities.any_running());
     }
 
     #[test]

@@ -97,9 +97,9 @@ impl WindowState {
         match toml::from_str(&raw) {
             Ok(state) => state,
             Err(error) => {
-                eprintln!(
-                    "diffui: ignoring unreadable window state at {}: {error}",
-                    path.display()
+                tracing::warn!(
+                    path = %path.display(),
+                    "ignoring unreadable window state: {error}"
                 );
                 Self::default()
             }
@@ -158,6 +158,30 @@ impl WindowState {
             _ => None,
         }
     }
+}
+
+/// Share of the screen's usable area a first-launch window takes.
+const DEFAULT_SCREEN_FRACTION: f32 = 0.85;
+/// Cap on a first-launch window, so a big display doesn't open a wall of
+/// whitespace.
+const DEFAULT_MAX_SIZE: (f32, f32) = (1800.0, 1150.0);
+
+/// The window size for a launch with no saved geometry: most of the screen's
+/// usable area (`visible`, logical points, menu bar and Dock excluded), up to
+/// a cap. iced's fixed 1024-wide default leaves a three-pane split view too
+/// narrow to read. `None` without a screen to measure.
+pub fn default_window_size(visible: Option<(f32, f32)>) -> Option<(f32, f32)> {
+    let (width, height) = visible.filter(|(w, h)| {
+        w.is_finite() && h.is_finite() && *w >= MIN_RESTORE_DIMENSION && *h >= MIN_RESTORE_DIMENSION
+    })?;
+    Some((
+        (width * DEFAULT_SCREEN_FRACTION)
+            .min(DEFAULT_MAX_SIZE.0)
+            .round(),
+        (height * DEFAULT_SCREEN_FRACTION)
+            .min(DEFAULT_MAX_SIZE.1)
+            .round(),
+    ))
 }
 
 /// Resolve the per-platform state file path. Uses runtime `cfg!` branches
@@ -320,5 +344,19 @@ mod tests {
             toml::from_str("sidebar_width = 300.0").expect("partial deserializes");
         assert_eq!(partial.sidebar_width, Some(300.0));
         assert_eq!(partial.size(), None);
+    }
+
+    #[test]
+    fn a_first_launch_window_takes_most_of_the_screen_up_to_a_cap() {
+        assert_eq!(
+            default_window_size(Some((1440.0, 875.0))),
+            Some((1224.0, 744.0))
+        );
+        assert_eq!(
+            default_window_size(Some((3008.0, 1667.0))),
+            Some((1800.0, 1150.0))
+        );
+        assert_eq!(default_window_size(None), None);
+        assert_eq!(default_window_size(Some((f32::NAN, 800.0))), None);
     }
 }

@@ -19,7 +19,11 @@
 use diffui_core::{FetchTarget, RevisionSelection};
 
 use crate::action::Action;
+use crate::bookmarks::BookmarkAction;
+use crate::compare::CompareAction;
+use crate::history_panel::HistoryAction;
 use crate::palette::{self, ResultRef};
+use crate::revops::{self, RevopsAction};
 use crate::theme::ThemePreference;
 use crate::{DetailField, Diffui, MainView, mutations};
 
@@ -42,6 +46,10 @@ pub(crate) enum Context {
     Menu,
     OpenRepo,
     ActivityPopover,
+    /// The bookmark-name prompt.
+    Prompt,
+    /// The keyboard-shortcut cheat sheet.
+    Shortcuts,
 }
 
 impl Context {
@@ -56,6 +64,8 @@ impl Context {
         Context::Menu,
         Context::OpenRepo,
         Context::ActivityPopover,
+        Context::Prompt,
+        Context::Shortcuts,
     ];
 
     /// The name this context goes by in `config.toml`'s `[keys.<name>]`.
@@ -70,6 +80,8 @@ impl Context {
             Context::Menu => "menu",
             Context::OpenRepo => "open-repo",
             Context::ActivityPopover => "activity",
+            Context::Prompt => "prompt",
+            Context::Shortcuts => "shortcuts",
         }
     }
 
@@ -94,6 +106,10 @@ pub(crate) enum PaletteScope {
     Revision,
     /// The actions column pushed from a file result.
     File,
+    /// A revision verb: listed at the top level acting on the selected
+    /// revision (the row names it), and in a revision result's actions
+    /// column acting on that result.
+    RevisionVerb,
 }
 
 /// The payload a producer hands a command: what the menu row was built for,
@@ -130,6 +146,12 @@ pub(crate) enum CommandArg {
     Revset(String),
     /// A palette result row.
     Result(ResultRef),
+    /// A revision to push under a generated bookmark, and where to
+    /// (`None`: the default push remote).
+    PushRevision {
+        revision: RevisionSelection,
+        remote: Option<String>,
+    },
 }
 
 impl CommandArg {
@@ -137,7 +159,8 @@ impl CommandArg {
         match self {
             CommandArg::Revision(revision)
             | CommandArg::Browse { revision, .. }
-            | CommandArg::Detail { revision, .. } => Some(revision),
+            | CommandArg::Detail { revision, .. }
+            | CommandArg::PushRevision { revision, .. } => Some(revision),
             _ => None,
         }
     }
@@ -202,9 +225,32 @@ pub(crate) fn palette_commands(
 ) -> Vec<&'static Command> {
     REGISTRY
         .iter()
-        .filter(|command| command.palette == scope)
+        .filter(|command| {
+            command.palette == scope
+                || (command.palette == PaletteScope::RevisionVerb
+                    && matches!(scope, PaletteScope::Root | PaletteScope::Revision))
+        })
         .filter(|command| (command.enabled)(ui, arg))
         .collect()
+}
+
+impl Command {
+    /// The label a palette row shows. Most commands use their menu label;
+    /// the revision verbs are spelled for a menu that already says what they
+    /// are (`Rebase ▸ Onto…`), which reads as nothing on its own in a list.
+    pub(crate) fn palette_label(&self) -> &'static str {
+        match self.id {
+            "revision.edit" => "Edit revision",
+            "revision.rebase.start" => "Rebase onto\u{2026}",
+            "revision.rebase.descendants.start" => "Rebase with descendants onto\u{2026}",
+            "revision.rebase.branch.start" => "Rebase whole branch onto\u{2026}",
+            "revision.squash.start" => "Squash into\u{2026}",
+            "revision.squash-into-parent" => "Squash into parent",
+            "revision.abandon" => "Abandon\u{2026}",
+            "repo.fetch" => "Fetch all remotes",
+            _ => self.label,
+        }
+    }
 }
 
 // ── Shared predicates ───────────────────────────────────────────────────────
@@ -225,7 +271,7 @@ fn row_present(ui: &Diffui, selection: &RevisionSelection) -> bool {
 
 /// A mutation is offered when the backend supports one (jj only) and every
 /// revision the command names is still on screen.
-fn can_mutate(ui: &Diffui, arg: &CommandArg) -> bool {
+pub(crate) fn can_mutate(ui: &Diffui, arg: &CommandArg) -> bool {
     if !ui.active().session.capabilities.mutate {
         return false;
     }
@@ -262,11 +308,58 @@ fn has_selected_file(ui: &Diffui, _: &CommandArg) -> bool {
     tab.session.document.files.get(tab.selected_file).is_some()
 }
 
+fn has_remotes(ui: &Diffui) -> bool {
+    !ui.active().session.bookmarks.remotes.is_empty()
+}
+
+/// The local bookmark a bookmark command names: a menu row's, or a palette
+/// bookmark result's (`main`, `main*`, `main??` — never `main@origin`).
+fn local_bookmark(ui: &Diffui, arg: &CommandArg) -> Option<String> {
+    let name = match arg {
+        CommandArg::Bookmark { name, .. } => name.as_str(),
+        CommandArg::Result(ResultRef::Bookmark(label)) => {
+            crate::bookmarks::local_bookmark_label(label)?
+        }
+        _ => return None,
+    };
+    let entry = ui.active().session.bookmarks.entry(name)?;
+    (!entry.local_targets.is_empty()).then(|| name.to_owned())
+}
+
+/// `(bookmark, remote)` of a palette `name@remote` result no one tracks yet.
+fn untracked_remote_bookmark(ui: &Diffui, arg: &CommandArg) -> Option<(String, String)> {
+    let CommandArg::Result(ResultRef::Bookmark(label)) = arg else {
+        return None;
+    };
+    let (name, remote) = label.trim_end_matches("??").rsplit_once('@')?;
+    let entry = ui.active().session.bookmarks.entry(name)?;
+    entry
+        .remotes
+        .iter()
+        .any(|r| r.remote == remote && !r.tracked)
+        .then(|| (name.to_owned(), remote.to_owned()))
+}
+
+/// `(bookmark, remote)` for a deletion push: the menu row's remote, else the
+/// first remote tracking the bookmark.
+fn deletion_remote(ui: &Diffui, arg: &CommandArg) -> Option<(String, String)> {
+    let name = local_bookmark(ui, arg)?;
+    let entry = ui.active().session.bookmarks.entry(&name)?;
+    let remote = match arg {
+        CommandArg::Bookmark {
+            remote: Some(remote),
+            ..
+        } => remote.clone(),
+        _ => entry.tracked_remote()?.to_owned(),
+    };
+    entry.tracks(&remote).then_some((name, remote))
+}
+
 // ── Shared builders ─────────────────────────────────────────────────────────
 
 /// The revision a command acts on: the one its producer named, the one a
 /// palette result resolves to, or — for a bare chord — whatever is selected.
-fn target_revision(ui: &Diffui, arg: &CommandArg) -> Option<RevisionSelection> {
+pub(crate) fn target_revision(ui: &Diffui, arg: &CommandArg) -> Option<RevisionSelection> {
     match arg {
         CommandArg::Result(item) => palette::revision_selection(item, ui),
         _ => match arg.revision() {
@@ -274,6 +367,17 @@ fn target_revision(ui: &Diffui, arg: &CommandArg) -> Option<RevisionSelection> {
             None => Some(ui.active().session.selected_revision.clone()),
         },
     }
+}
+
+/// The sidebar's marked rows that are still in the loaded graph, in mark
+/// order.
+fn marked_revisions(ui: &Diffui) -> Vec<RevisionSelection> {
+    ui.active()
+        .revision_multi_selection
+        .iter()
+        .map(|hex| RevisionSelection::Commit(hex.clone()))
+        .filter(|selection| row_present(ui, selection))
+        .collect()
 }
 
 /// Enter target mode on whichever revision the command was aimed at.
@@ -441,18 +545,33 @@ pub(crate) static REGISTRY: &[Command] = &[
             CommandArg::Fetch(target) => Some(Action::Fetch(target)),
             _ => Some(Action::Fetch(FetchTarget::AllRemotes)),
         },
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::Root,
     },
     Command {
         id: "repo.undo",
         label: "Undo",
-        hint: "Revert the latest jj operation",
+        hint: "Step back one jj operation (jj undo); file saves are kept",
+        // Target mode hands ⌘-chords down to the base context, so ⌘Z there
+        // undoes too. A focused text field keeps ⌘Z for its own text — see
+        // `modes::needs_unconsumed`.
         contexts: &[Context::Base],
-        chords: &[],
+        chords: &["cmd+z"],
         mac_chords: &[],
         enabled: can_mutate,
         build: |_ui, _arg| Some(Action::Undo),
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "repo.redo",
+        label: "Redo",
+        hint: "Re-apply what the last undo took back (jj redo)",
+        contexts: &[Context::Base],
+        // ⇧ lives in the character: ⌘⇧Z arrives as `cmd+Z`.
+        chords: &["cmd+Z"],
+        mac_chords: &[],
+        enabled: can_mutate,
+        build: |_ui, _arg| Some(Action::Redo),
+        palette: PaletteScope::Root,
     },
     Command {
         id: "repo.set-revset",
@@ -582,7 +701,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         label: "Edit description\u{2026}",
         hint: "Rewrite this revision's message",
         contexts: &[Context::Base],
-        chords: &[],
+        chords: &["d"],
         mac_chords: &[],
         enabled: can_mutate,
         build: |ui, arg| {
@@ -590,35 +709,35 @@ pub(crate) static REGISTRY: &[Command] = &[
                 target: Some(target),
             })
         },
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::RevisionVerb,
     },
     Command {
         id: "revision.new-child",
         label: "New child",
         hint: "Start a new change on top of this one",
         contexts: &[Context::Base],
-        chords: &[],
+        chords: &["n"],
         mac_chords: &[],
         enabled: can_mutate,
         build: |ui, arg| {
             target_revision(ui, &arg)
                 .map(|parent| Action::Mutate(mutations::MutationOp::New { parent }))
         },
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::RevisionVerb,
     },
     Command {
         id: "revision.edit",
         label: "Edit",
         hint: "Make this revision the working copy",
         contexts: &[Context::Base],
-        chords: &[],
+        chords: &["e"],
         mac_chords: &[],
         enabled: can_mutate,
         build: |ui, arg| {
             target_revision(ui, &arg)
                 .map(|target| Action::Mutate(mutations::MutationOp::Edit { target }))
         },
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::RevisionVerb,
     },
     Command {
         id: "revision.rebase.start",
@@ -637,7 +756,7 @@ pub(crate) static REGISTRY: &[Command] = &[
                 },
             )
         },
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::RevisionVerb,
     },
     Command {
         id: "revision.rebase.descendants.start",
@@ -656,14 +775,14 @@ pub(crate) static REGISTRY: &[Command] = &[
                 },
             )
         },
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::RevisionVerb,
     },
     Command {
         id: "revision.rebase.branch.start",
         label: "Whole branch onto\u{2026}",
         hint: "Move the branch this revision sits on",
         contexts: &[Context::Base],
-        chords: &["b", "B"],
+        chords: &["b"],
         mac_chords: &[],
         enabled: can_mutate,
         build: |ui, arg| {
@@ -675,36 +794,36 @@ pub(crate) static REGISTRY: &[Command] = &[
                 },
             )
         },
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::RevisionVerb,
     },
     Command {
         id: "revision.squash.start",
         label: "Into\u{2026}",
         hint: "Squash this revision into a picked one",
         contexts: &[Context::Base],
-        chords: &["s", "S"],
+        chords: &["s"],
         mac_chords: &[],
         enabled: can_mutate,
         build: |ui, arg| draft(ui, arg, mutations::DraftKind::Squash),
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::RevisionVerb,
     },
     Command {
         id: "revision.merge.start",
         label: "Merge with\u{2026}",
         hint: "Create a merge of this revision and a picked one",
         contexts: &[Context::Base],
-        chords: &["m", "M"],
+        chords: &["m"],
         mac_chords: &[],
         enabled: can_mutate,
         build: |ui, arg| draft(ui, arg, mutations::DraftKind::Merge),
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::RevisionVerb,
     },
     Command {
         id: "revision.squash-into-parent",
         label: "Into parent",
         hint: "Squash this revision into its parent",
         contexts: &[Context::Base],
-        chords: &[],
+        chords: &["S"],
         mac_chords: &[],
         enabled: can_mutate,
         build: |ui, arg| {
@@ -715,7 +834,7 @@ pub(crate) static REGISTRY: &[Command] = &[
                 })
             })
         },
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::RevisionVerb,
     },
     Command {
         id: "revision.duplicate",
@@ -729,7 +848,7 @@ pub(crate) static REGISTRY: &[Command] = &[
             target_revision(ui, &arg)
                 .map(|target| Action::Mutate(mutations::MutationOp::Duplicate { target }))
         },
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::RevisionVerb,
     },
     Command {
         id: "revision.absorb",
@@ -743,27 +862,40 @@ pub(crate) static REGISTRY: &[Command] = &[
             target_revision(ui, &arg)
                 .map(|from| Action::Mutate(mutations::MutationOp::Absorb { from }))
         },
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::RevisionVerb,
     },
     Command {
         id: "revision.abandon",
         label: "Abandon",
         hint: "Drop this revision, keeping its descendants",
         contexts: &[Context::Base],
-        chords: &[],
+        chords: &["a"],
         mac_chords: &[],
         enabled: can_mutate,
         build: |ui, arg| match arg {
             CommandArg::Revisions(targets) if !targets.is_empty() => {
                 Some(Action::Mutate(mutations::MutationOp::Abandon { targets }))
             }
-            other => target_revision(ui, &other).map(|target| {
-                Action::Mutate(mutations::MutationOp::Abandon {
-                    targets: vec![target],
-                })
-            }),
+            // A menu row was aimed at one row on purpose; run it.
+            CommandArg::Revision(target) => Some(Action::Mutate(mutations::MutationOp::Abandon {
+                targets: vec![target],
+            })),
+            // A single key or a palette pick is one stray press away from
+            // dropping a revision, so those ask first. A bare `a` takes the
+            // marked rows when there are any, as the context menu does.
+            other => {
+                let marked = marked_revisions(ui);
+                let targets = if matches!(other, CommandArg::None) && !marked.is_empty() {
+                    marked
+                } else {
+                    vec![target_revision(ui, &other)?]
+                };
+                Some(Action::ConfirmMutation(mutations::MutationOp::Abandon {
+                    targets,
+                }))
+            }
         },
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::RevisionVerb,
     },
     Command {
         id: "revision.browse-source",
@@ -777,7 +909,7 @@ pub(crate) static REGISTRY: &[Command] = &[
             let path = arg.path().map(str::to_owned);
             target_revision(ui, &arg).map(|revision| Action::BrowseSource { revision, path })
         },
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::RevisionVerb,
     },
     Command {
         id: "revision.copy-text",
@@ -825,6 +957,293 @@ pub(crate) static REGISTRY: &[Command] = &[
         enabled: always,
         build: |_ui, _arg| Some(Action::ClearMultiSelection),
         palette: PaletteScope::Hidden,
+    },
+    // ── Whole-revision ops: commit, new -A/-B, duplicate placement,
+    // divergent changes, author metadata, and the marked-set batch verbs ──
+    Command {
+        id: "revision.commit",
+        label: "Commit\u{2026}",
+        hint: "Describe the working copy and start a new change on top",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: revops::can_commit,
+        build: |_ui, _arg| Some(Action::Revops(RevopsAction::BeginCommit)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "revision.new-after",
+        label: "Insert new change after",
+        hint: "New change between this revision and its children",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: can_mutate,
+        build: |ui, arg| revops::insert_new_change(ui, arg, mutations::PlacementKind::After),
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "revision.new-before",
+        label: "Insert new change before",
+        hint: "New change between this revision and its parents",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: can_mutate,
+        build: |ui, arg| revops::insert_new_change(ui, arg, mutations::PlacementKind::Before),
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "revision.new.start",
+        label: "New change at\u{2026}",
+        hint: "Pick where a new change goes: onto, after or before a revision",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: can_mutate,
+        build: |ui, arg| revops::new_change_at(ui, arg, mutations::PlacementKind::Onto),
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "revision.duplicate.start",
+        label: "Duplicate onto\u{2026}",
+        hint: "Pick where a copy of this revision lands",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: can_mutate,
+        build: |ui, arg| draft(ui, arg, mutations::DraftKind::Duplicate),
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "revision.divergent.keep",
+        label: "Keep this divergent copy",
+        hint: "Abandon the change's other visible copies, ending the divergence",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: revops::is_divergent_target,
+        build: |ui, arg| {
+            target_revision(ui, &arg)
+                .map(|keep| Action::Mutate(mutations::MutationOp::KeepDivergent { keep }))
+        },
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "revision.divergent.abandon",
+        label: "Abandon this divergent copy",
+        hint: "Drop this copy of a divergent change, keeping the others",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: revops::is_divergent_target,
+        build: |ui, arg| {
+            target_revision(ui, &arg).map(|target| {
+                Action::Mutate(mutations::MutationOp::Abandon {
+                    targets: vec![target],
+                })
+            })
+        },
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "revision.reset-author",
+        label: "Reset author to me",
+        hint: "Set the author to the configured user (jj metaedit --update-author)",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: can_mutate,
+        build: |ui, arg| revops::metaedit(ui, arg, true, false),
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "revision.update-author-timestamp",
+        label: "Update author date to now",
+        hint: "jj metaedit --update-author-timestamp",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: can_mutate,
+        build: |ui, arg| revops::metaedit(ui, arg, false, true),
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "revision.parallelize.start",
+        label: "Parallelize with\u{2026}",
+        hint: "Pick revisions to make siblings of this one (space adds the candidate)",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: can_mutate,
+        build: |ui, arg| draft(ui, arg, mutations::DraftKind::Parallelize),
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "selection.toggle",
+        label: "Mark or unmark revision",
+        hint: "Add the revision to (or drop it from) the batch selection",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: can_mutate,
+        build: |ui, arg| {
+            target_revision(ui, &arg).map(|target| Action::Revops(RevopsAction::ToggleMark(target)))
+        },
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "selection.rebase.start",
+        label: "Rebase marked revisions onto\u{2026}",
+        hint: "Pick a destination for every marked revision",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: revops::batch_of_one,
+        build: |ui, arg| {
+            revops::batch_draft(
+                ui,
+                &arg,
+                mutations::DraftKind::Rebase {
+                    mode: mutations::RebaseSourceMode::Revisions,
+                },
+            )
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "selection.rebase.descendants.start",
+        label: "Rebase marked revisions with descendants onto\u{2026}",
+        hint: "Move every marked revision and everything under it",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: revops::batch_of_one,
+        build: |ui, arg| {
+            revops::batch_draft(
+                ui,
+                &arg,
+                mutations::DraftKind::Rebase {
+                    mode: mutations::RebaseSourceMode::WithDescendants,
+                },
+            )
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "selection.squash.start",
+        label: "Squash marked revisions into\u{2026}",
+        hint: "Fold every marked revision into a picked one",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: revops::batch_of_one,
+        build: |ui, arg| revops::batch_draft(ui, &arg, mutations::DraftKind::Squash),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "selection.duplicate",
+        label: "Duplicate marked revisions",
+        hint: "Copy every marked revision onto its own parents",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: revops::batch_of_one,
+        build: |ui, arg| {
+            Some(Action::Mutate(mutations::MutationOp::DuplicateTo {
+                targets: revops::batch(ui, &arg),
+                destination: None,
+            }))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "selection.duplicate.start",
+        label: "Duplicate marked revisions onto\u{2026}",
+        hint: "Pick where copies of the marked revisions land",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: revops::batch_of_one,
+        build: |ui, arg| revops::batch_draft(ui, &arg, mutations::DraftKind::Duplicate),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "selection.new-merge",
+        label: "New change on marked revisions",
+        hint: "A merge commit with every marked revision as a parent",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: revops::batch_of_two,
+        build: |ui, arg| {
+            Some(Action::Mutate(mutations::MutationOp::Merge {
+                parents: revops::batch(ui, &arg),
+            }))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "selection.parallelize",
+        label: "Parallelize marked revisions\u{2026}",
+        hint: "Make the marked revisions siblings, previewing new conflicts",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: revops::batch_of_two,
+        build: |ui, arg| revops::batch_draft(ui, &arg, mutations::DraftKind::Parallelize),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "selection.abandon",
+        label: "Abandon marked revisions",
+        hint: "Drop every marked revision, keeping their descendants",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: revops::batch_of_one,
+        build: |ui, arg| {
+            Some(Action::Mutate(mutations::MutationOp::Abandon {
+                targets: revops::batch(ui, &arg),
+            }))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "selection.reset-author",
+        label: "Reset author to me on marked revisions",
+        hint: "jj metaedit --update-author on every marked revision",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: revops::batch_of_one,
+        build: |ui, arg| {
+            revops::metaedit(
+                ui,
+                CommandArg::Revisions(revops::batch(ui, &arg)),
+                true,
+                false,
+            )
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "selection.update-author-timestamp",
+        label: "Update author date on marked revisions",
+        hint: "jj metaedit --update-author-timestamp on every marked revision",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: revops::batch_of_one,
+        build: |ui, arg| {
+            revops::metaedit(
+                ui,
+                CommandArg::Revisions(revops::batch(ui, &arg)),
+                false,
+                true,
+            )
+        },
+        palette: PaletteScope::Root,
     },
     // ── Bookmarks ───────────────────────────────────────────────────────
     Command {
@@ -907,6 +1326,161 @@ pub(crate) static REGISTRY: &[Command] = &[
             })),
             _ => None,
         },
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "bookmark.create",
+        label: "Create bookmark\u{2026}",
+        hint: "Name a new bookmark at the revision",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: can_mutate,
+        build: |ui, arg| {
+            target_revision(ui, &arg).map(|at| Action::Bookmark(BookmarkAction::Create { at }))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "revision.push-change",
+        label: "Push as new bookmark",
+        hint: "jj git push --change: push the revision under a generated bookmark",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| can_mutate(ui, arg) && has_remotes(ui),
+        build: |ui, arg| {
+            let remote = match &arg {
+                CommandArg::PushRevision { remote, .. } => remote.clone(),
+                _ => None,
+            };
+            target_revision(ui, &arg)
+                .map(|at| Action::Bookmark(BookmarkAction::PushChange { at, remote }))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "repo.push",
+        label: "Push tracked bookmarks",
+        hint: "jj git push: the tracked bookmarks between the remote and @",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| can_mutate(ui, arg) && has_remotes(ui),
+        build: |_ui, _arg| Some(Action::Bookmark(BookmarkAction::PushTracked)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "bookmark.push-to",
+        label: "Push bookmark",
+        hint: "Push to its tracked remote, or create it on the default one",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| {
+            can_mutate(ui, arg) && has_remotes(ui) && local_bookmark(ui, arg).is_some()
+        },
+        build: |ui, arg| {
+            let name = local_bookmark(ui, &arg)?;
+            let remote = match arg {
+                CommandArg::Bookmark { remote, .. } => remote,
+                _ => None,
+            };
+            Some(Action::Bookmark(BookmarkAction::Push { name, remote }))
+        },
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "bookmark.rename",
+        label: "Rename\u{2026}",
+        hint: "Rename this bookmark",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| can_mutate(ui, arg) && local_bookmark(ui, arg).is_some(),
+        build: |ui, arg| {
+            local_bookmark(ui, &arg).map(|name| Action::Bookmark(BookmarkAction::Rename { name }))
+        },
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "bookmark.delete-everywhere",
+        label: "Delete here and on remote",
+        hint: "Delete the bookmark and push the deletion",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| can_mutate(ui, arg) && deletion_remote(ui, arg).is_some(),
+        build: |ui, arg| {
+            let (name, remote) = deletion_remote(ui, &arg)?;
+            Some(Action::Bookmark(BookmarkAction::DeleteEverywhere {
+                name,
+                remote,
+            }))
+        },
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "bookmark.forget",
+        label: "Forget",
+        hint: "Drop the bookmark and stop tracking its remotes",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| can_mutate(ui, arg) && local_bookmark(ui, arg).is_some(),
+        build: |ui, arg| {
+            local_bookmark(ui, &arg)
+                .map(|name| Action::Mutate(mutations::MutationOp::ForgetBookmark { name }))
+        },
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "bookmark.untrack",
+        label: "Untrack",
+        hint: "Stop tracking this remote bookmark",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: can_mutate,
+        build: |_ui, arg| match arg {
+            CommandArg::Bookmark {
+                name,
+                remote: Some(remote),
+                ..
+            } => Some(Action::Mutate(mutations::MutationOp::UntrackBookmark {
+                name,
+                remote,
+            })),
+            _ => None,
+        },
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "bookmark.track-remote",
+        label: "Track remote bookmark",
+        hint: "jj bookmark track: follow this remote bookmark with a local one",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| can_mutate(ui, arg) && untracked_remote_bookmark(ui, arg).is_some(),
+        build: |ui, arg| {
+            let (name, remote) = untracked_remote_bookmark(ui, &arg)?;
+            Some(Action::Mutate(mutations::MutationOp::TrackBookmark {
+                name,
+                remote,
+            }))
+        },
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "bookmark.prompt-cancel",
+        label: "Cancel",
+        hint: "Close the bookmark-name prompt",
+        contexts: &[Context::Prompt],
+        chords: &["esc"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::Bookmark(BookmarkAction::PromptCancel)),
         palette: PaletteScope::Hidden,
     },
     // ── Target mode ─────────────────────────────────────────────────────
@@ -1107,7 +1681,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         mac_chords: &[],
         enabled: always,
         build: |_ui, _arg| Some(Action::OpenRepoDialog),
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::Root,
     },
     Command {
         id: "repo.close-dialog",
@@ -1230,7 +1804,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         mac_chords: &[],
         enabled: always,
         build: |_ui, _arg| Some(Action::ToggleActivityPopover),
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::Root,
     },
     Command {
         id: "activity.clear",
@@ -1254,7 +1828,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         mac_chords: &["alt+z", "alt+\u{3c9}"],
         enabled: always,
         build: |_ui, _arg| Some(Action::ToggleWrap),
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::Root,
     },
     Command {
         id: "view.toggle-split",
@@ -1265,7 +1839,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         mac_chords: &[],
         enabled: always,
         build: |_ui, _arg| Some(Action::ToggleSplit),
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::Root,
     },
     Command {
         id: "view.diff",
@@ -1274,9 +1848,9 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: always,
+        enabled: |ui, _arg| ui.active().main_view != MainView::Diff,
         build: |_ui, _arg| Some(Action::SetMainView(MainView::Diff)),
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::Root,
     },
     Command {
         id: "view.source",
@@ -1285,9 +1859,9 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: can_browse,
+        enabled: |ui, arg| can_browse(ui, arg) && ui.active().main_view != MainView::Source,
         build: |_ui, _arg| Some(Action::SetMainView(MainView::Source)),
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::Root,
     },
     // ── Tabs ────────────────────────────────────────────────────────────
     Command {
@@ -1299,7 +1873,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         mac_chords: &[],
         enabled: always,
         build: |_ui, _arg| Some(Action::CloseActiveTab),
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::Root,
     },
     tab_select!(1, "tab.select-1", "Go to tab 1", "cmd+1", 0),
     tab_select!(2, "tab.select-2", "Go to tab 2", "cmd+2", 1),
@@ -1310,7 +1884,478 @@ pub(crate) static REGISTRY: &[Command] = &[
     tab_select!(7, "tab.select-7", "Go to tab 7", "cmd+7", 6),
     tab_select!(8, "tab.select-8", "Go to tab 8", "cmd+8", 7),
     tab_select!(9, "tab.select-9", "Go to tab 9", "cmd+9", 8),
+    // ── Partial changes and conflicts (the diff pane's checkboxes) ──────
+    Command {
+        id: "changes.toggle-file",
+        label: "Select file for split / squash",
+        hint: "Tick or untick the file in the change selection",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| crate::changes::command_file(ui, arg).is_some(),
+        build: |ui, arg| {
+            let index = crate::changes::command_file(ui, &arg)?;
+            Some(Action::Changes(crate::changes::ChangesMsg::ToggleFile(
+                index,
+            )))
+        },
+        palette: PaletteScope::File,
+    },
+    Command {
+        id: "changes.split",
+        label: "Split selected changes\u{2026}",
+        hint: "Keep the selection in this revision, move the rest to a new one",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| crate::changes::has_selection(ui),
+        build: |_ui, _arg| Some(Action::Changes(crate::changes::ChangesMsg::OpenSplit)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "changes.squash-into-parent",
+        label: "Squash selected changes into parent",
+        hint: "jj squash with just the ticked files and hunks",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| crate::changes::has_selection(ui),
+        build: |_ui, _arg| {
+            Some(Action::Changes(
+                crate::changes::ChangesMsg::SquashIntoParent,
+            ))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "changes.move-into",
+        label: "Move selected changes into\u{2026}",
+        hint: "Pick the revision that receives the ticked files and hunks",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| crate::changes::has_selection(ui),
+        build: |_ui, _arg| Some(Action::Changes(crate::changes::ChangesMsg::MoveInto)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "changes.discard",
+        label: "Discard selected changes\u{2026}",
+        hint: "Restore the parent's content for the ticked files and hunks",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| crate::changes::has_selection(ui),
+        build: |_ui, _arg| Some(Action::Changes(crate::changes::ChangesMsg::Discard)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "changes.clear",
+        label: "Clear change selection",
+        hint: "Untick every file and hunk",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| crate::changes::has_selection(ui),
+        build: |_ui, _arg| Some(Action::Changes(crate::changes::ChangesMsg::Clear)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "file.restore",
+        label: "Restore file from parent (discard changes)\u{2026}",
+        hint: "jj restore for this file",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| crate::changes::command_file(ui, arg).is_some(),
+        build: |ui, arg| {
+            let path = crate::changes::command_file_path(ui, &arg)?;
+            Some(Action::Changes(crate::changes::ChangesMsg::RestoreFile(
+                path,
+            )))
+        },
+        palette: PaletteScope::File,
+    },
+    Command {
+        id: "file.move-into",
+        label: "Move file changes into\u{2026}",
+        hint: "Pick the revision that receives this file's changes",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| crate::changes::command_file(ui, arg).is_some(),
+        build: |ui, arg| {
+            let path = crate::changes::command_file_path(ui, &arg)?;
+            Some(Action::Changes(crate::changes::ChangesMsg::MoveFile(path)))
+        },
+        palette: PaletteScope::File,
+    },
+    Command {
+        id: "file.split",
+        label: "Split file into new change\u{2026}",
+        hint: "Move this file's changes into a new change on top",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| crate::changes::command_file(ui, arg).is_some(),
+        build: |ui, arg| {
+            let path = crate::changes::command_file_path(ui, &arg)?;
+            Some(Action::Changes(crate::changes::ChangesMsg::SplitFile(path)))
+        },
+        palette: PaletteScope::File,
+    },
+    Command {
+        id: "conflict.take-side-1",
+        label: "Resolve conflict: take side 1",
+        hint: "jj resolve --tool :ours for this file",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| crate::conflicts::command_resolution(ui, arg, Some(0)).is_some(),
+        build: |ui, arg| crate::conflicts::command_resolution(ui, &arg, Some(0)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "conflict.take-side-2",
+        label: "Resolve conflict: take side 2",
+        hint: "jj resolve --tool :theirs for this file",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| crate::conflicts::command_resolution(ui, arg, Some(1)).is_some(),
+        build: |ui, arg| crate::conflicts::command_resolution(ui, &arg, Some(1)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "conflict.take-base",
+        label: "Resolve conflict: take base",
+        hint: "Drop both sides' changes to this file",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| crate::conflicts::command_resolution(ui, arg, None).is_some(),
+        build: |ui, arg| crate::conflicts::command_resolution(ui, &arg, None),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "conflict.merge-tool",
+        label: "Resolve conflict in merge tool",
+        hint: "Run ui.merge-editor and write the result back",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| crate::conflicts::command_merge_tool(ui, arg).is_some(),
+        build: |ui, arg| crate::conflicts::command_merge_tool(ui, &arg),
+        palette: PaletteScope::Root,
+    },
+    // ── History (op log, evolog, file history, annotate) ────────────────
+    Command {
+        id: "history.op-log",
+        label: "Show operation log",
+        hint: "Browse jj's operation log; restore or revert an operation",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| crate::history_panel::available(ui),
+        build: |_ui, _arg| Some(Action::History(HistoryAction::ShowOpLog)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "history.evolog",
+        label: "Show evolution log",
+        hint: "Every previous version of this revision (jj evolog)",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| {
+            crate::history_panel::available(ui)
+                && arg
+                    .revision()
+                    .is_none_or(|revision| row_present(ui, revision))
+        },
+        build: |ui, arg| {
+            target_revision(ui, &arg)
+                .map(|revision| Action::History(HistoryAction::ShowEvolog(revision)))
+        },
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "history.evolog.selected",
+        label: "Show evolution log of the selected revision",
+        hint: "Every previous version of the selected revision (jj evolog)",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| crate::history_panel::available(ui),
+        build: |ui, _arg| {
+            Some(Action::History(HistoryAction::ShowEvolog(
+                ui.active().session.selected_revision.clone(),
+            )))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "file.history",
+        label: "Show file history",
+        hint: "Narrow the graph to the revisions that touched this file",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| crate::history_panel::available(ui),
+        build: |ui, arg| {
+            let revision = match &arg {
+                CommandArg::Browse { revision, .. } => revision.clone(),
+                _ => ui.active().session.selected_revision.clone(),
+            };
+            let path = match arg {
+                CommandArg::Result(ResultRef::File(path)) => path,
+                other => other.path()?.to_owned(),
+            };
+            Some(Action::History(HistoryAction::FileHistory {
+                revision,
+                path,
+            }))
+        },
+        palette: PaletteScope::File,
+    },
+    Command {
+        id: "file.history.current",
+        label: "Show history of the current file",
+        hint: "Narrow the graph to the revisions that touched the file on screen",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| {
+            crate::history_panel::available(ui) && crate::history_panel::current_file(ui).is_some()
+        },
+        build: |_ui, _arg| Some(Action::History(HistoryAction::CurrentFileHistory)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "file.history.clear",
+        label: "Clear file history filter",
+        hint: "Show the whole graph again",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| crate::history_panel::file_filter_active(ui),
+        build: |_ui, _arg| Some(Action::History(HistoryAction::ClearFileFilter)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "source.toggle-annotate",
+        label: "Toggle annotate (blame)",
+        hint: "Show which change last touched each line of the browsed file",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| crate::history_panel::can_annotate(ui),
+        build: |_ui, _arg| Some(Action::History(HistoryAction::ToggleAnnotate)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "history.restore-operation",
+        label: "Restore repository to the selected operation\u{2026}",
+        hint: "jj op restore: put every revision and bookmark back to that point",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| {
+            ui.active().session.capabilities.mutate
+                && crate::history_panel::selected_operation(ui).is_some()
+        },
+        build: |ui, _arg| {
+            crate::history_panel::selected_operation(ui)
+                .map(|id| Action::History(HistoryAction::RestoreOperation(id)))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "history.revert-operation",
+        label: "Revert the selected operation\u{2026}",
+        hint: "jj op revert: undo just that operation, keeping later work",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| {
+            ui.active().session.capabilities.mutate
+                && crate::history_panel::selected_operation(ui).is_some()
+        },
+        build: |ui, _arg| {
+            crate::history_panel::selected_operation(ui)
+                .map(|id| Action::History(HistoryAction::RevertOperation(id)))
+        },
+        palette: PaletteScope::Root,
+    },
+    // ── Diagnostics ─────────────────────────────────────────────────────
+    Command {
+        id: "app.reveal-log",
+        label: if cfg!(target_os = "macos") {
+            "Reveal log file in Finder"
+        } else {
+            "Reveal log file"
+        },
+        hint: "Show diffui's log, for bug reports and crash details",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::RevealLogFile),
+        palette: PaletteScope::Root,
+    },
+    // ── Help ────────────────────────────────────────────────────────────
+    Command {
+        id: "help.shortcuts",
+        label: "Keyboard shortcuts",
+        hint: "List every key binding",
+        contexts: &[Context::Base, Context::Shortcuts],
+        chords: &["?"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::ToggleShortcuts),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "app.open-config",
+        label: "Open settings file",
+        hint: "Edit config.toml (fonts, theme, keys, revset presets)",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::OpenConfigFile),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "shortcuts.close",
+        label: "Close shortcuts",
+        hint: "Dismiss the keyboard shortcut list",
+        contexts: &[Context::Shortcuts],
+        chords: &["esc"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::CloseShortcuts),
+        palette: PaletteScope::Hidden,
+    },
+    // ── Comparing two revisions ─────────────────────────────────────────
+    Command {
+        id: "compare.with",
+        label: "Compare with…",
+        hint: "Diff against this revision; click another to pick the other side",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: can_compare,
+        build: |ui, arg| {
+            target_revision(ui, &arg).map(|from| Action::Compare(CompareAction::PickWith(from)))
+        },
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "compare.with-working-copy",
+        label: "Compare with working copy",
+        hint: "Diff from this revision to the working copy",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: can_compare,
+        build: |ui, arg| {
+            target_revision(ui, &arg)
+                .map(|from| Action::Compare(CompareAction::WithWorkingCopy(from)))
+        },
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "compare.from-selected",
+        label: "Compare selected revision with…",
+        hint: "Pin the selected revision as the base, then click another",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: can_compare,
+        build: |ui, _arg| {
+            Some(Action::Compare(CompareAction::PickWith(
+                ui.active().session.selected_revision.clone(),
+            )))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "compare.marked",
+        label: "Compare marked revisions",
+        hint: "Diff the two ⌘-clicked revisions, older to newer",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| crate::compare::has_marked_pair(ui),
+        build: |_ui, _arg| Some(Action::Compare(CompareAction::Marked)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "compare.swap",
+        label: "Swap compared revisions",
+        hint: "Exchange the two sides of the comparison",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| crate::compare::comparing(ui),
+        build: |_ui, _arg| Some(Action::Compare(CompareAction::Swap)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "compare.interdiff",
+        label: "Toggle interdiff",
+        hint: "Switch between a tree diff and jj interdiff of the two revisions",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| crate::compare::comparing(ui),
+        build: |ui, _arg| {
+            let interdiff = matches!(
+                ui.active().session.diff_base,
+                diffui_core::DiffBase::Interdiff(_)
+            );
+            Some(Action::Compare(CompareAction::SetInterdiff(!interdiff)))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "compare.exit",
+        label: "Stop comparing",
+        hint: "Back to the selected revision's own diff",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| crate::compare::comparing(ui),
+        build: |_ui, _arg| Some(Action::Compare(CompareAction::Exit)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "file.expand-diff",
+        label: "Show full diff of file",
+        hint: "Load the diff of the selected file, which was collapsed for size",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| {
+            let tab = ui.active();
+            tab.session
+                .document
+                .files
+                .get(tab.selected_file)
+                .is_some_and(|file| file.collapsed.is_some())
+        },
+        build: |ui, _arg| Some(Action::ExpandFile(ui.active().selected_file)),
+        palette: PaletteScope::Root,
+    },
 ];
+
+fn can_compare(ui: &Diffui, arg: &CommandArg) -> bool {
+    ui.active().session.capabilities.compare
+        && arg
+            .revision()
+            .is_none_or(|revision| row_present(ui, revision))
+}
 
 #[cfg(test)]
 mod tests {
@@ -1356,6 +2401,62 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn revision_verbs_have_jj_style_keys() {
+        let map = crate::keymap::Keymap::build(&Default::default()).0;
+        for (key, id) in [
+            ("n", "revision.new-child"),
+            ("e", "revision.edit"),
+            ("d", "revision.edit-description"),
+            ("a", "revision.abandon"),
+            ("s", "revision.squash.start"),
+            ("S", "revision.squash-into-parent"),
+        ] {
+            let chord = crate::keymap::Chord::parse(key).expect("a parsable chord");
+            assert_eq!(map.resolve(Context::Base, &chord), Some(id), "{key}");
+        }
+    }
+
+    /// A key or palette abandon asks first; a menu row aimed at a revision
+    /// runs as picked.
+    #[test]
+    fn only_an_unaimed_abandon_asks_first() {
+        let mut ui = crate::tabs::tests::app();
+        crate::tabs::tests::push_tab(&mut ui, "/tmp/repo");
+        let abandon = command("revision.abandon").expect("registered");
+        assert!(matches!(
+            (abandon.build)(&ui, CommandArg::None),
+            Some(Action::ConfirmMutation(_))
+        ));
+        assert!(matches!(
+            (abandon.build)(&ui, CommandArg::Revision(RevisionSelection::WorkingCopy)),
+            Some(Action::Mutate(_))
+        ));
+    }
+
+    /// The revision verbs are offered at the top level (on the selection) and
+    /// in a revision result's actions column (on that result).
+    #[test]
+    fn revision_verbs_are_listed_in_both_palette_scopes() {
+        let mut ui = crate::tabs::tests::app();
+        crate::tabs::tests::push_tab(&mut ui, "/tmp/repo");
+        ui.tabs[0].state.session.capabilities.mutate = true;
+        for scope in [PaletteScope::Root, PaletteScope::Revision] {
+            let ids: Vec<CommandId> = palette_commands(&ui, scope, &CommandArg::None)
+                .iter()
+                .map(|command| command.id)
+                .collect();
+            for id in ["revision.new-child", "revision.edit", "revision.abandon"] {
+                assert!(ids.contains(&id), "{id} missing from {scope:?}");
+            }
+        }
+        let files: Vec<CommandId> = palette_commands(&ui, PaletteScope::File, &CommandArg::None)
+            .iter()
+            .map(|command| command.id)
+            .collect();
+        assert!(!files.contains(&"revision.abandon"));
     }
 
     /// Two commands sharing a chord inside one context would make resolution

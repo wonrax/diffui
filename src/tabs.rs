@@ -213,6 +213,15 @@ impl Diffui {
         }
         // A PR URL / `owner/repo#123` opens a PR tab; anything else is a path.
         if let Some(spec) = github::PrSpec::parse(trimmed) {
+            // A bare `owner/repo#123` typed from a repository whose remote
+            // lives on a GitHub Enterprise host means that host's PR.
+            let remotes = self
+                .tabs
+                .get(self.active)
+                .and_then(|tab| tab.state.repository.as_ref())
+                .map(|repository| github::remote_urls(&repository.root))
+                .unwrap_or_default();
+            let spec = spec.with_host_from_remotes(remotes.iter().map(String::as_str));
             return self.open_github_pr(spec);
         }
         match prepare_repository(&expand_user_path(trimmed)) {
@@ -466,6 +475,7 @@ pub(crate) mod tests {
                 additions: 1,
                 deletions: 0,
                 hunks: Vec::new(),
+                collapsed: None,
             }],
             total_additions: 1,
             total_deletions: 0,

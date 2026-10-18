@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use jj_lib::{
-    config::{ConfigLayer, ConfigSource, ConfigValue, StackedConfig},
+    config::{ConfigLayer, ConfigResolutionContext, ConfigSource, ConfigValue, StackedConfig},
     file_util::path_from_bytes,
     fileset::{
         FilesetAliasesMap, FilesetDiagnostics, FilesetExpression, FilesetParseContext,
@@ -32,8 +32,12 @@ pub(super) const DEFAULT_SNAPSHOT_MAX_NEW_FILE_SIZE: u64 = 1024 * 1024;
 pub(super) struct JjEnv {
     pub(super) vars: HashMap<String, String>,
     home_dir: Option<PathBuf>,
-    /// Default for `operation.hostname`; see [`process_hostname`].
+    /// Default for `operation.hostname`; see [`process_hostname`]. Also what
+    /// `--when.hostnames` scopes match against.
     hostname: Option<String>,
+    /// Where the system-wide `jj/config.toml` and `jj/conf.d` live: `/etc` on
+    /// unix, like jj-cli. `None` (the tests) reads no system config.
+    system_config_dir: Option<PathBuf>,
 }
 
 impl JjEnv {
@@ -48,6 +52,7 @@ impl JjEnv {
                 .collect(),
             home_dir: env::home_dir(),
             hostname: process_hostname(),
+            system_config_dir: cfg!(unix).then(|| PathBuf::from("/etc")),
         }
     }
 
@@ -73,6 +78,21 @@ impl JjEnv {
     /// `<config dir>/jj` — the directory jj 0.41 keeps per-repo config under.
     fn root_config_dir(&self) -> Option<PathBuf> {
         Some(self.config_dir()?.join("jj"))
+    }
+
+    /// The system-wide config file and directory, lowest precedence first —
+    /// jj-cli's `UnresolvedConfigEnv::resolve_system`, which `$JJ_CONFIG`
+    /// switches off along with the user files.
+    fn system_config_paths(&self) -> Vec<PathBuf> {
+        match &self.system_config_dir {
+            Some(dir) if self.var("JJ_CONFIG").is_none() => {
+                vec![
+                    dir.join("jj").join("config.toml"),
+                    dir.join("jj").join("conf.d"),
+                ]
+            }
+            _ => Vec::new(),
+        }
     }
 
     /// The user config files and directories, lowest precedence first, exactly
@@ -207,60 +227,202 @@ pub(crate) fn jj_settings(repo_root: &Path) -> Result<UserSettings> {
 }
 
 pub(super) fn jj_settings_with_env(repo_root: &Path, env: &JjEnv) -> Result<UserSettings> {
+    let files = JjConfigFiles::locate(repo_root, env);
     let mut config = StackedConfig::with_defaults();
     // `add_layer` inserts by `ConfigSource` rank, so these sit below and above
     // the file layers regardless of the order we hand them over in.
     config.add_layer(jj_env_base_layer(env));
     config.add_layer(jj_env_overrides_layer(env));
 
-    for path in env.user_config_paths() {
-        load_jj_user_config_path(&mut config, &path)?;
+    for path in &files.system {
+        load_jj_config_path(&mut config, ConfigSource::System, path)?;
+    }
+    for path in &files.user {
+        load_jj_config_path(&mut config, ConfigSource::User, path)?;
+    }
+    if let Some(path) = &files.repo {
+        config
+            .load_file(ConfigSource::Repo, path.clone())
+            .with_context(|| format!("failed to load jj repo config {}", path.display()))?;
+    }
+    if let Some(path) = &files.workspace {
+        config
+            .load_file(ConfigSource::Workspace, path.clone())
+            .with_context(|| format!("failed to load jj workspace config {}", path.display()))?;
     }
 
-    // Through the `.jj/repo` pointer so a secondary workspace picks up the
-    // primary repo's config. Best-effort: an unresolvable pointer just means
-    // no repo-level config layer (Workspace::load will surface the breakage).
-    if let Ok(repo_dir) = crate::repository::resolve_jj_repo_dir(repo_root) {
-        // jj ≤ 0.40 kept the repo config inside the repo dir; jj 0.41 moved it
-        // to `<user config dir>/repos/<config-id>/config.toml` with a
-        // `config-id` pointer file in the repo dir. Honor both, or a repo
-        // config written by a newer `jj config set --repo` is silently
-        // invisible here (revsets.log, immutable_heads() overrides, …).
-        let mut repo_config = repo_dir.join("config.toml");
-        if !repo_config.is_file()
-            && let Ok(id) = std::fs::read_to_string(repo_dir.join("config-id"))
-        {
-            let id = id.trim();
-            if !id.is_empty()
-                && id.chars().all(|c| c.is_ascii_alphanumeric())
-                && let Some(root) = env.root_config_dir()
-            {
-                let candidate = root.join("repos").join(id).join("config.toml");
-                if candidate.is_file() {
-                    repo_config = candidate;
-                }
-            }
-        }
-        if repo_config.is_file() {
-            config
-                .load_file(ConfigSource::Repo, repo_config.clone())
-                .with_context(|| {
-                    format!("failed to load jj repo config {}", repo_config.display())
-                })?;
-        }
-    }
+    // jj-cli's `ConfigEnv::resolve_config`: drop the `[[--scope]]` tables
+    // whose `--when` conditions don't hold for this workspace, and flatten the
+    // rest into their parents. Without it a per-repo `user.email` (or signing
+    // key, or `immutable_heads()`) scoped with `--when.repositories` never
+    // applied, and diffui committed under the default identity. There is no
+    // subcommand, so `--when.commands` scopes never match — the same as the
+    // CLI before it has parsed one.
+    let home_dir = env
+        .home_dir
+        .as_ref()
+        .map(|home| home.canonicalize().unwrap_or_else(|_| home.clone()));
+    let context = ConfigResolutionContext {
+        home_dir: home_dir.as_deref(),
+        repo_path: files.repo_dir.as_deref(),
+        workspace_path: Some(repo_root),
+        command: None,
+        hostname: env.hostname.as_deref().unwrap_or(""),
+        environment: &env.vars,
+    };
+    let config = jj_lib::config::resolve(&config, &context)
+        .context("failed to resolve conditional jj config")?;
+    // jj-cli 0.45.1 ships no deprecated-key migrations
+    // (`default_config_migrations` is empty), so there is nothing to apply.
 
     UserSettings::from_config(config).context("failed to build jj settings")
 }
 
-pub(super) fn load_jj_user_config_path(config: &mut StackedConfig, path: &Path) -> Result<()> {
+/// Every config file jj-cli 0.45 would read for the workspace at `repo_root`,
+/// found without writing anything: no config-id is minted and no legacy file
+/// migrated, since that's the CLI's job and a GUI opening a repo shouldn't
+/// rearrange the user's config directory.
+#[derive(Debug, Default)]
+pub(super) struct JjConfigFiles {
+    system: Vec<PathBuf>,
+    user: Vec<PathBuf>,
+    repo: Option<PathBuf>,
+    workspace: Option<PathBuf>,
+    /// `<main workspace>/.jj/repo`, the path `--when.repositories` matches.
+    repo_dir: Option<PathBuf>,
+    /// Pointer files whose appearance or edit moves the repo/workspace config
+    /// elsewhere, watched alongside the configs themselves.
+    pointers: Vec<PathBuf>,
+}
+
+impl JjConfigFiles {
+    pub(super) fn locate(repo_root: &Path, env: &JjEnv) -> Self {
+        let mut files = JjConfigFiles {
+            system: env.system_config_paths(),
+            user: env.user_config_paths(),
+            ..JjConfigFiles::default()
+        };
+        // Through the `.jj/repo` pointer so a secondary workspace picks up the
+        // primary repo's config. Best-effort: an unresolvable pointer just
+        // means no repo-level config layer (Workspace::load will surface the
+        // breakage).
+        if let Ok(repo_dir) = crate::repository::resolve_jj_repo_dir(repo_root) {
+            files.repo = secure_config_file(
+                env,
+                &repo_dir,
+                "config-id",
+                "config.toml",
+                "repos",
+                &mut files.pointers,
+            );
+            files.repo_dir = Some(repo_dir);
+        }
+        files.workspace = secure_config_file(
+            env,
+            &repo_root.join(".jj"),
+            "workspace-config-id",
+            "workspace-config.toml",
+            "workspaces",
+            &mut files.pointers,
+        );
+        files
+    }
+
+    /// Every path whose change should reload the settings: the config files
+    /// and directories (and each file inside a directory), plus the pointers.
+    fn watched(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for path in self.system.iter().chain(&self.user) {
+            paths.push(path.clone());
+            if path.is_dir()
+                && let Ok(entries) = std::fs::read_dir(path)
+            {
+                let mut inside: Vec<PathBuf> = entries
+                    .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                    .collect();
+                inside.sort();
+                paths.extend(inside);
+            }
+        }
+        paths.extend(self.repo.iter().cloned());
+        paths.extend(self.workspace.iter().cloned());
+        paths.extend(self.pointers.iter().cloned());
+        paths
+    }
+}
+
+/// jj 0.45's `SecureConfig` lookup, read-only: a `<id file>` in `dir` names
+/// `<config dir>/jj/<root>/<id>/config.toml`; without one, the legacy file in
+/// `dir` itself is read (jj ≤ 0.40 kept it there, and jj 0.41+ leaves a symlink
+/// behind when it migrates). `None` when neither exists.
+fn secure_config_file(
+    env: &JjEnv,
+    dir: &Path,
+    id_name: &str,
+    legacy_name: &str,
+    root_name: &str,
+    pointers: &mut Vec<PathBuf>,
+) -> Option<PathBuf> {
+    const CONFIG_ID_LEN: usize = 20;
+    let id_path = dir.join(id_name);
+    let legacy = dir.join(legacy_name);
+    pointers.push(id_path.clone());
+    pointers.push(legacy.clone());
+    if let Ok(id) = std::fs::read_to_string(&id_path) {
+        // jj rejects anything but a 20-hex-digit id; a bad pointer means no
+        // config rather than a path built from junk.
+        if id.len() == CONFIG_ID_LEN && id.chars().all(|c| c.is_ascii_hexdigit()) {
+            let candidate = env
+                .root_config_dir()?
+                .join(root_name)
+                .join(id)
+                .join("config.toml");
+            pointers.push(candidate.clone());
+            return candidate.is_file().then_some(candidate);
+        }
+        return None;
+    }
+    legacy.is_file().then_some(legacy)
+}
+
+/// A cheap fingerprint of every jj config file the settings were built from:
+/// path, size and mtime, plus the pointer files that decide which files those
+/// are. Comparing two stamps is a handful of `stat`s, cheap enough to pay
+/// before every mutation and refresh.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct JjConfigStamp(Vec<(PathBuf, Option<(u64, std::time::SystemTime)>)>);
+
+pub(crate) fn jj_config_stamp(repo_root: &Path) -> JjConfigStamp {
+    jj_config_stamp_with_env(repo_root, &JjEnv::from_process())
+}
+
+pub(super) fn jj_config_stamp_with_env(repo_root: &Path, env: &JjEnv) -> JjConfigStamp {
+    JjConfigStamp(
+        JjConfigFiles::locate(repo_root, env)
+            .watched()
+            .into_iter()
+            .map(|path| {
+                let meta = std::fs::metadata(&path)
+                    .ok()
+                    .and_then(|meta| Some((meta.len(), meta.modified().ok()?)));
+                (path, meta)
+            })
+            .collect(),
+    )
+}
+
+pub(super) fn load_jj_config_path(
+    config: &mut StackedConfig,
+    source: ConfigSource,
+    path: &Path,
+) -> Result<()> {
     if path.is_dir() {
         config
-            .load_dir(ConfigSource::User, path)
+            .load_dir(source, path)
             .with_context(|| format!("failed to load jj config dir {}", path.display()))?;
     } else if path.is_file() {
         config
-            .load_file(ConfigSource::User, path.to_path_buf())
+            .load_file(source, path.to_path_buf())
             .with_context(|| format!("failed to load jj config file {}", path.display()))?;
     }
     Ok(())
@@ -354,7 +516,7 @@ pub(crate) fn is_ignored(ignores: &GitIgnoreFile, path: &RepoPath, is_dir: bool)
 /// right for both — `<root>/.git` exists only when colocated, so a
 /// non-colocated repo's exclude file was previously never read. `None` for a
 /// repo with no git backend, which has no git dir to consult.
-pub(super) fn backing_git_dir(repo_root: &Path) -> Option<PathBuf> {
+pub(crate) fn backing_git_dir(repo_root: &Path) -> Option<PathBuf> {
     let store = crate::repository::resolve_jj_repo_dir(repo_root)
         .ok()?
         .join("store");
@@ -643,6 +805,118 @@ mod config_layering_tests {
         let settings = jj_settings_with_env(&root, &env).expect("jj settings");
         assert_eq!(settings.operation_hostname(), "op-host");
         assert_eq!(settings.operation_username(), "op-user");
+    }
+
+    /// A `[[--scope]]` table applies only where its `--when` holds: here a
+    /// work identity for every repo under `work/`. diffui used to load the
+    /// file and never resolve the scopes, so every repo committed — and
+    /// pushed — under the default identity.
+    #[test]
+    fn when_repositories_scopes_apply_to_matching_repos_only() {
+        let root = scratch_dir("when-repositories");
+        let home = root.join("home");
+        let work_repo = root.join("work").join("project");
+        let personal_repo = root.join("personal").join("project");
+        for repo in [&work_repo, &personal_repo] {
+            std::fs::create_dir_all(repo.join(".jj").join("repo")).expect("create repo dir");
+        }
+        write_file(
+            home.join(".config").join("jj").join("config.toml"),
+            &format!(
+                "[user]\nname = \"Me\"\nemail = \"me@personal.example\"\n\n\
+                 [[--scope]]\n--when.repositories = [\"{}\"]\n\
+                 [--scope.user]\nemail = \"me@work.example\"\n\n\
+                 [[--scope]]\n--when.hostnames = [\"build-box\"]\n\
+                 [--scope.operation]\nusername = \"ci\"\n",
+                root.join("work").display()
+            ),
+        );
+        let env = JjEnv {
+            home_dir: Some(home),
+            hostname: Some("build-box".to_owned()),
+            ..test_env(&[])
+        };
+
+        let work = jj_settings_with_env(&work_repo, &env).expect("jj settings");
+        assert_eq!(work.user_email(), "me@work.example");
+        assert_eq!(work.user_name(), "Me", "unscoped keys still apply");
+        assert_eq!(work.operation_username(), "ci", "--when.hostnames matches");
+
+        let personal = jj_settings_with_env(&personal_repo, &env).expect("jj settings");
+        assert_eq!(personal.user_email(), "me@personal.example");
+    }
+
+    /// jj 0.45 keeps repo and workspace config outside the repo, behind
+    /// `config-id` / `workspace-config-id` pointers, and the workspace layer
+    /// outranks the repo one. Neither pointer is created or migrated here.
+    #[test]
+    fn repo_and_workspace_configs_follow_their_config_ids() {
+        let root = scratch_dir("secure-config");
+        let home = root.join("home");
+        let repo = root.join("repo");
+        let repo_dir = repo.join(".jj").join("repo");
+        let configs = home.join(".config").join("jj");
+        write_file(repo_dir.join("config-id"), "0123456789abcdef0123");
+        write_file(
+            repo.join(".jj").join("workspace-config-id"),
+            "fedcba9876543210fedc",
+        );
+        write_file(
+            configs.join("repos/0123456789abcdef0123/config.toml"),
+            "[user]\nname = \"repo\"\nemail = \"repo@example.com\"\n",
+        );
+        write_file(
+            configs.join("workspaces/fedcba9876543210fedc/config.toml"),
+            "[user]\nname = \"workspace\"\n",
+        );
+        let env = JjEnv {
+            home_dir: Some(home),
+            ..test_env(&[])
+        };
+
+        let settings = jj_settings_with_env(&repo, &env).expect("jj settings");
+        assert_eq!(settings.user_name(), "workspace");
+        assert_eq!(settings.user_email(), "repo@example.com");
+        assert!(
+            !repo.join(".jj").join("workspace-config.toml").exists(),
+            "loading the settings writes nothing"
+        );
+    }
+
+    /// The stamp moves when a config file the settings came from is edited,
+    /// and when one appears where jj would look for it.
+    #[test]
+    fn the_config_stamp_notices_edits_and_new_files() {
+        let root = scratch_dir("config-stamp");
+        let home = root.join("home");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join(".jj").join("repo")).expect("create repo dir");
+        let user = write_file(
+            home.join(".config").join("jj").join("config.toml"),
+            "[user]\nname = \"one\"\n",
+        );
+        let env = JjEnv {
+            home_dir: Some(home.clone()),
+            ..test_env(&[])
+        };
+
+        let first = jj_config_stamp_with_env(&repo, &env);
+        assert_eq!(first, jj_config_stamp_with_env(&repo, &env), "stable");
+        write_file(user, "[user]\nname = \"two, longer\"\n");
+        let second = jj_config_stamp_with_env(&repo, &env);
+        assert_ne!(first, second, "an edit moves the stamp");
+        write_file(
+            home.join(".config")
+                .join("jj")
+                .join("conf.d")
+                .join("x.toml"),
+            "[ui]\n",
+        );
+        assert_ne!(
+            second,
+            jj_config_stamp_with_env(&repo, &env),
+            "a new conf.d file moves the stamp"
+        );
     }
 
     /// `core.excludesFile` decides where git — and therefore jj — reads

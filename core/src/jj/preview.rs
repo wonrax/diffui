@@ -212,3 +212,74 @@ pub(crate) async fn preview_rebase(
         simulated: true,
     })
 }
+
+/// Predict `jj parallelize` over `targets`: run it in a throwaway transaction
+/// and report, rebase-preview-shaped, how many targets move, how many
+/// descendants follow, and which commits newly conflict — parallelizing
+/// commits that build on each other is exactly how conflicts appear. Same
+/// storage caveat as [`preview_rebase`].
+pub(crate) async fn preview_parallelize(
+    repo: &Arc<ReadonlyRepo>,
+    workspace_name: &WorkspaceName,
+    targets: &[RevisionSelection],
+) -> Result<crate::mutations::RebasePreview> {
+    const PARALLELIZE_PREVIEW_SIMULATION_CAP: usize = 400;
+
+    let wc_commit_id = repo
+        .view()
+        .get_wc_commit_id(workspace_name)
+        .context("jj workspace has no working-copy commit")?
+        .clone();
+    let mut tx = repo.start_transaction();
+    let mut ids: Vec<CommitId> = Vec::new();
+    for selection in targets {
+        let commit = resolve_mutation_target(tx.repo(), &wc_commit_id, selection).await?;
+        if !ids.contains(commit.id()) {
+            ids.push(commit.id().clone());
+        }
+    }
+    let plan = super::revops::plan_parallelize(tx.repo(), &ids).await?;
+    let moved_commit_ids: Vec<String> = ids.iter().map(|id| id.hex()).collect();
+    let affected =
+        super::revops::descendants_capped(tx.repo(), &ids, PARALLELIZE_PREVIEW_SIMULATION_CAP)
+            .await?;
+    if affected.len() > PARALLELIZE_PREVIEW_SIMULATION_CAP {
+        return Ok(crate::mutations::RebasePreview {
+            moved: plan.needs_rewrite.len() as u32,
+            descendants: 0,
+            abandoned_empty: 0,
+            new_conflicts: Vec::new(),
+            entry_points: Vec::new(),
+            moved_commit_ids,
+            simulated: false,
+        });
+    }
+    let rewritten = super::revops::apply_parallelize(tx.repo_mut(), &plan).await?;
+    let mut new_conflicts: Vec<String> = Vec::new();
+    for (old_id, new_commit) in &rewritten {
+        if new_commit.tree_ids().is_resolved() {
+            continue;
+        }
+        let old = tx
+            .repo()
+            .store()
+            .get_commit_async(old_id)
+            .await
+            .with_context(|| format!("failed to load jj commit {}", old_id.hex()))?;
+        if old.tree_ids().is_resolved() {
+            new_conflicts.push(short_change_id(&old));
+        }
+    }
+    new_conflicts.sort_unstable();
+    let moved = plan.needs_rewrite.len();
+    // Dropping `tx` discards the simulation.
+    Ok(crate::mutations::RebasePreview {
+        moved: moved as u32,
+        descendants: rewritten.len().saturating_sub(moved) as u32,
+        abandoned_empty: 0,
+        new_conflicts,
+        entry_points: Vec::new(),
+        moved_commit_ids,
+        simulated: true,
+    })
+}

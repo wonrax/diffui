@@ -18,14 +18,16 @@ use jj_lib::{
     workspace::Workspace,
 };
 use tokio::sync::mpsc;
+use tracing::Instrument as _;
 
 use super::cancel::CancelFlag;
 use super::protocol::{
     Command, Event, GraphTail, JobId, Payload, PreviewRequest, RepoError, RepoId,
 };
-use super::{Envelope, Jobs, SettingsSource, route_commands};
+use super::{Envelope, Jobs, SettingsSource, catch_panic, route_commands};
+use crate::history::{HistoryRequest, HistoryResponse};
 use crate::jj;
-use crate::model::{LoadProgress, RevisionSelection, StreamRow};
+use crate::model::{DiffBase, LoadProgress, RevisionSelection, StreamRow};
 use crate::mutations::{DraftSimulation, MutationOp};
 use crate::repository::Repository;
 use crate::watcher::WatchBatch;
@@ -41,6 +43,9 @@ struct WorkspaceSlot {
     settings: UserSettings,
     snapshot: jj::SnapshotContext,
     name: WorkspaceNameBuf,
+    /// What the config files looked like when `settings` were read, or `None`
+    /// for fixed settings, which never reload.
+    config_stamp: Option<jj::settings::JjConfigStamp>,
 }
 
 pub(super) fn spawn(
@@ -125,7 +130,12 @@ impl Actor {
         while let Some(envelope) = commands.recv().await {
             match envelope {
                 Envelope::Shutdown => return,
-                Envelope::Watch(batch) => self.on_watch(batch).await,
+                Envelope::Watch(batch) => {
+                    if let Err(message) = catch_panic(self.on_watch(batch)).await {
+                        tracing::error!(repo = %self.id, "the watch handler panicked: {message}");
+                        self.forget_loaded_state();
+                    }
+                }
                 Envelope::Run {
                     repository,
                     command,
@@ -144,11 +154,25 @@ impl Actor {
                         job = job.0,
                         command = command_name(&command),
                     );
-                    let _entered = span.enter();
-                    let result = self.dispatch(&repository, command, &cancel).await;
-                    if let Err(error) = result {
-                        let error = classify(error);
-                        tracing::warn!(%error, "command failed");
+                    let work = async {
+                        #[cfg(feature = "fault-injection")]
+                        super::fault::trip(&repository.root);
+                        self.dispatch(&repository, command, &cancel).await
+                    };
+                    let error = match catch_panic(work).instrument(span.clone()).await {
+                        Ok(Ok(())) => None,
+                        Ok(Err(error)) => {
+                            let error = classify(error);
+                            span.in_scope(|| tracing::warn!(%error, "command failed"));
+                            Some(error)
+                        }
+                        Err(message) => {
+                            span.in_scope(|| tracing::error!("command panicked: {message}"));
+                            self.forget_loaded_state();
+                            Some(RepoError::Crashed(message))
+                        }
+                    };
+                    if let Some(error) = error {
                         self.emit(Payload::Failed { job, error });
                     }
                     self.finish(job);
@@ -186,6 +210,15 @@ impl Actor {
         }
     }
 
+    /// Drop everything loaded from disk after a panic: the workspace, its
+    /// lock-holding state and the cached repo may be half-updated, so the next
+    /// command reopens them from scratch.
+    fn forget_loaded_state(&mut self) {
+        self.workspace = None;
+        self.repo = None;
+        self.op_head = None;
+    }
+
     fn emit(&self, payload: Payload) {
         let _ = self.events.send(Event::new(self.id.clone(), payload));
     }
@@ -194,9 +227,14 @@ impl Actor {
     fn slot(&mut self, repository: &Repository) -> Result<&mut WorkspaceSlot> {
         if self.workspace.is_none() {
             let root = &repository.root;
-            let settings = match &self.settings {
-                SettingsSource::Layered => jj::settings::jj_settings(root)?,
-                SettingsSource::Fixed(settings) => (**settings).clone(),
+            // Stamped before the read, so an edit racing the load shows up as
+            // a change next time instead of being missed.
+            let (settings, config_stamp) = match &self.settings {
+                SettingsSource::Layered => {
+                    let stamp = jj::settings::jj_config_stamp(root);
+                    (jj::settings::jj_settings(root)?, Some(stamp))
+                }
+                SettingsSource::Fixed(settings) => ((**settings).clone(), None),
             };
             let workspace = jj::load_workspace(&settings, root)?;
             let name = workspace.workspace_name().to_owned();
@@ -206,12 +244,37 @@ impl Actor {
                 settings,
                 snapshot,
                 name,
+                config_stamp,
             });
         }
         Ok(self
             .workspace
             .as_mut()
             .expect("the workspace was just opened"))
+    }
+
+    /// Re-read the jj config when one of its files changed since the
+    /// workspace was opened, so an edited identity, signing setup or
+    /// `immutable_heads()` applies without reopening the tab. jj-lib bakes the
+    /// settings into the workspace's repo loader, so the workspace is reopened
+    /// with them (a handful of small file reads). Called before the work that
+    /// writes commits or answers a manual refresh; a stat per config file is
+    /// all it costs when nothing changed.
+    fn reload_settings_if_changed(&mut self, repository: &Repository) {
+        let Some(stamp) = self
+            .workspace
+            .as_ref()
+            .and_then(|slot| slot.config_stamp.as_ref())
+        else {
+            return;
+        };
+        if *stamp == jj::settings::jj_config_stamp(&repository.root) {
+            return;
+        }
+        tracing::info!("jj config changed on disk; reloading the workspace settings");
+        self.workspace = None;
+        self.repo = None;
+        self.op_head = None;
     }
 
     /// The repo at head, reloading only when the operation head has moved.
@@ -285,8 +348,44 @@ impl Actor {
             Command::LoadGraph { job, revset } => {
                 self.load_graph(repository, job, revset, cancel).await
             }
-            Command::LoadDiff { job, revision } => self.load_diff(repository, job, revision).await,
+            Command::LoadDiff {
+                job,
+                revision,
+                base,
+                expand,
+            } => {
+                self.load_diff(repository, job, revision, base, &expand)
+                    .await
+            }
+            Command::ExpandFile {
+                job,
+                revision,
+                base,
+                path,
+            } => {
+                let repo = self.repo_at_head(repository).await?;
+                let name = self.slot(repository)?.name.clone();
+                let commit_id = jj::resolve_revision(repo.as_ref(), &name, &revision).await?;
+                let base = jj::resolve_base(repo.as_ref(), &name, &base).await?;
+                let expand = [path.clone()];
+                let options = jj::DiffOptions {
+                    limits: jj::large_diff::DiffLimits::unlimited(),
+                    expand: &expand,
+                    only: Some(&path),
+                };
+                let (document, _) =
+                    jj::diff_jj_with_repo(repo.as_ref(), &commit_id, &base, repository, &options)
+                        .await?;
+                let file = document.files.into_iter().find(|file| file.path == path);
+                self.emit(Payload::FileExpanded { job, path, file });
+                Ok(())
+            }
             Command::Snapshot { job, origin } => {
+                // A watcher tick is a file save; only a refresh (or the tail
+                // of a mutation, or focus regain) is worth the config check.
+                if origin == crate::session::RefreshOrigin::Focus {
+                    self.reload_settings_if_changed(repository);
+                }
                 let slot = self.slot(repository)?;
                 let outcome = {
                     let WorkspaceSlot {
@@ -297,6 +396,9 @@ impl Actor {
                     jj::snapshot_working_copy(workspace, snapshot).await?
                 };
                 self.adopt(outcome.repo.clone());
+                if outcome.recovered_stale {
+                    self.emit(Payload::StaleWorkingCopyRecovered);
+                }
                 self.emit(Payload::SnapshotDone {
                     job,
                     origin,
@@ -312,6 +414,7 @@ impl Actor {
             } => self.mutate(repository, job, &op, allow_immutable).await,
             Command::Preview { job, draft } => self.preview(repository, job, draft).await,
             Command::Fetch { job, target } => {
+                self.reload_settings_if_changed(repository);
                 let progress = LoadProgress::default();
                 let slot = self.slot(repository)?;
                 let output = {
@@ -387,6 +490,7 @@ impl Actor {
                 revision,
                 path,
                 old_path,
+                base,
             } => {
                 let repo = self.repo_at_head(repository).await?;
                 let name = self.slot(repository)?.name.clone();
@@ -394,6 +498,7 @@ impl Actor {
                     repo.as_ref(),
                     &name,
                     &revision,
+                    &base,
                     &path,
                     old_path.as_deref(),
                 )
@@ -414,6 +519,42 @@ impl Actor {
                         .await?;
                 self.emit(Payload::BookmarkChecked { job, backwards });
                 Ok(())
+            }
+            Command::ConflictInfo { job, revision } => {
+                let repo = self.repo_at_head(repository).await?;
+                let name = self.slot(repository)?.name.clone();
+                let commit_id = jj::resolve_revision(repo.as_ref(), &name, &revision).await?;
+                let commit = repo
+                    .store()
+                    .get_commit_async(&commit_id)
+                    .await
+                    .with_context(|| format!("failed to load jj commit {}", commit_id.hex()))?;
+                let files = jj::conflict_files(&commit).await?;
+                self.emit(Payload::ConflictInfoLoaded {
+                    job,
+                    revision,
+                    files,
+                });
+                Ok(())
+            }
+            Command::PrepareMergeTool {
+                job,
+                revision,
+                path,
+            } => {
+                let repo = self.repo_at_head(repository).await?;
+                let (settings, name) = {
+                    let slot = self.slot(repository)?;
+                    (slot.settings.clone(), slot.name.clone())
+                };
+                let invocation =
+                    jj::prepare_merge_tool(repo.as_ref(), &settings, &name, &revision, &path)
+                        .await?;
+                self.emit(Payload::MergeToolPrepared { job, invocation });
+                Ok(())
+            }
+            Command::History { job, request } => {
+                self.history(repository, job, request, cancel).await
             }
             Command::Cancel { .. } => Ok(()),
         }
@@ -471,6 +612,7 @@ impl Actor {
                     branch_status,
                     bookmarks,
                     root_commit_id: Some(repo.store().root_commit_id().hex()),
+                    op_id: Some(repo.op_id().hex()),
                 },
             }),
             None => self.emit(Payload::Cancelled { job }),
@@ -483,12 +625,28 @@ impl Actor {
         repository: &Repository,
         job: JobId,
         revision: RevisionSelection,
+        base: DiffBase,
+        expand: &[String],
     ) -> Result<()> {
         let repo = self.repo_at_head(repository).await?;
         let name = self.slot(repository)?.name.clone();
         let commit_id = jj::resolve_revision(repo.as_ref(), &name, &revision).await?;
+        let base = jj::resolve_base(repo.as_ref(), &name, &base).await?;
+        let options = jj::DiffOptions {
+            expand,
+            ..Default::default()
+        };
         let (document, details) =
-            jj::diff_jj_with_repo(repo.as_ref(), &commit_id, repository).await?;
+            jj::diff_jj_with_repo(repo.as_ref(), &commit_id, &base, repository, &options).await?;
+        // A commit rewritten since the caller read its id resolved to its
+        // successor; answer under the id that was actually loaded, so the
+        // selection follows the change instead of naming a hidden commit.
+        let revision = match revision {
+            RevisionSelection::Commit(hex) if hex != commit_id.hex() => {
+                RevisionSelection::Commit(commit_id.hex())
+            }
+            revision => revision,
+        };
         self.emit(Payload::DiffLoaded {
             job,
             revision,
@@ -505,9 +663,10 @@ impl Actor {
         op: &MutationOp,
         allow_immutable: bool,
     ) -> Result<()> {
+        self.reload_settings_if_changed(repository);
         let progress = LoadProgress::default();
         let slot = self.slot(repository)?;
-        let outcome = {
+        let (outcome, recovered_stale) = {
             let WorkspaceSlot {
                 workspace,
                 settings,
@@ -526,6 +685,9 @@ impl Actor {
             .await?
         };
         self.adopt_written_op(repository).await;
+        if recovered_stale {
+            self.emit(Payload::StaleWorkingCopyRecovered);
+        }
         self.emit(Payload::MutationDone { job, outcome });
         Ok(())
     }
@@ -561,8 +723,116 @@ impl Actor {
                 )
                 .await?,
             ),
+            PreviewRequest::Parallelize { targets } => {
+                DraftSimulation::Rebase(jj::preview_parallelize(&repo, &name, &targets).await?)
+            }
         };
         self.emit(Payload::PreviewDone { job, simulation });
+        Ok(())
+    }
+}
+
+impl Actor {
+    /// Annotate on a thread of its own. Walking a long file's ancestry takes
+    /// seconds on a big repository, and everything else the tab asks for
+    /// would queue behind it on the actor. The thread loads its own repo at
+    /// the operation the actor is at, and sends the terminal event itself.
+    fn annotate_detached(
+        &mut self,
+        repository: &Repository,
+        repo: &ReadonlyRepo,
+        job: JobId,
+        revision: crate::model::RevisionSelection,
+        path: String,
+        cancel: &CancelFlag,
+    ) -> Result<()> {
+        let settings = self.slot(repository)?.settings.clone();
+        let root = repository.root.clone();
+        let operation = repo.op_id().hex();
+        let (events, id, cancel) = (self.events.clone(), self.id.clone(), cancel.clone());
+        std::thread::Builder::new()
+            .name("diffui-annotate".to_owned())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build();
+                let result = match runtime {
+                    Ok(runtime) => runtime.block_on(jj::history::annotate_at_operation(
+                        &settings, &root, &operation, &revision, &path,
+                    )),
+                    Err(error) => Err(error.into()),
+                };
+                let payload = match result {
+                    _ if cancel.is_cancelled() => Payload::Cancelled { job },
+                    Ok(annotation) => Payload::History {
+                        job,
+                        response: HistoryResponse::Annotation(annotation),
+                    },
+                    Err(error) => Payload::Failed {
+                        job,
+                        error: classify(error),
+                    },
+                };
+                let _ = events.send(Event::new(id, payload));
+            })
+            .context("failed to spawn the annotate thread")?;
+        Ok(())
+    }
+
+    /// The history views' reads. All run against the repo at head; none take
+    /// the working-copy lock.
+    async fn history(
+        &mut self,
+        repository: &Repository,
+        job: JobId,
+        request: HistoryRequest,
+        cancel: &CancelFlag,
+    ) -> Result<()> {
+        let repo = self.repo_at_head(repository).await?;
+        let name = self.slot(repository)?.name.clone();
+        let response = match request {
+            HistoryRequest::OpLog { limit } => {
+                let events = self.events.clone();
+                let id = self.id.clone();
+                let mut emit = |entries| {
+                    let _ =
+                        events.send(Event::new(id.clone(), Payload::OpLogBatch { job, entries }));
+                };
+                match jj::history::stream_op_log(&repo, limit, BATCH_SIZE, cancel, &mut emit)
+                    .await?
+                {
+                    Some(truncated) => HistoryResponse::OpLogDone { truncated },
+                    None => {
+                        self.emit(Payload::Cancelled { job });
+                        return Ok(());
+                    }
+                }
+            }
+            HistoryRequest::ShowOperation { operation_id } => {
+                HistoryResponse::Operation(jj::history::show_operation(&repo, &operation_id).await?)
+            }
+            HistoryRequest::Evolog { revision } => {
+                HistoryResponse::Evolog(jj::history::evolog(&repo, &name, &revision).await?)
+            }
+            HistoryRequest::Diff { target } => {
+                let (document, details) =
+                    jj::history::history_diff(&repo, repository, &target).await?;
+                HistoryResponse::Diff {
+                    target,
+                    document,
+                    details,
+                }
+            }
+            HistoryRequest::Annotate { revision, path } => {
+                self.annotate_detached(repository, &repo, job, revision, path, cancel)?;
+                return Ok(());
+            }
+        };
+        if cancel.is_cancelled() {
+            self.emit(Payload::Cancelled { job });
+        } else {
+            self.emit(Payload::History { job, response });
+        }
         Ok(())
     }
 }
@@ -581,6 +851,10 @@ fn command_name(command: &Command) -> &'static str {
         Command::ReadFile { .. } => "read_file",
         Command::FilePair { .. } => "file_pair",
         Command::BookmarkCheck { .. } => "bookmark_check",
+        Command::ConflictInfo { .. } => "conflict_info",
+        Command::PrepareMergeTool { .. } => "prepare_merge_tool",
+        Command::History { .. } => "history",
+        Command::ExpandFile { .. } => "expand_file",
         Command::Cancel { .. } => "cancel",
     }
 }
@@ -593,6 +867,12 @@ pub(super) fn classify(error: anyhow::Error) -> RepoError {
         return RepoError::Immutable {
             short_id: immutable.short_id.clone(),
         };
+    }
+    if let Some(rejection) = error.downcast_ref::<crate::push::PushRejection>() {
+        return RepoError::PushRejected(Box::new(rejection.clone()));
+    }
+    if let Some(failed) = error.downcast_ref::<jj::push::PushFailed>() {
+        return RepoError::Other(failed.to_string());
     }
     let message = format!("{error:#}");
     if message.contains("failed to parse revset")
@@ -668,6 +948,34 @@ pub fn rewritten_targets(
             }
         }
         MutationOp::Absorb { from } => push(from),
+        MutationOp::Commit { .. } => push(&RevisionSelection::WorkingCopy),
+        MutationOp::NewAt { destination } => match destination {
+            // The insertion's far side gains the new commit as a parent.
+            Destination::Before(target) => push(target),
+            Destination::Between { child, .. } => push(child),
+            Destination::Onto(_) | Destination::After(_) => {}
+        },
+        MutationOp::Parallelize { targets: picked }
+        | MutationOp::Metaedit {
+            targets: picked, ..
+        } => picked.iter().for_each(&mut push),
+        MutationOp::DuplicateTo { destination, .. } => match destination {
+            Some(Destination::Before(target)) => push(target),
+            Some(Destination::Between { child, .. }) => push(child),
+            _ => {}
+        },
+        // The copies to abandon are resolved in the backend; its guard
+        // covers them.
+        MutationOp::KeepDivergent { .. } => {}
+        MutationOp::Split { target, .. }
+        | MutationOp::RestoreChanges { target, .. }
+        | MutationOp::ResolveConflict { target, .. } => push(target),
+        MutationOp::SquashChanges { from, into, .. } => {
+            push(from);
+            if let SquashTarget::Revision(target) = into {
+                push(target);
+            }
+        }
         // New/Merge/Duplicate only create commits; bookmark and undo ops
         // rewrite nothing the caller named.
         MutationOp::New { .. }
@@ -677,7 +985,15 @@ pub fn rewritten_targets(
         | MutationOp::DeleteBookmark { .. }
         | MutationOp::TrackBookmark { .. }
         | MutationOp::PushBookmark { .. }
-        | MutationOp::Undo { .. } => {}
+        | MutationOp::Undo { .. }
+        | MutationOp::Redo
+        | MutationOp::CreateBookmark { .. }
+        | MutationOp::RenameBookmark { .. }
+        | MutationOp::ForgetBookmark { .. }
+        | MutationOp::UntrackBookmark { .. }
+        | MutationOp::Push(_)
+        | MutationOp::RestoreOperation { .. }
+        | MutationOp::RevertOperation { .. } => {}
     }
     targets
 }

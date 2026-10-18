@@ -93,12 +93,35 @@ pub fn build_toolbar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             font,
         ));
         actions = actions.push(fetch_split_button(theme, font, caret_hovered));
+        // Plain `jj git push` (tracked bookmarks that moved), behind a
+        // confirmation listing what goes out.
+        if is_jj
+            && ui.active().session.capabilities.mutate
+            && !ui.active().session.bookmarks.remotes.is_empty()
+        {
+            actions = actions.push(toolbar_button(
+                icons::UPLOAD,
+                "Push",
+                Message::Action(Action::Bookmark(
+                    crate::bookmarks::BookmarkAction::PushTracked,
+                )),
+                theme,
+                font,
+            ));
+        }
         // jj-only: git has no operation log to undo.
         if is_jj {
             actions = actions.push(toolbar_button(
                 icons::UNDO,
                 "Undo",
                 Message::Action(Action::Undo),
+                theme,
+                font,
+            ));
+            actions = actions.push(toolbar_button(
+                icons::REDO,
+                "Redo",
+                Message::Action(Action::Redo),
                 theme,
                 font,
             ));
@@ -121,10 +144,17 @@ pub fn build_toolbar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     ));
     // Side-by-side only applies to the diff; the source view is one column
     // by nature, so the toggle hides rather than sitting there inert.
-    if ui.active().main_view == MainView::Diff {
+    if ui.active().main_view != MainView::Source {
+        // On but too narrow to honour: the diff falls back to unified, and
+        // the tooltip says why rather than the toggle looking broken.
+        let split_label = if ui.diff_split && !crate::diff_panel::split_fits(ui) {
+            "Side-by-side diff (window too narrow, showing unified)"
+        } else {
+            "Side-by-side diff"
+        };
         toggles = toggles.push(toolbar_toggle_button(
             icons::SPLIT,
-            "Side-by-side diff",
+            split_label,
             ui.diff_split,
             Message::Action(Action::ToggleSplit),
             theme,
@@ -213,25 +243,27 @@ fn view_switcher(ui: &Diffui, theme: ThemeSpec, font: iced::Font) -> Element<'st
         })
     };
 
-    container(
-        row![
-            segment(icons::FILE_DIFF, "Diff", MainView::Diff),
-            segment(icons::CODE, "Source", MainView::Source),
-        ]
-        .spacing(theme::space::XXS)
-        .align_y(alignment::Vertical::Center),
-    )
-    .padding(INSET)
-    .style(move |_| container::Style {
-        background: Some(Background::Color(well_fill(theme))),
-        border: Border {
-            width: 0.0,
-            color: Color::TRANSPARENT,
-            radius: radius::BUTTON.into(),
-        },
-        ..container::Style::default()
-    })
-    .into()
+    let mut segments = row![
+        segment(icons::FILE_DIFF, "Diff", MainView::Diff),
+        segment(icons::CODE, "Source", MainView::Source),
+    ]
+    .spacing(theme::space::XXS)
+    .align_y(alignment::Vertical::Center);
+    if crate::history_panel::available(ui) {
+        segments = segments.push(segment(icons::HISTORY, "History", MainView::History));
+    }
+    container(segments)
+        .padding(INSET)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(well_fill(theme))),
+            border: Border {
+                width: 0.0,
+                color: Color::TRANSPARENT,
+                radius: radius::BUTTON.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
 }
 
 /// A toolbar action: icon + label, invisible at rest with a soft wash on

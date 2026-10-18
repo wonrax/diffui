@@ -8,14 +8,23 @@
 //! runtime — that thread is the only place a `Workspace` is ever held.
 
 pub(crate) mod browse;
+pub(crate) mod colocate;
 pub(crate) mod diff;
+pub(crate) mod history;
+pub(crate) mod large_diff;
 pub(crate) mod mutate;
+pub(crate) mod partial;
 pub(crate) mod preview;
+pub(crate) mod push;
 pub(crate) mod remote;
+pub(crate) mod resolve;
+pub(crate) mod revops;
 pub(crate) mod settings;
+pub(crate) mod undo;
 pub(crate) mod walk;
 pub(crate) mod workspace;
 
+pub use push::{DEFAULT_PUSH_BOOKMARK_TEMPLATE, validate_bookmark_name};
 pub use walk::jj_log_revset;
 /// Driving the walk from outside the actor, against a workspace it opens
 /// itself, is only ever the `track-alloc` memory profile: everything in the app
@@ -25,10 +34,11 @@ pub use walk::walk_jj_commits;
 pub use workspace::read_jj_op_head;
 
 pub(crate) use browse::{list_jj_source_tree, read_jj_file_pair_inner, read_jj_source_file};
-pub(crate) use diff::{diff_jj_with_repo, jj_revision_details};
+pub(crate) use diff::{DiffOptions, diff_jj_with_repo, jj_revision_details, resolve_base};
 pub(crate) use mutate::{ImmutableRewriteError, apply_mutation, check_bookmark_move_backwards};
-pub(crate) use preview::{preview_merge, preview_rebase};
+pub(crate) use preview::{preview_merge, preview_parallelize, preview_rebase};
 pub(crate) use remote::fetch_jj;
+pub(crate) use resolve::{conflict_files, prepare_merge_tool};
 pub(crate) use walk::{WorkspaceView, compute_jj_empty_status, walk_jj_with_repo};
 pub(crate) use workspace::{
     SnapshotContext, load_workspace, read_op_head_with, resolve_revision, snapshot_working_copy,

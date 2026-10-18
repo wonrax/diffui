@@ -3,13 +3,12 @@ use std::collections::HashMap;
 use anyhow::{Context, Result, bail};
 use jj_lib::{
     git::{
-        GitFetch, GitFetchRefExpression, GitImportOptions, GitProgress, GitPushOptions,
-        GitPushRefTargets, GitSettings, GitSidebandLineTerminator, GitSubprocessCallback,
-        GitSubprocessOptions, expand_fetch_refspecs, get_all_remote_names, push_refs,
+        GitFetch, GitFetchRefExpression, GitImportOptions, GitProgress, GitSettings,
+        GitSidebandLineTerminator, GitSubprocessCallback, expand_fetch_refspecs,
+        get_all_remote_names,
     },
-    merge::Diff,
-    ref_name::{RefName, RefNameBuf, RemoteName, RemoteNameBuf, WorkspaceName},
-    repo::{MutableRepo, Repo},
+    ref_name::{RemoteName, RemoteNameBuf, WorkspaceName},
+    repo::Repo,
     settings::UserSettings,
     str_util::{StringExpression, StringPattern},
     workspace::Workspace,
@@ -21,78 +20,6 @@ use jj_lib::object_id::ObjectId;
 use super::workspace::{LockOutcome, LockedWorkingCopy, SnapshotContext, lock_working_copy};
 use crate::model::LoadProgress;
 
-/// Push a single local bookmark to `remote` inside the caller's transaction.
-/// jj-lib's [`push_refs`] spawns `git push` under the hood, so authentication
-/// uses the user's existing git credential setup (SSH agent, credential
-/// helper). It also updates the local remote-tracking ref, keeping the
-/// sidebar's ahead/behind correct after the push.
-pub(super) fn push_bookmark(
-    settings: &UserSettings,
-    repo: &mut MutableRepo,
-    name: &str,
-    remote: &str,
-    progress: &LoadProgress,
-) -> Result<(String, Vec<String>)> {
-    let ref_name = RefName::new(name);
-    let remote_name = RemoteName::new(remote);
-
-    // `after` = where the local bookmark now points; `before` = where we last
-    // recorded the remote (its tracking ref). jj uses `before` as the expected
-    // on-remote position for its push lease check.
-    let after = repo
-        .view()
-        .get_local_bookmark(ref_name)
-        .added_ids()
-        .next()
-        .cloned();
-    if after.is_none() {
-        bail!("bookmark {name} has no local target to push");
-    }
-    let before = repo
-        .view()
-        .get_remote_bookmark(ref_name.to_remote_symbol(remote_name))
-        .target
-        .added_ids()
-        .next()
-        .cloned();
-    if before == after {
-        return Ok((format!("{name} already up to date on {remote}"), Vec::new()));
-    }
-
-    let subprocess_options = GitSubprocessOptions::from_settings(settings)
-        .context("failed to read git subprocess options")?;
-    let targets = GitPushRefTargets {
-        bookmarks: vec![(RefNameBuf::from(name), Diff { before, after })],
-        tags: Vec::new(),
-    };
-    // Collect the remote sideband (GitHub's "create a pull request" hint + URL)
-    // for the activity log, and forward git's transfer progress to the bar.
-    let mut callback = CollectingCallback::new(progress.clone());
-    let stats = push_refs(
-        repo,
-        subprocess_options,
-        remote_name,
-        &targets,
-        &mut callback,
-        &GitPushOptions::default(),
-    )
-    .with_context(|| format!("failed to push {name} to {remote}"))?;
-
-    if !stats.all_ok() {
-        let mut problems = Vec::new();
-        for (git_ref, reason) in stats.rejected.iter().chain(stats.remote_rejected.iter()) {
-            let reason = reason.as_deref().unwrap_or("rejected");
-            problems.push(format!("{}: {reason}", git_ref.as_str()));
-        }
-        if problems.is_empty() {
-            bail!("push of {name} to {remote} did not complete");
-        }
-        bail!("push rejected — {}", problems.join("; "));
-    }
-
-    Ok((format!("Pushed {name} to {remote}"), callback.lines))
-}
-
 /// Scale for mapping git's normalized [`GitProgress::overall`] (0..1) onto the
 /// integer `(loaded, total)` the activity bar reads. Arbitrary granularity.
 pub(super) const GIT_PROGRESS_SCALE: usize = 1000;
@@ -103,12 +30,12 @@ pub(super) const GIT_PROGRESS_SCALE: usize = 1000;
 /// git's transfer progress onto the activity's [`LoadProgress`] so the toolbar
 /// shows a determinate bar while the transfer runs.
 pub(super) struct CollectingCallback {
-    lines: Vec<String>,
+    pub(super) lines: Vec<String>,
     progress: LoadProgress,
 }
 
 impl CollectingCallback {
-    fn new(progress: LoadProgress) -> Self {
+    pub(super) fn new(progress: LoadProgress) -> Self {
         Self {
             lines: Vec::new(),
             progress,

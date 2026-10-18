@@ -21,8 +21,8 @@ use std::time::Instant;
 
 use crate::graph_layout::{GraphLayout, LaneFoldState};
 use crate::model::{
-    BookmarksInfo, BranchStatus, CommitStore, DiffDocument, LoadProgress, RevisionDetails,
-    RevisionSelection, StreamRow,
+    BookmarksInfo, BranchStatus, CommitStore, DiffBase, DiffDocument, LoadProgress,
+    RevisionDetails, RevisionSelection, StreamRow,
 };
 use crate::mutations::{MutationOp, MutationOutcome};
 use crate::repo::{
@@ -39,6 +39,9 @@ pub struct CachedDiff {
     pub document: DiffDocument,
     pub details: Option<RevisionDetails>,
 }
+
+/// Files with more diff rows than this are left uncoloured.
+pub const HIGHLIGHT_MAX_ROWS: usize = 10_000;
 
 /// What triggered a repository refresh — decides how much we reload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,6 +210,16 @@ pub struct Session {
     /// Compact commit store backing the sidebar.
     pub commits: CommitStore,
     pub selected_revision: RevisionSelection,
+    /// The "from" side the next diff load uses. Sticky: selecting another
+    /// revision while comparing compares that one against the same base.
+    pub diff_base: DiffBase,
+    /// The base `document` was actually loaded against — what the diff
+    /// pane's header describes and what full-context reads must match.
+    pub document_base: DiffBase,
+    /// Files of the shown diff the user expanded past the size caps. Sent
+    /// with every reload of the same diff so a refresh doesn't fold them
+    /// back; dropped when the revision or the base changes.
+    pub expanded_paths: Vec<String>,
     /// Op-log fingerprint of the last load, for the "did anything change" dedup
     /// (so our own snapshot writes don't trigger a re-walk).
     pub repository_snapshot: Option<RepositorySnapshot>,
@@ -258,7 +271,8 @@ pub struct Session {
 
     // ── inflight slots ──────────────────────────────────────────────────
     graph_job: Option<GraphJob>,
-    diff_job: Option<(JobId, RevisionSelection)>,
+    /// The diff switch in flight: the revision and the base it was asked for.
+    diff_job: Option<(JobId, RevisionSelection, DiffBase)>,
     snapshot_job: Option<(JobId, RefreshOrigin)>,
     /// The sweep in flight, with the graph job whose rows it addresses.
     empty_status_job: Option<(JobId, JobId)>,
@@ -266,6 +280,15 @@ pub struct Session {
     /// per-row result is checked against.
     graph_version: Option<JobId>,
     mutation_job: Option<JobId>,
+    /// The operation the rows on screen reflect: the op the last graph walk
+    /// read, advanced by a watcher snapshot that patched `@` in place. Kept
+    /// apart from [`Session::repository_snapshot`], which a snapshot advances
+    /// whether or not the rows followed — comparing against that is how a
+    /// stale graph used to answer a manual refresh with "already up to date".
+    /// `None` until a walk reports one (and always for git).
+    graph_fingerprint: Option<String>,
+    /// Collapsed files being fetched in full, by path.
+    expand_jobs: Vec<(JobId, String)>,
 }
 
 impl Session {
@@ -308,10 +331,11 @@ impl Session {
     /// frontend picks which tab an arriving event is for.
     pub fn owns_job(&self, job: JobId) -> bool {
         self.graph_job.as_ref().is_some_and(|load| load.id == job)
-            || self.diff_job.as_ref().is_some_and(|(id, _)| *id == job)
+            || self.diff_job.as_ref().is_some_and(|(id, ..)| *id == job)
             || self.snapshot_job.as_ref().is_some_and(|(id, _)| *id == job)
             || self.empty_status_job.is_some_and(|(id, _)| id == job)
             || self.mutation_job == Some(job)
+            || self.expand_jobs.iter().any(|(id, _)| *id == job)
     }
 
     /// Whether a mutation is running. Gates the actions a half-applied
@@ -325,7 +349,7 @@ impl Session {
     /// flight. The toolbar's progress line reads it; so does the guard that
     /// keeps a cold load's initial `@` diff from overwriting a palette jump.
     pub fn diff_pending(&self) -> Option<&RevisionSelection> {
-        self.diff_job.as_ref().map(|(_, revision)| revision)
+        self.diff_job.as_ref().map(|(_, revision, _)| revision)
     }
 
     pub fn diff_in_flight(&self) -> bool {
@@ -396,14 +420,121 @@ impl Session {
             return vec![Effect::RepaintDocument, Effect::RevealSelection];
         }
         let mut effects = Vec::new();
-        if let Some((job, _)) = self.diff_job.take() {
+        if let Some((job, ..)) = self.diff_job.take() {
             effects.push(Effect::Send(Command::Cancel { job }));
         }
         let job = self.next_job();
-        self.diff_job = Some((job, revision.clone()));
+        let base = self.diff_base.clone();
+        if revision != self.selected_revision || base != self.document_base {
+            self.expanded_paths.clear();
+        }
+        self.diff_job = Some((job, revision.clone(), base.clone()));
         self.loading_since = Some(Instant::now());
-        effects.push(Effect::Send(Command::LoadDiff { job, revision }));
+        effects.push(Effect::Send(Command::LoadDiff {
+            job,
+            revision,
+            base,
+            expand: self.expanded_paths.clone(),
+        }));
         effects
+    }
+
+    /// Fetch a file the backend collapsed for size in full. The path also
+    /// joins [`Self::expanded_paths`], so a reload landing meanwhile already
+    /// carries it expanded.
+    pub fn expand_file(&mut self, path: &str) -> Vec<Effect> {
+        let collapsed = self
+            .document
+            .files
+            .iter()
+            .any(|file| file.path == path && file.collapsed.is_some());
+        if !self.capabilities.compare
+            || !collapsed
+            || self.expand_jobs.iter().any(|(_, pending)| pending == path)
+        {
+            return Vec::new();
+        }
+        let job = self.next_job();
+        self.expand_jobs.push((job, path.to_owned()));
+        if !self.expanded_paths.iter().any(|expanded| expanded == path) {
+            self.expanded_paths.push(path.to_owned());
+        }
+        vec![Effect::Send(Command::ExpandFile {
+            job,
+            revision: self.selected_revision.clone(),
+            base: self.document_base.clone(),
+            path: path.to_owned(),
+        })]
+    }
+
+    fn on_file_expanded(
+        &mut self,
+        job: JobId,
+        path: String,
+        file: Option<crate::model::DiffFile>,
+    ) -> Vec<Effect> {
+        let Some(index) = self.expand_jobs.iter().position(|(id, _)| *id == job) else {
+            return Vec::new();
+        };
+        self.expand_jobs.remove(index);
+        let (Some(file), Some(slot)) = (
+            file,
+            self.document
+                .files
+                .iter_mut()
+                .find(|shown| shown.path == path && shown.collapsed.is_some()),
+        ) else {
+            return Vec::new();
+        };
+        *slot = file;
+        vec![Effect::RepaintDocument]
+    }
+
+    // ── comparing two revisions ─────────────────────────────────────────
+
+    /// Show `to`'s diff against `base` (`jj diff --from` / `jj interdiff
+    /// --from`). The base sticks: selecting another revision afterwards
+    /// compares that one against the same base, until [`Self::exit_compare`].
+    pub fn compare(&mut self, base: DiffBase, to: RevisionSelection) -> Vec<Effect> {
+        if !self.capabilities.compare && base.is_compare() {
+            return Vec::new();
+        }
+        self.diff_base = base;
+        self.load_diff(to)
+    }
+
+    /// Back to the selected revision's own diff.
+    pub fn exit_compare(&mut self) -> Vec<Effect> {
+        if !self.diff_base.is_compare() && !self.document_base.is_compare() {
+            return Vec::new();
+        }
+        self.diff_base = DiffBase::Parents;
+        let revision = self.selected_revision.clone();
+        self.load_diff(revision)
+    }
+
+    /// Swap the two sides: the base becomes the selected revision and the
+    /// selected revision the base.
+    pub fn swap_compare(&mut self) -> Vec<Effect> {
+        let to = self.selected_revision.clone();
+        let (base, from) = match &self.diff_base {
+            DiffBase::Parents => return Vec::new(),
+            DiffBase::Revision(from) => (DiffBase::Revision(to), from.clone()),
+            DiffBase::Interdiff(from) => (DiffBase::Interdiff(to), from.clone()),
+        };
+        self.compare(base, from)
+    }
+
+    /// Flip a comparison between a plain tree diff and an interdiff of the
+    /// same two revisions.
+    pub fn set_interdiff(&mut self, interdiff: bool) -> Vec<Effect> {
+        let base = match (&self.diff_base, interdiff) {
+            (DiffBase::Revision(from), true) => DiffBase::Interdiff(from.clone()),
+            (DiffBase::Interdiff(from), false) => DiffBase::Revision(from.clone()),
+            _ => return Vec::new(),
+        };
+        let to = self.selected_revision.clone();
+        self.compare(base, to)
     }
 
     /// Fold the working copy into `@`. Coalesces instead of racing when
@@ -487,6 +618,7 @@ impl Session {
                 warnings,
             } => self.on_snapshot(job, origin, snapshot, warnings),
             Payload::MutationDone { job, outcome } => self.on_mutation(job, outcome),
+            Payload::FileExpanded { job, path, file } => self.on_file_expanded(job, path, file),
             Payload::EmptyStatus { job, updates } => self.on_empty_status(job, updates),
             Payload::Progress { loaded, total, .. } => {
                 self.commit_progress.set_total(total);
@@ -494,6 +626,18 @@ impl Session {
                 Vec::new()
             }
             Payload::WorkingCopyChanged => self.snapshot(RefreshOrigin::Watcher),
+            Payload::StaleWorkingCopyRecovered => {
+                const NOTICE: &str = "Working copy was stale (changed by another process); \
+                                      updated to the latest operation";
+                vec![
+                    Effect::Activity(Activity::Toast {
+                        repo,
+                        title: "Working copy updated".to_owned(),
+                        body: NOTICE.to_owned(),
+                    }),
+                    Effect::Activity(Activity::Note(NOTICE.to_owned())),
+                ]
+            }
             Payload::RepositoryChanged => self.snapshot(RefreshOrigin::Focus),
             Payload::OpHeadChanged { fingerprint } => self.on_op_head(&fingerprint),
             Payload::Failed { job, error } => self.on_failed(repo, job, error),
@@ -510,7 +654,11 @@ impl Session {
             | Payload::TreeListed { .. }
             | Payload::FileRead { .. }
             | Payload::FilePairRead { .. }
-            | Payload::BookmarkChecked { .. } => Vec::new(),
+            | Payload::BookmarkChecked { .. }
+            | Payload::ConflictInfoLoaded { .. }
+            | Payload::MergeToolPrepared { .. }
+            | Payload::OpLogBatch { .. }
+            | Payload::History { .. } => Vec::new(),
         }
     }
 
@@ -557,12 +705,23 @@ impl Session {
             return Vec::new();
         };
         let swapped = load.staging.is_some();
+        // The change the selected row stands for, read off the store about to
+        // be replaced: a rewrite gives the commit a new id, and the selection
+        // should follow the change rather than fall off the graph.
+        let selected_change = match &self.selected_revision {
+            RevisionSelection::Commit(id) if swapped => self
+                .commits
+                .find_by_commit_id(id)
+                .map(|row| row.change_id().to_owned()),
+            _ => None,
+        };
         if let Some((commits, graph, prefixes)) = load.staging {
             self.commits = commits;
             self.graph = graph;
             self.sidebar_prefix_lens = prefixes;
         }
         self.graph_version = Some(job);
+        self.graph_fingerprint = tail.op_id;
         self.branch_status = tail.branch_status;
         self.bookmarks = tail.bookmarks;
         if tail.root_commit_id.is_some() {
@@ -583,6 +742,8 @@ impl Session {
         self.status = LoadStatus::Loaded;
         self.loading_since = None;
         self.selected_commit_index = self.find_selected_commit_index();
+        let followed = self.selected_commit_index.is_none()
+            && selected_change.is_some_and(|change| self.follow_selected_change(&change));
         self.repaint_version = self.repaint_version.wrapping_add(1);
 
         let mut effects = vec![Effect::Activity(Activity::LoadFinished {
@@ -591,6 +752,10 @@ impl Session {
         })];
         if swapped {
             effects.push(Effect::GraphReplaced);
+        }
+        if followed && !self.diff_in_flight() {
+            let revision = self.selected_revision.clone();
+            effects.extend(self.load_diff(revision));
         }
         effects.extend(self.resolve_empty_status());
         effects.extend(self.drain_pending_refresh());
@@ -604,23 +769,24 @@ impl Session {
         document: DiffDocument,
         details: Option<RevisionDetails>,
     ) -> Vec<Effect> {
-        if self.diff_job.as_ref().map(|(id, _)| *id) != Some(job) {
+        let Some((_, _, base)) = self.diff_job.take_if(|(id, ..)| *id == job) else {
             return Vec::new();
-        }
-        self.diff_job = None;
+        };
         self.loading_since = None;
 
         // A working-copy diff is the definitive emptiness signal for `@` (files
         // present ⇒ not empty), so an edit flips the chip without a re-walk.
         // Synthesized conflict entries don't count: jj calls a conflicted merge
         // whose tree is exactly its parents' merge "empty", and the chip should
-        // agree with the graph walk.
-        let wc_empty = matches!(revision, RevisionSelection::WorkingCopy).then(|| {
-            document
-                .files
-                .iter()
-                .all(|file| file.status == crate::model::DiffFileStatus::Conflicted)
-        });
+        // agree with the graph walk. A comparison says nothing about `@` alone.
+        let own_diff = !base.is_compare();
+        let wc_empty =
+            (own_diff && matches!(revision, RevisionSelection::WorkingCopy)).then(|| {
+                document
+                    .files
+                    .iter()
+                    .all(|file| file.status == crate::model::DiffFileStatus::Conflicted)
+            });
 
         if !self.capabilities.graph {
             self.park_displayed_document();
@@ -631,6 +797,7 @@ impl Session {
         let mut document = document;
         document.sort_in_tree_order();
         self.selected_revision = revision;
+        self.document_base = base;
         self.status = LoadStatus::Loaded;
         self.document = document;
         self.revision_details = details;
@@ -665,8 +832,16 @@ impl Session {
             .collect();
 
         let reflected = self.repository_snapshot.as_ref();
-        let changed =
-            reflected.map(|s| s.fingerprint.as_str()) != Some(snapshot.fingerprint.as_str());
+        // The rows on screen are behind this snapshot when the walk that built
+        // them read another op — even if an earlier snapshot already recorded
+        // this one. Comparing only against the last snapshot is what let a
+        // manual refresh call a stale graph "already up to date" forever.
+        let graph_behind = self
+            .graph_fingerprint
+            .as_deref()
+            .is_some_and(|op| op != snapshot.fingerprint);
+        let changed = graph_behind
+            || reflected.map(|s| s.fingerprint.as_str()) != Some(snapshot.fingerprint.as_str());
         if !changed {
             effects.push(Effect::Activity(Activity::LoadFinished {
                 ok: true,
@@ -683,11 +858,18 @@ impl Session {
         // the worktree signal wins the race and this snapshot advances the
         // fingerprint *past* the external op — without the escalation, that
         // swallowed the topology change and the graph stayed stale.
-        let external_op = match (reflected, snapshot.parent_fingerprint.as_deref()) {
-            (Some(reflected), Some(parent)) => reflected.fingerprint != parent,
+        let base = self
+            .graph_fingerprint
+            .as_deref()
+            .or(reflected.map(|s| s.fingerprint.as_str()));
+        let external_op = match (base, snapshot.parent_fingerprint.as_deref()) {
+            (Some(base), Some(parent)) => base != parent,
             _ => false,
         };
-        let origin = if external_op {
+        // A snapshot under an edited mid-stack commit rebased its children:
+        // every one of them has a new id, and the rows still name the old
+        // ones, which no mutation can act on any more.
+        let origin = if external_op || snapshot.rewrote_descendants {
             RefreshOrigin::Focus
         } else {
             origin
@@ -697,12 +879,21 @@ impl Session {
         match origin {
             RefreshOrigin::Watcher => {
                 // A working-tree edit moved `@`'s tree but not the topology, so
-                // skip the (up to ~1M-commit) re-walk. Keep `@`'s sidebar
-                // "empty" chip live even when the diff pane shows another
-                // revision: the snapshot just rewrote `@`'s tree.
+                // skip the (up to ~1M-commit) re-walk. The snapshot did give
+                // `@` a new commit id, though, and nothing else changed, so
+                // patching that one row brings the graph to the snapshot's op.
+                // Keep `@`'s sidebar "empty" chip live even when the diff pane
+                // shows another revision: the snapshot just rewrote `@`'s tree.
+                self.apply_working_copy_commit_id(snapshot.working_copy_commit_id.as_deref());
+                if self.graph_fingerprint.is_some() {
+                    self.graph_fingerprint = Some(snapshot.fingerprint.clone());
+                }
                 self.apply_working_copy_empty(snapshot.working_copy_empty);
-                if matches!(self.selected_revision, RevisionSelection::WorkingCopy) {
-                    effects.extend(self.load_diff(RevisionSelection::WorkingCopy));
+                if matches!(self.selected_revision, RevisionSelection::WorkingCopy)
+                    || self.diff_base.involves_working_copy()
+                {
+                    let revision = self.selected_revision.clone();
+                    effects.extend(self.load_diff(revision));
                 }
             }
             RefreshOrigin::Focus => {
@@ -779,6 +970,13 @@ impl Session {
             return Vec::new();
         }
         let owned_graph = self.graph_job.as_ref().is_some_and(|load| load.id == job);
+        // A comparison whose base no longer resolves (rewritten or abandoned
+        // since it was picked) falls back to the plain diff rather than
+        // leaving the pane on a comparison it can't refresh.
+        let failed_compare = self
+            .diff_job
+            .as_ref()
+            .is_some_and(|(id, _, base)| *id == job && base.is_compare());
         // A mutation's failure is reported by whoever started it (an immutable
         // rejection turns into an offer, not a toast), so only the slot is
         // cleared here.
@@ -801,9 +999,19 @@ impl Session {
         if !owned_mutation {
             effects.push(Effect::Activity(Activity::Toast {
                 repo,
-                title: "Operation failed".to_owned(),
+                title: if failed_compare {
+                    "Comparison ended".to_owned()
+                } else {
+                    "Operation failed".to_owned()
+                },
                 body: message,
             }));
+        }
+        if failed_compare && self.diff_base.is_compare() {
+            self.diff_base = DiffBase::Parents;
+            let revision = self.selected_revision.clone();
+            effects.extend(self.load_diff(revision));
+            return effects;
         }
         effects.extend(self.drain_pending_refresh());
         effects
@@ -815,7 +1023,7 @@ impl Session {
         if self.graph_job.as_ref().is_some_and(|load| load.id == job) {
             self.graph_job = None;
         }
-        if self.diff_job.as_ref().is_some_and(|(id, _)| *id == job) {
+        if self.diff_job.as_ref().is_some_and(|(id, ..)| *id == job) {
             self.diff_job = None;
         }
         if self.snapshot_job.as_ref().is_some_and(|(id, _)| *id == job) {
@@ -827,6 +1035,7 @@ impl Session {
         if self.mutation_job == Some(job) {
             self.mutation_job = None;
         }
+        self.expand_jobs.retain(|(id, _)| *id != job);
     }
 
     /// Run a refresh coalesced while the session was busy, now that it is idle.
@@ -914,6 +1123,33 @@ impl Session {
         out
     }
 
+    /// Point the working-copy row at `@`'s post-snapshot commit id. A no-op
+    /// when the id is unknown (git) or `@` isn't in the loaded graph.
+    fn apply_working_copy_commit_id(&mut self, commit_id: Option<&str>) {
+        let (Some(commit_id), Some(index)) = (commit_id, self.commits.working_copy_index()) else {
+            return;
+        };
+        if self.commits.row(index).commit_id() != commit_id {
+            self.commits.set_commit_id(index, commit_id);
+            self.repaint_version = self.repaint_version.wrapping_add(1);
+        }
+    }
+
+    /// Move a commit selection the reload dropped onto the row now carrying
+    /// its change, when exactly one does. Returns whether it moved.
+    fn follow_selected_change(&mut self, change_id: &str) -> bool {
+        let Some(row) = self.commits.find_by_change_id(change_id) else {
+            return false;
+        };
+        if row.is_divergent() {
+            return false;
+        }
+        let commit_id = row.commit_id().to_owned();
+        self.selected_revision = self.canonical_selection(&commit_id);
+        self.selected_commit_index = self.find_selected_commit_index();
+        self.selected_commit_index.is_some()
+    }
+
     /// Refresh the working-copy row's "empty" chip from a snapshot, without
     /// touching the diff pane or re-walking. A no-op when the value is unknown
     /// (git), `@` isn't in the loaded graph, or the chip already matches.
@@ -944,6 +1180,12 @@ impl Session {
             .iter()
             .enumerate()
         {
+            // A collapsed file has no rows to colour, and past a size the
+            // full-source parse costs more than the colour is worth.
+            let rows: usize = file.hunks.iter().map(|hunk| hunk.lines.len()).sum();
+            if file.collapsed.is_some() || rows > HIGHLIGHT_MAX_ROWS {
+                continue;
+            }
             let unhighlighted = file
                 .hunks
                 .iter()
@@ -1112,6 +1354,7 @@ mod tests {
             hunks: Vec::new(),
             additions: 1,
             deletions: 0,
+            collapsed: None,
         };
         let mut session = Session::unloaded(String::new());
         let job = session
@@ -1219,6 +1462,144 @@ mod tests {
         );
     }
 
+    fn sent_job(effects: &[Effect], pick: fn(&Command) -> Option<JobId>) -> Option<JobId> {
+        effects.iter().find_map(|effect| match effect {
+            Effect::Send(command) => pick(command),
+            _ => None,
+        })
+    }
+
+    /// The rows on screen were walked at op `a`; a snapshot has since recorded
+    /// op `b` without them following. A refresh must reload instead of calling
+    /// that "already up to date" because the *snapshot* is current.
+    #[test]
+    fn a_refresh_reloads_rows_walked_at_an_older_operation() {
+        let repo = crate::repo::repo_id(&crate::repo::OpenSpec::Local {
+            root: "/tmp/graph-behind".into(),
+            scope: Default::default(),
+        });
+        let mut session = Session::unloaded(String::new());
+        session.capabilities.graph = true;
+        let load = session.load_graph(false);
+        let job = sent_job(&load, |command| match command {
+            Command::LoadGraph { job, .. } => Some(*job),
+            _ => None,
+        })
+        .expect("a graph load");
+        session.apply(Event::new(
+            repo.clone(),
+            Payload::GraphLoaded {
+                job,
+                tail: crate::repo::GraphTail {
+                    op_id: Some("a".to_owned()),
+                    ..Default::default()
+                },
+            },
+        ));
+        let at_b = RepositorySnapshot {
+            fingerprint: "b".to_owned(),
+            parent_fingerprint: Some("b".to_owned()),
+            ..Default::default()
+        };
+        session.repository_snapshot = Some(at_b.clone());
+
+        let refresh = session.snapshot(RefreshOrigin::Focus);
+        let job = sent_job(&refresh, |command| match command {
+            Command::Snapshot { job, .. } => Some(*job),
+            _ => None,
+        })
+        .expect("a snapshot");
+        let effects = session.apply(Event::new(
+            repo,
+            Payload::SnapshotDone {
+                job,
+                origin: RefreshOrigin::Focus,
+                snapshot: at_b,
+                warnings: Vec::new(),
+            },
+        ));
+        assert!(
+            sent_job(&effects, |command| match command {
+                Command::LoadGraph { job, .. } => Some(*job),
+                _ => None,
+            })
+            .is_some(),
+            "the stale rows must be reloaded: {effects:?}"
+        );
+    }
+
+    /// A save under a childless `@` patches that one row's commit id rather
+    /// than re-walking, and the rows then count as current at the new op.
+    #[test]
+    fn a_watcher_snapshot_patches_the_working_copy_row() {
+        let repo = crate::repo::repo_id(&crate::repo::OpenSpec::Local {
+            root: "/tmp/patch-wc".into(),
+            scope: Default::default(),
+        });
+        let mut session = Session::unloaded(String::new());
+        session.capabilities.graph = true;
+        let load = session.load_graph(true);
+        let job = sent_job(&load, |command| match command {
+            Command::LoadGraph { job, .. } => Some(*job),
+            _ => None,
+        })
+        .expect("a graph load");
+        session.apply(Event::new(
+            repo.clone(),
+            Payload::Batch {
+                job,
+                rows: (0..3).map(row).collect(),
+            },
+        ));
+        session.apply(Event::new(
+            repo.clone(),
+            Payload::GraphLoaded {
+                job,
+                tail: crate::repo::GraphTail {
+                    op_id: Some("a".to_owned()),
+                    ..Default::default()
+                },
+            },
+        ));
+        session.repository_snapshot = Some(RepositorySnapshot {
+            fingerprint: "a".to_owned(),
+            ..Default::default()
+        });
+
+        let refresh = session.snapshot(RefreshOrigin::Watcher);
+        let job = sent_job(&refresh, |command| match command {
+            Command::Snapshot { job, .. } => Some(*job),
+            _ => None,
+        })
+        .expect("a snapshot");
+        let effects = session.apply(Event::new(
+            repo,
+            Payload::SnapshotDone {
+                job,
+                origin: RefreshOrigin::Watcher,
+                snapshot: RepositorySnapshot {
+                    fingerprint: "b".to_owned(),
+                    parent_fingerprint: Some("a".to_owned()),
+                    working_copy_commit_id: Some("rewritten".to_owned()),
+                    ..Default::default()
+                },
+                warnings: Vec::new(),
+            },
+        ));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Send(Command::LoadGraph { .. }))),
+            "no re-walk for a plain save: {effects:?}"
+        );
+        assert_eq!(
+            session.commits.working_copy().map(|row| row.commit_id()),
+            Some("rewritten")
+        );
+        assert!(session.commits.find_by_commit_id("rewritten").is_some());
+        assert_eq!(session.graph_fingerprint.as_deref(), Some("b"));
+    }
+
     #[test]
     fn coalesce_focus_subsumes_watcher() {
         assert_eq!(
@@ -1233,5 +1614,281 @@ mod tests {
             coalesce_refresh(Some(RefreshOrigin::Focus), RefreshOrigin::Watcher),
             RefreshOrigin::Focus
         );
+    }
+
+    // ── comparing ───────────────────────────────────────────────────────
+
+    fn compare_session() -> Session {
+        let mut session = Session::unloaded(String::new());
+        session.capabilities.compare = true;
+        session.capabilities.graph = true;
+        session
+    }
+
+    fn sent_diff(effects: &[Effect]) -> Option<(JobId, RevisionSelection, DiffBase)> {
+        effects.iter().find_map(|effect| match effect {
+            Effect::Send(Command::LoadDiff {
+                job,
+                revision,
+                base,
+                ..
+            }) => Some((*job, revision.clone(), base.clone())),
+            _ => None,
+        })
+    }
+
+    fn land(session: &mut Session, job: JobId, revision: RevisionSelection) -> Vec<Effect> {
+        let repo = crate::repo::repo_id(&crate::repo::OpenSpec::Local {
+            root: "/tmp/compare".into(),
+            scope: Default::default(),
+        });
+        session.apply(Event::new(
+            repo,
+            Payload::DiffLoaded {
+                job,
+                revision,
+                document: DiffDocument::default(),
+                details: None,
+            },
+        ))
+    }
+
+    fn commit(id: &str) -> RevisionSelection {
+        RevisionSelection::Commit(id.to_owned())
+    }
+
+    /// The base sticks across selections until the comparison is exited, and
+    /// the displayed base only moves when a load lands.
+    #[test]
+    fn a_comparison_base_sticks_until_exit() {
+        let mut session = compare_session();
+        let effects = session.compare(DiffBase::Revision(commit("aaa")), commit("bbb"));
+        let (job, revision, base) = sent_diff(&effects).expect("a diff load");
+        assert_eq!(revision, commit("bbb"));
+        assert_eq!(base, DiffBase::Revision(commit("aaa")));
+        assert_eq!(session.document_base, DiffBase::Parents, "not landed yet");
+        land(&mut session, job, revision);
+        assert_eq!(session.document_base, DiffBase::Revision(commit("aaa")));
+
+        // Picking another revision compares it against the same base.
+        let effects = session.load_diff(commit("ccc"));
+        let (job, revision, base) = sent_diff(&effects).expect("a diff load");
+        assert_eq!(base, DiffBase::Revision(commit("aaa")));
+        land(&mut session, job, revision);
+
+        let effects = session.exit_compare();
+        let (job, revision, base) = sent_diff(&effects).expect("a diff load");
+        assert_eq!((revision.clone(), base), (commit("ccc"), DiffBase::Parents));
+        land(&mut session, job, revision);
+        assert_eq!(session.document_base, DiffBase::Parents);
+        assert!(session.exit_compare().is_empty(), "nothing left to exit");
+    }
+
+    #[test]
+    fn swapping_exchanges_the_two_sides_and_keeps_the_mode() {
+        let mut session = compare_session();
+        let effects = session.compare(DiffBase::Interdiff(commit("aaa")), commit("bbb"));
+        let (job, revision, _) = sent_diff(&effects).expect("a diff load");
+        land(&mut session, job, revision);
+
+        let effects = session.swap_compare();
+        let (_, revision, base) = sent_diff(&effects).expect("a diff load");
+        assert_eq!(revision, commit("aaa"));
+        assert_eq!(base, DiffBase::Interdiff(commit("bbb")));
+
+        let effects = session.set_interdiff(false);
+        let (_, _, base) = sent_diff(&effects).expect("a diff load");
+        assert_eq!(base, DiffBase::Revision(commit("bbb")));
+    }
+
+    /// A backend without comparisons (git, a PR) never sends one.
+    #[test]
+    fn comparing_is_gated_on_the_capability() {
+        let mut session = Session::unloaded(String::new());
+        assert!(
+            session
+                .compare(DiffBase::Revision(commit("aaa")), commit("bbb"))
+                .is_empty()
+        );
+        assert_eq!(session.diff_base, DiffBase::Parents);
+    }
+
+    /// A comparison against `@` reloads on a working-tree edit even while a
+    /// commit is the selected side.
+    #[test]
+    fn a_working_copy_base_reloads_on_a_watcher_refresh() {
+        let mut session = compare_session();
+        let effects = session.compare(
+            DiffBase::Revision(RevisionSelection::WorkingCopy),
+            commit("bbb"),
+        );
+        let (job, revision, _) = sent_diff(&effects).expect("a diff load");
+        land(&mut session, job, revision);
+        session.repository_snapshot = Some(RepositorySnapshot {
+            fingerprint: "op1".to_owned(),
+            working_copy_empty: None,
+            parent_fingerprint: None,
+            ..Default::default()
+        });
+
+        let job = match session.snapshot(RefreshOrigin::Watcher).as_slice() {
+            [Effect::Send(Command::Snapshot { job, .. })] => *job,
+            other => panic!("expected a snapshot, got {other:?}"),
+        };
+        let repo = crate::repo::repo_id(&crate::repo::OpenSpec::Local {
+            root: "/tmp/compare".into(),
+            scope: Default::default(),
+        });
+        let effects = session.apply(Event::new(
+            repo,
+            Payload::SnapshotDone {
+                job,
+                origin: RefreshOrigin::Watcher,
+                snapshot: RepositorySnapshot {
+                    fingerprint: "op2".to_owned(),
+                    working_copy_empty: None,
+                    parent_fingerprint: Some("op1".to_owned()),
+                    ..Default::default()
+                },
+                warnings: Vec::new(),
+            },
+        ));
+        let (_, revision, base) = sent_diff(&effects).expect("the comparison reloads");
+        assert_eq!(revision, commit("bbb"));
+        assert_eq!(base, DiffBase::Revision(RevisionSelection::WorkingCopy));
+    }
+
+    /// A comparison whose base stopped resolving falls back to the plain diff.
+    #[test]
+    fn a_failed_comparison_falls_back_to_the_plain_diff() {
+        let mut session = compare_session();
+        let effects = session.compare(DiffBase::Revision(commit("gone")), commit("bbb"));
+        let (job, ..) = sent_diff(&effects).expect("a diff load");
+        let repo = crate::repo::repo_id(&crate::repo::OpenSpec::Local {
+            root: "/tmp/compare".into(),
+            scope: Default::default(),
+        });
+        let effects = session.apply(Event::new(
+            repo,
+            Payload::Failed {
+                job,
+                error: RepoError::Other("failed to load jj commit gone".to_owned()),
+            },
+        ));
+        let (_, _, base) = sent_diff(&effects).expect("the plain diff reloads");
+        assert_eq!(base, DiffBase::Parents);
+        assert_eq!(session.diff_base, DiffBase::Parents);
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Activity(Activity::Toast { title, .. }) if title == "Comparison ended"
+        )));
+    }
+
+    // ── size caps ───────────────────────────────────────────────────────
+
+    fn collapsed_file(path: &str) -> crate::model::DiffFile {
+        crate::model::DiffFile {
+            path: path.to_owned(),
+            old_path: None,
+            status: crate::model::DiffFileStatus::Added,
+            hunks: vec![crate::model::DiffHunkView {
+                header: "Large diff".to_owned(),
+                lines: Vec::new(),
+            }],
+            additions: 5_000,
+            deletions: 0,
+            collapsed: Some(crate::model::DiffCollapse::LargeFile),
+        }
+    }
+
+    /// Expanding swaps the placeholder for the full file in place, and the
+    /// path rides along on later reloads of the same diff — but not onto
+    /// another revision's.
+    #[test]
+    fn an_expanded_file_replaces_its_placeholder_and_survives_reloads() {
+        let mut session = compare_session();
+        let effects = session.load_diff(commit("aaa"));
+        let (job, ..) = sent_diff(&effects).expect("a diff load");
+        let repo = crate::repo::repo_id(&crate::repo::OpenSpec::Local {
+            root: "/tmp/caps".into(),
+            scope: Default::default(),
+        });
+        session.apply(Event::new(
+            repo.clone(),
+            Payload::DiffLoaded {
+                job,
+                revision: commit("aaa"),
+                document: DiffDocument {
+                    files: vec![collapsed_file("huge.txt")],
+                    total_additions: 5_000,
+                    total_deletions: 0,
+                },
+                details: None,
+            },
+        ));
+
+        let effects = session.expand_file("huge.txt");
+        let job = match effects.as_slice() {
+            [Effect::Send(Command::ExpandFile { job, path, .. })] if path == "huge.txt" => *job,
+            other => panic!("expected an ExpandFile, got {other:?}"),
+        };
+        assert!(
+            session.expand_file("huge.txt").is_empty(),
+            "already in flight"
+        );
+
+        let mut full = collapsed_file("huge.txt");
+        full.collapsed = None;
+        full.hunks[0].header = "@@ -0,0 +1,5000 @@".to_owned();
+        let effects = session.apply(Event::new(
+            repo,
+            Payload::FileExpanded {
+                job,
+                path: "huge.txt".to_owned(),
+                file: Some(full),
+            },
+        ));
+        assert!(matches!(effects.as_slice(), [Effect::RepaintDocument]));
+        assert_eq!(session.document.files[0].collapsed, None);
+
+        let effects = session.load_diff(commit("aaa"));
+        let expand = effects.iter().find_map(|effect| match effect {
+            Effect::Send(Command::LoadDiff { expand, .. }) => Some(expand.clone()),
+            _ => None,
+        });
+        assert_eq!(expand, Some(vec!["huge.txt".to_owned()]));
+
+        let effects = session.load_diff(commit("bbb"));
+        let expand = effects.iter().find_map(|effect| match effect {
+            Effect::Send(Command::LoadDiff { expand, .. }) => Some(expand.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            expand,
+            Some(Vec::new()),
+            "another revision starts collapsed"
+        );
+    }
+
+    #[test]
+    fn collapsed_and_oversized_files_are_not_highlighted() {
+        let mut session = Session::unloaded(String::new());
+        let row = crate::model::DiffLine {
+            kind: crate::model::DiffLineKind::Addition,
+            old_line: None,
+            new_line: Some(1),
+            content: "x".to_owned(),
+            syntax: Vec::new(),
+            emphasis: Vec::new(),
+        };
+        let mut small = collapsed_file("small.rs");
+        small.collapsed = None;
+        small.hunks[0].lines = vec![row.clone()];
+        let mut big = collapsed_file("big.rs");
+        big.collapsed = None;
+        big.hunks[0].lines = vec![row; HIGHLIGHT_MAX_ROWS + 1];
+        session.document.files = vec![collapsed_file("huge.rs"), small, big];
+        session.reset_highlights(1);
+        assert_eq!(Vec::from(session.highlight_pending.clone()), vec![1]);
     }
 }

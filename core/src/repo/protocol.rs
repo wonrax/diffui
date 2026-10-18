@@ -8,13 +8,16 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use crate::history::{HistoryRequest, HistoryResponse, OperationEntry};
 use crate::model::{
-    BookmarksInfo, BranchStatus, DiffDocument, RevisionDetails, RevisionSelection, StreamRow,
+    BookmarksInfo, BranchStatus, DiffBase, DiffDocument, DiffFile, RevisionDetails,
+    RevisionSelection, StreamRow,
 };
 use crate::mutations::{
     Destination, DraftSimulation, MutationOp, MutationOutcome, RebaseSourceMode,
 };
 use crate::repository::{FetchTarget, RepositorySnapshot};
+use crate::resolve::{ConflictFile, MergeToolInvocation};
 use crate::session::RefreshOrigin;
 use crate::source_browse::{SourceEntry, SourceFileLoad};
 
@@ -66,6 +69,9 @@ pub struct Capabilities {
     pub browse: bool,
     /// Can produce `jj show`-style revision headers.
     pub details: bool,
+    /// Can diff against something other than the parents ([`DiffBase`]),
+    /// and expand a file its diff collapsed for size.
+    pub compare: bool,
 }
 
 /// A typed backend failure. `Result<_, String>` stops at the core surface:
@@ -89,6 +95,12 @@ pub enum RepoError {
     /// The repository has no such capability (see [`Capabilities`]).
     Unsupported,
     Other(String),
+    /// `jj git push`'s commit checks refused the push; the rejection lists
+    /// each commit and carries the request for a rerun with allowances.
+    PushRejected(Box<crate::push::PushRejection>),
+    /// The actor panicked while running the command. It dropped whatever it
+    /// had loaded and keeps serving, so the next command starts clean.
+    Crashed(String),
 }
 
 impl fmt::Display for RepoError {
@@ -103,6 +115,12 @@ impl fmt::Display for RepoError {
             Self::Immutable { short_id } => write!(f, "{short_id} is immutable"),
             Self::Unsupported => f.write_str("this repository does not support that operation"),
             Self::Other(message) => write!(f, "{message}"),
+            Self::PushRejected(rejection) => write!(f, "{rejection}"),
+            Self::Crashed(message) => write!(
+                f,
+                "This repository's worker crashed: {message}. See the log \
+                 (\"Reveal log file\") for details; refresh to retry."
+            ),
         }
     }
 }
@@ -121,6 +139,10 @@ pub enum PreviewRequest {
     Merge {
         parents: Vec<RevisionSelection>,
     },
+    /// `jj parallelize` of the targets; answered rebase-shaped.
+    Parallelize {
+        targets: Vec<RevisionSelection>,
+    },
 }
 
 /// Work asked of a repository. Every variant that does work carries a
@@ -136,6 +158,11 @@ pub enum Command {
     LoadDiff {
         job: JobId,
         revision: RevisionSelection,
+        /// The "from" side; [`DiffBase::Parents`] for a plain revision diff.
+        base: DiffBase,
+        /// Paths to diff in full even past the size caps — files the user
+        /// already expanded, kept expanded across a reload.
+        expand: Vec<String>,
     },
     /// Fold the on-disk tree into `@`. `origin` rides along untouched so the
     /// projection knows how much to reload when the fingerprint moves.
@@ -181,6 +208,8 @@ pub enum Command {
         revision: RevisionSelection,
         path: String,
         old_path: Option<String>,
+        /// What the old side is read from, matching the displayed diff.
+        base: DiffBase,
     },
     /// Whether moving bookmark `name` to `to` is backwards or sideways — the
     /// move the jj CLI refuses without `--allow-backwards`.
@@ -188,6 +217,35 @@ pub enum Command {
         job: JobId,
         name: String,
         to: RevisionSelection,
+    },
+    /// The conflicted paths of `revision`, with jj's labels for their sides
+    /// — what the resolve actions are offered from.
+    ConflictInfo {
+        job: JobId,
+        revision: RevisionSelection,
+    },
+    /// Write the merge tool's input files for `path` at `revision` and build
+    /// its command line. Read-only; the frontend runs the tool and applies
+    /// the result as a [`MutationOp::ResolveConflict`].
+    PrepareMergeTool {
+        job: JobId,
+        revision: RevisionSelection,
+        path: String,
+    },
+    /// A history view's read: the op log, an operation's changes, an
+    /// evolog, an interdiff, or a file's annotation. See
+    /// [`HistoryRequest`].
+    History {
+        job: JobId,
+        request: HistoryRequest,
+    },
+    /// One file of a diff in full, past the size caps that collapsed it
+    /// ([`crate::model::DiffFile::collapsed`]).
+    ExpandFile {
+        job: JobId,
+        revision: RevisionSelection,
+        base: DiffBase,
+        path: String,
     },
     /// Ask the actor to stop `job`. A cancelled job reports
     /// [`Payload::Cancelled`] and never its success event, so the caller's
@@ -213,7 +271,11 @@ impl Command {
             | Self::ListTree { job, .. }
             | Self::ReadFile { job, .. }
             | Self::FilePair { job, .. }
-            | Self::BookmarkCheck { job, .. } => Some(*job),
+            | Self::BookmarkCheck { job, .. }
+            | Self::ConflictInfo { job, .. }
+            | Self::PrepareMergeTool { job, .. }
+            | Self::History { job, .. }
+            | Self::ExpandFile { job, .. } => Some(*job),
             Self::Cancel { .. } => None,
         }
     }
@@ -232,6 +294,10 @@ pub struct GraphTail {
     /// of rewrite targets before offering the operation. `None` for backends
     /// without one.
     pub root_commit_id: Option<String>,
+    /// The operation the walk read (`RepositorySnapshot::fingerprint`'s
+    /// form), so the projection knows exactly which op the rows on screen
+    /// reflect. `None` for backends without an op log.
+    pub op_id: Option<String>,
 }
 
 /// One event from a repository actor. `repo` rides on every one of them, so a
@@ -328,10 +394,28 @@ pub enum Payload {
         job: JobId,
         backwards: bool,
     },
+    /// The full diff of one collapsed file; `None` when the path is no longer
+    /// part of the diff.
+    FileExpanded {
+        job: JobId,
+        path: String,
+        file: Option<DiffFile>,
+    },
     Progress {
         job: JobId,
         loaded: usize,
         total: usize,
+    },
+    /// A slice of the operation log, newest first. Not terminal: the stream
+    /// ends with a [`HistoryResponse::OpLogDone`].
+    OpLogBatch {
+        job: JobId,
+        entries: Vec<OperationEntry>,
+    },
+    /// The answer to a [`Command::History`].
+    History {
+        job: JobId,
+        response: HistoryResponse,
     },
     /// The repository's operation head moved — ours or someone else's. The
     /// actor dedups on the fingerprint, so this only fires on a real change.
@@ -345,6 +429,21 @@ pub enum Payload {
     /// Git refs, worktree HEADs, or working-copy status may have changed.
     /// Git's synthetic working-copy row requires a graph refresh too.
     RepositoryChanged,
+    /// The jj checkout was stale — another process (a CLI command, another
+    /// workspace's snapshot) rewrote `@` — so the actor updated the files on
+    /// disk to the latest operation instead of snapshotting over it, like
+    /// `jj workspace update-stale`. Edits on disk were snapshotted first.
+    /// Unsolicited: it rides alongside the snapshot or mutation that hit it.
+    StaleWorkingCopyRecovered,
+    ConflictInfoLoaded {
+        job: JobId,
+        revision: RevisionSelection,
+        files: Vec<ConflictFile>,
+    },
+    MergeToolPrepared {
+        job: JobId,
+        invocation: MergeToolInvocation,
+    },
     Failed {
         job: JobId,
         error: RepoError,
@@ -370,13 +469,19 @@ impl Payload {
             | Self::FileRead { job, .. }
             | Self::FilePairRead { job, .. }
             | Self::BookmarkChecked { job, .. }
+            | Self::FileExpanded { job, .. }
             | Self::Progress { job, .. }
+            | Self::ConflictInfoLoaded { job, .. }
+            | Self::MergeToolPrepared { job, .. }
+            | Self::OpLogBatch { job, .. }
+            | Self::History { job, .. }
             | Self::Failed { job, .. }
             | Self::Cancelled { job, .. } => Some(*job),
             Self::Ready { .. }
             | Self::OpHeadChanged { .. }
             | Self::WorkingCopyChanged
-            | Self::RepositoryChanged => None,
+            | Self::RepositoryChanged
+            | Self::StaleWorkingCopyRecovered => None,
         }
     }
 
@@ -388,10 +493,12 @@ impl Payload {
             self,
             Self::Batch { .. }
                 | Self::Progress { .. }
+                | Self::OpLogBatch { .. }
                 | Self::Ready { .. }
                 | Self::OpHeadChanged { .. }
                 | Self::WorkingCopyChanged
                 | Self::RepositoryChanged
+                | Self::StaleWorkingCopyRecovered
         )
     }
 }

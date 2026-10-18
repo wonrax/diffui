@@ -109,14 +109,20 @@ fn build_file_navigator_surface<'a>(
     let rows_for_files = Rc::clone(&tree_rows);
     let lanes = EmptyFileTreeLanes::default();
     let build_file = Box::new(move |display: usize| {
-        changed_file_row(
-            &rows_for_files[display],
-            files,
-            theme,
-            additions_width,
-            deletions_width,
-            &lanes,
-        )
+        let row = &rows_for_files[display];
+        let mut view =
+            changed_file_row(row, files, theme, additions_width, deletions_width, &lanes);
+        view.check = match row {
+            FileTreeRow::File { file_index, .. } => {
+                crate::changes::tree_check(ui, Some(*file_index), None)
+            }
+            FileTreeRow::Dir { path, .. } => crate::changes::tree_check(
+                ui,
+                None,
+                Some(&format!("{}/", path.trim_end_matches('/'))),
+            ),
+        };
+        view
     });
     let build_revision = Box::new(move |_| crate::source_panel::empty_revision_row(theme));
     let list = RevisionList::new(
@@ -138,7 +144,8 @@ fn build_file_navigator_surface<'a>(
     .restore_scroll(ui.active().file_tree_scroll_offset, ui.scroll_restore_token)
     .on_file_context_menu(|row, rect, point| {
         Message::Ui(UiEvent::SidebarFileContextMenu(row, rect, point))
-    });
+    })
+    .on_file_check(|row| Message::Changes(crate::changes::ChangesMsg::ToggleTreeRow(row)));
     container(
         column![
             container(header).padding(Padding {
@@ -259,6 +266,7 @@ fn changed_file_row(
         file_index,
         lane_labels: Rc::clone(&lanes.labels),
         lane_segments: Rc::clone(&lanes.segments),
+        check: None,
     }
 }
 
@@ -288,6 +296,17 @@ pub fn build_collapsed_file_navigator(theme: ThemeSpec) -> Element<'static, Mess
 }
 
 pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
+    let body = build_diff_panel_body(ui, theme);
+    match crate::empty_states::outside_view_banner(ui, theme) {
+        Some(banner) => column![banner, body]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into(),
+        None => body,
+    }
+}
+
+fn build_diff_panel_body<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
     let body: Element<'a, Message> = if matches!(ui.active().session.status, LoadStatus::Loading)
         && ui.active().session.document.files.is_empty()
     {
@@ -402,7 +421,7 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
                         },
                         ..Default::default()
                     }),
-                    text("No changes")
+                    text("This revision has no changes")
                         .size(text_size::TITLE)
                         .font(crate::theme::emphasis_font(
                             ui.config.ui_font,
@@ -420,7 +439,8 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
             .height(Length::Fill)
             .padding(crate::theme::space::XXL)
             .center(Length::Fill);
-            return container(column![summary, empty])
+            let banner = crate::compare::build_compare_banner(ui, theme);
+            return container(column![].push(banner).push(summary).push(empty))
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .style(move |_| diff_panel_style(theme))
@@ -430,7 +450,8 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
         let mut dv = DiffView::new(
             files,
             ui.active().selected_file,
-            ui.active().session.selected_revision.view_key(),
+            ui.active().session.selected_revision.view_key()
+                + &ui.active().session.document_base.view_key(),
             diff_palette(theme),
             ui.config.mono_font,
             ui.config.code_type,
@@ -443,16 +464,34 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
         .content_version(ui.document_version)
         .layout_version(ui.active().session.document_id)
         .wrap(ui.diff_wrap)
-        .side_by_side(ui.diff_split);
+        .side_by_side(split_in_effect(ui));
 
         if let Some(details) = ui.active().session.revision_details.as_ref() {
             dv = dv.with_header(revision_header_lines(details));
+        }
+
+        let collapsed: Vec<bool> = ui
+            .active()
+            .session
+            .document
+            .files
+            .iter()
+            .map(|file| file.collapsed.is_some())
+            .collect();
+        if collapsed.contains(&true) {
+            dv = dv.on_expand_file(collapsed, |index| {
+                Message::Action(Action::ExpandFile(index))
+            });
         }
 
         // Per-file "browse source" affordance — repo tabs only (a PR tab has
         // no local tree to browse).
         if ui.active().repository.is_some() {
             dv = dv.on_browse_file(|index| Message::Ui(UiEvent::BrowseFileFromDiff(index)));
+        }
+
+        if let Some(marks) = crate::changes::diff_marks(ui, theme) {
+            dv = dv.change_marks(marks);
         }
 
         if let Some(find_state) = ui.active().find() {
@@ -480,10 +519,20 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
         // upper-right of the panel. `stack` overlays without taking
         // the diff view out of the column flow.
         let find_overlay = find::build_overlay(ui, theme);
-        let diff_with_find: Element<'a, Message> =
-            stack![diff_view, find_overlay].clip(true).into();
+        let mut layers = stack![diff_view, find_overlay].clip(true);
+        if let Some(bar) = crate::changes::selection_bar(ui, theme) {
+            layers = layers.push(bar);
+        }
+        let diff_with_find: Element<'a, Message> = layers.into();
 
-        column![summary, diff_with_find].spacing(0).into()
+        match crate::conflicts::conflict_banner(ui, theme) {
+            Some(banner) => column![summary, banner, diff_with_find].spacing(0).into(),
+            None => column![summary, diff_with_find].spacing(0).into(),
+        }
+    };
+    let body: Element<'a, Message> = match crate::compare::build_compare_banner(ui, theme) {
+        Some(banner) => column![banner, body].into(),
+        None => body,
     };
 
     container(body)
@@ -504,7 +553,11 @@ fn build_description_editor<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a,
         let input_padding = Padding::from([DESCRIPTION_EDITOR_PADDING_Y, 12.0]);
         let mut input = text_editor(&editor.content)
             .id(iced::widget::Id::new(DESCRIPTION_EDITOR_ID))
-            .placeholder("Describe this revision…")
+            .placeholder(if editor.commit {
+                "Describe the change you are committing…"
+            } else {
+                "Describe this revision…"
+            })
             .size(ui.config.code_type.size)
             .font(ui.config.mono_font)
             .line_height(text::LineHeight::Relative(
@@ -551,8 +604,14 @@ fn build_description_editor<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a,
         )
         .on_press_maybe((!saving).then_some(Message::Action(Action::CancelDescription)));
 
-        let save_enabled = !saving && editor.is_dirty();
-        let save_label = if saving { "Saving…" } else { "Save" };
+        // A commit may keep the description as it stands.
+        let save_enabled = !saving && (editor.is_dirty() || editor.commit);
+        let save_label = match (saving, editor.commit) {
+            (true, true) => "Committing…",
+            (true, false) => "Saving…",
+            (false, true) => "Commit",
+            (false, false) => "Save",
+        };
         let save = ui::text_button(
             None,
             save_label,
@@ -570,6 +629,12 @@ fn build_description_editor<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a,
                 .size(text_size::UI)
                 .font(ui.config.ui_font)
                 .color(theme.note_text)
+                .into()
+        } else if editor.commit {
+            text("Then starts a new change on top")
+                .size(text_size::UI)
+                .font(ui.config.ui_font)
+                .color(theme.subtle_text)
                 .into()
         } else {
             Space::new().into()
@@ -599,6 +664,46 @@ fn build_description_editor<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a,
             .into();
     }
     Space::new().height(0).into()
+}
+
+/// Code columns a side-by-side half has to hold before the split is worth
+/// it. Narrower than this and both halves soft-wrap mid-token on ordinary
+/// lines, which reads worse than one unified column.
+const MIN_SPLIT_COLUMN_CHARS: f32 = 56.0;
+
+/// The diff pane's width: the window minus the history and file panes and
+/// their dividers.
+fn diff_pane_width(ui: &Diffui) -> f32 {
+    let history_width = if ui.active().history_panel_collapsed {
+        crate::theme::COLLAPSED_PANEL_WIDTH
+    } else {
+        ui.sidebar_width
+    };
+    let files_width = if ui.active().session.document.files.is_empty() {
+        0.0
+    } else if ui.active().files_panel_collapsed {
+        crate::theme::COLLAPSED_PANEL_WIDTH + 1.0
+    } else {
+        ui.file_nav_width + 1.0
+    };
+    (ui.window_size.width - history_width - files_width - 1.0).max(0.0)
+}
+
+/// Whether a side-by-side diff has room for both halves. The toggle is the
+/// user's preference; this only decides whether it can be honoured now, so
+/// widening the window brings the split back.
+pub(crate) fn split_fits(ui: &Diffui) -> bool {
+    let size = ui.config.code_type.size;
+    let char_width = crate::measure::line_width("0000000000", size, ui.config.mono_font) / 10.0;
+    // Per half: a line-number gutter (one number, ~4 digits + padding) plus
+    // the code columns.
+    let half = 4.0 * char_width + 16.0 + MIN_SPLIT_COLUMN_CHARS * char_width;
+    diff_pane_width(ui) >= 2.0 * half
+}
+
+/// Side-by-side is on and fits.
+pub(crate) fn split_in_effect(ui: &Diffui) -> bool {
+    ui.diff_split && split_fits(ui)
 }
 
 fn description_editor_input_height(ui: &Diffui) -> f32 {
@@ -779,7 +884,7 @@ fn build_revision_summary<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, M
 /// The selectable block atop the diff: the description's body and the
 /// identity fields. The subject is left out — the header above already
 /// shows it as the title — along with the blank lines that set it apart.
-fn revision_header_lines(details: &diffui_core::RevisionDetails) -> Vec<HeaderLine> {
+pub(crate) fn revision_header_lines(details: &diffui_core::RevisionDetails) -> Vec<HeaderLine> {
     let description = details.description.trim();
     let body = description
         .split_once('\n')

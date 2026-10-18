@@ -10,11 +10,15 @@ pub mod git;
 pub mod github;
 pub mod graph;
 pub mod graph_layout;
+pub mod history;
 pub mod jj;
 pub mod model;
 pub mod mutations;
+pub mod partial;
+pub mod push;
 pub mod repo;
 pub mod repository;
+pub mod resolve;
 pub mod session;
 pub mod source_browse;
 pub mod syntax;
@@ -28,11 +32,14 @@ pub use mutations::{
     Destination, DraftKind, DraftSimulation, DraftSource, MergePreview, MutationOp,
     MutationOutcome, OpDraft, PlacementKind, RebasePreview, RebaseSourceMode, SquashTarget,
 };
+pub use partial::{DiffSelection, FileSelection, HunkPick, HunkRef};
+pub use push::{PushAllow, PushCheck, PushRejection, PushRequest, PushTarget, RejectedCommit};
 pub use repo::{
     Capabilities, Command, Event, JobId, OpenSpec, Payload, PreviewRequest, RepoError, RepoHandle,
     RepoId, canonical_selection, rewritten_targets,
 };
 pub use repository::{FetchTarget, Repository, RepositorySnapshot, Vcs, prepare_repository};
+pub use resolve::{ConflictFile, ConflictResolution, ConflictTerm, MergeToolInvocation};
 pub use session::{
     ColdBatchFold, ColdCursor, Effect, LoadStatus, RefreshOrigin, Session, coalesce_refresh,
     fold_cold_batch,

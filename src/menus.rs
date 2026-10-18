@@ -82,20 +82,7 @@ impl Diffui {
             RevisionSelection::Commit(hex) => Some(hex.clone()),
         };
         if marked.len() > 1 && clicked_id.as_deref().is_some_and(|id| marked.contains(&id)) {
-            return vec![
-                self.menu_row(
-                    format!("Abandon {} revisions", marked.len()),
-                    "revision.abandon",
-                    CommandArg::Revisions(
-                        marked
-                            .iter()
-                            .map(|id| RevisionSelection::Commit((*id).to_owned()))
-                            .collect(),
-                    ),
-                ),
-                MenuEntry::Separator,
-                self.menu_item("selection.clear", CommandArg::None),
-            ];
+            return self.batch_menu_tree(crate::revops::marked_selections(self));
         }
 
         let on = || CommandArg::Revision(selection.clone());
@@ -104,6 +91,9 @@ impl Diffui {
             MenuEntry::Separator,
             self.menu_item("revision.new-child", on()),
             self.menu_item("revision.edit", on()),
+        ];
+        top.extend(self.revops_menu_rows(selection));
+        top.extend([
             MenuEntry::Separator,
             // History surgery, grouped: multi-variant ops fold into submenus;
             // the "…" leaves enter target mode (pick the destination on the
@@ -124,7 +114,10 @@ impl Diffui {
                 ],
             },
             self.menu_item("revision.merge.start", on()),
-            self.menu_item("revision.duplicate", on()),
+            self.menu_item("revision.parallelize.start", on()),
+        ]);
+        top.extend(self.revops_surgery_rows(selection));
+        top.extend([
             self.menu_item("revision.absorb", on()),
             self.menu_item("revision.abandon", on()),
             MenuEntry::Separator,
@@ -135,7 +128,17 @@ impl Diffui {
                     path: None,
                 },
             ),
-        ];
+            MenuEntry::Submenu {
+                label: "Compare".to_owned(),
+                items: vec![
+                    self.menu_item("compare.with", on()),
+                    self.menu_item("compare.with-working-copy", on()),
+                ],
+            },
+        ]);
+        if crate::history_panel::available(self) {
+            top.push(self.menu_item("history.evolog", on()));
+        }
 
         // Copy revision metadata — values come from the loaded graph row.
         let copy_fields = {
@@ -251,10 +254,10 @@ impl Diffui {
         // Same list, but landing the move also pushes the bookmark to its
         // tracked remote — "advance main and publish it" as one pick. Kept a
         // sibling submenu rather than a per-bookmark verb submenu so the
-        // common plain move stays one level deep. Bookmarks without a
-        // tracked remote are omitted (nowhere to push); the submenu hides
-        // entirely when none qualify instead of sitting disabled in every
-        // menu of a remote-less repo. Conflicted bookmarks are omitted too:
+        // common plain move stays one level deep. A bookmark no remote tracks
+        // yet goes to the default push remote, which creates it there; the
+        // submenu hides entirely when none qualify instead of sitting disabled
+        // in every menu of a remote-less repo. Conflicted bookmarks are omitted too:
         // the move is a conflict *resolution* — publishing it in the same
         // gesture, typically right after a force-push surprise, deserves a
         // deliberate separate push once the resolved state looks right.
@@ -262,31 +265,29 @@ impl Diffui {
             .iter()
             .filter(|(_, _, conflicted)| !conflicted)
             .filter_map(|(name, _target, _)| {
-                let entry = self
-                    .active()
-                    .session
-                    .bookmarks
-                    .bookmarks
-                    .iter()
-                    .find(|b| b.name == *name)?;
-                let remote = entry.tracked_remote()?;
+                let (remote, new) = self.move_push_remote(name)?;
                 // The remote rides in the detail column rather than an arrow
                 // glyph in the label: `\u{2192}` renders as a fallback-font
                 // blob in plenty of UI fonts.
                 Some(menu::MenuEntry::Item {
                     label: name.clone(),
-                    detail: Some(remote.to_owned()),
+                    detail: Some(if new {
+                        format!("{remote} (new)")
+                    } else {
+                        remote.clone()
+                    }),
                     emphasized: false,
                     command: "bookmark.move",
                     arg: CommandArg::Bookmark {
                         name: name.clone(),
-                        remote: Some(remote.to_owned()),
+                        remote: Some(remote),
                         to: Some(selection.clone()),
                     },
                 })
             })
             .collect();
         top.push(MenuEntry::Separator);
+        top.extend(self.revision_bookmark_rows(selection));
         top.push(if move_items.is_empty() {
             MenuEntry::Disabled {
                 label: "Move bookmark here".to_owned(),
@@ -334,25 +335,8 @@ impl Diffui {
                                 to: Some(RevisionSelection::Commit(hex.to_owned())),
                             },
                         ));
-                    } else if let Some(remote) = entry.tracked_remote() {
-                        sub.push(self.menu_row(
-                            format!("Push to {remote}"),
-                            "bookmark.push",
-                            CommandArg::Bookmark {
-                                name: entry.name.clone(),
-                                remote: Some(remote.to_owned()),
-                                to: None,
-                            },
-                        ));
                     }
-                    sub.push(self.menu_item(
-                        "bookmark.delete",
-                        CommandArg::Bookmark {
-                            name: entry.name.clone(),
-                            remote: None,
-                            to: None,
-                        },
-                    ));
+                    sub.extend(self.local_bookmark_rows(entry));
                     let label = if entry.is_conflicted() {
                         format!("{}??", entry.name)
                     } else {
@@ -361,17 +345,15 @@ impl Diffui {
                     bookmark_items.push(MenuEntry::Submenu { label, items: sub });
                 }
                 for remote_ref in &entry.remotes {
-                    if remote_ref.target.as_str() == hex && !remote_ref.tracked {
+                    // Untracked remote bookmarks can be tracked; a tracked
+                    // one whose local bookmark was deleted can have that
+                    // deletion pushed. A tracked one with a live local
+                    // bookmark is handled through the local bookmark.
+                    let actionable = !remote_ref.tracked || entry.local_targets.is_empty();
+                    if remote_ref.target.as_str() == hex && actionable {
                         bookmark_items.push(MenuEntry::Submenu {
                             label: format!("{}@{}", entry.name, remote_ref.remote),
-                            items: vec![self.menu_item(
-                                "bookmark.track",
-                                CommandArg::Bookmark {
-                                    name: entry.name.clone(),
-                                    remote: Some(remote_ref.remote.clone()),
-                                    to: None,
-                                },
-                            )],
+                            items: self.remote_bookmark_rows(entry, remote_ref),
                         });
                     }
                 }
@@ -491,7 +473,37 @@ impl Diffui {
             MutationOp::DeleteBookmark { name } => format!("Delete bookmark {name}"),
             MutationOp::TrackBookmark { name, remote } => format!("Track {name}@{remote}"),
             MutationOp::PushBookmark { name, remote } => format!("Push {name} to {remote}"),
-            MutationOp::Undo { .. } => "Undo".to_owned(),
+            MutationOp::Undo { operation_id: None } => "Undo".to_owned(),
+            MutationOp::Undo {
+                operation_id: Some(_),
+            } => "Revert operation".to_owned(),
+            MutationOp::Redo => "Redo".to_owned(),
+            MutationOp::CreateBookmark { name, .. } => format!("Create bookmark {name}"),
+            MutationOp::RenameBookmark { old, new } => format!("Rename {old} to {new}"),
+            MutationOp::ForgetBookmark { name } => format!("Forget bookmark {name}"),
+            MutationOp::UntrackBookmark { name, remote } => format!("Untrack {name}@{remote}"),
+            MutationOp::Push(request) => crate::bookmarks::push_label(request),
+            MutationOp::Commit { .. } => "Commit".to_owned(),
+            MutationOp::NewAt { .. } => "New change".to_owned(),
+            MutationOp::Parallelize { targets } => {
+                format!("Parallelize {} revisions", targets.len())
+            }
+            MutationOp::DuplicateTo { targets, .. } => match targets.len() {
+                1 => "Duplicate".to_owned(),
+                n => format!("Duplicate {n} revisions"),
+            },
+            MutationOp::KeepDivergent { .. } => "Resolve divergent change".to_owned(),
+            MutationOp::Metaedit { .. } => "Update author".to_owned(),
+            MutationOp::Split { selection, .. } => format!("Split off {}", selection.summary()),
+            MutationOp::SquashChanges { selection, .. } => {
+                format!("Move {}", selection.summary())
+            }
+            MutationOp::RestoreChanges { selection, .. } => {
+                format!("Discard {}", selection.summary())
+            }
+            MutationOp::ResolveConflict { path, .. } => format!("Resolve {path}"),
+            MutationOp::RestoreOperation { .. } => "Restore operation".to_owned(),
+            MutationOp::RevertOperation { .. } => "Revert operation".to_owned(),
         };
         // Only pushes report real progress (git transfer); the rest are quick
         // local ops, so they stay indeterminate.
@@ -502,10 +514,11 @@ impl Diffui {
                     push_remote: Some(_),
                     ..
                 }
+                | MutationOp::Push(_)
         );
         // A batch abandon consumes the marked rows — the marks (and their
         // wash) mustn't outlive the pick.
-        if matches!(&op, MutationOp::Abandon { targets } if targets.len() > 1) {
+        if crate::revops::consumes_marks(self, &op) {
             self.active_mut().revision_multi_selection.clear();
         }
         let (activity_id, _) = self.begin_activity(tab_id, label, determinate);
@@ -535,7 +548,58 @@ impl Diffui {
                 diffui_core::Command::BookmarkCheck { job, name, to },
             );
         }
-        self.run_mutation(pending)
+        self.run_mutation_checking_wc_push(pending)
+    }
+
+    /// Raise a confirmation for `op` and run it on accept. Only abandon asks
+    /// today (reached from a single key or the palette); anything else runs
+    /// straight away. The activity row is opened now and sits queued, so a
+    /// cancel resolves it the same way the other confirmations do.
+    pub(crate) fn confirm_mutation_op(&mut self, op: mutations::MutationOp) -> Task<Message> {
+        use mutations::MutationOp;
+        let MutationOp::Abandon { targets } = &op else {
+            return self.start_mutation_op(op);
+        };
+        let Some(tab_id) = self.active_tab_id() else {
+            return Task::none();
+        };
+        if !self.active().session.capabilities.mutate || targets.is_empty() {
+            return Task::none();
+        }
+        let (title, label, body) = match targets.as_slice() {
+            [target] => {
+                let name = self.revision_short_label(target);
+                (
+                    format!("Abandon {name}?"),
+                    "Abandon".to_owned(),
+                    "Its changes are dropped and any descendants are rebased onto its \
+                     parent. jj's operation log keeps it, so Undo brings it back.",
+                )
+            }
+            _ => (
+                format!("Abandon {} revisions?", targets.len()),
+                format!("Abandon {} revisions", targets.len()),
+                "Their changes are dropped and any descendants are rebased onto their \
+                 parents. jj's operation log keeps them, so Undo brings them back.",
+            ),
+        };
+        let body = body.to_owned();
+        let (activity_id, _) = self.begin_activity(tab_id, label, false);
+        if let Some(log) = self.activity_log_for(tab_id) {
+            log.set_status(activity_id, activity::ActivityStatus::Queued);
+        }
+        self.push_mode(Mode::Confirm(ConfirmDialog {
+            title,
+            body,
+            confirm_label: "Abandon".to_owned(),
+            pending: PendingMutation {
+                op,
+                tab_id,
+                activity_id,
+                allow_immutable: false,
+            },
+        }));
+        Task::none()
     }
 
     /// Context-menu tree for a file-tree row (`display_index` into the
@@ -580,6 +644,7 @@ impl Diffui {
                     None => (None, false),
                 }
             }
+            MainView::History => (None, false),
         };
         let Some(path) = path else {
             return Vec::new();
@@ -600,6 +665,27 @@ impl Diffui {
             ));
             items.push(MenuEntry::Separator);
         }
+        if is_file
+            && self.active().main_view == MainView::Diff
+            && crate::changes::command_file(self, &CommandArg::Path(path.clone())).is_some()
+        {
+            items.extend(self.file_change_menu_items(&path));
+            items.push(MenuEntry::Separator);
+        }
+        if is_file && crate::history_panel::available(self) {
+            let revision = match self.active().main_view {
+                MainView::Source => crate::source_panel::browsed_revision(&self.active().source),
+                _ => self.active().session.selected_revision.clone(),
+            };
+            items.push(self.menu_item(
+                "file.history",
+                CommandArg::Browse {
+                    revision,
+                    path: Some(path.clone()),
+                },
+            ));
+            items.push(MenuEntry::Separator);
+        }
         items.push(self.menu_row(
             "Copy path",
             "file.copy-path",
@@ -608,6 +694,40 @@ impl Diffui {
         if self.active().repository.is_some() {
             items.push(self.menu_item("file.copy-absolute-path", CommandArg::Path(path)));
         }
+        items
+    }
+
+    /// The diff-view file menu's partial-change rows: resolve actions for a
+    /// conflicted file, then restore / move / split / select.
+    fn file_change_menu_items(&self, path: &str) -> Vec<menu::MenuEntry> {
+        let arg = || CommandArg::Path(path.to_owned());
+        let mut items = Vec::new();
+        if let Some(conflict) = crate::conflicts::conflict_at(self, path) {
+            if conflict.pickable {
+                for (index, id) in [(0, "conflict.take-side-1"), (1, "conflict.take-side-2")] {
+                    if let Some(side) = conflict.sides.get(index) {
+                        items.push(self.menu_row(
+                            format!("Resolve: take side {} ({})", index + 1, side.label),
+                            id,
+                            arg(),
+                        ));
+                    }
+                }
+                if !conflict.bases.is_empty() {
+                    items.push(self.menu_item("conflict.take-base", arg()));
+                }
+            }
+            if conflict.merge_tool_blocker.is_none() {
+                items.push(self.menu_item("conflict.merge-tool", arg()));
+            }
+            items.push(menu::MenuEntry::Separator);
+        }
+        items.extend([
+            self.menu_item("file.restore", arg()),
+            self.menu_item("file.move-into", arg()),
+            self.menu_item("file.split", arg()),
+            self.menu_item("changes.toggle-file", arg()),
+        ]);
         items
     }
 

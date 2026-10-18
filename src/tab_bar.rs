@@ -236,6 +236,15 @@ fn tab_widget<'a>(
     let label = row![badge, repo_label]
         .spacing(6)
         .align_y(alignment::Vertical::Center);
+    // The dot gives way to the `×` under the cursor, so it can't carry its
+    // own tooltip; the label says what the tab is and what the dot means.
+    let label = crate::ui::tooltip(
+        label,
+        tab_tooltip(tab),
+        iced::widget::tooltip::Position::Bottom,
+        ui.config.ui_font,
+        theme,
+    );
 
     let id = tab.id;
     let hovered = ui.hovered == Some(HoverTarget::Tab(id));
@@ -979,21 +988,37 @@ fn badge_chip(label: &'static str, color: Color, mono: iced::Font) -> Element<'s
         .into()
 }
 
-/// Small filled dot signalling the repo has uncommitted changes.
+/// Small ring signalling the working copy (`@`) has changes. A ring in the
+/// "modified" colour rather than a filled accent dot: in an editor a filled
+/// dot means unsaved work, and jj has none — it snapshots `@` on its own.
 fn dirty_dot(theme: ThemeSpec) -> Element<'static, Message> {
     container(Space::new())
-        .width(Length::Fixed(6.0))
-        .height(Length::Fixed(6.0))
+        .width(Length::Fixed(7.0))
+        .height(Length::Fixed(7.0))
         .style(move |_| container::Style {
-            background: Some(Background::Color(theme.accent)),
+            background: None,
             border: Border {
-                width: 0.0,
-                color: Color::TRANSPARENT,
-                radius: 3.0.into(),
+                width: 1.5,
+                color: theme.modified_token,
+                radius: 3.5.into(),
             },
             ..container::Style::default()
         })
         .into()
+}
+
+/// The tab's hover label: where it points, and what the ring means when it
+/// shows.
+fn tab_tooltip(tab: &crate::Tab) -> String {
+    let place = match &tab.source {
+        crate::TabSource::Repo { root, .. } => crate::contract_user_path(&root.to_string_lossy()),
+        crate::TabSource::GitHubPr(_) => format!("{}/{}", tab.owner, tab.name),
+    };
+    if tab_is_dirty(tab) {
+        format!("{place}\nWorking copy (@) has changes")
+    } else {
+        place
+    }
 }
 
 /// `+` button — opens the path dialog to add another repository. A square

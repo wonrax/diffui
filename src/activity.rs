@@ -105,7 +105,7 @@ pub struct Activity {
     /// `detail`; rebuilt from `detail` by [`Activity::sync_detail_editor`].
     pub detail_editor: Option<text_editor::Content>,
     /// The jj operation a finished mutation committed — arms the row's
-    /// one-click "Undo" (reverts exactly this op, not just the latest).
+    /// one-click "Revert" (reverts exactly this op, not just the latest).
     /// Cleared when fired, so it can't double-revert.
     pub undo_op: Option<String>,
 }
@@ -269,7 +269,7 @@ impl ActivityLog {
         }
     }
 
-    /// Arm a finished mutation row's per-op "Undo" with the operation it
+    /// Arm a finished mutation row's per-op "Revert" with the operation it
     /// committed.
     pub fn set_undo_op(&mut self, id: ActivityId, operation_id: String) {
         if let Some(activity) = self.get_mut(id) {
@@ -277,7 +277,7 @@ impl ActivityLog {
         }
     }
 
-    /// Disarm the per-op "Undo" (fired, or no longer safe to offer).
+    /// Disarm the per-op "Revert" (fired, or no longer safe to offer).
     pub fn clear_undo_op(&mut self, id: ActivityId) {
         if let Some(activity) = self.get_mut(id) {
             activity.undo_op = None;
@@ -744,13 +744,15 @@ fn activity_row<'a>(
             );
         }
     } else if let Some(duration) = activity.duration {
-        // A finished mutation offers a one-click revert of exactly its op.
+        // A finished mutation offers a one-click revert of exactly its op
+        // (`jj op revert`). Labelled apart from the toolbar's Undo, which
+        // steps back through the op log instead.
         if matches!(activity.status, ActivityStatus::Done)
             && let Some(operation_id) = activity.undo_op.clone()
         {
             head = head.push(
                 button(
-                    text("Undo")
+                    text("Revert")
                         .size(text_size::CAPTION)
                         .font(ui.config.ui_font)
                         .color(theme.accent),
