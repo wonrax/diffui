@@ -97,9 +97,9 @@ impl WindowState {
         match toml::from_str(&raw) {
             Ok(state) => state,
             Err(error) => {
-                eprintln!(
-                    "diffui: ignoring unreadable window state at {}: {error}",
-                    path.display()
+                tracing::warn!(
+                    path = %path.display(),
+                    "ignoring unreadable window state: {error}"
                 );
                 Self::default()
             }

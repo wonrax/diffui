@@ -189,8 +189,8 @@ fn resolve_font(name: &str, fallback: Font) -> Font {
     match installed_family(name) {
         Some(canonical) => font_from_name(&canonical),
         None => {
-            eprintln!(
-                "diffui: configured font family {name:?} is not installed; \
+            tracing::warn!(
+                "configured font family {name:?} is not installed; \
                  falling back to the system default"
             );
             fallback

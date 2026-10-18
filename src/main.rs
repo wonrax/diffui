@@ -20,6 +20,7 @@ mod graph_view;
 mod icons;
 mod input;
 mod keymap;
+mod logging;
 #[cfg(target_os = "macos")]
 mod macos_native;
 mod measure;
@@ -186,6 +187,7 @@ pub(crate) fn zoom_default_restore(visible: [f64; 4]) -> [f64; 4] {
 
 fn main() -> iced::Result {
     let cli = Cli::parse();
+    logging::init();
 
     // Positional paths are reserved for a future file-diff mode
     // (`diffui SIDE_1 SIDE_2`) and aren't implemented yet. Reject them up front

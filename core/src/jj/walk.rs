@@ -90,11 +90,11 @@ pub(super) fn revset_aliases_map(settings: &UserSettings) -> Result<RevsetAliase
         };
         for (decl, item) in table.iter() {
             let Some(defn) = item.as_str() else {
-                eprintln!("diffui: ignoring revset-alias `{decl}`: expected a string value");
+                tracing::warn!("ignoring revset-alias `{decl}`: expected a string value");
                 continue;
             };
             if let Err(err) = map.insert(decl, defn, None) {
-                eprintln!("diffui: ignoring invalid revset-alias `{decl}`: {err}");
+                tracing::warn!("ignoring invalid revset-alias `{decl}`: {err}");
             }
         }
     }
@@ -326,7 +326,7 @@ pub async fn walk_jj_with_repo(
                     .context("failed to evaluate immutable()")
             });
     if let Err(error) = &immutable_revset {
-        eprintln!("diffui: immutable() unavailable for log flags: {error:#}");
+        tracing::warn!("immutable() unavailable for log flags: {error:#}");
     }
     let is_immutable_fn = immutable_revset.as_ref().ok().map(|rs| rs.containing_fn());
 
@@ -644,7 +644,7 @@ pub(super) async fn compute_branch_status(
     match branch_status_inner(repo, wc_commit_id).await {
         Ok(status) => status,
         Err(error) => {
-            eprintln!("diffui: failed to compute branch status: {error:#}");
+            tracing::warn!("failed to compute branch status: {error:#}");
             None
         }
     }

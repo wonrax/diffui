@@ -18,8 +18,8 @@ impl Diffui {
         // A keymap problem is never fatal: a config written against another
         // build still opens the app, having said once what it had to skip.
         let (keymap, problems) = Keymap::build(&raw_keys);
-        for problem in problems {
-            eprintln!("diffui: {problem}");
+        for problem in &problems {
+            tracing::warn!("config: {problem}");
         }
         let sidebar_min_width = sidebar::min_width(config);
         // Restore the persisted sidebar split and window geometry. The window
@@ -1104,6 +1104,10 @@ impl Diffui {
             },
             Action::OpenUrl(url) => {
                 open_url(&url);
+                Task::none()
+            }
+            Action::RevealLogFile => {
+                crate::logging::reveal_log_file();
                 Task::none()
             }
         }

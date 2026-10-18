@@ -158,4 +158,8 @@ pub(crate) enum Action {
 
     /// Open a URL (from an activity's captured remote output) in the browser.
     OpenUrl(String),
+
+    // ── Diagnostics ─────────────────────────────────────────────────────
+    /// Show diffui's log file in the file manager.
+    RevealLogFile,
 }

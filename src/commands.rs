@@ -1310,6 +1310,22 @@ pub(crate) static REGISTRY: &[Command] = &[
     tab_select!(7, "tab.select-7", "Go to tab 7", "cmd+7", 6),
     tab_select!(8, "tab.select-8", "Go to tab 8", "cmd+8", 7),
     tab_select!(9, "tab.select-9", "Go to tab 9", "cmd+9", 8),
+    // ── Diagnostics ─────────────────────────────────────────────────────
+    Command {
+        id: "app.reveal-log",
+        label: if cfg!(target_os = "macos") {
+            "Reveal log file in Finder"
+        } else {
+            "Reveal log file"
+        },
+        hint: "Show diffui's log, for bug reports and crash details",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::RevealLogFile),
+        palette: PaletteScope::Root,
+    },
 ];
 
 #[cfg(test)]
