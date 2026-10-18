@@ -449,6 +449,12 @@ fn a_mutation_on_a_stale_workspace_recovers() {
         })
         .expect("the mutation recovers the stale checkout and then applies");
     assert!(outcome.operation_id.is_some());
+    assert!(
+        main.parked()
+            .iter()
+            .any(|event| matches!(event.payload, Payload::StaleWorkingCopyRecovered)),
+        "the silent checkout is reported, so the user can be told"
+    );
     assert_eq!(
         std::fs::read_to_string(root.join("side.txt")).ok(),
         Some("side-work\nside-more\n".to_owned()),

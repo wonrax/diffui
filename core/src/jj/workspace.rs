@@ -280,6 +280,10 @@ pub(crate) async fn lock_working_copy<'a>(
                 .finish(merged_repo.op_id().clone())
                 .await
                 .context("failed to finish jj working-copy recovery")?;
+            tracing::info!(
+                operation = %merged_repo.op_id().hex(),
+                "working copy was stale (changed by another process); updated it to the latest operation"
+            );
 
             return Ok(LockOutcome::Recovered {
                 repo: merged_repo,
@@ -447,6 +451,9 @@ pub(crate) struct SnapshotOutcome {
     /// diff and walk against it without reading the commit index again.
     pub(crate) repo: Arc<ReadonlyRepo>,
     pub(crate) warnings: Vec<String>,
+    /// The checkout was stale and got updated instead of snapshotted — worth
+    /// telling the user, since files changed on disk under them.
+    pub(crate) recovered_stale: bool,
 }
 
 /// Fold the on-disk tree into `@` and finish the lock.
@@ -486,6 +493,7 @@ pub(crate) async fn snapshot_working_copy(
                     snapshot,
                     repo,
                     warnings: Vec::new(),
+                    recovered_stale: true,
                 });
             }
         };
@@ -526,6 +534,7 @@ async fn absorb_snapshot(
             },
             repo,
             warnings,
+            recovered_stale: false,
         });
     }
 
@@ -588,6 +597,7 @@ async fn absorb_snapshot(
         },
         repo: new_repo,
         warnings,
+        recovered_stale: false,
     })
 }
 

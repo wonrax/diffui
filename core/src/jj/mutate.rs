@@ -81,6 +81,9 @@ pub(crate) async fn check_bookmark_move_backwards(
 /// out the resulting `@` so the files on disk match it. Skipping the checkout
 /// would leave the old files in place, and the next snapshot would record them
 /// into the moved-to commit.
+///
+/// The flag beside the outcome says the checkout was stale and had to be
+/// recovered first, which the caller tells the user about.
 pub(crate) async fn apply_mutation(
     workspace: &mut Workspace,
     settings: &UserSettings,
@@ -89,15 +92,18 @@ pub(crate) async fn apply_mutation(
     op: &MutationOp,
     progress: &LoadProgress,
     allow_immutable: bool,
-) -> Result<MutationOutcome> {
+) -> Result<(MutationOutcome, bool)> {
     if is_view_only(op) {
-        return apply_view_only(workspace, settings, op, progress).await;
+        return Ok((
+            apply_view_only(workspace, settings, op, progress).await?,
+            false,
+        ));
     }
     // Recovering a stale checkout finishes the lock session the mutation needs,
     // so the attempt reports back without mutating and the retry runs against
     // the recovered `@`. A second stale report means something outside is still
     // rewriting this workspace's `@`; refuse rather than keep taking the lock.
-    for _ in 0..2 {
+    for attempt in 0..2 {
         if let Some(outcome) = apply_mutation_attempt(
             workspace,
             settings,
@@ -109,7 +115,7 @@ pub(crate) async fn apply_mutation(
         )
         .await?
         {
-            return Ok(outcome);
+            return Ok((outcome, attempt > 0));
         }
     }
     bail!("jj working copy kept going stale while applying the mutation")

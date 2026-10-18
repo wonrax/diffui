@@ -349,6 +349,12 @@ pub enum Payload {
     /// Git refs, worktree HEADs, or working-copy status may have changed.
     /// Git's synthetic working-copy row requires a graph refresh too.
     RepositoryChanged,
+    /// The jj checkout was stale — another process (a CLI command, another
+    /// workspace's snapshot) rewrote `@` — so the actor updated the files on
+    /// disk to the latest operation instead of snapshotting over it, like
+    /// `jj workspace update-stale`. Edits on disk were snapshotted first.
+    /// Unsolicited: it rides alongside the snapshot or mutation that hit it.
+    StaleWorkingCopyRecovered,
     Failed {
         job: JobId,
         error: RepoError,
@@ -380,7 +386,8 @@ impl Payload {
             Self::Ready { .. }
             | Self::OpHeadChanged { .. }
             | Self::WorkingCopyChanged
-            | Self::RepositoryChanged => None,
+            | Self::RepositoryChanged
+            | Self::StaleWorkingCopyRecovered => None,
         }
     }
 
@@ -396,6 +403,7 @@ impl Payload {
                 | Self::OpHeadChanged { .. }
                 | Self::WorkingCopyChanged
                 | Self::RepositoryChanged
+                | Self::StaleWorkingCopyRecovered
         )
     }
 }

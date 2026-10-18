@@ -501,6 +501,18 @@ impl Session {
                 Vec::new()
             }
             Payload::WorkingCopyChanged => self.snapshot(RefreshOrigin::Watcher),
+            Payload::StaleWorkingCopyRecovered => {
+                const NOTICE: &str = "Working copy was stale (changed by another process); \
+                                      updated to the latest operation";
+                vec![
+                    Effect::Activity(Activity::Toast {
+                        repo,
+                        title: "Working copy updated".to_owned(),
+                        body: NOTICE.to_owned(),
+                    }),
+                    Effect::Activity(Activity::Note(NOTICE.to_owned())),
+                ]
+            }
             Payload::RepositoryChanged => self.snapshot(RefreshOrigin::Focus),
             Payload::OpHeadChanged { fingerprint } => self.on_op_head(&fingerprint),
             Payload::Failed { job, error } => self.on_failed(repo, job, error),

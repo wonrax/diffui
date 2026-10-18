@@ -335,6 +335,9 @@ impl Actor {
                     jj::snapshot_working_copy(workspace, snapshot).await?
                 };
                 self.adopt(outcome.repo.clone());
+                if outcome.recovered_stale {
+                    self.emit(Payload::StaleWorkingCopyRecovered);
+                }
                 self.emit(Payload::SnapshotDone {
                     job,
                     origin,
@@ -557,7 +560,7 @@ impl Actor {
         self.reload_settings_if_changed(repository);
         let progress = LoadProgress::default();
         let slot = self.slot(repository)?;
-        let outcome = {
+        let (outcome, recovered_stale) = {
             let WorkspaceSlot {
                 workspace,
                 settings,
@@ -576,6 +579,9 @@ impl Actor {
             .await?
         };
         self.adopt_written_op(repository).await;
+        if recovered_stale {
+            self.emit(Payload::StaleWorkingCopyRecovered);
+        }
         self.emit(Payload::MutationDone { job, outcome });
         Ok(())
     }
