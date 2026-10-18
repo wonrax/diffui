@@ -492,6 +492,14 @@ impl Diffui {
             MutationOp::TrackBookmark { name, remote } => format!("Track {name}@{remote}"),
             MutationOp::PushBookmark { name, remote } => format!("Push {name} to {remote}"),
             MutationOp::Undo { .. } => "Undo".to_owned(),
+            MutationOp::Split { selection, .. } => format!("Split off {}", selection.summary()),
+            MutationOp::SquashChanges { selection, .. } => {
+                format!("Move {}", selection.summary())
+            }
+            MutationOp::RestoreChanges { selection, .. } => {
+                format!("Discard {}", selection.summary())
+            }
+            MutationOp::ResolveConflict { path, .. } => format!("Resolve {path}"),
         };
         // Only pushes report real progress (git transfer); the rest are quick
         // local ops, so they stay indeterminate.

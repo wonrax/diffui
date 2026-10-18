@@ -15,6 +15,7 @@ use crate::mutations::{
     Destination, DraftSimulation, MutationOp, MutationOutcome, RebaseSourceMode,
 };
 use crate::repository::{FetchTarget, RepositorySnapshot};
+use crate::resolve::{ConflictFile, MergeToolInvocation};
 use crate::session::RefreshOrigin;
 use crate::source_browse::{SourceEntry, SourceFileLoad};
 
@@ -189,6 +190,20 @@ pub enum Command {
         name: String,
         to: RevisionSelection,
     },
+    /// The conflicted paths of `revision`, with jj's labels for their sides
+    /// — what the resolve actions are offered from.
+    ConflictInfo {
+        job: JobId,
+        revision: RevisionSelection,
+    },
+    /// Write the merge tool's input files for `path` at `revision` and build
+    /// its command line. Read-only; the frontend runs the tool and applies
+    /// the result as a [`MutationOp::ResolveConflict`].
+    PrepareMergeTool {
+        job: JobId,
+        revision: RevisionSelection,
+        path: String,
+    },
     /// Ask the actor to stop `job`. A cancelled job reports
     /// [`Payload::Cancelled`] and never its success event, so the caller's
     /// inflight slot is always cleared by exactly one terminal event.
@@ -213,7 +228,9 @@ impl Command {
             | Self::ListTree { job, .. }
             | Self::ReadFile { job, .. }
             | Self::FilePair { job, .. }
-            | Self::BookmarkCheck { job, .. } => Some(*job),
+            | Self::BookmarkCheck { job, .. }
+            | Self::ConflictInfo { job, .. }
+            | Self::PrepareMergeTool { job, .. } => Some(*job),
             Self::Cancel { .. } => None,
         }
     }
@@ -345,6 +362,15 @@ pub enum Payload {
     /// Git refs, worktree HEADs, or working-copy status may have changed.
     /// Git's synthetic working-copy row requires a graph refresh too.
     RepositoryChanged,
+    ConflictInfoLoaded {
+        job: JobId,
+        revision: RevisionSelection,
+        files: Vec<ConflictFile>,
+    },
+    MergeToolPrepared {
+        job: JobId,
+        invocation: MergeToolInvocation,
+    },
     Failed {
         job: JobId,
         error: RepoError,
@@ -371,6 +397,8 @@ impl Payload {
             | Self::FilePairRead { job, .. }
             | Self::BookmarkChecked { job, .. }
             | Self::Progress { job, .. }
+            | Self::ConflictInfoLoaded { job, .. }
+            | Self::MergeToolPrepared { job, .. }
             | Self::Failed { job, .. }
             | Self::Cancelled { job, .. } => Some(*job),
             Self::Ready { .. }

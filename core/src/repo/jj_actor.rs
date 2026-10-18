@@ -415,6 +415,39 @@ impl Actor {
                 self.emit(Payload::BookmarkChecked { job, backwards });
                 Ok(())
             }
+            Command::ConflictInfo { job, revision } => {
+                let repo = self.repo_at_head(repository).await?;
+                let name = self.slot(repository)?.name.clone();
+                let commit_id = jj::resolve_revision(repo.as_ref(), &name, &revision).await?;
+                let commit = repo
+                    .store()
+                    .get_commit_async(&commit_id)
+                    .await
+                    .with_context(|| format!("failed to load jj commit {}", commit_id.hex()))?;
+                let files = jj::conflict_files(&commit).await?;
+                self.emit(Payload::ConflictInfoLoaded {
+                    job,
+                    revision,
+                    files,
+                });
+                Ok(())
+            }
+            Command::PrepareMergeTool {
+                job,
+                revision,
+                path,
+            } => {
+                let repo = self.repo_at_head(repository).await?;
+                let (settings, name) = {
+                    let slot = self.slot(repository)?;
+                    (slot.settings.clone(), slot.name.clone())
+                };
+                let invocation =
+                    jj::prepare_merge_tool(repo.as_ref(), &settings, &name, &revision, &path)
+                        .await?;
+                self.emit(Payload::MergeToolPrepared { job, invocation });
+                Ok(())
+            }
             Command::Cancel { .. } => Ok(()),
         }
     }
@@ -581,6 +614,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::ReadFile { .. } => "read_file",
         Command::FilePair { .. } => "file_pair",
         Command::BookmarkCheck { .. } => "bookmark_check",
+        Command::ConflictInfo { .. } => "conflict_info",
+        Command::PrepareMergeTool { .. } => "prepare_merge_tool",
         Command::Cancel { .. } => "cancel",
     }
 }
@@ -668,6 +703,15 @@ pub fn rewritten_targets(
             }
         }
         MutationOp::Absorb { from } => push(from),
+        MutationOp::Split { target, .. }
+        | MutationOp::RestoreChanges { target, .. }
+        | MutationOp::ResolveConflict { target, .. } => push(target),
+        MutationOp::SquashChanges { from, into, .. } => {
+            push(from);
+            if let SquashTarget::Revision(target) = into {
+                push(target);
+            }
+        }
         // New/Merge/Duplicate only create commits; bookmark and undo ops
         // rewrite nothing the caller named.
         MutationOp::New { .. }

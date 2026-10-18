@@ -746,6 +746,187 @@ async fn mutate_locked(
                 .context("failed to merge the undo into the current view")?;
             format!("Undid: {description}")
         }
+        MutationOp::Split {
+            target,
+            selection,
+            first_description,
+            second_description,
+        } => {
+            let commit = resolve_mutation_target(tx.repo(), &current_wc_id, target).await?;
+            ensure_rewritable(
+                &repository.root,
+                settings,
+                &workspace_name,
+                tx.repo(),
+                &[commit.id().clone()],
+                allow_immutable,
+            )
+            .await?;
+            let (first, second) = super::partial::split(
+                tx.repo_mut(),
+                &commit,
+                selection,
+                first_description.as_deref(),
+                second_description,
+            )
+            .await?;
+            if matches!(target, RevisionSelection::Commit(_)) {
+                rewritten_commit = Some(first.id().hex());
+            }
+            format!(
+                "Split {}: the rest of it is now {}",
+                short_change_id(&first),
+                short_change_id(&second)
+            )
+        }
+        MutationOp::SquashChanges {
+            from,
+            selection,
+            into,
+        } => {
+            let source = resolve_mutation_target(tx.repo(), &current_wc_id, from).await?;
+            let destination = match into {
+                SquashTarget::Parent => {
+                    let parents = source
+                        .parents()
+                        .await
+                        .context("failed to load squash source parents")?;
+                    match parents.as_slice() {
+                        [parent] => parent.clone(),
+                        [] => bail!("{} has no parent to squash into", short_change_id(&source)),
+                        _ => bail!(
+                            "{} is a merge — pick an explicit squash destination",
+                            short_change_id(&source)
+                        ),
+                    }
+                }
+                SquashTarget::Revision(target) => {
+                    resolve_mutation_target(tx.repo(), &current_wc_id, target).await?
+                }
+            };
+            if source.id() == destination.id() {
+                bail!("can't move changes into the revision they come from");
+            }
+            ensure_rewritable(
+                &repository.root,
+                settings,
+                &workspace_name,
+                tx.repo(),
+                &[source.id().clone(), destination.id().clone()],
+                allow_immutable,
+            )
+            .await?;
+            let squashed =
+                super::partial::squash_selection(tx.repo_mut(), &source, &destination, selection)
+                    .await?;
+            tx.repo_mut()
+                .rebase_descendants()
+                .await
+                .context("failed to rebase descendants after the squash")?;
+            // Keep showing the source (the diff the selection was made in)
+            // unless it is gone, in which case follow the changes.
+            if squashed.abandoned_source {
+                rewritten_commit = Some(squashed.destination.id().hex());
+            } else if matches!(from, RevisionSelection::Commit(_)) {
+                rewritten_commit = super::partial::visible_commit_of(tx.repo(), source.change_id())
+                    .await
+                    .map(|id| id.hex());
+            }
+            let mut message = format!(
+                "Moved {} from {} into {}",
+                selection.summary(),
+                short_change_id(&source),
+                short_change_id(&squashed.destination)
+            );
+            if squashed.abandoned_source {
+                message.push_str(" (source emptied, abandoned)");
+            }
+            message
+        }
+        MutationOp::RestoreChanges { target, selection } => {
+            let commit = resolve_mutation_target(tx.repo(), &current_wc_id, target).await?;
+            ensure_rewritable(
+                &repository.root,
+                settings,
+                &workspace_name,
+                tx.repo(),
+                &[commit.id().clone()],
+                allow_immutable,
+            )
+            .await?;
+            let restored =
+                super::partial::restore_selection(tx.repo_mut(), &commit, selection).await?;
+            if matches!(target, RevisionSelection::Commit(_)) {
+                rewritten_commit = Some(restored.id().hex());
+            }
+            format!(
+                "Discarded {} in {}",
+                selection.summary(),
+                short_change_id(&commit)
+            )
+        }
+        MutationOp::ResolveConflict {
+            target,
+            path,
+            resolution,
+        } => {
+            let commit = resolve_mutation_target(tx.repo(), &current_wc_id, target).await?;
+            ensure_rewritable(
+                &repository.root,
+                settings,
+                &workspace_name,
+                tx.repo(),
+                &[commit.id().clone()],
+                allow_immutable,
+            )
+            .await?;
+            // A merge tool may have been open for a while; refuse to resolve a
+            // commit that has been rewritten since (that would resurrect it as
+            // a divergent copy).
+            if let Some(targets) = tx
+                .repo()
+                .resolve_change_id(commit.change_id())
+                .await
+                .context("failed to look up the conflicted revision")?
+                && !targets.has_visible(commit.id())
+            {
+                bail!(
+                    "{} changed while it was being resolved — resolve it again",
+                    short_change_id(&commit)
+                );
+            }
+            let resolved =
+                super::resolve::resolve_conflict(tx.repo_mut(), &commit, path, resolution).await?;
+            if matches!(target, RevisionSelection::Commit(_)) {
+                rewritten_commit = Some(resolved.id().hex());
+            }
+            let how = match resolution {
+                crate::resolve::ConflictResolution::Side(index) => {
+                    format!("took side {}", index + 1)
+                }
+                crate::resolve::ConflictResolution::Base(index) => {
+                    format!("took base {}", index + 1)
+                }
+                crate::resolve::ConflictResolution::Content { .. } => "merged".to_owned(),
+            };
+            let path_conflicted = !resolved
+                .tree()
+                .path_value(&super::partial::repo_path(path)?)
+                .await
+                .context("failed to read the resolved path")?
+                .is_resolved();
+            let still = if path_conflicted {
+                " — still conflicted"
+            } else if resolved.tree().has_conflict() {
+                " (other conflicts remain)"
+            } else {
+                ""
+            };
+            format!(
+                "Resolved {path} in {}: {how}{still}",
+                short_change_id(&commit)
+            )
+        }
     };
 
     tx.repo_mut()

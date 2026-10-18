@@ -10,8 +10,10 @@
 pub(crate) mod browse;
 pub(crate) mod diff;
 pub(crate) mod mutate;
+pub(crate) mod partial;
 pub(crate) mod preview;
 pub(crate) mod remote;
+pub(crate) mod resolve;
 pub(crate) mod settings;
 pub(crate) mod walk;
 pub(crate) mod workspace;
@@ -29,6 +31,7 @@ pub(crate) use diff::{diff_jj_with_repo, jj_revision_details};
 pub(crate) use mutate::{ImmutableRewriteError, apply_mutation, check_bookmark_move_backwards};
 pub(crate) use preview::{preview_merge, preview_rebase};
 pub(crate) use remote::fetch_jj;
+pub(crate) use resolve::{conflict_files, prepare_merge_tool};
 pub(crate) use walk::{WorkspaceView, compute_jj_empty_status, walk_jj_with_repo};
 pub(crate) use workspace::{
     SnapshotContext, load_workspace, read_op_head_with, resolve_revision, snapshot_working_copy,

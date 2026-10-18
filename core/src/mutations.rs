@@ -6,6 +6,8 @@
 //! disk (and doesn't lose uncommitted work).
 
 use crate::model::RevisionSelection;
+use crate::partial::DiffSelection;
+use crate::resolve::ConflictResolution;
 
 /// Which commits a rebase moves, relative to the picked source revisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +129,40 @@ pub enum MutationOp {
     /// snapshot-before-mutate discipline (an undo that moves `@` must not
     /// clobber unsnapshotted on-disk edits).
     Undo { operation_id: Option<String> },
+    // ── Partial changes and conflict resolution ─────────────────────────
+    /// `jj split` with the changes picked in the diff pane: `selection` stays
+    /// in `target` (same change id, description replaced by
+    /// `first_description` when given), everything else moves into a new
+    /// child described `second_description`. `target`'s descendants follow
+    /// the new child, and a workspace whose `@` was `target` moves onto it.
+    Split {
+        target: RevisionSelection,
+        selection: DiffSelection,
+        first_description: Option<String>,
+        second_description: String,
+    },
+    /// `jj squash --from <from> --into <into> <selection>`: move only the
+    /// picked changes. Like the CLI, the source is abandoned (descriptions
+    /// combined) only when the selection takes all of it.
+    SquashChanges {
+        from: RevisionSelection,
+        selection: DiffSelection,
+        into: SquashTarget,
+    },
+    /// `jj restore --changes-in <target> <selection>`: discard the picked
+    /// changes, putting the parent's content back. Undoable through the op
+    /// log like everything else.
+    RestoreChanges {
+        target: RevisionSelection,
+        selection: DiffSelection,
+    },
+    /// `jj resolve <path>` on `target`, with a side, a base, or a merge
+    /// tool's output.
+    ResolveConflict {
+        target: RevisionSelection,
+        path: String,
+        resolution: ConflictResolution,
+    },
 }
 
 /// User-facing summary of a successful mutation — becomes the status message.
@@ -243,6 +279,10 @@ pub struct OpDraft {
     /// Keyboard candidate: index into the loaded commit store, or `None`
     /// until the user starts navigating (arrows / j / k).
     pub candidate: Option<usize>,
+    /// Squash drafts only: move just these changes of the (single) source
+    /// rather than all of it — "Move selected into…".
+    /// Boxed: drafts are held in a mode enum that shouldn't grow for this.
+    pub selection: Option<Box<DiffSelection>>,
 }
 
 impl OpDraft {
@@ -252,6 +292,7 @@ impl OpDraft {
             sources,
             placement: PlacementKind::default(),
             candidate: None,
+            selection: None,
         }
     }
 
@@ -261,6 +302,31 @@ impl OpDraft {
             sources: vec![source],
             placement: PlacementKind::default(),
             candidate: None,
+            selection: None,
+        }
+    }
+
+    /// A squash draft that moves only `selection` out of `source`.
+    pub fn squash_changes(source: DraftSource, selection: DiffSelection) -> Self {
+        Self {
+            selection: Some(Box::new(selection)),
+            ..Self::squash(source)
+        }
+    }
+
+    /// The squash-draft op for `target`: the whole sources, or just the
+    /// selection when there is one.
+    fn squash_op(&self, target: RevisionSelection) -> MutationOp {
+        match (&self.selection, self.sources.as_slice()) {
+            (Some(selection), [source, ..]) => MutationOp::SquashChanges {
+                from: source.selection.clone(),
+                selection: (**selection).clone(),
+                into: SquashTarget::Revision(target),
+            },
+            _ => MutationOp::Squash {
+                from: self.sources.iter().map(|s| s.selection.clone()).collect(),
+                into: SquashTarget::Revision(target),
+            },
         }
     }
 
@@ -270,6 +336,7 @@ impl OpDraft {
             sources: vec![source],
             placement: PlacementKind::default(),
             candidate: None,
+            selection: None,
         }
     }
 
@@ -299,7 +366,10 @@ impl OpDraft {
             DraftKind::Rebase {
                 mode: RebaseSourceMode::Branch,
             } => format!("Rebase branch of {names}"),
-            DraftKind::Squash => format!("Squash {names}"),
+            DraftKind::Squash => match &self.selection {
+                Some(selection) => format!("Move {} from {names}", selection.summary()),
+                None => format!("Squash {names}"),
+            },
             DraftKind::Merge => format!("Merge {names}"),
         }
     }
@@ -342,10 +412,7 @@ impl OpDraft {
                     PlacementKind::Before => Destination::Before(target),
                 },
             },
-            DraftKind::Squash => MutationOp::Squash {
-                from: self.sources.iter().map(|s| s.selection.clone()).collect(),
-                into: SquashTarget::Revision(target),
-            },
+            DraftKind::Squash => self.squash_op(target),
             DraftKind::Merge => MutationOp::Merge {
                 parents: self
                     .sources
@@ -379,10 +446,7 @@ impl OpDraft {
                 sources: self.sources.iter().map(|s| s.selection.clone()).collect(),
                 destination: Destination::Between { parent, child },
             },
-            DraftKind::Squash => MutationOp::Squash {
-                from: self.sources.iter().map(|s| s.selection.clone()).collect(),
-                into: SquashTarget::Revision(parent),
-            },
+            DraftKind::Squash => self.squash_op(parent),
             // A merge has no between-gesture; the gap resolves to merging
             // with its parent side, like squash.
             DraftKind::Merge => MutationOp::Merge {
@@ -520,6 +584,31 @@ mod tests {
                 ]
             ),
             other => panic!("expected a source-only merge op, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn squash_draft_with_a_selection_lowers_to_a_partial_squash() {
+        let selection = DiffSelection {
+            files: vec![crate::partial::FileSelection {
+                path: "a.rs".to_owned(),
+                hunks: crate::partial::HunkPick::All,
+            }],
+        };
+        let draft = OpDraft::squash_changes(source("aaaa"), selection.clone());
+        assert_eq!(draft.headline(), "Move a.rs from aaaa");
+        let target = RevisionSelection::Commit("bbbb".to_owned());
+        match draft.op_for(target.clone(), PlacementKind::Onto) {
+            Some(MutationOp::SquashChanges {
+                from,
+                selection: picked,
+                into: SquashTarget::Revision(into),
+            }) => {
+                assert_eq!(from, RevisionSelection::Commit("aaaa".to_owned()));
+                assert_eq!(picked, selection);
+                assert_eq!(into, target);
+            }
+            other => panic!("expected a partial squash, got {other:?}"),
         }
     }
 }

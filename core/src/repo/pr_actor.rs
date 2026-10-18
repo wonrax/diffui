@@ -109,7 +109,9 @@ async fn run(
         | Command::ListTree { job, .. }
         | Command::ReadFile { job, .. }
         | Command::FilePair { job, .. }
-        | Command::BookmarkCheck { job, .. } => emit(Payload::Failed {
+        | Command::BookmarkCheck { job, .. }
+        | Command::ConflictInfo { job, .. }
+        | Command::PrepareMergeTool { job, .. } => emit(Payload::Failed {
             job,
             error: RepoError::Unsupported,
         }),
