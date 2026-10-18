@@ -20,6 +20,7 @@ mod graph_view;
 mod icons;
 mod input;
 mod keymap;
+mod launch_env;
 mod logging;
 #[cfg(target_os = "macos")]
 mod macos_native;
@@ -186,8 +187,13 @@ pub(crate) fn zoom_default_restore(visible: [f64; 4]) -> [f64; 4] {
 }
 
 fn main() -> iced::Result {
+    // First, while the process is still single-threaded: it may `set_var`.
+    let path_repair = launch_env::repair_path();
     let cli = Cli::parse();
     logging::init();
+    if let Some(repair) = path_repair {
+        tracing::info!("{repair}");
+    }
 
     // Positional paths are reserved for a future file-diff mode
     // (`diffui SIDE_1 SIDE_2`) and aren't implemented yet. Reject them up front
