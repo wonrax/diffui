@@ -28,6 +28,9 @@ pub(crate) enum Action {
     ClearMultiSelection,
     /// Run a jj mutation. Every mutation entry point funnels here.
     Mutate(mutations::MutationOp),
+    /// Ask before running a destructive mutation (a keyboard or palette
+    /// abandon), then run it like [`Action::Mutate`].
+    ConfirmMutation(mutations::MutationOp),
     /// Enter target mode: pick a destination for a rebase/squash/merge.
     StartDraft {
         kind: mutations::DraftKind,

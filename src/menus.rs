@@ -538,6 +538,57 @@ impl Diffui {
         self.run_mutation(pending)
     }
 
+    /// Raise a confirmation for `op` and run it on accept. Only abandon asks
+    /// today (reached from a single key or the palette); anything else runs
+    /// straight away. The activity row is opened now and sits queued, so a
+    /// cancel resolves it the same way the other confirmations do.
+    pub(crate) fn confirm_mutation_op(&mut self, op: mutations::MutationOp) -> Task<Message> {
+        use mutations::MutationOp;
+        let MutationOp::Abandon { targets } = &op else {
+            return self.start_mutation_op(op);
+        };
+        let Some(tab_id) = self.active_tab_id() else {
+            return Task::none();
+        };
+        if !self.active().session.capabilities.mutate || targets.is_empty() {
+            return Task::none();
+        }
+        let (title, label, body) = match targets.as_slice() {
+            [target] => {
+                let name = self.revision_short_label(target);
+                (
+                    format!("Abandon {name}?"),
+                    "Abandon".to_owned(),
+                    "Its changes are dropped and any descendants are rebased onto its \
+                     parent. jj's operation log keeps it, so Undo brings it back.",
+                )
+            }
+            _ => (
+                format!("Abandon {} revisions?", targets.len()),
+                format!("Abandon {} revisions", targets.len()),
+                "Their changes are dropped and any descendants are rebased onto their \
+                 parents. jj's operation log keeps them, so Undo brings them back.",
+            ),
+        };
+        let body = body.to_owned();
+        let (activity_id, _) = self.begin_activity(tab_id, label, false);
+        if let Some(log) = self.activity_log_for(tab_id) {
+            log.set_status(activity_id, activity::ActivityStatus::Queued);
+        }
+        self.push_mode(Mode::Confirm(ConfirmDialog {
+            title,
+            body,
+            confirm_label: "Abandon".to_owned(),
+            pending: PendingMutation {
+                op,
+                tab_id,
+                activity_id,
+                allow_immutable: false,
+            },
+        }));
+        Task::none()
+    }
+
     /// Context-menu tree for a file-tree row (`display_index` into the
     /// flattened tree of whichever sidebar is showing). In the diff view a
     /// file offers "Browse source at this revision" (jumped to it); both

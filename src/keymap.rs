@@ -375,18 +375,23 @@ impl Keymap {
     ) {
         self.bindings
             .retain(|(bound, _, bound_id)| *bound != context || *bound_id != id);
+        let mut added = Vec::new();
         for raw in spec.chords() {
             if raw.trim().eq_ignore_ascii_case("none") {
                 continue;
             }
             match Chord::parse(raw) {
-                Some(chord) => self.bindings.push((context, chord, id)),
+                Some(chord) => added.push((context, chord, id)),
                 None => problems.push(format!(
                     "[keys.{}] {id:?}: {raw:?} is not a chord",
                     context.name()
                 )),
             }
         }
+        // Resolution takes the first match, so a user's chord goes in front:
+        // binding a key a default already holds moves the key, rather than
+        // losing to the default.
+        self.bindings.splice(0..0, added);
     }
 
     /// The command `chord` runs in `context`, if any.

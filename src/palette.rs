@@ -743,7 +743,7 @@ fn push_command_candidates(
     for command in commands::palette_commands(ui, scope, arg) {
         out.push(Candidate {
             item: ResultRef::Command(command.id),
-            haystack: format!("{} {}", command.label, command.hint),
+            haystack: format!("{} {}", command.palette_label(), command.hint),
         });
     }
 }
@@ -1128,7 +1128,8 @@ fn build_result_row<'a>(
         Color::TRANSPARENT
     };
 
-    let body = result_row_body(ui, theme, &m.item);
+    let root = matches!(column_state.source, ColumnSource::Root);
+    let body = result_row_body(ui, theme, &m.item, root);
 
     let row_el = container(body)
         .padding([0.0, CONTENT_X - RESULTS_INSET])
@@ -1160,6 +1161,7 @@ fn result_row_body<'a>(
     ui: &'a Diffui,
     theme: ThemeSpec,
     item: &'a ResultRef,
+    root: bool,
 ) -> Element<'a, Message> {
     let primary = theme.text;
     let muted = theme.subtle_text;
@@ -1246,7 +1248,11 @@ fn result_row_body<'a>(
                 GLYPH_ICON_SIZE,
                 theme.modified_token,
             )),
-            primary_label(ui, primary, command_label(id)),
+            if root && is_revision_verb(id) {
+                verb_label(ui, theme, id)
+            } else {
+                primary_label(ui, primary, command_label(id))
+            },
             // The shortcut, where there is one: what the palette teaches.
             tail(
                 ui.keymap
@@ -1264,6 +1270,57 @@ fn result_row_body<'a>(
         tail,
     ]
     .spacing(0)
+    .align_y(alignment::Vertical::Center)
+    .into()
+}
+
+fn is_revision_verb(id: CommandId) -> bool {
+    commands::command(id).is_some_and(|command| command.palette == PaletteScope::RevisionVerb)
+}
+
+/// A top-level revision verb's label: the verb, then the revision it will act
+/// on (the selected one) so a pick never lands somewhere unexpected.
+fn verb_label<'a>(ui: &'a Diffui, theme: ThemeSpec, id: CommandId) -> Element<'a, Message> {
+    let selection = &ui.active().session.selected_revision;
+    let commits = &ui.active().session.commits;
+    let row = match selection {
+        RevisionSelection::WorkingCopy => commits.working_copy(),
+        RevisionSelection::Commit(hex) => commits.find_by_commit_id(hex),
+    };
+    let (target, summary) = match row {
+        Some(row) => {
+            let prefix = revision_prefix(Some(&row), &ChangeId(row.change_id().to_owned()));
+            let summary = if row.has_description() {
+                row.description().lines().next().unwrap_or("").to_owned()
+            } else {
+                "(no description)".to_owned()
+            };
+            (prefix, summary)
+        }
+        None => (ui.revision_short_label(selection), String::new()),
+    };
+    row![
+        text(command_label(id))
+            .size(text_size::BODY_LG)
+            .font(ui.config.ui_font)
+            .color(theme.text)
+            .wrapping(Wrapping::None),
+        Space::new().width(Length::Fixed(theme::space::SM)),
+        text(target)
+            .size(text_size::BODY)
+            .font(ui.config.mono_font)
+            .color(theme.accent)
+            .wrapping(Wrapping::None),
+        Space::new().width(Length::Fixed(theme::space::SM)),
+        text(summary)
+            .size(text_size::BODY)
+            .font(ui.config.ui_font)
+            .color(theme.subtle_text)
+            .width(Length::Fill)
+            .wrapping(Wrapping::None)
+            .ellipsis(Ellipsis::End),
+    ]
+    .width(Length::Fill)
     .align_y(alignment::Vertical::Center)
     .into()
 }
@@ -1333,7 +1390,7 @@ fn target_label(target: &ResultRef, ui: &Diffui) -> String {
 /// command that is in the registry, so the fallback never renders.
 fn command_label(id: CommandId) -> String {
     commands::command(id)
-        .map(|command| command.label.to_owned())
+        .map(|command| command.palette_label().to_owned())
         .unwrap_or_default()
 }
 

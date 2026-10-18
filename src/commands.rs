@@ -94,6 +94,10 @@ pub(crate) enum PaletteScope {
     Revision,
     /// The actions column pushed from a file result.
     File,
+    /// A revision verb: listed at the top level acting on the selected
+    /// revision (the row names it), and in a revision result's actions
+    /// column acting on that result.
+    RevisionVerb,
 }
 
 /// The payload a producer hands a command: what the menu row was built for,
@@ -202,9 +206,32 @@ pub(crate) fn palette_commands(
 ) -> Vec<&'static Command> {
     REGISTRY
         .iter()
-        .filter(|command| command.palette == scope)
+        .filter(|command| {
+            command.palette == scope
+                || (command.palette == PaletteScope::RevisionVerb
+                    && matches!(scope, PaletteScope::Root | PaletteScope::Revision))
+        })
         .filter(|command| (command.enabled)(ui, arg))
         .collect()
+}
+
+impl Command {
+    /// The label a palette row shows. Most commands use their menu label;
+    /// the revision verbs are spelled for a menu that already says what they
+    /// are (`Rebase ▸ Onto…`), which reads as nothing on its own in a list.
+    pub(crate) fn palette_label(&self) -> &'static str {
+        match self.id {
+            "revision.edit" => "Edit revision",
+            "revision.rebase.start" => "Rebase onto\u{2026}",
+            "revision.rebase.descendants.start" => "Rebase with descendants onto\u{2026}",
+            "revision.rebase.branch.start" => "Rebase whole branch onto\u{2026}",
+            "revision.squash.start" => "Squash into\u{2026}",
+            "revision.squash-into-parent" => "Squash into parent",
+            "revision.abandon" => "Abandon\u{2026}",
+            "repo.fetch" => "Fetch all remotes",
+            _ => self.label,
+        }
+    }
 }
 
 // ── Shared predicates ───────────────────────────────────────────────────────
@@ -274,6 +301,17 @@ fn target_revision(ui: &Diffui, arg: &CommandArg) -> Option<RevisionSelection> {
             None => Some(ui.active().session.selected_revision.clone()),
         },
     }
+}
+
+/// The sidebar's marked rows that are still in the loaded graph, in mark
+/// order.
+fn marked_revisions(ui: &Diffui) -> Vec<RevisionSelection> {
+    ui.active()
+        .revision_multi_selection
+        .iter()
+        .map(|hex| RevisionSelection::Commit(hex.clone()))
+        .filter(|selection| row_present(ui, selection))
+        .collect()
 }
 
 /// Enter target mode on whichever revision the command was aimed at.
@@ -441,7 +479,7 @@ pub(crate) static REGISTRY: &[Command] = &[
             CommandArg::Fetch(target) => Some(Action::Fetch(target)),
             _ => Some(Action::Fetch(FetchTarget::AllRemotes)),
         },
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::Root,
     },
     Command {
         id: "repo.undo",
@@ -452,7 +490,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         mac_chords: &[],
         enabled: can_mutate,
         build: |_ui, _arg| Some(Action::Undo),
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::Root,
     },
     Command {
         id: "repo.set-revset",
@@ -582,7 +620,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         label: "Edit description\u{2026}",
         hint: "Rewrite this revision's message",
         contexts: &[Context::Base],
-        chords: &[],
+        chords: &["d"],
         mac_chords: &[],
         enabled: can_mutate,
         build: |ui, arg| {
@@ -590,35 +628,35 @@ pub(crate) static REGISTRY: &[Command] = &[
                 target: Some(target),
             })
         },
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::RevisionVerb,
     },
     Command {
         id: "revision.new-child",
         label: "New child",
         hint: "Start a new change on top of this one",
         contexts: &[Context::Base],
-        chords: &[],
+        chords: &["n"],
         mac_chords: &[],
         enabled: can_mutate,
         build: |ui, arg| {
             target_revision(ui, &arg)
                 .map(|parent| Action::Mutate(mutations::MutationOp::New { parent }))
         },
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::RevisionVerb,
     },
     Command {
         id: "revision.edit",
         label: "Edit",
         hint: "Make this revision the working copy",
         contexts: &[Context::Base],
-        chords: &[],
+        chords: &["e"],
         mac_chords: &[],
         enabled: can_mutate,
         build: |ui, arg| {
             target_revision(ui, &arg)
                 .map(|target| Action::Mutate(mutations::MutationOp::Edit { target }))
         },
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::RevisionVerb,
     },
     Command {
         id: "revision.rebase.start",
@@ -637,7 +675,7 @@ pub(crate) static REGISTRY: &[Command] = &[
                 },
             )
         },
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::RevisionVerb,
     },
     Command {
         id: "revision.rebase.descendants.start",
@@ -656,14 +694,14 @@ pub(crate) static REGISTRY: &[Command] = &[
                 },
             )
         },
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::RevisionVerb,
     },
     Command {
         id: "revision.rebase.branch.start",
         label: "Whole branch onto\u{2026}",
         hint: "Move the branch this revision sits on",
         contexts: &[Context::Base],
-        chords: &["b", "B"],
+        chords: &["b"],
         mac_chords: &[],
         enabled: can_mutate,
         build: |ui, arg| {
@@ -675,36 +713,36 @@ pub(crate) static REGISTRY: &[Command] = &[
                 },
             )
         },
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::RevisionVerb,
     },
     Command {
         id: "revision.squash.start",
         label: "Into\u{2026}",
         hint: "Squash this revision into a picked one",
         contexts: &[Context::Base],
-        chords: &["s", "S"],
+        chords: &["s"],
         mac_chords: &[],
         enabled: can_mutate,
         build: |ui, arg| draft(ui, arg, mutations::DraftKind::Squash),
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::RevisionVerb,
     },
     Command {
         id: "revision.merge.start",
         label: "Merge with\u{2026}",
         hint: "Create a merge of this revision and a picked one",
         contexts: &[Context::Base],
-        chords: &["m", "M"],
+        chords: &["m"],
         mac_chords: &[],
         enabled: can_mutate,
         build: |ui, arg| draft(ui, arg, mutations::DraftKind::Merge),
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::RevisionVerb,
     },
     Command {
         id: "revision.squash-into-parent",
         label: "Into parent",
         hint: "Squash this revision into its parent",
         contexts: &[Context::Base],
-        chords: &[],
+        chords: &["S"],
         mac_chords: &[],
         enabled: can_mutate,
         build: |ui, arg| {
@@ -715,7 +753,7 @@ pub(crate) static REGISTRY: &[Command] = &[
                 })
             })
         },
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::RevisionVerb,
     },
     Command {
         id: "revision.duplicate",
@@ -729,7 +767,7 @@ pub(crate) static REGISTRY: &[Command] = &[
             target_revision(ui, &arg)
                 .map(|target| Action::Mutate(mutations::MutationOp::Duplicate { target }))
         },
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::RevisionVerb,
     },
     Command {
         id: "revision.absorb",
@@ -743,27 +781,40 @@ pub(crate) static REGISTRY: &[Command] = &[
             target_revision(ui, &arg)
                 .map(|from| Action::Mutate(mutations::MutationOp::Absorb { from }))
         },
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::RevisionVerb,
     },
     Command {
         id: "revision.abandon",
         label: "Abandon",
         hint: "Drop this revision, keeping its descendants",
         contexts: &[Context::Base],
-        chords: &[],
+        chords: &["a"],
         mac_chords: &[],
         enabled: can_mutate,
         build: |ui, arg| match arg {
             CommandArg::Revisions(targets) if !targets.is_empty() => {
                 Some(Action::Mutate(mutations::MutationOp::Abandon { targets }))
             }
-            other => target_revision(ui, &other).map(|target| {
-                Action::Mutate(mutations::MutationOp::Abandon {
-                    targets: vec![target],
-                })
-            }),
+            // A menu row was aimed at one row on purpose; run it.
+            CommandArg::Revision(target) => Some(Action::Mutate(mutations::MutationOp::Abandon {
+                targets: vec![target],
+            })),
+            // A single key or a palette pick is one stray press away from
+            // dropping a revision, so those ask first. A bare `a` takes the
+            // marked rows when there are any, as the context menu does.
+            other => {
+                let marked = marked_revisions(ui);
+                let targets = if matches!(other, CommandArg::None) && !marked.is_empty() {
+                    marked
+                } else {
+                    vec![target_revision(ui, &other)?]
+                };
+                Some(Action::ConfirmMutation(mutations::MutationOp::Abandon {
+                    targets,
+                }))
+            }
         },
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::RevisionVerb,
     },
     Command {
         id: "revision.browse-source",
@@ -777,7 +828,7 @@ pub(crate) static REGISTRY: &[Command] = &[
             let path = arg.path().map(str::to_owned);
             target_revision(ui, &arg).map(|revision| Action::BrowseSource { revision, path })
         },
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::RevisionVerb,
     },
     Command {
         id: "revision.copy-text",
@@ -1107,7 +1158,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         mac_chords: &[],
         enabled: always,
         build: |_ui, _arg| Some(Action::OpenRepoDialog),
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::Root,
     },
     Command {
         id: "repo.close-dialog",
@@ -1230,7 +1281,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         mac_chords: &[],
         enabled: always,
         build: |_ui, _arg| Some(Action::ToggleActivityPopover),
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::Root,
     },
     Command {
         id: "activity.clear",
@@ -1254,7 +1305,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         mac_chords: &["alt+z", "alt+\u{3c9}"],
         enabled: always,
         build: |_ui, _arg| Some(Action::ToggleWrap),
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::Root,
     },
     Command {
         id: "view.toggle-split",
@@ -1265,7 +1316,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         mac_chords: &[],
         enabled: always,
         build: |_ui, _arg| Some(Action::ToggleSplit),
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::Root,
     },
     Command {
         id: "view.diff",
@@ -1274,9 +1325,9 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: always,
+        enabled: |ui, _arg| ui.active().main_view != MainView::Diff,
         build: |_ui, _arg| Some(Action::SetMainView(MainView::Diff)),
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::Root,
     },
     Command {
         id: "view.source",
@@ -1285,9 +1336,9 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: can_browse,
+        enabled: |ui, arg| can_browse(ui, arg) && ui.active().main_view != MainView::Source,
         build: |_ui, _arg| Some(Action::SetMainView(MainView::Source)),
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::Root,
     },
     // ── Tabs ────────────────────────────────────────────────────────────
     Command {
@@ -1299,7 +1350,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         mac_chords: &[],
         enabled: always,
         build: |_ui, _arg| Some(Action::CloseActiveTab),
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::Root,
     },
     tab_select!(1, "tab.select-1", "Go to tab 1", "cmd+1", 0),
     tab_select!(2, "tab.select-2", "Go to tab 2", "cmd+2", 1),
@@ -1356,6 +1407,62 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn revision_verbs_have_jj_style_keys() {
+        let map = crate::keymap::Keymap::build(&Default::default()).0;
+        for (key, id) in [
+            ("n", "revision.new-child"),
+            ("e", "revision.edit"),
+            ("d", "revision.edit-description"),
+            ("a", "revision.abandon"),
+            ("s", "revision.squash.start"),
+            ("S", "revision.squash-into-parent"),
+        ] {
+            let chord = crate::keymap::Chord::parse(key).expect("a parsable chord");
+            assert_eq!(map.resolve(Context::Base, &chord), Some(id), "{key}");
+        }
+    }
+
+    /// A key or palette abandon asks first; a menu row aimed at a revision
+    /// runs as picked.
+    #[test]
+    fn only_an_unaimed_abandon_asks_first() {
+        let mut ui = crate::tabs::tests::app();
+        crate::tabs::tests::push_tab(&mut ui, "/tmp/repo");
+        let abandon = command("revision.abandon").expect("registered");
+        assert!(matches!(
+            (abandon.build)(&ui, CommandArg::None),
+            Some(Action::ConfirmMutation(_))
+        ));
+        assert!(matches!(
+            (abandon.build)(&ui, CommandArg::Revision(RevisionSelection::WorkingCopy)),
+            Some(Action::Mutate(_))
+        ));
+    }
+
+    /// The revision verbs are offered at the top level (on the selection) and
+    /// in a revision result's actions column (on that result).
+    #[test]
+    fn revision_verbs_are_listed_in_both_palette_scopes() {
+        let mut ui = crate::tabs::tests::app();
+        crate::tabs::tests::push_tab(&mut ui, "/tmp/repo");
+        ui.tabs[0].state.session.capabilities.mutate = true;
+        for scope in [PaletteScope::Root, PaletteScope::Revision] {
+            let ids: Vec<CommandId> = palette_commands(&ui, scope, &CommandArg::None)
+                .iter()
+                .map(|command| command.id)
+                .collect();
+            for id in ["revision.new-child", "revision.edit", "revision.abandon"] {
+                assert!(ids.contains(&id), "{id} missing from {scope:?}");
+            }
+        }
+        let files: Vec<CommandId> = palette_commands(&ui, PaletteScope::File, &CommandArg::None)
+            .iter()
+            .map(|command| command.id)
+            .collect();
+        assert!(!files.contains(&"revision.abandon"));
     }
 
     /// Two commands sharing a chord inside one context would make resolution

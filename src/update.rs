@@ -691,6 +691,7 @@ impl Diffui {
                 Task::none()
             }
             Action::Mutate(op) => self.start_mutation_op(op),
+            Action::ConfirmMutation(op) => self.confirm_mutation_op(op),
             Action::StartDraft { kind, source } => self.start_draft(kind, source),
             Action::EditDescription { target } => {
                 let target =
@@ -4179,7 +4180,7 @@ impl Diffui {
     /// Short display name for a revision, matching the sidebar: unique
     /// change-id prefix (min 8 chars), `/N`-suffixed for divergent/hidden
     /// copies, falling back to a commit-id prefix for rows not in the graph.
-    fn revision_short_label(&self, selection: &RevisionSelection) -> String {
+    pub(crate) fn revision_short_label(&self, selection: &RevisionSelection) -> String {
         let commits = &self.active().session.commits;
         let row = match selection {
             RevisionSelection::WorkingCopy => commits.working_copy(),
