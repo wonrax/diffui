@@ -19,6 +19,7 @@
 use diffui_core::{FetchTarget, RevisionSelection};
 
 use crate::action::Action;
+use crate::history_panel::HistoryAction;
 use crate::palette::{self, ResultRef};
 use crate::theme::ThemePreference;
 use crate::{DetailField, Diffui, MainView, mutations};
@@ -1310,6 +1311,145 @@ pub(crate) static REGISTRY: &[Command] = &[
     tab_select!(7, "tab.select-7", "Go to tab 7", "cmd+7", 6),
     tab_select!(8, "tab.select-8", "Go to tab 8", "cmd+8", 7),
     tab_select!(9, "tab.select-9", "Go to tab 9", "cmd+9", 8),
+    // ── History (op log, evolog, file history, annotate) ────────────────
+    Command {
+        id: "history.op-log",
+        label: "Show operation log",
+        hint: "Browse jj's operation log; restore or revert an operation",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| crate::history_panel::available(ui),
+        build: |_ui, _arg| Some(Action::History(HistoryAction::ShowOpLog)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "history.evolog",
+        label: "Show evolution log",
+        hint: "Every previous version of this revision (jj evolog)",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| {
+            crate::history_panel::available(ui)
+                && arg
+                    .revision()
+                    .is_none_or(|revision| row_present(ui, revision))
+        },
+        build: |ui, arg| {
+            target_revision(ui, &arg)
+                .map(|revision| Action::History(HistoryAction::ShowEvolog(revision)))
+        },
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "history.evolog.selected",
+        label: "Show evolution log of the selected revision",
+        hint: "Every previous version of the selected revision (jj evolog)",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| crate::history_panel::available(ui),
+        build: |ui, _arg| {
+            Some(Action::History(HistoryAction::ShowEvolog(
+                ui.active().session.selected_revision.clone(),
+            )))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "file.history",
+        label: "Show file history",
+        hint: "Narrow the graph to the revisions that touched this file",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| crate::history_panel::available(ui),
+        build: |ui, arg| {
+            let revision = match &arg {
+                CommandArg::Browse { revision, .. } => revision.clone(),
+                _ => ui.active().session.selected_revision.clone(),
+            };
+            let path = match arg {
+                CommandArg::Result(ResultRef::File(path)) => path,
+                other => other.path()?.to_owned(),
+            };
+            Some(Action::History(HistoryAction::FileHistory {
+                revision,
+                path,
+            }))
+        },
+        palette: PaletteScope::File,
+    },
+    Command {
+        id: "file.history.current",
+        label: "Show history of the current file",
+        hint: "Narrow the graph to the revisions that touched the file on screen",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| {
+            crate::history_panel::available(ui) && crate::history_panel::current_file(ui).is_some()
+        },
+        build: |_ui, _arg| Some(Action::History(HistoryAction::CurrentFileHistory)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "file.history.clear",
+        label: "Clear file history filter",
+        hint: "Show the whole graph again",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| crate::history_panel::file_filter_active(ui),
+        build: |_ui, _arg| Some(Action::History(HistoryAction::ClearFileFilter)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "source.toggle-annotate",
+        label: "Toggle annotate (blame)",
+        hint: "Show which change last touched each line of the browsed file",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| crate::history_panel::can_annotate(ui),
+        build: |_ui, _arg| Some(Action::History(HistoryAction::ToggleAnnotate)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "history.restore-operation",
+        label: "Restore repository to the selected operation\u{2026}",
+        hint: "jj op restore: put every revision and bookmark back to that point",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| {
+            ui.active().session.capabilities.mutate
+                && crate::history_panel::selected_operation(ui).is_some()
+        },
+        build: |ui, _arg| {
+            crate::history_panel::selected_operation(ui)
+                .map(|id| Action::History(HistoryAction::RestoreOperation(id)))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "history.revert-operation",
+        label: "Revert the selected operation\u{2026}",
+        hint: "jj op revert: undo just that operation, keeping later work",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| {
+            ui.active().session.capabilities.mutate
+                && crate::history_panel::selected_operation(ui).is_some()
+        },
+        build: |ui, _arg| {
+            crate::history_panel::selected_operation(ui)
+                .map(|id| Action::History(HistoryAction::RevertOperation(id)))
+        },
+        palette: PaletteScope::Root,
+    },
 ];
 
 #[cfg(test)]

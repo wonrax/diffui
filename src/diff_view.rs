@@ -250,6 +250,25 @@ pub struct DiffView<'a, Message> {
     /// draws and hit-tests the affordance beside the first description line;
     /// the actual editor is layered by the caller into the reserved spacer.
     on_edit_description: Option<fn() -> Message>,
+    /// Blame column of a plain document (see [`Self::annotations`]).
+    annotations: Option<AnnotationGutter<'a, Message>>,
+}
+
+/// One line's entry in the blame column of a plain document.
+#[derive(Debug, Clone)]
+pub struct AnnotationLabel {
+    /// Empty on the continuation lines of a run from one commit.
+    pub text: String,
+    pub color: Color,
+}
+
+/// A blame column drawn left of a plain document's line numbers: one label
+/// per line (by 0-based line number), and a click on it reports that line.
+pub struct AnnotationGutter<'a, Message> {
+    pub labels: &'a [AnnotationLabel],
+    /// Column width, in monospace cells.
+    pub width_chars: usize,
+    pub on_click: fn(usize) -> Message,
 }
 
 /// Per-render find-match data fed into `DiffView::with_find`. The widget
@@ -1161,6 +1180,7 @@ impl<'a, Message> DiffView<'a, Message> {
             plain: false,
             on_browse_file: None,
             on_edit_description: None,
+            annotations: None,
         }
     }
 
@@ -1181,7 +1201,50 @@ impl<'a, Message> DiffView<'a, Message> {
             // mirror it. Forced off so a caller can't combine the two.
             self.side_by_side = false;
         }
+        self.metrics.gutter_width += self.annotation_width();
         self
+    }
+
+    /// Draw a blame column left of the line numbers. Plain documents only;
+    /// widens the gutter, so every text position shifts with it.
+    pub fn annotations(mut self, gutter: AnnotationGutter<'a, Message>) -> Self {
+        let previous = self.annotation_width();
+        self.annotations = Some(gutter);
+        self.metrics.gutter_width += self.annotation_width() - previous;
+        self
+    }
+
+    fn annotation_width(&self) -> f32 {
+        match &self.annotations {
+            Some(gutter) if self.plain => {
+                gutter.width_chars as f32 * self.metrics.char_width + GUTTER_HORIZONTAL_PADDING
+            }
+            _ => 0.0,
+        }
+    }
+
+    /// The 0-based line under `point` when it sits in the blame column.
+    fn annotation_line_at(
+        &self,
+        index: &HeightIndex,
+        bounds: Rectangle,
+        vertical_offset: f32,
+        point: Point,
+    ) -> Option<usize> {
+        let width = self.annotation_width();
+        if width <= 0.0 || point.x >= bounds.x + width {
+            return None;
+        }
+        let row = index.row_at(point.y - bounds.y + vertical_offset)?;
+        let &(file, hunk, line) = index.row_ids.get(row)?;
+        let line = self
+            .files
+            .get(file as usize)?
+            .hunks
+            .get(hunk as usize)?
+            .lines
+            .get(line as usize)?;
+        line.new_line.map(|number| number.saturating_sub(1))
     }
 
     /// Draw a "browse source" icon button in every file header, firing with
@@ -2204,15 +2267,45 @@ impl<'a, Message> DiffView<'a, Message> {
         };
         let prefix = prefix_for_kind(line.kind);
         let bounds = render.bounds;
+        let annotation_width = self.annotation_width();
+        if annotation_width > 0.0
+            && let Some(gutter) = &self.annotations
+            && let Some(label) = line
+                .new_line
+                .and_then(|number| gutter.labels.get(number.saturating_sub(1)))
+            && !label.text.is_empty()
+        {
+            self.draw_text(
+                renderer,
+                &label.text,
+                TextRenderParams {
+                    width: (annotation_width - GUTTER_HORIZONTAL_PADDING).max(1.0),
+                    height: self.metrics.row_height,
+                    position: Point::new(
+                        bounds.x + GUTTER_HORIZONTAL_PADDING,
+                        render.y + self.metrics.text_y_pad,
+                    ),
+                    color: label.color,
+                    clip_bounds: Rectangle {
+                        width: annotation_width,
+                        ..bounds
+                    },
+                    wrapping: text::Wrapping::None,
+                },
+            );
+        }
 
         self.draw_text(
             renderer,
             &gutter,
             TextRenderParams {
-                width: (self.metrics.gutter_width - GUTTER_HORIZONTAL_PADDING * 2.0).max(1.0),
+                width: (self.metrics.gutter_width
+                    - annotation_width
+                    - GUTTER_HORIZONTAL_PADDING * 2.0)
+                    .max(1.0),
                 height: self.metrics.row_height,
                 position: Point::new(
-                    bounds.x + GUTTER_HORIZONTAL_PADDING,
+                    bounds.x + annotation_width + GUTTER_HORIZONTAL_PADDING,
                     render.y + self.metrics.text_y_pad,
                 ),
                 color: self.palette.text_muted,
@@ -3413,6 +3506,19 @@ where
                     shell.capture_event();
                     return;
                 }
+                if let Some(gutter) = &self.annotations {
+                    let line = self.annotation_line_at(
+                        &state.height_index.borrow(),
+                        bounds,
+                        state.vertical_offset,
+                        point,
+                    );
+                    if let Some(line) = line {
+                        shell.publish((gutter.on_click)(line));
+                        shell.capture_event();
+                        return;
+                    }
+                }
                 let position = {
                     let index = state.height_index.borrow();
                     self.position_at_point(
@@ -4125,6 +4231,17 @@ where
             return mouse::Interaction::Idle;
         }
         if self.browse_button_at(state, bounds, point).is_some() {
+            return mouse::Interaction::Pointer;
+        }
+        if self
+            .annotation_line_at(
+                &state.height_index.borrow(),
+                bounds,
+                state.vertical_offset,
+                point,
+            )
+            .is_some()
+        {
             return mouse::Interaction::Pointer;
         }
         if self

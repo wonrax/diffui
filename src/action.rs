@@ -158,4 +158,8 @@ pub(crate) enum Action {
 
     /// Open a URL (from an activity's captured remote output) in the browser.
     OpenUrl(String),
+
+    // ── History ─────────────────────────────────────────────────────────
+    /// Op log, evolog, file history, annotate — see [`crate::history_panel`].
+    History(crate::history_panel::HistoryAction),
 }

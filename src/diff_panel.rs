@@ -779,7 +779,7 @@ fn build_revision_summary<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, M
 /// The selectable block atop the diff: the description's body and the
 /// identity fields. The subject is left out — the header above already
 /// shows it as the title — along with the blank lines that set it apart.
-fn revision_header_lines(details: &diffui_core::RevisionDetails) -> Vec<HeaderLine> {
+pub(crate) fn revision_header_lines(details: &diffui_core::RevisionDetails) -> Vec<HeaderLine> {
     let description = details.description.trim();
     let body = description
         .split_once('\n')

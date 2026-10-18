@@ -303,6 +303,9 @@ impl Diffui {
         let Some(tab) = self.route_event(&event) else {
             return Task::none();
         };
+        if let Some(task) = self.history_event(tab, &event) {
+            return task;
+        }
         // A job can be both the frontend's and the projection's — a mutation
         // owns an activity row *and* a slot — so the two run in order rather
         // than one short-circuiting the other.
@@ -408,7 +411,11 @@ impl Diffui {
                 .tabs
                 .iter()
                 .filter(on_this_repo)
-                .find(|tab| tab.state.session.owns_job(job) || tab.state.jobs.owns(job))
+                .find(|tab| {
+                    tab.state.session.owns_job(job)
+                        || tab.state.jobs.owns(job)
+                        || tab.state.history.owns(job)
+                })
                 .map(|tab| tab.id),
             None => self.tabs.iter().find(on_this_repo).map(|tab| tab.id),
         }
@@ -644,6 +651,7 @@ impl Diffui {
         // A mode that isn't on screen must not keep the keyboard.
         self.prune_stale_modes();
         let welcome = self.ensure_welcome_prompt();
+        let history = self.sync_history();
         // Chokepoint: if the active tab coalesced a refresh while busy and it's
         // now idle, run it. A no-op when nothing's pending (the common case).
         let refresh = match self.active_tab_id() {
@@ -656,7 +664,7 @@ impl Diffui {
             }
             None => Task::none(),
         };
-        Task::batch([task, refresh, welcome])
+        Task::batch([task, refresh, welcome, history])
     }
 
     /// With no repository open the welcome screen *is* the open prompt, so
@@ -1106,6 +1114,7 @@ impl Diffui {
                 open_url(&url);
                 Task::none()
             }
+            Action::History(action) => self.perform_history(action),
         }
     }
 
@@ -2583,6 +2592,7 @@ impl Diffui {
                     .flatten();
                 self.open_source_browser(revision, jump)
             }
+            MainView::History => self.enter_history_view(),
         }
     }
 
@@ -4179,7 +4189,7 @@ impl Diffui {
     /// Short display name for a revision, matching the sidebar: unique
     /// change-id prefix (min 8 chars), `/N`-suffixed for divergent/hidden
     /// copies, falling back to a commit-id prefix for rows not in the graph.
-    fn revision_short_label(&self, selection: &RevisionSelection) -> String {
+    pub(crate) fn revision_short_label(&self, selection: &RevisionSelection) -> String {
         let commits = &self.active().session.commits;
         let row = match selection {
             RevisionSelection::WorkingCopy => commits.working_copy(),
@@ -4343,6 +4353,14 @@ impl Diffui {
                 source_panel::build_source_sidebar(self, theme),
                 vertical_divider(theme),
                 source_panel::build_source_panel(self, theme),
+            ]
+            .spacing(0)
+            .height(Length::Fill)
+            .into(),
+            MainView::History => row![
+                history_panel::build_history_sidebar(self, theme),
+                vertical_divider(theme),
+                history_panel::build_history_panel(self, theme),
             ]
             .spacing(0)
             .height(Length::Fill)

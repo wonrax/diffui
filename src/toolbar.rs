@@ -121,7 +121,7 @@ pub fn build_toolbar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     ));
     // Side-by-side only applies to the diff; the source view is one column
     // by nature, so the toggle hides rather than sitting there inert.
-    if ui.active().main_view == MainView::Diff {
+    if ui.active().main_view != MainView::Source {
         toggles = toggles.push(toolbar_toggle_button(
             icons::SPLIT,
             "Side-by-side diff",
@@ -213,25 +213,27 @@ fn view_switcher(ui: &Diffui, theme: ThemeSpec, font: iced::Font) -> Element<'st
         })
     };
 
-    container(
-        row![
-            segment(icons::FILE_DIFF, "Diff", MainView::Diff),
-            segment(icons::CODE, "Source", MainView::Source),
-        ]
-        .spacing(theme::space::XXS)
-        .align_y(alignment::Vertical::Center),
-    )
-    .padding(INSET)
-    .style(move |_| container::Style {
-        background: Some(Background::Color(well_fill(theme))),
-        border: Border {
-            width: 0.0,
-            color: Color::TRANSPARENT,
-            radius: radius::BUTTON.into(),
-        },
-        ..container::Style::default()
-    })
-    .into()
+    let mut segments = row![
+        segment(icons::FILE_DIFF, "Diff", MainView::Diff),
+        segment(icons::CODE, "Source", MainView::Source),
+    ]
+    .spacing(theme::space::XXS)
+    .align_y(alignment::Vertical::Center);
+    if crate::history_panel::available(ui) {
+        segments = segments.push(segment(icons::HISTORY, "History", MainView::History));
+    }
+    container(segments)
+        .padding(INSET)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(well_fill(theme))),
+            border: Border {
+                width: 0.0,
+                color: Color::TRANSPARENT,
+                radius: radius::BUTTON.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
 }
 
 /// A toolbar action: icon + label, invisible at rest with a soft wash on

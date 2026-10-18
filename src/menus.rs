@@ -136,6 +136,9 @@ impl Diffui {
                 },
             ),
         ];
+        if crate::history_panel::available(self) {
+            top.push(self.menu_item("history.evolog", on()));
+        }
 
         // Copy revision metadata — values come from the loaded graph row.
         let copy_fields = {
@@ -582,6 +585,7 @@ impl Diffui {
                     None => (None, false),
                 }
             }
+            MainView::History => (None, false),
         };
         let Some(path) = path else {
             return Vec::new();
@@ -597,6 +601,20 @@ impl Diffui {
                 "revision.browse-source",
                 CommandArg::Browse {
                     revision: self.active().session.selected_revision.clone(),
+                    path: Some(path.clone()),
+                },
+            ));
+            items.push(MenuEntry::Separator);
+        }
+        if is_file && crate::history_panel::available(self) {
+            let revision = match self.active().main_view {
+                MainView::Source => crate::source_panel::browsed_revision(&self.active().source),
+                _ => self.active().session.selected_revision.clone(),
+            };
+            items.push(self.menu_item(
+                "file.history",
+                CommandArg::Browse {
+                    revision,
                     path: Some(path.clone()),
                 },
             ));

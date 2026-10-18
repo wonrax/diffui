@@ -17,6 +17,7 @@ mod editor_drag;
 mod field;
 mod find;
 mod graph_view;
+mod history_panel;
 mod icons;
 mod input;
 mod keymap;
@@ -525,6 +526,8 @@ pub(crate) enum MainView {
     #[default]
     Diff,
     Source,
+    /// The operation log or a revision's evolog (jj only).
+    History,
 }
 
 /// One loaded file in the source browser: the synthesized all-context
@@ -716,6 +719,8 @@ pub(crate) struct TabState {
     /// Cleared on plain click, Esc, and draft start; ids whose rows left the
     /// loaded graph are ignored at use rather than eagerly pruned.
     pub(crate) revision_multi_selection: Vec<String>,
+    /// The history views: op log, evolog, file filter, annotate.
+    pub(crate) history: history_panel::HistoryState,
 }
 
 impl TabState {
@@ -751,6 +756,7 @@ impl TabState {
             pending_description_edit: None,
             pending_detail_copy: None,
             revision_multi_selection: Vec::new(),
+            history: Default::default(),
         }
     }
 
@@ -795,6 +801,7 @@ impl TabState {
                 .as_ref()
                 .map(|view| std::slice::from_ref(&view.file))
                 .unwrap_or(&[]),
+            MainView::History => &[],
         }
     }
 }

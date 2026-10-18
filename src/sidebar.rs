@@ -101,6 +101,9 @@ pub fn build_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         .width(Length::Fill)
         .padding(crate::field::PANEL_HEADER_PADDING),
     );
+    if let Some(banner) = crate::history_panel::file_filter_banner(ui, theme) {
+        body = body.push(banner);
+    }
     // Load failures no longer have a header to live under — surface them as a
     // soft alert card above the list rather than bare red text.
     if let LoadStatus::Failed(error) = &ui.active().session.status {
