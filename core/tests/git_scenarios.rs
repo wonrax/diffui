@@ -583,3 +583,34 @@ fn binary_file_carries_the_binary_hunk() {
     assert_eq!(document.files[0].hunks.len(), 1);
     assert_eq!(document.files[0].hunks[0].header, "binary files differ");
 }
+
+/// A repository with no commits: `git log HEAD` and `git diff HEAD` both exit
+/// 128 on the unborn branch, which used to fail the whole load.
+#[test]
+#[ignore]
+fn an_empty_repository_loads() {
+    if !git_present() {
+        eprintln!("skipping: git is not on PATH");
+        return;
+    }
+    let root = scratch_repo("empty-repo");
+    let repository = repository(&root);
+
+    let rows = block_on(load_git_commits(&repository, "")).expect("load an empty graph");
+    assert!(rows.is_empty(), "nothing committed, nothing changed");
+    block_on(load_git_repository_snapshot(&root)).expect("snapshot an empty repo");
+
+    write(&root, "first.txt", b"hello\n");
+    git(&root, &["add", "first.txt"]);
+    let rows = block_on(load_git_commits(&repository, "")).expect("load the staged state");
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].summary.is_working_copy);
+    assert!(rows[0].summary.parent_ids.is_empty(), "@ is a root here");
+
+    let (document, details) = block_on(load_git_diff(&repository, &RevisionSelection::WorkingCopy))
+        .expect("diff the working copy against the empty tree");
+    assert!(details.is_none());
+    assert_eq!(document.files.len(), 1);
+    assert_eq!(document.files[0].path, "first.txt");
+    assert_eq!(document.files[0].status, DiffFileStatus::Added);
+}
