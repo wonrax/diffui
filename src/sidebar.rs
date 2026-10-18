@@ -104,31 +104,10 @@ pub fn build_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     // Load failures no longer have a header to live under — surface them as a
     // soft alert card above the list rather than bare red text.
     if let LoadStatus::Failed(error) = &ui.active().session.status {
-        body = body.push(
-            container(
-                container(
-                    text(format!("Failed: {error}"))
-                        .size(CAPTION_TEXT_SIZE)
-                        .font(ui.config.ui_font)
-                        .color(theme.removed_text),
-                )
-                .width(Length::Fill)
-                .padding([6, 10])
-                .style(move |_| container::Style {
-                    background: Some(Background::Color(chip_background(theme.removed_text))),
-                    border: Border {
-                        width: 0.0,
-                        color: Color::TRANSPARENT,
-                        radius: theme::radius::CONTROL.into(),
-                    },
-                    ..container::Style::default()
-                }),
-            )
-            .width(Length::Fill)
-            .padding([6, 8]),
-        );
+        body = body.push(crate::empty_states::load_error(ui, theme, error));
     }
-    body = body.push(revision_list);
+    body = body
+        .push(crate::empty_states::revision_list_placeholder(ui, theme).unwrap_or(revision_list));
     // Target mode: the op bar floats between the list and the footer while a
     // rebase/squash draft is picking its destination.
     if ui.active().op_draft().is_some() {

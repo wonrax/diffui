@@ -288,6 +288,17 @@ pub fn build_collapsed_file_navigator(theme: ThemeSpec) -> Element<'static, Mess
 }
 
 pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
+    let body = build_diff_panel_body(ui, theme);
+    match crate::empty_states::outside_view_banner(ui, theme) {
+        Some(banner) => column![banner, body]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into(),
+        None => body,
+    }
+}
+
+fn build_diff_panel_body<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
     let body: Element<'a, Message> = if matches!(ui.active().session.status, LoadStatus::Loading)
         && ui.active().session.document.files.is_empty()
     {
@@ -402,7 +413,7 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
                         },
                         ..Default::default()
                     }),
-                    text("No changes")
+                    text("This revision has no changes")
                         .size(text_size::TITLE)
                         .font(crate::theme::emphasis_font(
                             ui.config.ui_font,
