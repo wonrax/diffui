@@ -93,6 +93,22 @@ pub fn build_toolbar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             font,
         ));
         actions = actions.push(fetch_split_button(theme, font, caret_hovered));
+        // Plain `jj git push` (tracked bookmarks that moved), behind a
+        // confirmation listing what goes out.
+        if is_jj
+            && ui.active().session.capabilities.mutate
+            && !ui.active().session.bookmarks.remotes.is_empty()
+        {
+            actions = actions.push(toolbar_button(
+                icons::UPLOAD,
+                "Push",
+                Message::Action(Action::Bookmark(
+                    crate::bookmarks::BookmarkAction::PushTracked,
+                )),
+                theme,
+                font,
+            ));
+        }
         // jj-only: git has no operation log to undo.
         if is_jj {
             actions = actions.push(toolbar_button(

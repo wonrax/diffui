@@ -104,3 +104,4 @@ pub const FILE: &str = "\u{e0c0}"; // file
 pub const FILE_CODE: &str = "\u{e0c3}"; // file-code
 pub const FILE_DIFF: &str = "\u{e317}"; // file-diff
 pub const FOLDER_OPEN: &str = "\u{e247}"; // folder-open
+pub const UPLOAD: &str = "\u{e19e}"; // upload

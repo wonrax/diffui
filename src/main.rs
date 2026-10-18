@@ -7,6 +7,7 @@ use std::{
 
 mod action;
 mod activity;
+mod bookmarks;
 mod chip;
 mod chrome;
 mod commands;

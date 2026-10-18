@@ -158,4 +158,7 @@ pub(crate) enum Action {
 
     /// Open a URL (from an activity's captured remote output) in the browser.
     OpenUrl(String),
+
+    /// Bookmark workflow and push — see [`crate::bookmarks`].
+    Bookmark(crate::bookmarks::BookmarkAction),
 }

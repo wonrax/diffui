@@ -251,10 +251,10 @@ impl Diffui {
         // Same list, but landing the move also pushes the bookmark to its
         // tracked remote — "advance main and publish it" as one pick. Kept a
         // sibling submenu rather than a per-bookmark verb submenu so the
-        // common plain move stays one level deep. Bookmarks without a
-        // tracked remote are omitted (nowhere to push); the submenu hides
-        // entirely when none qualify instead of sitting disabled in every
-        // menu of a remote-less repo. Conflicted bookmarks are omitted too:
+        // common plain move stays one level deep. A bookmark no remote tracks
+        // yet goes to the default push remote, which creates it there; the
+        // submenu hides entirely when none qualify instead of sitting disabled
+        // in every menu of a remote-less repo. Conflicted bookmarks are omitted too:
         // the move is a conflict *resolution* — publishing it in the same
         // gesture, typically right after a force-push surprise, deserves a
         // deliberate separate push once the resolved state looks right.
@@ -262,31 +262,29 @@ impl Diffui {
             .iter()
             .filter(|(_, _, conflicted)| !conflicted)
             .filter_map(|(name, _target, _)| {
-                let entry = self
-                    .active()
-                    .session
-                    .bookmarks
-                    .bookmarks
-                    .iter()
-                    .find(|b| b.name == *name)?;
-                let remote = entry.tracked_remote()?;
+                let (remote, new) = self.move_push_remote(name)?;
                 // The remote rides in the detail column rather than an arrow
                 // glyph in the label: `\u{2192}` renders as a fallback-font
                 // blob in plenty of UI fonts.
                 Some(menu::MenuEntry::Item {
                     label: name.clone(),
-                    detail: Some(remote.to_owned()),
+                    detail: Some(if new {
+                        format!("{remote} (new)")
+                    } else {
+                        remote.clone()
+                    }),
                     emphasized: false,
                     command: "bookmark.move",
                     arg: CommandArg::Bookmark {
                         name: name.clone(),
-                        remote: Some(remote.to_owned()),
+                        remote: Some(remote),
                         to: Some(selection.clone()),
                     },
                 })
             })
             .collect();
         top.push(MenuEntry::Separator);
+        top.extend(self.revision_bookmark_rows(selection));
         top.push(if move_items.is_empty() {
             MenuEntry::Disabled {
                 label: "Move bookmark here".to_owned(),
@@ -334,25 +332,8 @@ impl Diffui {
                                 to: Some(RevisionSelection::Commit(hex.to_owned())),
                             },
                         ));
-                    } else if let Some(remote) = entry.tracked_remote() {
-                        sub.push(self.menu_row(
-                            format!("Push to {remote}"),
-                            "bookmark.push",
-                            CommandArg::Bookmark {
-                                name: entry.name.clone(),
-                                remote: Some(remote.to_owned()),
-                                to: None,
-                            },
-                        ));
                     }
-                    sub.push(self.menu_item(
-                        "bookmark.delete",
-                        CommandArg::Bookmark {
-                            name: entry.name.clone(),
-                            remote: None,
-                            to: None,
-                        },
-                    ));
+                    sub.extend(self.local_bookmark_rows(entry));
                     let label = if entry.is_conflicted() {
                         format!("{}??", entry.name)
                     } else {
@@ -361,17 +342,15 @@ impl Diffui {
                     bookmark_items.push(MenuEntry::Submenu { label, items: sub });
                 }
                 for remote_ref in &entry.remotes {
-                    if remote_ref.target.as_str() == hex && !remote_ref.tracked {
+                    // Untracked remote bookmarks can be tracked; a tracked
+                    // one whose local bookmark was deleted can have that
+                    // deletion pushed. A tracked one with a live local
+                    // bookmark is handled through the local bookmark.
+                    let actionable = !remote_ref.tracked || entry.local_targets.is_empty();
+                    if remote_ref.target.as_str() == hex && actionable {
                         bookmark_items.push(MenuEntry::Submenu {
                             label: format!("{}@{}", entry.name, remote_ref.remote),
-                            items: vec![self.menu_item(
-                                "bookmark.track",
-                                CommandArg::Bookmark {
-                                    name: entry.name.clone(),
-                                    remote: Some(remote_ref.remote.clone()),
-                                    to: None,
-                                },
-                            )],
+                            items: self.remote_bookmark_rows(entry, remote_ref),
                         });
                     }
                 }
@@ -496,7 +475,7 @@ impl Diffui {
             MutationOp::RenameBookmark { old, new } => format!("Rename {old} to {new}"),
             MutationOp::ForgetBookmark { name } => format!("Forget bookmark {name}"),
             MutationOp::UntrackBookmark { name, remote } => format!("Untrack {name}@{remote}"),
-            MutationOp::Push(request) => format!("Push to {}", request.remote),
+            MutationOp::Push(request) => crate::bookmarks::push_label(request),
         };
         // Only pushes report real progress (git transfer); the rest are quick
         // local ops, so they stay indeterminate.
@@ -507,6 +486,7 @@ impl Diffui {
                     push_remote: Some(_),
                     ..
                 }
+                | MutationOp::Push(_)
         );
         // A batch abandon consumes the marked rows — the marks (and their
         // wash) mustn't outlive the pick.
@@ -540,7 +520,7 @@ impl Diffui {
                 diffui_core::Command::BookmarkCheck { job, name, to },
             );
         }
-        self.run_mutation(pending)
+        self.run_mutation_checking_wc_push(pending)
     }
 
     /// Context-menu tree for a file-tree row (`display_index` into the

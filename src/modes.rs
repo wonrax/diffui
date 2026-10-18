@@ -40,6 +40,8 @@ pub(crate) enum Mode {
     Confirm(ConfirmDialog),
     OpenRepo(OpenRepoDialog),
     ActivityPopover,
+    /// The bookmark-name prompt (create / rename).
+    NamePrompt(crate::bookmarks::NamePrompt),
 }
 
 /// A mode bound to one tab: it names rows, files, or text that belong to that
@@ -64,6 +66,7 @@ pub(crate) enum ModeKind {
     Find,
     Description,
     Draft,
+    NamePrompt,
 }
 
 impl Mode {
@@ -74,6 +77,7 @@ impl Mode {
             Mode::Confirm(_) => ModeKind::Confirm,
             Mode::OpenRepo(_) => ModeKind::OpenRepo,
             Mode::ActivityPopover => ModeKind::ActivityPopover,
+            Mode::NamePrompt(_) => ModeKind::NamePrompt,
         }
     }
 
@@ -84,6 +88,7 @@ impl Mode {
             Mode::Confirm(_) => Context::Confirm,
             Mode::OpenRepo(_) => Context::OpenRepo,
             Mode::ActivityPopover => Context::ActivityPopover,
+            Mode::NamePrompt(_) => Context::Prompt,
         }
     }
 }

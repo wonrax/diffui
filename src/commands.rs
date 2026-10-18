@@ -19,6 +19,7 @@
 use diffui_core::{FetchTarget, RevisionSelection};
 
 use crate::action::Action;
+use crate::bookmarks::BookmarkAction;
 use crate::palette::{self, ResultRef};
 use crate::theme::ThemePreference;
 use crate::{DetailField, Diffui, MainView, mutations};
@@ -42,6 +43,8 @@ pub(crate) enum Context {
     Menu,
     OpenRepo,
     ActivityPopover,
+    /// The bookmark-name prompt.
+    Prompt,
 }
 
 impl Context {
@@ -56,6 +59,7 @@ impl Context {
         Context::Menu,
         Context::OpenRepo,
         Context::ActivityPopover,
+        Context::Prompt,
     ];
 
     /// The name this context goes by in `config.toml`'s `[keys.<name>]`.
@@ -70,6 +74,7 @@ impl Context {
             Context::Menu => "menu",
             Context::OpenRepo => "open-repo",
             Context::ActivityPopover => "activity",
+            Context::Prompt => "prompt",
         }
     }
 
@@ -130,6 +135,12 @@ pub(crate) enum CommandArg {
     Revset(String),
     /// A palette result row.
     Result(ResultRef),
+    /// A revision to push under a generated bookmark, and where to
+    /// (`None`: the default push remote).
+    PushRevision {
+        revision: RevisionSelection,
+        remote: Option<String>,
+    },
 }
 
 impl CommandArg {
@@ -137,7 +148,8 @@ impl CommandArg {
         match self {
             CommandArg::Revision(revision)
             | CommandArg::Browse { revision, .. }
-            | CommandArg::Detail { revision, .. } => Some(revision),
+            | CommandArg::Detail { revision, .. }
+            | CommandArg::PushRevision { revision, .. } => Some(revision),
             _ => None,
         }
     }
@@ -260,6 +272,53 @@ fn can_browse(ui: &Diffui, arg: &CommandArg) -> bool {
 fn has_selected_file(ui: &Diffui, _: &CommandArg) -> bool {
     let tab = ui.active();
     tab.session.document.files.get(tab.selected_file).is_some()
+}
+
+fn has_remotes(ui: &Diffui) -> bool {
+    !ui.active().session.bookmarks.remotes.is_empty()
+}
+
+/// The local bookmark a bookmark command names: a menu row's, or a palette
+/// bookmark result's (`main`, `main*`, `main??` — never `main@origin`).
+fn local_bookmark(ui: &Diffui, arg: &CommandArg) -> Option<String> {
+    let name = match arg {
+        CommandArg::Bookmark { name, .. } => name.as_str(),
+        CommandArg::Result(ResultRef::Bookmark(label)) => {
+            crate::bookmarks::local_bookmark_label(label)?
+        }
+        _ => return None,
+    };
+    let entry = ui.active().session.bookmarks.entry(name)?;
+    (!entry.local_targets.is_empty()).then(|| name.to_owned())
+}
+
+/// `(bookmark, remote)` of a palette `name@remote` result no one tracks yet.
+fn untracked_remote_bookmark(ui: &Diffui, arg: &CommandArg) -> Option<(String, String)> {
+    let CommandArg::Result(ResultRef::Bookmark(label)) = arg else {
+        return None;
+    };
+    let (name, remote) = label.trim_end_matches("??").rsplit_once('@')?;
+    let entry = ui.active().session.bookmarks.entry(name)?;
+    entry
+        .remotes
+        .iter()
+        .any(|r| r.remote == remote && !r.tracked)
+        .then(|| (name.to_owned(), remote.to_owned()))
+}
+
+/// `(bookmark, remote)` for a deletion push: the menu row's remote, else the
+/// first remote tracking the bookmark.
+fn deletion_remote(ui: &Diffui, arg: &CommandArg) -> Option<(String, String)> {
+    let name = local_bookmark(ui, arg)?;
+    let entry = ui.active().session.bookmarks.entry(&name)?;
+    let remote = match arg {
+        CommandArg::Bookmark {
+            remote: Some(remote),
+            ..
+        } => remote.clone(),
+        _ => entry.tracked_remote()?.to_owned(),
+    };
+    entry.tracks(&remote).then_some((name, remote))
 }
 
 // ── Shared builders ─────────────────────────────────────────────────────────
@@ -907,6 +966,161 @@ pub(crate) static REGISTRY: &[Command] = &[
             })),
             _ => None,
         },
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "bookmark.create",
+        label: "Create bookmark\u{2026}",
+        hint: "Name a new bookmark at the revision",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: can_mutate,
+        build: |ui, arg| {
+            target_revision(ui, &arg).map(|at| Action::Bookmark(BookmarkAction::Create { at }))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "revision.push-change",
+        label: "Push as new bookmark",
+        hint: "jj git push --change: push the revision under a generated bookmark",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| can_mutate(ui, arg) && has_remotes(ui),
+        build: |ui, arg| {
+            let remote = match &arg {
+                CommandArg::PushRevision { remote, .. } => remote.clone(),
+                _ => None,
+            };
+            target_revision(ui, &arg)
+                .map(|at| Action::Bookmark(BookmarkAction::PushChange { at, remote }))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "repo.push",
+        label: "Push tracked bookmarks",
+        hint: "jj git push: the tracked bookmarks between the remote and @",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| can_mutate(ui, arg) && has_remotes(ui),
+        build: |_ui, _arg| Some(Action::Bookmark(BookmarkAction::PushTracked)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "bookmark.push-to",
+        label: "Push bookmark",
+        hint: "Push to its tracked remote, or create it on the default one",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| {
+            can_mutate(ui, arg) && has_remotes(ui) && local_bookmark(ui, arg).is_some()
+        },
+        build: |ui, arg| {
+            let name = local_bookmark(ui, &arg)?;
+            let remote = match arg {
+                CommandArg::Bookmark { remote, .. } => remote,
+                _ => None,
+            };
+            Some(Action::Bookmark(BookmarkAction::Push { name, remote }))
+        },
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "bookmark.rename",
+        label: "Rename\u{2026}",
+        hint: "Rename this bookmark",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| can_mutate(ui, arg) && local_bookmark(ui, arg).is_some(),
+        build: |ui, arg| {
+            local_bookmark(ui, &arg).map(|name| Action::Bookmark(BookmarkAction::Rename { name }))
+        },
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "bookmark.delete-everywhere",
+        label: "Delete here and on remote",
+        hint: "Delete the bookmark and push the deletion",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| can_mutate(ui, arg) && deletion_remote(ui, arg).is_some(),
+        build: |ui, arg| {
+            let (name, remote) = deletion_remote(ui, &arg)?;
+            Some(Action::Bookmark(BookmarkAction::DeleteEverywhere {
+                name,
+                remote,
+            }))
+        },
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "bookmark.forget",
+        label: "Forget",
+        hint: "Drop the bookmark and stop tracking its remotes",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| can_mutate(ui, arg) && local_bookmark(ui, arg).is_some(),
+        build: |ui, arg| {
+            local_bookmark(ui, &arg)
+                .map(|name| Action::Mutate(mutations::MutationOp::ForgetBookmark { name }))
+        },
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "bookmark.untrack",
+        label: "Untrack",
+        hint: "Stop tracking this remote bookmark",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: can_mutate,
+        build: |_ui, arg| match arg {
+            CommandArg::Bookmark {
+                name,
+                remote: Some(remote),
+                ..
+            } => Some(Action::Mutate(mutations::MutationOp::UntrackBookmark {
+                name,
+                remote,
+            })),
+            _ => None,
+        },
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "bookmark.track-remote",
+        label: "Track remote bookmark",
+        hint: "jj bookmark track: follow this remote bookmark with a local one",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| can_mutate(ui, arg) && untracked_remote_bookmark(ui, arg).is_some(),
+        build: |ui, arg| {
+            let (name, remote) = untracked_remote_bookmark(ui, &arg)?;
+            Some(Action::Mutate(mutations::MutationOp::TrackBookmark {
+                name,
+                remote,
+            }))
+        },
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "bookmark.prompt-cancel",
+        label: "Cancel",
+        hint: "Close the bookmark-name prompt",
+        contexts: &[Context::Prompt],
+        chords: &["esc"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::Bookmark(BookmarkAction::PromptCancel)),
         palette: PaletteScope::Hidden,
     },
     // ── Target mode ─────────────────────────────────────────────────────

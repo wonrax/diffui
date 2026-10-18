@@ -1106,6 +1106,7 @@ impl Diffui {
                 open_url(&url);
                 Task::none()
             }
+            Action::Bookmark(action) => self.update_bookmark(action),
         }
     }
 
@@ -2844,6 +2845,9 @@ impl Diffui {
             Err(diffui_core::RepoError::Immutable { short_id }) => {
                 self.confirm_immutable(pending, &[short_id], true)
             }
+            Err(diffui_core::RepoError::PushRejected(rejection)) => {
+                self.push_rejected(pending, *rejection)
+            }
             Err(error) => {
                 let error = error.to_string();
                 if description_save
@@ -2909,7 +2913,7 @@ impl Diffui {
             return self.run_mutation(pending);
         };
         if !backwards {
-            return self.run_mutation(pending);
+            return self.run_mutation_checking_wc_push(pending);
         }
         let target = match to {
             RevisionSelection::WorkingCopy => "The working copy".to_owned(),
@@ -2950,6 +2954,9 @@ impl Diffui {
                 ),
             ),
         };
+        if self.publishes_working_copy(&pending.op) {
+            body.push_str(&format!(" {}", crate::bookmarks::WORKING_COPY_PUSH_WARNING));
+        }
         // A move that also pushes rewrites the remote branch — say so before
         // the user commits to it.
         let confirm_label = match (push_remote, conflicted_sides) {
@@ -4192,7 +4199,7 @@ impl Diffui {
     /// Short display name for a revision, matching the sidebar: unique
     /// change-id prefix (min 8 chars), `/N`-suffixed for divergent/hidden
     /// copies, falling back to a commit-id prefix for rows not in the graph.
-    fn revision_short_label(&self, selection: &RevisionSelection) -> String {
+    pub(crate) fn revision_short_label(&self, selection: &RevisionSelection) -> String {
         let commits = &self.active().session.commits;
         let row = match selection {
             RevisionSelection::WorkingCopy => commits.working_copy(),
@@ -4447,6 +4454,7 @@ impl Diffui {
             || self.mode(ModeKind::Menu).is_some()
             || self.mode(ModeKind::OpenRepo).is_some()
             || self.mode(ModeKind::Confirm).is_some()
+            || self.mode(ModeKind::NamePrompt).is_some()
         {
             crate::pointer::suppress(shell)
         } else {
@@ -4461,6 +4469,7 @@ impl Diffui {
             activity::activity_popover(self, theme),
             menu::build_overlay(self, theme),
             tab_bar::build_open_repo_dialog(self, theme),
+            crate::bookmarks::build_name_prompt(self, theme),
             tab_bar::build_confirm_dialog(self, theme),
             activity::toast_layer(self, theme),
         ]
