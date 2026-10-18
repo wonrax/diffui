@@ -217,7 +217,10 @@ impl Drop for RepoEvents {
 pub fn repo_id(spec: &OpenSpec) -> RepoId {
     match spec {
         OpenSpec::Local { root, .. } => RepoId(root.to_string_lossy().into_owned()),
-        OpenSpec::GitHubPr(pr) => RepoId(format!("{}/{}#{}", pr.owner, pr.repo, pr.number)),
+        OpenSpec::GitHubPr(pr) => RepoId(match &pr.host {
+            Some(host) => format!("{host}/{}/{}#{}", pr.owner, pr.repo, pr.number),
+            None => format!("{}/{}#{}", pr.owner, pr.repo, pr.number),
+        }),
     }
 }
 

@@ -354,7 +354,7 @@ pub(crate) fn is_ignored(ignores: &GitIgnoreFile, path: &RepoPath, is_dir: bool)
 /// right for both — `<root>/.git` exists only when colocated, so a
 /// non-colocated repo's exclude file was previously never read. `None` for a
 /// repo with no git backend, which has no git dir to consult.
-pub(super) fn backing_git_dir(repo_root: &Path) -> Option<PathBuf> {
+pub(crate) fn backing_git_dir(repo_root: &Path) -> Option<PathBuf> {
     let store = crate::repository::resolve_jj_repo_dir(repo_root)
         .ok()?
         .join("store");
