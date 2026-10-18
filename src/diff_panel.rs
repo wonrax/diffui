@@ -553,6 +553,7 @@ fn build_description_editor<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a,
         let input_padding = Padding::from([DESCRIPTION_EDITOR_PADDING_Y, 12.0]);
         let mut input = text_editor(&editor.content)
             .id(iced::widget::Id::new(DESCRIPTION_EDITOR_ID))
+            .key_binding(crate::ui::editor_key_binding)
             .placeholder(if editor.commit {
                 "Describe the change you are committing…"
             } else {

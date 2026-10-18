@@ -162,3 +162,20 @@ pub fn tooltip<'a, Message: 'a>(
     .gap(6)
     .into()
 }
+
+/// A multi-line editor's default key handling minus ⌘⏎. That chord submits
+/// the form the editor sits in, and iced's default binding would also insert
+/// a newline at the caret just before the submit reads the text.
+pub fn editor_key_binding<Message>(
+    key_press: widget::text_editor::KeyPress,
+) -> Option<widget::text_editor::Binding<Message>> {
+    let submit = key_press.modifiers.command()
+        && matches!(
+            key_press.key,
+            iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter)
+        );
+    if submit {
+        return None;
+    }
+    widget::text_editor::Binding::from_key_press(key_press)
+}

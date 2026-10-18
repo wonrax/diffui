@@ -769,6 +769,7 @@ fn split_prompt<'a>(
                   placeholder: &'static str,
                   on_edit: fn(text_editor::Action) -> ChangesMsg| {
         text_editor(content)
+            .key_binding(ui::editor_key_binding)
             .placeholder(placeholder)
             .size(ui.config.code_type.size)
             .font(ui.config.mono_font)
