@@ -248,6 +248,8 @@ impl Command {
             "revision.squash-into-parent" => "Squash into parent",
             "revision.abandon" => "Abandon\u{2026}",
             "repo.fetch" => "Fetch all remotes",
+            "bookmark.track" => "Track remote bookmark",
+            "bookmark.delete" => "Delete bookmark",
             _ => self.label,
         }
     }
@@ -326,12 +328,20 @@ fn local_bookmark(ui: &Diffui, arg: &CommandArg) -> Option<String> {
     (!entry.local_targets.is_empty()).then(|| name.to_owned())
 }
 
-/// `(bookmark, remote)` of a palette `name@remote` result no one tracks yet.
+/// `(bookmark, remote)` of a remote bookmark no one tracks yet: a menu row's
+/// bookmark, or a palette `name@remote` result.
 fn untracked_remote_bookmark(ui: &Diffui, arg: &CommandArg) -> Option<(String, String)> {
-    let CommandArg::Result(ResultRef::Bookmark(label)) = arg else {
-        return None;
+    let (name, remote) = match arg {
+        CommandArg::Bookmark {
+            name,
+            remote: Some(remote),
+            ..
+        } => (name.as_str(), remote.as_str()),
+        CommandArg::Result(ResultRef::Bookmark(label)) => {
+            label.trim_end_matches("??").rsplit_once('@')?
+        }
+        _ => return None,
     };
-    let (name, remote) = label.trim_end_matches("??").rsplit_once('@')?;
     let entry = ui.active().session.bookmarks.entry(name)?;
     entry
         .remotes
@@ -549,7 +559,7 @@ pub(crate) static REGISTRY: &[Command] = &[
     },
     Command {
         id: "repo.undo",
-        label: "Undo",
+        label: "Undo last operation",
         hint: "Step back one jj operation (jj undo); file saves are kept",
         // Target mode hands ⌘-chords down to the base context, so ⌘Z there
         // undoes too. A focused text field keeps ⌘Z for its own text — see
@@ -563,7 +573,7 @@ pub(crate) static REGISTRY: &[Command] = &[
     },
     Command {
         id: "repo.redo",
-        label: "Redo",
+        label: "Redo last undone operation",
         hint: "Re-apply what the last undo took back (jj redo)",
         contexts: &[Context::Base],
         // ⇧ lives in the character: ⌘⇧Z arrives as `cmd+Z`.
@@ -1271,41 +1281,33 @@ pub(crate) static REGISTRY: &[Command] = &[
     Command {
         id: "bookmark.delete",
         label: "Delete",
-        hint: "Delete this bookmark",
+        hint: "Delete this bookmark (pushing later deletes it on tracked remotes too)",
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: can_mutate,
-        build: |_ui, arg| match arg {
-            CommandArg::Bookmark { name, .. } => {
-                Some(Action::Mutate(mutations::MutationOp::DeleteBookmark {
-                    name,
-                }))
-            }
-            _ => None,
+        enabled: |ui, arg| can_mutate(ui, arg) && local_bookmark(ui, arg).is_some(),
+        build: |ui, arg| {
+            local_bookmark(ui, &arg)
+                .map(|name| Action::Mutate(mutations::MutationOp::DeleteBookmark { name }))
         },
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::Revision,
     },
     Command {
         id: "bookmark.track",
         label: "Track",
-        hint: "Track this remote bookmark locally",
+        hint: "jj bookmark track: follow this remote bookmark with a local one",
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: can_mutate,
-        build: |_ui, arg| match arg {
-            CommandArg::Bookmark {
-                name,
-                remote: Some(remote),
-                ..
-            } => Some(Action::Mutate(mutations::MutationOp::TrackBookmark {
+        enabled: |ui, arg| can_mutate(ui, arg) && untracked_remote_bookmark(ui, arg).is_some(),
+        build: |ui, arg| {
+            let (name, remote) = untracked_remote_bookmark(ui, &arg)?;
+            Some(Action::Mutate(mutations::MutationOp::TrackBookmark {
                 name,
                 remote,
-            })),
-            _ => None,
+            }))
         },
-        palette: PaletteScope::Hidden,
+        palette: PaletteScope::Revision,
     },
     Command {
         id: "bookmark.push",
@@ -1339,7 +1341,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         build: |ui, arg| {
             target_revision(ui, &arg).map(|at| Action::Bookmark(BookmarkAction::Create { at }))
         },
-        palette: PaletteScope::Root,
+        palette: PaletteScope::RevisionVerb,
     },
     Command {
         id: "revision.push-change",
@@ -1357,7 +1359,7 @@ pub(crate) static REGISTRY: &[Command] = &[
             target_revision(ui, &arg)
                 .map(|at| Action::Bookmark(BookmarkAction::PushChange { at, remote }))
         },
-        palette: PaletteScope::Root,
+        palette: PaletteScope::RevisionVerb,
     },
     Command {
         id: "repo.push",
@@ -1454,23 +1456,6 @@ pub(crate) static REGISTRY: &[Command] = &[
             _ => None,
         },
         palette: PaletteScope::Hidden,
-    },
-    Command {
-        id: "bookmark.track-remote",
-        label: "Track remote bookmark",
-        hint: "jj bookmark track: follow this remote bookmark with a local one",
-        contexts: &[Context::Base],
-        chords: &[],
-        mac_chords: &[],
-        enabled: |ui, arg| can_mutate(ui, arg) && untracked_remote_bookmark(ui, arg).is_some(),
-        build: |ui, arg| {
-            let (name, remote) = untracked_remote_bookmark(ui, &arg)?;
-            Some(Action::Mutate(mutations::MutationOp::TrackBookmark {
-                name,
-                remote,
-            }))
-        },
-        palette: PaletteScope::Revision,
     },
     Command {
         id: "bookmark.prompt-cancel",
@@ -2077,22 +2062,7 @@ pub(crate) static REGISTRY: &[Command] = &[
             target_revision(ui, &arg)
                 .map(|revision| Action::History(HistoryAction::ShowEvolog(revision)))
         },
-        palette: PaletteScope::Revision,
-    },
-    Command {
-        id: "history.evolog.selected",
-        label: "Show evolution log of the selected revision",
-        hint: "Every previous version of the selected revision (jj evolog)",
-        contexts: &[Context::Base],
-        chords: &[],
-        mac_chords: &[],
-        enabled: |ui, _arg| crate::history_panel::available(ui),
-        build: |ui, _arg| {
-            Some(Action::History(HistoryAction::ShowEvolog(
-                ui.active().session.selected_revision.clone(),
-            )))
-        },
-        palette: PaletteScope::Root,
+        palette: PaletteScope::RevisionVerb,
     },
     Command {
         id: "file.history",
@@ -2155,7 +2125,7 @@ pub(crate) static REGISTRY: &[Command] = &[
     },
     Command {
         id: "history.restore-operation",
-        label: "Restore repository to the selected operation\u{2026}",
+        label: "Restore to selected operation\u{2026}",
         hint: "jj op restore: put every revision and bookmark back to that point",
         contexts: &[Context::Base],
         chords: &[],
@@ -2172,7 +2142,7 @@ pub(crate) static REGISTRY: &[Command] = &[
     },
     Command {
         id: "history.revert-operation",
-        label: "Revert the selected operation\u{2026}",
+        label: "Revert selected operation\u{2026}",
         hint: "jj op revert: undo just that operation, keeping later work",
         contexts: &[Context::Base],
         chords: &[],
@@ -2249,7 +2219,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         build: |ui, arg| {
             target_revision(ui, &arg).map(|from| Action::Compare(CompareAction::PickWith(from)))
         },
-        palette: PaletteScope::Revision,
+        palette: PaletteScope::RevisionVerb,
     },
     Command {
         id: "compare.with-working-copy",
@@ -2263,22 +2233,7 @@ pub(crate) static REGISTRY: &[Command] = &[
             target_revision(ui, &arg)
                 .map(|from| Action::Compare(CompareAction::WithWorkingCopy(from)))
         },
-        palette: PaletteScope::Revision,
-    },
-    Command {
-        id: "compare.from-selected",
-        label: "Compare selected revision with…",
-        hint: "Pin the selected revision as the base, then click another",
-        contexts: &[Context::Base],
-        chords: &[],
-        mac_chords: &[],
-        enabled: can_compare,
-        build: |ui, _arg| {
-            Some(Action::Compare(CompareAction::PickWith(
-                ui.active().session.selected_revision.clone(),
-            )))
-        },
-        palette: PaletteScope::Root,
+        palette: PaletteScope::RevisionVerb,
     },
     Command {
         id: "compare.marked",
