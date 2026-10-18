@@ -186,6 +186,11 @@ impl Chord {
             }
         }
         match &self.key {
+            // A bare letter reads as the key you type: `j`, not `J`, which
+            // looks like it needs shift. Once a modifier or shift is in the
+            // chord the platform convention takes over (`⌘K`, `⇧R`), the way
+            // AppKit's own menus print key equivalents.
+            ChordKey::Char(c) if !shifted && !self.mods.any_command_like() => out.push_str(c),
             ChordKey::Char(c) => out.push_str(&c.to_uppercase()),
             ChordKey::Named(named) => out.push_str(named_label(*named)),
         }
@@ -718,7 +723,9 @@ mod tests {
         } else {
             assert_eq!(chord("cmd+k").display(), "Ctrl+K");
         }
-        assert_eq!(chord("r").display(), "R");
+        assert_eq!(chord("r").display(), "r");
+        assert_eq!(chord("j").display(), "j");
+        assert_eq!(chord("?").display(), "?");
     }
 
     /// `r` and `R` start two different rebases and sit next to each other in
