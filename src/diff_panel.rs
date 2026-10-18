@@ -454,7 +454,7 @@ fn build_diff_panel_body<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Me
         .content_version(ui.document_version)
         .layout_version(ui.active().session.document_id)
         .wrap(ui.diff_wrap)
-        .side_by_side(ui.diff_split);
+        .side_by_side(split_in_effect(ui));
 
         if let Some(details) = ui.active().session.revision_details.as_ref() {
             dv = dv.with_header(revision_header_lines(details));
@@ -610,6 +610,46 @@ fn build_description_editor<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a,
             .into();
     }
     Space::new().height(0).into()
+}
+
+/// Code columns a side-by-side half has to hold before the split is worth
+/// it. Narrower than this and both halves soft-wrap mid-token on ordinary
+/// lines, which reads worse than one unified column.
+const MIN_SPLIT_COLUMN_CHARS: f32 = 56.0;
+
+/// The diff pane's width: the window minus the history and file panes and
+/// their dividers.
+fn diff_pane_width(ui: &Diffui) -> f32 {
+    let history_width = if ui.active().history_panel_collapsed {
+        crate::theme::COLLAPSED_PANEL_WIDTH
+    } else {
+        ui.sidebar_width
+    };
+    let files_width = if ui.active().session.document.files.is_empty() {
+        0.0
+    } else if ui.active().files_panel_collapsed {
+        crate::theme::COLLAPSED_PANEL_WIDTH + 1.0
+    } else {
+        ui.file_nav_width + 1.0
+    };
+    (ui.window_size.width - history_width - files_width - 1.0).max(0.0)
+}
+
+/// Whether a side-by-side diff has room for both halves. The toggle is the
+/// user's preference; this only decides whether it can be honoured now, so
+/// widening the window brings the split back.
+pub(crate) fn split_fits(ui: &Diffui) -> bool {
+    let size = ui.config.code_type.size;
+    let char_width = crate::measure::line_width("0000000000", size, ui.config.mono_font) / 10.0;
+    // Per half: a line-number gutter (one number, ~4 digits + padding) plus
+    // the code columns.
+    let half = 4.0 * char_width + 16.0 + MIN_SPLIT_COLUMN_CHARS * char_width;
+    diff_pane_width(ui) >= 2.0 * half
+}
+
+/// Side-by-side is on and fits.
+pub(crate) fn split_in_effect(ui: &Diffui) -> bool {
+    ui.diff_split && split_fits(ui)
 }
 
 fn description_editor_input_height(ui: &Diffui) -> f32 {

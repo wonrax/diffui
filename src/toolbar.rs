@@ -122,9 +122,16 @@ pub fn build_toolbar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     // Side-by-side only applies to the diff; the source view is one column
     // by nature, so the toggle hides rather than sitting there inert.
     if ui.active().main_view == MainView::Diff {
+        // On but too narrow to honour: the diff falls back to unified, and
+        // the tooltip says why rather than the toggle looking broken.
+        let split_label = if ui.diff_split && !crate::diff_panel::split_fits(ui) {
+            "Side-by-side diff (window too narrow, showing unified)"
+        } else {
+            "Side-by-side diff"
+        };
         toggles = toggles.push(toolbar_toggle_button(
             icons::SPLIT,
-            "Side-by-side diff",
+            split_label,
             ui.diff_split,
             Message::Action(Action::ToggleSplit),
             theme,
