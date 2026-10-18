@@ -8,6 +8,9 @@ members = ["core"]
 resolver = "3"
 
 [features]
+# iced's devtools: an F12 metrics overlay (and a "Press F12" toast on every
+# launch) plus an offer to `cargo install` comet. Useful while profiling the
+# UI, noise for everyone else, so it stays out of default builds.
 iced-debug = ["iced/debug"]
 # Restores every tree-sitter grammar arborium ships. The default build carries
 # only the languages a diff is likely to contain, because the rest of the parse
@@ -26,7 +29,7 @@ diffui-core = { path = "core" }
 clap = { version = "4.5", features = ["derive"] }
 # Pinned to a rev, not a branch: without one `cargo update` walks us onto iced
 # master, and 0.15 is still unreleased and still breaking its API weekly.
-iced = { git = "https://github.com/iced-rs/iced.git", rev = "81324eb2beb3765d4cd30635bfc2a8e64900f781", features = ["advanced", "tokio", "debug", "canvas", "svg"] }
+iced = { git = "https://github.com/iced-rs/iced.git", rev = "81324eb2beb3765d4cd30635bfc2a8e64900f781", features = ["advanced", "tokio", "canvas", "svg"] }
 jj-lib = "0.45.1"
 mimalloc = "0.1"
 futures = "0.3"
