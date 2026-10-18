@@ -41,6 +41,9 @@ struct WorkspaceSlot {
     settings: UserSettings,
     snapshot: jj::SnapshotContext,
     name: WorkspaceNameBuf,
+    /// What the config files looked like when `settings` were read, or `None`
+    /// for fixed settings, which never reload.
+    config_stamp: Option<jj::settings::JjConfigStamp>,
 }
 
 pub(super) fn spawn(
@@ -194,9 +197,14 @@ impl Actor {
     fn slot(&mut self, repository: &Repository) -> Result<&mut WorkspaceSlot> {
         if self.workspace.is_none() {
             let root = &repository.root;
-            let settings = match &self.settings {
-                SettingsSource::Layered => jj::settings::jj_settings(root)?,
-                SettingsSource::Fixed(settings) => (**settings).clone(),
+            // Stamped before the read, so an edit racing the load shows up as
+            // a change next time instead of being missed.
+            let (settings, config_stamp) = match &self.settings {
+                SettingsSource::Layered => {
+                    let stamp = jj::settings::jj_config_stamp(root);
+                    (jj::settings::jj_settings(root)?, Some(stamp))
+                }
+                SettingsSource::Fixed(settings) => ((**settings).clone(), None),
             };
             let workspace = jj::load_workspace(&settings, root)?;
             let name = workspace.workspace_name().to_owned();
@@ -206,12 +214,37 @@ impl Actor {
                 settings,
                 snapshot,
                 name,
+                config_stamp,
             });
         }
         Ok(self
             .workspace
             .as_mut()
             .expect("the workspace was just opened"))
+    }
+
+    /// Re-read the jj config when one of its files changed since the
+    /// workspace was opened, so an edited identity, signing setup or
+    /// `immutable_heads()` applies without reopening the tab. jj-lib bakes the
+    /// settings into the workspace's repo loader, so the workspace is reopened
+    /// with them (a handful of small file reads). Called before the work that
+    /// writes commits or answers a manual refresh; a stat per config file is
+    /// all it costs when nothing changed.
+    fn reload_settings_if_changed(&mut self, repository: &Repository) {
+        let Some(stamp) = self
+            .workspace
+            .as_ref()
+            .and_then(|slot| slot.config_stamp.as_ref())
+        else {
+            return;
+        };
+        if *stamp == jj::settings::jj_config_stamp(&repository.root) {
+            return;
+        }
+        tracing::info!("jj config changed on disk; reloading the workspace settings");
+        self.workspace = None;
+        self.repo = None;
+        self.op_head = None;
     }
 
     /// The repo at head, reloading only when the operation head has moved.
@@ -287,6 +320,11 @@ impl Actor {
             }
             Command::LoadDiff { job, revision } => self.load_diff(repository, job, revision).await,
             Command::Snapshot { job, origin } => {
+                // A watcher tick is a file save; only a refresh (or the tail
+                // of a mutation, or focus regain) is worth the config check.
+                if origin == crate::session::RefreshOrigin::Focus {
+                    self.reload_settings_if_changed(repository);
+                }
                 let slot = self.slot(repository)?;
                 let outcome = {
                     let WorkspaceSlot {
@@ -312,6 +350,7 @@ impl Actor {
             } => self.mutate(repository, job, &op, allow_immutable).await,
             Command::Preview { job, draft } => self.preview(repository, job, draft).await,
             Command::Fetch { job, target } => {
+                self.reload_settings_if_changed(repository);
                 let progress = LoadProgress::default();
                 let slot = self.slot(repository)?;
                 let output = {
@@ -515,6 +554,7 @@ impl Actor {
         op: &MutationOp,
         allow_immutable: bool,
     ) -> Result<()> {
+        self.reload_settings_if_changed(repository);
         let progress = LoadProgress::default();
         let slot = self.slot(repository)?;
         let outcome = {
