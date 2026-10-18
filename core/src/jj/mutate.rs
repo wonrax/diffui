@@ -286,6 +286,18 @@ async fn mutate_locked(
         MutationOp::Undo { operation_id } => Some(
             resolve_undo_target(&repo_loader.clone(), &base_repo, operation_id.as_deref()).await?,
         ),
+        MutationOp::RevertOperation { operation_id } => {
+            Some(resolve_undo_target(&repo_loader.clone(), &base_repo, Some(operation_id)).await?)
+        }
+        _ => None,
+    };
+    // Same discipline for a restore: an operation from before this workspace
+    // existed has no `@` for it, and finding that out after the fold landed
+    // would strand the lock.
+    let restore_target = match op {
+        MutationOp::RestoreOperation { operation_id } => {
+            Some(super::history::restore_target(repo_loader, operation_id, &workspace_name).await?)
+        }
         _ => None,
     };
 
@@ -313,7 +325,12 @@ async fn mutate_locked(
             .rebase_descendants()
             .await
             .context("failed to rebase descendants after working-copy fold")?;
-        if matches!(op, MutationOp::Undo { .. }) {
+        if matches!(
+            op,
+            MutationOp::Undo { .. }
+                | MutationOp::RestoreOperation { .. }
+                | MutationOp::RevertOperation { .. }
+        ) {
             tx.set_is_snapshot(true);
             let snapped = tx
                 .commit("snapshot working copy")
@@ -745,6 +762,42 @@ async fn mutate_locked(
                 .await
                 .context("failed to merge the undo into the current view")?;
             format!("Undid: {description}")
+        }
+        MutationOp::RestoreOperation { .. } => {
+            let (operation, view) =
+                restore_target.expect("a restore resolves its target before the fold");
+            let restored = super::history::restored_view(&view, tx.base_repo().view().store_view());
+            tx.repo_mut().set_view(restored);
+            let hex = operation.id().hex();
+            format!("Restored to operation {}", &hex[..hex.len().min(12)])
+        }
+        MutationOp::RevertOperation { .. } => {
+            let UndoTarget {
+                operation,
+                parent,
+                description,
+            } = undo_target.expect("a revert resolves its target before the fold");
+            let op_repo = repo_loader
+                .load_at(&operation)
+                .await
+                .context("failed to load the repo at the operation to revert")?;
+            let parent_repo = repo_loader
+                .load_at(&parent)
+                .await
+                .context("failed to load the repo before the operation to revert")?;
+            tx.repo_mut()
+                .merge(&op_repo, &parent_repo)
+                .await
+                .context("failed to merge the revert into the current view")?;
+            let reverted = super::history::restored_view(
+                tx.repo().view().store_view(),
+                tx.base_repo().view().store_view(),
+            );
+            if !reverted.wc_commit_ids.contains_key(&workspace_name) {
+                bail!("reverting this operation would remove this workspace's working copy");
+            }
+            tx.repo_mut().set_view(reverted);
+            format!("Reverted: {description}")
         }
     };
 

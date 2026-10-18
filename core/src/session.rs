@@ -510,7 +510,9 @@ impl Session {
             | Payload::TreeListed { .. }
             | Payload::FileRead { .. }
             | Payload::FilePairRead { .. }
-            | Payload::BookmarkChecked { .. } => Vec::new(),
+            | Payload::BookmarkChecked { .. }
+            | Payload::OpLogBatch { .. }
+            | Payload::History { .. } => Vec::new(),
         }
     }
 

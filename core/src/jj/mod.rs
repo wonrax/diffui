@@ -9,6 +9,7 @@
 
 pub(crate) mod browse;
 pub(crate) mod diff;
+pub(crate) mod history;
 pub(crate) mod mutate;
 pub(crate) mod preview;
 pub(crate) mod remote;

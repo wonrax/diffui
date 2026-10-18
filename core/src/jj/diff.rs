@@ -15,6 +15,7 @@ use jj_lib::{
     files::FileMergeHunkLevel,
     matchers::{EverythingMatcher, Matcher, PrefixMatcher},
     merge::{Diff, SameChange},
+    merged_tree::MergedTree,
     object_id::ObjectId,
     repo::{ReadonlyRepo, Repo},
     repo_path::RepoPath,
@@ -47,10 +48,22 @@ pub(crate) async fn diff_jj_with_repo(
         .parent_tree(repo)
         .await
         .with_context(|| format!("failed to load jj parent tree for {}", commit_id.hex()))?;
-    let new_tree = commit.tree();
     let matcher = repo_scope_matcher(repository)?;
+    let document = diff_trees(repo, &old_tree, &commit.tree(), matcher.as_ref()).await?;
+    Ok((document, Some(details)))
+}
+
+/// Diff two trees into a [`DiffDocument`], surfacing the new side's
+/// conflicts. Shared by the revision diff and the history views' interdiffs,
+/// which compare trees that aren't a commit and its parents.
+pub(crate) async fn diff_trees(
+    repo: &ReadonlyRepo,
+    old_tree: &MergedTree,
+    new_tree: &MergedTree,
+    matcher: &dyn Matcher,
+) -> Result<DiffDocument> {
     let copy_records = CopyRecords::default();
-    let tree_diff = old_tree.diff_stream_with_copies(&new_tree, matcher.as_ref(), &copy_records);
+    let tree_diff = old_tree.diff_stream_with_copies(new_tree, matcher, &copy_records);
     let labels = Diff::new(old_tree.labels(), new_tree.labels());
     let mut stream = materialized_diff_stream(repo.store(), tree_diff, labels);
     let materialize_options = ConflictMaterializeOptions {
@@ -201,7 +214,7 @@ pub(crate) async fn diff_jj_with_repo(
         let covered: std::collections::HashSet<&str> =
             files.iter().map(|file| file.path.as_str()).collect();
         let mut conflict_files = Vec::new();
-        for (repo_path, value) in new_tree.conflicts_matching(matcher.as_ref()) {
+        for (repo_path, value) in new_tree.conflicts_matching(matcher) {
             let path = repo_path_label(&repo_path);
             if covered.contains(path.as_str()) {
                 continue;
@@ -251,14 +264,11 @@ pub(crate) async fn diff_jj_with_repo(
     let total_additions = files.iter().map(|file| file.additions).sum();
     let total_deletions = files.iter().map(|file| file.deletions).sum();
 
-    Ok((
-        DiffDocument {
-            files,
-            total_additions,
-            total_deletions,
-        },
-        Some(details),
-    ))
+    Ok(DiffDocument {
+        files,
+        total_additions,
+        total_deletions,
+    })
 }
 
 pub(crate) fn jj_revision_details(

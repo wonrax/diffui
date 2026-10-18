@@ -127,6 +127,14 @@ pub enum MutationOp {
     /// snapshot-before-mutate discipline (an undo that moves `@` must not
     /// clobber unsnapshotted on-disk edits).
     Undo { operation_id: Option<String> },
+    /// Put the repository back to how it was at `operation_id`
+    /// (`jj op restore`): heads, bookmarks, tags, remote-tracking refs and
+    /// working-copy pointers as recorded there. The operations since stay in
+    /// the log, so a restore is itself undoable.
+    RestoreOperation { operation_id: String },
+    /// Reverse exactly what `operation_id` did while keeping everything since
+    /// (`jj op revert`).
+    RevertOperation { operation_id: String },
 }
 
 /// User-facing summary of a successful mutation — becomes the status message.

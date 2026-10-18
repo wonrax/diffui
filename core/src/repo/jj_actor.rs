@@ -24,6 +24,7 @@ use super::protocol::{
     Command, Event, GraphTail, JobId, Payload, PreviewRequest, RepoError, RepoId,
 };
 use super::{Envelope, Jobs, SettingsSource, route_commands};
+use crate::history::{HistoryRequest, HistoryResponse};
 use crate::jj;
 use crate::model::{LoadProgress, RevisionSelection, StreamRow};
 use crate::mutations::{DraftSimulation, MutationOp};
@@ -415,6 +416,9 @@ impl Actor {
                 self.emit(Payload::BookmarkChecked { job, backwards });
                 Ok(())
             }
+            Command::History { job, request } => {
+                self.history(repository, job, request, cancel).await
+            }
             Command::Cancel { .. } => Ok(()),
         }
     }
@@ -567,6 +571,111 @@ impl Actor {
     }
 }
 
+impl Actor {
+    /// Annotate on a thread of its own. Walking a long file's ancestry takes
+    /// seconds on a big repository, and everything else the tab asks for
+    /// would queue behind it on the actor. The thread loads its own repo at
+    /// the operation the actor is at, and sends the terminal event itself.
+    fn annotate_detached(
+        &mut self,
+        repository: &Repository,
+        repo: &ReadonlyRepo,
+        job: JobId,
+        revision: crate::model::RevisionSelection,
+        path: String,
+        cancel: &CancelFlag,
+    ) -> Result<()> {
+        let settings = self.slot(repository)?.settings.clone();
+        let root = repository.root.clone();
+        let operation = repo.op_id().hex();
+        let (events, id, cancel) = (self.events.clone(), self.id.clone(), cancel.clone());
+        std::thread::Builder::new()
+            .name("diffui-annotate".to_owned())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build();
+                let result = match runtime {
+                    Ok(runtime) => runtime.block_on(jj::history::annotate_at_operation(
+                        &settings, &root, &operation, &revision, &path,
+                    )),
+                    Err(error) => Err(error.into()),
+                };
+                let payload = match result {
+                    _ if cancel.is_cancelled() => Payload::Cancelled { job },
+                    Ok(annotation) => Payload::History {
+                        job,
+                        response: HistoryResponse::Annotation(annotation),
+                    },
+                    Err(error) => Payload::Failed {
+                        job,
+                        error: classify(error),
+                    },
+                };
+                let _ = events.send(Event::new(id, payload));
+            })
+            .context("failed to spawn the annotate thread")?;
+        Ok(())
+    }
+
+    /// The history views' reads. All run against the repo at head; none take
+    /// the working-copy lock.
+    async fn history(
+        &mut self,
+        repository: &Repository,
+        job: JobId,
+        request: HistoryRequest,
+        cancel: &CancelFlag,
+    ) -> Result<()> {
+        let repo = self.repo_at_head(repository).await?;
+        let name = self.slot(repository)?.name.clone();
+        let response = match request {
+            HistoryRequest::OpLog { limit } => {
+                let events = self.events.clone();
+                let id = self.id.clone();
+                let mut emit = |entries| {
+                    let _ =
+                        events.send(Event::new(id.clone(), Payload::OpLogBatch { job, entries }));
+                };
+                match jj::history::stream_op_log(&repo, limit, BATCH_SIZE, cancel, &mut emit)
+                    .await?
+                {
+                    Some(truncated) => HistoryResponse::OpLogDone { truncated },
+                    None => {
+                        self.emit(Payload::Cancelled { job });
+                        return Ok(());
+                    }
+                }
+            }
+            HistoryRequest::ShowOperation { operation_id } => {
+                HistoryResponse::Operation(jj::history::show_operation(&repo, &operation_id).await?)
+            }
+            HistoryRequest::Evolog { revision } => {
+                HistoryResponse::Evolog(jj::history::evolog(&repo, &name, &revision).await?)
+            }
+            HistoryRequest::Diff { target } => {
+                let (document, details) =
+                    jj::history::history_diff(&repo, repository, &target).await?;
+                HistoryResponse::Diff {
+                    target,
+                    document,
+                    details,
+                }
+            }
+            HistoryRequest::Annotate { revision, path } => {
+                self.annotate_detached(repository, &repo, job, revision, path, cancel)?;
+                return Ok(());
+            }
+        };
+        if cancel.is_cancelled() {
+            self.emit(Payload::Cancelled { job });
+        } else {
+            self.emit(Payload::History { job, response });
+        }
+        Ok(())
+    }
+}
+
 fn command_name(command: &Command) -> &'static str {
     match command {
         Command::LoadGraph { .. } => "load_graph",
@@ -581,6 +690,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::ReadFile { .. } => "read_file",
         Command::FilePair { .. } => "file_pair",
         Command::BookmarkCheck { .. } => "bookmark_check",
+        Command::History { .. } => "history",
         Command::Cancel { .. } => "cancel",
     }
 }
@@ -677,7 +787,9 @@ pub fn rewritten_targets(
         | MutationOp::DeleteBookmark { .. }
         | MutationOp::TrackBookmark { .. }
         | MutationOp::PushBookmark { .. }
-        | MutationOp::Undo { .. } => {}
+        | MutationOp::Undo { .. }
+        | MutationOp::RestoreOperation { .. }
+        | MutationOp::RevertOperation { .. } => {}
     }
     targets
 }

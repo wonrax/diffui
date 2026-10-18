@@ -8,6 +8,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use crate::history::{HistoryRequest, HistoryResponse, OperationEntry};
 use crate::model::{
     BookmarksInfo, BranchStatus, DiffDocument, RevisionDetails, RevisionSelection, StreamRow,
 };
@@ -189,6 +190,13 @@ pub enum Command {
         name: String,
         to: RevisionSelection,
     },
+    /// A history view's read: the op log, an operation's changes, an
+    /// evolog, an interdiff, or a file's annotation. See
+    /// [`HistoryRequest`].
+    History {
+        job: JobId,
+        request: HistoryRequest,
+    },
     /// Ask the actor to stop `job`. A cancelled job reports
     /// [`Payload::Cancelled`] and never its success event, so the caller's
     /// inflight slot is always cleared by exactly one terminal event.
@@ -213,7 +221,8 @@ impl Command {
             | Self::ListTree { job, .. }
             | Self::ReadFile { job, .. }
             | Self::FilePair { job, .. }
-            | Self::BookmarkCheck { job, .. } => Some(*job),
+            | Self::BookmarkCheck { job, .. }
+            | Self::History { job, .. } => Some(*job),
             Self::Cancel { .. } => None,
         }
     }
@@ -333,6 +342,17 @@ pub enum Payload {
         loaded: usize,
         total: usize,
     },
+    /// A slice of the operation log, newest first. Not terminal: the stream
+    /// ends with a [`HistoryResponse::OpLogDone`].
+    OpLogBatch {
+        job: JobId,
+        entries: Vec<OperationEntry>,
+    },
+    /// The answer to a [`Command::History`].
+    History {
+        job: JobId,
+        response: HistoryResponse,
+    },
     /// The repository's operation head moved — ours or someone else's. The
     /// actor dedups on the fingerprint, so this only fires on a real change.
     OpHeadChanged {
@@ -371,6 +391,8 @@ impl Payload {
             | Self::FilePairRead { job, .. }
             | Self::BookmarkChecked { job, .. }
             | Self::Progress { job, .. }
+            | Self::OpLogBatch { job, .. }
+            | Self::History { job, .. }
             | Self::Failed { job, .. }
             | Self::Cancelled { job, .. } => Some(*job),
             Self::Ready { .. }
@@ -388,6 +410,7 @@ impl Payload {
             self,
             Self::Batch { .. }
                 | Self::Progress { .. }
+                | Self::OpLogBatch { .. }
                 | Self::Ready { .. }
                 | Self::OpHeadChanged { .. }
                 | Self::WorkingCopyChanged
