@@ -16,12 +16,9 @@ use std::time::Duration;
 use diffui_core::watcher::RepoWatcher;
 
 /// Longest a batch may take to arrive. Generous: the assertion is about
-/// whether the watch reports at all, never about how quickly.
-const PATIENCE: Duration = Duration::from_secs(5);
-
-/// Long enough for a batch to have arrived if one was ever coming — the
-/// debounce window plus room for the notify thread.
-const QUIET: Duration = Duration::from_millis(1500);
+/// whether the watch reports at all, never about how quickly, and a loaded
+/// machine can hold FSEvents delivery back by seconds.
+const PATIENCE: Duration = Duration::from_secs(15);
 
 /// `(label, per_directory)` for the two shapes [`RepoWatcher::start_with`]
 /// takes.
@@ -48,9 +45,10 @@ fn an_ignored_tree_is_silent_while_the_worktree_reports() {
         harness::block_on(async {
             let mut watcher =
                 RepoWatcher::start_with(&root, per_directory).expect("start the watch");
+            harness::settle_watch(&mut watcher, shape).await;
 
             std::fs::write(root.join("target/debug/x.o"), "junk").expect("write into target");
-            let quiet = tokio::time::timeout(QUIET, watcher.next_batch()).await;
+            let quiet = tokio::time::timeout(harness::WATCH_QUIET, watcher.next_batch()).await;
             assert!(
                 quiet.is_err(),
                 "{shape}: an ignored write must not produce a batch, got {quiet:?}"
@@ -74,6 +72,7 @@ fn a_directory_created_after_the_watch_starts_is_picked_up() {
         harness::block_on(async {
             let mut watcher =
                 RepoWatcher::start_with(&root, per_directory).expect("start the watch");
+            harness::settle_watch(&mut watcher, shape).await;
 
             std::fs::create_dir_all(root.join("src/deep")).expect("mkdir src/deep");
             assert!(next_batch(&mut watcher, shape).await.worktree);
@@ -100,6 +99,7 @@ fn an_operation_reports_as_an_op_log_write() {
         harness::block_on(async {
             let mut watcher =
                 RepoWatcher::start_with(&root, per_directory).expect("start the watch");
+            harness::settle_watch(&mut watcher, shape).await;
 
             // A bookmark move writes an operation and touches nothing on disk,
             // so the batch it produces can only have come from `op_heads`. On

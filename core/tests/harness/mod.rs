@@ -700,3 +700,27 @@ pub fn git_available() -> bool {
         .output()
         .is_ok_and(|output| output.status.success())
 }
+
+/// Long enough for a watch batch to have arrived if one was ever coming: the
+/// debounce window plus room for the notify thread.
+pub const WATCH_QUIET: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Wait until `watcher` has been quiet for a full [`WATCH_QUIET`] window,
+/// draining whatever the fixture's own setup produced. Panics if it is still
+/// reporting after a handful of windows.
+///
+/// FSEvents stamps an event when `fseventsd` gets to it, not when the write
+/// happened, so under load a fixture's `mkdir`s and file writes can land on a
+/// stream opened after them. Without this, that stale batch shows up in
+/// whichever window a test reads next and is blamed on the write it made there.
+pub async fn settle_watch(watcher: &mut diffui_core::watcher::RepoWatcher, label: &str) {
+    for _ in 0..5 {
+        if tokio::time::timeout(WATCH_QUIET, watcher.next_batch())
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+    panic!("{label}: the watch never went quiet after setup");
+}
