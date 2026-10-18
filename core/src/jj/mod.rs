@@ -8,6 +8,7 @@
 //! runtime — that thread is the only place a `Workspace` is ever held.
 
 pub(crate) mod browse;
+pub(crate) mod colocate;
 pub(crate) mod diff;
 pub(crate) mod mutate;
 pub(crate) mod preview;

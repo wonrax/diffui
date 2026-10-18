@@ -743,13 +743,11 @@ async fn mutate_locked(
         .context("failed to rebase descendants after mutation")?;
 
     // Mirror jj's own post-operation behavior: export the updated bookmarks to
-    // the colocated git repo so the real git branches (which jj surfaces as
-    // `name@git`) follow the move. Without this the jj bookmark moves but the
-    // git branch stays put, unlike the `jj` CLI. Bookmarks that can't be
-    // represented as a single git ref (e.g. conflicted) come back in
-    // `failed_bookmarks`; that's expected and non-fatal, exactly as jj treats
-    // it, so only a hard backend error is propagated.
-    export_refs(tx.repo_mut()).context("failed to export bookmarks to the git backend")?;
+    // the git repo so the real git branches (which jj surfaces as `name@git`)
+    // follow the move, and — colocated — move this worktree's git HEAD and
+    // index to `@`'s parent, so `git status` agrees with the graph.
+    super::colocate::sync_git_after_transaction(tx.repo_mut(), &workspace_name, &repository.root)
+        .await?;
 
     // Undo and redo are described exactly as jj describes them: the next
     // `jj undo` (or ours) reads the description to walk the stack.

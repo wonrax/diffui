@@ -666,3 +666,43 @@ fn a_mutation_on_a_rewritten_id_follows_the_change() {
         other => panic!("expected a diff under the followed id, got {other:?}"),
     }
 }
+
+/// What colocated git's `HEAD` names: a detached commit id, or `None` while
+/// it is still an unborn branch.
+fn git_head(root: &std::path::Path) -> Option<String> {
+    let head = std::fs::read_to_string(root.join(".git").join("HEAD")).expect("read .git/HEAD");
+    let head = head.trim();
+    (!head.starts_with("ref: ")).then(|| head.to_owned())
+}
+
+/// jj points a colocated checkout's git `HEAD` at `@`'s parent after every
+/// transaction. diffui only exported the bookmarks, so `git status` and IDEs
+/// kept describing whatever commit the last CLI command left behind.
+#[test]
+fn a_mutation_moves_the_colocated_git_head_to_the_working_copy_parent() {
+    let root = harness::scratch_colocated_repo("colocated-head");
+    let mut repo = TestRepo::open(&root);
+    repo.snapshot();
+    commit_file(&mut repo, "a.txt", "one\n", "first");
+    let id_of = |rows: &[diffui_core::StreamRow], description: &str| {
+        rows.iter()
+            .find(|row| row.summary.description.starts_with(description))
+            .expect("row")
+            .summary
+            .commit_id
+            .clone()
+    };
+    let first = id_of(&repo.graph("all()"), "first");
+    assert_eq!(git_head(&root), Some(first.clone()));
+
+    commit_file(&mut repo, "b.txt", "two\n", "second");
+    let rows = repo.graph("all()");
+    assert_eq!(git_head(&root), Some(id_of(&rows, "second")));
+
+    // A new change on an older commit moves it back.
+    repo.mutate(MutationOp::New {
+        parent: RevisionSelection::Commit(first.clone()),
+    })
+    .expect("new on first");
+    assert_eq!(git_head(&root), Some(first));
+}

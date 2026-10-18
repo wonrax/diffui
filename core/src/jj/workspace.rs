@@ -460,6 +460,7 @@ pub(crate) async fn snapshot_working_copy(
     context: &SnapshotContext,
 ) -> Result<SnapshotOutcome> {
     let workspace_name = workspace.workspace_name().to_owned();
+    let workspace_root = workspace.workspace_root().to_owned();
     let repo_loader = workspace.repo_loader().clone();
     let options = context.options();
 
@@ -489,7 +490,7 @@ pub(crate) async fn snapshot_working_copy(
             }
         };
 
-    let result = absorb_snapshot(&mut locked, &workspace_name).await;
+    let result = absorb_snapshot(&mut locked, &workspace_name, &workspace_root).await;
     match result {
         Ok(outcome) => Ok(outcome),
         Err(error) => {
@@ -504,6 +505,7 @@ pub(crate) async fn snapshot_working_copy(
 async fn absorb_snapshot(
     locked: &mut LockedWorkingCopy<'_>,
     workspace_name: &WorkspaceName,
+    workspace_root: &Path,
 ) -> Result<SnapshotOutcome> {
     let warnings = std::mem::take(&mut locked.warnings);
     if !locked.tree_changed() {
@@ -552,6 +554,22 @@ async fn absorb_snapshot(
         .rebase_descendants()
         .await
         .context("failed to rebase descendants after jj snapshot")?;
+    // Best-effort, unlike the CLI: this runs on every save, and an IDE
+    // holding git's index lock for a moment must not make the save fail to
+    // land. The next mutation resets the index anyway.
+    if let Err(error) = super::colocate::sync_git_after_snapshot(
+        tx.repo_mut(),
+        workspace_root,
+        &locked.wc_commit.tree(),
+        &locked.tree,
+    )
+    .await
+    {
+        tracing::warn!(
+            error = format!("{error:#}"),
+            "failed to sync the colocated git index after a snapshot"
+        );
+    }
     let new_repo = tx
         .commit("snapshot working copy")
         .await

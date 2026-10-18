@@ -39,6 +39,21 @@ pub fn scratch_repo(test: &str) -> PathBuf {
     root
 }
 
+/// [`scratch_repo`], colocated: the git repo is `<root>/.git`, sharing the
+/// working tree, the way `jj git init --colocate` sets it up.
+pub fn scratch_colocated_repo(test: &str) -> PathBuf {
+    let root = std::env::temp_dir().join(format!("diffui-actor-{test}"));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create scratch dir");
+    let settings = test_settings();
+    block_on(async {
+        jj_lib::workspace::Workspace::init_colocated_git(&settings, &root, Default::default())
+            .await
+            .expect("init colocated jj workspace");
+    });
+    root
+}
+
 /// The settings a fixture's repository is read and written with: the identity
 /// and signing-off of [`test_settings`], plus the scratch repo's own
 /// `.jj/repo/config.toml` when a scenario wrote one (an `immutable_heads()`
