@@ -35,6 +35,9 @@ pub(crate) enum Message {
     Find(crate::find::FindMessage),
     /// Popup-menu messages — see [`crate::menu::MenuMessage`].
     Menu(crate::menu::MenuMessage),
+    /// Diff-pane change selection and conflict resolution — see
+    /// [`crate::changes::ChangesMsg`].
+    Changes(crate::changes::ChangesMsg),
 }
 
 /// Everything a widget reports that is *not* an intent: positions, hovers,

@@ -158,4 +158,9 @@ pub(crate) enum Action {
 
     /// Open a URL (from an activity's captured remote output) in the browser.
     OpenUrl(String),
+
+    // ── Partial changes / conflicts ─────────────────────────────────────
+    /// A change-selection or conflict-resolution intent (see
+    /// [`crate::changes`]).
+    Changes(crate::changes::ChangesMsg),
 }

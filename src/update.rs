@@ -640,6 +640,7 @@ impl Diffui {
             Message::Palette(message) => self.on_palette_message(message),
             Message::Find(message) => self.on_find_message(message),
             Message::Menu(message) => self.on_menu_message(message),
+            Message::Changes(message) => self.on_changes(message),
         };
         // A mode that isn't on screen must not keep the keyboard.
         self.prune_stale_modes();
@@ -1106,6 +1107,7 @@ impl Diffui {
                 open_url(&url);
                 Task::none()
             }
+            Action::Changes(message) => self.on_changes(message),
         }
     }
 
@@ -1699,6 +1701,9 @@ impl Diffui {
             return Task::none();
         };
         let context = self.key_context();
+        // iced's text editors never capture keys, so the split prompt's
+        // description editors claim plain keys here.
+        let consumed = consumed || self.active().changes.owns_keyboard();
         let Some(id) = self.resolve_chord(context, &chord, consumed) else {
             return Task::none();
         };

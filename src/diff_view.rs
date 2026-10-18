@@ -109,6 +109,56 @@ pub struct DiffFileView<'a> {
     pub deletions: usize,
 }
 
+/// Tri-state of a change-selection checkbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CheckState {
+    #[default]
+    Off,
+    /// Some of the file's hunks are picked.
+    Partial,
+    On,
+}
+
+/// A file's picks for the change-selection checkboxes.
+#[derive(Debug, Clone, Default)]
+pub struct FileMark {
+    pub state: CheckState,
+    pub hunks: HunkMarks,
+}
+
+/// Hunk-level checkboxes of one file.
+#[derive(Debug, Clone, Default)]
+pub enum HunkMarks {
+    /// Picked whole only (binary, conflicted, mode-only changes): its hunk
+    /// headers get no checkbox.
+    #[default]
+    None,
+    /// Every hunk has a checkbox; none is picked.
+    Unpicked,
+    /// Every hunk has a checkbox; these are picked.
+    Picked(Vec<bool>),
+}
+
+/// The change-selection checkboxes drawn in file and hunk headers: the
+/// marks (indexed like the widget's files) and where clicks go.
+pub struct ChangeMarks<Message> {
+    pub files: Vec<FileMark>,
+    pub accent: Color,
+    pub on_toggle_file: fn(usize) -> Message,
+    pub on_toggle_hunk: fn(usize, usize) -> Message,
+}
+
+/// A change-selection checkbox under the cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckHit {
+    File(usize),
+    Hunk(usize, usize),
+}
+
+/// Side of a change-selection checkbox, and the gap after it.
+const CHECK_SIZE: f32 = 14.0;
+const CHECK_GAP: f32 = 8.0;
+
 /// One line of the `jj show`-style revision header rendered at the top of
 /// the diff scroll area. Kept as a plain enum so `main.rs` decides the text
 /// content without leaking `RevisionDetails` into this module.
@@ -250,6 +300,9 @@ pub struct DiffView<'a, Message> {
     /// draws and hit-tests the affordance beside the first description line;
     /// the actual editor is layered by the caller into the reserved spacer.
     on_edit_description: Option<fn() -> Message>,
+    /// Change-selection checkboxes in file/hunk headers (see
+    /// [`Self::change_marks`]).
+    marks: Option<ChangeMarks<Message>>,
 }
 
 /// Per-render find-match data fed into `DiffView::with_find`. The widget
@@ -1161,6 +1214,7 @@ impl<'a, Message> DiffView<'a, Message> {
             plain: false,
             on_browse_file: None,
             on_edit_description: None,
+            marks: None,
         }
     }
 
@@ -1188,6 +1242,13 @@ impl<'a, Message> DiffView<'a, Message> {
     /// the file index when clicked. Ignored for plain documents.
     pub fn on_browse_file(mut self, callback: fn(usize) -> Message) -> Self {
         self.on_browse_file = Some(callback);
+        self
+    }
+
+    /// Draw change-selection checkboxes in file headers (and in the hunk
+    /// headers of files picked by hunk). Ignored for plain documents.
+    pub fn change_marks(mut self, marks: ChangeMarks<Message>) -> Self {
+        self.marks = Some(marks);
         self
     }
 
@@ -3406,6 +3467,16 @@ where
                     shell.capture_event();
                     return;
                 }
+                if let Some(hit) = self.check_at(state, bounds, point)
+                    && let Some(marks) = &self.marks
+                {
+                    shell.publish(match hit {
+                        CheckHit::File(file) => (marks.on_toggle_file)(file),
+                        CheckHit::Hunk(file, hunk) => (marks.on_toggle_hunk)(file, hunk),
+                    });
+                    shell.capture_event();
+                    return;
+                }
                 if let Some(file_index) = self.browse_button_at(state, bounds, point) {
                     if let Some(on_browse) = self.on_browse_file {
                         shell.publish(on_browse(file_index));
@@ -3937,6 +4008,19 @@ where
                         wrapping: text::Wrapping::None,
                     },
                 );
+                if let Some(picked) = self.hunk_mark(header.file_index, header.hunk_index) {
+                    let state = if picked {
+                        CheckState::On
+                    } else {
+                        CheckState::Off
+                    };
+                    self.draw_check(
+                        renderer,
+                        self.hunk_check_rect(header.y, bounds),
+                        state,
+                        bounds,
+                    );
+                }
             }
 
             // Draw selection backgrounds *before* the text so glyphs render
@@ -4124,7 +4208,9 @@ where
         {
             return mouse::Interaction::Idle;
         }
-        if self.browse_button_at(state, bounds, point).is_some() {
+        if self.browse_button_at(state, bounds, point).is_some()
+            || self.check_at(state, bounds, point).is_some()
+        {
             return mouse::Interaction::Pointer;
         }
         if self
@@ -4458,6 +4544,19 @@ impl<Message> DiffView<'_, Message> {
         );
 
         let text_y = centered_text_y(y, self.metrics.file_header_height, self.metrics.row_height);
+        let check_rect = self.file_check_rect(file_index, y, bounds);
+        let check_reserve = if let Some(rect) = check_rect {
+            let state = self
+                .marks
+                .as_ref()
+                .and_then(|marks| marks.files.get(file_index))
+                .map(|mark| mark.state)
+                .unwrap_or_default();
+            self.draw_check(renderer, rect, state, bounds);
+            CHECK_SIZE + CHECK_GAP
+        } else {
+            0.0
+        };
         let status_chip = Chip {
             label: file.status.short_label().to_owned(),
             font: self.font,
@@ -4470,7 +4569,7 @@ impl<Message> DiffView<'_, Message> {
         let chip_w = chip::draw(
             renderer,
             &status_chip,
-            bounds.x + HEADER_HORIZONTAL_PADDING,
+            bounds.x + HEADER_HORIZONTAL_PADDING + check_reserve,
             y + self.metrics.file_header_height / 2.0,
             bounds,
         );
@@ -4481,7 +4580,7 @@ impl<Message> DiffView<'_, Message> {
         } else {
             0.0
         };
-        let title_x = bounds.x + HEADER_HORIZONTAL_PADDING + chip_w + 8.0;
+        let title_x = bounds.x + HEADER_HORIZONTAL_PADDING + check_reserve + chip_w + 8.0;
         let title_width = (bounds.x + bounds.width
             - HEADER_HORIZONTAL_PADDING
             - summary_width
@@ -5111,6 +5210,167 @@ fn prefix_for_kind(kind: DiffLineKind) -> &'static str {
         DiffLineKind::Conflict => "!",
         DiffLineKind::Context => " ",
         DiffLineKind::Note => "\\",
+    }
+}
+
+// ── Change-selection checkboxes ─────────────────────────────────────────
+impl<Message> DiffView<'_, Message> {
+    /// Screen rect of a file header's checkbox when the header is drawn at
+    /// `header_y`, or `None` when the checkboxes are off.
+    fn file_check_rect(
+        &self,
+        file_index: usize,
+        header_y: f32,
+        bounds: Rectangle,
+    ) -> Option<Rectangle> {
+        let marks = self.marks.as_ref()?;
+        if self.plain || marks.files.get(file_index).is_none() {
+            return None;
+        }
+        Some(Rectangle {
+            x: bounds.x + HEADER_HORIZONTAL_PADDING,
+            y: header_y + (self.metrics.file_header_height - CHECK_SIZE) / 2.0,
+            width: CHECK_SIZE,
+            height: CHECK_SIZE,
+        })
+    }
+
+    /// Screen rect of a hunk header's checkbox (in the gutter band).
+    fn hunk_check_rect(&self, header_y: f32, bounds: Rectangle) -> Rectangle {
+        Rectangle {
+            x: bounds.x + GUTTER_HORIZONTAL_PADDING,
+            y: header_y + (self.metrics.hunk_header_height - CHECK_SIZE) / 2.0,
+            width: CHECK_SIZE,
+            height: CHECK_SIZE,
+        }
+    }
+
+    /// Whether hunk `(file, hunk)` is picked, or `None` when it has no
+    /// checkbox.
+    fn hunk_mark(&self, file: usize, hunk: usize) -> Option<bool> {
+        if self.plain {
+            return None;
+        }
+        let mark = self.marks.as_ref()?.files.get(file)?;
+        match &mark.hunks {
+            HunkMarks::None => None,
+            HunkMarks::Unpicked => (hunk < self.files.get(file)?.hunks.len()).then_some(false),
+            HunkMarks::Picked(picks) => picks.get(hunk).copied(),
+        }
+    }
+
+    /// The checkbox under `point`, if any. File headers (the pinned sticky
+    /// one included) win over the hunk headers scrolling beneath them.
+    fn check_at<P>(&self, state: &State<P>, bounds: Rectangle, point: Point) -> Option<CheckHit> {
+        self.marks.as_ref()?;
+        if self.plain {
+            return None;
+        }
+        let index = state.height_index.borrow();
+        let headers = self.visible_file_header_positions(&index, bounds, state.vertical_offset);
+        let mut over_file_header = false;
+        for (file_index, y) in headers {
+            if point.y >= y && point.y < y + self.metrics.file_header_height {
+                over_file_header = true;
+                if self
+                    .file_check_rect(file_index, y, bounds)
+                    .is_some_and(|rect| grow(rect, 3.0).contains(point))
+                {
+                    return Some(CheckHit::File(file_index));
+                }
+            }
+        }
+        if over_file_header {
+            return None;
+        }
+        let content_y = point.y - bounds.y + state.vertical_offset;
+        let slot = index
+            .hunk_tops
+            .partition_point(|&top| top <= content_y)
+            .checked_sub(1)?;
+        let top = index.hunk_tops[slot];
+        if content_y >= top + self.metrics.hunk_header_height {
+            return None;
+        }
+        let (file, hunk) = index.hunk_ids[slot];
+        let (file, hunk) = (file as usize, hunk as usize);
+        self.hunk_mark(file, hunk)?;
+        let y = bounds.y + (top - state.vertical_offset);
+        grow(self.hunk_check_rect(y, bounds), 3.0)
+            .contains(point)
+            .then_some(CheckHit::Hunk(file, hunk))
+    }
+
+    fn draw_check<Renderer>(
+        &self,
+        renderer: &mut Renderer,
+        rect: Rectangle,
+        state: CheckState,
+        clip: Rectangle,
+    ) where
+        Renderer: text::Renderer,
+    {
+        let Some(marks) = &self.marks else {
+            return;
+        };
+        let checked = state != CheckState::Off;
+        renderer.fill_quad(
+            renderer::Quad {
+                bounds: rect,
+                border: Border {
+                    radius: 3.0.into(),
+                    width: 1.0,
+                    color: if checked {
+                        marks.accent
+                    } else {
+                        Color {
+                            a: 0.55,
+                            ..self.palette.text_muted
+                        }
+                    },
+                },
+                shadow: Shadow::default(),
+                snap: true,
+            },
+            if checked {
+                marks.accent
+            } else {
+                Color::TRANSPARENT
+            },
+        );
+        let glyph = match state {
+            CheckState::Off => return,
+            CheckState::Partial => crate::icons::MINUS,
+            CheckState::On => crate::icons::CHECK,
+        };
+        renderer.fill_text(
+            text::Text {
+                content: glyph.to_owned(),
+                bounds: Size::new(rect.width, rect.height),
+                size: Pixels(CHECK_SIZE - 3.0),
+                line_height: text::LineHeight::Absolute(Pixels(rect.height)),
+                font: crate::icons::ICON_FONT,
+                align_x: text::Alignment::Center,
+                align_y: alignment::Vertical::Center,
+                shaping: text::Shaping::Basic,
+                wrapping: text::Wrapping::None,
+                ellipsis: text::Ellipsis::None,
+                hint_factor: None,
+            },
+            Point::new(rect.center_x(), rect.center_y()),
+            self.palette.panel,
+            clip,
+        );
+    }
+}
+
+/// `rect` grown by `by` on every side — a forgiving hit target.
+fn grow(rect: Rectangle, by: f32) -> Rectangle {
+    Rectangle {
+        x: rect.x - by,
+        y: rect.y - by,
+        width: rect.width + 2.0 * by,
+        height: rect.height + 2.0 * by,
     }
 }
 

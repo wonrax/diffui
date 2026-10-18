@@ -1310,6 +1310,126 @@ pub(crate) static REGISTRY: &[Command] = &[
     tab_select!(7, "tab.select-7", "Go to tab 7", "cmd+7", 6),
     tab_select!(8, "tab.select-8", "Go to tab 8", "cmd+8", 7),
     tab_select!(9, "tab.select-9", "Go to tab 9", "cmd+9", 8),
+    // ── Partial changes and conflicts (the diff pane's checkboxes) ──────
+    Command {
+        id: "changes.toggle-file",
+        label: "Select file for split / squash",
+        hint: "Tick or untick the file in the change selection",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| crate::changes::command_file(ui, arg).is_some(),
+        build: |ui, arg| {
+            let index = crate::changes::command_file(ui, &arg)?;
+            Some(Action::Changes(crate::changes::ChangesMsg::ToggleFile(
+                index,
+            )))
+        },
+        palette: PaletteScope::File,
+    },
+    Command {
+        id: "changes.split",
+        label: "Split selected changes\u{2026}",
+        hint: "Keep the selection in this revision, move the rest to a new one",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| crate::changes::has_selection(ui),
+        build: |_ui, _arg| Some(Action::Changes(crate::changes::ChangesMsg::OpenSplit)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "changes.squash-into-parent",
+        label: "Squash selected changes into parent",
+        hint: "jj squash with just the ticked files and hunks",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| crate::changes::has_selection(ui),
+        build: |_ui, _arg| {
+            Some(Action::Changes(
+                crate::changes::ChangesMsg::SquashIntoParent,
+            ))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "changes.move-into",
+        label: "Move selected changes into\u{2026}",
+        hint: "Pick the revision that receives the ticked files and hunks",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| crate::changes::has_selection(ui),
+        build: |_ui, _arg| Some(Action::Changes(crate::changes::ChangesMsg::MoveInto)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "changes.discard",
+        label: "Discard selected changes\u{2026}",
+        hint: "Restore the parent's content for the ticked files and hunks",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| crate::changes::has_selection(ui),
+        build: |_ui, _arg| Some(Action::Changes(crate::changes::ChangesMsg::Discard)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "changes.clear",
+        label: "Clear change selection",
+        hint: "Untick every file and hunk",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| crate::changes::has_selection(ui),
+        build: |_ui, _arg| Some(Action::Changes(crate::changes::ChangesMsg::Clear)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "file.restore",
+        label: "Restore file from parent (discard changes)\u{2026}",
+        hint: "jj restore for this file",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| crate::changes::command_file(ui, arg).is_some(),
+        build: |ui, arg| {
+            let path = crate::changes::command_file_path(ui, &arg)?;
+            Some(Action::Changes(crate::changes::ChangesMsg::RestoreFile(
+                path,
+            )))
+        },
+        palette: PaletteScope::File,
+    },
+    Command {
+        id: "file.move-into",
+        label: "Move file changes into\u{2026}",
+        hint: "Pick the revision that receives this file's changes",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| crate::changes::command_file(ui, arg).is_some(),
+        build: |ui, arg| {
+            let path = crate::changes::command_file_path(ui, &arg)?;
+            Some(Action::Changes(crate::changes::ChangesMsg::MoveFile(path)))
+        },
+        palette: PaletteScope::File,
+    },
+    Command {
+        id: "file.split",
+        label: "Split file into new change\u{2026}",
+        hint: "Move this file's changes into a new change on top",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| crate::changes::command_file(ui, arg).is_some(),
+        build: |ui, arg| {
+            let path = crate::changes::command_file_path(ui, &arg)?;
+            Some(Action::Changes(crate::changes::ChangesMsg::SplitFile(path)))
+        },
+        palette: PaletteScope::File,
+    },
 ];
 
 #[cfg(test)]

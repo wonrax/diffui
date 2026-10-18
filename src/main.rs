@@ -7,6 +7,7 @@ use std::{
 
 mod action;
 mod activity;
+mod changes;
 mod chip;
 mod chrome;
 mod commands;
@@ -716,6 +717,8 @@ pub(crate) struct TabState {
     /// Cleared on plain click, Esc, and draft start; ids whose rows left the
     /// loaded graph are ignored at use rather than eagerly pruned.
     pub(crate) revision_multi_selection: Vec<String>,
+    /// The diff pane's file/hunk pick and conflict-resolution state.
+    pub(crate) changes: changes::ChangesState,
 }
 
 impl TabState {
@@ -751,6 +754,7 @@ impl TabState {
             pending_description_edit: None,
             pending_detail_copy: None,
             revision_multi_selection: Vec::new(),
+            changes: Default::default(),
         }
     }
 

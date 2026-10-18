@@ -109,14 +109,20 @@ fn build_file_navigator_surface<'a>(
     let rows_for_files = Rc::clone(&tree_rows);
     let lanes = EmptyFileTreeLanes::default();
     let build_file = Box::new(move |display: usize| {
-        changed_file_row(
-            &rows_for_files[display],
-            files,
-            theme,
-            additions_width,
-            deletions_width,
-            &lanes,
-        )
+        let row = &rows_for_files[display];
+        let mut view =
+            changed_file_row(row, files, theme, additions_width, deletions_width, &lanes);
+        view.check = match row {
+            FileTreeRow::File { file_index, .. } => {
+                crate::changes::tree_check(ui, Some(*file_index), None)
+            }
+            FileTreeRow::Dir { path, .. } => crate::changes::tree_check(
+                ui,
+                None,
+                Some(&format!("{}/", path.trim_end_matches('/'))),
+            ),
+        };
+        view
     });
     let build_revision = Box::new(move |_| crate::source_panel::empty_revision_row(theme));
     let list = RevisionList::new(
@@ -138,7 +144,8 @@ fn build_file_navigator_surface<'a>(
     .restore_scroll(ui.active().file_tree_scroll_offset, ui.scroll_restore_token)
     .on_file_context_menu(|row, rect, point| {
         Message::Ui(UiEvent::SidebarFileContextMenu(row, rect, point))
-    });
+    })
+    .on_file_check(|row| Message::Changes(crate::changes::ChangesMsg::ToggleTreeRow(row)));
     container(
         column![
             container(header).padding(Padding {
@@ -259,6 +266,7 @@ fn changed_file_row(
         file_index,
         lane_labels: Rc::clone(&lanes.labels),
         lane_segments: Rc::clone(&lanes.segments),
+        check: None,
     }
 }
 
@@ -455,6 +463,10 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
             dv = dv.on_browse_file(|index| Message::Ui(UiEvent::BrowseFileFromDiff(index)));
         }
 
+        if let Some(marks) = crate::changes::diff_marks(ui, theme) {
+            dv = dv.change_marks(marks);
+        }
+
         if let Some(find_state) = ui.active().find() {
             dv = dv.with_find(diff_view::FindOverlay {
                 matches: &find_state.matches,
@@ -480,8 +492,11 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
         // upper-right of the panel. `stack` overlays without taking
         // the diff view out of the column flow.
         let find_overlay = find::build_overlay(ui, theme);
-        let diff_with_find: Element<'a, Message> =
-            stack![diff_view, find_overlay].clip(true).into();
+        let mut layers = stack![diff_view, find_overlay].clip(true);
+        if let Some(bar) = crate::changes::selection_bar(ui, theme) {
+            layers = layers.push(bar);
+        }
+        let diff_with_find: Element<'a, Message> = layers.into();
 
         column![summary, diff_with_find].spacing(0).into()
     };

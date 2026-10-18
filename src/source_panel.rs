@@ -461,6 +461,7 @@ fn source_file_row(
         file_index,
         lane_labels,
         lane_segments,
+        check: None,
     }
 }
 

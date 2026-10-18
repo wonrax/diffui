@@ -205,6 +205,9 @@ pub struct FileRowView {
     /// lane that survives into the continuation. See
     /// [`RevisionRowView::lane_segments`].
     pub lane_segments: Rc<[Option<usize>]>,
+    /// Change-selection checkbox drawn in place of the file/folder icon, or
+    /// `None` for no checkbox (see [`RevisionList::on_file_check`]).
+    pub check: Option<crate::diff_view::CheckState>,
 }
 
 /// Key the widget reports back so the parent can map it to its own
@@ -306,6 +309,8 @@ pub struct RevisionList<'a, Message> {
     /// *display* index into the file tree (like `on_select_file`), its
     /// on-screen rect, and the cursor point.
     on_file_context_menu: Option<fn(usize, Rectangle, Point) -> Message>,
+    /// A click on a file row's checkbox (its icon column), by display index.
+    on_file_check: Option<fn(usize) -> Message>,
     /// Reports the scroll offset (content-space px) whenever it changes, so the
     /// app can persist it per-tab. `None` ⇒ scroll position isn't tracked.
     on_scroll: Option<fn(f64) -> Message>,
@@ -380,6 +385,7 @@ impl<'a, Message> RevisionList<'a, Message> {
             on_select_file,
             on_context_menu: None,
             on_file_context_menu: None,
+            on_file_check: None,
             on_scroll: None,
             restore_offset: 0.0,
             restore_token: 0,
@@ -459,6 +465,13 @@ impl<'a, Message> RevisionList<'a, Message> {
         callback: fn(usize, Rectangle, Point) -> Message,
     ) -> Self {
         self.on_file_context_menu = Some(callback);
+        self
+    }
+
+    /// Register a click handler for file-row checkboxes (rows whose
+    /// [`FileRowView::check`] is set). Gets the row's display index.
+    pub fn on_file_check(mut self, callback: fn(usize) -> Message) -> Self {
+        self.on_file_check = Some(callback);
         self
     }
 
@@ -1186,7 +1199,22 @@ where
                             // File rows never drag, so their click stays on press.
                             RowKind::File(display_index) => {
                                 state.pending_click = None;
-                                shell.publish((self.on_select_file)(display_index));
+                                let checked = self.on_file_check.filter(|_| {
+                                    let item = self.item_at(row_idx);
+                                    let gutter_total = self.item_gutter_width(&item);
+                                    let Item::File(file) = item else {
+                                        return false;
+                                    };
+                                    let icon_x =
+                                        bounds.x + gutter_total + file.indent + FILE_CHEVRON_COL;
+                                    file.check.is_some()
+                                        && cursor_pos.x >= icon_x - 2.0
+                                        && cursor_pos.x < icon_x + FILE_ICON_COL + 2.0
+                                });
+                                match checked {
+                                    Some(on_check) => shell.publish(on_check(display_index)),
+                                    None => shell.publish((self.on_select_file)(display_index)),
+                                }
                                 shell.capture_event();
                             }
                         }
@@ -2295,18 +2323,31 @@ impl<'a, Message> RevisionList<'a, Message> {
             Some(false) => icons::FOLDER_OPEN,
             None => icons::FILE,
         };
-        fill_text_centered_y(
-            renderer,
-            icon_glyph,
-            content_x + FILE_CHEVRON_COL + FILE_ICON_COL / 2.0,
-            row_mid_y,
-            FILE_ICON_COL,
-            FILE_ICON_SIZE,
-            f.icon_color,
-            icons::ICON_FONT,
-            row_clip,
-            text::Alignment::Center,
-        );
+        if let Some(check) = f.check {
+            draw_file_check(
+                renderer,
+                content_x + FILE_CHEVRON_COL + FILE_ICON_COL / 2.0,
+                row_mid_y,
+                check,
+                self.style.accent,
+                self.style.muted_text,
+                self.style.background,
+                row_clip,
+            );
+        } else {
+            fill_text_centered_y(
+                renderer,
+                icon_glyph,
+                content_x + FILE_CHEVRON_COL + FILE_ICON_COL / 2.0,
+                row_mid_y,
+                FILE_ICON_COL,
+                FILE_ICON_SIZE,
+                f.icon_color,
+                icons::ICON_FONT,
+                row_clip,
+                text::Alignment::Center,
+            );
+        }
 
         // Layout: [indent][chevron][icon] name … [+N] [-N] [status chip] pad
         // — the status chip is the rightmost column so badges align down the
@@ -2800,6 +2841,65 @@ where
     fn from(widget: RevisionList<'a, Message>) -> Self {
         Element::new(widget)
     }
+}
+
+/// A file-tree change-selection checkbox centered at `(center_x, mid_y)`.
+#[allow(clippy::too_many_arguments)]
+fn draw_file_check<R>(
+    renderer: &mut R,
+    center_x: f32,
+    mid_y: f32,
+    check: crate::diff_view::CheckState,
+    accent: Color,
+    muted: Color,
+    glyph_color: Color,
+    clip: Rectangle,
+) where
+    R: text::Renderer,
+{
+    use crate::diff_view::CheckState;
+    const SIDE: f32 = 12.0;
+    let rect = Rectangle {
+        x: center_x - SIDE / 2.0,
+        y: mid_y - SIDE / 2.0,
+        width: SIDE,
+        height: SIDE,
+    };
+    let checked = check != CheckState::Off;
+    renderer.fill_quad(
+        iced::advanced::renderer::Quad {
+            bounds: rect,
+            border: iced::Border {
+                radius: 3.0.into(),
+                width: 1.0,
+                color: if checked {
+                    accent
+                } else {
+                    Color { a: 0.55, ..muted }
+                },
+            },
+            shadow: iced::Shadow::default(),
+            snap: true,
+        },
+        if checked { accent } else { Color::TRANSPARENT },
+    );
+    let glyph = match check {
+        CheckState::Off => return,
+        CheckState::Partial => icons::MINUS,
+        CheckState::On => icons::CHECK,
+    };
+    fill_text_centered_y(
+        renderer,
+        glyph,
+        center_x,
+        mid_y,
+        SIDE,
+        SIDE - 3.0,
+        glyph_color,
+        icons::ICON_FONT,
+        clip,
+        text::Alignment::Center,
+    );
 }
 
 #[cfg(test)]

@@ -608,6 +608,13 @@ impl Diffui {
             ));
             items.push(MenuEntry::Separator);
         }
+        if is_file
+            && self.active().main_view == MainView::Diff
+            && crate::changes::command_file(self, &CommandArg::Path(path.clone())).is_some()
+        {
+            items.extend(self.file_change_menu_items(&path));
+            items.push(MenuEntry::Separator);
+        }
         items.push(self.menu_row(
             "Copy path",
             "file.copy-path",
@@ -617,6 +624,18 @@ impl Diffui {
             items.push(self.menu_item("file.copy-absolute-path", CommandArg::Path(path)));
         }
         items
+    }
+
+    /// The diff-view file menu's partial-change rows: restore / move /
+    /// split / select.
+    fn file_change_menu_items(&self, path: &str) -> Vec<menu::MenuEntry> {
+        let arg = || CommandArg::Path(path.to_owned());
+        vec![
+            self.menu_item("file.restore", arg()),
+            self.menu_item("file.move-into", arg()),
+            self.menu_item("file.split", arg()),
+            self.menu_item("changes.toggle-file", arg()),
+        ]
     }
 
     /// macOS: pop the file context menu natively (blocking, glowing over the
