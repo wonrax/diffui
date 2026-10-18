@@ -543,7 +543,7 @@ impl Diffui {
             .is_some_and(|(id, _)| *id == job)
         {
             // The ancestry check failed, so we can't tell a backwards move from
-            // a fast-forward. Run it: this is where the guard did not exist.
+            // a fast-forward; `apply_bookmark_check` refuses the move.
             return self.apply_bookmark_check(tab, Err(error.to_string()));
         }
         if jobs.mutation.as_ref().is_some_and(|(id, _)| *id == job) {
@@ -2883,10 +2883,23 @@ impl Diffui {
         else {
             return Task::none();
         };
-        // A check that failed can't tell a backwards move from a fast-forward;
-        // run it, as it ran before the guard existed. The mutation path still
-        // surfaces any real failure.
-        let backwards = result.unwrap_or(false);
+        // A check that failed can't tell a backwards move from a fast-forward,
+        // and running it anyway would let a backwards move-and-push rewrite
+        // the remote with no confirmation. Fail closed: report, don't move.
+        let backwards = match result {
+            Ok(backwards) => backwards,
+            Err(error) => {
+                return self.finish_activity_row(
+                    pending.tab_id,
+                    pending.activity_id,
+                    Err(format!(
+                        "couldn't check whether the move is backwards, so nothing was \
+                         moved: {error}"
+                    )),
+                    None,
+                );
+            }
+        };
         let mutations::MutationOp::MoveBookmark {
             name,
             to,
@@ -5008,6 +5021,39 @@ mod tests {
             "matches must index the document that just landed"
         );
         assert_eq!(state.active, Some(0));
+    }
+
+    /// A backwards-move check that errors can't say the move is safe, so the
+    /// move (and its push) doesn't run and no confirmation pretends it can.
+    #[test]
+    fn a_failed_backwards_check_refuses_the_move_and_push() {
+        let mut ui = app();
+        let tab = push_tab(&mut ui, "/tmp/repo");
+        let (activity_id, _) = ui.begin_activity(tab, "Move main + push", false);
+        let state = ui.tab_mut(tab).unwrap();
+        let job = state.session.next_job();
+        state.jobs.bookmark_check = Some((
+            job,
+            PendingMutation {
+                op: mutations::MutationOp::MoveBookmark {
+                    name: "main".to_owned(),
+                    to: RevisionSelection::WorkingCopy,
+                    push_remote: Some("origin".to_owned()),
+                },
+                tab_id: tab,
+                activity_id,
+                allow_immutable: false,
+            },
+        ));
+
+        let _ = ui.apply_bookmark_check(tab, Err("index unavailable".to_owned()));
+
+        let state = ui.tab_mut(tab).unwrap();
+        assert!(state.jobs.bookmark_check.is_none());
+        assert!(state.jobs.mutation.is_none(), "nothing was sent");
+        assert!(state.queued_mutations.is_empty(), "nothing was queued");
+        assert!(ui.confirm().is_none());
+        assert!(!ui.active().activities.any_running());
     }
 
     #[test]
