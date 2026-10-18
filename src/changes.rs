@@ -209,6 +209,10 @@ pub(crate) fn editable(tab: &TabState) -> bool {
         && tab.repository.is_some()
         && tab.main_view == MainView::Diff
         && !tab.session.document.files.is_empty()
+        // A comparison's hunks are the difference between two revisions, not
+        // a change either one holds, so there is nothing to split off.
+        && !tab.session.diff_base.is_compare()
+        && !tab.session.document_base.is_compare()
 }
 
 /// Whether `file` can be picked hunk by hunk — a plain text change. Binary
