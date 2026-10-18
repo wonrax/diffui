@@ -20,6 +20,8 @@ pub(crate) enum Message {
     /// A user intent, from whichever producer resolved it. The one arm that
     /// performs work the user asked for — see [`crate::action`].
     Action(Action),
+    /// A click on a menu-bar item (macOS): the command's registry position.
+    MenuBar(u32),
     /// One event from a repository actor. Everything the projection owns —
     /// graph batches, diffs, snapshots, mutations — arrives here and is folded
     /// in by [`diffui_core::Session::apply`]; the rest is routed by job to the

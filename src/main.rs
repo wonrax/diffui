@@ -7,6 +7,7 @@ use std::{
 
 mod action;
 mod activity;
+mod app_menu;
 mod chip;
 mod chrome;
 mod commands;

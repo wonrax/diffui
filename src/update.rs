@@ -634,6 +634,7 @@ impl Diffui {
     pub(crate) fn update(&mut self, message: Message) -> Task<Message> {
         let task = match message {
             Message::Action(action) => self.perform(action),
+            Message::MenuBar(tag) => self.on_menu_bar_pick(tag),
             Message::Repo(event) => self.on_repo_event(*event),
             Message::Ui(event) => self.on_ui_event(event),
             Message::Window(event) => self.on_window_event(event),
@@ -1112,6 +1113,7 @@ impl Diffui {
                 open_url(&url);
                 Task::none()
             }
+            Action::OpenConfigFile => crate::app_menu::open_config_file(),
         }
     }
 
@@ -1465,6 +1467,7 @@ impl Diffui {
                 }
             }
             WindowEvent::Opened(position, size) => {
+                crate::app_menu::install(self);
                 // Seed tracking from the real window without marking dirty: the
                 // geometry we'd persist already matches what's on disk.
                 self.window_size = size;
@@ -4640,6 +4643,7 @@ impl Diffui {
             toast_tick,
             system::theme_changes()
                 .map(|mode| Message::Window(WindowEvent::SystemThemeChanged(mode))),
+            crate::app_menu::subscription(),
         ])
     }
 

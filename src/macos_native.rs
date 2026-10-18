@@ -300,3 +300,344 @@ fn install_glow(mtm: MainThreadMarker, rect: GlowRect) -> Option<Retained<CALaye
 
     Some(glow)
 }
+
+// ── The menu bar ────────────────────────────────────────────────────────────
+//
+// winit installs a bare app menu (About / Hide / Quit). [`install_menu_bar`]
+// replaces it with the app's own, built from the command registry by
+// `crate::app_menu`. Two rules keep it from fighting the keymap:
+//
+//   * A command item doesn't fire on its key equivalent. The command menus
+//     are a `KeymapMenu`, whose `performKeyEquivalent:` declines every key,
+//     so the keystroke falls through to the window and the keymap resolves
+//     it against the mode stack as before (and honours `[keys]`); the menu
+//     only *shows* the chord. A click sends the item's tag down
+//     [`menu_bar_picks`]. (Disabling the item during the key match doesn't
+//     work: AppKit swallows a key that matches a disabled item.) The app and
+//     Window menus stay plain `NSMenu`s, so ⌘, ⌘H ⌘Q ⌘M work natively.
+//   * Edit's copy / paste / select-all re-post their own key to the window
+//     when clicked, so the focused iced text field handles them exactly as
+//     it handles the keystroke.
+//
+// Like the popup menus, the bar blocks the main thread while it is open;
+// picks are queued on a channel and read by an iced subscription once it
+// closes.
+
+/// A key equivalent as AppKit spells it: the key (lower-case for a plain
+/// letter, upper-case implies shift) and the modifiers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyEquivalent {
+    pub key: String,
+    pub command: bool,
+    pub alt: bool,
+    pub control: bool,
+    pub shift: bool,
+}
+
+impl KeyEquivalent {
+    fn mask(&self) -> objc2_app_kit::NSEventModifierFlags {
+        use objc2_app_kit::NSEventModifierFlags as F;
+        let mut mask = F::empty();
+        for (held, flag) in [
+            (self.command, F::Command),
+            (self.alt, F::Option),
+            (self.control, F::Control),
+            (self.shift, F::Shift),
+        ] {
+            if held {
+                mask |= flag;
+            }
+        }
+        mask
+    }
+}
+
+/// One menu-bar item.
+pub enum BarItem {
+    /// Sends `tag` down [`menu_bar_picks`] when clicked.
+    Command {
+        title: String,
+        tag: u32,
+        key: Option<KeyEquivalent>,
+    },
+    /// A standard AppKit action sent down the responder chain (`hide:`,
+    /// `terminate:`, `performMiniaturize:`), handled by AppKit itself.
+    Standard {
+        title: String,
+        action: objc2::runtime::Sel,
+        key: Option<KeyEquivalent>,
+    },
+    /// Re-posts `key` to the key window when clicked (Edit's copy/paste).
+    EditKey {
+        title: String,
+        key: KeyEquivalent,
+    },
+    Submenu {
+        title: String,
+        items: Vec<BarItem>,
+    },
+    Separator,
+}
+
+/// What AppKit should treat a top-level menu as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarRole {
+    /// The application menu (always first; its title is the app's name).
+    App,
+    Plain,
+    /// The Window menu: AppKit appends the window list.
+    Windows,
+    /// The Help menu: AppKit adds its search field.
+    Help,
+}
+
+pub struct BarMenu {
+    pub title: String,
+    pub role: BarRole,
+    pub items: Vec<BarItem>,
+}
+
+static BAR_TX: std::sync::OnceLock<futures::channel::mpsc::UnboundedSender<u32>> =
+    std::sync::OnceLock::new();
+static BAR_RX: std::sync::Mutex<Option<futures::channel::mpsc::UnboundedReceiver<u32>>> =
+    std::sync::Mutex::new(None);
+
+/// The tags of clicked [`BarItem::Command`]s. Subscribed once; a second call
+/// gets a stream that never yields.
+pub fn menu_bar_picks() -> impl futures::Stream<Item = u32> {
+    bar_channel();
+    BAR_RX
+        .lock()
+        .ok()
+        .and_then(|mut rx| rx.take())
+        .unwrap_or_else(|| futures::channel::mpsc::unbounded().1)
+}
+
+fn bar_channel() -> &'static futures::channel::mpsc::UnboundedSender<u32> {
+    BAR_TX.get_or_init(|| {
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        if let Ok(mut slot) = BAR_RX.lock() {
+            *slot = Some(rx);
+        }
+        tx
+    })
+}
+
+define_class!(
+    // SAFETY:
+    // - The superclass NSObject has no subclassing requirements.
+    // - `BarTarget` does not implement `Drop`.
+    #[unsafe(super = NSObject)]
+    #[thread_kind = MainThreadOnly]
+    struct BarTarget;
+
+    // SAFETY: `NSObjectProtocol` has no safety requirements.
+    unsafe impl NSObjectProtocol for BarTarget {}
+
+    impl BarTarget {
+        // SAFETY: The selector takes a single object argument (the sender).
+        #[unsafe(method(barItemSelected:))]
+        fn bar_item_selected(&self, sender: &NSMenuItem) {
+            let _ = bar_channel().unbounded_send(sender.tag() as u32);
+        }
+
+        // SAFETY: The selector takes a single object argument (the sender).
+        #[unsafe(method(editKeySelected:))]
+        fn edit_key_selected(&self, sender: &NSMenuItem) {
+            let key = sender.keyEquivalent().to_string();
+            let mask = sender.keyEquivalentModifierMask();
+            repost_key(&key, mask);
+        }
+
+    }
+);
+
+define_class!(
+    // SAFETY:
+    // - Subclassing NSMenu is supported; only `performKeyEquivalent:` is
+    //   overridden, with its documented signature.
+    // - `KeymapMenu` does not implement `Drop`.
+    #[unsafe(super(NSMenu))]
+    #[thread_kind = MainThreadOnly]
+    struct KeymapMenu;
+
+    impl KeymapMenu {
+        // Decline every key equivalent: the keymap owns these keys.
+        //
+        // SAFETY: Matches `-performKeyEquivalent:`.
+        #[unsafe(method(performKeyEquivalent:))]
+        fn perform_key_equivalent(&self, _event: &NSEvent) -> objc2::runtime::Bool {
+            objc2::runtime::Bool::NO
+        }
+    }
+);
+
+impl BarTarget {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(());
+        // SAFETY: `NSObject`'s `init` is a correct designated initializer.
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+/// Post `key` (an AppKit key equivalent) with `mask` to the key window as a
+/// key down/up pair, as if typed.
+fn repost_key(key: &str, mask: objc2_app_kit::NSEventModifierFlags) {
+    use objc2::class;
+    use objc2_foundation::NSPoint;
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    let Some(window) = app.keyWindow() else {
+        return;
+    };
+    // Virtual key codes (US layout) for the keys the Edit menu reposts;
+    // winit reads the physical key from it and the logical key from the
+    // characters.
+    let code: u16 = match key {
+        "a" => 0,
+        "x" => 7,
+        "c" => 8,
+        "v" => 9,
+        "z" => 6,
+        _ => 0,
+    };
+    let characters = NSString::from_str(key);
+    // SAFETY: `keyEventWithType:…` takes plain values and two strings, and
+    // returns an autoreleased event or nil; `postEvent:atStart:` takes it.
+    unsafe {
+        let uptime: f64 = {
+            let info: *mut AnyObject = msg_send![class!(NSProcessInfo), processInfo];
+            msg_send![info, systemUptime]
+        };
+        for kind in [10usize, 11usize] {
+            let event: Option<Retained<NSEvent>> = msg_send![
+                class!(NSEvent),
+                keyEventWithType: kind,
+                location: NSPoint::new(0.0, 0.0),
+                modifierFlags: mask,
+                timestamp: uptime,
+                windowNumber: window.windowNumber(),
+                context: std::ptr::null_mut::<AnyObject>(),
+                characters: &*characters,
+                charactersIgnoringModifiers: &*characters,
+                isARepeat: false,
+                keyCode: code
+            ];
+            if let Some(event) = event {
+                app.postEvent_atStart(&event, false);
+            }
+        }
+    }
+}
+
+/// Replace the menu bar with `menus`. Call on the main thread once the app
+/// has finished launching (winit installs its default menu then).
+pub fn install_menu_bar(menus: &[BarMenu]) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    bar_channel();
+    let target = BarTarget::new(mtm);
+    let app = NSApplication::sharedApplication(mtm);
+    let bar = NSMenu::new(mtm);
+    for spec in menus {
+        let keymap_keys = matches!(spec.role, BarRole::Plain | BarRole::Help);
+        let menu = build_bar_menu(mtm, &target, &spec.title, &spec.items, keymap_keys);
+        let holder = NSMenuItem::new(mtm);
+        holder.setTitle(&NSString::from_str(&spec.title));
+        holder.setSubmenu(Some(&menu));
+        bar.addItem(&holder);
+        match spec.role {
+            BarRole::Windows => app.setWindowsMenu(Some(&menu)),
+            BarRole::Help => app.setHelpMenu(Some(&menu)),
+            BarRole::App | BarRole::Plain => {}
+        }
+    }
+    app.setMainMenu(Some(&bar));
+    // Menu items hold their target weakly; it has to live as long as the
+    // menu bar, which is the life of the process.
+    std::mem::forget(target);
+}
+
+/// Build one menu of the bar. `keymap_keys`: its items' key equivalents are
+/// shown only, never performed (see [`KeymapMenu`]).
+fn build_bar_menu(
+    mtm: MainThreadMarker,
+    target: &BarTarget,
+    title: &str,
+    items: &[BarItem],
+    keymap_keys: bool,
+) -> Retained<NSMenu> {
+    let title = NSString::from_str(title);
+    let menu: Retained<NSMenu> = if keymap_keys {
+        // SAFETY: `initWithTitle:` is NSMenu's designated initializer.
+        let menu: Retained<KeymapMenu> =
+            unsafe { msg_send![KeymapMenu::alloc(mtm), initWithTitle: &*title] };
+        Retained::into_super(menu)
+    } else {
+        let menu = NSMenu::new(mtm);
+        menu.setTitle(&title);
+        menu
+    };
+    // Whether a command can run is checked when its pick runs; AppKit's
+    // auto-enabling would grey out every item without a responder for it.
+    // The standard items (Hide, Quit, Minimize) are always available.
+    menu.setAutoenablesItems(false);
+    let target_ref: &AnyObject = target;
+    for item in items {
+        let built = match item {
+            BarItem::Separator => NSMenuItem::separatorItem(mtm),
+            BarItem::Command { title, tag, key } => {
+                let entry = bar_entry(mtm, title, sel!(barItemSelected:), key.as_ref());
+                entry.setTag(*tag as isize);
+                // SAFETY: `target` outlives the menu (see `install_menu_bar`).
+                unsafe { entry.setTarget(Some(target_ref)) };
+                entry
+            }
+            BarItem::Standard { title, action, key } => {
+                bar_entry(mtm, title, *action, key.as_ref())
+            }
+            BarItem::EditKey { title, key } => {
+                let entry = bar_entry(mtm, title, sel!(editKeySelected:), Some(key));
+                // SAFETY: as above.
+                unsafe { entry.setTarget(Some(target_ref)) };
+                entry
+            }
+            BarItem::Submenu { title, items } => {
+                let entry = NSMenuItem::new(mtm);
+                entry.setTitle(&NSString::from_str(title));
+                let submenu = build_bar_menu(mtm, target, title, items, keymap_keys);
+                entry.setSubmenu(Some(&submenu));
+                entry
+            }
+        };
+        menu.addItem(&built);
+    }
+    menu
+}
+
+fn bar_entry(
+    mtm: MainThreadMarker,
+    title: &str,
+    action: objc2::runtime::Sel,
+    key: Option<&KeyEquivalent>,
+) -> Retained<NSMenuItem> {
+    let key_string = NSString::from_str(key.map_or("", |key| key.key.as_str()));
+    // SAFETY: `action` is a selector the item's target (ours, or the
+    // responder chain for the standard ones) implements.
+    let entry = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str(title),
+            Some(action),
+            &key_string,
+        )
+    };
+    if let Some(key) = key {
+        entry.setKeyEquivalentModifierMask(key.mask());
+    }
+    entry.setEnabled(true);
+    entry
+}

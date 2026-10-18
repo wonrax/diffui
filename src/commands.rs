@@ -1378,6 +1378,17 @@ pub(crate) static REGISTRY: &[Command] = &[
         palette: PaletteScope::Root,
     },
     Command {
+        id: "app.open-config",
+        label: "Open settings file",
+        hint: "Edit config.toml (fonts, theme, keys, revset presets)",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::OpenConfigFile),
+        palette: PaletteScope::Root,
+    },
+    Command {
         id: "shortcuts.close",
         label: "Close shortcuts",
         hint: "Dismiss the keyboard shortcut list",

@@ -195,7 +195,7 @@ fn read_config_file() -> Option<RawConfig> {
     toml::from_str(&text).ok()
 }
 
-fn config_path() -> Option<PathBuf> {
+pub(crate) fn config_path() -> Option<PathBuf> {
     let base = if let Ok(xdg) = env::var("XDG_CONFIG_HOME")
         && !xdg.is_empty()
     {
