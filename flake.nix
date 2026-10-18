@@ -111,7 +111,7 @@
 
             meta = {
               description = "Native GUI diff viewer for jj and git";
-              homepage = "https://github.com/haiha/diffui";
+              homepage = "https://github.com/wonrax/diffui";
               mainProgram = "diffui";
               platforms = lib.platforms.unix;
             };
