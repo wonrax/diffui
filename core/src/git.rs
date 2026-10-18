@@ -261,24 +261,19 @@ fn parse_git_worktrees(output: &[u8]) -> Vec<GitWorktree> {
 }
 
 pub async fn load_git_repository_snapshot(repository_root: &Path) -> Result<RepositorySnapshot> {
-    let output = run_command(
+    let output = run_command_bytes(
         repository_root,
         "git",
         git_args(&[
             "status",
             "--porcelain=v1",
+            "-z",
             "--branch",
             "--untracked-files=normal",
         ]),
     )
     .await?;
-    let head = run_command(
-        repository_root,
-        "git",
-        git_args(&["rev-parse", "--verify", "HEAD"]),
-    )
-    .await
-    .unwrap_or_default();
+    let head = git_head(repository_root).await.unwrap_or_default();
     let refs = run_command(
         repository_root,
         "git",
@@ -291,29 +286,62 @@ pub async fn load_git_repository_snapshot(repository_root: &Path) -> Result<Repo
         git_args(&["worktree", "list", "--porcelain", "-z"]),
     )
     .await?;
-    // Status stays "M" across consecutive edits; include diff contents so the
-    // second save refreshes too. Hash bytes to keep large diffs out of state.
-    let diff_base = if head.is_empty() { "--cached" } else { "HEAD" };
-    let diff = run_command_bytes(
-        repository_root,
-        "git",
-        git_args(&[
-            "diff",
-            diff_base,
-            "--no-ext-diff",
-            "--no-textconv",
-            "--binary",
-        ]),
-    )
-    .await?;
+    // Status stays "M" across consecutive edits, so the second save of a file
+    // needs something else to move the fingerprint. That used to be a full
+    // `git diff HEAD --binary` on every watcher tick — every byte of every
+    // change, re-diffed per save. The size and mtime of each path status
+    // lists move on a save just the same, for a stat per dirty path.
     let mut fingerprint = std::collections::hash_map::DefaultHasher::new();
-    (output, head, refs, worktrees, diff).hash(&mut fingerprint);
+    for path in status_paths(&output) {
+        path.hash(&mut fingerprint);
+        path_stamp(&repository_root.join(path)).hash(&mut fingerprint);
+    }
+    (output, head, refs, worktrees).hash(&mut fingerprint);
     Ok(RepositorySnapshot {
         fingerprint: format!("{:016x}", fingerprint.finish()),
         working_copy_empty: None,
         // Git has no op log — the external-op escalation never applies.
         parent_fingerprint: None,
     })
+}
+
+/// The paths in `git status --porcelain=v1 -z` output: each entry is `XY
+/// path`, a rename or copy is followed by its source path as a field of its
+/// own, and `--branch` adds a leading `## ...` field.
+fn status_paths(output: &[u8]) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut fields = output.split(|&byte| byte == 0);
+    while let Some(field) = fields.next() {
+        if field.len() < 4 || field.starts_with(b"## ") {
+            continue;
+        }
+        let (status, path) = field.split_at(3);
+        paths.push(path_from_bytes(path));
+        if matches!(status[0], b'R' | b'C')
+            && let Some(source) = fields.next()
+        {
+            paths.push(path_from_bytes(source));
+        }
+    }
+    paths
+}
+
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
+/// Size and mtime of `path`, or `None` once it's gone — what a save changes.
+fn path_stamp(path: &Path) -> Option<(u64, Option<std::time::SystemTime>)> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()))
 }
 
 /// Global git flags prepended to every invocation we read the output of.
@@ -1013,6 +1041,15 @@ mod tests {
         ] {
             assert!(args(hostile).is_err(), "{hostile} must be refused");
         }
+    }
+
+    #[test]
+    fn status_paths_skip_the_branch_line_and_keep_rename_sources() {
+        let output = b"## main...origin/main\0 M src/a.rs\0R  new name.rs\0old name.rs\0?? dir/\0";
+        assert_eq!(
+            status_paths(output),
+            ["src/a.rs", "new name.rs", "old name.rs", "dir/"].map(PathBuf::from)
+        );
     }
 
     #[test]

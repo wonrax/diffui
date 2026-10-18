@@ -642,3 +642,33 @@ fn the_log_is_capped_unless_the_field_names_a_count() {
         .expect_err("an unlisted option is refused");
     assert!(error.to_string().contains("--output"), "{error:#}");
 }
+
+/// A second save of an already-modified file keeps `git status` identical, so
+/// the snapshot fingerprint has to notice it some other way (it used to hash a
+/// full `git diff HEAD --binary` on every tick).
+#[test]
+#[ignore]
+fn a_second_save_moves_the_snapshot_fingerprint() {
+    if !git_present() {
+        eprintln!("skipping: git is not on PATH");
+        return;
+    }
+    let root = scratch_repo("second-save");
+    write(&root, "file.txt", b"base\n");
+    commit(&root, "base");
+    let fingerprint = || {
+        block_on(load_git_repository_snapshot(&root))
+            .expect("snapshot")
+            .fingerprint
+    };
+    let clean = fingerprint();
+    assert_eq!(fingerprint(), clean, "nothing changed, nothing moves");
+
+    write(&root, "file.txt", b"first edit\n");
+    let first = fingerprint();
+    assert_ne!(first, clean);
+    assert_eq!(fingerprint(), first);
+
+    write(&root, "file.txt", b"second, longer edit\n");
+    assert_ne!(fingerprint(), first, "same status, new contents");
+}
