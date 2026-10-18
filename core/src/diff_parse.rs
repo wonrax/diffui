@@ -64,6 +64,7 @@ impl DiffStreamParser {
                 hunks: Vec::new(),
                 additions: 0,
                 deletions: 0,
+                collapsed: None,
             });
             return finished;
         }

@@ -9,8 +9,8 @@ use std::fmt;
 use std::path::PathBuf;
 
 use crate::model::{
-    BookmarksInfo, BranchStatus, DiffBase, DiffDocument, RevisionDetails, RevisionSelection,
-    StreamRow,
+    BookmarksInfo, BranchStatus, DiffBase, DiffDocument, DiffFile, RevisionDetails,
+    RevisionSelection, StreamRow,
 };
 use crate::mutations::{
     Destination, DraftSimulation, MutationOp, MutationOutcome, RebaseSourceMode,
@@ -67,7 +67,8 @@ pub struct Capabilities {
     pub browse: bool,
     /// Can produce `jj show`-style revision headers.
     pub details: bool,
-    /// Can diff against something other than the parents ([`DiffBase`]).
+    /// Can diff against something other than the parents ([`DiffBase`]),
+    /// and expand a file its diff collapsed for size.
     pub compare: bool,
 }
 
@@ -141,6 +142,9 @@ pub enum Command {
         revision: RevisionSelection,
         /// The "from" side; [`DiffBase::Parents`] for a plain revision diff.
         base: DiffBase,
+        /// Paths to diff in full even past the size caps — files the user
+        /// already expanded, kept expanded across a reload.
+        expand: Vec<String>,
     },
     /// Fold the on-disk tree into `@`. `origin` rides along untouched so the
     /// projection knows how much to reload when the fingerprint moves.
@@ -196,6 +200,14 @@ pub enum Command {
         name: String,
         to: RevisionSelection,
     },
+    /// One file of a diff in full, past the size caps that collapsed it
+    /// ([`crate::model::DiffFile::collapsed`]).
+    ExpandFile {
+        job: JobId,
+        revision: RevisionSelection,
+        base: DiffBase,
+        path: String,
+    },
     /// Ask the actor to stop `job`. A cancelled job reports
     /// [`Payload::Cancelled`] and never its success event, so the caller's
     /// inflight slot is always cleared by exactly one terminal event.
@@ -220,7 +232,8 @@ impl Command {
             | Self::ListTree { job, .. }
             | Self::ReadFile { job, .. }
             | Self::FilePair { job, .. }
-            | Self::BookmarkCheck { job, .. } => Some(*job),
+            | Self::BookmarkCheck { job, .. }
+            | Self::ExpandFile { job, .. } => Some(*job),
             Self::Cancel { .. } => None,
         }
     }
@@ -335,6 +348,13 @@ pub enum Payload {
         job: JobId,
         backwards: bool,
     },
+    /// The full diff of one collapsed file; `None` when the path is no longer
+    /// part of the diff.
+    FileExpanded {
+        job: JobId,
+        path: String,
+        file: Option<DiffFile>,
+    },
     Progress {
         job: JobId,
         loaded: usize,
@@ -377,6 +397,7 @@ impl Payload {
             | Self::FileRead { job, .. }
             | Self::FilePairRead { job, .. }
             | Self::BookmarkChecked { job, .. }
+            | Self::FileExpanded { job, .. }
             | Self::Progress { job, .. }
             | Self::Failed { job, .. }
             | Self::Cancelled { job, .. } => Some(*job),

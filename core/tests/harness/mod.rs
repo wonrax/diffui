@@ -273,6 +273,7 @@ impl TestRepo {
             job,
             revision,
             base: diffui_core::DiffBase::Parents,
+            expand: Vec::new(),
         });
         match events.into_iter().next_back() {
             Some(Payload::DiffLoaded { document, .. }) => document,

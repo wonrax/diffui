@@ -459,6 +459,7 @@ mod tests {
             }],
             additions: 0,
             deletions: 0,
+            collapsed: None,
         };
 
         let mut with_source = make_file();
@@ -510,6 +511,7 @@ mod tests {
             }],
             additions: 0,
             deletions: 0,
+            collapsed: None,
         };
         apply_syntax_highlighting_with_sources(&mut file, None, Some(source));
 
@@ -548,6 +550,7 @@ mod tests {
             }],
             additions: 0,
             deletions: 0,
+            collapsed: None,
         };
         apply_syntax_highlighting_with_sources(&mut file, None, Some(source));
         let comment = &file.hunks[0].lines[0].syntax;

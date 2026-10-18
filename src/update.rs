@@ -1111,6 +1111,7 @@ impl Diffui {
                 Task::none()
             }
             Action::Compare(action) => self.perform_compare(action),
+            Action::ExpandFile(index) => self.expand_collapsed_file(index),
         }
     }
 
@@ -4965,6 +4966,7 @@ mod tests {
                         })
                         .collect(),
                 }],
+                collapsed: None,
             }],
             total_additions: 0,
             total_deletions: 0,

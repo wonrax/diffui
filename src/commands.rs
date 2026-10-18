@@ -1404,6 +1404,24 @@ pub(crate) static REGISTRY: &[Command] = &[
         build: |_ui, _arg| Some(Action::Compare(CompareAction::Exit)),
         palette: PaletteScope::Root,
     },
+    Command {
+        id: "file.expand-diff",
+        label: "Show full diff of file",
+        hint: "Load the diff of the selected file, which was collapsed for size",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| {
+            let tab = ui.active();
+            tab.session
+                .document
+                .files
+                .get(tab.selected_file)
+                .is_some_and(|file| file.collapsed.is_some())
+        },
+        build: |ui, _arg| Some(Action::ExpandFile(ui.active().selected_file)),
+        palette: PaletteScope::Root,
+    },
 ];
 
 fn can_compare(ui: &Diffui, arg: &CommandArg) -> bool {

@@ -289,7 +289,34 @@ impl Actor {
                 job,
                 revision,
                 base,
-            } => self.load_diff(repository, job, revision, base).await,
+                expand,
+            } => {
+                self.load_diff(repository, job, revision, base, &expand)
+                    .await
+            }
+            Command::ExpandFile {
+                job,
+                revision,
+                base,
+                path,
+            } => {
+                let repo = self.repo_at_head(repository).await?;
+                let name = self.slot(repository)?.name.clone();
+                let commit_id = jj::resolve_revision(repo.as_ref(), &name, &revision).await?;
+                let base = jj::resolve_base(repo.as_ref(), &name, &base).await?;
+                let expand = [path.clone()];
+                let options = jj::DiffOptions {
+                    limits: jj::large_diff::DiffLimits::unlimited(),
+                    expand: &expand,
+                    only: Some(&path),
+                };
+                let (document, _) =
+                    jj::diff_jj_with_repo(repo.as_ref(), &commit_id, &base, repository, &options)
+                        .await?;
+                let file = document.files.into_iter().find(|file| file.path == path);
+                self.emit(Payload::FileExpanded { job, path, file });
+                Ok(())
+            }
             Command::Snapshot { job, origin } => {
                 let slot = self.slot(repository)?;
                 let outcome = {
@@ -490,13 +517,18 @@ impl Actor {
         job: JobId,
         revision: RevisionSelection,
         base: DiffBase,
+        expand: &[String],
     ) -> Result<()> {
         let repo = self.repo_at_head(repository).await?;
         let name = self.slot(repository)?.name.clone();
         let commit_id = jj::resolve_revision(repo.as_ref(), &name, &revision).await?;
         let base = jj::resolve_base(repo.as_ref(), &name, &base).await?;
+        let options = jj::DiffOptions {
+            expand,
+            ..Default::default()
+        };
         let (document, details) =
-            jj::diff_jj_with_repo(repo.as_ref(), &commit_id, &base, repository).await?;
+            jj::diff_jj_with_repo(repo.as_ref(), &commit_id, &base, repository, &options).await?;
         self.emit(Payload::DiffLoaded {
             job,
             revision,
@@ -589,6 +621,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::ReadFile { .. } => "read_file",
         Command::FilePair { .. } => "file_pair",
         Command::BookmarkCheck { .. } => "bookmark_check",
+        Command::ExpandFile { .. } => "expand_file",
         Command::Cancel { .. } => "cancel",
     }
 }

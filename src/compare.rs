@@ -268,3 +268,24 @@ pub(crate) fn build_compare_banner<'a>(
             .into(),
     )
 }
+
+impl Diffui {
+    /// Fetch the full diff of a file the backend collapsed for size.
+    pub(crate) fn expand_collapsed_file(&mut self, index: usize) -> Task<Message> {
+        let Some(tab) = self.active_tab_id() else {
+            return Task::none();
+        };
+        let target = self.active_mut();
+        let Some(path) = target
+            .session
+            .document
+            .files
+            .get(index)
+            .map(|file| file.path.clone())
+        else {
+            return Task::none();
+        };
+        let effects = target.session.expand_file(&path);
+        self.run_effects(tab, effects)
+    }
+}

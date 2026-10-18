@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use bstr::BStr;
 use futures::StreamExt;
 use jj_lib::{
     backend::CommitId,
@@ -9,22 +8,20 @@ use jj_lib::{
         materialized_diff_stream,
     },
     copies::CopyRecords,
-    diff_presentation::{
-        LineCompareMode,
-        unified::{DiffLineType, git_diff_part, unified_diff_hunks},
-    },
+    diff_presentation::unified::{DiffLineType, git_diff_part},
     files::FileMergeHunkLevel,
-    matchers::{EverythingMatcher, Matcher, PrefixMatcher},
+    matchers::{EverythingMatcher, FilesMatcher, Matcher, PrefixMatcher},
     merge::{Diff, SameChange},
     merged_tree::MergedTree,
     object_id::ObjectId,
     ref_name::WorkspaceName,
     repo::{ReadonlyRepo, Repo},
-    repo_path::RepoPath,
+    repo_path::{RepoPath, RepoPathBuf},
     rewrite::rebase_to_dest_parent,
     tree_merge::MergeOptions,
 };
 
+use super::large_diff::{self, DiffLimits, RowBudget};
 use super::walk::*;
 use super::workspace::resolve_revision;
 use crate::diff_parse::format_hunk_header;
@@ -33,6 +30,16 @@ use crate::model::{
     RevisionDetails, SignatureInfo,
 };
 use crate::repository::Repository;
+
+/// What a diff load covers beyond its two trees.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DiffOptions<'a> {
+    pub limits: DiffLimits,
+    /// Paths diffed in full regardless of `limits`.
+    pub expand: &'a [String],
+    /// Diff only this path (expanding one collapsed file).
+    pub only: Option<&'a str>,
+}
 
 /// The "from" side of a diff ([`DiffBase`]), resolved to a commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,12 +110,20 @@ pub(crate) async fn diff_jj_with_repo(
     commit_id: &CommitId,
     base: &ResolvedBase,
     repository: &Repository,
+    options: &DiffOptions<'_>,
 ) -> Result<(DiffDocument, Option<RevisionDetails>)> {
     let commit = load_commit(repo, commit_id).await?;
     let details = jj_revision_details(repo, &commit);
     let old_tree = base_tree(repo, &commit, base).await?;
     let new_tree = commit.tree();
-    let matcher = repo_scope_matcher(repository)?;
+    let matcher: Box<dyn Matcher> = match options.only {
+        Some(path) => Box::new(FilesMatcher::new([RepoPathBuf::from_internal_string(
+            path.to_owned(),
+        )
+        .with_context(|| format!("invalid repo path {path}"))?])),
+        None => repo_scope_matcher(repository)?,
+    };
+    let mut budget = RowBudget::new(options.limits);
     let copy_records = CopyRecords::default();
     let tree_diff = old_tree.diff_stream_with_copies(&new_tree, matcher.as_ref(), &copy_records);
     let labels = Diff::new(old_tree.labels(), new_tree.labels());
@@ -170,22 +185,41 @@ pub(crate) async fn diff_jj_with_repo(
             hunks: Vec::new(),
             additions: 0,
             deletions: 0,
+            collapsed: None,
         };
 
-        if before.content.is_binary || after.content.is_binary {
+        let binary = before.content.is_binary || after.content.is_binary;
+        let (before_bytes, after_bytes) = (
+            before.content.contents.as_slice(),
+            after.content.contents.as_slice(),
+        );
+        // Past the caps a file keeps its counts but gets no rows (see
+        // `large_diff`); one the user already expanded is exempt.
+        let collapse = if binary || options.expand.contains(&file.path) {
+            None
+        } else {
+            let (additions, deletions) = large_diff::count_changed_lines(before_bytes, after_bytes);
+            budget
+                .admit(additions + deletions)
+                .err()
+                .map(|reason| (reason, additions, deletions))
+        };
+
+        if binary {
             file.hunks.push(DiffHunkView {
                 header: "binary files differ".to_owned(),
                 lines: Vec::new(),
             });
+        } else if let Some((reason, additions, deletions)) = collapse {
+            file.hunks.push(DiffHunkView {
+                header: large_diff::collapsed_header(reason, additions + deletions),
+                lines: Vec::new(),
+            });
+            file.additions = additions;
+            file.deletions = deletions;
+            file.collapsed = Some(reason);
         } else {
-            let hunks = unified_diff_hunks(
-                Diff::new(
-                    BStr::new(before.content.contents.as_slice()),
-                    BStr::new(after.content.contents.as_slice()),
-                ),
-                3,
-                LineCompareMode::Exact,
-            );
+            let hunks = large_diff::hunks(before_bytes, after_bytes, 3, budget.limits());
             for hunk in hunks {
                 let mut rows = Vec::new();
                 let mut old_line = hunk.left_line_range.start + 1;
@@ -288,6 +322,7 @@ pub(crate) async fn diff_jj_with_repo(
                 hunks: Vec::new(),
                 additions: 0,
                 deletions: 0,
+                collapsed: None,
             };
             if part.content.is_binary {
                 file.hunks.push(DiffHunkView {

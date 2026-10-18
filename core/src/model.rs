@@ -161,6 +161,19 @@ pub struct DiffFile {
     pub hunks: Vec<DiffHunkView>,
     pub additions: usize,
     pub deletions: usize,
+    /// Set when the backend left this file's rows out for size: `hunks` is
+    /// then a single header-only placeholder, the counts are still real, and
+    /// the full diff is one `ExpandFile` away.
+    pub collapsed: Option<DiffCollapse>,
+}
+
+/// Why a file's diff came back without rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffCollapse {
+    /// The file alone changes too many lines.
+    LargeFile,
+    /// The revision as a whole already spent its row budget on other files.
+    OverBudget,
 }
 
 /// One commit's data as produced by a backend loader. This is a transient
@@ -1071,6 +1084,7 @@ mod tests {
             hunks: Vec::new(),
             additions: 0,
             deletions: 0,
+            collapsed: None,
         }
     }
 

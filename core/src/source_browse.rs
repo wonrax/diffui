@@ -159,6 +159,7 @@ pub fn synthesize_source_file(path: &str, content: &str) -> DiffFile {
         },
         additions: 0,
         deletions: 0,
+        collapsed: None,
     }
 }
 
@@ -170,6 +171,7 @@ fn empty_source_file(path: &str) -> DiffFile {
         hunks: Vec::new(),
         additions: 0,
         deletions: 0,
+        collapsed: None,
     }
 }
 

@@ -171,7 +171,8 @@ async fn run(repository: &Repository, command: Command, cancel: &CancelFlag) -> 
         Command::Mutate { job, .. }
         | Command::Preview { job, .. }
         | Command::RevisionDetails { job, .. }
-        | Command::BookmarkCheck { job, .. } => vec![Payload::Failed {
+        | Command::BookmarkCheck { job, .. }
+        | Command::ExpandFile { job, .. } => vec![Payload::Failed {
             job,
             error: RepoError::Unsupported,
         }],

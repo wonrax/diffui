@@ -89,6 +89,7 @@ async fn run(
             job,
             revision,
             base: DiffBase::Parents,
+            ..
         } => {
             stream_diff(spec, job, revision, cancel, &emit).await;
         }
@@ -118,7 +119,8 @@ async fn run(
         | Command::ListTree { job, .. }
         | Command::ReadFile { job, .. }
         | Command::FilePair { job, .. }
-        | Command::BookmarkCheck { job, .. } => emit(Payload::Failed {
+        | Command::BookmarkCheck { job, .. }
+        | Command::ExpandFile { job, .. } => emit(Payload::Failed {
             job,
             error: RepoError::Unsupported,
         }),

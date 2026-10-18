@@ -40,6 +40,9 @@ pub struct CachedDiff {
     pub details: Option<RevisionDetails>,
 }
 
+/// Files with more diff rows than this are left uncoloured.
+pub const HIGHLIGHT_MAX_ROWS: usize = 10_000;
+
 /// What triggered a repository refresh — decides how much we reload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefreshOrigin {
@@ -213,6 +216,10 @@ pub struct Session {
     /// The base `document` was actually loaded against — what the diff
     /// pane's header describes and what full-context reads must match.
     pub document_base: DiffBase,
+    /// Files of the shown diff the user expanded past the size caps. Sent
+    /// with every reload of the same diff so a refresh doesn't fold them
+    /// back; dropped when the revision or the base changes.
+    pub expanded_paths: Vec<String>,
     /// Op-log fingerprint of the last load, for the "did anything change" dedup
     /// (so our own snapshot writes don't trigger a re-walk).
     pub repository_snapshot: Option<RepositorySnapshot>,
@@ -273,6 +280,8 @@ pub struct Session {
     /// per-row result is checked against.
     graph_version: Option<JobId>,
     mutation_job: Option<JobId>,
+    /// Collapsed files being fetched in full, by path.
+    expand_jobs: Vec<(JobId, String)>,
 }
 
 impl Session {
@@ -319,6 +328,7 @@ impl Session {
             || self.snapshot_job.as_ref().is_some_and(|(id, _)| *id == job)
             || self.empty_status_job.is_some_and(|(id, _)| id == job)
             || self.mutation_job == Some(job)
+            || self.expand_jobs.iter().any(|(id, _)| *id == job)
     }
 
     /// Whether a mutation is running. Gates the actions a half-applied
@@ -408,14 +418,69 @@ impl Session {
         }
         let job = self.next_job();
         let base = self.diff_base.clone();
+        if revision != self.selected_revision || base != self.document_base {
+            self.expanded_paths.clear();
+        }
         self.diff_job = Some((job, revision.clone(), base.clone()));
         self.loading_since = Some(Instant::now());
         effects.push(Effect::Send(Command::LoadDiff {
             job,
             revision,
             base,
+            expand: self.expanded_paths.clone(),
         }));
         effects
+    }
+
+    /// Fetch a file the backend collapsed for size in full. The path also
+    /// joins [`Self::expanded_paths`], so a reload landing meanwhile already
+    /// carries it expanded.
+    pub fn expand_file(&mut self, path: &str) -> Vec<Effect> {
+        let collapsed = self
+            .document
+            .files
+            .iter()
+            .any(|file| file.path == path && file.collapsed.is_some());
+        if !self.capabilities.compare
+            || !collapsed
+            || self.expand_jobs.iter().any(|(_, pending)| pending == path)
+        {
+            return Vec::new();
+        }
+        let job = self.next_job();
+        self.expand_jobs.push((job, path.to_owned()));
+        if !self.expanded_paths.iter().any(|expanded| expanded == path) {
+            self.expanded_paths.push(path.to_owned());
+        }
+        vec![Effect::Send(Command::ExpandFile {
+            job,
+            revision: self.selected_revision.clone(),
+            base: self.document_base.clone(),
+            path: path.to_owned(),
+        })]
+    }
+
+    fn on_file_expanded(
+        &mut self,
+        job: JobId,
+        path: String,
+        file: Option<crate::model::DiffFile>,
+    ) -> Vec<Effect> {
+        let Some(index) = self.expand_jobs.iter().position(|(id, _)| *id == job) else {
+            return Vec::new();
+        };
+        self.expand_jobs.remove(index);
+        let (Some(file), Some(slot)) = (
+            file,
+            self.document
+                .files
+                .iter_mut()
+                .find(|shown| shown.path == path && shown.collapsed.is_some()),
+        ) else {
+            return Vec::new();
+        };
+        *slot = file;
+        vec![Effect::RepaintDocument]
     }
 
     // ── comparing two revisions ─────────────────────────────────────────
@@ -546,6 +611,7 @@ impl Session {
                 warnings,
             } => self.on_snapshot(job, origin, snapshot, warnings),
             Payload::MutationDone { job, outcome } => self.on_mutation(job, outcome),
+            Payload::FileExpanded { job, path, file } => self.on_file_expanded(job, path, file),
             Payload::EmptyStatus { job, updates } => self.on_empty_status(job, updates),
             Payload::Progress { loaded, total, .. } => {
                 self.commit_progress.set_total(total);
@@ -908,6 +974,7 @@ impl Session {
         if self.mutation_job == Some(job) {
             self.mutation_job = None;
         }
+        self.expand_jobs.retain(|(id, _)| *id != job);
     }
 
     /// Run a refresh coalesced while the session was busy, now that it is idle.
@@ -1025,6 +1092,12 @@ impl Session {
             .iter()
             .enumerate()
         {
+            // A collapsed file has no rows to colour, and past a size the
+            // full-source parse costs more than the colour is worth.
+            let rows: usize = file.hunks.iter().map(|hunk| hunk.lines.len()).sum();
+            if file.collapsed.is_some() || rows > HIGHLIGHT_MAX_ROWS {
+                continue;
+            }
             let unhighlighted = file
                 .hunks
                 .iter()
@@ -1193,6 +1266,7 @@ mod tests {
             hunks: Vec::new(),
             additions: 1,
             deletions: 0,
+            collapsed: None,
         };
         let mut session = Session::unloaded(String::new());
         let job = session
@@ -1331,6 +1405,7 @@ mod tests {
                 job,
                 revision,
                 base,
+                ..
             }) => Some((*job, revision.clone(), base.clone())),
             _ => None,
         })
@@ -1479,5 +1554,113 @@ mod tests {
             effect,
             Effect::Activity(Activity::Toast { title, .. }) if title == "Comparison ended"
         )));
+    }
+
+    // ── size caps ───────────────────────────────────────────────────────
+
+    fn collapsed_file(path: &str) -> crate::model::DiffFile {
+        crate::model::DiffFile {
+            path: path.to_owned(),
+            old_path: None,
+            status: crate::model::DiffFileStatus::Added,
+            hunks: vec![crate::model::DiffHunkView {
+                header: "Large diff".to_owned(),
+                lines: Vec::new(),
+            }],
+            additions: 5_000,
+            deletions: 0,
+            collapsed: Some(crate::model::DiffCollapse::LargeFile),
+        }
+    }
+
+    /// Expanding swaps the placeholder for the full file in place, and the
+    /// path rides along on later reloads of the same diff — but not onto
+    /// another revision's.
+    #[test]
+    fn an_expanded_file_replaces_its_placeholder_and_survives_reloads() {
+        let mut session = compare_session();
+        let effects = session.load_diff(commit("aaa"));
+        let (job, ..) = sent_diff(&effects).expect("a diff load");
+        let repo = crate::repo::repo_id(&crate::repo::OpenSpec::Local {
+            root: "/tmp/caps".into(),
+            scope: Default::default(),
+        });
+        session.apply(Event::new(
+            repo.clone(),
+            Payload::DiffLoaded {
+                job,
+                revision: commit("aaa"),
+                document: DiffDocument {
+                    files: vec![collapsed_file("huge.txt")],
+                    total_additions: 5_000,
+                    total_deletions: 0,
+                },
+                details: None,
+            },
+        ));
+
+        let effects = session.expand_file("huge.txt");
+        let job = match effects.as_slice() {
+            [Effect::Send(Command::ExpandFile { job, path, .. })] if path == "huge.txt" => *job,
+            other => panic!("expected an ExpandFile, got {other:?}"),
+        };
+        assert!(
+            session.expand_file("huge.txt").is_empty(),
+            "already in flight"
+        );
+
+        let mut full = collapsed_file("huge.txt");
+        full.collapsed = None;
+        full.hunks[0].header = "@@ -0,0 +1,5000 @@".to_owned();
+        let effects = session.apply(Event::new(
+            repo,
+            Payload::FileExpanded {
+                job,
+                path: "huge.txt".to_owned(),
+                file: Some(full),
+            },
+        ));
+        assert!(matches!(effects.as_slice(), [Effect::RepaintDocument]));
+        assert_eq!(session.document.files[0].collapsed, None);
+
+        let effects = session.load_diff(commit("aaa"));
+        let expand = effects.iter().find_map(|effect| match effect {
+            Effect::Send(Command::LoadDiff { expand, .. }) => Some(expand.clone()),
+            _ => None,
+        });
+        assert_eq!(expand, Some(vec!["huge.txt".to_owned()]));
+
+        let effects = session.load_diff(commit("bbb"));
+        let expand = effects.iter().find_map(|effect| match effect {
+            Effect::Send(Command::LoadDiff { expand, .. }) => Some(expand.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            expand,
+            Some(Vec::new()),
+            "another revision starts collapsed"
+        );
+    }
+
+    #[test]
+    fn collapsed_and_oversized_files_are_not_highlighted() {
+        let mut session = Session::unloaded(String::new());
+        let row = crate::model::DiffLine {
+            kind: crate::model::DiffLineKind::Addition,
+            old_line: None,
+            new_line: Some(1),
+            content: "x".to_owned(),
+            syntax: Vec::new(),
+            emphasis: Vec::new(),
+        };
+        let mut small = collapsed_file("small.rs");
+        small.collapsed = None;
+        small.hunks[0].lines = vec![row.clone()];
+        let mut big = collapsed_file("big.rs");
+        big.collapsed = None;
+        big.hunks[0].lines = vec![row; HIGHLIGHT_MAX_ROWS + 1];
+        session.document.files = vec![collapsed_file("huge.rs"), small, big];
+        session.reset_highlights(1);
+        assert_eq!(Vec::from(session.highlight_pending.clone()), vec![1]);
     }
 }

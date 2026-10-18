@@ -113,6 +113,7 @@ async fn load_jj_diff_against(
         job,
         revision,
         base,
+        expand: Vec::new(),
     })
     .await;
     match events.into_iter().next_back() {
@@ -2111,4 +2112,153 @@ fn compare_against_an_abandoned_base_fails() {
         DiffBase::Revision(RevisionSelection::Commit(second)),
     ));
     assert!(result.is_err(), "an abandoned base must not resolve");
+}
+
+// ── Size caps ───────────────────────────────────────────────────────────────
+
+fn numbered_lines(count: usize, tag: &str) -> String {
+    (0..count).map(|n| format!("{tag} line {n}\n")).collect()
+}
+
+/// A file past the per-file cap comes back with its counts and a header-only
+/// placeholder; asking for it by path returns every row.
+#[test]
+fn a_huge_file_collapses_and_expands_on_demand() {
+    let root = scratch_repo("caps-large-file");
+    write(&root, "small.txt", "one\n");
+    write(&root, "huge.txt", &numbered_lines(5_000, "huge"));
+    snapshot(&root);
+
+    let (document, _) = block_on(load_jj_diff(
+        repository(&root),
+        RevisionSelection::WorkingCopy,
+    ))
+    .expect("load the diff");
+    let huge = document
+        .files
+        .iter()
+        .find(|file| file.path == "huge.txt")
+        .expect("huge.txt in the diff");
+    assert_eq!(huge.collapsed, Some(diffui_core::DiffCollapse::LargeFile));
+    assert_eq!((huge.additions, huge.deletions), (5_000, 0));
+    assert_eq!(huge.hunks.len(), 1);
+    assert!(huge.hunks[0].lines.is_empty());
+    let small = document
+        .files
+        .iter()
+        .find(|file| file.path == "small.txt")
+        .expect("small.txt in the diff");
+    assert_eq!(small.collapsed, None);
+    assert_eq!(small.hunks[0].lines.len(), 1);
+
+    let events = block_on(run_one(&root, |job| Command::ExpandFile {
+        job,
+        revision: RevisionSelection::WorkingCopy,
+        base: DiffBase::Parents,
+        path: "huge.txt".to_owned(),
+    }));
+    match events.into_iter().next_back() {
+        Some(Payload::FileExpanded {
+            path,
+            file: Some(file),
+            ..
+        }) => {
+            assert_eq!(path, "huge.txt");
+            assert_eq!(file.collapsed, None);
+            assert_eq!(file.additions, 5_000);
+            let rows: usize = file.hunks.iter().map(|hunk| hunk.lines.len()).sum();
+            assert_eq!(rows, 5_000);
+        }
+        other => panic!("expected FileExpanded, got {other:?}"),
+    }
+
+    // A reload that names the path keeps it expanded.
+    let events = block_on(run_one(&root, |job| Command::LoadDiff {
+        job,
+        revision: RevisionSelection::WorkingCopy,
+        base: DiffBase::Parents,
+        expand: vec!["huge.txt".to_owned()],
+    }));
+    match events.into_iter().next_back() {
+        Some(Payload::DiffLoaded { document, .. }) => {
+            let huge = document
+                .files
+                .iter()
+                .find(|file| file.path == "huge.txt")
+                .expect("huge.txt in the diff");
+            assert_eq!(huge.collapsed, None);
+        }
+        other => panic!("expected DiffLoaded, got {other:?}"),
+    }
+}
+
+/// Once the revision has spent its row budget, the remaining files collapse
+/// even though each is small enough on its own.
+#[test]
+fn many_files_collapse_past_the_revision_budget() {
+    let root = scratch_repo("caps-budget");
+    for index in 0..12 {
+        write(
+            &root,
+            &format!("gen/file{index:02}.txt"),
+            &numbered_lines(2_900, &format!("f{index}")),
+        );
+    }
+    snapshot(&root);
+
+    let (document, _) = block_on(load_jj_diff(
+        repository(&root),
+        RevisionSelection::WorkingCopy,
+    ))
+    .expect("load the diff");
+    assert_eq!(document.files.len(), 12);
+    let shown = document
+        .files
+        .iter()
+        .filter(|file| file.collapsed.is_none())
+        .count();
+    assert_eq!(shown, 10, "30,000 rows fit ten 2,900-line files");
+    assert!(
+        document
+            .files
+            .iter()
+            .filter(|file| file.collapsed.is_some())
+            .all(
+                |file| file.collapsed == Some(diffui_core::DiffCollapse::OverBudget)
+                    && file.additions == 2_900
+            )
+    );
+    assert_eq!(document.total_additions, 12 * 2_900);
+}
+
+/// A rewrite past the word-diff size is diffed by line: the rows are all
+/// there, without word emphasis.
+#[test]
+fn a_big_rewrite_skips_word_level_emphasis() {
+    let root = scratch_repo("caps-word-diff");
+    let line = |n: usize, tag: &str| format!("    ({n}, \"{tag}{:0190}\"),\n", n);
+    let before: String = (0..1_400).map(|n| line(n, "a")).collect();
+    write(&root, "table.rs", &before);
+    commit(&root, "table");
+    let after: String = (0..1_400).map(|n| line(n, "b")).collect();
+    write(&root, "table.rs", &after);
+    snapshot(&root);
+
+    let (document, _) = block_on(load_jj_diff(
+        repository(&root),
+        RevisionSelection::WorkingCopy,
+    ))
+    .expect("load the diff");
+    let file = &document.files[0];
+    assert_eq!(file.collapsed, None);
+    assert_eq!((file.additions, file.deletions), (1_400, 1_400));
+    let emphasized = file
+        .hunks
+        .iter()
+        .flat_map(|hunk| &hunk.lines)
+        .any(|line| !line.emphasis.is_empty());
+    // Under the word-diff limit each pair would emphasize its changed
+    // token; past it nothing is.
+    assert!(before.len() + after.len() > 512 * 1024);
+    assert!(!emphasized);
 }

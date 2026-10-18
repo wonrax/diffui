@@ -451,6 +451,20 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
             dv = dv.with_header(revision_header_lines(details));
         }
 
+        let collapsed: Vec<bool> = ui
+            .active()
+            .session
+            .document
+            .files
+            .iter()
+            .map(|file| file.collapsed.is_some())
+            .collect();
+        if collapsed.contains(&true) {
+            dv = dv.on_expand_file(collapsed, |index| {
+                Message::Action(Action::ExpandFile(index))
+            });
+        }
+
         // Per-file "browse source" affordance — repo tabs only (a PR tab has
         // no local tree to browse).
         if ui.active().repository.is_some() {

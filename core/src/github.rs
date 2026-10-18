@@ -755,6 +755,7 @@ fn api_file_to_diff_file(file: ApiPrFile) -> DiffFile {
         hunks: Vec::new(),
         additions: 0,
         deletions: 0,
+        collapsed: None,
     });
     match &file.patch {
         Some(patch) => {

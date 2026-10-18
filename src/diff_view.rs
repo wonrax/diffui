@@ -250,6 +250,10 @@ pub struct DiffView<'a, Message> {
     /// draws and hit-tests the affordance beside the first description line;
     /// the actual editor is layered by the caller into the reserved spacer.
     on_edit_description: Option<fn() -> Message>,
+    /// Per file: whether the backend collapsed it for size. Its placeholder
+    /// hunk header is then a button firing `on_expand_file`.
+    collapsed_files: Vec<bool>,
+    on_expand_file: Option<fn(usize) -> Message>,
 }
 
 /// Per-render find-match data fed into `DiffView::with_find`. The widget
@@ -1161,6 +1165,8 @@ impl<'a, Message> DiffView<'a, Message> {
             plain: false,
             on_browse_file: None,
             on_edit_description: None,
+            collapsed_files: Vec::new(),
+            on_expand_file: None,
         }
     }
 
@@ -1189,6 +1195,45 @@ impl<'a, Message> DiffView<'a, Message> {
     pub fn on_browse_file(mut self, callback: fn(usize) -> Message) -> Self {
         self.on_browse_file = Some(callback);
         self
+    }
+
+    /// Make the placeholder hunk header of every file flagged in `collapsed`
+    /// a button that fires `callback` with the file index.
+    pub fn on_expand_file(mut self, collapsed: Vec<bool>, callback: fn(usize) -> Message) -> Self {
+        self.collapsed_files = collapsed;
+        self.on_expand_file = Some(callback);
+        self
+    }
+
+    fn is_collapsed(&self, file_index: usize) -> bool {
+        self.collapsed_files
+            .get(file_index)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// The collapsed file whose placeholder header is under `point`.
+    fn expand_header_at<P>(
+        &self,
+        state: &State<P>,
+        bounds: Rectangle,
+        point: Point,
+    ) -> Option<usize> {
+        self.on_expand_file?;
+        if self.plain {
+            return None;
+        }
+        let index = state.height_index.borrow();
+        let y = point.y - bounds.y + state.vertical_offset;
+        let hunk = index
+            .hunk_tops
+            .partition_point(|&top| top <= y)
+            .checked_sub(1)?;
+        if y >= index.hunk_tops[hunk] + self.metrics.hunk_header_height {
+            return None;
+        }
+        let file_index = index.hunk_ids[hunk].0 as usize;
+        self.is_collapsed(file_index).then_some(file_index)
     }
 
     pub fn with_header(mut self, header: Vec<HeaderLine>) -> Self {
@@ -3413,6 +3458,13 @@ where
                     shell.capture_event();
                     return;
                 }
+                if let Some(file_index) = self.expand_header_at(state, bounds, point) {
+                    if let Some(on_expand) = self.on_expand_file {
+                        shell.publish(on_expand(file_index));
+                    }
+                    shell.capture_event();
+                    return;
+                }
                 let position = {
                     let index = state.height_index.borrow();
                     self.position_at_point(
@@ -3932,7 +3984,11 @@ where
                             bounds.x + header_x + TEXT_X_PADDING,
                             header.y + self.metrics.text_y_pad,
                         ),
-                        color: self.palette.text_muted,
+                        color: if self.is_collapsed(header.file_index) {
+                            self.palette.text
+                        } else {
+                            self.palette.text_muted
+                        },
                         clip_bounds: header_clip,
                         wrapping: text::Wrapping::None,
                     },
@@ -4124,7 +4180,9 @@ where
         {
             return mouse::Interaction::Idle;
         }
-        if self.browse_button_at(state, bounds, point).is_some() {
+        if self.browse_button_at(state, bounds, point).is_some()
+            || self.expand_header_at(state, bounds, point).is_some()
+        {
             return mouse::Interaction::Pointer;
         }
         if self
