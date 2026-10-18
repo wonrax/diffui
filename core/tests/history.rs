@@ -337,7 +337,7 @@ fn reverting_an_operation_keeps_later_work() {
 
     let outcome = repo
         .mutate(MutationOp::RevertOperation {
-            operation_id: bookmark_op,
+            operation_id: bookmark_op.clone(),
         })
         .expect("revert");
     assert!(
@@ -345,6 +345,10 @@ fn reverting_an_operation_keeps_later_work() {
         "{}",
         outcome.message
     );
+    // The op-log view's revert and the activity row's are one `jj op revert`
+    // of exactly that operation, described the way the CLI describes it.
+    let (description, _) = &harness::operation_log(&root)[0];
+    assert_eq!(description, &format!("revert operation {bookmark_op}"));
     let rows = repo.graph("all()");
     assert!(
         rows.iter().all(|row| row.summary.bookmarks.is_empty()),
