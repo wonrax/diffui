@@ -48,6 +48,31 @@ pub fn choose_repository_folder() -> Option<String> {
         .map(|path| path.to_string())
 }
 
+/// The usable size (logical points, menu bar and Dock excluded) of the
+/// primary display, for sizing a first-launch window. Safe to call before
+/// the app has finished launching.
+pub fn primary_screen_visible_size() -> Option<(f32, f32)> {
+    use objc2::class;
+    use objc2_foundation::NSRect;
+    MainThreadMarker::new()?;
+    // SAFETY: `NSScreen` class methods and `visibleFrame` take no arguments
+    // and return an object / a plain struct; a nil screen is checked first.
+    unsafe {
+        let mut screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
+        if screen.is_null() {
+            let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
+            if !screens.is_null() {
+                screen = msg_send![screens, firstObject];
+            }
+        }
+        if screen.is_null() {
+            return None;
+        }
+        let frame: NSRect = msg_send![screen, visibleFrame];
+        Some((frame.size.width as f32, frame.size.height as f32))
+    }
+}
+
 /// A node in a native popup menu. Leaves carry a caller-chosen `id` that
 /// `popup_menu` returns when that leaf is picked (across any submenu depth).
 pub enum MenuItem {

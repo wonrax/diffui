@@ -209,6 +209,9 @@ fn main() -> iced::Result {
     let mut window_settings = window::Settings::default();
     if let Some((width, height)) = saved.size() {
         window_settings.size = Size::new(width, height);
+    } else if let Some((width, height)) = window_state::default_window_size(screen_visible_size()) {
+        window_settings.size = Size::new(width, height);
+        window_settings.position = window::Position::Centered;
     }
     if let Some((x, y)) = saved.position() {
         window_settings.position = window::Position::Specific(Point::new(x, y));
@@ -235,6 +238,15 @@ fn main() -> iced::Result {
     .subscription(Diffui::subscription)
     .theme(Diffui::theme)
     .run()
+}
+
+/// The primary display's usable size, where the platform can tell us before
+/// the window exists.
+fn screen_visible_size() -> Option<(f32, f32)> {
+    #[cfg(target_os = "macos")]
+    return macos_native::primary_screen_visible_size();
+    #[cfg(not(target_os = "macos"))]
+    None
 }
 
 #[derive(Debug, Clone, Parser)]
