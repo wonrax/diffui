@@ -32,11 +32,27 @@
 //! "selection.clear" = "none" # unbind
 //! ```
 //!
+//! The revset filter's preset menu (jj repositories) can be replaced with
+//! `[[revset_presets]]` entries, listed in order under the repo's own
+//! "Default" (its `revsets.log`). Without any, the built-in set is used:
+//! Everything `all()`, Mine `mine()`, Current line `ancestors(@)`,
+//! Conflicts `conflicts()`. Git repositories keep their own built-ins.
+//!
+//! ```toml
+//! [[revset_presets]]
+//! name = "My stack"
+//! revset = "trunk()..@"
+//!
+//! [[revset_presets]]
+//! name = "Recent"
+//! revset = "ancestors(@, 30)"
+//! ```
+//!
 //! Kerning and OpenType feature toggles (ligatures, stylistic sets) aren't
 //! configurable: the text stack (iced/cosmic-text) exposes no per-run feature
 //! or letter-spacing control today.
 
-use std::{env, path::PathBuf};
+use std::{env, path::PathBuf, sync::OnceLock};
 
 use iced::Font;
 use serde::Deserialize;
@@ -121,8 +137,29 @@ impl AppConfig {
                     .unwrap_or(defaults.baseline_offset),
             },
         };
+        if let Some(presets) = raw.revset_presets {
+            let _ = REVSET_PRESETS.set(presets);
+        }
         (config, raw.keys)
     }
+}
+
+/// One `[[revset_presets]]` entry: a label for the menu and the revset it
+/// applies.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RevsetPreset {
+    pub name: String,
+    pub revset: String,
+}
+
+/// The configured presets, set once by [`AppConfig::load`]. Kept beside
+/// `AppConfig` rather than in it so that type stays `Copy`.
+static REVSET_PRESETS: OnceLock<Vec<RevsetPreset>> = OnceLock::new();
+
+/// The `[[revset_presets]]` from `config.toml`, or `None` when the file has
+/// none (use the built-ins). An empty list is a choice: no presets.
+pub fn revset_presets() -> Option<&'static [RevsetPreset]> {
+    REVSET_PRESETS.get().map(Vec::as_slice)
 }
 
 #[derive(Default, Debug, Deserialize)]
@@ -136,6 +173,7 @@ struct RawConfig {
     code_baseline_offset: Option<f32>,
     #[serde(default)]
     keys: RawKeys,
+    revset_presets: Option<Vec<RevsetPreset>>,
 }
 
 /// Parse a config `theme` value. Case-insensitive; `Contrast` maps to the
@@ -237,4 +275,32 @@ fn default_mono_font() -> Font {
     // bundled names. Hardcoding "Menlo" / "Cascadia Code" was fragile:
     // Cascadia Code only ships on Windows 11+ and isn't on Linux at all.
     Font::MONOSPACE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn revset_presets_parse_as_an_array_of_tables() {
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [[revset_presets]]
+            name = "My stack"
+            revset = "trunk()..@"
+
+            [[revset_presets]]
+            name = "Recent"
+            revset = "ancestors(@, 30)"
+            "#,
+        )
+        .expect("parses");
+        let presets = raw.revset_presets.expect("present");
+        assert_eq!(presets.len(), 2);
+        assert_eq!(presets[0].name, "My stack");
+        assert_eq!(presets[1].revset, "ancestors(@, 30)");
+        // Absent means "use the built-ins", not "none".
+        let raw: RawConfig = toml::from_str("theme = \"dark\"").expect("parses");
+        assert!(raw.revset_presets.is_none());
+    }
 }

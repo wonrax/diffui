@@ -4258,11 +4258,7 @@ impl Diffui {
         if !tab.default_revset.is_empty() {
             entries.push(("Default".to_owned(), tab.default_revset.clone()));
         }
-        entries.extend(
-            presets
-                .iter()
-                .map(|(label, expr)| ((*label).to_owned(), (*expr).to_owned())),
-        );
+        entries.extend(presets);
         entries
     }
 

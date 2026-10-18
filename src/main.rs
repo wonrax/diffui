@@ -827,19 +827,32 @@ fn default_revset(repository: &Repository) -> String {
     }
 }
 
-/// Built-in revset presets for the caret menu, as `(label, expression)`. jj
-/// uses revset functions; git uses `git log` revision-range shortcuts. Shared
-/// by the native macOS menu and the iced fallback so they stay in sync.
-pub(crate) fn revset_presets(vcs: Option<Vcs>) -> &'static [(&'static str, &'static str)] {
-    match vcs {
+/// Revset presets for the caret menu, as `(label, expression)`. jj uses
+/// revset functions and can be configured with `[[revset_presets]]` (see
+/// [`config`]); git uses `git log` revision-range shortcuts. Shared by the
+/// native macOS menu and the iced fallback so they stay in sync.
+pub(crate) fn revset_presets(vcs: Option<Vcs>) -> Vec<(String, String)> {
+    let builtin: &[(&str, &str)] = match vcs {
         Some(Vcs::Git) => &[("All branches", "--all"), ("Current", "HEAD")],
-        _ => &[
-            ("Everything", "all()"),
-            ("Mine", "mine()"),
-            ("Current line", "ancestors(@)"),
-            ("Conflicts", "conflicts()"),
-        ],
-    }
+        _ => {
+            if let Some(configured) = config::revset_presets() {
+                return configured
+                    .iter()
+                    .map(|preset| (preset.name.clone(), preset.revset.clone()))
+                    .collect();
+            }
+            &[
+                ("Everything", "all()"),
+                ("Mine", "mine()"),
+                ("Current line", "ancestors(@)"),
+                ("Conflicts", "conflicts()"),
+            ]
+        }
+    };
+    builtin
+        .iter()
+        .map(|(label, expr)| ((*label).to_owned(), (*expr).to_owned()))
+        .collect()
 }
 
 /// A stable identity for an open tab, independent of its position in `tabs`.
