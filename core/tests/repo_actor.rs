@@ -504,3 +504,48 @@ fn a_cold_load_that_fails_at_snapshot_reports_the_failure() {
     ));
     assert!(matches!(session.status, diffui_core::LoadStatus::Failed(_)));
 }
+
+#[test]
+fn a_panicking_command_fails_its_job_and_the_actor_keeps_serving() {
+    let root = scratch_repo("actor-panic");
+    let mut repo = TestRepo::open(&root);
+    repo.snapshot();
+    commit_file(&mut repo, "a.txt", "one\n", "first");
+    let mut session = Session::unloaded("all()".to_owned());
+    session.capabilities = repo.handle.capabilities();
+
+    // Before the actor caught panics, this one ended its thread: the job never
+    // got a terminal event (the tab spun forever) and the drain below died on
+    // "the actor's event stream ended early".
+    diffui_core::repo::fault::panic_next_command(&root);
+    let effects = session.load_graph(true);
+    let job = graph_job(&effects);
+    repo.handle.send(Command::LoadGraph {
+        job,
+        revset: "all()".to_owned(),
+    });
+    let events = repo.drain(job);
+    let Some(Payload::Failed {
+        error: RepoError::Crashed(message),
+        ..
+    }) = events.last()
+    else {
+        panic!("expected a Crashed failure, got {events:?}");
+    };
+    assert!(message.contains("injected fault"), "{message}");
+    for payload in events {
+        session.apply(Event::new(repo_id(&root), payload));
+    }
+    let diffui_core::LoadStatus::Failed(shown) = &session.status else {
+        panic!("a crashed graph load should fail the tab");
+    };
+    assert!(shown.contains("worker crashed"), "{shown}");
+
+    // The actor dropped its loaded state and is still there: a retry reopens
+    // the workspace and loads.
+    let rows = repo.graph("all()");
+    assert!(
+        rows.iter()
+            .any(|row| row.summary.description.starts_with("first"))
+    );
+}

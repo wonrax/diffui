@@ -18,12 +18,13 @@ use jj_lib::{
     workspace::Workspace,
 };
 use tokio::sync::mpsc;
+use tracing::Instrument as _;
 
 use super::cancel::CancelFlag;
 use super::protocol::{
     Command, Event, GraphTail, JobId, Payload, PreviewRequest, RepoError, RepoId,
 };
-use super::{Envelope, Jobs, SettingsSource, route_commands};
+use super::{Envelope, Jobs, SettingsSource, catch_panic, route_commands};
 use crate::jj;
 use crate::model::{LoadProgress, RevisionSelection, StreamRow};
 use crate::mutations::{DraftSimulation, MutationOp};
@@ -125,7 +126,12 @@ impl Actor {
         while let Some(envelope) = commands.recv().await {
             match envelope {
                 Envelope::Shutdown => return,
-                Envelope::Watch(batch) => self.on_watch(batch).await,
+                Envelope::Watch(batch) => {
+                    if let Err(message) = catch_panic(self.on_watch(batch)).await {
+                        tracing::error!(repo = %self.id, "the watch handler panicked: {message}");
+                        self.forget_loaded_state();
+                    }
+                }
                 Envelope::Run {
                     repository,
                     command,
@@ -144,11 +150,25 @@ impl Actor {
                         job = job.0,
                         command = command_name(&command),
                     );
-                    let _entered = span.enter();
-                    let result = self.dispatch(&repository, command, &cancel).await;
-                    if let Err(error) = result {
-                        let error = classify(error);
-                        tracing::warn!(%error, "command failed");
+                    let work = async {
+                        #[cfg(feature = "fault-injection")]
+                        super::fault::trip(&repository.root);
+                        self.dispatch(&repository, command, &cancel).await
+                    };
+                    let error = match catch_panic(work).instrument(span.clone()).await {
+                        Ok(Ok(())) => None,
+                        Ok(Err(error)) => {
+                            let error = classify(error);
+                            span.in_scope(|| tracing::warn!(%error, "command failed"));
+                            Some(error)
+                        }
+                        Err(message) => {
+                            span.in_scope(|| tracing::error!("command panicked: {message}"));
+                            self.forget_loaded_state();
+                            Some(RepoError::Crashed(message))
+                        }
+                    };
+                    if let Some(error) = error {
                         self.emit(Payload::Failed { job, error });
                     }
                     self.finish(job);
@@ -184,6 +204,15 @@ impl Actor {
             }
             Err(error) => tracing::warn!(%error, "failed to read the jj op head"),
         }
+    }
+
+    /// Drop everything loaded from disk after a panic: the workspace, its
+    /// lock-holding state and the cached repo may be half-updated, so the next
+    /// command reopens them from scratch.
+    fn forget_loaded_state(&mut self) {
+        self.workspace = None;
+        self.repo = None;
+        self.op_head = None;
     }
 
     fn emit(&self, payload: Payload) {

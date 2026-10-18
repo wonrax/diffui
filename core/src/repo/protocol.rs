@@ -89,6 +89,9 @@ pub enum RepoError {
     /// The repository has no such capability (see [`Capabilities`]).
     Unsupported,
     Other(String),
+    /// The actor panicked while running the command. It dropped whatever it
+    /// had loaded and keeps serving, so the next command starts clean.
+    Crashed(String),
 }
 
 impl fmt::Display for RepoError {
@@ -103,6 +106,11 @@ impl fmt::Display for RepoError {
             Self::Immutable { short_id } => write!(f, "{short_id} is immutable"),
             Self::Unsupported => f.write_str("this repository does not support that operation"),
             Self::Other(message) => write!(f, "{message}"),
+            Self::Crashed(message) => write!(
+                f,
+                "This repository's worker crashed: {message}. See the log \
+                 (\"Reveal log file\") for details; refresh to retry."
+            ),
         }
     }
 }

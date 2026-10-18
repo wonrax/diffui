@@ -88,11 +88,16 @@ track-alloc = []
 # or `--no-default-features` build — or a frontend that supplies its own change
 # source — drops the `notify` dependency.
 watcher = ["dep:notify"]
+# Test-only: `repo::fault` arms a panic inside an actor so the recovery path
+# can be exercised. The dev-dependency on this crate below turns it on for the
+# integration tests; nothing else should enable it.
+fault-injection = []
 
 [dev-dependencies]
 # `tokio::time::pause`, so the watcher's debounce is tested against a virtual
 # clock rather than by sleeping through it.
 tokio = { version = "1.44", features = ["test-util"] }
+diffui-core = { path = ".", features = ["fault-injection"] }
 
 [dependencies]
 anyhow = "1.0"

@@ -83,6 +83,50 @@ fn watch(root: PathBuf, poke: mpsc::UnboundedSender<Envelope>) {
     }
 }
 
+/// Run `work`, turning a panic inside it into the panic's message.
+///
+/// A panic used to unwind straight out of the actor and end it: the thread (or
+/// task) died, the job in flight never got its terminal event, and every later
+/// command was dropped on a closed channel, leaving the tab spinning forever.
+/// The panic hook has already logged the backtrace by the time this returns.
+pub(crate) async fn catch_panic<F: Future>(work: F) -> Result<F::Output, String> {
+    use futures::FutureExt as _;
+    std::panic::AssertUnwindSafe(work)
+        .catch_unwind()
+        .await
+        .map_err(|payload| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_owned())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_owned())
+        })
+}
+
+/// Test-only fault injection: make the next command an actor runs for a
+/// repository panic, so the recovery path can be exercised end to end.
+#[cfg(feature = "fault-injection")]
+pub mod fault {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static ARMED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    /// Arm a panic for the next command run against `root`.
+    pub fn panic_next_command(root: &Path) {
+        ARMED.lock().unwrap().push(root.to_owned());
+    }
+
+    pub(crate) fn trip(root: &Path) {
+        let mut armed = ARMED.lock().unwrap();
+        if let Some(index) = armed.iter().position(|armed| armed == root) {
+            armed.remove(index);
+            drop(armed);
+            panic!("injected fault for {}", root.display());
+        }
+    }
+}
+
 /// What travels down the command channel. `Watch` and `Shutdown` are the
 /// actor's own control traffic and never leave this module — the protocol
 /// proper is [`Command`].

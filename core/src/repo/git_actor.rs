@@ -7,10 +7,11 @@
 //! frontend never has to ask which backend it is talking to.
 
 use tokio::sync::mpsc;
+use tracing::Instrument as _;
 
 use super::cancel::CancelFlag;
 use super::protocol::{Command, Event, GraphTail, Payload, RepoError, RepoId};
-use super::{Envelope, Jobs, route_commands};
+use super::{Envelope, Jobs, catch_panic, route_commands};
 use crate::repository::Repository;
 
 pub(super) fn spawn(
@@ -45,8 +46,22 @@ pub(super) fn spawn(
                         Err(_) => CancelFlag::default(),
                     };
                     let span = tracing::info_span!("repo_command", repo = %id, job = job.0);
-                    let _entered = span.enter();
-                    for payload in run(&repository, command, &cancel).await {
+                    let work = async {
+                        #[cfg(feature = "fault-injection")]
+                        super::fault::trip(&repository.root);
+                        run(&repository, command, &cancel).await
+                    };
+                    let payloads = match catch_panic(work).instrument(span.clone()).await {
+                        Ok(payloads) => payloads,
+                        Err(message) => {
+                            span.in_scope(|| tracing::error!("command panicked: {message}"));
+                            vec![Payload::Failed {
+                                job,
+                                error: RepoError::Crashed(message),
+                            }]
+                        }
+                    };
+                    for payload in payloads {
                         let _ = events.send(Event::new(id.clone(), payload));
                     }
                     if let Ok(mut jobs) = jobs.lock() {

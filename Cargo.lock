@@ -2272,6 +2272,7 @@ dependencies = [
  "arborium",
  "bstr",
  "chrono",
+ "diffui-core",
  "futures",
  "jj-lib",
  "notify",
