@@ -634,11 +634,21 @@ pub(super) fn compute_bookmarks_info(
         .unwrap_or_default();
     remotes.sort();
     let git_push = repo.settings().get_string("git.push").ok();
+    // Tags follow the bookmark chip rules (`collect_bookmark_labels`): a
+    // remote tag in sync with the local one is redundant, and `@git` never
+    // shows.
+    let mut tags: HashMap<String, Vec<String>> = HashMap::new();
+    for (name, target) in repo.view().tags() {
+        collect_bookmark_labels(name.as_str(), &target, |id, label| {
+            tags.entry(id.hex()).or_default().push(label);
+        });
+    }
     BookmarksInfo {
         bookmarks,
         working_copy_commit: Some(wc_commit_id.hex()),
         remotes,
         git_push,
+        tags,
     }
 }
 

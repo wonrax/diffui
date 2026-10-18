@@ -903,6 +903,10 @@ pub struct BookmarksInfo {
     pub remotes: Vec<String>,
     /// The `git.push` setting, when configured.
     pub git_push: Option<String>,
+    /// Tag labels by commit id (hex), in jj's `tags` template form (`v1`,
+    /// `v1@origin` for a remote tag elsewhere, `v1??` when conflicted). Read
+    /// only: the graph shows them, nothing acts on them.
+    pub tags: std::collections::HashMap<String, Vec<String>>,
 }
 
 impl BookmarksInfo {

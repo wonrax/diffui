@@ -934,8 +934,9 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
     let multi_selection = tab.revision_multi_selection.as_slice();
     let config = ui.config;
     let draft = tab.op_draft();
+    let tags = &tab.session.bookmarks.tags;
     let build_revision = Box::new(move |index: usize| {
-        build_revision_row(
+        let mut row = build_revision_row(
             commits,
             graph,
             prefix_lens,
@@ -945,7 +946,14 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
             multi_selection,
             draft,
             index,
-        )
+        );
+        // Tags trail the bookmarks, so the rail's `+N` overflow sheds them
+        // first.
+        if let Some(tags) = tags.get(commits.row(index).commit_id()) {
+            row.bookmark_chips
+                .extend(tag_chips_for(tags, theme, config));
+        }
+        row
     });
     let build_file: Box<dyn Fn(usize) -> FileRowView> =
         Box::new(|_| unreachable!("history does not contain file rows"));
@@ -1244,6 +1252,24 @@ pub(crate) fn bookmark_chips_for(
         });
     }
     chips
+}
+
+/// Read-only tag chips for a revision row: neutral rather than lane-colored,
+/// and wearing the tag glyph, so they never read as bookmarks. A remote tag
+/// that differs from the local one (`v1@origin`) is outlined, like a remote
+/// bookmark.
+pub(crate) fn tag_chips_for(tags: &[String], theme: ThemeSpec, config: AppConfig) -> Vec<Chip> {
+    tags.iter()
+        .map(|tag| Chip {
+            label: tag.clone(),
+            font: config.ui_font,
+            background: chip_background(theme.muted_text),
+            text_color: theme.muted_text,
+            border_color: tag.contains('@').then_some(theme.subtle_text),
+            border_dashed: false,
+            icon: Some(icons::TAG),
+        })
+        .collect()
 }
 
 /// Status chips (`empty`, `conflict`, `hidden`/`divergent`) for a commit row.

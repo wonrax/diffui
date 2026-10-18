@@ -531,6 +531,32 @@ fn tracked_push_sends_tracked_bookmarks_that_moved() {
 }
 
 #[test]
+fn tags_reach_the_graph_as_read_only_labels() {
+    let Some((mut repo, _remote)) = setup("push-tags") else {
+        return;
+    };
+    let first = commit(&mut repo, "a.txt", "first");
+    harness::block_on(async {
+        let workspace = harness::load_workspace(&repo.root);
+        let base = workspace
+            .repo_loader()
+            .load_at_head()
+            .await
+            .expect("load repo");
+        let mut tx = base.start_transaction();
+        let id = jj_lib::backend::CommitId::try_from_hex(&first).expect("commit id");
+        tx.repo_mut().set_local_tag_target(
+            jj_lib::ref_name::RefName::new("v1.0"),
+            jj_lib::op_store::RefTarget::normal(id),
+        );
+        tx.commit("test: tag").await.expect("commit the tag");
+    });
+    let info = bookmarks(&mut repo);
+    assert_eq!(info.tags.get(&first), Some(&vec!["v1.0".to_owned()]));
+    assert!(info.entry("v1.0").is_none(), "a tag is not a bookmark");
+}
+
+#[test]
 fn a_confirmed_push_reports_its_plan_before_pushing() {
     let Some((mut repo, remote)) = setup("push-confirm") else {
         return;

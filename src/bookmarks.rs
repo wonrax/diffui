@@ -750,6 +750,7 @@ mod tests {
             // no default push remote.
             remotes: vec!["fork".to_owned(), "upstream".to_owned()],
             git_push: None,
+            tags: Default::default(),
         };
         (ui, tab)
     }
