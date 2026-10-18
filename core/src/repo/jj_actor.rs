@@ -561,6 +561,9 @@ impl Actor {
                 )
                 .await?,
             ),
+            PreviewRequest::Parallelize { targets } => {
+                DraftSimulation::Rebase(jj::preview_parallelize(&repo, &name, &targets).await?)
+            }
         };
         self.emit(Payload::PreviewDone { job, simulation });
         Ok(())
@@ -668,6 +671,25 @@ pub fn rewritten_targets(
             }
         }
         MutationOp::Absorb { from } => push(from),
+        MutationOp::Commit { .. } => push(&RevisionSelection::WorkingCopy),
+        MutationOp::NewAt { destination } => match destination {
+            // The insertion's far side gains the new commit as a parent.
+            Destination::Before(target) => push(target),
+            Destination::Between { child, .. } => push(child),
+            Destination::Onto(_) | Destination::After(_) => {}
+        },
+        MutationOp::Parallelize { targets: picked }
+        | MutationOp::Metaedit {
+            targets: picked, ..
+        } => picked.iter().for_each(&mut push),
+        MutationOp::DuplicateTo { destination, .. } => match destination {
+            Some(Destination::Before(target)) => push(target),
+            Some(Destination::Between { child, .. }) => push(child),
+            _ => {}
+        },
+        // The copies to abandon are resolved in the backend; its guard
+        // covers them.
+        MutationOp::KeepDivergent { .. } => {}
         // New/Merge/Duplicate only create commits; bookmark and undo ops
         // rewrite nothing the caller named.
         MutationOp::New { .. }

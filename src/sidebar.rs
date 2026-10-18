@@ -222,6 +222,7 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     // The valid target row a confirm would land on.
     let target = armed.filter(|&index| !is_source_index(index));
     let merge_ready = matches!(draft.kind, DraftKind::Merge) && draft.sources.len() >= 2;
+    let parallel_ready = matches!(draft.kind, DraftKind::Parallelize) && draft.sources.len() >= 2;
     // Squash/merge gap drops resolve to the gap's parent side.
     let fold_target = target.or_else(|| {
         gap_sides
@@ -243,6 +244,9 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         DraftKind::Rebase { .. } => (icons::GIT_MERGE, "Rebase"),
         DraftKind::Squash => (icons::FOLD_VERTICAL, "Squash"),
         DraftKind::Merge => (icons::GIT_FORK, "Merge"),
+        DraftKind::New => (icons::SQUARE_PLUS, "New change"),
+        DraftKind::Duplicate => (icons::COPY, "Duplicate"),
+        DraftKind::Parallelize => (icons::COLUMNS_3, "Parallelize"),
     };
     let mut names = draft
         .sources
@@ -259,11 +263,15 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     // "+ N descendants": exact once the simulation lands; with-descendants
     // mode promises them even before it does.
     let descendants_suffix = match (draft.kind, sim_rebase) {
-        (DraftKind::Rebase { .. }, Some(preview)) if preview.descendants > 0 => Some(format!(
-            "+ {} descendant{}",
-            preview.descendants,
-            if preview.descendants == 1 { "" } else { "s" }
-        )),
+        (DraftKind::Rebase { .. } | DraftKind::Parallelize, Some(preview))
+            if preview.descendants > 0 =>
+        {
+            Some(format!(
+                "+ {} descendant{}",
+                preview.descendants,
+                if preview.descendants == 1 { "" } else { "s" }
+            ))
+        }
         (
             DraftKind::Rebase {
                 mode: diffui_core::RebaseSourceMode::WithDescendants,
@@ -444,7 +452,7 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
 
     let mut rows_column = column![].spacing(2);
     match draft.kind {
-        DraftKind::Rebase { .. } => {
+        DraftKind::Rebase { .. } | DraftKind::New | DraftKind::Duplicate => {
             // While a drag is live the fill mirrors what a drop would do —
             // a row means onto, a gap means between — and reverts to the
             // sticky keyboard placement when the drag ends.
@@ -527,7 +535,7 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
                 .map(|id| format!("folds {names} into {id} · descriptions combine"));
             rows_column = rows_column.push(target_row("Into", None, tone, description, None));
         }
-        DraftKind::Merge => {}
+        DraftKind::Merge | DraftKind::Parallelize => {}
     }
 
     // ---- Footer band: live verdict + counts on the left, Apply on the
@@ -549,6 +557,9 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             match draft.kind {
                 DraftKind::Squash => "Pick the revision to fold into".to_owned(),
                 DraftKind::Merge => "Pick the other parent".to_owned(),
+                DraftKind::New => "Pick where the new change goes".to_owned(),
+                DraftKind::Duplicate => "Pick where the copies land".to_owned(),
+                DraftKind::Parallelize => "Add another revision to parallelize".to_owned(),
                 _ if is_branch => "Pick a destination to resolve the branch".to_owned(),
                 _ => "Pick the destination".to_owned(),
             },
@@ -666,7 +677,7 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     // Merge can be complete from its selected parents alone; other drafts
     // execute on the armed candidate. Gap spots only exist mid-drag, where
     // the drop itself is the confirm.
-    let can_apply = merge_ready || target.is_some();
+    let can_apply = merge_ready || parallel_ready || target.is_some();
     let apply_color = if can_apply {
         theme.background
     } else {
@@ -691,6 +702,8 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     // own keycaps and Apply its ↵.
     let hints = text(match draft.kind {
         DraftKind::Merge => "Space toggles a parent · Esc cancels",
+        DraftKind::Parallelize => "Space or \u{2318}-click toggles a revision · Esc cancels",
+        DraftKind::New => "Esc cancels",
         _ => "Space toggles a source · Esc cancels",
     })
     .size(theme::text_size::CAPTION)
@@ -723,7 +736,7 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             background: Some(Background::Color(theme.border)),
             ..container::Style::default()
         });
-    let shows_target_rows = !matches!(draft.kind, DraftKind::Merge);
+    let shows_target_rows = !matches!(draft.kind, DraftKind::Merge | DraftKind::Parallelize);
     column![
         hairline,
         container(column![
@@ -1081,6 +1094,7 @@ fn build_revision_row(
         use revision_list::DraftMarker;
         if ui.hover_spot.is_some()
             || matches!(ui.draft.kind, DraftKind::Merge) && ui.draft.sources.len() >= 2
+            || matches!(ui.draft.kind, DraftKind::Parallelize)
         {
             return None;
         }
@@ -1092,14 +1106,16 @@ fn build_revision_row(
         }
         let candidate = ui.draft.candidate?;
         (candidate == index).then_some(match ui.draft.kind {
-            DraftKind::Squash | DraftKind::Merge => DraftMarker::Ring,
-            DraftKind::Rebase { .. } => match ui.draft.placement {
-                PlacementKind::Onto => DraftMarker::Ring,
-                // After = between the target and its children ⇒ lands just
-                // above the row; Before ⇒ just below it.
-                PlacementKind::After => DraftMarker::LineAbove,
-                PlacementKind::Before => DraftMarker::LineBelow,
-            },
+            DraftKind::Squash | DraftKind::Merge | DraftKind::Parallelize => DraftMarker::Ring,
+            DraftKind::Rebase { .. } | DraftKind::New | DraftKind::Duplicate => {
+                match ui.draft.placement {
+                    PlacementKind::Onto => DraftMarker::Ring,
+                    // After = between the target and its children ⇒ lands just
+                    // above the row; Before ⇒ just below it.
+                    PlacementKind::After => DraftMarker::LineAbove,
+                    PlacementKind::Before => DraftMarker::LineBelow,
+                }
+            }
         })
     });
     // Target-mode role chips: say in words what the wash/marker mean — every
@@ -1121,6 +1137,9 @@ fn build_revision_row(
                         DraftKind::Rebase { .. } => "move",
                         DraftKind::Squash => "squash",
                         DraftKind::Merge => "merge",
+                        DraftKind::New => "new",
+                        DraftKind::Duplicate => "copy",
+                        DraftKind::Parallelize => "parallel",
                     }
                     .to_owned(),
                     font: config.mono_font,
@@ -1135,8 +1154,9 @@ fn build_revision_row(
             // The live destination: the drag spot's row while dragging, else
             // the armed candidate. A gap spot gets no row chip — the
             // insertion line carries the "between" meaning.
-            let merge_ready =
-                matches!(ui.draft.kind, DraftKind::Merge) && ui.draft.sources.len() >= 2;
+            let merge_ready = matches!(ui.draft.kind, DraftKind::Merge)
+                && ui.draft.sources.len() >= 2
+                || matches!(ui.draft.kind, DraftKind::Parallelize);
             let destination_word = if merge_ready {
                 None
             } else {
@@ -1144,14 +1164,20 @@ fn build_revision_row(
                     Some(revision_list::DropSpot::OnRow(spot)) if spot == index => {
                         Some(match ui.draft.kind {
                             // Drops land Onto regardless of the armed placement.
-                            DraftKind::Rebase { .. } => "onto",
+                            DraftKind::Rebase { .. }
+                            | DraftKind::New
+                            | DraftKind::Duplicate
+                            | DraftKind::Parallelize => "onto",
                             DraftKind::Squash => "into",
                             DraftKind::Merge => "with",
                         })
                     }
                     Some(_) => None,
                     None => (ui.draft.candidate == Some(index)).then_some(match ui.draft.kind {
-                        DraftKind::Rebase { .. } => match ui.draft.placement {
+                        DraftKind::Rebase { .. }
+                        | DraftKind::New
+                        | DraftKind::Duplicate
+                        | DraftKind::Parallelize => match ui.draft.placement {
                             PlacementKind::Onto => "onto",
                             PlacementKind::After => "after",
                             PlacementKind::Before => "before",

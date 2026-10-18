@@ -127,6 +127,39 @@ pub enum MutationOp {
     /// snapshot-before-mutate discipline (an undo that moves `@` must not
     /// clobber unsnapshotted on-disk edits).
     Undo { operation_id: Option<String> },
+    /// Describe `@` and start a new empty child as the new `@`, in one
+    /// operation (`jj commit -m <description>`). The new `@` keeps the
+    /// committed tree, so nothing on disk changes.
+    Commit { description: String },
+    /// A new empty change placed at `destination` with `@` moved onto it
+    /// (`jj new -A/-B`, or `jj new -A x -B y` for a gap). `After` / `Before`
+    /// / `Between` rebase the commits on the far side of the insertion onto
+    /// the new change, like the CLI; `Onto` is a plain `jj new <target>`.
+    NewAt { destination: Destination },
+    /// Make the `targets` siblings instead of a chain (`jj parallelize`):
+    /// each keeps its content, takes its in-set parents' outside parents,
+    /// and the children of the set's heads end up merging them.
+    Parallelize { targets: Vec<RevisionSelection> },
+    /// Copy the `targets` (`jj duplicate`), onto their own parents when
+    /// `destination` is `None`, else at `-d` / `-A` / `-B` of it — in which
+    /// case the commits on the far side of an insertion are rebased onto the
+    /// copies.
+    DuplicateTo {
+        targets: Vec<RevisionSelection>,
+        destination: Option<Destination>,
+    },
+    /// Resolve a divergent change by keeping `keep` and abandoning every
+    /// other visible commit that shares its change id (`jj abandon` of the
+    /// other copies).
+    KeepDivergent { keep: RevisionSelection },
+    /// Rewrite authorship metadata (`jj metaedit --update-author` /
+    /// `--update-author-timestamp`): the author becomes the configured user,
+    /// and/or the author timestamp becomes now.
+    Metaedit {
+        targets: Vec<RevisionSelection>,
+        update_author: bool,
+        update_author_timestamp: bool,
+    },
 }
 
 /// User-facing summary of a successful mutation — becomes the status message.
@@ -204,8 +237,31 @@ pub enum DraftKind {
     },
     Squash,
     /// `jj new A B`: the source is the first parent, the picked target the
-    /// second. (Octopus merges want multi-select — future work.)
+    /// second; stacking more sources (space / ⌘-click) makes an octopus.
     Merge,
+    /// `jj new` at the picked target with the chosen placement (`-A`/`-B`).
+    /// Has no sources: what lands is a fresh empty change.
+    New,
+    /// `jj duplicate` the sources at the picked target with the chosen
+    /// placement.
+    Duplicate,
+    /// `jj parallelize` the sources. Complete from the sources alone — the
+    /// draft only exists to preview the result and to let space / ⌘-click
+    /// adjust the set.
+    Parallelize,
+}
+
+impl DraftKind {
+    /// Whether the draft lands relative to its target with an
+    /// onto / after / before placement.
+    pub fn uses_placement(self) -> bool {
+        matches!(self, Self::Rebase { .. } | Self::New | Self::Duplicate)
+    }
+
+    /// Whether confirming needs no destination, only the sources.
+    pub fn completes_from_sources(self) -> bool {
+        matches!(self, Self::Merge | Self::Parallelize)
+    }
 }
 
 /// Placement choice while a rebase draft is picking its destination — the op
@@ -273,6 +329,16 @@ impl OpDraft {
         }
     }
 
+    /// A draft of `kind` over `sources` (empty for [`DraftKind::New`]).
+    pub fn with_sources(kind: DraftKind, sources: Vec<DraftSource>) -> Self {
+        Self {
+            kind,
+            sources,
+            placement: PlacementKind::default(),
+            candidate: None,
+        }
+    }
+
     /// Whether `commit_id` is one of the draft's sources — sources can't be
     /// their own destination. (Deeper cycle checks — e.g. rebasing a subtree
     /// onto its own descendant — are left to jj-lib, whose error surfaces in
@@ -301,6 +367,9 @@ impl OpDraft {
             } => format!("Rebase branch of {names}"),
             DraftKind::Squash => format!("Squash {names}"),
             DraftKind::Merge => format!("Merge {names}"),
+            DraftKind::New => "New change".to_owned(),
+            DraftKind::Duplicate => format!("Duplicate {names}"),
+            DraftKind::Parallelize => format!("Parallelize {names}"),
         }
     }
 
@@ -315,6 +384,9 @@ impl OpDraft {
                     .iter()
                     .map(|source| source.selection.clone())
                     .collect(),
+            }),
+            DraftKind::Parallelize if self.sources.len() >= 2 => Some(MutationOp::Parallelize {
+                targets: self.sources.iter().map(|s| s.selection.clone()).collect(),
             }),
             _ => None,
         }
@@ -354,6 +426,15 @@ impl OpDraft {
                     .chain([target])
                     .collect(),
             },
+            DraftKind::New => MutationOp::NewAt {
+                destination: placed(target, placement),
+            },
+            DraftKind::Duplicate => MutationOp::DuplicateTo {
+                targets: self.sources.iter().map(|s| s.selection.clone()).collect(),
+                destination: Some(placed(target, placement)),
+            },
+            // Nothing to aim at: the set itself is the whole op.
+            DraftKind::Parallelize => return self.op_from_sources(),
         })
     }
 
@@ -393,7 +474,24 @@ impl OpDraft {
                     .chain([parent])
                     .collect(),
             },
+            DraftKind::New => MutationOp::NewAt {
+                destination: Destination::Between { parent, child },
+            },
+            DraftKind::Duplicate => MutationOp::DuplicateTo {
+                targets: self.sources.iter().map(|s| s.selection.clone()).collect(),
+                destination: Some(Destination::Between { parent, child }),
+            },
+            DraftKind::Parallelize => return self.op_from_sources(),
         })
+    }
+}
+
+/// The [`Destination`] a placement means relative to `target`.
+pub fn placed(target: RevisionSelection, placement: PlacementKind) -> Destination {
+    match placement {
+        PlacementKind::Onto => Destination::Onto(target),
+        PlacementKind::After => Destination::After(target),
+        PlacementKind::Before => Destination::Before(target),
     }
 }
 
@@ -521,5 +619,83 @@ mod tests {
             ),
             other => panic!("expected a source-only merge op, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn new_draft_lowers_each_placement_and_the_gap() {
+        let draft = OpDraft::with_sources(DraftKind::New, Vec::new());
+        let target = RevisionSelection::Commit("bbbb".to_owned());
+        for placement in [
+            PlacementKind::Onto,
+            PlacementKind::After,
+            PlacementKind::Before,
+        ] {
+            match draft.op_for(target.clone(), placement) {
+                Some(MutationOp::NewAt { destination }) => {
+                    assert_eq!(destination, placed(target.clone(), placement))
+                }
+                other => panic!("expected a placed new, got {other:?}"),
+            }
+        }
+        let parent = RevisionSelection::Commit("pppp".to_owned());
+        let child = RevisionSelection::Commit("cccc".to_owned());
+        match draft.op_for_gap(parent.clone(), child.clone()) {
+            Some(MutationOp::NewAt {
+                destination:
+                    Destination::Between {
+                        parent: p,
+                        child: c,
+                    },
+            }) => assert_eq!((p, c), (parent, child)),
+            other => panic!("expected a new between, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_draft_carries_every_source_to_the_destination() {
+        let draft =
+            OpDraft::with_sources(DraftKind::Duplicate, vec![source("aaaa"), source("bbbb")]);
+        let target = RevisionSelection::Commit("cccc".to_owned());
+        match draft.op_for(target.clone(), PlacementKind::After) {
+            Some(MutationOp::DuplicateTo {
+                targets,
+                destination,
+            }) => {
+                assert_eq!(targets.len(), 2);
+                assert_eq!(destination, Some(Destination::After(target)));
+            }
+            other => panic!("expected a placed duplicate, got {other:?}"),
+        }
+        // A source can't be its own destination.
+        assert!(
+            draft
+                .op_for(
+                    RevisionSelection::Commit("aaaa".into()),
+                    PlacementKind::Onto
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn parallelize_draft_completes_from_two_sources() {
+        let mut draft = OpDraft::with_sources(DraftKind::Parallelize, vec![source("aaaa")]);
+        assert!(draft.op_from_sources().is_none(), "one revision is no set");
+        draft.sources.push(source("bbbb"));
+        assert!(matches!(
+            draft.op_from_sources(),
+            Some(MutationOp::Parallelize { targets }) if targets.len() == 2
+        ));
+        // Any target confirms the same op: there is nothing to aim at.
+        assert!(matches!(
+            draft.op_for(
+                RevisionSelection::Commit("cccc".into()),
+                PlacementKind::Onto
+            ),
+            Some(MutationOp::Parallelize { .. })
+        ));
+        assert!(DraftKind::Parallelize.completes_from_sources());
+        assert!(!DraftKind::Parallelize.uses_placement());
+        assert!(DraftKind::New.uses_placement() && DraftKind::Duplicate.uses_placement());
     }
 }

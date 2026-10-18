@@ -1940,3 +1940,355 @@ fn move_bookmark_with_push_updates_the_remote() {
         "the remote itself received the new position"
     );
 }
+
+// ── Whole-revision ops: commit, new -A/-B, parallelize, duplicate placement,
+// divergent resolution, metaedit ─────────────────────────────────────────────
+
+/// `jj commit -m`: the on-disk edit lands in the described commit, and `@`
+/// moves to a fresh empty child of it — one operation, nothing left behind.
+#[test]
+fn commit_describes_the_working_copy_and_starts_an_empty_child() {
+    let root = scratch_repo("revops-commit");
+    write(&root, "file.txt", "hello\n");
+    let wc_change = change_id(&root, "@");
+
+    let outcome = run(
+        &root,
+        MutationOp::Commit {
+            description: "first".to_owned(),
+        },
+    );
+
+    assert!(outcome.moved_working_copy, "@ moves onto the new child");
+    assert_eq!(change_id(&root, "@-"), wc_change, "the old @ is committed");
+    let committed = commit_id(&root, "@-");
+    assert_eq!(harness::full_description(&root, &committed), "first\n");
+    assert_eq!(
+        diff_paths(&root, RevisionSelection::Commit(committed)),
+        vec!["file.txt".to_owned()],
+        "the on-disk edit was folded in before committing"
+    );
+    assert!(
+        diff_paths(&root, RevisionSelection::WorkingCopy).is_empty(),
+        "the new @ is empty"
+    );
+    assert_eq!(harness::full_description(&root, &commit_id(&root, "@")), "");
+}
+
+/// `jj new -A a`: the new change sits between `a` and `a`'s children.
+#[test]
+fn new_after_inserts_between_the_target_and_its_children() {
+    let root = scratch_repo("revops-new-after");
+    write(&root, "file.txt", "a\n");
+    commit(&root, "a");
+    write(&root, "file.txt", "a\nb\n");
+    commit(&root, "b");
+    let a = commit_id(&root, "description(exact:\"a\\n\")");
+    let b = change_id(&root, "description(exact:\"b\\n\")");
+
+    let outcome = run(
+        &root,
+        MutationOp::NewAt {
+            destination: Destination::After(RevisionSelection::Commit(a.clone())),
+        },
+    );
+
+    assert!(outcome.moved_working_copy);
+    assert_eq!(parent_ids(&root, "@"), vec![a]);
+    assert_eq!(parent_ids(&root, &b), vec![commit_id(&root, "@")]);
+    assert!(diff_paths(&root, RevisionSelection::WorkingCopy).is_empty());
+    assert_eq!(
+        harness::file_at(&root, &commit_id(&root, &b), "file.txt"),
+        "a\nb\n",
+        "the rebased child keeps its content"
+    );
+}
+
+/// `jj new -B b`: the new change takes `b`'s parents and `b` moves onto it.
+#[test]
+fn new_before_inserts_between_the_target_and_its_parents() {
+    let root = scratch_repo("revops-new-before");
+    write(&root, "file.txt", "a\n");
+    commit(&root, "a");
+    write(&root, "file.txt", "a\nb\n");
+    commit(&root, "b");
+    let a = commit_id(&root, "description(exact:\"a\\n\")");
+    let b = commit_id(&root, "description(exact:\"b\\n\")");
+    let b_change = change_id(&root, "description(exact:\"b\\n\")");
+
+    run(
+        &root,
+        MutationOp::NewAt {
+            destination: Destination::Before(RevisionSelection::Commit(b)),
+        },
+    );
+
+    assert_eq!(parent_ids(&root, "@"), vec![a]);
+    assert_eq!(parent_ids(&root, &b_change), vec![commit_id(&root, "@")]);
+}
+
+/// The CLI's loop guard: inserting between a commit and its own ancestor is
+/// refused, and nothing is written.
+#[test]
+fn new_between_refuses_to_create_a_loop() {
+    let root = scratch_repo("revops-new-loop");
+    write(&root, "file.txt", "a\n");
+    commit(&root, "a");
+    write(&root, "file.txt", "a\nb\n");
+    commit(&root, "b");
+    let a = commit_id(&root, "description(exact:\"a\\n\")");
+    let b = commit_id(&root, "description(exact:\"b\\n\")");
+    let head_before = block_on(read_jj_op_head(repository(&root))).expect("read op head");
+
+    let result = block_on(run_mutation(
+        repository(&root),
+        MutationOp::NewAt {
+            destination: Destination::Between {
+                parent: RevisionSelection::Commit(b),
+                child: RevisionSelection::Commit(a),
+            },
+        },
+        LoadProgress::default(),
+        false,
+    ));
+
+    let error = result.expect_err("a loop must be refused").to_string();
+    assert!(error.contains("loop"), "unexpected error: {error}");
+    assert_eq!(
+        block_on(read_jj_op_head(repository(&root))).expect("read op head"),
+        head_before
+    );
+}
+
+/// base → a → b → c, parallelize {a, b}: a and b become siblings on base,
+/// and c (b's child) merges both.
+#[test]
+fn parallelize_turns_a_chain_into_siblings() {
+    let root = scratch_repo("revops-parallelize");
+    write(&root, "base.txt", "base\n");
+    commit(&root, "base");
+    write(&root, "a.txt", "a\n");
+    commit(&root, "a");
+    write(&root, "b.txt", "b\n");
+    commit(&root, "b");
+    write(&root, "c.txt", "c\n");
+    commit(&root, "c");
+    let base = commit_id(&root, "description(exact:\"base\\n\")");
+    let a = change_id(&root, "description(exact:\"a\\n\")");
+    let b = change_id(&root, "description(exact:\"b\\n\")");
+    let c = change_id(&root, "description(exact:\"c\\n\")");
+
+    let outcome = run(
+        &root,
+        MutationOp::Parallelize {
+            targets: vec![
+                RevisionSelection::Commit(commit_id(&root, &a)),
+                RevisionSelection::Commit(commit_id(&root, &b)),
+            ],
+        },
+    );
+
+    assert!(
+        outcome.message.starts_with("Parallelized 2 revisions"),
+        "{}",
+        outcome.message
+    );
+    assert_eq!(parent_ids(&root, &a), vec![base.clone()]);
+    assert_eq!(parent_ids(&root, &b), vec![base]);
+    let mut c_parents = parent_ids(&root, &c);
+    c_parents.sort();
+    let mut expected = vec![commit_id(&root, &a), commit_id(&root, &b)];
+    expected.sort();
+    assert_eq!(c_parents, expected, "the head's child merges the siblings");
+    assert!(
+        diff_paths(&root, RevisionSelection::Commit(commit_id(&root, &b)))
+            .contains(&"b.txt".to_owned()),
+        "b keeps its own change"
+    );
+}
+
+/// Parallelizing a commit away from the one whose line it edits conflicts —
+/// the preview names it, and writes nothing.
+#[test]
+fn parallelize_preview_predicts_conflicts_without_mutating() {
+    let root = scratch_repo("revops-parallelize-preview");
+    write(&root, "file.txt", "one\n");
+    commit(&root, "base");
+    write(&root, "file.txt", "two\n");
+    commit(&root, "a");
+    write(&root, "file.txt", "three\n");
+    commit(&root, "b");
+    let a = commit_id(&root, "description(exact:\"a\\n\")");
+    let b = commit_id(&root, "description(exact:\"b\\n\")");
+    let b_change = change_id(&root, "description(exact:\"b\\n\")");
+    let head_before = block_on(read_jj_op_head(repository(&root))).expect("read op head");
+
+    let simulation = block_on(preview(
+        &root,
+        PreviewRequest::Parallelize {
+            targets: vec![
+                RevisionSelection::Commit(a.clone()),
+                RevisionSelection::Commit(b.clone()),
+            ],
+        },
+    ))
+    .expect("preview succeeds");
+    let diffui_core::DraftSimulation::Rebase(preview) = simulation else {
+        panic!("parallelize previews rebase-shaped, got {simulation:?}");
+    };
+
+    assert!(preview.simulated);
+    assert_eq!(preview.moved, 1, "only b's parents change");
+    assert!(preview.descendants >= 1, "@ follows b");
+    let short: String = b_change.chars().take(8).collect();
+    assert!(
+        preview.new_conflicts.contains(&short),
+        "b loses the line it edits: {:?}",
+        preview.new_conflicts
+    );
+    assert_eq!(
+        block_on(read_jj_op_head(repository(&root))).expect("read op head"),
+        head_before
+    );
+    assert_eq!(parent_ids(&root, &b), vec![a], "nothing moved");
+}
+
+/// `jj duplicate top -B mid`: the copy takes mid's parents and mid moves
+/// onto the copy; the original stays put.
+#[test]
+fn duplicate_before_a_target_rebases_it_onto_the_copy() {
+    let root = scratch_repo("revops-duplicate-before");
+    write(&root, "base.txt", "base\n");
+    commit(&root, "base");
+    write(&root, "mid.txt", "mid\n");
+    commit(&root, "mid");
+    write(&root, "top.txt", "top\n");
+    commit(&root, "top");
+    let base = commit_id(&root, "description(exact:\"base\\n\")");
+    let mid = commit_id(&root, "description(exact:\"mid\\n\")");
+    let mid_change = change_id(&root, "description(exact:\"mid\\n\")");
+    let top = commit_id(&root, "description(exact:\"top\\n\")");
+    let top_change = change_id(&root, "description(exact:\"top\\n\")");
+
+    let outcome = run(
+        &root,
+        MutationOp::DuplicateTo {
+            targets: vec![RevisionSelection::Commit(top.clone())],
+            destination: Some(Destination::Before(RevisionSelection::Commit(mid))),
+        },
+    );
+
+    let copy = outcome.rewritten_commit.expect("the copy is reported");
+    assert_eq!(
+        commit_ids(&root, "description(exact:\"top\\n\")").len(),
+        2,
+        "original + copy"
+    );
+    assert_eq!(parent_ids(&root, &copy), vec![base]);
+    assert_eq!(parent_ids(&root, &mid_change), vec![copy]);
+    assert_eq!(
+        parent_ids(&root, &top_change),
+        vec![commit_id(&root, &mid_change)],
+        "the original stays on mid, following it"
+    );
+}
+
+/// Batch duplicate without a destination copies each revision onto its own
+/// parents, as plain `jj duplicate a b` does.
+#[test]
+fn duplicate_several_revisions_onto_their_parents() {
+    let root = scratch_repo("revops-duplicate-many");
+    write(&root, "a.txt", "a\n");
+    commit(&root, "a");
+    write(&root, "b.txt", "b\n");
+    commit(&root, "b");
+    let a = commit_id(&root, "description(exact:\"a\\n\")");
+    let b = commit_id(&root, "description(exact:\"b\\n\")");
+
+    let outcome = run(
+        &root,
+        MutationOp::DuplicateTo {
+            targets: vec![RevisionSelection::Commit(a), RevisionSelection::Commit(b)],
+            destination: None,
+        },
+    );
+
+    assert_eq!(outcome.message, "Duplicated 2 revisions");
+    assert_eq!(commit_ids(&root, "description(exact:\"a\\n\")").len(), 2);
+    assert_eq!(commit_ids(&root, "description(exact:\"b\\n\")").len(), 2);
+}
+
+/// "Keep this copy": every other visible commit of a divergent change is
+/// abandoned, which ends the divergence.
+#[test]
+fn keep_divergent_abandons_the_other_copies() {
+    let root = scratch_repo("revops-keep-divergent");
+    write(&root, "file.txt", "hello\n");
+    commit(&root, "base");
+    let leaf_commit = new_leaf(&root, &[commit_id(&root, "@-")], "leaf");
+    let leaf = change_id(&root, "description(glob:\"leaf*\")");
+    harness::describe(&root, OpBase::Head, &leaf_commit, "leaf d1\n");
+    harness::describe(&root, OpBase::ParentOfHead, &leaf_commit, "leaf d2\n");
+    assert!(any_divergent(&root, "all()"), "fixture is divergent");
+    let keep = commit_id(&root, "description(exact:\"leaf d1\\n\")");
+
+    let outcome = run(
+        &root,
+        MutationOp::KeepDivergent {
+            keep: RevisionSelection::Commit(keep.clone()),
+        },
+    );
+
+    assert!(
+        outcome.message.contains("abandoned 1 other copy"),
+        "{}",
+        outcome.message
+    );
+    assert!(!any_divergent(&root, "all()"));
+    assert_eq!(commit_id(&root, &leaf), keep);
+
+    // Once resolved there is nothing left to keep against.
+    let again = block_on(run_mutation(
+        repository(&root),
+        MutationOp::KeepDivergent {
+            keep: RevisionSelection::Commit(keep),
+        },
+        LoadProgress::default(),
+        false,
+    ));
+    assert!(again.is_err(), "a non-divergent change is refused");
+}
+
+/// `jj metaedit --update-author`: the author becomes the configured user.
+#[test]
+fn metaedit_resets_the_author_to_the_configured_user() {
+    let root = scratch_repo("revops-metaedit");
+    write(&root, "file.txt", "hello\n");
+    commit(&root, "mine");
+    let target = commit_id(&root, "description(exact:\"mine\\n\")");
+    std::fs::write(
+        harness::repo_dir(&root).join("config.toml"),
+        "[user]\nname = \"Someone Else\"\nemail = \"else@example.com\"\n",
+    )
+    .expect("write repo config");
+
+    let outcome = run(
+        &root,
+        MutationOp::Metaedit {
+            targets: vec![RevisionSelection::Commit(target)],
+            update_author: true,
+            update_author_timestamp: false,
+        },
+    );
+
+    let rewritten = outcome.rewritten_commit.expect("the rewrite is reported");
+    let (_document, details) = block_on(load_jj_diff(
+        repository(&root),
+        RevisionSelection::Commit(rewritten),
+    ))
+    .expect("load the rewritten revision");
+    let details = details.expect("revision details");
+    assert_eq!(details.author.name, "Someone Else");
+    assert_eq!(details.author.email, "else@example.com");
+    assert_eq!(details.description, "mine\n");
+}

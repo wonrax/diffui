@@ -714,6 +714,24 @@ async fn mutate_locked(
             let plural = if count == 1 { "" } else { "s" };
             format!("Absorbed {short} into {count} revision{plural}")
         }
+        MutationOp::Commit { .. }
+        | MutationOp::NewAt { .. }
+        | MutationOp::Parallelize { .. }
+        | MutationOp::DuplicateTo { .. }
+        | MutationOp::KeepDivergent { .. }
+        | MutationOp::Metaedit { .. } => {
+            let guard = super::revops::RewriteGuard {
+                repo_root: &repository.root,
+                settings,
+                workspace_name: &workspace_name,
+                allow_immutable,
+            };
+            let outcome =
+                super::revops::apply(tx.repo_mut(), &guard, &workspace_name, &current_wc_id, op)
+                    .await?;
+            rewritten_commit = outcome.rewritten_commit;
+            outcome.message
+        }
         // Routed to `apply_view_only` before the lock was ever taken.
         MutationOp::MoveBookmark { .. }
         | MutationOp::DeleteBookmark { .. }

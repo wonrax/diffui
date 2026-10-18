@@ -2295,44 +2295,22 @@ impl Diffui {
         })
     }
 
-    /// Enter target mode with `source` as the draft's first source.
+    /// Enter target mode with `source` as the draft's first source — or, for
+    /// a [`mutations::DraftKind::New`] draft (which has no sources), with
+    /// `source` armed as the destination.
     pub(crate) fn start_draft(
         &mut self,
         kind: mutations::DraftKind,
         source: RevisionSelection,
     ) -> Task<Message> {
-        // jj-only, like every mutation.
-        if !self.active().session.capabilities.mutate {
-            return Task::none();
+        if kind == mutations::DraftKind::New {
+            return self.start_draft_with(
+                kind,
+                Vec::new(),
+                Some((source, mutations::PlacementKind::Onto)),
+            );
         }
-        let Some(draft_source) = self.draft_source_for(&source) else {
-            return Task::none();
-        };
-        // Target mode's plain keys and a half-written description can't both
-        // own the keyboard. An unsaved edit wins and says so, the same way it
-        // blocks a revision or tab switch; a clean editor just closes.
-        if let Some(editor) = self.active_mut().description_editor_mut() {
-            if editor.is_dirty() || editor.saving_activity.is_some() {
-                editor.switch_blocked = true;
-                return Task::none();
-            }
-            self.active_mut().pop_mode(ModeKind::Description);
-        }
-        let draft = match kind {
-            mutations::DraftKind::Rebase { mode } => {
-                diffui_core::OpDraft::rebase(mode, vec![draft_source])
-            }
-            mutations::DraftKind::Squash => diffui_core::OpDraft::squash(draft_source),
-            mutations::DraftKind::Merge => diffui_core::OpDraft::merge(draft_source),
-        };
-        // Two marked-row languages at once would be unreadable — the
-        // draft's source wash takes over from the multi-select marks.
-        let target = self.active_mut();
-        target.revision_multi_selection.clear();
-        target.push_mode(TabMode::Draft(DraftUi::new(draft)));
-        self.pop_mode(ModeKind::ActivityPopover);
-        self.pop_mode(ModeKind::Menu);
-        Task::none()
+        self.start_draft_with(kind, vec![source], None)
     }
 
     /// Arm a placement on the active draft, re-previewing the result.
@@ -2523,6 +2501,10 @@ impl Diffui {
             }
             // Filtered out before the request was parked.
             mutations::DraftKind::Squash => return Task::none(),
+            _ => match crate::revops::parked_preview_request(request) {
+                Some(draft) => draft,
+                None => return Task::none(),
+            },
         };
         let Some(tab) = self.active_tab_id() else {
             return Task::none();
@@ -3929,6 +3911,13 @@ impl Diffui {
         if self.active_mut().repository.is_none() {
             return Task::none();
         }
+        if self
+            .active()
+            .op_draft()
+            .is_some_and(|ui| ui.draft.kind == mutations::DraftKind::Parallelize)
+        {
+            return self.kick_parallelize_preview();
+        }
         // Destination from the drag spot when one is live, else the keyboard
         // candidate + placement. Resolved before borrowing the draft mutably.
         let (spot, candidate, placement, selected_merge_target) = match self.active().op_draft() {
@@ -3985,9 +3974,15 @@ impl Diffui {
         // The Idle paths must also drop any parked request: they don't bump
         // the version, so a still-running debounce timer would otherwise
         // pick the stale request up and revive a destination the user left.
-        if matches!(ui.draft.kind, mutations::DraftKind::Squash) {
+        if matches!(
+            ui.draft.kind,
+            mutations::DraftKind::Squash
+                | mutations::DraftKind::New
+                | mutations::DraftKind::Duplicate
+        ) {
             // Squash has no simulation (it rarely conflicts and the op bar
-            // already names the fold target).
+            // already names the fold target); neither does inserting an
+            // empty change, and duplicate's copies are left unsimulated.
             ui.preview = DraftPreviewState::Idle;
             ui.preview_request = None;
             return Task::none();

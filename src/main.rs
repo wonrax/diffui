@@ -32,6 +32,7 @@ mod path_browse;
 mod pointer;
 mod resize_handle;
 mod revision_list;
+mod revops;
 mod scrollbar;
 mod sidebar;
 mod source_panel;

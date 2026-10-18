@@ -492,6 +492,17 @@ impl Diffui {
             MutationOp::TrackBookmark { name, remote } => format!("Track {name}@{remote}"),
             MutationOp::PushBookmark { name, remote } => format!("Push {name} to {remote}"),
             MutationOp::Undo { .. } => "Undo".to_owned(),
+            MutationOp::Commit { .. } => "Commit".to_owned(),
+            MutationOp::NewAt { .. } => "New change".to_owned(),
+            MutationOp::Parallelize { targets } => {
+                format!("Parallelize {} revisions", targets.len())
+            }
+            MutationOp::DuplicateTo { targets, .. } => match targets.len() {
+                1 => "Duplicate".to_owned(),
+                n => format!("Duplicate {n} revisions"),
+            },
+            MutationOp::KeepDivergent { .. } => "Resolve divergent change".to_owned(),
+            MutationOp::Metaedit { .. } => "Update author".to_owned(),
         };
         // Only pushes report real progress (git transfer); the rest are quick
         // local ops, so they stay indeterminate.

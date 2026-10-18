@@ -104,3 +104,6 @@ pub const FILE: &str = "\u{e0c0}"; // file
 pub const FILE_CODE: &str = "\u{e0c3}"; // file-code
 pub const FILE_DIFF: &str = "\u{e317}"; // file-diff
 pub const FOLDER_OPEN: &str = "\u{e247}"; // folder-open
+pub const COPY: &str = "\u{e09e}"; // copy
+pub const COLUMNS_3: &str = "\u{e099}"; // columns-3
+pub const SQUARE_PLUS: &str = "\u{e173}"; // square-plus

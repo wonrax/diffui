@@ -12,6 +12,7 @@ pub(crate) mod diff;
 pub(crate) mod mutate;
 pub(crate) mod preview;
 pub(crate) mod remote;
+pub(crate) mod revops;
 pub(crate) mod settings;
 pub(crate) mod walk;
 pub(crate) mod workspace;
@@ -27,7 +28,7 @@ pub use workspace::read_jj_op_head;
 pub(crate) use browse::{list_jj_source_tree, read_jj_file_pair_inner, read_jj_source_file};
 pub(crate) use diff::{diff_jj_with_repo, jj_revision_details};
 pub(crate) use mutate::{ImmutableRewriteError, apply_mutation, check_bookmark_move_backwards};
-pub(crate) use preview::{preview_merge, preview_rebase};
+pub(crate) use preview::{preview_merge, preview_parallelize, preview_rebase};
 pub(crate) use remote::fetch_jj;
 pub(crate) use walk::{WorkspaceView, compute_jj_empty_status, walk_jj_with_repo};
 pub(crate) use workspace::{

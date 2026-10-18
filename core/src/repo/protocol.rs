@@ -121,6 +121,10 @@ pub enum PreviewRequest {
     Merge {
         parents: Vec<RevisionSelection>,
     },
+    /// `jj parallelize` of the targets; answered rebase-shaped.
+    Parallelize {
+        targets: Vec<RevisionSelection>,
+    },
 }
 
 /// Work asked of a repository. Every variant that does work carries a
