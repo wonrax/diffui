@@ -301,6 +301,62 @@ fn keycap<'a>(ui: &'a Diffui, theme: ThemeSpec, key: String) -> Element<'a, Mess
     .into()
 }
 
+/// The welcome screen's tips: the few keys and gestures that make the rest
+/// discoverable, under the open prompt. Chords come from the keymap so an
+/// override shows up here too.
+pub(crate) fn welcome_hints(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
+    let chord = |id: CommandId| {
+        ui.keymap
+            .chord_for(Context::Base, id)
+            .map(|chord| chord.display())
+    };
+    let tip = |key: Option<String>, what: &'static str| -> Element<'_, Message> {
+        let mut line = row![].spacing(theme::space::SM).align_y(Alignment::Center);
+        if let Some(key) = key {
+            line = line.push(keycap(ui, theme, key));
+        }
+        line.push(
+            text(what)
+                .size(text_size::UI)
+                .color(theme.subtle_text)
+                .font(ui.config.ui_font),
+        )
+        .into()
+    };
+    // The prompt above owns the keyboard here, and the palette needs a
+    // repository, so these read as "once one is open".
+    let heading = text("Once a repository is open")
+        .size(text_size::CAPTION)
+        .color(theme.subtle_text)
+        .font(emphasis_font(ui.config.ui_font, Weight::Medium));
+    let keys = row![
+        tip(chord("palette.toggle"), "Command palette"),
+        tip(chord("help.shortcuts"), "All shortcuts"),
+        tip(chord("repo.open-dialog"), "Open another"),
+    ]
+    .spacing(theme::space::XL)
+    .align_y(Alignment::Center);
+    let gestures =
+        text("Right-click a revision for its actions  \u{b7}  drag one onto another to rebase")
+            .size(text_size::UI)
+            .color(theme.subtle_text)
+            .font(ui.config.ui_font);
+    let all = crate::ui::button(
+        text("Keyboard shortcuts")
+            .size(text_size::UI)
+            .color(theme.muted_text)
+            .font(ui.config.ui_font),
+        crate::ui::Variant::Ghost,
+        crate::ui::Size::Compact,
+        theme,
+    )
+    .on_press(Message::Action(Action::ToggleShortcuts));
+    column![heading, keys, gestures, all]
+        .spacing(theme::space::MD)
+        .align_x(alignment::Horizontal::Center)
+        .into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

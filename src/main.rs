@@ -1024,7 +1024,8 @@ fn selection_from_key(key: &revision_list::RowSelectionKey) -> RevisionSelection
 /// Welcome screen shown whenever no repository is open: a fresh launch with
 /// nothing to restore (including from the macOS/Spotlight launcher, where cwd is
 /// `/`), or after the last tab is closed. It is the open prompt itself — the
-/// same card ⌘O raises over a tab, inline and focused — under the wordmark.
+/// same card ⌘O raises over a tab, inline and focused, with the recent
+/// repositories — under the wordmark, then a few tips.
 /// Only an explicit `--path` that failed to resolve surfaces an error; the
 /// session and cwd fallbacks resolve silently to this screen instead.
 fn empty_state<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
@@ -1052,6 +1053,7 @@ fn empty_state<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
     if let Some(dialog) = ui.open_repo_dialog() {
         body = body.push(tab_bar::open_repo_card(ui, theme, dialog));
     }
+    body = body.push(shortcuts::welcome_hints(ui, theme));
 
     // Optically centered: a touch above the true middle, where a centered
     // block reads as centered rather than as sinking.
