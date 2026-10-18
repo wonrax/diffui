@@ -420,7 +420,8 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
             .height(Length::Fill)
             .padding(crate::theme::space::XXL)
             .center(Length::Fill);
-            return container(column![summary, empty])
+            let banner = crate::compare::build_compare_banner(ui, theme);
+            return container(column![].push(banner).push(summary).push(empty))
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .style(move |_| diff_panel_style(theme))
@@ -430,7 +431,8 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
         let mut dv = DiffView::new(
             files,
             ui.active().selected_file,
-            ui.active().session.selected_revision.view_key(),
+            ui.active().session.selected_revision.view_key()
+                + &ui.active().session.document_base.view_key(),
             diff_palette(theme),
             ui.config.mono_font,
             ui.config.code_type,
@@ -484,6 +486,10 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
             stack![diff_view, find_overlay].clip(true).into();
 
         column![summary, diff_with_find].spacing(0).into()
+    };
+    let body: Element<'a, Message> = match crate::compare::build_compare_banner(ui, theme) {
+        Some(banner) => column![banner, body].into(),
+        None => body,
     };
 
     container(body)

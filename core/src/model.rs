@@ -70,6 +70,51 @@ impl RevisionSelection {
     }
 }
 
+/// What a revision's diff is taken against. The revision itself is always the
+/// "to" side; this names the "from" side.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DiffBase {
+    /// `jj diff -r X`: X against its (merged) parents.
+    #[default]
+    Parents,
+    /// `jj diff --from A --to X`: the two trees, whatever lies between them.
+    Revision(RevisionSelection),
+    /// `jj interdiff --from A --to X`: A's own change rebased onto X's
+    /// parents, against X — how two versions of a change differ, without the
+    /// noise of whatever their parents did in between.
+    Interdiff(RevisionSelection),
+}
+
+impl DiffBase {
+    /// The "from" revision, or `None` for a plain parent diff.
+    pub fn revision(&self) -> Option<&RevisionSelection> {
+        match self {
+            Self::Parents => None,
+            Self::Revision(revision) | Self::Interdiff(revision) => Some(revision),
+        }
+    }
+
+    pub fn is_compare(&self) -> bool {
+        !matches!(self, Self::Parents)
+    }
+
+    /// Whether either side of the diff names the working copy, so an edit on
+    /// disk changes it.
+    pub fn involves_working_copy(&self) -> bool {
+        matches!(self.revision(), Some(RevisionSelection::WorkingCopy))
+    }
+
+    /// A key that tells two diffs of the same revision apart when their bases
+    /// differ (the diff view resets its scroll when it changes).
+    pub fn view_key(&self) -> String {
+        match self {
+            Self::Parents => String::new(),
+            Self::Revision(revision) => format!("from:{}", revision.view_key()),
+            Self::Interdiff(revision) => format!("interdiff:{}", revision.view_key()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DiffDocument {
     pub files: Vec<DiffFile>,

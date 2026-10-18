@@ -10,6 +10,7 @@ mod activity;
 mod chip;
 mod chrome;
 mod commands;
+mod compare;
 mod config;
 mod diff_panel;
 mod diff_view;

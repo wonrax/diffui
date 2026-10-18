@@ -158,4 +158,8 @@ pub(crate) enum Action {
 
     /// Open a URL (from an activity's captured remote output) in the browser.
     OpenUrl(String),
+
+    // ── Comparing ───────────────────────────────────────────────────────
+    /// Diff two revisions against each other (see [`crate::compare`]).
+    Compare(crate::compare::CompareAction),
 }

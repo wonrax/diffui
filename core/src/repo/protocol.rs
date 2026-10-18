@@ -9,7 +9,8 @@ use std::fmt;
 use std::path::PathBuf;
 
 use crate::model::{
-    BookmarksInfo, BranchStatus, DiffDocument, RevisionDetails, RevisionSelection, StreamRow,
+    BookmarksInfo, BranchStatus, DiffBase, DiffDocument, RevisionDetails, RevisionSelection,
+    StreamRow,
 };
 use crate::mutations::{
     Destination, DraftSimulation, MutationOp, MutationOutcome, RebaseSourceMode,
@@ -66,6 +67,8 @@ pub struct Capabilities {
     pub browse: bool,
     /// Can produce `jj show`-style revision headers.
     pub details: bool,
+    /// Can diff against something other than the parents ([`DiffBase`]).
+    pub compare: bool,
 }
 
 /// A typed backend failure. `Result<_, String>` stops at the core surface:
@@ -136,6 +139,8 @@ pub enum Command {
     LoadDiff {
         job: JobId,
         revision: RevisionSelection,
+        /// The "from" side; [`DiffBase::Parents`] for a plain revision diff.
+        base: DiffBase,
     },
     /// Fold the on-disk tree into `@`. `origin` rides along untouched so the
     /// projection knows how much to reload when the fingerprint moves.
@@ -181,6 +186,8 @@ pub enum Command {
         revision: RevisionSelection,
         path: String,
         old_path: Option<String>,
+        /// What the old side is read from, matching the displayed diff.
+        base: DiffBase,
     },
     /// Whether moving bookmark `name` to `to` is backwards or sideways — the
     /// move the jj CLI refuses without `--allow-backwards`.

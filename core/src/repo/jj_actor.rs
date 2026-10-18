@@ -25,7 +25,7 @@ use super::protocol::{
 };
 use super::{Envelope, Jobs, SettingsSource, route_commands};
 use crate::jj;
-use crate::model::{LoadProgress, RevisionSelection, StreamRow};
+use crate::model::{DiffBase, LoadProgress, RevisionSelection, StreamRow};
 use crate::mutations::{DraftSimulation, MutationOp};
 use crate::repository::Repository;
 use crate::watcher::WatchBatch;
@@ -285,7 +285,11 @@ impl Actor {
             Command::LoadGraph { job, revset } => {
                 self.load_graph(repository, job, revset, cancel).await
             }
-            Command::LoadDiff { job, revision } => self.load_diff(repository, job, revision).await,
+            Command::LoadDiff {
+                job,
+                revision,
+                base,
+            } => self.load_diff(repository, job, revision, base).await,
             Command::Snapshot { job, origin } => {
                 let slot = self.slot(repository)?;
                 let outcome = {
@@ -387,6 +391,7 @@ impl Actor {
                 revision,
                 path,
                 old_path,
+                base,
             } => {
                 let repo = self.repo_at_head(repository).await?;
                 let name = self.slot(repository)?.name.clone();
@@ -394,6 +399,7 @@ impl Actor {
                     repo.as_ref(),
                     &name,
                     &revision,
+                    &base,
                     &path,
                     old_path.as_deref(),
                 )
@@ -483,12 +489,14 @@ impl Actor {
         repository: &Repository,
         job: JobId,
         revision: RevisionSelection,
+        base: DiffBase,
     ) -> Result<()> {
         let repo = self.repo_at_head(repository).await?;
         let name = self.slot(repository)?.name.clone();
         let commit_id = jj::resolve_revision(repo.as_ref(), &name, &revision).await?;
+        let base = jj::resolve_base(repo.as_ref(), &name, &base).await?;
         let (document, details) =
-            jj::diff_jj_with_repo(repo.as_ref(), &commit_id, repository).await?;
+            jj::diff_jj_with_repo(repo.as_ref(), &commit_id, &base, repository).await?;
         self.emit(Payload::DiffLoaded {
             job,
             revision,

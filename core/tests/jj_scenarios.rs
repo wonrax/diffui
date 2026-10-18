@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use diffui_core::jj::read_jj_op_head;
 use diffui_core::repo::{Command, JobId, OpenSpec, Payload, RepoError, SettingsSource};
 use diffui_core::{
-    BookmarksInfo, BranchStatus, CommitStore, Destination, DiffDocument, DiffFileStatus,
+    BookmarksInfo, BranchStatus, CommitStore, Destination, DiffBase, DiffDocument, DiffFileStatus,
     DiffLineKind, LoadProgress, MutationOp, MutationOutcome, PreviewRequest, RebaseSourceMode,
     Repository, RepositorySnapshot, RevisionDetails, RevisionSelection, SourceEntry,
     SourceFileLoad, SquashTarget, Vcs, list_ignored_dir,
@@ -101,7 +101,20 @@ async fn load_jj_diff(
     repository: Repository,
     revision: RevisionSelection,
 ) -> anyhow::Result<(DiffDocument, Option<RevisionDetails>)> {
-    let events = run_one(&repository.root, |job| Command::LoadDiff { job, revision }).await;
+    load_jj_diff_against(repository, revision, DiffBase::Parents).await
+}
+
+async fn load_jj_diff_against(
+    repository: Repository,
+    revision: RevisionSelection,
+    base: DiffBase,
+) -> anyhow::Result<(DiffDocument, Option<RevisionDetails>)> {
+    let events = run_one(&repository.root, |job| Command::LoadDiff {
+        job,
+        revision,
+        base,
+    })
+    .await;
     match events.into_iter().next_back() {
         Some(Payload::DiffLoaded {
             document, details, ..
@@ -1939,4 +1952,163 @@ fn move_bookmark_with_push_updates_the_remote() {
         target,
         "the remote itself received the new position"
     );
+}
+
+// ── Comparing two revisions ─────────────────────────────────────────────────
+
+/// `(path, status, additions, deletions)` of `revision`'s diff against `base`.
+fn compare_summary(
+    root: &Path,
+    revision: RevisionSelection,
+    base: DiffBase,
+) -> Vec<(String, DiffFileStatus, usize, usize)> {
+    let (document, _details) = block_on(load_jj_diff_against(repository(root), revision, base))
+        .expect("load the comparison");
+    document
+        .files
+        .into_iter()
+        .map(|file| (file.path, file.status, file.additions, file.deletions))
+        .collect()
+}
+
+/// `jj diff --from A --to B` spans every change between the two trees, not
+/// just B's own, and swapping the sides inverts it.
+#[test]
+fn compare_diffs_two_arbitrary_revisions() {
+    let root = scratch_repo("compare-range");
+    write(&root, "a.txt", "one\n");
+    commit(&root, "first");
+    write(&root, "a.txt", "one\ntwo\n");
+    write(&root, "b.txt", "b\n");
+    commit(&root, "second");
+    write(&root, "a.txt", "one\ntwo\nthree\n");
+    commit(&root, "third");
+    let first = commit_id(&root, "description(glob:\"first*\")");
+    let third = commit_id(&root, "description(glob:\"third*\")");
+
+    let forward = compare_summary(
+        &root,
+        RevisionSelection::Commit(third.clone()),
+        DiffBase::Revision(RevisionSelection::Commit(first.clone())),
+    );
+    assert_eq!(
+        forward,
+        vec![
+            ("a.txt".to_owned(), DiffFileStatus::Modified, 2, 0),
+            ("b.txt".to_owned(), DiffFileStatus::Added, 1, 0),
+        ]
+    );
+
+    let backward = compare_summary(
+        &root,
+        RevisionSelection::Commit(first.clone()),
+        DiffBase::Revision(RevisionSelection::Commit(third.clone())),
+    );
+    assert_eq!(
+        backward,
+        vec![
+            ("a.txt".to_owned(), DiffFileStatus::Modified, 0, 2),
+            ("b.txt".to_owned(), DiffFileStatus::Deleted, 0, 1),
+        ]
+    );
+
+    // A revision against itself is empty.
+    assert!(
+        compare_summary(
+            &root,
+            RevisionSelection::Commit(third.clone()),
+            DiffBase::Revision(RevisionSelection::Commit(third)),
+        )
+        .is_empty()
+    );
+}
+
+/// Comparing against the working copy reads `@`'s tree, edits on disk
+/// included once snapshotted.
+#[test]
+fn compare_with_the_working_copy() {
+    let root = scratch_repo("compare-wc");
+    write(&root, "a.txt", "one\n");
+    commit(&root, "first");
+    write(&root, "a.txt", "one\ntwo\n");
+    snapshot(&root);
+    let first = commit_id(&root, "description(glob:\"first*\")");
+
+    assert_eq!(
+        compare_summary(
+            &root,
+            RevisionSelection::WorkingCopy,
+            DiffBase::Revision(RevisionSelection::Commit(first)),
+        ),
+        vec![("a.txt".to_owned(), DiffFileStatus::Modified, 1, 0)]
+    );
+}
+
+/// `jj interdiff`: two versions of one change on different parents differ
+/// only in what the change itself does, not in what the parents brought.
+#[test]
+fn interdiff_ignores_what_the_parents_changed() {
+    let root = scratch_repo("compare-interdiff");
+    write(&root, "base.txt", "base\n");
+    commit(&root, "base");
+    let base = commit_id(&root, "description(glob:\"base*\")");
+
+    // v1 of the change, straight on base.
+    write(&root, "feature.txt", "feature v1\n");
+    commit(&root, "change v1");
+    let v1 = commit_id(&root, "description(glob:\"change v1*\")");
+
+    // Upstream moves on from base, touching an unrelated file.
+    new_edit(&root, std::slice::from_ref(&base), "upstream");
+    write(&root, "upstream.txt", "upstream\n");
+    snapshot(&root);
+    let upstream = commit_id(&root, "description(glob:\"upstream*\")");
+
+    // v2 of the change, on upstream, with one line more.
+    new_edit(&root, std::slice::from_ref(&upstream), "change v2");
+    write(&root, "feature.txt", "feature v1\nfeature v2\n");
+    snapshot(&root);
+    let v2 = commit_id(&root, "description(glob:\"change v2*\")");
+
+    // A plain comparison drags the upstream file in...
+    let plain = compare_summary(
+        &root,
+        RevisionSelection::Commit(v2.clone()),
+        DiffBase::Revision(RevisionSelection::Commit(v1.clone())),
+    );
+    assert!(plain.iter().any(|(path, ..)| path == "upstream.txt"));
+
+    // ...the interdiff shows only the change's own difference.
+    assert_eq!(
+        compare_summary(
+            &root,
+            RevisionSelection::Commit(v2),
+            DiffBase::Interdiff(RevisionSelection::Commit(v1)),
+        ),
+        vec![("feature.txt".to_owned(), DiffFileStatus::Modified, 1, 0)]
+    );
+}
+
+/// A base that no longer resolves fails the load (the session falls back to
+/// the plain diff on that failure).
+#[test]
+fn compare_against_an_abandoned_base_fails() {
+    let root = scratch_repo("compare-abandoned");
+    write(&root, "a.txt", "one\n");
+    commit(&root, "first");
+    write(&root, "a.txt", "one\ntwo\n");
+    commit(&root, "second");
+    let second = commit_id(&root, "description(glob:\"second*\")");
+    run(
+        &root,
+        MutationOp::Abandon {
+            targets: vec![RevisionSelection::Commit(second.clone())],
+        },
+    );
+    let result = block_on(load_jj_diff_against(
+        repository(&root),
+        RevisionSelection::WorkingCopy,
+        DiffBase::Revision(RevisionSelection::Commit(second)),
+    ));
+    assert!(result.is_err(), "an abandoned base must not resolve");
 }

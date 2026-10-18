@@ -36,15 +36,14 @@ pub(crate) async fn read_jj_file_pair_inner(
     repo: &ReadonlyRepo,
     workspace_name: &WorkspaceName,
     revision: &RevisionSelection,
+    base: &crate::model::DiffBase,
     path: &str,
     old_path: Option<&str>,
 ) -> Result<(Option<String>, Option<String>)> {
     let commit = resolve_browse_commit(repo, workspace_name, revision).await?;
     let new_tree = commit.tree();
-    let old_tree = commit
-        .parent_tree(repo)
-        .await
-        .with_context(|| format!("failed to load jj parent tree for {}", commit.id().hex()))?;
+    let base = super::diff::resolve_base(repo, workspace_name, base).await?;
+    let old_tree = super::diff::base_tree(repo, &commit, &base).await?;
 
     let new = read_jj_tree_file(repo, &new_tree, path).await;
     let old = read_jj_tree_file(repo, &old_tree, old_path.unwrap_or(path)).await;

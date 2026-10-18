@@ -231,6 +231,7 @@ fn capabilities_for(spec: &OpenSpec) -> Capabilities {
             fetch: true,
             browse: true,
             details: true,
+            compare: true,
         },
         OpenSpec::Local { .. } => Capabilities {
             graph: true,

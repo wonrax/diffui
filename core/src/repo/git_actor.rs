@@ -89,7 +89,14 @@ async fn run(repository: &Repository, command: Command, cancel: &CancelFlag) -> 
                 Err(error) => failed(job, error),
             }
         }
-        Command::LoadDiff { job, revision } => {
+        // Comparisons are jj-only for now; `Capabilities::compare` is off.
+        Command::LoadDiff { job, base, .. } if base.is_compare() => {
+            vec![Payload::Failed {
+                job,
+                error: RepoError::Unsupported,
+            }]
+        }
+        Command::LoadDiff { job, revision, .. } => {
             match crate::git::load_git_diff(repository, &revision).await {
                 Ok((document, details)) => vec![Payload::DiffLoaded {
                     job,
@@ -143,6 +150,7 @@ async fn run(repository: &Repository, command: Command, cancel: &CancelFlag) -> 
             revision,
             path,
             old_path,
+            ..
         } => {
             let (old, new) =
                 crate::git::read_git_file_pair(repository, &revision, &path, old_path.as_deref())

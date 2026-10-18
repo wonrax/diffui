@@ -269,7 +269,11 @@ impl TestRepo {
     }
 
     pub fn diff(&mut self, revision: RevisionSelection) -> diffui_core::DiffDocument {
-        let events = self.run(|job| Command::LoadDiff { job, revision });
+        let events = self.run(|job| Command::LoadDiff {
+            job,
+            revision,
+            base: diffui_core::DiffBase::Parents,
+        });
         match events.into_iter().next_back() {
             Some(Payload::DiffLoaded { document, .. }) => document,
             other => panic!("expected DiffLoaded, got {other:?}"),

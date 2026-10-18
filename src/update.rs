@@ -563,7 +563,11 @@ impl Diffui {
     /// Carry out what the projection asked for. Commands go straight down the
     /// actor's channel — the answer comes back through the subscription — so
     /// most effects produce no `Task` at all.
-    fn run_effects(&mut self, tab: TabId, effects: Vec<diffui_core::Effect>) -> Task<Message> {
+    pub(crate) fn run_effects(
+        &mut self,
+        tab: TabId,
+        effects: Vec<diffui_core::Effect>,
+    ) -> Task<Message> {
         use diffui_core::{Effect, session::Activity};
 
         let is_active = self.is_active(tab);
@@ -1106,6 +1110,7 @@ impl Diffui {
                 open_url(&url);
                 Task::none()
             }
+            Action::Compare(action) => self.perform_compare(action),
         }
     }
 
@@ -3662,6 +3667,7 @@ impl Diffui {
             return Task::none();
         };
         let revision = target.session.selected_revision.clone();
+        let base = target.session.document_base.clone();
         let mut commands = Vec::new();
         while target.session.highlight_in_flight < HIGHLIGHT_CONCURRENCY {
             let Some(file_index) = target.session.highlight_pending.pop_front() else {
@@ -3682,6 +3688,7 @@ impl Diffui {
                 revision: revision.clone(),
                 path,
                 old_path,
+                base: base.clone(),
             });
         }
         for command in commands {

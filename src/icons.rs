@@ -104,3 +104,7 @@ pub const FILE: &str = "\u{e0c0}"; // file
 pub const FILE_CODE: &str = "\u{e0c3}"; // file-code
 pub const FILE_DIFF: &str = "\u{e317}"; // file-diff
 pub const FOLDER_OPEN: &str = "\u{e247}"; // folder-open
+pub const ARROW_RIGHT: &str = "\u{e049}"; // arrow-right
+pub const ARROW_LEFT_RIGHT: &str = "\u{e24a}"; // arrow-left-right
+pub const GIT_COMPARE: &str = "\u{e359}"; // git-compare
+pub const UNFOLD_VERTICAL: &str = "\u{e43e}"; // unfold-vertical

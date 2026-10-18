@@ -3,6 +3,7 @@ use bstr::BStr;
 use futures::StreamExt;
 use jj_lib::{
     backend::CommitId,
+    commit::Commit,
     conflicts::{
         ConflictMarkerStyle, ConflictMaterializeOptions, materialize_tree_value,
         materialized_diff_stream,
@@ -15,38 +16,97 @@ use jj_lib::{
     files::FileMergeHunkLevel,
     matchers::{EverythingMatcher, Matcher, PrefixMatcher},
     merge::{Diff, SameChange},
+    merged_tree::MergedTree,
     object_id::ObjectId,
+    ref_name::WorkspaceName,
     repo::{ReadonlyRepo, Repo},
     repo_path::RepoPath,
+    rewrite::rebase_to_dest_parent,
     tree_merge::MergeOptions,
 };
 
 use super::walk::*;
+use super::workspace::resolve_revision;
 use crate::diff_parse::format_hunk_header;
 use crate::model::{
-    DiffDocument, DiffFile, DiffFileStatus, DiffHunkView, DiffLine, DiffLineKind, RevisionDetails,
-    SignatureInfo,
+    DiffBase, DiffDocument, DiffFile, DiffFileStatus, DiffHunkView, DiffLine, DiffLineKind,
+    RevisionDetails, SignatureInfo,
 };
 use crate::repository::Repository;
 
-/// Diff `commit_id` against its parents on an already-loaded repo. The actor
-/// keeps that repo between commands, so a diff switch costs a tree walk rather
-/// than another read of the (large) commit index.
+/// The "from" side of a diff ([`DiffBase`]), resolved to a commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResolvedBase {
+    Parents,
+    Tree(CommitId),
+    Interdiff(CommitId),
+}
+
+pub(crate) async fn resolve_base(
+    repo: &ReadonlyRepo,
+    workspace_name: &WorkspaceName,
+    base: &DiffBase,
+) -> Result<ResolvedBase> {
+    Ok(match base {
+        DiffBase::Parents => ResolvedBase::Parents,
+        DiffBase::Revision(revision) => {
+            ResolvedBase::Tree(resolve_revision(repo, workspace_name, revision).await?)
+        }
+        DiffBase::Interdiff(revision) => {
+            ResolvedBase::Interdiff(resolve_revision(repo, workspace_name, revision).await?)
+        }
+    })
+}
+
+/// The tree `commit`'s diff is taken from: its parents' merge, another
+/// revision's tree (`jj diff --from`), or another revision's own change
+/// rebased onto `commit`'s parents (`jj interdiff --from`).
+pub(crate) async fn base_tree(
+    repo: &ReadonlyRepo,
+    commit: &Commit,
+    base: &ResolvedBase,
+) -> Result<MergedTree> {
+    match base {
+        ResolvedBase::Parents => commit
+            .parent_tree(repo)
+            .await
+            .with_context(|| format!("failed to load jj parent tree for {}", commit.id().hex())),
+        ResolvedBase::Tree(from) => Ok(load_commit(repo, from).await?.tree()),
+        ResolvedBase::Interdiff(from) => {
+            let from = load_commit(repo, from).await?;
+            rebase_to_dest_parent(repo, std::slice::from_ref(&from), commit)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to rebase {} onto the parents of {}",
+                        from.id().hex(),
+                        commit.id().hex()
+                    )
+                })
+        }
+    }
+}
+
+async fn load_commit(repo: &ReadonlyRepo, commit_id: &CommitId) -> Result<Commit> {
+    repo.store()
+        .get_commit_async(commit_id)
+        .await
+        .with_context(|| format!("failed to load jj commit {}", commit_id.hex()))
+}
+
+/// Diff `commit_id` against `base` (its parents, unless comparing) on an
+/// already-loaded repo. The actor keeps that repo between commands, so a diff
+/// switch costs a tree walk rather than another read of the (large) commit
+/// index.
 pub(crate) async fn diff_jj_with_repo(
     repo: &ReadonlyRepo,
     commit_id: &CommitId,
+    base: &ResolvedBase,
     repository: &Repository,
 ) -> Result<(DiffDocument, Option<RevisionDetails>)> {
-    let commit = repo
-        .store()
-        .get_commit_async(commit_id)
-        .await
-        .with_context(|| format!("failed to load jj commit {}", commit_id.hex()))?;
+    let commit = load_commit(repo, commit_id).await?;
     let details = jj_revision_details(repo, &commit);
-    let old_tree = commit
-        .parent_tree(repo)
-        .await
-        .with_context(|| format!("failed to load jj parent tree for {}", commit_id.hex()))?;
+    let old_tree = base_tree(repo, &commit, base).await?;
     let new_tree = commit.tree();
     let matcher = repo_scope_matcher(repository)?;
     let copy_records = CopyRecords::default();
@@ -196,8 +256,9 @@ pub(crate) async fn diff_jj_with_repo(
     // (the same reason jj counts such a merge "empty"). Surface every
     // conflicted path the stream didn't already cover as a synthetic
     // `Conflicted` entry whose hunks are the materialized conflict regions —
-    // `jj resolve --list`, but with content.
-    if new_tree.has_conflict() {
+    // `jj resolve --list`, but with content. A comparison shows only what
+    // differs between its two sides, like `jj diff --from`.
+    if *base == ResolvedBase::Parents && new_tree.has_conflict() {
         let covered: std::collections::HashSet<&str> =
             files.iter().map(|file| file.path.as_str()).collect();
         let mut conflict_files = Vec::new();

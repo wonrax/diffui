@@ -19,6 +19,7 @@
 use diffui_core::{FetchTarget, RevisionSelection};
 
 use crate::action::Action;
+use crate::compare::CompareAction;
 use crate::palette::{self, ResultRef};
 use crate::theme::ThemePreference;
 use crate::{DetailField, Diffui, MainView, mutations};
@@ -1310,7 +1311,107 @@ pub(crate) static REGISTRY: &[Command] = &[
     tab_select!(7, "tab.select-7", "Go to tab 7", "cmd+7", 6),
     tab_select!(8, "tab.select-8", "Go to tab 8", "cmd+8", 7),
     tab_select!(9, "tab.select-9", "Go to tab 9", "cmd+9", 8),
+    // ── Comparing two revisions ─────────────────────────────────────────
+    Command {
+        id: "compare.with",
+        label: "Compare with…",
+        hint: "Diff against this revision; click another to pick the other side",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: can_compare,
+        build: |ui, arg| {
+            target_revision(ui, &arg).map(|from| Action::Compare(CompareAction::PickWith(from)))
+        },
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "compare.with-working-copy",
+        label: "Compare with working copy",
+        hint: "Diff from this revision to the working copy",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: can_compare,
+        build: |ui, arg| {
+            target_revision(ui, &arg)
+                .map(|from| Action::Compare(CompareAction::WithWorkingCopy(from)))
+        },
+        palette: PaletteScope::Revision,
+    },
+    Command {
+        id: "compare.from-selected",
+        label: "Compare selected revision with…",
+        hint: "Pin the selected revision as the base, then click another",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: can_compare,
+        build: |ui, _arg| {
+            Some(Action::Compare(CompareAction::PickWith(
+                ui.active().session.selected_revision.clone(),
+            )))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "compare.marked",
+        label: "Compare marked revisions",
+        hint: "Diff the two ⌘-clicked revisions, older to newer",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| crate::compare::has_marked_pair(ui),
+        build: |_ui, _arg| Some(Action::Compare(CompareAction::Marked)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "compare.swap",
+        label: "Swap compared revisions",
+        hint: "Exchange the two sides of the comparison",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| crate::compare::comparing(ui),
+        build: |_ui, _arg| Some(Action::Compare(CompareAction::Swap)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "compare.interdiff",
+        label: "Toggle interdiff",
+        hint: "Switch between a tree diff and jj interdiff of the two revisions",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| crate::compare::comparing(ui),
+        build: |ui, _arg| {
+            let interdiff = matches!(
+                ui.active().session.diff_base,
+                diffui_core::DiffBase::Interdiff(_)
+            );
+            Some(Action::Compare(CompareAction::SetInterdiff(!interdiff)))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "compare.exit",
+        label: "Stop comparing",
+        hint: "Back to the selected revision's own diff",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| crate::compare::comparing(ui),
+        build: |_ui, _arg| Some(Action::Compare(CompareAction::Exit)),
+        palette: PaletteScope::Root,
+    },
 ];
+
+fn can_compare(ui: &Diffui, arg: &CommandArg) -> bool {
+    ui.active().session.capabilities.compare
+        && arg
+            .revision()
+            .is_none_or(|revision| row_present(ui, revision))
+}
 
 #[cfg(test)]
 mod tests {

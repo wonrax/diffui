@@ -82,7 +82,9 @@ impl Diffui {
             RevisionSelection::Commit(hex) => Some(hex.clone()),
         };
         if marked.len() > 1 && clicked_id.as_deref().is_some_and(|id| marked.contains(&id)) {
-            return vec![
+            let compare =
+                (marked.len() == 2).then(|| self.menu_item("compare.marked", CommandArg::None));
+            return [
                 self.menu_row(
                     format!("Abandon {} revisions", marked.len()),
                     "revision.abandon",
@@ -94,8 +96,11 @@ impl Diffui {
                     ),
                 ),
                 MenuEntry::Separator,
-                self.menu_item("selection.clear", CommandArg::None),
-            ];
+            ]
+            .into_iter()
+            .chain(compare)
+            .chain([self.menu_item("selection.clear", CommandArg::None)])
+            .collect();
         }
 
         let on = || CommandArg::Revision(selection.clone());
@@ -135,6 +140,13 @@ impl Diffui {
                     path: None,
                 },
             ),
+            MenuEntry::Submenu {
+                label: "Compare".to_owned(),
+                items: vec![
+                    self.menu_item("compare.with", on()),
+                    self.menu_item("compare.with-working-copy", on()),
+                ],
+            },
         ];
 
         // Copy revision metadata — values come from the loaded graph row.
