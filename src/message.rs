@@ -35,6 +35,9 @@ pub(crate) enum Message {
     Find(crate::find::FindMessage),
     /// Popup-menu messages — see [`crate::menu::MenuMessage`].
     Menu(crate::menu::MenuMessage),
+    /// `jj --version` answered (or there is no `jj`) — see
+    /// [`crate::jj_version`].
+    JjCliVersion(Option<String>),
 }
 
 /// Everything a widget reports that is *not* an intent: positions, hovers,

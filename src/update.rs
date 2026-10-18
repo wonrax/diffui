@@ -315,6 +315,9 @@ impl Diffui {
                     tasks.push(self.start_tab_load(id));
                 }
             }
+            if capabilities.mutate {
+                tasks.push(crate::jj_version::check_once());
+            }
             return Task::batch(tasks);
         }
 
@@ -658,6 +661,7 @@ impl Diffui {
             Message::Palette(message) => self.on_palette_message(message),
             Message::Find(message) => self.on_find_message(message),
             Message::Menu(message) => self.on_menu_message(message),
+            Message::JjCliVersion(version) => self.on_jj_cli_version(version),
         };
         // A mode that isn't on screen must not keep the keyboard.
         self.prune_stale_modes();

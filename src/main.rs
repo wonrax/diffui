@@ -19,6 +19,7 @@ mod find;
 mod graph_view;
 mod icons;
 mod input;
+mod jj_version;
 mod keymap;
 mod launch_env;
 mod logging;
