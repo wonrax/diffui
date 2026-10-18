@@ -1,15 +1,11 @@
-//! End-to-end git scenarios against scratch repos built with the `git` CLI.
+//! End-to-end git scenarios against scratch repos built with the `git` CLI,
+//! under the system temp dir like the jj scenarios'.
 //!
-//! Ignored by default: they shell out to `git` and build repos under the
-//! system temp dir. Run with:
-//!
-//! ```sh
-//! cargo test -p diffui-core --test git_scenarios -- --ignored
-//! ```
-//!
-//! Where the jj scenarios panic when their CLI is missing, these skip: git is
-//! optional for a jj-only checkout. Each test rebuilds its repo from scratch,
-//! so reruns are deterministic; the repos are left behind for inspection.
+//! Without `git` on PATH these skip rather than fail: git is optional for a
+//! jj-only checkout. Each test rebuilds its repo from scratch, so reruns are
+//! deterministic; the repos are left behind for inspection.
+
+mod harness;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -127,7 +123,6 @@ fn add_worktree(root: &Path, name: &str, detached: bool) -> PathBuf {
 }
 
 #[test]
-#[ignore]
 fn worktree_heads_are_labeled_in_the_shared_graph() {
     if !git_present() {
         return;
@@ -209,7 +204,6 @@ fn worktree_heads_are_labeled_in_the_shared_graph() {
 }
 
 #[test]
-#[ignore]
 fn worktree_metadata_refreshes_in_both_watch_shapes() {
     if !git_present() {
         return;
@@ -237,6 +231,7 @@ fn worktree_metadata_refreshes_in_both_watch_shapes() {
         .unwrap();
         block_on(async {
             let mut watcher = RepoWatcher::start_with(&linked, per_directory).unwrap();
+            harness::settle_watch(&mut watcher, shape).await;
             git(
                 &linked,
                 &["commit", "--allow-empty", "-m", "move linked HEAD"],
@@ -273,6 +268,7 @@ fn worktree_metadata_refreshes_in_both_watch_shapes() {
         });
         block_on(async {
             let mut watcher = RepoWatcher::start_with(&root, per_directory).unwrap();
+            harness::settle_watch(&mut watcher, shape).await;
             git(
                 &linked,
                 &["commit", "--allow-empty", "-m", "move other HEAD"],
@@ -290,7 +286,6 @@ fn worktree_metadata_refreshes_in_both_watch_shapes() {
 }
 
 #[test]
-#[ignore]
 fn the_git_actor_starts_and_forwards_its_watch() {
     if !git_present() {
         return;
@@ -330,7 +325,6 @@ fn the_git_actor_starts_and_forwards_its_watch() {
 }
 
 #[test]
-#[ignore]
 fn the_first_worktree_added_after_open_is_watched() {
     if !git_present() {
         return;
@@ -343,6 +337,7 @@ fn the_first_worktree_added_after_open_is_watched() {
         commit(&root, "base");
         block_on(async {
             let mut watcher = RepoWatcher::start_with(&root, per_directory).unwrap();
+            harness::settle_watch(&mut watcher, shape).await;
             let linked = add_worktree(&root, "detached", true);
             let batch = tokio::time::timeout(Duration::from_secs(5), watcher.next_batch())
                 .await
@@ -380,7 +375,6 @@ fn the_first_worktree_added_after_open_is_watched() {
 /// Non-UTF-8 file content used to fail the whole load: `git diff` output was
 /// decoded strictly, so one latin-1 line took the diff down with it.
 #[test]
-#[ignore]
 fn latin1_content_still_diffs() {
     if !git_present() {
         eprintln!("skipping: git is not on PATH");
@@ -410,7 +404,6 @@ fn latin1_content_still_diffs() {
 /// alternative is offering a row that can't be opened.
 #[cfg(unix)]
 #[test]
-#[ignore]
 fn non_utf8_filename_does_not_take_the_listing_down() {
     if !git_present() {
         eprintln!("skipping: git is not on PATH");
@@ -456,7 +449,6 @@ fn non_utf8_filename_does_not_take_the_listing_down() {
 /// `diff.suppressBlankEmpty` and `color.ui` all reach the parser unless the
 /// invocation pins them.
 #[test]
-#[ignore]
 fn hostile_diff_config_does_not_reach_the_parser() {
     if !git_present() {
         eprintln!("skipping: git is not on PATH");
@@ -510,7 +502,6 @@ fn hostile_diff_config_does_not_reach_the_parser() {
 /// `git show` defaults to a `--cc` combined diff on a merge, which carries no
 /// `diff --git` headers — the commit rendered empty.
 #[test]
-#[ignore]
 fn merge_commit_diffs_against_its_first_parent() {
     if !git_present() {
         eprintln!("skipping: git is not on PATH");
@@ -562,7 +553,6 @@ fn merge_commit_diffs_against_its_first_parent() {
 
 /// `Binary files … differ` was dropped, leaving an empty Modified row.
 #[test]
-#[ignore]
 fn binary_file_carries_the_binary_hunk() {
     if !git_present() {
         eprintln!("skipping: git is not on PATH");
