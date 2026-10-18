@@ -21,11 +21,14 @@ const CARD_WIDTH: f32 = 760.0;
 const CARD_MAX_HEIGHT: f32 = 720.0;
 const ROW_HEIGHT: f32 = 24.0;
 
-/// The sections, in the order the sheet lists them. The popup-menu context
-/// only exists off macOS and holds nothing but Esc, so it is left out.
+/// The sections after the base context's groups, in the order the sheet
+/// lists them. The popup-menu context only exists off macOS and holds nothing
+/// but Esc, so it is left out.
 const SECTIONS: &[(Context, &str)] = &[
-    (Context::Base, "General"),
-    (Context::Draft, "Target mode (rebase / squash / merge)"),
+    (
+        Context::Draft,
+        "Target mode (rebase / squash / merge / new / duplicate)",
+    ),
     (Context::Palette, "Command palette"),
     (Context::Find, "Find in diff"),
     (Context::Description, "Description editor"),
@@ -33,6 +36,36 @@ const SECTIONS: &[(Context, &str)] = &[
     (Context::Confirm, "Confirmation"),
     (Context::ActivityPopover, "Activity log"),
 ];
+
+/// The base context is one keyboard for the graph and the diff pane, so its
+/// keys never collide; the sheet still splits them by what they act on, by
+/// command-id prefix. Anything unmatched lands in "General".
+const BASE_GROUPS: &[(&str, &[&str])] = &[
+    (
+        "Revisions",
+        &["revision.", "selection.", "bookmark.", "compare."],
+    ),
+    (
+        "Diff pane and files",
+        &[
+            "file.",
+            "changes.",
+            "conflict.",
+            "find.",
+            "view.",
+            "source.",
+        ],
+    ),
+    ("Repository and history", &["repo.", "history."]),
+];
+
+/// Which base group `id` is listed under.
+fn base_group(id: CommandId) -> &'static str {
+    BASE_GROUPS
+        .iter()
+        .find(|(_, prefixes)| prefixes.iter().any(|prefix| id.starts_with(prefix)))
+        .map_or("General", |(title, _)| title)
+}
 
 /// Pointer gestures, which have no binding to read but are just as hidden.
 const GESTURES: &[(&str, &str)] = &[
@@ -51,6 +84,7 @@ const GESTURES: &[(&str, &str)] = &[
 /// One row of the sheet: what the binding does and the keys that run it.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Entry {
+    pub(crate) id: CommandId,
     pub(crate) label: String,
     pub(crate) keys: Vec<String>,
 }
@@ -81,6 +115,7 @@ pub(crate) fn entries(ui: &Diffui, context: Context) -> Vec<Entry> {
             continue;
         }
         out.push(Entry {
+            id: command.id,
             label: label(command.id),
             keys,
         });
@@ -92,6 +127,7 @@ pub(crate) fn entries(ui: &Diffui, context: Context) -> Vec<Entry> {
             vec![first.clone()]
         };
         out.push(Entry {
+            id: "tab.select",
             label: "Go to tab 1\u{2013}9".to_owned(),
             keys,
         });
@@ -146,22 +182,42 @@ pub(crate) fn build_overlay(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
 
     let mut left = column![].spacing(theme::space::XL);
     let mut right = column![].spacing(theme::space::XL);
-    for (index, (context, title)) in SECTIONS.iter().enumerate() {
-        let rows = entries(ui, *context);
+    let rows_of = |entries: Vec<Entry>| -> Vec<Element<'_, Message>> {
+        entries
+            .into_iter()
+            .map(|entry| binding_row(ui, theme, entry.label, entry.keys))
+            .collect()
+    };
+    // Revisions is the long one: it and the repository keys go left, the
+    // rest balances against them on the right.
+    let base = entries(ui, Context::Base);
+    for title in [
+        "General",
+        "Revisions",
+        "Diff pane and files",
+        "Repository and history",
+    ] {
+        let rows: Vec<Entry> = base
+            .iter()
+            .filter(|entry| base_group(entry.id) == title)
+            .cloned()
+            .collect();
         if rows.is_empty() {
             continue;
         }
-        let rows = rows
-            .into_iter()
-            .map(|entry| binding_row(ui, theme, entry.label, entry.keys))
-            .collect();
-        let block = section(ui, theme, title, rows);
-        // General is the long one; everything else balances against it.
-        if index == 0 {
+        let block = section(ui, theme, title, rows_of(rows));
+        if matches!(title, "Revisions" | "Repository and history") {
             left = left.push(block);
         } else {
             right = right.push(block);
         }
+    }
+    for (context, title) in SECTIONS {
+        let rows = entries(ui, *context);
+        if rows.is_empty() {
+            continue;
+        }
+        right = right.push(section(ui, theme, title, rows_of(rows)));
     }
     let gestures = GESTURES
         .iter()
@@ -380,7 +436,10 @@ mod tests {
             1
         );
         // A command with no key in the context is not listed.
-        assert!(base.iter().all(|entry| entry.label != "Duplicate"));
+        assert!(
+            base.iter()
+                .all(|entry| entry.label != "Absorb into ancestors")
+        );
     }
 
     #[test]
@@ -398,5 +457,15 @@ mod tests {
         assert_eq!(keys_of("Select next file"), Some(vec!["n".to_owned()]));
         // `n` now selects the next file, so "New child" has no live key.
         assert_eq!(keys_of("New child"), None);
+    }
+
+    #[test]
+    fn base_keys_group_by_what_they_act_on() {
+        assert_eq!(base_group("revision.commit"), "Revisions");
+        assert_eq!(base_group("compare.with"), "Revisions");
+        assert_eq!(base_group("changes.split"), "Diff pane and files");
+        assert_eq!(base_group("history.op-log"), "Repository and history");
+        assert_eq!(base_group("palette.toggle"), "General");
+        assert_eq!(base_group("tab.select"), "General");
     }
 }
