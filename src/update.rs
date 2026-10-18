@@ -945,6 +945,11 @@ impl Diffui {
                 self.pop_mode(ModeKind::Menu);
                 Task::none()
             }
+            Action::ToggleShortcuts => self.toggle_shortcuts(),
+            Action::CloseShortcuts => {
+                self.pop_mode(ModeKind::Shortcuts);
+                Task::none()
+            }
             Action::ConfirmAccept => {
                 let Some(Mode::Confirm(dialog)) = self.pop_mode(ModeKind::Confirm) else {
                     return Task::none();
@@ -2599,7 +2604,8 @@ impl Diffui {
         // open-repo dialog and nothing else — so every other mode would be
         // holding the keyboard from behind a surface that never draws it.
         if self.tabs.is_empty() {
-            self.modes.retain(|mode| mode.kind() == ModeKind::OpenRepo);
+            self.modes
+                .retain(|mode| matches!(mode.kind(), ModeKind::OpenRepo | ModeKind::Shortcuts));
             self.no_tab.modes.clear();
             return;
         }
@@ -4292,7 +4298,11 @@ impl Diffui {
         // No repositories open: the welcome screen owns the whole window, with
         // the open prompt inline rather than as a modal over it.
         if self.tabs.is_empty() {
-            return container(empty_state(self, theme))
+            let welcome = stack![
+                empty_state(self, theme),
+                crate::shortcuts::build_overlay(self, theme),
+            ];
+            return container(welcome)
                 .height(Length::Fill)
                 .width(Length::Fill)
                 .style(move |_| app_shell_style(theme))
@@ -4435,6 +4445,7 @@ impl Diffui {
             || self.mode(ModeKind::Menu).is_some()
             || self.mode(ModeKind::OpenRepo).is_some()
             || self.mode(ModeKind::Confirm).is_some()
+            || self.mode(ModeKind::Shortcuts).is_some()
         {
             crate::pointer::suppress(shell)
         } else {
@@ -4450,6 +4461,7 @@ impl Diffui {
             menu::build_overlay(self, theme),
             tab_bar::build_open_repo_dialog(self, theme),
             tab_bar::build_confirm_dialog(self, theme),
+            crate::shortcuts::build_overlay(self, theme),
             activity::toast_layer(self, theme),
         ]
         .width(Length::Fill)

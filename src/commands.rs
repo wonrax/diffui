@@ -42,6 +42,8 @@ pub(crate) enum Context {
     Menu,
     OpenRepo,
     ActivityPopover,
+    /// The keyboard-shortcut cheat sheet.
+    Shortcuts,
 }
 
 impl Context {
@@ -56,6 +58,7 @@ impl Context {
         Context::Menu,
         Context::OpenRepo,
         Context::ActivityPopover,
+        Context::Shortcuts,
     ];
 
     /// The name this context goes by in `config.toml`'s `[keys.<name>]`.
@@ -70,6 +73,7 @@ impl Context {
             Context::Menu => "menu",
             Context::OpenRepo => "open-repo",
             Context::ActivityPopover => "activity",
+            Context::Shortcuts => "shortcuts",
         }
     }
 
@@ -1361,6 +1365,29 @@ pub(crate) static REGISTRY: &[Command] = &[
     tab_select!(7, "tab.select-7", "Go to tab 7", "cmd+7", 6),
     tab_select!(8, "tab.select-8", "Go to tab 8", "cmd+8", 7),
     tab_select!(9, "tab.select-9", "Go to tab 9", "cmd+9", 8),
+    // ── Help ────────────────────────────────────────────────────────────
+    Command {
+        id: "help.shortcuts",
+        label: "Keyboard shortcuts",
+        hint: "List every key binding",
+        contexts: &[Context::Base, Context::Shortcuts],
+        chords: &["?"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::ToggleShortcuts),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "shortcuts.close",
+        label: "Close shortcuts",
+        hint: "Dismiss the keyboard shortcut list",
+        contexts: &[Context::Shortcuts],
+        chords: &["esc"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::CloseShortcuts),
+        palette: PaletteScope::Hidden,
+    },
 ];
 
 #[cfg(test)]

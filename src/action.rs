@@ -108,6 +108,9 @@ pub(crate) enum Action {
     CloseActivityPopover,
     ClearActivities,
     DismissMenu,
+    /// Open or close the keyboard-shortcut cheat sheet.
+    ToggleShortcuts,
+    CloseShortcuts,
     ConfirmAccept,
     ConfirmCancel,
 

@@ -410,6 +410,19 @@ impl Keymap {
             .map(|(_, _, id)| *id)
     }
 
+    /// The chords that actually run `id` in `context`, in binding order. A
+    /// chord an earlier binding shadows is left out, so a list built from
+    /// this never advertises a key that does something else.
+    pub(crate) fn live_chords(&self, context: Context, id: CommandId) -> Vec<&Chord> {
+        self.bindings
+            .iter()
+            .filter(|(bound, chord, bound_id)| {
+                *bound == context && *bound_id == id && self.lookup(context, chord) == Some(id)
+            })
+            .map(|(_, chord, _)| chord)
+            .collect()
+    }
+
     /// The first chord bound to `id` in `context` — what a menu row shows as
     /// its hint.
     pub(crate) fn chord_for(&self, context: Context, id: CommandId) -> Option<&Chord> {

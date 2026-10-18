@@ -33,6 +33,7 @@ mod pointer;
 mod resize_handle;
 mod revision_list;
 mod scrollbar;
+mod shortcuts;
 mod sidebar;
 mod source_panel;
 mod tab_bar;

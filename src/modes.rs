@@ -40,6 +40,8 @@ pub(crate) enum Mode {
     Confirm(ConfirmDialog),
     OpenRepo(OpenRepoDialog),
     ActivityPopover,
+    /// The keyboard-shortcut cheat sheet.
+    Shortcuts,
 }
 
 /// A mode bound to one tab: it names rows, files, or text that belong to that
@@ -61,6 +63,7 @@ pub(crate) enum ModeKind {
     Confirm,
     OpenRepo,
     ActivityPopover,
+    Shortcuts,
     Find,
     Description,
     Draft,
@@ -74,6 +77,7 @@ impl Mode {
             Mode::Confirm(_) => ModeKind::Confirm,
             Mode::OpenRepo(_) => ModeKind::OpenRepo,
             Mode::ActivityPopover => ModeKind::ActivityPopover,
+            Mode::Shortcuts => ModeKind::Shortcuts,
         }
     }
 
@@ -84,6 +88,7 @@ impl Mode {
             Mode::Confirm(_) => Context::Confirm,
             Mode::OpenRepo(_) => Context::OpenRepo,
             Mode::ActivityPopover => Context::ActivityPopover,
+            Mode::Shortcuts => Context::Shortcuts,
         }
     }
 }
