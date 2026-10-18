@@ -14,7 +14,7 @@ use iced::widget::column;
 
 impl Diffui {
     pub(crate) fn new(cli: Cli, saved: WindowState) -> (Self, Task<Message>) {
-        let (config, raw_keys) = AppConfig::load();
+        let (config, raw_keys, config_error) = AppConfig::load();
         // A keymap problem is never fatal: a config written against another
         // build still opens the app, having said once what it had to skip.
         let (keymap, problems) = Keymap::build(&raw_keys);
@@ -249,6 +249,18 @@ impl Diffui {
             next_toast_id: 0,
         };
 
+        if let Some(error) = config_error {
+            app.push_sticky_toast("config.toml ignored, using defaults".to_owned(), &error);
+        } else if let Some(first) = problems.first() {
+            let more = match problems.len() {
+                1 => String::new(),
+                n => format!(" (and {} more; see the log)", n - 1),
+            };
+            app.push_sticky_toast(
+                "Some key bindings were ignored".to_owned(),
+                &format!("{first}{more}"),
+            );
+        }
         let theme_task =
             system::theme().map(|mode| Message::Window(WindowEvent::SystemThemeChanged(mode)));
         // Kicks the streaming load for whatever the active tab is — a repo
@@ -1187,7 +1199,9 @@ impl Diffui {
                 }
             }
             UiEvent::ToastDismiss(id) => self.toasts.retain(|toast| toast.id != id),
-            UiEvent::ToastTick => self.toasts.retain(|toast| toast.born.elapsed() < TOAST_TTL),
+            UiEvent::ToastTick => self
+                .toasts
+                .retain(|toast| toast.sticky || toast.born.elapsed() < TOAST_TTL),
             UiEvent::LoadingTick => {}
             UiEvent::RevisionContextMenu(key, row_rect, cursor) => {
                 return self.open_revision_menu(key, row_rect, cursor);
@@ -3919,10 +3933,19 @@ impl Diffui {
             title,
             detail,
             born: Instant::now(),
+            sticky: false,
         });
         if self.toasts.len() > MAX_TOASTS {
             let excess = self.toasts.len() - MAX_TOASTS;
             self.toasts.drain(..excess);
+        }
+    }
+
+    /// [`Self::push_error_toast`], but the toast stays up until dismissed.
+    pub(crate) fn push_sticky_toast(&mut self, title: String, error: &str) {
+        self.push_error_toast(title, error);
+        if let Some(toast) = self.toasts.last_mut() {
+            toast.sticky = true;
         }
     }
 

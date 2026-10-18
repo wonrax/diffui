@@ -479,6 +479,9 @@ pub(crate) struct Toast {
     /// activity row.
     pub(crate) detail: String,
     pub(crate) born: Instant,
+    /// Stays up until dismissed instead of expiring after [`TOAST_TTL`] — for
+    /// startup problems the user may not be looking at the window for.
+    pub(crate) sticky: bool,
 }
 
 /// How long a toast lingers before the tick prunes it.

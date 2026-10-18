@@ -5,8 +5,8 @@
 //!   ui_font              — family used for chrome, sidebar, file names, etc.
 //!                          Falls back to the system default when unset.
 //!   mono_font            — family used for code/IDs.
-//!                          Falls back to "Menlo" on macOS and "Cascadia Code"
-//!                          elsewhere.
+//!                          Falls back to the platform's default monospace
+//!                          family.
 //!   multi_click_ms       — max ms between clicks to count as a multi-click in
 //!                          the diff view. Defaults to 350.
 //!   theme                — color theme: System | Light | Dark | Contrast.
@@ -31,6 +31,9 @@
 //! "file.next" = "n"          # replaces the default j / ↓
 //! "selection.clear" = "none" # unbind
 //! ```
+//!
+//! A file that fails to parse is ignored whole: the app starts on defaults and
+//! says where the error is (see [`AppConfig::load`]).
 //!
 //! Kerning and OpenType feature toggles (ligatures, stylistic sets) aren't
 //! configurable: the text stack (iced/cosmic-text) exposes no per-run feature
@@ -81,11 +84,19 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
-    /// Read the config file, returning the resolved settings and the raw
+    /// Read the config file, returning the resolved settings, the raw
     /// `[keys]` section for [`crate::keymap::Keymap::build`] to layer over the
-    /// registry's defaults.
-    pub fn load() -> (Self, RawKeys) {
-        let raw = read_config_file().unwrap_or_default();
+    /// registry's defaults, and why the file was ignored, if it was. A file
+    /// that doesn't parse leaves every setting on its default — a partial read
+    /// would apply half a config that was never meant to be used that way.
+    pub fn load() -> (Self, RawKeys, Option<String>) {
+        let (raw, error) = match read_config_file() {
+            Ok(raw) => (raw.unwrap_or_default(), None),
+            Err(error) => {
+                tracing::warn!("ignoring config file: {error}");
+                (RawConfig::default(), Some(error))
+            }
+        };
         let defaults = CodeTypography::default();
         let config = Self {
             ui_font: raw
@@ -121,7 +132,7 @@ impl AppConfig {
                     .unwrap_or(defaults.baseline_offset),
             },
         };
-        (config, raw.keys)
+        (config, raw.keys, error)
     }
 }
 
@@ -151,10 +162,50 @@ fn theme_from_name(name: &str) -> Option<ThemePreference> {
     }
 }
 
-fn read_config_file() -> Option<RawConfig> {
-    let path = config_path()?;
-    let text = std::fs::read_to_string(&path).ok()?;
-    toml::from_str(&text).ok()
+/// `Ok(None)` when there is no config file; `Err` with a `path:line:col:
+/// message` description when there is one that can't be read or parsed.
+fn read_config_file() -> Result<Option<RawConfig>, String> {
+    let Some(path) = config_path() else {
+        return Ok(None);
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("{}: {error}", display_path(&path))),
+    };
+    toml::from_str(&text)
+        .map(Some)
+        .map_err(|error| describe_parse_error(&path, &text, &error))
+}
+
+/// `~/.config/diffui/config.toml:3:9: invalid type: …` — the location an
+/// editor can jump to, then the first line of toml's message (the rest is a
+/// source excerpt that doesn't fit a toast).
+fn describe_parse_error(path: &std::path::Path, text: &str, error: &toml::de::Error) -> String {
+    let message = error.message().lines().next().unwrap_or("").trim();
+    match error.span() {
+        Some(span) => {
+            let before = &text[..span.start.min(text.len())];
+            let line = before.matches('\n').count() + 1;
+            let column = before
+                .rsplit('\n')
+                .next()
+                .map_or(0, |line| line.chars().count())
+                + 1;
+            format!("{}:{line}:{column}: {message}", display_path(path))
+        }
+        None => format!("{}: {message}", display_path(path)),
+    }
+}
+
+/// `path` with the home directory folded to `~`.
+fn display_path(path: &std::path::Path) -> String {
+    if let Some(home) = env::var_os("HOME").filter(|home| !home.is_empty())
+        && let Ok(rest) = path.strip_prefix(&home)
+    {
+        return format!("~/{}", rest.display());
+    }
+    path.display().to_string()
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -237,4 +288,22 @@ fn default_mono_font() -> Font {
     // bundled names. Hardcoding "Menlo" / "Cascadia Code" was fragile:
     // Cascadia Code only ships on Windows 11+ and isn't on Linux at all.
     Font::MONOSPACE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_parse_error_names_the_line_and_column() {
+        let text = "theme = \"dark\"\ncode_font_size = \"big\"\n";
+        let error = toml::from_str::<RawConfig>(text).expect_err("a string is not a size");
+        let described =
+            describe_parse_error(std::path::Path::new("/etc/diffui.toml"), text, &error);
+        assert!(
+            described.starts_with("/etc/diffui.toml:2:18: "),
+            "{described}"
+        );
+        assert!(!described.contains('\n'), "{described}");
+    }
 }
