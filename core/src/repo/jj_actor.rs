@@ -471,6 +471,7 @@ impl Actor {
                     branch_status,
                     bookmarks,
                     root_commit_id: Some(repo.store().root_commit_id().hex()),
+                    op_id: Some(repo.op_id().hex()),
                 },
             }),
             None => self.emit(Payload::Cancelled { job }),
@@ -489,6 +490,15 @@ impl Actor {
         let commit_id = jj::resolve_revision(repo.as_ref(), &name, &revision).await?;
         let (document, details) =
             jj::diff_jj_with_repo(repo.as_ref(), &commit_id, repository).await?;
+        // A commit rewritten since the caller read its id resolved to its
+        // successor; answer under the id that was actually loaded, so the
+        // selection follows the change instead of naming a hidden commit.
+        let revision = match revision {
+            RevisionSelection::Commit(hex) if hex != commit_id.hex() => {
+                RevisionSelection::Commit(commit_id.hex())
+            }
+            revision => revision,
+        };
         self.emit(Payload::DiffLoaded {
             job,
             revision,

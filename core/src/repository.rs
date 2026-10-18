@@ -12,7 +12,7 @@ pub struct Repository {
     pub scope: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RepositorySnapshot {
     pub fingerprint: String,
     /// Whether the post-snapshot working-copy commit is empty (no diff from its
@@ -31,6 +31,15 @@ pub struct RepositorySnapshot {
     /// other than ours happened and the topology may have changed — the
     /// frontend escalates a diff-only watcher refresh to a full graph reload.
     pub parent_fingerprint: Option<String>,
+    /// The working-copy commit id after the snapshot. A snapshot that wrote an
+    /// op rewrote `@`, so its old id is gone; the projection patches the row
+    /// with this instead of re-walking. `None` for git.
+    pub working_copy_commit_id: Option<String>,
+    /// Whether the snapshot rebased descendants of `@` (the user is editing a
+    /// commit with children). Their commit ids all changed, so the rows on
+    /// screen address commits that are no longer visible and the graph has to
+    /// be reloaded rather than patched.
+    pub rewrote_descendants: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

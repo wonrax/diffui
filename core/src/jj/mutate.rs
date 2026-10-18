@@ -29,7 +29,8 @@ use jj_lib::{
 use super::remote::*;
 use super::walk::*;
 use super::workspace::{
-    LockOutcome, LockedWorkingCopy, SnapshotContext, lock_working_copy, resolve_revision,
+    LockOutcome, LockedWorkingCopy, SnapshotContext, follow_rewritten, lock_working_copy,
+    resolve_revision,
 };
 use crate::model::{LoadProgress, RevisionSelection};
 use crate::mutations::{Destination, MutationOp, MutationOutcome, RebaseSourceMode, SquashTarget};
@@ -1121,7 +1122,9 @@ pub(super) fn combined_squash_description(destination: &Commit, sources: &[Commi
 }
 
 /// Resolve a `RevisionSelection` to a `Commit`. The working-copy case uses
-/// `current_wc_id` (the post-snapshot `@`).
+/// `current_wc_id` (the post-snapshot `@`); a commit the caller still names by
+/// an id that has since been rewritten resolves to its visible successor (see
+/// [`follow_rewritten`]).
 pub(super) async fn resolve_mutation_target(
     repo: &MutableRepo,
     current_wc_id: &CommitId,
@@ -1133,10 +1136,15 @@ pub(super) async fn resolve_mutation_target(
             CommitId::try_from_hex(hex).with_context(|| format!("invalid jj commit id {hex}"))?
         }
     };
-    repo.store()
+    let commit = repo
+        .store()
         .get_commit_async(&commit_id)
         .await
-        .with_context(|| format!("failed to load jj commit {}", commit_id.hex()))
+        .with_context(|| format!("failed to load jj commit {}", commit_id.hex()))?;
+    if matches!(target, RevisionSelection::WorkingCopy) {
+        return Ok(commit);
+    }
+    follow_rewritten(repo, commit).await
 }
 
 pub(super) fn short_change_id(commit: &Commit) -> String {

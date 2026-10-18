@@ -504,3 +504,165 @@ fn a_cold_load_that_fails_at_snapshot_reports_the_failure() {
     ));
     assert!(matches!(session.status, diffui_core::LoadStatus::Failed(_)));
 }
+
+/// Send every command in `effects`, then keep draining and applying until the
+/// projection stops asking for more — a refresh's snapshot, the reload it
+/// escalates to, the diff that follows.
+fn settle(session: &mut Session, repo: &mut TestRepo, root: &std::path::Path, effects: &[Effect]) {
+    let jobs = |effects: &[Effect]| -> Vec<JobId> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Send(Command::Cancel { .. }) => None,
+                Effect::Send(command) => command.job(),
+                _ => None,
+            })
+            .collect()
+    };
+    for effect in effects {
+        if let Effect::Send(command) = effect {
+            repo.handle.send(command.clone());
+        }
+    }
+    let mut pending: std::collections::VecDeque<JobId> = jobs(effects).into();
+    while let Some(job) = pending.pop_front() {
+        for payload in repo.drain(job) {
+            let follow_ups = apply(session, repo, Event::new(repo_id(root), payload));
+            pending.extend(jobs(&follow_ups));
+        }
+    }
+}
+
+fn row_commit_id(session: &Session, description: &str) -> String {
+    session
+        .commits
+        .iter()
+        .find(|row| row.description().starts_with(description))
+        .unwrap_or_else(|| panic!("no row described {description:?}"))
+        .commit_id()
+        .to_owned()
+}
+
+/// Edit a commit that has a child, save a file, then squash the child: the
+/// watcher's snapshot rebases the child under the rewritten `@`, so its row has
+/// to carry the new id. It used to keep the old one — the squash then failed
+/// with "<id> is no longer in the repository", and Refresh said "already up
+/// to date" because the snapshot had already recorded the op the rows missed.
+#[test]
+fn a_watcher_snapshot_under_an_edited_parent_keeps_the_child_row_current() {
+    let root = scratch_repo("stale-child-after-snapshot");
+    let mut repo = TestRepo::open(&root);
+    repo.snapshot();
+    commit_file(&mut repo, "parent.txt", "parent\n", "parent");
+    commit_file(&mut repo, "child.txt", "child\n", "child");
+
+    let mut session = Session::unloaded(String::new());
+    session.capabilities = repo.handle.capabilities();
+    let effects = session.load_graph(true);
+    settle(&mut session, &mut repo, &root, &effects);
+    repo.mutate(MutationOp::Edit {
+        target: RevisionSelection::Commit(row_commit_id(&session, "parent")),
+    })
+    .expect("edit the parent");
+    let effects = session.snapshot(RefreshOrigin::Focus);
+    settle(&mut session, &mut repo, &root, &effects);
+    let stale_child = row_commit_id(&session, "child");
+
+    // The save the watcher reports: `@` (the parent) gets a new tree, and its
+    // child is rebased onto it.
+    write(&root, "parent.txt", "parent, edited\n");
+    let effects = session.apply(Event::new(repo_id(&root), Payload::WorkingCopyChanged));
+    settle(&mut session, &mut repo, &root, &effects);
+
+    let child = row_commit_id(&session, "child");
+    assert_ne!(child, stale_child, "the snapshot rebased the child");
+    assert!(
+        commit_ids(&root).contains(&child),
+        "the child row must name the visible commit"
+    );
+    let working_copy = session
+        .commits
+        .working_copy()
+        .expect("`@` is in the graph")
+        .commit_id()
+        .to_owned();
+    assert!(
+        commit_ids(&root).contains(&working_copy),
+        "the `@` row must name the post-snapshot commit"
+    );
+
+    // A refresh now has nothing to catch up on.
+    let effects = session.snapshot(RefreshOrigin::Focus);
+    settle(&mut session, &mut repo, &root, &effects);
+    assert_eq!(row_commit_id(&session, "child"), child);
+
+    repo.mutate(MutationOp::Squash {
+        from: vec![RevisionSelection::Commit(child)],
+        into: diffui_core::SquashTarget::Parent,
+    })
+    .expect("squash the child into the edited parent");
+    let rows = repo.graph("all()");
+    assert!(
+        rows.iter().all(|row| !row.summary.is_divergent),
+        "the squash must not resurrect anything as divergent"
+    );
+    let squashed = repo.diff(RevisionSelection::WorkingCopy);
+    let paths: Vec<&str> = squashed.files.iter().map(|f| f.path.as_str()).collect();
+    assert!(
+        paths.contains(&"child.txt") && paths.contains(&"parent.txt"),
+        "the parent now holds both changes: {paths:?}"
+    );
+}
+
+/// A row that still names a commit's pre-rewrite id — a menu opened before the
+/// reload landed — acts on the commit the row stands for, not on the hidden
+/// predecessor (which would resurrect it as a divergent copy).
+#[test]
+fn a_mutation_on_a_rewritten_id_follows_the_change() {
+    let root = scratch_repo("follow-rewritten-id");
+    let mut repo = TestRepo::open(&root);
+    repo.snapshot();
+    commit_file(&mut repo, "parent.txt", "parent\n", "parent");
+    commit_file(&mut repo, "child.txt", "child\n", "child");
+    let rows = repo.graph("all()");
+    let id_of = |rows: &[diffui_core::StreamRow], description: &str| {
+        rows.iter()
+            .find(|row| row.summary.description.starts_with(description))
+            .expect("row")
+            .summary
+            .commit_id
+            .clone()
+    };
+    let stale_child = id_of(&rows, "child");
+    repo.mutate(MutationOp::Edit {
+        target: RevisionSelection::Commit(id_of(&rows, "parent")),
+    })
+    .expect("edit the parent");
+    write(&root, "parent.txt", "parent, edited\n");
+    repo.snapshot();
+
+    repo.mutate(MutationOp::Describe {
+        target: RevisionSelection::Commit(stale_child.clone()),
+        description: "child, described".to_owned(),
+    })
+    .expect("describing by the stale id follows the rewrite");
+    let rows = repo.graph("all()");
+    assert!(rows.iter().all(|row| !row.summary.is_divergent));
+    assert!(
+        rows.iter()
+            .any(|row| row.summary.description.starts_with("child, described")),
+        "the visible child got the description"
+    );
+    // The diff of a stale id answers under the id it actually loaded.
+    let events = repo.run(|job| Command::LoadDiff {
+        job,
+        revision: RevisionSelection::Commit(stale_child.clone()),
+    });
+    match events.last() {
+        Some(Payload::DiffLoaded {
+            revision: RevisionSelection::Commit(id),
+            ..
+        }) => assert_ne!(id, &stale_child),
+        other => panic!("expected a diff under the followed id, got {other:?}"),
+    }
+}

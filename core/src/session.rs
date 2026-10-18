@@ -266,6 +266,13 @@ pub struct Session {
     /// per-row result is checked against.
     graph_version: Option<JobId>,
     mutation_job: Option<JobId>,
+    /// The operation the rows on screen reflect: the op the last graph walk
+    /// read, advanced by a watcher snapshot that patched `@` in place. Kept
+    /// apart from [`Session::repository_snapshot`], which a snapshot advances
+    /// whether or not the rows followed — comparing against that is how a
+    /// stale graph used to answer a manual refresh with "already up to date".
+    /// `None` until a walk reports one (and always for git).
+    graph_fingerprint: Option<String>,
 }
 
 impl Session {
@@ -557,12 +564,23 @@ impl Session {
             return Vec::new();
         };
         let swapped = load.staging.is_some();
+        // The change the selected row stands for, read off the store about to
+        // be replaced: a rewrite gives the commit a new id, and the selection
+        // should follow the change rather than fall off the graph.
+        let selected_change = match &self.selected_revision {
+            RevisionSelection::Commit(id) if swapped => self
+                .commits
+                .find_by_commit_id(id)
+                .map(|row| row.change_id().to_owned()),
+            _ => None,
+        };
         if let Some((commits, graph, prefixes)) = load.staging {
             self.commits = commits;
             self.graph = graph;
             self.sidebar_prefix_lens = prefixes;
         }
         self.graph_version = Some(job);
+        self.graph_fingerprint = tail.op_id;
         self.branch_status = tail.branch_status;
         self.bookmarks = tail.bookmarks;
         if tail.root_commit_id.is_some() {
@@ -583,6 +601,8 @@ impl Session {
         self.status = LoadStatus::Loaded;
         self.loading_since = None;
         self.selected_commit_index = self.find_selected_commit_index();
+        let followed = self.selected_commit_index.is_none()
+            && selected_change.is_some_and(|change| self.follow_selected_change(&change));
         self.repaint_version = self.repaint_version.wrapping_add(1);
 
         let mut effects = vec![Effect::Activity(Activity::LoadFinished {
@@ -591,6 +611,10 @@ impl Session {
         })];
         if swapped {
             effects.push(Effect::GraphReplaced);
+        }
+        if followed && !self.diff_in_flight() {
+            let revision = self.selected_revision.clone();
+            effects.extend(self.load_diff(revision));
         }
         effects.extend(self.resolve_empty_status());
         effects.extend(self.drain_pending_refresh());
@@ -665,8 +689,16 @@ impl Session {
             .collect();
 
         let reflected = self.repository_snapshot.as_ref();
-        let changed =
-            reflected.map(|s| s.fingerprint.as_str()) != Some(snapshot.fingerprint.as_str());
+        // The rows on screen are behind this snapshot when the walk that built
+        // them read another op — even if an earlier snapshot already recorded
+        // this one. Comparing only against the last snapshot is what let a
+        // manual refresh call a stale graph "already up to date" forever.
+        let graph_behind = self
+            .graph_fingerprint
+            .as_deref()
+            .is_some_and(|op| op != snapshot.fingerprint);
+        let changed = graph_behind
+            || reflected.map(|s| s.fingerprint.as_str()) != Some(snapshot.fingerprint.as_str());
         if !changed {
             effects.push(Effect::Activity(Activity::LoadFinished {
                 ok: true,
@@ -683,11 +715,18 @@ impl Session {
         // the worktree signal wins the race and this snapshot advances the
         // fingerprint *past* the external op — without the escalation, that
         // swallowed the topology change and the graph stayed stale.
-        let external_op = match (reflected, snapshot.parent_fingerprint.as_deref()) {
-            (Some(reflected), Some(parent)) => reflected.fingerprint != parent,
+        let base = self
+            .graph_fingerprint
+            .as_deref()
+            .or(reflected.map(|s| s.fingerprint.as_str()));
+        let external_op = match (base, snapshot.parent_fingerprint.as_deref()) {
+            (Some(base), Some(parent)) => base != parent,
             _ => false,
         };
-        let origin = if external_op {
+        // A snapshot under an edited mid-stack commit rebased its children:
+        // every one of them has a new id, and the rows still name the old
+        // ones, which no mutation can act on any more.
+        let origin = if external_op || snapshot.rewrote_descendants {
             RefreshOrigin::Focus
         } else {
             origin
@@ -697,9 +736,15 @@ impl Session {
         match origin {
             RefreshOrigin::Watcher => {
                 // A working-tree edit moved `@`'s tree but not the topology, so
-                // skip the (up to ~1M-commit) re-walk. Keep `@`'s sidebar
-                // "empty" chip live even when the diff pane shows another
-                // revision: the snapshot just rewrote `@`'s tree.
+                // skip the (up to ~1M-commit) re-walk. The snapshot did give
+                // `@` a new commit id, though, and nothing else changed, so
+                // patching that one row brings the graph to the snapshot's op.
+                // Keep `@`'s sidebar "empty" chip live even when the diff pane
+                // shows another revision: the snapshot just rewrote `@`'s tree.
+                self.apply_working_copy_commit_id(snapshot.working_copy_commit_id.as_deref());
+                if self.graph_fingerprint.is_some() {
+                    self.graph_fingerprint = Some(snapshot.fingerprint.clone());
+                }
                 self.apply_working_copy_empty(snapshot.working_copy_empty);
                 if matches!(self.selected_revision, RevisionSelection::WorkingCopy) {
                     effects.extend(self.load_diff(RevisionSelection::WorkingCopy));
@@ -912,6 +957,33 @@ impl Session {
             }
         }
         out
+    }
+
+    /// Point the working-copy row at `@`'s post-snapshot commit id. A no-op
+    /// when the id is unknown (git) or `@` isn't in the loaded graph.
+    fn apply_working_copy_commit_id(&mut self, commit_id: Option<&str>) {
+        let (Some(commit_id), Some(index)) = (commit_id, self.commits.working_copy_index()) else {
+            return;
+        };
+        if self.commits.row(index).commit_id() != commit_id {
+            self.commits.set_commit_id(index, commit_id);
+            self.repaint_version = self.repaint_version.wrapping_add(1);
+        }
+    }
+
+    /// Move a commit selection the reload dropped onto the row now carrying
+    /// its change, when exactly one does. Returns whether it moved.
+    fn follow_selected_change(&mut self, change_id: &str) -> bool {
+        let Some(row) = self.commits.find_by_change_id(change_id) else {
+            return false;
+        };
+        if row.is_divergent() {
+            return false;
+        }
+        let commit_id = row.commit_id().to_owned();
+        self.selected_revision = self.canonical_selection(&commit_id);
+        self.selected_commit_index = self.find_selected_commit_index();
+        self.selected_commit_index.is_some()
     }
 
     /// Refresh the working-copy row's "empty" chip from a snapshot, without
@@ -1217,6 +1289,144 @@ mod tests {
             ),
             vec![at]
         );
+    }
+
+    fn sent_job(effects: &[Effect], pick: fn(&Command) -> Option<JobId>) -> Option<JobId> {
+        effects.iter().find_map(|effect| match effect {
+            Effect::Send(command) => pick(command),
+            _ => None,
+        })
+    }
+
+    /// The rows on screen were walked at op `a`; a snapshot has since recorded
+    /// op `b` without them following. A refresh must reload instead of calling
+    /// that "already up to date" because the *snapshot* is current.
+    #[test]
+    fn a_refresh_reloads_rows_walked_at_an_older_operation() {
+        let repo = crate::repo::repo_id(&crate::repo::OpenSpec::Local {
+            root: "/tmp/graph-behind".into(),
+            scope: Default::default(),
+        });
+        let mut session = Session::unloaded(String::new());
+        session.capabilities.graph = true;
+        let load = session.load_graph(false);
+        let job = sent_job(&load, |command| match command {
+            Command::LoadGraph { job, .. } => Some(*job),
+            _ => None,
+        })
+        .expect("a graph load");
+        session.apply(Event::new(
+            repo.clone(),
+            Payload::GraphLoaded {
+                job,
+                tail: crate::repo::GraphTail {
+                    op_id: Some("a".to_owned()),
+                    ..Default::default()
+                },
+            },
+        ));
+        let at_b = RepositorySnapshot {
+            fingerprint: "b".to_owned(),
+            parent_fingerprint: Some("b".to_owned()),
+            ..Default::default()
+        };
+        session.repository_snapshot = Some(at_b.clone());
+
+        let refresh = session.snapshot(RefreshOrigin::Focus);
+        let job = sent_job(&refresh, |command| match command {
+            Command::Snapshot { job, .. } => Some(*job),
+            _ => None,
+        })
+        .expect("a snapshot");
+        let effects = session.apply(Event::new(
+            repo,
+            Payload::SnapshotDone {
+                job,
+                origin: RefreshOrigin::Focus,
+                snapshot: at_b,
+                warnings: Vec::new(),
+            },
+        ));
+        assert!(
+            sent_job(&effects, |command| match command {
+                Command::LoadGraph { job, .. } => Some(*job),
+                _ => None,
+            })
+            .is_some(),
+            "the stale rows must be reloaded: {effects:?}"
+        );
+    }
+
+    /// A save under a childless `@` patches that one row's commit id rather
+    /// than re-walking, and the rows then count as current at the new op.
+    #[test]
+    fn a_watcher_snapshot_patches_the_working_copy_row() {
+        let repo = crate::repo::repo_id(&crate::repo::OpenSpec::Local {
+            root: "/tmp/patch-wc".into(),
+            scope: Default::default(),
+        });
+        let mut session = Session::unloaded(String::new());
+        session.capabilities.graph = true;
+        let load = session.load_graph(true);
+        let job = sent_job(&load, |command| match command {
+            Command::LoadGraph { job, .. } => Some(*job),
+            _ => None,
+        })
+        .expect("a graph load");
+        session.apply(Event::new(
+            repo.clone(),
+            Payload::Batch {
+                job,
+                rows: (0..3).map(row).collect(),
+            },
+        ));
+        session.apply(Event::new(
+            repo.clone(),
+            Payload::GraphLoaded {
+                job,
+                tail: crate::repo::GraphTail {
+                    op_id: Some("a".to_owned()),
+                    ..Default::default()
+                },
+            },
+        ));
+        session.repository_snapshot = Some(RepositorySnapshot {
+            fingerprint: "a".to_owned(),
+            ..Default::default()
+        });
+
+        let refresh = session.snapshot(RefreshOrigin::Watcher);
+        let job = sent_job(&refresh, |command| match command {
+            Command::Snapshot { job, .. } => Some(*job),
+            _ => None,
+        })
+        .expect("a snapshot");
+        let effects = session.apply(Event::new(
+            repo,
+            Payload::SnapshotDone {
+                job,
+                origin: RefreshOrigin::Watcher,
+                snapshot: RepositorySnapshot {
+                    fingerprint: "b".to_owned(),
+                    parent_fingerprint: Some("a".to_owned()),
+                    working_copy_commit_id: Some("rewritten".to_owned()),
+                    ..Default::default()
+                },
+                warnings: Vec::new(),
+            },
+        ));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Send(Command::LoadGraph { .. }))),
+            "no re-walk for a plain save: {effects:?}"
+        );
+        assert_eq!(
+            session.commits.working_copy().map(|row| row.commit_id()),
+            Some("rewritten")
+        );
+        assert!(session.commits.find_by_commit_id("rewritten").is_some());
+        assert_eq!(session.graph_fingerprint.as_deref(), Some("b"));
     }
 
     #[test]

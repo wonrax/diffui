@@ -1190,13 +1190,14 @@ fn squash_multiple_sources_into_one_destination() {
         "dest\n\nsrc a\n\nsrc b\n"
     );
 
-    // Parent target + several sources is ambiguous and refused.
+    // Parent target + several sources is ambiguous and refused. (The
+    // squashed-away sources are gone now, so two visible revisions stand in.)
     let result = block_on(run_mutation(
         repository(&root),
         MutationOp::Squash {
             from: vec![
-                RevisionSelection::Commit(src_a),
-                RevisionSelection::Commit(src_b),
+                RevisionSelection::Commit(base),
+                RevisionSelection::Commit(commit_id(&root, &dest_change)),
             ],
             into: SquashTarget::Parent,
         },

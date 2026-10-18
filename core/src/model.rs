@@ -250,8 +250,9 @@ const INDEX_IDLE: Duration = Duration::from_millis(250);
 /// offsets do — see [`CommitStore::intern_text`].
 #[derive(Debug, Clone, Default)]
 struct IdOrder {
-    /// Row count the lanes were built at; any other length means they're stale
-    /// (only `push` changes it, and a row's ids never change afterwards).
+    /// Row count the lanes were built at; any other length means they're stale.
+    /// Only `push` changes it, and the one id that changes in place
+    /// ([`CommitStore::set_commit_id`]) clears it.
     built_at: Option<usize>,
     by_change_id: Vec<u32>,
     by_commit_id: Vec<u32>,
@@ -427,6 +428,19 @@ impl CommitStore {
             };
         }
         lens
+    }
+
+    /// Replace a row's commit id in place: a working-copy snapshot rewrote `@`
+    /// without touching anything else in the graph, so patching the one row is
+    /// all a re-walk would have changed. The old text stays in the arena (a few
+    /// dozen bytes per save, gone at the next reload).
+    pub fn set_commit_id(&mut self, index: usize, commit_id: &str) {
+        if index >= self.len() || self.row(index).commit_id() == commit_id {
+            return;
+        }
+        let span = self.intern_text(commit_id);
+        self.spans[index].commit_id = span;
+        self.id_order.get_mut().built_at = None;
     }
 
     /// Set a row's empty status, used to fill in the merge/root commits left

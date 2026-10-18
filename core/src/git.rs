@@ -214,6 +214,7 @@ pub async fn load_git_repository_snapshot(repository_root: &Path) -> Result<Repo
         working_copy_empty: None,
         // Git has no op log — the external-op escalation never applies.
         parent_fingerprint: None,
+        ..RepositorySnapshot::default()
     })
 }
 

@@ -232,6 +232,10 @@ pub struct GraphTail {
     /// of rewrite targets before offering the operation. `None` for backends
     /// without one.
     pub root_commit_id: Option<String>,
+    /// The operation the walk read (`RepositorySnapshot::fingerprint`'s
+    /// form), so the projection knows exactly which op the rows on screen
+    /// reflect. `None` for backends without an op log.
+    pub op_id: Option<String>,
 }
 
 /// One event from a repository actor. `repo` rides on every one of them, so a
