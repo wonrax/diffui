@@ -25,6 +25,12 @@ use crate::source_browse::{SourceEntry, SourceEntryStatus};
 /// with a real hex hash.
 pub const GIT_WORKING_COPY_ID: &str = "wc";
 
+/// How many commits a graph load lists unless the revision field asks for a
+/// count of its own (`-n N`, `--max-count=N`). `git log` of a whole
+/// million-commit history is seconds of git plus a graph nobody scrolls to
+/// the bottom of; the cut-off rows show their parents as stubs.
+pub const DEFAULT_LOG_LIMIT: usize = 10_000;
+
 pub async fn load_git_diff(
     repository: &Repository,
     revision: &RevisionSelection,
@@ -61,6 +67,12 @@ pub async fn load_git_commits(
     // `git log HEAD` fails outright.
     let head = git_head(&repository.root).await;
     let user_args = log_range_args(revision_range)?;
+    if !user_args
+        .iter()
+        .any(|arg| arg.to_string_lossy().starts_with("--max-count="))
+    {
+        args.push(OsString::from(format!("--max-count={DEFAULT_LOG_LIMIT}")));
+    }
     let default_view = user_args.is_empty();
     if default_view {
         args.extend(head.iter().map(OsString::from));

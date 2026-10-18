@@ -9,6 +9,10 @@
 use tokio::sync::mpsc;
 use tracing::Instrument as _;
 
+/// Rows per `Batch`, as the jj walk streams them, so a long log is folded in
+/// steps rather than in one message.
+const BATCH_SIZE: usize = 256;
+
 use super::cancel::CancelFlag;
 use super::protocol::{Command, Event, GraphTail, Payload, RepoError, RepoId};
 use super::{Envelope, Jobs, catch_panic, route_commands};
@@ -90,17 +94,26 @@ async fn run(repository: &Repository, command: Command, cancel: &CancelFlag) -> 
         Command::LoadGraph { job, revset } => {
             match crate::git::load_git_commits(repository, &revset).await {
                 Ok(_) if cancel.is_cancelled() => vec![Payload::Cancelled { job }],
-                // The git loader parses `git log` in one shot rather than per
-                // commit, so the "stream" is a single batch — which the
-                // projection folds exactly like a jj one. Ahead/behind and
-                // bookmarks aren't wired for git, so the tail is empty.
-                Ok(rows) => vec![
-                    Payload::Batch { job, rows },
-                    Payload::GraphLoaded {
+                // The git loader parses `git log` in one shot (lanes need to
+                // know which parents the listing contains), so the batches
+                // are cut afterwards. Ahead/behind and bookmarks aren't wired
+                // for git, so the tail is empty.
+                Ok(rows) => {
+                    let mut payloads: Vec<Payload> =
+                        Vec::with_capacity(rows.len() / BATCH_SIZE + 2);
+                    let mut rows = rows.into_iter().peekable();
+                    while rows.peek().is_some() {
+                        payloads.push(Payload::Batch {
+                            job,
+                            rows: rows.by_ref().take(BATCH_SIZE).collect(),
+                        });
+                    }
+                    payloads.push(Payload::GraphLoaded {
                         job,
                         tail: GraphTail::default(),
-                    },
-                ],
+                    });
+                    payloads
+                }
                 Err(error) => failed(job, error),
             }
         }

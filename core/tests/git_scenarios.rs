@@ -614,3 +614,31 @@ fn an_empty_repository_loads() {
     assert_eq!(document.files[0].path, "first.txt");
     assert_eq!(document.files[0].status, DiffFileStatus::Added);
 }
+
+/// The default view used to list the whole history in one `git log`, however
+/// long; it is capped now, and an explicit count in the revision field wins.
+#[test]
+#[ignore]
+fn the_log_is_capped_unless_the_field_names_a_count() {
+    if !git_present() {
+        eprintln!("skipping: git is not on PATH");
+        return;
+    }
+    let root = scratch_repo("log-cap");
+    for index in 0..5 {
+        write(&root, "file.txt", format!("{index}\n").as_bytes());
+        commit(&root, &format!("commit {index}"));
+    }
+    let repository = repository(&root);
+    let rows = block_on(load_git_commits(&repository, "")).expect("load the default view");
+    assert_eq!(rows.len(), 5, "well under the default cap");
+    let rows = block_on(load_git_commits(&repository, "-n 2")).expect("load two");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1].frame.missing_parents, 1, "the cut shows as a stub");
+    let rows = block_on(load_git_commits(&repository, "HEAD~1 --max-count=3"))
+        .expect("load from a revision");
+    assert_eq!(rows.len(), 3);
+    let error = block_on(load_git_commits(&repository, "--output=/tmp/pwned"))
+        .expect_err("an unlisted option is refused");
+    assert!(error.to_string().contains("--output"), "{error:#}");
+}
