@@ -1851,24 +1851,6 @@ fn evolog_header<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Option<Element<'a, Mes
     let history = &ui.active().history;
     let entry = history.evolog.get(history.selected_version?)?;
     let now = now_millis();
-    let segment = |label: &'static str, mode: EvologDiff, enabled: bool| {
-        let active = history.evolog_diff == mode;
-        ui::text_button(
-            None,
-            label,
-            if active {
-                ui::Variant::Raised
-            } else {
-                ui::Variant::Ghost
-            },
-            ui::Size::Compact,
-            ui.config.ui_font,
-            theme,
-        )
-        .on_press_maybe(enabled.then_some(Message::Action(Action::History(
-            HistoryAction::SetEvologDiff(mode),
-        ))))
-    };
     let has_previous = !entry.predecessor_ids.is_empty();
     let mut meta = row![caption(entry.commit.author.as_str(), theme.subtle_text, ui)]
         .spacing(space::SM)
@@ -1885,14 +1867,34 @@ fn evolog_header<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Option<Element<'a, Mes
             .width(Length::Fill),
         );
     }
-    let mut actions = row![
-        segment(
-            "Changes from previous version",
-            EvologDiff::Previous,
-            has_previous
-        ),
-        segment("Full diff", EvologDiff::Parents, true),
-    ]
+    // The first version has nothing before it, so it can only show its
+    // full diff (which is what it loads).
+    let shown = if has_previous {
+        history.evolog_diff
+    } else {
+        EvologDiff::Parents
+    };
+    let segment = |icon, label, mode: EvologDiff, enabled: bool| crate::toolbar::Segment {
+        icon: Some(icon),
+        label,
+        active: shown == mode,
+        on_press: enabled.then_some(Message::Action(Action::History(
+            HistoryAction::SetEvologDiff(mode),
+        ))),
+    };
+    let mut actions = row![crate::toolbar::segmented(
+        vec![
+            segment(
+                icons::GIT_COMPARE,
+                "Since previous version",
+                EvologDiff::Previous,
+                has_previous,
+            ),
+            segment(icons::FILE_DIFF, "Full diff", EvologDiff::Parents, true),
+        ],
+        ui.config.ui_font,
+        theme,
+    )]
     .spacing(space::XS)
     .align_y(alignment::Vertical::Center);
     if entry.commit.visible {

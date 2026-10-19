@@ -191,79 +191,112 @@ fn bar_style(theme: ThemeSpec) -> container::Style {
     }
 }
 
-/// The Diff ↔ Source view switcher: a segmented control — a recessed well
-/// (window-background fill) holding two tabs, the active one raised as a
-/// bordered pill. Deliberately *not* the bordered-button-group look of the
-/// fetch split button: this switches what the window shows, so it reads as
-/// tabs, not as an action.
+/// The Diff ↔ Source view switcher, a [`segmented`] control. Deliberately
+/// *not* the bordered-button-group look of the fetch split button: this
+/// switches what the window shows, so it reads as tabs, not as an action.
 fn view_switcher(ui: &Diffui, theme: ThemeSpec, font: iced::Font) -> Element<'static, Message> {
+    let segment = |icon: &'static str, label: &'static str, view: MainView| Segment {
+        icon: Some(icon),
+        label,
+        active: ui.active().main_view == view,
+        on_press: Some(Message::Action(Action::SetMainView(view))),
+    };
+    let mut segments = vec![
+        segment(icons::FILE_DIFF, "Diff", MainView::Diff),
+        segment(icons::CODE, "Source", MainView::Source),
+    ];
+    if crate::history_panel::available(ui) {
+        segments.push(segment(icons::HISTORY, "History", MainView::History));
+    }
+    segmented(segments, font, theme)
+}
+
+/// One tab of a [`segmented`] control. No `on_press` disables it.
+pub(crate) struct Segment {
+    pub(crate) icon: Option<&'static str>,
+    pub(crate) label: &'static str,
+    pub(crate) active: bool,
+    pub(crate) on_press: Option<Message>,
+}
+
+/// A segmented control, for switching between views of one thing: a
+/// recessed well (window-background fill) holding the tabs, the active one
+/// raised as a bordered pill.
+pub(crate) fn segmented(
+    segments: Vec<Segment>,
+    font: iced::Font,
+    theme: ThemeSpec,
+) -> Element<'static, Message> {
     // The well is one control step tall; the raised pill sits inside it on
     // an even 2px inset, so its corners stay concentric with the well's.
     const INSET: f32 = 2.0;
     const SEGMENT_HEIGHT: f32 = theme::control::COMPACT - 2.0 * INSET;
-    let segment = |icon: &'static str, label: &str, view: MainView| {
-        let active = ui.active().main_view == view;
+    let segment = |segment: Segment| {
+        let Segment {
+            icon,
+            label,
+            active,
+            on_press,
+        } = segment;
+        let enabled = on_press.is_some();
         let icon_color = if active {
             theme.accent
         } else {
             theme.subtle_text
         };
-        let text_color = if active { theme.text } else { theme.muted_text };
-        button(theme::centered_control_content(
-            row![
-                icons::icon(icon, ui::ICON_SIZE, icon_color),
-                text(label.to_owned())
-                    .size(text_size::UI)
-                    .color(text_color)
-                    .font(font),
-            ]
-            .spacing(6)
-            .align_y(alignment::Vertical::Center),
-        ))
-        .height(Length::Fixed(SEGMENT_HEIGHT))
-        .padding(Padding::from([0.0, 10.0 - INSET]))
-        .on_press(Message::Action(Action::SetMainView(view)))
-        .style(move |_, _| button::Style {
-            // Only the active segment carries a fill — inactive segments
-            // stay quiet even under the cursor; the pointer + label color
-            // are enough affordance inside a two-option control.
-            background: active.then_some(Background::Color(theme.panel_background_elevated)),
-            text_color,
-            border: Border {
-                width: if active { 1.0 } else { 0.0 },
-                color: if active {
-                    theme.border
-                } else {
-                    Color::TRANSPARENT
+        let text_color = if active {
+            theme.text
+        } else if enabled {
+            theme.muted_text
+        } else {
+            theme.subtle_text
+        };
+        let mut content = row![].spacing(6).align_y(alignment::Vertical::Center);
+        if let Some(icon) = icon {
+            content = content.push(icons::icon(icon, ui::ICON_SIZE, icon_color));
+        }
+        content = content.push(text(label).size(text_size::UI).color(text_color).font(font));
+        button(theme::centered_control_content(content))
+            .height(Length::Fixed(SEGMENT_HEIGHT))
+            .padding(Padding::from([0.0, 10.0 - INSET]))
+            .on_press_maybe(on_press)
+            .style(move |_, _| button::Style {
+                // Only the active segment carries a fill — inactive segments
+                // stay quiet even under the cursor; the pointer + label color
+                // are enough affordance inside a two-option control.
+                background: active.then_some(Background::Color(theme.panel_background_elevated)),
+                text_color,
+                border: Border {
+                    width: if active { 1.0 } else { 0.0 },
+                    color: if active {
+                        theme.border
+                    } else {
+                        Color::TRANSPARENT
+                    },
+                    radius: (radius::BUTTON - INSET).into(),
                 },
-                radius: (radius::BUTTON - INSET).into(),
-            },
-            shadow: iced::Shadow::default(),
-            snap: true,
-        })
+                shadow: iced::Shadow::default(),
+                snap: true,
+            })
+            .into()
     };
 
-    let mut segments = row![
-        segment(icons::FILE_DIFF, "Diff", MainView::Diff),
-        segment(icons::CODE, "Source", MainView::Source),
-    ]
-    .spacing(theme::space::XXS)
-    .align_y(alignment::Vertical::Center);
-    if crate::history_panel::available(ui) {
-        segments = segments.push(segment(icons::HISTORY, "History", MainView::History));
-    }
-    container(segments)
-        .padding(INSET)
-        .style(move |_| container::Style {
-            background: Some(Background::Color(well_fill(theme))),
-            border: Border {
-                width: 0.0,
-                color: Color::TRANSPARENT,
-                radius: radius::BUTTON.into(),
-            },
-            ..container::Style::default()
-        })
-        .into()
+    container(
+        iced::widget::Row::with_children(segments.into_iter().map(segment))
+            .spacing(theme::space::XXS)
+            .align_y(alignment::Vertical::Center),
+    )
+    .padding(INSET)
+    .style(move |_| container::Style {
+        background: Some(Background::Color(well_fill(theme))),
+        border: Border {
+            width: 0.0,
+            color: Color::TRANSPARENT,
+            radius: radius::BUTTON.into(),
+        },
+        ..container::Style::default()
+    })
+    .into()
 }
 
 /// A toolbar action: icon + label, invisible at rest with a soft wash on
