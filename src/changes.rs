@@ -17,8 +17,8 @@ use diffui_core::{
     DiffFile, DiffFileStatus, DiffHunkView, DiffSelection, FileSelection, HunkPick, HunkRef,
     LineRef, MutationOp, RevisionSelection, SquashTarget,
 };
-use iced::widget::{Space, column, container, row, text, text_editor};
-use iced::{Element, Length, Padding, Task, alignment};
+use iced::widget::{Space, column, container, text, text_editor};
+use iced::{Element, Length, Padding, Task};
 
 use crate::commands::CommandArg;
 use crate::diff_view::{
@@ -28,6 +28,7 @@ use crate::modes::{ModeKind, TabMode};
 use crate::palette::ResultRef;
 use crate::prose::Prose;
 use crate::theme::{self, ThemeSpec, text_size};
+use crate::typography::{self, Aligned};
 use crate::{
     ConfirmDialog, Diffui, MainView, Message, PendingMutation, TabState, activity, icons, ui,
 };
@@ -1179,39 +1180,57 @@ pub(crate) fn selection_bar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Option<Elem
     let medium = crate::theme::emphasis_font(font, iced::font::Weight::Medium);
 
     let picked = picked_prose(&selection);
-    let (lead_text, lead_icon) = if selecting {
+    // The icon centres on the caps and the runs share a baseline (see
+    // `crate::typography`).
+    let (lead_text, lead_icon): (Vec<Aligned<'a, Message>>, _) = if selecting {
         let status = if selection.is_empty() {
             Prose::from("Nothing selected yet")
         } else {
             picked
         };
         (
-            row![
-                text("Selecting lines")
-                    .size(text_size::UI)
-                    .font(medium)
-                    .color(theme.text),
-                status
-                    .view(font, mono, theme.muted_text, theme)
-                    .size(text_size::UI),
-            ]
-            .spacing(theme::space::MD),
+            vec![
+                Aligned::text(
+                    text("Selecting lines")
+                        .size(text_size::UI)
+                        .font(medium)
+                        .color(theme.text),
+                    medium,
+                    text_size::UI,
+                ),
+                Aligned::gap(theme::space::MD),
+                Aligned::text(
+                    status
+                        .view(font, mono, theme.muted_text, theme)
+                        .size(text_size::UI),
+                    font,
+                    text_size::UI,
+                ),
+            ],
             icons::LIST_CHECKS,
         )
     } else {
         (
-            row![
+            vec![Aligned::text(
                 picked
                     .text(" selected")
                     .view(font, mono, theme.text, theme)
-                    .size(text_size::UI)
-            ],
+                    .size(text_size::UI),
+                font,
+                text_size::UI,
+            )],
             icons::CHECK,
         )
     };
-    let lead = row![icons::icon(lead_icon, ui::ICON_SIZE, theme.info), lead_text]
-        .spacing(theme::space::SM)
-        .align_y(alignment::Vertical::Center);
+    let mut lead_items = vec![
+        Aligned::glyph(
+            icons::icon(lead_icon, ui::ICON_SIZE, theme.info),
+            ui::ICON_SIZE,
+        ),
+        Aligned::gap(theme::space::SM),
+    ];
+    lead_items.extend(lead_text);
+    let lead = typography::baseline_row(lead_items, 0.0);
 
     let mut labels: Vec<(&'static str, ChangesMsg, ui::Variant)> = Vec::new();
     if !selection.is_empty() {
@@ -1263,7 +1282,7 @@ pub(crate) fn selection_bar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Option<Elem
         })
     };
     let mut strip = if one_line {
-        column![ui::button_row(Some(lead.into()), buttons())]
+        column![ui::button_row(Some(lead), buttons())]
     } else {
         column![lead, ui::button_row(None, buttons())]
     }

@@ -32,6 +32,7 @@ use nucleo_matcher::{Config, Matcher, Utf32String};
 use crate::commands::{self, CommandArg, CommandId, PaletteScope};
 use crate::icons;
 use crate::theme::{self, ThemeSpec, text_size};
+use crate::typography::{self, Aligned};
 use crate::{Action, Diffui, Message};
 use diffui_core::RevisionSelection;
 
@@ -993,7 +994,11 @@ fn build_input<'a>(
 
     let mut input = iced::widget::text_input(placeholder, &column_state.query)
         .id(PALETTE_INPUT_ID)
-        .padding(Padding::from([10.0, CONTENT_X - RESULTS_INSET]))
+        .padding(typography::trimmed_padding(
+            Padding::from([10.0, CONTENT_X - RESULTS_INSET]),
+            ui.config.ui_font,
+            text_size::TITLE,
+        ))
         .size(text_size::TITLE)
         .font(ui.config.ui_font)
         .style(move |_, _status| {
@@ -1154,19 +1159,26 @@ fn result_row_body<'a>(
     // cleanly instead of wrapping into the next row or shoving the tail
     // off-screen.
     let tail = |value: String| {
-        text(value)
-            .size(text_size::CAPTION)
-            .font(ui.config.ui_font)
-            .color(muted)
+        Aligned::text(
+            text(value)
+                .size(text_size::CAPTION)
+                .font(ui.config.ui_font)
+                .color(muted),
+            ui.config.ui_font,
+            text_size::CAPTION,
+        )
     };
-    let (lead, label, tail): (Element<'a, Message>, Element<'a, Message>, _) = match item {
+    let (lead, label, tail): (Aligned<'a, Message>, Aligned<'a, Message>, _) = match item {
         ResultRef::WorkingCopy => (
-            glyph_box(
+            Aligned::text(
                 text("@")
                     .size(text_size::BODY)
                     .font(ui.config.mono_font)
                     .color(theme.accent),
-            ),
+                ui.config.mono_font,
+                text_size::BODY,
+            )
+            .map(glyph_box),
             primary_label(ui, primary, "Working copy"),
             tail(String::new()),
         ),
@@ -1184,11 +1196,14 @@ fn result_row_body<'a>(
                 .unwrap_or_default();
             let author = commit.map(|c| c.author().to_owned()).unwrap_or_default();
             (
-                text(prefix)
-                    .size(text_size::BODY)
-                    .font(ui.config.mono_font)
-                    .color(theme.accent)
-                    .into(),
+                Aligned::text(
+                    text(prefix)
+                        .size(text_size::BODY)
+                        .font(ui.config.mono_font)
+                        .color(theme.accent),
+                    ui.config.mono_font,
+                    text_size::BODY,
+                ),
                 primary_label(ui, primary, description),
                 tail(author),
             )
@@ -1209,27 +1224,19 @@ fn result_row_body<'a>(
                 })
                 .unwrap_or_default();
             (
-                glyph_box(icons::icon(
-                    icons::HASH,
-                    GLYPH_ICON_SIZE,
-                    theme.modified_token,
-                )),
+                glyph_icon(icons::HASH, theme.modified_token),
                 mono_primary_label(ui, primary, name.clone()),
                 tail(destination),
             )
         }
         ResultRef::File(path) => (
-            glyph_box(icons::icon(icons::FILE, GLYPH_ICON_SIZE, theme.info)),
+            glyph_icon(icons::FILE, theme.info),
             mono_primary_label(ui, primary, path.clone()),
             // The glyph already says "file".
             tail(String::new()),
         ),
         ResultRef::Command(id) => (
-            glyph_box(icons::icon(
-                icons::CHEVRON_RIGHT,
-                GLYPH_ICON_SIZE,
-                theme.modified_token,
-            )),
+            glyph_icon(icons::CHEVRON_RIGHT, theme.modified_token),
             if root && is_revision_verb(id) {
                 verb_label(ui, theme, id)
             } else {
@@ -1244,16 +1251,18 @@ fn result_row_body<'a>(
             ),
         ),
     };
-    row![
-        lead,
-        Space::new().width(Length::Fixed(GLYPH_GAP)),
-        label,
-        Space::new().width(Length::Fixed(theme::space::MD)),
-        tail,
-    ]
-    .spacing(0)
-    .align_y(alignment::Vertical::Center)
-    .into()
+    // The lead, the label and the hint are different fonts and sizes: they
+    // share a baseline (see `crate::typography`).
+    typography::baseline_row(
+        [
+            lead,
+            Aligned::gap(GLYPH_GAP),
+            label,
+            Aligned::gap(theme::space::MD),
+            tail,
+        ],
+        0.0,
+    )
 }
 
 fn is_revision_verb(id: CommandId) -> bool {
@@ -1262,7 +1271,7 @@ fn is_revision_verb(id: CommandId) -> bool {
 
 /// A top-level revision verb's label: the verb, then the revision it will act
 /// on (the selected one) so a pick never lands somewhere unexpected.
-fn verb_label<'a>(ui: &'a Diffui, theme: ThemeSpec, id: CommandId) -> Element<'a, Message> {
+fn verb_label<'a>(ui: &'a Diffui, theme: ThemeSpec, id: CommandId) -> Aligned<'a, Message> {
     let selection = &ui.active().session.selected_revision;
     let commits = &ui.active().session.commits;
     let row = match selection {
@@ -1281,30 +1290,52 @@ fn verb_label<'a>(ui: &'a Diffui, theme: ThemeSpec, id: CommandId) -> Element<'a
         }
         None => (ui.revision_short_label(selection), String::new()),
     };
-    row![
-        text(command_label(id))
-            .size(text_size::BODY_LG)
-            .font(ui.config.ui_font)
-            .color(theme.text)
-            .wrapping(Wrapping::None),
-        Space::new().width(Length::Fixed(theme::space::SM)),
-        text(target)
-            .size(text_size::BODY)
-            .font(ui.config.mono_font)
-            .color(theme.accent)
-            .wrapping(Wrapping::None),
-        Space::new().width(Length::Fixed(theme::space::SM)),
-        text(summary)
-            .size(text_size::BODY)
-            .font(ui.config.ui_font)
-            .color(theme.subtle_text)
-            .width(Length::Fill)
-            .wrapping(Wrapping::None)
-            .ellipsis(Ellipsis::End),
-    ]
-    .width(Length::Fill)
-    .align_y(alignment::Vertical::Center)
-    .into()
+    let font = ui.config.ui_font;
+    let mono = ui.config.mono_font;
+    typography::group(
+        [
+            Aligned::text(
+                text(command_label(id))
+                    .size(text_size::BODY_LG)
+                    .font(font)
+                    .color(theme.text)
+                    .wrapping(Wrapping::None),
+                font,
+                text_size::BODY_LG,
+            ),
+            Aligned::text(
+                text(target)
+                    .size(text_size::BODY)
+                    .font(mono)
+                    .color(theme.accent)
+                    .wrapping(Wrapping::None),
+                mono,
+                text_size::BODY,
+            ),
+            Aligned::text(
+                text(summary)
+                    .size(text_size::BODY)
+                    .font(font)
+                    .color(theme.subtle_text)
+                    .width(Length::Fill)
+                    .wrapping(Wrapping::None)
+                    .ellipsis(Ellipsis::End),
+                font,
+                text_size::BODY,
+            ),
+        ],
+        theme::space::SM,
+    )
+    .map(|line| container(line).width(Length::Fill).into())
+}
+
+/// A row's leading icon, centred in the [`GLYPH_BOX`] column and on the
+/// label's caps.
+fn glyph_icon<'a>(glyph: &'static str, color: Color) -> Aligned<'a, Message> {
+    Aligned::glyph(
+        glyph_box(icons::icon(glyph, GLYPH_ICON_SIZE, color)),
+        GLYPH_ICON_SIZE,
+    )
 }
 
 /// Center a row's leading glyph in the shared [`GLYPH_BOX`] column.
@@ -1322,15 +1353,18 @@ fn primary_label<'a>(
     ui: &'a Diffui,
     color: Color,
     label: impl Into<String>,
-) -> Element<'a, Message> {
-    text(label.into())
-        .size(text_size::BODY_LG)
-        .font(ui.config.ui_font)
-        .color(color)
-        .width(Length::Fill)
-        .wrapping(Wrapping::None)
-        .ellipsis(Ellipsis::End)
-        .into()
+) -> Aligned<'a, Message> {
+    Aligned::text(
+        text(label.into())
+            .size(text_size::BODY_LG)
+            .font(ui.config.ui_font)
+            .color(color)
+            .width(Length::Fill)
+            .wrapping(Wrapping::None)
+            .ellipsis(Ellipsis::End),
+        ui.config.ui_font,
+        text_size::BODY_LG,
+    )
 }
 
 /// [`primary_label`] in the mono font, a step smaller: mono faces run wide
@@ -1340,15 +1374,18 @@ fn mono_primary_label<'a>(
     ui: &'a Diffui,
     color: Color,
     label: impl Into<String>,
-) -> Element<'a, Message> {
-    text(label.into())
-        .size(text_size::BODY)
-        .font(ui.config.mono_font)
-        .color(color)
-        .width(Length::Fill)
-        .wrapping(Wrapping::None)
-        .ellipsis(Ellipsis::End)
-        .into()
+) -> Aligned<'a, Message> {
+    Aligned::text(
+        text(label.into())
+            .size(text_size::BODY)
+            .font(ui.config.mono_font)
+            .color(color)
+            .width(Length::Fill)
+            .wrapping(Wrapping::None)
+            .ellipsis(Ellipsis::End),
+        ui.config.mono_font,
+        text_size::BODY,
+    )
 }
 
 fn target_label(target: &ResultRef, ui: &Diffui) -> String {

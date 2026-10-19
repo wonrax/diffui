@@ -14,6 +14,7 @@ use crate::revision_list::{
     self, FileRowView, RevisionList, RevisionListStyle, RevisionRowView, RowSelectionKey,
 };
 use crate::theme::{self, ThemeSpec, chip_background, emphasis_font, sidebar_panel_style};
+use crate::typography::{self, Aligned};
 use crate::{Action, Diffui, HoverTarget, LoadStatus, Message, ToolbarMenu, UiEvent};
 use diffui_core::{CommitStore, DiffFile, FileTreeRow, RevisionSelection, RowView, file_tree_rows};
 use std::collections::HashSet;
@@ -792,86 +793,82 @@ const FOOTER_HEIGHT: f32 = theme::control::COMPACT;
 fn build_footer(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     let font = ui.config.mono_font;
     let dim = theme.subtle_text;
+    // Every run sits on one baseline and the arrows centre on the digits'
+    // caps (see `crate::typography`).
+    let label = |value: String, color: Color| {
+        Aligned::text(
+            text(value).size(FOOTER_TEXT_SIZE).font(font).color(color),
+            font,
+            FOOTER_TEXT_SIZE,
+        )
+    };
+    let glyph = |glyph: &'static str, color: Color| {
+        Aligned::glyph(
+            icons::icon(glyph, FOOTER_TEXT_SIZE, color),
+            FOOTER_TEXT_SIZE,
+        )
+    };
 
-    let left: Element<'_, Message> = match &ui.active().session.branch_status {
-        Some(status) => {
-            // Branch glyph + name; the tracked upstream rides along as a tooltip.
-            let name = row![
-                icons::icon(icons::GIT_BRANCH, FOOTER_TEXT_SIZE, dim),
-                text(&status.branch)
-                    .size(FOOTER_TEXT_SIZE)
-                    .font(font)
-                    .color(dim),
-            ]
-            .spacing(5)
-            .align_y(alignment::Vertical::Center);
-            let name: Element<'_, Message> = match &status.upstream {
-                Some(upstream) => {
-                    crate::ui::tooltip(name, upstream, tooltip::Position::Top, font, theme)
+    let mut left: Vec<Aligned<'_, Message>> = Vec::new();
+    if let Some(status) = &ui.active().session.branch_status {
+        // Branch glyph + name; the tracked upstream rides along as a tooltip.
+        let name = typography::group(
+            [
+                glyph(icons::GIT_BRANCH, dim),
+                label(status.branch.clone(), dim),
+            ],
+            5.0,
+        );
+        left.push(match &status.upstream {
+            Some(upstream) => name.map(|name| {
+                crate::ui::tooltip(name, upstream, tooltip::Position::Top, font, theme)
+            }),
+            None => name,
+        });
+        // Ahead/behind only mean something against a tracked upstream.
+        if status.upstream.is_some() {
+            if status.ahead == 0 && status.behind == 0 {
+                left.push(label("in sync".to_owned(), dim));
+            } else {
+                if status.ahead > 0 {
+                    left.push(typography::group(
+                        [
+                            glyph(icons::ARROW_UP, theme.added_text),
+                            label(status.ahead.to_string(), theme.added_text),
+                        ],
+                        1.0,
+                    ));
                 }
-                None => name.into(),
-            };
-
-            let mut group = row![name].spacing(8).align_y(alignment::Vertical::Center);
-            // Ahead/behind only mean something against a tracked upstream.
-            if status.upstream.is_some() {
-                if status.ahead == 0 && status.behind == 0 {
-                    group =
-                        group.push(text("in sync").size(FOOTER_TEXT_SIZE).font(font).color(dim));
-                } else {
-                    if status.ahead > 0 {
-                        group = group.push(
-                            row![
-                                icons::icon(icons::ARROW_UP, FOOTER_TEXT_SIZE, theme.added_text),
-                                text(status.ahead.to_string())
-                                    .size(FOOTER_TEXT_SIZE)
-                                    .font(font)
-                                    .color(theme.added_text),
-                            ]
-                            .spacing(1)
-                            .align_y(alignment::Vertical::Center),
-                        );
-                    }
-                    if status.behind > 0 {
-                        group = group.push(
-                            row![
-                                icons::icon(
-                                    icons::ARROW_DOWN,
-                                    FOOTER_TEXT_SIZE,
-                                    theme.removed_text
-                                ),
-                                text(status.behind.to_string())
-                                    .size(FOOTER_TEXT_SIZE)
-                                    .font(font)
-                                    .color(theme.removed_text),
-                            ]
-                            .spacing(1)
-                            .align_y(alignment::Vertical::Center),
-                        );
-                    }
+                if status.behind > 0 {
+                    left.push(typography::group(
+                        [
+                            glyph(icons::ARROW_DOWN, theme.removed_text),
+                            label(status.behind.to_string(), theme.removed_text),
+                        ],
+                        1.0,
+                    ));
                 }
             }
-            group.into()
         }
-        None => row![].into(),
-    };
+    }
 
     // jj counts changes; git has only commits.
     let noun = match ui.active().repository.as_ref().map(|r| r.vcs) {
         Some(Vcs::Git) => "commits",
         _ => "changes",
     };
-    let right = text(format!(
-        "{} {noun}",
-        thousands(ui.active().session.commits.len())
-    ))
-    .size(FOOTER_TEXT_SIZE)
-    .font(font)
-    .color(dim);
+    let right = label(
+        format!("{} {noun}", thousands(ui.active().session.commits.len())),
+        dim,
+    );
 
-    let bar = row![left, Space::new().width(Length::Fill), right]
-        .align_y(alignment::Vertical::Center)
-        .spacing(8);
+    let bar = row![
+        typography::baseline_row(left, 8.0),
+        Space::new().width(Length::Fill),
+        typography::baseline_row([right], 0.0),
+    ]
+    .align_y(alignment::Vertical::Center)
+    .spacing(8);
 
     // iced's `Border` paints all four edges; draw the hairline top rule as a
     // 1px line above the bar instead.

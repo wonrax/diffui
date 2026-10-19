@@ -34,6 +34,7 @@ use crate::theme::{
     self, ThemeSpec, centered_control_content_fill, chip_background, emphasis_font,
     ghost_button_style, input_style, modal_style, radius, text_size, well_fill,
 };
+use crate::typography::{self, Aligned};
 use crate::ui;
 use crate::{Action, Diffui, HoverTarget, Message, TabId, UiEvent, WindowEvent};
 
@@ -212,26 +213,30 @@ fn tab_widget<'a>(
     let name_color = if active { theme.text } else { theme.muted_text };
     // owner + name as a tight unit (no gap), matching the design's RepoLabel —
     // "code/diffui" reads as one path. The badge and dirty dot get the 6px
-    // rhythm from the outer row instead.
-    let mut repo_label = row![].spacing(0).align_y(alignment::Vertical::Center);
+    // rhythm from the outer row instead. The mono badge and the sans name
+    // share a baseline (see `crate::typography`).
+    let name_font = emphasis_font(ui.config.ui_font, Weight::Medium);
+    let mut repo_label = Vec::new();
     if !tab.owner.is_empty() {
-        repo_label = repo_label.push(
+        repo_label.push(Aligned::text(
             text(format!("{}/", tab.owner))
                 .size(TAB_TEXT_SIZE)
                 .color(theme.subtle_text)
                 .font(ui.config.ui_font),
-        );
+            ui.config.ui_font,
+            TAB_TEXT_SIZE,
+        ));
     }
-    repo_label = repo_label.push(
+    repo_label.push(Aligned::text(
         text(tab.name.as_str())
             .size(TAB_TEXT_SIZE)
             .color(name_color)
-            .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
-    );
+            .font(name_font),
+        name_font,
+        TAB_TEXT_SIZE,
+    ));
 
-    let label = row![badge, repo_label]
-        .spacing(6)
-        .align_y(alignment::Vertical::Center);
+    let label = typography::baseline_row([badge, typography::group(repo_label, 0.0)], 6.0);
     // The dot gives way to the `×` under the cursor, so it can't carry its
     // own tooltip; the label says what the tab is and what the dot means.
     let label = crate::ui::tooltip(
@@ -953,7 +958,7 @@ fn draw_join_fillet(renderer: &mut iced::Renderer, theme: ThemeSpec, tab: Rectan
 
 /// `jj` / `git` badge — a soft colored chip carrying the VCS kind, so a
 /// mixed set of repos reads at a glance.
-fn vcs_badge(vcs: Vcs, theme: ThemeSpec, mono: iced::Font) -> Element<'static, Message> {
+fn vcs_badge(vcs: Vcs, theme: ThemeSpec, mono: iced::Font) -> Aligned<'static, Message> {
     let (label, color) = match vcs {
         // Violet for jj (the trunk/lane hue), warm amber for git — distinct
         // from the diff add/del greens and reds.
@@ -965,23 +970,27 @@ fn vcs_badge(vcs: Vcs, theme: ThemeSpec, mono: iced::Font) -> Element<'static, M
 
 /// `pr` badge for GitHub pull-request tabs — accent-colored so it reads as
 /// "remote" next to the local jj/git chips.
-fn pr_badge(theme: ThemeSpec, mono: iced::Font) -> Element<'static, Message> {
+fn pr_badge(theme: ThemeSpec, mono: iced::Font) -> Aligned<'static, Message> {
     badge_chip("pr", theme.accent, mono)
 }
 
-fn badge_chip(label: &'static str, color: Color, mono: iced::Font) -> Element<'static, Message> {
-    container(text(label).size(text_size::BADGE).color(color).font(mono))
-        .padding(Padding::from([1, 4]))
-        .style(move |_| container::Style {
-            background: Some(Background::Color(chip_background(color))),
-            border: Border {
-                width: 0.0,
-                color: Color::TRANSPARENT,
-                radius: 4.0.into(),
-            },
-            ..container::Style::default()
-        })
-        .into()
+fn badge_chip(label: &'static str, color: Color, mono: iced::Font) -> Aligned<'static, Message> {
+    let padding = typography::trimmed_padding(Padding::from([1, 4]), mono, text_size::BADGE);
+    Aligned::boxed(
+        container(text(label).size(text_size::BADGE).color(color).font(mono))
+            .padding(padding)
+            .style(move |_| container::Style {
+                background: Some(Background::Color(chip_background(color))),
+                border: Border {
+                    width: 0.0,
+                    color: Color::TRANSPARENT,
+                    radius: 4.0.into(),
+                },
+                ..container::Style::default()
+            }),
+        padding,
+        typography::TextBox::default_line(mono, text_size::BADGE),
+    )
 }
 
 /// Small ring signalling the working copy (`@`) has changes. A ring in the
@@ -1152,12 +1161,16 @@ pub(crate) fn open_repo_card<'a>(
 ) -> Element<'a, Message> {
     let input = iced::widget::text_input("Path, owner/repo#123, or PR URL", &dialog.path)
         .id(OPEN_REPO_INPUT_ID)
-        .padding(Padding {
-            top: theme::space::MD,
-            right: theme::space::MD,
-            bottom: theme::space::MD,
-            left: OPEN_CONTENT_X,
-        })
+        .padding(typography::trimmed_padding(
+            Padding {
+                top: theme::space::MD,
+                right: theme::space::MD,
+                bottom: theme::space::MD,
+                left: OPEN_CONTENT_X,
+            },
+            ui.config.mono_font,
+            text_size::BODY_LG,
+        ))
         .size(text_size::BODY_LG)
         .font(ui.config.mono_font)
         .on_input(|path| Message::Ui(UiEvent::OpenRepoPathChanged(path)))
@@ -1378,43 +1391,53 @@ fn folder_row<'a>(
     index: usize,
     selected: bool,
 ) -> Element<'a, Message> {
-    let mut content = row![
-        container(icons::icon(icons::FOLDER, ui::ICON_SIZE, theme.subtle_text))
-            .width(Length::Fixed(OPEN_GLYPH_BOX))
-            .center_x(Length::Fixed(OPEN_GLYPH_BOX)),
-        Space::new().width(Length::Fixed(OPEN_GLYPH_GAP)),
-        text(entry.name.as_str())
-            .size(text_size::BODY)
-            .color(theme.text)
-            .font(ui.config.ui_font)
-            .width(Length::Fill)
-            .wrapping(text::Wrapping::None)
-            .ellipsis(text::Ellipsis::End),
-    ]
-    .align_y(alignment::Vertical::Center);
+    let mut content = vec![
+        Aligned::glyph(
+            container(icons::icon(icons::FOLDER, ui::ICON_SIZE, theme.subtle_text))
+                .width(Length::Fixed(OPEN_GLYPH_BOX))
+                .center_x(Length::Fixed(OPEN_GLYPH_BOX)),
+            ui::ICON_SIZE,
+        ),
+        Aligned::gap(OPEN_GLYPH_GAP),
+        Aligned::text(
+            text(entry.name.as_str())
+                .size(text_size::BODY)
+                .color(theme.text)
+                .font(ui.config.ui_font)
+                .width(Length::Fill)
+                .wrapping(text::Wrapping::None)
+                .ellipsis(text::Ellipsis::End),
+            ui.config.ui_font,
+            text_size::BODY,
+        ),
+    ];
     if let Some(vcs) = entry.vcs {
-        content = content.push(vcs_badge(vcs, theme, ui.config.mono_font));
+        content.push(vcs_badge(vcs, theme, ui.config.mono_font));
     }
 
-    button(content)
-        .width(Length::Fill)
-        .height(Length::Fixed(OPEN_ROW_HEIGHT))
-        .padding(Padding::from([0.0, OPEN_CONTENT_X - OPEN_LIST_INSET]))
-        .on_press(Message::Action(Action::OpenRepoPick(index)))
-        .style(move |_, status| button::Style {
-            background: (selected
-                || matches!(status, button::Status::Hovered | button::Status::Pressed))
-            .then_some(Background::Color(theme.selected_file)),
-            text_color: theme.text,
-            border: Border {
-                width: 0.0,
-                color: Color::TRANSPARENT,
-                radius: radius::CONTROL.into(),
-            },
-            shadow: Default::default(),
-            snap: true,
-        })
-        .into()
+    button(
+        container(typography::baseline_row(content, 0.0))
+            .height(Length::Fill)
+            .center_y(Length::Fill),
+    )
+    .width(Length::Fill)
+    .height(Length::Fixed(OPEN_ROW_HEIGHT))
+    .padding(Padding::from([0.0, OPEN_CONTENT_X - OPEN_LIST_INSET]))
+    .on_press(Message::Action(Action::OpenRepoPick(index)))
+    .style(move |_, status| button::Style {
+        background: (selected
+            || matches!(status, button::Status::Hovered | button::Status::Pressed))
+        .then_some(Background::Color(theme.selected_file)),
+        text_color: theme.text,
+        border: Border {
+            width: 0.0,
+            color: Color::TRANSPARENT,
+            radius: radius::CONTROL.into(),
+        },
+        shadow: Default::default(),
+        snap: true,
+    })
+    .into()
 }
 
 /// One line of the open prompt's recent list, laid out like a palette row:

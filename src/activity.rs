@@ -26,6 +26,7 @@ use crate::prose::Prose;
 use crate::theme::{
     ThemeSpec, chip_background, emphasis_font, ghost_button_style, popover_style, text_size,
 };
+use crate::typography::Aligned;
 use crate::{Action, Diffui, Message, UiEvent};
 use diffui_core::LoadProgress;
 
@@ -638,25 +639,37 @@ pub fn toast_layer(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         // the shared quiet popover chrome so the stack doesn't read as four
         // screaming outlines.
         let body = column![
-            row![
-                // A warning triangle, deliberately not an ✕ — that glyph
-                // reads as a dismiss button, not severity.
-                icons::icon(icons::ALERT_TRIANGLE, 15.0, theme.removed_text),
-                toast
-                    .title
-                    .view(
+            // The glyphs centre on the title's caps (see `crate::typography`).
+            crate::typography::baseline_row(
+                [
+                    // A warning triangle, deliberately not an ✕ — that glyph
+                    // reads as a dismiss button, not severity.
+                    Aligned::glyph(
+                        icons::icon(icons::ALERT_TRIANGLE, 15.0, theme.removed_text),
+                        15.0,
+                    ),
+                    Aligned::text(
+                        toast
+                            .title
+                            .view(
+                                emphasis_font(ui.config.ui_font, Weight::Semibold),
+                                ui.config.mono_font,
+                                theme.removed_text,
+                                theme,
+                            )
+                            .size(text_size::BODY)
+                            .width(Length::Fill),
                         emphasis_font(ui.config.ui_font, Weight::Semibold),
-                        ui.config.mono_font,
-                        theme.removed_text,
-                        theme,
-                    )
-                    .size(text_size::BODY)
-                    .width(Length::Fill),
-                crate::ui::close_button(theme.muted_text, theme)
-                    .on_press(Message::Ui(UiEvent::ToastDismiss(toast.id))),
-            ]
-            .spacing(8)
-            .align_y(alignment::Vertical::Center),
+                        text_size::BODY,
+                    ),
+                    Aligned::glyph(
+                        crate::ui::close_button(theme.muted_text, theme)
+                            .on_press(Message::Ui(UiEvent::ToastDismiss(toast.id))),
+                        crate::ui::CLOSE_SIDE,
+                    ),
+                ],
+                8.0,
+            ),
             toast
                 .detail
                 .view(

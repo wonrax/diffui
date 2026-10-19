@@ -674,7 +674,11 @@ pub(crate) fn build_name_prompt(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Me
 
     let input = text_input("bookmark name", &prompt.value)
         .id(NAME_PROMPT_INPUT_ID)
-        .padding(Padding::from([theme::space::SM, theme::space::MD]))
+        .padding(crate::typography::trimmed_padding(
+            Padding::from([theme::space::SM, theme::space::MD]),
+            mono,
+            text_size::BODY,
+        ))
         .size(text_size::BODY)
         .font(mono)
         .on_input(|value| Message::Action(Action::Bookmark(BookmarkAction::PromptInput(value))))

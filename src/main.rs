@@ -54,6 +54,7 @@ mod tab_bar;
 mod tabs;
 mod theme;
 mod toolbar;
+mod typography;
 mod ui;
 mod update;
 mod width_memo;

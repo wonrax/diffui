@@ -13,6 +13,7 @@ use iced::{Background, Border, Color, Font, Pixels, Point, Rectangle, Shadow, Si
 
 use crate::icons;
 use crate::theme::chip_background;
+use crate::typography::TextBox;
 use crate::width_memo::WidthMemo;
 
 pub const TEXT_SIZE: f32 = crate::theme::text_size::BODY;
@@ -92,6 +93,12 @@ pub fn width_memoized(memo: &WidthMemo, label: &str, icon: Option<&str>, font: F
 
 /// Draw `chip` with its left edge at `x`, vertically centered on `center_y`.
 /// Returns the chip's width so rails can advance to the next chip.
+/// The `center_y` to draw `chip` at so its label's baseline lands on
+/// `baseline_y` — for a chip sitting in a line of text.
+pub fn center_for_baseline(chip: &Chip, baseline_y: f32) -> f32 {
+    TextBox::new(chip.font, TEXT_SIZE, height()).center_for_baseline(baseline_y)
+}
+
 pub fn draw<R>(renderer: &mut R, chip: &Chip, x: f32, center_y: f32, clip: Rectangle) -> f32
 where
     R: text::Renderer + geometry::Renderer,
@@ -174,7 +181,10 @@ where
                 ellipsis: text::Ellipsis::None,
                 hint_factor: None,
             },
-            Point::new(x + PAD_X, rect_mid_y),
+            Point::new(
+                x + PAD_X,
+                rect_mid_y + TextBox::new(icons::ICON_FONT, ICON_SIZE, ICON_SIZE).trim_shift(),
+            ),
             chip.text_color,
             clip,
         );
@@ -197,7 +207,12 @@ where
             ellipsis: text::Ellipsis::None,
             hint_factor: None,
         },
-        Point::new(x + icon_indent + (chip_w - icon_indent) / 2.0, rect_mid_y),
+        // Optically centred: the label's caps, not its line box, sit on the
+        // chip's mid-line (see `crate::typography`).
+        Point::new(
+            x + icon_indent + (chip_w - icon_indent) / 2.0,
+            rect_mid_y + TextBox::new(chip.font, TEXT_SIZE, chip_h).trim_shift(),
+        ),
         chip.text_color,
         clip,
     );

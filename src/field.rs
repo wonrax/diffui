@@ -105,7 +105,11 @@ pub(crate) fn filter_field(
 ) -> Element<'_, Message> {
     let mut input = text_input(spec.placeholder, spec.value)
         .id(spec.id)
-        .padding(Padding::from([6, 9]))
+        .padding(crate::typography::trimmed_padding(
+            Padding::from([6, 9]),
+            font,
+            theme::text_size::UI,
+        ))
         .size(theme::text_size::UI)
         .font(font)
         .width(Length::Fill)

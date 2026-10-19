@@ -109,13 +109,18 @@ pub fn label<'a, Message: 'a>(
     size: Size,
     font: Font,
 ) -> Element<'a, Message> {
-    let label = text(label).size(size.text_size()).font(font);
+    // Optically centred: the control centres the caps, not the line box.
+    let label = crate::typography::centered(
+        text(label).size(size.text_size()).font(font),
+        font,
+        size.text_size(),
+    );
     match icon {
         Some((glyph, color)) => row![icons::icon(glyph, ICON_SIZE, color), label]
             .spacing(ICON_GAP)
             .align_y(alignment::Vertical::Center)
             .into(),
-        None => label.into(),
+        None => label,
     }
 }
 

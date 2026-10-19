@@ -3231,7 +3231,6 @@ impl<'a, Message> DiffView<'a, Message> {
             selection,
             hovered,
         } = at;
-        let center_y = y + self.metrics.row_height / 2.0;
         let value_x = self.rich_value_x(field, bounds);
         let cw = self.metrics.char_width;
         self.draw_header_value_selection(
@@ -3274,9 +3273,17 @@ impl<'a, Message> DiffView<'a, Message> {
             );
         }
         let mut x = value_x + chars.len() as f32 * cw;
+        // Chips sit on the value's baseline, not the row's middle.
+        let baseline = self.code_baseline(y + self.metrics.text_y_pad);
         for chip in &field.chips {
             x += HEADER_CHIP_GAP;
-            chip::draw(renderer, chip, x, center_y, clip);
+            chip::draw(
+                renderer,
+                chip,
+                x,
+                chip::center_for_baseline(chip, baseline),
+                clip,
+            );
             x += chip::width(&chip.label, chip.icon, chip.font);
         }
         for (slot, rect, _) in self.rich_targets(line_index, field, bounds, visible_top) {
@@ -3438,7 +3445,8 @@ impl<'a, Message> DiffView<'a, Message> {
                     );
                     let gap = 6.0;
                     let right_edge = bounds.x + bounds.width - HEADER_HORIZONTAL_PADDING;
-                    let center_y = y + self.metrics.row_height / 2.0;
+                    // The chips' labels sit on the field label's baseline.
+                    let baseline = self.code_baseline(y + self.metrics.text_y_pad);
                     let mut chip_x = value_x;
                     for c in chips {
                         let chip_w = chip::width(&c.label, c.icon, c.font);
@@ -3447,6 +3455,7 @@ impl<'a, Message> DiffView<'a, Message> {
                         if chip_x + chip_w > right_edge {
                             break;
                         }
+                        let center_y = chip::center_for_baseline(c, baseline);
                         chip::draw(renderer, c, chip_x, center_y, clip);
                         chip_x += chip_w + gap;
                     }
@@ -5158,6 +5167,18 @@ impl<Message> DiffView<'_, Message> {
         }
     }
 
+    /// Where the baseline of code text drawn with its line box's top at
+    /// `line_top` lands, so chips and other runs can sit on it.
+    fn code_baseline(&self, line_top: f32) -> f32 {
+        line_top
+            + crate::typography::TextBox::new(
+                self.font,
+                self.typography.size,
+                self.metrics.row_height,
+            )
+            .baseline()
+    }
+
     fn make_text(
         &self,
         content: &str,
@@ -5282,7 +5303,7 @@ impl<Message> DiffView<'_, Message> {
             renderer,
             &status_chip,
             bounds.x + HEADER_HORIZONTAL_PADDING + check_reserve,
-            y + self.metrics.file_header_height / 2.0,
+            chip::center_for_baseline(&status_chip, self.code_baseline(text_y)),
             bounds,
         );
 

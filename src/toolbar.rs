@@ -16,6 +16,7 @@ use crate::icons;
 use crate::repository::Vcs;
 use crate::sidebar;
 use crate::theme::{self, ThemeSpec, chip_background, radius, text_size, well_fill};
+use crate::typography::{self, Aligned, TextBox};
 use crate::ui;
 use crate::{Action, Diffui, FetchTarget, HoverTarget, MainView, Message, ToolbarMenu, UiEvent};
 use diffui_core::RevisionSelection;
@@ -267,7 +268,11 @@ pub(crate) fn segmented(
         if let Some(icon) = icon {
             content = content.push(icons::icon(icon, ui::ICON_SIZE, icon_color));
         }
-        content = content.push(text(label).size(text_size::UI).color(text_color).font(font));
+        content = content.push(crate::typography::centered(
+            text(label).size(text_size::UI).color(text_color).font(font),
+            font,
+            text_size::UI,
+        ));
         button(theme::centered_control_content(content))
             .height(Length::Fixed(SEGMENT_HEIGHT))
             .padding(Padding::from([0.0, 10.0 - INSET]))
@@ -376,21 +381,20 @@ fn browsed_revision_label(ui: &Diffui, theme: ThemeSpec, is_jj: bool) -> Element
         }
     };
 
-    let mut label = row![]
-        .spacing(theme::space::MD)
-        .height(Length::Fixed(CONTROL.height()))
-        .align_y(alignment::Vertical::Center)
-        .padding(Padding::from([0.0, theme::space::XS]));
+    // The chip, the mono id and the sans description share one baseline
+    // (see `crate::typography`).
+    let mut label: Vec<Aligned<'_, Message>> = Vec::new();
 
     if working_copy {
-        label = label.push(
+        let padding = typography::trimmed_padding(Padding::from([1, 6]), mono, text_size::CAPTION);
+        label.push(Aligned::boxed(
             container(
                 text("@ working copy")
                     .size(text_size::CAPTION)
                     .font(mono)
                     .color(theme.accent),
             )
-            .padding(Padding::from([1, 6]))
+            .padding(padding)
             .style(move |_| container::Style {
                 background: Some(Background::Color(chip_background(theme.accent))),
                 border: Border {
@@ -400,7 +404,9 @@ fn browsed_revision_label(ui: &Diffui, theme: ThemeSpec, is_jj: bool) -> Element
                 },
                 ..container::Style::default()
             }),
-        );
+            padding,
+            TextBox::default_line(mono, text_size::CAPTION),
+        ));
     } else {
         let id = match (&revision, commit) {
             (_, Some(row)) if is_jj => {
@@ -412,15 +418,14 @@ fn browsed_revision_label(ui: &Diffui, theme: ThemeSpec, is_jj: bool) -> Element
             }
             (RevisionSelection::WorkingCopy, None) => String::new(),
         };
-        // Same size as the description beside it: iced centers line boxes
-        // rather than aligning baselines, so equal sizes are what keep the
-        // two texts sitting on one line.
-        label = label.push(
+        label.push(Aligned::text(
             text(id)
                 .size(text_size::BODY)
                 .font(mono)
                 .color(theme.muted_text),
-        );
+            mono,
+            text_size::BODY,
+        ));
     }
 
     // Git's working copy is synthesized and its "description" is just the
@@ -432,15 +437,21 @@ fn browsed_revision_label(ui: &Diffui, theme: ThemeSpec, is_jj: bool) -> Element
         } else {
             ("No description".to_owned(), theme.subtle_text)
         };
-        label = label.push(
+        label.push(Aligned::text(
             text(line)
                 .size(text_size::BODY)
                 .font(ui.config.ui_font)
                 .color(color),
-        );
+            ui.config.ui_font,
+            text_size::BODY,
+        ));
     }
 
-    label.into()
+    container(typography::baseline_row(label, theme::space::MD))
+        .height(Length::Fixed(CONTROL.height()))
+        .center_y(Length::Fixed(CONTROL.height()))
+        .padding(Padding::from([0.0, theme::space::XS]))
+        .into()
 }
 
 /// Char-budget ellipsis for the toolbar's description line — the toolbar has

@@ -33,6 +33,7 @@ use crate::icons;
 use crate::measure::{self, LINE_HEIGHT_MULTIPLIER};
 use crate::scrollbar::{self, ScrollbarState, ScrollbarStyle};
 use crate::theme::chip_background;
+use crate::typography::TextBox;
 use crate::width_memo::WidthMemo;
 
 const LINE_SCROLL_ROWS: f32 = 1.5;
@@ -1967,6 +1968,19 @@ impl<'a, Message> RevisionList<'a, Message> {
         );
 
         // === Draw left-side flowing content ===
+        // One baseline for the whole meta line: the ids' caps are centred on
+        // the line, and the author (another font) and the chips join them on
+        // that baseline rather than centring their own boxes.
+        let meta_baseline = TextBox::new(
+            self.style.mono_font,
+            id_size,
+            id_size * LINE_HEIGHT_MULTIPLIER,
+        )
+        .baseline_for_center(title_mid_y);
+        let on_meta_line = |font: Font, size: f32| {
+            TextBox::new(font, size, size * LINE_HEIGHT_MULTIPLIER)
+                .center_for_baseline(meta_baseline)
+        };
         let mut x_cursor = content_left;
         if at_marker {
             fill_text_centered_y(
@@ -2033,7 +2047,7 @@ impl<'a, Message> RevisionList<'a, Message> {
                 renderer,
                 &rev.author,
                 x_cursor,
-                title_mid_y,
+                on_meta_line(self.style.primary_font, id_size),
                 author_draw_w,
                 id_size,
                 col_author,
@@ -2092,7 +2106,8 @@ impl<'a, Message> RevisionList<'a, Message> {
             .zip(bm_widths.iter())
             .take(visible_bookmarks)
         {
-            chip::draw_memoized(renderer, c, widths, chip_x, title_mid_y, row_clip);
+            let center = chip::center_for_baseline(c, meta_baseline);
+            chip::draw_memoized(renderer, c, widths, chip_x, center, row_clip);
             chip_x += bw + chip_gap;
         }
         if overflow_count > 0 {
@@ -2110,13 +2125,14 @@ impl<'a, Message> RevisionList<'a, Message> {
                 &overflow_chip,
                 widths,
                 chip_x,
-                title_mid_y,
+                chip::center_for_baseline(&overflow_chip, meta_baseline),
                 row_clip,
             );
             chip_x += overflow_w + chip_gap;
         }
         for (i, c) in rev.status_chips.iter().enumerate() {
-            chip::draw_memoized(renderer, c, widths, chip_x, title_mid_y, row_clip);
+            let center = chip::center_for_baseline(c, meta_baseline);
+            chip::draw_memoized(renderer, c, widths, chip_x, center, row_clip);
             chip_x += status_widths[i] + chip_gap;
         }
 
@@ -2377,6 +2393,20 @@ impl<'a, Message> RevisionList<'a, Message> {
         // start and its extension (and a compacted `a/b/c` chain its leaf)
         // without bleeding into the +N / -N columns; the full path is on the
         // hover tooltip.
+        // The name's caps are centred on the row; the stats and the status
+        // chip (other sizes and fonts) join it on its baseline.
+        let name_baseline = TextBox::new(
+            self.style.primary_font,
+            FILE_NAME_TEXT_SIZE,
+            FILE_NAME_TEXT_SIZE * LINE_HEIGHT_MULTIPLIER,
+        )
+        .baseline_for_center(row_mid_y);
+        let stats_center = TextBox::new(
+            self.style.primary_font,
+            CAPTION_TEXT_SIZE,
+            CAPTION_TEXT_SIZE * LINE_HEIGHT_MULTIPLIER,
+        )
+        .center_for_baseline(name_baseline);
         fill_text_ellipsized(
             renderer,
             &f.primary,
@@ -2409,7 +2439,7 @@ impl<'a, Message> RevisionList<'a, Message> {
                 &status_chip,
                 widths,
                 chip_left + ((chip_col - chip_w) / 2.0).max(0.0),
-                row_mid_y,
+                chip::center_for_baseline(&status_chip, name_baseline),
                 row_clip,
             );
         }
@@ -2425,7 +2455,7 @@ impl<'a, Message> RevisionList<'a, Message> {
                 renderer,
                 &plus,
                 plus_x + f.additions_width,
-                row_mid_y,
+                stats_center,
                 f.additions_width,
                 CAPTION_TEXT_SIZE,
                 f.additions_text,
@@ -2437,7 +2467,7 @@ impl<'a, Message> RevisionList<'a, Message> {
                 renderer,
                 &minus,
                 minus_x + f.deletions_width,
-                row_mid_y,
+                stats_center,
                 f.deletions_width,
                 CAPTION_TEXT_SIZE,
                 f.deletions_text,
@@ -2729,13 +2759,17 @@ fn fill_text_ellipsized<R: text::Renderer>(
             ellipsis,
             hint_factor: None,
         },
-        Point::new(x, center_y),
+        // Optically centred: the caps, not the line box, sit on `center_y`.
+        Point::new(x, center_y + TextBox::new(font, size, height).trim_shift()),
         color,
         clip,
     );
 }
 
-/// Fill text whose bounds box is centered vertically on `center_y`. We push
+/// Fill text optically centred on `center_y`: its cap box (cap top to
+/// baseline), not its line box, is what's centred — see
+/// [`crate::typography`]. Runs that must share a baseline with another font
+/// or size pass [`TextBox::center_for_baseline`] of that baseline. We push
 /// this through `fill_text` (the `Cached` text path) rather than
 /// `fill_paragraph` because Cached text is the only path where iced applies
 /// `align_y` placement, and it owns its `String` so we don't have to manage
@@ -2771,7 +2805,7 @@ fn fill_text_centered_y<R: text::Renderer>(
             ellipsis: text::Ellipsis::None,
             hint_factor: None,
         },
-        Point::new(x, center_y),
+        Point::new(x, center_y + TextBox::new(font, size, height).trim_shift()),
         color,
         clip,
     );

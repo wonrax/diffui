@@ -37,6 +37,7 @@ use crate::theme::{
     ThemeSpec, chip_background, diff_palette, diff_panel_style, emphasis_font, file_status_color,
     radius, sidebar_panel_style, space, text_size,
 };
+use crate::typography::{self, Aligned};
 use crate::{
     Action, ConfirmDialog, Diffui, MainView, Message, PendingMutation, TabId, activity, icons,
     meta_line, modes::Mode, ui,
@@ -1155,6 +1156,28 @@ fn mono<'a>(value: impl text::IntoFragment<'a>, color: Color, ui: &Diffui) -> te
         .wrapping(text::Wrapping::None)
 }
 
+/// [`mono`], placed on its line's baseline.
+fn mono_on_line<'a>(
+    value: impl text::IntoFragment<'a>,
+    color: Color,
+    ui: &Diffui,
+) -> Aligned<'a, Message> {
+    Aligned::text(
+        mono(value, color, ui),
+        ui.config.mono_font,
+        CAPTION_TEXT_SIZE,
+    )
+}
+
+/// A [`caption`] (or anything at its font and size), placed on its line's
+/// baseline.
+fn caption_on_line<'a>(
+    caption: impl Into<Element<'a, Message>>,
+    ui: &Diffui,
+) -> Aligned<'a, Message> {
+    Aligned::text(caption, ui.config.ui_font, text_size::CAPTION)
+}
+
 /// One displayed op-log row: an operation, or a folded run of snapshots.
 enum OpRow<'a> {
     Op(&'a OperationEntry),
@@ -1220,18 +1243,18 @@ fn op_row<'a>(
     } else {
         theme.muted_text
     };
-    let mut meta = row![mono(op.short_id(), id_color, ui)]
-        .spacing(space::SM)
-        .align_y(alignment::Vertical::Center);
+    let mut meta = vec![mono_on_line(op.short_id(), id_color, ui)];
     if op.is_current {
-        meta = meta.push(chip("current", theme.accent, ui));
+        meta.push(chip("current", theme.accent, ui));
     }
-    meta = meta.push(
+    meta.push(caption_on_line(
         caption(op.user.as_str(), theme.subtle_text, ui)
             .ellipsis(text::Ellipsis::End)
             .width(Length::Fill),
-    );
-    meta = meta.push(caption(age, theme.subtle_text, ui));
+        ui,
+    ));
+    meta.push(caption_on_line(caption(age, theme.subtle_text, ui), ui));
+    let meta = typography::baseline_row(meta, space::SM);
     let title = meta_line::description(
         op.summary(),
         SMALL_TEXT_SIZE,
@@ -1259,31 +1282,31 @@ fn snapshot_row<'a>(
     now: i64,
 ) -> Element<'a, Message> {
     let selected = ui.active().history.selected_op.as_deref() == Some(op.id.as_str());
-    let mut line = row![mono(
+    let mut line = vec![mono_on_line(
         op.short_id(),
         if op.is_current {
             theme.accent
         } else {
             theme.subtle_text
         },
-        ui
-    )]
-    .spacing(space::SM)
-    .height(Length::Fill)
-    .align_y(alignment::Vertical::Center);
+        ui,
+    )];
     if op.is_current {
-        line = line.push(chip("current", theme.accent, ui));
+        line.push(chip("current", theme.accent, ui));
     }
-    line = line.push(
+    line.push(caption_on_line(
         caption(op.summary(), theme.subtle_text, ui)
             .ellipsis(text::Ellipsis::End)
             .width(Length::Fill),
-    );
-    line = line.push(caption(
-        relative_age(op.time_millis, now),
-        theme.subtle_text,
         ui,
     ));
+    line.push(caption_on_line(
+        caption(relative_age(op.time_millis, now), theme.subtle_text, ui),
+        ui,
+    ));
+    let line = container(typography::baseline_row(line, space::SM))
+        .height(Length::Fill)
+        .center_y(Length::Fill);
     button(line)
         .width(Length::Fill)
         .height(card_height(FILE_ROW_HEIGHT))
@@ -1322,19 +1345,27 @@ fn run_row<'a>(
         format!("{from}\u{2013}{to}")
     };
     let header = button(
-        row![
-            icons::icon(chevron, RUN_CHEVRON, theme.subtle_text),
-            caption(
-                format!("{count} working-copy snapshots"),
-                theme.subtle_text,
-                ui
-            )
-            .width(Length::Fill),
-            caption(span, theme.subtle_text, ui),
-        ]
-        .spacing(space::SM)
+        container(typography::baseline_row(
+            [
+                Aligned::glyph(
+                    icons::icon(chevron, RUN_CHEVRON, theme.subtle_text),
+                    RUN_CHEVRON,
+                ),
+                caption_on_line(
+                    caption(
+                        format!("{count} working-copy snapshots"),
+                        theme.subtle_text,
+                        ui,
+                    )
+                    .width(Length::Fill),
+                    ui,
+                ),
+                caption_on_line(caption(span, theme.subtle_text, ui), ui),
+            ],
+            space::SM,
+        ))
         .height(Length::Fill)
-        .align_y(alignment::Vertical::Center),
+        .center_y(Length::Fill),
     )
     .width(Length::Fill)
     .height(card_height(FILE_ROW_HEIGHT))
@@ -1378,7 +1409,7 @@ fn run_row<'a>(
     .into()
 }
 
-fn chip<'a>(label: &'a str, color: Color, ui: &Diffui) -> Element<'a, Message> {
+fn chip<'a>(label: &'a str, color: Color, ui: &Diffui) -> Aligned<'a, Message> {
     meta_line::badge(label, color, ui)
 }
 
@@ -1390,29 +1421,36 @@ fn version_row<'a>(
     now: i64,
 ) -> Element<'a, Message> {
     let selected = ui.active().history.selected_version == Some(index);
-    let mut meta = row![mono(entry.commit.short_commit_id(), theme.muted_text, ui)]
-        .spacing(space::SM)
-        .align_y(alignment::Vertical::Center);
+    let mut meta = vec![mono_on_line(
+        entry.commit.short_commit_id(),
+        theme.muted_text,
+        ui,
+    )];
     if entry.commit.visible {
-        meta = meta.push(chip("current", theme.accent, ui));
+        meta.push(chip("current", theme.accent, ui));
     }
     if entry.commit.empty {
-        meta = meta.push(chip("empty", theme.subtle_text, ui));
+        meta.push(chip("empty", theme.subtle_text, ui));
     }
     let operation = entry.operation.as_ref().map_or_else(
         || "(operation no longer in the log)".to_owned(),
         |op| meta_line::shorten_ids(&op.summary),
     );
-    meta = meta.push(
+    meta.push(caption_on_line(
         caption(operation, theme.subtle_text, ui)
             .ellipsis(text::Ellipsis::End)
             .width(Length::Fill),
-    );
-    meta = meta.push(caption(
-        relative_age(entry.commit.time_millis, now),
-        theme.subtle_text,
         ui,
     ));
+    meta.push(caption_on_line(
+        caption(
+            relative_age(entry.commit.time_millis, now),
+            theme.subtle_text,
+            ui,
+        ),
+        ui,
+    ));
+    let meta = typography::baseline_row(meta, space::SM);
     let summary = if entry.commit.summary.is_empty() {
         "(no description set)"
     } else {
@@ -1610,25 +1648,23 @@ fn commit_line<'a>(
     ui: &'a Diffui,
     theme: ThemeSpec,
     commit: &'a CommitBrief,
-) -> iced::widget::Row<'a, Message> {
+) -> Aligned<'a, Message> {
     let summary = if commit.summary.is_empty() {
         "(no description set)"
     } else {
         commit.summary.as_str()
     };
-    let mut line = row![
-        mono(commit.short_change_id(), theme.accent, ui),
-        mono(commit.short_commit_id(), theme.subtle_text, ui),
-    ]
-    .spacing(space::SM)
-    .align_y(alignment::Vertical::Center);
+    let mut line = vec![
+        mono_on_line(commit.short_change_id(), theme.accent, ui),
+        mono_on_line(commit.short_commit_id(), theme.subtle_text, ui),
+    ];
     if !commit.visible {
-        line = line.push(chip("hidden", theme.subtle_text, ui));
+        line.push(chip("hidden", theme.subtle_text, ui));
     }
     if commit.empty {
-        line = line.push(chip("empty", theme.subtle_text, ui));
+        line.push(chip("empty", theme.subtle_text, ui));
     }
-    line.push(
+    line.push(Aligned::text(
         text(summary)
             .size(text_size::UI)
             .font(ui.config.ui_font)
@@ -1640,7 +1676,10 @@ fn commit_line<'a>(
             .wrapping(text::Wrapping::None)
             .ellipsis(text::Ellipsis::End)
             .width(Length::Fill),
-    )
+        ui.config.ui_font,
+        text_size::UI,
+    ));
+    typography::group(line, space::SM)
 }
 
 fn change_row<'a>(
@@ -1676,9 +1715,16 @@ fn change_row<'a>(
             .into()
     };
     let line = row![
-        container(mono(glyph, color, ui)).width(Length::Fixed(12.0)),
-        commit_line(ui, theme, &change.commit),
-        caption(verb, theme.subtle_text, ui),
+        container(typography::baseline_row(
+            [
+                mono_on_line(glyph, color, ui)
+                    .map(|glyph| container(glyph).width(Length::Fixed(12.0)).into()),
+                commit_line(ui, theme, &change.commit),
+                caption_on_line(caption(verb, theme.subtle_text, ui), ui),
+            ],
+            space::SM,
+        ))
+        .width(Length::Fill),
         open,
     ]
     .spacing(space::SM)

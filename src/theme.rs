@@ -1,5 +1,5 @@
 use iced::{
-    Background, Border, Color, Element, Font, Length, Padding, Shadow, Theme, Vector, border,
+    Background, Border, Color, Element, Font, Length, Shadow, Theme, Vector, border,
     font::{Family, Weight},
     theme,
     widget::{button, container, scrollable, text, text_input},
@@ -446,40 +446,27 @@ pub mod control {
     pub const STANDARD: f32 = 32.0;
 }
 
-/// Centers the visible ink of text and icon-font glyphs inside a fixed-height
-/// control. Their line boxes are mathematically centered but carry a little
-/// more space below the baseline, so a 1px top inset produces a half-point
-/// optical correction without changing the control's measured size.
+/// Centers a control's content in its fixed height. Text inside should be
+/// optically centred itself ([`crate::typography::centered`], which
+/// [`crate::ui::label`] does), so this centres boxes and nothing more.
 pub fn centered_control_content<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
     container(content)
         .height(Length::Fill)
-        .padding(Padding {
-            top: 1.0,
-            right: 0.0,
-            bottom: 0.0,
-            left: 0.0,
-        })
         .center_y(Length::Fill)
         .into()
 }
 
-/// Optical centering for a control whose outer button/container has an
-/// explicit width. Unlike [`centered_control_content`], this intentionally
-/// fills the available width so icon-only controls center horizontally too.
+/// [`centered_control_content`] for a control whose outer button/container
+/// has an explicit width: it fills the width too, so icon-only controls
+/// center horizontally.
 pub fn centered_control_content_fill<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
     container(content)
         .width(Length::Fill)
         .height(Length::Fill)
-        .padding(Padding {
-            top: 1.0,
-            right: 0.0,
-            bottom: 0.0,
-            left: 0.0,
-        })
         .center(Length::Fill)
         .into()
 }
