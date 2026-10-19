@@ -886,6 +886,8 @@ fn activity_row<'a>(
                 },
             }),
         0,
+        // The editor's default line box: 1.3 × its size.
+        text_size::CAPTION * 1.3,
         move |action| Message::Ui(UiEvent::ActivityDetailAction(id, action)),
     ),]
     .spacing(6);

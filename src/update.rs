@@ -1767,9 +1767,6 @@ impl Diffui {
             return Task::none();
         };
         let context = self.key_context();
-        // iced's text editors never capture keys, so the split prompt's
-        // description editors claim plain keys here.
-        let consumed = consumed || self.active().changes.owns_keyboard();
         let Some(id) = self.resolve_chord(context, &chord, consumed) else {
             return Task::none();
         };
@@ -1778,7 +1775,7 @@ impl Diffui {
 
     /// The command a chord names in `context`, falling back to the base context
     /// only where the mode allows it (see [`crate::modes::passes_through`]).
-    fn resolve_chord(
+    pub(crate) fn resolve_chord(
         &self,
         context: Context,
         chord: &Chord,
@@ -4570,6 +4567,7 @@ impl Diffui {
             || self.mode(ModeKind::Confirm).is_some()
             || self.mode(ModeKind::NamePrompt).is_some()
             || self.mode(ModeKind::Shortcuts).is_some()
+            || crate::changes::split_shown(self)
         {
             crate::pointer::suppress(shell)
         } else {
@@ -4585,6 +4583,7 @@ impl Diffui {
             menu::build_overlay(self, theme),
             tab_bar::build_open_repo_dialog(self, theme),
             crate::bookmarks::build_name_prompt(self, theme),
+            crate::changes::split_modal(self, theme),
             tab_bar::build_confirm_dialog(self, theme),
             crate::shortcuts::build_overlay(self, theme),
             activity::toast_layer(self, theme),

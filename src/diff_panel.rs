@@ -1,6 +1,6 @@
 use iced::{
     Background, Border, Color, Element, Length, Padding, alignment,
-    widget::{Space, column, container, mouse_area, row, stack, text, text_editor},
+    widget::{Space, column, container, mouse_area, row, stack, text},
 };
 
 use crate::diff_view::{self, DiffFileView, DiffView, HeaderLine};
@@ -20,7 +20,6 @@ use std::rc::Rc;
 const EMPTY_STATE_TEXT_SIZE: f32 = text_size::BODY_LG;
 pub(crate) const DESCRIPTION_EDITOR_ID: &str = "revision-description-editor";
 const DESCRIPTION_EDITOR_GAP: f32 = 8.0;
-const DESCRIPTION_EDITOR_PADDING_Y: f32 = 10.0;
 pub const DEFAULT_FILE_NAV_WIDTH: f32 = 236.0;
 pub const MIN_FILE_NAV_WIDTH: f32 = 168.0;
 pub const FILE_NAV_PEEK_WIDTH: f32 = 284.0;
@@ -552,60 +551,27 @@ fn build_description_editor<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a,
     {
         let saving = editor.saving_activity.is_some();
         let input_height = description_editor_input_height(ui);
-        let input_padding = Padding::from([DESCRIPTION_EDITOR_PADDING_Y, 12.0]);
-        let mut input = text_editor(&editor.content)
-            .id(iced::widget::Id::new(DESCRIPTION_EDITOR_ID))
-            .key_binding(crate::ui::editor_key_binding)
-            .placeholder(if editor.commit {
-                "Describe the change you are committing…"
-            } else {
-                "Describe this revision…"
-            })
-            .size(ui.config.code_type.size)
-            .font(ui.config.mono_font)
-            .line_height(text::LineHeight::Relative(
-                crate::measure::LINE_HEIGHT_MULTIPLIER,
-            ))
-            .height(Length::Fixed(input_height))
-            .padding(input_padding)
-            .wrapping(text::Wrapping::WordOrGlyph)
-            .style(move |_, _| text_editor::Style {
-                background: Background::Color(theme.background),
-                border: Border {
-                    width: 1.0,
-                    color: theme.border,
-                    radius: crate::theme::radius::CONTROL.into(),
+        let on_action = |action| Message::Ui(UiEvent::DescriptionAction(action));
+        let input = crate::input::multi_line(
+            &editor.content,
+            crate::input::MultiLine {
+                id: Some(DESCRIPTION_EDITOR_ID),
+                placeholder: if editor.commit {
+                    "Describe the change you are committing…"
+                } else {
+                    "Describe this revision…"
                 },
-                placeholder: theme.subtle_text,
-                value: theme.text,
-                selection: Color {
-                    a: 0.28,
-                    ..theme.accent
-                },
-            });
-        if !saving {
-            input = input.on_action(|action| Message::Ui(UiEvent::DescriptionAction(action)));
-        }
-        // Wrapped so double/triple-click drags extend by word/line. Bare while
-        // saving — the editor drops actions then, and the wrapper must too.
-        let input: Element<'_, Message> = if saving {
-            input.into()
-        } else {
-            crate::editor_drag::editor_drag_area(input, input_padding, |action| {
-                Message::Ui(UiEvent::DescriptionAction(action))
-            })
-            .into()
-        };
-
-        let cancel = ui::text_button(
-            None,
-            "Cancel",
-            ui::Variant::Raised,
-            ui::Size::Compact,
-            ui.config.ui_font,
+                font: ui.config.mono_font,
+                size: ui.config.code_type.size,
+                height: input_height,
+            },
             theme,
-        )
-        .on_press_maybe((!saving).then_some(Message::Action(Action::CancelDescription)));
+            // Read-only while saving.
+            (!saving).then_some(on_action),
+        );
+
+        let cancel = ui::cancel_button(ui::Size::Compact, ui.config.ui_font, theme)
+            .on_press_maybe((!saving).then_some(Message::Action(Action::CancelDescription)));
 
         // A commit may keep the description as it stands.
         let save_enabled = !saving && (editor.is_dirty() || editor.commit);
@@ -725,27 +691,20 @@ fn description_editor_input_height(ui: &Diffui) -> f32 {
     } else {
         ui.file_nav_width + 1.0
     };
-    let available_width = (ui.window_size.width
+    let width = (ui.window_size.width
         - history_width
         - files_width
         - 1.0
-        - diff_view::HEADER_HORIZONTAL_PADDING * 2.0
-        - 24.0)
+        - diff_view::HEADER_HORIZONTAL_PADDING * 2.0)
         .max(1.0);
-    // Sized by the same engine that lays the editor out (word-first wrap),
-    // so the box grows exactly with the wrapped text instead of estimating
-    // breaks from a chars-per-line division.
-    let line_height = (ui.config.code_type.size * crate::measure::LINE_HEIGHT_MULTIPLIER).max(1.0);
-    let visual_lines = crate::measure::wrapped_line_count(
+    crate::input::fit_height(
         &editor.text(),
-        ui.config.code_type.size,
         ui.config.mono_font,
-        line_height,
-        available_width,
-    );
-    let natural = (visual_lines as f32 * line_height).ceil() + DESCRIPTION_EDITOR_PADDING_Y * 2.0;
-    let maximum = (ui.window_size.height * 0.35).clamp(120.0, 280.0);
-    natural.clamp(88.0, maximum)
+        ui.config.code_type.size,
+        width,
+        88.0,
+        crate::input::editor_max_height(ui.window_size.height),
+    )
 }
 
 /// Compact stats line shown above the diff scroll area: saturated

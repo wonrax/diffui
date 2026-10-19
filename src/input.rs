@@ -26,8 +26,10 @@ use iced::advanced::{
     Layout, Shell, Widget, layout, mouse, overlay, renderer,
     widget::{Operation, Tree, tree},
 };
-use iced::widget::TextInput;
-use iced::{Element, Event, Font, Length, Point, Rectangle, Size, Theme, Vector};
+use iced::widget::{TextInput, text, text_editor};
+use iced::{Element, Event, Font, Length, Padding, Point, Rectangle, Size, Theme, Vector};
+
+use crate::theme::ThemeSpec;
 
 /// `input` must have been built with `value` and `font` — the wrapper reads
 /// them back from here because the stock widget doesn't expose them.
@@ -220,4 +222,94 @@ impl<'a, Message: Clone + 'a> Widget<Message, Theme, iced::Renderer> for SingleL
 /// The input's own layout inside the wrapper's.
 fn child(layout: Layout<'_>) -> Layout<'_> {
     layout.children().next().expect("the input's layout")
+}
+
+/// Inset of a [`multi_line`] editor's text from its border.
+pub(crate) const EDITOR_PADDING: Padding = Padding {
+    top: 10.0,
+    right: 12.0,
+    bottom: 10.0,
+    left: 12.0,
+};
+
+/// The app's multi-line editor (revision descriptions, the split prompt):
+/// the code font at the code size, word wrap, the input outline, ⌘⏎ left to
+/// the form ([`crate::ui::editor_key_binding`]), and word/line drag selection
+/// ([`crate::editor_drag`]). `on_action` is `None` while the text is being
+/// saved, which leaves the editor read-only.
+pub(crate) fn multi_line<'a, Message: Clone + 'a>(
+    content: &'a text_editor::Content,
+    spec: MultiLine,
+    theme: ThemeSpec,
+    on_action: Option<impl Fn(text_editor::Action) -> Message + Clone + 'a>,
+) -> Element<'a, Message> {
+    let mut editor = text_editor(content)
+        .key_binding(crate::ui::editor_key_binding)
+        .placeholder(spec.placeholder)
+        .size(spec.size)
+        .font(spec.font)
+        .line_height(text::LineHeight::Relative(
+            crate::measure::LINE_HEIGHT_MULTIPLIER,
+        ))
+        .height(Length::Fixed(spec.height))
+        .padding(EDITOR_PADDING)
+        .wrapping(text::Wrapping::WordOrGlyph)
+        .style(move |_, _| editor_style(theme));
+    if let Some(id) = spec.id {
+        editor = editor.id(iced::widget::Id::new(id));
+    }
+    match on_action {
+        Some(on_action) => {
+            editor = editor.on_action(on_action.clone());
+            let line_height = spec.size * crate::measure::LINE_HEIGHT_MULTIPLIER;
+            crate::editor_drag::editor_drag_area(editor, EDITOR_PADDING, line_height, on_action)
+                .into()
+        }
+        None => editor.into(),
+    }
+}
+
+/// What varies between [`multi_line`] editors.
+pub(crate) struct MultiLine {
+    pub id: Option<&'static str>,
+    pub placeholder: &'static str,
+    pub font: Font,
+    pub size: f32,
+    /// Fixed, usually from [`fit_height`] so the box grows with its text.
+    pub height: f32,
+}
+
+/// The height that shows all of `content` wrapped at `width` (the editor's
+/// outer width), between `min` and `max`; past `max` the editor scrolls.
+pub(crate) fn fit_height(
+    content: &str,
+    font: Font,
+    size: f32,
+    width: f32,
+    min: f32,
+    max: f32,
+) -> f32 {
+    let line_height = (size * crate::measure::LINE_HEIGHT_MULTIPLIER).max(1.0);
+    let text_width = (width - EDITOR_PADDING.left - EDITOR_PADDING.right).max(1.0);
+    let lines = crate::measure::wrapped_line_count(content, size, font, line_height, text_width);
+    let natural = (lines as f32 * line_height).ceil() + EDITOR_PADDING.top + EDITOR_PADDING.bottom;
+    natural.clamp(min, max.max(min))
+}
+
+/// The tallest a [`multi_line`] editor grows before it scrolls: room for a
+/// commit message's body, never most of the window.
+pub(crate) fn editor_max_height(window_height: f32) -> f32 {
+    (window_height * 0.45).clamp(160.0, 420.0)
+}
+
+/// The multi-line editor's box: exactly the single-line input's.
+pub(crate) fn editor_style(theme: ThemeSpec) -> text_editor::Style {
+    let input = crate::theme::input_style(theme);
+    text_editor::Style {
+        background: input.background,
+        border: input.border,
+        placeholder: input.placeholder,
+        value: input.value,
+        selection: input.selection,
+    }
 }

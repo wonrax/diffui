@@ -173,6 +173,8 @@ impl Diffui {
     pub(crate) fn key_context(&self) -> Context {
         match self.modes.last() {
             Some(mode) => mode.context(),
+            // The split prompt is a modal over the tab, above its own modes.
+            None if crate::changes::split_shown(self) => Context::Split,
             None => match self.active().modes.last() {
                 Some(mode) => mode.context(),
                 None => Context::Base,

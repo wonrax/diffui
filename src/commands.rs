@@ -50,6 +50,8 @@ pub(crate) enum Context {
     Prompt,
     /// The keyboard-shortcut cheat sheet.
     Shortcuts,
+    /// The split prompt's two description editors.
+    Split,
 }
 
 impl Context {
@@ -66,6 +68,7 @@ impl Context {
         Context::ActivityPopover,
         Context::Prompt,
         Context::Shortcuts,
+        Context::Split,
     ];
 
     /// The name this context goes by in `config.toml`'s `[keys.<name>]`.
@@ -82,6 +85,7 @@ impl Context {
             Context::ActivityPopover => "activity",
             Context::Prompt => "prompt",
             Context::Shortcuts => "shortcuts",
+            Context::Split => "split",
         }
     }
 
@@ -1756,6 +1760,28 @@ pub(crate) static REGISTRY: &[Command] = &[
         mac_chords: &[],
         enabled: always,
         build: |_ui, _arg| Some(Action::CancelDescription),
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "split.confirm",
+        label: "Split",
+        hint: "Split the revision with these descriptions",
+        contexts: &[Context::Split],
+        chords: &["cmd+enter"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::Changes(crate::changes::ChangesMsg::SplitConfirm)),
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "split.cancel",
+        label: "Cancel split",
+        hint: "Close the split prompt",
+        contexts: &[Context::Split],
+        chords: &["esc"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::Changes(crate::changes::ChangesMsg::SplitCancel)),
         palette: PaletteScope::Hidden,
     },
     Command {

@@ -72,8 +72,8 @@ enum Pick {
 pub(crate) struct SplitPrompt {
     revision: RevisionSelection,
     selection: DiffSelection,
-    /// What the prompt is splitting, for its title.
-    title: String,
+    /// What stays and what moves, under the title.
+    summary: Prose,
     original: String,
     first: text_editor::Content,
     second: text_editor::Content,
@@ -90,11 +90,6 @@ pub(crate) struct ChangesState {
 }
 
 impl ChangesState {
-    /// Whether the split prompt's editors are open (and so own plain keys).
-    pub(crate) fn owns_keyboard(&self) -> bool {
-        self.split.is_some()
-    }
-
     /// The picks, if they belong to `revision`.
     fn picks_for(&self, revision: &RevisionSelection) -> Option<&BTreeMap<String, Pick>> {
         (self.revision.as_ref() == Some(revision) && !self.picks.is_empty()).then_some(&self.picks)
@@ -464,9 +459,10 @@ impl Diffui {
                 let Some((revision, selection)) = self.current_selection() else {
                     return Task::none();
                 };
-                let title = format!("Keep {} here, move the rest", selection.summary());
-                self.open_split(revision, selection, title);
-                Task::none()
+                let summary = Prose::from("Keep ")
+                    .then(selection_prose(&selection))
+                    .text(", move the rest to a new change.");
+                self.open_split(revision, selection, summary)
             }
             ChangesMsg::SplitFirstEdited(action) => {
                 if let Some(prompt) = self.active_mut().changes.split.as_mut() {
@@ -547,9 +543,8 @@ impl Diffui {
                 self.open_split(
                     revision,
                     DiffSelection { files: rest },
-                    format!("Move {path} into a new change"),
-                );
-                Task::none()
+                    Prose::from("Move ").path(&path).text(" to a new change."),
+                )
             }
             ChangesMsg::Conflict(message) => self.on_conflict(message),
         }
@@ -600,7 +595,12 @@ impl Diffui {
         }
     }
 
-    fn open_split(&mut self, revision: RevisionSelection, selection: DiffSelection, title: String) {
+    fn open_split(
+        &mut self,
+        revision: RevisionSelection,
+        selection: DiffSelection,
+        summary: Prose,
+    ) -> Task<Message> {
         let tab = self.active_mut();
         let original = tab
             .session
@@ -613,11 +613,12 @@ impl Diffui {
         tab.changes.split = Some(SplitPrompt {
             revision,
             selection,
-            title,
+            summary,
             first: text_editor::Content::with_text(original.trim_end()),
             second: text_editor::Content::with_text(original.trim_end()),
             original,
         });
+        iced::widget::operation::focus(iced::widget::Id::new(SPLIT_FIRST_EDITOR_ID))
     }
 
     /// Target mode for moving `selection` out of `revision`.
@@ -688,10 +689,8 @@ pub(crate) fn selection_bar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Option<Elem
         return None;
     }
     let font = ui.config.ui_font;
-    if let Some(prompt) = tab.changes.split.as_ref()
-        && prompt.revision == tab.session.selected_revision
-    {
-        return Some(floating(split_prompt(ui, prompt, theme), theme));
+    if split_prompt_shown(ui).is_some() {
+        return None;
     }
     let selection = selection_of(tab);
     if selection.is_empty() {
@@ -763,83 +762,121 @@ fn floating<'a>(content: Element<'a, Message>, theme: ThemeSpec) -> Element<'a, 
     .into()
 }
 
-fn split_prompt<'a>(
-    ui: &'a Diffui,
-    prompt: &'a SplitPrompt,
-    theme: ThemeSpec,
-) -> Element<'a, Message> {
-    let font = ui.config.ui_font;
-    let tab = ui.active();
-    let label = revision_label(tab, &prompt.revision);
-    let caption = |content: String| {
-        text(content)
-            .size(text_size::CAPTION)
-            .font(font)
-            .color(theme.muted_text)
-    };
-    let editor = |content: &'a text_editor::Content,
-                  placeholder: &'static str,
-                  on_edit: fn(text_editor::Action) -> ChangesMsg| {
-        text_editor(content)
-            .key_binding(ui::editor_key_binding)
-            .placeholder(placeholder)
-            .size(ui.config.code_type.size)
-            .font(ui.config.mono_font)
-            .height(Length::Fixed(64.0))
-            .padding(Padding::from([6.0, 8.0]))
-            .on_action(move |action| Message::Changes(on_edit(action)))
-    };
-    let actions = row![
-        Space::new().width(Length::Fill),
-        ui::text_button(
-            None,
-            "Cancel",
-            ui::Variant::Ghost,
-            ui::Size::Compact,
-            font,
-            theme
-        )
-        .on_press(Message::Changes(ChangesMsg::SplitCancel)),
-        ui::text_button(
-            None,
-            "Split",
-            ui::Variant::Primary,
-            ui::Size::Compact,
-            font,
-            theme
-        )
-        .on_press(Message::Changes(ChangesMsg::SplitConfirm)),
-    ]
-    .spacing(6)
-    .align_y(alignment::Vertical::Center);
-    column![
-        text(format!("Split {label}: {}", prompt.title))
-            .size(text_size::UI)
-            .font(crate::theme::emphasis_font(
-                font,
-                iced::font::Weight::Medium
-            ))
-            .color(theme.text),
-        caption(format!("Stays in {label} ({})", prompt.selection.summary())),
-        editor(
-            &prompt.first,
-            "Description of the changes that stay",
-            ChangesMsg::SplitFirstEdited
-        ),
-        caption(
-            "Moves to a new change on top (the working copy follows it if it was here)".to_owned()
-        ),
-        editor(
-            &prompt.second,
-            "Description of the new change (empty is fine)",
-            ChangesMsg::SplitSecondEdited
-        ),
-        actions,
-    ]
-    .spacing(6)
-    .width(Length::Fill.max(520))
-    .into()
+pub(crate) const SPLIT_FIRST_EDITOR_ID: &str = "split-first-description";
+const SPLIT_WIDTH: f32 = 560.0;
+
+/// Whether the split prompt is up, and so owns the keyboard and pointer.
+pub(crate) fn split_shown(ui: &Diffui) -> bool {
+    split_prompt_shown(ui).is_some()
 }
+
+/// The split prompt, when it belongs on screen: open, and for the revision
+/// the diff shows.
+fn split_prompt_shown(ui: &Diffui) -> Option<&SplitPrompt> {
+    let tab = ui.active();
+    tab.changes
+        .split
+        .as_ref()
+        .filter(|prompt| editable(tab) && prompt.revision == tab.session.selected_revision)
+}
+
+/// The split prompt as a modal: what stays and what moves, the two
+/// descriptions in the app's editor, and the footer. Empty when closed. A
+/// stray click outside doesn't throw the typed descriptions away; Esc and
+/// Cancel do.
+pub(crate) fn split_modal<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
+    use iced::widget::tooltip::Position;
+    let Some(prompt) = split_prompt_shown(ui) else {
+        return Space::new().into();
+    };
+    let (font, mono) = (ui.config.ui_font, ui.config.mono_font);
+    let label = revision_label(ui.active(), &prompt.revision);
+    let size = ui.config.code_type.size;
+    let width = SPLIT_WIDTH - 2.0 * ui::DIALOG_PADDING;
+    // Two editors share what the window leaves under the card's fixed parts.
+    let max = ((ui.window_size.height - crate::theme::modal_top() - SPLIT_CHROME_HEIGHT) / 2.0)
+        .clamp(88.0, crate::input::editor_max_height(ui.window_size.height));
+    let field = |caption: Prose,
+                 content: &'a text_editor::Content,
+                 id: Option<&'static str>,
+                 placeholder: &'static str,
+                 on_edit: fn(text_editor::Action) -> ChangesMsg| {
+        column![
+            caption
+                .view(font, mono, theme.muted_text, theme)
+                .size(text_size::UI),
+            crate::input::multi_line(
+                content,
+                crate::input::MultiLine {
+                    id,
+                    placeholder,
+                    font: mono,
+                    size,
+                    height: crate::input::fit_height(&content.text(), mono, size, width, 88.0, max),
+                },
+                theme,
+                Some(move |action| Message::Changes(on_edit(action))),
+            ),
+        ]
+        .spacing(crate::theme::space::SM)
+    };
+    let cancel = ui::cancel_button(ui::Size::Standard, font, theme)
+        .on_press(Message::Changes(ChangesMsg::SplitCancel));
+    let split = ui::text_button(
+        None,
+        "Split",
+        ui::Variant::Primary,
+        ui::Size::Standard,
+        font,
+        theme,
+    )
+    .on_press(Message::Changes(ChangesMsg::SplitConfirm));
+
+    let body = column![
+        column![
+            ui::dialog_title(&Prose::from("Split ").rev(label.clone()), font, mono, theme),
+            ui::dialog_text(&prompt.summary, font, mono, theme),
+        ]
+        .spacing(crate::theme::space::SM),
+        field(
+            Prose::from("Stays in ").rev(label),
+            &prompt.first,
+            Some(SPLIT_FIRST_EDITOR_ID),
+            "Description of the changes that stay",
+            ChangesMsg::SplitFirstEdited,
+        ),
+        field(
+            Prose::from("New change on top"),
+            &prompt.second,
+            None,
+            "Description of the new change (empty is fine)",
+            ChangesMsg::SplitSecondEdited,
+        ),
+        ui::button_row(
+            None,
+            [
+                ui::tooltip(cancel, "Esc", Position::Bottom, font, theme),
+                ui::tooltip(split, "\u{2318}\u{21b5}", Position::Bottom, font, theme),
+            ],
+        ),
+    ]
+    .spacing(ui::DIALOG_SPACING);
+
+    ui::modal(
+        ui::dialog_card(body, SPLIT_WIDTH, theme),
+        Message::Ui(crate::UiEvent::ConfirmNoOp),
+        Message::Ui(crate::UiEvent::ConfirmNoOp),
+    )
+}
+
+/// The split card's height without its two editors: insets, title and
+/// summary, the two captions, the footer and the gaps between them.
+const SPLIT_CHROME_HEIGHT: f32 = 2.0 * ui::DIALOG_PADDING
+    + 44.0
+    + 2.0 * 22.0
+    + crate::theme::control::STANDARD
+    + 3.0 * ui::DIALOG_SPACING
+    + crate::theme::space::XXL;
 
 #[cfg(test)]
 mod tests {
@@ -952,6 +989,32 @@ mod tests {
         let mut conflicted = file("c.rs", &[H1]);
         conflicted.status = DiffFileStatus::Conflicted;
         assert!(!hunk_pickable(&conflicted, false));
+    }
+
+    /// The split prompt is a modal: Esc and ⌘⏎ are its own, and plain keys
+    /// type into its editors instead of driving the graph behind it.
+    #[test]
+    fn the_split_prompt_owns_the_keyboard() {
+        use crate::commands::Context;
+        use crate::keymap::Chord;
+        let mut ui = crate::tabs::tests::app();
+        let tab = crate::tabs::tests::push_tab(&mut ui, "/tmp/repo");
+        let state = ui.tab_mut(tab).unwrap();
+        state.session.capabilities.mutate = true;
+        state.session.document.files = vec![file("a.rs", &[H1]), file("b.rs", &[H1])];
+        let _ = ui.open_split(
+            RevisionSelection::WorkingCopy,
+            whole_file("a.rs"),
+            Prose::from("Keep a.rs"),
+        );
+        assert!(split_shown(&ui));
+        let context = ui.key_context();
+        assert_eq!(context, Context::Split);
+        let resolve =
+            |chord: &str| ui.resolve_chord(context, &Chord::parse(chord).expect("a chord"), false);
+        assert_eq!(resolve("esc"), Some("split.cancel"));
+        assert_eq!(resolve("cmd+enter"), Some("split.confirm"));
+        assert_eq!(resolve("j"), None);
     }
 
     #[test]
