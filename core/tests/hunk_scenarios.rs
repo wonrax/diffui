@@ -10,7 +10,7 @@ mod harness;
 
 use diffui_core::repo::{Command, Payload};
 use diffui_core::{
-    ConflictFile, ConflictResolution, DiffSelection, FileSelection, HunkPick, HunkRef,
+    ConflictFile, ConflictResolution, DiffSelection, FileSelection, HunkPick, HunkRef, LineRef,
     MergeToolInvocation, MutationOp, RepoError, RevisionSelection, SquashTarget,
 };
 use harness::{TestRepo, file_at, file_at_or_absent, full_description, scratch_repo, write};
@@ -94,6 +94,7 @@ fn select(
                                 .map(|&index| HunkRef {
                                     index,
                                     header: file.hunks[index].header.clone(),
+                                    lines: None,
                                 })
                                 .collect(),
                         )
@@ -313,6 +314,133 @@ fn restoring_a_hunk_and_a_file_puts_the_parent_content_back() {
     );
 }
 
+/// The selection the diff pane produces when the rows of `path`'s hunk
+/// `hunk` whose text `keep` accepts are picked one by one.
+fn select_lines(
+    repo: &mut TestRepo,
+    revision: &RevisionSelection,
+    path: &str,
+    hunk: usize,
+    keep: impl Fn(&str) -> bool,
+) -> DiffSelection {
+    let document = repo.diff(revision.clone());
+    let file = document
+        .files
+        .iter()
+        .find(|file| file.path == path)
+        .unwrap_or_else(|| panic!("{path} is not in the diff"));
+    let view = &file.hunks[hunk];
+    let lines: Vec<LineRef> = view
+        .lines
+        .iter()
+        .filter(|line| keep(line.content.trim_end()))
+        .filter_map(LineRef::of)
+        .collect();
+    assert!(!lines.is_empty(), "no row matched");
+    DiffSelection {
+        files: vec![FileSelection {
+            path: path.to_owned(),
+            hunks: HunkPick::Hunks(vec![HunkRef {
+                index: hunk,
+                header: view.header.clone(),
+                lines: Some(lines),
+            }]),
+        }],
+    }
+}
+
+/// base: c.txt with three lines in the middle → `@` rewrites them and
+/// appends a line at the end, all in one hunk.
+fn one_hunk_rewrite(name: &str) -> TestRepo {
+    let root = scratch_repo(name);
+    let mut repo = TestRepo::open(&root);
+    write(&root, "c.txt", "top\nold 1\nold 2\nold 3\nbottom\n");
+    commit(&mut repo, "base");
+    write(&root, "c.txt", "top\nnew 1\nnew 2\nnew 3\nbottom\nextra\n");
+    describe_wc(&mut repo, "rewrite");
+    repo
+}
+
+#[test]
+fn split_by_line_keeps_exactly_the_picked_rows() {
+    let mut repo = one_hunk_rewrite("split-lines");
+    // Remove "old 2", add "new 2" and "extra"; leave the rest for later.
+    let selection = select_lines(
+        &mut repo,
+        &RevisionSelection::WorkingCopy,
+        "c.txt",
+        0,
+        |line| matches!(line, "old 2" | "new 2" | "extra"),
+    );
+    assert_eq!(selection.summary(), "3 lines in c.txt");
+    repo.mutate(MutationOp::Split {
+        target: RevisionSelection::WorkingCopy,
+        selection,
+        first_description: None,
+        second_description: "the rest\n".to_owned(),
+    })
+    .expect("split");
+    let first = commit_of(&mut repo, "@-");
+    assert_eq!(
+        file_at(&repo.root, &first, "c.txt"),
+        "top\nold 1\nold 3\nnew 2\nbottom\nextra\n"
+    );
+    // The second half finishes the job: the child's content is unchanged.
+    let wc = commit_of(&mut repo, "@");
+    assert_eq!(
+        file_at(&repo.root, &wc, "c.txt"),
+        "top\nnew 1\nnew 2\nnew 3\nbottom\nextra\n"
+    );
+}
+
+#[test]
+fn restoring_lines_undoes_only_those_rows() {
+    let mut repo = one_hunk_rewrite("restore-lines");
+    // Undo the removal of "old 1" and the addition of "extra".
+    let selection = select_lines(
+        &mut repo,
+        &RevisionSelection::WorkingCopy,
+        "c.txt",
+        0,
+        |line| matches!(line, "old 1" | "extra"),
+    );
+    repo.mutate(MutationOp::RestoreChanges {
+        target: RevisionSelection::WorkingCopy,
+        selection,
+    })
+    .expect("restore");
+    let wc = commit_of(&mut repo, "@");
+    assert_eq!(
+        file_at(&repo.root, &wc, "c.txt"),
+        "top\nold 1\nnew 1\nnew 2\nnew 3\nbottom\n"
+    );
+}
+
+#[test]
+fn a_line_pick_that_no_longer_names_a_changed_line_is_refused() {
+    let mut repo = one_hunk_rewrite("stale-lines");
+    let mut selection = select_lines(
+        &mut repo,
+        &RevisionSelection::WorkingCopy,
+        "c.txt",
+        0,
+        |line| line == "new 1",
+    );
+    // "top" (line 0) is context, not a change.
+    if let HunkPick::Hunks(refs) = &mut selection.files[0].hunks {
+        refs[0].lines = Some(vec![LineRef::Added(0)]);
+    }
+    assert!(
+        repo.mutate(MutationOp::Split {
+            target: RevisionSelection::WorkingCopy,
+            selection,
+            first_description: None,
+            second_description: String::new(),
+        })
+        .is_err()
+    );
+}
+
 #[test]
 fn line_endings_and_missing_final_newlines_survive_a_partial_restore() {
     let root = scratch_repo("restore-eol");
@@ -366,6 +494,7 @@ fn a_selection_made_against_an_older_diff_is_refused() {
     selection.files[0].hunks = HunkPick::Hunks(vec![HunkRef {
         index: 9,
         header: "@@ -1 +1 @@".to_owned(),
+        lines: None,
     }]);
     assert!(
         repo.mutate(MutationOp::SquashChanges {
@@ -484,6 +613,7 @@ fn hunks_of_a_conflicted_file_cannot_be_picked() {
             hunks: HunkPick::Hunks(vec![HunkRef {
                 index: 0,
                 header: "@@ -1,3 +1,3 @@".to_owned(),
+                lines: None,
             }]),
         }],
     };

@@ -186,6 +186,7 @@ impl ChangesState {
                         .map(|(index, hunk)| HunkRef {
                             index,
                             header: hunk.header.clone(),
+                            lines: None,
                         })
                         .collect();
                     if refs.is_empty() {

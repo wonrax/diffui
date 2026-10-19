@@ -21,7 +21,7 @@ use jj_lib::{
 };
 
 use super::mutate::{combined_squash_description, short_change_id};
-use crate::partial::{DiffSelection, HunkPick, apply_hunks, pick_mask, text_hunks};
+use crate::partial::{DiffSelection, HunkMask, HunkPick, apply_lines, pick_mask, text_hunks};
 
 /// A resolved regular file at one side of a hunk-level pick.
 struct PlainFile {
@@ -121,7 +121,10 @@ pub(super) async fn tree_with_selection(
         };
         let hunks = text_hunks(&before_content, &after_content);
         let mask = pick_mask(&file.path, &hunks, refs).map_err(|message| anyhow!(message))?;
-        if mask.iter().all(|&picked| picked) {
+        if mask.iter().all(|hunk| *hunk == HunkMask::Nothing) {
+            continue;
+        }
+        if mask.iter().all(|hunk| *hunk == HunkMask::Everything) {
             // Every hunk: the file's whole value, so a deletion deletes rather
             // than leaving an empty file behind.
             let source = if apply_selected { commit } else { parent };
@@ -132,8 +135,8 @@ pub(super) async fn tree_with_selection(
             builder.set_or_remove(path, value);
             continue;
         }
-        let content = apply_hunks(&before_content, &after_content, &hunks, |index| {
-            mask[index] == apply_selected
+        let content = apply_lines(&before_content, &after_content, &hunks, |index, line| {
+            mask[index].picks(line) == apply_selected
         });
         let id = store
             .write_file(&path, &mut content.as_slice())

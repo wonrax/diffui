@@ -32,7 +32,7 @@ pub use mutations::{
     Destination, DraftKind, DraftSimulation, DraftSource, MergePreview, MutationOp,
     MutationOutcome, OpDraft, PlacementKind, RebasePreview, RebaseSourceMode, SquashTarget,
 };
-pub use partial::{DiffSelection, FileSelection, HunkPick, HunkRef};
+pub use partial::{DiffSelection, FileSelection, HunkPick, HunkRef, LineRef};
 pub use push::{PushAllow, PushCheck, PushRejection, PushRequest, PushTarget, RejectedCommit};
 pub use repo::{
     Capabilities, Command, Event, JobId, OpenSpec, Payload, PreviewRequest, RepoError, RepoHandle,
