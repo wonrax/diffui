@@ -796,24 +796,7 @@ fn build_revision_summary<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, M
         .lines()
         .find(|line| !line.trim().is_empty())
         .unwrap_or("No description");
-    let short_id = details
-        .change_id
-        .as_deref()
-        .unwrap_or(&details.commit_id)
-        .chars()
-        .take(8)
-        .collect::<String>();
-    let author = if details.author.name.is_empty() {
-        "Unknown author"
-    } else {
-        &details.author.name
-    };
-    let timestamp = details.author.timestamp.as_deref().unwrap_or("");
-    let meta = if timestamp.is_empty() {
-        format!("{author}  ·  {short_id}")
-    } else {
-        format!("{author}  ·  {timestamp}  ·  {short_id}")
-    };
+    let meta = revision_meta(ui, details, theme);
 
     // Counts of nothing say nothing; the empty state below says it better.
     let stats: Element<'_, Message> = if session.document.files.is_empty() {
@@ -836,13 +819,9 @@ fn build_revision_summary<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, M
                     theme.text
                 })
                 .wrapping(text::Wrapping::None),
-            text(meta)
-                .size(text_size::CAPTION)
-                .font(ui.config.mono_font)
-                .color(theme.subtle_text)
-                .wrapping(text::Wrapping::None),
+            meta,
         ]
-        .spacing(3)
+        .spacing(crate::theme::space::XS)
         .width(Length::Fill)
     ]
     .clip(true)
@@ -880,6 +859,104 @@ fn build_revision_summary<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, M
             ..Default::default()
         })
         .into()
+}
+
+/// The header's identity line: the change id as the graph draws it (the
+/// shortest unique prefix bright), the commit id dimmed, then the author and
+/// a relative date with the exact one on hover.
+fn revision_meta<'a>(
+    ui: &'a Diffui,
+    details: &'a diffui_core::RevisionDetails,
+    theme: ThemeSpec,
+) -> Element<'a, Message> {
+    use crate::meta_line::{Badge, Id, Meta};
+    use crate::sidebar::{COMMIT_ID_CHARS, REVISION_ID_CHARS, revision_id_display_len};
+
+    let row = ui
+        .active()
+        .session
+        .commits
+        .find_by_commit_id(&details.commit_id);
+    let mut ids = Vec::new();
+    match details.change_id.as_deref() {
+        Some(change_id) => {
+            let unique = row
+                .and_then(|row| row.shortest_change_id_len())
+                .unwrap_or(REVISION_ID_CHARS);
+            let mut id: String = change_id
+                .chars()
+                .take(revision_id_display_len(unique, change_id))
+                .collect();
+            // How jj log addresses one copy of a divergent or hidden change.
+            if let Some(offset) = row.and_then(|row| row.change_offset()) {
+                id.push_str(&format!("/{offset}"));
+            }
+            ids.push(Id {
+                text: id,
+                bright: unique,
+                bright_color: theme.accent,
+                color: theme.subtle_text,
+            });
+            ids.push(Id::plain(
+                details
+                    .commit_id
+                    .chars()
+                    .take(COMMIT_ID_CHARS)
+                    .collect::<String>(),
+                theme.muted_text,
+            ));
+        }
+        // Git commits and PRs have one id: a hash, or the PR number.
+        None => ids.push(Id::plain(
+            details
+                .commit_id
+                .chars()
+                .take(COMMIT_ID_CHARS)
+                .collect::<String>(),
+            theme.muted_text,
+        )),
+    }
+    let mut badges = Vec::new();
+    if row.is_some_and(|row| row.is_hidden()) {
+        badges.push(Badge {
+            label: "hidden",
+            color: theme.subtle_text,
+        });
+    } else if row.is_some_and(|row| row.is_divergent()) {
+        badges.push(Badge {
+            label: "divergent",
+            color: theme.modified_token,
+        });
+    }
+    let author = &details.author;
+    let who = if !author.name.is_empty() {
+        Some((author.name.clone(), Some(author.email.clone())))
+    } else if !author.email.is_empty() {
+        Some((author.email.clone(), None))
+    } else {
+        None
+    };
+    let when = author
+        .timestamp
+        .as_ref()
+        .filter(|timestamp| !timestamp.is_empty())
+        .map(|timestamp| {
+            (
+                diffui_core::history::parse_timestamp_millis(timestamp),
+                timestamp.clone(),
+            )
+        });
+    crate::meta_line::view(
+        Meta {
+            ids,
+            badges,
+            who,
+            when,
+            operation: None,
+        },
+        ui,
+        theme,
+    )
 }
 
 /// The selectable block atop the diff: the description's body and the

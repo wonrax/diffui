@@ -260,6 +260,16 @@ pub fn relative_age(then_millis: i64, now_millis: i64) -> String {
     }
 }
 
+/// Milliseconds since the epoch of a signature timestamp as the backends
+/// render it: `2026-10-18 23:29:51 +0700` (jj, git) or RFC 3339 (GitHub).
+pub fn parse_timestamp_millis(timestamp: &str) -> Option<i64> {
+    let timestamp = timestamp.trim();
+    chrono::DateTime::parse_from_str(timestamp, "%Y-%m-%d %H:%M:%S %z")
+        .or_else(|_| chrono::DateTime::parse_from_rfc3339(timestamp))
+        .ok()
+        .map(|time| time.timestamp_millis())
+}
+
 /// Milliseconds since the epoch, for [`relative_age`].
 pub fn now_millis() -> i64 {
     std::time::SystemTime::now()
@@ -290,6 +300,22 @@ pub fn file_history_revset(revision_symbol: &str, path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signature_timestamps_parse_from_every_backend() {
+        // 2026-10-18 16:29:51 UTC.
+        let utc = 1_792_340_991_000;
+        assert_eq!(
+            parse_timestamp_millis("2026-10-18 23:29:51 +0700"),
+            Some(utc)
+        );
+        assert_eq!(parse_timestamp_millis("2026-10-18T16:29:51Z"), Some(utc));
+        assert_eq!(
+            parse_timestamp_millis("2026-10-18T09:29:51-07:00"),
+            Some(utc)
+        );
+        assert_eq!(parse_timestamp_millis("yesterday"), None);
+    }
 
     #[test]
     fn ages_round_down_to_the_coarsest_unit() {
