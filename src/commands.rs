@@ -50,6 +50,8 @@ pub(crate) enum Context {
     Prompt,
     /// The keyboard-shortcut cheat sheet.
     Shortcuts,
+    /// Line-select mode in the diff pane.
+    Lines,
 }
 
 impl Context {
@@ -66,6 +68,7 @@ impl Context {
         Context::ActivityPopover,
         Context::Prompt,
         Context::Shortcuts,
+        Context::Lines,
     ];
 
     /// The name this context goes by in `config.toml`'s `[keys.<name>]`.
@@ -82,6 +85,7 @@ impl Context {
             Context::ActivityPopover => "activity",
             Context::Prompt => "prompt",
             Context::Shortcuts => "shortcuts",
+            Context::Lines => "lines",
         }
     }
 
@@ -256,6 +260,10 @@ impl Command {
 }
 
 // ── Shared predicates ───────────────────────────────────────────────────────
+
+fn lines_action(message: crate::changes::LineMsg) -> Action {
+    Action::Changes(crate::changes::ChangesMsg::Lines(message))
+}
 
 fn always(_: &Diffui, _: &CommandArg) -> bool {
     true
@@ -1944,6 +1952,103 @@ pub(crate) static REGISTRY: &[Command] = &[
         enabled: |ui, _arg| crate::changes::has_selection(ui),
         build: |_ui, _arg| Some(Action::Changes(crate::changes::ChangesMsg::Clear)),
         palette: PaletteScope::Root,
+    },
+    Command {
+        id: "lines.toggle",
+        label: "Select lines",
+        hint: "Pick single changed lines to split, squash, move or discard",
+        contexts: &[Context::Base, Context::Lines],
+        chords: &["v"],
+        mac_chords: &[],
+        enabled: |ui, _arg| crate::changes::can_select_lines(ui),
+        build: |_ui, _arg| Some(lines_action(crate::changes::LineMsg::Toggle)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "lines.exit",
+        label: "Stop selecting lines",
+        hint: "Leave line-select mode; the picked lines stay picked",
+        contexts: &[Context::Lines],
+        chords: &["esc"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(lines_action(crate::changes::LineMsg::Exit)),
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "lines.next",
+        label: "Next changed line",
+        hint: "Move the line cursor down",
+        contexts: &[Context::Lines],
+        chords: &["j", "down"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| {
+            Some(lines_action(crate::changes::LineMsg::Step {
+                by: 1,
+                extend: false,
+            }))
+        },
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "lines.previous",
+        label: "Previous changed line",
+        hint: "Move the line cursor up",
+        contexts: &[Context::Lines],
+        chords: &["k", "up"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| {
+            Some(lines_action(crate::changes::LineMsg::Step {
+                by: -1,
+                extend: false,
+            }))
+        },
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "lines.extend-next",
+        label: "Extend the pick down",
+        hint: "Move down and give that line the same pick",
+        contexts: &[Context::Lines],
+        chords: &["J", "shift+down"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| {
+            Some(lines_action(crate::changes::LineMsg::Step {
+                by: 1,
+                extend: true,
+            }))
+        },
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "lines.extend-previous",
+        label: "Extend the pick up",
+        hint: "Move up and give that line the same pick",
+        contexts: &[Context::Lines],
+        chords: &["K", "shift+up"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| {
+            Some(lines_action(crate::changes::LineMsg::Step {
+                by: -1,
+                extend: true,
+            }))
+        },
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "lines.toggle-line",
+        label: "Pick or unpick line",
+        hint: "Toggle the line under the cursor",
+        contexts: &[Context::Lines],
+        chords: &["space"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(lines_action(crate::changes::LineMsg::ToggleCursor)),
+        palette: PaletteScope::Hidden,
     },
     Command {
         id: "file.restore",

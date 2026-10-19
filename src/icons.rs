@@ -119,3 +119,4 @@ pub const ARROW_RIGHT: &str = "\u{e049}"; // arrow-right
 pub const ARROW_LEFT_RIGHT: &str = "\u{e24a}"; // arrow-left-right
 pub const GIT_COMPARE: &str = "\u{e359}"; // git-compare
 pub const UNFOLD_VERTICAL: &str = "\u{e43e}"; // unfold-vertical
+pub const LIST_CHECKS: &str = "\u{e1d0}"; // list-checks

@@ -29,6 +29,7 @@ const SECTIONS: &[(Context, &str)] = &[
         Context::Draft,
         "Target mode (rebase / squash / merge / new / duplicate)",
     ),
+    (Context::Lines, "Line selection"),
     (Context::Palette, "Command palette"),
     (Context::Find, "Find in diff"),
     (Context::Description, "Description editor"),
@@ -50,6 +51,7 @@ const BASE_GROUPS: &[(&str, &[&str])] = &[
         &[
             "file.",
             "changes.",
+            "lines.",
             "conflict.",
             "find.",
             "view.",

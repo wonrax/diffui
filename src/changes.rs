@@ -1,11 +1,12 @@
-//! Partial changes in the diff pane: picking files and hunks with checkboxes
-//! and acting on the pick — split, squash into the parent, move into a
-//! picked revision, discard.
+//! Partial changes in the diff pane: picking files and hunks with checkboxes,
+//! single lines in line-select mode, and acting on the pick — split, squash
+//! into the parent, move into a picked revision, discard.
 //!
 //! The pick lives per tab and belongs to the revision it was made in; showing
-//! another revision drops it. Hunks are remembered by their header, so a
-//! reload that leaves a hunk where it was keeps it picked, and one that moves
-//! it silently unpicks it (the backend refuses stale headers either way).
+//! another revision drops it. Hunks are remembered by their header and lines
+//! by their line numbers, so a reload that leaves a hunk where it was keeps it
+//! picked, and one that moves it silently unpicks it (the backend refuses
+//! stale headers and lines either way).
 //!
 //! Everything lands as an ordinary [`MutationOp`] through the same activity /
 //! immutable-guard pipeline every other mutation uses.
@@ -13,14 +14,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use diffui_core::{
-    DiffFile, DiffFileStatus, DiffSelection, FileSelection, HunkPick, HunkRef, MutationOp,
-    RevisionSelection, SquashTarget,
+    DiffFile, DiffFileStatus, DiffHunkView, DiffSelection, FileSelection, HunkPick, HunkRef,
+    LineRef, MutationOp, RevisionSelection, SquashTarget,
 };
 use iced::widget::{Space, column, container, row, text, text_editor};
 use iced::{Element, Length, Padding, Task, alignment};
 
 use crate::commands::CommandArg;
-use crate::diff_view::{ChangeMarks, CheckState, FileMark, HunkMarks};
+use crate::diff_view::{
+    ChangeMarks, CheckState, FileMark, HunkMark, HunkMarks, LineAt, LineMode, LinePress,
+};
+use crate::modes::{ModeKind, TabMode};
 use crate::palette::ResultRef;
 use crate::theme::{ThemeSpec, text_size};
 use crate::{
@@ -34,6 +38,8 @@ pub(crate) enum ChangesMsg {
     ToggleFile(usize),
     /// Toggle one hunk: `(file, hunk)` document indices.
     ToggleHunk(usize, usize),
+    /// Line-select mode — see [`LineMsg`].
+    Lines(LineMsg),
     /// Toggle a changed-files tree row (display index); a directory toggles
     /// every file under it.
     ToggleTreeRow(usize),
@@ -58,12 +64,88 @@ pub(crate) enum ChangesMsg {
     Conflict(crate::conflicts::ConflictMsg),
 }
 
+/// An intent of line-select mode.
+#[derive(Debug, Clone)]
+pub(crate) enum LineMsg {
+    /// Enter the mode, or leave it if it is on.
+    Toggle,
+    Exit,
+    /// Move the line cursor to the next (`1`) or previous (`-1`) pickable
+    /// line; `extend` gives the line it lands on the anchor's state.
+    Step {
+        by: isize,
+        extend: bool,
+    },
+    /// Toggle the line under the cursor.
+    ToggleCursor,
+    /// A press on a changed line.
+    Press(LinePress),
+    /// A drag from the pressed line onto this one.
+    Paint(LineAt),
+}
+
 /// One file's pick.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Pick {
     Whole,
-    /// Hunk headers.
-    Hunks(BTreeSet<String>),
+    /// Picked hunks by header. Never empty, and never every hunk with
+    /// [`HunkLines::All`] (that is [`Pick::Whole`]).
+    Hunks(BTreeMap<String, HunkLines>),
+}
+
+/// How much of a picked hunk is picked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HunkLines {
+    All,
+    /// Some of its changed lines: never none, never all.
+    Only(BTreeSet<LineRef>),
+}
+
+/// The changed lines of `hunk`, with their row index in it.
+fn changed_lines(hunk: &DiffHunkView) -> impl Iterator<Item = (usize, LineRef)> + '_ {
+    hunk.lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| LineRef::of(line).map(|line| (index, line)))
+}
+
+/// Line-select mode: changed lines become pickable one by one. A
+/// [`crate::modes::TabMode`], so it owns j/k/space/esc while it is on.
+#[derive(Debug, Clone)]
+pub(crate) struct LineSelect {
+    /// The revision it was entered in; the mode is dead once another one
+    /// shows.
+    revision: RevisionSelection,
+    /// The document the cursor and anchor index into; a reload drops them.
+    document: u64,
+    /// The keyboard's line.
+    cursor: Option<LineAt>,
+    /// Where the last click or toggle happened: shift-click and drags
+    /// extend from here.
+    anchor: Option<LineAt>,
+    /// What the last click or toggle set its line to, and so what a range
+    /// from the anchor sets.
+    paint: bool,
+    /// The range only takes lines of the anchor's kind (a side-by-side press
+    /// lands in one column).
+    one_side: bool,
+    /// Bumped when the cursor moves by keyboard: the diff view scrolls it
+    /// into view.
+    reveal: u64,
+}
+
+impl LineSelect {
+    pub(crate) fn new(revision: RevisionSelection, document: u64) -> Self {
+        Self {
+            revision,
+            document,
+            cursor: None,
+            anchor: None,
+            paint: true,
+            one_side: false,
+            reveal: 0,
+        }
+    }
 }
 
 /// The split prompt: which selection, and the two descriptions.
@@ -108,39 +190,190 @@ impl ChangesState {
         &mut self.picks
     }
 
+    /// Toggle a file whole: picked whole goes to none, anything else
+    /// (including a partial pick) to whole.
     fn toggle_file(&mut self, revision: &RevisionSelection, file: &DiffFile) {
         let picks = self.picks_mut(revision);
-        if picks.remove(&file.path).is_none() {
+        if picks.remove(&file.path) != Some(Pick::Whole) {
             picks.insert(file.path.clone(), Pick::Whole);
         }
     }
 
-    /// Toggle one hunk. A file whose every hunk ends up picked is picked
-    /// whole; one with none left is dropped.
+    /// Toggle one hunk: picked whole goes to none, anything else to whole. A
+    /// file whose every hunk ends up picked is picked whole; one with none
+    /// left is dropped.
     fn toggle_hunk(&mut self, revision: &RevisionSelection, file: &DiffFile, hunk: usize) {
-        let Some(header) = file.hunks.get(hunk).map(|hunk| hunk.header.clone()) else {
+        let Some(view) = file.hunks.get(hunk) else {
             return;
         };
-        let all: BTreeSet<String> = file.hunks.iter().map(|hunk| hunk.header.clone()).collect();
+        let lines: Vec<LineRef> = changed_lines(view).map(|(_, line)| line).collect();
+        let picked = self.hunk_state(revision, file, hunk) == CheckState::On;
+        self.set_lines(revision, file, hunk, &lines, !picked);
+    }
+
+    /// How much of hunk `hunk` of `file` is picked.
+    fn hunk_state(&self, revision: &RevisionSelection, file: &DiffFile, hunk: usize) -> CheckState {
+        let Some(header) = file.hunks.get(hunk).map(|hunk| &hunk.header) else {
+            return CheckState::Off;
+        };
+        match self
+            .picks_for(revision)
+            .and_then(|picks| picks.get(&file.path))
+        {
+            None => CheckState::Off,
+            Some(Pick::Whole) => CheckState::On,
+            Some(Pick::Hunks(hunks)) => match hunks.get(header) {
+                None => CheckState::Off,
+                Some(HunkLines::All) => CheckState::On,
+                Some(HunkLines::Only(_)) => CheckState::Partial,
+            },
+        }
+    }
+
+    /// Whether changed line `line` of hunk `hunk` is picked.
+    fn line_picked(
+        &self,
+        revision: &RevisionSelection,
+        file: &DiffFile,
+        hunk: usize,
+        line: LineRef,
+    ) -> bool {
+        let Some(header) = file.hunks.get(hunk).map(|hunk| &hunk.header) else {
+            return false;
+        };
+        match self
+            .picks_for(revision)
+            .and_then(|picks| picks.get(&file.path))
+        {
+            None => false,
+            Some(Pick::Whole) => true,
+            Some(Pick::Hunks(hunks)) => match hunks.get(header) {
+                None => false,
+                Some(HunkLines::All) => true,
+                Some(HunkLines::Only(lines)) => lines.contains(&line),
+            },
+        }
+    }
+
+    /// Pick (or unpick) `lines` of hunk `hunk`, keeping the pick in its
+    /// normal form: a hunk with every changed line picked is picked whole,
+    /// a file with every hunk picked whole is picked whole, and empty picks
+    /// are dropped.
+    fn set_lines(
+        &mut self,
+        revision: &RevisionSelection,
+        file: &DiffFile,
+        hunk: usize,
+        lines: &[LineRef],
+        picked: bool,
+    ) {
+        let Some(view) = file.hunks.get(hunk) else {
+            return;
+        };
+        let changed: BTreeSet<LineRef> = changed_lines(view).map(|(_, line)| line).collect();
         let picks = self.picks_mut(revision);
-        let mut headers = match picks.remove(&file.path) {
-            None => BTreeSet::new(),
-            Some(Pick::Whole) => all.clone(),
-            Some(Pick::Hunks(headers)) => headers,
+        let mut hunks = match picks.remove(&file.path) {
+            None => BTreeMap::new(),
+            Some(Pick::Whole) => file
+                .hunks
+                .iter()
+                .map(|hunk| (hunk.header.clone(), HunkLines::All))
+                .collect(),
+            Some(Pick::Hunks(hunks)) => hunks,
         };
-        if !headers.remove(&header) {
-            headers.insert(header);
+        let mut set = match hunks.remove(&view.header) {
+            None => BTreeSet::new(),
+            Some(HunkLines::All) => changed.clone(),
+            Some(HunkLines::Only(set)) => set,
+        };
+        for line in lines.iter().filter(|line| changed.contains(line)) {
+            if picked {
+                set.insert(*line);
+            } else {
+                set.remove(line);
+            }
         }
-        headers.retain(|header| all.contains(header));
-        if headers.is_empty() {
+        if set == changed && !changed.is_empty() {
+            hunks.insert(view.header.clone(), HunkLines::All);
+        } else if !set.is_empty() {
+            hunks.insert(view.header.clone(), HunkLines::Only(set));
+        }
+        hunks.retain(|header, _| file.hunks.iter().any(|hunk| hunk.header == *header));
+        if hunks.is_empty() {
             return;
         }
-        let pick = if headers == all {
+        let whole = file
+            .hunks
+            .iter()
+            .all(|hunk| hunks.get(&hunk.header) == Some(&HunkLines::All));
+        let pick = if whole {
             Pick::Whole
         } else {
-            Pick::Hunks(headers)
+            Pick::Hunks(hunks)
         };
         picks.insert(file.path.clone(), pick);
+    }
+
+    /// Whether the changed line at `at` is picked.
+    fn picked_at(&self, revision: &RevisionSelection, files: &[DiffFile], at: LineAt) -> bool {
+        let Some(file) = files.get(at.file) else {
+            return false;
+        };
+        line_ref_at(files, at).is_some_and(|line| self.line_picked(revision, file, at.hunk, line))
+    }
+
+    /// Flip the changed line at `at`; returns whether it is picked now.
+    fn toggle_line(
+        &mut self,
+        revision: &RevisionSelection,
+        files: &[DiffFile],
+        at: LineAt,
+    ) -> bool {
+        let (Some(file), Some(line)) = (files.get(at.file), line_ref_at(files, at)) else {
+            return false;
+        };
+        let picked = !self.line_picked(revision, file, at.hunk, line);
+        self.set_lines(revision, file, at.hunk, &[line], picked);
+        picked
+    }
+
+    /// Set every changed line from `anchor` to `to` (one file, either
+    /// direction) to `picked`. `one_side` keeps to the anchor's kind of line:
+    /// a side-by-side drag down the old column leaves the new one alone.
+    fn paint_range(
+        &mut self,
+        revision: &RevisionSelection,
+        files: &[DiffFile],
+        anchor: LineAt,
+        to: LineAt,
+        picked: bool,
+        one_side: bool,
+    ) {
+        let Some(file) = files.get(anchor.file).filter(|_| anchor.file == to.file) else {
+            return;
+        };
+        let side = line_ref_at(files, anchor).map(|line| matches!(line, LineRef::Added(_)));
+        let (from, to) = (anchor.min(to), anchor.max(to));
+        for hunk in from.hunk..=to.hunk {
+            let Some(view) = file.hunks.get(hunk) else {
+                continue;
+            };
+            let lines: Vec<LineRef> = changed_lines(view)
+                .filter(|(index, _)| {
+                    let at = LineAt {
+                        file: anchor.file,
+                        hunk,
+                        line: *index,
+                    };
+                    from <= at && at <= to
+                })
+                .map(|(_, line)| line)
+                .filter(|line| !one_side || side == Some(matches!(line, LineRef::Added(_))))
+                .collect();
+            if !lines.is_empty() {
+                self.set_lines(revision, file, hunk, &lines, picked);
+            }
+        }
     }
 
     /// Toggle every file under `prefix` (`"dir/"`): all picked whole goes
@@ -177,16 +410,32 @@ impl ChangesState {
             };
             let hunks = match pick {
                 Pick::Whole => HunkPick::All,
-                Pick::Hunks(headers) => {
+                Pick::Hunks(hunks) => {
                     let refs: Vec<HunkRef> = file
                         .hunks
                         .iter()
                         .enumerate()
-                        .filter(|(_, hunk)| headers.contains(&hunk.header))
-                        .map(|(index, hunk)| HunkRef {
-                            index,
-                            header: hunk.header.clone(),
-                            lines: None,
+                        .filter_map(|(index, hunk)| {
+                            let lines = match hunks.get(&hunk.header)? {
+                                HunkLines::All => None,
+                                HunkLines::Only(set) => {
+                                    // Lines a reload took out of the hunk
+                                    // are no longer picked.
+                                    let lines: Vec<LineRef> = changed_lines(hunk)
+                                        .map(|(_, line)| line)
+                                        .filter(|line| set.contains(line))
+                                        .collect();
+                                    if lines.is_empty() {
+                                        return None;
+                                    }
+                                    Some(lines)
+                                }
+                            };
+                            Some(HunkRef {
+                                index,
+                                header: hunk.header.clone(),
+                                lines,
+                            })
                         })
                         .collect();
                     if refs.is_empty() {
@@ -228,20 +477,108 @@ fn hunk_pickable(file: &DiffFile, conflicted: bool) -> bool {
             .all(|hunk| hunk.header.starts_with("@@") && !hunk.lines.is_empty())
 }
 
+/// The changed line a document position names.
+fn line_ref_at(files: &[DiffFile], at: LineAt) -> Option<LineRef> {
+    LineRef::of(files.get(at.file)?.hunks.get(at.hunk)?.lines.get(at.line)?)
+}
+
+/// The pickable changed line `by` steps (±1) from `from` in document
+/// order. Without a cursor, the first one at or after the start of
+/// `selected_file`.
+fn step_line(
+    files: &[DiffFile],
+    pickable: &dyn Fn(usize) -> bool,
+    from: Option<LineAt>,
+    selected_file: usize,
+    by: isize,
+) -> Option<LineAt> {
+    let forward = by >= 0 || from.is_none();
+    let start = from.unwrap_or(LineAt {
+        file: selected_file.min(files.len().saturating_sub(1)),
+        hunk: 0,
+        line: 0,
+    });
+    let changed = |at: LineAt| pickable(at.file) && line_ref_at(files, at).is_some();
+    if from.is_none() && changed(start) {
+        return Some(start);
+    }
+    let mut at = start;
+    loop {
+        at = if forward {
+            next_position(files, at)?
+        } else {
+            previous_position(files, at)?
+        };
+        if changed(at) {
+            return Some(at);
+        }
+    }
+}
+
+/// The diff row after `at`, across hunks and files.
+fn next_position(files: &[DiffFile], at: LineAt) -> Option<LineAt> {
+    let (mut file, mut hunk, mut line) = (at.file, at.hunk, at.line + 1);
+    loop {
+        let hunks = &files.get(file)?.hunks;
+        if let Some(view) = hunks.get(hunk) {
+            if line < view.lines.len() {
+                return Some(LineAt { file, hunk, line });
+            }
+            hunk += 1;
+        } else {
+            file += 1;
+            hunk = 0;
+        }
+        line = 0;
+    }
+}
+
+/// The diff row before `at`, across hunks and files.
+fn previous_position(files: &[DiffFile], at: LineAt) -> Option<LineAt> {
+    let (mut file, mut hunk) = (at.file, at.hunk);
+    if at.line > 0 {
+        return Some(LineAt {
+            line: at.line - 1,
+            ..at
+        });
+    }
+    loop {
+        if hunk > 0 {
+            hunk -= 1;
+        } else {
+            file = file.checked_sub(1)?;
+            hunk = files.get(file)?.hunks.len();
+            continue;
+        }
+        let len = files.get(file)?.hunks.get(hunk)?.lines.len();
+        if len > 0 {
+            return Some(LineAt {
+                file,
+                hunk,
+                line: len - 1,
+            });
+        }
+    }
+}
+
 fn file_check(file: &DiffFile, pick: Option<&Pick>) -> CheckState {
     match pick {
         None => CheckState::Off,
         Some(Pick::Whole) => CheckState::On,
-        Some(Pick::Hunks(headers)) => {
-            let picked = file
+        Some(Pick::Hunks(hunks)) => {
+            let present = file
                 .hunks
                 .iter()
-                .filter(|hunk| headers.contains(&hunk.header))
-                .count();
-            match picked {
-                0 => CheckState::Off,
-                n if n == file.hunks.len() => CheckState::On,
-                _ => CheckState::Partial,
+                .filter_map(|hunk| hunks.get(&hunk.header))
+                .collect::<Vec<_>>();
+            if present.is_empty() {
+                CheckState::Off
+            } else if present.len() == file.hunks.len()
+                && present.iter().all(|lines| **lines == HunkLines::All)
+            {
+                CheckState::On
+            } else {
+                CheckState::Partial
             }
         }
     }
@@ -325,7 +662,8 @@ pub(crate) fn diff_marks(ui: &Diffui, theme: ThemeSpec) -> Option<ChangeMarks<Me
     if !editable(tab) {
         return None;
     }
-    let picks = tab.changes.picks_for(&tab.session.selected_revision);
+    let revision = &tab.session.selected_revision;
+    let picks = tab.changes.picks_for(revision);
     let files = tab
         .session
         .document
@@ -336,17 +674,28 @@ pub(crate) fn diff_marks(ui: &Diffui, theme: ThemeSpec) -> Option<ChangeMarks<Me
             let conflicted = crate::conflicts::is_conflicted(tab, &file.path);
             let hunks = if !hunk_pickable(file, conflicted) {
                 HunkMarks::None
+            } else if pick.is_none() {
+                HunkMarks::Unpicked
             } else {
-                match pick {
-                    None => HunkMarks::Unpicked,
-                    Some(Pick::Whole) => HunkMarks::Picked(vec![true; file.hunks.len()]),
-                    Some(Pick::Hunks(headers)) => HunkMarks::Picked(
-                        file.hunks
-                            .iter()
-                            .map(|hunk| headers.contains(&hunk.header))
-                            .collect(),
-                    ),
-                }
+                HunkMarks::Picked(
+                    (0..file.hunks.len())
+                        .map(|hunk| match tab.changes.hunk_state(revision, file, hunk) {
+                            CheckState::Off => HunkMark::Off,
+                            CheckState::On => HunkMark::On,
+                            CheckState::Partial => HunkMark::Lines(
+                                file.hunks[hunk]
+                                    .lines
+                                    .iter()
+                                    .map(|line| {
+                                        LineRef::of(line).is_some_and(|line| {
+                                            tab.changes.line_picked(revision, file, hunk, line)
+                                        })
+                                    })
+                                    .collect(),
+                            ),
+                        })
+                        .collect(),
+                )
             };
             FileMark {
                 state: file_check(file, pick),
@@ -354,12 +703,33 @@ pub(crate) fn diff_marks(ui: &Diffui, theme: ThemeSpec) -> Option<ChangeMarks<Me
             }
         })
         .collect();
+    let lines = live_line_select(tab).map(|mode| LineMode {
+        cursor: mode
+            .cursor
+            .filter(|_| mode.document == tab.session.document_id),
+        reveal: mode.reveal,
+        on_press: |press| Message::Changes(ChangesMsg::Lines(LineMsg::Press(press))),
+        on_paint: |line| Message::Changes(ChangesMsg::Lines(LineMsg::Paint(line))),
+    });
     Some(ChangeMarks {
         files,
         accent: theme.accent,
         on_toggle_file: |file| Message::Changes(ChangesMsg::ToggleFile(file)),
         on_toggle_hunk: |file, hunk| Message::Changes(ChangesMsg::ToggleHunk(file, hunk)),
+        lines,
     })
+}
+
+/// The active tab's line-select mode, if it is on and still applies: the
+/// diff is pickable and shows the revision the mode was entered in.
+pub(crate) fn live_line_select(tab: &TabState) -> Option<&LineSelect> {
+    tab.line_select()
+        .filter(|mode| editable(tab) && mode.revision == tab.session.selected_revision)
+}
+
+/// Whether line-select mode can be entered on the active tab.
+pub(crate) fn can_select_lines(ui: &Diffui) -> bool {
+    editable(ui.active())
 }
 
 /// The changed-files tree checkbox for a row: a file's own state, or for a
@@ -419,6 +789,10 @@ impl Diffui {
             }
             ChangesMsg::ToggleTreeRow(display) => {
                 self.toggle_tree_row(display);
+                Task::none()
+            }
+            ChangesMsg::Lines(message) => {
+                self.on_lines(message);
                 Task::none()
             }
             ChangesMsg::Clear => {
@@ -554,6 +928,111 @@ impl Diffui {
         (!selection.is_empty()).then(|| (tab.session.selected_revision.clone(), selection))
     }
 
+    fn on_lines(&mut self, message: LineMsg) {
+        let tab = self.active_mut();
+        if let LineMsg::Toggle = message {
+            if live_line_select(tab).is_some() {
+                tab.pop_mode(ModeKind::Lines);
+            } else if editable(tab) {
+                let revision = tab.session.selected_revision.clone();
+                let document = tab.session.document_id;
+                tab.push_mode(TabMode::Lines(LineSelect::new(revision, document)));
+            }
+            return;
+        }
+        if live_line_select(tab).is_none() {
+            return;
+        }
+        let revision = tab.session.selected_revision.clone();
+        let selected_file = tab.selected_file;
+        let pickable: Vec<bool> = tab
+            .session
+            .document
+            .files
+            .iter()
+            .map(|file| hunk_pickable(file, crate::conflicts::is_conflicted(tab, &file.path)))
+            .collect();
+        let TabState {
+            session,
+            changes,
+            modes,
+            ..
+        } = tab;
+        let files = &session.document.files;
+        let Some(TabMode::Lines(mode)) = modes
+            .iter_mut()
+            .rev()
+            .find(|mode| mode.kind() == ModeKind::Lines)
+        else {
+            return;
+        };
+        if mode.document != session.document_id {
+            mode.document = session.document_id;
+            mode.cursor = None;
+            mode.anchor = None;
+        }
+        match message {
+            LineMsg::Toggle => {}
+            LineMsg::Exit => {
+                modes.retain(|mode| mode.kind() != ModeKind::Lines);
+            }
+            LineMsg::Step { by, extend } => {
+                let from = mode.cursor;
+                let pickable = |file: usize| pickable.get(file).copied().unwrap_or(false);
+                let Some(next) = step_line(files, &pickable, from, selected_file, by) else {
+                    return;
+                };
+                if extend {
+                    let anchor = *mode.anchor.get_or_insert(from.unwrap_or(next));
+                    if anchor.file == next.file {
+                        if from.is_none() {
+                            mode.paint = !changes.picked_at(&revision, files, next);
+                        }
+                        changes.paint_range(&revision, files, anchor, next, mode.paint, false);
+                    }
+                }
+                mode.cursor = Some(next);
+                mode.reveal = mode.reveal.wrapping_add(1);
+            }
+            LineMsg::ToggleCursor => {
+                if let Some(cursor) = mode.cursor {
+                    mode.paint = changes.toggle_line(&revision, files, cursor);
+                    mode.anchor = Some(cursor);
+                    mode.one_side = false;
+                }
+            }
+            LineMsg::Press(press) => {
+                let extend = press.extend
+                    && mode
+                        .anchor
+                        .is_some_and(|anchor| anchor.file == press.line.file);
+                if extend && let Some(anchor) = mode.anchor {
+                    changes.paint_range(
+                        &revision,
+                        files,
+                        anchor,
+                        press.line,
+                        mode.paint,
+                        mode.one_side,
+                    );
+                } else {
+                    mode.paint = changes.toggle_line(&revision, files, press.line);
+                    mode.anchor = Some(press.line);
+                    mode.one_side = press.one_side;
+                }
+                mode.cursor = Some(press.line);
+            }
+            LineMsg::Paint(line) => {
+                if let Some(anchor) = mode.anchor
+                    && anchor.file == line.file
+                {
+                    changes.paint_range(&revision, files, anchor, line, mode.paint, mode.one_side);
+                    mode.cursor = Some(line);
+                }
+            }
+        }
+    }
+
     fn toggle_file(&mut self, index: usize) {
         let tab = self.active_mut();
         let revision = tab.session.selected_revision.clone();
@@ -683,37 +1162,68 @@ pub(crate) fn selection_bar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Option<Elem
         return Some(floating(split_prompt(ui, prompt, theme), theme));
     }
     let selection = selection_of(tab);
-    if selection.is_empty() {
+    let selecting = live_line_select(tab).is_some();
+    if selection.is_empty() && !selecting {
         return None;
     }
     let button = |label: &'static str, msg: ChangesMsg, variant: ui::Variant| {
         ui::text_button(None, label, variant, ui::Size::Compact, font, theme)
             .on_press(Message::Changes(msg))
     };
-    let summary = row![
-        icons::icon(icons::CHECK, ui::ICON_SIZE, theme.accent),
-        text(format!("{} selected", selection.summary()))
-            .size(text_size::UI)
-            .font(font)
-            .color(theme.text),
-    ]
+    let clear = ui::tooltip(
+        ui::icon_button(icons::CLOSE, theme.muted_text, ui::Size::Compact, theme)
+            .on_press(Message::Changes(ChangesMsg::Clear)),
+        "Clear selection",
+        iced::widget::tooltip::Position::Top,
+        font,
+        theme,
+    );
+    let summary = if selecting {
+        let picked = if selection.is_empty() {
+            "Nothing picked yet".to_owned()
+        } else {
+            format!("{} picked", selection.summary())
+        };
+        row![
+            icons::icon(icons::LIST_CHECKS, ui::ICON_SIZE, theme.accent),
+            text("Selecting lines")
+                .size(text_size::UI)
+                .font(crate::theme::emphasis_font(
+                    font,
+                    iced::font::Weight::Medium
+                ))
+                .color(theme.text),
+            text(picked)
+                .size(text_size::UI)
+                .font(font)
+                .color(theme.muted_text),
+        ]
+    } else {
+        row![
+            icons::icon(icons::CHECK, ui::ICON_SIZE, theme.accent),
+            text(format!("{} selected", selection.summary()))
+                .size(text_size::UI)
+                .font(font)
+                .color(theme.text),
+        ]
+    }
     .spacing(6)
     .align_y(alignment::Vertical::Center);
     // Two lines so the bar fits a narrow diff pane: what is picked (and the
     // clear button), then the actions, wrapping when they have to.
-    let header = row![
-        summary,
-        Space::new().width(Length::Fill),
-        ui::tooltip(
-            ui::icon_button(icons::CLOSE, theme.muted_text, ui::Size::Compact, theme)
-                .on_press(Message::Changes(ChangesMsg::Clear)),
-            "Clear selection",
-            iced::widget::tooltip::Position::Top,
-            font,
-            theme,
-        ),
-    ]
-    .align_y(alignment::Vertical::Center);
+    let mut header = row![summary, Space::new().width(Length::Fill)]
+        .spacing(6)
+        .align_y(alignment::Vertical::Center);
+    if !selection.is_empty() {
+        header = header.push(clear);
+    }
+    if selecting {
+        header = header.push(button(
+            "Done",
+            ChangesMsg::Lines(LineMsg::Exit),
+            ui::Variant::Ghost,
+        ));
+    }
     let actions = row![
         button("Split\u{2026}", ChangesMsg::OpenSplit, ui::Variant::Raised),
         button(
@@ -731,9 +1241,18 @@ pub(crate) fn selection_bar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Option<Elem
     .spacing(6)
     .wrap()
     .vertical_spacing(6);
-    let bar = column![header, actions]
-        .spacing(4)
-        .width(Length::Fill.max(420));
+    let mut bar = column![header].spacing(4).width(Length::Fill.max(420));
+    if !selection.is_empty() {
+        bar = bar.push(actions);
+    }
+    if selecting {
+        bar = bar.push(
+            text("Click or drag lines \u{b7} Shift-click a range \u{b7} j/k and Space \u{b7} Esc when done")
+                .size(text_size::CAPTION)
+                .font(font)
+                .color(theme.muted_text),
+        );
+    }
     Some(floating(bar.into(), theme))
 }
 
@@ -947,5 +1466,188 @@ mod tests {
     fn descriptions_are_stored_like_jj_stores_them() {
         assert_eq!(stored_description("feat: x\n\n\n"), "feat: x\n");
         assert_eq!(stored_description("  \n"), "");
+    }
+
+    fn row(kind: DiffLineKind, old_line: Option<usize>, new_line: Option<usize>) -> DiffLine {
+        DiffLine {
+            kind,
+            old_line,
+            new_line,
+            content: "x".to_owned(),
+            syntax: Vec::new(),
+            emphasis: Vec::new(),
+        }
+    }
+
+    /// Two hunks: lines 2–3 rewritten (rows 1–4: two removals, two
+    /// additions), and line 21 rewritten (rows 1–2).
+    fn rewrite(path: &str) -> DiffFile {
+        use DiffLineKind::{Addition, Context, Deletion};
+        DiffFile {
+            path: path.to_owned(),
+            old_path: None,
+            status: DiffFileStatus::Modified,
+            collapsed: None,
+            hunks: vec![
+                DiffHunkView {
+                    header: "@@ -1,4 +1,4 @@".to_owned(),
+                    lines: vec![
+                        row(Context, Some(1), Some(1)),
+                        row(Deletion, Some(2), None),
+                        row(Deletion, Some(3), None),
+                        row(Addition, None, Some(2)),
+                        row(Addition, None, Some(3)),
+                        row(Context, Some(4), Some(4)),
+                    ],
+                },
+                DiffHunkView {
+                    header: "@@ -20,3 +20,3 @@".to_owned(),
+                    lines: vec![
+                        row(Context, Some(20), Some(20)),
+                        row(Deletion, Some(21), None),
+                        row(Addition, None, Some(21)),
+                        row(Context, Some(22), Some(22)),
+                    ],
+                },
+            ],
+            additions: 3,
+            deletions: 3,
+        }
+    }
+
+    fn at(file: usize, hunk: usize, line: usize) -> LineAt {
+        LineAt { file, hunk, line }
+    }
+
+    fn refs(selection: &DiffSelection) -> Vec<(usize, Option<Vec<LineRef>>)> {
+        match &selection.files[0].hunks {
+            HunkPick::All => Vec::new(),
+            HunkPick::Hunks(refs) => refs
+                .iter()
+                .map(|hunk| (hunk.index, hunk.lines.clone()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn single_lines_pick_partially_and_collapse_to_whole_hunks_and_files() {
+        let wc = RevisionSelection::WorkingCopy;
+        let files = vec![rewrite("a.rs")];
+        let mut state = ChangesState::default();
+
+        assert!(state.toggle_line(&wc, &files, at(0, 0, 1)));
+        assert_eq!(state.hunk_state(&wc, &files[0], 0), CheckState::Partial);
+        assert_eq!(
+            file_check(&files[0], state.picks.get("a.rs")),
+            CheckState::Partial
+        );
+        let selection = state.selection(&wc, &files);
+        assert_eq!(selection.summary(), "1 line in a.rs");
+        assert_eq!(refs(&selection), vec![(0, Some(vec![LineRef::Removed(1)]))]);
+
+        // The rest of the first hunk's changes: it is picked whole.
+        for line in 2..=4 {
+            state.toggle_line(&wc, &files, at(0, 0, line));
+        }
+        assert_eq!(state.hunk_state(&wc, &files[0], 0), CheckState::On);
+        assert_eq!(refs(&state.selection(&wc, &files)), vec![(0, None)]);
+        // And the second hunk's: the file is.
+        state.toggle_line(&wc, &files, at(0, 1, 1));
+        state.toggle_line(&wc, &files, at(0, 1, 2));
+        assert_eq!(state.picks.get("a.rs"), Some(&Pick::Whole));
+
+        // Unpicking one line of a whole file leaves everything else.
+        assert!(!state.toggle_line(&wc, &files, at(0, 1, 2)));
+        assert_eq!(
+            refs(&state.selection(&wc, &files)),
+            vec![(0, None), (1, Some(vec![LineRef::Removed(20)]))]
+        );
+        // Context rows are not lines to pick.
+        assert!(!state.toggle_line(&wc, &files, at(0, 0, 0)));
+    }
+
+    #[test]
+    fn a_mixed_checkbox_picks_everything_under_it() {
+        let wc = RevisionSelection::WorkingCopy;
+        let files = vec![rewrite("a.rs")];
+        let mut state = ChangesState::default();
+        state.toggle_line(&wc, &files, at(0, 0, 3));
+        state.toggle_hunk(&wc, &files[0], 0);
+        assert_eq!(state.hunk_state(&wc, &files[0], 0), CheckState::On);
+        state.toggle_hunk(&wc, &files[0], 0);
+        assert!(state.selection(&wc, &files).is_empty());
+
+        state.toggle_line(&wc, &files, at(0, 1, 1));
+        state.toggle_file(&wc, &files[0]);
+        assert_eq!(state.picks.get("a.rs"), Some(&Pick::Whole));
+        state.toggle_file(&wc, &files[0]);
+        assert!(state.selection(&wc, &files).is_empty());
+    }
+
+    #[test]
+    fn a_range_paints_every_changed_line_between_or_one_column_of_them() {
+        let wc = RevisionSelection::WorkingCopy;
+        let files = vec![rewrite("a.rs")];
+
+        // Unified: from the first removal down into the second hunk.
+        let mut state = ChangesState::default();
+        state.paint_range(&wc, &files, at(0, 0, 1), at(0, 1, 1), true, false);
+        assert_eq!(
+            refs(&state.selection(&wc, &files)),
+            vec![(0, None), (1, Some(vec![LineRef::Removed(20)]))]
+        );
+
+        // Side by side, dragged up the new column: only additions.
+        let mut state = ChangesState::default();
+        state.paint_range(&wc, &files, at(0, 1, 2), at(0, 0, 0), true, true);
+        assert_eq!(
+            refs(&state.selection(&wc, &files)),
+            vec![
+                (0, Some(vec![LineRef::Added(1), LineRef::Added(2)])),
+                (1, Some(vec![LineRef::Added(20)])),
+            ]
+        );
+        // Painting the same range off again empties the pick.
+        state.paint_range(&wc, &files, at(0, 1, 2), at(0, 0, 0), false, true);
+        assert!(state.selection(&wc, &files).is_empty());
+
+        // Ranges never cross files.
+        let two = vec![rewrite("a.rs"), rewrite("b.rs")];
+        let mut state = ChangesState::default();
+        state.paint_range(&wc, &two, at(0, 0, 1), at(1, 0, 1), true, false);
+        assert!(state.selection(&wc, &two).is_empty());
+    }
+
+    #[test]
+    fn the_line_cursor_walks_changed_lines_of_pickable_files() {
+        let files = vec![
+            rewrite("a.rs"),
+            file("b.bin", &["binary files differ"]),
+            rewrite("c.rs"),
+        ];
+        let pickable = |index: usize| index != 1;
+        let step = |from: Option<LineAt>, by: isize| step_line(&files, &pickable, from, 0, by);
+        // No cursor yet: the first changed line of the selected file.
+        assert_eq!(step(None, 1), Some(at(0, 0, 1)));
+        assert_eq!(step(Some(at(0, 0, 4)), 1), Some(at(0, 1, 1)));
+        // Over the context row, the hunk boundary and the binary file.
+        assert_eq!(step(Some(at(0, 1, 2)), 1), Some(at(2, 0, 1)));
+        assert_eq!(step(Some(at(2, 0, 1)), -1), Some(at(0, 1, 2)));
+        assert_eq!(step(Some(at(0, 0, 1)), -1), None);
+        assert_eq!(step(Some(at(2, 1, 2)), 1), None);
+        // Starting from a file without pickable lines finds the next one.
+        assert_eq!(step_line(&files, &pickable, None, 1, 1), Some(at(2, 0, 1)));
+    }
+
+    #[test]
+    fn line_picks_a_reload_moved_are_dropped() {
+        let wc = RevisionSelection::WorkingCopy;
+        let files = vec![rewrite("a.rs")];
+        let mut state = ChangesState::default();
+        state.toggle_line(&wc, &files, at(0, 0, 1));
+        // Same header, but the removal now sits on another line.
+        let mut reloaded = rewrite("a.rs");
+        reloaded.hunks[0].lines[1].old_line = Some(5);
+        assert!(state.selection(&wc, &[reloaded]).is_empty());
     }
 }
