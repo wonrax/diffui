@@ -12,6 +12,11 @@ use iced::{Background, Border, Color, Point, Rectangle, Shadow, border};
 
 /// Width of the outer (transparent) container holding the track.
 const WIDTH: f32 = 12.0;
+/// How far from a scroll view's right edge its content keeps text: the
+/// bar's whole footprint, so text never sits beneath it. Row washes and
+/// backgrounds still run under the bar. Every scroll view, hand-drawn or
+/// [`crate::ui::scrollable`], leaves this gutter.
+pub const GUTTER: f32 = WIDTH;
 /// Padding from each side of the container to the inner pill track.
 const PADDING: f32 = 2.0;
 /// Floor for the thumb height. Purely proportional sizing collapses the pill

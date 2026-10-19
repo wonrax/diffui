@@ -32,11 +32,10 @@ pub fn emphasis_font(base: Font, weight: Weight) -> Font {
     }
 }
 
-/// Geometry knobs shared by every `iced::widget::scrollable` we style.
-/// Mirrors the values in `crate::scrollbar` (12px outer, 2px margin → 8px
-/// pill) so the iced-managed scrollbars in the palette / find overlays
-/// read as the same widget as the hand-drawn ones in `RevisionList` and
-/// `DiffView`.
+/// Geometry of [`crate::ui::scrollable`]'s bar. Mirrors `crate::scrollbar`
+/// (a 12px footprint, 2px clear of every edge → an 8px pill) so the iced
+/// scroll views read as the same widget as the hand-drawn ones in
+/// `RevisionList` and `DiffView`.
 pub const SCROLLBAR_WIDTH: f32 = 8.0;
 pub const SCROLLBAR_MARGIN: f32 = 2.0;
 pub const COLLAPSED_PANEL_WIDTH: f32 = 36.0;

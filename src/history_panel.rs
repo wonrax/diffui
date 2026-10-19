@@ -16,7 +16,7 @@ use std::collections::HashSet;
 
 use iced::{
     Background, Border, Color, Element, Length, Padding, alignment,
-    widget::{Space, button, column, container, row, scrollable, text},
+    widget::{Space, button, column, container, row, text},
 };
 
 use diffui_core::history::{
@@ -1418,7 +1418,10 @@ pub(crate) fn build_history_sidebar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Ele
                     .padding(space::SM),
                 );
             }
-            (header.into(), scrollable(rows).height(Length::Fill).into())
+            (
+                header.into(),
+                ui::scrollable(rows, theme).height(Length::Fill).into(),
+            )
         }
         HistoryKind::Evolog { label, .. } => {
             let header = row![
@@ -1457,7 +1460,10 @@ pub(crate) fn build_history_sidebar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Ele
                     ui,
                 ));
             }
-            (header.into(), scrollable(rows).height(Length::Fill).into())
+            (
+                header.into(),
+                ui::scrollable(rows, theme).height(Length::Fill).into(),
+            )
         }
     };
 
@@ -1733,10 +1739,13 @@ fn operation_changes<'a>(
             ui,
         ));
     }
-    scrollable(list.padding(Padding {
-        bottom: space::SM,
-        ..Padding::from([0.0, space::SM])
-    }))
+    ui::scrollable(
+        list.padding(Padding {
+            bottom: space::SM,
+            ..Padding::from([0.0, space::SM])
+        }),
+        theme,
+    )
     .width(Length::Fill)
     .height(Length::Shrink.max(260.0))
     .into()

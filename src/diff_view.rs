@@ -1905,8 +1905,14 @@ impl<'a, Message> DiffView<'a, Message> {
         tops.partition_point(|&top| top <= offset).saturating_sub(1)
     }
 
+    /// The text area's width: what's right of the text's left edge, less the
+    /// scrollbar's gutter so wrapped text never runs beneath the bar.
     fn content_width(&self, viewport_width: f32) -> f32 {
-        (viewport_width - self.metrics.gutter_width - PREFIX_WIDTH - 16.0)
+        (viewport_width
+            - self.metrics.gutter_width
+            - PREFIX_WIDTH
+            - TEXT_X_PADDING
+            - scrollbar::GUTTER)
             .max(self.metrics.char_width)
     }
 
@@ -1931,8 +1937,11 @@ impl<'a, Message> DiffView<'a, Message> {
             + GUTTER_HORIZONTAL_PADDING * 2.0)
             .max(GUTTER_MIN_WIDTH * 0.5);
         let column_width = ((viewport_width - 1.0) / 2.0).max(1.0);
+        // Both columns keep the scrollbar's gutter, so the right one's text
+        // stays clear of the bar and the two still wrap alike.
         let text_width =
-            (column_width - gutter_width - PREFIX_WIDTH - 12.0).max(self.metrics.char_width);
+            (column_width - gutter_width - PREFIX_WIDTH - TEXT_X_PADDING - scrollbar::GUTTER)
+                .max(self.metrics.char_width);
         SplitLayout {
             gutter_width,
             text_width,

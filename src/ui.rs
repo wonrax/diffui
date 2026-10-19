@@ -11,7 +11,9 @@ use iced::{
     Color, Element, Font, Length, Padding, alignment,
     font::Weight,
     widget::{
-        self, Button, Container, Row, Space, container, mouse_area, opaque, row, stack, text,
+        self, Button, Container, Row, Scrollable, Space, container, mouse_area, opaque, row,
+        scrollable::{Direction, Scrollbar},
+        stack, text,
     },
 };
 
@@ -254,6 +256,26 @@ pub fn dialog_text<'a, Message: 'a>(
         .size(text_size::UI)
         .width(Length::Fill)
         .into()
+}
+
+/// Every iced scroll view in the app: a vertical bar floating over the
+/// content's right edge, 2px clear of the view's edges, styled and placed
+/// like the hand-drawn bar of the graph and the diff. Like there, the
+/// content runs under the bar: row washes may reach the edge, but text keeps
+/// [`crate::scrollbar::GUTTER`] clear on the right.
+pub fn scrollable<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    theme: ThemeSpec,
+) -> Scrollable<'a, Message> {
+    widget::scrollable(content)
+        .direction(Direction::Vertical(
+            Scrollbar::new()
+                .width(theme::SCROLLBAR_WIDTH)
+                .scroller_width(theme::SCROLLBAR_WIDTH)
+                .margin(theme::SCROLLBAR_MARGIN)
+                .padding(theme::SCROLLBAR_MARGIN),
+        ))
+        .style(move |_, status| theme::iced_scrollable_style(theme, status))
 }
 
 /// The hover label every chrome control uses.

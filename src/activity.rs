@@ -17,17 +17,13 @@ use std::time::{Duration, Instant};
 use iced::{
     Background, Border, Color, Element, Length, Padding, alignment,
     font::Weight,
-    widget::{
-        Space, button, column, container, mouse_area, opaque, row, scrollable, stack, text,
-        text_editor,
-    },
+    widget::{Space, button, column, container, mouse_area, opaque, row, stack, text, text_editor},
 };
 
 use crate::chip;
 use crate::icons;
 use crate::theme::{
-    ThemeSpec, chip_background, emphasis_font, ghost_button_style, iced_scrollable_style,
-    popover_style, text_size,
+    ThemeSpec, chip_background, emphasis_font, ghost_button_style, popover_style, text_size,
 };
 use crate::{Action, Diffui, Message, UiEvent};
 use diffui_core::LoadProgress;
@@ -579,15 +575,22 @@ pub fn activity_popover(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             .width(Length::Fill)
             .height(Length::Fixed(1.0))
             .style(move |_| solid(theme.border)),
+        // The list scrolls out to the card's right edge, where the bar sits
+        // as in every scroll view; its right inset moves inside.
         container(
-            scrollable(list)
-                .height(Length::Shrink)
-                .style(move |_, s| iced_scrollable_style(theme, s)),
+            crate::ui::scrollable(
+                container(list).padding(Padding {
+                    right: 8.0,
+                    ..Padding::ZERO
+                }),
+                theme,
+            )
+            .height(Length::Shrink),
         )
         .height(Length::Fit.max(520.0))
         .padding(Padding {
             top: 6.0,
-            right: 8.0,
+            right: 0.0,
             bottom: 8.0,
             left: 8.0,
         }),

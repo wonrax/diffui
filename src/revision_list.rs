@@ -61,7 +61,9 @@ const FILE_ICON_SIZE: f32 = 12.0;
 const FILE_NAME_TEXT_SIZE: f32 = crate::theme::text_size::BODY;
 pub const GUTTER_LEFT_PADDING: f32 = 8.0;
 pub const GUTTER_PADDING: f32 = 8.0;
-const CONTENT_PADDING: f32 = 12.0;
+/// Right inset of row content: the scrollbar's gutter, so text stays clear
+/// of the bar the row cards run under.
+const CONTENT_PADDING: f32 = crate::scrollbar::GUTTER;
 const SMALL_TEXT_SIZE: f32 = crate::theme::text_size::BODY_LG;
 const CAPTION_TEXT_SIZE: f32 = crate::theme::text_size::CAPTION;
 /// Text size for the collapse/expand chevron on the selected revision row. The
@@ -70,7 +72,7 @@ const CAPTION_TEXT_SIZE: f32 = crate::theme::text_size::CAPTION;
 /// clearly as a chevron without dominating the row.
 const CHEVRON_TEXT_SIZE: f32 = 15.0;
 pub const FILE_ROW_GAP: f32 = 6.0;
-pub const FILE_ROW_RIGHT_PAD: f32 = 10.0;
+pub const FILE_ROW_RIGHT_PAD: f32 = crate::scrollbar::GUTTER;
 const TOOLTIP_RADIUS: f32 = crate::theme::radius::SURFACE;
 // Wider horizontally than vertically: the SURFACE radius eats into the
 // card's left/right ends, so the text needs extra x inset to read centered.

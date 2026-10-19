@@ -28,11 +28,7 @@ use iced::advanced::{
 use iced::{
     Background, Border, Color, Element, Event, Length, Padding, Point, Rectangle, Size, Theme,
     alignment,
-    widget::{
-        Space, column, container, mouse_area, opaque, pin, row, scrollable,
-        scrollable::{Direction, Scrollbar},
-        stack, text,
-    },
+    widget::{Space, column, container, mouse_area, opaque, pin, row, stack, text},
 };
 
 use crate::commands::{CommandArg, CommandId};
@@ -78,12 +74,6 @@ const MENU_ITEM_PAD_X: f32 = 8.0;
 /// not controls. Width measurement ([`card_width`]) keys off the same sizes.
 const MENU_LABEL_SIZE: f32 = text_size::BODY;
 const MENU_DETAIL_SIZE: f32 = text_size::UI;
-/// `Scrollbar::spacing` for a scrolling card — embedded rail (reserves its own
-/// width) so long rows don't run under it.
-const MENU_SCROLLBAR_SPACING: f32 = 6.0;
-/// Rail flush against the card's right padding so its margin to the edge
-/// matches the top/bottom padding.
-const MENU_SCROLLBAR_MARGIN: f32 = 0.0;
 /// Sub-pixel cushion so a row sized to exactly its measured width doesn't
 /// ellipsize from float rounding.
 const MENU_TEXT_SLACK: f32 = 2.0;
@@ -725,14 +715,9 @@ fn card_width(ui: &Diffui, entries: &[MenuEntry]) -> f32 {
         content = content.max(w);
     }
 
-    let content_h: f32 = entries.iter().map(MenuEntry::height).sum();
-    let reserve = content_h + MENU_CARD_PAD * 2.0 > menu_max_height(ui);
-    let scrollbar = if reserve {
-        theme::SCROLLBAR_WIDTH + MENU_SCROLLBAR_MARGIN * 2.0 + MENU_SCROLLBAR_SPACING
-    } else {
-        0.0
-    };
-    let raw = MENU_CARD_PAD * 2.0 + MENU_ITEM_PAD_X * 2.0 + content + scrollbar + MENU_TEXT_SLACK;
+    // A scrolling card's bar floats over the rows' right inset, which is as
+    // wide as the bar's gutter, so it needs no width of its own.
+    let raw = MENU_CARD_PAD * 2.0 + MENU_ITEM_PAD_X * 2.0 + content + MENU_TEXT_SLACK;
     raw.clamp(MENU_MIN_WIDTH, MENU_MAX_WIDTH).ceil()
 }
 
@@ -764,28 +749,29 @@ fn build_card<'a>(
         // submenus at the same depth must not inherit the old one's scroll
         // state. The reported offsets feed [`card_rects`]'s flyout anchoring.
         let id_path: Vec<String> = prefix.iter().map(usize::to_string).collect();
-        scrollable(list)
-            .id(format!("menu-card-{}", id_path.join("-")))
-            .on_scroll(move |viewport| {
-                Message::Menu(MenuMessage::CardScrolled(
-                    depth,
-                    viewport.absolute_offset().y,
-                ))
-            })
-            .width(Length::Fill)
-            .height(Length::Shrink)
-            .direction(Direction::Vertical(
-                Scrollbar::default()
-                    .width(theme::SCROLLBAR_WIDTH)
-                    .scroller_width(theme::SCROLLBAR_WIDTH)
-                    .margin(MENU_SCROLLBAR_MARGIN)
-                    .spacing(MENU_SCROLLBAR_SPACING),
+        // Out to the card's right edge, like every scroll view's bar; the
+        // card's right inset moves inside the list.
+        crate::ui::scrollable(
+            container(list).padding(Padding {
+                right: MENU_CARD_PAD,
+                ..Padding::ZERO
+            }),
+            theme,
+        )
+        .id(format!("menu-card-{}", id_path.join("-")))
+        .on_scroll(move |viewport| {
+            Message::Menu(MenuMessage::CardScrolled(
+                depth,
+                viewport.absolute_offset().y,
             ))
-            .style(move |_, status| theme::iced_scrollable_style(theme, status))
-            .into()
+        })
+        .width(Length::Fill)
+        .height(Length::Shrink)
+        .into()
     } else {
         list.into()
     };
+    let scrolls = content_h + MENU_CARD_PAD * 2.0 > max_h;
 
     // The card swallows presses (either button) so a click inside it never
     // reaches the dismiss backdrop; rows carry their own hover/release handlers.
@@ -793,7 +779,10 @@ fn build_card<'a>(
         container(body)
             .width(Length::Fixed(width))
             .height(Length::Fit.max(max_h))
-            .padding(Padding::from([MENU_CARD_PAD, MENU_CARD_PAD]))
+            .padding(Padding {
+                right: if scrolls { 0.0 } else { MENU_CARD_PAD },
+                ..Padding::from(MENU_CARD_PAD)
+            })
             .style(move |_| popover_style(theme)),
     )
     .on_press(Message::Menu(MenuMessage::CapturePress))

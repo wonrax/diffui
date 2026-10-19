@@ -9,7 +9,7 @@
 use iced::{
     Alignment, Background, Border, Element, Length, Padding, Task, alignment,
     font::Weight,
-    widget::{Space, column, container, row, scrollable, text},
+    widget::{Space, column, container, row, text},
 };
 
 use crate::commands::{self, CommandId, Context, REGISTRY};
@@ -231,7 +231,11 @@ pub(crate) fn build_overlay(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
             .color(theme.subtle_text)
             .font(ui.config.ui_font),
     ]
-    .align_y(alignment::Vertical::Center);
+    .align_y(alignment::Vertical::Center)
+    .padding(Padding {
+        right: crate::ui::DIALOG_PADDING,
+        ..Padding::ZERO
+    });
 
     let columns = row![
         left.width(Length::FillPortion(1)),
@@ -241,19 +245,28 @@ pub(crate) fn build_overlay(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
 
     let body = column![
         header,
-        scrollable(container(columns).padding(Padding {
-            right: theme::space::LG,
-            ..Padding::ZERO
-        }))
-        .height(Length::Fill)
-        .style(move |_, status| theme::iced_scrollable_style(theme, status)),
+        // The list scrolls out to the card's right edge, so the bar sits
+        // where every other scroll view's does; the inset moves inside.
+        crate::ui::scrollable(
+            container(columns).padding(Padding {
+                right: crate::ui::DIALOG_PADDING,
+                ..Padding::ZERO
+            }),
+            theme,
+        )
+        .height(Length::Fill),
     ]
     .spacing(theme::space::XL);
 
-    let card = crate::ui::dialog_card(body, CARD_WIDTH, theme).height(Length::Fixed(
-        (ui.window_size.height - theme::modal_top() - theme::space::XXL)
-            .clamp(240.0, CARD_MAX_HEIGHT),
-    ));
+    let card = crate::ui::dialog_card(body, CARD_WIDTH, theme)
+        .padding(Padding {
+            right: 0.0,
+            ..Padding::from(crate::ui::DIALOG_PADDING)
+        })
+        .height(Length::Fixed(
+            (ui.window_size.height - theme::modal_top() - theme::space::XXL)
+                .clamp(240.0, CARD_MAX_HEIGHT),
+        ));
     crate::ui::modal(
         card,
         Message::Action(Action::CloseShortcuts),
