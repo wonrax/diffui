@@ -19,13 +19,17 @@ use iced::{
 use crate::diff_view::{HeaderAction, HeaderField, HeaderLine};
 use crate::meta_line::{self, Badge, Id, Meta};
 use crate::sidebar::{COMMIT_ID_CHARS, REVISION_ID_CHARS, revision_id_display_len};
-use crate::theme::{ThemeSpec, emphasis_font, space, text_size};
+use crate::theme::{ThemeSpec, chip_background, emphasis_font, space, text_size};
 use crate::{Action, Diffui, Message, icons, ui};
 
-/// The title leads the pane, a step above dialog titles.
-const TITLE_SIZE: f32 = 17.0;
-/// Width of the additions/deletions bar beside the counts.
-const STAT_BAR_WIDTH: f32 = 36.0;
+/// The title leads the pane at the dialog-title step, one above the graph
+/// row's description (`BODY_LG`).
+const TITLE_SIZE: f32 = text_size::TITLE;
+/// Height of the additions/deletions bar under the counts.
+const STAT_BAR_HEIGHT: f32 = 3.0;
+/// The smallest share of the bar a non-zero side gets, so one deletion
+/// against thousands of additions still shows.
+const STAT_BAR_MIN_SHARE: f32 = 0.08;
 
 pub(crate) fn view<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
     let session = &ui.active().session;
@@ -118,64 +122,96 @@ pub(crate) fn view<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message>
         .into()
 }
 
-/// `+N −M`, a bar splitting the change between them, and the file count.
+/// `+N −M` on one small line with a bar under it, as wide as the line,
+/// split between them. The file count and exact totals are on hover.
 fn diff_stats<'a>(ui: &Diffui, theme: ThemeSpec) -> Element<'a, Message> {
     let document = &ui.active().session.document;
     let (additions, deletions) = (document.total_additions, document.total_deletions);
-    let count = |value: String, color: Color| {
-        text(value)
-            .size(text_size::UI)
-            .font(ui.config.ui_font)
-            .color(color)
-    };
-    let mut stats = row![
+    let font = ui.config.ui_font;
+    let count =
+        |value: String, color: Color| text(value).size(text_size::CAPTION).font(font).color(color);
+    let counts = row![
         count(
-            format!("+{additions}"),
+            format!("+{}", compact_count(additions)),
             crate::diff_panel::stat_color(additions, theme.added_text, theme)
         ),
         count(
-            format!("\u{2212}{deletions}"),
+            format!("\u{2212}{}", compact_count(deletions)),
             crate::diff_panel::stat_color(deletions, theme.removed_text, theme)
         ),
     ]
-    .spacing(space::SM)
-    .align_y(alignment::Vertical::Center);
-    let total = additions + deletions;
-    if total > 0 {
-        let added = (STAT_BAR_WIDTH * additions as f32 / total as f32).round();
-        let segment = |width: f32, color: Color| {
-            container(Space::new())
-                .width(Length::Fixed(width))
-                .height(Length::Fixed(4.0))
-                .style(move |_| container::Style {
-                    background: Some(Background::Color(color)),
-                    border: Border {
-                        radius: 2.0.into(),
-                        ..Border::default()
-                    },
-                    ..container::Style::default()
-                })
-        };
-        let mut bar = Row::new().spacing(1);
-        if added > 0.0 {
-            bar = bar.push(segment(added, theme.added_text));
-        }
-        if added < STAT_BAR_WIDTH {
-            bar = bar.push(segment(STAT_BAR_WIDTH - added, theme.removed_text));
-        }
-        stats = stats.push(bar);
+    .spacing(space::SM);
+
+    let segment = |portion: u16, color: Color| {
+        container(Space::new())
+            .width(Length::FillPortion(portion))
+            .height(Length::Fixed(STAT_BAR_HEIGHT))
+            .style(move |_| container::Style {
+                background: Some(Background::Color(color)),
+                border: Border {
+                    radius: (STAT_BAR_HEIGHT / 2.0).into(),
+                    ..Border::default()
+                },
+                ..container::Style::default()
+            })
+    };
+    let (added, removed) = bar_portions(additions, deletions);
+    let mut bar = Row::new().spacing(1).width(Length::Fill);
+    if added > 0 {
+        bar = bar.push(segment(added, theme.added_text));
     }
+    if removed > 0 {
+        bar = bar.push(segment(removed, theme.removed_text));
+    }
+    if added == 0 && removed == 0 {
+        bar = bar.push(segment(1, chip_background(theme.muted_text)));
+    }
+
     let files = document.files.len();
-    stats
-        .push(count(
-            if files == 1 {
-                "1 file".to_owned()
-            } else {
-                format!("{files} files")
-            },
-            theme.subtle_text,
-        ))
-        .into()
+    let summary = format!(
+        "{files} {}, {additions} added, {deletions} removed",
+        if files == 1 { "file" } else { "files" }
+    );
+    ui::tooltip(
+        Column::new()
+            .push(counts)
+            .push(bar)
+            .spacing(space::XXS)
+            .width(Length::Shrink),
+        summary,
+        iced::widget::tooltip::Position::Bottom,
+        font,
+        theme,
+    )
+}
+
+/// A count short enough for the stats line: thousands abbreviated past
+/// four digits.
+fn compact_count(count: usize) -> String {
+    match count {
+        0..10_000 => count.to_string(),
+        10_000..1_000_000 => format!("{}k", count / 1_000),
+        _ => format!("{}M", count / 1_000_000),
+    }
+}
+
+/// The bar's two shares out of 1000, each non-zero side getting at least
+/// [`STAT_BAR_MIN_SHARE`] of it.
+fn bar_portions(additions: usize, deletions: usize) -> (u16, u16) {
+    let total = additions + deletions;
+    if total == 0 {
+        return (0, 0);
+    }
+    if additions == 0 || deletions == 0 {
+        return (
+            u16::from(additions > 0) * 1000,
+            u16::from(deletions > 0) * 1000,
+        );
+    }
+    let share =
+        (additions as f32 / total as f32).clamp(STAT_BAR_MIN_SHARE, 1.0 - STAT_BAR_MIN_SHARE);
+    let added = (share * 1000.0).round() as u16;
+    (added, 1000 - added)
 }
 
 fn status_badges(row: Option<diffui_core::RowView<'_>>, theme: ThemeSpec) -> Vec<Badge> {
@@ -555,7 +591,20 @@ fn signature_field(label: &str, signature: &SignatureInfo, theme: ThemeSpec) -> 
 mod tests {
     use diffui_core::{ParentBrief, RevisionDetails, SignatureInfo};
 
-    use super::{header_lines, wrap_columns};
+    use super::{bar_portions, compact_count, header_lines, wrap_columns};
+
+    #[test]
+    fn the_stat_bar_keeps_both_sides_visible_and_counts_stay_short() {
+        assert_eq!(bar_portions(0, 0), (0, 0));
+        assert_eq!(bar_portions(5, 0), (1000, 0));
+        assert_eq!(bar_portions(0, 5), (0, 1000));
+        assert_eq!(bar_portions(1, 1), (500, 500));
+        // One deletion against thousands of additions still gets a sliver.
+        assert_eq!(bar_portions(10_000, 1), (920, 80));
+        assert_eq!(compact_count(9_999), "9999");
+        assert_eq!(compact_count(12_345), "12k");
+        assert_eq!(compact_count(3_400_000), "3M");
+    }
 
     #[test]
     fn description_lines_wrap_at_spaces_and_keep_their_indent() {
