@@ -648,6 +648,11 @@ pub struct RowView<'a> {
 }
 
 impl<'a> RowView<'a> {
+    /// The row's position in its [`CommitStore`].
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
     pub fn change_id(&self) -> &'a str {
         self.store.slice(self.store.spans[self.index].change_id)
     }

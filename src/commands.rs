@@ -1816,6 +1816,17 @@ pub(crate) static REGISTRY: &[Command] = &[
         palette: PaletteScope::Root,
     },
     Command {
+        id: "view.toggle-commit-details",
+        label: "Toggle commit details",
+        hint: "Show the description and fields above the diff, or just the title",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::ToggleCommitDetails),
+        palette: PaletteScope::Root,
+    },
+    Command {
         id: "view.toggle-split",
         label: "Toggle side-by-side diff",
         hint: "Switch between the unified and two-column diff",

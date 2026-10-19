@@ -224,6 +224,8 @@ impl Diffui {
             file_nav_width,
             diff_wrap: saved.diff_wrap.unwrap_or(true),
             diff_split: saved.diff_split.unwrap_or(false),
+            commit_details_collapsed: saved.commit_details_collapsed.unwrap_or(false),
+            commit_body_expanded: false,
             sidebar_min_width,
             window_size,
             window_position,
@@ -1069,6 +1071,15 @@ impl Diffui {
                 // usual geometry debounce.
                 self.document_version = self.document_version.wrapping_add(1);
                 self.mark_geometry_dirty();
+                Task::none()
+            }
+            Action::ToggleCommitDetails => {
+                self.commit_details_collapsed = !self.commit_details_collapsed;
+                self.mark_geometry_dirty();
+                Task::none()
+            }
+            Action::ToggleCommitBody => {
+                self.commit_body_expanded = !self.commit_body_expanded;
                 Task::none()
             }
             Action::ToggleSplit => {
@@ -4850,6 +4861,7 @@ impl Diffui {
             file_nav_width: Some(self.file_nav_width),
             diff_wrap: Some(self.diff_wrap),
             diff_split: Some(self.diff_split),
+            commit_details_collapsed: Some(self.commit_details_collapsed),
             // GitHub-PR tabs are session-only (no local root to restore from),
             // so they drop out of the persisted set here.
             open_repos: self

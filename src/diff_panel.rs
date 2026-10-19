@@ -466,10 +466,6 @@ fn build_diff_panel_body<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Me
         .wrap(ui.diff_wrap)
         .side_by_side(split_in_effect(ui));
 
-        if let Some(details) = ui.active().session.revision_details.as_ref() {
-            dv = dv.with_header(revision_header_lines(details));
-        }
-
         let collapsed: Vec<bool> = ui
             .active()
             .session
@@ -674,7 +670,7 @@ const MIN_SPLIT_COLUMN_CHARS: f32 = 56.0;
 
 /// The diff pane's width: the window minus the history and file panes and
 /// their dividers.
-fn diff_pane_width(ui: &Diffui) -> f32 {
+pub(crate) fn diff_pane_width(ui: &Diffui) -> f32 {
     let history_width = if ui.active().history_panel_collapsed {
         crate::theme::COLLAPSED_PANEL_WIDTH
     } else {
@@ -746,11 +742,8 @@ fn description_editor_input_height(ui: &Diffui) -> f32 {
     natural.clamp(88.0, maximum)
 }
 
-/// Compact stats line shown above the diff scroll area: saturated
-/// `+N` / `−M` glyphs followed by a quiet `· N files` tail. Mirrors the
-/// pattern the sidebar header used to carry — moved here so the sidebar
-/// stays focused on the revision list and the totals sit next to the
-/// content they describe.
+/// The commit info block above the diff (see [`crate::commit_info`]), or
+/// the description editor while it is open for this revision.
 fn build_revision_summary<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
     let session = &ui.active().session;
     if ui
@@ -760,203 +753,7 @@ fn build_revision_summary<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, M
     {
         return build_description_editor(ui, theme);
     }
-    let (additions, deletions) = (
-        session.document.total_additions,
-        session.document.total_deletions,
-    );
-    let stats = row![
-        text(format!("+{additions}"))
-            .size(text_size::UI)
-            .font(ui.config.ui_font)
-            .color(stat_color(additions, theme.added_text, theme)),
-        text(format!("−{deletions}"))
-            .size(text_size::UI)
-            .font(ui.config.ui_font)
-            .color(stat_color(deletions, theme.removed_text, theme)),
-        text(format_file_count(session.document.files.len()))
-            .size(text_size::UI)
-            .font(ui.config.ui_font)
-            .color(theme.subtle_text),
-    ]
-    .spacing(7)
-    .align_y(alignment::Vertical::Center);
-
-    let Some(details) = session.revision_details.as_ref() else {
-        return container(stats)
-            .width(Length::Fill)
-            .height(Length::Fixed(crate::field::PANEL_HEADER_HEIGHT))
-            .padding([0.0, crate::theme::space::XL])
-            .center_y(Length::Fixed(crate::field::PANEL_HEADER_HEIGHT))
-            .style(move |_| container::Style::default().background(theme.panel_background))
-            .into();
-    };
-
-    let description = details.description.trim();
-    let title = description
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("No description");
-    let meta = revision_meta(ui, details, theme);
-
-    // Counts of nothing say nothing; the empty state below says it better.
-    let stats: Element<'_, Message> = if session.document.files.is_empty() {
-        Space::new().into()
-    } else {
-        stats.into()
-    };
-    let title_stack = stack![
-        column![
-            stats,
-            text(title.to_owned())
-                .size(text_size::TITLE)
-                .font(crate::theme::emphasis_font(
-                    ui.config.ui_font,
-                    iced::font::Weight::Medium,
-                ))
-                .color(if description.is_empty() {
-                    theme.subtle_text
-                } else {
-                    theme.text
-                })
-                .wrapping(text::Wrapping::None),
-            meta,
-        ]
-        .spacing(crate::theme::space::XS)
-        .width(Length::Fill)
-    ]
-    .clip(true)
-    .width(Length::Fill);
-
-    let mut actions = row![].spacing(6).align_y(alignment::Vertical::Center);
-    if session.capabilities.mutate {
-        actions = actions.push(ui::tooltip(
-            ui::icon_button(icons::PENCIL, theme.muted_text, ui::Size::Compact, theme)
-                .on_press(Message::Action(Action::EditDescription { target: None })),
-            "Edit description",
-            iced::widget::tooltip::Position::Left,
-            ui.config.ui_font,
-            theme,
-        ));
-    }
-
-    let content = column![
-        row![title_stack, actions]
-            .spacing(12)
-            .align_y(alignment::Vertical::Center)
-    ]
-    .spacing(10);
-
-    container(content)
-        .width(Length::Fill)
-        .padding([10.0, crate::theme::space::XL])
-        .style(move |_| container::Style {
-            background: Some(Background::Color(theme.panel_background)),
-            border: Border {
-                width: 0.0,
-                color: Color::TRANSPARENT,
-                radius: 0.0.into(),
-            },
-            ..Default::default()
-        })
-        .into()
-}
-
-/// The header's identity line: the change id as the graph draws it (the
-/// shortest unique prefix bright), the commit id dimmed, then the author and
-/// a relative date with the exact one on hover.
-fn revision_meta<'a>(
-    ui: &'a Diffui,
-    details: &'a diffui_core::RevisionDetails,
-    theme: ThemeSpec,
-) -> Element<'a, Message> {
-    use crate::meta_line::{Badge, Id, Meta};
-    use crate::sidebar::{COMMIT_ID_CHARS, REVISION_ID_CHARS, revision_id_display_len};
-
-    let row = ui
-        .active()
-        .session
-        .commits
-        .find_by_commit_id(&details.commit_id);
-    let mut ids = Vec::new();
-    match details.change_id.as_deref() {
-        Some(change_id) => {
-            let unique = row
-                .and_then(|row| row.shortest_change_id_len())
-                .unwrap_or(REVISION_ID_CHARS);
-            let mut id: String = change_id
-                .chars()
-                .take(revision_id_display_len(unique, change_id))
-                .collect();
-            // How jj log addresses one copy of a divergent or hidden change.
-            if let Some(offset) = row.and_then(|row| row.change_offset()) {
-                id.push_str(&format!("/{offset}"));
-            }
-            ids.push(Id {
-                text: id,
-                bright: unique,
-                bright_color: theme.accent,
-                color: theme.subtle_text,
-            });
-            ids.push(Id::plain(
-                details
-                    .commit_id
-                    .chars()
-                    .take(COMMIT_ID_CHARS)
-                    .collect::<String>(),
-                theme.muted_text,
-            ));
-        }
-        // Git commits and PRs have one id: a hash, or the PR number.
-        None => ids.push(Id::plain(
-            details
-                .commit_id
-                .chars()
-                .take(COMMIT_ID_CHARS)
-                .collect::<String>(),
-            theme.muted_text,
-        )),
-    }
-    let mut badges = Vec::new();
-    if row.is_some_and(|row| row.is_hidden()) {
-        badges.push(Badge {
-            label: "hidden",
-            color: theme.subtle_text,
-        });
-    } else if row.is_some_and(|row| row.is_divergent()) {
-        badges.push(Badge {
-            label: "divergent",
-            color: theme.modified_token,
-        });
-    }
-    let author = &details.author;
-    let who = if !author.name.is_empty() {
-        Some((author.name.clone(), Some(author.email.clone())))
-    } else if !author.email.is_empty() {
-        Some((author.email.clone(), None))
-    } else {
-        None
-    };
-    let when = author
-        .timestamp
-        .as_ref()
-        .filter(|timestamp| !timestamp.is_empty())
-        .map(|timestamp| {
-            (
-                diffui_core::history::parse_timestamp_millis(timestamp),
-                timestamp.clone(),
-            )
-        });
-    crate::meta_line::view(
-        Meta {
-            ids,
-            badges,
-            who,
-            when,
-            operation: None,
-        },
-        ui,
-        theme,
-    )
+    crate::commit_info::view(ui, theme)
 }
 
 /// The selectable block atop the diff: the description's body and the
@@ -1003,14 +800,6 @@ pub(crate) fn revision_header_lines(details: &diffui_core::RevisionDetails) -> V
         lines.push(HeaderLine::field("signature", signature));
     }
     lines
-}
-
-fn format_file_count(count: usize) -> String {
-    if count == 1 {
-        "1 file".to_owned()
-    } else {
-        format!("{count} files")
-    }
 }
 
 fn format_signature_line(sig: &SignatureInfo) -> String {

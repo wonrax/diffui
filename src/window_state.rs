@@ -62,6 +62,10 @@ pub struct WindowState {
     /// to the unified view.
     #[serde(default)]
     pub diff_split: Option<bool>,
+    /// Whether the diff header is folded to its title and metadata line.
+    /// `None` falls back to unfolded.
+    #[serde(default)]
+    pub commit_details_collapsed: Option<bool>,
     /// Repository roots that were open as tabs, in tab order. Restored on the
     /// next launch when no repositories are given on the command line.
     #[serde(default)]
@@ -294,6 +298,7 @@ mod tests {
             files_panel_collapsed: BTreeMap::from([("/b/repo".to_owned(), true)]),
             diff_wrap: Some(false),
             diff_split: Some(true),
+            commit_details_collapsed: Some(true),
             open_repos: vec!["/a/repo".to_owned(), "/b/repo".to_owned()],
             active_repo: Some("/b/repo".to_owned()),
             revsets: BTreeMap::from([
