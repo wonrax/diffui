@@ -32,10 +32,6 @@ const FILE_HEADER_VPAD: f32 = 8.0;
 const HUNK_HEADER_VPAD: f32 = 3.0;
 const PREFIX_WIDTH: f32 = 24.0;
 const TEXT_X_PADDING: f32 = 8.0;
-/// Baseline text drop within a default-ratio row. A custom `code_line_height`
-/// splits its extra (or removed) leading evenly around this, and
-/// `code_baseline_offset` shifts it — see [`LayoutMetrics::new`].
-const TEXT_Y_PADDING: f32 = 2.0;
 // Rows advanced per wheel-notch line on Linux/Windows (macOS trackpads take the
 // pixel path below). Above the ~3-line OS default — browsing a long diff with a
 // wheel felt sluggish otherwise.
@@ -483,9 +479,10 @@ pub struct FindOverlay<'a> {
 #[derive(Debug, Clone, Copy)]
 struct LayoutMetrics {
     row_height: f32,
-    /// Vertical offset of a row's text below its top edge. The historical
-    /// [`TEXT_Y_PADDING`] at the default typography, shifted by half of any
-    /// configured extra leading plus the user's baseline offset.
+    /// Vertical offset of a row's text line box below its top edge: the
+    /// shift that centres the code font's caps in the row (see
+    /// [`crate::typography::TextBox::trim_shift`]), plus the user's
+    /// `code_baseline_offset`.
     text_y_pad: f32,
     file_header_height: f32,
     hunk_header_height: f32,
@@ -510,12 +507,11 @@ impl LayoutMetrics {
     ) -> Self {
         let text_size = typography.size;
         let row_height = (text_size * typography.line_height).round();
-        // Pixel-identical to the fixed TEXT_Y_PADDING at default typography;
-        // a custom line height splits its leading delta evenly above/below,
-        // and the baseline offset then nudges the result.
-        let default_row_height = (text_size * crate::config::DEFAULT_CODE_LINE_HEIGHT).round();
-        let text_y_pad =
-            TEXT_Y_PADDING + (row_height - default_row_height) / 2.0 + typography.baseline_offset;
+        // The line box is the row; cosmic-text centres ascent + descent in it,
+        // and this moves the caps to the middle instead, from the font's own
+        // metrics. Any line height gets the same treatment.
+        let text_y_pad = crate::typography::TextBox::new(font, text_size, row_height).trim_shift()
+            + typography.baseline_offset;
         // Plain (source-browse) documents render no file/hunk header strips;
         // zero heights keep the prefix-sum index, hit tests, and draw all
         // consistent without a parallel layout mode.
@@ -4696,10 +4692,14 @@ where
                     &hunk.header,
                     TextRenderParams {
                         width: self.text_width(&hunk.header),
-                        height: self.metrics.hunk_header_height,
+                        height: self.metrics.row_height,
                         position: Point::new(
                             bounds.x + header_x + TEXT_X_PADDING,
-                            header.y + self.metrics.text_y_pad,
+                            centered_text_y(
+                                header.y,
+                                self.metrics.hunk_header_height,
+                                self.metrics.row_height,
+                            ) + self.metrics.text_y_pad,
                         ),
                         color: if self.is_collapsed(header.file_index) {
                             self.palette.text
@@ -5276,7 +5276,8 @@ impl<Message> DiffView<'_, Message> {
             self.palette.border,
         );
 
-        let text_y = centered_text_y(y, self.metrics.file_header_height, self.metrics.row_height);
+        let text_y = centered_text_y(y, self.metrics.file_header_height, self.metrics.row_height)
+            + self.metrics.text_y_pad;
         let check_rect = self.file_check_rect(file_index, y, bounds);
         let check_reserve = if let Some(rect) = check_rect {
             let state = self
@@ -6359,10 +6360,9 @@ where
 mod tests {
     use super::*;
 
-    /// The typography config drives the layout metrics: default values stay
-    /// pixel-identical to the historical constants, a custom line height
-    /// splits its leading delta evenly around the text, and the baseline
-    /// offset shifts it verbatim.
+    /// The typography config drives the layout metrics: the text's caps are
+    /// centred in the row whatever its height, and the baseline offset
+    /// shifts them verbatim.
     #[test]
     fn layout_metrics_follow_code_typography() {
         use crate::config::CodeTypography;
@@ -6370,32 +6370,34 @@ mod tests {
 
         let default = metrics(CodeTypography::default());
         assert_eq!(default.row_height, 22.0, "12px × 1.85 rounds to 22");
-        assert_eq!(default.text_y_pad, TEXT_Y_PADDING);
+        // The caps sit centred in the row: the shift comes from the font.
+        let trim = crate::typography::TextBox::new(Font::MONOSPACE, 12.0, 22.0).trim_shift();
+        assert_eq!(default.text_y_pad, trim);
 
         let airy = metrics(CodeTypography {
             line_height: 2.35,
             ..CodeTypography::default()
         });
         assert_eq!(airy.row_height, 28.0, "12px × 2.35 rounds to 28");
-        // 6px of extra leading, half above the text.
-        assert_eq!(airy.text_y_pad, TEXT_Y_PADDING + 3.0);
+        // Extra leading is centred by the line box itself; the shift that
+        // centres the caps doesn't depend on it.
+        assert_eq!(airy.text_y_pad, trim);
 
         let nudged = metrics(CodeTypography {
             baseline_offset: -1.5,
             ..CodeTypography::default()
         });
         assert_eq!(nudged.row_height, default.row_height);
-        assert_eq!(nudged.text_y_pad, TEXT_Y_PADDING - 1.5);
+        assert_eq!(nudged.text_y_pad, trim - 1.5);
 
         let bigger = metrics(CodeTypography {
             size: 16.0,
             ..CodeTypography::default()
         });
         assert_eq!(bigger.row_height, 30.0, "16px × 1.85 rounds to 30");
-        // Size alone keeps the historical fixed padding (the default-ratio
-        // delta is zero by construction), matching the pre-config behavior
-        // for any `text_size`.
-        assert_eq!(bigger.text_y_pad, TEXT_Y_PADDING);
+        // The shift scales with the size.
+        let ratio = bigger.text_y_pad / trim;
+        assert!((ratio - 16.0 / 12.0).abs() < 1e-3, "{ratio}");
     }
 
     pub(super) fn test_palette() -> Palette {
