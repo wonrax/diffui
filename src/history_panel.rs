@@ -1114,6 +1114,8 @@ enum OpRow<'a> {
         first: &'a OperationEntry,
         count: usize,
         oldest: &'a OperationEntry,
+        /// The run's operations, when it is unfolded.
+        children: Option<&'a [OperationEntry]>,
     },
 }
 
@@ -1136,10 +1138,11 @@ fn op_rows<'a>(history: &'a HistoryState) -> Vec<OpRow<'a>> {
                 first: op,
                 count: run,
                 oldest: &ops[run_end - 1],
+                children: history
+                    .expanded_runs
+                    .contains(&op.id)
+                    .then(|| &ops[index..run_end]),
             });
-            if history.expanded_runs.contains(&op.id) {
-                rows.extend(ops[index..run_end].iter().map(OpRow::Op));
-            }
             index = run_end;
         } else {
             rows.push(OpRow::Op(op));
@@ -1149,58 +1152,51 @@ fn op_rows<'a>(history: &'a HistoryState) -> Vec<OpRow<'a>> {
     rows
 }
 
+/// Height of the op log's one-line rows: snapshots and snapshot runs.
+const OP_LINE_HEIGHT: f32 = 24.0;
+/// Width of the chevron column in a snapshot run's row.
+const RUN_CHEVRON: f32 = 12.0;
+
 fn op_row<'a>(
     ui: &'a Diffui,
     theme: ThemeSpec,
     op: &'a OperationEntry,
     now: i64,
 ) -> Element<'a, Message> {
+    if op.is_snapshot {
+        return snapshot_row(ui, theme, op, now);
+    }
     let history = &ui.active().history;
     let selected = history.selected_op.as_deref() == Some(op.id.as_str());
     let age = relative_age(op.time_millis, now);
-    let content: Element<'a, Message> = if op.is_snapshot {
-        row![
-            Space::new().width(Length::Fixed(space::LG)),
-            mono(op.short_id(), theme.subtle_text, ui),
-            caption(op.summary(), theme.subtle_text, ui)
-                .ellipsis(text::Ellipsis::End)
-                .width(Length::Fill),
-            caption(age, theme.subtle_text, ui),
-        ]
-        .spacing(space::SM)
-        .align_y(alignment::Vertical::Center)
-        .into()
+    let id_color = if op.is_current {
+        theme.accent
     } else {
-        let id_color = if op.is_current {
-            theme.accent
-        } else {
-            theme.muted_text
-        };
-        let mut head = row![mono(op.short_id(), id_color, ui)]
-            .spacing(space::SM)
-            .align_y(alignment::Vertical::Center);
-        if op.is_current {
-            head = head.push(chip("current", theme.accent, ui));
-        }
-        head = head.push(
-            caption(op.user.as_str(), theme.subtle_text, ui)
-                .ellipsis(text::Ellipsis::End)
-                .width(Length::Fill),
-        );
-        head = head.push(caption(age, theme.subtle_text, ui));
-        column![
-            head,
-            text(op.summary())
-                .size(text_size::BODY)
-                .font(ui.config.ui_font)
-                .color(theme.text)
-                .wrapping(text::Wrapping::None)
-                .ellipsis(text::Ellipsis::End)
-                .width(Length::Fill),
-        ]
-        .spacing(2)
-        .into()
+        theme.muted_text
     };
+    let mut head = row![mono(op.short_id(), id_color, ui)]
+        .spacing(space::SM)
+        .align_y(alignment::Vertical::Center);
+    if op.is_current {
+        head = head.push(chip("current", theme.accent, ui));
+    }
+    head = head.push(
+        caption(op.user.as_str(), theme.subtle_text, ui)
+            .ellipsis(text::Ellipsis::End)
+            .width(Length::Fill),
+    );
+    head = head.push(caption(age, theme.subtle_text, ui));
+    let content = column![
+        head,
+        text(op.summary())
+            .size(text_size::BODY)
+            .font(ui.config.ui_font)
+            .color(theme.text)
+            .wrapping(text::Wrapping::None)
+            .ellipsis(text::Ellipsis::End)
+            .width(Length::Fill),
+    ]
+    .spacing(2);
     button(content)
         .width(Length::Fill)
         .padding(Padding::from([space::XS, space::MD]))
@@ -1211,28 +1207,79 @@ fn op_row<'a>(
         .into()
 }
 
+/// A snapshot on one quiet line, on its own or inside an unfolded run.
+fn snapshot_row<'a>(
+    ui: &'a Diffui,
+    theme: ThemeSpec,
+    op: &'a OperationEntry,
+    now: i64,
+) -> Element<'a, Message> {
+    let selected = ui.active().history.selected_op.as_deref() == Some(op.id.as_str());
+    let mut line = row![mono(
+        op.short_id(),
+        if op.is_current {
+            theme.accent
+        } else {
+            theme.subtle_text
+        },
+        ui
+    )]
+    .spacing(space::SM)
+    .height(Length::Fill)
+    .align_y(alignment::Vertical::Center);
+    if op.is_current {
+        line = line.push(chip("current", theme.accent, ui));
+    }
+    line = line.push(
+        caption(op.summary(), theme.subtle_text, ui)
+            .ellipsis(text::Ellipsis::End)
+            .width(Length::Fill),
+    );
+    line = line.push(caption(
+        relative_age(op.time_millis, now),
+        theme.subtle_text,
+        ui,
+    ));
+    button(line)
+        .width(Length::Fill)
+        .height(Length::Fixed(OP_LINE_HEIGHT))
+        .padding(Padding::from([0.0, space::MD]))
+        .on_press(Message::Action(Action::History(
+            HistoryAction::SelectOperation(op.id.clone()),
+        )))
+        .style(move |_, status| row_style(theme, selected, status))
+        .into()
+}
+
+/// A folded run of snapshots, and its operations under it when unfolded:
+/// indented behind a guide line dropped from the chevron, the way the file
+/// tree nests a folder's files.
 fn run_row<'a>(
     ui: &'a Diffui,
     theme: ThemeSpec,
     first: &'a OperationEntry,
     count: usize,
     oldest: &'a OperationEntry,
+    children: Option<&'a [OperationEntry]>,
     now: i64,
 ) -> Element<'a, Message> {
-    let expanded = ui.active().history.expanded_runs.contains(&first.id);
-    let chevron = if expanded {
+    let chevron = if children.is_some() {
         icons::CHEVRON_DOWN
     } else {
         icons::CHEVRON_RIGHT
     };
-    let span = format!(
-        "{}\u{2013}{}",
+    let (from, to) = (
         relative_age(oldest.time_millis, now),
-        relative_age(first.time_millis, now)
+        relative_age(first.time_millis, now),
     );
-    button(
+    let span = if from == to {
+        to
+    } else {
+        format!("{from}\u{2013}{to}")
+    };
+    let header = button(
         row![
-            icons::icon(chevron, 12.0, theme.subtle_text),
+            icons::icon(chevron, RUN_CHEVRON, theme.subtle_text),
             caption(
                 format!("{count} working-copy snapshots"),
                 theme.subtle_text,
@@ -1242,14 +1289,46 @@ fn run_row<'a>(
             caption(span, theme.subtle_text, ui),
         ]
         .spacing(space::SM)
+        .height(Length::Fill)
         .align_y(alignment::Vertical::Center),
     )
     .width(Length::Fill)
-    .padding(Padding::from([space::XXS, space::MD]))
+    .height(Length::Fixed(OP_LINE_HEIGHT))
+    .padding(Padding::from([0.0, space::MD]))
     .on_press(Message::Action(Action::History(
         HistoryAction::ToggleSnapshotRun(first.id.clone()),
     )))
-    .style(move |_, status| row_style(theme, false, status))
+    .style(move |_, status| row_style(theme, false, status));
+    let Some(children) = children else {
+        return header.into();
+    };
+
+    let guide = container(Space::new())
+        .width(Length::Fixed(1.0))
+        .height(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(theme.border)),
+            ..container::Style::default()
+        });
+    let mut rows = column![].spacing(1);
+    for op in children {
+        rows = rows.push(snapshot_row(ui, theme, op, now));
+    }
+    // The guide hangs from the chevron's centre; the children's ids line up
+    // with the run's label.
+    let guide_x = space::MD + RUN_CHEVRON / 2.0 - 0.5;
+    let label_x = space::MD + RUN_CHEVRON + space::SM;
+    let child_x = label_x - space::MD;
+    column![
+        header,
+        row![
+            Space::new().width(Length::Fixed(guide_x)),
+            guide,
+            Space::new().width(Length::Fixed(child_x - guide_x - 1.0)),
+            rows,
+        ],
+    ]
+    .spacing(1)
     .into()
 }
 
@@ -1404,7 +1483,8 @@ pub(crate) fn build_history_sidebar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Ele
                         first,
                         count,
                         oldest,
-                    } => run_row(ui, theme, first, count, oldest, now),
+                        children,
+                    } => run_row(ui, theme, first, count, oldest, children, now),
                 });
             }
             if history.ops_job.is_some() {
@@ -2077,7 +2157,23 @@ mod tests {
             .into_iter()
             .map(|row| match row {
                 OpRow::Op(op) => op.id.clone(),
-                OpRow::Run { first, count, .. } => format!("{}x{count}", first.id),
+                OpRow::Run {
+                    first,
+                    count,
+                    children,
+                    ..
+                } => match children {
+                    Some(children) => format!(
+                        "{}x{count}[{}]",
+                        first.id,
+                        children
+                            .iter()
+                            .map(|op| op.id.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ),
+                    None => format!("{}x{count}", first.id),
+                },
             })
             .collect()
     }
@@ -2246,6 +2342,6 @@ mod tests {
         // The current op always shows; a lone snapshot isn't worth a fold.
         assert_eq!(shape(&history), ["a", "bx2", "d", "e", "f"]);
         history.expanded_runs.insert("b".to_owned());
-        assert_eq!(shape(&history), ["a", "bx2", "b", "c", "d", "e", "f"]);
+        assert_eq!(shape(&history), ["a", "bx2[b,c]", "d", "e", "f"]);
     }
 }
