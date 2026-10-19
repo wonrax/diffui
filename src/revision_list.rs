@@ -2892,7 +2892,6 @@ fn draw_file_check<R>(
 ) where
     R: text::Renderer,
 {
-    use crate::diff_view::CheckState;
     const SIDE: f32 = 12.0;
     let rect = Rectangle {
         x: center_x - SIDE / 2.0,
@@ -2900,41 +2899,7 @@ fn draw_file_check<R>(
         width: SIDE,
         height: SIDE,
     };
-    let checked = check != CheckState::Off;
-    renderer.fill_quad(
-        iced::advanced::renderer::Quad {
-            bounds: rect,
-            border: iced::Border {
-                radius: 3.0.into(),
-                width: 1.0,
-                color: if checked {
-                    accent
-                } else {
-                    Color { a: 0.55, ..muted }
-                },
-            },
-            shadow: iced::Shadow::default(),
-            snap: true,
-        },
-        if checked { accent } else { Color::TRANSPARENT },
-    );
-    let glyph = match check {
-        CheckState::Off => return,
-        CheckState::Partial => icons::MINUS,
-        CheckState::On => icons::CHECK,
-    };
-    fill_text_centered_y(
-        renderer,
-        glyph,
-        center_x,
-        mid_y,
-        SIDE,
-        SIDE - 3.0,
-        glyph_color,
-        icons::ICON_FONT,
-        clip,
-        text::Alignment::Center,
-    );
+    crate::diff_view::draw_checkbox(renderer, rect, check, accent, muted, glyph_color, clip);
 }
 
 #[cfg(test)]

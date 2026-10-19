@@ -5871,41 +5871,79 @@ impl<Message> DiffView<'_, Message> {
         let Some(marks) = &self.marks else {
             return;
         };
-        let checked = state != CheckState::Off;
-        renderer.fill_quad(
-            renderer::Quad {
-                bounds: rect,
-                border: Border {
-                    radius: 3.0.into(),
-                    width: 1.0,
-                    color: if checked {
-                        marks.accent
-                    } else {
-                        Color {
-                            a: 0.55,
-                            ..self.palette.text_muted
-                        }
-                    },
-                },
-                shadow: Shadow::default(),
-                snap: true,
-            },
-            if checked {
-                marks.accent
-            } else {
-                Color::TRANSPARENT
-            },
+        draw_checkbox(
+            renderer,
+            rect,
+            state,
+            marks.accent,
+            self.palette.text_muted,
+            self.palette.panel,
+            clip,
         );
-        let glyph = match state {
-            CheckState::Off => return,
-            CheckState::Partial => crate::icons::MINUS,
-            CheckState::On => crate::icons::CHECK,
-        };
-        renderer.fill_text(
+    }
+}
+
+/// A change-selection checkbox in `rect`. Checked and mixed share the
+/// accent fill and shape and differ only in the mark: a tick, or the short
+/// bar of a macOS mixed checkbox (drawn, so it can't be read as the diff's
+/// `−` prefix).
+pub(crate) fn draw_checkbox<Renderer>(
+    renderer: &mut Renderer,
+    rect: Rectangle,
+    state: CheckState,
+    accent: Color,
+    muted: Color,
+    mark: Color,
+    clip: Rectangle,
+) where
+    Renderer: text::Renderer,
+{
+    let checked = state != CheckState::Off;
+    renderer.fill_quad(
+        renderer::Quad {
+            bounds: rect,
+            border: Border {
+                radius: 3.0.into(),
+                width: 1.0,
+                color: if checked {
+                    accent
+                } else {
+                    Color { a: 0.55, ..muted }
+                },
+            },
+            shadow: Shadow::default(),
+            snap: true,
+        },
+        if checked { accent } else { Color::TRANSPARENT },
+    );
+    match state {
+        CheckState::Off => {}
+        CheckState::Partial => {
+            let width = (rect.width * 0.5).round();
+            let height = 2.0;
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: Rectangle {
+                        x: (rect.center_x() - width / 2.0).round(),
+                        y: (rect.center_y() - height / 2.0).round(),
+                        width,
+                        height,
+                    },
+                    border: Border {
+                        radius: (height / 2.0).into(),
+                        ..Border::default()
+                    },
+                    shadow: Shadow::default(),
+                    snap: true,
+                },
+                mark,
+            );
+        }
+        CheckState::On => renderer.fill_text(
             text::Text {
-                content: glyph.to_owned(),
+                content: crate::icons::CHECK.to_owned(),
                 bounds: Size::new(rect.width, rect.height),
-                size: Pixels(CHECK_SIZE - 3.0),
+                size: Pixels(rect.height - 3.0),
                 line_height: text::LineHeight::Absolute(Pixels(rect.height)),
                 font: crate::icons::ICON_FONT,
                 align_x: text::Alignment::Center,
@@ -5916,9 +5954,9 @@ impl<Message> DiffView<'_, Message> {
                 hint_factor: None,
             },
             Point::new(rect.center_x(), rect.center_y()),
-            self.palette.panel,
+            mark,
             clip,
-        );
+        ),
     }
 }
 
