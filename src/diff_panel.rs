@@ -3,7 +3,7 @@ use iced::{
     widget::{Space, column, container, mouse_area, row, stack, text},
 };
 
-use crate::diff_view::{self, DiffFileView, DiffView, HeaderLine};
+use crate::diff_view::{self, DiffFileView, DiffView};
 use crate::find;
 use crate::icons;
 use crate::revision_list::{FileRowView, RevisionList};
@@ -13,7 +13,7 @@ use crate::theme::{
 };
 use crate::ui;
 use crate::{Action, Diffui, LoadStatus, Message, UiEvent};
-use diffui_core::{FileTreeRow, SignatureInfo};
+use diffui_core::FileTreeRow;
 use jj_lib::graph::GraphEdgeType;
 use std::rc::Rc;
 
@@ -435,7 +435,42 @@ fn build_diff_panel_body<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Me
             .padding(crate::theme::space::XXL)
             .center(Length::Fill);
             let banner = crate::compare::build_compare_banner(ui, theme);
-            return container(column![].push(banner).push(summary).push(empty))
+            // No diff to carry the commit's header, so a header-only diff
+            // view stands in above the empty state, selectable the same way.
+            let header = ui
+                .active()
+                .session
+                .revision_details
+                .as_ref()
+                .map(|details| {
+                    crate::commit_info::header_lines(ui, details, theme, true, diff_pane_width(ui))
+                })
+                .filter(|lines| !lines.is_empty())
+                .map(|lines| {
+                    let height = diff_view::header_block_height(&lines, ui.config.code_type);
+                    container(
+                        DiffView::new(
+                            Vec::new(),
+                            0,
+                            format!("header:{}", ui.active().session.document_id),
+                            diff_palette(theme),
+                            ui.config.mono_font,
+                            ui.config.code_type,
+                            ui.config.multi_click_ms,
+                            |index| Message::Action(Action::SelectFile(index)),
+                        )
+                        .on_copy(|text| Message::Action(Action::Copy(text)))
+                        .on_header_action(crate::commit_info::header_action)
+                        .content_version(ui.document_version)
+                        .with_header(lines),
+                    )
+                    .height(Length::Fixed(height))
+                });
+            let mut stack = column![].push(banner).push(summary);
+            if let Some(header) = header {
+                stack = stack.push(header);
+            }
+            return container(stack.push(empty))
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .style(move |_| diff_panel_style(theme))
@@ -459,7 +494,17 @@ fn build_diff_panel_body<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Me
         .content_version(ui.document_version)
         .layout_version(ui.active().session.document_id)
         .wrap(ui.diff_wrap)
-        .side_by_side(split_in_effect(ui));
+        .side_by_side(split_in_effect(ui))
+        .on_header_action(crate::commit_info::header_action);
+        if let Some(details) = ui.active().session.revision_details.as_ref() {
+            dv = dv.with_header(crate::commit_info::header_lines(
+                ui,
+                details,
+                theme,
+                true,
+                diff_pane_width(ui),
+            ));
+        }
 
         let collapsed: Vec<bool> = ui
             .active()
@@ -713,119 +758,9 @@ fn build_revision_summary<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, M
     crate::commit_info::view(ui, theme)
 }
 
-/// The selectable block atop the diff: the description's body and the
-/// identity fields. The subject is left out — the header above already
-/// shows it as the title — along with the blank lines that set it apart.
-pub(crate) fn revision_header_lines(details: &diffui_core::RevisionDetails) -> Vec<HeaderLine> {
-    let description = details.description.trim();
-    let body = description
-        .split_once('\n')
-        .map_or("", |(_, body)| body)
-        .trim();
-    let mut lines = body
-        .lines()
-        .map(HeaderLine::description)
-        .collect::<Vec<_>>();
-    if !body.is_empty() {
-        lines.push(HeaderLine::blank());
-    }
-    if let Some(change_id) = &details.change_id {
-        lines.push(HeaderLine::field("change", change_id));
-    }
-    lines.push(HeaderLine::field("commit", &details.commit_id));
-    if !details.bookmarks.is_empty() {
-        lines.push(HeaderLine::field(
-            "bookmarks",
-            &details.bookmarks.join(", "),
-        ));
-    }
-    lines.push(HeaderLine::field(
-        "author",
-        &format_signature_line(&details.author),
-    ));
-    // Only when someone else committed it: the same person again, a few
-    // minutes later, is noise.
-    if let Some(committer) = details.committer.as_ref().filter(|committer| {
-        committer.name != details.author.name || committer.email != details.author.email
-    }) {
-        lines.push(HeaderLine::field(
-            "committer",
-            &format_signature_line(committer),
-        ));
-    }
-    if let Some(signature) = &details.signature {
-        lines.push(HeaderLine::field("signature", signature));
-    }
-    lines
-}
-
-fn format_signature_line(sig: &SignatureInfo) -> String {
-    let mut parts = String::new();
-    if !sig.name.is_empty() {
-        parts.push_str(&sig.name);
-    }
-    if !sig.email.is_empty() {
-        if !parts.is_empty() {
-            parts.push(' ');
-        }
-        parts.push('<');
-        parts.push_str(&sig.email);
-        parts.push('>');
-    }
-    if let Some(ts) = &sig.timestamp
-        && !ts.is_empty()
-    {
-        parts.push_str(" (");
-        parts.push_str(ts);
-        parts.push(')');
-    }
-    parts
-}
-
 #[cfg(test)]
 mod tests {
     use iced::Font;
-
-    use super::{HeaderLine, revision_header_lines};
-
-    #[test]
-    fn selectable_details_preserve_description_and_identity() {
-        let details = diffui_core::RevisionDetails {
-            commit_id: "abcdef012345".to_owned(),
-            change_id: Some("zyxwvut98765".to_owned()),
-            bookmarks: vec!["main".to_owned()],
-            author: diffui_core::SignatureInfo {
-                name: "Ada".to_owned(),
-                email: "ada@example.com".to_owned(),
-                timestamp: Some("2026-09-07".to_owned()),
-            },
-            committer: None,
-            signature: None,
-            description: "subject\n\nbody".to_owned(),
-            parents: Vec::new(),
-        };
-
-        let rendered = revision_header_lines(&details)
-            .into_iter()
-            .map(|line| match line {
-                HeaderLine::Description(value) => format!("description:{value}"),
-                HeaderLine::Blank => "blank".to_owned(),
-                HeaderLine::Field { label, value } => format!("{label}{value}"),
-                other => panic!("unexpected header line: {other:?}"),
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            rendered,
-            [
-                "description:body",
-                "blank",
-                "change   zyxwvut98765",
-                "commit   abcdef012345",
-                "bookmarksmain",
-                "author   Ada <ada@example.com> (2026-09-07)",
-            ]
-        );
-    }
 
     #[test]
     fn description_height_counts_newlines_and_wrapping() {

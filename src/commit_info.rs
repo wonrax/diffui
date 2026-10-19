@@ -1,40 +1,29 @@
-//! The commit info block above the diff.
+//! The commit info block: what a revision is, above its diff.
 //!
-//! One block says what the revision is: the title with the change's size and
-//! the edit and fold controls; the description body at a reading measure,
-//! clamped when long; and a field grid in two columns, who and when on the
-//! left, which ids on the right, each id with a copy button and the parents
-//! as links. Folded, the block is the title and the shared
-//! [`crate::meta_line`] line, the same line the History view's headers use.
+//! Above the diff sits the title, with the change's size and the edit and
+//! fold controls. The rest scrolls with the diff, drawn by the diff view as
+//! its header ([`header_lines`]) so it stays selectable text: the
+//! description's body in mono, then one column of fields: author, date,
+//! change and commit ids in the graph's colours with copy buttons, parents
+//! as links, and the bookmarks. The History view's diffs
+//! carry the same header. Folded, the block is the title and the shared
+//! [`crate::meta_line`] line, the line the History view's headers use.
 
 use diffui_core::history::{human_timestamp, now_millis, parse_timestamp_millis};
-use diffui_core::{ParentBrief, RevisionDetails};
+use diffui_core::{RevisionDetails, SignatureInfo};
 use iced::{
     Background, Border, Color, Element, Length, Padding, alignment,
-    widget::{Column, Row, Space, button, column, container, row, text},
+    widget::{Column, Row, Space, container, row, text},
 };
 
+use crate::diff_view::{HeaderAction, HeaderField, HeaderLine};
 use crate::meta_line::{self, Badge, Id, Meta};
 use crate::sidebar::{COMMIT_ID_CHARS, REVISION_ID_CHARS, revision_id_display_len};
-use crate::theme::{ThemeSpec, chip_background, emphasis_font, space, text_size};
+use crate::theme::{ThemeSpec, emphasis_font, space, text_size};
 use crate::{Action, Diffui, Message, icons, ui};
 
-/// Lines of description body shown before the rest folds behind "Show more".
-const BODY_CLAMP_LINES: usize = 4;
-/// Widest the description body runs: a comfortable reading measure.
-const BODY_MAX_WIDTH: f32 = 720.0;
-/// Width of the field grid's label column.
-const FIELD_LABEL_WIDTH: f32 = 64.0;
-/// One field row: tall enough for the copy button beside an id.
-const FIELD_ROW_HEIGHT: f32 = 22.0;
-/// Side of the copy and parent-link hit targets inside a field row.
-const FIELD_BUTTON: f32 = 20.0;
-/// Side of the author's initials badge.
-const MONOGRAM_SIZE: f32 = 18.0;
 /// The title leads the pane, a step above dialog titles.
 const TITLE_SIZE: f32 = 17.0;
-/// Widest a name, email or parent subject runs before it ellipsizes.
-const FIELD_TEXT_MAX: f32 = 240.0;
 /// Width of the additions/deletions bar beside the counts.
 const STAT_BAR_WIDTH: f32 = 36.0;
 
@@ -51,12 +40,10 @@ pub(crate) fn view<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message>
             .into();
     };
 
-    let description = details.description.trim();
-    let title = description.lines().find(|line| !line.trim().is_empty());
-    let body = description
-        .split_once('\n')
-        .map_or("", |(_, body)| body)
-        .trim();
+    let title = details
+        .description
+        .lines()
+        .find(|line| !line.trim().is_empty());
 
     let mut title_row = row![
         text(title.unwrap_or("No description").to_owned())
@@ -115,27 +102,16 @@ pub(crate) fn view<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message>
         theme,
     ));
 
-    let mut block = Column::new().push(title_row);
+    let mut block = Column::new().push(title_row).spacing(space::XXS);
     if folded {
-        block = block
-            .push(revision_meta(ui, details, theme))
-            .spacing(space::XXS);
-    } else {
-        block = block.spacing(space::SM);
-        if !body.is_empty() {
-            block = block.push(description_body(ui, body, theme));
-        }
-        block = block.push(container(field_grid(ui, details, theme)).padding(Padding {
-            top: space::XS,
-            ..Padding::ZERO
-        }));
+        block = block.push(revision_meta(ui, details, theme));
     }
     container(block)
         .width(Length::Fill)
         .padding(Padding {
             top: space::MD,
             right: space::LG,
-            bottom: if folded { space::MD } else { space::LG },
+            bottom: space::MD,
             left: space::XL,
         })
         .style(move |_| container::Style::default().background(theme.panel_background))
@@ -202,385 +178,6 @@ fn diff_stats<'a>(ui: &Diffui, theme: ThemeSpec) -> Element<'a, Message> {
         .into()
 }
 
-/// The description body at a reading measure. Past [`BODY_CLAMP_LINES`] it
-/// clamps behind "Show more"; unfolded, it scrolls past 40% of the window so
-/// the diff keeps a foothold.
-fn description_body<'a>(ui: &Diffui, body: &str, theme: ThemeSpec) -> Element<'a, Message> {
-    let size = text_size::BODY;
-    let line_height = (size * crate::measure::LINE_HEIGHT_MULTIPLIER).round();
-    let width =
-        (crate::diff_panel::diff_pane_width(ui) - space::XL - space::LG).clamp(1.0, BODY_MAX_WIDTH);
-    let measure = |content: &str| {
-        crate::measure::wrapped_line_count(content, size, ui.config.ui_font, line_height, width)
-    };
-    let lines = measure(body);
-    let paragraphs: Vec<usize> = body.split("\n\n").map(measure).collect();
-    let paragraph = text(body.to_owned())
-        .size(size)
-        .font(ui.config.ui_font)
-        .line_height(iced::Pixels(line_height))
-        .color(theme.text)
-        .width(Length::Fixed(width));
-    let Some(clamp) = clamped_lines(&paragraphs, lines) else {
-        return paragraph.into();
-    };
-    let expanded = ui.commit_body_expanded;
-    let shown: Element<'a, Message> = if expanded {
-        let natural = lines as f32 * line_height;
-        let cap = (ui.window_size.height * 0.4).max(BODY_CLAMP_LINES as f32 * line_height);
-        ui::scrollable(
-            container(paragraph).padding(Padding::ZERO.right(crate::scrollbar::GUTTER)),
-            theme,
-        )
-        .height(Length::Fixed(natural.min(cap)))
-        .into()
-    } else {
-        container(paragraph)
-            .height(Length::Fixed(clamp as f32 * line_height))
-            .clip(true)
-            .into()
-    };
-    let toggle = button(
-        row![
-            text(if expanded { "Show less" } else { "Show more" })
-                .size(text_size::UI)
-                .font(ui.config.ui_font),
-            icons::icon(
-                if expanded {
-                    icons::CHEVRON_UP
-                } else {
-                    icons::CHEVRON_DOWN
-                },
-                12.0,
-                theme.accent,
-            ),
-        ]
-        .spacing(space::XXS)
-        .align_y(alignment::Vertical::Center),
-    )
-    .padding(0)
-    .on_press(Message::Action(Action::ToggleCommitBody))
-    .style(move |_, _| button::Style {
-        text_color: theme.accent,
-        ..button::Style::default()
-    });
-    column![shown, toggle].spacing(space::XS).into()
-}
-
-/// How many lines a folded body shows, or `None` when it shows whole: as
-/// many whole paragraphs as fit in [`BODY_CLAMP_LINES`] (so the fold never
-/// lands on the blank line between two), or the clamp when even the first
-/// is longer. One line past the clamp isn't worth a fold.
-fn clamped_lines(paragraphs: &[usize], total: usize) -> Option<usize> {
-    if total <= BODY_CLAMP_LINES + 1 {
-        return None;
-    }
-    let mut shown = 0;
-    for (index, &lines) in paragraphs.iter().enumerate() {
-        let with = shown + usize::from(index > 0) + lines;
-        if with > BODY_CLAMP_LINES {
-            break;
-        }
-        shown = with;
-    }
-    Some(if shown == 0 { BODY_CLAMP_LINES } else { shown })
-}
-
-/// Who and when on the left; the change, commit, parents and refs on the
-/// right. The columns wrap onto each other when the pane is narrow.
-fn field_grid<'a>(
-    ui: &'a Diffui,
-    details: &'a RevisionDetails,
-    theme: ThemeSpec,
-) -> Element<'a, Message> {
-    let mut people = Column::new();
-    people = people.push(field(
-        "author",
-        signature(ui, &details.author, true, theme),
-        ui,
-        theme,
-    ));
-    if let Some(timestamp) = details
-        .author
-        .timestamp
-        .as_deref()
-        .filter(|timestamp| !timestamp.is_empty())
-    {
-        people = people.push(field("date", date(ui, timestamp, theme), ui, theme));
-    }
-    // Only when someone else committed it: the same person again, a few
-    // minutes later, is noise.
-    if let Some(committer) = details.committer.as_ref().filter(|committer| {
-        committer.name != details.author.name || committer.email != details.author.email
-    }) {
-        people = people.push(field(
-            "committer",
-            signature(ui, committer, false, theme),
-            ui,
-            theme,
-        ));
-    }
-    if let Some(signature) = &details.signature {
-        people = people.push(field(
-            "signature",
-            plain(signature.clone(), theme.muted_text, ui),
-            ui,
-            theme,
-        ));
-    }
-
-    let row_of = ui
-        .active()
-        .session
-        .commits
-        .find_by_commit_id(&details.commit_id);
-    let mut ids = Column::new();
-    if let Some(change_id) = details.change_id.as_deref() {
-        let unique = unique_prefix(ui, row_of);
-        let mut shown = change_id.to_owned();
-        // How jj log addresses one copy of a divergent or hidden change.
-        if let Some(offset) = row_of.and_then(|row| row.change_offset()) {
-            shown.push_str(&format!("/{offset}"));
-        }
-        let mut value = Row::new()
-            .spacing(space::SM)
-            .align_y(alignment::Vertical::Center)
-            .push(meta_line::id_text(
-                Id {
-                    text: shown,
-                    bright: unique,
-                    bright_color: theme.accent,
-                    color: theme.subtle_text,
-                },
-                ui,
-            ));
-        for badge in status_badges(row_of, theme) {
-            value = value.push(meta_line::badge(badge.label, badge.color, ui));
-        }
-        value = value.push(copy_button(change_id, "Copy the change id", ui, theme));
-        ids = ids.push(field("change", inset(value), ui, theme));
-    }
-    let pull_request = details.commit_id.starts_with('#');
-    let commit = Row::new()
-        .spacing(space::SM)
-        .align_y(alignment::Vertical::Center)
-        .push(meta_line::id_text(
-            if details.change_id.is_some() {
-                // jj: the short commit id bright, as the graph shows it.
-                Id {
-                    text: details.commit_id.clone(),
-                    bright: COMMIT_ID_CHARS,
-                    bright_color: theme.muted_text,
-                    color: theme.subtle_text,
-                }
-            } else if pull_request {
-                Id::plain(details.commit_id.clone(), theme.muted_text)
-            } else {
-                // Git: the hash is the revision's one id, coloured like the
-                // graph colours it.
-                Id {
-                    text: details.commit_id.clone(),
-                    bright: unique_prefix(ui, row_of),
-                    bright_color: theme.accent,
-                    color: theme.subtle_text,
-                }
-            },
-            ui,
-        ))
-        .push(copy_button(
-            &details.commit_id,
-            if pull_request {
-                "Copy the pull request number"
-            } else {
-                "Copy the commit id"
-            },
-            ui,
-            theme,
-        ));
-    ids = ids.push(field(
-        if pull_request { "pull" } else { "commit" },
-        inset(commit),
-        ui,
-        theme,
-    ));
-    if !details.parents.is_empty() {
-        let mut parents = Row::new()
-            .spacing(space::XS)
-            .align_y(alignment::Vertical::Center);
-        for parent in &details.parents {
-            parents = parents.push(parent_link(ui, parent, theme));
-        }
-        ids = ids.push(field(
-            if details.parents.len() == 1 {
-                "parent"
-            } else {
-                "parents"
-            },
-            parents,
-            ui,
-            theme,
-        ));
-    }
-    if !details.bookmarks.is_empty() {
-        let mut refs = Row::new()
-            .spacing(space::XS)
-            .align_y(alignment::Vertical::Center);
-        for name in &details.bookmarks {
-            refs = refs.push(meta_line::badge(name, theme.accent, ui));
-        }
-        ids = ids.push(field(
-            if details.change_id.is_some() {
-                "bookmarks"
-            } else {
-                "refs"
-            },
-            inset(refs),
-            ui,
-            theme,
-        ));
-    }
-
-    row![people, ids]
-        .spacing(space::XXL)
-        .wrap()
-        .vertical_spacing(space::XS)
-        .into()
-}
-
-/// Lines a plain value up with the text inside a parent link, which carries
-/// the link's hover padding.
-fn inset<'a>(value: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
-    container(value)
-        .padding(Padding {
-            left: space::XS,
-            ..Padding::ZERO
-        })
-        .into()
-}
-
-/// One row of the grid: a quiet lowercase label, then its value.
-fn field<'a>(
-    label: &'static str,
-    value: impl Into<Element<'a, Message>>,
-    ui: &Diffui,
-    theme: ThemeSpec,
-) -> Element<'a, Message> {
-    row![
-        container(
-            text(label)
-                .size(text_size::UI)
-                .font(ui.config.ui_font)
-                .color(theme.subtle_text)
-        )
-        .width(Length::Fixed(FIELD_LABEL_WIDTH)),
-        value.into(),
-    ]
-    .height(Length::Fixed(FIELD_ROW_HEIGHT))
-    .align_y(alignment::Vertical::Center)
-    .into()
-}
-
-fn plain<'a>(value: String, color: Color, ui: &Diffui) -> text::Text<'a> {
-    text(value)
-        .size(text_size::UI)
-        .font(ui.config.ui_font)
-        .color(color)
-        .wrapping(text::Wrapping::None)
-        .ellipsis(text::Ellipsis::End)
-}
-
-/// A name with its email after it, dimmer; the author leads with initials.
-fn signature<'a>(
-    ui: &Diffui,
-    signature: &diffui_core::SignatureInfo,
-    monogram_first: bool,
-    theme: ThemeSpec,
-) -> Element<'a, Message> {
-    let mut value = Row::new()
-        .spacing(space::SM)
-        .align_y(alignment::Vertical::Center);
-    if monogram_first {
-        value = value.push(monogram(&signature.name, &signature.email, ui, theme));
-    }
-    let name = if signature.name.is_empty() {
-        "Unknown"
-    } else {
-        signature.name.as_str()
-    };
-    value = value.push(
-        container(plain(name.to_owned(), theme.text, ui)).width(Length::Shrink.max(FIELD_TEXT_MAX)),
-    );
-    if !signature.email.is_empty() {
-        value = value.push(
-            container(plain(signature.email.clone(), theme.subtle_text, ui))
-                .width(Length::Shrink.max(FIELD_TEXT_MAX)),
-        );
-    }
-    value.into()
-}
-
-/// Initials in a tinted disc: who it is at a glance, with no avatar fetched
-/// from anywhere.
-fn monogram<'a>(name: &str, email: &str, ui: &Diffui, theme: ThemeSpec) -> Element<'a, Message> {
-    container(
-        text(initials(name, email))
-            .size(9.0)
-            .font(emphasis_font(
-                ui.config.ui_font,
-                iced::font::Weight::Semibold,
-            ))
-            .color(theme.accent),
-    )
-    .center(Length::Fixed(MONOGRAM_SIZE))
-    .style(move |_| container::Style {
-        background: Some(Background::Color(chip_background(theme.accent))),
-        border: Border {
-            radius: (MONOGRAM_SIZE / 2.0).into(),
-            ..Border::default()
-        },
-        ..container::Style::default()
-    })
-    .into()
-}
-
-/// Up to two initials from a name ("Ada Lovelace" → "AL"), else the first
-/// letter of the email, else "?".
-pub(crate) fn initials(name: &str, email: &str) -> String {
-    let from_name: String = name
-        .split_whitespace()
-        .filter_map(|word| word.chars().find(|c| c.is_alphanumeric()))
-        .take(2)
-        .flat_map(char::to_uppercase)
-        .collect();
-    if !from_name.is_empty() {
-        return from_name;
-    }
-    email
-        .chars()
-        .find(|c| c.is_alphanumeric())
-        .map_or_else(|| "?".to_owned(), |c| c.to_uppercase().collect())
-}
-
-/// "Oct 19, 2026, 15:48" with "51m ago" after it.
-fn date<'a>(ui: &Diffui, timestamp: &str, theme: ThemeSpec) -> Element<'a, Message> {
-    let mut value = Row::new()
-        .spacing(space::SM)
-        .align_y(alignment::Vertical::Center)
-        .push(plain(
-            human_timestamp(timestamp).unwrap_or_else(|| timestamp.to_owned()),
-            theme.text,
-            ui,
-        ));
-    if let Some(millis) = parse_timestamp_millis(timestamp) {
-        value = value.push(plain(
-            meta_line::age_phrase(millis, now_millis()),
-            theme.subtle_text,
-            ui,
-        ));
-    }
-    value.into()
-}
-
 fn status_badges(row: Option<diffui_core::RowView<'_>>, theme: ThemeSpec) -> Vec<Badge> {
     match row {
         Some(row) if row.is_hidden() => vec![Badge {
@@ -609,102 +206,6 @@ fn unique_prefix(ui: &Diffui, row: Option<diffui_core::RowView<'_>>) -> usize {
     })
     .filter(|&len| len > 0)
     .unwrap_or(REVISION_ID_CHARS)
-}
-
-/// A small ghost button copying the whole of `value`.
-fn copy_button<'a>(
-    value: &str,
-    tip: &'static str,
-    ui: &Diffui,
-    theme: ThemeSpec,
-) -> Element<'a, Message> {
-    ui::tooltip(
-        button(
-            container(icons::icon(icons::COPY, 12.0, theme.subtle_text))
-                .center_x(Length::Fill)
-                .center_y(Length::Fill),
-        )
-        .width(Length::Fixed(FIELD_BUTTON))
-        .height(Length::Fixed(FIELD_BUTTON))
-        .padding(0)
-        .on_press(Message::Action(Action::Copy(value.to_owned())))
-        .style(move |_, status| crate::theme::ghost_button_style(theme, status)),
-        tip,
-        iced::widget::tooltip::Position::Bottom,
-        ui.config.ui_font,
-        theme,
-    )
-}
-
-/// A parent as a link: its id as the graph draws it and its subject. Opens
-/// it in the diff view.
-fn parent_link<'a>(
-    ui: &'a Diffui,
-    parent: &'a ParentBrief,
-    theme: ThemeSpec,
-) -> Element<'a, Message> {
-    let session = &ui.active().session;
-    let row_of = session.commits.find_by_commit_id(&parent.commit_id);
-    let id = match parent.change_id.as_deref() {
-        Some(change_id) => {
-            let unique = unique_prefix(ui, row_of);
-            let mut shown: String = change_id
-                .chars()
-                .take(revision_id_display_len(unique, change_id))
-                .collect();
-            if let Some(offset) = row_of.and_then(|row| row.change_offset()) {
-                shown.push_str(&format!("/{offset}"));
-            }
-            Id {
-                text: shown,
-                bright: unique,
-                bright_color: theme.accent,
-                color: theme.subtle_text,
-            }
-        }
-        None => Id {
-            text: parent
-                .commit_id
-                .chars()
-                .take(COMMIT_ID_CHARS)
-                .collect::<String>(),
-            bright: unique_prefix(ui, row_of),
-            bright_color: theme.accent,
-            color: theme.subtle_text,
-        },
-    };
-    let root = !parent.commit_id.is_empty() && parent.commit_id.chars().all(|c| c == '0');
-    let subject = if root {
-        "root()".to_owned()
-    } else if !parent.summary.is_empty() {
-        parent.summary.clone()
-    } else {
-        row_of
-            .map(|row| {
-                row.description()
-                    .lines()
-                    .next()
-                    .unwrap_or_default()
-                    .to_owned()
-            })
-            .filter(|summary| !summary.is_empty())
-            .unwrap_or_else(|| "(no description set)".to_owned())
-    };
-    let selection = session.canonical_selection(&parent.commit_id);
-    button(
-        row![
-            meta_line::id_text(id, ui),
-            container(plain(subject, theme.muted_text, ui))
-                .width(Length::Shrink.max(FIELD_TEXT_MAX)),
-        ]
-        .spacing(space::SM)
-        .align_y(alignment::Vertical::Center),
-    )
-    .height(Length::Fixed(FIELD_BUTTON))
-    .padding(Padding::from([0.0, space::XS]))
-    .on_press(Message::Action(Action::SelectRevision(selection)))
-    .style(move |_, status| crate::theme::ghost_button_style(theme, status))
-    .into()
 }
 
 /// The folded block's identity line: the change id as the graph draws it
@@ -793,31 +294,365 @@ fn revision_meta<'a>(
     )
 }
 
+/// The diff view's header for `details`: the description's body, then the
+/// field column. Empty when the block is folded, if `foldable` (the diff
+/// pane; the History view's headers already say what the revision is, so
+/// its diffs always carry the details).
+///
+/// `pane_width` is the width of the diff view it heads: with line wrap on,
+/// the description wraps to it, since a header line is one row.
+pub(crate) fn header_lines(
+    ui: &Diffui,
+    details: &RevisionDetails,
+    theme: ThemeSpec,
+    foldable: bool,
+    pane_width: f32,
+) -> Vec<HeaderLine> {
+    if foldable && ui.commit_details_collapsed {
+        return Vec::new();
+    }
+    let text = details
+        .description
+        .trim()
+        .split_once('\n')
+        .map_or("", |(_, body)| body)
+        .trim();
+    let columns = ui.diff_wrap.then(|| {
+        let size = ui.config.code_type.size;
+        let char_width = crate::measure::line_width("0000000000", size, ui.config.mono_font) / 10.0;
+        let text_width = pane_width
+            - 2.0 * crate::diff_view::HEADER_HORIZONTAL_PADDING
+            - crate::scrollbar::GUTTER;
+        (text_width / char_width.max(1.0)).floor().max(20.0) as usize
+    });
+    let mut lines: Vec<HeaderLine> = text
+        .lines()
+        .flat_map(|line| match columns {
+            Some(columns) => wrap_columns(line, columns),
+            None => vec![line.to_owned()],
+        })
+        .map(|line| HeaderLine::description(&line))
+        .collect();
+    if !lines.is_empty() {
+        lines.push(HeaderLine::blank());
+    }
+
+    lines.push(rich(signature_field("Author", &details.author, theme)));
+    if let Some(timestamp) = details
+        .author
+        .timestamp
+        .as_deref()
+        .filter(|timestamp| !timestamp.is_empty())
+    {
+        let exact = human_timestamp(timestamp).unwrap_or_else(|| timestamp.to_owned());
+        let mut date = HeaderField::new("Date", exact.clone());
+        if let Some(millis) = parse_timestamp_millis(timestamp) {
+            date.value = format!("{exact}  {}", meta_line::age_phrase(millis, now_millis()));
+            date.runs = vec![(0, theme.text), (exact.chars().count(), theme.subtle_text)];
+        }
+        lines.push(rich(date));
+    }
+    // Only when someone else committed it: the same person again, a few
+    // minutes later, is noise.
+    if let Some(committer) = details.committer.as_ref().filter(|committer| {
+        committer.name != details.author.name || committer.email != details.author.email
+    }) {
+        lines.push(rich(signature_field("Committer", committer, theme)));
+    }
+    if let Some(signature) = &details.signature {
+        lines.push(rich(HeaderField::new("Signature", signature.clone())));
+    }
+
+    let session = &ui.active().session;
+    let row_of = session.commits.find_by_commit_id(&details.commit_id);
+    if let Some(change_id) = details.change_id.as_deref() {
+        let unique = unique_prefix(ui, row_of);
+        let mut value = change_id.to_owned();
+        // How jj log addresses one copy of a divergent or hidden change.
+        if let Some(offset) = row_of.and_then(|row| row.change_offset()) {
+            value.push_str(&format!("/{offset}"));
+        }
+        let mut change = HeaderField::new("Change", value);
+        change.runs = vec![(0, theme.accent), (unique, theme.subtle_text)];
+        if let Some(row) = row_of {
+            change.chips = crate::sidebar::status_chips_for(row, theme, ui.config);
+        }
+        change.buttons = vec![(icons::COPY, HeaderAction::Copy(change_id.to_owned()))];
+        lines.push(rich(change));
+    }
+    let pull_request = details.commit_id.starts_with('#');
+    let mut commit = HeaderField::new(
+        if pull_request {
+            "Pull request"
+        } else {
+            "Commit"
+        },
+        details.commit_id.clone(),
+    );
+    commit.runs = if details.change_id.is_some() {
+        // jj: the short commit id stands out, as the graph shows it.
+        vec![(0, theme.muted_text), (COMMIT_ID_CHARS, theme.subtle_text)]
+    } else if pull_request {
+        vec![(0, theme.muted_text)]
+    } else {
+        // Git: the hash is the revision's one id, coloured as the graph
+        // colours it.
+        vec![
+            (0, theme.accent),
+            (unique_prefix(ui, row_of), theme.subtle_text),
+        ]
+    };
+    commit.buttons = vec![(icons::COPY, HeaderAction::Copy(details.commit_id.clone()))];
+    lines.push(rich(commit));
+
+    for (index, parent) in details.parents.iter().enumerate() {
+        let parent_row = session.commits.find_by_commit_id(&parent.commit_id);
+        let unique = unique_prefix(ui, parent_row);
+        let mut id: String = match parent.change_id.as_deref() {
+            Some(change_id) => change_id
+                .chars()
+                .take(revision_id_display_len(unique, change_id))
+                .collect(),
+            None => parent.commit_id.chars().take(COMMIT_ID_CHARS).collect(),
+        };
+        if let Some(offset) = parent_row.and_then(|row| row.change_offset()) {
+            id.push_str(&format!("/{offset}"));
+        }
+        let root = !parent.commit_id.is_empty() && parent.commit_id.chars().all(|c| c == '0');
+        let subject = if root {
+            "root()".to_owned()
+        } else if !parent.summary.is_empty() {
+            parent.summary.clone()
+        } else {
+            parent_row
+                .map(|row| {
+                    row.description()
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned()
+                })
+                .filter(|summary| !summary.is_empty())
+                .unwrap_or_else(|| "(no description set)".to_owned())
+        };
+        let id_chars = id.chars().count();
+        let label = match (index, details.parents.len()) {
+            (0, 1) => "Parent",
+            (0, _) => "Parents",
+            _ => "",
+        };
+        let mut field = HeaderField::new(label, format!("{id}  {subject}"));
+        field.runs = vec![
+            (0, theme.accent),
+            (unique.min(id_chars), theme.subtle_text),
+            (id_chars, theme.muted_text),
+        ];
+        field.link = Some((id_chars, HeaderAction::Open(parent.commit_id.clone())));
+        lines.push(rich(field));
+    }
+    let chips =
+        crate::sidebar::bookmark_chips_for(&details.bookmarks, theme.accent, theme, ui.config);
+    if !chips.is_empty() {
+        lines.push(HeaderLine::Bookmarks {
+            label: if details.change_id.is_some() {
+                "Bookmarks"
+            } else {
+                "Refs"
+            }
+            .to_owned(),
+            chips,
+        });
+    }
+    lines
+}
+
+/// What the diff view's header links and buttons do.
+pub(crate) fn header_action(action: HeaderAction) -> Message {
+    match action {
+        HeaderAction::Copy(value) => Message::Action(Action::Copy(value)),
+        HeaderAction::Open(commit_id) => Message::Action(Action::History(
+            crate::history_panel::HistoryAction::OpenRevision(commit_id),
+        )),
+    }
+}
+
+/// `line` broken at spaces into rows of at most `columns` characters; a
+/// word longer than a row is cut. Continuation rows keep the line's indent,
+/// so a wrapped list item still hangs under its text.
+fn wrap_columns(line: &str, columns: usize) -> Vec<String> {
+    let line = line.trim_end();
+    if line.chars().count() <= columns {
+        return vec![line.to_owned()];
+    }
+    let indent: String = line.chars().take_while(|c| *c == ' ').collect();
+    let hang = if indent.len() * 2 < columns {
+        indent.as_str()
+    } else {
+        ""
+    };
+    let mut rows = Vec::new();
+    let mut row = indent.clone();
+    for word in line.split(' ').filter(|word| !word.is_empty()) {
+        let mut word = word.to_owned();
+        loop {
+            let used = row.chars().count();
+            let fresh = row.trim().is_empty();
+            let needed = word.chars().count() + usize::from(!fresh);
+            if used + needed <= columns {
+                if !fresh {
+                    row.push(' ');
+                }
+                row.push_str(&word);
+                break;
+            }
+            if !fresh {
+                rows.push(std::mem::replace(&mut row, hang.to_owned()));
+                continue;
+            }
+            // A word wider than a whole row: cut it.
+            let room = columns.saturating_sub(used).max(1);
+            let head: String = word.chars().take(room).collect();
+            word = word.chars().skip(room).collect();
+            row.push_str(&head);
+            rows.push(std::mem::replace(&mut row, hang.to_owned()));
+            if word.is_empty() {
+                break;
+            }
+        }
+    }
+    if !row.trim().is_empty() {
+        rows.push(row);
+    }
+    rows
+}
+
+fn rich(field: HeaderField) -> HeaderLine {
+    HeaderLine::Rich(Box::new(field))
+}
+
+/// "Name <email>", the address quieter.
+fn signature_field(label: &str, signature: &SignatureInfo, theme: ThemeSpec) -> HeaderField {
+    let name = if signature.name.is_empty() {
+        "Unknown"
+    } else {
+        signature.name.as_str()
+    };
+    let mut field = HeaderField::new(label, name);
+    if !signature.email.is_empty() {
+        field.value = format!("{name} <{}>", signature.email);
+        field.runs = vec![(0, theme.text), (name.chars().count(), theme.subtle_text)];
+    }
+    field
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BODY_CLAMP_LINES, clamped_lines, initials};
+    use diffui_core::{ParentBrief, RevisionDetails, SignatureInfo};
+
+    use super::{header_lines, wrap_columns};
 
     #[test]
-    fn a_long_body_folds_on_a_paragraph_boundary() {
-        // Short enough to show whole.
-        assert_eq!(clamped_lines(&[5], 5), None);
-        // Three lines, a blank, then more: the fold lands after the three.
-        assert_eq!(clamped_lines(&[3, 4, 2], 11), Some(3));
-        // Two short paragraphs fit with the blank between them.
-        assert_eq!(clamped_lines(&[1, 2, 6], 11), Some(4));
-        // A first paragraph longer than the clamp is cut at the clamp.
-        assert_eq!(clamped_lines(&[9], 9), Some(BODY_CLAMP_LINES));
+    fn description_lines_wrap_at_spaces_and_keep_their_indent() {
+        assert_eq!(wrap_columns("short line", 20), ["short line"]);
+        assert_eq!(
+            wrap_columns("one two three four five", 10),
+            ["one two", "three four", "five"]
+        );
+        assert_eq!(
+            wrap_columns("  - a list item that wraps", 12),
+            ["  - a list", "  item that", "  wraps"]
+        );
+        assert_eq!(wrap_columns("abcdefghijkl", 5), ["abcde", "fghij", "kl"]);
+    }
+    use crate::diff_view::{HeaderAction, HeaderLine};
+
+    fn render(lines: &[HeaderLine]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| match line {
+                HeaderLine::Description(value) => format!("| {value}"),
+                HeaderLine::Blank => String::new(),
+                HeaderLine::Rich(field) => format!("{}: {}", field.label, field.value),
+                HeaderLine::Bookmarks { label, chips } => format!(
+                    "{label}: {}",
+                    chips
+                        .iter()
+                        .map(|chip| chip.label.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                other => panic!("unexpected header line: {other:?}"),
+            })
+            .collect()
     }
 
     #[test]
-    fn initials_come_from_the_name_then_the_email() {
-        assert_eq!(initials("Ada Lovelace", "ada@example.com"), "AL");
+    fn the_header_is_the_description_then_one_column_of_fields() {
+        let mut ui = crate::tabs::tests::app();
+        crate::tabs::tests::push_tab(&mut ui, "/tmp/diffui-commit-info-test");
+        let theme = ui.resolved_theme().spec();
+        let details = RevisionDetails {
+            commit_id: "abcdef0123456789abcdef0123456789abcdef01".to_owned(),
+            change_id: Some("zyxwvutsrqponmlkzyxwvutsrqponmlk".to_owned()),
+            bookmarks: vec!["main".to_owned()],
+            author: SignatureInfo {
+                name: "Ada Lovelace".to_owned(),
+                email: "ada@example.com".to_owned(),
+                timestamp: Some("2026-09-07 10:00:00 +0000".to_owned()),
+            },
+            committer: None,
+            signature: None,
+            description: "subject\n\nbody one\nbody two\n".to_owned(),
+            parents: vec![ParentBrief {
+                commit_id: "1111111111111111111111111111111111111111".to_owned(),
+                change_id: Some("kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk".to_owned()),
+                summary: "the parent".to_owned(),
+            }],
+        };
+
+        let lines = header_lines(&ui, &details, theme, true, 2000.0);
+        let rendered = render(&lines);
         assert_eq!(
-            initials("Bartholomew Alexander Featherstonehaugh", ""),
-            "BA"
+            rendered[..4],
+            [
+                "| body one",
+                "| body two",
+                "",
+                "Author: Ada Lovelace <ada@example.com>"
+            ]
         );
-        assert_eq!(initials("wonrax", "x@y.z"), "W");
-        assert_eq!(initials("", "hai@example.com"), "H");
-        assert_eq!(initials("", ""), "?");
+        assert!(rendered[4].starts_with("Date: Sep 7, 2026, 10:00  "));
+        assert_eq!(
+            rendered[5..],
+            [
+                "Change: zyxwvutsrqponmlkzyxwvutsrqponmlk",
+                "Commit: abcdef0123456789abcdef0123456789abcdef01",
+                "Parent: kkkkkkkk  the parent",
+                "Bookmarks: main",
+            ]
+        );
+        // The copy buttons copy whole ids; the parent's id opens it.
+        let HeaderLine::Rich(commit) = &lines[6] else {
+            panic!("the commit line is a field");
+        };
+        assert_eq!(
+            commit.buttons[0].1,
+            HeaderAction::Copy(details.commit_id.clone())
+        );
+        let HeaderLine::Rich(parent) = &lines[7] else {
+            panic!("the parent line is a field");
+        };
+        assert_eq!(
+            parent.link,
+            Some((8, HeaderAction::Open(details.parents[0].commit_id.clone())))
+        );
+
+        // Folded, the diff pane's header is gone; the History view's stays.
+        ui.commit_details_collapsed = true;
+        assert!(header_lines(&ui, &details, theme, true, 2000.0).is_empty());
+        assert_eq!(
+            header_lines(&ui, &details, theme, false, 2000.0).len(),
+            lines.len()
+        );
     }
 }

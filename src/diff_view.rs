@@ -67,6 +67,11 @@ pub(crate) const HEADER_VERTICAL_PADDING: f32 = 12.0;
 pub(crate) const HEADER_HORIZONTAL_PADDING: f32 = 16.0;
 // Space drawn between the label column and the value column.
 const HEADER_LABEL_GAP: f32 = 8.0;
+/// Gap between a rich field's value, its badges and its buttons.
+const HEADER_CHIP_GAP: f32 = 6.0;
+/// Side of a rich field's icon buttons (copy).
+const HEADER_BUTTON_SIZE: f32 = 20.0;
+const HEADER_BUTTON_ICON_SIZE: f32 = 12.0;
 // Description lines lead the header as its title, flush with the labels.
 const HEADER_DESCRIPTION_INDENT: f32 = 0.0;
 const HEADER_EDIT_WIDTH: f32 = 66.0;
@@ -228,6 +233,83 @@ pub enum HeaderLine {
     /// Fixed-height space occupied by an interactive child layered over the
     /// custom-rendered header (currently the description editor).
     Spacer(f32),
+    /// A field of the commit info grid: a selectable value in colour runs,
+    /// with badges, a link and buttons around it.
+    Rich(Box<HeaderField>),
+}
+
+/// Height a header-only diff view needs to show `header` whole.
+pub fn header_block_height(
+    header: &[HeaderLine],
+    typography: crate::config::CodeTypography,
+) -> f32 {
+    if header.is_empty() {
+        return 0.0;
+    }
+    let row_height = (typography.size * typography.line_height).round();
+    header
+        .iter()
+        .map(|line| match line {
+            HeaderLine::Spacer(height) => *height,
+            _ => row_height,
+        })
+        .sum::<f32>()
+        + HEADER_VERTICAL_PADDING * 2.0
+}
+
+/// What a press on a [`HeaderField`]'s link or button asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeaderAction {
+    /// Copy this text.
+    Copy(String),
+    /// Open the revision with this commit id.
+    Open(String),
+}
+
+/// One field of the commit info grid (see [`HeaderLine::Rich`]). Its label
+/// shares the header's label column; its value stays selectable like the
+/// plain fields'.
+#[derive(Debug, Clone)]
+pub struct HeaderField {
+    pub label: String,
+    /// The selectable text.
+    pub value: String,
+    /// Colour runs over `value` as (first char, colour), in order. Text
+    /// before the first run, or all of it when empty, is in the text colour.
+    pub runs: Vec<(usize, Color)>,
+    /// Badges after the value (`divergent`, `hidden`).
+    pub chips: Vec<Chip>,
+    /// The value's first `n` characters are a link (a parent's id): a press
+    /// on them fires the action instead of starting a selection.
+    pub link: Option<(usize, HeaderAction)>,
+    /// Icon buttons after the value and its badges.
+    pub buttons: Vec<(&'static str, HeaderAction)>,
+}
+
+/// Where and how [`DiffView::draw_rich_field`] draws one field.
+#[derive(Clone, Copy)]
+struct RichDraw {
+    bounds: Rectangle,
+    clip: Rectangle,
+    /// Screen y of the line's top.
+    y: f32,
+    visible_top: f32,
+    selection: Option<(TextPosition, TextPosition)>,
+    /// The field's link (0) or button (1..) under the cursor.
+    hovered: Option<usize>,
+}
+
+impl HeaderField {
+    pub fn new(label: &str, value: impl Into<String>) -> Self {
+        Self {
+            label: label.to_owned(),
+            value: value.into(),
+            runs: Vec::new(),
+            chips: Vec::new(),
+            link: None,
+            buttons: Vec::new(),
+        }
+    }
 }
 
 impl HeaderLine {
@@ -347,6 +429,8 @@ pub struct DiffView<'a, Message> {
     /// draws and hit-tests the affordance beside the first description line;
     /// the actual editor is layered by the caller into the reserved spacer.
     on_edit_description: Option<fn() -> Message>,
+    /// Fires for the links and buttons of [`HeaderLine::Rich`] fields.
+    on_header_action: Option<fn(HeaderAction) -> Message>,
     /// Change-selection checkboxes in file/hunk headers (see
     /// [`Self::change_marks`]).
     marks: Option<ChangeMarks<Message>>,
@@ -1075,6 +1159,9 @@ struct State<Paragraph> {
     /// Whether the cursor is over the description block. Reveals the edit
     /// affordance at its right edge.
     hovered_description: bool,
+    /// The rich-field link or button under the cursor: (header line, slot),
+    /// slot 0 being the link and 1.. the buttons.
+    hovered_header_action: Option<(usize, usize)>,
     /// Line-select mode: the pickable line under the mouse.
     hovered_line: Option<LineAt>,
     /// Line-select mode: a press on a line is being dragged — the line it
@@ -1293,6 +1380,7 @@ impl<'a, Message> DiffView<'a, Message> {
             plain: false,
             on_browse_file: None,
             on_edit_description: None,
+            on_header_action: None,
             marks: None,
             annotations: None,
             collapsed_files: Vec::new(),
@@ -1361,6 +1449,12 @@ impl<'a, Message> DiffView<'a, Message> {
             .lines
             .get(line as usize)?;
         line.new_line.map(|number| number.saturating_sub(1))
+    }
+
+    /// Fire for the links and buttons of the header's rich fields.
+    pub fn on_header_action(mut self, callback: fn(HeaderAction) -> Message) -> Self {
+        self.on_header_action = Some(callback);
+        self
     }
 
     /// Draw a "browse source" icon button in every file header, firing with
@@ -1587,6 +1681,7 @@ impl<'a, Message> DiffView<'a, Message> {
         match self.header.get(index)? {
             HeaderLine::Field { value, .. } => Some(value),
             HeaderLine::Description(line) => Some(line),
+            HeaderLine::Rich(field) => Some(&field.value),
             _ => None,
         }
     }
@@ -1595,22 +1690,108 @@ impl<'a, Message> DiffView<'a, Message> {
     /// column + gap. Mirrors `draw_revision_header`'s layout so hit-testing and
     /// selection rendering land on the same glyphs the renderer drew.
     fn header_value_x(&self, bounds: Rectangle) -> f32 {
-        let left_x = bounds.x + HEADER_HORIZONTAL_PADDING;
-        let label_width = self
-            .header
+        bounds.x + HEADER_HORIZONTAL_PADDING + self.header_label_width() + HEADER_LABEL_GAP
+    }
+
+    /// The label column: as wide as the widest label of any field.
+    fn header_label_width(&self) -> f32 {
+        self.header
             .iter()
-            .find_map(|line| match line {
-                HeaderLine::Field { label, .. } => Some(self.text_width(label)),
+            .filter_map(|line| match line {
+                HeaderLine::Field { label, .. } | HeaderLine::Bookmarks { label, .. } => {
+                    Some(label.trim_end())
+                }
+                HeaderLine::Rich(field) => Some(field.label.trim_end()),
                 _ => None,
             })
-            .unwrap_or(0.0);
-        left_x + label_width + HEADER_LABEL_GAP
+            .map(|label| self.text_width(label))
+            .fold(0.0, f32::max)
+    }
+
+    /// Where a rich field's value starts.
+    fn rich_value_x(&self, _field: &HeaderField, bounds: Rectangle) -> f32 {
+        self.header_value_x(bounds)
+    }
+
+    /// Content-space y of header line `index`'s top.
+    fn header_line_top(&self, index: usize) -> f32 {
+        HEADER_VERTICAL_PADDING
+            + self.header[..index.min(self.header.len())]
+                .iter()
+                .map(|line| self.header_line_height(line))
+                .sum::<f32>()
+    }
+
+    /// The link and buttons of rich header line `index` on screen, as
+    /// (slot, rect, action): slot 0 is the link, 1.. the buttons.
+    fn rich_targets(
+        &self,
+        index: usize,
+        field: &HeaderField,
+        bounds: Rectangle,
+        vertical_offset: f32,
+    ) -> Vec<(usize, Rectangle, HeaderAction)> {
+        let top = bounds.y + self.header_line_top(index) - vertical_offset;
+        let cw = self.metrics.char_width;
+        let value_x = self.rich_value_x(field, bounds);
+        let mut targets = Vec::new();
+        if let Some((chars, action)) = &field.link {
+            targets.push((
+                0,
+                Rectangle {
+                    x: value_x,
+                    y: top,
+                    width: *chars as f32 * cw,
+                    height: self.metrics.row_height,
+                },
+                action.clone(),
+            ));
+        }
+        let mut x = value_x + field.value.chars().count() as f32 * cw;
+        for chip in &field.chips {
+            x += HEADER_CHIP_GAP + chip::width(&chip.label, chip.icon, chip.font);
+        }
+        let side = HEADER_BUTTON_SIZE.min(self.metrics.row_height);
+        for (slot, (_, action)) in field.buttons.iter().enumerate() {
+            x += HEADER_CHIP_GAP;
+            targets.push((
+                slot + 1,
+                Rectangle {
+                    x,
+                    y: top + (self.metrics.row_height - side) / 2.0,
+                    width: side,
+                    height: side,
+                },
+                action.clone(),
+            ));
+            x += side;
+        }
+        targets
+    }
+
+    /// The rich-field link or button under `point`, if any.
+    fn header_action_at(
+        &self,
+        bounds: Rectangle,
+        vertical_offset: f32,
+        point: Point,
+    ) -> Option<(usize, usize, HeaderAction)> {
+        self.on_header_action?;
+        let index = self.header_line_at_y(point.y - bounds.y + vertical_offset)?;
+        let HeaderLine::Rich(field) = &self.header[index] else {
+            return None;
+        };
+        self.rich_targets(index, field, bounds, vertical_offset)
+            .into_iter()
+            .find(|(_, rect, _)| rect.contains(point))
+            .map(|(slot, _, action)| (index, slot, action))
     }
 
     /// Screen-x where header line `index`'s selectable text starts: the value
     /// column for fields, or the indented column for description lines.
     fn header_text_origin_x(&self, index: usize, bounds: Rectangle) -> f32 {
         match self.header.get(index) {
+            Some(HeaderLine::Rich(field)) => self.rich_value_x(field, bounds),
             Some(HeaderLine::Description(_)) => {
                 bounds.x
                     + HEADER_HORIZONTAL_PADDING
@@ -3030,6 +3211,131 @@ impl<'a, Message> DiffView<'a, Message> {
         }
     }
 
+    /// A rich field's value: selection tint, the value in its
+    /// colour runs (the link underlined under the cursor), trailing badges
+    /// and icon buttons.
+    fn draw_rich_field<Renderer>(
+        &self,
+        renderer: &mut Renderer,
+        line_index: usize,
+        field: &HeaderField,
+        at: RichDraw,
+    ) where
+        Renderer: text::Renderer + geometry::Renderer,
+    {
+        let RichDraw {
+            bounds,
+            clip,
+            y,
+            visible_top,
+            selection,
+            hovered,
+        } = at;
+        let center_y = y + self.metrics.row_height / 2.0;
+        let value_x = self.rich_value_x(field, bounds);
+        let cw = self.metrics.char_width;
+        self.draw_header_value_selection(
+            renderer,
+            line_index,
+            &field.value,
+            Point::new(value_x, y),
+            selection,
+        );
+        let chars: Vec<(usize, char)> = field.value.char_indices().collect();
+        let byte_at = |char_index: usize| {
+            chars
+                .get(char_index)
+                .map_or(field.value.len(), |(byte, _)| *byte)
+        };
+        let mut runs: Vec<(usize, Color)> = Vec::with_capacity(field.runs.len() + 1);
+        if field.runs.first().is_none_or(|(start, _)| *start > 0) {
+            runs.push((0, self.palette.text));
+        }
+        runs.extend(field.runs.iter().copied());
+        for (index, &(start, color)) in runs.iter().enumerate() {
+            let end = runs
+                .get(index + 1)
+                .map_or(chars.len(), |(next, _)| *next)
+                .min(chars.len());
+            if start >= end {
+                continue;
+            }
+            self.draw_text(
+                renderer,
+                &field.value[byte_at(start)..byte_at(end)],
+                TextRenderParams {
+                    width: ((end - start) as f32 * cw + cw).max(1.0),
+                    height: self.metrics.row_height,
+                    position: Point::new(value_x + start as f32 * cw, y + self.metrics.text_y_pad),
+                    color,
+                    clip_bounds: clip,
+                    wrapping: text::Wrapping::None,
+                },
+            );
+        }
+        let mut x = value_x + chars.len() as f32 * cw;
+        for chip in &field.chips {
+            x += HEADER_CHIP_GAP;
+            chip::draw(renderer, chip, x, center_y, clip);
+            x += chip::width(&chip.label, chip.icon, chip.font);
+        }
+        for (slot, rect, _) in self.rich_targets(line_index, field, bounds, visible_top) {
+            let hot = hovered == Some(slot);
+            if slot == 0 {
+                if hot {
+                    self.draw_background(
+                        renderer,
+                        rect.x,
+                        rect.y + self.metrics.row_height - 3.0,
+                        rect.width,
+                        1.0,
+                        self.palette.text_muted,
+                    );
+                }
+                continue;
+            }
+            if hot {
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds: rect,
+                        border: Border {
+                            radius: crate::theme::radius::CONTROL.into(),
+                            ..Border::default()
+                        },
+                        shadow: Shadow::default(),
+                        snap: true,
+                    },
+                    Color {
+                        a: 0.14,
+                        ..self.palette.text_muted
+                    },
+                );
+            }
+            renderer.fill_text(
+                text::Text {
+                    content: field.buttons[slot - 1].0.to_owned(),
+                    bounds: Size::new(rect.width, rect.height),
+                    size: Pixels(HEADER_BUTTON_ICON_SIZE),
+                    line_height: text::LineHeight::Absolute(Pixels(rect.height)),
+                    font: icons::ICON_FONT,
+                    align_x: text::Alignment::Center,
+                    align_y: alignment::Vertical::Center,
+                    shaping: text::Shaping::Basic,
+                    wrapping: text::Wrapping::None,
+                    ellipsis: text::Ellipsis::None,
+                    hint_factor: None,
+                },
+                Point::new(rect.center_x(), rect.center_y()),
+                if hot {
+                    self.palette.text
+                } else {
+                    self.palette.text_muted
+                },
+                clip,
+            );
+        }
+    }
+
     fn draw_revision_header<Renderer>(
         &self,
         renderer: &mut Renderer,
@@ -3037,6 +3343,7 @@ impl<'a, Message> DiffView<'a, Message> {
         visible_top: f32,
         selection: Option<(TextPosition, TextPosition)>,
         show_description_edit: bool,
+        hovered_action: Option<(usize, usize)>,
     ) where
         Renderer: text::Renderer + geometry::Renderer,
     {
@@ -3074,17 +3381,7 @@ impl<'a, Message> DiffView<'a, Message> {
         };
         let label_color = self.palette.text_muted;
         let value_color = self.palette.text;
-        // Measure the label column once. All field labels are padded to the
-        // same width in `HeaderLine::field`, so any non-empty one gives us
-        // the column extent.
-        let label_width = self
-            .header
-            .iter()
-            .find_map(|line| match line {
-                HeaderLine::Field { label, .. } => Some(self.text_width(label)),
-                _ => None,
-            })
-            .unwrap_or(0.0);
+        let label_width = self.header_label_width();
 
         let mut y = header_screen_y + HEADER_VERTICAL_PADDING;
         let left_x = bounds.x + HEADER_HORIZONTAL_PADDING;
@@ -3212,6 +3509,35 @@ impl<'a, Message> DiffView<'a, Message> {
                         self.draw_description_edit_label(renderer, button, clip);
                     }
                 }
+                HeaderLine::Rich(field) => {
+                    self.draw_text(
+                        renderer,
+                        &field.label,
+                        TextRenderParams {
+                            width: label_width.max(1.0),
+                            height: self.metrics.row_height,
+                            position: Point::new(left_x, y + self.metrics.text_y_pad),
+                            color: label_color,
+                            clip_bounds: clip,
+                            wrapping: text::Wrapping::None,
+                        },
+                    );
+                    self.draw_rich_field(
+                        renderer,
+                        line_index,
+                        field,
+                        RichDraw {
+                            bounds,
+                            clip,
+                            y,
+                            visible_top,
+                            selection,
+                            hovered: hovered_action
+                                .filter(|(line, _)| *line == line_index)
+                                .map(|(_, slot)| slot),
+                        },
+                    );
+                }
                 HeaderLine::Blank | HeaderLine::Spacer(_) => {}
             }
             y += self.header_line_height(line);
@@ -3260,6 +3586,7 @@ where
             last_palette_text: None,
             hovered_browse: None,
             hovered_description: false,
+            hovered_header_action: None,
             hovered_line: None,
             line_drag: None,
             last_line_reveal: None,
@@ -3658,6 +3985,10 @@ where
                 state.hovered_description = cursor.position_over(bounds).is_some_and(|point| {
                     self.description_row_contains(bounds, state.vertical_offset, point)
                 });
+                state.hovered_header_action = cursor.position_over(bounds).and_then(|point| {
+                    self.header_action_at(bounds, state.vertical_offset, point)
+                        .map(|(line, slot, _)| (line, slot))
+                });
 
                 shell.capture_event();
                 shell.request_redraw();
@@ -3706,6 +4037,16 @@ where
                         return;
                     }
                     scrollbar::ScrollbarEvent::None => {}
+                }
+                // A header field's link or button wins over selection too.
+                if let Some((_, _, action)) =
+                    self.header_action_at(bounds, state.vertical_offset, point)
+                {
+                    if let Some(on_action) = self.on_header_action {
+                        shell.publish(on_action(action));
+                    }
+                    shell.capture_event();
+                    return;
                 }
                 // The per-file browse button wins over selection: a press on
                 // it fires the callback instead of anchoring a drag.
@@ -3906,6 +4247,13 @@ where
                         self.description_row_contains(bounds, state.vertical_offset, *position);
                     if hovered_description != state.hovered_description {
                         state.hovered_description = hovered_description;
+                        shell.request_redraw();
+                    }
+                    let hovered_action = self
+                        .header_action_at(bounds, state.vertical_offset, *position)
+                        .map(|(line, slot, _)| (line, slot));
+                    if hovered_action != state.hovered_header_action {
+                        state.hovered_header_action = hovered_action;
                         shell.request_redraw();
                     }
                     return;
@@ -4298,6 +4646,7 @@ where
                     visible_top,
                     selection_range,
                     state.hovered_description,
+                    state.hovered_header_action,
                 );
             }
 
@@ -4576,6 +4925,9 @@ where
         if self
             .description_edit_bounds(bounds, state.vertical_offset)
             .is_some_and(|button| button.contains(point))
+            || self
+                .header_action_at(bounds, state.vertical_offset, point)
+                .is_some()
         {
             return mouse::Interaction::Pointer;
         }

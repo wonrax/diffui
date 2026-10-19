@@ -2090,7 +2090,16 @@ fn history_diff_view<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Messag
     .wrap(ui.diff_wrap)
     .side_by_side(ui.diff_split);
     if let Some(details) = &diff.details {
-        view = view.with_header(crate::diff_panel::revision_header_lines(details));
+        view = view
+            .with_header(crate::commit_info::header_lines(
+                ui,
+                details,
+                theme,
+                false,
+                // The History view's right pane: the window less its list.
+                ui.window_size.width - ui.sidebar_width - 1.0,
+            ))
+            .on_header_action(crate::commit_info::header_action);
     }
     view.into()
 }

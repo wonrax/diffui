@@ -132,8 +132,6 @@ pub(crate) enum Action {
     /// Fold the diff header down to its title and one metadata line, or
     /// unfold it.
     ToggleCommitDetails,
-    /// Show a long description body in full, or clamp it again.
-    ToggleCommitBody,
     /// Collapse or restore the revision history pane.
     ToggleHistoryPanel,
     /// Collapse or restore the changed-files pane.

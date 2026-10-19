@@ -226,7 +226,6 @@ impl Diffui {
             diff_wrap: saved.diff_wrap.unwrap_or(true),
             diff_split: saved.diff_split.unwrap_or(false),
             commit_details_collapsed: saved.commit_details_collapsed.unwrap_or(false),
-            commit_body_expanded: false,
             sidebar_min_width,
             window_size,
             window_position,
@@ -1077,10 +1076,6 @@ impl Diffui {
             Action::ToggleCommitDetails => {
                 self.commit_details_collapsed = !self.commit_details_collapsed;
                 self.mark_geometry_dirty();
-                Task::none()
-            }
-            Action::ToggleCommitBody => {
-                self.commit_body_expanded = !self.commit_body_expanded;
                 Task::none()
             }
             Action::ToggleSplit => {

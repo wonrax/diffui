@@ -311,9 +311,6 @@ pub(crate) struct Diffui {
     /// of the description body and the field grid. Global, persisted with
     /// the window state.
     pub(crate) commit_details_collapsed: bool,
-    /// A long description body shows in full instead of clamped. Global,
-    /// not persisted.
-    pub(crate) commit_body_expanded: bool,
     /// View-time memo for the file list's stat-column widths and flattened file
     /// tree, keyed on document identity. Without it, the sidebar re-shaped ~5·N
     /// strings through `cosmic_text` on every diff-scroll file-boundary crossing
