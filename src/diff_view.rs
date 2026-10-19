@@ -5409,10 +5409,11 @@ impl<Message> DiffView<'_, Message> {
         })
     }
 
-    /// Screen rect of a hunk header's checkbox (in the gutter band).
+    /// Screen rect of a hunk header's checkbox (in the gutter band), on the
+    /// same vertical axis as the file header's.
     fn hunk_check_rect(&self, header_y: f32, bounds: Rectangle) -> Rectangle {
         Rectangle {
-            x: bounds.x + GUTTER_HORIZONTAL_PADDING,
+            x: bounds.x + HEADER_HORIZONTAL_PADDING,
             y: header_y + (self.metrics.hunk_header_height - CHECK_SIZE) / 2.0,
             width: CHECK_SIZE,
             height: CHECK_SIZE,
