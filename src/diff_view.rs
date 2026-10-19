@@ -183,7 +183,9 @@ pub struct LineMode<Message> {
 /// marks (indexed like the widget's files) and where clicks go.
 pub struct ChangeMarks<Message> {
     pub files: Vec<FileMark>,
-    pub accent: Color,
+    /// Fill of a checked box and a picked line's bar: the control colour
+    /// the primary button wears, kept off the diff's reds and greens.
+    pub control: Color,
     pub on_toggle_file: fn(usize) -> Message,
     pub on_toggle_hunk: fn(usize, usize) -> Message,
     /// Line-select mode, when it is on.
@@ -5731,7 +5733,7 @@ impl<Message> DiffView<'_, Message> {
             return;
         }
         let cursor = marks.lines.as_ref().and_then(|mode| mode.cursor);
-        let accent = marks.accent;
+        let accent = marks.control;
         for row in rows {
             // (line, lane x, lane width) per column.
             let mut members = [None, None];
@@ -5875,7 +5877,7 @@ impl<Message> DiffView<'_, Message> {
             renderer,
             rect,
             state,
-            marks.accent,
+            marks.control,
             self.palette.text_muted,
             self.palette.panel,
             clip,
@@ -5884,14 +5886,14 @@ impl<Message> DiffView<'_, Message> {
 }
 
 /// A change-selection checkbox in `rect`. Checked and mixed share the
-/// accent fill and shape and differ only in the mark: a tick, or the short
-/// bar of a macOS mixed checkbox (drawn, so it can't be read as the diff's
-/// `−` prefix).
+/// `fill` and shape and differ only in the mark: a tick, or the short bar of
+/// a macOS mixed checkbox (drawn, so it can't be read as the diff's `−`
+/// prefix).
 pub(crate) fn draw_checkbox<Renderer>(
     renderer: &mut Renderer,
     rect: Rectangle,
     state: CheckState,
-    accent: Color,
+    fill: Color,
     muted: Color,
     mark: Color,
     clip: Rectangle,
@@ -5906,7 +5908,7 @@ pub(crate) fn draw_checkbox<Renderer>(
                 radius: 3.0.into(),
                 width: 1.0,
                 color: if checked {
-                    accent
+                    fill
                 } else {
                     Color { a: 0.55, ..muted }
                 },
@@ -5914,7 +5916,7 @@ pub(crate) fn draw_checkbox<Renderer>(
             shadow: Shadow::default(),
             snap: true,
         },
-        if checked { accent } else { Color::TRANSPARENT },
+        if checked { fill } else { Color::TRANSPARENT },
     );
     match state {
         CheckState::Off => {}
@@ -6739,7 +6741,7 @@ mod tests {
                 state: CheckState::Off,
                 hunks: HunkMarks::Unpicked,
             }],
-            accent: Color::WHITE,
+            control: Color::WHITE,
             on_toggle_file: |_| (),
             on_toggle_hunk: |_, _| (),
             lines: lines.then_some(LineMode {

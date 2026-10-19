@@ -1400,6 +1400,7 @@ pub(crate) fn revision_list_style(
         background: theme.panel_background,
         selected_background: theme.selected_file,
         accent: theme.accent,
+        control: theme.info,
         border: theme.border,
         muted_text: theme.muted_text,
         subtle_text: theme.subtle_text,

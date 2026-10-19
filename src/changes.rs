@@ -720,7 +720,7 @@ pub(crate) fn diff_marks(ui: &Diffui, theme: ThemeSpec) -> Option<ChangeMarks<Me
     });
     Some(ChangeMarks {
         files,
-        accent: theme.accent,
+        control: theme.info,
         on_toggle_file: |file| Message::Changes(ChangesMsg::ToggleFile(file)),
         on_toggle_hunk: |file, hunk| Message::Changes(ChangesMsg::ToggleHunk(file, hunk)),
         lines,
@@ -1209,12 +1209,9 @@ pub(crate) fn selection_bar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Option<Elem
             icons::CHECK,
         )
     };
-    let lead = row![
-        icons::icon(lead_icon, ui::ICON_SIZE, theme.accent),
-        lead_text
-    ]
-    .spacing(theme::space::SM)
-    .align_y(alignment::Vertical::Center);
+    let lead = row![icons::icon(lead_icon, ui::ICON_SIZE, theme.info), lead_text]
+        .spacing(theme::space::SM)
+        .align_y(alignment::Vertical::Center);
 
     let mut labels: Vec<(&'static str, ChangesMsg, ui::Variant)> = Vec::new();
     if !selection.is_empty() {

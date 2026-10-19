@@ -91,6 +91,9 @@ pub struct RevisionListStyle {
     /// row's gradient and recolors the working-copy node disc in the
     /// graph.
     pub accent: Color,
+    /// Fill of a checked change-selection box (see
+    /// [`crate::diff_view::ChangeMarks::control`]).
+    pub control: Color,
     pub border: Color,
     pub muted_text: Color,
     pub subtle_text: Color,
@@ -2334,7 +2337,7 @@ impl<'a, Message> RevisionList<'a, Message> {
                 content_x + FILE_CHEVRON_COL + FILE_ICON_COL / 2.0,
                 row_mid_y,
                 check,
-                self.style.accent,
+                self.style.control,
                 self.style.muted_text,
                 self.style.background,
                 row_clip,
@@ -2885,7 +2888,7 @@ fn draw_file_check<R>(
     center_x: f32,
     mid_y: f32,
     check: crate::diff_view::CheckState,
-    accent: Color,
+    fill: Color,
     muted: Color,
     glyph_color: Color,
     clip: Rectangle,
@@ -2899,7 +2902,7 @@ fn draw_file_check<R>(
         width: SIDE,
         height: SIDE,
     };
-    crate::diff_view::draw_checkbox(renderer, rect, check, accent, muted, glyph_color, clip);
+    crate::diff_view::draw_checkbox(renderer, rect, check, fill, muted, glyph_color, clip);
 }
 
 #[cfg(test)]
