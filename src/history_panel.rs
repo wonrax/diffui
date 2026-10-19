@@ -28,6 +28,11 @@ use diffui_core::{DiffDocument, JobId, MutationOp, RevisionDetails, RevisionSele
 
 use crate::diff_view::{AnnotationGutter, AnnotationLabel, DiffFileView, DiffView};
 use crate::prose::Prose;
+use crate::revision_list::{
+    CAPTION_TEXT_SIZE, CONTENT_PADDING, FILE_ROW_HEIGHT, GUTTER_LEFT_PADDING, GUTTER_PADDING,
+    REVISION_ROW_HEIGHT, ROW_CARD_INSET_X, ROW_CARD_INSET_Y, ROW_CARD_RADIUS, ROW_LINE_GAP,
+    SMALL_TEXT_SIZE,
+};
 use crate::theme::{
     ThemeSpec, chip_background, diff_palette, diff_panel_style, emphasis_font, file_status_color,
     radius, sidebar_panel_style, space, text_size,
@@ -1077,11 +1082,61 @@ fn row_style(theme: ThemeSpec, selected: bool, status: button::Status) -> button
         border: Border {
             width: 0.0,
             color: Color::TRANSPARENT,
-            radius: radius::PUSH.into(),
+            radius: ROW_CARD_RADIUS.into(),
         },
         shadow: iced::Shadow::default(),
         snap: true,
     }
+}
+
+// The lists' rows sit like the revision graph's: row cards inset from the
+// row by the graph's card insets, content starting where a lane-less graph
+// row's would and stopping at the scrollbar gutter, two-line rows as tall
+// as a revision row and one-line rows as a file row.
+
+/// Where row content starts, from the pane's leading edge.
+const ROW_CONTENT_LEFT: f32 = GUTTER_LEFT_PADDING + GUTTER_PADDING;
+/// iced centres text in a line box 1.3× its size; the graph stacks bare
+/// text boxes [`ROW_LINE_GAP`] apart, so a two-line row's spacing gives
+/// back both lines' half-leading.
+const TWO_LINE_SPACING: f32 = ROW_LINE_GAP - 0.15 * (SMALL_TEXT_SIZE + CAPTION_TEXT_SIZE);
+
+/// Padding of a list of rows: the graph's card insets, plus the window
+/// border at the leading edge as the graph adds it.
+fn list_padding() -> Padding {
+    Padding {
+        top: ROW_CARD_INSET_Y,
+        right: ROW_CARD_INSET_X,
+        bottom: ROW_CARD_INSET_Y,
+        left: ROW_CARD_INSET_X + crate::chrome::window_border(),
+    }
+}
+
+/// Padding inside a row card, putting content at [`ROW_CONTENT_LEFT`].
+fn card_padding() -> Padding {
+    Padding {
+        top: 0.0,
+        right: CONTENT_PADDING - ROW_CARD_INSET_X,
+        bottom: 0.0,
+        left: ROW_CONTENT_LEFT - ROW_CARD_INSET_X - crate::chrome::window_border(),
+    }
+}
+
+/// A row card's height: the row's, less the card insets.
+fn card_height(row_height: f32) -> Length {
+    Length::Fixed(row_height - 2.0 * ROW_CARD_INSET_Y)
+}
+
+/// The graph's two-line stack: a title, and a caption-size line of ids and
+/// meta under it.
+fn two_line<'a>(
+    title: impl Into<Element<'a, Message>>,
+    meta: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    container(column![title.into(), meta.into()].spacing(TWO_LINE_SPACING))
+        .height(Length::Fill)
+        .center_y(Length::Fill)
+        .into()
 }
 
 fn caption<'a>(value: impl text::IntoFragment<'a>, color: Color, ui: &Diffui) -> text::Text<'a> {
@@ -1094,7 +1149,7 @@ fn caption<'a>(value: impl text::IntoFragment<'a>, color: Color, ui: &Diffui) ->
 
 fn mono<'a>(value: impl text::IntoFragment<'a>, color: Color, ui: &Diffui) -> text::Text<'a> {
     text(value)
-        .size(text_size::UI)
+        .size(CAPTION_TEXT_SIZE)
         .font(ui.config.mono_font)
         .color(color)
         .wrapping(text::Wrapping::None)
@@ -1145,8 +1200,6 @@ fn op_rows<'a>(history: &'a HistoryState) -> Vec<OpRow<'a>> {
     rows
 }
 
-/// Height of the op log's one-line rows: snapshots and snapshot runs.
-const OP_LINE_HEIGHT: f32 = 24.0;
 /// Width of the chevron column in a snapshot run's row.
 const RUN_CHEVRON: f32 = 12.0;
 
@@ -1167,33 +1220,30 @@ fn op_row<'a>(
     } else {
         theme.muted_text
     };
-    let mut head = row![mono(op.short_id(), id_color, ui)]
+    let mut meta = row![mono(op.short_id(), id_color, ui)]
         .spacing(space::SM)
         .align_y(alignment::Vertical::Center);
     if op.is_current {
-        head = head.push(chip("current", theme.accent, ui));
+        meta = meta.push(chip("current", theme.accent, ui));
     }
-    head = head.push(
+    meta = meta.push(
         caption(op.user.as_str(), theme.subtle_text, ui)
             .ellipsis(text::Ellipsis::End)
             .width(Length::Fill),
     );
-    head = head.push(caption(age, theme.subtle_text, ui));
-    let content = column![
-        head,
-        meta_line::description(
-            op.summary(),
-            text_size::BODY,
-            ui.config.ui_font,
-            theme.text,
-            ui,
-            theme,
-        ),
-    ]
-    .spacing(2);
-    button(content)
+    meta = meta.push(caption(age, theme.subtle_text, ui));
+    let title = meta_line::description(
+        op.summary(),
+        SMALL_TEXT_SIZE,
+        ui.config.ui_font,
+        theme.text,
+        ui,
+        theme,
+    );
+    button(two_line(title, meta))
         .width(Length::Fill)
-        .padding(Padding::from([space::XS, space::MD]))
+        .height(card_height(REVISION_ROW_HEIGHT))
+        .padding(card_padding())
         .on_press(Message::Action(Action::History(
             HistoryAction::SelectOperation(op.id.clone()),
         )))
@@ -1236,8 +1286,8 @@ fn snapshot_row<'a>(
     ));
     button(line)
         .width(Length::Fill)
-        .height(Length::Fixed(OP_LINE_HEIGHT))
-        .padding(Padding::from([0.0, space::MD]))
+        .height(card_height(FILE_ROW_HEIGHT))
+        .padding(card_padding())
         .on_press(Message::Action(Action::History(
             HistoryAction::SelectOperation(op.id.clone()),
         )))
@@ -1287,8 +1337,8 @@ fn run_row<'a>(
         .align_y(alignment::Vertical::Center),
     )
     .width(Length::Fill)
-    .height(Length::Fixed(OP_LINE_HEIGHT))
-    .padding(Padding::from([0.0, space::MD]))
+    .height(card_height(FILE_ROW_HEIGHT))
+    .padding(card_padding())
     .on_press(Message::Action(Action::History(
         HistoryAction::ToggleSnapshotRun(first.id.clone()),
     )))
@@ -1304,15 +1354,17 @@ fn run_row<'a>(
             background: Some(Background::Color(theme.border)),
             ..container::Style::default()
         });
-    let mut rows = column![].spacing(1);
+    let mut rows = column![].spacing(2.0 * ROW_CARD_INSET_Y);
     for op in children {
         rows = rows.push(snapshot_row(ui, theme, op, now));
     }
     // The guide hangs from the chevron's centre; the children's ids line up
-    // with the run's label.
-    let guide_x = space::MD + RUN_CHEVRON / 2.0 - 0.5;
-    let label_x = space::MD + RUN_CHEVRON + space::SM;
-    let child_x = label_x - space::MD;
+    // with the run's label. Positions are within the list's padding, where
+    // a card's content starts at the card padding's left.
+    let content = card_padding().left;
+    let guide_x = content + RUN_CHEVRON / 2.0 - 0.5;
+    let label_x = content + RUN_CHEVRON + space::SM;
+    let child_x = label_x - content;
     column![
         header,
         row![
@@ -1322,7 +1374,7 @@ fn run_row<'a>(
             rows,
         ],
     ]
-    .spacing(1)
+    .spacing(2.0 * ROW_CARD_INSET_Y)
     .into()
 }
 
@@ -1338,17 +1390,25 @@ fn version_row<'a>(
     now: i64,
 ) -> Element<'a, Message> {
     let selected = ui.active().history.selected_version == Some(index);
-    let mut head = row![mono(entry.commit.short_commit_id(), theme.muted_text, ui)]
+    let mut meta = row![mono(entry.commit.short_commit_id(), theme.muted_text, ui)]
         .spacing(space::SM)
         .align_y(alignment::Vertical::Center);
     if entry.commit.visible {
-        head = head.push(chip("current", theme.accent, ui));
+        meta = meta.push(chip("current", theme.accent, ui));
     }
     if entry.commit.empty {
-        head = head.push(chip("empty", theme.subtle_text, ui));
+        meta = meta.push(chip("empty", theme.subtle_text, ui));
     }
-    head = head.push(Space::new().width(Length::Fill));
-    head = head.push(caption(
+    let operation = entry.operation.as_ref().map_or_else(
+        || "(operation no longer in the log)".to_owned(),
+        |op| meta_line::shorten_ids(&op.summary),
+    );
+    meta = meta.push(
+        caption(operation, theme.subtle_text, ui)
+            .ellipsis(text::Ellipsis::End)
+            .width(Length::Fill),
+    );
+    meta = meta.push(caption(
         relative_age(entry.commit.time_millis, now),
         theme.subtle_text,
         ui,
@@ -1358,47 +1418,46 @@ fn version_row<'a>(
     } else {
         entry.commit.summary.as_str()
     };
-    let operation = entry.operation.as_ref().map_or_else(
-        || "(operation no longer in the log)".to_owned(),
-        |op| meta_line::shorten_ids(&op.summary),
-    );
-    button(
-        column![
-            head,
-            text(summary)
-                .size(text_size::BODY)
-                .font(ui.config.ui_font)
-                .color(if entry.commit.summary.is_empty() {
-                    theme.subtle_text
-                } else {
-                    theme.text
-                })
-                .wrapping(text::Wrapping::None)
-                .ellipsis(text::Ellipsis::End)
-                .width(Length::Fill),
-            caption(operation, theme.subtle_text, ui)
-                .ellipsis(text::Ellipsis::End)
-                .width(Length::Fill),
-        ]
-        .spacing(2),
-    )
-    .width(Length::Fill)
-    .padding(Padding::from([space::XS, space::MD]))
-    .on_press(Message::Action(Action::History(
-        HistoryAction::SelectVersion(index),
-    )))
-    .style(move |_, status| row_style(theme, selected, status))
-    .into()
+    let title = text(summary)
+        .size(SMALL_TEXT_SIZE)
+        .font(ui.config.ui_font)
+        .color(if entry.commit.summary.is_empty() {
+            theme.subtle_text
+        } else {
+            theme.text
+        })
+        .wrapping(text::Wrapping::None)
+        .ellipsis(text::Ellipsis::End)
+        .width(Length::Fill);
+    button(two_line(title, meta))
+        .width(Length::Fill)
+        .height(card_height(REVISION_ROW_HEIGHT))
+        .padding(card_padding())
+        .on_press(Message::Action(Action::History(
+            HistoryAction::SelectVersion(index),
+        )))
+        .style(move |_, status| row_style(theme, selected, status))
+        .into()
 }
 
+/// A list's header, its leading glyph on the rows' content edge and its
+/// trailing button's glyph on their right edge. `leading_button`: the
+/// header starts with an icon button, whose glyph sits centred in it.
 fn header_bar<'a>(
     content: impl Into<Element<'a, Message>>,
+    leading_button: bool,
     theme: ThemeSpec,
 ) -> Element<'a, Message> {
+    let glyph_inset = (ui::Size::Compact.height() - ui::ICON_SIZE) / 2.0;
     container(content)
         .width(Length::Fill)
         .height(Length::Fixed(crate::field::PANEL_HEADER_HEIGHT))
-        .padding(Padding::from([0.0, space::MD]))
+        .padding(Padding {
+            top: 0.0,
+            right: (CONTENT_PADDING - glyph_inset).max(0.0),
+            bottom: 0.0,
+            left: ROW_CONTENT_LEFT - if leading_button { glyph_inset } else { 0.0 },
+        })
         .center_y(Length::Fixed(crate::field::PANEL_HEADER_HEIGHT))
         .style(move |_| container::Style {
             background: Some(Background::Color(theme.panel_background)),
@@ -1451,8 +1510,8 @@ pub(crate) fn build_history_sidebar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Ele
             .spacing(space::SM)
             .align_y(alignment::Vertical::Center);
             let mut rows = column![]
-                .spacing(1)
-                .padding(Padding::from([space::XS, space::XS]));
+                .spacing(2.0 * ROW_CARD_INSET_Y)
+                .padding(list_padding());
             for entry in op_rows(history) {
                 rows = rows.push(match entry {
                     OpRow::Op(op) => op_row(ui, theme, op, now),
@@ -1520,8 +1579,8 @@ pub(crate) fn build_history_sidebar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Ele
             .spacing(space::XS)
             .align_y(alignment::Vertical::Center);
             let mut rows = column![]
-                .spacing(1)
-                .padding(Padding::from([space::XS, space::XS]));
+                .spacing(2.0 * ROW_CARD_INSET_Y)
+                .padding(list_padding());
             for (index, entry) in history.evolog.iter().enumerate() {
                 rows = rows.push(version_row(ui, theme, index, entry, now));
             }
@@ -1539,7 +1598,8 @@ pub(crate) fn build_history_sidebar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Ele
         }
     };
 
-    container(column![header_bar(header, theme), list])
+    let leading_button = matches!(history.kind, HistoryKind::Evolog { .. });
+    container(column![header_bar(header, leading_button, theme), list])
         .width(Length::Fixed(ui.sidebar_width))
         .height(Length::Fill)
         .style(move |_| sidebar_panel_style(theme))
