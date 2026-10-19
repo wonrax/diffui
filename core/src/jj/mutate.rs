@@ -565,7 +565,7 @@ async fn mutate_locked(
                 // Branch mode with the destination inside the branch: a
                 // benign no-op, like the CLI's "Nothing changed".
                 None => format!(
-                    "Nothing to rebase — the branch is already based on {}",
+                    "Nothing to rebase: the branch is already based on {}",
                     short_change_id(&anchor)
                 ),
                 Some(target) => {
@@ -640,7 +640,7 @@ async fn mutate_locked(
                             short_change_id(first_source)
                         ),
                         _ => bail!(
-                            "{} is a merge — pick an explicit squash destination",
+                            "{} is a merge, so pick a squash destination",
                             short_change_id(first_source)
                         ),
                     }
@@ -682,7 +682,7 @@ async fn mutate_locked(
                 .context("failed to squash")?
             else {
                 bail!(
-                    "nothing to squash from {} — no changes there",
+                    "nothing to squash from {}: it has no changes",
                     source_names.join(", ")
                 );
             };
@@ -785,9 +785,7 @@ async fn mutate_locked(
                 ));
             }
             if selected.target_commits.is_empty() {
-                bail!(
-                    "nothing to absorb from {short} — no mutable ancestor touches the same lines"
-                );
+                bail!("nothing to absorb from {short}: no mutable ancestor touches the same lines");
             }
             let stats = absorb_hunks(tx.repo_mut(), &absorb_source, selected.target_commits)
                 .await
@@ -889,7 +887,7 @@ async fn mutate_locked(
                         [parent] => parent.clone(),
                         [] => bail!("{} has no parent to squash into", short_change_id(&source)),
                         _ => bail!(
-                            "{} is a merge — pick an explicit squash destination",
+                            "{} is a merge, so pick a squash destination",
                             short_change_id(&source)
                         ),
                     }
@@ -985,7 +983,7 @@ async fn mutate_locked(
                 && !targets.has_visible(commit.id())
             {
                 bail!(
-                    "{} changed while it was being resolved — resolve it again",
+                    "{} changed while it was being resolved. Resolve it again.",
                     short_change_id(&commit)
                 );
             }
@@ -1010,7 +1008,7 @@ async fn mutate_locked(
                 .context("failed to read the resolved path")?
                 .is_resolved();
             let still = if path_conflicted {
-                " — still conflicted"
+                " (still conflicted)"
             } else if resolved.tree().has_conflict() {
                 " (other conflicts remain)"
             } else {
@@ -1291,8 +1289,7 @@ impl std::fmt::Display for ImmutableRewriteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "commit {} is immutable — it's reachable from immutable_heads() \
-             (usually pushed/shared history)",
+            "commit {} is immutable (usually pushed or shared history)",
             self.short_id
         )
     }
@@ -1369,7 +1366,7 @@ pub(super) fn rebase_stats_message(
     };
     let moved = stats.num_rebased_targets;
     if moved == 0 && stats.num_skipped_rebases > 0 {
-        return "Nothing to rebase — already in place".to_owned();
+        return "Nothing to rebase: already in place".to_owned();
     }
     let plural = if moved == 1 { "" } else { "s" };
     let mut message = format!("Rebased {moved} revision{plural} {place} {anchor}");

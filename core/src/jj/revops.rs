@@ -511,7 +511,7 @@ pub(super) async fn keep_divergent(
         .collect();
     if others.is_empty() {
         bail!(
-            "{} is not divergent — no other visible copy to abandon",
+            "{} is not divergent: there is no other visible copy to abandon",
             short_change_id(&kept)
         );
     }

@@ -93,7 +93,7 @@ pub(crate) async fn conflict_files(commit: &Commit) -> Result<Vec<ConflictFile>>
                 });
                 let blocker = if file.ids.num_sides() > 2 {
                     Some(format!(
-                        "a {}-sided conflict — merge tools take two sides; pick a side \
+                        "a {}-sided conflict. Merge tools take two sides; pick a side \
                          or edit the conflict markers in the working copy",
                         file.ids.num_sides()
                     ))
@@ -128,7 +128,7 @@ pub(crate) async fn conflict_files(commit: &Commit) -> Result<Vec<ConflictFile>>
                         .collect(),
                     pickable: false,
                     merge_tool_blocker: Some(
-                        "a term is a symlink, directory or submodule — resolve it in the \
+                        "a term is a symlink, directory or submodule. Resolve it in the \
                          working copy"
                             .to_owned(),
                     ),
@@ -152,7 +152,7 @@ pub(super) async fn resolve_conflict(
     let (conflict, file) = conflict_at(&tree, &repo_path, path).await?;
     let file = file.ok_or_else(|| {
         anyhow!(
-            "{path}'s conflict involves a symlink, directory or submodule — resolve it in \
+            "{path}'s conflict involves a symlink, directory or submodule. Resolve it in \
              the working copy"
         )
     })?;
@@ -264,7 +264,7 @@ pub(crate) async fn prepare_merge_tool(
         .ok_or_else(|| anyhow!("{path}'s conflict involves a symlink, directory or submodule"))?;
     if file.contents.num_sides() != 2 {
         bail!(
-            "{path} is a {}-sided conflict; merge tools take two sides — pick a side or \
+            "{path} is a {}-sided conflict, and merge tools take two sides. Pick a side or \
              edit the conflict markers in the working copy",
             file.contents.num_sides()
         );

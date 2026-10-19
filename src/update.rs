@@ -10,6 +10,7 @@ use super::*;
 use crate::find::FindMessage;
 use crate::menu::MenuMessage;
 use crate::palette::PaletteMessage;
+use crate::prose::Prose;
 use iced::widget::column;
 
 impl Diffui {
@@ -1777,9 +1778,6 @@ impl Diffui {
             return Task::none();
         };
         let context = self.key_context();
-        // iced's text editors never capture keys, so the split prompt's
-        // description editors claim plain keys here.
-        let consumed = consumed || self.active().changes.owns_keyboard();
         let Some(id) = self.resolve_chord(context, &chord, consumed) else {
             return Task::none();
         };
@@ -1788,7 +1786,7 @@ impl Diffui {
 
     /// The command a chord names in `context`, falling back to the base context
     /// only where the mode allows it (see [`crate::modes::passes_through`]).
-    fn resolve_chord(
+    pub(crate) fn resolve_chord(
         &self,
         context: Context,
         chord: &Chord,
@@ -2979,13 +2977,7 @@ impl Diffui {
         if !backwards {
             return self.run_mutation_checking_wc_push(pending);
         }
-        let target = match to {
-            RevisionSelection::WorkingCopy => "The working copy".to_owned(),
-            RevisionSelection::Commit(hex) => {
-                let _ = hex;
-                self.revision_short_label(to)
-            }
-        };
+        let target = self.revision_prose(to);
         // A conflicted bookmark also lands here (it has no single commit to be
         // "a descendant of"), but there the move *is* the fix — the dialog
         // explains the resolution rather than warning about a backwards move
@@ -3001,45 +2993,45 @@ impl Diffui {
             .map(|b| b.local_targets.len());
         let (title, mut body) = match conflicted_sides {
             Some(sides) => (
-                format!("Resolve conflicted bookmark \u{201c}{name}\u{201d}?"),
-                format!(
-                    "\u{201c}{name}\u{201d} is conflicted — it points at {sides} \
-                     commits at once (concurrent moves, or a force-pushed \
-                     remote). Moving it to {target} picks that side and \
-                     resolves the conflict."
-                ),
+                Prose::from("Resolve conflicted bookmark ")
+                    .bookmark(name)
+                    .text("?"),
+                Prose::new()
+                    .bookmark(name)
+                    .text(format!(" points at {sides} commits. Moving it to "))
+                    .then(target)
+                    .text(" picks that one."),
             ),
             None => (
-                format!("Move bookmark \u{201c}{name}\u{201d} backwards?"),
-                format!(
-                    "{target} is not a descendant of the commit \u{201c}{name}\u{201d} \
-                     points at, so this is a backwards or sideways move — the jj CLI \
-                     refuses it without --allow-backwards."
-                ),
+                Prose::from("Move ").bookmark(name).text(" backwards?"),
+                target
+                    .text(" is behind or beside where ")
+                    .bookmark(name)
+                    .text(" is now."),
             ),
         };
-        if self.publishes_working_copy(&pending.op) {
-            body.push_str(&format!(" {}", crate::bookmarks::WORKING_COPY_PUSH_WARNING));
-        }
         // A move that also pushes rewrites the remote branch — say so before
         // the user commits to it.
         let confirm_label = match (push_remote, conflicted_sides) {
             (Some(remote), None) => {
-                body.push_str(&format!(
-                    " The bookmark is then pushed, moving it backwards on \
-                     \u{201c}{remote}\u{201d} too."
-                ));
+                body = body
+                    .text(" The push moves it on ")
+                    .remote(remote)
+                    .text(" too.");
                 "Move & push anyway".to_owned()
             }
             (Some(remote), Some(_)) => {
-                body.push_str(&format!(
-                    " The bookmark is then pushed to \u{201c}{remote}\u{201d}."
-                ));
+                body = body.text(" Then pushes it to ").remote(remote).text(".");
                 "Move, resolve & push".to_owned()
             }
             (None, Some(_)) => "Move & resolve".to_owned(),
             (None, None) => "Move anyway".to_owned(),
         };
+        if self.publishes_working_copy(&pending.op) {
+            body = body
+                .text(" ")
+                .then(crate::bookmarks::working_copy_push_warning());
+        }
         self.push_mode(Mode::Confirm(ConfirmDialog {
             title,
             body,
@@ -3059,7 +3051,7 @@ impl Diffui {
         result: Result<Vec<String>, String>,
         summary: Option<String>,
     ) -> Task<Message> {
-        let mut failure: Option<(String, String)> = None;
+        let mut failure: Option<(Prose, String)> = None;
         if let Some(log) = self.activity_log_for(tab) {
             match result {
                 Ok(lines) => {
@@ -3069,8 +3061,8 @@ impl Diffui {
                 Err(error) => {
                     let title = log
                         .label(activity_id)
-                        .map(|label| format!("{label} failed"))
-                        .unwrap_or_else(|| "Operation failed".to_owned());
+                        .map(|label| label.clone().text(" failed"))
+                        .unwrap_or_else(|| "Operation failed".into());
                     failure = Some((title, error.clone()));
                     log.append_output(activity_id, error.clone());
                     log.finish(activity_id, activity::ActivityStatus::Error, Some(error));
@@ -3848,7 +3840,7 @@ impl Diffui {
     pub(crate) fn begin_activity(
         &mut self,
         tab: TabId,
-        label: impl Into<String>,
+        label: impl Into<Prose>,
         determinate: bool,
     ) -> (activity::ActivityId, LoadProgress) {
         let id = self.allocate_activity_id();
@@ -3990,7 +3982,7 @@ impl Diffui {
     /// Float an error toast (bottom-right) for a failed operation. The
     /// activity log keeps the full record; this only makes the failure
     /// impossible to miss. Newest last, capped so a burst can't wall the UI.
-    pub(crate) fn push_error_toast(&mut self, title: String, error: &str) {
+    pub(crate) fn push_error_toast(&mut self, title: impl Into<Prose>, error: &str) {
         const MAX_TOASTS: usize = 4;
         const MAX_DETAIL: usize = 160;
         let mut detail: String = error
@@ -4006,8 +3998,8 @@ impl Diffui {
         self.next_toast_id = self.next_toast_id.wrapping_add(1);
         self.toasts.push(Toast {
             id: self.next_toast_id,
-            title,
-            detail,
+            title: title.into(),
+            detail: Prose::from_backticks(&detail),
             born: Instant::now(),
             sticky: false,
         });
@@ -4018,7 +4010,7 @@ impl Diffui {
     }
 
     /// [`Self::push_error_toast`], but the toast stays up until dismissed.
-    pub(crate) fn push_sticky_toast(&mut self, title: String, error: &str) {
+    pub(crate) fn push_sticky_toast(&mut self, title: impl Into<Prose>, error: &str) {
         self.push_error_toast(title, error);
         if let Some(toast) = self.toasts.last_mut() {
             toast.sticky = true;
@@ -4265,31 +4257,49 @@ impl Diffui {
         } else {
             ("revisions", "are")
         };
-        let names = targets.join(", ");
+        let mut names = Prose::new();
+        for (index, target) in targets.iter().enumerate() {
+            if index > 0 {
+                names = names.text(", ");
+            }
+            names = names.rev(target);
+        }
         let mut body = if after_rejection {
-            format!("This operation would also rewrite {names}, which {verb_be} immutable")
+            Prose::from("This would also rewrite ")
+                .then(names)
+                .text(format!(", which {verb_be} immutable"))
         } else {
-            format!("{names} {verb_be} immutable")
+            names.text(format!(" {verb_be} immutable"))
         };
-        body.push_str(
-            " — reachable from immutable_heads(), which usually means pushed or \
-             otherwise shared history. The jj CLI refuses this without \
-             --ignore-immutable.",
-        );
+        body = body.text(" (usually pushed or shared).");
         if matches!(pending.op, MutationOp::Edit { .. }) {
-            body.push_str(" Editing it makes further working-copy changes amend it in place.");
+            body = body.text(" Later working-copy changes amend it in place.");
         }
         // Stacking rather than replacing: a second guarded mutation raised
         // while a dialog is open (a background tab's op being refused) waits
         // under it and surfaces when that one resolves, instead of silently
         // taking over the buttons the user was about to press.
         self.push_mode(Mode::Confirm(ConfirmDialog {
-            title: format!("{verb} immutable {noun}?"),
+            title: format!("{verb} immutable {noun}?").into(),
             body,
             confirm_label: confirm_label.to_owned(),
             pending,
         }));
         Task::none()
+    }
+
+    /// [`Self::revision_short_label`] as an id in prose, or plain words when
+    /// the revision isn't in the graph.
+    pub(crate) fn revision_prose(&self, selection: &RevisionSelection) -> Prose {
+        let label = self.revision_short_label(selection);
+        let in_graph = match selection {
+            RevisionSelection::WorkingCopy => self.active().session.commits.working_copy(),
+            RevisionSelection::Commit(hex) => self.active().session.commits.find_by_commit_id(hex),
+        };
+        match (in_graph, selection) {
+            (None, RevisionSelection::WorkingCopy) => Prose::from(label),
+            _ => Prose::new().rev(label),
+        }
     }
 
     /// Short display name for a revision, matching the sidebar: unique
@@ -4334,8 +4344,10 @@ impl Diffui {
         }
         self.pop_mode(ModeKind::Menu);
         let label = match &target {
-            FetchTarget::AllRemotes => "Fetching all remotes".to_owned(),
-            FetchTarget::RemoteBranch { remote, branch } => format!("Fetching {remote}/{branch}"),
+            FetchTarget::AllRemotes => Prose::from("Fetching all remotes"),
+            FetchTarget::RemoteBranch { remote, branch } => {
+                Prose::from("Fetching ").code(format!("{remote}/{branch}"))
+            }
         };
         let (activity_id, _) = self.begin_activity(tab, label, true);
         let Some(state) = self.tab_mut(tab) else {
@@ -4568,6 +4580,7 @@ impl Diffui {
             || self.mode(ModeKind::Confirm).is_some()
             || self.mode(ModeKind::NamePrompt).is_some()
             || self.mode(ModeKind::Shortcuts).is_some()
+            || crate::changes::split_shown(self)
         {
             crate::pointer::suppress(shell)
         } else {
@@ -4583,6 +4596,7 @@ impl Diffui {
             menu::build_overlay(self, theme),
             tab_bar::build_open_repo_dialog(self, theme),
             crate::bookmarks::build_name_prompt(self, theme),
+            crate::changes::split_modal(self, theme),
             tab_bar::build_confirm_dialog(self, theme),
             crate::shortcuts::build_overlay(self, theme),
             activity::toast_layer(self, theme),
@@ -5186,8 +5200,8 @@ mod tests {
     fn a_confirmation_swallows_every_key_but_its_own() {
         let mut ui = app();
         ui.push_mode(Mode::Confirm(ConfirmDialog {
-            title: "Rewrite?".to_owned(),
-            body: String::new(),
+            title: "Rewrite?".into(),
+            body: Prose::new(),
             confirm_label: "Rewrite anyway".to_owned(),
             pending: PendingMutation {
                 op: mutations::MutationOp::Undo { operation_id: None },

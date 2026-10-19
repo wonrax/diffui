@@ -17,6 +17,7 @@ use iced::{Element, Length, Padding, Task, alignment};
 
 use crate::changes::{ChangesMsg, editable};
 use crate::commands::CommandArg;
+use crate::prose::Prose;
 use crate::theme::{ThemeSpec, text_size};
 use crate::{Action, Diffui, Message, PendingMutation, TabId, TabState, activity, icons, ui};
 
@@ -155,7 +156,7 @@ impl Diffui {
                                 Some(format!("{} closed", invocation.tool)),
                             );
                         }
-                        let label = format!("Resolve {}", invocation.path);
+                        let label = Prose::from("Resolve ").path(&invocation.path);
                         let op = MutationOp::ResolveConflict {
                             target: invocation.revision,
                             path: invocation.path,
@@ -182,7 +183,7 @@ impl Diffui {
 
     /// Run `op` on `tab`, which may no longer be the active one (a merge
     /// tool finishing after a tab switch).
-    fn resolve_in(&mut self, tab: TabId, op: MutationOp, label: String) -> Task<Message> {
+    fn resolve_in(&mut self, tab: TabId, op: MutationOp, label: Prose) -> Task<Message> {
         if self.tab_mut(tab).is_none() {
             return Task::none();
         }
@@ -301,7 +302,9 @@ impl Diffui {
                 let invocation = Box::new(invocation.clone());
                 let (activity, _) = self.begin_activity(
                     tab,
-                    format!("Resolving {path} in {}", invocation.tool),
+                    Prose::from("Resolving ")
+                        .path(&path)
+                        .text(format!(" in {}", invocation.tool)),
                     false,
                 );
                 Task::perform(
@@ -454,13 +457,14 @@ pub(crate) fn conflict_banner<'a>(
 
     let headline = row![
         icons::icon(icons::ALERT_TRIANGLE, ui::ICON_SIZE, theme.conflict_marker),
-        text(format!(
-            "{path} is conflicted ({} sides) \u{2014} take:",
-            conflict.sides.len()
-        ))
-        .size(text_size::UI)
-        .font(font)
-        .color(theme.text),
+        Prose::new()
+            .path(path)
+            .text(format!(
+                " is conflicted ({} sides). Take:",
+                conflict.sides.len()
+            ))
+            .view(font, ui.config.mono_font, theme.text, theme)
+            .size(text_size::UI),
     ]
     .spacing(6)
     .align_y(alignment::Vertical::Center);
@@ -474,17 +478,10 @@ pub(crate) fn conflict_banner<'a>(
         tab.session.selected_revision,
         RevisionSelection::WorkingCopy
     ) {
-        caption(
-            "Or edit the conflict markers in the file: jj records it as resolved once the \
-                 markers are gone.",
-        )
-        .into()
+        caption("Or edit out the conflict markers; the file is resolved once they're gone.").into()
     } else {
         row![
-            caption(
-                "Or by hand: start a new change on top, edit the conflict markers there, \
-                     then squash it back.",
-            ),
+            caption("Or fix the markers in a new change on top, then squash it back.",),
             ui::text_button(
                 None,
                 "New change on top",

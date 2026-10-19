@@ -16,7 +16,7 @@ use std::collections::HashSet;
 
 use iced::{
     Background, Border, Color, Element, Length, Padding, alignment,
-    widget::{Space, button, column, container, row, scrollable, text},
+    widget::{Space, button, column, container, row, text},
 };
 
 use diffui_core::history::{
@@ -27,6 +27,7 @@ use diffui_core::history::{
 use diffui_core::{DiffDocument, JobId, MutationOp, RevisionDetails, RevisionSelection, Vcs};
 
 use crate::diff_view::{AnnotationGutter, AnnotationLabel, DiffFileView, DiffView};
+use crate::prose::Prose;
 use crate::theme::{
     ThemeSpec, chip_background, diff_palette, diff_panel_style, emphasis_font, file_status_color,
     radius, sidebar_panel_style, space, text_size,
@@ -500,28 +501,25 @@ impl Diffui {
             .unwrap_or_default();
         let (title, body, confirm_label, label, op) = if restore {
             (
-                format!("Restore the repository to operation {short}?"),
-                format!(
-                    "Every revision, bookmark and working-copy position goes back to how it \
-                     was after \u{201c}{summary}\u{201d}, like jj op restore. Uncommitted \
-                     changes are snapshotted first, and the operations since stay in the log, \
-                     so this can itself be undone."
-                ),
+                Prose::from("Restore to operation ").op(short).text("?"),
+                Prose::from(format!(
+                    "Every revision and bookmark goes back to how \u{201c}{summary}\u{201d} \
+                     left them. This can be undone too."
+                )),
                 "Restore",
-                format!("Restore to {short}"),
+                Prose::from("Restore to ").op(short),
                 MutationOp::RestoreOperation {
                     operation_id: id.clone(),
                 },
             )
         } else {
             (
-                format!("Revert operation {short}?"),
-                format!(
-                    "Applies the inverse of \u{201c}{summary}\u{201d} on top of the current \
-                     state, like jj op revert. Work done since that operation is kept."
-                ),
+                Prose::from("Revert operation ").op(short).text("?"),
+                Prose::from(format!(
+                    "Undoes just \u{201c}{summary}\u{201d}, keeping the work done since."
+                )),
                 "Revert",
-                format!("Revert {short}"),
+                Prose::from("Revert ").op(short),
                 MutationOp::RevertOperation {
                     operation_id: id.clone(),
                 },
@@ -1022,17 +1020,17 @@ pub(crate) fn file_filter_banner<'a>(
     let filter = ui.active().history.file_filter.as_ref()?;
     let content = row![
         icons::icon(icons::FILE_CLOCK, ui::ICON_SIZE, theme.accent),
-        text(format!("History of {}", filter.path))
+        Prose::from("History of ")
+            .path(&filter.path)
+            .view(ui.config.ui_font, ui.config.mono_font, theme.text, theme)
             .size(text_size::UI)
-            .font(ui.config.ui_font)
-            .color(theme.text)
             .wrapping(text::Wrapping::None)
             .ellipsis(text::Ellipsis::End)
             .width(Length::Fill),
         ui::tooltip(
-            ui::icon_button(icons::CLOSE, theme.muted_text, ui::Size::Compact, theme).on_press(
-                Message::Action(Action::History(HistoryAction::ClearFileFilter))
-            ),
+            ui::close_button(theme.muted_text, theme).on_press(Message::Action(Action::History(
+                HistoryAction::ClearFileFilter
+            ))),
             "Show the whole graph again",
             iced::widget::tooltip::Position::Bottom,
             ui.config.ui_font,
@@ -1045,7 +1043,10 @@ pub(crate) fn file_filter_banner<'a>(
         container(
             container(content)
                 .width(Length::Fill)
-                .padding(Padding::from([0.0, space::MD]))
+                .padding(Padding {
+                    left: space::MD,
+                    ..Padding::from(ui::BANNER_INSET)
+                })
                 .style(move |_| container::Style {
                     background: Some(Background::Color(chip_background(theme.accent))),
                     border: Border {
@@ -1489,7 +1490,10 @@ pub(crate) fn build_history_sidebar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Ele
                     .padding(space::SM),
                 );
             }
-            (header.into(), scrollable(rows).height(Length::Fill).into())
+            (
+                header.into(),
+                ui::scrollable(rows, theme).height(Length::Fill).into(),
+            )
         }
         HistoryKind::Evolog { label, .. } => {
             let header = row![
@@ -1528,7 +1532,10 @@ pub(crate) fn build_history_sidebar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Ele
                     ui,
                 ));
             }
-            (header.into(), scrollable(rows).height(Length::Fill).into())
+            (
+                header.into(),
+                ui::scrollable(rows, theme).height(Length::Fill).into(),
+            )
         }
     };
 
@@ -1827,7 +1834,7 @@ fn operation_changes<'a>(
     let mut list = column![].spacing(1);
     if changes.is_merge {
         list = list.push(note(
-            "A merge of concurrent operations \u{2014} like the jj CLI, no changes are listed.",
+            "A merge of concurrent operations. Like the jj CLI, it lists no changes.",
             theme.subtle_text,
             ui,
         ));
@@ -1859,10 +1866,13 @@ fn operation_changes<'a>(
             ui,
         ));
     }
-    scrollable(list.padding(Padding {
-        bottom: space::SM,
-        ..Padding::from([0.0, space::SM])
-    }))
+    ui::scrollable(
+        list.padding(Padding {
+            bottom: space::SM,
+            ..Padding::from([0.0, space::SM])
+        }),
+        theme,
+    )
     .width(Length::Fill)
     .height(Length::Shrink.max(260.0))
     .into()
@@ -2025,7 +2035,7 @@ fn history_diff_view<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Messag
     if diff.document.files.is_empty() {
         let message = match description_change(history) {
             Some((old, new)) => format!(
-                "No file changes \u{2014} the description changed from \u{201c}{old}\u{201d} to \u{201c}{new}\u{201d}"
+                "No file changes. The description changed from \u{201c}{old}\u{201d} to \u{201c}{new}\u{201d}"
             ),
             None => "No file changes".to_owned(),
         };

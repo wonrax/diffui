@@ -304,7 +304,7 @@ pub(super) async fn push_request(
     for (symbol, reason) in &stats.unexported_bookmarks {
         problems.push(format!("{symbol}: couldn't export to git ({reason})"));
     }
-    let failure = format!("push rejected \u{2014} {}", problems.join("; "));
+    let failure = format!("push rejected: {}", problems.join("; "));
     if !stats.some_exported() {
         return Err(PushFailed(failure).into());
     }

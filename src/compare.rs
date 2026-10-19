@@ -231,8 +231,7 @@ pub(crate) fn build_compare_banner<'a>(
             theme,
         ),
         ui::tooltip(
-            ui::icon_button(icons::CLOSE, theme.muted_text, ui::Size::Compact, theme)
-                .on_press(action(CompareAction::Exit)),
+            ui::close_button(theme.muted_text, theme).on_press(action(CompareAction::Exit)),
             "Stop comparing",
             iced::widget::tooltip::Position::Left,
             font,

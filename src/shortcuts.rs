@@ -9,7 +9,7 @@
 use iced::{
     Alignment, Background, Border, Element, Length, Padding, Task, alignment,
     font::Weight,
-    widget::{Space, column, container, mouse_area, opaque, row, scrollable, stack, text},
+    widget::{Space, column, container, row, text},
 };
 
 use crate::commands::{self, CommandId, Context, REGISTRY};
@@ -29,9 +29,11 @@ const SECTIONS: &[(Context, &str)] = &[
         Context::Draft,
         "Target mode (rebase / squash / merge / new / duplicate)",
     ),
+    (Context::Lines, "Line selection"),
     (Context::Palette, "Command palette"),
     (Context::Find, "Find in diff"),
     (Context::Description, "Description editor"),
+    (Context::Split, "Split prompt"),
     (Context::OpenRepo, "Open repository"),
     (Context::Confirm, "Confirmation"),
     (Context::ActivityPopover, "Activity log"),
@@ -50,6 +52,7 @@ const BASE_GROUPS: &[(&str, &[&str])] = &[
         &[
             "file.",
             "changes.",
+            "lines.",
             "conflict.",
             "find.",
             "view.",
@@ -172,14 +175,6 @@ pub(crate) fn build_overlay(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
         return Space::new().into();
     }
 
-    let scrim = mouse_area(
-        container(Space::new().width(Length::Fill).height(Length::Fill))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(|_| theme::scrim_style()),
-    )
-    .on_press(Message::Action(Action::CloseShortcuts));
-
     let mut left = column![].spacing(theme::space::XL);
     let mut right = column![].spacing(theme::space::XL);
     let rows_of = |entries: Vec<Entry>| -> Vec<Element<'_, Message>> {
@@ -238,7 +233,11 @@ pub(crate) fn build_overlay(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
             .color(theme.subtle_text)
             .font(ui.config.ui_font),
     ]
-    .align_y(alignment::Vertical::Center);
+    .align_y(alignment::Vertical::Center)
+    .padding(Padding {
+        right: crate::ui::DIALOG_PADDING,
+        ..Padding::ZERO
+    });
 
     let columns = row![
         left.width(Length::FillPortion(1)),
@@ -248,38 +247,33 @@ pub(crate) fn build_overlay(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
 
     let body = column![
         header,
-        scrollable(container(columns).padding(Padding {
-            right: theme::space::LG,
-            ..Padding::ZERO
-        }))
-        .height(Length::Fill)
-        .style(move |_, status| theme::iced_scrollable_style(theme, status)),
+        // The list scrolls out to the card's right edge, so the bar sits
+        // where every other scroll view's does; the inset moves inside.
+        crate::ui::scrollable(
+            container(columns).padding(Padding {
+                right: crate::ui::DIALOG_PADDING,
+                ..Padding::ZERO
+            }),
+            theme,
+        )
+        .height(Length::Fill),
     ]
     .spacing(theme::space::XL);
 
-    let card = mouse_area(
-        container(body)
-            .width(Length::Fixed(CARD_WIDTH))
-            .height(Length::Fixed(
-                (ui.window_size.height - theme::modal_top() - theme::space::XXL)
-                    .clamp(240.0, CARD_MAX_HEIGHT),
-            ))
-            .padding(theme::space::XXL)
-            .style(move |_| theme::modal_style(theme)),
-    )
-    // A click on the card is not a click on the scrim.
-    .on_press(Message::Ui(UiEvent::ConfirmNoOp));
-
-    let centered = container(card)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .align_x(alignment::Horizontal::Center)
+    let card = crate::ui::dialog_card(body, CARD_WIDTH, theme)
         .padding(Padding {
-            top: theme::modal_top(),
-            ..Padding::ZERO
-        });
-
-    opaque(stack![scrim, centered])
+            right: 0.0,
+            ..Padding::from(crate::ui::DIALOG_PADDING)
+        })
+        .height(Length::Fixed(
+            (ui.window_size.height - theme::modal_top() - theme::space::XXL)
+                .clamp(240.0, CARD_MAX_HEIGHT),
+        ));
+    crate::ui::modal(
+        card,
+        Message::Action(Action::CloseShortcuts),
+        Message::Ui(UiEvent::ConfirmNoOp),
+    )
 }
 
 fn section<'a>(

@@ -24,9 +24,7 @@ use iced::{
     border,
     font::Weight,
     widget::{
-        Space, button, column, container, mouse_area, opaque, pin, responsive, row, scrollable,
-        scrollable::{Direction, Scrollbar},
-        stack, text,
+        Space, button, column, container, mouse_area, opaque, pin, responsive, row, stack, text,
     },
 };
 use nucleo_matcher::{Config, Matcher, Utf32String};
@@ -1088,28 +1086,12 @@ fn build_results<'a>(
         list = list.push(build_result_row(ui, theme, column_state, depth, index, m));
     }
 
-    let scrollable_list = scrollable(list)
+    // The bar floats over the rows' right inset like the graph's does; the
+    // rows' text padding keeps every label and hint clear of it.
+    crate::ui::scrollable(list.padding(RESULTS_INSET), theme)
         .id(results_scrollable_id(depth))
-        .direction(Direction::Vertical(
-            Scrollbar::default()
-                .width(theme::SCROLLBAR_WIDTH)
-                .scroller_width(theme::SCROLLBAR_WIDTH)
-                .margin(theme::SCROLLBAR_MARGIN)
-                // `spacing` switches the scrollbar from overlay mode to
-                // embedded — the rail reserves its own width in the
-                // layout instead of floating over the content. Without
-                // this, long author/hint text on the right of result
-                // rows runs underneath the rail.
-                .spacing(6.0),
-        ))
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(move |_, status| theme::iced_scrollable_style(theme, status));
-
-    container(scrollable_list)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .padding(RESULTS_INSET)
         .into()
 }
 

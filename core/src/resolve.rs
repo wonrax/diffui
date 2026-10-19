@@ -109,7 +109,7 @@ impl MergeToolInvocation {
             .map_err(|error| format!("failed to read the merge tool's output: {error}"))?;
         if content.is_empty() || content == self.initial_output {
             return Err(format!(
-                "{} left the output file empty or unchanged — nothing was resolved",
+                "{} left the output file empty or unchanged, so nothing was resolved",
                 self.tool
             ));
         }

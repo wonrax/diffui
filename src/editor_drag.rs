@@ -13,6 +13,12 @@
 //! `Drag` actions the widget refuses to — straight into the caller's normal
 //! `on_action` pipeline, where they land in the shared `Content` the widget
 //! renders from.
+//!
+//! It also brings trackpad scrolling to the speed of the app's other scroll
+//! views. The widget turns a pixel delta into `delta / 4` *lines*, so a
+//! 20px-line editor moved five times as far as the finger did; the wrapper
+//! rescales pixel deltas so one pixel of gesture scrolls
+//! [`PIXEL_SCROLL_SCALE`] pixels of text, like the diff view.
 
 use iced::advanced::{
     Layout, Shell, Widget, layout, mouse, overlay, renderer,
@@ -23,19 +29,29 @@ use iced::{
     widget::text_editor::Action,
 };
 
+/// Content pixels a trackpad's pixel of scroll moves, as in the diff view.
+pub(crate) const PIXEL_SCROLL_SCALE: f32 = 0.5;
+
+/// The pixels-per-line the stock editor assumes when it turns a pixel
+/// delta into lines.
+const STOCK_PIXELS_PER_LINE: f32 = 4.0;
+
 /// Wrap `content` (a `text_editor` with `on_action` wired) so double/triple
 /// -click drags extend its selection by word/line, publishing the synthesized
 /// [`Action::Drag`]s through `on_action`. `padding` must match the editor's
 /// own — action positions are editor-content-relative, and the wrapper can't
-/// read the child's padding back out of the `Element`.
+/// read the child's padding back out of the `Element`. `line_height` is the
+/// editor's line box in pixels, for the scroll-speed correction.
 pub(crate) fn editor_drag_area<'a, Message>(
     content: impl Into<Element<'a, Message, Theme>>,
     padding: impl Into<Padding>,
+    line_height: f32,
     on_action: impl Fn(Action) -> Message + 'a,
 ) -> EditorDragArea<'a, Message> {
     EditorDragArea {
         content: content.into(),
         padding: padding.into(),
+        line_height,
         on_action: Box::new(on_action),
     }
 }
@@ -43,7 +59,24 @@ pub(crate) fn editor_drag_area<'a, Message>(
 pub(crate) struct EditorDragArea<'a, Message> {
     content: Element<'a, Message, Theme>,
     padding: Padding,
+    line_height: f32,
     on_action: Box<dyn Fn(Action) -> Message + 'a>,
+}
+
+/// `delta` rescaled so the stock editor, which reads a pixel delta as
+/// `delta / 4` lines, scrolls `delta * PIXEL_SCROLL_SCALE` pixels of text.
+/// Line deltas (a mouse wheel's notches) pass through.
+fn rescale_wheel(delta: mouse::ScrollDelta, line_height: f32) -> mouse::ScrollDelta {
+    match delta {
+        mouse::ScrollDelta::Pixels { x, y } => {
+            let factor = STOCK_PIXELS_PER_LINE * PIXEL_SCROLL_SCALE / line_height.max(1.0);
+            mouse::ScrollDelta::Pixels {
+                x: x * factor,
+                y: y * factor,
+            }
+        }
+        lines => lines,
+    }
 }
 
 /// The wrapper's own click bookkeeping — a shadow of the `text_editor`'s
@@ -110,6 +143,16 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for EditorDragArea<'_, Mess
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        let rescaled;
+        let event = match event {
+            Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
+                rescaled = Event::Mouse(mouse::Event::WheelScrolled {
+                    delta: rescale_wheel(*delta, self.line_height),
+                });
+                &rescaled
+            }
+            _ => event,
+        };
         // The editor reacts first (focus, its own click handling); the shadow
         // tracker then observes the same event. No `is_event_captured` gate —
         // the editor itself has none for clicks, and skipping here while it
@@ -223,5 +266,30 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for EditorDragArea<'_, Mess
 impl<'a, Message: 'a> From<EditorDragArea<'a, Message>> for Element<'a, Message, Theme> {
     fn from(area: EditorDragArea<'a, Message>) -> Self {
         Element::new(area)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The stock editor's own conversion, so the test checks the outcome
+    /// (pixels of text moved) rather than the factor.
+    fn stock_lines(delta: mouse::ScrollDelta) -> f32 {
+        match delta {
+            mouse::ScrollDelta::Pixels { y, .. } => -y / STOCK_PIXELS_PER_LINE,
+            mouse::ScrollDelta::Lines { y, .. } => -y * 4.0,
+        }
+    }
+
+    #[test]
+    fn a_trackpad_pixel_scrolls_the_editor_like_the_diff_view() {
+        let line_height = 18.2;
+        let swipe = mouse::ScrollDelta::Pixels { x: 0.0, y: -100.0 };
+        let moved = stock_lines(rescale_wheel(swipe, line_height)) * line_height;
+        assert!((moved - 100.0 * PIXEL_SCROLL_SCALE).abs() < 0.01, "{moved}");
+        // A wheel notch is already in lines.
+        let notch = mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 };
+        assert_eq!(rescale_wheel(notch, line_height), notch);
     }
 }

@@ -68,7 +68,7 @@ pub fn min_width(config: AppConfig) -> f32 {
 /// Mirrors `revision_list::CONTENT_PADDING` — the right-edge padding
 /// inside a revision row. Kept here so `min_width` can budget the row
 /// without exposing the constant through `revision_list`.
-const REVISION_CONTENT_RIGHT_PAD: f32 = 12.0;
+const REVISION_CONTENT_RIGHT_PAD: f32 = crate::scrollbar::GUTTER;
 
 const CAPTION_TEXT_SIZE: f32 = theme::text_size::CAPTION;
 pub(crate) const REVISION_ID_CHARS: usize = 8;
@@ -558,7 +558,7 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             if is_branch && preview.simulated && preview.moved == 0 {
                 (
                     None,
-                    "Nothing to move — the branch is already there".to_owned(),
+                    "Nothing to move: the branch is already there".to_owned(),
                     theme.muted_text,
                     None,
                 )

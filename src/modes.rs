@@ -54,6 +54,8 @@ pub(crate) enum TabMode {
     Description(DescriptionEditor),
     /// Target mode — an in-progress rebase/squash/merge destination pick.
     Draft(DraftUi),
+    /// Line-select mode: the diff's changed lines are pickable one by one.
+    Lines(crate::changes::LineSelect),
 }
 
 /// What a mode is, independent of what it holds. Used to decide whether a push
@@ -70,6 +72,7 @@ pub(crate) enum ModeKind {
     Description,
     Draft,
     NamePrompt,
+    Lines,
 }
 
 impl Mode {
@@ -104,6 +107,7 @@ impl TabMode {
             TabMode::Find(_) => ModeKind::Find,
             TabMode::Description(_) => ModeKind::Description,
             TabMode::Draft(_) => ModeKind::Draft,
+            TabMode::Lines(_) => ModeKind::Lines,
         }
     }
 
@@ -112,6 +116,7 @@ impl TabMode {
             TabMode::Find(_) => Context::Find,
             TabMode::Description(_) => Context::Description,
             TabMode::Draft(_) => Context::Draft,
+            TabMode::Lines(_) => Context::Lines,
         }
     }
 
@@ -124,7 +129,7 @@ impl TabMode {
     /// — the opposite of what the visible layering says.
     fn layer(&self) -> u8 {
         match self {
-            TabMode::Description(_) | TabMode::Draft(_) => 0,
+            TabMode::Description(_) | TabMode::Draft(_) | TabMode::Lines(_) => 0,
             TabMode::Find(_) => 1,
         }
     }
@@ -133,13 +138,18 @@ impl TabMode {
 /// Whether a chord unclaimed by `context` may be re-resolved against
 /// [`Context::Base`].
 ///
-/// Target mode is the only one that lets anything past: its plain keys are the
-/// destination picker, but ⌘/⌥/⌃ combos (tab switching, the wrap toggle) still
-/// belong to the window. Every other mode is modal — a confirmation dialog in
-/// particular passes nothing, because the mutation behind it is one the jj CLI
-/// itself refuses.
+/// Target mode lets ⌘/⌥/⌃ combos past: its plain keys are the destination
+/// picker, but combos (tab switching, the wrap toggle) still belong to the
+/// window. Line-select mode only claims the few keys that walk and pick lines,
+/// so everything else — split, squash, the palette — works from inside it.
+/// Every other mode is modal — a confirmation dialog in particular passes
+/// nothing, because the mutation behind it is one the jj CLI itself refuses.
 pub(crate) fn passes_through(context: Context, chord: &Chord) -> bool {
-    matches!(context, Context::Draft) && chord.mods.any_command_like()
+    match context {
+        Context::Draft => chord.mods.any_command_like(),
+        Context::Lines => true,
+        _ => false,
+    }
 }
 
 /// Whether a chord in `context` requires that no focused widget consumed the
@@ -148,7 +158,7 @@ pub(crate) fn passes_through(context: Context, chord: &Chord) -> bool {
 /// exempt in target mode: leaving the mode has to work from inside that box.
 pub(crate) fn needs_unconsumed(context: Context, chord: &Chord) -> bool {
     match context {
-        Context::Base => !chord.mods.any_command_like() || is_text_undo(chord),
+        Context::Base | Context::Lines => !chord.mods.any_command_like() || is_text_undo(chord),
         Context::Draft => {
             (!chord.mods.any_command_like()
                 && !matches!(chord.key, ChordKey::Named(keyboard::key::Named::Escape)))
@@ -173,7 +183,17 @@ impl Diffui {
     pub(crate) fn key_context(&self) -> Context {
         match self.modes.last() {
             Some(mode) => mode.context(),
+            // The split prompt is a modal over the tab, above its own modes.
+            None if crate::changes::split_shown(self) => Context::Split,
             None => match self.active().modes.last() {
+                // Line-select mode outlives what it applies to (another
+                // revision showing, the history view); it stops taking keys
+                // then rather than swallowing j/k for nothing.
+                Some(TabMode::Lines(_))
+                    if crate::changes::live_line_select(self.active()).is_none() =>
+                {
+                    Context::Base
+                }
                 Some(mode) => mode.context(),
                 None => Context::Base,
             },
@@ -324,6 +344,13 @@ impl TabState {
         }
     }
 
+    pub(crate) fn line_select(&self) -> Option<&crate::changes::LineSelect> {
+        match self.mode(ModeKind::Lines) {
+            Some(TabMode::Lines(mode)) => Some(mode),
+            _ => None,
+        }
+    }
+
     pub(crate) fn op_draft_mut(&mut self) -> Option<&mut DraftUi> {
         match self.mode_mut(ModeKind::Draft) {
             Some(TabMode::Draft(draft)) => Some(draft),
@@ -382,6 +409,15 @@ mod tests {
     }
 
     #[test]
+    fn line_select_mode_claims_its_keys_and_passes_the_rest() {
+        assert!(passes_through(Context::Lines, &chord("X")));
+        assert!(passes_through(Context::Lines, &chord("cmd+k")));
+        // A focused input still keeps the plain keys it is typing.
+        assert!(needs_unconsumed(Context::Lines, &chord("j")));
+        assert!(!needs_unconsumed(Context::Lines, &chord("cmd+k")));
+    }
+
+    #[test]
     fn a_focused_input_keeps_the_plain_keys_it_is_typing() {
         // Plain keys belong to whatever has focus; combos never do.
         assert!(needs_unconsumed(Context::Base, &chord("j")));
@@ -405,8 +441,8 @@ mod stack_tests {
 
     fn confirm(title: &str) -> ConfirmDialog {
         ConfirmDialog {
-            title: title.to_owned(),
-            body: String::new(),
+            title: title.into(),
+            body: crate::prose::Prose::new(),
             confirm_label: "Do it".to_owned(),
             pending: PendingMutation {
                 op: mutations::MutationOp::Undo { operation_id: None },
@@ -442,9 +478,15 @@ mod stack_tests {
         // the top one surfaces the next rather than dropping its mutation.
         ui.push_mode(Mode::Confirm(confirm("first")));
         ui.push_mode(Mode::Confirm(confirm("second")));
-        assert_eq!(ui.confirm().map(|d| d.title.as_str()), Some("second"));
+        assert_eq!(
+            ui.confirm().map(|d| d.title.to_string()).as_deref(),
+            Some("second")
+        );
         ui.pop_mode(ModeKind::Confirm);
-        assert_eq!(ui.confirm().map(|d| d.title.as_str()), Some("first"));
+        assert_eq!(
+            ui.confirm().map(|d| d.title.to_string()).as_deref(),
+            Some("first")
+        );
     }
 
     #[test]
@@ -464,6 +506,21 @@ mod stack_tests {
         assert_eq!(ui.key_context(), Context::Base);
         ui.active = 0;
         assert_eq!(ui.key_context(), Context::Find);
+    }
+
+    #[test]
+    fn a_line_select_mode_that_no_longer_applies_holds_no_keys() {
+        let mut ui = app();
+        let tab = push_tab(&mut ui, "/tmp/first");
+        ui.active = 0;
+        // This tab has no diff to pick lines from.
+        ui.tab_mut(tab)
+            .expect("the tab is open")
+            .push_mode(TabMode::Lines(crate::changes::LineSelect::new(
+                diffui_core::RevisionSelection::WorkingCopy,
+                0,
+            )));
+        assert_eq!(ui.key_context(), Context::Base);
     }
 
     #[test]

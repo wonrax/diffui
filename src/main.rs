@@ -42,6 +42,7 @@ mod modes;
 mod palette;
 mod path_browse;
 mod pointer;
+mod prose;
 mod resize_handle;
 mod revision_list;
 mod revops;
@@ -503,10 +504,10 @@ impl DraftUi {
 pub(crate) struct Toast {
     pub(crate) id: u64,
     /// What failed, e.g. "Rebase failed".
-    pub(crate) title: String,
+    pub(crate) title: prose::Prose,
     /// First line of the error, truncated; the full text lives in the
-    /// activity row.
-    pub(crate) detail: String,
+    /// activity row. Names jj quotes in backticks render as code.
+    pub(crate) detail: prose::Prose,
     pub(crate) born: Instant,
     /// Stays up until dismissed instead of expiring after [`TOAST_TTL`] — for
     /// startup problems the user may not be looking at the window for.
@@ -549,8 +550,8 @@ impl DescriptionEditor {
 /// accepting still runs correctly after a tab switch.
 #[derive(Debug, Clone)]
 pub(crate) struct ConfirmDialog {
-    pub(crate) title: String,
-    pub(crate) body: String,
+    pub(crate) title: prose::Prose,
+    pub(crate) body: prose::Prose,
     pub(crate) confirm_label: String,
     pub(crate) pending: PendingMutation,
 }

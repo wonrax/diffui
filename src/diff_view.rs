@@ -114,7 +114,7 @@ pub struct DiffFileView<'a> {
 pub enum CheckState {
     #[default]
     Off,
-    /// Some of the file's hunks are picked.
+    /// Some of the file's hunks, or the hunk's lines, are picked.
     Partial,
     On,
 }
@@ -135,8 +135,48 @@ pub enum HunkMarks {
     None,
     /// Every hunk has a checkbox; none is picked.
     Unpicked,
-    /// Every hunk has a checkbox; these are picked.
-    Picked(Vec<bool>),
+    /// Every hunk has a checkbox; this is how much of each is picked.
+    Picked(Vec<HunkMark>),
+}
+
+/// How much of one hunk is picked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HunkMark {
+    Off,
+    On,
+    /// Some of its changed lines: per row of the hunk, whether it is picked.
+    Lines(Vec<bool>),
+}
+
+/// One diff row, by document index. Orders in document order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LineAt {
+    pub file: usize,
+    pub hunk: usize,
+    pub line: usize,
+}
+
+/// A press on a pickable changed line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinePress {
+    pub line: LineAt,
+    /// Shift was held: extend from the last press instead of toggling.
+    pub extend: bool,
+    /// The press landed in one column of a side-by-side row, so a range
+    /// from it should stay in that column.
+    pub one_side: bool,
+}
+
+/// Line-select mode: changed lines take clicks and drags, and the keyboard
+/// has a line cursor.
+pub struct LineMode<Message> {
+    pub cursor: Option<LineAt>,
+    /// Bumped when the cursor moves by keyboard; a change scrolls it into
+    /// view.
+    pub reveal: u64,
+    pub on_press: fn(LinePress) -> Message,
+    /// A drag from the pressed line has reached this one.
+    pub on_paint: fn(LineAt) -> Message,
 }
 
 /// The change-selection checkboxes drawn in file and hunk headers: the
@@ -146,6 +186,8 @@ pub struct ChangeMarks<Message> {
     pub accent: Color,
     pub on_toggle_file: fn(usize) -> Message,
     pub on_toggle_hunk: fn(usize, usize) -> Message,
+    /// Line-select mode, when it is on.
+    pub lines: Option<LineMode<Message>>,
 }
 
 /// A change-selection checkbox under the cursor.
@@ -158,6 +200,13 @@ enum CheckHit {
 /// Side of a change-selection checkbox, and the gap after it.
 const CHECK_SIZE: f32 = 14.0;
 const CHECK_GAP: f32 = 8.0;
+
+/// Width of the accent bar a picked line wears at its gutter's left edge.
+const PICK_BAR_WIDTH: f32 = 3.0;
+
+/// Room kept below a line the keyboard cursor scrolls to: the floating
+/// selection bar covers the bottom of the pane while lines are being picked.
+const LINE_REVEAL_BOTTOM_MARGIN: f32 = 140.0;
 
 /// One line of the `jj show`-style revision header rendered at the top of
 /// the diff scroll area. Kept as a plain enum so `main.rs` decides the text
@@ -1028,6 +1077,15 @@ struct State<Paragraph> {
     /// Whether the cursor is over the description block. Reveals the edit
     /// affordance at its right edge.
     hovered_description: bool,
+    /// Line-select mode: the pickable line under the mouse.
+    hovered_line: Option<LineAt>,
+    /// Line-select mode: a press on a line is being dragged — the line it
+    /// last reached, and the side-by-side column it is held to.
+    line_drag: Option<(LineAt, Option<SplitSide>)>,
+    /// Last [`LineMode::reveal`] acted on.
+    last_line_reveal: Option<u64>,
+    /// A line to scroll into view on the next `update()`.
+    pending_line_reveal: Option<LineAt>,
     /// Prefix-sum layout index (see [`HeightIndex`]). `RefCell` because
     /// `draw`/`mouse_interaction` only get `&State` but must be able to
     /// (re)build it lazily; borrows are short and never overlap.
@@ -1905,8 +1963,14 @@ impl<'a, Message> DiffView<'a, Message> {
         tops.partition_point(|&top| top <= offset).saturating_sub(1)
     }
 
+    /// The text area's width: what's right of the text's left edge, less the
+    /// scrollbar's gutter so wrapped text never runs beneath the bar.
     fn content_width(&self, viewport_width: f32) -> f32 {
-        (viewport_width - self.metrics.gutter_width - PREFIX_WIDTH - 16.0)
+        (viewport_width
+            - self.metrics.gutter_width
+            - PREFIX_WIDTH
+            - TEXT_X_PADDING
+            - scrollbar::GUTTER)
             .max(self.metrics.char_width)
     }
 
@@ -1931,8 +1995,11 @@ impl<'a, Message> DiffView<'a, Message> {
             + GUTTER_HORIZONTAL_PADDING * 2.0)
             .max(GUTTER_MIN_WIDTH * 0.5);
         let column_width = ((viewport_width - 1.0) / 2.0).max(1.0);
+        // Both columns keep the scrollbar's gutter, so the right one's text
+        // stays clear of the bar and the two still wrap alike.
         let text_width =
-            (column_width - gutter_width - PREFIX_WIDTH - 12.0).max(self.metrics.char_width);
+            (column_width - gutter_width - PREFIX_WIDTH - TEXT_X_PADDING - scrollbar::GUTTER)
+                .max(self.metrics.char_width);
         SplitLayout {
             gutter_width,
             text_width,
@@ -3195,6 +3262,10 @@ where
             last_palette_text: None,
             hovered_browse: None,
             hovered_description: false,
+            hovered_line: None,
+            line_drag: None,
+            last_line_reveal: None,
+            pending_line_reveal: None,
             height_index: RefCell::new(HeightIndex::default()),
             geometry: RefCell::new(GeometryMemo::default()),
         })
@@ -3274,6 +3345,19 @@ where
 
         if state.selected_file != self.selected_file {
             state.pending_file_jump = Some(self.selected_file);
+        }
+
+        match self.marks.as_ref().and_then(|marks| marks.lines.as_ref()) {
+            Some(mode) => {
+                if state.last_line_reveal != Some(mode.reveal) {
+                    state.last_line_reveal = Some(mode.reveal);
+                    state.pending_line_reveal = mode.cursor;
+                }
+            }
+            None => {
+                state.hovered_line = None;
+                state.line_drag = None;
+            }
         }
 
         if let Some(find) = &self.find
@@ -3410,6 +3494,38 @@ where
                 shell.publish((self.on_selected_file_changed)(selected_file));
             }
             shell.request_redraw();
+        }
+
+        if let Some(at) = state.pending_line_reveal.take() {
+            let span = {
+                let index = state.height_index.borrow();
+                index
+                    .row_of_line(at.file, at.hunk, at.line)
+                    .map(|row| (index.row_tops[row], index.row_heights[row]))
+            };
+            if let Some((top, height)) = span {
+                // Clear of the sticky file header above and the selection bar
+                // below.
+                let above = top - self.metrics.file_header_height - self.metrics.row_height;
+                let below = top + height + LINE_REVEAL_BOTTOM_MARGIN - bounds.height;
+                let target = if above < state.vertical_offset {
+                    above
+                } else if below > state.vertical_offset {
+                    below
+                } else {
+                    state.vertical_offset
+                };
+                let target = target.clamp(0.0, max_vertical);
+                if (target - state.vertical_offset).abs() > f32::EPSILON {
+                    state.vertical_offset = target;
+                    let selected_file = self.file_at_offset(&state.height_index.borrow(), target);
+                    if selected_file != state.selected_file {
+                        state.selected_file = selected_file;
+                        shell.publish((self.on_selected_file_changed)(selected_file));
+                    }
+                }
+                shell.request_redraw();
+            }
         }
 
         // Tab restore: jump straight to the saved offset, overriding the
@@ -3642,6 +3758,28 @@ where
                     shell.capture_event();
                     return;
                 }
+                if let Some(mode) = self.line_mode()
+                    && let Some((line, lane)) = self.pickable_line_at(
+                        &state.height_index.borrow(),
+                        state.vertical_offset,
+                        bounds,
+                        point,
+                        None,
+                    )
+                {
+                    shell.publish((mode.on_press)(LinePress {
+                        line,
+                        extend: state.modifiers.shift(),
+                        one_side: lane.is_some(),
+                    }));
+                    state.line_drag = Some((line, lane));
+                    state.selection_anchor = None;
+                    state.selection_focus = None;
+                    state.selection_lane = None;
+                    shell.capture_event();
+                    shell.request_redraw();
+                    return;
+                }
                 let position = {
                     let index = state.height_index.borrow();
                     self.position_at_point(
@@ -3722,7 +3860,41 @@ where
                     }
                     return;
                 }
+                if let Some((last, lane)) = state.line_drag {
+                    if let Some(mode) = self.line_mode()
+                        && let Some((line, _)) = self.pickable_line_at(
+                            &state.height_index.borrow(),
+                            state.vertical_offset,
+                            bounds,
+                            *position,
+                            Some(lane),
+                        )
+                        && line != last
+                    {
+                        shell.publish((mode.on_paint)(line));
+                        state.line_drag = Some((line, lane));
+                        state.hovered_line = Some(line);
+                        shell.request_redraw();
+                    }
+                    return;
+                }
                 if !state.is_selecting {
+                    let hovered_line = self
+                        .line_mode()
+                        .and_then(|_| {
+                            self.pickable_line_at(
+                                &state.height_index.borrow(),
+                                state.vertical_offset,
+                                bounds,
+                                *position,
+                                None,
+                            )
+                        })
+                        .map(|(line, _)| line);
+                    if hovered_line != state.hovered_line {
+                        state.hovered_line = hovered_line;
+                        shell.request_redraw();
+                    }
                     // Browse-button hover wash (manual — this widget has no
                     // per-region hover for free).
                     let hovered = cursor
@@ -3750,6 +3922,10 @@ where
                 if let scrollbar::ScrollbarEvent::Captured =
                     scrollbar::on_button_released(&mut state.scrollbar)
                 {
+                    shell.capture_event();
+                    return;
+                }
+                if state.line_drag.take().is_some() {
                     shell.capture_event();
                     return;
                 }
@@ -4103,6 +4279,14 @@ where
             // passes all walk the same columns.
             let lanes = self.lane_geometries(bounds, split.as_ref(), horizontal_offset);
             self.draw_emphasis_highlights(renderer, &state.geometry, &visible_rows, &lanes);
+            // After the emphasis, so a line left out of the pick fades whole.
+            self.draw_line_marks(
+                renderer,
+                &visible_rows,
+                split.as_ref(),
+                bounds,
+                state.hovered_line,
+            );
 
             let selection_range = match (state.selection_anchor, state.selection_focus) {
                 (Some(anchor), Some(focus)) if anchor != focus => Some(ordered(anchor, focus)),
@@ -4170,12 +4354,7 @@ where
                         wrapping: text::Wrapping::None,
                     },
                 );
-                if let Some(picked) = self.hunk_mark(header.file_index, header.hunk_index) {
-                    let state = if picked {
-                        CheckState::On
-                    } else {
-                        CheckState::Off
-                    };
+                if let Some(state) = self.hunk_mark(header.file_index, header.hunk_index) {
                     self.draw_check(
                         renderer,
                         self.hunk_check_rect(header.y, bounds),
@@ -4373,6 +4552,15 @@ where
         if self.browse_button_at(state, bounds, point).is_some()
             || self.check_at(state, bounds, point).is_some()
             || self.expand_header_at(state, bounds, point).is_some()
+            || self
+                .pickable_line_at(
+                    &state.height_index.borrow(),
+                    state.vertical_offset,
+                    bounds,
+                    point,
+                    None,
+                )
+                .is_some()
         {
             return mouse::Interaction::Pointer;
         }
@@ -5409,27 +5597,227 @@ impl<Message> DiffView<'_, Message> {
         })
     }
 
-    /// Screen rect of a hunk header's checkbox (in the gutter band).
+    /// Screen rect of a hunk header's checkbox (in the gutter band), on the
+    /// same vertical axis as the file header's.
     fn hunk_check_rect(&self, header_y: f32, bounds: Rectangle) -> Rectangle {
         Rectangle {
-            x: bounds.x + GUTTER_HORIZONTAL_PADDING,
+            x: bounds.x + HEADER_HORIZONTAL_PADDING,
             y: header_y + (self.metrics.hunk_header_height - CHECK_SIZE) / 2.0,
             width: CHECK_SIZE,
             height: CHECK_SIZE,
         }
     }
 
-    /// Whether hunk `(file, hunk)` is picked, or `None` when it has no
+    /// How much of hunk `(file, hunk)` is picked, or `None` when it has no
     /// checkbox.
-    fn hunk_mark(&self, file: usize, hunk: usize) -> Option<bool> {
+    fn hunk_mark(&self, file: usize, hunk: usize) -> Option<CheckState> {
         if self.plain {
             return None;
         }
         let mark = self.marks.as_ref()?.files.get(file)?;
         match &mark.hunks {
             HunkMarks::None => None,
-            HunkMarks::Unpicked => (hunk < self.files.get(file)?.hunks.len()).then_some(false),
-            HunkMarks::Picked(picks) => picks.get(hunk).copied(),
+            HunkMarks::Unpicked => {
+                (hunk < self.files.get(file)?.hunks.len()).then_some(CheckState::Off)
+            }
+            HunkMarks::Picked(picks) => Some(match picks.get(hunk)? {
+                HunkMark::Off => CheckState::Off,
+                HunkMark::On => CheckState::On,
+                HunkMark::Lines(_) => CheckState::Partial,
+            }),
+        }
+    }
+
+    fn line_mode(&self) -> Option<&LineMode<Message>> {
+        self.marks.as_ref()?.lines.as_ref()
+    }
+
+    /// Whether the changed line `at` is picked, or `None` when it shows no
+    /// pick: it is not a changed line of a pickable hunk, or line-select mode
+    /// is off and its hunk is picked all or nothing (the checkbox says it).
+    fn line_mark(&self, at: LineAt) -> Option<bool> {
+        if self.plain {
+            return None;
+        }
+        let marks = self.marks.as_ref()?;
+        let line = self
+            .files
+            .get(at.file)?
+            .hunks
+            .get(at.hunk)?
+            .lines
+            .get(at.line)?;
+        if !matches!(line.kind, DiffLineKind::Addition | DiffLineKind::Deletion) {
+            return None;
+        }
+        let selecting = marks.lines.is_some();
+        match &marks.files.get(at.file)?.hunks {
+            HunkMarks::None => None,
+            HunkMarks::Unpicked => selecting.then_some(false),
+            HunkMarks::Picked(picks) => match picks.get(at.hunk)? {
+                HunkMark::Off => selecting.then_some(false),
+                HunkMark::On => selecting.then_some(true),
+                HunkMark::Lines(lines) => Some(lines.get(at.line).copied().unwrap_or(false)),
+            },
+        }
+    }
+
+    /// The pickable changed line under `point` in line-select mode, and the
+    /// side-by-side column it is in. `lock` holds a split row to one column,
+    /// as a drag that started there does.
+    fn pickable_line_at(
+        &self,
+        index: &HeightIndex,
+        vertical_offset: f32,
+        bounds: Rectangle,
+        point: Point,
+        lock: Option<Option<SplitSide>>,
+    ) -> Option<(LineAt, Option<SplitSide>)> {
+        self.line_mode()?;
+        if !bounds.contains(point) {
+            return None;
+        }
+        let over_header = self
+            .visible_file_header_positions(index, bounds, vertical_offset)
+            .into_iter()
+            .any(|(_, y)| point.y >= y && point.y < y + self.metrics.file_header_height);
+        if over_header {
+            return None;
+        }
+        let content_y = point.y - bounds.y + vertical_offset;
+        let row = index.row_at(content_y)?;
+        if content_y >= index.row_tops[row] + index.row_heights[row] {
+            return None;
+        }
+        let (file, hunk, line) = index.row_ids[row];
+        let (file, hunk) = (file as usize, hunk as usize);
+        let (line, lane) = match index.pair_lines.get(row) {
+            Some(&(left, right)) if self.side_by_side && !index.is_full_width(file) => {
+                let lane = lock.flatten().unwrap_or(
+                    if point.x >= bounds.x + self.split_layout(bounds.width).divider_x {
+                        SplitSide::Right
+                    } else {
+                        SplitSide::Left
+                    },
+                );
+                let member = match lane {
+                    SplitSide::Left => left,
+                    SplitSide::Right => right,
+                };
+                if member == NO_LINE {
+                    return None;
+                }
+                (member as usize, Some(lane))
+            }
+            _ => (line as usize, None),
+        };
+        let at = LineAt { file, hunk, line };
+        self.line_mark(at).map(|_| (at, lane))
+    }
+
+    /// Picks on changed lines: an accent bar at the gutter edge of a picked
+    /// line, a faded tint on an unpicked one, a faint bar under the mouse,
+    /// and the keyboard cursor's outline.
+    fn draw_line_marks<Renderer>(
+        &self,
+        renderer: &mut Renderer,
+        rows: &[VisibleRow],
+        split: Option<&SplitLayout>,
+        bounds: Rectangle,
+        hovered: Option<LineAt>,
+    ) where
+        Renderer: renderer::Renderer,
+    {
+        let Some(marks) = &self.marks else {
+            return;
+        };
+        if self.plain {
+            return;
+        }
+        let cursor = marks.lines.as_ref().and_then(|mode| mode.cursor);
+        let accent = marks.accent;
+        for row in rows {
+            // (line, lane x, lane width) per column.
+            let mut members = [None, None];
+            match (split, row.pair) {
+                (Some(split), Some((left, right))) => {
+                    if left != NO_LINE {
+                        members[0] = Some((left as usize, 0.0, split.divider_x));
+                    }
+                    if right != NO_LINE {
+                        members[1] = Some((
+                            right as usize,
+                            split.right_gutter_x,
+                            bounds.width - split.right_gutter_x,
+                        ));
+                    }
+                }
+                _ => {
+                    members[0] = Some((row.line_index, 0.0, bounds.width));
+                }
+            }
+            for (line, x, width) in members.into_iter().flatten() {
+                let at = LineAt {
+                    file: row.file_index,
+                    hunk: row.hunk_index,
+                    line,
+                };
+                let Some(picked) = self.line_mark(at) else {
+                    continue;
+                };
+                let x = bounds.x + x;
+                if picked {
+                    self.draw_background(renderer, x, row.y, PICK_BAR_WIDTH, row.height, accent);
+                } else {
+                    // Left out of the pick: the change tint fades back toward
+                    // the panel, so what is in reads at a glance.
+                    self.draw_background(
+                        renderer,
+                        x,
+                        row.y,
+                        width,
+                        row.height,
+                        Color {
+                            a: 0.5,
+                            ..self.palette.panel
+                        },
+                    );
+                    // Hover previews the bar a click would add.
+                    if hovered == Some(at) {
+                        self.draw_background(
+                            renderer,
+                            x,
+                            row.y,
+                            PICK_BAR_WIDTH,
+                            row.height,
+                            Color { a: 0.4, ..accent },
+                        );
+                    }
+                }
+                if cursor == Some(at) {
+                    renderer.fill_quad(
+                        renderer::Quad {
+                            bounds: Rectangle {
+                                x: x + 0.5,
+                                y: row.y + 0.5,
+                                width: (width - 1.0).max(0.0),
+                                height: (row.height - 1.0).max(0.0),
+                            },
+                            border: Border {
+                                radius: 2.0.into(),
+                                width: 1.0,
+                                color: Color {
+                                    a: 0.45,
+                                    ..self.palette.text
+                                },
+                            },
+                            shadow: Shadow::default(),
+                            snap: true,
+                        },
+                        Color::TRANSPARENT,
+                    );
+                }
+            }
         }
     }
 
@@ -6302,6 +6690,81 @@ mod tests {
     /// `\ No newline at end of file` belongs to the line above it, not to a
     /// side: counting it made a new file without a trailing newline render
     /// split, with one column entirely hatched padding.
+    #[test]
+    fn line_select_hits_changed_lines_in_the_clicked_column() {
+        let hunks = vec![vec![DiffHunkView {
+            header: "@@".to_owned(),
+            lines: vec![
+                line(DiffLineKind::Context, "same", 1),
+                line(DiffLineKind::Deletion, "old text here", 2),
+                line(DiffLineKind::Addition, "new text here", 2),
+            ],
+        }]];
+        let marks = |lines: bool| ChangeMarks {
+            files: vec![FileMark {
+                state: CheckState::Off,
+                hunks: HunkMarks::Unpicked,
+            }],
+            accent: Color::WHITE,
+            on_toggle_file: |_| (),
+            on_toggle_hunk: |_, _| (),
+            lines: lines.then_some(LineMode {
+                cursor: None,
+                reveal: 0,
+                on_press: |_| (),
+                on_paint: |_| (),
+            }),
+        };
+        let bounds = Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 900.0,
+            height: 600.0,
+        };
+        for side_by_side in [false, true] {
+            let mut view = test_view(&hunks).change_marks(marks(true));
+            view.side_by_side = side_by_side;
+            let cells = TestCaches::default();
+            view.ensure_height_index(&cells.index, &cells.geometry, bounds.width);
+            let index = cells.index.borrow();
+            let hit = |x: f32, row: usize| {
+                let point = Point::new(x, index.row_tops[row] + 1.0);
+                view.pickable_line_at(&index, 0.0, bounds, point, None)
+                    .map(|(line, lane)| (line.line, lane))
+            };
+            // Context is not pickable, in the gutter or the text.
+            assert_eq!(hit(10.0, 0), None);
+            assert_eq!(hit(400.0, 0), None);
+            if side_by_side {
+                // The removal and the addition share one row.
+                assert_eq!(hit(10.0, 1), Some((1, Some(SplitSide::Left))));
+                assert_eq!(hit(800.0, 1), Some((2, Some(SplitSide::Right))));
+                // A drag held to the left column stays there.
+                let held = view.pickable_line_at(
+                    &index,
+                    0.0,
+                    bounds,
+                    Point::new(800.0, index.row_tops[1] + 1.0),
+                    Some(Some(SplitSide::Left)),
+                );
+                assert_eq!(held.map(|(line, _)| line.line), Some(1));
+            } else {
+                assert_eq!(hit(10.0, 1), Some((1, None)));
+                assert_eq!(hit(400.0, 2), Some((2, None)));
+            }
+        }
+        // Outside line-select mode nothing is a line target.
+        let view = test_view(&hunks).change_marks(marks(false));
+        let cells = TestCaches::default();
+        view.ensure_height_index(&cells.index, &cells.geometry, bounds.width);
+        let index = cells.index.borrow();
+        let point = Point::new(10.0, index.row_tops[1] + 1.0);
+        assert_eq!(
+            view.pickable_line_at(&index, 0.0, bounds, point, None),
+            None
+        );
+    }
+
     #[test]
     fn a_trailing_note_leaves_a_new_file_single_sided() {
         let note = DiffLine {

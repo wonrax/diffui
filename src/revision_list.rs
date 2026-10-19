@@ -48,7 +48,9 @@ pub const FILE_ROW_HEIGHT: f32 = 26.0;
 /// spacing between rows.
 const ROW_CARD_INSET_X: f32 = 2.0 * ROW_CARD_INSET_Y;
 const ROW_CARD_INSET_Y: f32 = 1.0;
-const ROW_CARD_RADIUS: f32 = crate::theme::radius::PUSH;
+/// Corner radius of a row's card — and of the highlight a context menu puts
+/// over it, which must sit exactly on the card.
+pub(crate) const ROW_CARD_RADIUS: f32 = crate::theme::radius::PUSH;
 /// Horizontal indent per tree depth level for file/directory rows.
 pub const FILE_TREE_INDENT: f32 = 14.0;
 /// Width of the collapse-chevron column in file/directory rows (empty for
@@ -61,7 +63,9 @@ const FILE_ICON_SIZE: f32 = 12.0;
 const FILE_NAME_TEXT_SIZE: f32 = crate::theme::text_size::BODY;
 pub const GUTTER_LEFT_PADDING: f32 = 8.0;
 pub const GUTTER_PADDING: f32 = 8.0;
-const CONTENT_PADDING: f32 = 12.0;
+/// Right inset of row content: the scrollbar's gutter, so text stays clear
+/// of the bar the row cards run under.
+const CONTENT_PADDING: f32 = crate::scrollbar::GUTTER;
 const SMALL_TEXT_SIZE: f32 = crate::theme::text_size::BODY_LG;
 const CAPTION_TEXT_SIZE: f32 = crate::theme::text_size::CAPTION;
 /// Text size for the collapse/expand chevron on the selected revision row. The
@@ -70,7 +74,7 @@ const CAPTION_TEXT_SIZE: f32 = crate::theme::text_size::CAPTION;
 /// clearly as a chevron without dominating the row.
 const CHEVRON_TEXT_SIZE: f32 = 15.0;
 pub const FILE_ROW_GAP: f32 = 6.0;
-pub const FILE_ROW_RIGHT_PAD: f32 = 10.0;
+pub const FILE_ROW_RIGHT_PAD: f32 = crate::scrollbar::GUTTER;
 const TOOLTIP_RADIUS: f32 = crate::theme::radius::SURFACE;
 // Wider horizontally than vertically: the SURFACE radius eats into the
 // card's left/right ends, so the text needs extra x inset to read centered.
@@ -1261,17 +1265,18 @@ where
                     let Some(row_idx) = self.row_at_offset(local_y) else {
                         break 'event;
                     };
-                    // The row's on-screen rect (window-content points) anchors
-                    // the native highlight drawn while the menu is open.
+                    // The row card's on-screen rect (window-content points):
+                    // the highlight drawn while the menu is open lies exactly
+                    // over the hover/selection card, at ROW_CARD_RADIUS.
                     let row_h = row_height_of(self.row_kind(row_idx));
                     let screen_y =
                         bounds.y + (self.row_top(row_idx) - state.vertical_offset) as f32;
-                    let row_rect = Rectangle {
+                    let row_rect = self.card_bounds(Rectangle {
                         x: bounds.x,
                         y: screen_y,
                         width: bounds.width,
                         height: row_h,
-                    };
+                    });
                     match self.row_kind(row_idx) {
                         RowKind::Revision(_) => {
                             let Some(callback) = self.on_context_menu else {

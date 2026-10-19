@@ -23,7 +23,7 @@ use iced::{
     font::Weight,
     keyboard, mouse,
     time::Instant,
-    widget::{Space, button, column, container, mouse_area, opaque, row, stack, text},
+    widget::{Space, button, column, container, mouse_area, row, stack, text},
     window,
 };
 
@@ -32,7 +32,7 @@ use crate::icons;
 use crate::repository::Vcs;
 use crate::theme::{
     self, ThemeSpec, centered_control_content_fill, chip_background, emphasis_font,
-    ghost_button_style, input_style, modal_style, radius, scrim_style, text_size, well_fill,
+    ghost_button_style, input_style, modal_style, radius, text_size, well_fill,
 };
 use crate::ui;
 use crate::{Action, Diffui, HoverTarget, Message, TabId, UiEvent, WindowEvent};
@@ -93,10 +93,6 @@ const OPEN_ROW_HEIGHT: f32 = 34.0;
 const OPEN_GLYPH_BOX: f32 = 16.0;
 const OPEN_GLYPH_GAP: f32 = 10.0;
 const OPEN_REMOVE_SIDE: f32 = 24.0;
-/// Inner padding of both modal cards (confirm, open-repo).
-const DIALOG_PADDING: f32 = theme::space::XL + theme::space::XS;
-/// Gap between neighbouring dialog buttons (and the field beside its button).
-const DIALOG_BUTTON_GAP: f32 = theme::space::MD;
 
 /// The strip's height: the title-bar height where it stands in for one,
 /// otherwise its top padding plus the tabs.
@@ -1086,73 +1082,32 @@ pub fn build_confirm_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
     let Some(dialog) = ui.confirm() else {
         return Space::new().into();
     };
-
-    let scrim = mouse_area(
-        container(Space::new().width(Length::Fill).height(Length::Fill))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(|_| scrim_style()),
-    )
-    .on_press(Message::Action(Action::ConfirmCancel));
-
-    let cancel = ui::text_button(
-        None,
-        "Cancel",
-        ui::Variant::Raised,
-        ui::Size::Standard,
-        ui.config.ui_font,
-        theme,
-    )
-    .on_press(Message::Action(Action::ConfirmCancel));
-
+    let (font, mono) = (ui.config.ui_font, ui.config.mono_font);
     // Red fill: the confirm runs a mutation the jj CLI refuses by default.
     let accept = ui::text_button(
         None,
         dialog.confirm_label.as_str(),
         ui::Variant::Destructive,
         ui::Size::Standard,
-        ui.config.ui_font,
+        font,
         theme,
     )
     .on_press(Message::Action(Action::ConfirmAccept));
+    let cancel = ui::cancel_button(ui::Size::Standard, font, theme)
+        .on_press(Message::Action(Action::ConfirmCancel));
 
-    let body = column![
-        text(dialog.title.as_str())
-            .size(text_size::TITLE)
-            .color(theme.text)
-            .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
-        text(dialog.body.as_str())
-            .size(text_size::UI)
-            .color(theme.muted_text)
-            .font(ui.config.ui_font),
-        row![Space::new().width(Length::Fill), cancel, accept]
-            .spacing(DIALOG_BUTTON_GAP)
-            .align_y(alignment::Vertical::Center),
-    ]
-    .spacing(12);
+    let mut body =
+        column![ui::dialog_title(&dialog.title, font, mono, theme)].spacing(ui::DIALOG_SPACING);
+    if !dialog.body.is_empty() {
+        body = body.push(ui::dialog_text(&dialog.body, font, mono, theme));
+    }
+    body = body.push(ui::button_row(None, [cancel.into(), accept.into()]));
 
-    let card = mouse_area(
-        container(body)
-            .width(Length::Fixed(460.0))
-            .padding(DIALOG_PADDING)
-            .style(move |_| modal_style(theme)),
+    ui::modal(
+        ui::dialog_card(body, ui::DIALOG_WIDTH, theme),
+        Message::Action(Action::ConfirmCancel),
+        Message::Ui(UiEvent::ConfirmNoOp),
     )
-    .on_press(Message::Ui(UiEvent::ConfirmNoOp));
-
-    let centered = container(card)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .align_x(alignment::Horizontal::Center)
-        .padding(Padding {
-            top: crate::theme::modal_top(),
-            right: 0.0,
-            bottom: 0.0,
-            left: 0.0,
-        });
-
-    // `opaque` keeps wheel events and the cursor from bleeding through to the
-    // shell below the modal (see `activity_popover` for the mechanics).
-    opaque(stack![scrim, centered])
 }
 
 /// True when the repo behind `tab` has a non-empty working copy. Best-effort:
@@ -1180,33 +1135,11 @@ pub fn build_open_repo_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Mess
         return Space::new().into();
     };
 
-    let scrim = mouse_area(
-        container(Space::new().width(Length::Fill).height(Length::Fill))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(|_| scrim_style()),
+    ui::modal(
+        open_repo_card(ui, theme, dialog),
+        Message::Action(Action::CloseRepoDialog),
+        Message::Ui(UiEvent::OpenRepoNoOp),
     )
-    .on_press(Message::Action(Action::CloseRepoDialog));
-
-    // Catch clicks on the card so they don't fall through to the scrim and
-    // dismiss the dialog while the user is interacting with it.
-    let card =
-        mouse_area(open_repo_card(ui, theme, dialog)).on_press(Message::Ui(UiEvent::OpenRepoNoOp));
-
-    let centered = container(card)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .align_x(alignment::Horizontal::Center)
-        .padding(Padding {
-            top: crate::theme::modal_top(),
-            right: 0.0,
-            bottom: 0.0,
-            left: 0.0,
-        });
-
-    // `opaque` keeps wheel events and the cursor from bleeding through to the
-    // shell below the modal (see `activity_popover` for the mechanics).
-    opaque(stack![scrim, centered])
 }
 
 /// The open prompt itself, shared by the modal and the welcome screen: a

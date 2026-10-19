@@ -134,6 +134,18 @@ pub fn build_toolbar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     let mut toggles = row![]
         .spacing(theme::space::SM)
         .align_y(alignment::Vertical::Center);
+    if crate::changes::can_select_lines(ui) {
+        toggles = toggles.push(toolbar_toggle_button(
+            icons::LIST_CHECKS,
+            "Select lines (v)",
+            crate::changes::live_line_select(ui.active()).is_some(),
+            Message::Action(Action::Changes(crate::changes::ChangesMsg::Lines(
+                crate::changes::LineMsg::Toggle,
+            ))),
+            theme,
+            font,
+        ));
+    }
     toggles = toggles.push(toolbar_toggle_button(
         icons::WRAP,
         "Wrap lines",
