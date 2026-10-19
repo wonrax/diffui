@@ -270,6 +270,16 @@ pub fn parse_timestamp_millis(timestamp: &str) -> Option<i64> {
         .map(|time| time.timestamp_millis())
 }
 
+/// A signature timestamp for people, in the offset it was made in:
+/// `Oct 19, 2026, 15:48`. `None` when it doesn't parse.
+pub fn human_timestamp(timestamp: &str) -> Option<String> {
+    let timestamp = timestamp.trim();
+    chrono::DateTime::parse_from_str(timestamp, "%Y-%m-%d %H:%M:%S %z")
+        .or_else(|_| chrono::DateTime::parse_from_rfc3339(timestamp))
+        .ok()
+        .map(|time| time.format("%b %-d, %Y, %H:%M").to_string())
+}
+
 /// Milliseconds since the epoch, for [`relative_age`].
 pub fn now_millis() -> i64 {
     std::time::SystemTime::now()
@@ -315,6 +325,15 @@ mod tests {
             Some(utc)
         );
         assert_eq!(parse_timestamp_millis("yesterday"), None);
+        assert_eq!(
+            human_timestamp("2026-10-08 23:29:51 +0700").as_deref(),
+            Some("Oct 8, 2026, 23:29")
+        );
+        assert_eq!(
+            human_timestamp("2026-10-18T16:29:51Z").as_deref(),
+            Some("Oct 18, 2026, 16:29")
+        );
+        assert_eq!(human_timestamp("yesterday"), None);
     }
 
     #[test]

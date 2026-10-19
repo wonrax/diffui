@@ -5,7 +5,7 @@
 //! with the graph's colours, then a person and a relative time, each behind
 //! a small icon and set apart by space rather than by separator glyphs.
 
-use diffui_core::history::{now_millis, relative_age};
+use diffui_core::history::{human_timestamp, now_millis, relative_age};
 use iced::{
     Background, Border, Color, Element, Length, alignment,
     widget::{Row, container, row, text},
@@ -82,7 +82,10 @@ pub(crate) fn view<'a>(meta: Meta, ui: &Diffui, theme: ThemeSpec) -> Element<'a,
     }
     if let Some((millis, absolute)) = meta.when {
         let (label, detail) = match millis {
-            Some(millis) => (age_phrase(millis, now_millis()), Some(absolute)),
+            Some(millis) => (
+                age_phrase(millis, now_millis()),
+                Some(human_timestamp(&absolute).unwrap_or(absolute)),
+            ),
             None => (absolute, None),
         };
         line = line.push(hover(
@@ -142,7 +145,7 @@ pub(crate) fn badge<'a>(label: &'a str, color: Color, ui: &Diffui) -> Element<'a
     .into()
 }
 
-fn id_text<'a>(id: Id, ui: &Diffui) -> Element<'a, Message> {
+pub(crate) fn id_text<'a>(id: Id, ui: &Diffui) -> Element<'a, Message> {
     let split = id
         .text
         .char_indices()
