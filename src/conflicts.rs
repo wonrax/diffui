@@ -478,17 +478,10 @@ pub(crate) fn conflict_banner<'a>(
         tab.session.selected_revision,
         RevisionSelection::WorkingCopy
     ) {
-        caption(
-            "Or edit the conflict markers in the file: jj records it as resolved once the \
-                 markers are gone.",
-        )
-        .into()
+        caption("Or edit out the conflict markers; the file is resolved once they're gone.").into()
     } else {
         row![
-            caption(
-                "Or by hand: start a new change on top, edit the conflict markers there, \
-                     then squash it back.",
-            ),
+            caption("Or fix the markers in a new change on top, then squash it back.",),
             ui::text_button(
                 None,
                 "New change on top",

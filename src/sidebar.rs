@@ -558,7 +558,7 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             if is_branch && preview.simulated && preview.moved == 0 {
                 (
                     None,
-                    "Nothing to move — the branch is already there".to_owned(),
+                    "Nothing to move: the branch is already there".to_owned(),
                     theme.muted_text,
                     None,
                 )

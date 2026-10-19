@@ -53,8 +53,8 @@ async fn plain_file(tree: &MergedTree, path: &RepoPath, label: &str) -> Result<O
             executable,
             copy_id,
         })),
-        Ok(Some(_)) => bail!("{label} is not a regular file — select the whole file instead"),
-        Err(_) => bail!("{label} is conflicted — select the whole file instead"),
+        Ok(Some(_)) => bail!("{label} is not a regular file, so select the whole file"),
+        Err(_) => bail!("{label} is conflicted, so select the whole file"),
     }
 }
 
@@ -104,7 +104,7 @@ pub(super) async fn tree_with_selection(
         let after = plain_file(commit, &path, &file.path).await?;
         let executable = match (&before, &after) {
             (Some(before), Some(after)) if before.executable != after.executable => bail!(
-                "{} also changes its executable bit — select the whole file instead",
+                "{} also changes its executable bit, so select the whole file",
                 file.path
             ),
             (_, Some(after)) => after.executable,
@@ -183,7 +183,7 @@ pub(super) async fn split(
     let selected =
         tree_with_selection(&parent_tree, &parent_tree, &commit.tree(), selection, true).await?;
     if selected.tree_ids() == parent_tree.tree_ids() {
-        bail!("nothing selected — the new revision would take every change");
+        bail!("nothing selected: the new revision would take every change");
     }
     // Workspaces whose `@` is the split commit follow the remaining changes,
     // as `jj split` does. Read before anything is rewritten.
@@ -260,7 +260,7 @@ pub(super) async fn squash_selection(
     };
     if picked.is_empty_selection() {
         bail!(
-            "nothing to move from {} — the selection changes nothing",
+            "nothing to move from {}: the selection changes nothing",
             short_change_id(source)
         );
     }
@@ -304,7 +304,7 @@ pub(super) async fn restore_selection(
     let tree = commit.tree();
     let restored = tree_with_selection(&tree, &parent_tree, &tree, selection, false).await?;
     if restored.tree_ids() == tree.tree_ids() {
-        bail!("nothing to discard — the selection changes nothing");
+        bail!("nothing to discard: the selection changes nothing");
     }
     repo.rewrite_commit(commit)
         .set_tree(restored)

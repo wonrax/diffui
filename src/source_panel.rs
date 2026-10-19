@@ -476,7 +476,7 @@ pub fn build_source_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, M
     } else if let Some(view) = &source.file {
         if view.binary {
             centered_note(
-                format!("Binary file ({}) — not shown", format_bytes(view.byte_len)),
+                format!("Binary file ({}), not shown", format_bytes(view.byte_len)),
                 theme.subtle_text,
             )
         } else if view.too_large {

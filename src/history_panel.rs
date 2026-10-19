@@ -1714,7 +1714,7 @@ fn operation_changes<'a>(
     let mut list = column![].spacing(1);
     if changes.is_merge {
         list = list.push(note(
-            "A merge of concurrent operations \u{2014} like the jj CLI, no changes are listed.",
+            "A merge of concurrent operations. Like the jj CLI, it lists no changes.",
             theme.subtle_text,
             ui,
         ));
@@ -1909,7 +1909,7 @@ fn history_diff_view<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Messag
     if diff.document.files.is_empty() {
         let message = match description_change(history) {
             Some((old, new)) => format!(
-                "No file changes \u{2014} the description changed from \u{201c}{old}\u{201d} to \u{201c}{new}\u{201d}"
+                "No file changes. The description changed from \u{201c}{old}\u{201d} to \u{201c}{new}\u{201d}"
             ),
             None => "No file changes".to_owned(),
         };

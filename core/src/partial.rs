@@ -186,7 +186,7 @@ pub fn pick_mask(path: &str, hunks: &[TextHunk], refs: &[HunkRef]) -> Result<Vec
             Some(hunk) if hunk.header == hunk_ref.header => mask[hunk_ref.index] = true,
             _ => {
                 return Err(format!(
-                    "the diff of {path} changed since its hunks were selected — reselect them"
+                    "the diff of {path} changed since its hunks were selected. Select them again."
                 ));
             }
         }

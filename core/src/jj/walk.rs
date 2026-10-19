@@ -555,7 +555,7 @@ pub(super) fn describe_resolution_error(
         } => {
             let sides: Vec<String> = targets.iter().map(short).collect();
             anyhow::anyhow!(
-                "{error} — it points at {}; select every side with \
+                "{error}. It points at {}; select every side with \
                  bookmarks(exact:\"{symbol}\"), pick one by commit id, or move \
                  the bookmark onto a revision to resolve the conflict",
                 sides.join(", ")
@@ -564,7 +564,7 @@ pub(super) fn describe_resolution_error(
         E::ConflictedRef { targets, .. } => {
             let sides: Vec<String> = targets.iter().map(short).collect();
             anyhow::anyhow!(
-                "{error} — it points at {}; pick one side by commit id",
+                "{error}. It points at {}; pick one side by commit id",
                 sides.join(", ")
             )
         }
@@ -577,7 +577,7 @@ pub(super) fn describe_resolution_error(
                 .map(|(offset, _)| format!("{symbol}/{offset}"))
                 .collect();
             anyhow::anyhow!(
-                "{error} — address one copy as {} (the sidebar shows each \
+                "{error}. Address one copy as {} (the sidebar shows each \
                  row's /N suffix)",
                 copies.join(", ")
             )

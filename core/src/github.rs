@@ -272,7 +272,7 @@ fn gh_spawn_error(error: std::io::Error) -> anyhow::Error {
             "The GitHub CLI (`gh`) wasn't found. Install it (e.g. `brew install gh`) and run \
              `gh auth login`. If it is installed: an app opened from Finder or the Dock only \
              sees the system PATH (/usr/bin:/bin:/usr/sbin:/sbin), so gh in /opt/homebrew/bin \
-             or ~/.local/bin is invisible to it — launch diffui from a terminal, or make gh's \
+             or ~/.local/bin is invisible to it. Launch diffui from a terminal, or make gh's \
              directory part of the launchd PATH."
         )
     } else {
