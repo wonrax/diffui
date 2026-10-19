@@ -1061,6 +1061,19 @@ pub struct RevisionDetails {
     pub committer: Option<SignatureInfo>,
     pub signature: Option<String>,
     pub description: String,
+    /// The revision's parents, first parent first.
+    pub parents: Vec<ParentBrief>,
+}
+
+/// A parent named in [`RevisionDetails`]: enough to show and open it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParentBrief {
+    pub commit_id: String,
+    /// `None` on git, which has no change ids.
+    pub change_id: Option<String>,
+    /// The first line of its description; empty when the backend didn't read
+    /// it (git).
+    pub summary: String,
 }
 
 #[derive(Debug, Clone, Default)]

@@ -2475,6 +2475,34 @@ fn metaedit_resets_the_author_to_the_configured_user() {
     assert_eq!(details.description, "mine\n");
 }
 
+/// The details name the revision's parent, with its change id and subject.
+#[test]
+fn revision_details_name_the_parents() {
+    let root = scratch_repo("details-parents");
+    write(&root, "file.txt", "one\n");
+    commit(&root, "first\n\nbody");
+    write(&root, "file.txt", "two\n");
+    commit(&root, "second");
+    let first = commit_id(&root, "description(exact:\"first\\n\\nbody\\n\")");
+    let second = commit_id(&root, "description(exact:\"second\\n\")");
+
+    let (_document, details) = block_on(load_jj_diff(
+        repository(&root),
+        RevisionSelection::Commit(second),
+    ))
+    .expect("load the second revision");
+    let parents = details.expect("revision details").parents;
+    assert_eq!(parents.len(), 1);
+    assert_eq!(parents[0].commit_id, first);
+    assert_eq!(parents[0].summary, "first");
+    assert!(
+        parents[0]
+            .change_id
+            .as_deref()
+            .is_some_and(|id| !id.is_empty())
+    );
+}
+
 // ── Comparing two revisions ─────────────────────────────────────────────────
 
 /// `(path, status, additions, deletions)` of `revision`'s diff against `base`.

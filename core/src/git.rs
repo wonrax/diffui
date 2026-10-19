@@ -14,7 +14,8 @@ use crate::FetchTarget;
 use crate::diff_parse::parse_unified_diff;
 use crate::graph::assign_lanes;
 use crate::model::{
-    CommitSummary, DiffDocument, RevisionDetails, RevisionSelection, SignatureInfo, StreamRow,
+    CommitSummary, DiffDocument, ParentBrief, RevisionDetails, RevisionSelection, SignatureInfo,
+    StreamRow,
 };
 use crate::repository::{Repository, RepositorySnapshot};
 use crate::source_browse::{SourceEntry, SourceEntryStatus};
@@ -763,7 +764,7 @@ async fn load_git_revision_details(
         RevisionSelection::WorkingCopy => "HEAD".to_owned(),
         RevisionSelection::Commit(id) => id.clone(),
     };
-    let format = format!("%H{SEP}%an{SEP}%ae{SEP}%ad{SEP}%cn{SEP}%ce{SEP}%cd{SEP}%D{SEP}%B");
+    let format = format!("%H{SEP}%P{SEP}%an{SEP}%ae{SEP}%ad{SEP}%cn{SEP}%ce{SEP}%cd{SEP}%D{SEP}%B");
     // The same shape jj's details carry, so a timestamp reads the same in
     // either kind of repository.
     let mut args = git_args(&["show", "--no-patch", "--date=format:%Y-%m-%d %H:%M:%S %z"]);
@@ -771,8 +772,17 @@ async fn load_git_revision_details(
     args.push(OsString::from(target));
     let output = run_command(&repository.root, "git", args).await?;
 
-    let mut parts = output.splitn(9, '\x1f');
+    let mut parts = output.splitn(10, '\x1f');
     let commit_id = parts.next().unwrap_or("").trim().to_owned();
+    let parents = parts
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .map(|commit_id| ParentBrief {
+            commit_id: commit_id.to_owned(),
+            ..ParentBrief::default()
+        })
+        .collect();
     let author_name = parts.next().unwrap_or("").to_owned();
     let author_email = parts.next().unwrap_or("").to_owned();
     let author_date = parts.next().unwrap_or("").to_owned();
@@ -804,6 +814,7 @@ async fn load_git_revision_details(
         }),
         signature: None,
         description,
+        parents,
     })
 }
 

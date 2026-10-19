@@ -27,7 +27,7 @@ use super::workspace::resolve_revision;
 use crate::diff_parse::format_hunk_header;
 use crate::model::{
     DiffBase, DiffDocument, DiffFile, DiffFileStatus, DiffHunkView, DiffLine, DiffLineKind,
-    RevisionDetails, SignatureInfo,
+    ParentBrief, RevisionDetails, SignatureInfo,
 };
 use crate::repository::Repository;
 
@@ -113,7 +113,7 @@ pub(crate) async fn diff_jj_with_repo(
     options: &DiffOptions<'_>,
 ) -> Result<(DiffDocument, Option<RevisionDetails>)> {
     let commit = load_commit(repo, commit_id).await?;
-    let details = jj_revision_details(repo, &commit);
+    let details = jj_revision_details(repo, &commit).await;
     let old_tree = base_tree(repo, &commit, base).await?;
     let matcher: Box<dyn Matcher> = match options.only {
         Some(path) => Box::new(FilesMatcher::new([RepoPathBuf::from_internal_string(
@@ -378,7 +378,7 @@ pub(crate) async fn diff_trees(
     })
 }
 
-pub(crate) fn jj_revision_details(
+pub(crate) async fn jj_revision_details(
     repo: &dyn Repo,
     commit: &jj_lib::commit::Commit,
 ) -> RevisionDetails {
@@ -400,6 +400,23 @@ pub(crate) fn jj_revision_details(
 
     let author = jj_signature_info(commit.author());
     let committer = jj_signature_info(commit.committer());
+    // An unreadable parent is left out rather than failing the header.
+    let parents = commit
+        .parents()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|parent| ParentBrief {
+            commit_id: parent.id().hex(),
+            change_id: Some(parent.change_id().to_string()),
+            summary: parent
+                .description()
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_owned(),
+        })
+        .collect();
 
     RevisionDetails {
         commit_id: commit.id().hex(),
@@ -409,6 +426,7 @@ pub(crate) fn jj_revision_details(
         committer: Some(committer),
         signature: None,
         description: commit.description().to_owned(),
+        parents,
     }
 }
 

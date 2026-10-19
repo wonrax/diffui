@@ -606,6 +606,7 @@ async fn fetch_pr_commit_diff(
                     committer: None,
                     signature: None,
                     description: meta.message,
+                    parents: Vec::new(),
                 }
             });
         }
@@ -657,6 +658,7 @@ pub fn pr_revision_details(info: &PrInfo) -> RevisionDetails {
         committer: None,
         signature: None,
         description: format!("{}\n\n{}", info.title, info.url),
+        parents: Vec::new(),
     }
 }
 

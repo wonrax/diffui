@@ -439,7 +439,7 @@ impl Actor {
                     .get_commit_async(&commit_id)
                     .await
                     .with_context(|| format!("failed to load jj commit {}", commit_id.hex()))?;
-                let details = jj::jj_revision_details(repo.as_ref(), &commit);
+                let details = jj::jj_revision_details(repo.as_ref(), &commit).await;
                 self.emit(Payload::DetailsLoaded {
                     job,
                     revision,

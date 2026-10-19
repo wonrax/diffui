@@ -438,7 +438,7 @@ pub(crate) async fn history_diff(
                 true,
             )
             .await?;
-            Ok((document, Some(jj_revision_details(repo, &commit))))
+            Ok((document, Some(jj_revision_details(repo, &commit).await)))
         }
         HistoryDiffTarget::InterDiff { from, to } => {
             let to = load_commit(repo, to).await?;
@@ -461,7 +461,7 @@ pub(crate) async fn history_diff(
                 true,
             )
             .await?;
-            Ok((document, Some(jj_revision_details(repo, &to))))
+            Ok((document, Some(jj_revision_details(repo, &to).await)))
         }
     }
 }

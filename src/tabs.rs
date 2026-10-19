@@ -536,6 +536,7 @@ pub(crate) mod tests {
             committer: None,
             signature: None,
             description: description.to_owned(),
+            parents: Vec::new(),
         }
     }
 

@@ -1056,6 +1056,7 @@ mod tests {
             committer: None,
             signature: None,
             description: "subject\n\nbody".to_owned(),
+            parents: Vec::new(),
         };
 
         let rendered = revision_header_lines(&details)
