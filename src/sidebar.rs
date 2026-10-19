@@ -910,10 +910,7 @@ fn thousands(n: usize) -> String {
 }
 
 fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
-    let graph_style = RevisionGraphStyle {
-        lane_base_color: theme.lane_base,
-        missing_color: theme.subtle_text,
-    };
+    let graph_style = revision_graph_style(theme);
     let reveal_target = ui
         .active()
         .op_draft()
@@ -1231,6 +1228,36 @@ fn build_revision_row(
 /// it — so they read as a different kind of thing than the bookmark pills
 /// sharing the rail. Remotes render outlined (transparent fill + 1px
 /// lane-color border) so they read as "tracking" rather than "live".
+/// The graph's lane colours for `theme`.
+fn revision_graph_style(theme: ThemeSpec) -> RevisionGraphStyle {
+    RevisionGraphStyle {
+        lane_base_color: theme.lane_base,
+        missing_color: theme.subtle_text,
+    }
+}
+
+/// The bookmark and tag chips the graph draws on row `index`, for views
+/// that show a revision's refs the way the graph does.
+pub(crate) fn graph_ref_chips(
+    session: &diffui_core::Session,
+    index: usize,
+    theme: ThemeSpec,
+    config: AppConfig,
+) -> Vec<Chip> {
+    let commit = session.commits.row(index);
+    let lane = session.graph.frame(index, usize::MAX).node_lane;
+    let mut chips = bookmark_chips_for(
+        commit.bookmarks(),
+        revision_graph_style(theme).lane_color(lane),
+        theme,
+        config,
+    );
+    if let Some(tags) = session.bookmarks.tags.get(commit.commit_id()) {
+        chips.extend(tag_chips_for(tags, theme, config));
+    }
+    chips
+}
+
 pub(crate) fn bookmark_chips_for(
     bookmarks: &[String],
     lane_color: Color,

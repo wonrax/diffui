@@ -5,7 +5,7 @@
 //! its header ([`header_lines`]) so it stays selectable text: the
 //! description's body in mono, then one column of fields: author, date,
 //! change and commit ids in the graph's colours with copy buttons, parents
-//! as links, and the bookmarks. The History view's diffs
+//! as links, and the refs as the graph draws them. The History view's diffs
 //! carry the same header. Folded, the block is the title and the shared
 //! [`crate::meta_line`] line, the line the History view's headers use.
 
@@ -450,8 +450,14 @@ pub(crate) fn header_lines(
         field.link = Some((id_chars, HeaderAction::Open(parent.commit_id.clone())));
         lines.push(rich(field));
     }
-    let chips =
-        crate::sidebar::bookmark_chips_for(&details.bookmarks, theme.accent, theme, ui.config);
+    // The refs as the graph draws them on this revision's row, lane colour
+    // and all; a revision off the graph shows its bookmarks in the accent.
+    let chips = match row_of {
+        Some(row) => crate::sidebar::graph_ref_chips(session, row.index(), theme, ui.config),
+        None => {
+            crate::sidebar::bookmark_chips_for(&details.bookmarks, theme.accent, theme, ui.config)
+        }
+    };
     if !chips.is_empty() {
         lines.push(HeaderLine::Bookmarks {
             label: if details.change_id.is_some() {
