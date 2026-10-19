@@ -8,9 +8,8 @@
 //! confirmation stack work the way they do for every other mutation.
 
 use iced::{
-    Element, Length, Padding, Task, alignment,
-    font::Weight,
-    widget::{Space, column, container, mouse_area, opaque, row, stack, text, text_input},
+    Element, Length, Padding, Task,
+    widget::{Space, column, text_input},
 };
 
 use diffui_core::{PushAllow, PushRejection, PushRequest, PushTarget, RevisionSelection};
@@ -19,9 +18,8 @@ use crate::commands::CommandArg;
 use crate::menu::MenuEntry;
 use crate::modes::{Mode, ModeKind};
 use crate::mutations::MutationOp;
-use crate::theme::{
-    self, ThemeSpec, emphasis_font, input_style, modal_style, scrim_style, text_size,
-};
+use crate::prose::Prose;
+use crate::theme::{self, ThemeSpec, input_style, text_size};
 use crate::{Action, ConfirmDialog, Diffui, Message, PendingMutation, activity, ui};
 
 pub(crate) const NAME_PROMPT_INPUT_ID: &str = "bookmark-name-input";
@@ -75,7 +73,7 @@ pub(crate) struct NamePrompt {
 
 /// What submitting the prompt's current text would do.
 enum PromptVerdict {
-    Invalid(String),
+    Invalid(Prose),
     Create(String),
     /// The name already exists: `jj bookmark set` moves it here instead.
     Move(String),
@@ -232,10 +230,11 @@ impl Diffui {
     fn prompt_verdict(&self, prompt: &NamePrompt) -> PromptVerdict {
         let name = prompt.value.trim().to_owned();
         if name.is_empty() {
-            return PromptVerdict::Invalid(String::new());
+            return PromptVerdict::Invalid(Prose::new());
         }
-        if let Err(error) = diffui_core::jj::validate_bookmark_name(&name) {
-            return PromptVerdict::Invalid(error.to_string());
+        // The name is right there in the field; the core error only repeats it.
+        if diffui_core::jj::validate_bookmark_name(&name).is_err() {
+            return PromptVerdict::Invalid("Not a valid bookmark name.".into());
         }
         let info = &self.active().session.bookmarks;
         // A local bookmark, or a deleted one whose tracked remote copy still
@@ -248,14 +247,14 @@ impl Diffui {
             PromptKind::Create { .. } if taken => PromptVerdict::Move(name),
             PromptKind::Create { .. } => PromptVerdict::Create(name),
             PromptKind::Rename { old } if *old == name => {
-                PromptVerdict::Invalid("That's its current name.".to_owned())
+                PromptVerdict::Invalid("That's its current name.".into())
             }
             PromptKind::Rename { .. }
                 if info
                     .entry(&name)
                     .is_some_and(|entry| !entry.local_targets.is_empty()) =>
             {
-                PromptVerdict::Invalid(format!("Bookmark {name} already exists."))
+                PromptVerdict::Invalid(Prose::new().bookmark(name).text(" already exists."))
             }
             PromptKind::Rename { old } => PromptVerdict::Rename {
                 old: old.clone(),
@@ -279,12 +278,8 @@ impl Diffui {
             let mut request = rejection.request;
             request.confirm = false;
             self.push_mode(Mode::Confirm(ConfirmDialog {
-                title: format!("Push to \u{201c}{}\u{201d}?", request.remote),
-                body: format!(
-                    "Changes to push to {}:\n\n{}",
-                    request.remote,
-                    rejection.plan.join("\n")
-                ),
+                title: Prose::from("Push to ").remote(&request.remote).text("?"),
+                body: rejection.plan.join("\n").into(),
                 confirm_label: "Push".to_owned(),
                 pending: PendingMutation {
                     op: MutationOp::Push(request),
@@ -302,7 +297,7 @@ impl Diffui {
             return self.finish_mutation_error(pending, error);
         };
         if let Some(log) = self.activity_log_for(pending.tab_id) {
-            log.extend_output(pending.activity_id, lines.clone());
+            log.extend_output(pending.activity_id, lines);
             log.set_status(pending.activity_id, activity::ActivityStatus::Queued);
         }
         let count = rejection.commits.len();
@@ -314,22 +309,47 @@ impl Diffui {
                 if rejection.truncated { "+" } else { "" }
             )
         };
-        let mut body = format!(
-            "This would publish {commits} that jj git push refuses by default:\n\n{}\n\n\
-             Changes to push to {}:\n{}\n\nPushing anyway is `jj git push {}`.",
-            lines.join("\n"),
-            rejection.remote,
-            rejection.plan.join("\n"),
-            allow.flags().join(" ")
-        );
+        let mut body = Prose::from(format!(
+            "This publishes {commits} that pushes refuse by default:"
+        ));
+        for commit in &rejection.commits {
+            let reasons: Vec<&str> = commit.reasons.iter().map(|r| r.describe()).collect();
+            let subject = if commit.subject.is_empty() {
+                "(no description set)"
+            } else {
+                commit.subject.as_str()
+            };
+            body = body
+                .text("\n")
+                .rev(&commit.change_id)
+                .text(format!(" {subject}: {}", reasons.join(" and ")));
+        }
+        if rejection.truncated {
+            body = body.text("\n\u{2026} and more");
+        }
+        if let Some(revset) = &rejection.private_commits {
+            body = body
+                .text("\nPrivate commits are ")
+                .code(revset)
+                .text(" (git.private-commits).");
+        }
+        body = body.text(format!(
+            "\n\nChanges to push:\n{}",
+            rejection.plan.join("\n")
+        ));
         if rejection.commits.iter().any(|commit| commit.working_copy) {
-            body.push_str(" One of them is the working-copy commit, which is still in progress.");
+            body = body
+                .text("\n\nOne of them is ")
+                .rev("@")
+                .text(", still being edited.");
         }
         let mut request = rejection.request;
         request.allow = allow;
         request.confirm = false;
         self.push_mode(Mode::Confirm(ConfirmDialog {
-            title: format!("Push to \u{201c}{}\u{201d} refused", request.remote),
+            title: Prose::from("Push to ")
+                .remote(&request.remote)
+                .text(" anyway?"),
             body,
             confirm_label: "Push anyway".to_owned(),
             pending: PendingMutation {
@@ -377,8 +397,8 @@ impl Diffui {
             log.set_status(pending.activity_id, activity::ActivityStatus::Queued);
         }
         self.push_mode(Mode::Confirm(ConfirmDialog {
-            title: "Push the working-copy commit?".to_owned(),
-            body: WORKING_COPY_PUSH_WARNING.to_owned(),
+            title: Prose::from("Push the working-copy commit?"),
+            body: working_copy_push_warning(),
             confirm_label: "Push anyway".to_owned(),
             pending,
         }));
@@ -560,9 +580,14 @@ impl Diffui {
     }
 }
 
-pub(crate) const WORKING_COPY_PUSH_WARNING: &str = "This pushes the working-copy commit (@), the one you're still editing. Anything saved \
-     after the push is snapshotted into it and the bookmark moves off what the remote has. \
-     Usually you push @- after starting a new change.";
+/// Why pushing `@` is usually a mistake.
+pub(crate) fn working_copy_push_warning() -> Prose {
+    Prose::new()
+        .rev("@")
+        .text(" is still being edited, so later saves drift from what the remote has. Usually you push ")
+        .rev("@-")
+        .text(" instead.")
+}
 
 /// Activity label for a push.
 pub(crate) fn push_label(request: &PushRequest) -> String {
@@ -595,39 +620,33 @@ pub(crate) fn local_bookmark_label(label: &str) -> Option<&str> {
 
 // ── Name prompt view ────────────────────────────────────────────────────
 
-const PROMPT_PADDING: f32 = theme::space::XL + theme::space::XS;
-
-/// The bookmark-name prompt: a modal card with the field, a line saying what
-/// Enter will do (or why it can't), and the buttons. Empty when closed.
+/// The bookmark-name prompt: a modal card with the field, a line under it
+/// only when there is something to say (what Enter will do instead, or why
+/// it can't), and the buttons. Empty when closed.
 pub(crate) fn build_name_prompt(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     let Some(prompt) = ui.name_prompt() else {
         return Space::new().into();
     };
+    let (font, mono) = (ui.config.ui_font, ui.config.mono_font);
     let cancel = Message::Action(Action::Bookmark(BookmarkAction::PromptCancel));
     let submit = Message::Action(Action::Bookmark(BookmarkAction::PromptSubmit));
-
-    let scrim = mouse_area(
-        container(Space::new().width(Length::Fill).height(Length::Fill))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(|_| scrim_style()),
-    )
-    .on_press(cancel.clone());
 
     let verdict = ui.prompt_verdict(prompt);
     let (title, verb) = match &prompt.kind {
         PromptKind::Create { at } => (
-            format!("New bookmark at {}", ui.revision_short_label(at)),
+            Prose::from("New bookmark at ").then(ui.revision_prose(at)),
             "Create",
         ),
-        PromptKind::Rename { old } => (format!("Rename bookmark {old}"), "Rename"),
+        PromptKind::Rename { old } => (Prose::from("Rename ").bookmark(old), "Rename"),
     };
-    let (note, note_color, verb) = match &verdict {
-        PromptVerdict::Invalid(reason) => (reason.clone(), theme.removed_text, verb),
-        PromptVerdict::Create(_) => (String::new(), theme.muted_text, verb),
+    let (note, error, verb) = match &verdict {
+        PromptVerdict::Invalid(reason) => (reason.clone(), true, verb),
+        PromptVerdict::Create(_) => (Prose::new(), false, verb),
         PromptVerdict::Move(name) => (
-            format!("{name} already exists \u{2014} this moves it here (jj bookmark set)."),
-            theme.muted_text,
+            Prose::new()
+                .bookmark(name)
+                .text(" exists. This moves it here."),
+            false,
             "Move here",
         ),
         PromptVerdict::Rename { old, .. } => {
@@ -638,79 +657,64 @@ pub(crate) fn build_name_prompt(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Me
                 .entry(old)
                 .is_some_and(|entry| entry.is_tracked_anywhere());
             let note = if on_remote {
-                format!("The remote keeps {old} until you push its deletion.")
+                Prose::new()
+                    .bookmark(old)
+                    .text(" stays on the remote until you push.")
             } else {
-                String::new()
+                Prose::new()
             };
-            (note, theme.muted_text, verb)
+            (note, false, verb)
         }
     };
 
     let input = text_input("bookmark name", &prompt.value)
         .id(NAME_PROMPT_INPUT_ID)
         .padding(Padding::from([theme::space::SM, theme::space::MD]))
-        .size(text_size::BODY_LG)
-        .font(ui.config.mono_font)
+        .size(text_size::BODY)
+        .font(mono)
         .on_input(|value| Message::Action(Action::Bookmark(BookmarkAction::PromptInput(value))))
         .on_submit(submit.clone())
         .style(move |_, _| input_style(theme));
+    let mut field =
+        column![crate::input::single_line(input, &prompt.value, mono)].spacing(theme::space::SM);
+    if !note.is_empty() {
+        let color = if error {
+            theme.removed_text
+        } else {
+            theme.muted_text
+        };
+        field = field.push(
+            note.view(font, mono, color, theme)
+                .size(text_size::UI)
+                .width(Length::Fill),
+        );
+    }
 
-    let cancel_button = ui::text_button(
-        None,
-        "Cancel",
-        ui::Variant::Raised,
-        ui::Size::Standard,
-        ui.config.ui_font,
-        theme,
-    )
-    .on_press(cancel);
     let mut accept = ui::text_button(
         None,
         verb,
         ui::Variant::Primary,
         ui::Size::Standard,
-        ui.config.ui_font,
+        font,
         theme,
     );
     if !matches!(verdict, PromptVerdict::Invalid(_)) {
         accept = accept.on_press(submit);
     }
+    let cancel_button = ui::cancel_button(ui::Size::Standard, font, theme).on_press(cancel.clone());
 
     let body = column![
-        text(title)
-            .size(text_size::TITLE)
-            .color(theme.text)
-            .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
-        input,
-        text(note)
-            .size(text_size::UI)
-            .color(note_color)
-            .font(ui.config.ui_font),
-        row![Space::new().width(Length::Fill), cancel_button, accept]
-            .spacing(theme::space::MD)
-            .align_y(alignment::Vertical::Center),
+        ui::dialog_title(&title, font, mono, theme),
+        field,
+        ui::button_row(None, [cancel_button.into(), accept.into()]),
     ]
-    .spacing(12);
+    .spacing(ui::DIALOG_SPACING);
 
-    let card = mouse_area(
-        container(body)
-            .width(Length::Fixed(460.0))
-            .padding(PROMPT_PADDING)
-            .style(move |_| modal_style(theme)),
+    ui::modal(
+        ui::dialog_card(body, ui::DIALOG_WIDTH, theme),
+        cancel,
+        Message::Ui(crate::UiEvent::ConfirmNoOp),
     )
-    .on_press(Message::Ui(crate::UiEvent::ConfirmNoOp));
-
-    let centered = container(card)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .align_x(alignment::Horizontal::Center)
-        .padding(Padding {
-            top: crate::theme::modal_top(),
-            right: 0.0,
-            bottom: 0.0,
-            left: 0.0,
-        });
-    opaque(stack![scrim, centered])
 }
 
 #[cfg(test)]
@@ -803,11 +807,8 @@ mod tests {
         );
         let _ = ui.push_rejected(held, rejection(vec![PushCheck::EmptyDescription]));
         let dialog = ui.confirm().expect("a confirmation is raised");
-        assert!(
-            dialog.body.contains("--allow-empty-description"),
-            "{}",
-            dialog.body
-        );
+        let body = dialog.body.to_string();
+        assert!(body.contains("has no description"), "{body}");
         match &dialog.pending.op {
             MutationOp::Push(request) => {
                 assert!(request.allow.empty_description);

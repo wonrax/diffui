@@ -9,10 +9,14 @@
 
 use iced::{
     Color, Element, Font, Length, Padding, alignment,
-    widget::{self, Button, container, row, text},
+    font::Weight,
+    widget::{
+        self, Button, Container, Row, Space, container, mouse_area, opaque, row, stack, text,
+    },
 };
 
 use crate::icons;
+use crate::prose::Prose;
 use crate::theme::{self, ThemeSpec, text_size};
 
 /// Control height step. Everything sharing a row should share a step.
@@ -59,7 +63,7 @@ const ICON_GAP: f32 = 6.0;
 pub enum Variant {
     /// Invisible at rest: for controls that sit on a framed surface.
     Ghost,
-    /// Visible at rest: standalone secondary actions.
+    /// Visible at rest: standalone secondary actions, and every Cancel.
     Raised,
     /// The one call-to-action of a surface.
     Primary,
@@ -125,6 +129,34 @@ pub fn text_button<'a, Message: Clone + 'a>(
     button(label(icon, text, size, font), variant, size, theme)
 }
 
+/// Gap between buttons sitting side by side, in dialogs, editors and bars.
+pub const BUTTON_GAP: f32 = theme::space::SM;
+
+/// A row of buttons ending at the right edge, `leading` (a hint, a status)
+/// at the left. Every dialog and editor footer is one of these.
+pub fn button_row<'a, Message: 'a>(
+    leading: Option<Element<'a, Message>>,
+    buttons: impl IntoIterator<Item = Element<'a, Message>>,
+) -> Row<'a, Message> {
+    let mut row = row![]
+        .spacing(BUTTON_GAP)
+        .align_y(alignment::Vertical::Center);
+    if let Some(leading) = leading {
+        row = row.push(leading);
+    }
+    row.push(Space::new().width(Length::Fill)).extend(buttons)
+}
+
+/// The Cancel of a dialog or editor footer: always the raised secondary
+/// button, beside the footer's one filled call-to-action.
+pub fn cancel_button<'a, Message: Clone + 'a>(
+    size: Size,
+    font: Font,
+    theme: ThemeSpec,
+) -> Button<'a, Message> {
+    text_button(None, "Cancel", Variant::Raised, size, font, theme)
+}
+
 /// A square ghost button holding one glyph.
 pub fn icon_button<'a, Message: Clone + 'a>(
     glyph: &'static str,
@@ -142,6 +174,86 @@ pub fn icon_button<'a, Message: Clone + 'a>(
     .height(Length::Fixed(side))
     .padding(0)
     .style(move |_, status| theme::ghost_button_style(theme, status))
+}
+
+// ── Modals ──────────────────────────────────────────────────────────────
+
+/// Inset between a dialog card's edge and its content.
+pub const DIALOG_PADDING: f32 = theme::space::XL + theme::space::XS;
+/// Gap between a dialog's title, body, fields and footer.
+pub const DIALOG_SPACING: f32 = theme::space::LG;
+/// Width of a dialog that asks one question.
+pub const DIALOG_WIDTH: f32 = 460.0;
+
+/// A card over the scrim, hung from [`theme::modal_top`]. A press on the
+/// scrim sends `dismiss`; one on the card sends `swallow`, which must do
+/// nothing (it only keeps the press from reaching the scrim).
+pub fn modal<'a, Message: Clone + 'a>(
+    card: impl Into<Element<'a, Message>>,
+    dismiss: Message,
+    swallow: Message,
+) -> Element<'a, Message> {
+    let scrim = mouse_area(
+        container(Space::new().width(Length::Fill).height(Length::Fill))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|_| theme::scrim_style()),
+    )
+    .on_press(dismiss);
+    let centered = container(mouse_area(card).on_press(swallow))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(alignment::Horizontal::Center)
+        .padding(Padding {
+            top: theme::modal_top(),
+            ..Padding::ZERO
+        });
+    // `opaque` keeps wheel events and the cursor from bleeding through to the
+    // shell below the modal.
+    opaque(stack![scrim, centered])
+}
+
+/// The dialog card: the modal surface with the shared inset.
+pub fn dialog_card<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    width: f32,
+    theme: ThemeSpec,
+) -> Container<'a, Message> {
+    container(content)
+        .width(Length::Fixed(width))
+        .padding(DIALOG_PADDING)
+        .style(move |_| theme::modal_style(theme))
+}
+
+/// A dialog's title line.
+pub fn dialog_title<'a, Message: 'a>(
+    title: &Prose,
+    font: Font,
+    mono: Font,
+    theme: ThemeSpec,
+) -> Element<'a, Message> {
+    title
+        .view(
+            theme::emphasis_font(font, Weight::Medium),
+            mono,
+            theme.text,
+            theme,
+        )
+        .size(text_size::TITLE)
+        .into()
+}
+
+/// A dialog's explanatory text.
+pub fn dialog_text<'a, Message: 'a>(
+    body: &Prose,
+    font: Font,
+    mono: Font,
+    theme: ThemeSpec,
+) -> Element<'a, Message> {
+    body.view(font, mono, theme.muted_text, theme)
+        .size(text_size::UI)
+        .width(Length::Fill)
+        .into()
 }
 
 /// The hover label every chrome control uses.

@@ -405,8 +405,8 @@ mod stack_tests {
 
     fn confirm(title: &str) -> ConfirmDialog {
         ConfirmDialog {
-            title: title.to_owned(),
-            body: String::new(),
+            title: title.into(),
+            body: crate::prose::Prose::new(),
             confirm_label: "Do it".to_owned(),
             pending: PendingMutation {
                 op: mutations::MutationOp::Undo { operation_id: None },
@@ -442,9 +442,15 @@ mod stack_tests {
         // the top one surfaces the next rather than dropping its mutation.
         ui.push_mode(Mode::Confirm(confirm("first")));
         ui.push_mode(Mode::Confirm(confirm("second")));
-        assert_eq!(ui.confirm().map(|d| d.title.as_str()), Some("second"));
+        assert_eq!(
+            ui.confirm().map(|d| d.title.to_string()).as_deref(),
+            Some("second")
+        );
         ui.pop_mode(ModeKind::Confirm);
-        assert_eq!(ui.confirm().map(|d| d.title.as_str()), Some("first"));
+        assert_eq!(
+            ui.confirm().map(|d| d.title.to_string()).as_deref(),
+            Some("first")
+        );
     }
 
     #[test]

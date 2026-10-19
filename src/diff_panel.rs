@@ -363,7 +363,9 @@ fn build_diff_panel_body<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Me
         let summary = build_revision_summary(ui, theme);
 
         if files.is_empty() {
-            let mut actions = row![].spacing(8).align_y(alignment::Vertical::Center);
+            let mut actions = row![]
+                .spacing(ui::BUTTON_GAP)
+                .align_y(alignment::Vertical::Center);
             if ui.active().repository.is_some() {
                 actions = actions.push(
                     ui::text_button(
@@ -655,7 +657,7 @@ fn build_description_editor<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a,
             keyed(cancel, "Esc"),
             keyed(save, "\u{2318}\u{21b5}"),
         ]
-        .spacing(8)
+        .spacing(ui::BUTTON_GAP)
         .align_y(alignment::Vertical::Center);
 
         return container(column![input, actions].spacing(DESCRIPTION_EDITOR_GAP))

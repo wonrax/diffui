@@ -22,6 +22,7 @@ use iced::{Element, Length, Padding, Task, alignment};
 use crate::commands::CommandArg;
 use crate::diff_view::{ChangeMarks, CheckState, FileMark, HunkMarks};
 use crate::palette::ResultRef;
+use crate::prose::Prose;
 use crate::theme::{ThemeSpec, text_size};
 use crate::{
     ConfirmDialog, Diffui, MainView, Message, PendingMutation, TabState, activity, icons, ui,
@@ -265,6 +266,17 @@ fn revision_label(tab: &TabState, revision: &RevisionSelection) -> String {
             RevisionSelection::Commit(hex) => hex.chars().take(8).collect(),
         },
     }
+}
+
+/// [`DiffSelection::summary`] with a single file's path marked as one.
+pub(crate) fn selection_prose(selection: &DiffSelection) -> Prose {
+    let summary = selection.summary();
+    if let [only] = selection.files.as_slice()
+        && let Some(lead) = summary.strip_suffix(only.path.as_str())
+    {
+        return Prose::from(lead).path(&only.path);
+    }
+    Prose::from(summary)
 }
 
 fn whole_file(path: &str) -> DiffSelection {
@@ -637,12 +649,12 @@ impl Diffui {
             log.set_status(activity_id, activity::ActivityStatus::Queued);
         }
         self.push_mode(crate::modes::Mode::Confirm(ConfirmDialog {
-            title: format!("Discard {summary}?"),
-            body: format!(
-                "This puts the parent's content back for the selected changes in {label} \
-                 (jj restore). The changes leave the revision, but nothing is lost for good: \
-                 Undo in the toolbar or the activity log brings them back."
-            ),
+            title: Prose::from("Discard ")
+                .then(selection_prose(&selection))
+                .text("?"),
+            body: Prose::from("The changes leave ")
+                .rev(label)
+                .text(". Undo brings them back."),
             confirm_label: "Discard".to_owned(),
             pending: PendingMutation {
                 op: MutationOp::RestoreChanges {

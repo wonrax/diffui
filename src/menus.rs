@@ -12,6 +12,7 @@
 
 use super::*;
 use crate::commands::{self, CommandId};
+use crate::prose::Prose;
 
 impl Diffui {
     /// A menu row for `command`, labelled and chord-hinted from the registry.
@@ -567,23 +568,22 @@ impl Diffui {
             return Task::none();
         }
         let (title, label, body) = match targets.as_slice() {
-            [target] => {
-                let name = self.revision_short_label(target);
-                (
-                    format!("Abandon {name}?"),
-                    "Abandon".to_owned(),
-                    "Its changes are dropped and any descendants are rebased onto its \
-                     parent. jj's operation log keeps it, so Undo brings it back.",
-                )
-            }
+            [target] => (
+                Prose::from("Abandon ")
+                    .then(self.revision_prose(target))
+                    .text("?"),
+                "Abandon".to_owned(),
+                "Its changes are dropped and its descendants move onto its parent. Undo \
+                 brings it back.",
+            ),
             _ => (
-                format!("Abandon {} revisions?", targets.len()),
+                format!("Abandon {} revisions?", targets.len()).into(),
                 format!("Abandon {} revisions", targets.len()),
-                "Their changes are dropped and any descendants are rebased onto their \
-                 parents. jj's operation log keeps them, so Undo brings them back.",
+                "Their changes are dropped and their descendants move onto their parents. \
+                 Undo brings them back.",
             ),
         };
-        let body = body.to_owned();
+        let body = Prose::from(body);
         let (activity_id, _) = self.begin_activity(tab_id, label, false);
         if let Some(log) = self.activity_log_for(tab_id) {
             log.set_status(activity_id, activity::ActivityStatus::Queued);

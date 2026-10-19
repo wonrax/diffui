@@ -863,6 +863,15 @@ mod tests {
             spec.removed_text,
             TEXT,
         ));
+        // Names in dialog, toast and banner prose (`crate::prose`).
+        for (label, color) in [
+            ("revision id in prose", spec.accent),
+            ("bookmark in prose", spec.lane_base),
+        ] {
+            for background in [spec.panel_background, spec.panel_background_elevated] {
+                pairs.push((label, color, background, TEXT));
+            }
+        }
         // The graph's lanes are strokes, not glyphs to read.
         for base in [spec.panel_background, spec.selected_file] {
             pairs.push(("lane", spec.lane_base, base, GLYPH));

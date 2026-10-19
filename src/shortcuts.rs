@@ -9,7 +9,7 @@
 use iced::{
     Alignment, Background, Border, Element, Length, Padding, Task, alignment,
     font::Weight,
-    widget::{Space, column, container, mouse_area, opaque, row, scrollable, stack, text},
+    widget::{Space, column, container, row, scrollable, text},
 };
 
 use crate::commands::{self, CommandId, Context, REGISTRY};
@@ -172,14 +172,6 @@ pub(crate) fn build_overlay(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
         return Space::new().into();
     }
 
-    let scrim = mouse_area(
-        container(Space::new().width(Length::Fill).height(Length::Fill))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(|_| theme::scrim_style()),
-    )
-    .on_press(Message::Action(Action::CloseShortcuts));
-
     let mut left = column![].spacing(theme::space::XL);
     let mut right = column![].spacing(theme::space::XL);
     let rows_of = |entries: Vec<Entry>| -> Vec<Element<'_, Message>> {
@@ -257,29 +249,15 @@ pub(crate) fn build_overlay(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
     ]
     .spacing(theme::space::XL);
 
-    let card = mouse_area(
-        container(body)
-            .width(Length::Fixed(CARD_WIDTH))
-            .height(Length::Fixed(
-                (ui.window_size.height - theme::modal_top() - theme::space::XXL)
-                    .clamp(240.0, CARD_MAX_HEIGHT),
-            ))
-            .padding(theme::space::XXL)
-            .style(move |_| theme::modal_style(theme)),
+    let card = crate::ui::dialog_card(body, CARD_WIDTH, theme).height(Length::Fixed(
+        (ui.window_size.height - theme::modal_top() - theme::space::XXL)
+            .clamp(240.0, CARD_MAX_HEIGHT),
+    ));
+    crate::ui::modal(
+        card,
+        Message::Action(Action::CloseShortcuts),
+        Message::Ui(UiEvent::ConfirmNoOp),
     )
-    // A click on the card is not a click on the scrim.
-    .on_press(Message::Ui(UiEvent::ConfirmNoOp));
-
-    let centered = container(card)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .align_x(alignment::Horizontal::Center)
-        .padding(Padding {
-            top: theme::modal_top(),
-            ..Padding::ZERO
-        });
-
-    opaque(stack![scrim, centered])
 }
 
 fn section<'a>(

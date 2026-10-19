@@ -40,6 +40,7 @@ mod modes;
 mod palette;
 mod path_browse;
 mod pointer;
+mod prose;
 mod resize_handle;
 mod revision_list;
 mod revops;
@@ -540,8 +541,8 @@ impl DescriptionEditor {
 /// accepting still runs correctly after a tab switch.
 #[derive(Debug, Clone)]
 pub(crate) struct ConfirmDialog {
-    pub(crate) title: String,
-    pub(crate) body: String,
+    pub(crate) title: prose::Prose,
+    pub(crate) body: prose::Prose,
     pub(crate) confirm_label: String,
     pub(crate) pending: PendingMutation,
 }

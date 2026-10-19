@@ -10,6 +10,7 @@ use super::*;
 use crate::find::FindMessage;
 use crate::menu::MenuMessage;
 use crate::palette::PaletteMessage;
+use crate::prose::Prose;
 use iced::widget::column;
 
 impl Diffui {
@@ -2968,13 +2969,7 @@ impl Diffui {
         if !backwards {
             return self.run_mutation_checking_wc_push(pending);
         }
-        let target = match to {
-            RevisionSelection::WorkingCopy => "The working copy".to_owned(),
-            RevisionSelection::Commit(hex) => {
-                let _ = hex;
-                self.revision_short_label(to)
-            }
-        };
+        let target = self.revision_prose(to);
         // A conflicted bookmark also lands here (it has no single commit to be
         // "a descendant of"), but there the move *is* the fix — the dialog
         // explains the resolution rather than warning about a backwards move
@@ -2990,45 +2985,45 @@ impl Diffui {
             .map(|b| b.local_targets.len());
         let (title, mut body) = match conflicted_sides {
             Some(sides) => (
-                format!("Resolve conflicted bookmark \u{201c}{name}\u{201d}?"),
-                format!(
-                    "\u{201c}{name}\u{201d} is conflicted — it points at {sides} \
-                     commits at once (concurrent moves, or a force-pushed \
-                     remote). Moving it to {target} picks that side and \
-                     resolves the conflict."
-                ),
+                Prose::from("Resolve conflicted bookmark ")
+                    .bookmark(name)
+                    .text("?"),
+                Prose::new()
+                    .bookmark(name)
+                    .text(format!(" points at {sides} commits. Moving it to "))
+                    .then(target)
+                    .text(" picks that one."),
             ),
             None => (
-                format!("Move bookmark \u{201c}{name}\u{201d} backwards?"),
-                format!(
-                    "{target} is not a descendant of the commit \u{201c}{name}\u{201d} \
-                     points at, so this is a backwards or sideways move — the jj CLI \
-                     refuses it without --allow-backwards."
-                ),
+                Prose::from("Move ").bookmark(name).text(" backwards?"),
+                target
+                    .text(" is behind or beside where ")
+                    .bookmark(name)
+                    .text(" is now."),
             ),
         };
-        if self.publishes_working_copy(&pending.op) {
-            body.push_str(&format!(" {}", crate::bookmarks::WORKING_COPY_PUSH_WARNING));
-        }
         // A move that also pushes rewrites the remote branch — say so before
         // the user commits to it.
         let confirm_label = match (push_remote, conflicted_sides) {
             (Some(remote), None) => {
-                body.push_str(&format!(
-                    " The bookmark is then pushed, moving it backwards on \
-                     \u{201c}{remote}\u{201d} too."
-                ));
+                body = body
+                    .text(" The push moves it on ")
+                    .remote(remote)
+                    .text(" too.");
                 "Move & push anyway".to_owned()
             }
             (Some(remote), Some(_)) => {
-                body.push_str(&format!(
-                    " The bookmark is then pushed to \u{201c}{remote}\u{201d}."
-                ));
+                body = body.text(" Then pushes it to ").remote(remote).text(".");
                 "Move, resolve & push".to_owned()
             }
             (None, Some(_)) => "Move & resolve".to_owned(),
             (None, None) => "Move anyway".to_owned(),
         };
+        if self.publishes_working_copy(&pending.op) {
+            body = body
+                .text(" ")
+                .then(crate::bookmarks::working_copy_push_warning());
+        }
         self.push_mode(Mode::Confirm(ConfirmDialog {
             title,
             body,
@@ -4254,31 +4249,49 @@ impl Diffui {
         } else {
             ("revisions", "are")
         };
-        let names = targets.join(", ");
+        let mut names = Prose::new();
+        for (index, target) in targets.iter().enumerate() {
+            if index > 0 {
+                names = names.text(", ");
+            }
+            names = names.rev(target);
+        }
         let mut body = if after_rejection {
-            format!("This operation would also rewrite {names}, which {verb_be} immutable")
+            Prose::from("This would also rewrite ")
+                .then(names)
+                .text(format!(", which {verb_be} immutable"))
         } else {
-            format!("{names} {verb_be} immutable")
+            names.text(format!(" {verb_be} immutable"))
         };
-        body.push_str(
-            " — reachable from immutable_heads(), which usually means pushed or \
-             otherwise shared history. The jj CLI refuses this without \
-             --ignore-immutable.",
-        );
+        body = body.text(" (usually pushed or shared).");
         if matches!(pending.op, MutationOp::Edit { .. }) {
-            body.push_str(" Editing it makes further working-copy changes amend it in place.");
+            body = body.text(" Later working-copy changes amend it in place.");
         }
         // Stacking rather than replacing: a second guarded mutation raised
         // while a dialog is open (a background tab's op being refused) waits
         // under it and surfaces when that one resolves, instead of silently
         // taking over the buttons the user was about to press.
         self.push_mode(Mode::Confirm(ConfirmDialog {
-            title: format!("{verb} immutable {noun}?"),
+            title: format!("{verb} immutable {noun}?").into(),
             body,
             confirm_label: confirm_label.to_owned(),
             pending,
         }));
         Task::none()
+    }
+
+    /// [`Self::revision_short_label`] as an id in prose, or plain words when
+    /// the revision isn't in the graph.
+    pub(crate) fn revision_prose(&self, selection: &RevisionSelection) -> Prose {
+        let label = self.revision_short_label(selection);
+        let in_graph = match selection {
+            RevisionSelection::WorkingCopy => self.active().session.commits.working_copy(),
+            RevisionSelection::Commit(hex) => self.active().session.commits.find_by_commit_id(hex),
+        };
+        match (in_graph, selection) {
+            (None, RevisionSelection::WorkingCopy) => Prose::from(label),
+            _ => Prose::new().rev(label),
+        }
     }
 
     /// Short display name for a revision, matching the sidebar: unique
@@ -5174,8 +5187,8 @@ mod tests {
     fn a_confirmation_swallows_every_key_but_its_own() {
         let mut ui = app();
         ui.push_mode(Mode::Confirm(ConfirmDialog {
-            title: "Rewrite?".to_owned(),
-            body: String::new(),
+            title: "Rewrite?".into(),
+            body: Prose::new(),
             confirm_label: "Rewrite anyway".to_owned(),
             pending: PendingMutation {
                 op: mutations::MutationOp::Undo { operation_id: None },

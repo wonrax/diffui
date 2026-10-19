@@ -27,6 +27,7 @@ use diffui_core::history::{
 use diffui_core::{DiffDocument, JobId, MutationOp, RevisionDetails, RevisionSelection, Vcs};
 
 use crate::diff_view::{AnnotationGutter, AnnotationLabel, DiffFileView, DiffView};
+use crate::prose::Prose;
 use crate::theme::{
     ThemeSpec, chip_background, diff_palette, diff_panel_style, emphasis_font, file_status_color,
     radius, sidebar_panel_style, space, text_size,
@@ -488,13 +489,11 @@ impl Diffui {
             .unwrap_or_default();
         let (title, body, confirm_label, label, op) = if restore {
             (
-                format!("Restore the repository to operation {short}?"),
-                format!(
-                    "Every revision, bookmark and working-copy position goes back to how it \
-                     was after \u{201c}{summary}\u{201d}, like jj op restore. Uncommitted \
-                     changes are snapshotted first, and the operations since stay in the log, \
-                     so this can itself be undone."
-                ),
+                Prose::from("Restore to operation ").op(short).text("?"),
+                Prose::from(format!(
+                    "Every revision and bookmark goes back to how \u{201c}{summary}\u{201d} \
+                     left them. This can be undone too."
+                )),
                 "Restore",
                 format!("Restore to {short}"),
                 MutationOp::RestoreOperation {
@@ -503,11 +502,10 @@ impl Diffui {
             )
         } else {
             (
-                format!("Revert operation {short}?"),
-                format!(
-                    "Applies the inverse of \u{201c}{summary}\u{201d} on top of the current \
-                     state, like jj op revert. Work done since that operation is kept."
-                ),
+                Prose::from("Revert operation ").op(short).text("?"),
+                Prose::from(format!(
+                    "Undoes just \u{201c}{summary}\u{201d}, keeping the work done since."
+                )),
                 "Revert",
                 format!("Revert {short}"),
                 MutationOp::RevertOperation {
