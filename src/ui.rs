@@ -39,7 +39,7 @@ impl Size {
     }
 
     /// Horizontal inset of a labelled button.
-    fn pad_x(self) -> f32 {
+    pub fn pad_x(self) -> f32 {
         match self {
             Size::Compact => 10.0,
             Size::Standard => 14.0,

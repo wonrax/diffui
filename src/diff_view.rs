@@ -204,10 +204,6 @@ const CHECK_GAP: f32 = 8.0;
 /// Width of the accent bar a picked line wears at its gutter's left edge.
 const PICK_BAR_WIDTH: f32 = 3.0;
 
-/// Room kept below a line the keyboard cursor scrolls to: the floating
-/// selection bar covers the bottom of the pane while lines are being picked.
-const LINE_REVEAL_BOTTOM_MARGIN: f32 = 140.0;
-
 /// One line of the `jj show`-style revision header rendered at the top of
 /// the diff scroll area. Kept as a plain enum so `main.rs` decides the text
 /// content without leaking `RevisionDetails` into this module.
@@ -3504,10 +3500,10 @@ where
                     .map(|row| (index.row_tops[row], index.row_heights[row]))
             };
             if let Some((top, height)) = span {
-                // Clear of the sticky file header above and the selection bar
-                // below.
+                // Clear of the sticky file header above, and a row of context
+                // either side.
                 let above = top - self.metrics.file_header_height - self.metrics.row_height;
-                let below = top + height + LINE_REVEAL_BOTTOM_MARGIN - bounds.height;
+                let below = top + height + self.metrics.row_height - bounds.height;
                 let target = if above < state.vertical_offset {
                     above
                 } else if below > state.vertical_offset {

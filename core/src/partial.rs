@@ -134,29 +134,33 @@ impl DiffSelection {
             .any(|file| matches!(file.hunks, HunkPick::Hunks(_)))
     }
 
-    /// "2 files" / "3 hunks in 2 files" / "1 hunk and 4 lines in a.rs" —
-    /// what the activity log and the selection bar call this selection.
-    pub fn summary(&self) -> String {
-        let files = self.file_count();
+    /// What a partial selection picks, without where: "3 hunks", "4 lines",
+    /// "1 hunk and 4 lines". `None` when every file is picked whole.
+    pub fn picked_counts(&self) -> Option<String> {
         if !self.has_partial_files() {
-            return match self.files.as_slice() {
-                [only] => only.path.clone(),
-                _ => format!("{files} files"),
-            };
+            return None;
         }
         let count = |n: usize, noun: &str| match n {
             1 => format!("1 {noun}"),
             _ => format!("{n} {noun}s"),
         };
         let (hunks, lines) = (self.hunk_count(), self.line_count());
-        let picked = match (hunks, lines) {
+        Some(match (hunks, lines) {
             (_, 0) => count(hunks, "hunk"),
             (0, _) => count(lines, "line"),
             _ => format!("{} and {}", count(hunks, "hunk"), count(lines, "line")),
-        };
-        match self.files.as_slice() {
-            [only] => format!("{picked} in {}", only.path),
-            _ => format!("{picked} in {files} files"),
+        })
+    }
+
+    /// "2 files" / "3 hunks in 2 files" / "1 hunk and 4 lines in a.rs" —
+    /// what the activity log and the selection bar call this selection.
+    pub fn summary(&self) -> String {
+        let files = self.file_count();
+        match (self.picked_counts(), self.files.as_slice()) {
+            (None, [only]) => only.path.clone(),
+            (None, _) => format!("{files} files"),
+            (Some(picked), [only]) => format!("{picked} in {}", only.path),
+            (Some(picked), _) => format!("{picked} in {files} files"),
         }
     }
 }

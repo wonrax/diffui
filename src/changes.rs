@@ -27,7 +27,7 @@ use crate::diff_view::{
 use crate::modes::{ModeKind, TabMode};
 use crate::palette::ResultRef;
 use crate::prose::Prose;
-use crate::theme::{ThemeSpec, text_size};
+use crate::theme::{self, ThemeSpec, text_size};
 use crate::{
     ConfirmDialog, Diffui, MainView, Message, PendingMutation, TabState, activity, icons, ui,
 };
@@ -1161,15 +1161,12 @@ impl Diffui {
 
 // ── Views ───────────────────────────────────────────────────────────────
 
-/// The floating bar over the diff: the pick's summary and its actions, or
-/// the split prompt. `None` (nothing drawn) when nothing is picked.
+/// The strip docked under the diff while anything is picked or lines are
+/// being selected: what is picked, the actions on it, and the way out of
+/// line-select mode. It takes layout space, so it never covers code.
 pub(crate) fn selection_bar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Option<Element<'a, Message>> {
     let tab = ui.active();
-    if !editable(tab) {
-        return None;
-    }
-    let font = ui.config.ui_font;
-    if split_prompt_shown(ui).is_some() {
+    if !editable(tab) || split_prompt_shown(ui).is_some() {
         return None;
     }
     let selection = selection_of(tab);
@@ -1177,109 +1174,164 @@ pub(crate) fn selection_bar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Option<Elem
     if selection.is_empty() && !selecting {
         return None;
     }
-    let button = |label: &'static str, msg: ChangesMsg, variant: ui::Variant| {
-        ui::text_button(None, label, variant, ui::Size::Compact, font, theme)
-            .on_press(Message::Changes(msg))
-    };
-    let clear = ui::tooltip(
-        ui::icon_button(icons::CLOSE, theme.muted_text, ui::Size::Compact, theme)
-            .on_press(Message::Changes(ChangesMsg::Clear)),
-        "Clear selection",
-        iced::widget::tooltip::Position::Top,
-        font,
-        theme,
-    );
-    let summary = if selecting {
-        let picked = if selection.is_empty() {
-            "Nothing picked yet".to_owned()
+    let font = ui.config.ui_font;
+    let mono = ui.config.mono_font;
+    let medium = crate::theme::emphasis_font(font, iced::font::Weight::Medium);
+
+    let picked = picked_prose(&selection);
+    let (lead_text, lead_icon) = if selecting {
+        let status = if selection.is_empty() {
+            Prose::from("Nothing selected yet")
         } else {
-            format!("{} picked", selection.summary())
+            picked
         };
-        row![
-            icons::icon(icons::LIST_CHECKS, ui::ICON_SIZE, theme.accent),
-            text("Selecting lines")
-                .size(text_size::UI)
-                .font(crate::theme::emphasis_font(
-                    font,
-                    iced::font::Weight::Medium
-                ))
-                .color(theme.text),
-            text(picked)
-                .size(text_size::UI)
-                .font(font)
-                .color(theme.muted_text),
-        ]
+        (
+            row![
+                text("Selecting lines")
+                    .size(text_size::UI)
+                    .font(medium)
+                    .color(theme.text),
+                status
+                    .view(font, mono, theme.muted_text, theme)
+                    .size(text_size::UI),
+            ]
+            .spacing(theme::space::MD),
+            icons::LIST_CHECKS,
+        )
     } else {
-        row![
-            icons::icon(icons::CHECK, ui::ICON_SIZE, theme.accent),
-            text(format!("{} selected", selection.summary()))
-                .size(text_size::UI)
-                .font(font)
-                .color(theme.text),
-        ]
-    }
-    .spacing(6)
+        (
+            row![
+                picked
+                    .text(" selected")
+                    .view(font, mono, theme.text, theme)
+                    .size(text_size::UI)
+            ],
+            icons::CHECK,
+        )
+    };
+    let lead = row![
+        icons::icon(lead_icon, ui::ICON_SIZE, theme.accent),
+        lead_text
+    ]
+    .spacing(theme::space::SM)
     .align_y(alignment::Vertical::Center);
-    // Two lines so the bar fits a narrow diff pane: what is picked (and the
-    // clear button), then the actions, wrapping when they have to.
-    let mut header = row![summary, Space::new().width(Length::Fill)]
-        .spacing(6)
-        .align_y(alignment::Vertical::Center);
+
+    let mut labels: Vec<(&'static str, ChangesMsg, ui::Variant)> = Vec::new();
     if !selection.is_empty() {
-        header = header.push(clear);
+        labels.extend([
+            ("Clear", ChangesMsg::Clear, ui::Variant::Ghost),
+            ("Split\u{2026}", ChangesMsg::OpenSplit, ui::Variant::Raised),
+            (
+                "Squash into parent",
+                ChangesMsg::SquashIntoParent,
+                ui::Variant::Raised,
+            ),
+            (
+                "Move into\u{2026}",
+                ChangesMsg::MoveInto,
+                ui::Variant::Raised,
+            ),
+            ("Discard\u{2026}", ChangesMsg::Discard, ui::Variant::Raised),
+        ]);
     }
     if selecting {
-        header = header.push(button(
+        labels.push((
             "Done",
             ChangesMsg::Lines(LineMsg::Exit),
-            ui::Variant::Ghost,
+            ui::Variant::Primary,
         ));
     }
-    let actions = row![
-        button("Split\u{2026}", ChangesMsg::OpenSplit, ui::Variant::Raised),
-        button(
-            "Squash into parent",
-            ChangesMsg::SquashIntoParent,
-            ui::Variant::Raised
-        ),
-        button(
-            "Move into\u{2026}",
-            ChangesMsg::MoveInto,
-            ui::Variant::Raised
-        ),
-        button("Discard\u{2026}", ChangesMsg::Discard, ui::Variant::Raised),
-    ]
-    .spacing(6)
-    .wrap()
-    .vertical_spacing(6);
-    let mut bar = column![header].spacing(4).width(Length::Fill.max(420));
-    if !selection.is_empty() {
-        bar = bar.push(actions);
+    // Whether the summary and every button share one line in this pane.
+    let buttons_width: f32 = labels
+        .iter()
+        .map(|(label, _, _)| {
+            crate::measure::line_width(label, text_size::UI, font) + 2.0 * ui::Size::Compact.pad_x()
+        })
+        .sum::<f32>()
+        + ui::BUTTON_GAP * labels.len() as f32;
+    let lead_width = ui::ICON_SIZE
+        + theme::space::SM
+        + crate::measure::line_width(
+            &format!("Selecting lines  {} selected", selection.summary()),
+            text_size::UI,
+            font,
+        );
+    let one_line = lead_width + buttons_width + 2.0 * crate::diff_view::HEADER_HORIZONTAL_PADDING
+        <= crate::diff_panel::diff_pane_width(ui);
+    let buttons = || {
+        labels.iter().map(|(label, msg, variant)| {
+            ui::text_button(None, *label, *variant, ui::Size::Compact, font, theme)
+                .on_press(Message::Changes(msg.clone()))
+                .into()
+        })
+    };
+    let mut strip = if one_line {
+        column![ui::button_row(Some(lead.into()), buttons())]
+    } else {
+        column![lead, ui::button_row(None, buttons())]
     }
+    .spacing(theme::space::SM);
     if selecting {
-        bar = bar.push(
-            text("Click or drag lines \u{b7} Shift-click a range \u{b7} j/k and Space \u{b7} Esc when done")
+        strip = strip.push(
+            text(line_select_hint(ui))
                 .size(text_size::CAPTION)
                 .font(font)
                 .color(theme.muted_text),
         );
     }
-    Some(floating(bar.into(), theme))
+    Some(
+        container(strip)
+            .width(Length::Fill)
+            .padding(Padding::from([
+                theme::space::MD,
+                crate::diff_view::HEADER_HORIZONTAL_PADDING,
+            ]))
+            .style(move |_| {
+                container::Style::default()
+                    .background(theme.file_header)
+                    .border(iced::Border {
+                        width: 1.0,
+                        color: theme.border,
+                        radius: 0.0.into(),
+                    })
+            })
+            .into(),
+    )
 }
 
-/// Bottom-centered floating card.
-fn floating<'a>(content: Element<'a, Message>, theme: ThemeSpec) -> Element<'a, Message> {
-    container(
-        container(content)
-            .padding(Padding::from([8.0, 12.0]))
-            .style(move |_| crate::theme::popover_style(theme)),
-    )
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .align_x(alignment::Horizontal::Center)
-    .align_y(alignment::Vertical::Bottom)
-    .padding(16)
-    .into()
+/// "3 lines in `src/a.rs`" with the path styled as one.
+fn picked_prose(selection: &DiffSelection) -> Prose {
+    match (selection.picked_counts(), selection.files.as_slice()) {
+        (None, [only]) => Prose::new().path(&only.path),
+        (Some(picked), [only]) => Prose::from(format!("{picked} in ")).path(&only.path),
+        _ => Prose::from(selection.summary()),
+    }
+}
+
+/// How line-select mode is driven, with the keys as they are bound.
+fn line_select_hint(ui: &Diffui) -> String {
+    use crate::commands::Context;
+    let key = |id: &'static str| {
+        ui.keymap
+            .chord_for(Context::Lines, id)
+            .map(|chord| chord.display())
+    };
+    let mut parts = vec![
+        "Click or drag lines".to_owned(),
+        "Shift-click a range".to_owned(),
+    ];
+    match (key("lines.next"), key("lines.previous")) {
+        (Some(next), Some(previous)) => parts.push(format!("{next}/{previous} to move")),
+        (Some(step), None) | (None, Some(step)) => parts.push(format!("{step} to move")),
+        (None, None) => {}
+    }
+    if let Some(toggle) = key("lines.toggle-line") {
+        parts.push(format!("{toggle} to pick"));
+    }
+    if let Some(exit) = key("lines.exit") {
+        parts.push(format!("{exit} when done"));
+    }
+    parts.join(" \u{b7} ")
 }
 
 pub(crate) const SPLIT_FIRST_EDITOR_ID: &str = "split-first-description";
@@ -1724,5 +1776,59 @@ mod tests {
         let mut reloaded = rewrite("a.rs");
         reloaded.hunks[0].lines[1].old_line = Some(5);
         assert!(state.selection(&wc, &[reloaded]).is_empty());
+    }
+
+    #[test]
+    fn the_line_select_hint_names_the_bound_keys() {
+        let mut ui = crate::tabs::tests::app();
+        assert_eq!(
+            line_select_hint(&ui),
+            "Click or drag lines \u{b7} Shift-click a range \u{b7} j/k to move \u{b7} \
+             Space to pick \u{b7} Esc when done"
+        );
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            keys: crate::keymap::RawKeys,
+        }
+        let fixture: Fixture = toml::from_str(
+            r#"
+            [keys.lines]
+            "lines.next" = "n"
+            "lines.toggle-line" = "x"
+            "lines.exit" = []
+            "#,
+        )
+        .expect("valid keys");
+        ui.keymap = crate::keymap::Keymap::build(&fixture.keys).0;
+        assert_eq!(
+            line_select_hint(&ui),
+            "Click or drag lines \u{b7} Shift-click a range \u{b7} n/k to move \u{b7} \
+             x to pick"
+        );
+    }
+
+    #[test]
+    fn the_strip_styles_a_single_file_path_as_a_path() {
+        let one = DiffSelection {
+            files: vec![FileSelection {
+                path: "src/a.rs".to_owned(),
+                hunks: HunkPick::Hunks(vec![HunkRef {
+                    index: 0,
+                    header: String::new(),
+                    lines: Some(vec![LineRef::Added(0), LineRef::Added(1)]),
+                }]),
+            }],
+        };
+        assert_eq!(
+            picked_prose(&one),
+            Prose::from("2 lines in ").path("src/a.rs")
+        );
+        let whole = DiffSelection {
+            files: vec![FileSelection {
+                path: "src/a.rs".to_owned(),
+                hunks: HunkPick::All,
+            }],
+        };
+        assert_eq!(picked_prose(&whole), Prose::new().path("src/a.rs"));
     }
 }

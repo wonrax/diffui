@@ -510,11 +510,13 @@ fn build_diff_panel_body<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Me
         // upper-right of the panel. `stack` overlays without taking
         // the diff view out of the column flow.
         let find_overlay = find::build_overlay(ui, theme);
-        let mut layers = stack![diff_view, find_overlay].clip(true);
-        if let Some(bar) = crate::changes::selection_bar(ui, theme) {
-            layers = layers.push(bar);
-        }
-        let diff_with_find: Element<'a, Message> = layers.into();
+        let layers = stack![diff_view, find_overlay].clip(true);
+        // The selection strip docks below the diff rather than floating over
+        // it, so the last lines stay readable while something is picked.
+        let diff_with_find: Element<'a, Message> = match crate::changes::selection_bar(ui, theme) {
+            Some(bar) => column![layers, bar].into(),
+            None => layers.into(),
+        };
 
         match crate::conflicts::conflict_banner(ui, theme) {
             Some(banner) => column![summary, banner, diff_with_find].spacing(0).into(),
