@@ -268,34 +268,45 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     let state_hint: Option<(&'static str, Color)> = ((armed_invalid || gap_invalid)
         && !matches!(draft.kind, DraftKind::Parallelize))
     .then_some(("Can't target the revision being moved", theme.removed_text));
-    let mut operation = row![
-        icons::icon(glyph, 15.0, theme.accent),
-        text(verb)
-            .size(theme::text_size::BODY)
-            .font(emphasis_font(
-                ui.config.ui_font,
-                iced::font::Weight::Semibold
-            ))
-            .color(theme.text),
-        text(names.clone())
-            .size(theme::text_size::BODY)
-            .font(emphasis_font(
-                ui.config.mono_font,
-                iced::font::Weight::Medium
-            ))
-            .color(theme.text),
-    ]
-    .spacing(7)
-    .align_y(alignment::Vertical::Center);
+    // The verb, the mono names and the suffix share a baseline; the glyph
+    // and the close button centre on the caps (see `crate::typography`).
+    let verb_font = emphasis_font(ui.config.ui_font, iced::font::Weight::Semibold);
+    let names_font = emphasis_font(ui.config.mono_font, iced::font::Weight::Medium);
+    let mut operation = vec![
+        Aligned::glyph(icons::icon(glyph, 15.0, theme.accent), 15.0),
+        Aligned::gap(7.0),
+        Aligned::text(
+            text(verb)
+                .size(theme::text_size::BODY)
+                .font(verb_font)
+                .color(theme.text),
+            verb_font,
+            theme::text_size::BODY,
+        ),
+        Aligned::gap(7.0),
+        Aligned::text(
+            text(names.clone())
+                .size(theme::text_size::BODY)
+                .font(names_font)
+                .color(theme.text),
+            names_font,
+            theme::text_size::BODY,
+        ),
+    ];
     if let Some(suffix) = descendants_suffix {
-        operation = operation.push(
+        operation.push(Aligned::gap(7.0));
+        operation.push(Aligned::text(
             text(suffix)
                 .size(theme::text_size::BODY)
                 .font(ui.config.ui_font)
                 .color(theme.muted_text),
-        );
+            ui.config.ui_font,
+            theme::text_size::BODY,
+        ));
     }
-    operation = operation.push(Space::new().width(Length::Fill)).push(
+    let operation = row![
+        typography::baseline_row(operation, 0.0),
+        Space::new().width(Length::Fill),
         crate::ui::icon_button(
             icons::CLOSE,
             theme.muted_text,
@@ -303,7 +314,8 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             theme,
         )
         .on_press(Message::Action(Action::DraftCancel)),
-    );
+    ]
+    .align_y(alignment::Vertical::Center);
     let mut headline = column![operation].spacing(2).width(Length::Fill);
     if let Some((hint, color)) = state_hint {
         headline = headline.push(
@@ -365,27 +377,30 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
                 theme.subtle_text,
             ),
         };
-        let mut content = row![
-            container(
+        // The label, the keycap and the description share a baseline (see
+        // `crate::typography`).
+        let label_font = emphasis_font(ui_font, iced::font::Weight::Semibold);
+        let mut content = vec![
+            Aligned::text(
                 text(label)
                     .size(theme::text_size::UI)
-                    .font(emphasis_font(ui_font, iced::font::Weight::Semibold))
-                    .color(label_color)
+                    .font(label_font)
+                    .color(label_color),
+                label_font,
+                theme::text_size::UI,
             )
-            .width(Length::Fixed(52.0)),
-        ]
-        .spacing(8)
-        .align_y(alignment::Vertical::Center);
+            .map(|label| container(label).width(Length::Fixed(52.0)).into()),
+        ];
         if let Some(key) = key {
-            content = content.push(
-                container(
-                    text(key)
-                        .size(theme::text_size::CAPTION)
-                        .font(mono_font)
-                        .color(key_color),
-                )
-                .padding([0, 5])
-                .style(move |_| container::Style {
+            content.push(Aligned::chip(
+                text(key)
+                    .size(theme::text_size::CAPTION)
+                    .font(mono_font)
+                    .color(key_color),
+                mono_font,
+                theme::text_size::CAPTION,
+                iced::Padding::from([0, 5]),
+                move |_| container::Style {
                     background: Some(Background::Color(key_bg)),
                     border: Border {
                         width: 0.0,
@@ -393,17 +408,20 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
                         radius: 4.0.into(),
                     },
                     ..container::Style::default()
-                }),
-            );
+                },
+            ));
         }
         if let Some(description) = description {
-            content = content.push(
+            content.push(Aligned::text(
                 text(description)
                     .size(theme::text_size::UI)
                     .font(ui_font)
                     .color(desc_color),
-            );
+                ui_font,
+                theme::text_size::UI,
+            ));
         }
+        let content = typography::baseline_row(content, 8.0);
         let armed = tone == RowTone::Armed;
         let styled = iced::widget::button(content)
             .width(Length::Fill)
@@ -638,16 +656,22 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             None,
         ),
     };
-    let mut verdict = row![].spacing(6).align_y(alignment::Vertical::Center);
+    let mut verdict = Vec::new();
     if let Some(status_glyph) = status_icon {
-        verdict = verdict.push(icons::icon(status_glyph, 13.0, status_color));
+        verdict.push(Aligned::glyph(
+            icons::icon(status_glyph, 13.0, status_color),
+            13.0,
+        ));
     }
-    verdict = verdict.push(
+    verdict.push(Aligned::text(
         text(status_text)
             .size(theme::text_size::UI)
             .font(ui_font)
             .color(status_color),
-    );
+        ui_font,
+        theme::text_size::UI,
+    ));
+    let verdict = typography::baseline_row(verdict, 6.0);
     let mut summary = column![verdict].spacing(2).width(Length::Fill);
     if let Some(counts) = counts {
         summary = summary.push(
@@ -667,15 +691,19 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     } else {
         theme.subtle_text
     };
+    let apply_font = emphasis_font(ui_font, iced::font::Weight::Medium);
     let apply = crate::ui::button(
-        row![
-            text("Apply")
-                .size(theme::text_size::UI)
-                .font(emphasis_font(ui_font, iced::font::Weight::Medium)),
-            icons::icon(icons::ENTER, 12.0, apply_color),
-        ]
-        .spacing(6)
-        .align_y(alignment::Vertical::Center),
+        typography::baseline_row(
+            [
+                Aligned::text(
+                    text("Apply").size(theme::text_size::UI).font(apply_font),
+                    apply_font,
+                    theme::text_size::UI,
+                ),
+                Aligned::glyph(icons::icon(icons::ENTER, 12.0, apply_color), 12.0),
+            ],
+            6.0,
+        ),
         crate::ui::Variant::Primary,
         crate::ui::Size::Compact,
         theme,

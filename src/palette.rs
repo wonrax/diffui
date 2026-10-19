@@ -882,18 +882,23 @@ fn column_footer<'a>(
     column_state: &'a PaletteColumn,
 ) -> Element<'a, Message> {
     let key_hint = |key: &'static str, label: &'static str| {
-        row![
-            text(key)
-                .size(text_size::CAPTION)
-                .font(ui.config.ui_font)
-                .color(theme.muted_text),
-            text(label)
-                .size(text_size::CAPTION)
-                .font(ui.config.ui_font)
-                .color(theme.subtle_text),
-        ]
-        .spacing(theme::space::XS)
-        .align_y(alignment::Vertical::Center)
+        // Both runs are one caption; centred on their caps beside the pills.
+        typography::centered(
+            row![
+                text(key)
+                    .size(text_size::CAPTION)
+                    .font(ui.config.ui_font)
+                    .color(theme.muted_text),
+                text(label)
+                    .size(text_size::CAPTION)
+                    .font(ui.config.ui_font)
+                    .color(theme.subtle_text),
+            ]
+            .spacing(theme::space::XS)
+            .align_y(alignment::Vertical::Center),
+            ui.config.ui_font,
+            text_size::CAPTION,
+        )
     };
     let (lead, hints, lead_inset): (Element<'_, Message>, _, f32) = match &column_state.source {
         ColumnSource::Root => {
@@ -911,9 +916,11 @@ fn column_footer<'a>(
             ] {
                 let active = active_prefix == prefix;
                 scopes = scopes.push(
-                    button(theme::centered_control_content(
+                    button(theme::centered_control_content(typography::centered(
                         text(label).size(text_size::CAPTION).font(ui.config.ui_font),
-                    ))
+                        ui.config.ui_font,
+                        text_size::CAPTION,
+                    )))
                     .height(Length::Fixed(SCOPE_HEIGHT))
                     .padding([0.0, SCOPE_PAD_X])
                     .on_press(Message::Palette(PaletteMessage::QueryChanged(
@@ -942,14 +949,17 @@ fn column_footer<'a>(
             )
         }
         ColumnSource::Actions(target) => (
-            text(target_label(target, ui))
-                .size(text_size::CAPTION)
-                .font(theme::emphasis_font(ui.config.ui_font, Weight::Medium))
-                .color(theme.subtle_text)
-                .width(Length::Fill)
-                .wrapping(Wrapping::None)
-                .ellipsis(Ellipsis::End)
-                .into(),
+            typography::centered(
+                text(target_label(target, ui))
+                    .size(text_size::CAPTION)
+                    .font(theme::emphasis_font(ui.config.ui_font, Weight::Medium))
+                    .color(theme.subtle_text)
+                    .width(Length::Fill)
+                    .wrapping(Wrapping::None)
+                    .ellipsis(Ellipsis::End),
+                theme::emphasis_font(ui.config.ui_font, Weight::Medium),
+                text_size::CAPTION,
+            ),
             row![key_hint("esc", "Back"), key_hint("\u{21b5}", "Run")],
             CONTENT_X,
         ),

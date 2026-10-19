@@ -49,13 +49,12 @@ pub(crate) fn view<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message>
         .lines()
         .find(|line| !line.trim().is_empty());
 
-    let mut title_row = row![
+    let title_font = emphasis_font(ui.config.ui_font, iced::font::Weight::Semibold);
+    // Centred on its caps against the buttons beside it.
+    let mut title_row = row![crate::typography::centered(
         text(title.unwrap_or("No description").to_owned())
             .size(TITLE_SIZE)
-            .font(emphasis_font(
-                ui.config.ui_font,
-                iced::font::Weight::Semibold
-            ))
+            .font(title_font)
             .color(if title.is_some() {
                 theme.text
             } else {
@@ -64,7 +63,9 @@ pub(crate) fn view<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message>
             .wrapping(text::Wrapping::None)
             .ellipsis(text::Ellipsis::End)
             .width(Length::Fill),
-    ]
+        title_font,
+        TITLE_SIZE,
+    )]
     .spacing(space::SM)
     .align_y(alignment::Vertical::Center);
     if let Some(stats) = stats {

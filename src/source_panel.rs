@@ -24,6 +24,7 @@ use crate::sidebar;
 use crate::theme::{
     ThemeSpec, chip_background, diff_palette, diff_panel_style, sidebar_panel_style, text_size,
 };
+use crate::typography::{self, Aligned};
 use crate::{Action, Diffui, Message, SourceState, UiEvent};
 use diffui_core::{
     DiffFileStatus, RevisionSelection, SourceEntry, SourceEntryStatus, SourceTreeRow,
@@ -581,32 +582,52 @@ fn build_info_bar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> 
     let source = &ui.active().source;
     let mono = ui.config.mono_font;
 
-    let mut bar = row![].spacing(8).align_y(alignment::Vertical::Center);
-
+    // The path (mono), the size and status captions (sans) and the status
+    // chip share a baseline; the file glyph centres on the caps (see
+    // `crate::typography`).
+    let font = ui.config.ui_font;
+    let caption = |value: String, color: Color| {
+        Aligned::text(
+            text(value).size(text_size::UI).font(font).color(color),
+            font,
+            text_size::UI,
+        )
+    };
+    let mut left: Vec<Aligned<'a, Message>> = Vec::new();
     if let Some(path) = &source.selected {
         let (dir, name) = match path.rfind('/') {
             Some(slash) => path.split_at(slash + 1),
             None => ("", path.as_str()),
         };
-        bar = bar.push(icons::icon(icons::FILE, BAR_TEXT_SIZE, theme.subtle_text));
-        bar = bar.push(
-            row![
-                text(dir.to_owned())
-                    .size(BAR_TEXT_SIZE)
-                    .font(mono)
-                    .color(theme.subtle_text),
-                text(name.to_owned())
-                    .size(BAR_TEXT_SIZE)
-                    .font(mono)
-                    .color(theme.text),
-            ]
-            .spacing(0),
-        );
+        left.push(Aligned::glyph(
+            icons::icon(icons::FILE, BAR_TEXT_SIZE, theme.subtle_text),
+            BAR_TEXT_SIZE,
+        ));
+        left.push(typography::group(
+            [
+                Aligned::text(
+                    text(dir.to_owned())
+                        .size(BAR_TEXT_SIZE)
+                        .font(mono)
+                        .color(theme.subtle_text),
+                    mono,
+                    BAR_TEXT_SIZE,
+                ),
+                Aligned::text(
+                    text(name.to_owned())
+                        .size(BAR_TEXT_SIZE)
+                        .font(mono)
+                        .color(theme.text),
+                    mono,
+                    BAR_TEXT_SIZE,
+                ),
+            ],
+            0.0,
+        ));
     }
 
-    bar = bar.push(Space::new().width(Length::Fill));
-
     // Right side: the selected entry's status (when notable) + size counts.
+    let mut right: Vec<Aligned<'a, Message>> = Vec::new();
     let status = source.selected.as_deref().and_then(|path| {
         let (entries, _) = ui
             .active()
@@ -620,24 +641,22 @@ fn build_info_bar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> 
     });
     match status {
         Some(SourceEntryStatus::Ignored) => {
-            bar = bar.push(status_chip_text("ignored", theme.subtle_text, ui));
+            right.push(status_chip_text("ignored", theme.subtle_text, ui));
         }
         Some(SourceEntryStatus::Untracked) => {
-            bar = bar.push(status_chip_text("untracked", theme.added_text, ui));
+            right.push(status_chip_text("untracked", theme.added_text, ui));
         }
         _ => {}
     }
     if let Some((status, failed)) = crate::history_panel::annotation_status(ui) {
-        bar = bar.push(
-            text(status)
-                .size(text_size::UI)
-                .font(ui.config.ui_font)
-                .color(if failed {
-                    theme.removed_text
-                } else {
-                    theme.subtle_text
-                }),
-        );
+        right.push(caption(
+            status,
+            if failed {
+                theme.removed_text
+            } else {
+                theme.subtle_text
+            },
+        ));
     }
     if let Some(view) = &source.file {
         let detail = if view.binary || view.too_large {
@@ -649,20 +668,17 @@ fn build_info_bar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> 
                 format_bytes(view.byte_len)
             )
         };
-        bar = bar.push(
-            text(detail)
-                .size(text_size::UI)
-                .font(ui.config.ui_font)
-                .color(theme.subtle_text),
-        );
+        right.push(caption(detail, theme.subtle_text));
     } else if source.loading.is_some() {
-        bar = bar.push(
-            text("Loading…")
-                .size(text_size::UI)
-                .font(ui.config.ui_font)
-                .color(theme.subtle_text),
-        );
+        right.push(caption("Loading…".to_owned(), theme.subtle_text));
     }
+    let mut bar = row![
+        typography::baseline_row(left, 8.0),
+        Space::new().width(Length::Fill),
+        typography::baseline_row(right, 8.0),
+    ]
+    .spacing(8)
+    .align_y(alignment::Vertical::Center);
     if crate::history_panel::can_annotate(ui) {
         bar = bar.push(crate::history_panel::source_bar_actions(ui, theme));
     }
@@ -679,24 +695,23 @@ fn build_info_bar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> 
         .into()
 }
 
-fn status_chip_text<'a>(label: &'a str, color: Color, ui: &Diffui) -> Element<'a, Message> {
-    container(
-        text(label)
-            .size(text_size::CAPTION)
-            .font(ui.config.mono_font)
-            .color(color),
-    )
-    .padding(Padding::from([1, 6]))
-    .style(move |_| container::Style {
-        background: Some(Background::Color(chip_background(color))),
-        border: iced::Border {
-            width: 0.0,
-            color: Color::TRANSPARENT,
-            radius: crate::chip::RADIUS.into(),
+fn status_chip_text<'a>(label: &'a str, color: Color, ui: &Diffui) -> Aligned<'a, Message> {
+    let mono = ui.config.mono_font;
+    Aligned::chip(
+        text(label).size(text_size::CAPTION).font(mono).color(color),
+        mono,
+        text_size::CAPTION,
+        Padding::from([1, 6]),
+        move |_| container::Style {
+            background: Some(Background::Color(chip_background(color))),
+            border: iced::Border {
+                width: 0.0,
+                color: Color::TRANSPARENT,
+                radius: crate::chip::RADIUS.into(),
+            },
+            ..container::Style::default()
         },
-        ..container::Style::default()
-    })
-    .into()
+    )
 }
 
 fn format_bytes(bytes: usize) -> String {

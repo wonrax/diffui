@@ -387,44 +387,44 @@ pub fn activity_indicator(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message>
     let running = activities.running_count();
     let queued = activities.queued_count();
 
+    // Spinner, label and count badges on one baseline (see
+    // `crate::typography`).
+    let font = ui.config.ui_font;
+    let badge = |label: String, color: Color| {
+        Aligned::chip(
+            text(label).size(text_size::BADGE).font(mono).color(color),
+            mono,
+            text_size::BADGE,
+            Padding::from([1, 5]),
+            move |_| chip::container_style(color),
+        )
+    };
     let body: Element<'_, Message> = if let Some(active) = activities.first_running_visible() {
-        let mut chips = row![
-            text(spinner_glyph(active.started))
-                .size(text_size::UI)
-                .font(mono)
-                .color(theme.accent),
-            active
-                .label
-                .view(ui.config.ui_font, mono, theme.text, theme)
-                .size(text_size::UI),
-        ]
-        .spacing(6)
-        .align_y(alignment::Vertical::Center);
+        let mut chips = vec![
+            Aligned::text(
+                text(spinner_glyph(active.started))
+                    .size(text_size::UI)
+                    .font(mono)
+                    .color(theme.accent),
+                mono,
+                text_size::UI,
+            ),
+            Aligned::text(
+                active
+                    .label
+                    .view(font, mono, theme.text, theme)
+                    .size(text_size::UI),
+                font,
+                text_size::UI,
+            ),
+        ];
         if running > 1 {
-            chips = chips.push(
-                container(
-                    text(format!("+{}", running - 1))
-                        .size(text_size::BADGE)
-                        .font(mono)
-                        .color(theme.muted_text),
-                )
-                .padding(Padding::from([1, 5]))
-                .style(move |_| chip::container_style(theme.muted_text)),
-            );
+            chips.push(badge(format!("+{}", running - 1), theme.muted_text));
         }
         if queued > 0 {
-            chips = chips.push(
-                container(
-                    text(format!("{queued} queued"))
-                        .size(text_size::BADGE)
-                        .font(mono)
-                        .color(theme.subtle_text),
-                )
-                .padding(Padding::from([1, 5]))
-                .style(move |_| chip::container_style(theme.subtle_text)),
-            );
+            chips.push(badge(format!("{queued} queued"), theme.subtle_text));
         }
-        chips.into()
+        crate::typography::baseline_row(chips, 6.0)
     } else {
         // Idle: a muted glyph that still opens the popover so finished entries
         // remain reachable.
@@ -433,16 +433,23 @@ pub fn activity_indicator(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message>
         } else {
             icons::CHECK // idle — everything finished
         };
-        row![
-            icons::icon(glyph, crate::ui::ICON_SIZE, theme.subtle_text),
-            text("Activity")
-                .size(text_size::UI)
-                .font(ui.config.ui_font)
-                .color(theme.subtle_text),
-        ]
-        .spacing(6)
-        .align_y(alignment::Vertical::Center)
-        .into()
+        crate::typography::baseline_row(
+            [
+                Aligned::glyph(
+                    icons::icon(glyph, crate::ui::ICON_SIZE, theme.subtle_text),
+                    crate::ui::ICON_SIZE,
+                ),
+                Aligned::text(
+                    text("Activity")
+                        .size(text_size::UI)
+                        .font(font)
+                        .color(theme.subtle_text),
+                    font,
+                    text_size::UI,
+                ),
+            ],
+            6.0,
+        )
     };
 
     crate::ui::button(
@@ -533,10 +540,14 @@ pub fn activity_popover(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     .on_press(Message::Action(Action::ToggleActivityPopover));
 
     let header = row![
-        text("Activity")
-            .size(text_size::BODY_LG)
-            .font(emphasis_font(ui.config.ui_font, Weight::Semibold))
-            .color(theme.text),
+        crate::typography::centered(
+            text("Activity")
+                .size(text_size::BODY_LG)
+                .font(emphasis_font(ui.config.ui_font, Weight::Semibold))
+                .color(theme.text),
+            emphasis_font(ui.config.ui_font, Weight::Semibold),
+            text_size::BODY_LG,
+        ),
         Space::new().width(Length::Fill),
         clear_button(ui, theme),
     ]
@@ -733,42 +744,44 @@ fn activity_row<'a>(
     let (loaded, total, determinate) = activity.progress_snapshot();
     let expandable = !activity.detail.is_empty();
 
-    let mut head = row![
-        status_icon(activity, theme, mono),
-        activity
-            .label
-            .view(
-                emphasis_font(ui.config.ui_font, Weight::Medium),
-                mono,
-                theme.text,
-                theme,
-            )
-            .size(text_size::UI)
-            .wrapping(text::Wrapping::None)
-            .ellipsis(text::Ellipsis::End)
-            .width(Length::Fill),
-    ]
-    .spacing(8)
-    .align_y(alignment::Vertical::Center);
+    // The title, the mono counters, the Revert pill and the timing share a
+    // baseline; the status glyph and chevron centre on the caps (see
+    // `crate::typography`).
+    let title_font = emphasis_font(ui.config.ui_font, Weight::Medium);
+    let mut head: Vec<Aligned<'a, Message>> = vec![
+        Aligned::glyph(status_icon(activity, theme, mono), STATUS_ICON_BOX),
+        Aligned::gap(8.0),
+        Aligned::text(
+            activity
+                .label
+                .view(title_font, mono, theme.text, theme)
+                .size(text_size::UI)
+                .wrapping(text::Wrapping::None)
+                .ellipsis(text::Ellipsis::End)
+                .width(Length::Fill),
+            title_font,
+            text_size::UI,
+        ),
+    ];
+    let caption = |value: String, font: iced::Font, color: Color| {
+        [
+            Aligned::gap(8.0),
+            Aligned::text(
+                text(value).size(text_size::CAPTION).font(font).color(color),
+                font,
+                text_size::CAPTION,
+            ),
+        ]
+    };
 
     if matches!(activity.status, ActivityStatus::Running) {
         if determinate {
             let pct = (loaded * 100 / total.max(1)).min(100);
-            head = head.push(
-                text(format!("{pct}%"))
-                    .size(text_size::CAPTION)
-                    .font(mono)
-                    .color(theme.muted_text),
-            );
+            head.extend(caption(format!("{pct}%"), mono, theme.muted_text));
         } else if loaded > 0 {
             // Indeterminate but counting (the jj lazy walk has no known total):
             // surface the running count.
-            head = head.push(
-                text(loaded.to_string())
-                    .size(text_size::CAPTION)
-                    .font(mono)
-                    .color(theme.muted_text),
-            );
+            head.extend(caption(loaded.to_string(), mono, theme.muted_text));
         }
     } else if let Some(duration) = activity.duration {
         // A finished mutation offers a one-click revert of exactly its op
@@ -777,27 +790,32 @@ fn activity_row<'a>(
         if matches!(activity.status, ActivityStatus::Done)
             && let Some(operation_id) = activity.undo_op.clone()
         {
-            head = head.push(
+            let font = ui.config.ui_font;
+            let padding =
+                crate::typography::trimmed_padding(Padding::from([1, 7]), font, text_size::CAPTION);
+            head.push(Aligned::gap(8.0));
+            head.push(Aligned::boxed(
                 button(
                     text("Revert")
                         .size(text_size::CAPTION)
-                        .font(ui.config.ui_font)
+                        .font(font)
                         .color(theme.accent),
                 )
-                .padding(Padding::from([1, 7]))
+                .padding(padding)
                 .on_press(Message::Action(Action::UndoOperation(
                     activity.id,
                     operation_id,
                 )))
                 .style(move |_, status| ghost_button_style(theme, status)),
-            );
+                padding,
+                crate::typography::TextBox::default_line(font, text_size::CAPTION),
+            ));
         }
-        head = head.push(
-            text(format_duration(duration))
-                .size(text_size::CAPTION)
-                .font(ui.config.ui_font)
-                .color(theme.subtle_text),
-        );
+        head.extend(caption(
+            format_duration(duration),
+            ui.config.ui_font,
+            theme.subtle_text,
+        ));
     }
     if expandable {
         let chevron = if activity.expanded {
@@ -805,8 +823,13 @@ fn activity_row<'a>(
         } else {
             icons::CHEVRON_DOWN
         };
-        head = head.push(icons::icon(chevron, 13.0, theme.subtle_text));
+        head.push(Aligned::gap(8.0));
+        head.push(Aligned::glyph(
+            icons::icon(chevron, 13.0, theme.subtle_text),
+            13.0,
+        ));
     }
+    let head = crate::typography::baseline_row(head, 0.0);
 
     // Header (title line + result subtitle + the determinate bar). This is the
     // click target that toggles the detail; the detail itself sits *outside*

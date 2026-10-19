@@ -283,6 +283,24 @@ impl<'a, Message: 'a> Aligned<'a, Message> {
         }
     }
 
+    /// A chip, badge or keycap: one line of text in a styled box, its
+    /// padding trimmed so the text is optically centred in the box
+    /// ([`trimmed_padding`]) and the box placed by that text's baseline.
+    pub fn chip(
+        content: impl Into<Element<'a, Message>>,
+        font: Font,
+        size: f32,
+        padding: Padding,
+        style: impl Fn(&iced::Theme) -> container::Style + 'a,
+    ) -> Self {
+        let padding = trimmed_padding(padding, font, size);
+        Self::boxed(
+            container(content).padding(padding).style(style),
+            padding,
+            TextBox::default_line(font, size),
+        )
+    }
+
     /// The same child wrapped in something that doesn't move it vertically
     /// (a tooltip, a width limit).
     pub fn map(self, wrap: impl FnOnce(Element<'a, Message>) -> Element<'a, Message>) -> Self {
@@ -427,6 +445,11 @@ mod tests {
             assert!(metrics.cap_height > 0.4, "{font:?}: {metrics:?}");
             assert!(metrics.descent > 0.0, "{font:?}: {metrics:?}");
         }
+        // Whatever face a named family resolves to here (or the fallback),
+        // its metrics are usable.
+        let named = FontMetrics::of(Font::new("Cascadia Code"));
+        println!("Cascadia Code: {named:?}");
+        assert!(named.ascent > 0.0 && named.cap_height > 0.0);
     }
 
     #[test]

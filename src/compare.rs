@@ -16,6 +16,7 @@ use iced::{Background, Border, Color, Element, Length, Task, alignment};
 use crate::action::Action;
 use crate::message::Message;
 use crate::theme::{ThemeSpec, text_size};
+use crate::typography::Aligned;
 use crate::{Diffui, icons, ui};
 
 #[derive(Debug, Clone)]
@@ -155,29 +156,41 @@ pub(crate) fn build_compare_banner<'a>(
     let (from_id, from_title) = revision_label(ui, from);
     let (to_id, to_title) = revision_label(ui, to);
     let id = |id: String| {
-        text(id)
-            .size(text_size::UI)
-            .font(mono)
-            .color(theme.accent)
-            .wrapping(text::Wrapping::None)
+        Aligned::text(
+            text(id)
+                .size(text_size::UI)
+                .font(mono)
+                .color(theme.accent)
+                .wrapping(text::Wrapping::None),
+            mono,
+            text_size::UI,
+        )
+    };
+    let glyph = |glyph: &'static str, color| {
+        Aligned::glyph(icons::icon(glyph, ui::ICON_SIZE, color), ui::ICON_SIZE)
     };
     let label = if interdiff { "Interdiff" } else { "Comparing" };
-    let headline = row![
-        icons::icon(icons::GIT_COMPARE, ui::ICON_SIZE, theme.accent),
-        text(label)
-            .size(text_size::UI)
-            .font(crate::theme::emphasis_font(
-                font,
-                iced::font::Weight::Medium
-            ))
-            .color(theme.text)
-            .wrapping(text::Wrapping::None),
-        id(from_id),
-        icons::icon(icons::ARROW_RIGHT, ui::ICON_SIZE, theme.muted_text),
-        id(to_id),
-    ]
-    .spacing(8)
-    .align_y(alignment::Vertical::Center);
+    let medium = crate::theme::emphasis_font(font, iced::font::Weight::Medium);
+    // The label and the mono ids share a baseline, the icons centre on the
+    // caps (see `crate::typography`).
+    let headline = crate::typography::baseline_row(
+        [
+            glyph(icons::GIT_COMPARE, theme.accent),
+            Aligned::text(
+                text(label)
+                    .size(text_size::UI)
+                    .font(medium)
+                    .color(theme.text)
+                    .wrapping(text::Wrapping::None),
+                medium,
+                text_size::UI,
+            ),
+            id(from_id),
+            glyph(icons::ARROW_RIGHT, theme.muted_text),
+            id(to_id),
+        ],
+        8.0,
+    );
     // The titles ride on a quieter second line so the ids and controls never
     // get clipped by a narrow pane; a revision compared with itself turns the
     // line into the hint for picking the other side.

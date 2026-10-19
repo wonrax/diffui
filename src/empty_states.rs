@@ -6,13 +6,14 @@
 use iced::{
     Background, Border, Color, Element, Length, Padding, alignment,
     font::Weight,
-    widget::{Space, column, container, row, text},
+    widget::{Space, column, container, text},
 };
 
 use diffui_core::RevisionSelection;
 
 use crate::prose::Prose;
 use crate::theme::{self, ThemeSpec, chip_background, emphasis_font, text_size};
+use crate::typography::{self, Aligned};
 use crate::{Action, Diffui, LoadStatus, Message, icons, ui};
 
 /// The prefixes jj-lib's revset errors arrive with once the actor has
@@ -127,15 +128,23 @@ pub(crate) fn load_error<'a>(
         ("Couldn't load the history", error)
     };
     let mut body = column![
-        row![
-            icons::icon(icons::ALERT_TRIANGLE, ui::ICON_SIZE, theme.removed_text),
-            text(title)
-                .size(text_size::UI)
-                .color(theme.removed_text)
-                .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
-        ]
-        .spacing(theme::space::SM)
-        .align_y(alignment::Vertical::Center),
+        typography::baseline_row(
+            [
+                Aligned::glyph(
+                    icons::icon(icons::ALERT_TRIANGLE, ui::ICON_SIZE, theme.removed_text),
+                    ui::ICON_SIZE,
+                ),
+                Aligned::text(
+                    text(title)
+                        .size(text_size::UI)
+                        .color(theme.removed_text)
+                        .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
+                    emphasis_font(ui.config.ui_font, Weight::Medium),
+                    text_size::UI,
+                ),
+            ],
+            theme::space::SM,
+        ),
         text(detail)
             .size(text_size::CAPTION)
             .color(theme.text)
@@ -196,25 +205,31 @@ pub(crate) fn outside_view_banner<'a>(
         selection => ui.revision_prose(selection),
     };
     Some(
-        container(
-            row![
-                icons::icon(icons::ALERT_TRIANGLE, ui::ICON_SIZE, theme.info),
-                label
-                    .text(" isn't in the current revset.")
-                    .view(
-                        ui.config.ui_font,
-                        ui.config.mono_font,
-                        theme.muted_text,
-                        theme,
-                    )
-                    .size(text_size::UI)
-                    .width(Length::Fill)
-                    .wrapping(text::Wrapping::None)
-                    .ellipsis(text::Ellipsis::End),
-            ]
-            .spacing(theme::space::MD)
-            .align_y(alignment::Vertical::Center),
-        )
+        container(typography::baseline_row(
+            [
+                Aligned::glyph(
+                    icons::icon(icons::ALERT_TRIANGLE, ui::ICON_SIZE, theme.info),
+                    ui::ICON_SIZE,
+                ),
+                Aligned::text(
+                    label
+                        .text(" isn't in the current revset.")
+                        .view(
+                            ui.config.ui_font,
+                            ui.config.mono_font,
+                            theme.muted_text,
+                            theme,
+                        )
+                        .size(text_size::UI)
+                        .width(Length::Fill)
+                        .wrapping(text::Wrapping::None)
+                        .ellipsis(text::Ellipsis::End),
+                    ui.config.ui_font,
+                    text_size::UI,
+                ),
+            ],
+            theme::space::MD,
+        ))
         .width(Length::Fill)
         .padding([theme::space::SM, theme::space::LG])
         .style(move |_| container::Style::default().background(chip_background(theme.info)))

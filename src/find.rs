@@ -285,12 +285,17 @@ pub fn build_overlay<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Messag
     let bar = row![
         input,
         row![case_button, regex_button].spacing(theme::space::XXS),
-        text(count_label)
-            .size(text_size::CAPTION)
-            .color(theme.subtle_text)
-            .font(ui.config.ui_font)
-            .width(Length::Fixed(COUNT_WIDTH))
-            .align_x(alignment::Horizontal::Center),
+        // Centred on its caps among the toggles and buttons.
+        crate::typography::centered(
+            text(count_label)
+                .size(text_size::CAPTION)
+                .color(theme.subtle_text)
+                .font(ui.config.ui_font)
+                .width(Length::Fixed(COUNT_WIDTH))
+                .align_x(alignment::Horizontal::Center),
+            ui.config.ui_font,
+            text_size::CAPTION,
+        ),
         row![prev_button, next_button, close_button].spacing(theme::space::XXS),
     ]
     .spacing(theme::space::SM)

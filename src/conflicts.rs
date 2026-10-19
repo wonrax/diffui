@@ -19,6 +19,7 @@ use crate::changes::{ChangesMsg, editable};
 use crate::commands::CommandArg;
 use crate::prose::Prose;
 use crate::theme::{ThemeSpec, text_size};
+use crate::typography::{self, Aligned};
 use crate::{Action, Diffui, Message, PendingMutation, TabId, TabState, activity, icons, ui};
 
 #[derive(Debug, Clone)]
@@ -455,19 +456,27 @@ pub(crate) fn conflict_banner<'a>(
         }),
     ));
 
-    let headline = row![
-        icons::icon(icons::ALERT_TRIANGLE, ui::ICON_SIZE, theme.conflict_marker),
-        Prose::new()
-            .path(path)
-            .text(format!(
-                " is conflicted ({} sides). Take:",
-                conflict.sides.len()
-            ))
-            .view(font, ui.config.mono_font, theme.text, theme)
-            .size(text_size::UI),
-    ]
-    .spacing(6)
-    .align_y(alignment::Vertical::Center);
+    let headline = typography::baseline_row(
+        [
+            Aligned::glyph(
+                icons::icon(icons::ALERT_TRIANGLE, ui::ICON_SIZE, theme.conflict_marker),
+                ui::ICON_SIZE,
+            ),
+            Aligned::text(
+                Prose::new()
+                    .path(path)
+                    .text(format!(
+                        " is conflicted ({} sides). Take:",
+                        conflict.sides.len()
+                    ))
+                    .view(font, ui.config.mono_font, theme.text, theme)
+                    .size(text_size::UI),
+                font,
+                text_size::UI,
+            ),
+        ],
+        6.0,
+    );
     let caption = |content: &'static str| {
         text(content)
             .size(text_size::CAPTION)
@@ -480,8 +489,14 @@ pub(crate) fn conflict_banner<'a>(
     ) {
         caption("Or edit out the conflict markers; the file is resolved once they're gone.").into()
     } else {
+        // A wrapping row centres boxes; the caption centres its caps, like
+        // the button's label beside it (see `crate::typography`).
         row![
-            caption("Or fix the markers in a new change on top, then squash it back.",),
+            typography::centered(
+                caption("Or fix the markers in a new change on top, then squash it back."),
+                font,
+                text_size::CAPTION,
+            ),
             ui::text_button(
                 None,
                 "New change on top",

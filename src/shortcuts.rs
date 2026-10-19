@@ -15,6 +15,7 @@ use iced::{
 use crate::commands::{self, CommandId, Context, REGISTRY};
 use crate::modes::{Mode, ModeKind};
 use crate::theme::{self, ThemeSpec, emphasis_font, text_size};
+use crate::typography::{self, Aligned};
 use crate::{Action, Diffui, Message, UiEvent};
 
 const CARD_WIDTH: f32 = 760.0;
@@ -222,18 +223,29 @@ pub(crate) fn build_overlay(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
         .collect();
     left = left.push(section(ui, theme, "Mouse", gestures));
 
-    let header = row![
-        text("Keyboard shortcuts")
-            .size(text_size::TITLE)
-            .color(theme.text)
-            .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
-        Space::new().width(Length::Fill),
-        text("Rebind in config.toml [keys]   \u{b7}   esc to close")
-            .size(text_size::CAPTION)
-            .color(theme.subtle_text)
-            .font(ui.config.ui_font),
-    ]
-    .align_y(alignment::Vertical::Center)
+    let title_font = emphasis_font(ui.config.ui_font, Weight::Medium);
+    let header = row![typography::baseline_row(
+        [
+            Aligned::text(
+                text("Keyboard shortcuts")
+                    .size(text_size::TITLE)
+                    .color(theme.text)
+                    .font(title_font)
+                    .width(Length::Fill),
+                title_font,
+                text_size::TITLE,
+            ),
+            Aligned::text(
+                text("Rebind in config.toml [keys]   \u{b7}   esc to close")
+                    .size(text_size::CAPTION)
+                    .color(theme.subtle_text)
+                    .font(ui.config.ui_font),
+                ui.config.ui_font,
+                text_size::CAPTION,
+            ),
+        ],
+        0.0,
+    )]
     .padding(Padding {
         right: crate::ui::DIALOG_PADDING,
         ..Padding::ZERO
@@ -307,48 +319,54 @@ fn binding_row<'a>(
     label: String,
     keys: Vec<String>,
 ) -> Element<'a, Message> {
-    let mut caps = row![].spacing(theme::space::XS).align_y(Alignment::Center);
-    for key in keys {
-        caps = caps.push(keycap(ui, theme, key));
+    // The label and the mono keycaps share a baseline (see
+    // `crate::typography`).
+    let mut line = vec![Aligned::text(
+        text(label)
+            .size(text_size::UI)
+            .color(theme.text)
+            .font(ui.config.ui_font)
+            .width(Length::Fill)
+            .wrapping(text::Wrapping::None)
+            .ellipsis(text::Ellipsis::End),
+        ui.config.ui_font,
+        text_size::UI,
+    )];
+    for (index, key) in keys.into_iter().enumerate() {
+        line.push(Aligned::gap(if index == 0 {
+            theme::space::MD
+        } else {
+            theme::space::XS
+        }));
+        line.push(keycap(ui, theme, key));
     }
-    container(
-        row![
-            text(label)
-                .size(text_size::UI)
-                .color(theme.text)
-                .font(ui.config.ui_font)
-                .width(Length::Fill)
-                .wrapping(text::Wrapping::None)
-                .ellipsis(text::Ellipsis::End),
-            caps,
-        ]
-        .spacing(theme::space::MD)
-        .align_y(Alignment::Center),
-    )
-    .height(Length::Fixed(ROW_HEIGHT))
-    .center_y(Length::Fixed(ROW_HEIGHT))
-    .into()
+    container(typography::baseline_row(line, 0.0))
+        .height(Length::Fixed(ROW_HEIGHT))
+        .center_y(Length::Fixed(ROW_HEIGHT))
+        .into()
 }
 
 /// A key rendered like the tab strip's `⌘K` control: hairline border, mono.
-fn keycap<'a>(ui: &'a Diffui, theme: ThemeSpec, key: String) -> Element<'a, Message> {
-    container(
+fn keycap<'a>(ui: &'a Diffui, theme: ThemeSpec, key: String) -> Aligned<'a, Message> {
+    let mono = ui.config.mono_font;
+    Aligned::chip(
         text(key)
             .size(text_size::CAPTION)
             .color(theme.muted_text)
-            .font(ui.config.mono_font),
-    )
-    .padding(Padding::from([1, 5]))
-    .style(move |_| container::Style {
-        background: Some(Background::Color(theme::chip_background(theme.muted_text))),
-        border: Border {
-            width: 1.0,
-            color: theme.border,
-            radius: 4.0.into(),
+            .font(mono),
+        mono,
+        text_size::CAPTION,
+        Padding::from([1, 5]),
+        move |_| container::Style {
+            background: Some(Background::Color(theme::chip_background(theme.muted_text))),
+            border: Border {
+                width: 1.0,
+                color: theme.border,
+                radius: 4.0.into(),
+            },
+            ..container::Style::default()
         },
-        ..container::Style::default()
-    })
-    .into()
+    )
 }
 
 /// The welcome screen's tips: the few keys and gestures that make the rest
@@ -361,17 +379,19 @@ pub(crate) fn welcome_hints(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
             .map(|chord| chord.display())
     };
     let tip = |key: Option<String>, what: &'static str| -> Element<'_, Message> {
-        let mut line = row![].spacing(theme::space::SM).align_y(Alignment::Center);
+        let mut line = Vec::new();
         if let Some(key) = key {
-            line = line.push(keycap(ui, theme, key));
+            line.push(keycap(ui, theme, key));
         }
-        line.push(
+        line.push(Aligned::text(
             text(what)
                 .size(text_size::UI)
                 .color(theme.subtle_text)
                 .font(ui.config.ui_font),
-        )
-        .into()
+            ui.config.ui_font,
+            text_size::UI,
+        ));
+        typography::baseline_row(line, theme::space::SM)
     };
     // The prompt above owns the keyboard here, and the palette needs a
     // repository, so these read as "once one is open".

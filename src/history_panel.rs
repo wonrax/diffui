@@ -1024,27 +1024,40 @@ pub(crate) fn file_filter_banner<'a>(
         return None;
     }
     let filter = ui.active().history.file_filter.as_ref()?;
-    let content = row![
-        icons::icon(icons::FILE_CLOCK, ui::ICON_SIZE, theme.accent),
-        Prose::from("History of ")
-            .path(&filter.path)
-            .view(ui.config.ui_font, ui.config.mono_font, theme.text, theme)
-            .size(text_size::UI)
-            .wrapping(text::Wrapping::None)
-            .ellipsis(text::Ellipsis::End)
-            .width(Length::Fill),
-        ui::tooltip(
-            ui::close_button(theme.muted_text, theme).on_press(Message::Action(Action::History(
-                HistoryAction::ClearFileFilter
-            ))),
-            "Show the whole graph again",
-            iced::widget::tooltip::Position::Bottom,
-            ui.config.ui_font,
-            theme,
-        ),
-    ]
-    .spacing(space::SM)
-    .align_y(alignment::Vertical::Center);
+    // The icon and the close button centre on the text's caps (see
+    // `crate::typography`).
+    let content = typography::baseline_row(
+        [
+            Aligned::glyph(
+                icons::icon(icons::FILE_CLOCK, ui::ICON_SIZE, theme.accent),
+                ui::ICON_SIZE,
+            ),
+            Aligned::text(
+                Prose::from("History of ")
+                    .path(&filter.path)
+                    .view(ui.config.ui_font, ui.config.mono_font, theme.text, theme)
+                    .size(text_size::UI)
+                    .wrapping(text::Wrapping::None)
+                    .ellipsis(text::Ellipsis::End)
+                    .width(Length::Fill),
+                ui.config.ui_font,
+                text_size::UI,
+            ),
+            Aligned::glyph(
+                ui::tooltip(
+                    ui::close_button(theme.muted_text, theme).on_press(Message::Action(
+                        Action::History(HistoryAction::ClearFileFilter),
+                    )),
+                    "Show the whole graph again",
+                    iced::widget::tooltip::Position::Bottom,
+                    ui.config.ui_font,
+                    theme,
+                ),
+                ui::CLOSE_SIDE,
+            ),
+        ],
+        space::SM,
+    );
     Some(
         container(
             container(content)
@@ -1538,11 +1551,15 @@ pub(crate) fn build_history_sidebar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Ele
         HistoryKind::OpLog => {
             let header = row![
                 icons::icon(icons::HISTORY, ui::ICON_SIZE, theme.subtle_text),
-                text("Operations")
-                    .size(text_size::UI)
-                    .font(title_font)
-                    .color(theme.text)
-                    .width(Length::Fill),
+                container(typography::centered(
+                    text("Operations")
+                        .size(text_size::UI)
+                        .font(title_font)
+                        .color(theme.text),
+                    title_font,
+                    text_size::UI,
+                ))
+                .width(Length::Fill),
                 reload,
             ]
             .spacing(space::SM)
@@ -1607,11 +1624,21 @@ pub(crate) fn build_history_sidebar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Ele
                     ui.config.ui_font,
                     theme,
                 ),
-                text("Evolution of ")
-                    .size(text_size::UI)
-                    .font(title_font)
-                    .color(theme.text),
-                mono(label.as_str(), theme.accent, ui).width(Length::Fill),
+                container(typography::baseline_row(
+                    [
+                        Aligned::text(
+                            text("Evolution of ")
+                                .size(text_size::UI)
+                                .font(title_font)
+                                .color(theme.text),
+                            title_font,
+                            text_size::UI,
+                        ),
+                        mono_on_line(label.as_str(), theme.accent, ui),
+                    ],
+                    0.0,
+                ))
+                .width(Length::Fill),
                 reload,
             ]
             .spacing(space::XS)
@@ -1759,34 +1786,40 @@ fn ref_side_label(side: &[CommitBrief]) -> String {
 /// glyph column, the ref, where it moved from and to, and the kind where a
 /// commit row has its verb.
 fn ref_row<'a>(ui: &'a Diffui, theme: ThemeSpec, change: &'a RefChange) -> Element<'a, Message> {
-    let (marker, kind): (Element<'a, Message>, &str) = match change.kind {
-        RefKind::WorkingCopy => (mono("@", theme.subtle_text, ui).into(), "working copy"),
-        RefKind::Bookmark => (
-            icons::icon(icons::GIT_BRANCH, 12.0, theme.subtle_text),
-            "bookmark",
-        ),
-        RefKind::RemoteBookmark => (
-            icons::icon(icons::GIT_BRANCH, 12.0, theme.subtle_text),
-            "remote bookmark",
-        ),
-        RefKind::Tag => (icons::icon(icons::TAG, 12.0, theme.subtle_text), "tag"),
+    let glyph =
+        |glyph: &'static str| Aligned::glyph(icons::icon(glyph, 12.0, theme.subtle_text), 12.0);
+    let (marker, kind): (Aligned<'a, Message>, &str) = match change.kind {
+        RefKind::WorkingCopy => (mono_on_line("@", theme.subtle_text, ui), "working copy"),
+        RefKind::Bookmark => (glyph(icons::GIT_BRANCH), "bookmark"),
+        RefKind::RemoteBookmark => (glyph(icons::GIT_BRANCH), "remote bookmark"),
+        RefKind::Tag => (glyph(icons::TAG), "tag"),
     };
-    let side = |commits: &'a [CommitBrief], color: Color| -> Element<'a, Message> {
+    let side = |commits: &'a [CommitBrief], color: Color| -> Aligned<'a, Message> {
         if commits.is_empty() {
-            caption("(absent)", theme.subtle_text, ui).into()
+            caption_on_line(caption("(absent)", theme.subtle_text, ui), ui)
         } else {
-            mono(ref_side_label(commits), color, ui).into()
+            mono_on_line(ref_side_label(commits), color, ui)
         }
     };
+    // Mono names and ids, sans captions and the glyphs on one line (see
+    // `crate::typography`).
     container(
         row![
-            container(marker).width(Length::Fixed(12.0)),
-            mono(change.name.as_str(), theme.text, ui),
-            side(&change.from, theme.removed_text),
-            icons::icon(icons::ARROW_RIGHT, 12.0, theme.subtle_text),
-            side(&change.to, theme.added_text),
+            typography::baseline_row(
+                [
+                    marker.map(|marker| container(marker).width(Length::Fixed(12.0)).into()),
+                    mono_on_line(change.name.as_str(), theme.text, ui),
+                    side(&change.from, theme.removed_text),
+                    glyph(icons::ARROW_RIGHT),
+                    side(&change.to, theme.added_text),
+                ],
+                space::SM,
+            ),
             Space::new().width(Length::Fill),
-            caption(kind, theme.subtle_text, ui),
+            typography::baseline_row(
+                [caption_on_line(caption(kind, theme.subtle_text, ui), ui)],
+                0.0,
+            ),
             Space::new().width(Length::Fixed(ui::Size::Compact.height())),
         ]
         .spacing(space::SM)
@@ -1885,13 +1918,18 @@ fn operation_header<'a>(
 
     let mut block = column![
         row![
-            meta_line::description(
-                op.summary(),
-                text_size::BODY_LG,
+            // Centred on its caps against the buttons beside it.
+            typography::centered(
+                meta_line::description(
+                    op.summary(),
+                    text_size::BODY_LG,
+                    emphasis_font(ui.config.ui_font, iced::font::Weight::Medium),
+                    theme.text,
+                    ui,
+                    theme,
+                ),
                 emphasis_font(ui.config.ui_font, iced::font::Weight::Medium),
-                theme.text,
-                ui,
-                theme,
+                text_size::BODY_LG,
             ),
             ui::tooltip(
                 restore,
@@ -1914,17 +1952,20 @@ fn operation_header<'a>(
     ]
     .spacing(space::XS);
     if let Some(args) = &op.args {
-        block = block.push(
-            row![
-                icons::icon(icons::TERMINAL, 12.0, theme.subtle_text),
-                caption(args.as_str(), theme.subtle_text, ui)
-                    .font(ui.config.mono_font)
-                    .ellipsis(text::Ellipsis::End)
-                    .width(Length::Fill),
-            ]
-            .spacing(space::XS)
-            .align_y(alignment::Vertical::Center),
-        );
+        block = block.push(typography::baseline_row(
+            [
+                Aligned::glyph(icons::icon(icons::TERMINAL, 12.0, theme.subtle_text), 12.0),
+                Aligned::text(
+                    caption(args.as_str(), theme.subtle_text, ui)
+                        .font(ui.config.mono_font)
+                        .ellipsis(text::Ellipsis::End)
+                        .width(Length::Fill),
+                    ui.config.mono_font,
+                    text_size::CAPTION,
+                ),
+            ],
+            space::XS,
+        ));
     }
     container(block)
         .width(Length::Fill)
@@ -2053,22 +2094,27 @@ fn evolog_header<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Option<Element<'a, Mes
     Some(
         container(
             column![
-                row![
-                    mono(entry.commit.short_commit_id(), theme.muted_text, ui),
-                    text(if entry.commit.summary.is_empty() {
-                        "(no description set)"
-                    } else {
-                        entry.commit.summary.as_str()
-                    })
-                    .size(text_size::BODY_LG)
-                    .font(emphasis_font(ui.config.ui_font, iced::font::Weight::Medium))
-                    .color(theme.text)
-                    .wrapping(text::Wrapping::None)
-                    .ellipsis(text::Ellipsis::End)
-                    .width(Length::Fill),
-                ]
-                .spacing(space::SM)
-                .align_y(alignment::Vertical::Center),
+                typography::baseline_row(
+                    [
+                        mono_on_line(entry.commit.short_commit_id(), theme.muted_text, ui),
+                        Aligned::text(
+                            text(if entry.commit.summary.is_empty() {
+                                "(no description set)"
+                            } else {
+                                entry.commit.summary.as_str()
+                            })
+                            .size(text_size::BODY_LG)
+                            .font(emphasis_font(ui.config.ui_font, iced::font::Weight::Medium))
+                            .color(theme.text)
+                            .wrapping(text::Wrapping::None)
+                            .ellipsis(text::Ellipsis::End)
+                            .width(Length::Fill),
+                            emphasis_font(ui.config.ui_font, iced::font::Weight::Medium),
+                            text_size::BODY_LG,
+                        ),
+                    ],
+                    space::SM,
+                ),
                 meta,
                 actions,
             ]

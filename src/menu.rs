@@ -28,13 +28,14 @@ use iced::advanced::{
 use iced::{
     Background, Border, Color, Element, Event, Length, Padding, Point, Rectangle, Size, Theme,
     alignment,
-    widget::{Space, column, container, mouse_area, opaque, pin, row, stack, text},
+    widget::{Space, column, container, mouse_area, opaque, pin, stack, text},
 };
 
 use crate::commands::{CommandArg, CommandId};
 use crate::icons;
 use crate::measure;
 use crate::theme::{self, ThemeSpec, emphasis_font, popover_style, text_size};
+use crate::typography::{self, Aligned};
 use crate::{Diffui, Message};
 
 /// Messages from an open popup menu, nested under [`Message::Menu`].
@@ -816,14 +817,19 @@ fn build_row<'a>(
             .align_y(alignment::Vertical::Center)
             .into();
         }
-        MenuEntry::Disabled { label } => text(label)
-            .size(MENU_LABEL_SIZE)
-            .color(theme.subtle_text)
-            .font(font)
-            .width(Length::Fill)
-            .wrapping(iced::advanced::text::Wrapping::None)
-            .ellipsis(iced::advanced::text::Ellipsis::End)
-            .into(),
+        // Labels centre their caps in the row; a detail or chevron joins on
+        // the label's baseline (see `crate::typography`).
+        MenuEntry::Disabled { label } => typography::centered(
+            text(label)
+                .size(MENU_LABEL_SIZE)
+                .color(theme.subtle_text)
+                .font(font)
+                .width(Length::Fill)
+                .wrapping(iced::advanced::text::Wrapping::None)
+                .ellipsis(iced::advanced::text::Ellipsis::End),
+            font,
+            MENU_LABEL_SIZE,
+        ),
         MenuEntry::Item {
             label,
             detail,
@@ -841,36 +847,51 @@ fn build_row<'a>(
                 .font(label_font)
                 .wrapping(iced::advanced::text::Wrapping::None);
             match detail {
-                Some(detail) => row![
-                    label_widget,
-                    text(detail)
-                        .size(MENU_DETAIL_SIZE)
-                        .color(theme.subtle_text)
-                        .font(mono)
-                        .width(Length::Fill)
-                        .align_x(iced::advanced::text::Alignment::Right)
-                        .wrapping(iced::advanced::text::Wrapping::None)
-                        .ellipsis(iced::advanced::text::Ellipsis::End),
-                ]
-                .spacing(MENU_ROW_GAP)
-                .align_y(alignment::Vertical::Center)
-                .into(),
-                None => label_widget.width(Length::Fill).into(),
+                Some(detail) => typography::baseline_row(
+                    [
+                        Aligned::text(label_widget, label_font, MENU_LABEL_SIZE),
+                        Aligned::text(
+                            text(detail)
+                                .size(MENU_DETAIL_SIZE)
+                                .color(theme.subtle_text)
+                                .font(mono)
+                                .width(Length::Fill)
+                                .align_x(iced::advanced::text::Alignment::Right)
+                                .wrapping(iced::advanced::text::Wrapping::None)
+                                .ellipsis(iced::advanced::text::Ellipsis::End),
+                            mono,
+                            MENU_DETAIL_SIZE,
+                        ),
+                    ],
+                    MENU_ROW_GAP,
+                ),
+                None => typography::centered(
+                    label_widget.width(Length::Fill),
+                    label_font,
+                    MENU_LABEL_SIZE,
+                ),
             }
         }
-        MenuEntry::Submenu { label, .. } => row![
-            text(label)
-                .size(MENU_LABEL_SIZE)
-                .color(theme.text)
-                .font(font)
-                .width(Length::Fill)
-                .wrapping(iced::advanced::text::Wrapping::None)
-                .ellipsis(iced::advanced::text::Ellipsis::End),
-            icons::icon(icons::CHEVRON_RIGHT, CHEVRON_WIDTH, theme.muted_text),
-        ]
-        .spacing(MENU_ROW_GAP)
-        .align_y(alignment::Vertical::Center)
-        .into(),
+        MenuEntry::Submenu { label, .. } => typography::baseline_row(
+            [
+                Aligned::text(
+                    text(label)
+                        .size(MENU_LABEL_SIZE)
+                        .color(theme.text)
+                        .font(font)
+                        .width(Length::Fill)
+                        .wrapping(iced::advanced::text::Wrapping::None)
+                        .ellipsis(iced::advanced::text::Ellipsis::End),
+                    font,
+                    MENU_LABEL_SIZE,
+                ),
+                Aligned::glyph(
+                    icons::icon(icons::CHEVRON_RIGHT, CHEVRON_WIDTH, theme.muted_text),
+                    CHEVRON_WIDTH,
+                ),
+            ],
+            MENU_ROW_GAP,
+        ),
     };
 
     let bg = if active {

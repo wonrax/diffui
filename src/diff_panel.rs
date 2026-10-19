@@ -69,13 +69,17 @@ fn build_file_navigator_surface<'a>(
     }
     let header = row![
         // A section's count rides in its title, as in "Changed commits (2)".
-        text(format!("Changed files ({})", files.len()))
-            .size(text_size::UI)
-            .font(crate::theme::emphasis_font(
-                ui.config.ui_font,
-                iced::font::Weight::Medium,
-            ))
-            .color(theme.subtle_text),
+        crate::typography::centered(
+            text(format!("Changed files ({})", files.len()))
+                .size(text_size::UI)
+                .font(crate::theme::emphasis_font(
+                    ui.config.ui_font,
+                    iced::font::Weight::Medium,
+                ))
+                .color(theme.subtle_text),
+            crate::theme::emphasis_font(ui.config.ui_font, iced::font::Weight::Medium),
+            text_size::UI,
+        ),
         Space::new().width(Length::Fill),
         trailing,
     ]
@@ -630,18 +634,21 @@ fn build_description_editor<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a,
 
         // The keys live in the buttons' tooltips; the strip only speaks up
         // when the editor is holding a revision switch back.
+        // Centred on its caps beside the buttons' labels.
+        let hint_text = |value: &'static str, color| {
+            crate::typography::centered(
+                text(value)
+                    .size(text_size::UI)
+                    .font(ui.config.ui_font)
+                    .color(color),
+                ui.config.ui_font,
+                text_size::UI,
+            )
+        };
         let hint: Element<'_, Message> = if editor.switch_blocked {
-            text("Save or cancel before switching revisions")
-                .size(text_size::UI)
-                .font(ui.config.ui_font)
-                .color(theme.note_text)
-                .into()
+            hint_text("Save or cancel before switching revisions", theme.note_text)
         } else if editor.commit {
-            text("Then starts a new change on top")
-                .size(text_size::UI)
-                .font(ui.config.ui_font)
-                .color(theme.subtle_text)
-                .into()
+            hint_text("Then starts a new change on top", theme.subtle_text)
         } else {
             Space::new().into()
         };

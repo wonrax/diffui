@@ -1237,17 +1237,26 @@ pub(crate) fn open_repo_card<'a>(
     if let Some(error) = &dialog.error {
         body = body.push(
             container(
-                row![
-                    icons::icon(icons::ALERT_TRIANGLE, ui::ICON_SIZE, theme.removed_text),
-                    text(error.as_str())
-                        .size(text_size::UI)
-                        .color(theme.removed_text)
-                        .font(ui.config.ui_font)
-                        .width(Length::Fill)
-                        .wrapping(text::Wrapping::Word),
-                ]
-                .spacing(theme::space::MD)
-                .align_y(alignment::Vertical::Center),
+                // The glyph centres on the first line's caps.
+                typography::baseline_row(
+                    [
+                        Aligned::glyph(
+                            icons::icon(icons::ALERT_TRIANGLE, ui::ICON_SIZE, theme.removed_text),
+                            ui::ICON_SIZE,
+                        ),
+                        Aligned::text(
+                            text(error.as_str())
+                                .size(text_size::UI)
+                                .color(theme.removed_text)
+                                .font(ui.config.ui_font)
+                                .width(Length::Fill)
+                                .wrapping(text::Wrapping::Word),
+                            ui.config.ui_font,
+                            text_size::UI,
+                        ),
+                    ],
+                    theme::space::MD,
+                ),
             )
             .width(Length::Fill)
             .padding(Padding {
@@ -1311,10 +1320,14 @@ fn recents_section<'a>(
         return None;
     }
     let clear = ui::button(
-        text("Clear")
-            .size(text_size::CAPTION)
-            .color(theme.subtle_text)
-            .font(ui.config.ui_font),
+        typography::centered(
+            text("Clear")
+                .size(text_size::CAPTION)
+                .color(theme.subtle_text)
+                .font(ui.config.ui_font),
+            ui.config.ui_font,
+            text_size::CAPTION,
+        ),
         ui::Variant::Ghost,
         ui::Size::Compact,
         theme,
@@ -1324,10 +1337,14 @@ fn recents_section<'a>(
     .on_press(Message::Action(Action::ClearRecentRepos));
     let header = container(
         row![
-            text("Recent")
-                .size(text_size::CAPTION)
-                .color(theme.subtle_text)
-                .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
+            typography::centered(
+                text("Recent")
+                    .size(text_size::CAPTION)
+                    .color(theme.subtle_text)
+                    .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
+                emphasis_font(ui.config.ui_font, Weight::Medium),
+                text_size::CAPTION,
+            ),
             Space::new().width(Length::Fill),
             clear,
         ]
@@ -1358,7 +1375,7 @@ fn folder_section<'a>(
     if rows.is_empty() {
         return None;
     }
-    let header = container(
+    let header = container(typography::centered(
         text(query.typed_dir)
             .size(text_size::CAPTION)
             .color(theme.subtle_text)
@@ -1366,7 +1383,9 @@ fn folder_section<'a>(
             .width(Length::Fill)
             .wrapping(text::Wrapping::None)
             .ellipsis(text::Ellipsis::Middle),
-    )
+        ui.config.mono_font,
+        text_size::CAPTION,
+    ))
     .padding([0.0, OPEN_CONTENT_X]);
 
     let mut list = column![].spacing(0);
@@ -1449,41 +1468,59 @@ fn recent_repo_compact_row<'a>(
     root: &'a str,
 ) -> Element<'a, Message> {
     let (owner, name) = crate::repo_label(std::path::Path::new(root));
-    let mut label = row![].spacing(0).align_y(alignment::Vertical::Center);
+    // The name (sans) and the path (smaller mono) share a baseline; the
+    // glyph centres on the caps (see `crate::typography`).
+    let name_font = emphasis_font(ui.config.ui_font, Weight::Medium);
+    let mut label = Vec::new();
     if !owner.is_empty() {
-        label = label.push(
+        label.push(Aligned::text(
             text(format!("{owner}/"))
                 .size(text_size::BODY)
                 .color(theme.subtle_text)
                 .font(ui.config.ui_font),
-        );
+            ui.config.ui_font,
+            text_size::BODY,
+        ));
     }
-    label = label.push(
+    label.push(Aligned::text(
         text(name)
             .size(text_size::BODY)
             .color(theme.text)
-            .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
-    );
-    let content = row![
-        container(icons::icon(icons::FOLDER, ui::ICON_SIZE, theme.subtle_text))
-            .width(Length::Fixed(OPEN_GLYPH_BOX))
-            .center_x(Length::Fixed(OPEN_GLYPH_BOX)),
-        Space::new().width(Length::Fixed(OPEN_GLYPH_GAP)),
-        label,
-        Space::new().width(Length::Fixed(theme::space::MD)),
-        // Middle-ellipsized: a path's ends (where it lives, what it's
-        // called) say more than its middle.
-        text(crate::contract_user_path(root))
-            .size(text_size::CAPTION)
-            .color(theme.subtle_text)
-            .font(ui.config.mono_font)
-            .width(Length::Fill)
-            .wrapping(text::Wrapping::None)
-            .ellipsis(text::Ellipsis::Middle),
-        // Keeps the path clear of the floating `×`.
-        Space::new().width(Length::Fixed(OPEN_REMOVE_SIDE)),
-    ]
-    .align_y(alignment::Vertical::Center);
+            .font(name_font),
+        name_font,
+        text_size::BODY,
+    ));
+    let content = container(typography::baseline_row(
+        [
+            Aligned::glyph(
+                container(icons::icon(icons::FOLDER, ui::ICON_SIZE, theme.subtle_text))
+                    .width(Length::Fixed(OPEN_GLYPH_BOX))
+                    .center_x(Length::Fixed(OPEN_GLYPH_BOX)),
+                ui::ICON_SIZE,
+            ),
+            Aligned::gap(OPEN_GLYPH_GAP),
+            typography::group(label, 0.0),
+            Aligned::gap(theme::space::MD),
+            // Middle-ellipsized: a path's ends (where it lives, what it's
+            // called) say more than its middle.
+            Aligned::text(
+                text(crate::contract_user_path(root))
+                    .size(text_size::CAPTION)
+                    .color(theme.subtle_text)
+                    .font(ui.config.mono_font)
+                    .width(Length::Fill)
+                    .wrapping(text::Wrapping::None)
+                    .ellipsis(text::Ellipsis::Middle),
+                ui.config.mono_font,
+                text_size::CAPTION,
+            ),
+            // Keeps the path clear of the floating `×`.
+            Aligned::gap(OPEN_REMOVE_SIDE),
+        ],
+        0.0,
+    ))
+    .height(Length::Fill)
+    .center_y(Length::Fill);
 
     let row_button = button(content)
         .width(Length::Fill)
