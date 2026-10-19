@@ -768,6 +768,7 @@ impl Diffui {
             y: row_rect.y,
             width: row_rect.width,
             height: row_rect.height,
+            radius: crate::revision_list::ROW_CARD_RADIUS,
         };
         let Some(chosen) = macos_native::popup_menu(&items, Some(glow)) else {
             return Task::none();
@@ -820,6 +821,7 @@ impl Diffui {
             y: row_rect.y,
             width: row_rect.width,
             height: row_rect.height,
+            radius: crate::revision_list::ROW_CARD_RADIUS,
         };
         let Some(chosen) = macos_native::popup_menu(&items, Some(glow)) else {
             return Task::none();

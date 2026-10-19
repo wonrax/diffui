@@ -940,7 +940,8 @@ fn glow_card(
             border: Border {
                 width: 1.5,
                 color: border,
-                radius: crate::theme::radius::CONTROL.into(),
+                // Traces the row card it sits on.
+                radius: crate::revision_list::ROW_CARD_RADIUS.into(),
             },
             // A soft accent halo — the "glow" half of the effect, pulsing with
             // the border.

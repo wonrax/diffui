@@ -115,6 +115,8 @@ pub struct GlowRect {
     pub y: f32,
     pub width: f32,
     pub height: f32,
+    /// The row card's corner radius, so the glow traces the card exactly.
+    pub radius: f32,
 }
 
 /// Ivars for the menu's target object: the tag of the chosen item, or `-1` if
@@ -263,7 +265,7 @@ fn install_glow(mtm: MainThreadMarker, rect: GlowRect) -> Option<Retained<CALaye
 
     let glow = CALayer::new();
     glow.setFrame(frame);
-    glow.setCornerRadius(6.0);
+    glow.setCornerRadius(f64::from(rect.radius));
     glow.setBackgroundColor(Some(&fill));
     glow.setBorderColor(Some(&accent));
     glow.setBorderWidth(1.5);
