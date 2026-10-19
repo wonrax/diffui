@@ -609,3 +609,259 @@ fn a_confirmed_push_reports_its_plan_before_pushing() {
         .expect("push after confirming");
     assert_eq!(remote_ref(&remote, "main"), Some(second));
 }
+
+// ── git.sign-on-push ────────────────────────────────────────────────────────
+
+/// A stand-in for `ssh-keygen -Y sign` (or 1Password's `op-ssh-sign`) that
+/// logs each call and prints a signature-shaped blob, or fails like a
+/// cancelled prompt. Returns the repo config that signs through it with
+/// `behavior`, plus `extra`, and the call log's path.
+fn signing_config(test: &str, behavior: &str, fail: bool, extra: &str) -> (String, PathBuf) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = std::env::temp_dir().join(format!("diffui-actor-{test}-signer"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create signer dir");
+    let log = dir.join("calls.log");
+    let program = dir.join("sign.sh");
+    let result = if fail {
+        "echo 'cancelled by user' >&2\nexit 1\n"
+    } else {
+        "printf '%s\\n' '-----BEGIN SSH SIGNATURE-----' 'ZmFrZQ==' '-----END SSH SIGNATURE-----'\n"
+    };
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\ncat > /dev/null\n{result}",
+            log.display()
+        ),
+    )
+    .expect("write signer");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+        .expect("make signer executable");
+    let config = format!(
+        "[git]\nsign-on-push = true\n\
+         [signing]\nbehavior = \"{behavior}\"\nbackend = \"ssh\"\nkey = \"ssh-ed25519 AAAAtest\"\n\
+         [signing.backends.ssh]\nprogram = \"{}\"\n{extra}",
+        program.display()
+    );
+    (config, log)
+}
+
+/// How many times the signer ran.
+fn sign_calls(log: &Path) -> usize {
+    std::fs::read_to_string(log).map_or(0, |text| text.lines().count())
+}
+
+fn is_signed(root: &Path, commit_id: &str) -> bool {
+    harness::block_on(async {
+        let workspace = harness::load_workspace(root);
+        let repo = workspace
+            .repo_loader()
+            .load_at_head()
+            .await
+            .expect("load repo at head");
+        let id = jj_lib::backend::CommitId::try_from_hex(commit_id).expect("commit id");
+        jj_lib::repo::Repo::store(repo.as_ref())
+            .get_commit_async(&id)
+            .await
+            .expect("load commit")
+            .is_signed()
+    })
+}
+
+/// Whether the commit at `refs/heads/<name>` on the remote carries a signature.
+fn remote_signed(remote: &Path, name: &str) -> bool {
+    harness::run_git(
+        remote,
+        &["cat-file", "commit", &format!("refs/heads/{name}")],
+    )
+    .lines()
+    .any(|line| line.starts_with("gpgsig"))
+}
+
+#[test]
+fn sign_on_push_with_everything_signed_pushes_without_rewriting() {
+    let (config, log) = signing_config("push-sign-all-signed", "own", false, "");
+    let Some((mut repo, remote)) = setup_with_config("push-sign-all-signed", Some(&config)) else {
+        return;
+    };
+    let first = commit(&mut repo, "a.txt", "first");
+    assert!(is_signed(&repo.root, &first), "own signs on write");
+    repo.mutate(MutationOp::CreateBookmark {
+        name: "feature".to_owned(),
+        to: at(&first),
+    })
+    .expect("create bookmark");
+    let calls = sign_calls(&log);
+    let ops = harness::operation_log(&repo.root).len();
+
+    let outcome = repo
+        .mutate(push("origin", vec![PushTarget::Bookmark("feature".into())]))
+        .expect("push signed commits");
+    assert_eq!(outcome.message, "Pushed feature to origin");
+    assert_eq!(remote_ref(&remote, "feature"), Some(first.clone()));
+    assert!(remote_signed(&remote, "feature"));
+    assert_eq!(one(&mut repo, "feature"), first, "nothing was rewritten");
+    assert_eq!(sign_calls(&log), calls, "nothing was signed again");
+    assert_eq!(
+        harness::operation_log(&repo.root).len(),
+        ops + 1,
+        "just the push"
+    );
+}
+
+#[test]
+fn sign_on_push_signs_unsigned_commits_then_pushes_them() {
+    let (config, _log) = signing_config("push-sign-unsigned", "keep", false, "");
+    let Some((mut repo, remote)) = setup_with_config("push-sign-unsigned", Some(&config)) else {
+        return;
+    };
+    commit(&mut repo, "a.txt", "first");
+    let second = commit(&mut repo, "b.txt", "second");
+    assert!(
+        !is_signed(&repo.root, &second),
+        "keep leaves new commits unsigned"
+    );
+    repo.mutate(MutationOp::CreateBookmark {
+        name: "feature".to_owned(),
+        to: at(&second),
+    })
+    .expect("create bookmark");
+    // An edit the app hasn't snapshotted yet survives `@` being rebased.
+    write(&repo.root, "wip.txt", "wip\n");
+
+    let outcome = repo
+        .mutate(push("origin", vec![PushTarget::Bookmark("feature".into())]))
+        .expect("sign and push");
+    assert_eq!(outcome.message, "Pushed feature to origin");
+    assert!(
+        outcome
+            .output
+            .iter()
+            .any(|line| line == "Signed 2 commits, rebased 1 descendant"),
+        "{:?}",
+        outcome.output
+    );
+
+    let signed = one(&mut repo, "feature");
+    assert_ne!(signed, second, "the bookmark follows the signed rewrite");
+    assert!(is_signed(&repo.root, &signed));
+    let parent = one(&mut repo, "feature-");
+    assert!(is_signed(&repo.root, &parent));
+    assert_eq!(remote_ref(&remote, "feature"), Some(signed.clone()));
+    assert!(remote_signed(&remote, "feature"));
+    assert_eq!(one(&mut repo, "@-"), signed, "@ was rebased onto it");
+    let wc = one(&mut repo, "@");
+    assert_eq!(harness::file_at(&repo.root, &wc, "wip.txt"), "wip\n");
+
+    let ops: Vec<String> = harness::operation_log(&repo.root)
+        .into_iter()
+        .map(|(description, _)| description)
+        .collect();
+    assert!(ops[0].starts_with("diffui: Pushed feature"), "{ops:?}");
+    assert_eq!(ops[1], "diffui: sign commits before push", "{ops:?}");
+}
+
+#[test]
+fn sign_on_push_signs_before_a_move_and_push_and_a_change_push() {
+    let (config, _log) = signing_config("push-sign-move", "keep", false, "");
+    let Some((mut repo, remote)) = setup_with_config("push-sign-move", Some(&config)) else {
+        return;
+    };
+    let first = commit(&mut repo, "a.txt", "first");
+    let outcome = repo
+        .mutate(MutationOp::MoveBookmark {
+            name: "main".to_owned(),
+            to: at(&first),
+            push_remote: Some("origin".to_owned()),
+        })
+        .expect("move, sign, and push");
+    assert!(
+        outcome.message.ends_with("Pushed main to origin"),
+        "{}",
+        outcome.message
+    );
+    let main = one(&mut repo, "main");
+    assert_ne!(main, first);
+    assert!(is_signed(&repo.root, &main));
+    assert_eq!(remote_ref(&remote, "main"), Some(main));
+
+    let second = commit(&mut repo, "b.txt", "second");
+    let change = repo.graph("@-")[0].summary.change_id.clone();
+    repo.mutate(push("origin", vec![PushTarget::Change(at(&second))]))
+        .expect("push --change");
+    let name = format!("push-{}", &change[..12]);
+    let pushed = one(&mut repo, &name);
+    assert!(is_signed(&repo.root, &pushed));
+    assert_eq!(remote_ref(&remote, &name), Some(pushed));
+}
+
+#[test]
+fn sign_on_push_skips_immutable_commits_with_a_warning() {
+    let (config, _log) = signing_config(
+        "push-sign-immutable",
+        "keep",
+        false,
+        "[revset-aliases]\n'immutable_heads()' = 'description(glob:\"frozen*\")'\n",
+    );
+    let Some((mut repo, remote)) = setup_with_config("push-sign-immutable", Some(&config)) else {
+        return;
+    };
+    let frozen = commit(&mut repo, "a.txt", "frozen");
+    let frozen_change = repo.graph("@-")[0].summary.change_id.clone();
+    let next = commit(&mut repo, "b.txt", "next");
+    repo.mutate(MutationOp::CreateBookmark {
+        name: "feature".to_owned(),
+        to: at(&next),
+    })
+    .expect("create bookmark");
+
+    let outcome = repo
+        .mutate(push("origin", vec![PushTarget::Bookmark("feature".into())]))
+        .expect("push around the immutable commit");
+    assert!(
+        outcome.output.contains(&format!(
+            "Skipped signing 1 immutable commit: {}",
+            &frozen_change[..8]
+        )),
+        "{:?}",
+        outcome.output
+    );
+    let signed = one(&mut repo, "feature");
+    assert!(is_signed(&repo.root, &signed));
+    assert_eq!(one(&mut repo, "feature-"), frozen, "left as it was");
+    assert!(!is_signed(&repo.root, &frozen));
+    assert_eq!(remote_ref(&remote, "feature"), Some(signed));
+}
+
+#[test]
+fn a_signing_failure_pushes_nothing_and_rewrites_nothing() {
+    let (config, log) = signing_config("push-sign-fails", "keep", true, "");
+    let Some((mut repo, remote)) = setup_with_config("push-sign-fails", Some(&config)) else {
+        return;
+    };
+    let first = commit(&mut repo, "a.txt", "first");
+    repo.mutate(MutationOp::CreateBookmark {
+        name: "feature".to_owned(),
+        to: at(&first),
+    })
+    .expect("create bookmark");
+    let wc = one(&mut repo, "@");
+    let ops = harness::operation_log(&repo.root).len();
+
+    let error = repo
+        .mutate(push("origin", vec![PushTarget::Bookmark("feature".into())]))
+        .expect_err("a cancelled signature stops the push");
+    let message = error.to_string();
+    assert!(
+        message.starts_with("signing failed, nothing was pushed: ")
+            && message.contains("cancelled by user"),
+        "{message}"
+    );
+    assert!(sign_calls(&log) > 0, "the signer was asked");
+    assert_eq!(remote_ref(&remote, "feature"), None);
+    assert_eq!(one(&mut repo, "feature"), first);
+    assert_eq!(one(&mut repo, "@"), wc);
+    assert_eq!(harness::operation_log(&repo.root).len(), ops);
+}

@@ -874,6 +874,9 @@ pub(super) fn classify(error: anyhow::Error) -> RepoError {
     if let Some(failed) = error.downcast_ref::<jj::push::PushFailed>() {
         return RepoError::Other(failed.to_string());
     }
+    if let Some(failed) = error.downcast_ref::<jj::push::SignFailed>() {
+        return RepoError::Other(failed.to_string());
+    }
     let message = format!("{error:#}");
     if message.contains("failed to parse revset")
         || message.contains("failed to resolve")

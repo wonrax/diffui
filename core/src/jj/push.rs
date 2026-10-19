@@ -11,6 +11,12 @@
 //!
 //! Everything here runs inside the caller's transaction, so a refused push
 //! commits nothing — not even the bookmark a `--change` push would create.
+//!
+//! `git.sign-on-push` is the CLI's `sign_commits_before_push`: the commits
+//! about to be pushed that aren't signed yet are signed (immutable ones are
+//! skipped with a warning) and their descendants rebased. The caller runs that
+//! in a transaction of its own under the working-copy lock, so a failed push
+//! keeps the signatures.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -18,7 +24,7 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow, bail};
 use futures::{StreamExt, TryStreamExt};
 use jj_lib::{
-    backend::CommitId,
+    backend::{BackendError, CommitId},
     commit::Commit,
     config::ConfigGetResultExt as _,
     git::{
@@ -33,6 +39,8 @@ use jj_lib::{
     repo::{MutableRepo, Repo},
     revset::{ResolvedRevsetExpression, RevsetDiagnostics, RevsetExpression, SymbolResolver},
     settings::UserSettings,
+    signing::{SignBehavior, SignError},
+    ssh_signing::SshError,
 };
 
 use super::mutate::{resolve_mutation_target, short_change_id};
@@ -73,16 +81,26 @@ struct Named {
     allow_delete: bool,
 }
 
-/// Run `request` inside `repo` (a transaction's mutable repo): apply its local
-/// bookmark changes, classify every bookmark it names, check the commits the
-/// push would publish, and push. A [`PushRejection`] comes back as the error
+/// A push that passed every check, ready to sign and send. `updates` is empty
+/// when every bookmark it names already matches the remote.
+pub(super) struct PlannedPush {
+    remote: String,
+    updates: Vec<(RefNameBuf, Diff<Option<CommitId>>)>,
+    /// Lines that lead the activity output: bookmarks created or already in
+    /// place, and what signing did.
+    pub notes: Vec<String>,
+    plan: Vec<String>,
+}
+
+/// Plan `request` inside `repo` (a transaction's mutable repo): apply its
+/// local bookmark changes, classify every bookmark it names, and check the
+/// commits the push would publish. A [`PushRejection`] comes back as the error
 /// (downcastable through anyhow) when a commit check fails.
-pub(super) async fn push_request(
+pub(super) async fn plan_push(
     context: &PushContext<'_>,
     repo: &mut MutableRepo,
     request: &PushRequest,
-    progress: &LoadProgress,
-) -> Result<PushOutcome> {
+) -> Result<PlannedPush> {
     let remote = RemoteName::new(&request.remote);
     if remote == REMOTE_NAME_FOR_LOCAL_GIT_REPO {
         bail!("git remote named 'git' is reserved for the local Git repository");
@@ -214,29 +232,12 @@ pub(super) async fn push_request(
         }
     }
     if updates.is_empty() {
-        notes.push("Nothing changed.".to_owned());
-        return Ok(PushOutcome {
-            message: format!("Nothing to push to {}", request.remote),
-            output: notes,
-            partial_failure: None,
+        return Ok(PlannedPush {
+            remote: request.remote.clone(),
+            updates,
+            notes,
+            plan: Vec::new(),
         });
-    }
-
-    // `git.sign-on-push` rewrites the pushed commits (and rebases `@` when it
-    // descends from them), which needs the working-copy lock this lock-free
-    // path doesn't hold. Refuse rather than publish unsigned commits.
-    if context
-        .settings
-        .get_bool("git.sign-on-push")
-        .optional()
-        .ok()
-        .flatten()
-        .unwrap_or(false)
-    {
-        bail!(
-            "git.sign-on-push is set, and diffui can't sign commits while pushing yet; \
-             push with `jj git push` instead"
-        );
     }
 
     let new_heads: Vec<CommitId> = updates
@@ -256,7 +257,36 @@ pub(super) async fn push_request(
             request: request.clone(),
         }));
     }
+    Ok(PlannedPush {
+        remote: request.remote.clone(),
+        updates,
+        notes,
+        plan,
+    })
+}
 
+/// Push `planned` from `repo`, the transaction it was planned in.
+pub(super) fn send_push(
+    context: &PushContext<'_>,
+    repo: &mut MutableRepo,
+    planned: PlannedPush,
+    progress: &LoadProgress,
+) -> Result<PushOutcome> {
+    let PlannedPush {
+        remote: remote_name,
+        updates,
+        mut notes,
+        plan,
+    } = planned;
+    if updates.is_empty() {
+        notes.push("Nothing changed.".to_owned());
+        return Ok(PushOutcome {
+            message: format!("Nothing to push to {remote_name}"),
+            output: notes,
+            partial_failure: None,
+        });
+    }
+    let remote = RemoteName::new(&remote_name);
     let targets = GitPushRefTargets {
         bookmarks: updates.clone(),
         tags: Vec::new(),
@@ -274,13 +304,13 @@ pub(super) async fn push_request(
         &mut callback,
         &GitPushOptions::default(),
     )
-    .with_context(|| format!("failed to push to {}", request.remote))?;
+    .with_context(|| format!("failed to push to {remote_name}"))?;
 
     let mut output = notes;
     output.extend(plan);
     output.append(&mut callback.lines);
     let names: Vec<&str> = updates.iter().map(|(name, _)| name.as_str()).collect();
-    let message = format!("Pushed {} to {}", names.join(", "), request.remote);
+    let message = format!("Pushed {} to {remote_name}", names.join(", "));
 
     if stats.all_ok() {
         return Ok(PushOutcome {
@@ -328,6 +358,209 @@ impl std::fmt::Display for PushFailed {
 }
 
 impl std::error::Error for PushFailed {}
+
+/// What `git.sign-on-push` asks of a planned push.
+#[derive(Default)]
+pub(super) struct SignPlan {
+    /// Mutable commits to sign before the push goes out.
+    pub to_sign: Vec<CommitId>,
+    /// The CLI's "Skipped signing N immutable commits" warning, when any are.
+    pub skipped_note: Option<String>,
+}
+
+/// jj-cli's `sign_commits_before_push` selection: the commits in
+/// `remote_bookmarks(remote)..new_heads` that aren't signed yet and that
+/// `signing.behavior = "own"` would sign. Immutable ones are left alone and
+/// named in the warning instead. Empty when `git.sign-on-push` is off.
+pub(super) async fn sign_plan(
+    context: &PushContext<'_>,
+    repo: &MutableRepo,
+    planned: &PlannedPush,
+) -> Result<SignPlan> {
+    let sign_on_push = context
+        .settings
+        .get_bool("git.sign-on-push")
+        .optional()
+        .context("failed to read git.sign-on-push")?
+        .unwrap_or(false);
+    let new_heads: Vec<CommitId> = planned
+        .updates
+        .iter()
+        .filter_map(|(_, update)| update.after.clone())
+        .collect();
+    if !sign_on_push || new_heads.is_empty() {
+        return Ok(SignPlan::default());
+    }
+    let old_heads: Vec<CommitId> = repo
+        .view()
+        .remote_bookmarks(RemoteName::new(&planned.remote))
+        .flat_map(|(_, remote_ref)| remote_ref.target.added_ids())
+        .cloned()
+        .collect();
+    let to_push = RevsetExpression::commits(old_heads).range(&RevsetExpression::commits(new_heads));
+    let symbol_resolver = SymbolResolver::new(
+        repo,
+        &[] as &[Box<dyn jj_lib::revset::SymbolResolverExtension>],
+    );
+    let immutable = parse_user_revset(
+        context.repo_root,
+        context.settings,
+        context.workspace_name,
+        "immutable()",
+    )?
+    .resolve_user_expression(repo, &symbol_resolver)
+    .context("failed to resolve immutable()")?;
+
+    let mut sign_settings = context.settings.sign_settings();
+    sign_settings.behavior = SignBehavior::Own;
+    let needs_signing =
+        |commit: &Commit| !commit.is_signed() && sign_settings.should_sign(commit.store_commit());
+
+    // Like the CLI, name up to ten and say "10+" past that.
+    let mut skipped = Vec::new();
+    let mut stream = to_push
+        .intersection(&immutable)
+        .evaluate(repo)
+        .context("failed to evaluate the commits to sign")?
+        .stream();
+    while let Some(id) = stream.next().await {
+        let commit = load_commit(repo, &id.context("failed to walk the commits to sign")?).await?;
+        if needs_signing(&commit) {
+            skipped.push(short_change_id(&commit));
+            if skipped.len() > 10 {
+                break;
+            }
+        }
+    }
+    let mut to_sign = Vec::new();
+    let mut stream = to_push
+        .minus(&immutable)
+        .evaluate(repo)
+        .context("failed to evaluate the commits to sign")?
+        .stream();
+    while let Some(id) = stream.next().await {
+        let commit = load_commit(repo, &id.context("failed to walk the commits to sign")?).await?;
+        if needs_signing(&commit) {
+            to_sign.push(commit.id().clone());
+        }
+    }
+    if !to_sign.is_empty() && !repo.store().signer().can_sign() {
+        bail!("git.sign-on-push is set, but no signing.backend is configured");
+    }
+
+    let skipped_note = (!skipped.is_empty()).then(|| {
+        let count = match skipped.len() {
+            1 => "1 immutable commit".to_owned(),
+            n if n > 10 => "10+ immutable commits".to_owned(),
+            n => format!("{n} immutable commits"),
+        };
+        skipped.truncate(10);
+        format!("Skipped signing {count}: {}", skipped.join(", "))
+    });
+    Ok(SignPlan {
+        to_sign,
+        skipped_note,
+    })
+}
+
+async fn load_commit(repo: &MutableRepo, id: &CommitId) -> Result<Commit> {
+    repo.store()
+        .get_commit_async(id)
+        .await
+        .with_context(|| format!("failed to load jj commit {}", id.hex()))
+}
+
+/// What signing before a push rewrote.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct Signed {
+    pub signed: usize,
+    pub rebased: usize,
+}
+
+impl Signed {
+    /// The activity line, `Signed 2 commits, rebased 1 descendant`.
+    pub fn note(&self) -> String {
+        let plural = |n: usize, word: &str| {
+            if n == 1 {
+                format!("{n} {word}")
+            } else {
+                format!("{n} {word}s")
+            }
+        };
+        let mut note = format!("Signed {}", plural(self.signed, "commit"));
+        if self.rebased > 0 {
+            note.push_str(&format!(", rebased {}", plural(self.rebased, "descendant")));
+        }
+        note
+    }
+}
+
+/// Rewrite `ids` signed and rebase their descendants onto them (`@` among
+/// them, when it descends), as jj-cli does before a push. Bookmarks on the
+/// rewritten commits follow them. A failure in the signing backend itself (a
+/// cancelled 1Password prompt, a missing key) comes back as [`SignFailed`].
+pub(super) async fn sign_commits(repo: &mut MutableRepo, ids: &[CommitId]) -> Result<Signed> {
+    let wanted: HashSet<&CommitId> = ids.iter().collect();
+    let mut stats = Signed::default();
+    repo.transform_descendants(ids.to_vec(), async |rewriter| {
+        if wanted.contains(rewriter.old_commit().id()) {
+            rewriter
+                .reparent()
+                .set_sign_behavior(SignBehavior::Own)
+                .write()
+                .await?;
+            stats.signed += 1;
+        } else {
+            rewriter.reparent().write().await?;
+            stats.rebased += 1;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(sign_error)?;
+    // Settle the rewrites the walk recorded, as committing a transaction
+    // requires (the CLI's `tx.finish` does the same).
+    repo.rebase_descendants()
+        .await
+        .context("failed to rebase descendants after signing")?;
+    Ok(stats)
+}
+
+/// [`SignFailed`] with the backend's own words when the signer is what
+/// failed; any other write error keeps its chain.
+fn sign_error(error: BackendError) -> anyhow::Error {
+    let mut is_sign_error = false;
+    let mut root = error.to_string();
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+    while let Some(cause) = source {
+        is_sign_error |= cause.is::<SignError>();
+        root = match cause.downcast_ref::<SshError>() {
+            // The signing program's own words ("user cancelled", say) beat
+            // jj's "SSH sign failed with exit status" wrapper.
+            Some(SshError::Command { stderr, .. }) if !stderr.trim().is_empty() => stderr.clone(),
+            _ => cause.to_string(),
+        };
+        source = cause.source();
+    }
+    if !is_sign_error {
+        return anyhow::Error::new(error).context("failed to rewrite the commits to sign");
+    }
+    let reason = root.split_whitespace().collect::<Vec<_>>().join(" ");
+    let reason = reason.trim_end_matches(':');
+    SignFailed(format!("signing failed, nothing was pushed: {reason}")).into()
+}
+
+/// The signing backend refused to sign the commits a push needed signed.
+#[derive(Debug)]
+pub struct SignFailed(pub String);
+
+impl std::fmt::Display for SignFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SignFailed {}
 
 /// The CLI's `classify_bookmark_update`, with its messages and hints.
 fn classify(

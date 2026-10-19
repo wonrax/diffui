@@ -14,7 +14,7 @@ use jj_lib::{
     object_id::ObjectId,
     op_store::{OperationId, RefTarget},
     operation::Operation,
-    ref_name::{RefName, RemoteName, WorkspaceName},
+    ref_name::{RefName, RefNameBuf, RemoteName, WorkspaceName},
     repo::{MutableRepo, ReadonlyRepo, Repo, RepoLoader},
     revset::{RevsetExpression, SymbolResolver},
     rewrite::{
@@ -23,11 +23,13 @@ use jj_lib::{
         move_commits, squash_commits,
     },
     settings::UserSettings,
+    transaction::Transaction,
     workspace::Workspace,
 };
 
 use super::push::{
-    PushContext, create_bookmark, forget_bookmark, push_request, rename_bookmark, untrack_bookmark,
+    PlannedPush, PushContext, Signed, create_bookmark, forget_bookmark, plan_push, rename_bookmark,
+    send_push, sign_commits, sign_plan, untrack_bookmark,
 };
 use super::walk::*;
 use super::workspace::{
@@ -76,7 +78,8 @@ pub(crate) async fn check_bookmark_move_backwards(
 /// pushing one — never touch the disk, so they never take the working-copy
 /// lock. A push in particular must not: it talks to a network, and holding
 /// jj's working-copy lock across that stalls every snapshot for as long as the
-/// remote takes to answer.
+/// remote takes to answer. (Signing commits for `git.sign-on-push` does take
+/// it, briefly and before the network: see [`apply_view_only`].)
 ///
 /// Everything else runs one locked working-copy session, mirroring what `jj`
 /// itself runs: snapshot the current on-disk state into `@` (so uncommitted
@@ -98,7 +101,7 @@ pub(crate) async fn apply_mutation(
 ) -> Result<(MutationOutcome, bool)> {
     if is_view_only(op) {
         return Ok((
-            apply_view_only(workspace, settings, &repository.root, op, progress).await?,
+            apply_view_only(workspace, settings, context, &repository.root, op, progress).await?,
             false,
         ));
     }
@@ -144,46 +147,121 @@ fn is_view_only(op: &MutationOp) -> bool {
 /// The lock-free path for the bookmark ops. A move that also pushes keeps both
 /// halves in one transaction, so a failed push still rolls the move back and
 /// the action never half-lands — the whole thing simply runs outside the lock.
+///
+/// The exception is `git.sign-on-push` with commits still to sign: those are
+/// signed first, in an operation of their own under the working-copy lock
+/// ([`sign_before_push`]), and the push is then planned again over the signed
+/// commits. A push that fails after that keeps the signatures, as in the CLI.
 async fn apply_view_only(
-    workspace: &Workspace,
+    workspace: &mut Workspace,
     settings: &UserSettings,
+    context: &SnapshotContext,
     repo_root: &Path,
     op: &MutationOp,
     progress: &LoadProgress,
 ) -> Result<MutationOutcome> {
     let workspace_name = workspace.workspace_name().to_owned();
-    let base_repo = workspace
-        .repo_loader()
-        .load_at_head()
-        .await
-        .context("failed to load jj repo")?;
-    let wc_commit_id = base_repo
-        .view()
-        .get_wc_commit_id(&workspace_name)
-        .context("jj workspace has no working-copy commit")?
-        .clone();
+    let mut signed: Option<Signed> = None;
+    loop {
+        let base_repo = workspace
+            .repo_loader()
+            .load_at_head()
+            .await
+            .context("failed to load jj repo")?;
+        let wc_commit_id = base_repo
+            .view()
+            .get_wc_commit_id(&workspace_name)
+            .context("jj workspace has no working-copy commit")?
+            .clone();
 
-    let mut tx = base_repo.start_transaction();
-    let mut output: Vec<String> = Vec::new();
-    let mut partial_failure: Option<String> = None;
-    let push_context = PushContext {
-        settings,
-        repo_root,
-        workspace_name: &workspace_name,
-        wc_commit_id: &wc_commit_id,
-    };
-    let message = match op {
+        let mut tx = base_repo.start_transaction();
+        let push_context = PushContext {
+            settings,
+            repo_root,
+            workspace_name: &workspace_name,
+            wc_commit_id: &wc_commit_id,
+        };
+        let (moved, planned) = stage_view_only(&push_context, tx.repo_mut(), op).await?;
+        let mut output: Vec<String> = Vec::new();
+        let mut partial_failure: Option<String> = None;
+        let message = match planned {
+            Some(mut planned) => {
+                let signing = sign_plan(&push_context, tx.repo(), &planned).await?;
+                if !signing.to_sign.is_empty() {
+                    if signed.is_some() {
+                        bail!(
+                            "the commits to push changed while they were being signed; push again"
+                        );
+                    }
+                    drop(tx);
+                    signed =
+                        Some(sign_before_push(workspace, settings, context, repo_root, op).await?);
+                    continue;
+                }
+                planned.notes.extend(
+                    signed
+                        .filter(|signed| signed.signed > 0)
+                        .as_ref()
+                        .map(Signed::note),
+                );
+                planned.notes.extend(signing.skipped_note);
+                let pushed = send_push(&push_context, tx.repo_mut(), planned, progress)?;
+                output = pushed.output;
+                partial_failure = pushed.partial_failure;
+                match moved {
+                    Some(moved) => format!("{moved} \u{b7} {}", pushed.message),
+                    None => pushed.message,
+                }
+            }
+            None => moved.context("a bookmark op without a push describes itself")?,
+        };
+
+        // Mirror jj's own post-operation behavior: export the updated bookmarks to
+        // the colocated git repo so the real git branches follow the move.
+        export_refs(tx.repo_mut()).context("failed to export bookmarks to the git backend")?;
+        let new_repo = tx
+            .commit(format!("diffui: {message}"))
+            .await
+            .context("failed to commit bookmark transaction")?;
+        // Some refs reached the remote and some didn't: what did land is recorded
+        // above (as the CLI does), and the refusal is still the outcome.
+        if let Some(failure) = partial_failure {
+            return Err(super::push::PushFailed(failure).into());
+        }
+
+        return Ok(MutationOutcome {
+            message,
+            moved_working_copy: false,
+            rewritten_commit: None,
+            output,
+            operation_id: Some(new_repo.op_id().hex()),
+        });
+    }
+}
+
+/// Apply a view-only `op`'s bookmark changes inside `repo`. Returns the
+/// message for what changed locally, and the planned push when the op pushes
+/// (whose own message follows once it has gone out).
+async fn stage_view_only(
+    push_context: &PushContext<'_>,
+    repo: &mut MutableRepo,
+    op: &MutationOp,
+) -> Result<(Option<String>, Option<PlannedPush>)> {
+    let settings = push_context.settings;
+    let wc_commit_id = push_context.wc_commit_id;
+    let request = match op {
         MutationOp::MoveBookmark {
             name,
             to,
             push_remote,
         } => {
-            let commit = resolve_mutation_target(tx.repo(), &wc_commit_id, to).await?;
+            let commit = resolve_mutation_target(repo, wc_commit_id, to).await?;
             let short = short_change_id(&commit);
-            tx.repo_mut().set_local_bookmark_target(
+            repo.set_local_bookmark_target(
                 RefName::new(name),
                 RefTarget::normal(commit.id().clone()),
             );
+            let moved = format!("Moved bookmark {name} to {short}");
             match push_remote {
                 // The push reads the bookmark's target back out of this
                 // transaction's view, so it pushes the position set above —
@@ -201,87 +279,191 @@ async fn apply_view_only(
                         allow: PushAllow::default(),
                         confirm: false,
                     };
-                    let pushed =
-                        push_request(&push_context, tx.repo_mut(), &request, progress).await?;
-                    output = pushed.output;
-                    partial_failure = pushed.partial_failure;
-                    format!("Moved bookmark {name} to {short} \u{b7} {}", pushed.message)
+                    let planned = plan_push(push_context, repo, &request).await?;
+                    return Ok((Some(moved), Some(planned)));
                 }
-                None => format!("Moved bookmark {name} to {short}"),
+                None => return Ok((Some(moved), None)),
             }
         }
+        MutationOp::PushBookmark { name, remote } => &PushRequest {
+            remote: remote.clone(),
+            targets: vec![PushTarget::Bookmark(name.clone())],
+            allow: PushAllow::default(),
+            confirm: false,
+        },
+        MutationOp::Push(request) => request,
         MutationOp::DeleteBookmark { name } => {
-            tx.repo_mut()
-                .set_local_bookmark_target(RefName::new(name), RefTarget::absent());
-            format!("Deleted bookmark {name}")
+            repo.set_local_bookmark_target(RefName::new(name), RefTarget::absent());
+            return Ok((Some(format!("Deleted bookmark {name}")), None));
         }
         MutationOp::TrackBookmark { name, remote } => {
             let symbol = RefName::new(name).to_remote_symbol(RemoteName::new(remote));
-            tx.repo_mut()
-                .track_remote_bookmark(symbol)
+            repo.track_remote_bookmark(symbol)
                 .await
                 .with_context(|| format!("failed to track {name}@{remote}"))?;
-            format!("Tracking {name}@{remote}")
-        }
-        MutationOp::PushBookmark { name, remote } => {
-            let request = PushRequest {
-                remote: remote.clone(),
-                targets: vec![PushTarget::Bookmark(name.clone())],
-                allow: PushAllow::default(),
-                confirm: false,
-            };
-            let pushed = push_request(&push_context, tx.repo_mut(), &request, progress).await?;
-            output = pushed.output;
-            partial_failure = pushed.partial_failure;
-            pushed.message
-        }
-        MutationOp::Push(request) => {
-            let pushed = push_request(&push_context, tx.repo_mut(), request, progress).await?;
-            output = pushed.output;
-            partial_failure = pushed.partial_failure;
-            pushed.message
+            return Ok((Some(format!("Tracking {name}@{remote}")), None));
         }
         MutationOp::CreateBookmark { name, to } => {
-            let commit = resolve_mutation_target(tx.repo(), &wc_commit_id, to).await?;
-            create_bookmark(settings, tx.repo_mut(), name, &commit).await?;
-            format!("Created bookmark {name} at {}", short_change_id(&commit))
+            let commit = resolve_mutation_target(repo, wc_commit_id, to).await?;
+            create_bookmark(settings, repo, name, &commit).await?;
+            let message = format!("Created bookmark {name} at {}", short_change_id(&commit));
+            return Ok((Some(message), None));
         }
         MutationOp::RenameBookmark { old, new } => {
-            rename_bookmark(tx.repo_mut(), old, new).await?;
-            format!("Renamed bookmark {old} to {new}")
+            rename_bookmark(repo, old, new).await?;
+            return Ok((Some(format!("Renamed bookmark {old} to {new}")), None));
         }
         MutationOp::ForgetBookmark { name } => {
-            forget_bookmark(tx.repo_mut(), name)?;
-            format!("Forgot bookmark {name}")
+            forget_bookmark(repo, name)?;
+            return Ok((Some(format!("Forgot bookmark {name}")), None));
         }
         MutationOp::UntrackBookmark { name, remote } => {
-            untrack_bookmark(tx.repo_mut(), name, remote)?;
-            format!("Stopped tracking {name}@{remote}")
+            untrack_bookmark(repo, name, remote)?;
+            return Ok((Some(format!("Stopped tracking {name}@{remote}")), None));
         }
         // `is_view_only` gates this function; anything else is a caller bug.
         _ => bail!("not a view-only mutation"),
     };
+    let planned = plan_push(push_context, repo, request).await?;
+    Ok((None, Some(planned)))
+}
 
-    // Mirror jj's own post-operation behavior: export the updated bookmarks to
-    // the colocated git repo so the real git branches follow the move.
-    export_refs(tx.repo_mut()).context("failed to export bookmarks to the git backend")?;
-    let new_repo = tx
-        .commit(format!("diffui: {message}"))
-        .await
-        .context("failed to commit bookmark transaction")?;
-    // Some refs reached the remote and some didn't: what did land is recorded
-    // above (as the CLI does), and the refusal is still the outcome.
-    if let Some(failure) = partial_failure {
-        return Err(super::push::PushFailed(failure).into());
+/// Sign what `op`'s push needs signed, as an operation of its own under the
+/// working-copy lock. Signing rewrites the pushed commits and rebases their
+/// descendants, `@` among them, so this is a rewrite like any other: the disk
+/// is folded into `@` first and the new `@` checked out after. The push is
+/// planned again inside the transaction to pick the commits (the repo may have
+/// moved since the lock-free plan); its bookmark changes are then rolled back,
+/// since they belong to the push, which runs afterwards without the lock.
+async fn sign_before_push(
+    workspace: &mut Workspace,
+    settings: &UserSettings,
+    context: &SnapshotContext,
+    repo_root: &Path,
+    op: &MutationOp,
+) -> Result<Signed> {
+    let workspace_name = workspace.workspace_name().to_owned();
+    let repo_loader = workspace.repo_loader().clone();
+    let options = context.options();
+    // A stale checkout is recovered instead of locked; the retry signs against
+    // the recovered `@`, as `apply_mutation` does.
+    for _ in 0..2 {
+        let mut locked =
+            match lock_working_copy(workspace, &repo_loader, &workspace_name, &options).await? {
+                LockOutcome::Locked(locked) => locked,
+                LockOutcome::Recovered { .. } => continue,
+            };
+        let result = sign_locked(&mut locked, settings, repo_root, &workspace_name, op).await;
+        if result.is_err() {
+            locked.abandon();
+        }
+        return result;
+    }
+    bail!("jj working copy kept going stale while signing the commits to push")
+}
+
+/// The body of [`sign_before_push`], with the lock held.
+async fn sign_locked(
+    locked: &mut LockedWorkingCopy<'_>,
+    settings: &UserSettings,
+    repo_root: &Path,
+    workspace_name: &WorkspaceName,
+    op: &MutationOp,
+) -> Result<Signed> {
+    let base_repo = locked.repo.clone();
+    let mut tx = base_repo.start_transaction();
+    fold_working_copy(&mut tx, locked, workspace_name).await?;
+    let wc_commit_id = tx
+        .repo()
+        .view()
+        .get_wc_commit_id(workspace_name)
+        .context("jj workspace has no working-copy commit")?
+        .clone();
+    let push_context = PushContext {
+        settings,
+        repo_root,
+        workspace_name,
+        wc_commit_id: &wc_commit_id,
+    };
+
+    let bookmarks_before: HashMap<RefNameBuf, RefTarget> = tx
+        .repo()
+        .view()
+        .local_bookmarks()
+        .map(|(name, target)| (name.to_owned(), target.clone()))
+        .collect();
+    let (_, planned) = stage_view_only(&push_context, tx.repo_mut(), op).await?;
+    let to_sign = match &planned {
+        Some(planned) => sign_plan(&push_context, tx.repo(), planned).await?.to_sign,
+        None => Vec::new(),
+    };
+    let mut names: HashSet<RefNameBuf> = bookmarks_before.keys().cloned().collect();
+    names.extend(
+        tx.repo()
+            .view()
+            .local_bookmarks()
+            .map(|(name, _)| name.to_owned()),
+    );
+    for name in names {
+        let before = bookmarks_before
+            .get(&name)
+            .cloned()
+            .unwrap_or_else(RefTarget::absent);
+        if *tx.repo().view().get_local_bookmark(&name) != before {
+            tx.repo_mut().set_local_bookmark_target(&name, before);
+        }
     }
 
-    Ok(MutationOutcome {
-        message,
-        moved_working_copy: false,
-        rewritten_commit: None,
-        output,
-        operation_id: Some(new_repo.op_id().hex()),
-    })
+    let signed = sign_commits(tx.repo_mut(), &to_sign).await?;
+    if !tx.repo().has_changes() {
+        locked.finish(base_repo.op_id().clone()).await?;
+        return Ok(signed);
+    }
+    super::colocate::sync_git_after_transaction(tx.repo_mut(), workspace_name, repo_root).await?;
+    let new_repo = tx
+        .commit("diffui: sign commits before push")
+        .await
+        .context("failed to commit the signing transaction")?;
+    let new_wc_id = new_repo
+        .view()
+        .get_wc_commit_id(workspace_name)
+        .context("jj workspace has no working-copy commit after signing")?
+        .clone();
+    let new_wc_commit = new_repo
+        .store()
+        .get_commit_async(&new_wc_id)
+        .await
+        .with_context(|| format!("failed to load new working-copy commit {}", new_wc_id.hex()))?;
+    locked.check_out(&new_wc_commit).await?;
+    locked.finish(new_repo.op_id().clone()).await?;
+    Ok(signed)
+}
+
+/// Fold the disk tree the lock's snapshot read into `@`, so a rewrite that
+/// moves `@` doesn't lose uncommitted work. Returns whether `@` changed.
+async fn fold_working_copy(
+    tx: &mut Transaction,
+    locked: &LockedWorkingCopy<'_>,
+    workspace_name: &WorkspaceName,
+) -> Result<bool> {
+    if !locked.tree_changed() {
+        return Ok(false);
+    }
+    let rewritten = tx
+        .repo_mut()
+        .rewrite_commit(&locked.wc_commit)
+        .set_tree(locked.tree.clone())
+        .write()
+        .await
+        .context("failed to fold working-copy changes before mutation")?;
+    tx.repo_mut()
+        .set_wc_commit(workspace_name.to_owned(), rewritten.id().clone())
+        .context("failed to update working-copy pointer before mutation")?;
+    tx.repo_mut()
+        .rebase_descendants()
+        .await
+        .context("failed to rebase descendants after working-copy fold")?;
+    Ok(true)
 }
 
 /// One pass of [`apply_mutation`]. `Ok(None)` means the working copy was stale
@@ -345,8 +527,6 @@ async fn mutate_locked(
     allow_immutable: bool,
 ) -> Result<MutationOutcome> {
     let base_repo = locked.repo.clone();
-    let wc_commit = locked.wc_commit.clone();
-    let new_tree = locked.tree.clone();
     let workspace_name = workspace_name.to_owned();
 
     // An undo, redo or revert has to know its target *before* the pre-op fold
@@ -387,29 +567,15 @@ async fn mutate_locked(
     // unrecoverable from the op log. For those the fold is committed as its
     // own snapshot op first, mirroring the CLI's snapshot-before-command; the
     // undo then carries the edit over onto the `@` it restores.
-    if new_tree.tree_ids_and_labels() != wc_commit.tree().tree_ids_and_labels() {
-        let rewritten = tx
-            .repo_mut()
-            .rewrite_commit(&wc_commit)
-            .set_tree(new_tree)
-            .write()
+    if fold_working_copy(&mut tx, locked, &workspace_name).await?
+        && (op_plan.is_some() || restore_target.is_some())
+    {
+        tx.set_is_snapshot(true);
+        let snapped = tx
+            .commit("snapshot working copy")
             .await
-            .context("failed to fold working-copy changes before mutation")?;
-        tx.repo_mut()
-            .set_wc_commit(workspace_name.clone(), rewritten.id().clone())
-            .context("failed to update working-copy pointer before mutation")?;
-        tx.repo_mut()
-            .rebase_descendants()
-            .await
-            .context("failed to rebase descendants after working-copy fold")?;
-        if op_plan.is_some() || restore_target.is_some() {
-            tx.set_is_snapshot(true);
-            let snapped = tx
-                .commit("snapshot working copy")
-                .await
-                .context("failed to commit pre-undo snapshot")?;
-            tx = snapped.start_transaction();
-        }
+            .context("failed to commit pre-undo snapshot")?;
+        tx = snapped.start_transaction();
     }
 
     // The post-fold `@`, used to resolve a `WorkingCopy` target after the fold
