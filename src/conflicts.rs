@@ -156,7 +156,7 @@ impl Diffui {
                                 Some(format!("{} closed", invocation.tool)),
                             );
                         }
-                        let label = format!("Resolve {}", invocation.path);
+                        let label = Prose::from("Resolve ").path(&invocation.path);
                         let op = MutationOp::ResolveConflict {
                             target: invocation.revision,
                             path: invocation.path,
@@ -183,7 +183,7 @@ impl Diffui {
 
     /// Run `op` on `tab`, which may no longer be the active one (a merge
     /// tool finishing after a tab switch).
-    fn resolve_in(&mut self, tab: TabId, op: MutationOp, label: String) -> Task<Message> {
+    fn resolve_in(&mut self, tab: TabId, op: MutationOp, label: Prose) -> Task<Message> {
         if self.tab_mut(tab).is_none() {
             return Task::none();
         }
@@ -302,7 +302,9 @@ impl Diffui {
                 let invocation = Box::new(invocation.clone());
                 let (activity, _) = self.begin_activity(
                     tab,
-                    format!("Resolving {path} in {}", invocation.tool),
+                    Prose::from("Resolving ")
+                        .path(&path)
+                        .text(format!(" in {}", invocation.tool)),
                     false,
                 );
                 Task::perform(

@@ -495,7 +495,7 @@ impl Diffui {
                      left them. This can be undone too."
                 )),
                 "Restore",
-                format!("Restore to {short}"),
+                Prose::from("Restore to ").op(short),
                 MutationOp::RestoreOperation {
                     operation_id: id.clone(),
                 },
@@ -507,7 +507,7 @@ impl Diffui {
                     "Undoes just \u{201c}{summary}\u{201d}, keeping the work done since."
                 )),
                 "Revert",
-                format!("Revert {short}"),
+                Prose::from("Revert ").op(short),
                 MutationOp::RevertOperation {
                     operation_id: id.clone(),
                 },

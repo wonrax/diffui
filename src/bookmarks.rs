@@ -191,13 +191,14 @@ impl Diffui {
         let body = if remotes.is_empty() {
             "This repository has no git remotes.".to_owned()
         } else {
+            let remotes: Vec<String> = remotes.iter().map(|remote| format!("`{remote}`")).collect();
             format!(
-                "There are several remotes ({}) and git.push isn't set. Pick one from the \
-                 revision's context menu, or set git.push.",
+                "Several remotes ({}) and no `git.push`. Pick one from the revision's menu, \
+                 or set `git.push`.",
                 remotes.join(", ")
             )
         };
-        self.push_error_toast("Push needs a remote".to_owned(), &body);
+        self.push_error_toast("Push needs a remote", &body);
         Task::none()
     }
 
@@ -365,8 +366,8 @@ impl Diffui {
         if let Some(log) = self.activity_log_for(pending.tab_id) {
             let title = log
                 .label(pending.activity_id)
-                .map(|label| format!("{label} failed"))
-                .unwrap_or_else(|| "Push failed".to_owned());
+                .map(|label| label.clone().text(" failed"))
+                .unwrap_or_else(|| "Push failed".into());
             log.append_output(pending.activity_id, error.clone());
             log.finish(
                 pending.activity_id,
@@ -590,18 +591,22 @@ pub(crate) fn working_copy_push_warning() -> Prose {
 }
 
 /// Activity label for a push.
-pub(crate) fn push_label(request: &PushRequest) -> String {
-    let what: Vec<String> = request
-        .targets
-        .iter()
-        .map(|target| match target {
-            PushTarget::Bookmark(name) | PushTarget::SetBookmark { name, .. } => name.clone(),
-            PushTarget::DeleteBookmark(name) => format!("deletion of {name}"),
-            PushTarget::Change(_) => "new bookmark".to_owned(),
-            PushTarget::Tracked => "tracked bookmarks".to_owned(),
-        })
-        .collect();
-    format!("Push {} to {}", what.join(", "), request.remote)
+pub(crate) fn push_label(request: &PushRequest) -> Prose {
+    let mut label = Prose::from("Push ");
+    for (index, target) in request.targets.iter().enumerate() {
+        if index > 0 {
+            label = label.text(", ");
+        }
+        label = match target {
+            PushTarget::Bookmark(name) | PushTarget::SetBookmark { name, .. } => {
+                label.bookmark(name)
+            }
+            PushTarget::DeleteBookmark(name) => label.text("deletion of ").bookmark(name),
+            PushTarget::Change(_) => label.text("new bookmark"),
+            PushTarget::Tracked => label.text("tracked bookmarks"),
+        };
+    }
+    label.text(" to ").remote(&request.remote)
 }
 
 /// A local-bookmark name from a palette bookmark result's label: `main` and

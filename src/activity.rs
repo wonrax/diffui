@@ -22,6 +22,7 @@ use iced::{
 
 use crate::chip;
 use crate::icons;
+use crate::prose::Prose;
 use crate::theme::{
     ThemeSpec, chip_background, emphasis_font, ghost_button_style, popover_style, text_size,
 };
@@ -69,7 +70,7 @@ pub enum ActivityStatus {
 #[derive(Debug, Clone)]
 pub struct Activity {
     pub id: ActivityId,
-    pub label: String,
+    pub label: Prose,
     pub status: ActivityStatus,
     /// Live progress handle the worker bumps from its thread; the UI polls it
     /// each frame. `total == 0` ⇒ indeterminate (spinner / pulsing line).
@@ -177,7 +178,7 @@ impl ActivityLog {
     pub fn start(
         &mut self,
         id: ActivityId,
-        label: impl Into<String>,
+        label: impl Into<Prose>,
         determinate: bool,
     ) -> LoadProgress {
         let progress = LoadProgress::default();
@@ -211,13 +212,13 @@ impl ActivityLog {
         if self
             .activities
             .last()
-            .is_some_and(|activity| activity.label == text)
+            .is_some_and(|activity| activity.label.to_string() == text)
         {
             return;
         }
         self.activities.push(Activity {
             id: ActivityId(u64::MAX),
-            label: text,
+            label: text.into(),
             status: ActivityStatus::Done,
             progress: LoadProgress::default(),
             determinate: false,
@@ -281,11 +282,11 @@ impl ActivityLog {
     }
 
     /// The entry's title — error toasts name what failed with it.
-    pub fn label(&self, id: ActivityId) -> Option<&str> {
+    pub fn label(&self, id: ActivityId) -> Option<&Prose> {
         self.activities
             .iter()
             .find(|activity| activity.id == id)
-            .map(|activity| activity.label.as_str())
+            .map(|activity| &activity.label)
     }
 
     pub fn toggle_expand(&mut self, id: ActivityId) {
@@ -391,10 +392,10 @@ pub fn activity_indicator(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message>
                 .size(text_size::UI)
                 .font(mono)
                 .color(theme.accent),
-            text(active.label.as_str())
-                .size(text_size::UI)
-                .font(ui.config.ui_font)
-                .color(theme.text),
+            active
+                .label
+                .view(ui.config.ui_font, mono, theme.text, theme)
+                .size(text_size::UI),
         ]
         .spacing(6)
         .align_y(alignment::Vertical::Center);
@@ -641,20 +642,30 @@ pub fn toast_layer(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
                 // A warning triangle, deliberately not an ✕ — that glyph
                 // reads as a dismiss button, not severity.
                 icons::icon(icons::ALERT_TRIANGLE, 15.0, theme.removed_text),
-                text(toast.title.as_str())
+                toast
+                    .title
+                    .view(
+                        emphasis_font(ui.config.ui_font, Weight::Semibold),
+                        ui.config.mono_font,
+                        theme.removed_text,
+                        theme,
+                    )
                     .size(text_size::BODY)
-                    .font(emphasis_font(ui.config.ui_font, Weight::Semibold))
-                    .color(theme.removed_text)
                     .width(Length::Fill),
                 crate::ui::close_button(theme.muted_text, theme)
                     .on_press(Message::Ui(UiEvent::ToastDismiss(toast.id))),
             ]
             .spacing(8)
             .align_y(alignment::Vertical::Center),
-            text(toast.detail.as_str())
-                .size(text_size::UI)
-                .font(ui.config.ui_font)
-                .color(theme.muted_text),
+            toast
+                .detail
+                .view(
+                    ui.config.ui_font,
+                    ui.config.mono_font,
+                    theme.muted_text,
+                    theme,
+                )
+                .size(text_size::UI),
         ]
         .spacing(5);
         cards = cards.push(
@@ -711,10 +722,15 @@ fn activity_row<'a>(
 
     let mut head = row![
         status_icon(activity, theme, mono),
-        text(activity.label.as_str())
+        activity
+            .label
+            .view(
+                emphasis_font(ui.config.ui_font, Weight::Medium),
+                mono,
+                theme.text,
+                theme,
+            )
             .size(text_size::UI)
-            .font(emphasis_font(ui.config.ui_font, Weight::Medium))
-            .color(theme.text)
             .wrapping(text::Wrapping::None)
             .ellipsis(text::Ellipsis::End)
             .width(Length::Fill),
@@ -1049,7 +1065,10 @@ mod tests {
         log.start(ActivityId(1), "Fetch", false);
         assert!(log.any_running());
         assert_eq!(log.running_count(), 1);
-        assert_eq!(log.first_running().map(|a| a.label.as_str()), Some("Fetch"));
+        assert_eq!(
+            log.first_running().map(|a| a.label.to_string()),
+            Some("Fetch".to_owned())
+        );
 
         log.append_output(ActivityId(1), "remote: hi");
         log.finish(ActivityId(1), ActivityStatus::Done, Some("done".to_owned()));
@@ -1114,9 +1133,15 @@ mod tests {
         log.start(ActivityId(1), "a", false);
         log.start(ActivityId(2), "b", false);
         // First *running* is the earliest still-running entry.
-        assert_eq!(log.first_running().map(|a| a.label.as_str()), Some("a"));
+        assert_eq!(
+            log.first_running().map(|a| a.label.to_string()),
+            Some("a".to_owned())
+        );
         log.finish(ActivityId(1), ActivityStatus::Done, None);
-        assert_eq!(log.first_running().map(|a| a.label.as_str()), Some("b"));
+        assert_eq!(
+            log.first_running().map(|a| a.label.to_string()),
+            Some("b".to_owned())
+        );
     }
 
     #[test]
@@ -1133,8 +1158,8 @@ mod tests {
         // The finished (errored) entry is gone; the running one survives.
         assert_eq!(log.running_count(), 1);
         assert_eq!(
-            log.first_running().map(|a| a.label.as_str()),
-            Some("still-running")
+            log.first_running().map(|a| a.label.to_string()),
+            Some("still-running".to_owned())
         );
     }
 
@@ -1148,22 +1173,22 @@ mod tests {
         // Queued doesn't count as running and never drives the spinner.
         assert_eq!(log.running_count(), 1);
         assert_eq!(
-            log.first_running().map(|a| a.label.as_str()),
-            Some("running")
+            log.first_running().map(|a| a.label.to_string()),
+            Some("running".to_owned())
         );
 
         // Clearing keeps both the running and the queued entry.
         log.finish(ActivityId(1), ActivityStatus::Done, None);
         log.clear_finished();
         assert_eq!(log.activities.len(), 1);
-        assert_eq!(log.activities[0].label, "queued");
+        assert_eq!(log.activities[0].label.to_string(), "queued");
 
         // When the queue drains it starts running for real.
         log.set_status(ActivityId(2), ActivityStatus::Running);
         assert_eq!(log.running_count(), 1);
         assert_eq!(
-            log.first_running().map(|a| a.label.as_str()),
-            Some("queued")
+            log.first_running().map(|a| a.label.to_string()),
+            Some("queued".to_owned())
         );
     }
 }

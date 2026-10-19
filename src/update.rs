@@ -3040,7 +3040,7 @@ impl Diffui {
         result: Result<Vec<String>, String>,
         summary: Option<String>,
     ) -> Task<Message> {
-        let mut failure: Option<(String, String)> = None;
+        let mut failure: Option<(Prose, String)> = None;
         if let Some(log) = self.activity_log_for(tab) {
             match result {
                 Ok(lines) => {
@@ -3050,8 +3050,8 @@ impl Diffui {
                 Err(error) => {
                     let title = log
                         .label(activity_id)
-                        .map(|label| format!("{label} failed"))
-                        .unwrap_or_else(|| "Operation failed".to_owned());
+                        .map(|label| label.clone().text(" failed"))
+                        .unwrap_or_else(|| "Operation failed".into());
                     failure = Some((title, error.clone()));
                     log.append_output(activity_id, error.clone());
                     log.finish(activity_id, activity::ActivityStatus::Error, Some(error));
@@ -3829,7 +3829,7 @@ impl Diffui {
     pub(crate) fn begin_activity(
         &mut self,
         tab: TabId,
-        label: impl Into<String>,
+        label: impl Into<Prose>,
         determinate: bool,
     ) -> (activity::ActivityId, LoadProgress) {
         let id = self.allocate_activity_id();
@@ -3971,7 +3971,7 @@ impl Diffui {
     /// Float an error toast (bottom-right) for a failed operation. The
     /// activity log keeps the full record; this only makes the failure
     /// impossible to miss. Newest last, capped so a burst can't wall the UI.
-    pub(crate) fn push_error_toast(&mut self, title: String, error: &str) {
+    pub(crate) fn push_error_toast(&mut self, title: impl Into<Prose>, error: &str) {
         const MAX_TOASTS: usize = 4;
         const MAX_DETAIL: usize = 160;
         let mut detail: String = error
@@ -3987,8 +3987,8 @@ impl Diffui {
         self.next_toast_id = self.next_toast_id.wrapping_add(1);
         self.toasts.push(Toast {
             id: self.next_toast_id,
-            title,
-            detail,
+            title: title.into(),
+            detail: Prose::from_backticks(&detail),
             born: Instant::now(),
             sticky: false,
         });
@@ -3999,7 +3999,7 @@ impl Diffui {
     }
 
     /// [`Self::push_error_toast`], but the toast stays up until dismissed.
-    pub(crate) fn push_sticky_toast(&mut self, title: String, error: &str) {
+    pub(crate) fn push_sticky_toast(&mut self, title: impl Into<Prose>, error: &str) {
         self.push_error_toast(title, error);
         if let Some(toast) = self.toasts.last_mut() {
             toast.sticky = true;
@@ -4333,8 +4333,10 @@ impl Diffui {
         }
         self.pop_mode(ModeKind::Menu);
         let label = match &target {
-            FetchTarget::AllRemotes => "Fetching all remotes".to_owned(),
-            FetchTarget::RemoteBranch { remote, branch } => format!("Fetching {remote}/{branch}"),
+            FetchTarget::AllRemotes => Prose::from("Fetching all remotes"),
+            FetchTarget::RemoteBranch { remote, branch } => {
+                Prose::from("Fetching ").code(format!("{remote}/{branch}"))
+            }
         };
         let (activity_id, _) = self.begin_activity(tab, label, true);
         let Some(state) = self.tab_mut(tab) else {

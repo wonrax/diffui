@@ -443,68 +443,85 @@ impl Diffui {
             return Task::none();
         }
         // Surface the mutation as an activity (push captures its remote output).
-        let label = match &op {
-            MutationOp::New { .. } => "New change".to_owned(),
-            MutationOp::Edit { .. } => "Edit".to_owned(),
+        let label: Prose = match &op {
+            MutationOp::New { .. } => "New change".into(),
+            MutationOp::Edit { .. } => "Edit".into(),
             MutationOp::Abandon { targets } => {
                 if targets.len() == 1 {
-                    "Abandon".to_owned()
+                    "Abandon".into()
                 } else {
-                    format!("Abandon {} revisions", targets.len())
+                    format!("Abandon {} revisions", targets.len()).into()
                 }
             }
-            MutationOp::Describe { .. } => "Update description".to_owned(),
+            MutationOp::Describe { .. } => "Update description".into(),
             MutationOp::Rebase { sources, .. } => {
                 if sources.len() == 1 {
-                    "Rebase".to_owned()
+                    "Rebase".into()
                 } else {
-                    format!("Rebase {} revisions", sources.len())
+                    format!("Rebase {} revisions", sources.len()).into()
                 }
             }
-            MutationOp::Squash { .. } => "Squash".to_owned(),
-            MutationOp::Merge { .. } => "New merge".to_owned(),
-            MutationOp::Duplicate { .. } => "Duplicate".to_owned(),
-            MutationOp::Absorb { .. } => "Absorb".to_owned(),
+            MutationOp::Squash { .. } => "Squash".into(),
+            MutationOp::Merge { .. } => "New merge".into(),
+            MutationOp::Duplicate { .. } => "Duplicate".into(),
+            MutationOp::Absorb { .. } => "Absorb".into(),
             MutationOp::MoveBookmark {
                 name,
                 push_remote: Some(remote),
                 ..
-            } => format!("Move {name} + push to {remote}"),
-            MutationOp::MoveBookmark { name, .. } => format!("Move bookmark {name}"),
-            MutationOp::DeleteBookmark { name } => format!("Delete bookmark {name}"),
-            MutationOp::TrackBookmark { name, remote } => format!("Track {name}@{remote}"),
-            MutationOp::PushBookmark { name, remote } => format!("Push {name} to {remote}"),
-            MutationOp::Undo { operation_id: None } => "Undo".to_owned(),
+            } => Prose::from("Move ")
+                .bookmark(name)
+                .text(" + push to ")
+                .remote(remote),
+            MutationOp::MoveBookmark { name, .. } => Prose::from("Move bookmark ").bookmark(name),
+            MutationOp::DeleteBookmark { name } => Prose::from("Delete bookmark ").bookmark(name),
+            MutationOp::TrackBookmark { name, remote } => {
+                Prose::from("Track ").bookmark(format!("{name}@{remote}"))
+            }
+            MutationOp::PushBookmark { name, remote } => Prose::from("Push ")
+                .bookmark(name)
+                .text(" to ")
+                .remote(remote),
+            MutationOp::Undo { operation_id: None } => "Undo".into(),
             MutationOp::Undo {
                 operation_id: Some(_),
-            } => "Revert operation".to_owned(),
-            MutationOp::Redo => "Redo".to_owned(),
-            MutationOp::CreateBookmark { name, .. } => format!("Create bookmark {name}"),
-            MutationOp::RenameBookmark { old, new } => format!("Rename {old} to {new}"),
-            MutationOp::ForgetBookmark { name } => format!("Forget bookmark {name}"),
-            MutationOp::UntrackBookmark { name, remote } => format!("Untrack {name}@{remote}"),
+            } => "Revert operation".into(),
+            MutationOp::Redo => "Redo".into(),
+            MutationOp::CreateBookmark { name, .. } => {
+                Prose::from("Create bookmark ").bookmark(name)
+            }
+            MutationOp::RenameBookmark { old, new } => Prose::from("Rename ")
+                .bookmark(old)
+                .text(" to ")
+                .bookmark(new),
+            MutationOp::ForgetBookmark { name } => Prose::from("Forget bookmark ").bookmark(name),
+            MutationOp::UntrackBookmark { name, remote } => {
+                Prose::from("Untrack ").bookmark(format!("{name}@{remote}"))
+            }
             MutationOp::Push(request) => crate::bookmarks::push_label(request),
-            MutationOp::Commit { .. } => "Commit".to_owned(),
-            MutationOp::NewAt { .. } => "New change".to_owned(),
+            MutationOp::Commit { .. } => "Commit".into(),
+            MutationOp::NewAt { .. } => "New change".into(),
             MutationOp::Parallelize { targets } => {
-                format!("Parallelize {} revisions", targets.len())
+                format!("Parallelize {} revisions", targets.len()).into()
             }
             MutationOp::DuplicateTo { targets, .. } => match targets.len() {
-                1 => "Duplicate".to_owned(),
-                n => format!("Duplicate {n} revisions"),
+                1 => "Duplicate".into(),
+                n => format!("Duplicate {n} revisions").into(),
             },
-            MutationOp::KeepDivergent { .. } => "Resolve divergent change".to_owned(),
-            MutationOp::Metaedit { .. } => "Update author".to_owned(),
-            MutationOp::Split { selection, .. } => format!("Split off {}", selection.summary()),
+            MutationOp::KeepDivergent { .. } => "Resolve divergent change".into(),
+            MutationOp::Metaedit { .. } => "Update author".into(),
+            MutationOp::Split { selection, .. } => {
+                Prose::from("Split off ").then(crate::changes::selection_prose(selection))
+            }
             MutationOp::SquashChanges { selection, .. } => {
-                format!("Move {}", selection.summary())
+                Prose::from("Move ").then(crate::changes::selection_prose(selection))
             }
             MutationOp::RestoreChanges { selection, .. } => {
-                format!("Discard {}", selection.summary())
+                Prose::from("Discard ").then(crate::changes::selection_prose(selection))
             }
-            MutationOp::ResolveConflict { path, .. } => format!("Resolve {path}"),
-            MutationOp::RestoreOperation { .. } => "Restore operation".to_owned(),
-            MutationOp::RevertOperation { .. } => "Revert operation".to_owned(),
+            MutationOp::ResolveConflict { path, .. } => Prose::from("Resolve ").path(path),
+            MutationOp::RestoreOperation { .. } => "Restore operation".into(),
+            MutationOp::RevertOperation { .. } => "Revert operation".into(),
         };
         // Only pushes report real progress (git transfer); the rest are quick
         // local ops, so they stay indeterminate.

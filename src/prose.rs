@@ -86,6 +86,27 @@ impl Prose {
         self
     }
 
+    /// Plain text where `` `quoted` `` runs are code, the way jj quotes names
+    /// in its messages. An unpaired backtick stays as typed.
+    pub(crate) fn from_backticks(source: &str) -> Self {
+        let mut prose = Self::new();
+        let mut rest = source;
+        while let Some(open) = rest.find('`') {
+            let Some(len) = rest[open + 1..].find('`') else {
+                break;
+            };
+            let close = open + 1 + len;
+            prose = prose.text(&rest[..open]);
+            if len == 0 {
+                prose = prose.text("``");
+            } else {
+                prose = prose.push(Kind::Code, &rest[open + 1..close]);
+            }
+            rest = &rest[close + 1..];
+        }
+        prose.text(rest)
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.parts.is_empty()
     }
@@ -169,5 +190,25 @@ mod tests {
         let prose = Prose::new().text("a").text("b").path("").text("c");
         assert_eq!(prose.parts, [(Kind::Text, "abc".to_owned())]);
         assert!(Prose::new().text("").is_empty());
+    }
+
+    #[test]
+    fn backticked_names_become_code() {
+        let prose = Prose::from_backticks("Revision `nope` doesn't exist");
+        assert_eq!(
+            prose.parts,
+            [
+                (Kind::Text, "Revision ".to_owned()),
+                (Kind::Code, "nope".to_owned()),
+                (Kind::Text, " doesn't exist".to_owned()),
+            ]
+        );
+        assert_eq!(prose.to_string(), "Revision nope doesn't exist");
+        // Unpaired and empty quotes are left as typed.
+        assert_eq!(
+            Prose::from_backticks("a ` b").parts,
+            [(Kind::Text, "a ` b".to_owned())]
+        );
+        assert_eq!(Prose::from_backticks("x `` y").to_string(), "x `` y");
     }
 }

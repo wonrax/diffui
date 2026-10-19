@@ -531,11 +531,8 @@ impl Diffui {
                     .collect();
                 if rest.is_empty() {
                     self.push_error_toast(
-                        "Nothing to split".to_owned(),
-                        &format!(
-                            "{path} is the only change in this revision — there is nothing \
-                             to leave behind"
-                        ),
+                        "Nothing to split",
+                        &format!("`{path}` is the only change here, so nothing would stay."),
                     );
                     return Task::none();
                 }
@@ -643,9 +640,12 @@ impl Diffui {
         let Some(tab_id) = self.active_tab_id() else {
             return Task::none();
         };
-        let summary = selection.summary();
         let label = revision_label(self.active(), &revision);
-        let (activity_id, _) = self.begin_activity(tab_id, format!("Discard {summary}"), false);
+        let (activity_id, _) = self.begin_activity(
+            tab_id,
+            Prose::from("Discard ").then(selection_prose(&selection)),
+            false,
+        );
         if let Some(log) = self.activity_log_for(tab_id) {
             log.set_status(activity_id, activity::ActivityStatus::Queued);
         }
