@@ -43,6 +43,11 @@ const OP_LOG_PAGE: usize = 300;
 const ANNOTATION_CHARS: usize = 25;
 const ANNOTATION_AUTHOR_CHARS: usize = 10;
 
+/// Height of every row in an operation's changed-commit and moved-ref
+/// lists: a compact icon button on an even inset, so a row without the
+/// button is just as tall as one with it.
+const CHANGE_ROW_HEIGHT: f32 = crate::theme::control::COMPACT + 2.0 * space::XXS;
+
 /// What the History view lists.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) enum HistoryKind {
@@ -1528,15 +1533,10 @@ fn change_row<'a>(
         CommitChangeKind::Rewritten => ("~", theme.modified_token, "rewritten"),
         CommitChangeKind::Abandoned => ("\u{2212}", theme.removed_text, "abandoned"),
     };
-    let mut line = row![
-        container(mono(glyph, color, ui)).width(Length::Fixed(12.0)),
-        commit_line(ui, theme, &change.commit),
-        caption(verb, theme.subtle_text, ui),
-    ]
-    .spacing(space::SM)
-    .align_y(alignment::Vertical::Center);
-    if change.commit.visible {
-        line = line.push(ui::tooltip(
+    // A hidden commit has nothing to open, but keeps the slot so every
+    // row's verb ends at the same edge.
+    let open: Element<'a, Message> = if change.commit.visible {
+        ui::tooltip(
             ui::icon_button(icons::FILE_DIFF, theme.muted_text, ui::Size::Compact, theme).on_press(
                 Message::Action(Action::History(HistoryAction::OpenRevision(
                     change.commit.commit_id.clone(),
@@ -1546,11 +1546,25 @@ fn change_row<'a>(
             iced::widget::tooltip::Position::Left,
             ui.config.ui_font,
             theme,
-        ));
-    }
+        )
+    } else {
+        Space::new()
+            .width(Length::Fixed(ui::Size::Compact.height()))
+            .into()
+    };
+    let line = row![
+        container(mono(glyph, color, ui)).width(Length::Fixed(12.0)),
+        commit_line(ui, theme, &change.commit),
+        caption(verb, theme.subtle_text, ui),
+        open,
+    ]
+    .spacing(space::SM)
+    .height(Length::Fill)
+    .align_y(alignment::Vertical::Center);
     button(line)
         .width(Length::Fill)
-        .padding(Padding::from([space::XXS, space::SM]))
+        .height(Length::Fixed(CHANGE_ROW_HEIGHT))
+        .padding(Padding::from([0.0, space::SM]))
         .on_press(Message::Action(Action::History(
             HistoryAction::SelectChange(index),
         )))
@@ -1590,7 +1604,8 @@ fn ref_row<'a>(ui: &'a Diffui, theme: ThemeSpec, change: &'a RefChange) -> Eleme
         .spacing(space::SM)
         .align_y(alignment::Vertical::Center),
     )
-    .padding(Padding::from([space::XXS, space::SM]))
+    .padding(Padding::from([0.0, space::SM]))
+    .center_y(Length::Fixed(CHANGE_ROW_HEIGHT))
     .into()
 }
 
