@@ -89,8 +89,8 @@ pub(crate) enum HistoryAction {
     /// Show a (visible) commit in the diff view.
     OpenRevision(String),
     DiffScrolled(f32),
-    /// The history diff's scroll-tracked file changed; nothing to do.
-    DiffFileChanged,
+    /// The history diff scrolled onto another file.
+    DiffFileChanged(usize),
     /// Narrow the graph to the revisions that touched `path`, up to
     /// `revision`.
     FileHistory {
@@ -155,6 +155,10 @@ pub(crate) struct HistoryState {
     diff: Option<HistoryDiff>,
     diff_job: Option<(JobId, HistoryDiffTarget)>,
     diff_scroll: f32,
+    /// The file the history diff is on. The diff widget treats the file it
+    /// is given as the one to show, so this must follow its scroll reports
+    /// or it pulls the view back to the file it was given.
+    diff_file: usize,
     /// The last failure of a list or detail read, shown in place of it.
     error: Option<String>,
     pub(crate) file_filter: Option<FileFilter>,
@@ -288,7 +292,10 @@ impl Diffui {
                 self.active_mut().history.diff_scroll = offset;
                 iced::Task::none()
             }
-            HistoryAction::DiffFileChanged => iced::Task::none(),
+            HistoryAction::DiffFileChanged(index) => {
+                self.active_mut().history.diff_file = index;
+                iced::Task::none()
+            }
             HistoryAction::FileHistory { revision, path } => self.show_file_history(revision, path),
             HistoryAction::CurrentFileHistory => match current_file(self) {
                 Some((revision, path)) => self.show_file_history(revision, path),
@@ -634,6 +641,7 @@ impl Diffui {
                     self.scroll_restore_token = self.scroll_restore_token.wrapping_add(1);
                     let history = &mut self.tab_mut(tab)?.history;
                     history.diff_scroll = 0.0;
+                    history.diff_file = 0;
                     history.diff = Some(HistoryDiff {
                         target,
                         document,
@@ -1938,13 +1946,13 @@ fn history_diff_view<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Messag
         .collect::<Vec<_>>();
     let mut view = DiffView::new(
         files,
-        0,
+        history.diff_file,
         format!("history:{}", diff.doc_id),
         diff_palette(theme),
         ui.config.mono_font,
         ui.config.code_type,
         ui.config.multi_click_ms,
-        |_| Message::Action(Action::History(HistoryAction::DiffFileChanged)),
+        |index| Message::Action(Action::History(HistoryAction::DiffFileChanged(index))),
     )
     .on_copy(|text| Message::Action(Action::Copy(text)))
     .on_scroll(|offset| Message::Action(Action::History(HistoryAction::DiffScrolled(offset))))
@@ -2165,6 +2173,46 @@ mod tests {
         let _ = ui.perform_history(HistoryAction::ClearFileFilter);
         assert_eq!(ui.active().session.revset, "mine()");
         assert!(!file_filter_active(&ui));
+    }
+
+    #[test]
+    fn the_history_diff_keeps_the_file_it_was_scrolled_to() {
+        let (mut ui, repo) = jj_app();
+        let _ = ui.perform_history(HistoryAction::ShowOpLog);
+        let land = |ui: &mut Diffui, commit_id: &str| {
+            let job = JobId::next();
+            let target = HistoryDiffTarget::Commit {
+                commit_id: commit_id.to_owned(),
+            };
+            ui.active_mut().history.diff_job = Some((job, target.clone()));
+            deliver(
+                ui,
+                &repo,
+                diffui_core::Payload::History {
+                    job,
+                    response: HistoryResponse::Diff {
+                        target,
+                        document: DiffDocument::default(),
+                        details: None,
+                    },
+                },
+            );
+        };
+        land(&mut ui, "a");
+        assert_eq!(ui.active().history.diff_file, 0);
+        // The diff widget scrolls the file it is handed into view, so the
+        // file it reports scrolling onto must be what it is handed next;
+        // a fixed 0 snapped every scroll past the first file back up.
+        let _ = ui.update(Message::Action(Action::History(
+            HistoryAction::DiffFileChanged(2),
+        )));
+        assert_eq!(ui.active().history.diff_file, 2);
+        land(&mut ui, "b");
+        assert_eq!(
+            ui.active().history.diff_file,
+            0,
+            "a new diff opens at its top"
+        );
     }
 
     #[test]
