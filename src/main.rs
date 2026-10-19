@@ -36,6 +36,7 @@ mod measure;
 mod menu;
 mod menus;
 mod message;
+mod meta_line;
 mod modes;
 mod palette;
 mod path_browse;

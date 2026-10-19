@@ -33,7 +33,7 @@ use crate::theme::{
 };
 use crate::{
     Action, ConfirmDialog, Diffui, MainView, Message, PendingMutation, TabId, activity, icons,
-    modes::Mode, ui,
+    meta_line, modes::Mode, ui,
 };
 
 /// Operations read per page of the op log.
@@ -496,7 +496,7 @@ impl Diffui {
             .ops
             .iter()
             .find(|op| op.id == id)
-            .map(|op| op.summary().to_owned())
+            .map(|op| meta_line::shorten_ids(op.summary()))
             .unwrap_or_default();
         let (title, body, confirm_label, label, op) = if restore {
             (
@@ -795,14 +795,6 @@ impl Diffui {
 }
 
 type Task = iced::Task<Message>;
-
-/// "5m ago", or "just now".
-fn age_phrase(then: i64, now: i64) -> String {
-    match relative_age(then, now).as_str() {
-        "now" => "just now".to_owned(),
-        age => format!("{age} ago"),
-    }
-}
 
 fn clear_job(history: &mut HistoryState, job: JobId) {
     if history.ops_job == Some(job) {
@@ -1188,13 +1180,14 @@ fn op_row<'a>(
     head = head.push(caption(age, theme.subtle_text, ui));
     let content = column![
         head,
-        text(op.summary())
-            .size(text_size::BODY)
-            .font(ui.config.ui_font)
-            .color(theme.text)
-            .wrapping(text::Wrapping::None)
-            .ellipsis(text::Ellipsis::End)
-            .width(Length::Fill),
+        meta_line::description(
+            op.summary(),
+            text_size::BODY,
+            ui.config.ui_font,
+            theme.text,
+            ui,
+            theme,
+        ),
     ]
     .spacing(2);
     button(content)
@@ -1333,23 +1326,7 @@ fn run_row<'a>(
 }
 
 fn chip<'a>(label: &'a str, color: Color, ui: &Diffui) -> Element<'a, Message> {
-    container(
-        text(label)
-            .size(text_size::BADGE)
-            .font(ui.config.ui_font)
-            .color(color),
-    )
-    .padding(Padding::from([0, 5]))
-    .style(move |_| container::Style {
-        background: Some(Background::Color(chip_background(color))),
-        border: Border {
-            width: 0.0,
-            color: Color::TRANSPARENT,
-            radius: crate::chip::RADIUS.into(),
-        },
-        ..container::Style::default()
-    })
-    .into()
+    meta_line::badge(label, color, ui)
 }
 
 fn version_row<'a>(
@@ -1380,11 +1357,10 @@ fn version_row<'a>(
     } else {
         entry.commit.summary.as_str()
     };
-    let operation = entry
-        .operation
-        .as_ref()
-        .map(|op| op.summary.as_str())
-        .unwrap_or("(operation no longer in the log)");
+    let operation = entry.operation.as_ref().map_or_else(
+        || "(operation no longer in the log)".to_owned(),
+        |op| meta_line::shorten_ids(&op.summary),
+    );
     button(
         column![
             head,
@@ -1654,7 +1630,7 @@ fn change_row<'a>(
 
 fn ref_side_label(side: &[CommitBrief]) -> String {
     match side {
-        [] => "(absent)".to_owned(),
+        [] => String::new(),
         [only] => only.short_change_id().to_owned(),
         many => format!(
             "conflict: {}",
@@ -1666,22 +1642,42 @@ fn ref_side_label(side: &[CommitBrief]) -> String {
     }
 }
 
+/// A moved ref, laid out like a changed commit's row: a kind marker in the
+/// glyph column, the ref, where it moved from and to, and the kind where a
+/// commit row has its verb.
 fn ref_row<'a>(ui: &'a Diffui, theme: ThemeSpec, change: &'a RefChange) -> Element<'a, Message> {
-    let kind = match change.kind {
-        RefKind::WorkingCopy => "working copy",
-        RefKind::Bookmark => "bookmark",
-        RefKind::RemoteBookmark => "remote bookmark",
-        RefKind::Tag => "tag",
+    let (marker, kind): (Element<'a, Message>, &str) = match change.kind {
+        RefKind::WorkingCopy => (mono("@", theme.subtle_text, ui).into(), "working copy"),
+        RefKind::Bookmark => (
+            icons::icon(icons::GIT_BRANCH, 12.0, theme.subtle_text),
+            "bookmark",
+        ),
+        RefKind::RemoteBookmark => (
+            icons::icon(icons::GIT_BRANCH, 12.0, theme.subtle_text),
+            "remote bookmark",
+        ),
+        RefKind::Tag => (icons::icon(icons::TAG, 12.0, theme.subtle_text), "tag"),
+    };
+    let side = |commits: &'a [CommitBrief], color: Color| -> Element<'a, Message> {
+        if commits.is_empty() {
+            caption("(absent)", theme.subtle_text, ui).into()
+        } else {
+            mono(ref_side_label(commits), color, ui).into()
+        }
     };
     container(
         row![
-            container(caption(kind, theme.subtle_text, ui)).width(Length::Fixed(96.0)),
+            container(marker).width(Length::Fixed(12.0)),
             mono(change.name.as_str(), theme.text, ui),
-            mono(ref_side_label(&change.from), theme.removed_text, ui),
-            caption("\u{2192}", theme.subtle_text, ui),
-            mono(ref_side_label(&change.to), theme.added_text, ui),
+            side(&change.from, theme.removed_text),
+            icons::icon(icons::ARROW_RIGHT, 12.0, theme.subtle_text),
+            side(&change.to, theme.added_text),
+            Space::new().width(Length::Fill),
+            caption(kind, theme.subtle_text, ui),
+            Space::new().width(Length::Fixed(ui::Size::Compact.height())),
         ]
         .spacing(space::SM)
+        .height(Length::Fill)
         .align_y(alignment::Vertical::Center),
     )
     .padding(Padding::from([0.0, space::SM]))
@@ -1712,22 +1708,37 @@ fn operation_header<'a>(
     op: &'a OperationEntry,
     changes: Option<&'a OperationChanges>,
 ) -> Element<'a, Message> {
-    let now = now_millis();
-    let mut meta = row![mono(op.short_id(), theme.muted_text, ui)]
-        .spacing(space::SM)
-        .align_y(alignment::Vertical::Center);
+    let mut badges = Vec::new();
     if op.is_current {
-        meta = meta.push(chip("current", theme.accent, ui));
+        badges.push(meta_line::Badge {
+            label: "current",
+            color: theme.accent,
+        });
     }
     if op.is_snapshot {
-        meta = meta.push(chip("snapshot", theme.subtle_text, ui));
+        badges.push(meta_line::Badge {
+            label: "snapshot",
+            color: theme.subtle_text,
+        });
     }
-    meta = meta.push(caption(op.user.as_str(), theme.subtle_text, ui));
-    meta = meta.push(caption(
-        format!("{} ({})", op.time, age_phrase(op.time_millis, now)),
-        theme.subtle_text,
+    let meta = meta_line::view(
+        meta_line::Meta {
+            ids: vec![meta_line::Id::plain(
+                op.short_id(),
+                if op.is_current {
+                    theme.accent
+                } else {
+                    theme.muted_text
+                },
+            )],
+            badges,
+            who: Some((op.user.clone(), None)),
+            when: Some((Some(op.time_millis), op.time.clone())),
+            operation: None,
+        },
         ui,
-    ));
+        theme,
+    );
 
     let can_mutate = ui.active().session.capabilities.mutate;
     let has_parent = !op.parent_ids.is_empty();
@@ -1761,13 +1772,14 @@ fn operation_header<'a>(
 
     let mut block = column![
         row![
-            text(op.summary())
-                .size(text_size::BODY_LG)
-                .font(emphasis_font(ui.config.ui_font, iced::font::Weight::Medium))
-                .color(theme.text)
-                .wrapping(text::Wrapping::None)
-                .ellipsis(text::Ellipsis::End)
-                .width(Length::Fill),
+            meta_line::description(
+                op.summary(),
+                text_size::BODY_LG,
+                emphasis_font(ui.config.ui_font, iced::font::Weight::Medium),
+                theme.text,
+                ui,
+                theme,
+            ),
             ui::tooltip(
                 restore,
                 "Put every revision and bookmark back to how this operation left them (jj op restore)",
@@ -1790,10 +1802,15 @@ fn operation_header<'a>(
     .spacing(space::XS);
     if let Some(args) = &op.args {
         block = block.push(
-            caption(args.as_str(), theme.subtle_text, ui)
-                .font(ui.config.mono_font)
-                .ellipsis(text::Ellipsis::End)
-                .width(Length::Fill),
+            row![
+                icons::icon(icons::TERMINAL, 12.0, theme.subtle_text),
+                caption(args.as_str(), theme.subtle_text, ui)
+                    .font(ui.config.mono_font)
+                    .ellipsis(text::Ellipsis::End)
+                    .width(Length::Fill),
+            ]
+            .spacing(space::XS)
+            .align_y(alignment::Vertical::Center),
         );
     }
     container(block)
@@ -1826,7 +1843,11 @@ fn operation_changes<'a>(
         }
     }
     if !changes.refs.is_empty() {
-        list = list.push(section_title("Moved refs".to_owned(), ui, theme));
+        list = list.push(section_title(
+            format!("Moved refs ({})", changes.refs.len()),
+            ui,
+            theme,
+        ));
         for change in &changes.refs {
             list = list.push(ref_row(ui, theme, change));
         }
@@ -1850,23 +1871,23 @@ fn operation_changes<'a>(
 fn evolog_header<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Option<Element<'a, Message>> {
     let history = &ui.active().history;
     let entry = history.evolog.get(history.selected_version?)?;
-    let now = now_millis();
     let has_previous = !entry.predecessor_ids.is_empty();
-    let mut meta = row![caption(entry.commit.author.as_str(), theme.subtle_text, ui)]
-        .spacing(space::SM)
-        .align_y(alignment::Vertical::Center);
-    if let Some(op) = &entry.operation {
-        meta = meta.push(mono(op.short_id(), theme.subtle_text, ui));
-        meta = meta.push(
-            caption(
-                format!("{} \u{b7} {}", op.summary, age_phrase(op.time_millis, now)),
-                theme.subtle_text,
-                ui,
-            )
-            .ellipsis(text::Ellipsis::End)
-            .width(Length::Fill),
-        );
-    }
+    let meta = meta_line::view(
+        meta_line::Meta {
+            who: Some((entry.commit.author.clone(), None)),
+            when: entry
+                .operation
+                .as_ref()
+                .map(|op| (Some(op.time_millis), String::new())),
+            operation: entry
+                .operation
+                .as_ref()
+                .map(|op| (op.short_id().to_owned(), op.summary.clone())),
+            ..meta_line::Meta::default()
+        },
+        ui,
+        theme,
+    );
     // The first version has nothing before it, so it can only show its
     // full diff (which is what it loads).
     let shown = if has_previous {
