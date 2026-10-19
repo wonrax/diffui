@@ -11,7 +11,7 @@ use diffui_core::history::{human_timestamp, now_millis, parse_timestamp_millis};
 use diffui_core::{ParentBrief, RevisionDetails};
 use iced::{
     Background, Border, Color, Element, Length, Padding, alignment,
-    widget::{Column, Row, Space, button, column, container, row, scrollable, text},
+    widget::{Column, Row, Space, button, column, container, row, text},
 };
 
 use crate::meta_line::{self, Badge, Id, Meta};
@@ -228,10 +228,12 @@ fn description_body<'a>(ui: &Diffui, body: &str, theme: ThemeSpec) -> Element<'a
     let shown: Element<'a, Message> = if expanded {
         let natural = lines as f32 * line_height;
         let cap = (ui.window_size.height * 0.4).max(BODY_CLAMP_LINES as f32 * line_height);
-        scrollable(paragraph)
-            .height(Length::Fixed(natural.min(cap)))
-            .style(move |_, status| crate::theme::iced_scrollable_style(theme, status))
-            .into()
+        ui::scrollable(
+            container(paragraph).padding(Padding::ZERO.right(crate::scrollbar::GUTTER)),
+            theme,
+        )
+        .height(Length::Fixed(natural.min(cap)))
+        .into()
     } else {
         container(paragraph)
             .height(Length::Fixed(clamp as f32 * line_height))
