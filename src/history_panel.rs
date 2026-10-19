@@ -1015,17 +1015,17 @@ pub(crate) fn file_filter_banner<'a>(
     let filter = ui.active().history.file_filter.as_ref()?;
     let content = row![
         icons::icon(icons::FILE_CLOCK, ui::ICON_SIZE, theme.accent),
-        text(format!("History of {}", filter.path))
+        Prose::from("History of ")
+            .path(&filter.path)
+            .view(ui.config.ui_font, ui.config.mono_font, theme.text, theme)
             .size(text_size::UI)
-            .font(ui.config.ui_font)
-            .color(theme.text)
             .wrapping(text::Wrapping::None)
             .ellipsis(text::Ellipsis::End)
             .width(Length::Fill),
         ui::tooltip(
-            ui::icon_button(icons::CLOSE, theme.muted_text, ui::Size::Compact, theme).on_press(
-                Message::Action(Action::History(HistoryAction::ClearFileFilter))
-            ),
+            ui::close_button(theme.muted_text, theme).on_press(Message::Action(Action::History(
+                HistoryAction::ClearFileFilter
+            ))),
             "Show the whole graph again",
             iced::widget::tooltip::Position::Bottom,
             ui.config.ui_font,
@@ -1038,7 +1038,10 @@ pub(crate) fn file_filter_banner<'a>(
         container(
             container(content)
                 .width(Length::Fill)
-                .padding(Padding::from([0.0, space::MD]))
+                .padding(Padding {
+                    left: space::MD,
+                    ..Padding::from(ui::BANNER_INSET)
+                })
                 .style(move |_| container::Style {
                     background: Some(Background::Color(chip_background(theme.accent))),
                     border: Border {

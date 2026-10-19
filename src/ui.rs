@@ -178,6 +178,31 @@ pub fn icon_button<'a, Message: Clone + 'a>(
     .style(move |_, status| theme::ghost_button_style(theme, status))
 }
 
+/// The close (or clear) ✕ at the end of a banner or strip: a small square
+/// wash, so it sits inside the banner with even insets instead of filling
+/// its height.
+pub fn close_button<'a, Message: Clone + 'a>(
+    color: Color,
+    theme: ThemeSpec,
+) -> Button<'a, Message> {
+    Button::new(
+        container(icons::icon(icons::CLOSE, CLOSE_ICON_SIZE, color))
+            .center_x(Length::Fill)
+            .center_y(Length::Fill),
+    )
+    .width(Length::Fixed(CLOSE_SIDE))
+    .height(Length::Fixed(CLOSE_SIDE))
+    .padding(0)
+    .style(move |_, status| theme::ghost_button_style(theme, status))
+}
+
+/// Side of [`close_button`]'s square.
+pub const CLOSE_SIDE: f32 = 20.0;
+/// A banner's inset around its [`close_button`] on the top, right and
+/// bottom, so the ✕ sits in an even frame on a compact-control-tall banner.
+pub const BANNER_INSET: f32 = (theme::control::COMPACT - CLOSE_SIDE) / 2.0;
+const CLOSE_ICON_SIZE: f32 = 12.0;
+
 // ── Modals ──────────────────────────────────────────────────────────────
 
 /// Inset between a dialog card's edge and its content.

@@ -17,6 +17,7 @@ use iced::{Element, Length, Padding, Task, alignment};
 
 use crate::changes::{ChangesMsg, editable};
 use crate::commands::CommandArg;
+use crate::prose::Prose;
 use crate::theme::{ThemeSpec, text_size};
 use crate::{Action, Diffui, Message, PendingMutation, TabId, TabState, activity, icons, ui};
 
@@ -454,13 +455,14 @@ pub(crate) fn conflict_banner<'a>(
 
     let headline = row![
         icons::icon(icons::ALERT_TRIANGLE, ui::ICON_SIZE, theme.conflict_marker),
-        text(format!(
-            "{path} is conflicted ({} sides) \u{2014} take:",
-            conflict.sides.len()
-        ))
-        .size(text_size::UI)
-        .font(font)
-        .color(theme.text),
+        Prose::new()
+            .path(path)
+            .text(format!(
+                " is conflicted ({} sides). Take:",
+                conflict.sides.len()
+            ))
+            .view(font, ui.config.mono_font, theme.text, theme)
+            .size(text_size::UI),
     ]
     .spacing(6)
     .align_y(alignment::Vertical::Center);

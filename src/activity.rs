@@ -646,13 +646,8 @@ pub fn toast_layer(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
                     .font(emphasis_font(ui.config.ui_font, Weight::Semibold))
                     .color(theme.removed_text)
                     .width(Length::Fill),
-                crate::ui::icon_button(
-                    icons::CLOSE,
-                    theme.muted_text,
-                    crate::ui::Size::Compact,
-                    theme,
-                )
-                .on_press(Message::Ui(UiEvent::ToastDismiss(toast.id))),
+                crate::ui::close_button(theme.muted_text, theme)
+                    .on_press(Message::Ui(UiEvent::ToastDismiss(toast.id))),
             ]
             .spacing(8)
             .align_y(alignment::Vertical::Center),
@@ -663,15 +658,15 @@ pub fn toast_layer(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         ]
         .spacing(5);
         cards = cards.push(
-            // The title row is one control step tall for the close button, so
-            // the top and right insets give up the margin its wash keeps around
-            // the glyph: the warning glyph and the close glyph both sit 14px
-            // in from their card edges.
+            // The title row is the close button's height, so the top and
+            // right insets give up the margin its wash keeps around the glyph:
+            // the warning glyph and the close glyph both sit 14px in from
+            // their card edges.
             container(body)
                 .width(Length::Fill)
                 .padding(Padding {
-                    top: 7.0,
-                    right: 7.0,
+                    top: 10.0,
+                    right: 10.0,
                     bottom: 12.0,
                     left: 14.0,
                 })

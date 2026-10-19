@@ -11,6 +11,7 @@ use iced::{
 
 use diffui_core::RevisionSelection;
 
+use crate::prose::Prose;
 use crate::theme::{self, ThemeSpec, chip_background, emphasis_font, text_size};
 use crate::{Action, Diffui, LoadStatus, Message, icons, ui};
 
@@ -191,22 +192,25 @@ pub(crate) fn outside_view_banner<'a>(
         return None;
     }
     let label = match &ui.active().session.selected_revision {
-        RevisionSelection::WorkingCopy => "The working copy (@)".to_owned(),
-        selection => ui.revision_short_label(selection),
+        RevisionSelection::WorkingCopy => Prose::from("The working copy ").rev("@"),
+        selection => ui.revision_prose(selection),
     };
     Some(
         container(
             row![
                 icons::icon(icons::ALERT_TRIANGLE, ui::ICON_SIZE, theme.info),
-                text(format!(
-                    "{label} isn't in the current view \u{2014} the revset doesn't include it."
-                ))
-                .size(text_size::UI)
-                .color(theme.muted_text)
-                .font(ui.config.ui_font)
-                .width(Length::Fill)
-                .wrapping(text::Wrapping::None)
-                .ellipsis(text::Ellipsis::End),
+                label
+                    .text(" isn't in the current revset.")
+                    .view(
+                        ui.config.ui_font,
+                        ui.config.mono_font,
+                        theme.muted_text,
+                        theme,
+                    )
+                    .size(text_size::UI)
+                    .width(Length::Fill)
+                    .wrapping(text::Wrapping::None)
+                    .ellipsis(text::Ellipsis::End),
             ]
             .spacing(theme::space::MD)
             .align_y(alignment::Vertical::Center),
