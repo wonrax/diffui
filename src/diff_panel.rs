@@ -57,14 +57,7 @@ fn build_file_navigator_surface<'a>(
         return Space::new().width(0).into();
     }
 
-    let mut trailing = row![
-        text(files.len().to_string())
-            .size(text_size::CAPTION)
-            .font(ui.config.mono_font)
-            .color(theme.subtle_text)
-    ]
-    .spacing(crate::field::PANEL_TOGGLE_INSET)
-    .align_y(alignment::Vertical::Center);
+    let mut trailing = row![].align_y(alignment::Vertical::Center);
     if show_collapse {
         trailing = trailing.push(crate::field::panel_toggle_button(
             ui.config.ui_font,
@@ -75,7 +68,8 @@ fn build_file_navigator_surface<'a>(
         ));
     }
     let header = row![
-        text("Changed files")
+        // A section's count rides in its title, as in "Changed commits (2)".
+        text(format!("Changed files ({})", files.len()))
             .size(text_size::UI)
             .font(crate::theme::emphasis_font(
                 ui.config.ui_font,

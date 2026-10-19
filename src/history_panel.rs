@@ -1730,7 +1730,11 @@ fn operation_changes<'a>(
         }
     }
     if !changes.refs.is_empty() {
-        list = list.push(section_title("Moved refs".to_owned(), ui, theme));
+        list = list.push(section_title(
+            format!("Moved refs ({})", changes.refs.len()),
+            ui,
+            theme,
+        ));
         for change in &changes.refs {
             list = list.push(ref_row(ui, theme, change));
         }
