@@ -53,7 +53,8 @@ impl CliConfig {
 
     /// jj-cli's defaults with the user's config on top. `settings` is what
     /// diffui already resolved for the repository (see
-    /// `jj::settings::jj_settings`), which lacks jj-cli's default layer.
+    /// `jj::settings::jj_settings`); settings built without jj-cli's defaults
+    /// still get them from [`builtin`](Self::builtin).
     pub fn from_settings(settings: &jj_lib::settings::UserSettings) -> Self {
         let mut cli = Self::builtin();
         cli.overlay(settings.config());

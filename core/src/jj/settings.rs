@@ -1,18 +1,38 @@
+//! jj's config, read through jj-cli's own loader: its shipped defaults
+//! (`revsets.log`, the revset aliases, the merge tools,
+//! `templates.git_push_bookmark`, `snapshot.*`), its environment layers, its
+//! system and user file lookup, `--when` scopes and config migrations.
+//!
+//! Ported, because jj's version writes or needs a command context. Check each
+//! against jj-cli on a bump:
+//! - `secure_config_file` ports jj-lib's `SecureConfig::maybe_load_config`
+//!   (`lib/src/secure_config.rs`), read-only. jj's mints config ids, rewrites
+//!   metadata and migrates legacy files, which a GUI opening a repo shouldn't.
+//! - `snapshot_base_ignores` ports `WorkspaceCommandHelper::base_ignores`
+//!   (`cli/src/cli_util.rs`).
+//! - `snapshot_auto_track_matcher` and `snapshot_max_new_file_size` port
+//!   `WorkspaceCommandHelper::auto_tracking_matcher` and
+//!   `snapshot_options_with_start_tracking_matcher` (`cli/src/cli_util.rs`).
+
 use std::{
     collections::HashMap,
     env,
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::Arc,
 };
 
-use anyhow::{Context, Result};
-use jj_lib::{
-    config::{ConfigLayer, ConfigResolutionContext, ConfigSource, ConfigValue, StackedConfig},
-    file_util::path_from_bytes,
-    fileset::{
-        FilesetAliasesMap, FilesetDiagnostics, FilesetExpression, FilesetParseContext,
-        parse as parse_fileset,
+use anyhow::{Context, Result, anyhow};
+use jj_cli::{
+    command_error::CommandError,
+    config::{
+        ConfigEnv, config_from_environment, default_config_layers, default_config_migrations,
     },
+    ui::Ui,
+};
+use jj_lib::{
+    config::ConfigSource,
+    file_util::path_from_bytes,
+    fileset::{FilesetDiagnostics, FilesetExpression, FilesetParseContext, parse as parse_fileset},
     gitignore::GitIgnoreFile,
     matchers::Matcher,
     repo_path::RepoPath,
@@ -20,24 +40,27 @@ use jj_lib::{
     ui_path::RepoPathUiConverter,
 };
 
-// Fallback used only when the user has not configured `snapshot.max-new-file-size`.
-// Matches jj-cli's shipped default (1 MiB).
-pub(super) const DEFAULT_SNAPSHOT_MAX_NEW_FILE_SIZE: u64 = 1024 * 1024;
+/// A jj-cli error as an `anyhow` one. jj-cli's own errors carry no `Display`
+/// of their own; the message is the wrapped error and its sources.
+pub(super) fn cli_error(error: CommandError) -> anyhow::Error {
+    let mut message = error.error.to_string();
+    let mut source = error.error.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    anyhow!(message)
+}
 
-/// The slice of the process environment jj's config layering reads. Held as a
-/// value rather than read from `std::env` at each use so the tests can drive
-/// the loader directly — `set_var` is `unsafe` and would race every other test
-/// in the binary.
+/// The slice of the process environment the git-ignore lookup reads. Held as
+/// a value rather than read from `std::env` at each use so the tests can drive
+/// it directly — `set_var` is `unsafe` and would race every other test in the
+/// binary.
 #[derive(Clone, Debug, Default)]
 pub(super) struct JjEnv {
     pub(super) vars: HashMap<String, String>,
     home_dir: Option<PathBuf>,
-    /// Default for `operation.hostname`; see [`process_hostname`]. Also what
-    /// `--when.hostnames` scopes match against.
-    hostname: Option<String>,
-    /// Where the system-wide `jj/config.toml` and `jj/conf.d` live: `/etc` on
-    /// unix, like jj-cli. `None` (the tests) reads no system config.
-    system_config_dir: Option<PathBuf>,
 }
 
 impl JjEnv {
@@ -51,234 +74,57 @@ impl JjEnv {
                 })
                 .collect(),
             home_dir: env::home_dir(),
-            hostname: process_hostname(),
-            system_config_dir: cfg!(unix).then(|| PathBuf::from("/etc")),
         }
     }
 
     fn var(&self, name: &str) -> Option<&str> {
         self.vars.get(name).map(String::as_str)
     }
-
-    /// jj-cli resolves its config dir through `etcetera::choose_base_strategy`,
-    /// which is the XDG strategy on every unix — macOS included, where jj
-    /// deliberately does *not* look in `~/Library/Application Support`.
-    /// etcetera ignores a relative `XDG_CONFIG_HOME`, so we do too.
-    fn config_dir(&self) -> Option<PathBuf> {
-        let xdg = self
-            .var("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .filter(|dir| dir.is_absolute());
-        match xdg {
-            Some(dir) => Some(dir),
-            None => Some(self.home_dir.as_ref()?.join(".config")),
-        }
-    }
-
-    /// `<config dir>/jj` — the directory jj 0.41 keeps per-repo config under.
-    fn root_config_dir(&self) -> Option<PathBuf> {
-        Some(self.config_dir()?.join("jj"))
-    }
-
-    /// The system-wide config file and directory, lowest precedence first —
-    /// jj-cli's `UnresolvedConfigEnv::resolve_system`, which `$JJ_CONFIG`
-    /// switches off along with the user files.
-    fn system_config_paths(&self) -> Vec<PathBuf> {
-        match &self.system_config_dir {
-            Some(dir) if self.var("JJ_CONFIG").is_none() => {
-                vec![
-                    dir.join("jj").join("config.toml"),
-                    dir.join("jj").join("conf.d"),
-                ]
-            }
-            _ => Vec::new(),
-        }
-    }
-
-    /// The user config files and directories, lowest precedence first, exactly
-    /// as jj-cli's `UnresolvedConfigEnv::resolve` orders them: the legacy
-    /// `~/.jjconfig.toml`, then `<config dir>/jj/config.toml`, then
-    /// `<config dir>/jj/conf.d`. Anything else sitting next to `config.toml`
-    /// is not jj's to read — we used to load the whole directory, so one
-    /// malformed stray `*.toml` failed every operation diffui ran.
-    fn user_config_paths(&self) -> Vec<PathBuf> {
-        if let Some(paths) = self.var("JJ_CONFIG") {
-            return env::split_paths(paths)
-                .filter(|path| !path.as_os_str().is_empty())
-                .collect();
-        }
-
-        let mut paths = Vec::new();
-        let home_config = self
-            .home_dir
-            .as_ref()
-            .map(|home| home.join(".jjconfig.toml"));
-        let config_dir = self.config_dir();
-        let platform_config = config_dir
-            .as_ref()
-            .map(|dir| dir.join("jj").join("config.toml"));
-
-        // The home file counts only when it exists — unless there is no config
-        // dir at all, in which case it is the one place a config could live.
-        if let Some(path) = home_config
-            && (path.exists() || platform_config.is_none())
-        {
-            paths.push(path);
-        }
-        paths.extend(platform_config);
-        if let Some(dir) = config_dir {
-            let conf_d = dir.join("jj").join("conf.d");
-            if conf_d.exists() {
-                paths.push(conf_d);
-            }
-        }
-        paths
-    }
 }
 
-/// The machine's hostname, for `operation.hostname`. jj-cli reads it through
-/// `whoami`; diffui-core has no equivalent dependency, so we take Linux's
-/// procfs entry and fall back to the `hostname` command (macOS has no such
-/// file but always ships `/bin/hostname`). Cached, because the alternative is
-/// spawning a process on every snapshot tick — and without it every operation
-/// diffui writes shows a blank host in `jj op log` while the CLI's shows one.
-pub(super) fn process_hostname() -> Option<String> {
-    static HOSTNAME: OnceLock<Option<String>> = OnceLock::new();
-    fn non_empty(value: String) -> Option<String> {
-        let value = value.trim().to_owned();
-        (!value.is_empty()).then_some(value)
-    }
-    HOSTNAME
-        .get_or_init(|| {
-            std::fs::read_to_string("/proc/sys/kernel/hostname")
-                .ok()
-                .and_then(non_empty)
-                .or_else(|| {
-                    let output = std::process::Command::new("hostname").output().ok()?;
-                    non_empty(String::from_utf8(output.stdout).ok()?)
-                })
-        })
-        .clone()
-}
-
-pub(super) const OP_HOSTNAME: &str = "operation.hostname";
-pub(super) const OP_USERNAME: &str = "operation.username";
-
-/// `ConfigLayer::set_value` only rejects a malformed config name or a value
-/// with no TOML representation; every call below passes a literal name and a
-/// plain scalar, so the error is unreachable (jj-cli unwraps it too).
-pub(super) fn set_env_config_value(
-    layer: &mut ConfigLayer,
-    name: &'static str,
-    value: impl Into<ConfigValue>,
-) {
-    layer
-        .set_value(name, value)
-        .expect("literal config name and scalar value");
-}
-
-/// jj-cli's `env_base_layer`: environment-derived values a config file is
-/// still allowed to override. Its presentation-only entries (`$NO_COLOR`,
-/// `$VISUAL`, `$EDITOR`) are left out — nothing in jj-lib reads `ui.color` or
-/// `ui.editor`, they only drive the CLI's own output and editor launching.
-pub(super) fn jj_env_base_layer(env: &JjEnv) -> ConfigLayer {
-    let mut layer = ConfigLayer::empty(ConfigSource::EnvBase);
-    if let Some(hostname) = &env.hostname {
-        set_env_config_value(&mut layer, OP_HOSTNAME, hostname.as_str());
-    }
-    // jj-cli asks `whoami` first and falls back to `$USER`; that fallback is
-    // all we have. launchd exports both `USER` and `LOGNAME` to a macOS GUI
-    // app, so a bundled diffui still gets a name.
-    if let Some(username) = env.var("USER").or_else(|| env.var("LOGNAME")) {
-        set_env_config_value(&mut layer, OP_USERNAME, username);
-    }
-    layer
-}
-
-/// jj-cli's `env_overrides_layer`, minus `$JJ_EDITOR` (`ui.editor` again).
-/// Without this a diffui commit ignores the `JJ_USER`/`JJ_EMAIL` a wrapper
-/// script or a test harness set and signs the commit as whoever the config
-/// file names instead.
-pub(super) fn jj_env_overrides_layer(env: &JjEnv) -> ConfigLayer {
-    let mut layer = ConfigLayer::empty(ConfigSource::EnvOverrides);
-    for (name, key) in [
-        ("JJ_USER", "user.name"),
-        ("JJ_EMAIL", "user.email"),
-        ("JJ_TIMESTAMP", "debug.commit-timestamp"),
-        ("JJ_OP_TIMESTAMP", "debug.operation-timestamp"),
-        ("JJ_OP_HOSTNAME", OP_HOSTNAME),
-        ("JJ_OP_USERNAME", OP_USERNAME),
-    ] {
-        if let Some(value) = env.var(name) {
-            set_env_config_value(&mut layer, key, value);
-        }
-    }
-    if let Some(seed) = env
-        .var("JJ_RANDOMNESS_SEED")
-        .and_then(|value| value.parse::<i64>().ok())
-    {
-        set_env_config_value(&mut layer, "debug.randomness-seed", seed);
-    }
-    layer
-}
-
+/// The settings jj-cli would run a command with in the workspace at
+/// `repo_root`, short of the command's own `--config` flags. jj-cli's
+/// environment layers set `ui.editor`, `ui.color` and `ui.pager` too; nothing
+/// in diffui reads them, so they ride along unused.
 pub(crate) fn jj_settings(repo_root: &Path) -> Result<UserSettings> {
-    jj_settings_with_env(repo_root, &JjEnv::from_process())
-}
+    let mut env = ConfigEnv::from_environment();
+    let mut config = config_from_environment(default_config_layers());
+    env.reload_system_config(&mut config)
+        .context("failed to load the system jj config")?;
+    env.reload_user_config(&mut config)
+        .context("failed to load the user jj config")?;
 
-pub(super) fn jj_settings_with_env(repo_root: &Path, env: &JjEnv) -> Result<UserSettings> {
-    let files = JjConfigFiles::locate(repo_root, env);
-    let mut config = StackedConfig::with_defaults();
-    // `add_layer` inserts by `ConfigSource` rank, so these sit below and above
-    // the file layers regardless of the order we hand them over in.
-    config.add_layer(jj_env_base_layer(env));
-    config.add_layer(jj_env_overrides_layer(env));
-
-    for path in &files.system {
-        load_jj_config_path(&mut config, ConfigSource::System, path)?;
-    }
-    for path in &files.user {
-        load_jj_config_path(&mut config, ConfigSource::User, path)?;
-    }
+    let files = JjConfigFiles::locate(repo_root, &env);
     if let Some(path) = &files.repo {
         config
+            .as_mut()
             .load_file(ConfigSource::Repo, path.clone())
             .with_context(|| format!("failed to load jj repo config {}", path.display()))?;
     }
     if let Some(path) = &files.workspace {
         config
+            .as_mut()
             .load_file(ConfigSource::Workspace, path.clone())
             .with_context(|| format!("failed to load jj workspace config {}", path.display()))?;
     }
 
-    // jj-cli's `ConfigEnv::resolve_config`: drop the `[[--scope]]` tables
-    // whose `--when` conditions don't hold for this workspace, and flatten the
-    // rest into their parents. Without it a per-repo `user.email` (or signing
-    // key, or `immutable_heads()`) scoped with `--when.repositories` never
-    // applied, and diffui committed under the default identity. There is no
-    // subcommand, so `--when.commands` scopes never match — the same as the
-    // CLI before it has parsed one.
-    let home_dir = env
-        .home_dir
-        .as_ref()
-        .map(|home| home.canonicalize().unwrap_or_else(|_| home.clone()));
-    let context = ConfigResolutionContext {
-        home_dir: home_dir.as_deref(),
-        repo_path: files.repo_dir.as_deref(),
-        workspace_path: Some(repo_root),
-        command: None,
-        hostname: env.hostname.as_deref().unwrap_or(""),
-        environment: &env.vars,
-    };
-    let config = jj_lib::config::resolve(&config, &context)
+    // What `--when.repositories` and `--when.workspaces` match. There is no
+    // subcommand, so `--when.commands` scopes never match, the same as the CLI
+    // before it has parsed one.
+    if let Some(repo_dir) = &files.repo_dir {
+        env.reset_repo_path(repo_dir);
+    }
+    env.reset_workspace_path(repo_root);
+    let mut config = env
+        .resolve_config(&config)
         .context("failed to resolve conditional jj config")?;
-    // jj-cli 0.45.1 ships no deprecated-key migrations
-    // (`default_config_migrations` is empty), so there is nothing to apply.
+    jj_lib::config::migrate(&mut config, &default_config_migrations())
+        .context("failed to migrate deprecated jj config")?;
 
     UserSettings::from_config(config).context("failed to build jj settings")
 }
 
-/// Every config file jj-cli 0.45 would read for the workspace at `repo_root`,
+/// Every config file jj-cli would read for the workspace at `repo_root`,
 /// found without writing anything: no config-id is minted and no legacy file
 /// migrated, since that's the CLI's job and a GUI opening a repo shouldn't
 /// rearrange the user's config directory.
@@ -296,19 +142,26 @@ pub(super) struct JjConfigFiles {
 }
 
 impl JjConfigFiles {
-    pub(super) fn locate(repo_root: &Path, env: &JjEnv) -> Self {
+    pub(super) fn locate(repo_root: &Path, env: &ConfigEnv) -> Self {
         let mut files = JjConfigFiles {
-            system: env.system_config_paths(),
-            user: env.user_config_paths(),
+            system: env
+                .existing_system_config_paths()
+                .map(Path::to_path_buf)
+                .collect(),
+            user: env.user_config_paths().map(Path::to_path_buf).collect(),
             ..JjConfigFiles::default()
         };
+        // `<config dir>/jj`, which holds the `repos/` and `workspaces/` trees.
+        let root_config_dir = env
+            .repo_configs_root_dir()
+            .and_then(|repos| Some(repos.parent()?.to_path_buf()));
         // Through the `.jj/repo` pointer so a secondary workspace picks up the
         // primary repo's config. Best-effort: an unresolvable pointer just
         // means no repo-level config layer (Workspace::load will surface the
         // breakage).
         if let Ok(repo_dir) = crate::repository::resolve_jj_repo_dir(repo_root) {
             files.repo = secure_config_file(
-                env,
+                root_config_dir.as_deref(),
                 &repo_dir,
                 "config-id",
                 "config.toml",
@@ -318,7 +171,7 @@ impl JjConfigFiles {
             files.repo_dir = Some(repo_dir);
         }
         files.workspace = secure_config_file(
-            env,
+            root_config_dir.as_deref(),
             &repo_root.join(".jj"),
             "workspace-config-id",
             "workspace-config.toml",
@@ -356,7 +209,7 @@ impl JjConfigFiles {
 /// `dir` itself is read (jj ≤ 0.40 kept it there, and jj 0.41+ leaves a symlink
 /// behind when it migrates). `None` when neither exists.
 fn secure_config_file(
-    env: &JjEnv,
+    root_config_dir: Option<&Path>,
     dir: &Path,
     id_name: &str,
     legacy_name: &str,
@@ -372,8 +225,7 @@ fn secure_config_file(
         // jj rejects anything but a 20-hex-digit id; a bad pointer means no
         // config rather than a path built from junk.
         if id.len() == CONFIG_ID_LEN && id.chars().all(|c| c.is_ascii_hexdigit()) {
-            let candidate = env
-                .root_config_dir()?
+            let candidate = root_config_dir?
                 .join(root_name)
                 .join(id)
                 .join("config.toml");
@@ -393,12 +245,8 @@ fn secure_config_file(
 pub struct JjConfigStamp(Vec<(PathBuf, Option<(u64, std::time::SystemTime)>)>);
 
 pub(crate) fn jj_config_stamp(repo_root: &Path) -> JjConfigStamp {
-    jj_config_stamp_with_env(repo_root, &JjEnv::from_process())
-}
-
-pub(super) fn jj_config_stamp_with_env(repo_root: &Path, env: &JjEnv) -> JjConfigStamp {
     JjConfigStamp(
-        JjConfigFiles::locate(repo_root, env)
+        JjConfigFiles::locate(repo_root, &ConfigEnv::from_environment())
             .watched()
             .into_iter()
             .map(|path| {
@@ -411,43 +259,23 @@ pub(super) fn jj_config_stamp_with_env(repo_root: &Path, env: &JjEnv) -> JjConfi
     )
 }
 
-pub(super) fn load_jj_config_path(
-    config: &mut StackedConfig,
-    source: ConfigSource,
-    path: &Path,
-) -> Result<()> {
-    if path.is_dir() {
-        config
-            .load_dir(source, path)
-            .with_context(|| format!("failed to load jj config dir {}", path.display()))?;
-    } else if path.is_file() {
-        config
-            .load_file(source, path.to_path_buf())
-            .with_context(|| format!("failed to load jj config file {}", path.display()))?;
-    }
-    Ok(())
-}
-
+/// `snapshot.max-new-file-size`, where 0 means no limit, as in jj-cli.
 pub(super) fn snapshot_max_new_file_size(settings: &UserSettings) -> Result<u64> {
-    use jj_lib::config::ConfigGetError;
-    match settings.get_value_with("snapshot.max-new-file-size", HumanByteSize::try_from) {
-        Ok(size) => Ok(size.0),
-        Err(ConfigGetError::NotFound { .. }) => Ok(DEFAULT_SNAPSHOT_MAX_NEW_FILE_SIZE),
-        Err(err) => Err(err).context("invalid snapshot.max-new-file-size"),
-    }
+    let HumanByteSize(size) = settings
+        .get_value_with("snapshot.max-new-file-size", HumanByteSize::try_from)
+        .context("invalid snapshot.max-new-file-size")?;
+    Ok(if size == 0 { u64::MAX } else { size })
 }
 
 pub(super) fn snapshot_auto_track_matcher(
     settings: &UserSettings,
     repo_root: &Path,
 ) -> Result<Box<dyn Matcher>> {
-    use jj_lib::config::ConfigGetError;
-    let raw = match settings.get_string("snapshot.auto-track") {
-        Ok(value) => value,
-        Err(ConfigGetError::NotFound { .. }) => "all()".to_string(),
-        Err(err) => return Err(err).context("invalid snapshot.auto-track"),
-    };
-    let aliases = FilesetAliasesMap::new();
+    let raw = settings
+        .get_string("snapshot.auto-track")
+        .context("invalid snapshot.auto-track")?;
+    let aliases = jj_cli::cli_util::load_fileset_aliases(&Ui::null(), settings.config())
+        .map_err(cli_error)?;
     let path_converter = RepoPathUiConverter::Fs {
         cwd: repo_root.to_path_buf(),
         base: repo_root.to_path_buf(),
@@ -682,6 +510,9 @@ pub(super) fn git_config_value(raw: &str) -> String {
 #[cfg(test)]
 mod config_layering_tests {
     use std::path::PathBuf;
+    use std::process::Command;
+
+    use jj_lib::config::StackedConfig;
 
     use super::*;
 
@@ -703,8 +534,12 @@ mod config_layering_tests {
         RepoPath::from_internal_string(value).expect("valid repo path")
     }
 
-    /// An environment holding only what the test puts in it: no home, no
-    /// hostname, and none of the variables the test runner happens to carry.
+    fn utf8(path: &Path) -> &str {
+        path.to_str().expect("utf-8 scratch path")
+    }
+
+    /// An environment holding only what the test puts in it: no home and
+    /// none of the variables the test runner happens to carry.
     fn test_env(vars: &[(&str, &str)]) -> JjEnv {
         JjEnv {
             vars: vars
@@ -713,6 +548,73 @@ mod config_layering_tests {
                 .collect(),
             ..JjEnv::default()
         }
+    }
+
+    const PROBE_ROOT: &str = "DIFFUI_SETTINGS_PROBE_ROOT";
+    const PROBE_KEYS: &str = "DIFFUI_SETTINGS_PROBE_KEYS";
+    const PROBE_MARK: &str = "diffui-settings-probe:";
+
+    /// What [`settings_probe`] read in its child process: each asked-for
+    /// config value that exists, plus the config stamp under `stamp`.
+    struct Probe(HashMap<String, String>);
+
+    impl Probe {
+        fn get(&self, key: &str) -> &str {
+            self.0
+                .get(key)
+                .unwrap_or_else(|| panic!("{key} is unset: {:?}", self.0))
+        }
+    }
+
+    /// Load the settings for `repo_root` in a child copy of this test binary
+    /// whose environment is exactly `vars`. jj-cli reads `$HOME`,
+    /// `$XDG_CONFIG_HOME`, `$JJ_CONFIG` and the `JJ_*` overrides straight from
+    /// the process environment, and `set_var` would race every other test.
+    fn probe(repo_root: &Path, vars: &[(&str, &str)], keys: &[&str]) -> Probe {
+        let path = concat!(module_path!(), "::settings_probe");
+        let test = path.split_once("::").map_or(path, |(_, test)| test);
+        let output = Command::new(env::current_exe().expect("the test binary"))
+            .args([test, "--exact", "--nocapture", "--test-threads=1"])
+            .env_clear()
+            .envs(vars.iter().copied())
+            .env(PROBE_ROOT, repo_root)
+            .env(PROBE_KEYS, keys.join(","))
+            .output()
+            .expect("run the settings probe");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "the settings probe failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Probe(
+            stdout
+                .lines()
+                .filter_map(|line| line.split_once(PROBE_MARK)?.1.split_once('='))
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .collect(),
+        )
+    }
+
+    /// The child half of [`probe`]; does nothing in an ordinary test run.
+    #[test]
+    fn settings_probe() {
+        let Some(root) = env::var_os(PROBE_ROOT) else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let keys = env::var(PROBE_KEYS).unwrap_or_default();
+        let settings = jj_settings(&root).expect("jj settings");
+        for key in keys.split(',').filter(|key| !key.is_empty()) {
+            let name: jj_lib::config::ConfigNamePathBuf = key.parse().expect("a config name");
+            if let Ok(value) = settings.get_value(&name) {
+                let value = value
+                    .as_str()
+                    .map_or_else(|| value.to_string(), str::to_owned);
+                println!("{PROBE_MARK}{key}={value}");
+            }
+        }
+        println!("{PROBE_MARK}stamp={:?}", jj_config_stamp(&root));
     }
 
     /// jj-cli reads exactly `config.toml` and `conf.d/*.toml` from its config
@@ -740,20 +642,19 @@ mod config_layering_tests {
         );
         write_file(config_dir.join("junk.toml"), "this is = = not toml\n");
 
-        let env = JjEnv {
-            home_dir: Some(home),
-            ..test_env(&[])
-        };
-        let settings =
-            jj_settings_with_env(&root, &env).expect("a stray junk.toml must not fail the load");
+        let settings = probe(
+            &root,
+            &[("HOME", utf8(&home))],
+            &["user.name", "user.email"],
+        );
 
         assert_eq!(
-            settings.user_name(),
+            settings.get("user.name"),
             "conf.d",
             "conf.d outranks config.toml"
         );
         assert_eq!(
-            settings.user_email(),
+            settings.get("user.email"),
             "home@example.com",
             "~/.jjconfig.toml still supplies what no higher layer sets"
         );
@@ -773,38 +674,39 @@ mod config_layering_tests {
             "[user]\nname = \"file\"\nemail = \"file@example.com\"\n\
              [operation]\nhostname = \"file-host\"\n",
         );
+        let keys = [
+            "user.name",
+            "user.email",
+            "operation.hostname",
+            "operation.username",
+        ];
+        let mut vars = vec![
+            ("HOME", utf8(&home)),
+            ("JJ_USER", "Env User"),
+            ("JJ_EMAIL", "env@example.com"),
+        ];
 
-        let mut env = JjEnv {
-            home_dir: Some(home),
-            hostname: Some("base-host".to_owned()),
-            ..test_env(&[
-                ("USER", "login-name"),
-                ("JJ_USER", "Env User"),
-                ("JJ_EMAIL", "env@example.com"),
-            ])
-        };
-
-        let settings = jj_settings_with_env(&root, &env).expect("jj settings");
-        assert_eq!(settings.user_name(), "Env User", "JJ_USER beats the file");
-        assert_eq!(settings.user_email(), "env@example.com");
+        let settings = probe(&root, &vars, &keys);
         assert_eq!(
-            settings.operation_hostname(),
+            settings.get("user.name"),
+            "Env User",
+            "JJ_USER beats the file"
+        );
+        assert_eq!(settings.get("user.email"), "env@example.com");
+        assert_eq!(
+            settings.get("operation.hostname"),
             "file-host",
             "the file beats the base env layer"
         );
-        assert_eq!(
-            settings.operation_username(),
-            "login-name",
-            "$USER is the default when nothing else names one"
+        assert!(
+            !settings.get("operation.username").is_empty(),
+            "the login name is the default when nothing else names one"
         );
 
-        env.vars
-            .insert("JJ_OP_HOSTNAME".to_owned(), "op-host".to_owned());
-        env.vars
-            .insert("JJ_OP_USERNAME".to_owned(), "op-user".to_owned());
-        let settings = jj_settings_with_env(&root, &env).expect("jj settings");
-        assert_eq!(settings.operation_hostname(), "op-host");
-        assert_eq!(settings.operation_username(), "op-user");
+        vars.extend([("JJ_OP_HOSTNAME", "op-host"), ("JJ_OP_USERNAME", "op-user")]);
+        let settings = probe(&root, &vars, &keys);
+        assert_eq!(settings.get("operation.hostname"), "op-host");
+        assert_eq!(settings.get("operation.username"), "op-user");
     }
 
     /// A `[[--scope]]` table applies only where its `--when` holds: here a
@@ -820,30 +722,35 @@ mod config_layering_tests {
         for repo in [&work_repo, &personal_repo] {
             std::fs::create_dir_all(repo.join(".jj").join("repo")).expect("create repo dir");
         }
+        let vars = [("HOME", utf8(&home))];
+        // `--when.hostnames` matches the machine's own name.
+        let hostname = probe(&root, &vars, &["operation.hostname"])
+            .get("operation.hostname")
+            .to_owned();
         write_file(
             home.join(".config").join("jj").join("config.toml"),
             &format!(
                 "[user]\nname = \"Me\"\nemail = \"me@personal.example\"\n\n\
                  [[--scope]]\n--when.repositories = [\"{}\"]\n\
                  [--scope.user]\nemail = \"me@work.example\"\n\n\
-                 [[--scope]]\n--when.hostnames = [\"build-box\"]\n\
+                 [[--scope]]\n--when.hostnames = [\"{hostname}\"]\n\
                  [--scope.operation]\nusername = \"ci\"\n",
                 root.join("work").display()
             ),
         );
-        let env = JjEnv {
-            home_dir: Some(home),
-            hostname: Some("build-box".to_owned()),
-            ..test_env(&[])
-        };
+        let keys = ["user.name", "user.email", "operation.username"];
 
-        let work = jj_settings_with_env(&work_repo, &env).expect("jj settings");
-        assert_eq!(work.user_email(), "me@work.example");
-        assert_eq!(work.user_name(), "Me", "unscoped keys still apply");
-        assert_eq!(work.operation_username(), "ci", "--when.hostnames matches");
+        let work = probe(&work_repo, &vars, &keys);
+        assert_eq!(work.get("user.email"), "me@work.example");
+        assert_eq!(work.get("user.name"), "Me", "unscoped keys still apply");
+        assert_eq!(
+            work.get("operation.username"),
+            "ci",
+            "--when.hostnames matches"
+        );
 
-        let personal = jj_settings_with_env(&personal_repo, &env).expect("jj settings");
-        assert_eq!(personal.user_email(), "me@personal.example");
+        let personal = probe(&personal_repo, &vars, &keys);
+        assert_eq!(personal.get("user.email"), "me@personal.example");
     }
 
     /// jj 0.45 keeps repo and workspace config outside the repo, behind
@@ -869,14 +776,14 @@ mod config_layering_tests {
             configs.join("workspaces/fedcba9876543210fedc/config.toml"),
             "[user]\nname = \"workspace\"\n",
         );
-        let env = JjEnv {
-            home_dir: Some(home),
-            ..test_env(&[])
-        };
 
-        let settings = jj_settings_with_env(&repo, &env).expect("jj settings");
-        assert_eq!(settings.user_name(), "workspace");
-        assert_eq!(settings.user_email(), "repo@example.com");
+        let settings = probe(
+            &repo,
+            &[("HOME", utf8(&home))],
+            &["user.name", "user.email"],
+        );
+        assert_eq!(settings.get("user.name"), "workspace");
+        assert_eq!(settings.get("user.email"), "repo@example.com");
         assert!(
             !repo.join(".jj").join("workspace-config.toml").exists(),
             "loading the settings writes nothing"
@@ -895,15 +802,13 @@ mod config_layering_tests {
             home.join(".config").join("jj").join("config.toml"),
             "[user]\nname = \"one\"\n",
         );
-        let env = JjEnv {
-            home_dir: Some(home.clone()),
-            ..test_env(&[])
-        };
+        let vars = [("HOME", utf8(&home))];
+        let stamp = || probe(&repo, &vars, &[]).get("stamp").to_owned();
 
-        let first = jj_config_stamp_with_env(&repo, &env);
-        assert_eq!(first, jj_config_stamp_with_env(&repo, &env), "stable");
+        let first = stamp();
+        assert_eq!(first, stamp(), "stable");
         write_file(user, "[user]\nname = \"two, longer\"\n");
-        let second = jj_config_stamp_with_env(&repo, &env);
+        let second = stamp();
         assert_ne!(first, second, "an edit moves the stamp");
         write_file(
             home.join(".config")
@@ -912,10 +817,82 @@ mod config_layering_tests {
                 .join("x.toml"),
             "[ui]\n",
         );
-        assert_ne!(
-            second,
-            jj_config_stamp_with_env(&repo, &env),
-            "a new conf.d file moves the stamp"
+        assert_ne!(second, stamp(), "a new conf.d file moves the stamp");
+    }
+
+    /// The defaults are jj-cli's shipped config, not copies of it: what a
+    /// repo with no config of its own reads is exactly what jj-cli ships.
+    #[test]
+    fn defaults_are_jj_clis_shipped_config() {
+        let root = scratch_dir("cli-defaults");
+        let home = root.join("home");
+        let keys = [
+            "revsets.log",
+            "templates.git_push_bookmark",
+            "snapshot.max-new-file-size",
+            "snapshot.auto-track",
+            "git.private-commits",
+            "merge-tools.vscode.program",
+        ];
+        let settings = probe(&root, &[("HOME", utf8(&home))], &keys);
+
+        let mut shipped = StackedConfig::empty();
+        shipped.extend_layers(default_config_layers());
+        for key in keys {
+            let name: jj_lib::config::ConfigNamePathBuf = key.parse().expect("a config name");
+            let value = shipped.get_value(&name).expect("jj-cli ships the key");
+            let value = value
+                .as_str()
+                .map_or_else(|| value.to_string(), str::to_owned);
+            assert_eq!(settings.get(key), value, "{key}");
+        }
+        assert_eq!(settings.get("revsets.log"), "builtin_log()");
+    }
+
+    /// `$JJ_CONFIG` replaces the user files (and the system ones) with the
+    /// paths it lists, as in the CLI.
+    #[test]
+    fn jj_config_replaces_the_user_config_files() {
+        let root = scratch_dir("jj-config-env");
+        let home = root.join("home");
+        write_file(
+            home.join(".config").join("jj").join("config.toml"),
+            "[user]\nname = \"default location\"\n",
+        );
+        let elsewhere = write_file(
+            root.join("elsewhere.toml"),
+            "[user]\nname = \"elsewhere\"\n",
+        );
+
+        let settings = probe(
+            &root,
+            &[("HOME", utf8(&home)), ("JJ_CONFIG", utf8(&elsewhere))],
+            &["user.name"],
+        );
+        assert_eq!(settings.get("user.name"), "elsewhere");
+    }
+
+    #[test]
+    fn a_zero_max_new_file_size_means_no_limit() {
+        let settings = |size: &str| {
+            let mut config = StackedConfig::with_defaults();
+            config.extend_layers(default_config_layers());
+            config.add_layer(
+                jj_lib::config::ConfigLayer::parse(
+                    ConfigSource::User,
+                    &format!("snapshot.max-new-file-size = {size}\n"),
+                )
+                .expect("parse"),
+            );
+            UserSettings::from_config(config).expect("settings")
+        };
+        assert_eq!(
+            snapshot_max_new_file_size(&settings("0")).unwrap(),
+            u64::MAX
+        );
+        assert_eq!(
+            snapshot_max_new_file_size(&settings("\"2KiB\"")).unwrap(),
+            2048
         );
     }
 

@@ -69,14 +69,15 @@ pub fn test_settings_for(root: &Path) -> jj_lib::settings::UserSettings {
     jj_lib::settings::UserSettings::from_config(config).expect("build test settings")
 }
 
-/// Settings with an identity and signing off, so a commit written here never
-/// reaches for the user's real config or a signing agent.
+/// jj-cli's defaults plus an identity and signing off, so a commit written
+/// here never reaches for the user's real config or a signing agent.
 pub fn test_settings() -> jj_lib::settings::UserSettings {
     jj_lib::settings::UserSettings::from_config(test_config()).expect("build test settings")
 }
 
 fn test_config() -> jj_lib::config::StackedConfig {
     let mut config = jj_lib::config::StackedConfig::with_defaults();
+    config.extend_layers(jj_cli::config::default_config_layers());
     let layer = jj_lib::config::ConfigLayer::parse(
         jj_lib::config::ConfigSource::User,
         r#"
