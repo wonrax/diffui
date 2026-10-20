@@ -11,6 +11,7 @@ use iced::{
     widget::{container, text},
 };
 
+use crate::ellipsis;
 use crate::theme::{ThemeSpec, chip_background, space, text_size};
 use crate::typography::{self, Aligned, TextBox};
 use crate::{Diffui, Message, icons, ui};
@@ -266,16 +267,21 @@ pub(crate) fn shorten_ids(description: &str) -> String {
         .join(" ")
 }
 
-/// An operation description with its ids short and in mono, on one line
-/// that ellipsizes its last run of prose.
-pub(crate) fn description<'a>(
+/// An operation description with its ids short and in mono, as a line the
+/// caller cuts to fit or wraps. The ids are sized so their caps stand as
+/// tall as the prose's: a mono face at the same size runs taller.
+pub(crate) fn description(
     description: &str,
     size: f32,
     font: iced::Font,
     color: Color,
     ui: &Diffui,
     theme: ThemeSpec,
-) -> Element<'a, Message> {
+) -> ellipsis::Line<'static> {
+    let mono = ui.config.mono_font;
+    let id_size = (size * typography::FontMetrics::of(font).cap_height
+        / typography::FontMetrics::of(mono).cap_height)
+        .min(size);
     // One rich text, so the mono ids sit on the prose's baseline.
     let mut spans = Vec::new();
     for (index, part) in split_ids(description).into_iter().enumerate() {
@@ -285,18 +291,12 @@ pub(crate) fn description<'a>(
         spans.push(match part {
             Part::Prose(prose) => iced::widget::span(prose),
             Part::Id(id) => iced::widget::span(id)
-                .font(ui.config.mono_font)
+                .font(mono)
+                .size(id_size)
                 .color(theme.muted_text),
         });
     }
-    iced::widget::rich_text::<(), Message, iced::Theme>(spans)
-        .size(size)
-        .font(font)
-        .color(color)
-        .wrapping(text::Wrapping::None)
-        .ellipsis(text::Ellipsis::End)
-        .width(Length::Fill)
-        .into()
+    ellipsis::Line::new(spans, font, size, color)
 }
 
 #[cfg(test)]

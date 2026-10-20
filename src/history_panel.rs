@@ -1273,21 +1273,19 @@ fn op_row<'a>(
     // The command that wrote the op, when one was recorded (the jj CLI's,
     // or diffui's equivalent), says more than who ran it; the header below
     // the list still names the user.
+    // One line whatever the command holds (a message's line breaks read as
+    // spaces), cut short before the age.
     match &op.args {
         Some(args) => meta.push(Aligned::text(
-            container(
-                crate::plan::command_prose(args)
-                    .view(
-                        ui.config.mono_font,
-                        ui.config.mono_font,
-                        theme.subtle_text,
-                        theme,
-                    )
-                    .size(CAPTION_TEXT_SIZE)
-                    .wrapping(text::Wrapping::None),
-            )
-            .width(Length::Fill)
-            .clip(true),
+            crate::plan::command_prose(args)
+                .line(
+                    ui.config.mono_font,
+                    ui.config.mono_font,
+                    theme.subtle_text,
+                    theme,
+                    CAPTION_TEXT_SIZE,
+                )
+                .view(),
             ui.config.mono_font,
             CAPTION_TEXT_SIZE,
         )),
@@ -1307,7 +1305,8 @@ fn op_row<'a>(
         theme.text,
         ui,
         theme,
-    );
+    )
+    .view();
     button(two_line(title, meta))
         .width(Length::Fill)
         .height(card_height(REVISION_ROW_HEIGHT))
@@ -1959,7 +1958,9 @@ fn operation_header<'a>(
                     theme.text,
                     ui,
                     theme,
-                ),
+                )
+                .wrapped()
+                .width(Length::Fill),
                 emphasis_font(ui.config.ui_font, iced::font::Weight::Medium),
                 text_size::BODY_LG,
             ),
@@ -1984,11 +1985,12 @@ fn operation_header<'a>(
     ]
     .spacing(space::XS);
     if let Some(args) = &op.args {
-        block = block.push(
-            container(crate::plan::caption_command_line(ui, theme, args))
-                .width(Length::Fill)
-                .clip(true),
-        );
+        block = block.push(crate::plan::wrapped_command_line(
+            ui,
+            theme,
+            args,
+            text_size::CAPTION,
+        ));
     }
     container(block)
         .width(Length::Fill)
