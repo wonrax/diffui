@@ -256,15 +256,12 @@ pub(crate) fn args_strip<'a>(
                     12.0,
                 ),
                 Aligned::gap(theme::space::SM),
-                Aligned::text(
-                    crate::prose::Prose::from_backticks(&reason)
-                        .view(font, mono, theme.removed_text, theme)
-                        .size(text_size::UI)
-                        .wrapping(Wrapping::None)
-                        .ellipsis(Ellipsis::End)
-                        .width(Length::Fill),
+                sentence(
+                    &crate::prose::Prose::from_backticks(&reason),
                     font,
-                    text_size::UI,
+                    mono,
+                    theme.removed_text,
+                    theme,
                 ),
             ],
             0.0,
@@ -480,16 +477,7 @@ pub(crate) fn footer<'a>(
     } else {
         plan.words.clone()
     };
-    lead.push(Aligned::text(
-        words
-            .view(font, mono, theme.text, theme)
-            .size(text_size::UI)
-            .wrapping(Wrapping::None)
-            .ellipsis(Ellipsis::End)
-            .width(Length::Fill),
-        font,
-        text_size::UI,
-    ));
+    lead.push(sentence(&words, font, mono, theme.text, theme));
     let (key, label, live) = match &plan.state {
         PlanState::Ready(_) => ("\u{21b5}", enter_label(plan.kind), true),
         PlanState::Pending => ("", "Resolving\u{2026}", false),
@@ -527,6 +515,19 @@ pub(crate) fn footer<'a>(
         .center_y(Length::Fixed(palette::FOOTER_HEIGHT))
         .style(move |_| palette::footer_style(theme))
         .into()
+}
+
+/// A one-line sentence that shares the row's baseline with its badge or
+/// glyph, clipped at the row's end.
+fn sentence<'a>(
+    words: &crate::prose::Prose,
+    font: iced::Font,
+    mono: iced::Font,
+    color: Color,
+    theme: ThemeSpec,
+) -> Aligned<'a, Message> {
+    typography::group(words.runs(font, mono, color, theme, text_size::UI), 0.0)
+        .map(|line| container(line).width(Length::Fill).clip(true).into())
 }
 
 fn enter_label(kind: Option<CommandKind>) -> &'static str {

@@ -10,6 +10,7 @@ use iced::widget::text::{Rich, Span};
 use iced::{Color, Font};
 
 use crate::theme::ThemeSpec;
+use crate::typography::Aligned;
 
 /// What a run of text names, which decides how it renders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +144,40 @@ impl Prose {
             })
             .collect();
         Rich::with_spans(spans).font(font).color(color)
+    }
+
+    /// The same text as one [`Aligned`] run per name, for a line that has
+    /// to share a baseline with chips and glyphs (a rich text's runs aren't
+    /// placed by [`crate::typography`], and drift off it). One line, no
+    /// wrapping; the caller clips it.
+    pub(crate) fn runs<'a, Message: 'a>(
+        &self,
+        font: Font,
+        mono: Font,
+        color: Color,
+        theme: ThemeSpec,
+        size: f32,
+    ) -> Vec<Aligned<'a, Message>> {
+        self.parts
+            .iter()
+            .map(|(kind, part)| {
+                let (font, color) = match kind {
+                    Kind::Text => (font, color),
+                    Kind::Revision => (mono, theme.accent),
+                    Kind::Bookmark => (mono, theme.lane_base),
+                    Kind::Path | Kind::Operation | Kind::Remote | Kind::Code => (mono, color),
+                };
+                Aligned::text(
+                    iced::widget::text(part.clone())
+                        .size(size)
+                        .font(font)
+                        .color(color)
+                        .wrapping(iced::widget::text::Wrapping::None),
+                    font,
+                    size,
+                )
+            })
+            .collect()
     }
 }
 
