@@ -23,12 +23,14 @@ use jj_lib::{
     merge::Merge,
     merged_tree::MergedTree,
     object_id::ObjectId,
-    op_store::{OperationId, View},
+    op_store::OperationId,
     operation::Operation,
     ref_name::WorkspaceName,
     repo::{ReadonlyRepo, Repo, RepoLoader},
     transaction::Transaction,
 };
+
+use super::history::restored_view;
 
 /// jj-cli's `UNDO_OP_DESC_PREFIX` (`cli/src/commands/undo.rs`).
 pub(crate) const UNDO_OP_DESC_PREFIX: &str = "undo: restore to operation ";
@@ -177,8 +179,7 @@ impl OpRestorePlan {
                 if !merged.wc_commit_ids.contains_key(workspace_name) {
                     bail!("reverting this operation would remove this workspace's working copy");
                 }
-                tx.repo_mut()
-                    .set_view(view_with_repo_portions_restored(&merged, &current));
+                tx.repo_mut().set_view(restored_view(&merged, &current));
             }
             PlanKind::Restore {
                 restore,
@@ -188,30 +189,12 @@ impl OpRestorePlan {
                     .view()
                     .await
                     .context("failed to read the view to restore")?;
-                tx.repo_mut().set_view(view_with_repo_portions_restored(
-                    restored.store_view(),
-                    &current,
-                ));
+                tx.repo_mut()
+                    .set_view(restored_view(restored.store_view(), &current));
                 carry_snapshotted_edits(tx, loader, workspace_name, latest_real).await?;
             }
         }
         Ok(())
-    }
-}
-
-/// jj-cli's `view_with_desired_portions_restored` with its default `--what`
-/// (the repo and the remote-tracking bookmarks): everything comes from
-/// `restored` except the git-ref bookkeeping, which has to keep describing
-/// what the git repo actually holds now so the next export diffs correctly.
-fn view_with_repo_portions_restored(restored: &View, current: &View) -> View {
-    View {
-        head_ids: restored.head_ids.clone(),
-        local_bookmarks: restored.local_bookmarks.clone(),
-        local_tags: restored.local_tags.clone(),
-        remote_views: restored.remote_views.clone(),
-        git_refs: current.git_refs.clone(),
-        git_heads: current.git_heads.clone(),
-        wc_commit_ids: restored.wc_commit_ids.clone(),
     }
 }
 
