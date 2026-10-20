@@ -91,6 +91,10 @@ const OPEN_SECTION_HEIGHT: f32 = 28.0;
 const OPEN_SECTION_PILL: f32 = 22.0;
 const OPEN_SECTION_PILL_PAD_X: f32 = theme::space::SM;
 const OPEN_ROW_HEIGHT: f32 = 34.0;
+/// Rows the card's list shows before it scrolls: as many as the folder
+/// suggestions can be, so typing a path and clearing it again keeps the card
+/// the same size once the recents fill it.
+const OPEN_LIST_ROWS: usize = crate::path_browse::MAX_SUGGESTIONS;
 const OPEN_GLYPH_BOX: f32 = 16.0;
 const OPEN_GLYPH_GAP: f32 = 10.0;
 const OPEN_REMOVE_SIDE: f32 = 24.0;
@@ -1274,7 +1278,7 @@ pub(crate) fn open_repo_card<'a>(
         Some((query, rows)) => folder_section(ui, theme, dialog, query, rows),
         None => recents_section(ui, theme),
     };
-    if let Some((header, list)) = section {
+    if let Some((header, list, rows)) = section {
         body = body.push(
             container(Space::new())
                 .width(Length::Fill)
@@ -1287,10 +1291,34 @@ pub(crate) fn open_repo_card<'a>(
                 .height(Length::Fixed(OPEN_SECTION_HEIGHT))
                 .center_y(Length::Fixed(OPEN_SECTION_HEIGHT)),
         );
-        body = body.push(container(list).width(Length::Fill).padding(Padding {
-            top: 0.0,
-            ..Padding::from(OPEN_LIST_INSET)
-        }));
+        let list: Element<'_, Message> = if rows > OPEN_LIST_ROWS {
+            // Past the fixed height the list scrolls, its bar at the card's
+            // edge and the rows clear of it.
+            container(
+                ui::scrollable(
+                    container(list).padding(Padding {
+                        right: crate::scrollbar::GUTTER,
+                        ..Padding::ZERO
+                    }),
+                    theme,
+                )
+                .height(Length::Fixed(OPEN_LIST_ROWS as f32 * OPEN_ROW_HEIGHT)),
+            )
+            .padding(Padding {
+                top: 0.0,
+                right: 0.0,
+                ..Padding::from(OPEN_LIST_INSET)
+            })
+            .into()
+        } else {
+            container(list)
+                .padding(Padding {
+                    top: 0.0,
+                    ..Padding::from(OPEN_LIST_INSET)
+                })
+                .into()
+        };
+        body = body.push(container(list).width(Length::Fill));
     }
 
     container(body)
@@ -1304,7 +1332,7 @@ pub(crate) fn open_repo_card<'a>(
 fn recents_section<'a>(
     ui: &'a Diffui,
     theme: ThemeSpec,
-) -> Option<(Element<'a, Message>, Element<'a, Message>)> {
+) -> Option<(Element<'a, Message>, Element<'a, Message>, usize)> {
     let open_roots: Vec<&str> = ui
         .tabs
         .iter()
@@ -1314,7 +1342,6 @@ fn recents_section<'a>(
         .recent_repos
         .iter()
         .filter(|root| !open_roots.contains(&root.as_str()))
-        .take(5)
         .collect();
     if recents.is_empty() {
         return None;
@@ -1356,11 +1383,12 @@ fn recents_section<'a>(
         ..Padding::from([0.0, OPEN_CONTENT_X])
     });
 
+    let rows = recents.len();
     let mut list = column![].spacing(0);
     for root in recents {
         list = list.push(recent_repo_compact_row(ui, theme, root));
     }
-    Some((header.into(), list.into()))
+    Some((header.into(), list.into(), rows))
 }
 
 /// The folders under the typed path, headed by the folder being browsed.
@@ -1371,7 +1399,7 @@ fn folder_section<'a>(
     dialog: &'a crate::OpenRepoDialog,
     query: crate::path_browse::Query,
     rows: Vec<&'a crate::path_browse::Entry>,
-) -> Option<(Element<'a, Message>, Element<'a, Message>)> {
+) -> Option<(Element<'a, Message>, Element<'a, Message>, usize)> {
     if rows.is_empty() {
         return None;
     }
@@ -1388,6 +1416,7 @@ fn folder_section<'a>(
     ))
     .padding([0.0, OPEN_CONTENT_X]);
 
+    let count = rows.len();
     let mut list = column![].spacing(0);
     for (index, entry) in rows.into_iter().enumerate() {
         list = list.push(folder_row(
@@ -1398,7 +1427,7 @@ fn folder_section<'a>(
             dialog.selected == Some(index),
         ));
     }
-    Some((header.into(), list.into()))
+    Some((header.into(), list.into(), count))
 }
 
 /// One folder suggestion: glyph · name · a jj/git chip when the folder is a
