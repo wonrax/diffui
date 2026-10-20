@@ -5,6 +5,14 @@
 //! Exporting the bookmarks alone left git's `HEAD` and index wherever the last
 //! jj CLI command put them, so after a diffui `new`/`edit`/squash `git status`
 //! and IDE git views described a commit `@` had long left.
+//!
+//! Ported from jj-cli 0.45.1. Check each against its source on a jj bump:
+//! - `is_colocated`: `git_util::is_colocated_git_workspace`
+//!   (`cli/src/git_util.rs`), which takes a `Workspace` the transaction tail
+//!   doesn't hold.
+//! - `sync_git_after_transaction`: the git tail of
+//!   `WorkspaceCommandHelper::finish_transaction` and `try_reset_git_head`
+//!   (`cli/src/cli_util.rs`).
 
 use std::path::Path;
 

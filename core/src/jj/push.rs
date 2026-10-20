@@ -17,6 +17,18 @@
 //! skipped with a warning) and their descendants rebased. The caller runs that
 //! in a transaction of its own under the working-copy lock, so a failed push
 //! keeps the signatures.
+//!
+//! Ported from jj-cli 0.45.1, whose versions take its `Ui` and command helper.
+//! Check each against its source on a jj bump:
+//! - `plan_push`, `classify`, `default_push_range`, `describe_updates` and
+//!   `ensure_new_bookmark_name`: `cmd_git_push`, `classify_bookmark_update`,
+//!   `find_default_target_revisions`, `print_commits_ready_to_push` and
+//!   `ensure_new_bookmark_name` (`cli/src/commands/git/push.rs`).
+//! - `check_commits`: `CommitsValidator` (same file).
+//! - `sign_plan` and `sign_commits`: `sign_commits_before_push` (same file).
+//! - `create_bookmark`, `rename_bookmark`, `forget_bookmark` and
+//!   `untrack_bookmark`: `jj bookmark create/rename/forget/untrack`
+//!   (`cli/src/commands/bookmark/`).
 
 use std::collections::HashSet;
 use std::path::Path;

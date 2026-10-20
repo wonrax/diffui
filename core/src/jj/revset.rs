@@ -2,6 +2,13 @@
 //! workspace, errors kept in jj's words with the position they point at,
 //! resolved to commit ids with jj's single-revision and no-gaps rules, and
 //! turned into the two trees of a range diff (`jj diff -r REVSET`).
+//!
+//! Ported from jj-cli 0.45.1, because jj-cli's versions need its command
+//! helper. Check each against its source on a jj bump:
+//! - `RevsetScope::range`: `cmd_diff`'s gap check and trees
+//!   (`cli/src/commands/diff.rs`).
+//! - `single`: the wording of `RevsetEvaluationSizeError::to_command_error`
+//!   (`cli/src/revset_util.rs`).
 
 use std::path::Path;
 use std::sync::Arc;

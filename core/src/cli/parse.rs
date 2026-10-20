@@ -1,6 +1,11 @@
 //! From a typed line to a [`ParsedCommand`]: tokenise, expand aliases and
 //! the default command the way jj-cli 0.45.1 does, validate with jj's own
 //! clap tree, then classify.
+//!
+//! Ported from jj-cli 0.45.1, because jj-cli's version runs inside
+//! `CliRunner`. Check against its source on a jj bump:
+//! - The alias and default-command expansion: `resolve_aliases` and
+//!   `resolve_default_command` (`cli/src/cli_util.rs`).
 
 use std::collections::BTreeMap;
 use std::ops::Range;

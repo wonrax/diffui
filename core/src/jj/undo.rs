@@ -16,6 +16,14 @@
 //! restore lands on, the way an editor keeps unsaved text across an undo of
 //! something else. When no snapshot came in between, the result is exactly
 //! the view `jj undo` / `jj redo` would have restored.
+//!
+//! Ported from jj-cli 0.45.1, where these live in private command modules.
+//! Check each against its source on a jj bump:
+//! - `UNDO_OP_DESC_PREFIX` and `REDO_OP_DESC_PREFIX`: `cli/src/commands/undo.rs`
+//!   and `cli/src/commands/redo.rs`.
+//! - `plan_undo` and `plan_redo`: `cmd_undo` and `cmd_redo` (same files).
+//! - `plan_revert`: `cmd_op_revert` (`cli/src/commands/operation/revert.rs`).
+//! - The restore itself is [`super::history::restored_view`].
 
 use anyhow::{Context, Result, bail};
 use jj_lib::{

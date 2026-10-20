@@ -2,6 +2,13 @@
 //! `jj evolog`, `jj file annotate`, and the interdiffs they show. Read-only
 //! against a repo the actor already holds; the op restore/revert mutations
 //! live with the other mutations in [`super::mutate`].
+//!
+//! Ported from jj-cli 0.45.1, where these live in private command modules.
+//! Check each against its source on a jj bump:
+//! - `changed_commits`: `compute_operation_commits_diff`
+//!   (`cli/src/commands/operation/diff.rs`).
+//! - `restored_view`: `view_with_desired_portions_restored` with
+//!   `DEFAULT_REVERT_WHAT` (`cli/src/commands/operation/mod.rs`).
 
 use std::collections::{HashMap, HashSet};
 use std::slice;
