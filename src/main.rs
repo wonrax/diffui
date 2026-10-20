@@ -55,6 +55,7 @@ mod tab_bar;
 mod tabs;
 mod theme;
 mod toolbar;
+mod trunk;
 mod typography;
 mod ui;
 mod update;
@@ -984,6 +985,8 @@ pub(crate) struct PendingJobs {
     pub(crate) mutation: Option<(JobId, PendingMutation)>,
     /// A backwards-bookmark-move check, holding the mutation it gates.
     pub(crate) bookmark_check: Option<(JobId, PendingMutation)>,
+    /// The forecast a rebase onto trunk waits on, holding that rebase.
+    pub(crate) trunk_rebase: Option<(JobId, mutations::MutationOp)>,
     /// Full file sources requested for background syntax highlighting, keyed
     /// by job: `(document id, file index)`.
     pub(crate) file_pairs: HashMap<JobId, (u64, usize)>,
@@ -1001,6 +1004,7 @@ impl PendingJobs {
                 .bookmark_check
                 .as_ref()
                 .is_some_and(|(id, _)| *id == job)
+            || self.trunk_rebase.as_ref().is_some_and(|(id, _)| *id == job)
             || self.file_pairs.contains_key(&job)
     }
 
@@ -1015,6 +1019,7 @@ impl PendingJobs {
         self.fetch.take_if(|(id, ..)| *id == job);
         self.mutation.take_if(|(id, _)| *id == job);
         self.bookmark_check.take_if(|(id, _)| *id == job);
+        self.trunk_rebase.take_if(|(id, _)| *id == job);
         self.file_pairs.remove(&job);
     }
 }

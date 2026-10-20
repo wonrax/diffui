@@ -256,6 +256,7 @@ impl Command {
             "revision.rebase.start" => "Rebase onto\u{2026}",
             "revision.rebase.descendants.start" => "Rebase with descendants onto\u{2026}",
             "revision.rebase.branch.start" => "Rebase whole branch onto\u{2026}",
+            "revision.rebase.onto-trunk" => "Rebase onto trunk",
             "revision.squash.start" => "Squash into\u{2026}",
             "revision.squash-into-parent" => "Squash into parent",
             "revision.abandon" => "Abandon\u{2026}",
@@ -820,6 +821,17 @@ pub(crate) static REGISTRY: &[Command] = &[
                 },
             )
         },
+        palette: PaletteScope::RevisionVerb,
+    },
+    Command {
+        id: "revision.rebase.onto-trunk",
+        label: "Whole branch onto trunk",
+        hint: "Move the branch this revision sits on onto trunk()",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| can_mutate(ui, arg) && crate::trunk::blocker(ui, arg).is_none(),
+        build: |ui, arg| target_revision(ui, &arg).map(Action::RebaseOntoTrunk),
         palette: PaletteScope::RevisionVerb,
     },
     Command {

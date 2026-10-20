@@ -31,6 +31,9 @@ pub(crate) enum Action {
     /// Ask before running a destructive mutation (a keyboard or palette
     /// abandon), then run it like [`Action::Mutate`].
     ConfirmMutation(mutations::MutationOp),
+    /// `jj rebase -b <this> -o trunk()`, asking first only when the
+    /// forecast names new conflicts (see [`crate::trunk`]).
+    RebaseOntoTrunk(RevisionSelection),
     /// Enter target mode: pick a destination for a rebase/squash/merge.
     StartDraft {
         kind: mutations::DraftKind,

@@ -470,6 +470,15 @@ impl Diffui {
             return None;
         }
         Some(match &event.payload {
+            Payload::PreviewDone { simulation, .. }
+                if target
+                    .jobs
+                    .trunk_rebase
+                    .as_ref()
+                    .is_some_and(|(id, _)| *id == job) =>
+            {
+                self.finish_trunk_preview(tab, job, Ok(simulation))
+            }
             Payload::PreviewDone { simulation, .. } => {
                 self.tab_mut(tab)?.jobs.preview = None;
                 self.apply_draft_preview(tab, Ok(simulation.clone()))
@@ -555,6 +564,9 @@ impl Diffui {
             return Task::none();
         };
         let jobs = &mut target.jobs;
+        if jobs.trunk_rebase.as_ref().is_some_and(|(id, _)| *id == job) {
+            return self.finish_trunk_preview(tab, job, Err(error.to_string()));
+        }
         if jobs.preview == Some(job) {
             jobs.preview = None;
             return self.apply_draft_preview(tab, Err(error.to_string()));
@@ -1170,6 +1182,7 @@ impl Diffui {
             Action::Bookmark(action) => self.update_bookmark(action),
             Action::Revops(action) => self.perform_revops(action),
             Action::Credential(action) => self.update_credential(action),
+            Action::RebaseOntoTrunk(source) => self.rebase_onto_trunk(source),
             Action::Changes(message) => self.on_changes(message),
             Action::History(action) => self.perform_history(action),
             Action::RevealLogFile => {

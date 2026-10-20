@@ -274,6 +274,7 @@ mod mac {
                     registered(ui, "revision.rebase.start"),
                     registered(ui, "revision.rebase.descendants.start"),
                     registered(ui, "revision.rebase.branch.start"),
+                    registered(ui, "revision.rebase.onto-trunk"),
                     registered(ui, "revision.squash.start"),
                     registered(ui, "revision.squash-into-parent"),
                     registered(ui, "revision.merge.start"),

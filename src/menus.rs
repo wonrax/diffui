@@ -105,6 +105,7 @@ impl Diffui {
                     self.menu_item("revision.rebase.start", on()),
                     self.menu_item("revision.rebase.descendants.start", on()),
                     self.menu_item("revision.rebase.branch.start", on()),
+                    self.menu_item("revision.rebase.onto-trunk", on()),
                 ],
             },
             MenuEntry::Submenu {
