@@ -18,7 +18,7 @@ use std::{
     collections::HashMap,
     env,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -80,6 +80,18 @@ impl JjEnv {
     fn var(&self, name: &str) -> Option<&str> {
         self.vars.get(name).map(String::as_str)
     }
+}
+
+/// Settings holding only jj-cli's shipped config: what a repo with no config
+/// of its own reads, and the reference for telling jj's defaults apart from
+/// the user's.
+pub(crate) fn shipped_settings() -> &'static UserSettings {
+    static SHIPPED: LazyLock<UserSettings> = LazyLock::new(|| {
+        let mut config = jj_lib::config::StackedConfig::with_defaults();
+        config.extend_layers(default_config_layers());
+        UserSettings::from_config(config).expect("jj-cli's shipped config builds settings")
+    });
+    &SHIPPED
 }
 
 /// The settings jj-cli would run a command with in the workspace at

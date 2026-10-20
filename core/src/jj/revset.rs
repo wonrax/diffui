@@ -23,7 +23,8 @@ use jj_lib::{
     settings::UserSettings,
 };
 
-use super::walk::{DEFAULT_REVSET_ALIASES, parse_revset_raw, revset_aliases_map};
+use super::settings::shipped_settings;
+use super::walk::{parse_revset_raw, revset_aliases_map};
 use crate::model::{DiffBase, DiffRange, DiffRequest, RevisionSelection};
 use crate::repo::CancelFlag;
 use crate::revset::{
@@ -400,9 +401,12 @@ pub(crate) fn symbols(repo: &ReadonlyRepo, settings: &UserSettings) -> RevsetSym
         }
     }
     // User aliases first: the defaults are the ones users know already.
+    let shipped = revset_aliases_map(shipped_settings()).ok();
     let is_default = |alias: &RevsetAlias| {
-        DEFAULT_REVSET_ALIASES.contains(&format!("'{}", alias.signature()))
-            || DEFAULT_REVSET_ALIASES.contains(&format!("'{}'", alias.name))
+        shipped.as_ref().is_some_and(|shipped| match &alias.params {
+            None => shipped.get_symbol(&alias.name).is_some(),
+            Some(params) => shipped.get_function(&alias.name, params.len()).is_some(),
+        })
     };
     aliases.sort_by(|a, b| {
         is_default(a)

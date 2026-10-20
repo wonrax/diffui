@@ -2,10 +2,9 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
+use jj_cli::ui::Ui;
 use jj_lib::{
     backend::{CommitId, TreeId},
-    config::{ConfigLayer, ConfigSource},
-    fileset::FilesetAliasesMap,
     git::REMOTE_NAME_FOR_LOCAL_GIT_REPO,
     graph::TopoGroupedGraph,
     merge::Merge,
@@ -31,94 +30,34 @@ use crate::model::{
 };
 use crate::repo::CancelFlag;
 
-/// jj's everyday revset aliases — `trunk()`, `immutable_heads()`, `mutable()`,
-/// `immutable()`, … — are *not* jj-lib builtins. They ship in jj-**cli**'s
-/// embedded config, which we don't depend on, so a jj-lib-only client starts
-/// with an empty alias map and any revset mentioning them fails to parse
-/// ("Function `trunk` doesn't exist"). This is a verbatim copy of jj's
-/// `cli/src/config/revsets.toml` `[revset-aliases]` table; keep it in sync when
-/// bumping jj-lib. The alias *bodies* only reference real jj-lib builtins
-/// (`remote_bookmarks`, `tags`, `untracked_remote_bookmarks`,
-/// `untracked_remote_tags`, `visible_heads`, `root`), so they resolve once seeded.
-pub(super) const DEFAULT_REVSET_ALIASES: &str = r#"
-[revset-aliases]
-# trunk() can be overridden as '<bookmark>@<remote>'.
-'trunk()' = '''
-latest(
-  remote_bookmarks(exact:"main", exact:"origin") |
-  remote_bookmarks(exact:"master", exact:"origin") |
-  remote_bookmarks(exact:"trunk", exact:"origin") |
-  remote_bookmarks(exact:"main", exact:"upstream") |
-  remote_bookmarks(exact:"master", exact:"upstream") |
-  remote_bookmarks(exact:"trunk", exact:"upstream") |
-  root()
-)
-'''
-
-# The default set of revisions shown by `jj log` if no revisions or paths are
-# specified.
-'builtin_log()' = 'present(@) | ancestors(immutable_heads().., 2) | trunk()'
-
-# If immutable_heads() failed to evaluate, many jj commands wouldn't work. Use
-# present(expr) if symbols in expr might not always exist.
-'builtin_immutable_heads()' = '''
-trunk() | tags() | untracked_remote_bookmarks() | untracked_remote_tags()
-'''
-'immutable_heads()' = 'builtin_immutable_heads()'
-'immutable()' = '::(immutable_heads() | root())'
-'mutable()' = '~immutable()'
-
-'visible()' = '::visible_heads()'
-'hidden()' = '~visible()'
-"#;
-
-/// Build the revset alias map jj itself would use: our embedded copy of jj's
-/// default aliases at the bottom, then the user's configured `[revset-aliases]`
-/// layered on top so a user-defined `trunk()`/`immutable_heads()` overrides
-/// ours. This mirrors jj-cli's `load_aliases_map` — later (higher-precedence)
-/// config layers win, and a malformed individual alias is logged and skipped
-/// rather than breaking every revset parse.
+/// The revset aliases jj itself would use: jj-cli's shipped ones under the
+/// user's `[revset-aliases]`, later layers winning. A malformed alias is
+/// skipped (jj-cli warns about it) rather than breaking every revset parse.
 pub(super) fn revset_aliases_map(settings: &UserSettings) -> Result<RevsetAliasesMap> {
-    let defaults = ConfigLayer::parse(ConfigSource::Default, DEFAULT_REVSET_ALIASES)
-        .context("failed to parse builtin revset aliases")?;
-    let mut map = RevsetAliasesMap::new();
-    let layers = std::iter::once(&defaults).chain(settings.config().layers().iter().map(|l| &**l));
-    for layer in layers {
-        let table = match layer.look_up_table(["revset-aliases"]) {
-            Ok(Some(table)) => table,
-            // Absent, or present but not a table (malformed config): skip.
-            Ok(None) | Err(_) => continue,
-        };
-        for (decl, item) in table.iter() {
-            let Some(defn) = item.as_str() else {
-                tracing::warn!("ignoring revset-alias `{decl}`: expected a string value");
-                continue;
-            };
-            if let Err(err) = map.insert(decl, defn, None) {
-                tracing::warn!("ignoring invalid revset-alias `{decl}`: {err}");
-            }
-        }
-    }
-    Ok(map)
+    jj_cli::cli_util::load_revset_aliases(&Ui::null(), settings.config()).map_err(cli_error)
 }
 
-/// jj-cli's default `revsets.log` — the revset `jj log` displays. Like the
-/// alias defaults above it ships in jj-**cli**'s embedded config rather than
-/// jj-lib, so we re-embed it as the fallback when the user hasn't set their own.
-/// Upstream spells it `builtin_log()`; this is that alias's body, because the
-/// string lands in the revset field, where the expansion is the editable form.
-pub(super) const DEFAULT_LOG_REVSET: &str =
-    "present(@) | ancestors(immutable_heads().., 2) | trunk()";
-
 /// The revset diffui opens a jj repo with when the user has no per-repo revset
-/// saved: their configured `revsets.log` if set, else jj's default (so the
-/// initial view matches `jj log`). Falls back to the default if the repo's
-/// settings can't be loaded.
+/// saved: `revsets.log`, so the initial view matches `jj log`. Uses jj-cli's
+/// shipped value when the repo's settings can't be loaded.
 pub fn jj_log_revset(repo_root: &Path) -> String {
-    jj_settings(repo_root)
-        .ok()
-        .and_then(|settings| settings.get_string("revsets.log").ok())
-        .unwrap_or_else(|| DEFAULT_LOG_REVSET.to_owned())
+    match jj_settings(repo_root) {
+        Ok(settings) => log_revset(&settings),
+        Err(_) => log_revset(shipped_settings()),
+    }
+}
+
+/// `revsets.log`. jj-cli ships it as `builtin_log()`; that alias's body is
+/// what lands in the revset field, where the expansion is the editable form.
+pub(super) fn log_revset(settings: &UserSettings) -> String {
+    let revset = settings.get_string("revsets.log").unwrap_or_default();
+    if revset.trim() == "builtin_log()"
+        && let Ok(aliases) = revset_aliases_map(settings)
+        && let Some((_, _, body, _)) = aliases.get_function("builtin_log", 0)
+    {
+        return body.trim().to_owned();
+    }
+    revset
 }
 
 /// Parse a user-entered revset string into a jj expression for the graph
@@ -154,7 +93,8 @@ pub(super) fn parse_revset_raw(
     src: &str,
 ) -> Result<Result<Arc<UserRevsetExpression>, jj_lib::revset::RevsetParseError>> {
     let aliases = revset_aliases_map(settings)?;
-    let fileset_aliases = FilesetAliasesMap::new();
+    let fileset_aliases = jj_cli::cli_util::load_fileset_aliases(&Ui::null(), settings.config())
+        .map_err(cli_error)?;
     let extensions = RevsetExtensions::default();
     let path_converter = RepoPathUiConverter::Fs {
         cwd: repo_root.to_path_buf(),
@@ -930,6 +870,63 @@ mod revset_tests {
         let s = settings();
         let root = Path::new("/tmp");
         assert!(parse_user_revset(root, &s, WorkspaceName::DEFAULT, "(((").is_err());
+    }
+
+    /// jj-cli's shipped config with `toml` as the user's config on top.
+    fn user_settings(toml: &str) -> UserSettings {
+        let mut config = shipped_settings().config().clone();
+        config.add_layer(
+            jj_lib::config::ConfigLayer::parse(jj_lib::config::ConfigSource::User, toml)
+                .expect("parse the user config"),
+        );
+        UserSettings::from_config(config).expect("settings")
+    }
+
+    /// The default log revset is jj-cli's shipped `revsets.log`, expanded
+    /// from its `builtin_log()` alias.
+    #[test]
+    fn the_default_log_revset_is_jj_clis() {
+        let shipped = shipped_settings();
+        let body: String = shipped
+            .get(["revset-aliases", "builtin_log()"])
+            .expect("jj-cli ships builtin_log()");
+        assert_eq!(log_revset(shipped), body.trim());
+        assert_eq!(
+            log_revset(shipped),
+            "present(@) | ancestors(immutable_heads().., 2) | trunk()"
+        );
+        assert_eq!(log_revset(&user_settings("revsets.log = \"@-\"\n")), "@-");
+        assert_eq!(
+            log_revset(&user_settings(
+                "[revset-aliases]\n'builtin_log()' = 'mine()'\n"
+            )),
+            "mine()",
+            "a user's own builtin_log() is the one expanded"
+        );
+    }
+
+    /// The user's aliases sit over jj-cli's, in both of jj's spellings.
+    #[test]
+    fn user_revset_aliases_load_over_jj_clis() {
+        let settings = user_settings(
+            "[revset-aliases]\n\
+             'wip()' = 'description(glob:\"wip*\")'\n\
+             'tagged()' = { definition = 'tags()', doc = 'Tagged revisions' }\n\
+             'immutable_heads()' = 'none()'\n",
+        );
+        let aliases = revset_aliases_map(&settings).expect("aliases");
+        let (_, _, immutable_heads, _) = aliases
+            .get_function("immutable_heads", 0)
+            .expect("immutable_heads()");
+        assert_eq!(immutable_heads, "none()", "the user's definition wins");
+        let root = Path::new("/tmp");
+        let ws = WorkspaceName::DEFAULT;
+        for revset in ["wip()", "tagged()", "trunk()", "mutable()"] {
+            assert!(
+                parse_user_revset(root, &settings, ws, revset).is_ok(),
+                "{revset}"
+            );
+        }
     }
 
     /// Regression: a revset that excludes the working-copy commit must not panic
