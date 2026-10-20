@@ -110,7 +110,12 @@ pub fn build_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     }
     // Load failures no longer have a header to live under — surface them as a
     // soft alert card above the list rather than bare red text.
-    if let LoadStatus::Failed(error) = &ui.active().session.status {
+    // A revset error is told once: by the field, under it, when its own
+    // check has it; the card only for what that check couldn't foresee.
+    if let LoadStatus::Failed(error) = &ui.active().session.status
+        && !(crate::empty_states::is_revset_error(error)
+            && crate::revset_assist::explains_revset_error(ui))
+    {
         body = body.push(crate::empty_states::load_error(ui, theme, error));
     }
     let list = crate::empty_states::revision_list_placeholder(ui, theme).unwrap_or(revision_list);

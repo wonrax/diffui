@@ -217,9 +217,17 @@ impl Diffui {
         }
         self.close_revset_field();
         let revset = self.active().session.revset.clone();
-        self.recents.push_revset(revset);
+        self.recents.push_revset(revset.clone());
         self.recents.save();
-        self.evaluate_revset()
+        // Check it now rather than after the typing pause, so a bad revset
+        // is explained by the field, under it, as soon as it is run.
+        let check = if self.active().cmdline.field.checked.as_deref() == Some(revset.as_str()) {
+            Task::none()
+        } else {
+            let version = self.active().cmdline.field.version;
+            self.settle_revset_field(version)
+        };
+        Task::batch([self.evaluate_revset(), check])
     }
 
     pub(crate) fn close_revset_field(&mut self) {
@@ -281,20 +289,38 @@ pub(crate) fn dropdown(ui: &Diffui, theme: ThemeSpec) -> Option<Element<'_, Mess
 
 /// jj's error under the field: the revset with the bad part underlined, and
 /// the message.
-pub(crate) fn error_strip(ui: &Diffui, theme: ThemeSpec) -> Option<Element<'_, Message>> {
+/// jj's error for the revset in the field, when it is the one to show: the
+/// check is for what the field holds, and not about a word still being
+/// typed (`desc` on its way to `description(` isn't wrong yet).
+fn shown_error(ui: &Diffui) -> Option<&RevsetError> {
     let field = &ui.active().cmdline.field;
     let error = field.error.as_ref()?;
     let value = &ui.active().session.revset;
     if field.checked.as_deref() != Some(value.as_str()) {
         return None;
     }
-    // `desc` on its way to `description(` isn't wrong yet.
     if field.open
         && let Some(span) = &error.span
         && crate::cmdline::touches_caret(value, field.cursor, span)
     {
         return None;
     }
+    Some(error)
+}
+
+/// Whether the field already explains a revset error (or is about to: its
+/// check of this revset is in flight), so a failed load of the same revset
+/// mustn't say it again.
+pub(crate) fn explains_revset_error(ui: &Diffui) -> bool {
+    let field = &ui.active().cmdline.field;
+    shown_error(ui).is_some()
+        || field.job.is_some()
+            && field.checked.as_deref() != Some(ui.active().session.revset.as_str())
+}
+
+pub(crate) fn error_strip(ui: &Diffui, theme: ThemeSpec) -> Option<Element<'_, Message>> {
+    let error = shown_error(ui)?;
+    let value = &ui.active().session.revset;
     let font = ui.config.ui_font;
     let mono = ui.config.mono_font;
     let message = typography::baseline_row(
@@ -349,6 +375,14 @@ pub(crate) fn error_strip(ui: &Diffui, theme: ThemeSpec) -> Option<Element<'_, M
                 }),
             );
         }
+    }
+    // The way back, beside the only place the error is told.
+    if let Some(reset) = crate::empty_states::reset_button(ui, theme) {
+        body = body.push(container(reset).padding(Padding {
+            top: theme::space::XS,
+            left: 12.0 + theme::space::SM,
+            ..Padding::ZERO
+        }));
     }
     Some(
         container(body)

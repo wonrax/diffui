@@ -88,7 +88,7 @@ pub(crate) fn revision_list_placeholder<'a>(
 
 /// "Reset to default" — the repo's own `revsets.log` (or jj's default) —
 /// unless that is what is already applied.
-fn reset_button<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Option<Element<'a, Message>> {
+pub(crate) fn reset_button<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Option<Element<'a, Message>> {
     let tab = ui.active();
     let default = tab.default_revset.clone();
     if tab.repository.is_none() || tab.session.revset.trim() == default.trim() {
