@@ -14,12 +14,18 @@
 //!    [`lower`] once its revsets are resolved), something that opens
 //!    diffui's own editor, or a passthrough run of the real CLI
 //!    ([`passthrough`]).
+//!
+//! The other direction, op → command, is
+//! [`MutationOp::cli_equivalent`](crate::MutationOp::cli_equivalent), and
+//! [`OpDraft::cli_prefix`](crate::OpDraft::cli_prefix) for a target-mode
+//! draft still picking its destination.
 
 mod command;
 mod grammar;
 mod lower;
 mod parse;
 pub mod passthrough;
+mod render;
 pub mod tokenize;
 
 use std::path::Path;
@@ -30,6 +36,7 @@ pub use command::{
 };
 pub use lower::{LowerContext, LowerError, NativeAction, lower};
 pub use parse::{CliConfig, ParseError, ParsedCommand};
+pub use render::{CliEquivalent, CommitIds, RevisionNames, jj_args_tag};
 
 /// The command line for one repository: jj's grammar plus that
 /// repository's aliases. Cheap to clone; the grammar is shared.
