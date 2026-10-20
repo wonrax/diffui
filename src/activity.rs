@@ -5,9 +5,10 @@
 //! the first running task's label + a `+N` chip when several run at once) and a
 //! thin progress line along the toolbar's bottom edge. Clicking the indicator
 //! opens a popover listing every entry: a status icon, the title, a one-line
-//! result summary underneath, and the elapsed time. Rows with captured output
-//! expand into a code block showing the remote sideband (e.g. GitHub's
-//! "Create a pull request" hint, with clickable URLs).
+//! result summary underneath, and the elapsed time. Each line is cut to the
+//! panel's width; a row with a line cut short expands to show it whole, and
+//! rows with captured output expand into a code block showing the remote
+//! sideband (e.g. GitHub's "Create a pull request" hint, with clickable URLs).
 //!
 //! Entries are **persistent**: running and finished alike stay until the user
 //! clears them or the app restarts — nothing auto-dismisses.
@@ -17,10 +18,14 @@ use std::time::{Duration, Instant};
 use iced::{
     Background, Border, Color, Element, Length, Padding, alignment,
     font::Weight,
-    widget::{Space, button, column, container, mouse_area, opaque, row, stack, text, text_editor},
+    widget::{
+        Space, button, column, container, mouse_area, opaque, responsive, row, stack, text,
+        text_editor,
+    },
 };
 
 use crate::chip;
+use crate::ellipsis;
 use crate::icons;
 use crate::prose::Prose;
 use crate::theme::{
@@ -747,26 +752,38 @@ const STATUS_ICON_BOX: f32 = 14.0;
 /// title text (status box + the head row's spacing).
 const TITLE_INDENT: f32 = STATUS_ICON_BOX + 8.0;
 
-/// The "Output" pill on a jj CLI run's row.
-fn output_pill<'a>(ui: &Diffui, theme: ThemeSpec, id: ActivityId) -> Aligned<'a, Message> {
+/// Horizontal padding inside the row's header, each side.
+const ROW_PAD_X: f32 = 8.0;
+/// Space before each trailing item on the title line.
+const TRAILING_GAP: f32 = 8.0;
+const CHEVRON: f32 = 13.0;
+
+/// A small ghost pill on the title line ("Revert", "Output"), and its width.
+fn pill<'a>(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    label: &'a str,
+    on_press: Message,
+) -> (Aligned<'a, Message>, f32) {
     let font = ui.config.ui_font;
     let padding =
         crate::typography::trimmed_padding(Padding::from([1, 7]), font, text_size::CAPTION);
-    Aligned::boxed(
+    let width =
+        ellipsis::text_width(label, text_size::CAPTION, font) + padding.left + padding.right;
+    let pill = Aligned::boxed(
         button(
-            text("Output")
+            text(label)
                 .size(text_size::CAPTION)
                 .font(font)
                 .color(theme.accent),
         )
         .padding(padding)
-        .on_press(Message::Action(Action::CommandLine(
-            crate::cmdline::CmdAction::Output(crate::cli_output::OutputAction::Open(id)),
-        )))
+        .on_press(on_press)
         .style(move |_, status| ghost_button_style(theme, status)),
         padding,
         crate::typography::TextBox::default_line(font, text_size::CAPTION),
-    )
+    );
+    (pill, width)
 }
 
 fn activity_row<'a>(
@@ -774,191 +791,12 @@ fn activity_row<'a>(
     theme: ThemeSpec,
     activity: &'a Activity,
 ) -> Element<'a, Message> {
-    let mono = ui.config.mono_font;
-    let (loaded, total, determinate) = activity.progress_snapshot();
-    let expandable = !activity.detail.is_empty();
-
-    // The title, the mono counters, the Revert pill and the timing share a
-    // baseline; the status glyph and chevron centre on the caps (see
-    // `crate::typography`).
-    let title_font = emphasis_font(ui.config.ui_font, Weight::Medium);
-    let mut head: Vec<Aligned<'a, Message>> = vec![
-        Aligned::glyph(status_icon(activity, theme, mono), STATUS_ICON_BOX),
-        Aligned::gap(8.0),
-        Aligned::text(
-            activity
-                .label
-                .view(title_font, mono, theme.text, theme)
-                .size(text_size::UI)
-                .wrapping(text::Wrapping::None)
-                .ellipsis(text::Ellipsis::End)
-                .width(Length::Fill),
-            title_font,
-            text_size::UI,
-        ),
-    ];
-    let caption = |value: String, font: iced::Font, color: Color| {
-        [
-            Aligned::gap(8.0),
-            Aligned::text(
-                text(value).size(text_size::CAPTION).font(font).color(color),
-                font,
-                text_size::CAPTION,
-            ),
-        ]
-    };
-
-    if matches!(activity.status, ActivityStatus::Running) {
-        if determinate {
-            let pct = (loaded * 100 / total.max(1)).min(100);
-            head.extend(caption(format!("{pct}%"), mono, theme.muted_text));
-        } else if loaded > 0 {
-            // Indeterminate but counting (the jj lazy walk has no known total):
-            // surface the running count.
-            head.extend(caption(loaded.to_string(), mono, theme.muted_text));
-        }
-    } else if let Some(duration) = activity.duration {
-        // A finished mutation offers a one-click revert of exactly its op
-        // (`jj op revert`). Labelled apart from the toolbar's Undo, which
-        // steps back through the op log instead.
-        if matches!(activity.status, ActivityStatus::Done)
-            && let Some(operation_id) = activity.undo_op.clone()
-        {
-            let font = ui.config.ui_font;
-            let padding =
-                crate::typography::trimmed_padding(Padding::from([1, 7]), font, text_size::CAPTION);
-            head.push(Aligned::gap(8.0));
-            head.push(Aligned::boxed(
-                button(
-                    text("Revert")
-                        .size(text_size::CAPTION)
-                        .font(font)
-                        .color(theme.accent),
-                )
-                .padding(padding)
-                .on_press(Message::Action(Action::UndoOperation(
-                    activity.id,
-                    operation_id,
-                )))
-                .style(move |_, status| ghost_button_style(theme, status)),
-                padding,
-                crate::typography::TextBox::default_line(font, text_size::CAPTION),
-            ));
-        }
-        // A jj CLI run reopens its output panel.
-        if ui
-            .active()
-            .cmdline
-            .runs
-            .iter()
-            .any(|run| run.activity == activity.id)
-        {
-            head.push(Aligned::gap(8.0));
-            head.push(output_pill(ui, theme, activity.id));
-        }
-        head.extend(caption(
-            format_duration(duration),
-            ui.config.ui_font,
-            theme.subtle_text,
-        ));
-    }
-    if expandable {
-        let chevron = if activity.expanded {
-            icons::CHEVRON_UP
-        } else {
-            icons::CHEVRON_DOWN
-        };
-        head.push(Aligned::gap(8.0));
-        head.push(Aligned::glyph(
-            icons::icon(chevron, 13.0, theme.subtle_text),
-            13.0,
-        ));
-    }
-    let head = crate::typography::baseline_row(head, 0.0);
-
-    // Header (title line + result subtitle + the determinate bar). This is the
-    // click target that toggles the detail; the detail itself sits *outside*
-    // it, so dragging to select text there doesn't collapse the row.
-    let mut header = column![head].spacing(3);
-    if let Some(command) = activity.command.as_deref() {
-        header = header.push(
-            container(crate::plan::caption_command_line(ui, theme, command))
-                .width(Length::Fill)
-                .clip(true)
-                .padding(Padding {
-                    top: 0.0,
-                    right: 0.0,
-                    bottom: 0.0,
-                    left: TITLE_INDENT,
-                }),
-        );
-    }
-    if let Some(result) = activity.result.as_deref() {
-        header = header.push(
-            container(
-                text(result)
-                    .size(text_size::UI)
-                    .font(ui.config.ui_font)
-                    .color(theme.muted_text)
-                    .wrapping(text::Wrapping::None)
-                    .ellipsis(text::Ellipsis::End),
-            )
-            .width(Length::Fill)
-            .padding(Padding {
-                top: 0.0,
-                right: 0.0,
-                bottom: 0.0,
-                left: TITLE_INDENT,
-            }),
-        );
-    }
-    if matches!(activity.status, ActivityStatus::Running) && determinate {
-        let accent = theme.accent;
-        let fill = ((loaded as f32 / total as f32).clamp(0.0, 1.0) * 1000.0) as u16;
-        let rest = 1000u16.saturating_sub(fill);
-        let mut bar = row![].height(Length::Fixed(4.0));
-        if fill > 0 {
-            bar = bar.push(
-                container(Space::new())
-                    .width(Length::FillPortion(fill))
-                    .height(Length::Fixed(4.0))
-                    .style(move |_| rounded(accent)),
-            );
-        }
-        if rest > 0 {
-            bar = bar.push(
-                container(Space::new())
-                    .width(Length::FillPortion(rest))
-                    .height(Length::Fixed(4.0))
-                    .style(move |_| rounded(chip_background(theme.muted_text))),
-            );
-        }
-        header = header.push(container(bar).width(Length::Fill).padding(Padding {
-            top: 1.0,
-            right: 0.0,
-            bottom: 0.0,
-            left: TITLE_INDENT,
-        }));
-    }
-
-    let id = activity.id;
-    let header_area = mouse_area(
-        container(header)
-            .width(Length::Fill)
-            .padding(Padding::from([6, 8])),
-    );
-    // Only rows with captured output expand on click.
-    let header_area: Element<'a, Message> = if expandable {
-        header_area
-            .on_press(Message::Ui(UiEvent::ActivityExpand(id)))
-            .into()
-    } else {
-        header_area.into()
-    };
-
-    if !activity.expanded || !expandable {
-        return header_area;
-    }
+    // Laid out at the width it gets, so each line can be cut to fit and the
+    // row knows whether it has more to show.
+    let header: Element<'a, Message> =
+        responsive(move |bounds| activity_header(ui, theme, activity, bounds.width))
+            .height(Length::Shrink)
+            .into();
 
     // Expanded: the captured output in a code block under the header — one
     // read-only text_editor holding every line, so drag-selection sweeps
@@ -966,9 +804,15 @@ fn activity_row<'a>(
     // the selection). Long lines wrap instead of panning individually. URLs
     // in the output stay plain selectable text; each one also gets a
     // one-click link under the buffer.
-    let Some(editor) = activity.detail_editor.as_ref() else {
-        return header_area;
+    let Some(editor) = activity
+        .detail_editor
+        .as_ref()
+        .filter(|_| activity.expanded)
+    else {
+        return header;
     };
+    let mono = ui.config.mono_font;
+    let id = activity.id;
     // The drag wrapper adds word/line extension to double/triple-click drags,
     // publishing through the same action pipeline (the log's read-only filter
     // applies to those like any other action).
@@ -1035,7 +879,7 @@ fn activity_row<'a>(
         .clip(true)
         .style(move |_| code_block_style(theme));
     column![
-        header_area,
+        header,
         container(block).width(Length::Fill).padding(Padding {
             top: 2.0,
             right: 8.0,
@@ -1044,6 +888,214 @@ fn activity_row<'a>(
         }),
     ]
     .into()
+}
+
+/// The row's header: the title line, the command, the result and the
+/// progress bar, `width` wide. A click on it toggles the row open when it
+/// has output, or a line cut short; open, every line shows in full. The
+/// detail sits outside it, so dragging to select text there doesn't
+/// collapse the row.
+fn activity_header<'a>(
+    ui: &'a Diffui,
+    theme: ThemeSpec,
+    activity: &'a Activity,
+    width: f32,
+) -> Element<'a, Message> {
+    let mono = ui.config.mono_font;
+    let ui_font = ui.config.ui_font;
+    let (loaded, total, determinate) = activity.progress_snapshot();
+
+    // What sits right of the title: the counters, the Revert and Output
+    // pills, the timing; each with its width, so the title knows its room.
+    let mut trailing: Vec<(Aligned<'a, Message>, f32)> = Vec::new();
+    let caption = |value: String, font: iced::Font, color: Color| {
+        let width = ellipsis::text_width(&value, text_size::CAPTION, font);
+        (
+            Aligned::text(
+                text(value).size(text_size::CAPTION).font(font).color(color),
+                font,
+                text_size::CAPTION,
+            ),
+            width,
+        )
+    };
+    if matches!(activity.status, ActivityStatus::Running) {
+        if determinate {
+            let pct = (loaded * 100 / total.max(1)).min(100);
+            trailing.push(caption(format!("{pct}%"), mono, theme.muted_text));
+        } else if loaded > 0 {
+            // Indeterminate but counting (the jj lazy walk has no known total):
+            // surface the running count.
+            trailing.push(caption(loaded.to_string(), mono, theme.muted_text));
+        }
+    } else if let Some(duration) = activity.duration {
+        // A finished mutation offers a one-click revert of exactly its op
+        // (`jj op revert`). Labelled apart from the toolbar's Undo, which
+        // steps back through the op log instead.
+        if matches!(activity.status, ActivityStatus::Done)
+            && let Some(operation_id) = activity.undo_op.clone()
+        {
+            trailing.push(pill(
+                ui,
+                theme,
+                "Revert",
+                Message::Action(Action::UndoOperation(activity.id, operation_id)),
+            ));
+        }
+        // A jj CLI run reopens its output panel.
+        if ui
+            .active()
+            .cmdline
+            .runs
+            .iter()
+            .any(|run| run.activity == activity.id)
+        {
+            trailing.push(pill(
+                ui,
+                theme,
+                "Output",
+                Message::Action(Action::CommandLine(crate::cmdline::CmdAction::Output(
+                    crate::cli_output::OutputAction::Open(activity.id),
+                ))),
+            ));
+        }
+        trailing.push(caption(
+            format_duration(duration),
+            ui_font,
+            theme.subtle_text,
+        ));
+    }
+
+    // Collapsed, each line is cut to its room; whether any had to be is
+    // what makes the row expandable without output.
+    let text_width = width - 2.0 * ROW_PAD_X - TITLE_INDENT;
+    let trailing_width: f32 = trailing.iter().map(|(_, width)| TRAILING_GAP + width).sum();
+    let title_font = emphasis_font(ui_font, Weight::Medium);
+    let title = activity
+        .label
+        .line(title_font, mono, theme.text, theme, text_size::UI);
+    let result = activity.result.as_deref().map(|result| {
+        crate::prose::Prose::from(result).line(
+            ui_font,
+            mono,
+            theme.muted_text,
+            theme,
+            text_size::UI,
+        )
+    });
+    let cut_short = !title.fits(text_width - trailing_width)
+        || activity.command.as_deref().is_some_and(|command| {
+            !crate::plan::command_fits(ui, theme, command, text_size::CAPTION, text_width)
+        })
+        || result
+            .as_ref()
+            .is_some_and(|result| !result.fits(text_width));
+    let expandable = !activity.detail.is_empty() || cut_short;
+    let open = activity.expanded && expandable;
+    let chevron_width = if expandable {
+        TRAILING_GAP + CHEVRON
+    } else {
+        0.0
+    };
+
+    // The title, the mono counters, the Revert pill and the timing share a
+    // baseline; the status glyph and chevron centre on the caps (see
+    // `crate::typography`).
+    let title: Element<'a, Message> = if open {
+        title.wrapped().width(Length::Fill).into()
+    } else {
+        title
+            .cut(text_width - trailing_width - chevron_width)
+            .width(Length::Fill)
+            .into()
+    };
+    let mut head: Vec<Aligned<'a, Message>> = vec![
+        Aligned::glyph(status_icon(activity, theme, mono), STATUS_ICON_BOX),
+        Aligned::gap(8.0),
+        Aligned::text(title, title_font, text_size::UI),
+    ];
+    for (item, _) in trailing {
+        head.push(Aligned::gap(TRAILING_GAP));
+        head.push(item);
+    }
+    if expandable {
+        let chevron = if open {
+            icons::CHEVRON_UP
+        } else {
+            icons::CHEVRON_DOWN
+        };
+        head.push(Aligned::gap(TRAILING_GAP));
+        head.push(Aligned::glyph(
+            icons::icon(chevron, CHEVRON, theme.subtle_text),
+            CHEVRON,
+        ));
+    }
+    let head = crate::typography::baseline_row(head, 0.0);
+
+    let indented = |content: Element<'a, Message>| {
+        container(content).width(Length::Fill).padding(Padding {
+            top: 0.0,
+            right: 0.0,
+            bottom: 0.0,
+            left: TITLE_INDENT,
+        })
+    };
+    let mut header = column![head].spacing(3);
+    if let Some(command) = activity.command.as_deref() {
+        header = header.push(indented(if open {
+            crate::plan::wrapped_command_line(ui, theme, command, text_size::CAPTION)
+        } else {
+            crate::plan::caption_command_line(ui, theme, command)
+        }));
+    }
+    if let Some(result) = result {
+        header = header.push(indented(if open {
+            result.wrapped().width(Length::Fill).into()
+        } else {
+            result.cut(text_width).into()
+        }));
+    }
+    if matches!(activity.status, ActivityStatus::Running) && determinate {
+        let accent = theme.accent;
+        let fill = ((loaded as f32 / total as f32).clamp(0.0, 1.0) * 1000.0) as u16;
+        let rest = 1000u16.saturating_sub(fill);
+        let mut bar = row![].height(Length::Fixed(4.0));
+        if fill > 0 {
+            bar = bar.push(
+                container(Space::new())
+                    .width(Length::FillPortion(fill))
+                    .height(Length::Fixed(4.0))
+                    .style(move |_| rounded(accent)),
+            );
+        }
+        if rest > 0 {
+            bar = bar.push(
+                container(Space::new())
+                    .width(Length::FillPortion(rest))
+                    .height(Length::Fixed(4.0))
+                    .style(move |_| rounded(chip_background(theme.muted_text))),
+            );
+        }
+        header = header.push(container(bar).width(Length::Fill).padding(Padding {
+            top: 1.0,
+            right: 0.0,
+            bottom: 0.0,
+            left: TITLE_INDENT,
+        }));
+    }
+
+    let header_area = mouse_area(
+        container(header)
+            .width(Length::Fill)
+            .padding(Padding::from([6.0, ROW_PAD_X])),
+    );
+    if expandable {
+        header_area
+            .on_press(Message::Ui(UiEvent::ActivityExpand(activity.id)))
+            .into()
+    } else {
+        header_area.into()
+    }
 }
 
 /// Status glyph centered in the fixed [`STATUS_ICON_BOX`] square.
