@@ -15,7 +15,6 @@
 //!   `snapshot_options_with_start_tracking_matcher` (`cli/src/cli_util.rs`).
 
 use std::{
-    collections::HashMap,
     env,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
@@ -51,35 +50,6 @@ pub(super) fn cli_error(error: CommandError) -> anyhow::Error {
         source = cause.source();
     }
     anyhow!(message)
-}
-
-/// The slice of the process environment the git-ignore lookup reads. Held as
-/// a value rather than read from `std::env` at each use so the tests can drive
-/// it directly — `set_var` is `unsafe` and would race every other test in the
-/// binary.
-#[derive(Clone, Debug, Default)]
-pub(super) struct JjEnv {
-    pub(super) vars: HashMap<String, String>,
-    home_dir: Option<PathBuf>,
-}
-
-impl JjEnv {
-    fn from_process() -> Self {
-        Self {
-            // Non-Unicode variables are dropped rather than panicked on, the
-            // way jj-cli's `ConfigEnv::from_environment` does it.
-            vars: env::vars_os()
-                .filter_map(|(name, value)| {
-                    Some((name.into_string().ok()?, value.into_string().ok()?))
-                })
-                .collect(),
-            home_dir: env::home_dir(),
-        }
-    }
-
-    fn var(&self, name: &str) -> Option<&str> {
-        self.vars.get(name).map(String::as_str)
-    }
 }
 
 /// Settings holding only jj-cli's shipped config: what a repo with no config
@@ -308,17 +278,10 @@ pub(super) fn snapshot_auto_track_matcher(
 // (git's default location when unset) and `info/exclude` from the git dir
 // behind the repo.
 pub(crate) fn snapshot_base_ignores(repo_root: &Path) -> Result<Arc<GitIgnoreFile>> {
-    snapshot_base_ignores_with_env(repo_root, &JjEnv::from_process())
-}
-
-pub(super) fn snapshot_base_ignores_with_env(
-    repo_root: &Path,
-    env: &JjEnv,
-) -> Result<Arc<GitIgnoreFile>> {
     let mut ignores = GitIgnoreFile::empty();
     let git_dir = backing_git_dir(repo_root);
 
-    if let Some(excludes) = git_excludes_file(repo_root, git_dir.as_deref(), env) {
+    if let Some(excludes) = git_excludes_file(repo_root, git_dir.as_deref()) {
         ignores = ignores
             .chain_with_file(RepoPath::root(), excludes.clone())
             .with_context(|| format!("failed to read git excludes {}", excludes.display()))?;
@@ -368,159 +331,42 @@ pub(crate) fn backing_git_dir(repo_root: &Path) -> Option<PathBuf> {
 }
 
 /// The path git would read ignore patterns from outside the tree:
-/// `core.excludesFile` if any config file sets it, else git's default
-/// `$XDG_CONFIG_HOME/git/ignore`. The old code always assumed the default, so
-/// a user who pointed `core.excludesFile` elsewhere had those patterns
-/// dropped — and with `snapshot.auto-track = all()` diffui then tracked, on
-/// every tick, files jj itself ignores.
-pub(super) fn git_excludes_file(
-    work_dir: &Path,
-    git_dir: Option<&Path>,
-    env: &JjEnv,
-) -> Option<PathBuf> {
-    let configured = git_config_files(git_dir, env)
-        .iter()
-        .rev()
-        .find_map(|path| git_config_excludes_file(&std::fs::read_to_string(path).ok()?));
+/// `core.excludesFile` as git's config sets it (system, global and the repo's
+/// own, includes followed), read through gix the way jj-cli reads it, else
+/// git's default `$XDG_CONFIG_HOME/git/ignore`. A relative path is relative to
+/// the work tree, as in git.
+fn git_excludes_file(work_dir: &Path, git_dir: Option<&Path>) -> Option<PathBuf> {
+    const KEY: &str = "core.excludesFile";
+    let repo = git_dir.and_then(|dir| {
+        gix::open_opts(dir, gix::open::Options::default().open_path_as_is(true)).ok()
+    });
+    let configured = match repo {
+        Some(repo) => repo.config_snapshot().string(KEY),
+        None => gix::config::File::from_globals()
+            .ok()
+            .and_then(|config| config.string(KEY)),
+    };
     match configured {
-        // git reads a relative excludes path from the work tree; `join` on an
-        // absolute one keeps it as-is.
-        Some(value) => Some(work_dir.join(expand_home_dir(env, &value))),
-        None => xdg_config_home(env).map(|dir| dir.join("git").join("ignore")),
-    }
-}
-
-/// The git config files that can carry `core.excludesFile`, lowest precedence
-/// first: system, then global, then the repo's own. A later assignment wins,
-/// which is why the caller searches this list back to front.
-pub(super) fn git_config_files(git_dir: Option<&Path>, env: &JjEnv) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    if !env.var("GIT_CONFIG_NOSYSTEM").is_some_and(git_config_bool) {
-        files.push(
-            env.var("GIT_CONFIG_SYSTEM")
-                .map_or_else(|| PathBuf::from("/etc/gitconfig"), PathBuf::from),
-        );
-    }
-    match env.var("GIT_CONFIG_GLOBAL") {
-        Some(path) => files.push(PathBuf::from(path)),
-        None => {
-            files.extend(xdg_config_home(env).map(|dir| dir.join("git").join("config")));
-            files.extend(env.home_dir.as_ref().map(|home| home.join(".gitconfig")));
+        Some(value) => {
+            let path = std::str::from_utf8(&value).ok()?;
+            Some(work_dir.join(jj_lib::file_util::expand_home_path(path)))
         }
+        None => xdg_config_home().map(|dir| dir.join("git").join("ignore")),
     }
-    files.extend(git_dir.map(|dir| dir.join("config")));
-    files
-}
-
-/// git's own truthiness for the `GIT_CONFIG_*` switches.
-pub(super) fn git_config_bool(value: &str) -> bool {
-    ["1", "true", "yes", "on"]
-        .iter()
-        .any(|truthy| value.eq_ignore_ascii_case(truthy))
 }
 
 /// `$XDG_CONFIG_HOME`, or `~/.config`. jj-cli's `base_ignores` accepts a
-/// relative value here, unlike the etcetera-backed config dir behind
-/// [`JjEnv::config_dir`], so this deliberately isn't the same lookup.
-pub(super) fn xdg_config_home(env: &JjEnv) -> Option<PathBuf> {
-    if let Some(dir) = env.var("XDG_CONFIG_HOME").filter(|dir| !dir.is_empty()) {
+/// relative value here, unlike the config dir jj's own config lives in.
+fn xdg_config_home() -> Option<PathBuf> {
+    if let Some(dir) = env::var_os("XDG_CONFIG_HOME").filter(|dir| !dir.is_empty()) {
         return Some(PathBuf::from(dir));
     }
-    env.home_dir.as_ref().map(|home| home.join(".config"))
-}
-
-/// `jj_lib::file_util::expand_home_path` against our captured environment
-/// rather than the process's, so the tests stay off the real home directory.
-pub(super) fn expand_home_dir(env: &JjEnv, value: &str) -> PathBuf {
-    if let Some(rest) = value.strip_prefix("~/")
-        && let Some(home) = &env.home_dir
-    {
-        return home.join(rest);
-    }
-    PathBuf::from(value)
-}
-
-/// The last `core.excludesFile` assigned in one git config file's text.
-///
-/// Deliberately only as much of git's syntax as a path assignment needs —
-/// section headers, quoted values, escapes, trailing comments. `include.path`
-/// and conditional includes are not followed; a value reachable only through
-/// one leaves us on git's default excludes path, which is where every repo
-/// was before this lookup existed.
-pub(super) fn git_config_excludes_file(text: &str) -> Option<String> {
-    let mut value = None;
-    let mut in_core = false;
-    for line in text.lines() {
-        let mut rest = line.trim();
-        if let Some(end) = git_config_section_end(rest) {
-            in_core = rest[1..end].trim().eq_ignore_ascii_case("core");
-            rest = rest[end + 1..].trim_start();
-        }
-        if !in_core || rest.starts_with(['#', ';']) {
-            continue;
-        }
-        let Some((key, raw)) = rest.split_once('=') else {
-            continue;
-        };
-        if key.trim().eq_ignore_ascii_case("excludesfile") {
-            value = Some(git_config_value(raw.trim_start()));
-        }
-    }
-    value.filter(|value| !value.is_empty())
-}
-
-/// Byte offset of the `]` closing a `[section]` header, quoted subsection
-/// names included. `None` when the line doesn't open one.
-pub(super) fn git_config_section_end(line: &str) -> Option<usize> {
-    let mut chars = line.char_indices();
-    if chars.next()?.1 != '[' {
-        return None;
-    }
-    let mut quoted = false;
-    while let Some((index, c)) = chars.next() {
-        match c {
-            '\\' if quoted => {
-                chars.next();
-            }
-            '"' => quoted = !quoted,
-            ']' if !quoted => return Some(index),
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Unescape one git config value: quotes drop out, `\n`/`\t`/`\b` and escaped
-/// literals resolve, and an unquoted `#`/`;` starts a comment. Whitespace
-/// after the last quoted or non-blank character is trailing.
-pub(super) fn git_config_value(raw: &str) -> String {
-    let mut value = String::new();
-    let mut end = 0;
-    let mut quoted = false;
-    let mut chars = raw.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => quoted = !quoted,
-            '\\' => match chars.next() {
-                Some('n') => value.push('\n'),
-                Some('t') => value.push('\t'),
-                Some('b') => value.push('\u{8}'),
-                Some(escaped) => value.push(escaped),
-                None => break,
-            },
-            '#' | ';' if !quoted => break,
-            _ => value.push(c),
-        }
-        if quoted || !c.is_whitespace() {
-            end = value.len();
-        }
-    }
-    value.truncate(end);
-    value
+    env::home_dir().map(|home| home.join(".config"))
 }
 
 #[cfg(test)]
 mod config_layering_tests {
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::process::Command;
 
@@ -550,24 +396,14 @@ mod config_layering_tests {
         path.to_str().expect("utf-8 scratch path")
     }
 
-    /// An environment holding only what the test puts in it: no home and
-    /// none of the variables the test runner happens to carry.
-    fn test_env(vars: &[(&str, &str)]) -> JjEnv {
-        JjEnv {
-            vars: vars
-                .iter()
-                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
-                .collect(),
-            ..JjEnv::default()
-        }
-    }
-
     const PROBE_ROOT: &str = "DIFFUI_SETTINGS_PROBE_ROOT";
     const PROBE_KEYS: &str = "DIFFUI_SETTINGS_PROBE_KEYS";
+    const PROBE_IGNORED: &str = "DIFFUI_SETTINGS_PROBE_IGNORED";
     const PROBE_MARK: &str = "diffui-settings-probe:";
 
     /// What [`settings_probe`] read in its child process: each asked-for
-    /// config value that exists, plus the config stamp under `stamp`.
+    /// config value that exists, the config stamp under `stamp`, and for each
+    /// asked-for path, `ignored:<path>` = whether the base ignores match it.
     struct Probe(HashMap<String, String>);
 
     impl Probe {
@@ -583,6 +419,15 @@ mod config_layering_tests {
     /// `$XDG_CONFIG_HOME`, `$JJ_CONFIG` and the `JJ_*` overrides straight from
     /// the process environment, and `set_var` would race every other test.
     fn probe(repo_root: &Path, vars: &[(&str, &str)], keys: &[&str]) -> Probe {
+        run_probe(repo_root, vars, keys, &[])
+    }
+
+    /// [`probe`] for the base ignores: whether each of `paths` is ignored.
+    fn probe_ignored(repo_root: &Path, vars: &[(&str, &str)], paths: &[&str]) -> Probe {
+        run_probe(repo_root, vars, &[], paths)
+    }
+
+    fn run_probe(repo_root: &Path, vars: &[(&str, &str)], keys: &[&str], paths: &[&str]) -> Probe {
         let path = concat!(module_path!(), "::settings_probe");
         let test = path.split_once("::").map_or(path, |(_, test)| test);
         let output = Command::new(env::current_exe().expect("the test binary"))
@@ -591,6 +436,7 @@ mod config_layering_tests {
             .envs(vars.iter().copied())
             .env(PROBE_ROOT, repo_root)
             .env(PROBE_KEYS, keys.join(","))
+            .env(PROBE_IGNORED, paths.join(","))
             .output()
             .expect("run the settings probe");
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -627,6 +473,14 @@ mod config_layering_tests {
             }
         }
         println!("{PROBE_MARK}stamp={:?}", jj_config_stamp(&root));
+        let paths = env::var(PROBE_IGNORED).unwrap_or_default();
+        if !paths.is_empty() {
+            let ignores = snapshot_base_ignores(&root).expect("base ignores");
+            for path in paths.split(',') {
+                let ignored = ignores.matches_file(repo_path(path));
+                println!("{PROBE_MARK}ignored:{path}={ignored}");
+            }
+        }
     }
 
     /// jj-cli reads exactly `config.toml` and `conf.d/*.toml` from its config
@@ -922,20 +776,18 @@ mod config_layering_tests {
             "[core]\n\texcludesFile = ~/my-ignores # where the patterns live\n",
         );
 
-        let env = JjEnv {
-            home_dir: Some(home),
-            ..test_env(&[(
-                "GIT_CONFIG_SYSTEM",
-                root.join("absent").to_str().expect("utf-8 scratch path"),
-            )])
-        };
-        let ignores = snapshot_base_ignores_with_env(&root, &env).expect("base ignores");
+        let ignores = probe_ignored(
+            &root,
+            &[("HOME", utf8(&home)), ("GIT_CONFIG_NOSYSTEM", "1")],
+            &["build.tmp", "build.rs"],
+        );
 
-        assert!(
-            ignores.matches_file(repo_path("build.tmp")),
+        assert_eq!(
+            ignores.get("ignored:build.tmp"),
+            "true",
             "excludesFile patterns apply"
         );
-        assert!(!ignores.matches_file(repo_path("build.rs")));
+        assert_eq!(ignores.get("ignored:build.rs"), "false");
     }
 
     /// With `core.excludesFile` unset, git falls back to
@@ -946,17 +798,17 @@ mod config_layering_tests {
         let xdg = root.join("xdg");
         write_file(xdg.join("git").join("ignore"), "*.log\n");
 
-        let env = test_env(&[
-            ("XDG_CONFIG_HOME", xdg.to_str().expect("utf-8 scratch path")),
-            (
-                "GIT_CONFIG_SYSTEM",
-                root.join("absent").to_str().expect("utf-8 scratch path"),
-            ),
-        ]);
-        let ignores = snapshot_base_ignores_with_env(&root, &env).expect("base ignores");
+        let ignores = probe_ignored(
+            &root,
+            &[
+                ("XDG_CONFIG_HOME", utf8(&xdg)),
+                ("GIT_CONFIG_NOSYSTEM", "1"),
+            ],
+            &["run.log", "run.rs"],
+        );
 
-        assert!(ignores.matches_file(repo_path("run.log")));
-        assert!(!ignores.matches_file(repo_path("run.rs")));
+        assert_eq!(ignores.get("ignored:run.log"), "true");
+        assert_eq!(ignores.get("ignored:run.rs"), "false");
     }
 
     /// `info/exclude` has to come from the git dir `store/git_target` names,
@@ -964,14 +816,6 @@ mod config_layering_tests {
     /// a repo jj owns outright never had its exclude file read at all.
     #[test]
     fn base_ignores_read_info_exclude_from_either_git_dir_layout() {
-        let env = test_env(&[(
-            "GIT_CONFIG_SYSTEM",
-            std::env::temp_dir()
-                .join("diffui-core-absent-gitconfig")
-                .to_str()
-                .expect("utf-8 temp path"),
-        )]);
-
         for (name, git_target, git_dir) in [
             ("internal", "git", ".jj/repo/store/git"),
             ("colocated", "../../../.git", ".git"),
@@ -983,44 +827,41 @@ mod config_layering_tests {
                 "*.secret\n",
             );
 
-            let ignores = snapshot_base_ignores_with_env(&root, &env).expect("base ignores");
-            assert!(
-                ignores.matches_file(repo_path("token.secret")),
-                "{name} layout"
+            let ignores = probe_ignored(
+                &root,
+                &[("GIT_CONFIG_NOSYSTEM", "1")],
+                &["token.secret", "token.rs"],
             );
-            assert!(
-                !ignores.matches_file(repo_path("token.rs")),
-                "{name} layout"
-            );
+            assert_eq!(ignores.get("ignored:token.secret"), "true", "{name} layout");
+            assert_eq!(ignores.get("ignored:token.rs"), "false", "{name} layout");
         }
     }
 
+    /// A real git repo's own config is read too, the way git layers it over
+    /// the global one.
     #[test]
-    fn git_config_excludes_file_reads_gits_syntax() {
-        let lookup = |text: &str| super::git_config_excludes_file(text);
+    fn base_ignores_read_core_excludes_file_from_the_repos_git_config() {
+        let root = scratch_dir("excludes-repo-config");
+        let git_dir = root.join(".jj/repo/store/git");
+        std::fs::create_dir_all(&git_dir).expect("create the git dir");
+        gix::init_bare(&git_dir).expect("init a bare git repo");
+        write_file(root.join(".jj/repo/store/git_target"), "git");
+        write_file(root.join("repo-ignores"), "*.bak\n");
+        let config = git_dir.join("config");
+        let mut text = std::fs::read_to_string(&config).expect("read git config");
+        text.push_str("[core]\n\texcludesFile = repo-ignores\n");
+        std::fs::write(&config, text).expect("write git config");
 
-        assert_eq!(
-            lookup("[core]\n\texcludesfile = ~/.gitignore\n").as_deref(),
-            Some("~/.gitignore")
+        let ignores = probe_ignored(
+            &root,
+            &[("GIT_CONFIG_NOSYSTEM", "1")],
+            &["old.bak", "old.rs"],
         );
         assert_eq!(
-            lookup("[CORE] excludesFile = \"/a b/ignore\" ; note\n").as_deref(),
-            Some("/a b/ignore"),
-            "section and key are case-insensitive, quotes and comments strip"
+            ignores.get("ignored:old.bak"),
+            "true",
+            "relative to the work tree"
         );
-        assert_eq!(
-            lookup(
-                "[core]\nexcludesfile = /first\n[user]\nname = x\n[core]\nexcludesfile = /last\n"
-            )
-            .as_deref(),
-            Some("/last"),
-            "the last assignment wins"
-        );
-        assert_eq!(
-            lookup("[core \"sub\"]\nexcludesfile = /sub\n"),
-            None,
-            "a subsection is not the `core` section"
-        );
-        assert_eq!(lookup("[core]\n# excludesfile = /commented\n"), None);
+        assert_eq!(ignores.get("ignored:old.rs"), "false");
     }
 }

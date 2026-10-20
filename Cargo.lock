@@ -2532,6 +2532,7 @@ dependencies = [
  "clap",
  "diffui-core",
  "futures",
+ "gix",
  "jj-cli",
  "jj-lib",
  "notify",

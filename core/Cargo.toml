@@ -153,4 +153,7 @@ arborium = { version = "2.16.0", features = [
     "lang-zsh",
 ] }
 jj-cli = { version = "0.45.1", default-features = false, features = ["git"] }
+# Already in the tree through jj-lib, same version and features: reads git's
+# config for `core.excludesFile` the way jj-cli does.
+gix = { version = "0.87.1", default-features = false }
 clap = "4.5"
