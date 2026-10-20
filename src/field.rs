@@ -43,6 +43,14 @@ pub const COLLAPSED_RAIL_PADDING: f32 = PANEL_TOGGLE_INSET;
 /// Gap between the caret square and the field's top/right/bottom edges —
 /// equal on all three sides so the caret reads as a centered inset button.
 const CARET_MARGIN: f32 = 3.0;
+/// A field's leading icon: its inset from the field's left edge, and size.
+pub const LEADING_ICON_INSET: f32 = 9.0;
+pub const LEADING_ICON_SIZE: f32 = 13.0;
+/// The text's inset from what precedes it, the field's edge or its icon.
+const TEXT_INSET: f32 = 9.0;
+/// Where the text of a field with a leading icon starts, from the field's
+/// left edge: the column what hangs under the field (its error) lines up on.
+pub const LEADING_TEXT_X: f32 = LEADING_ICON_INSET + LEADING_ICON_SIZE + TEXT_INSET;
 
 pub(crate) fn panel_toggle_button<'a>(
     font: Font,
@@ -106,7 +114,7 @@ pub(crate) fn filter_field(
     let mut input = text_input(spec.placeholder, spec.value)
         .id(spec.id)
         .padding(crate::typography::trimmed_padding(
-            Padding::from([6, 9]),
+            Padding::from([6.0, TEXT_INSET]),
             font,
             theme::text_size::UI,
         ))
@@ -129,11 +137,14 @@ pub(crate) fn filter_field(
     let mut bar = row![].align_y(alignment::Vertical::Center);
     if let Some(icon) = spec.leading_icon {
         bar = bar.push(
-            container(crate::icons::icon(icon, 13.0, theme.subtle_text)).padding(Padding {
-                top: 0.0,
-                right: 0.0,
-                bottom: 0.0,
-                left: 9.0,
+            container(crate::icons::icon(
+                icon,
+                LEADING_ICON_SIZE,
+                theme.subtle_text,
+            ))
+            .padding(Padding {
+                left: LEADING_ICON_INSET,
+                ..Padding::ZERO
             }),
         );
     }
