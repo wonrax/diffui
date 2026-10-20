@@ -203,7 +203,8 @@ async fn run(repository: &Repository, command: Command, cancel: &CancelFlag) -> 
         | Command::ConflictInfo { job, .. }
         | Command::PrepareMergeTool { job, .. }
         | Command::History { job, .. }
-        | Command::ExpandFile { job, .. } => vec![Payload::Failed {
+        | Command::ExpandFile { job, .. }
+        | Command::ResolveRevset { job, .. } => vec![Payload::Failed {
             job,
             error: RepoError::Unsupported,
         }],

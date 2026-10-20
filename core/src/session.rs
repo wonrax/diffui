@@ -29,6 +29,7 @@ use crate::repo::{
     Capabilities, Command, Event, JobId, Payload, PreviewRequest, RepoError, RepoId,
 };
 use crate::repository::{FetchTarget, RepositorySnapshot};
+use crate::revset::RevsetQuery;
 
 /// A parked diff document for a source that flips between several documents —
 /// a PR's "all changes" view vs its per-commit diffs — so flipping back is an
@@ -537,6 +538,21 @@ impl Session {
         self.compare(base, to)
     }
 
+    // ── typed revsets ───────────────────────────────────────────────────
+
+    /// Parse and resolve a revset against the repository, for live feedback
+    /// as it is typed: a count, the rows to tint, or jj's error with its span.
+    /// The answer is a [`Payload::RevsetResolved`] the frontend routes by the
+    /// returned job, like a preview; superseding a query is the caller's
+    /// `Command::Cancel` for the old job.
+    pub fn resolve_revset(&mut self, query: RevsetQuery) -> (JobId, Vec<Effect>) {
+        let job = self.next_job();
+        (
+            job,
+            vec![Effect::Send(Command::ResolveRevset { job, query })],
+        )
+    }
+
     /// Fold the working copy into `@`. Coalesces instead of racing when
     /// something is already in flight: a second snapshot thrashes jj's lock,
     /// and the in-flight work's terminal event drains what was held.
@@ -658,7 +674,8 @@ impl Session {
             | Payload::ConflictInfoLoaded { .. }
             | Payload::MergeToolPrepared { .. }
             | Payload::OpLogBatch { .. }
-            | Payload::History { .. } => Vec::new(),
+            | Payload::History { .. }
+            | Payload::RevsetResolved { .. } => Vec::new(),
         }
     }
 
@@ -1783,6 +1800,8 @@ mod tests {
             Effect::Activity(Activity::Toast { title, .. }) if title == "Comparison ended"
         )));
     }
+
+    // ── typed revsets ───────────────────────────────────────────────────
 
     // ── size caps ───────────────────────────────────────────────────────
 

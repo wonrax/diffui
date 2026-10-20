@@ -133,7 +133,8 @@ async fn run(
         | Command::ConflictInfo { job, .. }
         | Command::PrepareMergeTool { job, .. }
         | Command::History { job, .. }
-        | Command::ExpandFile { job, .. } => emit(Payload::Failed {
+        | Command::ExpandFile { job, .. }
+        | Command::ResolveRevset { job, .. } => emit(Payload::Failed {
             job,
             error: RepoError::Unsupported,
         }),

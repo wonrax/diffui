@@ -138,6 +138,20 @@ pub(super) fn parse_user_revset(
     if trimmed.is_empty() || trimmed == "all()" {
         return Ok(RevsetExpression::all());
     }
+    parse_revset_raw(repo_root, settings, workspace_name, trimmed)?
+        .context("failed to parse revset")
+}
+
+/// [`parse_user_revset`]'s parse proper, with no shortcut and jj-lib's own
+/// error, which still carries where in `src` it went wrong (see
+/// [`crate::jj::revset`]). The outer error is the alias table failing to
+/// load; the inner one is the revset's.
+pub(super) fn parse_revset_raw(
+    repo_root: &Path,
+    settings: &UserSettings,
+    workspace_name: &WorkspaceName,
+    src: &str,
+) -> Result<Result<Arc<UserRevsetExpression>, jj_lib::revset::RevsetParseError>> {
     let aliases = revset_aliases_map(settings)?;
     let fileset_aliases = FilesetAliasesMap::new();
     let extensions = RevsetExtensions::default();
@@ -159,7 +173,7 @@ pub(super) fn parse_user_revset(
         extensions: &extensions,
         workspace: Some(workspace_ctx),
     };
-    parse_revset(&mut RevsetDiagnostics::new(), trimmed, &context).context("failed to parse revset")
+    Ok(parse_revset(&mut RevsetDiagnostics::new(), src, &context))
 }
 
 /// Walk the jj revset graph, emitting commits in batches as they're built, and

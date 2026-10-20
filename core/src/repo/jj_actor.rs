@@ -556,6 +556,22 @@ impl Actor {
             Command::History { job, request } => {
                 self.history(repository, job, request, cancel).await
             }
+            Command::ResolveRevset { job, query } => {
+                let repo = self.repo_at_head(repository).await?;
+                let name = self.slot(repository)?.name.clone();
+                let answer = revset_scope(&repo, &name, repository)
+                    .query(&query, cancel)
+                    .await;
+                match answer {
+                    Some(result) if !cancel.is_cancelled() => self.emit(Payload::RevsetResolved {
+                        job,
+                        revset: query.revset,
+                        result,
+                    }),
+                    _ => self.emit(Payload::Cancelled { job }),
+                }
+                Ok(())
+            }
             Command::Cancel { .. } => Ok(()),
         }
     }
@@ -855,7 +871,21 @@ fn command_name(command: &Command) -> &'static str {
         Command::PrepareMergeTool { .. } => "prepare_merge_tool",
         Command::History { .. } => "history",
         Command::ExpandFile { .. } => "expand_file",
+        Command::ResolveRevset { .. } => "resolve_revset",
         Command::Cancel { .. } => "cancel",
+    }
+}
+
+/// Where the actor parses a revset: the repo at head, this workspace's `@`.
+fn revset_scope<'a>(
+    repo: &'a ReadonlyRepo,
+    name: &'a WorkspaceNameBuf,
+    repository: &'a Repository,
+) -> jj::revset::RevsetScope<'a> {
+    jj::revset::RevsetScope {
+        repo,
+        workspace_name: name,
+        repo_root: &repository.root,
     }
 }
 
@@ -876,6 +906,9 @@ pub(super) fn classify(error: anyhow::Error) -> RepoError {
     }
     if let Some(failed) = error.downcast_ref::<jj::push::SignFailed>() {
         return RepoError::Other(failed.to_string());
+    }
+    if let Some(revset) = error.downcast_ref::<crate::revset::RevsetError>() {
+        return RepoError::Revset(revset.to_string());
     }
     let message = format!("{error:#}");
     if message.contains("failed to parse revset")

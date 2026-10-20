@@ -20,6 +20,7 @@ pub mod push;
 pub mod repo;
 pub mod repository;
 pub mod resolve;
+pub mod revset;
 pub mod session;
 pub mod source_browse;
 pub mod syntax;
@@ -41,6 +42,7 @@ pub use repo::{
 };
 pub use repository::{FetchTarget, Repository, RepositorySnapshot, Vcs, prepare_repository};
 pub use resolve::{ConflictFile, ConflictResolution, ConflictTerm, MergeToolInvocation};
+pub use revset::{RevsetError, RevsetExpect, RevsetMatch, RevsetQuery};
 pub use session::{
     ColdBatchFold, ColdCursor, Effect, LoadStatus, RefreshOrigin, Session, coalesce_refresh,
     fold_cold_batch,

@@ -18,6 +18,7 @@ use crate::mutations::{
 };
 use crate::repository::{FetchTarget, RepositorySnapshot};
 use crate::resolve::{ConflictFile, MergeToolInvocation};
+use crate::revset::{RevsetError, RevsetMatch, RevsetQuery};
 use crate::session::RefreshOrigin;
 use crate::source_browse::{SourceEntry, SourceFileLoad};
 
@@ -247,6 +248,15 @@ pub enum Command {
         base: DiffBase,
         path: String,
     },
+    /// Parse and resolve a revset against the repository as it stands, with
+    /// the aliases and workspace the graph walk uses. Answered by
+    /// [`Payload::RevsetResolved`] even when the revset is bad: that is an
+    /// answer, not a failure. Cheap, and meant to be sent on every debounced
+    /// keystroke, cancelling the one before.
+    ResolveRevset {
+        job: JobId,
+        query: RevsetQuery,
+    },
     /// Ask the actor to stop `job`. A cancelled job reports
     /// [`Payload::Cancelled`] and never its success event, so the caller's
     /// inflight slot is always cleared by exactly one terminal event.
@@ -275,7 +285,8 @@ impl Command {
             | Self::ConflictInfo { job, .. }
             | Self::PrepareMergeTool { job, .. }
             | Self::History { job, .. }
-            | Self::ExpandFile { job, .. } => Some(*job),
+            | Self::ExpandFile { job, .. }
+            | Self::ResolveRevset { job, .. } => Some(*job),
             Self::Cancel { .. } => None,
         }
     }
@@ -444,6 +455,13 @@ pub enum Payload {
         job: JobId,
         invocation: MergeToolInvocation,
     },
+    /// The answer to a [`Command::ResolveRevset`]: what `revset` matched, or
+    /// why it doesn't parse or resolve.
+    RevsetResolved {
+        job: JobId,
+        revset: String,
+        result: Result<RevsetMatch, RevsetError>,
+    },
     Failed {
         job: JobId,
         error: RepoError,
@@ -475,6 +493,7 @@ impl Payload {
             | Self::MergeToolPrepared { job, .. }
             | Self::OpLogBatch { job, .. }
             | Self::History { job, .. }
+            | Self::RevsetResolved { job, .. }
             | Self::Failed { job, .. }
             | Self::Cancelled { job, .. } => Some(*job),
             Self::Ready { .. }

@@ -1,7 +1,8 @@
 //! The jj backend, split by concern: config layering ([`settings`]), the
 //! working-copy lock prologue ([`workspace`]), the revset walk ([`walk`]),
 //! diffs ([`diff`]), source browsing ([`browse`]), history mutation
-//! ([`mutate`]), draft simulation ([`preview`]) and git remotes ([`remote`]).
+//! ([`mutate`]), draft simulation ([`preview`]), git remotes ([`remote`]) and
+//! typed revsets ([`revset`]).
 //!
 //! jj-lib's stores and workspaces are `!Send`, so everything below runs on the
 //! repository actor's own thread ([`crate::repo`]) under a current-thread
@@ -19,6 +20,7 @@ pub(crate) mod push;
 pub(crate) mod remote;
 pub(crate) mod resolve;
 pub(crate) mod revops;
+pub(crate) mod revset;
 pub(crate) mod settings;
 pub(crate) mod undo;
 pub(crate) mod walk;
