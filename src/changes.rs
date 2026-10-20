@@ -1281,20 +1281,14 @@ pub(crate) fn selection_bar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Option<Elem
                 .into()
         })
     };
-    let mut strip = if one_line {
+    // Line selection's keys are in the hint strip docked under this one
+    // (see `crate::mode_hints`).
+    let strip = if one_line {
         column![ui::button_row(Some(lead), buttons())]
     } else {
         column![lead, ui::button_row(None, buttons())]
     }
     .spacing(theme::space::SM);
-    if selecting {
-        strip = strip.push(
-            text(line_select_hint(ui))
-                .size(text_size::CAPTION)
-                .font(font)
-                .color(theme.muted_text),
-        );
-    }
     Some(
         container(strip)
             .width(Length::Fill)
@@ -1322,32 +1316,6 @@ fn picked_prose(selection: &DiffSelection) -> Prose {
         (Some(picked), [only]) => Prose::from(format!("{picked} in ")).path(&only.path),
         _ => Prose::from(selection.summary()),
     }
-}
-
-/// How line-select mode is driven, with the keys as they are bound.
-fn line_select_hint(ui: &Diffui) -> String {
-    use crate::commands::Context;
-    let key = |id: &'static str| {
-        ui.keymap
-            .chord_for(Context::Lines, id)
-            .map(|chord| chord.display())
-    };
-    let mut parts = vec![
-        "Click or drag lines".to_owned(),
-        "Shift-click a range".to_owned(),
-    ];
-    match (key("lines.next"), key("lines.previous")) {
-        (Some(next), Some(previous)) => parts.push(format!("{next}/{previous} to move")),
-        (Some(step), None) | (None, Some(step)) => parts.push(format!("{step} to move")),
-        (None, None) => {}
-    }
-    if let Some(toggle) = key("lines.toggle-line") {
-        parts.push(format!("{toggle} to pick"));
-    }
-    if let Some(exit) = key("lines.exit") {
-        parts.push(format!("{exit} when done"));
-    }
-    parts.join(" \u{b7} ")
 }
 
 pub(crate) const SPLIT_FIRST_EDITOR_ID: &str = "split-first-description";
@@ -1792,35 +1760,6 @@ mod tests {
         let mut reloaded = rewrite("a.rs");
         reloaded.hunks[0].lines[1].old_line = Some(5);
         assert!(state.selection(&wc, &[reloaded]).is_empty());
-    }
-
-    #[test]
-    fn the_line_select_hint_names_the_bound_keys() {
-        let mut ui = crate::tabs::tests::app();
-        assert_eq!(
-            line_select_hint(&ui),
-            "Click or drag lines \u{b7} Shift-click a range \u{b7} j/k to move \u{b7} \
-             Space to pick \u{b7} Esc when done"
-        );
-        #[derive(serde::Deserialize)]
-        struct Fixture {
-            keys: crate::keymap::RawKeys,
-        }
-        let fixture: Fixture = toml::from_str(
-            r#"
-            [keys.lines]
-            "lines.next" = "n"
-            "lines.toggle-line" = "x"
-            "lines.exit" = []
-            "#,
-        )
-        .expect("valid keys");
-        ui.keymap = crate::keymap::Keymap::build(&fixture.keys).0;
-        assert_eq!(
-            line_select_hint(&ui),
-            "Click or drag lines \u{b7} Shift-click a range \u{b7} n/k to move \u{b7} \
-             x to pick"
-        );
     }
 
     #[test]

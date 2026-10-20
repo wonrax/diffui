@@ -380,7 +380,7 @@ fn binding_row<'a>(
 }
 
 /// A key rendered like the tab strip's `⌘K` control: hairline border, mono.
-fn keycap<'a>(ui: &'a Diffui, theme: ThemeSpec, key: String) -> Aligned<'a, Message> {
+pub(crate) fn keycap<'a>(ui: &'a Diffui, theme: ThemeSpec, key: String) -> Aligned<'a, Message> {
     let mono = ui.config.mono_font;
     Aligned::chip(
         text(key)

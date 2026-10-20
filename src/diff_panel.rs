@@ -561,11 +561,16 @@ fn build_diff_panel_body<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Me
         let find_overlay = find::build_overlay(ui, theme);
         let layers = stack![diff_view, find_overlay].clip(true);
         // The selection strip docks below the diff rather than floating over
-        // it, so the last lines stay readable while something is picked.
-        let diff_with_find: Element<'a, Message> = match crate::changes::selection_bar(ui, theme) {
-            Some(bar) => column![layers, bar].into(),
-            None => layers.into(),
-        };
+        // it, so the last lines stay readable while something is picked; the
+        // active mode's key hints dock under it.
+        let mut diff_with_find = column![layers];
+        if let Some(bar) = crate::changes::selection_bar(ui, theme) {
+            diff_with_find = diff_with_find.push(bar);
+        }
+        if let Some(hints) = crate::mode_hints::strip(ui, theme) {
+            diff_with_find = diff_with_find.push(hints);
+        }
+        let diff_with_find: Element<'a, Message> = diff_with_find.into();
 
         match crate::conflicts::conflict_banner(ui, theme) {
             Some(banner) => column![summary, banner, diff_with_find].spacing(0).into(),

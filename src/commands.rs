@@ -1097,12 +1097,23 @@ pub(crate) static REGISTRY: &[Command] = &[
     Command {
         id: "selection.clear",
         label: "Clear selection",
-        hint: "Drop the sidebar's marked rows",
+        hint: "Drop the sidebar's marked rows, else stop comparing",
         contexts: &[Context::Base],
         chords: &["esc"],
         mac_chords: &[],
         enabled: always,
-        build: |_ui, _arg| Some(Action::ClearMultiSelection),
+        // Esc backs out of whatever is on: the marks first, then a
+        // comparison.
+        build: |ui, _arg| {
+            Some(
+                if ui.active().revision_multi_selection.is_empty() && crate::compare::comparing(ui)
+                {
+                    Action::Compare(CompareAction::Exit)
+                } else {
+                    Action::ClearMultiSelection
+                },
+            )
+        },
         palette: PaletteScope::Hidden,
     },
     // ── Whole-revision ops: commit, new -A/-B, duplicate placement,

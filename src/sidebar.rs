@@ -348,7 +348,7 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     let ui_font = ui.config.ui_font;
     let mono_font = ui.config.mono_font;
     let target_row = |label: &'static str,
-                      key: Option<&'static str>,
+                      key: Option<String>,
                       tone: RowTone,
                       description: Option<String>,
                       on_press: Option<Message>|
@@ -498,14 +498,19 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
                     RowTone::Chosen
                 }
             };
-            for (label, key, placement) in [
-                ("Onto", "o", PlacementKind::Onto),
-                ("After", "a", PlacementKind::After),
-                ("Before", "b", PlacementKind::Before),
+            for (label, command, placement) in [
+                ("Onto", "draft.place.onto", PlacementKind::Onto),
+                ("After", "draft.place.after", PlacementKind::After),
+                ("Before", "draft.place.before", PlacementKind::Before),
             ] {
+                // The key as bound, so a rebinding shows here too.
+                let key = ui
+                    .keymap
+                    .chord_for(crate::commands::Context::Draft, command)
+                    .map(crate::keymap::Chord::display);
                 rows_column = rows_column.push(target_row(
                     label,
-                    Some(key),
+                    key,
                     tone(placement),
                     describe(placement),
                     Some(Message::Action(Action::DraftPlacement(placement))),
@@ -710,26 +715,13 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     )
     .on_press_maybe(can_apply.then_some(Message::Action(Action::DraftConfirm)));
 
-    // Only the keys nothing on screen already shows: the rows carry their
-    // own keycaps and Apply its ↵.
-    let hints = text(match draft.kind {
-        DraftKind::Merge => "Space toggles a parent · Esc cancels",
-        DraftKind::Parallelize => "Space or \u{2318}-click toggles a revision · Esc cancels",
-        DraftKind::New => "Esc cancels",
-        _ => "Space toggles a source · Esc cancels",
-    })
-    .size(theme::text_size::CAPTION)
-    .font(ui_font)
-    .color(theme.subtle_text);
-
+    // The mode's other keys are in the hint strip docked under the diff
+    // (see `crate::mode_hints`); the rows carry their own keycaps and Apply
+    // its ↵.
     let band = container(
-        column![
-            row![summary, apply]
-                .spacing(8)
-                .align_y(alignment::Vertical::Center),
-            hints,
-        ]
-        .spacing(6),
+        row![summary, apply]
+            .spacing(8)
+            .align_y(alignment::Vertical::Center),
     )
     .width(Length::Fill)
     .padding([8, 12])
