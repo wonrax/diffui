@@ -1758,6 +1758,47 @@ fn log_rows_carry_the_immutable_flag() {
     );
 }
 
+/// Rows descending from `trunk()` are flagged, and the trunk's id rides
+/// along with the bookmarks; with no trunk bookmark, `trunk()` is the root
+/// commit, which counts as no trunk at all.
+#[test]
+fn log_rows_carry_the_trunk_flag() {
+    let root = scratch_repo("trunk-log-flag");
+    write(&root, "a.txt", "a\n");
+    commit(&root, "base");
+    write(&root, "a.txt", "b\n");
+    commit(&root, "on trunk");
+    let load = || {
+        block_on(load_jj_commits(
+            root.clone(),
+            "all()".to_owned(),
+            LoadProgress::default(),
+        ))
+        .expect("load commits")
+    };
+
+    let (store, _graph, _branch, bookmarks) = load();
+    assert_eq!(bookmarks.trunk, None, "root() is no trunk");
+    assert!(store.iter().all(|row| !row.on_trunk()));
+
+    let base = commit_id(&root, "description(exact:\"base\\n\")");
+    std::fs::write(
+        root.join(".jj/repo/config.toml"),
+        format!("[revset-aliases]\n'trunk()' = '{base}'\n"),
+    )
+    .expect("write repo config");
+    let (store, _graph, _branch, bookmarks) = load();
+    assert_eq!(bookmarks.trunk.as_deref(), Some(base.as_str()));
+    let flagged: Vec<&str> = store
+        .iter()
+        .filter(|row| row.on_trunk())
+        .map(|row| row.description())
+        .collect();
+    assert!(flagged.contains(&"base"), "trunk itself, got {flagged:?}");
+    assert!(flagged.contains(&"on trunk"), "its child, got {flagged:?}");
+    assert_eq!(flagged.len(), 3, "base, its child and @, got {flagged:?}");
+}
+
 /// The rebase preview predicts conflicts without touching the repo's visible
 /// state: the op log head must not move, and the conflicting change is named.
 #[test]

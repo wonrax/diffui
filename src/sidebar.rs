@@ -1509,6 +1509,7 @@ mod tests {
             change_offset: None,
             is_working_copy: false,
             is_immutable: false,
+            on_trunk: false,
             bookmarks: Vec::new(),
             parent_ids: Vec::new(),
         }

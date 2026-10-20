@@ -344,6 +344,35 @@ pub async fn walk_jj_with_repo(
     }
     let is_immutable_fn = immutable_revset.as_ref().ok().map(|rs| rs.containing_fn());
 
+    // `trunk()` and what descends from it, for "rebase onto trunk". The
+    // builtin alias falls back to `root()` when no trunk bookmark exists,
+    // which is not a trunk anyone means, so it is subtracted. Best-effort
+    // like `immutable()`: a failure reads as "no trunk".
+    let user_revset = |source: &str| {
+        parse_user_revset(repo_root, repo.settings(), workspace_name, source)
+            .and_then(|expr| {
+                expr.resolve_user_expression(repo, &symbol_resolver)
+                    .with_context(|| format!("failed to resolve {source}"))
+            })
+            .and_then(|resolved| {
+                resolved
+                    .evaluate(repo)
+                    .with_context(|| format!("failed to evaluate {source}"))
+            })
+    };
+    let trunk_id = match user_revset("trunk() ~ root()") {
+        Ok(revset) => revset.stream().next().await.and_then(Result::ok),
+        Err(error) => {
+            tracing::warn!("trunk() unavailable: {error:#}");
+            None
+        }
+    };
+    let on_trunk_revset = match &trunk_id {
+        Some(_) => user_revset("(trunk() ~ root())::").ok(),
+        None => None,
+    };
+    let on_trunk_fn = on_trunk_revset.as_ref().map(|rs| rs.containing_fn());
+
     let mut lane_assigner = LaneAssigner::new();
     let mut tree_ids: HashMap<CommitId, Merge<TreeId>> = HashMap::new();
     let mut ids: Vec<CommitId> = Vec::new();
@@ -420,6 +449,10 @@ pub async fn walk_jj_with_repo(
                 Some(contains) => contains(&id).await.unwrap_or(false),
                 None => false,
             };
+            let on_trunk = match &on_trunk_fn {
+                Some(contains) => contains(&id).await.unwrap_or(false),
+                None => false,
+            };
             let summary = CommitSummary {
                 change_id: commit.change_id().to_string(),
                 commit_id: id.hex(),
@@ -438,6 +471,7 @@ pub async fn walk_jj_with_repo(
                 change_offset,
                 is_working_copy: id == *wc_commit_id,
                 is_immutable,
+                on_trunk,
                 bookmarks,
                 parent_ids: commit.parent_ids().iter().map(|id| id.hex()).collect(),
             };
@@ -488,7 +522,8 @@ pub async fn walk_jj_with_repo(
     let branch_status = compute_branch_status(repo, wc_commit_id).await;
     // Repo-wide bookmark table for the revision context menu (move/track/
     // delete/push) — a single bookmarks() walk on the same repo.
-    let bookmarks = compute_bookmarks_info(repo, wc_commit_id);
+    let mut bookmarks = compute_bookmarks_info(repo, wc_commit_id);
+    bookmarks.trunk = trunk_id.map(|id| id.hex());
     Ok(Some((empty_updates, branch_status, bookmarks)))
 }
 
@@ -663,6 +698,7 @@ pub(super) fn compute_bookmarks_info(
         remotes,
         git_push,
         tags,
+        trunk: None,
     }
 }
 

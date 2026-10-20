@@ -277,6 +277,10 @@ pub struct CommitSummary {
     /// rewrite-confirmation dialogs. `false` for backends without the
     /// concept (git, PR listings).
     pub is_immutable: bool,
+    /// Whether the commit descends from (or is) `trunk()` — so rebasing its
+    /// branch onto trunk would move nothing. `false` when `trunk()` is the
+    /// root commit (no trunk bookmark) and for backends without the concept.
+    pub on_trunk: bool,
     /// Ref labels pointing at this commit. Other workspaces' working
     /// copies (or Git worktree HEADs) come first as `name@` (matches jj log's
     /// `working_copies`-before-`bookmarks` order), then bookmarks as in
@@ -304,6 +308,7 @@ mod commit_flags {
     /// `parent_ids`; drives insert-between drop targets.
     pub const NEXT_ROW_IS_PARENT: u16 = 1 << 7;
     pub const IS_IMMUTABLE: u16 = 1 << 8;
+    pub const ON_TRUNK: u16 = 1 << 9;
 }
 
 /// Byte range `[start, start+len)` into a [`CommitStore`]'s text arena.
@@ -621,6 +626,9 @@ impl CommitStore {
         if commit.is_immutable {
             flags |= commit_flags::IS_IMMUTABLE;
         }
+        if commit.on_trunk {
+            flags |= commit_flags::ON_TRUNK;
+        }
         if let Some(empty) = commit.is_empty {
             flags |= commit_flags::IS_EMPTY_KNOWN;
             if empty {
@@ -785,6 +793,12 @@ impl<'a> RowView<'a> {
     /// [`CommitSummary::is_immutable`]).
     pub fn is_immutable(&self) -> bool {
         self.flags() & commit_flags::IS_IMMUTABLE != 0
+    }
+
+    /// Whether this commit descends from `trunk()` (see
+    /// [`CommitSummary::on_trunk`]).
+    pub fn on_trunk(&self) -> bool {
+        self.flags() & commit_flags::ON_TRUNK != 0
     }
 
     /// Whether the next display row is a direct parent of this commit — i.e.
@@ -1050,6 +1064,9 @@ pub struct BookmarksInfo {
     /// `v1@origin` for a remote tag elsewhere, `v1??` when conflicted). Read
     /// only: the graph shows them, nothing acts on them.
     pub tags: std::collections::HashMap<String, Vec<String>>,
+    /// `trunk()`'s commit id (hex), unless it falls back to the root commit
+    /// because no trunk bookmark exists. jj only.
+    pub trunk: Option<String>,
 }
 
 impl BookmarksInfo {
@@ -1238,6 +1255,7 @@ mod tests {
             change_offset: None,
             is_working_copy: false,
             is_immutable: false,
+            on_trunk: false,
             bookmarks: Vec::new(),
             parent_ids: parent_ids.iter().map(|id| (*id).to_owned()).collect(),
         };
@@ -1281,6 +1299,7 @@ mod tests {
             change_offset: None,
             is_working_copy: false,
             is_immutable: false,
+            on_trunk: false,
             bookmarks: Vec::new(),
             parent_ids: Vec::new(),
         }

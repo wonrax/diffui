@@ -1393,6 +1393,7 @@ mod tests {
                 change_offset: None,
                 is_working_copy: index == 0,
                 is_immutable: false,
+                on_trunk: false,
                 bookmarks: Vec::new(),
                 parent_ids: if index == 0 {
                     Vec::new()

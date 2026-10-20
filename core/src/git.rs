@@ -918,6 +918,7 @@ fn build_commit_summaries(rows: Vec<ParsedCommitRow>) -> Vec<StreamRow> {
                 change_offset: None,
                 is_working_copy: row.is_working_copy,
                 is_immutable: false,
+                on_trunk: false,
                 bookmarks: Vec::new(),
                 parent_ids: row.parents,
             },

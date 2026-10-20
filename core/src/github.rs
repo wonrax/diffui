@@ -477,6 +477,7 @@ pub fn pr_commit_rows(commits: &[PrCommit]) -> Vec<StreamRow> {
         change_offset: None,
         is_working_copy: true,
         is_immutable: false,
+        on_trunk: false,
         bookmarks: Vec::new(),
         parent_ids: Vec::new(),
     });
@@ -499,6 +500,7 @@ pub fn pr_commit_rows(commits: &[PrCommit]) -> Vec<StreamRow> {
             change_offset: None,
             is_working_copy: false,
             is_immutable: false,
+            on_trunk: false,
             bookmarks: Vec::new(),
             parent_ids: Vec::new(),
         });

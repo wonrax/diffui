@@ -764,6 +764,7 @@ mod tests {
             remotes: vec!["fork".to_owned(), "upstream".to_owned()],
             git_push: None,
             tags: Default::default(),
+            trunk: None,
         };
         (ui, tab)
     }
