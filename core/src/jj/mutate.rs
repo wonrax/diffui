@@ -175,6 +175,10 @@ async fn apply_view_only(
             .clone();
 
         let mut tx = base_repo.start_transaction();
+        tx.set_attribute(
+            "args".to_owned(),
+            super::op_args::op_args(base_repo.as_ref(), op, false).await,
+        );
         let push_context = PushContext {
             settings,
             repo_root,
@@ -528,6 +532,7 @@ async fn mutate_locked(
 ) -> Result<MutationOutcome> {
     let base_repo = locked.repo.clone();
     let workspace_name = workspace_name.to_owned();
+    let args = super::op_args::op_args(base_repo.as_ref(), op, allow_immutable).await;
 
     // An undo, redo or revert has to know its target *before* the pre-op fold
     // is committed: resolving it can fail (a merge operation has no single
@@ -1194,6 +1199,7 @@ async fn mutate_locked(
         Some(plan) => plan.op_description.clone(),
         None => format!("diffui: {message}"),
     };
+    tx.set_attribute("args".to_owned(), args);
     let new_repo = tx
         .commit(description)
         .await

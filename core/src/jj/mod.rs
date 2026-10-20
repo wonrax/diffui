@@ -14,6 +14,7 @@ pub(crate) mod diff;
 pub(crate) mod history;
 pub(crate) mod large_diff;
 pub(crate) mod mutate;
+pub(crate) mod op_args;
 pub(crate) mod partial;
 pub(crate) mod preview;
 pub(crate) mod push;

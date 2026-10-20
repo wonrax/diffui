@@ -590,6 +590,40 @@ fn describe_mutation_replaces_the_full_message_without_moving_working_copy() {
     assert_eq!(harness::full_description(&root, &rewritten), description);
 }
 
+/// diffui's operations carry the `args` tag jj-cli would have written for
+/// the same command, so `jj op log` in a terminal says what diffui ran.
+#[test]
+fn mutations_record_their_jj_command_on_the_operation() {
+    let root = scratch_repo("op-args-tag");
+    write(&root, "file.txt", "hello\n");
+    commit(&root, "old description");
+    let target = commit_id(&root, "@-");
+    let name: String = change_id(&root, "@-").chars().take(8).collect();
+
+    run(
+        &root,
+        MutationOp::Describe {
+            target: RevisionSelection::Commit(target),
+            description: "it's new".to_owned(),
+        },
+    );
+    assert_eq!(
+        harness::head_operation_args(&root).as_deref(),
+        Some(format!("jj describe {name} -m 'it\\'s new'").as_str())
+    );
+
+    run(
+        &root,
+        MutationOp::New {
+            parent: RevisionSelection::WorkingCopy,
+        },
+    );
+    assert_eq!(
+        harness::head_operation_args(&root).as_deref(),
+        Some("jj new")
+    );
+}
+
 /// Opening a secondary workspace (`jj workspace add`) must resolve `@` to
 /// *that workspace's* working copy, read op heads through the `.jj/repo`
 /// pointer file, and label the other workspace's working copy `name@` in the

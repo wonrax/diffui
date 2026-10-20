@@ -699,6 +699,14 @@ pub fn operation_log(root: &Path) -> Vec<(String, String)> {
     })
 }
 
+/// The `args` tag of the operation at head: the command line jj-cli (or
+/// diffui) recorded for it.
+pub fn head_operation_args(root: &Path) -> Option<String> {
+    at_head(root, async |_loader, repo| {
+        repo.operation().metadata().attributes.get("args").cloned()
+    })
+}
+
 /// A bare git repository at `path`, and `name` pointing at it from `root`'s
 /// internal git store — a local path is a perfectly good `jj git push` remote.
 /// Both go through the `git` CLI, which the push itself needs anyway (jj-lib

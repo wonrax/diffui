@@ -17,6 +17,7 @@ pub mod history;
 pub mod jj;
 pub mod model;
 pub mod mutations;
+pub mod plan;
 pub mod partial;
 pub mod preview_graph;
 pub mod push;

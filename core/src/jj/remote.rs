@@ -164,6 +164,10 @@ async fn fetch_locked(
     }
 
     let mut tx = repo.start_transaction();
+    tx.set_attribute(
+        "args".to_owned(),
+        crate::plan::args_tag(&crate::plan::fetch_command(target)),
+    );
     // Fold any uncommitted on-disk changes into `@` first, so the fetch's
     // operation carries them instead of stranding them behind an op that
     // rewrote the view.
