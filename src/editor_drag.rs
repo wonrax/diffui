@@ -14,11 +14,10 @@
 //! `on_action` pipeline, where they land in the shared `Content` the widget
 //! renders from.
 //!
-//! It also brings trackpad scrolling to the speed of the app's other scroll
-//! views. The widget turns a pixel delta into `delta / 4` *lines*, so a
-//! 20px-line editor moved five times as far as the finger did; the wrapper
-//! rescales pixel deltas so one pixel of gesture scrolls
-//! [`PIXEL_SCROLL_SCALE`] pixels of text, like the diff view.
+//! It also brings scrolling to the speed of the app's other scroll views. The
+//! widget turns a pixel delta into `delta / 4` *lines*, so a 20px-line editor
+//! moved five times as far as the finger did; the wrapper rescales deltas so
+//! the text moves as many points as [`crate::wheel`] moves everything else.
 
 use iced::advanced::{
     Layout, Shell, Widget, layout, mouse, overlay, renderer,
@@ -28,9 +27,6 @@ use iced::{
     Element, Event, Length, Padding, Point, Rectangle, Size, Theme, Vector,
     widget::text_editor::Action,
 };
-
-/// Content pixels a trackpad's pixel of scroll moves, as in the diff view.
-pub(crate) const PIXEL_SCROLL_SCALE: f32 = 0.5;
 
 /// The pixels-per-line the stock editor assumes when it turns a pixel
 /// delta into lines.
@@ -64,18 +60,14 @@ pub(crate) struct EditorDragArea<'a, Message> {
 }
 
 /// `delta` rescaled so the stock editor, which reads a pixel delta as
-/// `delta / 4` lines, scrolls `delta * PIXEL_SCROLL_SCALE` pixels of text.
-/// Line deltas (a mouse wheel's notches) pass through.
+/// `delta / 4` lines, scrolls the text as many points as
+/// [`crate::wheel::movement`] says.
 fn rescale_wheel(delta: mouse::ScrollDelta, line_height: f32) -> mouse::ScrollDelta {
-    match delta {
-        mouse::ScrollDelta::Pixels { x, y } => {
-            let factor = STOCK_PIXELS_PER_LINE * PIXEL_SCROLL_SCALE / line_height.max(1.0);
-            mouse::ScrollDelta::Pixels {
-                x: x * factor,
-                y: y * factor,
-            }
-        }
-        lines => lines,
+    let factor = STOCK_PIXELS_PER_LINE / line_height.max(1.0);
+    let points = crate::wheel::movement(delta);
+    mouse::ScrollDelta::Pixels {
+        x: -points.x * factor,
+        y: -points.y * factor,
     }
 }
 
@@ -283,13 +275,15 @@ mod tests {
     }
 
     #[test]
-    fn a_trackpad_pixel_scrolls_the_editor_like_the_diff_view() {
+    fn the_editor_scrolls_as_far_as_every_other_scroll_view() {
         let line_height = 18.2;
-        let swipe = mouse::ScrollDelta::Pixels { x: 0.0, y: -100.0 };
-        let moved = stock_lines(rescale_wheel(swipe, line_height)) * line_height;
-        assert!((moved - 100.0 * PIXEL_SCROLL_SCALE).abs() < 0.01, "{moved}");
-        // A wheel notch is already in lines.
-        let notch = mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 };
-        assert_eq!(rescale_wheel(notch, line_height), notch);
+        for delta in [
+            mouse::ScrollDelta::Pixels { x: 0.0, y: -100.0 },
+            mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
+        ] {
+            let moved = stock_lines(rescale_wheel(delta, line_height)) * line_height;
+            let expected = crate::wheel::movement(delta).y;
+            assert!((moved - expected).abs() < 0.01, "{moved} vs {expected}");
+        }
     }
 }

@@ -177,6 +177,9 @@ pub(crate) enum WindowEvent {
     /// on Wayland) and inner size. Seeds geometry tracking without marking it
     /// dirty — the restored state is already on disk.
     Opened(Option<Point>, Size),
+    /// The window's scale factor: its initial one on open, then each change
+    /// as it moves between displays.
+    Rescaled(f32),
     Resized(Size),
     Moved(Point),
     FocusChanged(bool),

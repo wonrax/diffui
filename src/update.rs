@@ -231,6 +231,7 @@ impl Diffui {
             sidebar_min_width,
             window_size,
             window_position,
+            scale_factor: 1.0,
             geometry_dirty_since: None,
             zoom_anim: None,
             zoom_restore: None,
@@ -1674,6 +1675,7 @@ impl Diffui {
                     self.configure_custom_titlebar(),
                 ]);
             }
+            WindowEvent::Rescaled(scale_factor) => self.scale_factor = scale_factor,
             WindowEvent::Resized(size) => {
                 if self.window_size != size {
                     self.window_size = size;
@@ -4887,6 +4889,14 @@ impl Diffui {
                 _ => None,
             })
             .map(Message::Window);
+        // The scale factor trackpad deltas are divided by (`wheel`). `Opened`
+        // carries the first one; it changes when the window changes display.
+        let scale_events = event::listen_with(|event, _status, _window| match event {
+            Event::Window(
+                window::Event::Opened { scale_factor, .. } | window::Event::Rescaled(scale_factor),
+            ) => Some(Message::Window(WindowEvent::Rescaled(scale_factor))),
+            _ => None,
+        });
         // Watch the working tree for changes instead of polling. The
         // subscription identity is keyed on the repo root, so the watcher
         // One actor per open repository. Spawning it inside the subscription
@@ -4993,6 +5003,7 @@ impl Diffui {
             keyboard,
             modifier_events,
             window_events,
+            scale_events,
             repositories,
             palette_tick,
             loading_tick,

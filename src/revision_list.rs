@@ -36,9 +36,6 @@ use crate::theme::chip_background;
 use crate::typography::TextBox;
 use crate::width_memo::WidthMemo;
 
-const LINE_SCROLL_ROWS: f32 = 1.5;
-const PIXEL_SCROLL_SCALE: f32 = 0.65;
-
 pub const REVISION_ROW_HEIGHT: f32 = 46.0;
 pub const FILE_ROW_HEIGHT: f32 = 26.0;
 /// Selection/hover chrome is an inset rounded card, not an edge-to-edge
@@ -1159,14 +1156,7 @@ where
                     if cursor.position_over(bounds).is_none() {
                         break 'event;
                     }
-                    let movement = match *delta {
-                        mouse::ScrollDelta::Lines { x: _, y } => {
-                            Vector::new(0.0, -y * REVISION_ROW_HEIGHT * LINE_SCROLL_ROWS)
-                        }
-                        mouse::ScrollDelta::Pixels { x: _, y } => {
-                            Vector::new(0.0, -y * PIXEL_SCROLL_SCALE)
-                        }
-                    };
+                    let movement = crate::wheel::movement(*delta);
                     if movement.y != 0.0 {
                         state.vertical_offset =
                             (state.vertical_offset + movement.y as f64).clamp(0.0, max_vertical);

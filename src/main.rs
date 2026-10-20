@@ -70,6 +70,7 @@ mod trunk;
 mod typography;
 mod ui;
 mod update;
+mod wheel;
 mod width_memo;
 mod window_state;
 
@@ -254,7 +255,7 @@ fn main() -> iced::Result {
     iced::application(
         move || Diffui::new(cli.clone(), saved.clone()),
         Diffui::update,
-        Diffui::view,
+        view,
     )
     .title("diffui")
     .fonts([icons::ICON_FONT_BYTES])
@@ -269,6 +270,11 @@ fn main() -> iced::Result {
     .subscription(Diffui::subscription)
     .theme(Diffui::theme)
     .run()
+}
+
+/// The app's view, with wheel deltas normalized for the window's scale factor.
+fn view(app: &Diffui) -> Element<'_, Message> {
+    wheel::normalized(app.view(), app.scale_factor)
 }
 
 /// The primary display's usable size, where the platform can tell us before
@@ -364,6 +370,9 @@ pub(crate) struct Diffui {
     /// doesn't report window positions).
     pub(crate) window_size: Size,
     pub(crate) window_position: Option<Point>,
+    /// The window's display scale factor, from `Opened` and `Rescaled`;
+    /// [`wheel::normalized`] divides trackpad deltas by it.
+    pub(crate) scale_factor: f32,
     /// Set when the window geometry or sidebar width changes; cleared once the
     /// new value is persisted. While it's `Some`, the subscription runs a
     /// debounce timer whose tick flushes the geometry to disk after the

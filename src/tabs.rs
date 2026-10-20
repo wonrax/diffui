@@ -405,6 +405,7 @@ pub(crate) mod tests {
             sidebar_min_width: 0.0,
             window_size: Size::new(1280.0, 800.0),
             window_position: None,
+            scale_factor: 1.0,
             geometry_dirty_since: None,
             zoom_anim: None,
             zoom_restore: None,

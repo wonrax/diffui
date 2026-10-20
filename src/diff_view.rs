@@ -35,11 +35,6 @@ const FILE_HEADER_VPAD: f32 = 8.0;
 const HUNK_HEADER_VPAD: f32 = 3.0;
 const PREFIX_WIDTH: f32 = 24.0;
 const TEXT_X_PADDING: f32 = 8.0;
-// Rows advanced per wheel-notch line on Linux/Windows (macOS trackpads take the
-// pixel path below). Above the ~3-line OS default — browsing a long diff with a
-// wheel felt sluggish otherwise.
-const LINE_SCROLL_ROWS: f32 = 5.0;
-const PIXEL_SCROLL_SCALE: f32 = 0.5;
 // A pause this long between wheel events ends a scroll gesture, unlocking the
 // axis the gesture was pinned to. Touchpads stream events every few ms while
 // a finger moves (inertia included), so a real gap means a new intent.
@@ -4084,26 +4079,10 @@ where
                 // shift+wheel into the x delta itself, and trackpads / tilt
                 // wheels emit real x deltas — swapping those would just
                 // re-derive vertical scroll.
-                let shift_swap = |x: f32, y: f32| {
-                    if state.modifiers.shift() && x == 0.0 {
-                        (y, 0.0)
-                    } else {
-                        (x, y)
-                    }
-                };
-                let mut movement = match *delta {
-                    mouse::ScrollDelta::Lines { x, y } => {
-                        let (x, y) = shift_swap(x, y);
-                        Vector::new(
-                            -x * self.metrics.char_width * LINE_SCROLL_ROWS,
-                            -y * self.metrics.row_height * LINE_SCROLL_ROWS,
-                        )
-                    }
-                    mouse::ScrollDelta::Pixels { x, y } => {
-                        let (x, y) = shift_swap(x, y);
-                        Vector::new(-x * PIXEL_SCROLL_SCALE, -y * PIXEL_SCROLL_SCALE)
-                    }
-                };
+                let mut movement = crate::wheel::movement(*delta);
+                if state.modifiers.shift() && movement.x == 0.0 {
+                    movement = Vector::new(movement.y, 0.0);
+                }
 
                 // IDE-style axis lock while horizontal scrolling exists (no
                 // wrap, overflowing lines): the gesture's first event picks
