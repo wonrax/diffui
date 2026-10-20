@@ -1211,6 +1211,7 @@ mod tests {
             change_offset: None,
             is_working_copy: wc,
             is_immutable: false,
+            on_trunk: false,
             bookmarks: Vec::new(),
             parent_ids: Vec::new(),
         }
