@@ -67,7 +67,7 @@ pub enum SquashTarget {
 
 /// A revision mutation. Targets are `RevisionSelection`s so the working-copy
 /// case (which has no stable change-id) stays representable.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MutationOp {
     /// Create a new child commit of `parent` and move `@` onto it (`jj new`).
     New { parent: RevisionSelection },

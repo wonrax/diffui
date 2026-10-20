@@ -10,11 +10,14 @@
 //!    (`jj_cli::commands::default_app()`), so flags, defaults and errors are
 //!    jj's;
 //! 4. classification into a [`CliCommand`]: a view diffui shows, a native
-//!    mutation (the same op the GUI builds), something that opens diffui's
-//!    own editor, or a passthrough run of the real CLI ([`passthrough`]).
+//!    mutation (the same `MutationOp` the GUI builds; lower it with
+//!    [`lower`] once its revsets are resolved), something that opens
+//!    diffui's own editor, or a passthrough run of the real CLI
+//!    ([`passthrough`]).
 
 mod command;
 mod grammar;
+mod lower;
 mod parse;
 pub mod passthrough;
 pub mod tokenize;
@@ -25,6 +28,7 @@ pub use command::{
     CliCommand, CommandKind, MutationCommand, RevsetArg, RevsetDestination, RevsetSlot, Spanned,
     UiCommand, ViewCommand,
 };
+pub use lower::{LowerContext, LowerError, NativeAction, lower};
 pub use parse::{CliConfig, ParseError, ParsedCommand};
 
 /// The command line for one repository: jj's grammar plus that
