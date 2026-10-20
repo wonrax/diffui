@@ -18,7 +18,7 @@ use crate::mutations::{
 };
 use crate::repository::{FetchTarget, RepositorySnapshot};
 use crate::resolve::{ConflictFile, MergeToolInvocation};
-use crate::revset::{RevsetError, RevsetMatch, RevsetQuery};
+use crate::revset::{RevsetError, RevsetMatch, RevsetQuery, RevsetSymbols};
 use crate::session::RefreshOrigin;
 use crate::source_browse::{SourceEntry, SourceFileLoad};
 
@@ -309,6 +309,9 @@ pub struct GraphTail {
     /// form), so the projection knows exactly which op the rows on screen
     /// reflect. `None` for backends without an op log.
     pub op_id: Option<String>,
+    /// Revset aliases and workspace names, for revset completion. Empty for
+    /// backends without revsets.
+    pub symbols: RevsetSymbols,
 }
 
 /// One event from a repository actor. `repo` rides on every one of them, so a

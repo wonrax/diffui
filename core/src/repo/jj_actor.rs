@@ -629,6 +629,7 @@ impl Actor {
                     bookmarks,
                     root_commit_id: Some(repo.store().root_commit_id().hex()),
                     op_id: Some(repo.op_id().hex()),
+                    symbols: jj::revset::symbols(&repo, repo.settings()),
                 },
             }),
             None => self.emit(Payload::Cancelled { job }),

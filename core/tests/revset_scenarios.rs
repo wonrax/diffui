@@ -157,3 +157,31 @@ fn revset_errors_carry_jj_wording_and_spans() {
             .is_ok()
     );
 }
+
+#[test]
+fn graph_loads_report_revset_symbols() {
+    let root = scratch_repo("revset-symbols");
+    std::fs::write(
+        harness::repo_dir(&root).join("config.toml"),
+        "[revset-aliases]\n'stack(x, n)' = 'ancestors(x, n) & mutable()'\n'wip' = 'description(wip)'\n",
+    )
+    .expect("write the repo config");
+    let mut repo = TestRepo::open(&root);
+    let events = repo.run(|job| Command::LoadGraph {
+        job,
+        revset: "all()".to_owned(),
+    });
+    let Some(Payload::GraphLoaded { tail, .. }) = events.into_iter().next_back() else {
+        panic!("expected the graph to load");
+    };
+    let names: Vec<String> = tail
+        .symbols
+        .aliases
+        .iter()
+        .map(|alias| alias.signature())
+        .collect();
+    assert_eq!(names[..2], ["stack(x, n)", "wip"], "user aliases first");
+    assert!(names.contains(&"trunk()".to_owned()));
+    assert!(names.contains(&"mutable()".to_owned()));
+    assert_eq!(tail.symbols.workspaces, ["default"]);
+}

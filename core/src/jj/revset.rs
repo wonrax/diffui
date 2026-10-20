@@ -15,11 +15,14 @@ use jj_lib::{
         ResolvedRevsetExpression, RevsetExpression, RevsetParseError, RevsetParseErrorKind,
         RevsetResolutionError, SymbolResolver, UserRevsetExpression,
     },
+    settings::UserSettings,
 };
 
-use super::walk::parse_revset_raw;
+use super::walk::{DEFAULT_REVSET_ALIASES, parse_revset_raw, revset_aliases_map};
 use crate::repo::CancelFlag;
-use crate::revset::{COUNT_CAP, RevsetError, RevsetExpect, RevsetMatch, RevsetQuery};
+use crate::revset::{
+    COUNT_CAP, RevsetAlias, RevsetError, RevsetExpect, RevsetMatch, RevsetQuery, RevsetSymbols,
+};
 
 /// Where a revset is parsed and resolved: the repo at head, the workspace
 /// whose `@` it means, and the root its file patterns are relative to.
@@ -173,6 +176,62 @@ fn short_hash(id: &CommitId) -> String {
 
 fn evaluation_error(error: jj_lib::revset::RevsetEvaluationError) -> RevsetError {
     RevsetError::new(error.to_string())
+}
+
+/// Aliases (jj's defaults under the user's) and workspace names, for
+/// completion. Read off the settings and view the walk already holds.
+pub(crate) fn symbols(repo: &ReadonlyRepo, settings: &UserSettings) -> RevsetSymbols {
+    let mut aliases = Vec::new();
+    if let Ok(map) = revset_aliases_map(settings) {
+        for name in map.symbol_names() {
+            if let Some((_, definition, _)) = map.get_symbol(name) {
+                aliases.push(RevsetAlias {
+                    name: name.to_owned(),
+                    params: None,
+                    definition: definition.clone(),
+                });
+            }
+        }
+        for name in map.function_names() {
+            // The map only answers by arity; aliases rarely take more than a
+            // handful of parameters.
+            for arity in 0..=8 {
+                if let Some((_, params, definition, _)) = map.get_function(name, arity) {
+                    aliases.push(RevsetAlias {
+                        name: name.to_owned(),
+                        params: Some(params.to_vec()),
+                        definition: definition.clone(),
+                    });
+                }
+            }
+        }
+    }
+    // User aliases first: the defaults are the ones users know already.
+    let is_default = |alias: &RevsetAlias| {
+        DEFAULT_REVSET_ALIASES.contains(&format!("'{}", alias.signature()))
+            || DEFAULT_REVSET_ALIASES.contains(&format!("'{}'", alias.name))
+    };
+    aliases.sort_by(|a, b| {
+        is_default(a)
+            .cmp(&is_default(b))
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| {
+                a.params
+                    .as_ref()
+                    .map(Vec::len)
+                    .cmp(&b.params.as_ref().map(Vec::len))
+            })
+    });
+    let workspaces = repo
+        .view()
+        .wc_commit_ids()
+        .keys()
+        .map(|name| name.as_str().to_owned())
+        .collect();
+    RevsetSymbols {
+        aliases,
+        workspaces,
+    }
 }
 
 // ── errors ──────────────────────────────────────────────────────────────
@@ -337,7 +396,6 @@ fn find_symbol(src: &str, symbol: &str) -> Option<std::ops::Range<usize>> {
 #[cfg(test)]
 mod tests {
     use jj_lib::config::StackedConfig;
-    use jj_lib::settings::UserSettings;
 
     use super::*;
 

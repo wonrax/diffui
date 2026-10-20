@@ -42,7 +42,9 @@ pub use repo::{
 };
 pub use repository::{FetchTarget, Repository, RepositorySnapshot, Vcs, prepare_repository};
 pub use resolve::{ConflictFile, ConflictResolution, ConflictTerm, MergeToolInvocation};
-pub use revset::{RevsetError, RevsetExpect, RevsetMatch, RevsetQuery};
+pub use revset::{
+    RevsetCompleter, RevsetError, RevsetExpect, RevsetMatch, RevsetQuery, RevsetSymbols,
+};
 pub use session::{
     ColdBatchFold, ColdCursor, Effect, LoadStatus, RefreshOrigin, Session, coalesce_refresh,
     fold_cold_batch,

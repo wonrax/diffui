@@ -29,7 +29,7 @@ use crate::repo::{
     Capabilities, Command, Event, JobId, Payload, PreviewRequest, RepoError, RepoId,
 };
 use crate::repository::{FetchTarget, RepositorySnapshot};
-use crate::revset::RevsetQuery;
+use crate::revset::{RevsetCompleter, RevsetQuery, RevsetSymbols};
 
 /// A parked diff document for a source that flips between several documents —
 /// a PR's "all changes" view vs its per-commit diffs — so flipping back is an
@@ -231,6 +231,9 @@ pub struct Session {
     /// Repo-wide bookmark table, loaded with the graph; drives the context
     /// menu's move/track/delete/push. Empty for git.
     pub bookmarks: BookmarksInfo,
+    /// Revset aliases and workspace names from the last graph load, for
+    /// revset completion (see [`Session::revset_completer`]).
+    pub revset_symbols: RevsetSymbols,
     /// The repository's root commit id, once a graph load has reported it.
     /// Rewrite-target lists exclude it (see
     /// [`rewritten_targets`](crate::repo::rewritten_targets)).
@@ -553,6 +556,17 @@ impl Session {
         )
     }
 
+    /// Revset completion over this session's graph, bookmarks and aliases.
+    /// `history` is the caller's previously used revsets, newest first.
+    pub fn revset_completer<'a>(&'a self, history: &'a [String]) -> RevsetCompleter<'a> {
+        RevsetCompleter {
+            symbols: &self.revset_symbols,
+            bookmarks: &self.bookmarks,
+            commits: &self.commits,
+            history,
+        }
+    }
+
     /// Fold the working copy into `@`. Coalesces instead of racing when
     /// something is already in flight: a second snapshot thrashes jj's lock,
     /// and the in-flight work's terminal event drains what was held.
@@ -741,6 +755,7 @@ impl Session {
         self.graph_fingerprint = tail.op_id;
         self.branch_status = tail.branch_status;
         self.bookmarks = tail.bookmarks;
+        self.revset_symbols = tail.symbols;
         if tail.root_commit_id.is_some() {
             self.root_commit_id = tail.root_commit_id;
         }
@@ -1802,6 +1817,23 @@ mod tests {
     }
 
     // ── typed revsets ───────────────────────────────────────────────────
+
+    #[test]
+    fn the_completer_reads_the_last_graph_load() {
+        let mut session = compare_session();
+        session
+            .revset_symbols
+            .aliases
+            .push(crate::revset::RevsetAlias {
+                name: "wip".to_owned(),
+                params: None,
+                definition: "description(wip)".to_owned(),
+            });
+        let history = vec!["wip & mine()".to_owned()];
+        let found = session.revset_completer(&history).complete_revset("wi", 2);
+        let inserts: Vec<&str> = found.iter().map(|c| c.insert.as_str()).collect();
+        assert_eq!(inserts, ["wip & mine()", "wip"]);
+    }
 
     // ── size caps ───────────────────────────────────────────────────────
 
