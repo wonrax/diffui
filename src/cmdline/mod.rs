@@ -5,11 +5,9 @@
 //! what Enter will do. Enter runs it through whatever diffui already has: a
 //! view, the target-mode draft, a mutation, an editor, or the jj CLI itself.
 //!
-//! The text input doesn't report its cursor, so [`CommandLine::cursor`] is
-//! tracked here: every edit is matched against the last known cursor (typing,
-//! deleting and pasting all happen there), and the keys that move the caret
-//! without editing are mirrored from the key handler. A mouse click inside
-//! the field is the one move this can't see; the next edit puts it right.
+//! The line is edited in a one-line `text_editor`: its text, caret and
+//! selection come from one layout, the words are coloured by a highlighter
+//! over that same layout, and its cursor is the command line's cursor.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -31,6 +29,9 @@ use crate::{Action, Diffui, MainView, Message, TabId};
 mod plan;
 
 pub(crate) use plan::{PlanState, ResolvedView, Run, sentence};
+
+/// Focus target of the command line's editor.
+pub(crate) const COMMAND_INPUT_ID: &str = "palette-command-input";
 
 /// What a query starts with to be a command line.
 pub(crate) const PREFIX: &str = "jj ";
@@ -142,9 +143,66 @@ pub(crate) struct HistoryWalk {
     pub(crate) typed: String,
 }
 
+/// The command line's one-line editor. `Content` is neither `Clone` nor
+/// worth printing; the palette state is both.
+pub(crate) struct LineEditor(pub(crate) iced::widget::text_editor::Content);
+
+impl LineEditor {
+    fn new(line: &str, cursor: usize) -> Self {
+        let mut editor = Self(iced::widget::text_editor::Content::with_text(line));
+        editor.place(cursor);
+        editor
+    }
+
+    /// The caret's byte offset into the (one-line) text.
+    pub(crate) fn cursor(&self) -> usize {
+        self.0.cursor().position.index
+    }
+
+    /// One line, whatever was pasted.
+    pub(crate) fn text(&self) -> String {
+        self.0.text().replace(['\n', '\r'], " ")
+    }
+
+    fn place(&mut self, cursor: usize) {
+        use iced::advanced::text::editor::Cursor;
+        self.0.move_to(Cursor {
+            position: iced::advanced::text::Position {
+                line: 0,
+                index: cursor,
+            },
+            selection: None,
+        });
+    }
+
+    /// Show `line` with the caret at `cursor`, leaving the editor (and its
+    /// undo history) alone when it already does.
+    fn sync(&mut self, line: &str, cursor: usize) {
+        if self.text() != line {
+            *self = Self::new(line, cursor);
+        } else if self.cursor() != cursor && self.0.selection().is_none() {
+            self.place(cursor);
+        }
+    }
+}
+
+impl Clone for LineEditor {
+    fn clone(&self) -> Self {
+        Self::new(&self.text(), self.cursor())
+    }
+}
+
+impl std::fmt::Debug for LineEditor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("LineEditor").field(&self.text()).finish()
+    }
+}
+
 /// The command-line half of the root palette column.
 #[derive(Debug, Clone)]
 pub(crate) struct CommandLine {
+    /// Where the line is edited.
+    pub(crate) editor: LineEditor,
     /// The line as last parsed.
     pub(crate) line: String,
     /// Byte offset of the caret in the line.
@@ -174,6 +232,7 @@ pub(crate) struct CommandLine {
 impl CommandLine {
     fn new(cli: &JjCli, line: &str) -> Self {
         Self {
+            editor: LineEditor::new(line, line.len()),
             line: line.to_owned(),
             cursor: line.len(),
             parsed: cli.parse(line),
@@ -371,6 +430,11 @@ pub(crate) fn apply_completion(line: &str, completion: &Completion) -> (String, 
     (out, start + completion.insert.len())
 }
 
+/// Focus the command line's editor.
+fn focus_command_input() -> Task<Message> {
+    iced::widget::operation::focus(iced::widget::Id::new(COMMAND_INPUT_ID))
+}
+
 /// The text-input operation that puts the caret at byte `at` of `line`.
 pub(crate) fn place_caret(id: &'static str, line: &str, at: usize) -> Task<Message> {
     iced::widget::operation::move_cursor_to(
@@ -453,6 +517,7 @@ impl Diffui {
             .command
             .get_or_insert_with(|| Box::new(CommandLine::new(&cli, &line)));
         command.cursor = floor_boundary(&line, cursor);
+        command.editor.sync(&line, command.cursor);
         command.parsed = cli.parse(&line);
         command.slots = revset_slots(&cli, &line, &command.parsed);
         command.line = line.clone();
@@ -484,8 +549,25 @@ impl Diffui {
             }
             return None;
         }
-        let previous = column.command.as_ref().map_or(old.len(), |c| c.cursor);
-        let cursor = cursor_after_edit(old, &column.query, previous);
+        // Only the search input reports edits here: the line just became a
+        // command line, typed at its end.
+        let entering = column.command.is_none();
+        let cursor = cursor_after_edit(old, &column.query, old.len());
+        let task = self.command_line_changed(column, cursor)?;
+        Some(if entering {
+            Task::batch([task, focus_command_input()])
+        } else {
+            task
+        })
+    }
+
+    /// The line is now `column.query`, with the caret at `cursor`: re-parse,
+    /// end a history walk typed over, and restart the settle timer.
+    fn command_line_changed(
+        &mut self,
+        column: &mut palette::PaletteColumn,
+        cursor: usize,
+    ) -> Option<Task<Message>> {
         let walk = column.command.as_ref().and_then(|c| c.history.clone());
         self.refresh_command_line(column, cursor);
         let command = column.command.as_mut()?;
@@ -495,6 +577,57 @@ impl Diffui {
         command.settled = false;
         command.run_when_ready = false;
         Some(self.schedule_settle(command))
+    }
+
+    /// An edit or a caret move in the command line's editor.
+    pub(crate) fn command_line_edit(
+        &mut self,
+        action: iced::widget::text_editor::Action,
+    ) -> Task<Message> {
+        let Some(mut state) = self.take_palette() else {
+            return Task::none();
+        };
+        let mut task = Task::none();
+        if let Some(column) = state.top_mut()
+            && let Some(command) = column.command.as_mut()
+        {
+            command.editor.0.perform(action);
+            let line = command.editor.text();
+            let cursor = command.editor.cursor().min(line.len());
+            if line == column.query {
+                // Only the caret moved: complete what is under it now.
+                if cursor != command.cursor {
+                    self.refresh_command_line(column, cursor);
+                }
+            } else {
+                column.query = line.clone();
+                if is_command(&line) {
+                    task = self
+                        .command_line_changed(column, cursor)
+                        .unwrap_or_else(Task::none);
+                } else {
+                    // Back to a search: the search input takes over, caret
+                    // and all.
+                    if let Some(command) = column.command.take() {
+                        self.cancel_command_jobs(&command);
+                    }
+                    column.dirty = true;
+                    column.query_version = column.query_version.wrapping_add(1);
+                    let version = column.query_version;
+                    task = Task::batch([
+                        iced::widget::operation::focus(iced::widget::Id::new(
+                            palette::PALETTE_INPUT_ID,
+                        )),
+                        place_caret(palette::PALETTE_INPUT_ID, &line, cursor),
+                        Task::done(Message::Palette(palette::PaletteMessage::Recompute(
+                            0, version,
+                        ))),
+                    ]);
+                }
+            }
+        }
+        self.push_mode(crate::modes::Mode::Palette(state));
+        task
     }
 
     fn schedule_settle(&self, command: &mut CommandLine) -> Task<Message> {
@@ -649,41 +782,7 @@ impl Diffui {
             }
         }
         self.push_mode(crate::modes::Mode::Palette(state));
-        Task::batch([
-            open,
-            iced::widget::operation::move_cursor_to_end(iced::widget::Id::new(
-                palette::PALETTE_INPUT_ID,
-            )),
-            settle,
-        ])
-    }
-
-    /// A caret-moving key while the command line has the keyboard.
-    pub(crate) fn command_line_key(&mut self, key: &keyboard::Key, modifiers: keyboard::Modifiers) {
-        let Some(line) = self
-            .palette()
-            .and_then(|state| state.top())
-            .filter(|column| column.command.is_some())
-            .map(|column| column.query.clone())
-        else {
-            return;
-        };
-        let Some(cursor) = self.command_line().map(|command| command.cursor) else {
-            return;
-        };
-        let Some(moved) = cursor_after_key(&line, cursor, key, modifiers) else {
-            return;
-        };
-        if moved == cursor {
-            return;
-        }
-        let Some(mut state) = self.take_palette() else {
-            return;
-        };
-        if let Some(column) = state.top_mut() {
-            self.refresh_command_line(column, moved);
-        }
-        self.push_mode(crate::modes::Mode::Palette(state));
+        Task::batch([open, focus_command_input(), settle])
     }
 
     /// ↑/↓ in command mode: walk history from an untouched line, else move
@@ -760,10 +859,7 @@ impl Diffui {
                 command.history = walk;
                 command.navigated = false;
                 command.settled = false;
-                task = Task::batch([
-                    self.schedule_settle(command),
-                    place_caret(palette::PALETTE_INPUT_ID, &line, line.len()),
-                ]);
+                task = self.schedule_settle(command);
             }
         }
         self.push_mode(crate::modes::Mode::Palette(state));
@@ -810,10 +906,7 @@ impl Diffui {
                 command.history = None;
                 command.navigated = false;
                 command.settled = false;
-                task = Task::batch([
-                    self.schedule_settle(command),
-                    place_caret(palette::PALETTE_INPUT_ID, &line, cursor),
-                ]);
+                task = self.schedule_settle(command);
             }
         }
         self.push_mode(crate::modes::Mode::Palette(state));
@@ -1070,16 +1163,6 @@ impl Diffui {
     }
 }
 
-/// Mirror a key into the command line before the keymap sees it: the caret
-/// keys the text field handles itself.
-pub(crate) fn caret_key(key: &keyboard::Key) -> bool {
-    matches!(
-        key.as_ref(),
-        keyboard::Key::Named(Named::ArrowLeft | Named::ArrowRight | Named::Home | Named::End)
-            | keyboard::Key::Character("a" | "e")
-    )
-}
-
 /// The tab state the command line keeps per repository.
 #[derive(Debug, Default)]
 pub(crate) struct TabCommandLine {
@@ -1210,6 +1293,25 @@ mod tests {
         let mut command = CommandLine::new(&cli, line);
         command.slots = revset_slots(&cli, line, &command.parsed);
         assert!(crate::cmdline_view::revset_roles(line, &command).contains(&(13..17)));
+    }
+
+    #[test]
+    fn the_line_editor_holds_the_line_and_its_caret() {
+        let mut editor = LineEditor::new("jj rebase -s x", 9);
+        assert_eq!(editor.text(), "jj rebase -s x");
+        assert_eq!(editor.cursor(), 9);
+        // A new line from outside (a completion, history) moves the caret
+        // with it; the same line just moves the caret.
+        editor.sync("jj rebase -s xyz -o ", 20);
+        assert_eq!(
+            (editor.text().as_str(), editor.cursor()),
+            ("jj rebase -s xyz -o ", 20)
+        );
+        editor.sync("jj rebase -s xyz -o ", 13);
+        assert_eq!(editor.cursor(), 13);
+        // A paste with a newline stays one line.
+        let pasted = LineEditor::new("jj log\n-r @", 0);
+        assert_eq!(pasted.text(), "jj log -r @");
     }
 
     #[test]

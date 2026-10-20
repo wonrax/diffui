@@ -1868,9 +1868,6 @@ impl Diffui {
             return Task::none();
         };
         let context = self.key_context();
-        if context == Context::Palette && crate::cmdline::caret_key(key) {
-            self.command_line_key(key, modifiers);
-        }
         if context == Context::Base
             && let Some(task) = self.revset_field_key(key, modifiers, consumed)
         {
@@ -1986,6 +1983,7 @@ impl Diffui {
                 Task::none()
             }
             PaletteMessage::Accept => self.palette_submit(),
+            PaletteMessage::CommandEdit(action) => self.command_line_edit(action),
             PaletteMessage::AcceptIndex(depth, index) => {
                 // The click carries the column it was drawn in: a push or pop
                 // between the press and its delivery must not run whatever row

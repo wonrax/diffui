@@ -8,13 +8,12 @@ use std::ops::Range;
 use diffui_core::cli::{CommandKind, tokenize};
 use diffui_core::completion::{Completion, CompletionKind};
 use iced::advanced::text::{Ellipsis, Wrapping};
-use iced::widget::text::Span;
-use iced::widget::{Space, column, container, mouse_area, rich_text, text};
+use iced::widget::{column, container, mouse_area, text};
 use iced::{Background, Border, Color, Element, Length, Padding};
 
 use crate::cmdline::{CommandLine, PlanState};
 use crate::icons;
-use crate::palette::{self, CONTENT_X, GLYPH_GAP, PaletteMessage, RESULTS_INSET};
+use crate::palette::{self, CONTENT_X, GLYPH_GAP, INPUT_HEIGHT, PaletteMessage, RESULTS_INSET};
 use crate::theme::{self, ThemeSpec, text_size};
 use crate::typography::{self, Aligned};
 use crate::{Diffui, Message};
@@ -22,7 +21,9 @@ use crate::{Diffui, Message};
 /// The strip under the input: the revset arguments, or the error.
 pub(crate) const ARGS_HEIGHT: f32 = 30.0;
 
-/// The input, with the line's words coloured over it when it fits.
+/// The command line's input: a one-line editor in the code font, its words
+/// coloured by a highlighter over the editor's own layout, so the text, the
+/// caret and the selection can never drift apart.
 pub(crate) fn input<'a>(
     ui: &'a Diffui,
     theme: ThemeSpec,
@@ -30,59 +31,69 @@ pub(crate) fn input<'a>(
     command: &'a CommandLine,
     focused: bool,
 ) -> Element<'a, Message> {
+    use iced::widget::text_editor;
     let mono = ui.config.mono_font;
+    let line_height = text_size::TITLE * typography::DEFAULT_LINE_HEIGHT;
+    // The box the search input's line sits in: the line centred in the band,
+    // its caps optically centred on the line.
     let padding = typography::trimmed_padding(
-        Padding::from([10.0, CONTENT_X - RESULTS_INSET]),
+        Padding::from([
+            (INPUT_HEIGHT - line_height) / 2.0,
+            CONTENT_X - RESULTS_INSET,
+        ]),
         mono,
         text_size::TITLE,
     );
-    let room = palette::COLUMN_WIDTH - 2.0 * RESULTS_INSET - padding.left - padding.right - 4.0;
-    let overlay = crate::measure::line_width(query, text_size::TITLE, mono) < room;
-    let mut field = iced::widget::text_input("", query)
-        .id(palette::PALETTE_INPUT_ID)
-        .padding(padding)
-        .size(text_size::TITLE)
+    let mut editor = text_editor(&command.editor.0)
+        .id(iced::widget::Id::new(crate::cmdline::COMMAND_INPUT_ID))
         .font(mono)
-        .style(move |_, _| {
-            let mut style = theme::input_style(theme);
-            style.background = Background::Color(Color::TRANSPARENT);
-            style.border = Border::default();
-            if overlay {
-                // The coloured copy underneath shows through.
-                style.value = Color::TRANSPARENT;
-            }
-            style
-        });
-    if focused {
-        field = field
-            .on_input(|q| Message::Palette(PaletteMessage::QueryChanged(q)))
-            .on_submit(Message::Palette(PaletteMessage::Accept));
-    }
-    let field = if overlay {
-        crate::input::single_line_with_caret(field, query, mono, theme.text)
-    } else {
-        crate::input::single_line(field, query, mono)
-    };
-    let painted: Element<'a, Message> = if overlay {
-        container(
-            rich_text(colored_spans(ui, theme, query, command))
-                .size(text_size::TITLE)
-                .font(mono)
-                .wrapping(Wrapping::None),
-        )
+        .size(text_size::TITLE)
         .padding(padding)
+        .height(Length::Fixed(INPUT_HEIGHT))
+        .wrapping(Wrapping::None)
+        .key_binding(|press| {
+            use iced::keyboard::{Key, key::Named};
+            match press.key.as_ref() {
+                // Enter runs (or takes a candidate); the palette's own keys
+                // move through the list and history.
+                Key::Named(Named::Enter) => Some(text_editor::Binding::Custom(Message::Palette(
+                    PaletteMessage::Accept,
+                ))),
+                Key::Named(Named::ArrowUp | Named::ArrowDown | Named::Tab | Named::Escape) => None,
+                _ => text_editor::Binding::from_key_press(press),
+            }
+        })
+        .style(move |_, _| {
+            let input = theme::input_style(theme);
+            text_editor::Style {
+                background: Background::Color(Color::TRANSPARENT),
+                border: Border::default(),
+                placeholder: input.placeholder,
+                value: input.value,
+                selection: input.selection,
+            }
+        })
+        .highlight_with::<RoleParser>(
+            painted_roles(ui, query, command),
+            move |role: Role, _: &iced::Theme| iced::advanced::text::highlighter::Style {
+                color: Some(role_color(role, theme)),
+                style: None,
+            },
+        );
+    if focused {
+        editor = editor.on_action(|action| Message::Palette(PaletteMessage::CommandEdit(action)));
+    }
+    container(editor)
+        .padding(RESULTS_INSET)
+        .height(Length::Fixed(INPUT_HEIGHT + 2.0 * RESULTS_INSET))
         .width(Length::Fill)
-        .center_y(Length::Fill)
+        .center_y(Length::Fixed(INPUT_HEIGHT + 2.0 * RESULTS_INSET))
         .into()
-    } else {
-        Space::new().into()
-    };
-    palette::input_band(painted, field)
 }
 
 /// What a stretch of the line is, for its colour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Role {
+pub(crate) enum Role {
     Program,
     Subcommand,
     Flag,
@@ -90,72 +101,99 @@ enum Role {
     /// The revset the caret is in.
     FocusedRevset,
     Value,
+    /// What the error on show points at.
+    Error,
 }
 
-/// The line cut into coloured runs: `jj`, the subcommand, flags, revset
-/// arguments (the focused one washed), other values, and the error's span
-/// underlined.
-fn colored_spans<'a>(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    line: &str,
-    command: &CommandLine,
-) -> Vec<Span<'a, ()>> {
+fn role_color(role: Role, theme: ThemeSpec) -> Color {
+    match role {
+        Role::Program => theme.subtle_text,
+        Role::Flag => theme.muted_text,
+        Role::Revset | Role::FocusedRevset => theme.accent,
+        Role::Error => theme.removed_text,
+        Role::Subcommand | Role::Value => theme.text,
+    }
+}
+
+/// The line cut into runs that don't overlap, each with the role it is
+/// drawn as: the error's span over everything, then the roles of the words.
+fn painted_roles(ui: &Diffui, line: &str, command: &CommandLine) -> Vec<(Range<usize>, Role)> {
     let roles = roles(line, command);
     let error = error_span(ui, line, command);
-    // Cut at every role change and at the error's edges.
     let mut cuts: Vec<usize> = vec![0, line.len()];
     for (range, _) in &roles {
-        cuts.push(range.start);
-        cuts.push(range.end);
+        cuts.extend([range.start, range.end]);
     }
     if let Some(error) = &error {
-        cuts.push(error.start.min(line.len()));
-        cuts.push(error.end.min(line.len()));
+        cuts.extend([error.start.min(line.len()), error.end.min(line.len())]);
     }
-    cuts.retain(|at| line.is_char_boundary(*at));
+    cuts.retain(|at| *at <= line.len() && line.is_char_boundary(*at));
     cuts.sort_unstable();
     cuts.dedup();
-    let mut spans = Vec::new();
-    for pair in cuts.windows(2) {
-        let (start, end) = (pair[0], pair[1]);
-        if start == end {
-            continue;
+    cuts.windows(2)
+        .filter_map(|pair| {
+            let (start, end) = (pair[0], pair[1]);
+            let in_error = error
+                .as_ref()
+                .is_some_and(|error| error.start <= start && end <= error.end);
+            let role = if in_error {
+                Role::Error
+            } else {
+                roles
+                    .iter()
+                    .find(|(range, _)| range.start <= start && end <= range.end)
+                    .map(|(_, role)| *role)?
+            };
+            Some((start..end, role))
+        })
+        .collect()
+}
+
+/// Feeds the editor's highlighter the roles worked out for its one line.
+pub(crate) struct RoleParser {
+    roles: Vec<(Range<usize>, Role)>,
+    line: usize,
+}
+
+impl iced::advanced::text::Parser for RoleParser {
+    type Settings = Vec<(Range<usize>, Role)>;
+    type Output = Role;
+    type Iterator<'a> = std::vec::IntoIter<(Range<usize>, Role)>;
+
+    fn new(settings: &Self::Settings) -> Self {
+        Self {
+            roles: settings.clone(),
+            line: 0,
         }
-        let role = roles
-            .iter()
-            .find(|(range, _)| range.start <= start && end <= range.end)
-            .map(|(_, role)| *role);
-        let mut span = Span::new(line[start..end].to_owned()).color(match role {
-            Some(Role::Program) => theme.subtle_text,
-            Some(Role::Subcommand) => theme.text,
-            Some(Role::Flag) => theme.muted_text,
-            Some(Role::Revset | Role::FocusedRevset) => theme.accent,
-            Some(Role::Value) | None => theme.text,
-        });
-        if role == Some(Role::FocusedRevset) {
-            span = span.background(theme::chip_background(theme.accent));
-        }
-        if let Some(error) = &error
-            && error.start <= start
-            && end <= error.end.max(error.start + 1)
-        {
-            span = span.color(theme.removed_text).underline(true);
-        }
-        spans.push(span);
     }
-    // An error at the very end (a missing value) has nothing to underline:
-    // mark the spot.
-    if let Some(error) = &error
-        && error.start >= line.len()
-    {
-        spans.push(
-            Span::new("\u{2038}".to_owned())
-                .color(theme.removed_text)
-                .underline(false),
-        );
+
+    fn update(&mut self, settings: &Self::Settings) {
+        self.roles = settings.clone();
+        self.line = 0;
     }
-    spans
+
+    fn change_line(&mut self, line: usize) {
+        self.line = self.line.min(line);
+    }
+
+    fn parse_line(&mut self, line: &str) -> Self::Iterator<'_> {
+        let first = self.line == 0;
+        self.line += 1;
+        let roles = if first {
+            self.roles
+                .iter()
+                .filter(|(range, _)| range.end <= line.len())
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        roles.into_iter()
+    }
+
+    fn current_line(&self) -> usize {
+        self.line
+    }
 }
 
 /// The spans the line colours as revset arguments.
