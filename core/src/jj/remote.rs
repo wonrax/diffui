@@ -1,11 +1,9 @@
-use std::collections::HashMap;
-
 use anyhow::{Context, Result, bail};
+use jj_cli::ui::Ui;
 use jj_lib::{
     git::{
-        GitFetch, GitFetchRefExpression, GitImportOptions, GitProgress, GitSettings,
-        GitSidebandLineTerminator, GitSubprocessCallback, expand_fetch_refspecs,
-        get_all_remote_names,
+        GitFetch, GitFetchRefExpression, GitProgress, GitSettings, GitSidebandLineTerminator,
+        GitSubprocessCallback, expand_fetch_refspecs, get_all_remote_names,
     },
     ref_name::{RemoteName, RemoteNameBuf, WorkspaceName},
     repo::Repo,
@@ -17,6 +15,7 @@ use jj_lib::{
 use crate::FetchTarget;
 use jj_lib::object_id::ObjectId;
 
+use super::settings::cli_error;
 use super::workspace::{LockOutcome, LockedWorkingCopy, SnapshotContext, lock_working_copy};
 use crate::model::LoadProgress;
 
@@ -146,11 +145,12 @@ async fn fetch_locked(
     let repo = locked.repo.clone();
     let git_settings =
         GitSettings::from_settings(settings).context("failed to read git settings")?;
-    let import_options = GitImportOptions {
-        abandon_unreachable_commits: git_settings.abandon_unreachable_commits,
-        record_synthetic_predecessors: git_settings.record_synthetic_predecessors,
-        remote_auto_track_bookmarks: HashMap::new(),
-    };
+    let remote_settings = settings
+        .remote_settings()
+        .context("failed to read remotes.* settings")?;
+    let import_options =
+        jj_cli::git_util::load_git_import_options(&Ui::null(), &git_settings, &remote_settings)
+            .map_err(cli_error)?;
 
     // Resolve which remotes to fetch from.
     let remotes: Vec<RemoteNameBuf> = match target {

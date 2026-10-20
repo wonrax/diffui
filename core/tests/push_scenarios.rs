@@ -474,6 +474,50 @@ fn a_remote_that_moved_since_the_last_fetch_rejects_the_push() {
     assert_eq!(one(&mut repo, "main"), first, "the local move rolled back");
 }
 
+/// A fetch imports with jj-cli's import options, so a bookmark new on the
+/// remote is tracked when `remotes.<name>.auto-track-bookmarks` matches it.
+#[test]
+fn fetch_tracks_new_bookmarks_the_remote_settings_match() {
+    let config = "[remotes.origin]\nauto-track-bookmarks = \"glob:feat*\"\n";
+    let Some((mut repo, remote)) = setup_with_config("fetch-auto-track", Some(config)) else {
+        return;
+    };
+    let first = commit(&mut repo, "a.txt", "first");
+    repo.mutate(MutationOp::CreateBookmark {
+        name: "main".to_owned(),
+        to: at(&first),
+    })
+    .expect("create bookmark");
+    repo.mutate(push("origin", vec![PushTarget::Bookmark("main".into())]))
+        .expect("push");
+    for name in ["feature", "other"] {
+        harness::run_git(
+            &remote,
+            &["update-ref", &format!("refs/heads/{name}"), &first],
+        );
+    }
+
+    let fetch = repo.send(|job| Command::Fetch {
+        job,
+        target: diffui_core::FetchTarget::AllRemotes,
+    });
+    let events = repo.drain(fetch);
+    assert!(
+        matches!(events.last(), Some(Payload::FetchDone { .. })),
+        "{events:?}"
+    );
+
+    let info = bookmarks(&mut repo);
+    let feature = info.entry("feature").expect("feature came in");
+    assert!(feature.tracks("origin"), "auto-track-bookmarks matched it");
+    assert_eq!(feature.local_target(), Some(first.as_str()));
+    assert!(
+        info.entry("other")
+            .is_none_or(|other| other.local_target().is_none()),
+        "a name the pattern doesn't match stays remote-only"
+    );
+}
+
 #[test]
 fn rename_carries_tracking_and_forget_untracks() {
     let Some((mut repo, _remote)) = setup("push-rename-forget") else {
