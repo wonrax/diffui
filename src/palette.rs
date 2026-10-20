@@ -630,6 +630,11 @@ pub fn recompute_matches(column: &mut PaletteColumn, ui: &Diffui, search_revisio
     }
     let (mode, needle) = parse_query(&column.query);
     let mut matcher = Matcher::new(Config::DEFAULT);
+    // nucleo matches case-insensitively by folding the haystack; the needle
+    // has to arrive folded already, or an uppercase letter trips its
+    // prefilter assertion.
+    let needle = needle.to_lowercase();
+    let needle = needle.as_str();
     let needle_utf32 = Utf32String::from(needle);
 
     let mut candidates: Vec<Candidate> = Vec::new();
@@ -1662,6 +1667,24 @@ mod tests {
                 "{persisted} maps to {id}, which no longer exists"
             );
         }
+    }
+
+    /// An uppercase letter in the query used to trip nucleo's prefilter
+    /// assertion and take the app down.
+    #[test]
+    fn an_uppercase_query_matches_like_a_lowercase_one() {
+        let mut ui = crate::tabs::tests::app();
+        crate::tabs::tests::push_tab(&mut ui, "/tmp/palette");
+        ui.active = 0;
+        let mut column = PaletteState::open(&ui).stack.remove(0);
+        column.query = "Theme".to_owned();
+        recompute_matches(&mut column, &ui, false);
+        let upper: Vec<_> = column.matches.iter().map(|m| m.item.clone()).collect();
+        column.query = "theme".to_owned();
+        recompute_matches(&mut column, &ui, false);
+        let lower: Vec<_> = column.matches.iter().map(|m| m.item.clone()).collect();
+        assert!(!upper.is_empty());
+        assert_eq!(upper, lower);
     }
 
     #[test]
