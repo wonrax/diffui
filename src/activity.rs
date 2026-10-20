@@ -978,6 +978,9 @@ fn activity_row<'a>(
             .font(mono)
             .padding(0)
             .wrapping(text::Wrapping::WordOrGlyph)
+            .key_binding(|press| {
+                text_editor::Binding::from_key_press(crate::ui::cocoa_key_press(press, true))
+            })
             .on_action(move |action| Message::Ui(UiEvent::ActivityDetailAction(id, action)))
             .style(move |_, _| text_editor::Style {
                 background: Background::Color(Color::TRANSPARENT),

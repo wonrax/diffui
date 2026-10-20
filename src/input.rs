@@ -19,6 +19,10 @@
 //! wrapper lays the input out once with a stand-in font before the real one,
 //! which makes the editor re-apply it.
 //!
+//! The keys: the stock widget takes no key binding, so the macOS ⌃ chords
+//! every native field honours (⌃A, ⌃E, ⌃K, …) reach it rewritten as the named
+//! keys they stand for ([`crate::ui::cocoa_key_event`]).
+//!
 //! This replaces the `text_input` vendored from iced `4255f61` for its missing
 //! stateful horizontal scroll, which upstream has since grown.
 
@@ -178,9 +182,10 @@ impl<'a, Message: Clone + 'a> Widget<Message, Theme, iced::Renderer> for SingleL
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        let cocoa = crate::ui::cocoa_key_event(event);
         self.input_mut().update(
             &mut tree.children[0],
-            event,
+            cocoa.as_ref().unwrap_or(event),
             child(layout),
             on_line(cursor, layout.bounds()),
             renderer,

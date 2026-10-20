@@ -10,6 +10,7 @@
 use iced::{
     Color, Element, Font, Length, Padding, alignment,
     font::Weight,
+    keyboard,
     widget::{
         self, Button, Container, Row, Scrollable, Space, container, mouse_area, opaque, row,
         scrollable::{Direction, Scrollbar},
@@ -333,6 +334,7 @@ pub fn tooltip<'a, Message: 'a>(
 pub fn editor_key_binding<Message>(
     key_press: widget::text_editor::KeyPress,
 ) -> Option<widget::text_editor::Binding<Message>> {
+    let key_press = cocoa_key_press(key_press, true);
     let submit = key_press.modifiers.command()
         && matches!(
             key_press.key,
@@ -342,4 +344,244 @@ pub fn editor_key_binding<Message>(
         return None;
     }
     widget::text_editor::Binding::from_key_press(key_press)
+}
+
+/// The named key, and modifiers, a macOS text field reads a ⌃ chord as: ⌃A/⌃E
+/// line start/end, ⌃B/⌃F back/forward a character, ⌃N/⌃P down/up a line,
+/// ⌃H/⌃D delete back/forward, ⌃K delete to the end of the line. ⇧ extends a
+/// motion's selection. A one-line field (`multi_line` false) has no line to
+/// move to and leaves ⌃N/⌃P to whatever list it drives. `None` for any other
+/// press. `latin` is the letter the key carries without modifiers.
+pub fn cocoa_text_key(
+    latin: char,
+    modifiers: keyboard::Modifiers,
+    multi_line: bool,
+) -> Option<(keyboard::key::Named, keyboard::Modifiers)> {
+    use keyboard::{Modifiers, key::Named};
+    if !modifiers.control() || modifiers.alt() || modifiers.logo() {
+        return None;
+    }
+    let motion = |named| Some((named, modifiers & Modifiers::SHIFT));
+    match latin.to_ascii_lowercase() {
+        'a' => motion(Named::Home),
+        'e' => motion(Named::End),
+        'b' => motion(Named::ArrowLeft),
+        'f' => motion(Named::ArrowRight),
+        'n' if multi_line => motion(Named::ArrowDown),
+        'p' if multi_line => motion(Named::ArrowUp),
+        'h' => Some((Named::Backspace, Modifiers::empty())),
+        'd' => Some((Named::Delete, Modifiers::empty())),
+        // ⌘⌦ is iced's "delete to the end of the line".
+        'k' => Some((Named::Delete, Modifiers::LOGO)),
+        _ => None,
+    }
+}
+
+/// On macOS, a press of one of the [`cocoa_text_key`] chords as the named
+/// key it stands for; `None` for any other press, and anywhere else (⌃ is the
+/// command key there).
+///
+/// iced maps a few of these itself and then drops them: AppKit sends a
+/// control character as a ⌃ press's text, which iced's binding refuses to
+/// insert and gives up on before it reaches the mapped key.
+pub fn cocoa_key(
+    key: &keyboard::Key,
+    physical_key: keyboard::key::Physical,
+    modifiers: keyboard::Modifiers,
+    multi_line: bool,
+) -> Option<(keyboard::Key, keyboard::Modifiers)> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let latin = key.to_latin(physical_key)?;
+    let (named, modifiers) = cocoa_text_key(latin, modifiers, multi_line)?;
+    Some((keyboard::Key::Named(named), modifiers))
+}
+
+/// `key_press` with a [`cocoa_key`] chord swapped for its named key, ready
+/// for iced's own [`widget::text_editor::Binding::from_key_press`]. Every
+/// `text_editor`'s key binding starts here.
+pub fn cocoa_key_press(
+    key_press: widget::text_editor::KeyPress,
+    multi_line: bool,
+) -> widget::text_editor::KeyPress {
+    match cocoa_key(
+        &key_press.key,
+        key_press.physical_key,
+        key_press.modifiers,
+        multi_line,
+    ) {
+        Some((key, modifiers)) => widget::text_editor::KeyPress {
+            key: key.clone(),
+            modified_key: key,
+            modifiers,
+            text: None,
+            ..key_press
+        },
+        None => key_press,
+    }
+}
+
+/// A key press for a one-line `text_input`, with a [`cocoa_key`] chord
+/// swapped for its named key. The stock widget takes no key binding, so
+/// [`crate::input::single_line`] hands it this event instead of the real one.
+pub fn cocoa_key_event(event: &iced::Event) -> Option<iced::Event> {
+    let iced::Event::Keyboard(keyboard::Event::KeyPressed {
+        key,
+        physical_key,
+        location,
+        modifiers,
+        repeat,
+        ..
+    }) = event
+    else {
+        return None;
+    };
+    let (key, modifiers) = cocoa_key(key, *physical_key, *modifiers, false)?;
+    Some(iced::Event::Keyboard(keyboard::Event::KeyPressed {
+        key: key.clone(),
+        modified_key: key,
+        physical_key: *physical_key,
+        location: *location,
+        modifiers,
+        text: None,
+        repeat: *repeat,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced::keyboard::{Key, Modifiers, key::Named};
+    use iced::widget::text_editor::{Binding, KeyPress, Motion};
+
+    fn ctrl_press(letter: &str, modifiers: Modifiers) -> KeyPress {
+        KeyPress {
+            key: Key::Character(letter.into()),
+            modified_key: Key::Character(letter.into()),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            modifiers,
+            // What AppKit sends as the text of ⌃<letter>.
+            text: Some(
+                char::from(letter.as_bytes()[0] & 0x1f)
+                    .to_string()
+                    .as_str()
+                    .into(),
+            ),
+            is_focused: true,
+        }
+    }
+
+    fn binding(letter: &str, modifiers: Modifiers) -> Option<Binding<()>> {
+        editor_key_binding(ctrl_press(letter, modifiers))
+    }
+
+    #[test]
+    fn cocoa_chords_name_their_keys() {
+        let ctrl = Modifiers::CTRL;
+        let shift = Modifiers::CTRL | Modifiers::SHIFT;
+        let none = Modifiers::empty();
+        for (latin, multi_line, modifiers, expected) in [
+            ('a', false, ctrl, Some((Named::Home, none))),
+            ('e', false, ctrl, Some((Named::End, none))),
+            ('b', false, ctrl, Some((Named::ArrowLeft, none))),
+            ('f', false, ctrl, Some((Named::ArrowRight, none))),
+            ('a', false, shift, Some((Named::Home, Modifiers::SHIFT))),
+            ('A', false, shift, Some((Named::Home, Modifiers::SHIFT))),
+            ('h', false, ctrl, Some((Named::Backspace, none))),
+            ('d', false, shift, Some((Named::Delete, none))),
+            ('k', false, ctrl, Some((Named::Delete, Modifiers::LOGO))),
+            ('n', true, ctrl, Some((Named::ArrowDown, none))),
+            ('p', true, shift, Some((Named::ArrowUp, Modifiers::SHIFT))),
+            // A one-line field leaves ⌃N/⌃P to its list.
+            ('n', false, ctrl, None),
+            ('p', false, ctrl, None),
+            // Not a text-system chord.
+            ('x', true, ctrl, None),
+            ('a', true, none, None),
+            ('a', true, Modifiers::LOGO, None),
+            ('a', true, Modifiers::CTRL | Modifiers::LOGO, None),
+            ('a', true, Modifiers::CTRL | Modifiers::ALT, None),
+        ] {
+            assert_eq!(
+                cocoa_text_key(latin, modifiers, multi_line),
+                expected,
+                "{latin} {modifiers:?} multi_line={multi_line}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn editors_take_cocoa_chords() {
+        let ctrl = Modifiers::CTRL;
+        let shift = Modifiers::CTRL | Modifiers::SHIFT;
+        assert!(matches!(
+            binding("a", ctrl),
+            Some(Binding::Move(Motion::Home))
+        ));
+        assert!(matches!(
+            binding("e", ctrl),
+            Some(Binding::Move(Motion::End))
+        ));
+        assert!(matches!(
+            binding("e", shift),
+            Some(Binding::Select(Motion::End))
+        ));
+        assert!(matches!(
+            binding("b", ctrl),
+            Some(Binding::Move(Motion::Left))
+        ));
+        assert!(matches!(
+            binding("f", ctrl),
+            Some(Binding::Move(Motion::Right))
+        ));
+        assert!(matches!(
+            binding("n", ctrl),
+            Some(Binding::Move(Motion::Down))
+        ));
+        assert!(matches!(
+            binding("p", ctrl),
+            Some(Binding::Move(Motion::Up))
+        ));
+        assert!(matches!(binding("h", ctrl), Some(Binding::Backspace)));
+        assert!(matches!(binding("d", ctrl), Some(Binding::Delete)));
+        assert!(matches!(binding("k", ctrl), Some(Binding::DeleteLine)));
+        // Untouched: the control character is still never typed.
+        assert!(binding("x", ctrl).is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn one_line_events_become_named_keys() {
+        let press = |letter: &str, modifiers| {
+            iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                key: Key::Character(letter.into()),
+                modified_key: Key::Character(letter.into()),
+                physical_key: keyboard::key::Physical::Unidentified(
+                    keyboard::key::NativeCode::Unidentified,
+                ),
+                location: keyboard::Location::Standard,
+                modifiers,
+                text: Some("\u{1}".into()),
+                repeat: false,
+            })
+        };
+        let Some(iced::Event::Keyboard(keyboard::Event::KeyPressed {
+            key,
+            modifiers,
+            text,
+            ..
+        })) = cocoa_key_event(&press("a", Modifiers::CTRL | Modifiers::SHIFT))
+        else {
+            panic!("⌃⇧A is a text-system chord");
+        };
+        assert_eq!(key, Key::Named(Named::Home));
+        assert_eq!(modifiers, Modifiers::SHIFT);
+        assert_eq!(text, None);
+        assert!(cocoa_key_event(&press("n", Modifiers::CTRL)).is_none());
+        assert!(cocoa_key_event(&press("a", Modifiers::LOGO)).is_none());
+    }
 }

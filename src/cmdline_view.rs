@@ -53,6 +53,7 @@ pub(crate) fn input<'a>(
         .wrapping(Wrapping::None)
         .key_binding(|press| {
             use iced::keyboard::{Key, key::Named};
+            let press = crate::ui::cocoa_key_press(press, false);
             match press.key.as_ref() {
                 // Enter runs (or takes a candidate); the palette's own keys
                 // move through the list and history.

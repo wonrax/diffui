@@ -366,8 +366,8 @@ fn floor_boundary(text: &str, mut at: usize) -> usize {
 }
 
 /// Where a caret-moving key puts the caret, mirroring the platform's text
-/// field: arrows by character, ⌥ by word, ⌘ (and Home/End, ⌃A/⌃E) to the
-/// ends. `None` for any key that doesn't move it.
+/// field: arrows (and ⌃B/⌃F) by character, ⌥ by word, ⌘ (and Home/End,
+/// ⌃A/⌃E) to the ends. `None` for any key that doesn't move it.
 pub(crate) fn cursor_after_key(
     line: &str,
     cursor: usize,
@@ -403,6 +403,11 @@ pub(crate) fn cursor_after_key(
             .map_or(word.len(), |(i, _)| i);
         at + skipped + len
     };
+    let physical = keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Unidentified);
+    let cocoa = crate::ui::cocoa_key(key, physical, modifiers, false);
+    let (key, modifiers) = cocoa
+        .as_ref()
+        .map_or((key, modifiers), |(key, modifiers)| (key, *modifiers));
     let command = modifiers.command() || modifiers.logo();
     match key.as_ref() {
         keyboard::Key::Named(Named::ArrowLeft) if command => Some(0),
@@ -413,8 +418,6 @@ pub(crate) fn cursor_after_key(
         keyboard::Key::Named(Named::ArrowRight) => Some(next(cursor)),
         keyboard::Key::Named(Named::Home) => Some(0),
         keyboard::Key::Named(Named::End) => Some(line.len()),
-        keyboard::Key::Character("a") if modifiers.control() => Some(0),
-        keyboard::Key::Character("e") if modifiers.control() => Some(line.len()),
         _ => None,
     }
 }
@@ -1224,6 +1227,32 @@ mod tests {
             cursor_after_key(line, 2, &keyboard::Key::Character("x".into()), none),
             None
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn caret_follows_cocoa_chords() {
+        let line = "jj rebase -s abc";
+        let ctrl = |letter: &str| {
+            (
+                keyboard::Key::Character(letter.into()),
+                keyboard::Modifiers::CTRL,
+            )
+        };
+        for (letter, from, to) in [
+            ("a", 9, Some(0)),
+            ("e", 2, Some(16)),
+            ("b", 9, Some(8)),
+            ("f", 9, Some(10)),
+            ("k", 9, None),
+        ] {
+            let (key, modifiers) = ctrl(letter);
+            assert_eq!(
+                cursor_after_key(line, from, &key, modifiers),
+                to,
+                "⌃{letter}"
+            );
+        }
     }
 
     #[test]
