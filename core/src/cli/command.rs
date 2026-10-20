@@ -248,6 +248,8 @@ pub enum MutationCommand {
         changes: Vec<RevsetArg>,
         allow: PushAllow,
     },
+    /// `jj git fetch`.
+    Fetch,
     /// `jj git fetch --all-remotes`.
     FetchAll,
     /// `jj git fetch --remote R --branch B`.

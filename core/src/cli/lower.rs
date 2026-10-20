@@ -347,6 +347,7 @@ pub fn lower(
                 confirm,
             })
         }
+        MutationCommand::Fetch => return Ok(NativeAction::Fetch(FetchTarget::Default)),
         MutationCommand::FetchAll => return Ok(NativeAction::Fetch(FetchTarget::AllRemotes)),
         MutationCommand::FetchBranch { remote, branch } => {
             return Ok(NativeAction::Fetch(FetchTarget::RemoteBranch {

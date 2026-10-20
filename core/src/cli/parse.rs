@@ -889,6 +889,7 @@ fn classify(view: &ArgsView) -> CliCommand {
                 },
             }))
         }
+        ["git", "fetch"] if view.only(&[]) => CliCommand::Mutation(MutationCommand::Fetch),
         ["git", "fetch"] if view.only(&["all_remotes"]) && view.flag("all_remotes") => {
             CliCommand::Mutation(MutationCommand::FetchAll)
         }
@@ -1188,8 +1189,7 @@ mod tests {
                 branch: "main".to_owned()
             }
         );
-        // Plain fetch follows `git.fetch`, which the CLI reads exactly.
-        assert_eq!(command("jj git fetch"), CliCommand::Passthrough);
+        assert_eq!(mutation("jj git fetch"), MutationCommand::Fetch);
     }
 
     #[test]

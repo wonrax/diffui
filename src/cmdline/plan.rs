@@ -588,6 +588,7 @@ impl Words<'_> {
                 }
                 _ => Prose::from("Push to the remote"),
             },
+            MutationCommand::Fetch => Prose::from("Fetch from the configured remotes"),
             MutationCommand::FetchAll => Prose::from("Fetch from every remote"),
             MutationCommand::FetchBranch { remote, branch } => Prose::from("Fetch ")
                 .bookmark(branch.clone())
