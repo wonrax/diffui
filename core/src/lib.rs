@@ -5,6 +5,7 @@
 //! engine. It has **no `iced` dependency**, so alternative frontends
 //! (electron, swiftui, web, …) can build on it.
 
+pub mod askpass;
 pub mod cli;
 pub mod completion;
 pub mod diff_parse;

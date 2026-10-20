@@ -291,8 +291,10 @@ pub(super) fn send_push(
         bookmarks: updates.clone(),
         tags: Vec::new(),
     };
-    let subprocess_options = GitSubprocessOptions::from_settings(context.settings)
+    let mut subprocess_options = GitSubprocessOptions::from_settings(context.settings)
         .context("failed to read git subprocess options")?;
+    let askpass = crate::askpass::Scope::new();
+    subprocess_options.environment.extend(askpass.environment());
     // Collect the remote sideband (GitHub's "create a pull request" hint + URL)
     // for the activity log, and forward git's transfer progress to the bar.
     let mut callback = CollectingCallback::new(progress.clone());
@@ -304,6 +306,7 @@ pub(super) fn send_push(
         &mut callback,
         &GitPushOptions::default(),
     )
+    .map_err(|error| askpass.explain(error.into()))
     .with_context(|| format!("failed to push to {remote_name}"))?;
 
     let mut output = notes;

@@ -465,7 +465,10 @@ pub async fn fetch_git(repository: &Repository, target: &FetchTarget) -> Result<
             OsString::from(branch),
         ],
     };
-    run_command_lines(&repository.root, "git", args).await
+    let askpass = crate::askpass::Scope::new();
+    run_command_lines(&repository.root, "git", args, askpass.environment())
+        .await
+        .map_err(|error| askpass.explain(error))
 }
 
 /// Run a command and return its combined stdout+stderr split into non-empty
@@ -476,9 +479,11 @@ async fn run_command_lines(
     current_dir: &Path,
     program: &str,
     args: Vec<OsString>,
+    env: std::collections::HashMap<OsString, OsString>,
 ) -> Result<Vec<String>> {
     let output = Command::new(program)
         .args(args)
+        .envs(env)
         .current_dir(current_dir)
         .stdin(Stdio::null())
         .output()

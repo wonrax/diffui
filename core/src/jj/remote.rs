@@ -185,12 +185,11 @@ async fn fetch_locked(
     }
     let lines;
     {
-        let mut fetcher = GitFetch::new(
-            tx.repo_mut(),
-            git_settings.to_subprocess_options(),
-            &import_options,
-        )
-        .context("failed to start git fetch")?;
+        let askpass = crate::askpass::Scope::new();
+        let mut subprocess_options = git_settings.to_subprocess_options();
+        subprocess_options.environment.extend(askpass.environment());
+        let mut fetcher = GitFetch::new(tx.repo_mut(), subprocess_options, &import_options)
+            .context("failed to start git fetch")?;
         let mut callback = CollectingCallback::new(progress.clone());
         for remote in &remotes {
             // All branches for a whole-remote fetch; the single branch for a
@@ -209,6 +208,7 @@ async fn fetch_locked(
                 .context("failed to expand fetch refspecs")?;
             fetcher
                 .fetch(remote, refspecs, &mut callback, None)
+                .map_err(|error| askpass.explain(error.into()))
                 .with_context(|| format!("failed to fetch from {}", remote.as_str()))?;
         }
         fetcher
