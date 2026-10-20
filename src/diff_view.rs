@@ -35,6 +35,9 @@ const FILE_HEADER_VPAD: f32 = 8.0;
 const HUNK_HEADER_VPAD: f32 = 3.0;
 const PREFIX_WIDTH: f32 = 24.0;
 const TEXT_X_PADDING: f32 = 8.0;
+/// A plain document's inset of its code from the gutter's edge and from the
+/// top, to the glyphs: it has no prefix column to clear.
+const PLAIN_INSET: f32 = 12.0;
 // A pause this long between wheel events ends a scroll gesture, unlocking the
 // axis the gesture was pinned to. Touchpads stream events every few ms while
 // a finger moves (inertia included), so a real gap means a new intent.
@@ -491,6 +494,11 @@ struct LayoutMetrics {
     text_y_pad: f32,
     file_header_height: f32,
     hunk_header_height: f32,
+    /// The `+`/`-` column between the gutter and the code; narrower in a
+    /// plain document, which has none to draw.
+    prefix_width: f32,
+    /// Space above the first row: a plain document's top inset.
+    top_inset: f32,
     gutter_width: f32,
     gutter_digit_count: usize,
     /// Real monospace glyph advance for the diff font + size, measured
@@ -552,11 +560,24 @@ impl LayoutMetrics {
         let gutter_width = (gutter_text_chars as f32 * char_width
             + GUTTER_HORIZONTAL_PADDING * 2.0)
             .max(gutter_min);
+        // Inset to the caps: the row already holds half its leading above
+        // them.
+        let (prefix_width, top_inset) = if plain {
+            let caps = crate::typography::TextBox::new(font, text_size, row_height).cap_height();
+            (
+                PLAIN_INSET - TEXT_X_PADDING,
+                (PLAIN_INSET - (row_height - caps) / 2.0).max(0.0),
+            )
+        } else {
+            (PREFIX_WIDTH, 0.0)
+        };
         Self {
             row_height,
             text_y_pad,
             file_header_height,
             hunk_header_height,
+            prefix_width,
+            top_inset,
             gutter_width,
             gutter_digit_count,
             char_width,
@@ -1550,7 +1571,7 @@ impl<'a, Message> DiffView<'a, Message> {
     fn strip_text_x(&self, index: &HeightIndex, file: usize, bounds: Rectangle) -> f32 {
         let region_x = match self.side_by_side && !index.is_full_width(file) {
             true => self.split_layout(bounds.width).gutter_width + PREFIX_WIDTH,
-            false => self.metrics.gutter_width + PREFIX_WIDTH,
+            false => self.metrics.gutter_width + self.metrics.prefix_width,
         };
         bounds.x + region_x + TEXT_X_PADDING
     }
@@ -1606,7 +1627,7 @@ impl<'a, Message> DiffView<'a, Message> {
         // one is narrower, which only leaves more room).
         let min_x = bounds.x
             + self.metrics.gutter_width
-            + PREFIX_WIDTH
+            + self.metrics.prefix_width
             + TEXT_X_PADDING
             + self.text_width(header);
         Some((
@@ -2171,7 +2192,7 @@ impl<'a, Message> DiffView<'a, Message> {
         let unified_width = self.wrap_width(self.content_width(width));
         let split_width = self.wrap_width(self.effective_text_width(width));
 
-        let mut y = self.header_height();
+        let mut y = self.header_height() + self.metrics.top_inset;
         for (file_index, file) in self.files.iter().enumerate() {
             index.file_tops.push(y);
             y += self.metrics.file_header_height;
@@ -2372,7 +2393,7 @@ impl<'a, Message> DiffView<'a, Message> {
     fn content_width(&self, viewport_width: f32) -> f32 {
         (viewport_width
             - self.metrics.gutter_width
-            - PREFIX_WIDTH
+            - self.metrics.prefix_width
             - TEXT_X_PADDING
             - scrollbar::GUTTER)
             .max(self.metrics.char_width)
@@ -2601,7 +2622,8 @@ impl<'a, Message> DiffView<'a, Message> {
         lock: Option<SplitSide>,
     ) -> Option<(TextPosition, Option<SplitSide>)> {
         let split = self.side_by_side.then(|| self.split_layout(bounds.width));
-        let unified_text_x = bounds.x + self.metrics.gutter_width + PREFIX_WIDTH + TEXT_X_PADDING;
+        let unified_text_x =
+            bounds.x + self.metrics.gutter_width + self.metrics.prefix_width + TEXT_X_PADDING;
         let text_x = match &split {
             // Side picked by the divider below; seed with the left column.
             Some(split) => bounds.x + split.left_text_x,
@@ -2907,7 +2929,7 @@ impl<'a, Message> DiffView<'a, Message> {
         );
 
         let position = Point::new(
-            bounds.x + self.metrics.gutter_width + PREFIX_WIDTH + TEXT_X_PADDING
+            bounds.x + self.metrics.gutter_width + self.metrics.prefix_width + TEXT_X_PADDING
                 - render.horizontal_offset,
             render.y + self.metrics.text_y_pad,
         );
@@ -3093,9 +3115,12 @@ impl<'a, Message> DiffView<'a, Message> {
             HighlightGeometry {
                 char_width: self.metrics.char_width,
                 wrap_width: self.wrap_width(self.content_width(bounds.width)),
-                text_x: bounds.x + self.metrics.gutter_width + PREFIX_WIDTH + TEXT_X_PADDING
+                text_x: bounds.x
+                    + self.metrics.gutter_width
+                    + self.metrics.prefix_width
+                    + TEXT_X_PADDING
                     - horizontal_offset,
-                clip_left: bounds.x + self.metrics.gutter_width + PREFIX_WIDTH,
+                clip_left: bounds.x + self.metrics.gutter_width + self.metrics.prefix_width,
                 clip_right: bounds.x + bounds.width,
                 row_height: self.metrics.row_height,
             },
@@ -4658,7 +4683,7 @@ where
         // split layout's narrower gutter widens this accordingly.
         let text_region_x = match &split {
             Some(split) => split.gutter_width + PREFIX_WIDTH,
-            None => self.metrics.gutter_width + PREFIX_WIDTH,
+            None => self.metrics.gutter_width + self.metrics.prefix_width,
         };
         let content_clip_bounds = Rectangle {
             x: bounds.x + text_region_x,
@@ -4669,7 +4694,7 @@ where
         // Clip for unified-rendered rows — in split mode their (wider)
         // double gutter sits to the right of the split columns' clip edge,
         // so they need their own rect or h-scrolled text would paint over it.
-        let unified_region_x = self.metrics.gutter_width + PREFIX_WIDTH;
+        let unified_region_x = self.metrics.gutter_width + self.metrics.prefix_width;
         let unified_clip_bounds = Rectangle {
             x: bounds.x + unified_region_x,
             y: bounds.y,
@@ -5326,7 +5351,7 @@ where
                 };
             }
         }
-        if point.x >= bounds.x + self.metrics.gutter_width + PREFIX_WIDTH {
+        if point.x >= bounds.x + self.metrics.gutter_width + self.metrics.prefix_width {
             mouse::Interaction::Text
         } else {
             mouse::Interaction::Idle
@@ -7189,6 +7214,28 @@ mod tests {
         // Plain documents draw no strips.
         view.plain = true;
         assert_eq!(view.file_strip_height(0), 0.0);
+    }
+
+    #[test]
+    fn a_plain_document_insets_its_code_alike_from_the_gutter_and_the_top() {
+        let hunks = test_hunks();
+        let view = test_view(&hunks).plain(true);
+        let cells = TestCaches::default();
+        view.ensure_height_index(&cells.index, &cells.geometry, 800.0);
+        let index = cells.index.borrow();
+        // The first row starts below the inset, and its caps sit
+        // PLAIN_INSET below the top, as the code sits PLAIN_INSET right of
+        // the gutter.
+        assert_eq!(index.row_tops[0], view.metrics.top_inset);
+        let caps =
+            crate::typography::TextBox::new(view.font, 13.0, view.metrics.row_height).cap_height();
+        let cap_top = view.metrics.top_inset + (view.metrics.row_height - caps) / 2.0;
+        assert!((cap_top - PLAIN_INSET).abs() < 1e-3, "{cap_top}");
+        assert_eq!(view.metrics.prefix_width + TEXT_X_PADDING, PLAIN_INSET);
+        // A diff keeps its prefix column and starts at the top.
+        let diff = test_view(&hunks);
+        assert_eq!(diff.metrics.prefix_width, PREFIX_WIDTH);
+        assert_eq!(diff.metrics.top_inset, 0.0);
     }
 
     #[test]
