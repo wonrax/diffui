@@ -5,6 +5,7 @@
 
 use std::ops::Range;
 
+use crate::completion::ValueKind;
 use crate::mutations::RebaseSourceMode;
 use crate::push::PushAllow;
 
@@ -45,6 +46,15 @@ pub struct RevsetSlot {
     /// (`REVSETS`).
     pub flag: String,
     pub revset: String,
+    pub span: Range<usize>,
+}
+
+/// One argument value of a line and the kind jj's grammar gives it, for
+/// drawing a command by what its words name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValueSlot {
+    pub kind: ValueKind,
+    pub value: String,
     pub span: Range<usize>,
 }
 

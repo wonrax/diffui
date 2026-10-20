@@ -17,7 +17,7 @@ use jj_lib::config::{ConfigGetResultExt as _, StackedConfig};
 
 use super::command::{
     CliCommand, MutationCommand, RevsetArg, RevsetDestination, RevsetSlot, Spanned, UiCommand,
-    ViewCommand,
+    ValueSlot, ViewCommand,
 };
 use super::grammar::{self, Scan};
 use super::tokenize::{self, Token};
@@ -345,21 +345,39 @@ pub fn parse(config: &CliConfig, input: &str) -> Result<ParsedCommand, ParseErro
 /// value for `-o` and doesn't parse, but `main` is still `-r`'s revset. For
 /// colouring and resolving a line while it is being typed.
 pub fn revset_slots(config: &CliConfig, input: &str) -> Vec<RevsetSlot> {
+    scan_partial(config, input, |view| view.revset_slots()).unwrap_or_default()
+}
+
+/// Every argument value of `input` that jj's grammar places, with the kind
+/// of value it is, whether or not the line is valid: what a drawn command
+/// colours by.
+pub fn value_slots(config: &CliConfig, input: &str) -> Vec<ValueSlot> {
+    scan_partial(config, input, |view| {
+        view.value_slots()
+            .into_iter()
+            .map(|(_, slot)| slot)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// Expand and scan `input` as far as it goes, valid or not, and read it
+/// with `read`. `None` when an alias doesn't expand.
+fn scan_partial<T>(
+    config: &CliConfig,
+    input: &str,
+    read: impl FnOnce(&ArgsView) -> T,
+) -> Option<T> {
     let line = Line::new(input);
-    let Ok(mut words) = expand_aliases(config, line.typed_words(), &line) else {
-        return Vec::new();
-    };
+    let mut words = expand_aliases(config, line.typed_words(), &line).ok()?;
     insert_default_command(config, &mut words);
-    let Ok(words) = expand_aliases(config, words, &line) else {
-        return Vec::new();
-    };
+    let words = expand_aliases(config, words, &line).ok()?;
     let scan = grammar::scan(words.iter().map(|w| w.value.as_str()));
-    ArgsView {
+    Some(read(&ArgsView {
         scan: &scan,
         words: &words,
         line: &line,
-    }
-    .revset_slots()
+    }))
 }
 
 /// Turn clap's error into one line and a span.
@@ -570,6 +588,20 @@ impl ArgsView<'_> {
     }
 
     fn revset_slots(&self) -> Vec<RevsetSlot> {
+        self.value_slots()
+            .into_iter()
+            .filter(|(_, slot)| slot.kind == ValueKind::Revset)
+            .map(|(flag, slot)| RevsetSlot {
+                flag,
+                revset: slot.value,
+                span: slot.span,
+            })
+            .collect()
+    }
+
+    /// Every value given, with the flag it was given to (`--onto`, or the
+    /// positional's placeholder) and its kind.
+    fn value_slots(&self) -> Vec<(String, ValueSlot)> {
         let command = self.scan.command();
         let mut slots = Vec::new();
         for occurrence in &self.scan.occurrences {
@@ -582,9 +614,6 @@ impl ArgsView<'_> {
             }) else {
                 continue;
             };
-            if grammar::value_kind(command, arg) != ValueKind::Revset {
-                continue;
-            }
             let word = &self.words[value.word];
             let flag = match (arg.get_long(), arg.get_short()) {
                 (Some(long), _) => format!("--{long}"),
@@ -594,11 +623,14 @@ impl ArgsView<'_> {
                     .and_then(|names| names.first())
                     .map_or_else(String::new, |name| name.to_string()),
             };
-            slots.push(RevsetSlot {
+            slots.push((
                 flag,
-                revset: word.value[value.range.clone()].to_owned(),
-                span: self.line.range_span(word, value.range.clone()),
-            });
+                ValueSlot {
+                    kind: grammar::value_kind(command, arg),
+                    value: word.value[value.range.clone()].to_owned(),
+                    span: self.line.range_span(word, value.range.clone()),
+                },
+            ));
         }
         slots
     }

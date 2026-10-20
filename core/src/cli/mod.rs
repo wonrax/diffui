@@ -26,6 +26,7 @@
 mod command;
 mod complete;
 mod grammar;
+pub mod highlight;
 mod lower;
 mod parse;
 pub mod passthrough;
@@ -36,7 +37,7 @@ use std::path::Path;
 
 pub use command::{
     CliCommand, CommandKind, MutationCommand, RevsetArg, RevsetDestination, RevsetSlot, Spanned,
-    UiCommand, ViewCommand,
+    UiCommand, ValueSlot, ViewCommand,
 };
 pub use lower::{LowerContext, LowerError, NativeAction, lower};
 pub use parse::{CliConfig, ParseError, ParsedCommand};
@@ -76,6 +77,12 @@ impl JjCli {
     /// also while it doesn't parse yet (see [`parse::revset_slots`]).
     pub fn revset_slots(&self, line: &str) -> Vec<RevsetSlot> {
         parse::revset_slots(&self.config, line)
+    }
+
+    /// Every argument value of `line` and its kind, also while it doesn't
+    /// parse yet (see [`parse::value_slots`]).
+    pub fn value_slots(&self, line: &str) -> Vec<ValueSlot> {
+        parse::value_slots(&self.config, line)
     }
 
     /// Candidates for the word at `cursor` (a byte offset into `line`).
