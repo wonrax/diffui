@@ -30,7 +30,7 @@ use crate::{Action, Diffui, MainView, Message, TabId};
 
 mod plan;
 
-pub(crate) use plan::{PlanState, ResolvedView, Run};
+pub(crate) use plan::{PlanState, ResolvedView, Run, sentence};
 
 /// What a query starts with to be a command line.
 pub(crate) const PREFIX: &str = "jj ";
@@ -94,11 +94,17 @@ pub(crate) enum CmdAction {
     Output(crate::cli_output::OutputAction),
 }
 
-/// Widget plumbing for the command line.
+/// Widget plumbing for the command line and the revset field.
 #[derive(Debug, Clone)]
 pub(crate) enum CmdEvent {
     /// Typing paused: resolve the revsets of this version of the line.
     Settle(u64),
+    /// The revset field's typing paused.
+    FieldSettle(u64),
+    /// Hover over a revset field candidate.
+    FieldSelect(usize),
+    /// Click on a revset field candidate.
+    FieldAccept(usize),
 }
 
 /// How a revset argument resolved, kept by its text so it survives edits
@@ -397,6 +403,12 @@ impl Diffui {
     pub(crate) fn on_cmd_event(&mut self, event: CmdEvent) -> Task<Message> {
         match event {
             CmdEvent::Settle(version) => self.settle_command_line(version),
+            CmdEvent::FieldSettle(version) => self.settle_revset_field(version),
+            CmdEvent::FieldSelect(index) => {
+                self.revset_field_select(index);
+                Task::none()
+            }
+            CmdEvent::FieldAccept(index) => self.accept_revset_field(index),
         }
     }
 
@@ -1056,6 +1068,7 @@ pub(crate) fn caret_key(key: &keyboard::Key) -> bool {
 pub(crate) struct TabCommandLine {
     pub(crate) cli: Option<JjCli>,
     pub(crate) runs: Vec<crate::cli_output::CliRun>,
+    pub(crate) field: crate::revset_assist::FieldAssist,
 }
 
 #[cfg(test)]

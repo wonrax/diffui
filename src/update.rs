@@ -499,6 +499,11 @@ impl Diffui {
             Payload::FilePairRead { old, new, .. } => {
                 self.apply_file_pair(tab, job, old.clone(), new.clone())
             }
+            Payload::RevsetResolved { revset, result, .. }
+                if self.tab_mut(tab)?.jobs.revset_field == Some(job) =>
+            {
+                self.revset_field_resolved(tab, revset, result.clone())
+            }
             Payload::RevsetResolved { revset, result, .. } => {
                 self.command_revset_resolved(tab, job, revset, result.clone())
             }
@@ -585,7 +590,7 @@ impl Diffui {
         if jobs.cli.contains_key(&job) {
             return self.fail_cli_run(tab, job, error);
         }
-        if jobs.cmdline.remove(&job) {
+        if jobs.cmdline.remove(&job) || jobs.revset_field.take_if(|id| *id == job).is_some() {
             return Task::none();
         }
         if jobs.preview == Some(job) {
@@ -1107,7 +1112,7 @@ impl Diffui {
                 self.active_mut().session.revset = expr;
                 self.evaluate_revset()
             }
-            Action::SubmitRevset => self.evaluate_revset(),
+            Action::SubmitRevset => self.submit_revset_field(),
 
             // ── View ────────────────────────────────────────────────────
             Action::ToggleWrap => {
@@ -1234,7 +1239,10 @@ impl Diffui {
     /// depends on state the widget can't see.
     fn on_ui_event(&mut self, event: UiEvent) -> Task<Message> {
         match event {
-            UiEvent::SelectRowKey(key) => return self.on_revision_row_click(key),
+            UiEvent::SelectRowKey(key) => {
+                self.close_revset_field();
+                return self.on_revision_row_click(key);
+            }
             UiEvent::SidebarFileRow(display_index) => {
                 let target = self.active_mut();
                 let rows = diffui_core::file_tree_rows(
@@ -1350,7 +1358,7 @@ impl Diffui {
                     }
                 }
             }
-            UiEvent::RevsetChanged(value) => self.active_mut().session.revset = value,
+            UiEvent::RevsetChanged(value) => return self.revset_field_edited(value),
             UiEvent::RangeEditChanged(value) => {
                 if let Some(edit) = self.active_mut().range_edit.as_mut() {
                     *edit = value;
@@ -1855,6 +1863,11 @@ impl Diffui {
         let context = self.key_context();
         if context == Context::Palette && crate::cmdline::caret_key(key) {
             self.command_line_key(key, modifiers);
+        }
+        if context == Context::Base
+            && let Some(task) = self.revset_field_key(key, modifiers, consumed)
+        {
+            return task;
         }
         let Some(id) = self.resolve_chord(context, &chord, consumed) else {
             return Task::none();

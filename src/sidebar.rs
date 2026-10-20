@@ -1,6 +1,6 @@
 use iced::{
     Background, Border, Color, Element, Length, alignment,
-    widget::{Space, column, container, row, text, tooltip},
+    widget::{Space, column, container, row, stack, text, tooltip},
 };
 
 use crate::chip::{self, Chip};
@@ -102,6 +102,9 @@ pub fn build_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         .width(Length::Fill)
         .padding(crate::field::PANEL_HEADER_PADDING),
     );
+    if let Some(error) = crate::revset_assist::error_strip(ui, theme) {
+        body = body.push(error);
+    }
     if let Some(banner) = crate::history_panel::file_filter_banner(ui, theme) {
         body = body.push(banner);
     }
@@ -110,8 +113,16 @@ pub fn build_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     if let LoadStatus::Failed(error) = &ui.active().session.status {
         body = body.push(crate::empty_states::load_error(ui, theme, error));
     }
-    body = body
-        .push(crate::empty_states::revision_list_placeholder(ui, theme).unwrap_or(revision_list));
+    let list = crate::empty_states::revision_list_placeholder(ui, theme).unwrap_or(revision_list);
+    // The revset field's completions hang over the top of the list.
+    body = body.push(match crate::revset_assist::dropdown(ui, theme) {
+        Some(dropdown) => Element::from(
+            stack![list, dropdown]
+                .width(Length::Fill)
+                .height(Length::Fill),
+        ),
+        None => list,
+    });
     // Target mode: the op bar floats between the list and the footer while a
     // rebase/squash draft is picking its destination.
     if ui.active().op_draft().is_some() {

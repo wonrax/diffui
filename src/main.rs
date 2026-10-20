@@ -54,6 +54,7 @@ mod range;
 mod resize_handle;
 mod revision_list;
 mod revops;
+mod revset_assist;
 mod scrollbar;
 mod shortcuts;
 mod sidebar;
@@ -792,7 +793,8 @@ pub(crate) struct TabState {
     pub(crate) history: history_panel::HistoryState,
     /// The post-op graph the sidebar draws in place of the loaded one.
     pub(crate) graph_preview: graph_preview::GraphPreviewState,
-    /// The command line's per-repository state: its grammar and CLI runs.
+    /// The command line's per-repository state: its grammar, CLI runs and
+    /// the revset field's completion.
     pub(crate) cmdline: cmdline::TabCommandLine,
 }
 
@@ -1015,6 +1017,8 @@ pub(crate) struct PendingJobs {
     pub(crate) file_pairs: HashMap<JobId, (u64, usize)>,
     /// The command line's revset resolutions in flight.
     pub(crate) cmdline: HashSet<JobId>,
+    /// The revset field's check in flight.
+    pub(crate) revset_field: Option<JobId>,
     /// Passthrough jj CLI runs, with their activity rows.
     pub(crate) cli: HashMap<JobId, activity::ActivityId>,
 }
@@ -1034,6 +1038,7 @@ impl PendingJobs {
             || self.trunk_rebase.as_ref().is_some_and(|(id, _)| *id == job)
             || self.file_pairs.contains_key(&job)
             || self.cmdline.contains(&job)
+            || self.revset_field == Some(job)
             || self.cli.contains_key(&job)
     }
 
@@ -1051,6 +1056,7 @@ impl PendingJobs {
         self.trunk_rebase.take_if(|(id, _)| *id == job);
         self.file_pairs.remove(&job);
         self.cmdline.remove(&job);
+        self.revset_field.take_if(|id| *id == job);
         self.cli.remove(&job);
     }
 }
