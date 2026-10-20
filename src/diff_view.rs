@@ -473,6 +473,24 @@ pub struct AnnotationStyle {
     pub age: Color,
     /// Every part of a hidden commit's entry.
     pub hidden: Color,
+    /// Behind the run of lines of the entry under the cursor.
+    pub hover: Color,
+}
+
+/// The run of lines from one commit (`start..end`, 0-based) that `line`
+/// belongs to, when its entry is a link: its commit is still visible.
+fn annotation_run(labels: &[AnnotationLabel], line: usize) -> Option<(usize, usize)> {
+    if labels.get(line)?.hidden {
+        return None;
+    }
+    let start = labels[..=line]
+        .iter()
+        .rposition(|label| !label.id.is_empty())?;
+    let end = labels[line + 1..]
+        .iter()
+        .position(|label| !label.id.is_empty())
+        .map_or(labels.len(), |after| line + 1 + after);
+    Some((start, end))
 }
 
 /// A blame column drawn left of a plain document's line numbers: one label
@@ -1208,6 +1226,8 @@ struct State<Paragraph> {
     /// File whose header's browse button the cursor is over, if any —
     /// drives its hover wash (manual, like every hover in this widget).
     hovered_browse: Option<usize>,
+    /// The blame run under the cursor: `start..end` lines.
+    hovered_annotation: Option<(usize, usize)>,
     /// Whether the cursor is over the description block. Reveals the edit
     /// affordance at its right edge.
     hovered_description: bool,
@@ -1503,6 +1523,19 @@ impl<'a, Message> DiffView<'a, Message> {
             }
             _ => 0.0,
         }
+    }
+
+    /// The blame run under `point` (see [`annotation_run`]).
+    fn annotation_run_at(
+        &self,
+        index: &HeightIndex,
+        bounds: Rectangle,
+        vertical_offset: f32,
+        point: Point,
+    ) -> Option<(usize, usize)> {
+        let gutter = self.annotations.as_ref()?;
+        let line = self.annotation_line_at(index, bounds, vertical_offset, point)?;
+        annotation_run(gutter.labels, line)
     }
 
     /// The 0-based line under `point` when it sits in the blame column.
@@ -3849,6 +3882,7 @@ where
             last_header_height_bits: 0,
             last_palette_text: None,
             hovered_browse: None,
+            hovered_annotation: None,
             hovered_description: false,
             hovered_header_action: None,
             hovered_line: None,
@@ -4280,6 +4314,14 @@ where
                 if hovered != state.hovered_browse {
                     state.hovered_browse = hovered;
                 }
+                state.hovered_annotation = cursor.position_over(bounds).and_then(|point| {
+                    self.annotation_run_at(
+                        &state.height_index.borrow(),
+                        bounds,
+                        state.vertical_offset,
+                        point,
+                    )
+                });
                 state.hovered_hunk_action = cursor
                     .position_over(bounds)
                     .and_then(|point| self.hunk_action_at(state, bounds, point));
@@ -4552,6 +4594,18 @@ where
                         .and_then(|point| self.browse_button_at(state, bounds, point));
                     if hovered != state.hovered_browse {
                         state.hovered_browse = hovered;
+                        shell.request_redraw();
+                    }
+                    let hovered = cursor.position_over(bounds).and_then(|point| {
+                        self.annotation_run_at(
+                            &state.height_index.borrow(),
+                            bounds,
+                            state.vertical_offset,
+                            point,
+                        )
+                    });
+                    if hovered != state.hovered_annotation {
+                        state.hovered_annotation = hovered;
                         shell.request_redraw();
                     }
                     let hovered = cursor
@@ -4938,6 +4992,9 @@ where
             if let Some(split) = &split {
                 self.draw_split_row_tints(renderer, &visible_rows, split, bounds);
             }
+            if let (Some(gutter), Some(run)) = (&self.annotations, state.hovered_annotation) {
+                self.draw_annotation_hover(renderer, gutter, run, &visible_rows, bounds);
+            }
             if !self.plain {
                 let first = height_index
                     .media_bands
@@ -5306,7 +5363,7 @@ where
             return mouse::Interaction::Pointer;
         }
         if self
-            .annotation_line_at(
+            .annotation_run_at(
                 &state.height_index.borrow(),
                 bounds,
                 state.vertical_offset,
@@ -5717,6 +5774,72 @@ impl<Message> DiffView<'_, Message> {
             author_end - author_x,
             colors(style.author),
         );
+    }
+
+    /// The hovered blame run (`start..end` lines): a wash behind its rows'
+    /// entries, and its id underlined.
+    fn draw_annotation_hover<Renderer>(
+        &self,
+        renderer: &mut Renderer,
+        gutter: &AnnotationGutter<'_, Message>,
+        (start, end): (usize, usize),
+        rows: &[VisibleRow],
+        bounds: Rectangle,
+    ) where
+        Renderer: text::Renderer,
+    {
+        let in_run = |row: &&VisibleRow| {
+            self.files[row.file_index].hunks[row.hunk_index].lines[row.line_index]
+                .new_line
+                .is_some_and(|number| (start + 1..=end).contains(&number))
+        };
+        let mut span = rows.iter().filter(in_run);
+        let Some(first) = span.next() else {
+            return;
+        };
+        let bottom = span
+            .next_back()
+            .map_or(first.y + first.height, |last| last.y + last.height);
+        let top = first.y;
+        renderer.fill_quad(
+            renderer::Quad {
+                bounds: Rectangle {
+                    x: bounds.x + 2.0,
+                    y: top + 1.0,
+                    width: self.annotation_width() - 4.0,
+                    height: (bottom - top - 2.0).max(1.0),
+                },
+                border: Border {
+                    radius: crate::theme::radius::CONTROL.into(),
+                    ..Border::default()
+                },
+                shadow: Shadow::default(),
+                snap: true,
+            },
+            gutter.style.hover,
+        );
+        // The id is on the run's first line, when that one shows.
+        let starts_here =
+            self.files[first.file_index].hunks[first.hunk_index].lines[first.line_index].new_line
+                == Some(start + 1);
+        if let Some(label) = gutter.labels.get(start).filter(|_| starts_here) {
+            let baseline = first.y
+                + self.metrics.text_y_pad
+                + crate::typography::TextBox::new(
+                    self.font,
+                    self.typography.size,
+                    self.metrics.row_height,
+                )
+                .baseline();
+            self.draw_background(
+                renderer,
+                bounds.x + GUTTER_HORIZONTAL_PADDING,
+                (baseline + 2.0).round(),
+                label.id.chars().count() as f32 * self.metrics.char_width,
+                1.0,
+                gutter.style.id,
+            );
+        }
     }
 
     /// A file strip at screen-y `y`: a hunk strip's band washed in the
@@ -7336,6 +7459,28 @@ mod tests {
         let diff = test_view(&hunks);
         assert_eq!(diff.metrics.prefix_width, PREFIX_WIDTH);
         assert_eq!(diff.metrics.top_inset, 0.0);
+    }
+
+    #[test]
+    fn a_blame_run_spans_its_commits_lines_and_skips_hidden_ones() {
+        let entry = |id: &str, hidden| AnnotationLabel {
+            id: id.to_owned(),
+            hidden,
+            ..AnnotationLabel::default()
+        };
+        let labels = [
+            entry("aaaa", false),
+            entry("", false),
+            entry("", false),
+            entry("bbbb", true),
+            entry("", true),
+            entry("cccc", false),
+        ];
+        assert_eq!(annotation_run(&labels, 0), Some((0, 3)));
+        assert_eq!(annotation_run(&labels, 2), Some((0, 3)));
+        assert_eq!(annotation_run(&labels, 4), None);
+        assert_eq!(annotation_run(&labels, 5), Some((5, 6)));
+        assert_eq!(annotation_run(&labels, 6), None);
     }
 
     #[test]

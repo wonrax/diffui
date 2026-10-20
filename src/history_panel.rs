@@ -941,6 +941,7 @@ pub(crate) fn source_annotations<'a>(ui: &'a Diffui) -> Option<AnnotationGutter<
             author: theme.muted_text,
             age: theme.subtle_text,
             hidden: theme.subtle_text,
+            hover: crate::theme::chip_background(theme.muted_text),
         },
     })
 }
