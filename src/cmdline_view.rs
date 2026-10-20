@@ -158,6 +158,16 @@ fn colored_spans<'a>(
     spans
 }
 
+/// The spans the line colours as revset arguments.
+#[cfg(test)]
+pub(crate) fn revset_roles(line: &str, command: &CommandLine) -> Vec<Range<usize>> {
+    roles(line, command)
+        .into_iter()
+        .filter(|(_, role)| matches!(role, Role::Revset | Role::FocusedRevset))
+        .map(|(range, _)| range)
+        .collect()
+}
+
 fn roles(line: &str, command: &CommandLine) -> Vec<(Range<usize>, Role)> {
     let tokens = tokenize::tokenize(line);
     let slots = command.slots();

@@ -78,6 +78,21 @@ pub(crate) fn typed_flag(line: &str, slot: &RevsetSlot) -> String {
     }
 }
 
+/// The revset arguments of `line`: the parse's, or while the line doesn't
+/// parse yet (`jj rebase -r main -o`, a flag still waiting for its value)
+/// the ones jj's grammar already places, so they stay coloured, counted and
+/// tinted while the next one is typed.
+pub(crate) fn revset_slots(
+    cli: &JjCli,
+    line: &str,
+    parsed: &Result<ParsedCommand, ParseError>,
+) -> Vec<RevsetSlot> {
+    match parsed {
+        Ok(parsed) => parsed.revsets.clone(),
+        Err(_) => cli.revset_slots(line),
+    }
+}
+
 /// Whether a palette query is a command line.
 pub(crate) fn is_command(query: &str) -> bool {
     query.starts_with(PREFIX)
@@ -135,6 +150,9 @@ pub(crate) struct CommandLine {
     /// Byte offset of the caret in the line.
     pub(crate) cursor: usize,
     pub(crate) parsed: Result<ParsedCommand, ParseError>,
+    /// The revset arguments: the parse's, or while the line doesn't parse
+    /// yet, the ones it has so far (see [`revset_slots`]).
+    slots: Vec<RevsetSlot>,
     pub(crate) completions: Vec<Completion>,
     pub(crate) selected: usize,
     pub(crate) scroll_y: f32,
@@ -159,6 +177,7 @@ impl CommandLine {
             line: line.to_owned(),
             cursor: line.len(),
             parsed: cli.parse(line),
+            slots: Vec::new(),
             completions: Vec::new(),
             selected: 0,
             scroll_y: 0.0,
@@ -175,10 +194,7 @@ impl CommandLine {
 
     /// The revset arguments as typed.
     pub(crate) fn slots(&self) -> &[RevsetSlot] {
-        match &self.parsed {
-            Ok(parsed) => &parsed.revsets,
-            Err(_) => &[],
-        }
+        &self.slots
     }
 
     /// The argument the caret is in (or just after): the one whose rows the
@@ -438,6 +454,7 @@ impl Diffui {
             .get_or_insert_with(|| Box::new(CommandLine::new(&cli, &line)));
         command.cursor = floor_boundary(&line, cursor);
         command.parsed = cli.parse(&line);
+        command.slots = revset_slots(&cli, &line, &command.parsed);
         command.line = line.clone();
         command.insisted = false;
         let history: Vec<String> = self.recents.revsets.iter().cloned().collect();
@@ -1163,6 +1180,36 @@ mod tests {
         assert!(touches_caret("jj rebase -s ", 13, &(10..12)));
         // An error earlier in the line is the user's to see.
         assert!(!touches_caret("jj rebase -s nope -o x", 22, &(13..17)));
+    }
+
+    #[test]
+    fn arguments_keep_their_colour_while_the_next_flag_waits_for_a_value() {
+        let cli = JjCli::default();
+        let slots = |line: &str| {
+            let parsed = cli.parse(line);
+            revset_slots(&cli, line, &parsed)
+                .into_iter()
+                .map(|slot| (slot.revset, slot.span))
+                .collect::<Vec<_>>()
+        };
+        // Before `-o`, while it waits for a value, and once it has one.
+        assert_eq!(
+            slots("jj rebase -r main"),
+            vec![("main".to_owned(), 13..17)]
+        );
+        assert_eq!(
+            slots("jj rebase -r main -o"),
+            vec![("main".to_owned(), 13..17)]
+        );
+        assert_eq!(
+            slots("jj rebase -r main -o x"),
+            vec![("main".to_owned(), 13..17), ("x".to_owned(), 21..22)]
+        );
+        // And the colours follow: `main` is still a revset in the roles.
+        let line = "jj rebase -r main -o";
+        let mut command = CommandLine::new(&cli, line);
+        command.slots = revset_slots(&cli, line, &command.parsed);
+        assert!(crate::cmdline_view::revset_roles(line, &command).contains(&(13..17)));
     }
 
     #[test]

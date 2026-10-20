@@ -72,6 +72,12 @@ impl JjCli {
         parse::parse(&self.config, line)
     }
 
+    /// The revset arguments of `line` as far as jj's grammar places them,
+    /// also while it doesn't parse yet (see [`parse::revset_slots`]).
+    pub fn revset_slots(&self, line: &str) -> Vec<RevsetSlot> {
+        parse::revset_slots(&self.config, line)
+    }
+
     /// Candidates for the word at `cursor` (a byte offset into `line`).
     pub fn complete(
         &self,

@@ -340,6 +340,28 @@ pub fn parse(config: &CliConfig, input: &str) -> Result<ParsedCommand, ParseErro
     })
 }
 
+/// The revset arguments of `input` as far as jj's grammar places them,
+/// whether or not the line is valid yet: `jj rebase -r main -o` has no
+/// value for `-o` and doesn't parse, but `main` is still `-r`'s revset. For
+/// colouring and resolving a line while it is being typed.
+pub fn revset_slots(config: &CliConfig, input: &str) -> Vec<RevsetSlot> {
+    let line = Line::new(input);
+    let Ok(mut words) = expand_aliases(config, line.typed_words(), &line) else {
+        return Vec::new();
+    };
+    insert_default_command(config, &mut words);
+    let Ok(words) = expand_aliases(config, words, &line) else {
+        return Vec::new();
+    };
+    let scan = grammar::scan(words.iter().map(|w| w.value.as_str()));
+    ArgsView {
+        scan: &scan,
+        words: &words,
+        line: &line,
+    }
+    .revset_slots()
+}
+
 /// Turn clap's error into one line and a span.
 fn clap_error(error: &clap::Error, scan: &Scan, words: &[Word], line: &Line) -> ParseError {
     let rendered = error.render().to_string();
@@ -934,6 +956,31 @@ fn classify(view: &ArgsView) -> CliCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn revset_arguments_are_placed_before_the_line_is_valid() {
+        let config = CliConfig::builtin();
+        let slots = |line: &str| {
+            revset_slots(&config, line)
+                .into_iter()
+                .map(|slot| (slot.flag, slot.revset, slot.span))
+                .collect::<Vec<_>>()
+        };
+        let main = ("--revision".to_owned(), "main".to_owned(), 13..17);
+        // No destination yet, a flag still waiting for its value, half a
+        // flag: `main` stays `-r`'s revset throughout.
+        assert!(parse(&config, "jj rebase -r main").is_err());
+        assert_eq!(slots("jj rebase -r main"), vec![main.clone()]);
+        assert_eq!(slots("jj rebase -r main -o"), vec![main.clone()]);
+        assert_eq!(slots("jj rebase -r main -o "), vec![main.clone()]);
+        assert_eq!(slots("jj rebase -r main --ont"), vec![main]);
+        // A valid line places them as its parse does.
+        let line = "jj rebase -r main -o 'trunk()'";
+        assert_eq!(
+            revset_slots(&config, line),
+            parse(&config, line).unwrap().revsets
+        );
+    }
 
     fn parse_ok(input: &str) -> ParsedCommand {
         parse(&CliConfig::builtin(), input).unwrap_or_else(|e| panic!("{input}: {e:?}"))
