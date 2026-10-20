@@ -26,8 +26,7 @@ use super::partial::repo_path;
 use super::workspace::resolve_revision;
 use crate::model::RevisionSelection;
 use crate::resolve::{
-    ConflictFile, ConflictResolution, ConflictTerm, MergeToolInvocation, interpolate,
-    merge_tool_from_settings,
+    ConflictFile, ConflictResolution, ConflictTerm, MergeToolInvocation, merge_tool_from_settings,
 };
 
 /// The conflicted path's tree value and its file-level view, when every term
@@ -281,8 +280,6 @@ pub(crate) async fn prepare_merge_tool(
     let initial_output = if tool.edits_markers {
         let marker_style = tool
             .marker_style
-            .as_deref()
-            .and_then(parse_marker_style)
             .or_else(|| settings.get("ui.conflict-marker-style").ok())
             .unwrap_or(ConflictMarkerStyle::Diff);
         let options = ConflictMaterializeOptions {
@@ -332,7 +329,7 @@ pub(crate) async fn prepare_merge_tool(
     variables.insert("path", path.to_owned());
 
     Ok(MergeToolInvocation {
-        args: interpolate(&tool.merge_args, &variables),
+        args: jj_cli::config::interpolate_variables(&tool.merge_args, &variables),
         output: dir.join(format!("output{suffix}")),
         dir,
         tool: tool.name,
@@ -352,14 +349,6 @@ pub(crate) async fn prepare_merge_tool(
         },
         path: path.to_owned(),
     })
-}
-
-fn parse_marker_style(style: &str) -> Option<ConflictMarkerStyle> {
-    use serde::Deserialize as _;
-    ConflictMarkerStyle::deserialize(
-        serde::de::value::StrDeserializer::<serde::de::value::Error>::new(style),
-    )
-    .ok()
 }
 
 /// A fresh, private scratch directory under the system temp dir.
