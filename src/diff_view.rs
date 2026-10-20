@@ -4931,6 +4931,7 @@ where
                     {
                         crate::hunk_actions::draw_button(
                             renderer,
+                            row_spec,
                             button,
                             placed,
                             &actions.style,

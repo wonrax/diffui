@@ -8,6 +8,7 @@ use iced::advanced::{renderer, text};
 use iced::{Border, Color, Font, Pixels, Point, Rectangle, Shadow, Size, alignment};
 
 use crate::measure;
+use crate::typography::TextBox;
 
 /// Inset of a label inside its button, and the gap between buttons.
 const PAD_X: f32 = 8.0;
@@ -156,7 +157,7 @@ pub fn draw_row<Renderer: text::Renderer>(
         draw_run(
             renderer,
             lead,
-            Point::new(first.rect.x - GAP - width, first.rect.center_y()),
+            Point::new(first.rect.x - GAP - width, baseline(row, style, first.rect)),
             width,
             first.rect.height,
             style.size,
@@ -180,9 +181,23 @@ pub fn draw_row<Renderer: text::Renderer>(
     );
 }
 
-/// Paint one placed button.
+/// The baseline every run of `row` sits on when its buttons are `rect`
+/// tall: the one that optically centres the row's tallest caps in the
+/// button, so mono ids and UI-font words read as one line.
+pub fn baseline(row: &Row, style: &Style, rect: Rectangle) -> f32 {
+    let cap_height = row
+        .lead
+        .iter()
+        .chain(row.buttons.iter().flat_map(|button| &button.runs))
+        .map(|run| TextBox::new(run.font, style.size, rect.height).cap_height())
+        .fold(0.0, f32::max);
+    rect.center_y() + cap_height / 2.0
+}
+
+/// Paint one placed button of `row`.
 pub fn draw_button<Renderer: text::Renderer>(
     renderer: &mut Renderer,
+    row: &Row,
     button: &Button,
     placed: &Placed,
     style: &Style,
@@ -212,13 +227,14 @@ pub fn draw_button<Renderer: text::Renderer>(
     } else {
         &button.runs[..]
     };
+    let baseline = baseline(row, style, rect);
     let mut x = rect.x + PAD_X;
     for run in runs {
         let width = run_width(run, style.size);
         draw_run(
             renderer,
             run,
-            Point::new(x, rect.center_y()),
+            Point::new(x, baseline),
             width,
             rect.height,
             style.size,
@@ -228,7 +244,13 @@ pub fn draw_button<Renderer: text::Renderer>(
     }
 }
 
-/// One run, left-aligned at `at.x` and centred on `at.y`.
+/// Where a run's `height`-tall line box starts for its baseline to land on
+/// `baseline`.
+fn run_top(run: &Run, size: f32, height: f32, baseline: f32) -> f32 {
+    baseline - TextBox::new(run.font, size, height).baseline()
+}
+
+/// One run, left-aligned at `at.x` with its baseline on `at.y`.
 fn draw_run<Renderer: text::Renderer>(
     renderer: &mut Renderer,
     run: &Run,
@@ -246,13 +268,13 @@ fn draw_run<Renderer: text::Renderer>(
             line_height: text::LineHeight::Absolute(Pixels(height)),
             font: run.font,
             align_x: text::Alignment::Left,
-            align_y: alignment::Vertical::Center,
+            align_y: alignment::Vertical::Top,
             shaping: text::Shaping::Advanced,
             wrapping: text::Wrapping::None,
             ellipsis: text::Ellipsis::None,
             hint_factor: None,
         },
-        at,
+        Point::new(at.x, run_top(run, size, height, at.y)),
         run.color,
         clip,
     );
@@ -307,6 +329,30 @@ mod tests {
         assert!(placed.iter().all(|p| !p.compact));
         // Centred in the strip.
         assert!((placed[0].rect.center_y() - 115.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn mono_and_ui_runs_share_the_optically_centred_baseline() {
+        let mut row = row(&[&["sknyzssr", " rebase destination"]]);
+        row.buttons[0].runs[0].font = Font::MONOSPACE;
+        row.lead = Some(Run {
+            text: "Take".to_owned(),
+            font: Font::DEFAULT,
+            color: Color::BLACK,
+        });
+        let style = style();
+        let rect = Rectangle::new(Point::new(0.0, 100.0), Size::new(200.0, 24.0));
+        let shared = baseline(&row, &style, rect);
+        let runs = row.buttons[0].runs.iter().chain(row.lead.as_ref());
+        let mut tallest: f32 = 0.0;
+        for run in runs {
+            let line = TextBox::new(run.font, style.size, rect.height);
+            let top = run_top(run, style.size, rect.height, shared);
+            assert!((top + line.baseline() - shared).abs() < 1e-4);
+            tallest = tallest.max(line.cap_height());
+        }
+        // The tallest caps are centred in the button.
+        assert!((shared - tallest / 2.0 - rect.center_y()).abs() < 1e-4);
     }
 
     #[test]
