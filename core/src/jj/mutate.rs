@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use futures::{StreamExt, TryStreamExt};
+use jj_cli::description_util::try_combine_messages;
 use jj_lib::{
     absorb::{AbsorbSource, absorb_hunks, split_hunks_to_trees},
     backend::{ChangeId, CommitId},
@@ -1537,19 +1538,21 @@ pub(super) fn rebase_stats_message(
     message
 }
 
-/// Squash description policy: keep whichever side has one; when both do,
-/// join them with a blank line (destination first, like `jj squash`'s
-/// combined-editor prefill). The user can refine it afterwards with the
-/// inline description editor.
-pub(super) fn combined_squash_description(destination: &Commit, sources: &[Commit]) -> String {
+/// `jj squash`'s description for the destination: the one non-empty
+/// description among it and the abandoned sources, as is (jj-cli's
+/// `try_combine_messages`). When several have one, jj opens an editor on all
+/// of them; diffui writes them destination first, a blank line apart, which
+/// is what saving that editor unchanged gives. The user can refine it with
+/// the inline description editor.
+pub(super) fn combined_squash_description(destination: &Commit, abandoned: &[Commit]) -> String {
+    if let Some(description) = try_combine_messages(abandoned, destination) {
+        return description;
+    }
     let parts: Vec<&str> = std::iter::once(destination)
-        .chain(sources)
+        .chain(abandoned)
         .map(|commit| commit.description().trim())
         .filter(|description| !description.is_empty())
         .collect();
-    if parts.is_empty() {
-        return String::new();
-    }
     // Stored descriptions end with a newline (jj's own convention).
     let mut combined = parts.join("\n\n");
     combined.push('\n');
@@ -1564,7 +1567,6 @@ pub(super) async fn squash_whole(
     sources: Vec<Commit>,
     destination: &Commit,
 ) -> Result<Option<Commit>> {
-    let combined = combined_squash_description(destination, &sources);
     let mut selections: Vec<CommitWithSelection> = Vec::new();
     for source in sources {
         selections.push(CommitWithSelection {
@@ -1582,6 +1584,7 @@ pub(super) async fn squash_whole(
     else {
         return Ok(None);
     };
+    let combined = combined_squash_description(destination, &squashed.abandoned_commits);
     let new_destination = squashed
         .commit_builder
         .set_description(combined)

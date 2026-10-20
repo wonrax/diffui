@@ -1162,6 +1162,42 @@ fn squash_into_parent_folds_changes_and_descriptions() {
     );
 }
 
+/// With only one side described, `jj squash` keeps that description as it
+/// is, leading whitespace included (jj-cli's `try_combine_messages`).
+#[test]
+fn squash_keeps_a_lone_description_verbatim() {
+    let root = scratch_repo("squash-lone-description");
+    write(&root, "a.txt", "a\n");
+    run(
+        &root,
+        MutationOp::New {
+            parent: RevisionSelection::WorkingCopy,
+        },
+    );
+    let base_change = change_id(&root, "@-");
+    write(&root, "b.txt", "b\n");
+    run(
+        &root,
+        MutationOp::Describe {
+            target: RevisionSelection::WorkingCopy,
+            description: "    indented body\n".to_owned(),
+        },
+    );
+
+    run(
+        &root,
+        MutationOp::Squash {
+            from: vec![RevisionSelection::WorkingCopy],
+            into: SquashTarget::Parent,
+        },
+    );
+
+    assert_eq!(
+        harness::full_description(&root, &commit_id(&root, &base_change)),
+        "    indented body\n"
+    );
+}
+
 /// Squash into an arbitrary (non-parent) revision on a sibling branch.
 #[test]
 fn squash_into_arbitrary_revision() {
