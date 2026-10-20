@@ -118,9 +118,11 @@ pub(crate) enum MenuEntry {
         label: String,
         items: Vec<MenuEntry>,
     },
-    /// A greyed, non-interactive row (e.g. an otherwise-empty submenu).
+    /// A greyed, non-interactive row (e.g. an otherwise-empty submenu), and
+    /// why, when there is something to say.
     Disabled {
         label: String,
+        reason: Option<String>,
     },
     Separator,
 }
@@ -710,7 +712,13 @@ fn card_width(ui: &Diffui, entries: &[MenuEntry]) -> f32 {
             MenuEntry::Submenu { label, .. } => {
                 measure::line_width(label, MENU_LABEL_SIZE, font) + MENU_ROW_GAP + CHEVRON_WIDTH
             }
-            MenuEntry::Disabled { label } => measure::line_width(label, MENU_LABEL_SIZE, font),
+            MenuEntry::Disabled { label, reason } => {
+                let mut w = measure::line_width(label, MENU_LABEL_SIZE, font);
+                if let Some(reason) = reason {
+                    w += MENU_ROW_GAP + measure::line_width(reason, MENU_DETAIL_SIZE, font);
+                }
+                w
+            }
             MenuEntry::Separator => 0.0,
         };
         content = content.max(w);
@@ -819,17 +827,41 @@ fn build_row<'a>(
         }
         // Labels centre their caps in the row; a detail or chevron joins on
         // the label's baseline (see `crate::typography`).
-        MenuEntry::Disabled { label } => typography::centered(
-            text(label)
+        MenuEntry::Disabled { label, reason } => {
+            let label_widget = text(label)
                 .size(MENU_LABEL_SIZE)
                 .color(theme.subtle_text)
                 .font(font)
-                .width(Length::Fill)
-                .wrapping(iced::advanced::text::Wrapping::None)
-                .ellipsis(iced::advanced::text::Ellipsis::End),
-            font,
-            MENU_LABEL_SIZE,
-        ),
+                .wrapping(iced::advanced::text::Wrapping::None);
+            match reason {
+                // Why it's greyed, where an enabled row shows its chord.
+                Some(reason) => typography::baseline_row(
+                    [
+                        Aligned::text(label_widget, font, MENU_LABEL_SIZE),
+                        Aligned::text(
+                            text(reason)
+                                .size(MENU_DETAIL_SIZE)
+                                .color(theme.subtle_text)
+                                .font(font)
+                                .width(Length::Fill)
+                                .align_x(iced::advanced::text::Alignment::Right)
+                                .wrapping(iced::advanced::text::Wrapping::None)
+                                .ellipsis(iced::advanced::text::Ellipsis::End),
+                            font,
+                            MENU_DETAIL_SIZE,
+                        ),
+                    ],
+                    MENU_ROW_GAP,
+                ),
+                None => typography::centered(
+                    label_widget
+                        .width(Length::Fill)
+                        .ellipsis(iced::advanced::text::Ellipsis::End),
+                    font,
+                    MENU_LABEL_SIZE,
+                ),
+            }
+        }
         MenuEntry::Item {
             label,
             detail,

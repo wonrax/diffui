@@ -18,6 +18,12 @@ impl Diffui {
     /// A menu row for `command`, labelled and chord-hinted from the registry.
     pub(crate) fn menu_item(&self, command: CommandId, arg: CommandArg) -> menu::MenuEntry {
         let entry = commands::command(command);
+        if let Some(Err(reason)) = entry.map(|entry| (entry.enabled)(self, &arg)) {
+            return menu::MenuEntry::Disabled {
+                label: entry.map(|c| c.label.to_owned()).unwrap_or_default(),
+                reason: Some(reason.to_owned()),
+            };
+        }
         menu::MenuEntry::Item {
             label: entry.map(|c| c.label.to_owned()).unwrap_or_default(),
             detail: self
@@ -38,6 +44,14 @@ impl Diffui {
         command: CommandId,
         arg: CommandArg,
     ) -> menu::MenuEntry {
+        if let Some(Err(reason)) =
+            commands::command(command).map(|entry| (entry.enabled)(self, &arg))
+        {
+            return menu::MenuEntry::Disabled {
+                label: label.into(),
+                reason: Some(reason.to_owned()),
+            };
+        }
         menu::MenuEntry::Item {
             label: label.into(),
             detail: None,
@@ -293,6 +307,7 @@ impl Diffui {
         top.push(if move_items.is_empty() {
             MenuEntry::Disabled {
                 label: "Move bookmark here".to_owned(),
+                reason: None,
             }
         } else {
             MenuEntry::Submenu {
@@ -423,7 +438,7 @@ impl Diffui {
         let Some(command) = commands::command(id) else {
             return Task::none();
         };
-        if !(command.enabled)(self, &arg) {
+        if (command.enabled)(self, &arg).is_err() {
             return Task::none();
         }
         match (command.build)(self, arg) {

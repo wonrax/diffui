@@ -37,7 +37,32 @@ pub(crate) fn subscription() -> Subscription<Message> {
 /// up its default one.
 pub(crate) fn install(ui: &Diffui) {
     #[cfg(target_os = "macos")]
-    crate::macos_native::install_menu_bar(&mac::menus(ui));
+    {
+        let menus = mac::menus(ui);
+        mac::record_bar_tags(&menus);
+        crate::macos_native::install_menu_bar(&menus);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = ui;
+}
+
+/// Tell the menu bar which of its commands can't run in the state `ui` is in
+/// now, so their items are greyed when a menu opens. Cheap enough to run
+/// after every update: a predicate per bar command, no repository reads.
+pub(crate) fn refresh_availability(ui: &Diffui) {
+    #[cfg(target_os = "macos")]
+    {
+        let unavailable = mac::bar_tags()
+            .iter()
+            .copied()
+            .filter(|tag| {
+                REGISTRY
+                    .get(*tag as usize)
+                    .is_some_and(|command| (command.enabled)(ui, &CommandArg::None).is_err())
+            })
+            .collect();
+        crate::macos_native::set_unavailable_bar_commands(unavailable);
+    }
     #[cfg(not(target_os = "macos"))]
     let _ = ui;
 }
@@ -172,6 +197,32 @@ mod mac {
                 control: false,
                 shift: false,
             },
+        }
+    }
+
+    static TAGS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+
+    /// Remember the tags of every command `menus` shows, at install.
+    pub(super) fn record_bar_tags(menus: &[BarMenu]) {
+        let mut tags = Vec::new();
+        for menu in menus {
+            walk(&menu.items, &mut tags);
+        }
+        let _ = TAGS.set(tags);
+    }
+
+    /// The tags of every command the bar shows; empty before install.
+    pub(super) fn bar_tags() -> &'static [u32] {
+        TAGS.get().map_or(&[], Vec::as_slice)
+    }
+
+    fn walk(items: &[BarItem], out: &mut Vec<u32>) {
+        for item in items {
+            match item {
+                BarItem::Command { tag, .. } => out.push(*tag),
+                BarItem::Submenu { items, .. } => walk(items, out),
+                _ => {}
+            }
         }
     }
 

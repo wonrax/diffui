@@ -702,6 +702,7 @@ impl Diffui {
         };
         // A mode that isn't on screen must not keep the keyboard.
         self.prune_stale_modes();
+        crate::app_menu::refresh_availability(self);
         let welcome = self.ensure_welcome_prompt();
         let conflicts = self.sync_conflicts();
         let history = self.sync_history();
@@ -3559,6 +3560,10 @@ impl Diffui {
         let Some(selected) = top.matches.get(top.selected) else {
             return Task::none();
         };
+        // A greyed row says why it can't run; accepting it does nothing.
+        if selected.disabled.is_some() {
+            return Task::none();
+        }
         let item = selected.item.clone();
         let target = match &top.source {
             ColumnSource::Root => None,

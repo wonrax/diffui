@@ -17,7 +17,9 @@ use std::cell::Cell;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
-use objc2_app_kit::{NSApplication, NSEvent, NSMenu, NSMenuItem, NSModalResponseOK, NSOpenPanel};
+use objc2_app_kit::{
+    NSApplication, NSEvent, NSMenu, NSMenuDelegate, NSMenuItem, NSModalResponseOK, NSOpenPanel,
+};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_core_graphics::CGColor;
 use objc2_foundation::{
@@ -81,6 +83,8 @@ pub enum MenuItem {
         label: String,
         id: u32,
         enabled: bool,
+        /// A second, smaller line under the label: why a greyed row is.
+        subtitle: Option<String>,
     },
     /// A nested submenu. Empty `items` renders as a single disabled row.
     Submenu { label: String, items: Vec<MenuItem> },
@@ -94,6 +98,7 @@ impl MenuItem {
             label: label.into(),
             id,
             enabled: true,
+            subtitle: None,
         }
     }
 
@@ -172,9 +177,17 @@ fn build_menu(mtm: MainThreadMarker, target: &AnyObject, items: &[MenuItem]) -> 
             MenuItem::Separator => {
                 menu.addItem(&NSMenuItem::separatorItem(mtm));
             }
-            MenuItem::Entry { label, id, enabled } => {
+            MenuItem::Entry {
+                label,
+                id,
+                enabled,
+                subtitle,
+            } => {
                 let menu_item = NSMenuItem::new(mtm);
                 menu_item.setTitle(&NSString::from_str(label));
+                if let Some(subtitle) = subtitle {
+                    set_subtitle(&menu_item, subtitle);
+                }
                 menu_item.setEnabled(*enabled);
                 menu_item.setTag(*id as isize);
                 if *enabled {
@@ -202,6 +215,15 @@ fn build_menu(mtm: MainThreadMarker, target: &AnyObject, items: &[MenuItem]) -> 
         }
     }
     menu
+}
+
+/// `subtitle` under the item's title (macOS 14.4+; older systems skip it, as
+/// they have no such property).
+fn set_subtitle(item: &NSMenuItem, subtitle: &str) {
+    let responds: bool = unsafe { msg_send![item, respondsToSelector: sel!(setSubtitle:)] };
+    if responds {
+        item.setSubtitle(Some(&NSString::from_str(subtitle)));
+    }
 }
 
 /// Show a native `NSMenu` (with nested submenus) at the current cursor location
@@ -399,6 +421,18 @@ pub struct BarMenu {
     pub items: Vec<BarItem>,
 }
 
+/// Tags of the bar's commands that can't run right now; see
+/// [`set_unavailable_bar_commands`].
+static BAR_UNAVAILABLE: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Record which of the bar's command tags are unavailable. Read when a menu
+/// opens, so it only has to be current by then.
+pub fn set_unavailable_bar_commands(tags: Vec<u32>) {
+    if let Ok(mut slot) = BAR_UNAVAILABLE.lock() {
+        *slot = tags;
+    }
+}
+
 static BAR_TX: std::sync::OnceLock<futures::channel::mpsc::UnboundedSender<u32>> =
     std::sync::OnceLock::new();
 static BAR_RX: std::sync::Mutex<Option<futures::channel::mpsc::UnboundedReceiver<u32>>> =
@@ -435,6 +469,22 @@ define_class!(
 
     // SAFETY: `NSObjectProtocol` has no safety requirements.
     unsafe impl NSObjectProtocol for BarTarget {}
+
+    // SAFETY: `menuNeedsUpdate:` matches the protocol's signature.
+    unsafe impl NSMenuDelegate for BarTarget {
+        // Grey the commands the app reported as unavailable, as the menu
+        // opens. Items are enabled by hand (`setAutoenablesItems(false)`),
+        // so this is the only place their state changes.
+        #[unsafe(method(menuNeedsUpdate:))]
+        fn menu_needs_update(&self, menu: &NSMenu) {
+            let unavailable = BAR_UNAVAILABLE.lock().map(|tags| tags.clone()).unwrap_or_default();
+            for item in menu.itemArray().iter() {
+                if item.action() == Some(sel!(barItemSelected:)) {
+                    item.setEnabled(!unavailable.contains(&(item.tag() as u32)));
+                }
+            }
+        }
+    }
 
     impl BarTarget {
         // SAFETY: The selector takes a single object argument (the sender).
@@ -587,6 +637,7 @@ fn build_bar_menu(
     // auto-enabling would grey out every item without a responder for it.
     // The standard items (Hide, Quit, Minimize) are always available.
     menu.setAutoenablesItems(false);
+    menu.setDelegate(Some(objc2::runtime::ProtocolObject::from_ref(target)));
     let target_ref: &AnyObject = target;
     for item in items {
         let built = match item {

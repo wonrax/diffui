@@ -240,6 +240,9 @@ pub enum ResultRef {
 pub struct PaletteMatch {
     pub item: ResultRef,
     pub score: u32,
+    /// Why a command row can't run: it lists greyed, below the rows that
+    /// can, with this beside it.
+    pub disabled: Option<commands::Reason>,
 }
 
 /// In-memory MRU bookkeeping. Two tracks: recently-jumped revisions and
@@ -635,10 +638,12 @@ pub fn recompute_matches(column: &mut PaletteColumn, ui: &Diffui, search_revisio
         matches.push(PaletteMatch {
             item: candidate.item,
             score: total,
+            disabled: candidate.disabled,
         });
     }
 
-    matches.sort_by_key(|entry| std::cmp::Reverse(entry.score));
+    // What can run first, then what can't, each by score.
+    matches.sort_by_key(|entry| (entry.disabled.is_some(), std::cmp::Reverse(entry.score)));
     matches.truncate(MAX_RESULT_ROWS);
 
     column.matches = matches;
@@ -651,12 +656,14 @@ struct Candidate {
     /// identifiers for the row, so a query like "abc def" matches across
     /// change-id + description + author.
     haystack: String,
+    disabled: Option<commands::Reason>,
 }
 
 fn push_revision_candidates(out: &mut Vec<Candidate>, ui: &Diffui) {
     out.push(Candidate {
         item: ResultRef::WorkingCopy,
         haystack: "working copy @".to_owned(),
+        disabled: None,
     });
     for commit in ui.active().session.commits.iter() {
         let mut haystack = String::with_capacity(
@@ -681,6 +688,7 @@ fn push_revision_candidates(out: &mut Vec<Candidate>, ui: &Diffui) {
                 commit: commit.commit_id().to_owned(),
             },
             haystack,
+            disabled: None,
         });
     }
 }
@@ -716,6 +724,7 @@ fn push_bookmark_candidates(out: &mut Vec<Candidate>, ui: &Diffui) {
             out.push(Candidate {
                 item: ResultRef::Bookmark(bookmark.clone()),
                 haystack,
+                disabled: None,
             });
         }
     }
@@ -726,23 +735,26 @@ fn push_file_candidates(out: &mut Vec<Candidate>, ui: &Diffui) {
         out.push(Candidate {
             item: ResultRef::File(file.path.clone()),
             haystack: file.path.clone(),
+            disabled: None,
         });
     }
 }
 
-/// The registry's commands for `scope`, filtered by their `enabled` predicate
-/// against the argument they would run with — a row the palette offers is a
-/// row that will actually do something when accepted.
+/// The registry's commands for `scope`, each with its `enabled` verdict
+/// against the argument it would run with. The ones that can't run stay
+/// listed, greyed with the reason, so a missing row never has to be guessed
+/// at.
 fn push_command_candidates(
     out: &mut Vec<Candidate>,
     ui: &Diffui,
     scope: PaletteScope,
     arg: &CommandArg,
 ) {
-    for command in commands::palette_commands(ui, scope, arg) {
+    for (command, availability) in commands::palette_commands(ui, scope, arg) {
         out.push(Candidate {
             item: ResultRef::Command(command.id),
             haystack: format!("{} {}", command.palette_label(), command.hint),
+            disabled: availability.err(),
         });
     }
 }
@@ -1126,7 +1138,7 @@ fn build_result_row<'a>(
     };
 
     let root = matches!(column_state.source, ColumnSource::Root);
-    let body = result_row_body(ui, theme, &m.item, root);
+    let body = result_row_body(ui, theme, &m.item, root, m.disabled);
 
     let row_el = container(body)
         .padding([0.0, CONTENT_X - RESULTS_INSET])
@@ -1159,6 +1171,7 @@ fn result_row_body<'a>(
     theme: ThemeSpec,
     item: &'a ResultRef,
     root: bool,
+    disabled: Option<commands::Reason>,
 ) -> Element<'a, Message> {
     let primary = theme.text;
     let muted = theme.subtle_text;
@@ -1244,6 +1257,13 @@ fn result_row_body<'a>(
             mono_primary_label(ui, primary, path.clone()),
             // The glyph already says "file".
             tail(String::new()),
+        ),
+        // A command that can't run: greyed, with the reason where the
+        // shortcut would be.
+        ResultRef::Command(id) if let Some(reason) = disabled => (
+            glyph_icon(icons::CHEVRON_RIGHT, muted),
+            primary_label(ui, muted, command_label(id)),
+            tail(reason.to_owned()),
         ),
         ResultRef::Command(id) => (
             glyph_icon(icons::CHEVRON_RIGHT, theme.modified_token),

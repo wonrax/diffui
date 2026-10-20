@@ -12,7 +12,7 @@ use iced::{
     widget::{Space, column, container, row, text},
 };
 
-use crate::commands::{self, CommandId, Context, REGISTRY};
+use crate::commands::{self, CommandArg, CommandId, Context, REGISTRY};
 use crate::modes::{Mode, ModeKind};
 use crate::theme::{self, ThemeSpec, emphasis_font, text_size};
 use crate::typography::{self, Aligned};
@@ -91,6 +91,9 @@ pub(crate) struct Entry {
     pub(crate) id: CommandId,
     pub(crate) label: String,
     pub(crate) keys: Vec<String>,
+    /// Why the command can't run right now (base context only: the other
+    /// contexts' keys only exist inside their mode).
+    pub(crate) disabled: Option<commands::Reason>,
 }
 
 /// The live bindings of `context`, in registry order. The nine `⌘N` tab
@@ -118,10 +121,14 @@ pub(crate) fn entries(ui: &Diffui, context: Context) -> Vec<Entry> {
             tab_jumps.extend(keys);
             continue;
         }
+        let disabled = (context == Context::Base)
+            .then(|| (command.enabled)(ui, &CommandArg::None).err())
+            .flatten();
         out.push(Entry {
             id: command.id,
             label: label(command.id),
             keys,
+            disabled,
         });
     }
     if let (Some(first), Some(last)) = (tab_jumps.first(), tab_jumps.last()) {
@@ -134,6 +141,7 @@ pub(crate) fn entries(ui: &Diffui, context: Context) -> Vec<Entry> {
             id: "tab.select",
             label: "Go to tab 1\u{2013}9".to_owned(),
             keys,
+            disabled: None,
         });
     }
     out
@@ -181,7 +189,7 @@ pub(crate) fn build_overlay(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
     let rows_of = |entries: Vec<Entry>| -> Vec<Element<'_, Message>> {
         entries
             .into_iter()
-            .map(|entry| binding_row(ui, theme, entry.label, entry.keys))
+            .map(|entry| binding_row(ui, theme, entry.label, entry.keys, entry.disabled))
             .collect()
     };
     // Revisions is the long one: it and the repository keys go left, the
@@ -218,7 +226,13 @@ pub(crate) fn build_overlay(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
     let gestures = GESTURES
         .iter()
         .map(|(gesture, what)| {
-            binding_row(ui, theme, (*what).to_owned(), vec![(*gesture).to_owned()])
+            binding_row(
+                ui,
+                theme,
+                (*what).to_owned(),
+                vec![(*gesture).to_owned()],
+                None,
+            )
         })
         .collect();
     left = left.push(section(ui, theme, "Mouse", gestures));
@@ -318,20 +332,39 @@ fn binding_row<'a>(
     theme: ThemeSpec,
     label: String,
     keys: Vec<String>,
+    disabled: Option<commands::Reason>,
 ) -> Element<'a, Message> {
+    let font = ui.config.ui_font;
+    let label = text(label)
+        .size(text_size::UI)
+        .font(font)
+        .wrapping(text::Wrapping::None)
+        .ellipsis(text::Ellipsis::End);
     // The label and the mono keycaps share a baseline (see
-    // `crate::typography`).
-    let mut line = vec![Aligned::text(
-        text(label)
-            .size(text_size::UI)
-            .color(theme.text)
-            .font(ui.config.ui_font)
-            .width(Length::Fill)
-            .wrapping(text::Wrapping::None)
-            .ellipsis(text::Ellipsis::End),
-        ui.config.ui_font,
-        text_size::UI,
-    )];
+    // `crate::typography`). A command that can't run right now greys out
+    // and says why after its label.
+    let mut line = match disabled {
+        None => vec![Aligned::text(
+            label.color(theme.text).width(Length::Fill),
+            font,
+            text_size::UI,
+        )],
+        Some(reason) => vec![
+            Aligned::text(label.color(theme.subtle_text), font, text_size::UI),
+            Aligned::gap(theme::space::SM),
+            Aligned::text(
+                text(reason)
+                    .size(text_size::CAPTION)
+                    .color(theme.subtle_text)
+                    .font(font)
+                    .width(Length::Fill)
+                    .wrapping(text::Wrapping::None)
+                    .ellipsis(text::Ellipsis::End),
+                font,
+                text_size::CAPTION,
+            ),
+        ],
+    };
     for (index, key) in keys.into_iter().enumerate() {
         line.push(Aligned::gap(if index == 0 {
             theme::space::MD

@@ -186,6 +186,18 @@ impl CommandArg {
     }
 }
 
+/// Why a command can't run right now: terse, no full stop ("Nothing to
+/// undo").
+pub(crate) type Reason = &'static str;
+
+/// A command's `enabled` verdict.
+pub(crate) type Availability = Result<(), Reason>;
+
+/// `Ok` when `condition` holds, else unavailable for `reason`.
+pub(crate) fn require(condition: bool, reason: Reason) -> Availability {
+    if condition { Ok(()) } else { Err(reason) }
+}
+
 /// One registry row.
 pub(crate) struct Command {
     pub(crate) id: CommandId,
@@ -199,7 +211,9 @@ pub(crate) struct Command {
     /// reports a different key: ⌥Z composes to `Ω` there, so the base letter
     /// alone would never match.
     pub(crate) mac_chords: &'static [&'static str],
-    pub(crate) enabled: fn(&Diffui, &CommandArg) -> bool,
+    /// `Err` carries why the command can't run right now, in a few words:
+    /// the palette, the menus and the `?` sheet show it beside the greyed row.
+    pub(crate) enabled: fn(&Diffui, &CommandArg) -> Availability,
     pub(crate) build: fn(&Diffui, CommandArg) -> Option<Action>,
     pub(crate) palette: PaletteScope,
 }
@@ -228,13 +242,13 @@ pub(crate) fn command(id: &str) -> Option<&'static Command> {
     REGISTRY.iter().find(|command| command.id == id)
 }
 
-/// The commands the palette offers in `scope`, in registry order, filtered by
-/// `enabled` against the arg they would run with.
+/// The commands the palette offers in `scope`, in registry order, each with
+/// its `enabled` verdict against the arg it would run with.
 pub(crate) fn palette_commands(
     ui: &Diffui,
     scope: PaletteScope,
     arg: &CommandArg,
-) -> Vec<&'static Command> {
+) -> Vec<(&'static Command, Availability)> {
     REGISTRY
         .iter()
         .filter(|command| {
@@ -242,7 +256,7 @@ pub(crate) fn palette_commands(
                 || (command.palette == PaletteScope::RevisionVerb
                     && matches!(scope, PaletteScope::Root | PaletteScope::Revision))
         })
-        .filter(|command| (command.enabled)(ui, arg))
+        .map(|command| (command, (command.enabled)(ui, arg)))
         .collect()
 }
 
@@ -274,8 +288,22 @@ fn lines_action(message: crate::changes::LineMsg) -> Action {
     Action::Changes(crate::changes::ChangesMsg::Lines(message))
 }
 
-fn always(_: &Diffui, _: &CommandArg) -> bool {
-    true
+fn always(_: &Diffui, _: &CommandArg) -> Availability {
+    Ok(())
+}
+
+/// The reasons more than one predicate gives.
+pub(crate) mod reason {
+    use super::Reason;
+
+    pub(crate) const NOT_JJ: Reason = "Needs a jj repository";
+    pub(crate) const GONE: Reason = "Revision is no longer in the log";
+    pub(crate) const NO_REPOSITORY: Reason = "No local repository in this tab";
+    pub(crate) const NO_FILE: Reason = "No file selected";
+    pub(crate) const NO_REMOTES: Reason = "No git remotes";
+    pub(crate) const NO_LOCAL_BOOKMARK: Reason = "No local bookmark here";
+    pub(crate) const NOT_COMPARING: Reason = "Not comparing revisions";
+    pub(crate) const NO_COMPARE: Reason = "Can't compare in this tab";
 }
 
 /// Whether the row a command names is still in the loaded graph. A menu built
@@ -290,45 +318,123 @@ fn row_present(ui: &Diffui, selection: &RevisionSelection) -> bool {
 
 /// A mutation is offered when the backend supports one (jj only) and every
 /// revision the command names is still on screen.
-pub(crate) fn can_mutate(ui: &Diffui, arg: &CommandArg) -> bool {
-    if !ui.active().session.capabilities.mutate {
-        return false;
-    }
+pub(crate) fn can_mutate(ui: &Diffui, arg: &CommandArg) -> Availability {
+    require(ui.active().session.capabilities.mutate, reason::NOT_JJ)?;
     match arg {
         CommandArg::Revisions(targets) => {
-            !targets.is_empty() && targets.iter().all(|target| row_present(ui, target))
+            require(!targets.is_empty(), "No revisions marked")?;
+            require(
+                targets.iter().all(|target| row_present(ui, target)),
+                reason::GONE,
+            )
         }
-        CommandArg::Bookmark { to: Some(to), .. } => row_present(ui, to),
+        CommandArg::Bookmark { to: Some(to), .. } => require(row_present(ui, to), reason::GONE),
         _ => match arg.revision() {
-            Some(revision) => row_present(ui, revision),
-            None => true,
+            Some(revision) => require(row_present(ui, revision), reason::GONE),
+            None => Ok(()),
         },
     }
 }
 
-fn can_read_graph(ui: &Diffui, _: &CommandArg) -> bool {
-    ui.active().session.capabilities.graph
+fn can_read_graph(ui: &Diffui, _: &CommandArg) -> Availability {
+    require(
+        ui.active().session.capabilities.graph,
+        "No revision graph in this tab",
+    )
 }
 
-fn can_fetch(ui: &Diffui, _: &CommandArg) -> bool {
-    ui.active().session.capabilities.fetch
+fn can_fetch(ui: &Diffui, _: &CommandArg) -> Availability {
+    require(
+        ui.active().session.capabilities.fetch,
+        "Nothing to fetch in this tab",
+    )
 }
 
 /// A local repository is open, so there is a tree to browse.
-fn can_browse(ui: &Diffui, arg: &CommandArg) -> bool {
-    ui.active().repository.is_some()
-        && arg
-            .revision()
-            .is_none_or(|revision| row_present(ui, revision))
+fn can_browse(ui: &Diffui, arg: &CommandArg) -> Availability {
+    require(ui.active().repository.is_some(), reason::NO_REPOSITORY)?;
+    require(
+        arg.revision()
+            .is_none_or(|revision| row_present(ui, revision)),
+        reason::GONE,
+    )
 }
 
-fn has_selected_file(ui: &Diffui, _: &CommandArg) -> bool {
+fn has_selected_file(ui: &Diffui, _: &CommandArg) -> Availability {
     let tab = ui.active();
-    tab.session.document.files.get(tab.selected_file).is_some()
+    require(
+        tab.session.document.files.get(tab.selected_file).is_some(),
+        reason::NO_FILE,
+    )
 }
 
-fn has_remotes(ui: &Diffui) -> bool {
-    !ui.active().session.bookmarks.remotes.is_empty()
+fn has_remotes(ui: &Diffui) -> Availability {
+    require(
+        !ui.active().session.bookmarks.remotes.is_empty(),
+        reason::NO_REMOTES,
+    )
+}
+
+/// The bookmark a bookmark command names is a local one.
+fn has_local_bookmark(ui: &Diffui, arg: &CommandArg) -> Availability {
+    require(local_bookmark(ui, arg).is_some(), reason::NO_LOCAL_BOOKMARK)
+}
+
+/// Picking changes out of the diff: the reason `changes::editable` is false.
+fn can_pick_changes(ui: &Diffui) -> Availability {
+    let tab = ui.active();
+    require(tab.session.capabilities.mutate, reason::NOT_JJ)?;
+    require(tab.repository.is_some(), reason::NO_REPOSITORY)?;
+    require(tab.main_view == MainView::Diff, "Only in the diff view")?;
+    require(
+        !tab.session.document.files.is_empty(),
+        "This revision has no changes",
+    )?;
+    require(
+        !crate::compare::comparing(ui),
+        "Not while comparing revisions",
+    )
+}
+
+/// A file-level change command: the file it names can be picked.
+fn has_command_file(ui: &Diffui, arg: &CommandArg) -> Availability {
+    can_pick_changes(ui)?;
+    require(
+        crate::changes::command_file(ui, arg).is_some(),
+        reason::NO_FILE,
+    )
+}
+
+/// A command over the diff pane's pick.
+fn has_picked_changes(ui: &Diffui, _: &CommandArg) -> Availability {
+    can_pick_changes(ui)?;
+    require(crate::changes::has_selection(ui), "No changes picked")
+}
+
+/// A conflict-resolution command: the file it names is a conflict it can
+/// resolve.
+fn conflict_resolution(ui: &Diffui, arg: &CommandArg, side: Option<usize>) -> Availability {
+    has_command_file(ui, arg)?;
+    require(
+        crate::conflicts::command_resolution(ui, arg, side).is_some(),
+        "No conflict to resolve this way",
+    )
+}
+
+fn history_available(ui: &Diffui) -> Availability {
+    require(crate::history_panel::available(ui), reason::NOT_JJ)
+}
+
+fn operation_selected(ui: &Diffui, _: &CommandArg) -> Availability {
+    require(ui.active().session.capabilities.mutate, reason::NOT_JJ)?;
+    require(
+        crate::history_panel::selected_operation(ui).is_some(),
+        "No operation selected in the op log",
+    )
+}
+
+fn comparing(ui: &Diffui, _: &CommandArg) -> Availability {
+    require(crate::compare::comparing(ui), reason::NOT_COMPARING)
 }
 
 /// The local bookmark a bookmark command names: a menu row's, or a palette
@@ -712,7 +818,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: |ui, _arg| ui.active().repository.is_some(),
+        enabled: |ui, _arg| require(ui.active().repository.is_some(), reason::NO_REPOSITORY),
         build: |ui, arg| {
             let path = arg.path()?;
             let repository = ui.active().repository.as_ref()?;
@@ -830,7 +936,10 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: |ui, arg| can_mutate(ui, arg) && crate::trunk::blocker(ui, arg).is_none(),
+        enabled: |ui, arg| {
+            can_mutate(ui, arg)?;
+            crate::trunk::blocker(ui, arg).map_or(Ok(()), Err)
+        },
         build: |ui, arg| target_revision(ui, &arg).map(Action::RebaseOntoTrunk),
         palette: PaletteScope::RevisionVerb,
     },
@@ -1313,7 +1422,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: |ui, arg| can_mutate(ui, arg) && local_bookmark(ui, arg).is_some(),
+        enabled: |ui, arg| can_mutate(ui, arg).and_then(|()| has_local_bookmark(ui, arg)),
         build: |ui, arg| {
             local_bookmark(ui, &arg)
                 .map(|name| Action::Mutate(mutations::MutationOp::DeleteBookmark { name }))
@@ -1327,7 +1436,13 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: |ui, arg| can_mutate(ui, arg) && untracked_remote_bookmark(ui, arg).is_some(),
+        enabled: |ui, arg| {
+            can_mutate(ui, arg)?;
+            require(
+                untracked_remote_bookmark(ui, arg).is_some(),
+                "No untracked remote bookmark here",
+            )
+        },
         build: |ui, arg| {
             let (name, remote) = untracked_remote_bookmark(ui, &arg)?;
             Some(Action::Mutate(mutations::MutationOp::TrackBookmark {
@@ -1378,7 +1493,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: |ui, arg| can_mutate(ui, arg) && has_remotes(ui),
+        enabled: |ui, arg| can_mutate(ui, arg).and_then(|()| has_remotes(ui)),
         build: |ui, arg| {
             let remote = match &arg {
                 CommandArg::PushRevision { remote, .. } => remote.clone(),
@@ -1396,7 +1511,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &["P"],
         mac_chords: &[],
-        enabled: |ui, arg| can_mutate(ui, arg) && has_remotes(ui),
+        enabled: |ui, arg| can_mutate(ui, arg).and_then(|()| has_remotes(ui)),
         build: |_ui, _arg| Some(Action::Bookmark(BookmarkAction::PushTracked)),
         palette: PaletteScope::Root,
     },
@@ -1408,7 +1523,9 @@ pub(crate) static REGISTRY: &[Command] = &[
         chords: &[],
         mac_chords: &[],
         enabled: |ui, arg| {
-            can_mutate(ui, arg) && has_remotes(ui) && local_bookmark(ui, arg).is_some()
+            can_mutate(ui, arg)?;
+            has_remotes(ui)?;
+            has_local_bookmark(ui, arg)
         },
         build: |ui, arg| {
             let name = local_bookmark(ui, &arg)?;
@@ -1427,7 +1544,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: |ui, arg| can_mutate(ui, arg) && local_bookmark(ui, arg).is_some(),
+        enabled: |ui, arg| can_mutate(ui, arg).and_then(|()| has_local_bookmark(ui, arg)),
         build: |ui, arg| {
             local_bookmark(ui, &arg).map(|name| Action::Bookmark(BookmarkAction::Rename { name }))
         },
@@ -1440,7 +1557,13 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: |ui, arg| can_mutate(ui, arg) && deletion_remote(ui, arg).is_some(),
+        enabled: |ui, arg| {
+            can_mutate(ui, arg)?;
+            require(
+                deletion_remote(ui, arg).is_some(),
+                "Not tracked on any remote",
+            )
+        },
         build: |ui, arg| {
             let (name, remote) = deletion_remote(ui, &arg)?;
             Some(Action::Bookmark(BookmarkAction::DeleteEverywhere {
@@ -1457,7 +1580,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: |ui, arg| can_mutate(ui, arg) && local_bookmark(ui, arg).is_some(),
+        enabled: |ui, arg| can_mutate(ui, arg).and_then(|()| has_local_bookmark(ui, arg)),
         build: |ui, arg| {
             local_bookmark(ui, &arg)
                 .map(|name| Action::Mutate(mutations::MutationOp::ForgetBookmark { name }))
@@ -1926,7 +2049,12 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: |ui, _arg| ui.active().main_view != MainView::Diff,
+        enabled: |ui, _arg| {
+            require(
+                ui.active().main_view != MainView::Diff,
+                "Already showing the diff",
+            )
+        },
         build: |_ui, _arg| Some(Action::SetMainView(MainView::Diff)),
         palette: PaletteScope::Root,
     },
@@ -1937,7 +2065,13 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: |ui, arg| can_browse(ui, arg) && ui.active().main_view != MainView::Source,
+        enabled: |ui, arg| {
+            can_browse(ui, arg)?;
+            require(
+                ui.active().main_view != MainView::Source,
+                "Already showing the source",
+            )
+        },
         build: |_ui, _arg| Some(Action::SetMainView(MainView::Source)),
         palette: PaletteScope::Root,
     },
@@ -1970,7 +2104,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &["x"],
         mac_chords: &[],
-        enabled: |ui, arg| crate::changes::command_file(ui, arg).is_some(),
+        enabled: has_command_file,
         build: |ui, arg| {
             let index = crate::changes::command_file(ui, &arg)?;
             Some(Action::Changes(crate::changes::ChangesMsg::ToggleFile(
@@ -1986,7 +2120,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &["X"],
         mac_chords: &[],
-        enabled: |ui, _arg| crate::changes::has_selection(ui),
+        enabled: has_picked_changes,
         build: |_ui, _arg| Some(Action::Changes(crate::changes::ChangesMsg::OpenSplit)),
         palette: PaletteScope::Root,
     },
@@ -1997,7 +2131,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: |ui, _arg| crate::changes::has_selection(ui),
+        enabled: has_picked_changes,
         build: |_ui, _arg| {
             Some(Action::Changes(
                 crate::changes::ChangesMsg::SquashIntoParent,
@@ -2012,7 +2146,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: |ui, _arg| crate::changes::has_selection(ui),
+        enabled: has_picked_changes,
         build: |_ui, _arg| Some(Action::Changes(crate::changes::ChangesMsg::MoveInto)),
         palette: PaletteScope::Root,
     },
@@ -2023,7 +2157,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: |ui, _arg| crate::changes::has_selection(ui),
+        enabled: has_picked_changes,
         build: |_ui, _arg| Some(Action::Changes(crate::changes::ChangesMsg::Discard)),
         palette: PaletteScope::Root,
     },
@@ -2034,7 +2168,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: |ui, _arg| crate::changes::has_selection(ui),
+        enabled: has_picked_changes,
         build: |_ui, _arg| Some(Action::Changes(crate::changes::ChangesMsg::Clear)),
         palette: PaletteScope::Root,
     },
@@ -2045,7 +2179,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base, Context::Lines],
         chords: &["v"],
         mac_chords: &[],
-        enabled: |ui, _arg| crate::changes::can_select_lines(ui),
+        enabled: |ui, _arg| can_pick_changes(ui),
         build: |_ui, _arg| Some(lines_action(crate::changes::LineMsg::Toggle)),
         palette: PaletteScope::Root,
     },
@@ -2142,7 +2276,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: |ui, arg| crate::changes::command_file(ui, arg).is_some(),
+        enabled: has_command_file,
         build: |ui, arg| {
             let path = crate::changes::command_file_path(ui, &arg)?;
             Some(Action::Changes(crate::changes::ChangesMsg::RestoreFile(
@@ -2158,7 +2292,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: |ui, arg| crate::changes::command_file(ui, arg).is_some(),
+        enabled: has_command_file,
         build: |ui, arg| {
             let path = crate::changes::command_file_path(ui, &arg)?;
             Some(Action::Changes(crate::changes::ChangesMsg::MoveFile(path)))
@@ -2172,7 +2306,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: |ui, arg| crate::changes::command_file(ui, arg).is_some(),
+        enabled: has_command_file,
         build: |ui, arg| {
             let path = crate::changes::command_file_path(ui, &arg)?;
             Some(Action::Changes(crate::changes::ChangesMsg::SplitFile(path)))
@@ -2186,7 +2320,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: |ui, arg| crate::conflicts::command_resolution(ui, arg, Some(0)).is_some(),
+        enabled: |ui, arg| conflict_resolution(ui, arg, Some(0)),
         build: |ui, arg| crate::conflicts::command_resolution(ui, &arg, Some(0)),
         palette: PaletteScope::Root,
     },
@@ -2197,7 +2331,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: |ui, arg| crate::conflicts::command_resolution(ui, arg, Some(1)).is_some(),
+        enabled: |ui, arg| conflict_resolution(ui, arg, Some(1)),
         build: |ui, arg| crate::conflicts::command_resolution(ui, &arg, Some(1)),
         palette: PaletteScope::Root,
     },
@@ -2208,7 +2342,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: |ui, arg| crate::conflicts::command_resolution(ui, arg, None).is_some(),
+        enabled: |ui, arg| conflict_resolution(ui, arg, None),
         build: |ui, arg| crate::conflicts::command_resolution(ui, &arg, None),
         palette: PaletteScope::Root,
     },
@@ -2219,7 +2353,13 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: |ui, arg| crate::conflicts::command_merge_tool(ui, arg).is_some(),
+        enabled: |ui, arg| {
+            has_command_file(ui, arg)?;
+            require(
+                crate::conflicts::command_merge_tool(ui, arg).is_some(),
+                "The merge tool can't take this file",
+            )
+        },
         build: |ui, arg| crate::conflicts::command_merge_tool(ui, &arg),
         palette: PaletteScope::Root,
     },
@@ -2231,7 +2371,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &["O"],
         mac_chords: &[],
-        enabled: |ui, _arg| crate::history_panel::available(ui),
+        enabled: |ui, _arg| history_available(ui),
         build: |_ui, _arg| Some(Action::History(HistoryAction::ShowOpLog)),
         palette: PaletteScope::Root,
     },
@@ -2243,10 +2383,12 @@ pub(crate) static REGISTRY: &[Command] = &[
         chords: &["E"],
         mac_chords: &[],
         enabled: |ui, arg| {
-            crate::history_panel::available(ui)
-                && arg
-                    .revision()
-                    .is_none_or(|revision| row_present(ui, revision))
+            history_available(ui)?;
+            require(
+                arg.revision()
+                    .is_none_or(|revision| row_present(ui, revision)),
+                reason::GONE,
+            )
         },
         build: |ui, arg| {
             target_revision(ui, &arg)
@@ -2261,7 +2403,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: |ui, _arg| crate::history_panel::available(ui),
+        enabled: |ui, _arg| history_available(ui),
         build: |ui, arg| {
             let revision = match &arg {
                 CommandArg::Browse { revision, .. } => revision.clone(),
@@ -2286,7 +2428,11 @@ pub(crate) static REGISTRY: &[Command] = &[
         chords: &["H"],
         mac_chords: &[],
         enabled: |ui, _arg| {
-            crate::history_panel::available(ui) && crate::history_panel::current_file(ui).is_some()
+            history_available(ui)?;
+            require(
+                crate::history_panel::current_file(ui).is_some(),
+                reason::NO_FILE,
+            )
         },
         build: |_ui, _arg| Some(Action::History(HistoryAction::CurrentFileHistory)),
         palette: PaletteScope::Root,
@@ -2298,7 +2444,12 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: |ui, _arg| crate::history_panel::file_filter_active(ui),
+        enabled: |ui, _arg| {
+            require(
+                crate::history_panel::file_filter_active(ui),
+                "No file history filter on",
+            )
+        },
         build: |_ui, _arg| Some(Action::History(HistoryAction::ClearFileFilter)),
         palette: PaletteScope::Root,
     },
@@ -2309,7 +2460,12 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &["A"],
         mac_chords: &[],
-        enabled: |ui, _arg| crate::history_panel::can_annotate(ui),
+        enabled: |ui, _arg| {
+            require(
+                crate::history_panel::can_annotate(ui),
+                "Open a text file in the source view",
+            )
+        },
         build: |_ui, _arg| Some(Action::History(HistoryAction::ToggleAnnotate)),
         palette: PaletteScope::Root,
     },
@@ -2320,10 +2476,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: |ui, _arg| {
-            ui.active().session.capabilities.mutate
-                && crate::history_panel::selected_operation(ui).is_some()
-        },
+        enabled: operation_selected,
         build: |ui, _arg| {
             crate::history_panel::selected_operation(ui)
                 .map(|id| Action::History(HistoryAction::RestoreOperation(id)))
@@ -2337,10 +2490,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: |ui, _arg| {
-            ui.active().session.capabilities.mutate
-                && crate::history_panel::selected_operation(ui).is_some()
-        },
+        enabled: operation_selected,
         build: |ui, _arg| {
             crate::history_panel::selected_operation(ui)
                 .map(|id| Action::History(HistoryAction::RevertOperation(id)))
@@ -2432,7 +2582,13 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: |ui, _arg| crate::compare::has_marked_pair(ui),
+        enabled: |ui, _arg| {
+            require(ui.active().session.capabilities.compare, reason::NO_COMPARE)?;
+            require(
+                crate::compare::has_marked_pair(ui),
+                "Mark exactly two revisions",
+            )
+        },
         build: |_ui, _arg| Some(Action::Compare(CompareAction::Marked)),
         palette: PaletteScope::Root,
     },
@@ -2443,7 +2599,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: |ui, _arg| crate::compare::comparing(ui),
+        enabled: comparing,
         build: |_ui, _arg| Some(Action::Compare(CompareAction::Swap)),
         palette: PaletteScope::Root,
     },
@@ -2454,7 +2610,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: |ui, _arg| crate::compare::comparing(ui),
+        enabled: comparing,
         build: |ui, _arg| {
             let interdiff = matches!(
                 ui.active().session.diff_base,
@@ -2471,7 +2627,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: |ui, _arg| crate::compare::comparing(ui),
+        enabled: comparing,
         build: |_ui, _arg| Some(Action::Compare(CompareAction::Exit)),
         palette: PaletteScope::Root,
     },
@@ -2484,22 +2640,25 @@ pub(crate) static REGISTRY: &[Command] = &[
         mac_chords: &[],
         enabled: |ui, _arg| {
             let tab = ui.active();
-            tab.session
-                .document
-                .files
-                .get(tab.selected_file)
-                .is_some_and(|file| file.collapsed.is_some())
+            let file = tab.session.document.files.get(tab.selected_file);
+            require(file.is_some(), reason::NO_FILE)?;
+            require(
+                file.is_some_and(|file| file.collapsed.is_some()),
+                "Diff is already in full",
+            )
         },
         build: |ui, _arg| Some(Action::ExpandFile(ui.active().selected_file)),
         palette: PaletteScope::Root,
     },
 ];
 
-fn can_compare(ui: &Diffui, arg: &CommandArg) -> bool {
-    ui.active().session.capabilities.compare
-        && arg
-            .revision()
-            .is_none_or(|revision| row_present(ui, revision))
+fn can_compare(ui: &Diffui, arg: &CommandArg) -> Availability {
+    require(ui.active().session.capabilities.compare, reason::NO_COMPARE)?;
+    require(
+        arg.revision()
+            .is_none_or(|revision| row_present(ui, revision)),
+        reason::GONE,
+    )
 }
 
 #[cfg(test)]
@@ -2591,7 +2750,7 @@ mod tests {
         for scope in [PaletteScope::Root, PaletteScope::Revision] {
             let ids: Vec<CommandId> = palette_commands(&ui, scope, &CommandArg::None)
                 .iter()
-                .map(|command| command.id)
+                .map(|(command, _)| command.id)
                 .collect();
             for id in ["revision.new-child", "revision.edit", "revision.abandon"] {
                 assert!(ids.contains(&id), "{id} missing from {scope:?}");
@@ -2599,9 +2758,38 @@ mod tests {
         }
         let files: Vec<CommandId> = palette_commands(&ui, PaletteScope::File, &CommandArg::None)
             .iter()
-            .map(|command| command.id)
+            .map(|(command, _)| command.id)
             .collect();
         assert!(!files.contains(&"revision.abandon"));
+    }
+
+    /// A command that can't run stays in the palette with why.
+    #[test]
+    fn unavailable_commands_carry_their_reason() {
+        let mut ui = crate::tabs::tests::app();
+        crate::tabs::tests::push_tab(&mut ui, "/tmp/repo");
+        let verdict = |ui: &Diffui, id: CommandId| {
+            palette_commands(ui, PaletteScope::Root, &CommandArg::None)
+                .into_iter()
+                .find(|(command, _)| command.id == id)
+                .map(|(_, availability)| availability)
+        };
+        assert_eq!(verdict(&ui, "revision.edit"), Some(Err(reason::NOT_JJ)));
+        assert_eq!(
+            verdict(&ui, "compare.exit"),
+            Some(Err(reason::NOT_COMPARING))
+        );
+        assert_eq!(verdict(&ui, "theme.dark"), Some(Ok(())));
+
+        ui.tabs[0].state.session.capabilities.mutate = true;
+        assert_eq!(verdict(&ui, "revision.edit"), Some(Ok(())));
+        assert_eq!(
+            (command("revision.edit").unwrap().enabled)(
+                &ui,
+                &CommandArg::Revision(RevisionSelection::Commit("gone".to_owned()))
+            ),
+            Err(reason::GONE)
+        );
     }
 
     /// Two commands sharing a chord inside one context would make resolution

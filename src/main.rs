@@ -1161,10 +1161,11 @@ fn lower_menu_to_native(
         .iter()
         .map(|entry| match entry {
             MenuEntry::Separator => MenuItem::Separator,
-            MenuEntry::Disabled { label } => MenuItem::Entry {
+            MenuEntry::Disabled { label, reason } => MenuItem::Entry {
                 label: label.clone(),
                 id: 0,
                 enabled: false,
+                subtitle: reason.clone(),
             },
             MenuEntry::Item {
                 label,

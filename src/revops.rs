@@ -256,7 +256,7 @@ pub(crate) fn consumes_marks(ui: &Diffui, op: &mutations::MutationOp) -> bool {
 // ── Command predicates and builders ─────────────────────────────────────────
 
 use crate::action::Action;
-use crate::commands::{CommandArg, can_mutate, target_revision};
+use crate::commands::{Availability, CommandArg, can_mutate, require, target_revision};
 
 /// The sidebar's marked rows still in the loaded graph, in mark order, with
 /// the working-copy row addressed as [`RevisionSelection::WorkingCopy`] so a
@@ -281,16 +281,18 @@ pub(crate) fn batch(ui: &Diffui, arg: &CommandArg) -> Vec<RevisionSelection> {
     }
 }
 
-fn batch_enabled(ui: &Diffui, arg: &CommandArg, minimum: usize) -> bool {
+fn batch_enabled(ui: &Diffui, arg: &CommandArg, minimum: usize) -> Availability {
     let targets = batch(ui, arg);
-    targets.len() >= minimum && can_mutate(ui, &CommandArg::Revisions(targets))
+    require(!targets.is_empty(), "No revisions marked")?;
+    require(targets.len() >= minimum, "Mark two or more revisions")?;
+    can_mutate(ui, &CommandArg::Revisions(targets))
 }
 
-pub(crate) fn batch_of_one(ui: &Diffui, arg: &CommandArg) -> bool {
+pub(crate) fn batch_of_one(ui: &Diffui, arg: &CommandArg) -> Availability {
     batch_enabled(ui, arg, 1)
 }
 
-pub(crate) fn batch_of_two(ui: &Diffui, arg: &CommandArg) -> bool {
+pub(crate) fn batch_of_two(ui: &Diffui, arg: &CommandArg) -> Availability {
     batch_enabled(ui, arg, 2)
 }
 
@@ -314,18 +316,25 @@ fn target_row<'a>(ui: &'a Diffui, arg: &CommandArg) -> Option<diffui_core::RowVi
 }
 
 /// "Commit…" is offered for the working copy only — `jj commit` has no `-r`.
-pub(crate) fn can_commit(ui: &Diffui, arg: &CommandArg) -> bool {
-    can_mutate(ui, arg)
-        && match arg {
+pub(crate) fn can_commit(ui: &Diffui, arg: &CommandArg) -> Availability {
+    can_mutate(ui, arg)?;
+    require(
+        match arg {
             CommandArg::None => ui.active().session.commits.working_copy().is_some(),
             _ => target_row(ui, arg).is_some_and(|row| row.is_working_copy()),
-        }
+        },
+        "Only the working copy commits",
+    )
 }
 
 /// The divergent-change verbs only make sense on a row that is one copy of
 /// a divergent change.
-pub(crate) fn is_divergent_target(ui: &Diffui, arg: &CommandArg) -> bool {
-    can_mutate(ui, arg) && target_row(ui, arg).is_some_and(|row| row.is_divergent())
+pub(crate) fn is_divergent_target(ui: &Diffui, arg: &CommandArg) -> Availability {
+    can_mutate(ui, arg)?;
+    require(
+        target_row(ui, arg).is_some_and(|row| row.is_divergent()),
+        "Change isn't divergent",
+    )
 }
 
 /// How many copies of `row`'s change the loaded graph shows.
@@ -458,7 +467,7 @@ impl Diffui {
     pub(crate) fn revops_menu_rows(&self, selection: &RevisionSelection) -> Vec<MenuEntry> {
         let on = || CommandArg::Revision(selection.clone());
         let mut rows = Vec::new();
-        if can_commit(self, &on()) {
+        if can_commit(self, &on()).is_ok() {
             rows.push(self.menu_item("revision.commit", on()));
         }
         rows.push(MenuEntry::Submenu {
@@ -507,9 +516,11 @@ impl Diffui {
                 items: vec![
                     MenuEntry::Disabled {
                         label: "Several visible commits share this change id".to_owned(),
+                        reason: None,
                     },
                     MenuEntry::Disabled {
                         label: "(usually the same change rewritten concurrently)".to_owned(),
+                        reason: None,
                     },
                     MenuEntry::Separator,
                     self.menu_row(keep, "revision.divergent.keep", on()),
@@ -572,7 +583,7 @@ mod tests {
         let mut out = Vec::new();
         for entry in entries {
             match entry {
-                MenuEntry::Item { label, .. } | MenuEntry::Disabled { label } => {
+                MenuEntry::Item { label, .. } | MenuEntry::Disabled { label, .. } => {
                     out.push(label.clone())
                 }
                 MenuEntry::Submenu { label, items } => {
@@ -682,14 +693,14 @@ mod tests {
     #[test]
     fn commit_is_offered_on_the_working_copy_only() {
         let ui = loaded(graph());
-        assert!(can_commit(&ui, &CommandArg::None));
-        assert!(can_commit(
-            &ui,
-            &CommandArg::Revision(RevisionSelection::WorkingCopy)
-        ));
-        assert!(!can_commit(
-            &ui,
-            &CommandArg::Revision(RevisionSelection::Commit("a".repeat(8)))
-        ));
+        assert!(can_commit(&ui, &CommandArg::None).is_ok());
+        assert!(can_commit(&ui, &CommandArg::Revision(RevisionSelection::WorkingCopy)).is_ok());
+        assert_eq!(
+            can_commit(
+                &ui,
+                &CommandArg::Revision(RevisionSelection::Commit("a".repeat(8)))
+            ),
+            Err("Only the working copy commits")
+        );
     }
 }
