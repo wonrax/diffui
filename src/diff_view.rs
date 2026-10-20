@@ -436,6 +436,8 @@ pub struct DiffView<'a, Message> {
     /// hunk header is then a button firing `on_expand_file`.
     collapsed_files: Vec<bool>,
     on_expand_file: Option<fn(usize) -> Message>,
+    /// Buttons on hunk header strips (see [`Self::hunk_actions`]).
+    hunk_actions: Option<crate::hunk_actions::HunkActions<'a, Message>>,
 }
 
 /// One line's entry in the blame column of a plain document.
@@ -1167,6 +1169,12 @@ struct State<Paragraph> {
     last_line_reveal: Option<u64>,
     /// A line to scroll into view on the next `update()`.
     pending_line_reveal: Option<LineAt>,
+    /// The hunk-strip button under the cursor: `(row, button)`.
+    hovered_hunk_action: Option<(usize, usize)>,
+    /// Last [`crate::hunk_actions::HunkActions::reveal`] token acted on.
+    last_hunk_reveal: Option<u64>,
+    /// A hunk header to scroll into view on the next `update()`.
+    pending_hunk_reveal: Option<(usize, usize)>,
     /// Prefix-sum layout index (see [`HeightIndex`]). `RefCell` because
     /// `draw`/`mouse_interaction` only get `&State` but must be able to
     /// (re)build it lazily; borrows are short and never overlap.
@@ -1381,6 +1389,7 @@ impl<'a, Message> DiffView<'a, Message> {
             annotations: None,
             collapsed_files: Vec::new(),
             on_expand_file: None,
+            hunk_actions: None,
         }
     }
 
@@ -1473,6 +1482,88 @@ impl<'a, Message> DiffView<'a, Message> {
         self.collapsed_files = collapsed;
         self.on_expand_file = Some(callback);
         self
+    }
+
+    /// Draw buttons at the right end of some hunks' header strips: a
+    /// conflict region's take-a-side controls. Ignored for plain documents.
+    pub fn hunk_actions(mut self, actions: crate::hunk_actions::HunkActions<'a, Message>) -> Self {
+        self.hunk_actions = Some(actions);
+        self
+    }
+
+    /// The hunk-strip buttons of `(file, hunk)` when its header is drawn at
+    /// screen-y `y`: the row's index and where each button sits.
+    fn hunk_action_layout(
+        &self,
+        file: usize,
+        hunk: usize,
+        y: f32,
+        bounds: Rectangle,
+    ) -> Option<(usize, Vec<crate::hunk_actions::Placed>)> {
+        let actions = self.hunk_actions.as_ref()?;
+        if self.plain {
+            return None;
+        }
+        let row = actions.row(file, hunk)?;
+        let header = &self.files.get(file)?.hunks.get(hunk)?.header;
+        let strip = Rectangle {
+            x: bounds.x,
+            y,
+            width: bounds.width,
+            height: self.metrics.hunk_header_height,
+        };
+        // Where the strip's own text ends (the unified gutter; the split
+        // one is narrower, which only leaves more room).
+        let min_x = bounds.x
+            + self.metrics.gutter_width
+            + PREFIX_WIDTH
+            + TEXT_X_PADDING
+            + self.text_width(header);
+        Some((
+            row,
+            crate::hunk_actions::place(
+                &actions.rows[row],
+                &actions.style,
+                strip,
+                HEADER_HORIZONTAL_PADDING,
+                min_x,
+            ),
+        ))
+    }
+
+    /// The hunk-strip button under `point`: `(row, button)`.
+    fn hunk_action_at<P>(
+        &self,
+        state: &State<P>,
+        bounds: Rectangle,
+        point: Point,
+    ) -> Option<(usize, usize)> {
+        self.hunk_actions.as_ref()?;
+        let index = state.height_index.borrow();
+        // A (sticky) file header drawn over the strip wins.
+        let headers = self.visible_file_header_positions(&index, bounds, state.vertical_offset);
+        if headers
+            .iter()
+            .any(|&(_, y)| point.y >= y && point.y < y + self.metrics.file_header_height)
+        {
+            return None;
+        }
+        let content_y = point.y - bounds.y + state.vertical_offset;
+        let slot = index
+            .hunk_tops
+            .partition_point(|&top| top <= content_y)
+            .checked_sub(1)?;
+        let top = index.hunk_tops[slot];
+        if content_y >= top + self.metrics.hunk_header_height {
+            return None;
+        }
+        let (file, hunk) = index.hunk_ids[slot];
+        let y = bounds.y + (top - state.vertical_offset);
+        let (row, placed) = self.hunk_action_layout(file as usize, hunk as usize, y, bounds)?;
+        placed
+            .iter()
+            .position(|button| button.rect.contains(point))
+            .map(|button| (row, button))
     }
 
     fn is_collapsed(&self, file_index: usize) -> bool {
@@ -3596,6 +3687,9 @@ where
             line_drag: None,
             last_line_reveal: None,
             pending_line_reveal: None,
+            hovered_hunk_action: None,
+            last_hunk_reveal: None,
+            pending_hunk_reveal: None,
             height_index: RefCell::new(HeightIndex::default()),
             geometry: RefCell::new(GeometryMemo::default()),
         })
@@ -3688,6 +3782,20 @@ where
                 state.hovered_line = None;
                 state.line_drag = None;
             }
+        }
+
+        match self
+            .hunk_actions
+            .as_ref()
+            .and_then(|actions| actions.reveal)
+        {
+            Some((file, hunk, token)) => {
+                if state.last_hunk_reveal != Some(token) {
+                    state.last_hunk_reveal = Some(token);
+                    state.pending_hunk_reveal = Some((file, hunk));
+                }
+            }
+            None => state.hovered_hunk_action = None,
         }
 
         if let Some(find) = &self.find
@@ -3824,6 +3932,39 @@ where
                 shell.publish((self.on_selected_file_changed)(selected_file));
             }
             shell.request_redraw();
+        }
+
+        if let Some((file, hunk)) = state.pending_hunk_reveal.take() {
+            let top = {
+                let index = state.height_index.borrow();
+                index
+                    .hunk_ids
+                    .binary_search(&(file as u32, hunk as u32))
+                    .ok()
+                    .map(|slot| index.hunk_tops[slot])
+            };
+            if let Some(top) = top {
+                // Left alone when the strip and a few of its rows show below
+                // the sticky file header; else parked right under it.
+                let above = top - self.metrics.file_header_height;
+                let below = top + self.metrics.hunk_header_height + 4.0 * self.metrics.row_height
+                    - bounds.height;
+                let target = if above < state.vertical_offset || below > state.vertical_offset {
+                    above
+                } else {
+                    state.vertical_offset
+                };
+                let target = target.clamp(0.0, max_vertical);
+                if (target - state.vertical_offset).abs() > f32::EPSILON {
+                    state.vertical_offset = target;
+                    let selected_file = self.file_at_offset(&state.height_index.borrow(), target);
+                    if selected_file != state.selected_file {
+                        state.selected_file = selected_file;
+                        shell.publish((self.on_selected_file_changed)(selected_file));
+                    }
+                }
+                shell.request_redraw();
+            }
         }
 
         if let Some(at) = state.pending_line_reveal.take() {
@@ -3987,6 +4128,9 @@ where
                 if hovered != state.hovered_browse {
                     state.hovered_browse = hovered;
                 }
+                state.hovered_hunk_action = cursor
+                    .position_over(bounds)
+                    .and_then(|point| self.hunk_action_at(state, bounds, point));
                 state.hovered_description = cursor.position_over(bounds).is_some_and(|point| {
                     self.description_row_contains(bounds, state.vertical_offset, point)
                 });
@@ -4062,6 +4206,13 @@ where
                     if let Some(on_edit) = self.on_edit_description {
                         shell.publish(on_edit());
                     }
+                    shell.capture_event();
+                    return;
+                }
+                if let Some((row, button)) = self.hunk_action_at(state, bounds, point)
+                    && let Some(actions) = &self.hunk_actions
+                {
+                    shell.publish((actions.on_press)(row, button));
                     shell.capture_event();
                     return;
                 }
@@ -4246,6 +4397,13 @@ where
                         .and_then(|point| self.browse_button_at(state, bounds, point));
                     if hovered != state.hovered_browse {
                         state.hovered_browse = hovered;
+                        shell.request_redraw();
+                    }
+                    let hovered = cursor
+                        .position_over(bounds)
+                        .and_then(|point| self.hunk_action_at(state, bounds, point));
+                    if hovered != state.hovered_hunk_action {
+                        state.hovered_hunk_action = hovered;
                         shell.request_redraw();
                     }
                     let hovered_description =
@@ -4718,6 +4876,42 @@ where
                         bounds,
                     );
                 }
+                if let Some(actions) = &self.hunk_actions
+                    && let Some((row, placed)) = self.hunk_action_layout(
+                        header.file_index,
+                        header.hunk_index,
+                        header.y,
+                        bounds,
+                    )
+                {
+                    let row_spec = &actions.rows[row];
+                    let strip = Rectangle {
+                        x: bounds.x,
+                        y: header.y,
+                        width: bounds.width,
+                        height: self.metrics.hunk_header_height,
+                    };
+                    crate::hunk_actions::draw_row(
+                        renderer,
+                        row_spec,
+                        &placed,
+                        &actions.style,
+                        strip,
+                        bounds,
+                    );
+                    for (index, (button, placed)) in
+                        row_spec.buttons.iter().zip(&placed).enumerate()
+                    {
+                        crate::hunk_actions::draw_button(
+                            renderer,
+                            button,
+                            placed,
+                            &actions.style,
+                            state.hovered_hunk_action == Some((row, index)),
+                            bounds,
+                        );
+                    }
+                }
             }
 
             // Draw selection backgrounds *before* the text so glyphs render
@@ -4937,6 +5131,7 @@ where
             || self
                 .header_action_at(bounds, state.vertical_offset, point)
                 .is_some()
+            || self.hunk_action_at(state, bounds, point).is_some()
         {
             return mouse::Interaction::Pointer;
         }

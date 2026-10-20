@@ -30,6 +30,7 @@ mod find;
 mod graph_preview;
 mod graph_view;
 mod history_panel;
+mod hunk_actions;
 mod icons;
 mod input;
 mod jj_version;
