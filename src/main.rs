@@ -201,6 +201,10 @@ pub(crate) fn zoom_default_restore(visible: [f64; 4]) -> [f64; 4] {
 }
 
 fn main() -> iced::Result {
+    // `diffui jj …`, or a passthrough child started as `jj`: be the jj CLI.
+    if let Some(code) = diffui_core::cli::passthrough::jj_main() {
+        std::process::exit(code.into());
+    }
     // First, while the process is still single-threaded: it may `set_var`.
     let path_repair = launch_env::repair_path();
     let cli = Cli::parse();

@@ -152,3 +152,5 @@ arborium = { version = "2.16.0", features = [
     "lang-zig",
     "lang-zsh",
 ] }
+jj-cli = { version = "0.45.1", default-features = false, features = ["git"] }
+clap = "4.5"
