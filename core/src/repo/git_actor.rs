@@ -148,7 +148,15 @@ async fn run(repository: &Repository, command: Command, cancel: &CancelFlag) -> 
             }
         }
         Command::Fetch { job, target } => match crate::git::fetch_git(repository, &target).await {
-            Ok(output) => vec![Payload::FetchDone { job, output }],
+            Ok(output) => vec![Payload::FetchDone {
+                job,
+                outcome: crate::FetchOutcome {
+                    remotes: Vec::new(),
+                    changed: !output.is_empty(),
+                    output,
+                    warnings: Vec::new(),
+                },
+            }],
             Err(error) => failed(job, error),
         },
         Command::ListTree { job, revision } => {

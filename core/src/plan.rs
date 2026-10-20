@@ -63,6 +63,7 @@ pub fn args_tag(equivalent: &CliEquivalent) -> String {
 /// `jj git fetch` for a fetch target.
 pub fn fetch_command(target: &FetchTarget) -> CliEquivalent {
     let args = match target {
+        FetchTarget::Default => vec!["git".to_owned(), "fetch".to_owned()],
         FetchTarget::AllRemotes => vec!["git", "fetch", "--all-remotes"]
             .into_iter()
             .map(str::to_owned)

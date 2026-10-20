@@ -20,7 +20,7 @@ use crate::mutations::{
 };
 use crate::partial::DiffSelection;
 use crate::preview_graph::PostOpGraph;
-use crate::repository::{FetchTarget, RepositorySnapshot};
+use crate::repository::{FetchOutcome, FetchTarget, RepositorySnapshot};
 use crate::resolve::{ConflictFile, MergeToolInvocation};
 use crate::revset::{RevsetError, RevsetMatch, RevsetQuery, RevsetSymbols};
 use crate::session::RefreshOrigin;
@@ -431,7 +431,7 @@ pub enum Payload {
     },
     FetchDone {
         job: JobId,
-        output: Vec<String>,
+        outcome: FetchOutcome,
     },
     DetailsLoaded {
         job: JobId,

@@ -439,7 +439,7 @@ impl Actor {
                 self.reload_settings_if_changed(repository);
                 let progress = LoadProgress::default();
                 let slot = self.slot(repository)?;
-                let output = {
+                let outcome = {
                     let WorkspaceSlot {
                         workspace,
                         settings,
@@ -449,7 +449,7 @@ impl Actor {
                     jj::fetch_jj(workspace, settings, snapshot, &target, &progress).await?
                 };
                 self.adopt_written_op(repository).await;
-                self.emit(Payload::FetchDone { job, output });
+                self.emit(Payload::FetchDone { job, outcome });
                 Ok(())
             }
             Command::RevisionDetails { job, revision } => {

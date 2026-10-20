@@ -450,12 +450,14 @@ fn git_backend_command(
     args
 }
 
-/// `git fetch` (all remotes, or a single remote/branch). Captures both stdout
+/// `git fetch` (git's default remote, all remotes, or a single
+/// remote/branch). Captures both stdout
 /// and stderr as lines for the activity log — git writes progress and remote
 /// messages to stderr even on success. No output means the fetch was a no-op
 /// (up to date); the caller words the summary.
 pub async fn fetch_git(repository: &Repository, target: &FetchTarget) -> Result<Vec<String>> {
     let args: Vec<OsString> = match target {
+        FetchTarget::Default => vec![OsString::from("fetch")],
         FetchTarget::AllRemotes => {
             vec![OsString::from("fetch"), OsString::from("--all")]
         }

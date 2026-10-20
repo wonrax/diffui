@@ -491,7 +491,7 @@ impl Diffui {
             Payload::FileRead { path, file, .. } => {
                 self.apply_source_file(tab, path.clone(), Ok(file.clone()))
             }
-            Payload::FetchDone { output, .. } => self.finish_fetch(tab, Ok(output.clone())),
+            Payload::FetchDone { outcome, .. } => self.finish_fetch(tab, Ok(outcome.clone())),
             Payload::MutationDone { outcome, .. } => self.finish_mutation(tab, Ok(outcome.clone())),
             Payload::BookmarkChecked { backwards, .. } => {
                 self.apply_bookmark_check(tab, Ok(*backwards))
@@ -2984,25 +2984,53 @@ impl Diffui {
         )
     }
 
-    /// A fetch finished. "Up to date" when the remote sent nothing back;
-    /// otherwise name the fetched target (the activity title may be
-    /// ellipsized, the subtitle shows it in full).
-    fn finish_fetch(&mut self, tab: TabId, result: Result<Vec<String>, String>) -> Task<Message> {
+    /// A fetch finished. "Up to date" when jj found nothing to change;
+    /// otherwise name what was fetched (the activity title may be
+    /// ellipsized, the subtitle shows it in full). jj's first warning rides
+    /// along in the summary; every line of jj's and git's output goes to the
+    /// row's expanded output, warnings first.
+    fn finish_fetch(
+        &mut self,
+        tab: TabId,
+        result: Result<diffui_core::FetchOutcome, String>,
+    ) -> Task<Message> {
         let Some((_, activity_id, target)) =
             self.tab_mut(tab).and_then(|state| state.jobs.fetch.take())
         else {
             return Task::none();
         };
-        let summary = match result.as_ref() {
-            Err(_) => None,
-            Ok(lines) if lines.is_empty() => Some("Fetched \u{b7} up to date".to_owned()),
-            Ok(_) => Some(match &target {
-                FetchTarget::AllRemotes => "Fetched all remotes".to_owned(),
-                FetchTarget::RemoteBranch { remote, branch } => {
-                    format!("Fetched {remote}/{branch}")
+        let summary = result.as_ref().ok().map(|outcome| {
+            let mut summary = if !outcome.changed {
+                "Fetched \u{b7} up to date".to_owned()
+            } else {
+                match &target {
+                    FetchTarget::Default if !outcome.remotes.is_empty() => {
+                        format!("Fetched {}", outcome.remotes.join(", "))
+                    }
+                    FetchTarget::Default => "Fetched".to_owned(),
+                    FetchTarget::AllRemotes => "Fetched all remotes".to_owned(),
+                    FetchTarget::RemoteBranch { remote, branch } => {
+                        format!("Fetched {remote}/{branch}")
+                    }
                 }
-            }),
-        };
+            };
+            if let Some(first) = outcome.warnings.first() {
+                summary.push_str(" \u{b7} ");
+                summary.push_str(first);
+                if outcome.warnings.len() > 1 {
+                    summary.push_str(&format!(" (+{} more)", outcome.warnings.len() - 1));
+                }
+            }
+            summary
+        });
+        let result = result.map(|outcome| {
+            outcome
+                .warnings
+                .iter()
+                .map(|warning| format!("Warning: {warning}"))
+                .chain(outcome.output)
+                .collect::<Vec<_>>()
+        });
         let ok = result.is_ok();
         let mut tasks = vec![self.finish_activity_row(tab, activity_id, result, summary)];
         if ok {
@@ -4520,6 +4548,7 @@ impl Diffui {
         }
         self.pop_mode(ModeKind::Menu);
         let label = match &target {
+            FetchTarget::Default => Prose::from("Fetching"),
             FetchTarget::AllRemotes => Prose::from("Fetching all remotes"),
             FetchTarget::RemoteBranch { remote, branch } => {
                 Prose::from("Fetching ").code(format!("{remote}/{branch}"))

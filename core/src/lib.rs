@@ -47,7 +47,9 @@ pub use repo::{
     Capabilities, Command, Event, JobId, OpenSpec, Payload, PreviewRequest, RepoError, RepoHandle,
     RepoId, canonical_selection, rewritten_targets,
 };
-pub use repository::{FetchTarget, Repository, RepositorySnapshot, Vcs, prepare_repository};
+pub use repository::{
+    FetchOutcome, FetchTarget, Repository, RepositorySnapshot, Vcs, prepare_repository,
+};
 pub use resolve::{
     ConflictFile, ConflictPick, ConflictResolution, ConflictTerm, MergeToolInvocation,
     conflict_region, hunk_conflict_region,

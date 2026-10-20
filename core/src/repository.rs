@@ -51,11 +51,30 @@ pub enum Vcs {
 /// What a fetch should pull.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchTarget {
-    /// Every remote, all branches (`jj git fetch --all-remotes` /
-    /// `git fetch --all`).
+    /// `jj git fetch`: the remotes `git.fetch` names, else `origin` (or the
+    /// only remote), with each remote's configured bookmarks and tags
+    /// (`git fetch` for a plain git repo).
+    Default,
+    /// Every remote, each with its configured bookmarks and tags
+    /// (`jj git fetch --all-remotes` / `git fetch --all`).
     AllRemotes,
-    /// One branch on one remote (`name@remote`).
+    /// One branch on one remote (`name@remote`), no tags.
     RemoteBranch { remote: String, branch: String },
+}
+
+/// What a finished fetch reports.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FetchOutcome {
+    /// The remotes fetched from, in order.
+    pub remotes: Vec<String>,
+    /// Status lines in jj's words (what was imported, abandoned, rebased),
+    /// then git's own output.
+    pub output: Vec<String>,
+    /// jj's warnings, in its words, without the `Warning: ` prefix.
+    pub warnings: Vec<String>,
+    /// Whether the fetch changed the repo. jj says "Nothing changed." and
+    /// writes no operation otherwise.
+    pub changed: bool,
 }
 
 pub fn prepare_repository(input: &Path) -> Result<Repository> {
