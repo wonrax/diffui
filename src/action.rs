@@ -172,6 +172,9 @@ pub(crate) enum Action {
     /// Bookmark workflow and push — see [`crate::bookmarks`].
     Bookmark(crate::bookmarks::BookmarkAction),
 
+    /// Answer the credential prompt — see [`crate::credentials`].
+    Credential(crate::credentials::CredentialAction),
+
     /// Commit, placed new / duplicate, batch drafts — see [`crate::revops`].
     Revops(crate::revops::RevopsAction),
 

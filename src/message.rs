@@ -40,6 +40,9 @@ pub(crate) enum Message {
     /// Diff-pane change selection and conflict resolution — see
     /// [`crate::changes::ChangesMsg`].
     Changes(crate::changes::ChangesMsg),
+    /// git or ssh asked for a credential, or stopped asking — see
+    /// [`crate::credentials`].
+    Askpass(diffui_core::askpass::AskpassEvent),
     /// `jj --version` answered (or there is no `jj`) — see
     /// [`crate::jj_version`].
     JjCliVersion(Option<String>),

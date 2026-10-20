@@ -686,6 +686,7 @@ impl Diffui {
             Message::Menu(message) => self.on_menu_message(message),
             Message::Changes(message) => self.on_changes(message),
             Message::JjCliVersion(version) => self.on_jj_cli_version(version),
+            Message::Askpass(event) => self.on_askpass_event(event),
         };
         // A mode that isn't on screen must not keep the keyboard.
         self.prune_stale_modes();
@@ -1168,6 +1169,7 @@ impl Diffui {
             }
             Action::Bookmark(action) => self.update_bookmark(action),
             Action::Revops(action) => self.perform_revops(action),
+            Action::Credential(action) => self.update_credential(action),
             Action::Changes(message) => self.on_changes(message),
             Action::History(action) => self.perform_history(action),
             Action::RevealLogFile => {
@@ -2655,6 +2657,7 @@ impl Diffui {
         // open-repo dialog and nothing else — so every other mode would be
         // holding the keyboard from behind a surface that never draws it.
         if self.tabs.is_empty() {
+            self.cancel_credentials();
             self.modes
                 .retain(|mode| matches!(mode.kind(), ModeKind::OpenRepo | ModeKind::Shortcuts));
             self.no_tab.modes.clear();
@@ -3052,6 +3055,16 @@ impl Diffui {
                 Ok(lines) => {
                     log.extend_output(activity_id, lines);
                     log.finish(activity_id, activity::ActivityStatus::Done, summary);
+                }
+                // The user said no to git's credential prompt: not a failure.
+                Err(error) if diffui_core::askpass::is_cancelled(&error) => {
+                    let title = log
+                        .label(activity_id)
+                        .map(|label| label.clone().text(" cancelled"))
+                        .unwrap_or_else(|| "Cancelled".into());
+                    let note = "Declined at the credential prompt".to_owned();
+                    failure = Some((title, note.clone()));
+                    log.finish(activity_id, activity::ActivityStatus::Cancelled, Some(note));
                 }
                 Err(error) => {
                     let title = log
@@ -4574,6 +4587,7 @@ impl Diffui {
             || self.mode(ModeKind::OpenRepo).is_some()
             || self.mode(ModeKind::Confirm).is_some()
             || self.mode(ModeKind::NamePrompt).is_some()
+            || self.mode(ModeKind::Credential).is_some()
             || self.mode(ModeKind::Shortcuts).is_some()
             || crate::changes::split_shown(self)
         {
@@ -4593,6 +4607,7 @@ impl Diffui {
             crate::bookmarks::build_name_prompt(self, theme),
             crate::changes::split_modal(self, theme),
             tab_bar::build_confirm_dialog(self, theme),
+            crate::credentials::build_overlay(self, theme),
             crate::shortcuts::build_overlay(self, theme),
             activity::toast_layer(self, theme),
         ]
@@ -4777,6 +4792,7 @@ impl Diffui {
             system::theme_changes()
                 .map(|mode| Message::Window(WindowEvent::SystemThemeChanged(mode))),
             crate::app_menu::subscription(),
+            crate::credentials::subscription(),
         ])
     }
 

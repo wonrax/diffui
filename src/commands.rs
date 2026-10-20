@@ -54,6 +54,8 @@ pub(crate) enum Context {
     Lines,
     /// The split prompt's two description editors.
     Split,
+    /// The credential prompt git or ssh raised.
+    Credential,
 }
 
 impl Context {
@@ -72,6 +74,7 @@ impl Context {
         Context::Shortcuts,
         Context::Lines,
         Context::Split,
+        Context::Credential,
     ];
 
     /// The name this context goes by in `config.toml`'s `[keys.<name>]`.
@@ -90,6 +93,7 @@ impl Context {
             Context::Shortcuts => "shortcuts",
             Context::Lines => "lines",
             Context::Split => "split",
+            Context::Credential => "credential",
         }
     }
 
@@ -1478,6 +1482,38 @@ pub(crate) static REGISTRY: &[Command] = &[
         mac_chords: &[],
         enabled: always,
         build: |_ui, _arg| Some(Action::Bookmark(BookmarkAction::PromptCancel)),
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "credential.accept",
+        label: "Yes",
+        hint: "Answer yes to the credential prompt's question",
+        contexts: &[Context::Credential],
+        // A field submits itself on Enter; this only answers the yes/no
+        // questions, which have none.
+        chords: &["enter"],
+        mac_chords: &[],
+        enabled: always,
+        build: |ui, _arg| {
+            crate::credentials::is_question(ui).then_some(Action::Credential(
+                crate::credentials::CredentialAction::Submit,
+            ))
+        },
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "credential.cancel",
+        label: "Cancel",
+        hint: "Decline the credential prompt; the push or fetch stops",
+        contexts: &[Context::Credential],
+        chords: &["esc"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| {
+            Some(Action::Credential(
+                crate::credentials::CredentialAction::Cancel,
+            ))
+        },
         palette: PaletteScope::Hidden,
     },
     // ── Target mode ─────────────────────────────────────────────────────

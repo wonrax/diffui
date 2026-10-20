@@ -44,6 +44,8 @@ pub(crate) enum Mode {
     NamePrompt(crate::bookmarks::NamePrompt),
     /// The keyboard-shortcut cheat sheet.
     Shortcuts,
+    /// git or ssh asking for a credential.
+    Credential(crate::credentials::CredentialDialog),
 }
 
 /// A mode bound to one tab: it names rows, files, or text that belong to that
@@ -73,6 +75,7 @@ pub(crate) enum ModeKind {
     Draft,
     NamePrompt,
     Lines,
+    Credential,
 }
 
 impl Mode {
@@ -85,6 +88,7 @@ impl Mode {
             Mode::ActivityPopover => ModeKind::ActivityPopover,
             Mode::NamePrompt(_) => ModeKind::NamePrompt,
             Mode::Shortcuts => ModeKind::Shortcuts,
+            Mode::Credential(_) => ModeKind::Credential,
         }
     }
 
@@ -97,6 +101,7 @@ impl Mode {
             Mode::ActivityPopover => Context::ActivityPopover,
             Mode::NamePrompt(_) => Context::Prompt,
             Mode::Shortcuts => Context::Shortcuts,
+            Mode::Credential(_) => Context::Credential,
         }
     }
 }

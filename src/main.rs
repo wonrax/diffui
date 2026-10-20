@@ -17,6 +17,7 @@ mod commit_info;
 mod compare;
 mod config;
 mod conflicts;
+mod credentials;
 mod diff_panel;
 mod diff_view;
 mod editor_drag;
@@ -201,6 +202,10 @@ pub(crate) fn zoom_default_restore(visible: [f64; 4]) -> [f64; 4] {
 }
 
 fn main() -> iced::Result {
+    // Started by git or ssh to ask for a credential: relay it and exit.
+    if let Some(code) = diffui_core::askpass::run_helper() {
+        std::process::exit(code);
+    }
     // `diffui jj …`, or a passthrough child started as `jj`: be the jj CLI.
     if let Some(code) = diffui_core::cli::passthrough::jj_main() {
         std::process::exit(code.into());
@@ -211,6 +216,9 @@ fn main() -> iced::Result {
     logging::init();
     if let Some(repair) = path_repair {
         tracing::info!("{repair}");
+    }
+    if let Err(error) = diffui_core::askpass::start() {
+        tracing::warn!("credential prompts unavailable: {error}");
     }
 
     // Restore the last window geometry before the window is created. The
