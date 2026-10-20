@@ -132,6 +132,8 @@ pub(crate) enum Action {
     // ── View ────────────────────────────────────────────────────────────
     ToggleWrap,
     ToggleSplit,
+    /// Show SVG files as their text diff, or rendered.
+    SetSvgSource(bool),
     /// Fold the diff header down to its title and one metadata line, or
     /// unfold it.
     ToggleCommitDetails,

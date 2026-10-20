@@ -590,6 +590,10 @@ fn build_diff_panel_body<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Me
                 Message::Action(Action::ExpandFile(index))
             });
         }
+        if let Some((media, key)) = crate::media::document_media(ui, &ui.active().session.document)
+        {
+            dv = dv.media(media, key);
+        }
 
         // Per-file "browse source" affordance — repo tabs only (a PR tab has
         // no local tree to browse).

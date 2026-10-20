@@ -6,7 +6,7 @@ use iced::advanced::{
     Layout, Shell, Widget,
     graphics::geometry::{self, Frame, LineCap, Path, Stroke},
     graphics::text::Paragraph as ShapedParagraph,
-    layout, mouse, renderer, text,
+    image, layout, mouse, renderer, text,
     widget::{Tree, tree},
 };
 use iced::{
@@ -19,6 +19,9 @@ use crate::find::FindMatch;
 use crate::icons;
 use crate::measure;
 use crate::scrollbar::{self, ScrollbarState, ScrollbarStyle};
+
+mod media;
+pub use media::{Media, MediaImage, MediaSide};
 
 // Row height is `text_size * line_height` rounded to the nearest int, so
 // glyphs (which iced renders at `text_size * 1.4` line height) sit inside
@@ -436,6 +439,11 @@ pub struct DiffView<'a, Message> {
     /// hunk header is then a button firing `on_expand_file`.
     collapsed_files: Vec<bool>,
     on_expand_file: Option<fn(usize) -> Message>,
+    /// Per file: the image preview drawn in place of its rows (see
+    /// [`Self::media`]).
+    media: Vec<Option<Media>>,
+    /// Identity of the previews' layout, part of the height index's key.
+    media_key: Option<u64>,
     /// Buttons on hunk header strips (see [`Self::hunk_actions`]).
     hunk_actions: Option<crate::hunk_actions::HunkActions<'a, Message>>,
 }
@@ -944,7 +952,7 @@ struct ParagraphKey {
 #[derive(Debug, Default)]
 struct HeightIndex {
     /// Rebuild key: `(layout_version, files.len(), header height bits, wrap
-    /// width bits, wrap, side_by_side)`. The file/header counts are part of
+    /// width bits, wrap, side_by_side, media key)`. The file/header counts are part of
     /// the key because streaming PR loads *append* files (and the header
     /// appears when `gh pr view` lands) without replacing the document —
     /// appends leave existing rows in place, but they extend the layout.
@@ -957,7 +965,7 @@ struct HeightIndex {
     /// is then exactly one line tall no matter how wide the pane is, so a
     /// sidebar drag (which changes the pane width on every frame of the
     /// gesture) must not spend an O(document) rebuild per frame proving it.
-    key: Option<(u64, usize, usize, u32, bool, bool)>,
+    key: Option<HeightKey>,
     /// Content-space y of each file's header top, plus one trailing sentinel
     /// holding the content end. `file_tops[0]` equals the revision-header
     /// height.
@@ -993,7 +1001,12 @@ struct HeightIndex {
     max_columns: f32,
     /// Total content height (revision header + every file).
     total_height: f32,
+    /// `(file, top, height)` of each image preview block, in document order.
+    media_bands: Vec<(usize, f32, f32)>,
 }
+
+/// The shape of [`HeightIndex::key`].
+type HeightKey = (u64, usize, usize, u32, bool, bool, Option<u64>);
 
 /// `pair_lines` sentinel: this side of the row has no line (padding).
 const NO_LINE: u32 = u32::MAX;
@@ -1389,8 +1402,19 @@ impl<'a, Message> DiffView<'a, Message> {
             annotations: None,
             collapsed_files: Vec::new(),
             on_expand_file: None,
+            media: Vec::new(),
+            media_key: None,
             hunk_actions: None,
         }
+    }
+
+    /// Image previews, by file index: a file with one shows it in place of
+    /// its rows. `key` names the layout (which files preview), so the height
+    /// index rebuilds when it changes.
+    pub fn media(mut self, media: Vec<Option<Media>>, key: u64) -> Self {
+        self.media = media;
+        self.media_key = Some(key);
+        self
     }
 
     /// Render as a plain source document (the source browser): no file/hunk
@@ -1995,17 +2019,20 @@ impl<'a, Message> DiffView<'a, Message> {
         // full-width rows wrap against different widths, both functions of it.
         // With wrapping off the layout doesn't depend on the width at all —
         // see [`WIDTH_AGNOSTIC`].
+        // Previews fit the pane's width, so a document with any keys on it
+        // even without wrapping.
         let key = Some((
             self.layout_version,
             self.files.len(),
             self.header_height().to_bits() as usize,
-            if self.wrap {
+            if self.wrap || self.media_key.is_some() {
                 width.to_bits()
             } else {
                 WIDTH_AGNOSTIC
             },
             self.wrap,
             self.side_by_side,
+            self.media_key,
         ));
         if cell.borrow().key == key {
             return;
@@ -2036,6 +2063,7 @@ impl<'a, Message> DiffView<'a, Message> {
         if self.side_by_side {
             index.pair_lines.reserve(row_count);
         }
+        index.media_bands.clear();
         index.max_columns = 0.0;
         index.full_width_files = if self.side_by_side {
             self.files.iter().map(Self::file_is_single_sided).collect()
@@ -2049,6 +2077,13 @@ impl<'a, Message> DiffView<'a, Message> {
         for (file_index, file) in self.files.iter().enumerate() {
             index.file_tops.push(y);
             y += self.metrics.file_header_height;
+            if let Some(media) = self.media_of(file_index) {
+                // The preview stands in for the file's rows.
+                let height = media::layout(media, width, self.metrics.row_height).height;
+                index.media_bands.push((file_index, y, height));
+                y += height;
+                continue;
+            }
             let split_file = self.side_by_side && !index.is_full_width(file_index);
             for (hunk_index, hunk) in file.hunks.iter().enumerate() {
                 index.hunk_tops.push(y);
@@ -3643,7 +3678,7 @@ impl<'a, Message> DiffView<'a, Message> {
 
 impl<'a, Message, Renderer> Widget<Message, Theme, Renderer> for DiffView<'a, Message>
 where
-    Renderer: text::Renderer + geometry::Renderer,
+    Renderer: text::Renderer + geometry::Renderer + image::Renderer<Handle = image::Handle>,
 {
     fn tag(&self) -> tree::Tag {
         tree::Tag::of::<State<Renderer::Paragraph>>()
@@ -4782,6 +4817,19 @@ where
             }
             if let Some(split) = &split {
                 self.draw_split_row_tints(renderer, &visible_rows, split, bounds);
+            }
+            if !self.plain {
+                let first = height_index
+                    .media_bands
+                    .partition_point(|&(_, top, height)| top + height < visible_top);
+                for &(file_index, top, _) in &height_index.media_bands[first..] {
+                    if top > visible_bottom {
+                        break;
+                    }
+                    if let Some(media) = self.media_of(file_index) {
+                        self.draw_media(renderer, media, bounds.y + (top - visible_top), bounds);
+                    }
+                }
             }
 
             // One lane list for the frame: the emphasis, selection and find
@@ -6544,7 +6592,7 @@ fn grow(rect: Rectangle, by: f32) -> Rectangle {
 impl<'a, Message, Renderer> From<DiffView<'a, Message>> for Element<'a, Message, Theme, Renderer>
 where
     Message: 'a,
-    Renderer: text::Renderer + geometry::Renderer + 'a,
+    Renderer: text::Renderer + geometry::Renderer + image::Renderer<Handle = image::Handle> + 'a,
 {
     fn from(diff_view: DiffView<'a, Message>) -> Self {
         Element::new(diff_view)

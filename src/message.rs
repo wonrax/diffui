@@ -156,6 +156,8 @@ pub(crate) enum UiEvent {
     /// `document_id` (routed to whichever tab still shows it, on screen or
     /// not, and dropped once that document is gone).
     FileHighlighted(u64, usize, Vec<(usize, usize, Vec<SyntaxSpan>)>),
+    /// A preview finished decoding off the UI thread.
+    MediaDecoded(Box<crate::media::Decoded>),
 }
 
 /// The platform half: window geometry and lifecycle, live modifier state, and

@@ -189,6 +189,11 @@ pub(crate) struct HistoryState {
 }
 
 impl HistoryState {
+    /// The diff on screen and its document id.
+    pub(crate) fn diff_document(&self) -> Option<(&DiffDocument, u64)> {
+        self.diff.as_ref().map(|diff| (&diff.document, diff.doc_id))
+    }
+
     /// Whether the source view shows its blame gutter.
     pub(crate) fn annotating(&self) -> bool {
         self.annotate
@@ -2259,6 +2264,9 @@ fn history_diff_view<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Messag
     .layout_version(diff.doc_id)
     .wrap(ui.diff_wrap)
     .side_by_side(ui.diff_split);
+    if let Some((media, key)) = crate::media::document_media(ui, &diff.document) {
+        view = view.media(media, key);
+    }
     if let Some(details) = &diff.details {
         view = view
             .with_header(crate::commit_info::header_lines(

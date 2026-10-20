@@ -40,6 +40,7 @@ mod logging;
 #[cfg(target_os = "macos")]
 mod macos_native;
 mod measure;
+mod media;
 mod menu;
 mod menus;
 mod message;
@@ -334,6 +335,11 @@ pub(crate) struct Diffui {
     /// of the description body and the field grid. Global, persisted with
     /// the window state.
     pub(crate) commit_details_collapsed: bool,
+    /// SVG files show their text diff rather than the rendered preview.
+    /// Global across tabs and diff sources.
+    pub(crate) svg_source: bool,
+    /// Decoded image and SVG previews, by blob id (see [`media`]).
+    pub(crate) media: media::MediaCache,
     /// View-time memo for the file list's stat-column widths and flattened file
     /// tree, keyed on document identity. Without it, the sidebar re-shaped ~5·N
     /// strings through `cosmic_text` on every diff-scroll file-boundary crossing

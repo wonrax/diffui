@@ -147,6 +147,9 @@ pub fn build_toolbar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             font,
         ));
     }
+    if crate::media::shows_svg_preview(ui) {
+        toggles = toggles.push(svg_switcher(ui, theme, font));
+    }
     toggles = toggles.push(toolbar_toggle_button(
         icons::WRAP,
         "Wrap lines",
@@ -222,6 +225,25 @@ fn view_switcher(ui: &Diffui, theme: ThemeSpec, font: iced::Font) -> Element<'st
         segments.push(segment(icons::HISTORY, "History", MainView::History));
     }
     segmented(segments, font, theme)
+}
+
+/// How the diff shows SVG files: rendered, or as their markup's text diff.
+/// Only on screen while the diff holds an SVG it can render.
+fn svg_switcher(ui: &Diffui, theme: ThemeSpec, font: iced::Font) -> Element<'static, Message> {
+    let segment = |icon: &'static str, label: &'static str, source: bool| Segment {
+        icon: Some(icon),
+        label,
+        active: ui.svg_source == source,
+        on_press: Some(Message::Action(Action::SetSvgSource(source))),
+    };
+    segmented(
+        vec![
+            segment(icons::IMAGE, "Rendered", false),
+            segment(icons::CODE_XML, "Markup", true),
+        ],
+        font,
+        theme,
+    )
 }
 
 /// One tab of a [`segmented`] control. No `on_press` disables it.

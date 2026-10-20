@@ -2155,6 +2155,17 @@ pub(crate) static REGISTRY: &[Command] = &[
         palette: PaletteScope::Root,
     },
     Command {
+        id: "view.toggle-svg-markup",
+        label: "Toggle SVG markup",
+        hint: "Show SVG files rendered, or as the diff of their markup",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: always,
+        build: |ui, _arg| Some(Action::SetSvgSource(!ui.svg_source)),
+        palette: PaletteScope::Root,
+    },
+    Command {
         id: "view.toggle-commit-details",
         label: "Toggle commit details",
         hint: "Show the description and fields above the diff, or just the title",

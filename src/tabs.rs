@@ -399,6 +399,8 @@ pub(crate) mod tests {
             diff_wrap: true,
             diff_split: false,
             commit_details_collapsed: false,
+            svg_source: false,
+            media: Default::default(),
             sidebar_file_cache: Default::default(),
             sidebar_min_width: 0.0,
             window_size: Size::new(1280.0, 800.0),

@@ -226,6 +226,8 @@ impl Diffui {
             diff_wrap: saved.diff_wrap.unwrap_or(true),
             diff_split: saved.diff_split.unwrap_or(false),
             commit_details_collapsed: saved.commit_details_collapsed.unwrap_or(false),
+            svg_source: false,
+            media: Default::default(),
             sidebar_min_width,
             window_size,
             window_position,
@@ -735,6 +737,7 @@ impl Diffui {
         let welcome = self.ensure_welcome_prompt();
         let conflicts = self.sync_conflicts();
         let history = self.sync_history();
+        let media = self.sync_media();
         // Chokepoint: if the active tab coalesced a refresh while busy and it's
         // now idle, run it. A no-op when nothing's pending (the common case).
         let refresh = match self.active_tab_id() {
@@ -747,7 +750,7 @@ impl Diffui {
             }
             None => Task::none(),
         };
-        Task::batch([task, refresh, welcome, conflicts, history])
+        Task::batch([task, refresh, welcome, conflicts, history, media])
     }
 
     /// With no repository open the welcome screen *is* the open prompt, so
@@ -1123,6 +1126,12 @@ impl Diffui {
                 // usual geometry debounce.
                 self.document_version = self.document_version.wrapping_add(1);
                 self.mark_geometry_dirty();
+                Task::none()
+            }
+            Action::SetSvgSource(source) => {
+                // The previews stand in for rows, so the layout moves; the
+                // widget re-keys its height index off the flag.
+                self.svg_source = source;
                 Task::none()
             }
             Action::ToggleCommitDetails => {
@@ -1522,6 +1531,7 @@ impl Diffui {
                 return self.kick_draft_preview();
             }
             UiEvent::DraftPreviewKick(version) => return self.run_parked_preview(version),
+            UiEvent::MediaDecoded(decoded) => return self.on_media_decoded(*decoded),
             UiEvent::FileHighlighted(document_id, file_index, spans) => {
                 let Some((tab, target)) = self.document_target_mut(document_id) else {
                     // The document was replaced; this result highlighted a
