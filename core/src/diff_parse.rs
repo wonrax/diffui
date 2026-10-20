@@ -135,6 +135,7 @@ pub fn parse_unified_diff(output: &str) -> DiffDocument {
         files,
         total_additions,
         total_deletions,
+        range: None,
     }
 }
 

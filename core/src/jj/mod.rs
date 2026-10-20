@@ -36,7 +36,9 @@ pub use walk::walk_jj_commits;
 pub use workspace::read_jj_op_head;
 
 pub(crate) use browse::{list_jj_source_tree, read_jj_file_pair_inner, read_jj_source_file};
-pub(crate) use diff::{DiffOptions, diff_jj_with_repo, jj_revision_details, resolve_base};
+pub(crate) use diff::{
+    DiffOptions, diff_jj_range, diff_jj_with_repo, jj_revision_details, resolve_base,
+};
 pub(crate) use mutate::{ImmutableRewriteError, apply_mutation, check_bookmark_move_backwards};
 pub(crate) use preview::{preview_merge, preview_parallelize, preview_rebase};
 pub(crate) use remote::fetch_jj;

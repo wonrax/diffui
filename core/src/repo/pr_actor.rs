@@ -207,6 +207,7 @@ async fn stream_diff(
                     files: std::mem::take(&mut batch),
                     total_additions: totals.0,
                     total_deletions: totals.1,
+                    range: None,
                 },
                 details: None,
             });
@@ -227,6 +228,7 @@ async fn stream_diff(
                 files: batch,
                 total_additions: totals.0,
                 total_deletions: totals.1,
+                range: None,
             },
             details: None,
         }),

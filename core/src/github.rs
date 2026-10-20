@@ -634,6 +634,7 @@ async fn fetch_pr_commit_diff(
             files,
             total_additions,
             total_deletions,
+            range: None,
         },
         details,
     ))

@@ -1,13 +1,21 @@
 //! Typed revsets against a live repository actor: resolution with jj's errors
-//! and their spans.
+//! and spans, and range diffs checked against what jj 0.45.1's own
+//! `jj diff --git -r` prints.
+//!
+//! The expected diffs are golden text captured from the real CLI on these
+//! exact fixtures. Set `DIFFUI_GOLDEN_JJ` to a jj 0.45.1 binary to have each
+//! test run it again and compare, which is how the goldens were made and how
+//! to refresh them after a jj bump.
 
 mod harness;
 
 use std::path::Path;
 
-use diffui_core::repo::{Command, Payload};
+use diffui_core::repo::{Command, Payload, RepoError};
 use diffui_core::revset::{RevsetError, RevsetExpect, RevsetMatch, RevsetQuery};
-use diffui_core::{MutationOp, RevisionSelection};
+use diffui_core::{
+    DiffBase, DiffDocument, DiffFileStatus, MutationOp, RevisionSelection, parse_unified_diff,
+};
 use harness::{TestRepo, commit_file, commit_ids, full_description, scratch_repo, write};
 
 /// The fixture every scenario here shares:
@@ -83,6 +91,310 @@ impl Fixture {
             Some(Payload::RevsetResolved { result, .. }) => result,
             other => panic!("expected RevsetResolved, got {other:?}"),
         }
+    }
+
+    fn range_diff(&mut self, revset: &str) -> Result<DiffDocument, RepoError> {
+        let revset = revset.to_owned();
+        let events = self.repo.run(|job| Command::LoadDiff {
+            job,
+            revision: RevisionSelection::WorkingCopy,
+            base: DiffBase::Range(revset),
+            expand: Vec::new(),
+        });
+        match events.into_iter().next_back() {
+            Some(Payload::DiffLoaded {
+                document, details, ..
+            }) => {
+                assert!(details.is_none(), "a range has no single header");
+                Ok(document)
+            }
+            Some(Payload::Failed { error, .. }) => Err(error),
+            other => panic!("expected a diff, got {other:?}"),
+        }
+    }
+
+    /// Check `document` against jj's own `jj diff --git -r revset`.
+    fn assert_matches_jj(&self, revset: &str, document: &DiffDocument, golden: &str) {
+        if let Ok(jj) = std::env::var("DIFFUI_GOLDEN_JJ") {
+            let live = run_jj(&jj, &self.repo.root, &["diff", "--git", "-r", revset]);
+            assert_eq!(live, golden, "jj's output moved; refresh the golden");
+        }
+        let expected = parse_unified_diff(golden);
+        // One line per file, hunk and row, so a mismatch reads like a diff.
+        let shape = |document: &DiffDocument| {
+            let mut lines = Vec::new();
+            for file in &document.files {
+                lines.push(format!("{} {:?}", file.path, file.status));
+                for hunk in &file.hunks {
+                    lines.push(format!("  {:?}", hunk_range(&hunk.header)));
+                    for line in &hunk.lines {
+                        lines.push(format!("    {:?} {}", line.kind, line.content));
+                    }
+                }
+            }
+            lines
+        };
+        assert_eq!(shape(document), shape(&expected), "diff of {revset}");
+        assert_eq!(document.total_additions, expected.total_additions);
+        assert_eq!(document.total_deletions, expected.total_deletions);
+    }
+}
+
+/// A hunk header's line ranges. diffui writes git's short form (`+1` for one
+/// line) where jj writes `+1,1`; the ranges are what has to agree.
+fn hunk_range(header: &str) -> [usize; 4] {
+    let mut numbers = [0, 1, 0, 1];
+    let sides = header.split_whitespace().skip(1).take(2);
+    for (index, side) in sides.enumerate() {
+        let (start, len) = side[1..].split_once(',').unwrap_or((&side[1..], "1"));
+        numbers[index * 2] = start.parse().expect("a hunk start");
+        numbers[index * 2 + 1] = len.parse().expect("a hunk length");
+    }
+    numbers
+}
+
+/// Run the real CLI against a scratch repo with nobody's config but ours.
+fn run_jj(jj: &str, root: &Path, args: &[&str]) -> String {
+    let config = root.with_extension("jjconfig.toml");
+    std::fs::write(
+        &config,
+        "[user]\nname = \"Scenario Test\"\nemail = \"scenario@example.com\"\n",
+    )
+    .expect("write the CLI config");
+    let output = std::process::Command::new(jj)
+        .args(args)
+        .args(["--no-pager", "--color=never", "--ignore-working-copy"])
+        .current_dir(root)
+        .env("JJ_CONFIG", &config)
+        .output()
+        .expect("run jj");
+    let mut text = String::from_utf8(output.stdout).expect("utf-8 output");
+    text.push_str(&String::from_utf8(output.stderr).expect("utf-8 errors"));
+    text
+}
+
+const GOLDEN_A_B: &str = "\
+diff --git a/a.txt b/a.txt
+new file mode 100644
+index 0000000000..4cb29ea38f
+--- /dev/null
++++ b/a.txt
+@@ -0,0 +1,3 @@
++one
++two
++three
+diff --git a/b.txt b/b.txt
+new file mode 100644
+index 0000000000..af9c6fd168
+--- /dev/null
++++ b/b.txt
+@@ -0,0 +1,1 @@
++bee
+";
+
+const GOLDEN_B_C: &str = "\
+diff --git a/a.txt b/a.txt
+index 4cb29ea38f..ddc897f039 100644
+--- a/a.txt
++++ b/a.txt
+@@ -1,3 +1,3 @@
+ one
+-two
++TWO
+ three
+diff --git a/b.txt b/b.txt
+new file mode 100644
+index 0000000000..af9c6fd168
+--- /dev/null
++++ b/b.txt
+@@ -0,0 +1,1 @@
++bee
+";
+
+const GOLDEN_B_D: &str = "\
+diff --git a/b.txt b/b.txt
+new file mode 100644
+index 0000000000..af9c6fd168
+--- /dev/null
++++ b/b.txt
+@@ -0,0 +1,1 @@
++bee
+diff --git a/d.txt b/d.txt
+new file mode 100644
+index 0000000000..8fa56d0232
+--- /dev/null
++++ b/d.txt
+@@ -0,0 +1,1 @@
++dee
+";
+
+const GOLDEN_ROOT_A: &str = "\
+diff --git a/a.txt b/a.txt
+new file mode 100644
+index 0000000000..4cb29ea38f
+--- /dev/null
++++ b/a.txt
+@@ -0,0 +1,3 @@
++one
++two
++three
+";
+
+#[test]
+fn range_diffs_match_jj() {
+    let mut fixture = fixture("revset-range-golden");
+    let (a, b, c, d) = (
+        fixture.a.clone(),
+        fixture.b.clone(),
+        fixture.c.clone(),
+        fixture.d.clone(),
+    );
+
+    // Root and child: nothing between them.
+    let revset = format!("{a}|{b}");
+    let document = fixture.range_diff(&revset).expect("A|B diffs");
+    fixture.assert_matches_jj(&revset, &document, GOLDEN_A_B);
+    let range = document
+        .range
+        .as_ref()
+        .expect("a range carries its commits");
+    assert_eq!(range.revset, revset);
+    assert_eq!(range.count, 2);
+    assert_eq!(range.commits, [b.clone(), a.clone()], "newest first");
+    assert_eq!(range.heads, std::slice::from_ref(&b));
+    assert_eq!(range.roots, std::slice::from_ref(&a));
+    assert_eq!(
+        range.base,
+        ["0".repeat(40)],
+        "A's parent is the root commit"
+    );
+    assert!(!range.includes_working_copy);
+
+    // A modification on top of an addition: from A's tree.
+    let revset = format!("{b}|{c}");
+    let document = fixture.range_diff(&revset).expect("B|C diffs");
+    fixture.assert_matches_jj(&revset, &document, GOLDEN_B_C);
+    assert_eq!(
+        document.range.as_ref().unwrap().base,
+        std::slice::from_ref(&a)
+    );
+
+    // Two heads, one shared parent: both sides merged.
+    let revset = format!("{b}|{d}");
+    let document = fixture.range_diff(&revset).expect("B|D diffs");
+    fixture.assert_matches_jj(&revset, &document, GOLDEN_B_D);
+    let range = document.range.as_ref().unwrap();
+    assert_eq!(range.heads.len(), 2);
+    assert_eq!(
+        range.base,
+        std::slice::from_ref(&a),
+        "the shared parent counts once"
+    );
+
+    // The root commit as a root: from the empty tree.
+    let revset = format!("root()|{a}");
+    let document = fixture.range_diff(&revset).expect("root()|A diffs");
+    fixture.assert_matches_jj(&revset, &document, GOLDEN_ROOT_A);
+    assert!(document.range.as_ref().unwrap().base.is_empty());
+
+    // An empty set diffs nothing, as jj does.
+    let document = fixture.range_diff("none()").expect("none() diffs");
+    assert!(document.files.is_empty());
+    assert_eq!(document.range.as_ref().unwrap().count, 0);
+}
+
+#[test]
+fn range_diffs_refuse_gaps_in_jj_words() {
+    let mut fixture = fixture("revset-range-gaps");
+    let (a, b, c) = (fixture.a.clone(), fixture.b.clone(), fixture.c.clone());
+    let revset = format!("{a}|{c}");
+    let expected = format!(
+        "Cannot diff revsets with gaps in. Revision {} would need to be in the set.",
+        &b[..12]
+    );
+    match fixture.range_diff(&revset) {
+        Err(RepoError::Revset(message)) => assert_eq!(message, expected),
+        other => panic!("expected the gap error, got {other:?}"),
+    }
+    if let Ok(jj) = std::env::var("DIFFUI_GOLDEN_JJ") {
+        let live = run_jj(&jj, &fixture.repo.root, &["diff", "-r", &revset]);
+        assert!(
+            live.contains("Error: Cannot diff revsets with gaps in."),
+            "{live}"
+        );
+        assert!(
+            live.contains(&format!(
+                "Hint: Revision {} would need to be in the set.",
+                &b[..12]
+            )),
+            "{live}"
+        );
+    }
+    // The same rule answers a query that asks for it, before Enter.
+    let error = fixture
+        .resolve(RevsetQuery::new(&revset).expect(RevsetExpect::Contiguous))
+        .expect_err("a gap");
+    assert_eq!(error.message, "Cannot diff revsets with gaps in.");
+}
+
+#[test]
+fn range_diffs_follow_the_working_copy() {
+    let mut fixture = fixture("revset-range-wc");
+    let c = fixture.c.clone();
+    let revset = format!("{c}::");
+    let document = fixture.range_diff(&revset).expect("C:: diffs");
+    let range = document.range.as_ref().unwrap();
+    assert!(range.includes_working_copy);
+    assert_eq!(range.count, 2);
+    assert_eq!(document.files.len(), 1);
+
+    // An edit on disk lands in the range on the next load.
+    write(&fixture.repo.root, "e.txt", "new\n");
+    fixture.repo.snapshot();
+    let document = fixture.range_diff(&revset).expect("C:: diffs again");
+    let paths: Vec<&str> = document
+        .files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect();
+    assert_eq!(paths, ["a.txt", "e.txt"]);
+}
+
+#[test]
+fn range_files_expand_and_read_both_sides() {
+    let mut fixture = fixture("revset-range-files");
+    let (b, c) = (fixture.b.clone(), fixture.c.clone());
+    let base = DiffBase::Range(format!("{b}|{c}"));
+
+    let events = fixture.repo.run(|job| Command::ExpandFile {
+        job,
+        revision: RevisionSelection::WorkingCopy,
+        base: base.clone(),
+        path: "a.txt".to_owned(),
+    });
+    match events.into_iter().next_back() {
+        Some(Payload::FileExpanded {
+            file: Some(file), ..
+        }) => {
+            assert_eq!(file.status, DiffFileStatus::Modified);
+            assert_eq!((file.additions, file.deletions), (1, 1));
+        }
+        other => panic!("expected the expanded file, got {other:?}"),
+    }
+
+    let events = fixture.repo.run(|job| Command::FilePair {
+        job,
+        revision: RevisionSelection::WorkingCopy,
+        path: "a.txt".to_owned(),
+        old_path: None,
+        base,
+    });
+    match events.into_iter().next_back() {
+        Some(Payload::FilePairRead { old, new, .. }) => {
+            assert_eq!(old.as_deref(), Some("one\ntwo\nthree\n"));
+            assert_eq!(new.as_deref(), Some("one\nTWO\nthree\n"));
+        }
+        other => panic!("expected the file pair, got {other:?}"),
     }
 }
 

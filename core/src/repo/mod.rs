@@ -279,6 +279,7 @@ fn capabilities_for(spec: &OpenSpec) -> Capabilities {
             browse: true,
             details: true,
             compare: true,
+            range_diff: true,
         },
         OpenSpec::Local { .. } => Capabilities {
             graph: true,

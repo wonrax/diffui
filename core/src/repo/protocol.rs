@@ -73,6 +73,9 @@ pub struct Capabilities {
     /// Can diff against something other than the parents ([`DiffBase`]),
     /// and expand a file its diff collapsed for size.
     pub compare: bool,
+    /// Can parse and resolve revsets: range diffs ([`DiffBase::Range`]) and
+    /// [`Command::ResolveRevset`] (jj only).
+    pub range_diff: bool,
 }
 
 /// A typed backend failure. `Result<_, String>` stops at the core surface:

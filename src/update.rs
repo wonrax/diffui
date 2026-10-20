@@ -5109,6 +5109,7 @@ mod tests {
             }],
             total_additions: 0,
             total_deletions: 0,
+            range: None,
         };
 
         let mut ui = app();

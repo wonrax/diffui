@@ -500,7 +500,9 @@ impl Session {
     /// --from`). The base sticks: selecting another revision afterwards
     /// compares that one against the same base, until [`Self::exit_compare`].
     pub fn compare(&mut self, base: DiffBase, to: RevisionSelection) -> Vec<Effect> {
-        if !self.capabilities.compare && base.is_compare() {
+        if !self.capabilities.compare && base.is_compare()
+            || !self.capabilities.range_diff && base.range().is_some()
+        {
             return Vec::new();
         }
         self.diff_base = base;
@@ -522,7 +524,7 @@ impl Session {
     pub fn swap_compare(&mut self) -> Vec<Effect> {
         let to = self.selected_revision.clone();
         let (base, from) = match &self.diff_base {
-            DiffBase::Parents => return Vec::new(),
+            DiffBase::Parents | DiffBase::Range(_) => return Vec::new(),
             DiffBase::Revision(from) => (DiffBase::Revision(to), from.clone()),
             DiffBase::Interdiff(from) => (DiffBase::Interdiff(to), from.clone()),
         };
@@ -542,6 +544,17 @@ impl Session {
     }
 
     // ── typed revsets ───────────────────────────────────────────────────
+
+    /// Show the combined diff of the commits `revset` matches (`jj diff -r`
+    /// with several), as a sticky base like a comparison: it stays until
+    /// [`Self::exit_compare`], and is re-resolved on every reload, so a range
+    /// ending at `@` follows the working copy. A set with gaps fails the load
+    /// with jj's message and falls back to the selected revision's own diff.
+    /// [`DiffDocument::range`] says what the range held once it lands.
+    pub fn diff_range(&mut self, revset: impl Into<String>) -> Vec<Effect> {
+        let to = self.selected_revision.clone();
+        self.compare(DiffBase::Range(revset.into()), to)
+    }
 
     /// Parse and resolve a revset against the repository, for live feedback
     /// as it is typed: a count, the rows to tint, or jj's error with its span.
@@ -565,6 +578,20 @@ impl Session {
             commits: &self.commits,
             history,
         }
+    }
+
+    /// Whether the diff on screen (or on its way) changes when the working
+    /// copy does: `@` is on one side of it, or in the range it covers.
+    fn diff_follows_working_copy(&self) -> bool {
+        matches!(self.selected_revision, RevisionSelection::WorkingCopy)
+            && !matches!(self.diff_base, DiffBase::Range(_))
+            || self.diff_base.involves_working_copy()
+            || self.diff_base.range().is_some()
+                && self
+                    .document
+                    .range
+                    .as_ref()
+                    .is_none_or(|range| range.includes_working_copy)
     }
 
     /// Fold the working copy into `@`. Coalesces instead of racing when
@@ -921,9 +948,7 @@ impl Session {
                     self.graph_fingerprint = Some(snapshot.fingerprint.clone());
                 }
                 self.apply_working_copy_empty(snapshot.working_copy_empty);
-                if matches!(self.selected_revision, RevisionSelection::WorkingCopy)
-                    || self.diff_base.involves_working_copy()
-                {
+                if self.diff_follows_working_copy() {
                     let revision = self.selected_revision.clone();
                     effects.extend(self.load_diff(revision));
                 }
@@ -1009,6 +1034,10 @@ impl Session {
             .diff_job
             .as_ref()
             .is_some_and(|(id, _, base)| *id == job && base.is_compare());
+        let failed_range = self
+            .diff_job
+            .as_ref()
+            .is_some_and(|(id, _, base)| *id == job && base.range().is_some());
         // A mutation's failure is reported by whoever started it (an immutable
         // rejection turns into an offer, not a toast), so only the slot is
         // cleared here.
@@ -1031,7 +1060,9 @@ impl Session {
         if !owned_mutation {
             effects.push(Effect::Activity(Activity::Toast {
                 repo,
-                title: if failed_compare {
+                title: if failed_range {
+                    "Range diff ended".to_owned()
+                } else if failed_compare {
                     "Comparison ended".to_owned()
                 } else {
                     "Operation failed".to_owned()
@@ -1415,6 +1446,7 @@ mod tests {
                     ],
                     total_additions: 3,
                     total_deletions: 0,
+                    range: None,
                 },
                 details: None,
             },
@@ -1818,9 +1850,140 @@ mod tests {
 
     // ── typed revsets ───────────────────────────────────────────────────
 
+    fn range_session() -> Session {
+        let mut session = compare_session();
+        session.capabilities.range_diff = true;
+        session
+    }
+
+    fn test_repo() -> RepoId {
+        crate::repo::repo_id(&crate::repo::OpenSpec::Local {
+            root: "/tmp/range".into(),
+            scope: Default::default(),
+        })
+    }
+
+    fn land_range(session: &mut Session, job: JobId, includes_working_copy: bool) {
+        session.apply(Event::new(
+            test_repo(),
+            Payload::DiffLoaded {
+                job,
+                revision: commit("bbb"),
+                document: DiffDocument {
+                    range: Some(Box::new(crate::model::DiffRange {
+                        revset: "aaa|bbb".to_owned(),
+                        includes_working_copy,
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+                details: None,
+            },
+        ));
+    }
+
+    /// Run a watcher snapshot that moved the op and return its effects.
+    fn watcher_snapshot(session: &mut Session) -> Vec<Effect> {
+        session.repository_snapshot = Some(RepositorySnapshot {
+            fingerprint: "op1".to_owned(),
+            ..Default::default()
+        });
+        let job = match session.snapshot(RefreshOrigin::Watcher).as_slice() {
+            [Effect::Send(Command::Snapshot { job, .. })] => *job,
+            other => panic!("expected a snapshot, got {other:?}"),
+        };
+        session.apply(Event::new(
+            test_repo(),
+            Payload::SnapshotDone {
+                job,
+                origin: RefreshOrigin::Watcher,
+                snapshot: RepositorySnapshot {
+                    fingerprint: "op2".to_owned(),
+                    parent_fingerprint: Some("op1".to_owned()),
+                    ..Default::default()
+                },
+                warnings: Vec::new(),
+            },
+        ))
+    }
+
+    /// A range is a sticky base: it survives selecting another revision,
+    /// can't be swapped or turned into an interdiff, and exits like a
+    /// comparison. Partial picks read it as one (`is_compare`).
+    #[test]
+    fn a_range_sticks_until_exit() {
+        let mut session = range_session();
+        session.selected_revision = commit("bbb");
+        let effects = session.diff_range("aaa|bbb");
+        let (job, revision, base) = sent_diff(&effects).expect("a range load");
+        assert_eq!(revision, commit("bbb"));
+        assert_eq!(base, DiffBase::Range("aaa|bbb".to_owned()));
+        assert!(session.diff_base.is_compare());
+        land_range(&mut session, job, false);
+        assert_eq!(session.document_base, DiffBase::Range("aaa|bbb".to_owned()));
+        assert_eq!(session.document.range.as_ref().unwrap().revset, "aaa|bbb");
+
+        assert!(session.swap_compare().is_empty());
+        assert!(session.set_interdiff(true).is_empty());
+        // Another row moves the cursor; the diff stays the range.
+        let (job, revision, base) = sent_diff(&session.load_diff(commit("ccc"))).expect("a reload");
+        assert_eq!(base, DiffBase::Range("aaa|bbb".to_owned()));
+        land(&mut session, job, revision);
+        assert_eq!(session.selected_revision, commit("ccc"));
+
+        let (_, revision, base) = sent_diff(&session.exit_compare()).expect("the plain diff");
+        assert_eq!((revision, base), (commit("ccc"), DiffBase::Parents));
+    }
+
+    #[test]
+    fn ranges_are_gated_on_the_capability() {
+        let mut session = compare_session();
+        assert!(session.diff_range("aaa|bbb").is_empty());
+        assert_eq!(session.diff_base, DiffBase::Parents);
+    }
+
+    /// A range ending at `@` reloads on a working-tree edit; one that
+    /// doesn't, doesn't.
+    #[test]
+    fn a_range_reloads_on_a_watcher_refresh_only_when_it_holds_the_working_copy() {
+        let mut session = range_session();
+        session.selected_revision = RevisionSelection::WorkingCopy;
+        let (job, ..) = sent_diff(&session.diff_range("aaa|bbb")).expect("a range load");
+        land_range(&mut session, job, false);
+        assert!(
+            sent_diff(&watcher_snapshot(&mut session)).is_none(),
+            "the range doesn't hold @, even though @ is selected"
+        );
+
+        let (job, ..) = sent_diff(&session.diff_range("aaa::")).expect("a range load");
+        land_range(&mut session, job, true);
+        let (_, _, base) = sent_diff(&watcher_snapshot(&mut session)).expect("the range reloads");
+        assert_eq!(base, DiffBase::Range("aaa::".to_owned()));
+    }
+
+    #[test]
+    fn a_failed_range_falls_back_to_the_plain_diff() {
+        let mut session = range_session();
+        let (job, ..) = sent_diff(&session.diff_range("aaa|ccc")).expect("a range load");
+        let effects = session.apply(Event::new(
+            test_repo(),
+            Payload::Failed {
+                job,
+                error: RepoError::Revset("Cannot diff revsets with gaps in.".to_owned()),
+            },
+        ));
+        let (_, _, base) = sent_diff(&effects).expect("the plain diff reloads");
+        assert_eq!(base, DiffBase::Parents);
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Activity(Activity::Toast { title, body, .. })
+                if title == "Range diff ended" && body.starts_with("Cannot diff")
+        )));
+    }
+
     #[test]
     fn the_completer_reads_the_last_graph_load() {
-        let mut session = compare_session();
+        let mut session = range_session();
         session
             .revset_symbols
             .aliases
@@ -1873,6 +2036,7 @@ mod tests {
                     files: vec![collapsed_file("huge.txt")],
                     total_additions: 5_000,
                     total_deletions: 0,
+                    range: None,
                 },
                 details: None,
             },

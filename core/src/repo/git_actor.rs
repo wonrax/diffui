@@ -117,7 +117,8 @@ async fn run(repository: &Repository, command: Command, cancel: &CancelFlag) -> 
                 Err(error) => failed(job, error),
             }
         }
-        // Comparisons are jj-only for now; `Capabilities::compare` is off.
+        // Comparisons and ranges are jj-only for now; `Capabilities::compare`
+        // and `range_diff` are off.
         Command::LoadDiff { job, base, .. } if base.is_compare() => {
             vec![Payload::Failed {
                 job,

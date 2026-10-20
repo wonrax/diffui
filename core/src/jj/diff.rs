@@ -62,6 +62,10 @@ pub(crate) async fn resolve_base(
         DiffBase::Interdiff(revision) => {
             ResolvedBase::Interdiff(resolve_revision(repo, workspace_name, revision).await?)
         }
+        // A range names both sides; its loads go through `diff_jj_range`.
+        DiffBase::Range(revset) => {
+            anyhow::bail!("the range {revset} has no single base revision")
+        }
     })
 }
 
@@ -115,13 +119,7 @@ pub(crate) async fn diff_jj_with_repo(
     let commit = load_commit(repo, commit_id).await?;
     let details = jj_revision_details(repo, &commit).await;
     let old_tree = base_tree(repo, &commit, base).await?;
-    let matcher: Box<dyn Matcher> = match options.only {
-        Some(path) => Box::new(FilesMatcher::new([RepoPathBuf::from_internal_string(
-            path.to_owned(),
-        )
-        .with_context(|| format!("invalid repo path {path}"))?])),
-        None => repo_scope_matcher(repository)?,
-    };
+    let matcher = diff_matcher(repository, options)?;
     // A comparison shows only what differs between its two sides, like
     // `jj diff --from`, so only a diff against the parents lists conflicts.
     let document = diff_trees(
@@ -134,6 +132,41 @@ pub(crate) async fn diff_jj_with_repo(
     )
     .await?;
     Ok((document, Some(details)))
+}
+
+/// `jj diff -r REVSET` over several commits: the range's merged base against
+/// its merged heads, carrying what the range holds. Conflicts surface as they
+/// do for a single revision, since the base is the roots' parents.
+pub(crate) async fn diff_jj_range(
+    repo: &ReadonlyRepo,
+    range: super::revset::ResolvedRange,
+    repository: &Repository,
+    options: &DiffOptions<'_>,
+) -> Result<DiffDocument> {
+    let matcher = diff_matcher(repository, options)?;
+    let mut document = diff_trees(
+        repo,
+        &range.from,
+        &range.to,
+        matcher.as_ref(),
+        options,
+        true,
+    )
+    .await?;
+    document.range = Some(Box::new(range.info));
+    Ok(document)
+}
+
+/// The paths a diff load covers: the one file being expanded, or the tab's
+/// scope.
+fn diff_matcher(repository: &Repository, options: &DiffOptions<'_>) -> Result<Box<dyn Matcher>> {
+    Ok(match options.only {
+        Some(path) => Box::new(FilesMatcher::new([RepoPathBuf::from_internal_string(
+            path.to_owned(),
+        )
+        .with_context(|| format!("invalid repo path {path}"))?])),
+        None => repo_scope_matcher(repository)?,
+    })
 }
 
 /// Diff two trees into a [`DiffDocument`], within `options`' caps, and —
@@ -375,6 +408,7 @@ pub(crate) async fn diff_trees(
         files,
         total_additions,
         total_deletions,
+        range: None,
     })
 }
 

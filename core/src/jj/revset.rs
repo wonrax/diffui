@@ -1,24 +1,30 @@
 //! Revsets as the user types them: parsed with the graph walk's aliases and
-//! workspace, errors kept in jj's words with the position they point at, and
-//! resolved to commit ids with jj's single-revision and no-gaps rules.
+//! workspace, errors kept in jj's words with the position they point at,
+//! resolved to commit ids with jj's single-revision and no-gaps rules, and
+//! turned into the two trees of a range diff (`jj diff -r REVSET`).
 
 use std::path::Path;
 use std::sync::Arc;
 
+use anyhow::{Context as _, Result};
 use futures::StreamExt as _;
 use jj_lib::{
     backend::CommitId,
+    commit::Commit,
+    merged_tree::MergedTree,
     object_id::ObjectId as _,
     ref_name::WorkspaceName,
-    repo::ReadonlyRepo,
+    repo::{ReadonlyRepo, Repo as _},
     revset::{
         ResolvedRevsetExpression, RevsetExpression, RevsetParseError, RevsetParseErrorKind,
         RevsetResolutionError, SymbolResolver, UserRevsetExpression,
     },
+    rewrite::merge_commit_trees,
     settings::UserSettings,
 };
 
 use super::walk::{DEFAULT_REVSET_ALIASES, parse_revset_raw, revset_aliases_map};
+use crate::model::DiffRange;
 use crate::repo::CancelFlag;
 use crate::revset::{
     COUNT_CAP, RevsetAlias, RevsetError, RevsetExpect, RevsetMatch, RevsetQuery, RevsetSymbols,
@@ -65,6 +71,46 @@ impl RevsetScope<'_> {
         expression
             .resolve_user_expression(self.repo, &resolver)
             .map_err(|error| resolution_error(src, error))
+    }
+
+    /// The commit ids `expression` evaluates to, newest first.
+    async fn ids(
+        &self,
+        src: &str,
+        expression: &Arc<UserRevsetExpression>,
+    ) -> Result<Vec<CommitId>, RevsetError> {
+        let resolved = self.resolve(src, expression)?;
+        let revset = resolved.evaluate(self.repo).map_err(evaluation_error)?;
+        let mut ids = Vec::new();
+        let mut stream = revset.stream();
+        while let Some(id) = stream.next().await {
+            ids.push(id.map_err(evaluation_error)?);
+        }
+        Ok(ids)
+    }
+
+    /// What `expression` holds, in one pass that keeps no more than `limit`
+    /// ids: `::@` on a big repository is a count, not a million-entry list.
+    async fn members(
+        &self,
+        src: &str,
+        expression: &Arc<UserRevsetExpression>,
+        limit: usize,
+    ) -> Result<Members, RevsetError> {
+        let working_copy = self.repo.view().get_wc_commit_id(self.workspace_name);
+        let resolved = self.resolve(src, expression)?;
+        let revset = resolved.evaluate(self.repo).map_err(evaluation_error)?;
+        let mut members = Members::default();
+        let mut stream = revset.stream();
+        while let Some(id) = stream.next().await {
+            let id = id.map_err(evaluation_error)?;
+            members.count += 1;
+            members.has_working_copy |= Some(&id) == working_copy;
+            if members.ids.len() < limit {
+                members.ids.push(id);
+            }
+        }
+        Ok(members)
     }
 
     /// jj's no-gaps rule for `jj diff -r`: every commit between the set's
@@ -154,6 +200,77 @@ impl RevsetScope<'_> {
         }
         Some(Ok(found))
     }
+
+    /// The two trees of `jj diff -r src` and what the set holds, following
+    /// jj-cli 0.45.1's `cmd_diff`: refuse a set with gaps, then diff the
+    /// merged parents of its roots against its merged heads.
+    pub async fn range(&self, src: &str) -> Result<ResolvedRange> {
+        let expression = self.parse(src)?;
+        self.check_gaps(src, &expression).await?;
+        let members = self
+            .members(src, &expression, DiffRange::COMMIT_LIMIT)
+            .await?;
+        let heads = self.load(self.ids(src, &expression.heads()).await?).await?;
+        let roots = self.load(self.ids(src, &expression.roots()).await?).await?;
+        // Parents in root order, each once: jj collects them into an
+        // `IndexSet` outside the revset to keep that order.
+        let mut parents: Vec<Commit> = Vec::new();
+        for root in &roots {
+            for parent in root
+                .parents()
+                .await
+                .with_context(|| format!("failed to load the parents of {}", root.id().hex()))?
+            {
+                if !parents.iter().any(|known| known.id() == parent.id()) {
+                    parents.push(parent);
+                }
+            }
+        }
+        let from = merge_commit_trees(self.repo, &parents)
+            .await
+            .context("failed to merge the range's base trees")?;
+        let to = merge_commit_trees(self.repo, &heads)
+            .await
+            .context("failed to merge the range's head trees")?;
+        let info = DiffRange {
+            revset: src.to_owned(),
+            count: members.count,
+            includes_working_copy: members.has_working_copy,
+            commits: members.ids.iter().map(|id| id.hex()).collect(),
+            heads: heads.iter().map(|commit| commit.id().hex()).collect(),
+            roots: roots.iter().map(|commit| commit.id().hex()).collect(),
+            base: parents.iter().map(|commit| commit.id().hex()).collect(),
+        };
+        Ok(ResolvedRange { from, to, info })
+    }
+
+    async fn load(&self, ids: Vec<CommitId>) -> Result<Vec<Commit>> {
+        let mut commits = Vec::with_capacity(ids.len());
+        for id in ids {
+            commits.push(
+                self.repo
+                    .store()
+                    .get_commit_async(&id)
+                    .await
+                    .with_context(|| format!("failed to load jj commit {}", id.hex()))?,
+            );
+        }
+        Ok(commits)
+    }
+}
+
+#[derive(Default)]
+struct Members {
+    ids: Vec<CommitId>,
+    count: usize,
+    has_working_copy: bool,
+}
+
+/// A range diff's two sides, resolved.
+pub(crate) struct ResolvedRange {
+    pub from: MergedTree,
+    pub to: MergedTree,
+    pub info: DiffRange,
 }
 
 /// jj-cli's `resolve_single_rev` wording.

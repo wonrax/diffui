@@ -365,17 +365,22 @@ impl Actor {
             } => {
                 let repo = self.repo_at_head(repository).await?;
                 let name = self.slot(repository)?.name.clone();
-                let commit_id = jj::resolve_revision(repo.as_ref(), &name, &revision).await?;
-                let base = jj::resolve_base(repo.as_ref(), &name, &base).await?;
                 let expand = [path.clone()];
                 let options = jj::DiffOptions {
                     limits: jj::large_diff::DiffLimits::unlimited(),
                     expand: &expand,
                     only: Some(&path),
                 };
-                let (document, _) =
+                let document = if let DiffBase::Range(revset) = &base {
+                    let range = revset_scope(&repo, &name, repository).range(revset).await?;
+                    jj::diff_jj_range(repo.as_ref(), range, repository, &options).await?
+                } else {
+                    let commit_id = jj::resolve_revision(repo.as_ref(), &name, &revision).await?;
+                    let base = jj::resolve_base(repo.as_ref(), &name, &base).await?;
                     jj::diff_jj_with_repo(repo.as_ref(), &commit_id, &base, repository, &options)
-                        .await?;
+                        .await?
+                        .0
+                };
                 let file = document.files.into_iter().find(|file| file.path == path);
                 self.emit(Payload::FileExpanded { job, path, file });
                 Ok(())
@@ -497,6 +502,7 @@ impl Actor {
                 let (old, new) = jj::read_jj_file_pair_inner(
                     repo.as_ref(),
                     &name,
+                    &repository.root,
                     &revision,
                     &base,
                     &path,
@@ -647,12 +653,25 @@ impl Actor {
     ) -> Result<()> {
         let repo = self.repo_at_head(repository).await?;
         let name = self.slot(repository)?.name.clone();
-        let commit_id = jj::resolve_revision(repo.as_ref(), &name, &revision).await?;
-        let base = jj::resolve_base(repo.as_ref(), &name, &base).await?;
         let options = jj::DiffOptions {
             expand,
             ..Default::default()
         };
+        if let DiffBase::Range(revset) = &base {
+            // The revset names both sides; the selected revision rides along
+            // untouched as the graph's cursor.
+            let range = revset_scope(&repo, &name, repository).range(revset).await?;
+            let document = jj::diff_jj_range(repo.as_ref(), range, repository, &options).await?;
+            self.emit(Payload::DiffLoaded {
+                job,
+                revision,
+                document,
+                details: None,
+            });
+            return Ok(());
+        }
+        let commit_id = jj::resolve_revision(repo.as_ref(), &name, &revision).await?;
+        let base = jj::resolve_base(repo.as_ref(), &name, &base).await?;
         let (document, details) =
             jj::diff_jj_with_repo(repo.as_ref(), &commit_id, &base, repository, &options).await?;
         // A commit rewritten since the caller read its id resolved to its

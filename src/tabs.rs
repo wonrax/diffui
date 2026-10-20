@@ -480,6 +480,7 @@ pub(crate) mod tests {
             }],
             total_additions: 1,
             total_deletions: 0,
+            range: None,
         }
     }
 

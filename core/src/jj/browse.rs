@@ -35,11 +35,23 @@ use crate::source_browse::{SourceEntry, SourceEntryStatus, SourceFileData};
 pub(crate) async fn read_jj_file_pair_inner(
     repo: &ReadonlyRepo,
     workspace_name: &WorkspaceName,
+    repo_root: &std::path::Path,
     revision: &RevisionSelection,
     base: &crate::model::DiffBase,
     path: &str,
     old_path: Option<&str>,
 ) -> Result<(Option<String>, Option<String>)> {
+    if let crate::model::DiffBase::Range(revset) = base {
+        let scope = super::revset::RevsetScope {
+            repo,
+            workspace_name,
+            repo_root,
+        };
+        let range = scope.range(revset).await?;
+        let new = read_jj_tree_file(repo, &range.to, path).await;
+        let old = read_jj_tree_file(repo, &range.from, old_path.unwrap_or(path)).await;
+        return Ok((old, new));
+    }
     let commit = resolve_browse_commit(repo, workspace_name, revision).await?;
     let new_tree = commit.tree();
     let base = super::diff::resolve_base(repo, workspace_name, base).await?;

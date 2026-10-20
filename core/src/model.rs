@@ -70,8 +70,8 @@ impl RevisionSelection {
     }
 }
 
-/// What a revision's diff is taken against. The revision itself is always the
-/// "to" side; this names the "from" side.
+/// What a revision's diff is taken against. The revision itself is the "to"
+/// side of every base but [`DiffBase::Range`]; this names the "from" side.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum DiffBase {
     /// `jj diff -r X`: X against its (merged) parents.
@@ -83,23 +83,41 @@ pub enum DiffBase {
     /// parents, against X — how two versions of a change differ, without the
     /// noise of whatever their parents did in between.
     Interdiff(RevisionSelection),
+    /// `jj diff -r REVSET` over several commits: the merged parents of the
+    /// set's roots against its merged heads. The revset names both sides, so
+    /// the selected revision plays no part and stays the graph's cursor. The
+    /// revset is re-resolved on every load, so a range ending at `@` follows
+    /// the working copy. Like a comparison, its hunks belong to no single
+    /// commit, so [`DiffBase::is_compare`] holds and partial picks are off.
+    Range(String),
 }
 
 impl DiffBase {
-    /// The "from" revision, or `None` for a plain parent diff.
+    /// The "from" revision, or `None` for a plain parent diff or a range.
     pub fn revision(&self) -> Option<&RevisionSelection> {
         match self {
-            Self::Parents => None,
+            Self::Parents | Self::Range(_) => None,
             Self::Revision(revision) | Self::Interdiff(revision) => Some(revision),
         }
     }
 
+    /// Whether the diff is something other than one revision's own change:
+    /// a comparison, an interdiff or a range.
     pub fn is_compare(&self) -> bool {
         !matches!(self, Self::Parents)
     }
 
+    /// The range's revset, when this is one.
+    pub fn range(&self) -> Option<&str> {
+        match self {
+            Self::Range(revset) => Some(revset),
+            _ => None,
+        }
+    }
+
     /// Whether either side of the diff names the working copy, so an edit on
-    /// disk changes it.
+    /// disk changes it. A range only knows once it resolved; see
+    /// [`DiffRange::includes_working_copy`].
     pub fn involves_working_copy(&self) -> bool {
         matches!(self.revision(), Some(RevisionSelection::WorkingCopy))
     }
@@ -111,8 +129,35 @@ impl DiffBase {
             Self::Parents => String::new(),
             Self::Revision(revision) => format!("from:{}", revision.view_key()),
             Self::Interdiff(revision) => format!("interdiff:{}", revision.view_key()),
+            Self::Range(revset) => format!("range:{revset}"),
         }
     }
+}
+
+/// The commits a range diff covers, carried on its [`DiffDocument`] so the
+/// view can label the range and tint its rows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiffRange {
+    /// The revset as given.
+    pub revset: String,
+    /// Commit ids (hex) in the set, newest first, at most
+    /// [`DiffRange::COMMIT_LIMIT`].
+    pub commits: Vec<String>,
+    /// How many commits the set holds.
+    pub count: usize,
+    /// The set's heads, whose merged tree is the "to" side.
+    pub heads: Vec<String>,
+    /// The set's roots, whose merged parents are the "from" side.
+    pub roots: Vec<String>,
+    /// Those parents, in jj's order.
+    pub base: Vec<String>,
+    /// Whether `@` is in the set, so an edit on disk changes the diff.
+    pub includes_working_copy: bool,
+}
+
+impl DiffRange {
+    /// Commit ids past this are counted, not listed.
+    pub const COMMIT_LIMIT: usize = 10_000;
 }
 
 #[derive(Debug, Clone, Default)]
@@ -120,6 +165,9 @@ pub struct DiffDocument {
     pub files: Vec<DiffFile>,
     pub total_additions: usize,
     pub total_deletions: usize,
+    /// What a range diff covers; `None` for every other diff. Boxed: every
+    /// other document would otherwise carry its size.
+    pub range: Option<Box<DiffRange>>,
 }
 
 impl DiffDocument {
