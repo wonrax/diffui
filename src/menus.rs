@@ -751,6 +751,9 @@ impl Diffui {
                     items.push(self.menu_item("conflict.take-base", arg()));
                 }
             }
+            if conflict.pickable {
+                items.push(self.menu_item("conflict.edit-markers", arg()));
+            }
             if conflict.merge_tool_blocker.is_none() {
                 items.push(self.menu_item("conflict.merge-tool", arg()));
             }

@@ -60,6 +60,8 @@ pub(crate) enum Context {
     Credential,
     /// A jj CLI run's output panel.
     Output,
+    /// The conflict marker editor.
+    ConflictEdit,
 }
 
 impl Context {
@@ -80,6 +82,7 @@ impl Context {
         Context::Split,
         Context::Credential,
         Context::Output,
+        Context::ConflictEdit,
     ];
 
     /// The name this context goes by in `config.toml`'s `[keys.<name>]`.
@@ -100,6 +103,7 @@ impl Context {
             Context::Split => "split",
             Context::Credential => "credential",
             Context::Output => "output",
+            Context::ConflictEdit => "conflict-edit",
         }
     }
 
@@ -424,6 +428,24 @@ fn conflict_resolution(ui: &Diffui, arg: &CommandArg, side: Option<usize>) -> Av
     require(
         crate::conflicts::command_resolution(ui, arg, side).is_some(),
         "No conflict to resolve this way",
+    )
+}
+
+/// A region command: the diff shows a conflict region it can take `pick`
+/// for.
+fn region_resolution(
+    ui: &Diffui,
+    arg: &CommandArg,
+    pick: diffui_core::ConflictPick,
+) -> Availability {
+    can_pick_changes(ui)?;
+    require(
+        crate::conflicts::has_regions(ui),
+        "No conflict region in this diff",
+    )?;
+    require(
+        crate::conflicts::command_region(ui, arg, pick).is_some(),
+        "The region has no such side",
     )
 }
 
@@ -2474,6 +2496,134 @@ pub(crate) static REGISTRY: &[Command] = &[
         },
         build: |ui, arg| crate::conflicts::command_merge_tool(ui, &arg),
         palette: PaletteScope::Root,
+    },
+    Command {
+        id: "conflict.edit-markers",
+        label: "Edit conflict markers",
+        hint: "Edit the file with jj's conflict markers in place",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| {
+            has_command_file(ui, arg)?;
+            require(
+                crate::conflicts::command_edit_markers(ui, arg).is_some(),
+                "No conflicted file to edit",
+            )
+        },
+        build: |ui, arg| crate::conflicts::command_edit_markers(ui, &arg),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "conflict.region.take-side-1",
+        label: "Resolve region: take side 1",
+        hint: "Take side 1 for the current conflict region only",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| region_resolution(ui, arg, diffui_core::ConflictPick::Side(0)),
+        build: |ui, arg| {
+            crate::conflicts::command_region(ui, &arg, diffui_core::ConflictPick::Side(0))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "conflict.region.take-side-2",
+        label: "Resolve region: take side 2",
+        hint: "Take side 2 for the current conflict region only",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| region_resolution(ui, arg, diffui_core::ConflictPick::Side(1)),
+        build: |ui, arg| {
+            crate::conflicts::command_region(ui, &arg, diffui_core::ConflictPick::Side(1))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "conflict.region.take-base",
+        label: "Resolve region: take base",
+        hint: "Drop both sides' change in the current conflict region",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| region_resolution(ui, arg, diffui_core::ConflictPick::Base(0)),
+        build: |ui, arg| {
+            crate::conflicts::command_region(ui, &arg, diffui_core::ConflictPick::Base(0))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "conflict.region.next",
+        label: "Next conflict region",
+        hint: "Move to the next conflict region in the diff",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| {
+            can_pick_changes(ui)?;
+            require(
+                crate::conflicts::has_regions(ui),
+                "No conflict region in this diff",
+            )
+        },
+        build: |_ui, _arg| {
+            Some(Action::Changes(crate::changes::ChangesMsg::Conflict(
+                crate::conflicts::ConflictMsg::StepRegion(1),
+            )))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "conflict.region.previous",
+        label: "Previous conflict region",
+        hint: "Move to the previous conflict region in the diff",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| {
+            can_pick_changes(ui)?;
+            require(
+                crate::conflicts::has_regions(ui),
+                "No conflict region in this diff",
+            )
+        },
+        build: |_ui, _arg| {
+            Some(Action::Changes(crate::changes::ChangesMsg::Conflict(
+                crate::conflicts::ConflictMsg::StepRegion(-1),
+            )))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "conflict.edit.save",
+        label: "Save conflict edit",
+        hint: "Write the edited file back; markers left in keep it conflicted",
+        contexts: &[Context::ConflictEdit],
+        chords: &["cmd+enter"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| {
+            Some(Action::Changes(crate::changes::ChangesMsg::Conflict(
+                crate::conflicts::ConflictMsg::EditorSave,
+            )))
+        },
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "conflict.edit.cancel",
+        label: "Cancel conflict edit",
+        hint: "Close the marker editor, discarding the edit",
+        contexts: &[Context::ConflictEdit],
+        chords: &["esc"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| {
+            Some(Action::Changes(crate::changes::ChangesMsg::Conflict(
+                crate::conflicts::ConflictMsg::EditorCancel,
+            )))
+        },
+        palette: PaletteScope::Hidden,
     },
     // ── History (op log, evolog, file history, annotate) ────────────────
     Command {

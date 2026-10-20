@@ -35,6 +35,7 @@ const SECTIONS: &[(Context, &str)] = &[
     (Context::Find, "Find in diff"),
     (Context::Description, "Description editor"),
     (Context::Split, "Split prompt"),
+    (Context::ConflictEdit, "Conflict marker editor"),
     (Context::OpenRepo, "Open repository"),
     (Context::Confirm, "Confirmation"),
     (Context::ActivityPopover, "Activity log"),

@@ -33,6 +33,15 @@ const fn hint(commands: &'static [CommandId], what: &'static str) -> Hint {
 /// selection, which outranks a comparison: the top one owns the keyboard.
 fn active_hints(ui: &Diffui) -> Option<(Context, Vec<Hint>)> {
     let tab = ui.active();
+    if crate::conflicts::editor_shown(ui).is_some() {
+        return Some((
+            Context::ConflictEdit,
+            vec![
+                hint(&["conflict.edit.save"], "save"),
+                hint(&["conflict.edit.cancel"], "cancel"),
+            ],
+        ));
+    }
     if let Some(draft) = tab.op_draft() {
         let kind = draft.draft.kind;
         let mut hints = vec![hint(
@@ -102,6 +111,21 @@ fn active_hints(ui: &Diffui) -> Option<(Context, Vec<Hint>)> {
             hints.push(hint(&["selection.clear"], "stop comparing"));
         }
         return Some((Context::Base, hints));
+    }
+    // Conflict regions on screen: their keys, once bound.
+    if crate::conflicts::has_regions(ui) {
+        return Some((
+            Context::Base,
+            vec![
+                hint(
+                    &["conflict.region.next", "conflict.region.previous"],
+                    "region",
+                ),
+                hint(&["conflict.region.take-side-1"], "take side 1"),
+                hint(&["conflict.region.take-side-2"], "take side 2"),
+                hint(&["conflict.region.take-base"], "take base"),
+            ],
+        ));
     }
     None
 }

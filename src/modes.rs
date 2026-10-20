@@ -195,6 +195,7 @@ impl Diffui {
             Some(mode) => mode.context(),
             // The split prompt is a modal over the tab, above its own modes.
             None if crate::changes::split_shown(self) => Context::Split,
+            None if crate::conflicts::editor_shown(self).is_some() => Context::ConflictEdit,
             None => match self.active().modes.last() {
                 // Line-select mode outlives what it applies to (another
                 // revision showing, the history view); it stops taking keys

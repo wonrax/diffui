@@ -600,6 +600,9 @@ fn build_diff_panel_body<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Me
         if let Some(marks) = crate::changes::diff_marks(ui, theme) {
             dv = dv.change_marks(marks);
         }
+        if let Some(actions) = crate::conflicts::hunk_actions(ui, theme) {
+            dv = dv.hunk_actions(actions);
+        }
 
         if let Some(find_state) = ui.active().find() {
             dv = dv.with_find(diff_view::FindOverlay {
@@ -620,7 +623,9 @@ fn build_diff_panel_body<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Me
             });
         }
 
-        let diff_view: Element<'a, Message> = dv.into();
+        // The marker editor stands in for the diff while it is open.
+        let diff_view: Element<'a, Message> =
+            crate::conflicts::marker_editor(ui, theme).unwrap_or_else(|| dv.into());
 
         // The find bar sits on top of the diff view, pinned to the
         // upper-right of the panel. `stack` overlays without taking

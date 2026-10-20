@@ -1076,6 +1076,7 @@ impl Diffui {
                 {
                     editor.saving_activity = None;
                 }
+                self.marker_save_finished(dialog.pending.tab_id, dialog.pending.activity_id, false);
                 Task::none()
             }
 
@@ -3055,6 +3056,7 @@ impl Diffui {
                 if description_save && let Some(target) = self.tab_mut(tab) {
                     target.pop_mode(ModeKind::Description);
                 }
+                self.marker_save_finished(tab, activity_id, true);
                 Task::none()
             }
             Err(diffui_core::RepoError::Immutable { short_id }) => {
@@ -3072,6 +3074,7 @@ impl Diffui {
                 {
                     editor.saving_activity = None;
                 }
+                self.marker_save_finished(tab, activity_id, false);
                 self.finish_activity_row(tab, activity_id, Err(error), None)
             }
         }
