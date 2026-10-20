@@ -92,6 +92,20 @@ pub(super) fn parse_revset_raw(
     workspace_name: &WorkspaceName,
     src: &str,
 ) -> Result<Result<Arc<UserRevsetExpression>, jj_lib::revset::RevsetParseError>> {
+    with_revset_parse_context(repo_root, settings, workspace_name, |context, _| {
+        parse_revset(&mut RevsetDiagnostics::new(), src, &context)
+    })
+}
+
+/// What jj-cli's `revset_parse_context` holds for this workspace (the alias
+/// maps, `@`, the user's email, git's pseudo-remote), handed to `f` with the
+/// path converter it resolves file patterns through, since it borrows both.
+pub(super) fn with_revset_parse_context<T>(
+    repo_root: &Path,
+    settings: &UserSettings,
+    workspace_name: &WorkspaceName,
+    f: impl for<'a> FnOnce(RevsetParseContext<'a>, &'a RepoPathUiConverter) -> T,
+) -> Result<T> {
     let aliases = revset_aliases_map(settings)?;
     let fileset_aliases = jj_cli::cli_util::load_fileset_aliases(&Ui::null(), settings.config())
         .map_err(cli_error)?;
@@ -114,7 +128,7 @@ pub(super) fn parse_revset_raw(
         extensions: &extensions,
         workspace: Some(workspace_ctx),
     };
-    Ok(parse_revset(&mut RevsetDiagnostics::new(), src, &context))
+    Ok(f(context, &path_converter))
 }
 
 /// Walk the jj revset graph, emitting commits in batches as they're built, and

@@ -371,6 +371,26 @@ fn push_change_creates_the_generated_bookmark() {
     );
 }
 
+/// `templates.git_push_bookmark` renders through jj-cli's template engine, so
+/// anything a jj template can say names the bookmark.
+#[test]
+fn push_change_renders_the_bookmark_template_like_jj() {
+    let config = "[templates]\n\
+                  git_push_bookmark = '\"me/\" ++ change_id.shortest(8) ++ \"-\" ++ \
+                  description.first_line()'\n";
+    let Some((mut repo, remote)) = setup_with_config("push-change-template", Some(config)) else {
+        return;
+    };
+    let first = commit(&mut repo, "a.txt", "first");
+    let change = repo.graph("@-")[0].summary.change_id.clone();
+    let outcome = repo
+        .mutate(push("origin", vec![PushTarget::Change(at(&first))]))
+        .expect("push --change");
+    let name = format!("me/{}-first", &change[..8]);
+    assert_eq!(outcome.message, format!("Pushed {name} to origin"));
+    assert_eq!(remote_ref(&remote, &name), Some(first));
+}
+
 #[test]
 fn untracked_remote_bookmark_blocks_the_push_until_tracked() {
     let Some((mut repo, _remote)) = setup("push-untracked") else {

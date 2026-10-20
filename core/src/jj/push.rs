@@ -20,17 +20,28 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::{StreamExt, TryStreamExt};
+use jj_cli::{
+    cli_util::load_template_aliases,
+    commit_templater::{CommitTemplateLanguage, CommitTemplateLanguageExtension},
+    revset_util::parse_immutable_heads_expression,
+    template_builder,
+    template_parser::TemplateDiagnostics,
+    ui::Ui,
+};
 use jj_lib::{
     backend::{BackendError, CommitId},
     commit::Commit,
     config::ConfigGetResultExt as _,
+    conflicts::ConflictMarkerStyle,
     git::{
         GitPushOptions, GitPushRefTargets, GitSubprocessOptions, REMOTE_NAME_FOR_LOCAL_GIT_REPO,
         get_all_remote_names, push_refs,
     },
+    id_prefix::IdPrefixContext,
     merge::Diff,
     object_id::ObjectId,
     op_store::RefTarget,
@@ -45,12 +56,10 @@ use jj_lib::{
 
 use super::mutate::{resolve_mutation_target, short_change_id};
 use super::remote::CollectingCallback;
-use super::walk::parse_user_revset;
+use super::settings::cli_error;
+use super::walk::{parse_user_revset, with_revset_parse_context};
 use crate::model::LoadProgress;
 use crate::push::{PushAllow, PushCheck, PushRejection, PushRequest, PushTarget, RejectedCommit};
-
-/// jj-cli's default `templates.git_push_bookmark`.
-pub const DEFAULT_PUSH_BOOKMARK_TEMPLATE: &str = r#""push-" ++ change_id.short()"#;
 
 /// How many offending commits a rejection lists before it says "and more".
 const MAX_REJECTED: usize = 20;
@@ -163,7 +172,7 @@ pub(super) async fn plan_push(
             }
             PushTarget::Change(revision) => {
                 let commit = resolve_mutation_target(repo, context.wc_commit_id, revision).await?;
-                let name = push_bookmark_name(context.settings, &commit)?;
+                let name = push_bookmark_name(context, repo, &commit)?;
                 let name = RefNameBuf::from(name);
                 let target = RefTarget::normal(commit.id().clone());
                 if repo.view().get_local_bookmark(&name) != &target {
@@ -383,9 +392,7 @@ pub(super) async fn sign_plan(
     let sign_on_push = context
         .settings
         .get_bool("git.sign-on-push")
-        .optional()
-        .context("failed to read git.sign-on-push")?
-        .unwrap_or(false);
+        .context("failed to read git.sign-on-push")?;
     let new_heads: Vec<CommitId> = planned
         .updates
         .iter()
@@ -639,9 +646,8 @@ async fn check_commits(
         context
             .settings
             .get_string("git.private-commits")
-            .optional()
-            .context("failed to read git.private-commits")?
-            .filter(|revset| revset.trim() != "none()")
+            .context("failed to read git.private-commits")
+            .map(|revset| (revset.trim() != "none()").then_some(revset))?
     };
     let private = match &private_revset {
         Some(revset) => Some(
@@ -812,96 +818,73 @@ fn ensure_new_bookmark_name(repo: &dyn Repo, name: &RefName) -> Result<()> {
     Ok(())
 }
 
-/// The bookmark name `jj git push --change` would generate for `commit`.
-///
-/// jj-cli evaluates `templates.git_push_bookmark` with its template engine,
-/// which lives in jj-cli, not jj-lib. This evaluates the shapes that setting
-/// takes in practice — string literals concatenated with `++` and
-/// `change_id.short([n])` / `commit_id.short([n])` — and refuses anything else
-/// rather than inventing a name the user's config didn't ask for.
-pub(super) fn push_bookmark_name(settings: &UserSettings, commit: &Commit) -> Result<String> {
-    let template = settings
+/// The bookmark name `jj git push --change` would generate for `commit`:
+/// `templates.git_push_bookmark` rendered by jj-cli's template engine, set up
+/// the way jj-cli's `commit_template_language` sets it up.
+pub(super) fn push_bookmark_name(
+    context: &PushContext<'_>,
+    repo: &dyn Repo,
+    commit: &Commit,
+) -> Result<String> {
+    let settings = context.settings;
+    let text = settings
         .get_string("templates.git_push_bookmark")
+        .context("failed to read templates.git_push_bookmark")?;
+    let template_aliases =
+        load_template_aliases(&Ui::null(), settings.config()).map_err(cli_error)?;
+    let marker_style: ConflictMarkerStyle = settings
+        .get("ui.conflict-marker-style")
+        .context("invalid ui.conflict-marker-style")?;
+    let short_prefixes = settings
+        .get_string("revsets.short-prefixes")
         .optional()
-        .context("failed to read templates.git_push_bookmark")?
-        .unwrap_or_else(|| DEFAULT_PUSH_BOOKMARK_TEMPLATE.to_owned());
-    let name = eval_push_bookmark_template(
-        &template,
-        &commit.change_id().reverse_hex(),
-        &commit.id().hex(),
-    )?;
+        .transpose()
+        .unwrap_or_else(|| settings.get_string("revsets.log"))
+        .context("invalid revsets.short-prefixes")?;
+    let output = with_revset_parse_context(
+        context.repo_root,
+        settings,
+        context.workspace_name,
+        |revset_context, path_converter| -> Result<Vec<u8>> {
+            let mut diagnostics = RevsetDiagnostics::new();
+            let immutable = parse_immutable_heads_expression(&mut diagnostics, &revset_context)
+                .context("invalid revset-aliases.immutable_heads()")?
+                .ancestors();
+            let mut id_prefix_context = IdPrefixContext::new(Arc::default());
+            if !short_prefixes.is_empty() {
+                let expression =
+                    jj_lib::revset::parse(&mut diagnostics, &short_prefixes, &revset_context)
+                        .context("invalid revsets.short-prefixes")?;
+                id_prefix_context = id_prefix_context.disambiguate_within(expression);
+            }
+            let language = CommitTemplateLanguage::new(
+                repo,
+                path_converter,
+                context.workspace_name,
+                revset_context,
+                &id_prefix_context,
+                immutable,
+                marker_style,
+                &[] as &[Arc<dyn CommitTemplateLanguageExtension>],
+            );
+            let template = template_builder::parse::<Commit, _>(
+                &language,
+                &mut TemplateDiagnostics::new(),
+                &text,
+                &template_aliases,
+            )
+            .with_context(|| format!("invalid templates.git_push_bookmark {text:?}"))?;
+            Ok(template.format_plain_text(commit))
+        },
+    )??;
+    let name = String::from_utf8(output)
+        .context("templates.git_push_bookmark generated an invalid character")?;
+    if name.is_empty() {
+        bail!("templates.git_push_bookmark generated an empty bookmark name");
+    }
     validate_bookmark_name(&name)
         .with_context(|| format!("templates.git_push_bookmark produced {name:?}"))?;
     Ok(name)
-}
-
-pub(super) fn eval_push_bookmark_template(
-    template: &str,
-    change_id: &str,
-    commit_id: &str,
-) -> Result<String> {
-    let unsupported = || {
-        anyhow!(
-            "templates.git_push_bookmark = {template:?} uses template features diffui can't \
-             evaluate (it supports string literals, ++, and change_id/commit_id.short()); \
-             push with `jj git push --change` instead"
-        )
-    };
-    let mut out = String::new();
-    let mut rest = template.trim();
-    loop {
-        if let Some(quote) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') {
-            let mut chars = rest[1..].char_indices();
-            let mut literal = String::new();
-            let mut end = None;
-            while let Some((index, c)) = chars.next() {
-                match c {
-                    '\\' if quote == '"' => match chars.next() {
-                        Some((_, 'n')) => literal.push('\n'),
-                        Some((_, 't')) => literal.push('\t'),
-                        Some((_, escaped)) => literal.push(escaped),
-                        None => return Err(unsupported()),
-                    },
-                    c if c == quote => {
-                        end = Some(index + 2);
-                        break;
-                    }
-                    c => literal.push(c),
-                }
-            }
-            let end = end.ok_or_else(unsupported)?;
-            out.push_str(&literal);
-            rest = rest[end..].trim_start();
-        } else {
-            let (id, after) = if let Some(after) = rest.strip_prefix("change_id.short(") {
-                (change_id, after)
-            } else if let Some(after) = rest.strip_prefix("commit_id.short(") {
-                (commit_id, after)
-            } else {
-                return Err(unsupported());
-            };
-            let close = after.find(')').ok_or_else(unsupported)?;
-            let arg = after[..close].trim();
-            let len = if arg.is_empty() {
-                12
-            } else {
-                arg.parse::<usize>().map_err(|_| unsupported())?
-            };
-            out.extend(id.chars().take(len));
-            rest = after[close + 1..].trim_start();
-        }
-        if rest.is_empty() {
-            break;
-        }
-        rest = rest
-            .strip_prefix("++")
-            .ok_or_else(unsupported)?
-            .trim_start();
-    }
-    if out.is_empty() {
-        bail!("templates.git_push_bookmark generated an empty bookmark name");
-    }
-    Ok(out)
 }
 
 /// A bookmark name jj accepts unquoted that is also a valid git branch name
@@ -1069,43 +1052,6 @@ pub(super) fn untrack_bookmark(repo: &mut MutableRepo, name: &str, remote: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn default_template_names_push_and_twelve_change_id_chars() {
-        let name = eval_push_bookmark_template(
-            DEFAULT_PUSH_BOOKMARK_TEMPLATE,
-            "zyxwvutsrqponmlkzyxw",
-            "0123456789abcdef",
-        )
-        .unwrap();
-        assert_eq!(name, "push-zyxwvutsrqpo");
-    }
-
-    #[test]
-    fn template_supports_prefixes_lengths_and_commit_ids() {
-        let name = eval_push_bookmark_template(
-            r#"'me/' ++ change_id.short(8) ++ "-" ++ commit_id.short(4)"#,
-            "zyxwvutsrqponmlk",
-            "0123456789abcdef",
-        )
-        .unwrap();
-        assert_eq!(name, "me/zyxwvuts-0123");
-    }
-
-    #[test]
-    fn template_refuses_what_it_cannot_evaluate() {
-        for template in [
-            r#""push-" ++ change_id.shortest()"#,
-            r#"description.first_line()"#,
-            r#""a" "b""#,
-            r#""unterminated"#,
-        ] {
-            assert!(
-                eval_push_bookmark_template(template, "zyxw", "0123").is_err(),
-                "{template} should be refused"
-            );
-        }
-    }
 
     #[test]
     fn bookmark_names_follow_jj_and_git_rules() {
