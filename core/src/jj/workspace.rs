@@ -1,3 +1,4 @@
+use std::cell::OnceCell;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -356,10 +357,60 @@ pub(crate) async fn resolve_revision(
         .get_commit_async(&commit_id)
         .await
         .with_context(|| format!("failed to load jj commit {}", commit_id.hex()))?;
-    Ok(follow_rewritten(repo, commit).await?.id().clone())
+    Ok(follow_rewritten(repo, commit, None).await?.id().clone())
 }
 
-/// The visible commit a row's cached `commit` stands for.
+/// What a command's revision targets resolve against: the commit `@` stands
+/// for, and the operation the UI's rows reflected when it named them. Built
+/// once per command and handed to every resolution in it.
+pub(crate) struct TargetContext {
+    pub(crate) wc_id: CommitId,
+    seen: Option<SeenOp>,
+}
+
+/// The operation a command's sender last saw, with the repo at it loaded on
+/// first use: only a hidden target ever needs it.
+struct SeenOp {
+    loader: RepoLoader,
+    id: OperationId,
+    repo: OnceCell<Option<Arc<ReadonlyRepo>>>,
+}
+
+impl TargetContext {
+    /// `seen_op` is the hex id of the operation the sender's rows reflect;
+    /// `None` (or an id that doesn't parse) follows every hidden commit.
+    pub(crate) fn new(loader: &RepoLoader, wc_id: CommitId, seen_op: Option<&str>) -> Self {
+        let seen = seen_op
+            .and_then(OperationId::try_from_hex)
+            .map(|id| SeenOp {
+                loader: loader.clone(),
+                id,
+                repo: OnceCell::new(),
+            });
+        Self { wc_id, seen }
+    }
+
+    /// Whether `commit` was visible at the seen operation. `None` when there
+    /// is no seen operation, or it can't be loaded any more.
+    async fn visible_when_seen(&self, commit: &Commit) -> Option<bool> {
+        let seen = self.seen.as_ref()?;
+        if seen.repo.get().is_none() {
+            let repo = match seen.loader.load_operation(&seen.id).await {
+                Ok(op) => seen.loader.load_at(&op).await.ok(),
+                Err(_) => None,
+            };
+            if repo.is_none() {
+                tracing::debug!(op = %seen.id.hex(), "the seen operation didn't load");
+            }
+            let _ = seen.repo.set(repo);
+        }
+        let repo = seen.repo.get()?.as_ref()?;
+        let targets = repo.resolve_change_id(commit.change_id()).await.ok()?;
+        Some(targets.is_some_and(|targets| targets.has_visible(commit.id())))
+    }
+}
+
+/// The commit a command that names `commit` means.
 ///
 /// A row names its commit by id, and a rewrite the row hasn't seen yet — the
 /// watcher's snapshot rebasing the children of an edited `@`, a CLI command,
@@ -370,7 +421,15 @@ pub(crate) async fn resolve_revision(
 /// to the one visible commit carrying it, the way `jj` resolves a change id.
 /// A change that was abandoned or has gone divergent is refused instead,
 /// because there is no single commit the row could mean.
-pub(crate) async fn follow_rewritten(repo: &dyn Repo, commit: Commit) -> Result<Commit> {
+///
+/// A commit that was already hidden when the sender saw the repo (a remote
+/// bookmark's old position, a typed commit id) is the user's pick, not a stale
+/// row, and resolves exactly, as `jj` resolves a commit id.
+pub(crate) async fn follow_rewritten(
+    repo: &dyn Repo,
+    commit: Commit,
+    context: Option<&TargetContext>,
+) -> Result<Commit> {
     let targets = repo
         .resolve_change_id(commit.change_id())
         .await
@@ -379,6 +438,11 @@ pub(crate) async fn follow_rewritten(repo: &dyn Repo, commit: Commit) -> Result<
         bail!("{} is no longer in the repository", commit.id().hex());
     };
     if targets.has_visible(commit.id()) {
+        return Ok(commit);
+    }
+    if let Some(context) = context
+        && context.visible_when_seen(&commit).await == Some(false)
+    {
         return Ok(commit);
     }
     let visible: Vec<&CommitId> = targets.visible_with_offsets().map(|(_, id)| id).collect();

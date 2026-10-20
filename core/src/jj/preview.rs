@@ -21,6 +21,7 @@ use jj_lib::{
 
 use super::mutate::*;
 use super::walk::{describe_resolution_error, parse_user_revset, ref_labels};
+use super::workspace::TargetContext;
 use crate::model::{CommitSummary, RevisionSelection};
 use crate::mutations::{
     Destination, DraftSimulation, InsertPreview, MergePreview, MutationOp, RebasePreview,
@@ -45,6 +46,8 @@ pub(crate) struct PreviewScope<'a> {
     pub(crate) settings: &'a UserSettings,
     pub(crate) repository: &'a Repository,
     pub(crate) workspace_name: &'a WorkspaceName,
+    /// The operation the sender's rows reflect (see [`TargetContext`]).
+    pub(crate) seen_op: Option<&'a str>,
 }
 
 /// One draft simulation, before the graph walk.
@@ -75,39 +78,30 @@ pub(crate) async fn preview(
         .get_wc_commit_id(scope.workspace_name)
         .context("jj workspace has no working-copy commit")?
         .clone();
+    let context = TargetContext::new(scope.repo.loader(), wc_commit_id, scope.seen_op);
     let mut tx = scope.repo.start_transaction();
     let simulated = match request {
         PreviewRequest::Rebase {
             mode,
             sources,
             destination,
-        } => simulate_rebase(&mut tx, &wc_commit_id, *mode, sources, destination, cancel).await?,
+        } => simulate_rebase(&mut tx, &context, *mode, sources, destination, cancel).await?,
         PreviewRequest::Merge { parents } => {
-            simulate_merge(&mut tx, scope.workspace_name, &wc_commit_id, parents).await?
+            simulate_merge(&mut tx, scope.workspace_name, &context, parents).await?
         }
         PreviewRequest::Parallelize { targets } => {
-            simulate_parallelize(&mut tx, &wc_commit_id, targets).await?
+            simulate_parallelize(&mut tx, &context, targets).await?
         }
         PreviewRequest::Squash {
             sources,
             into,
             selection,
-        } => {
-            simulate_squash(
-                &mut tx,
-                &wc_commit_id,
-                sources,
-                into,
-                selection.as_ref(),
-                cancel,
-            )
-            .await?
-        }
+        } => simulate_squash(&mut tx, &context, sources, into, selection.as_ref(), cancel).await?,
         PreviewRequest::NewAt { destination } => {
             let op = MutationOp::NewAt {
                 destination: destination.clone(),
             };
-            simulate_insert(scope, &mut tx, &wc_commit_id, &op, cancel).await?
+            simulate_insert(scope, &mut tx, &context, &op, cancel).await?
         }
         PreviewRequest::Duplicate {
             targets,
@@ -117,7 +111,7 @@ pub(crate) async fn preview(
                 targets: targets.clone(),
                 destination: Some(destination.clone()),
             };
-            simulate_insert(scope, &mut tx, &wc_commit_id, &op, cancel).await?
+            simulate_insert(scope, &mut tx, &context, &op, cancel).await?
         }
     };
     let graph = match (graph_revset, simulated.walk) {
@@ -147,6 +141,7 @@ pub(crate) async fn preview_at_operation(
     operation_hex: &str,
     request: &PreviewRequest,
     graph_revset: Option<&str>,
+    seen_op: Option<&str>,
     cancel: &CancelFlag,
 ) -> Result<(DraftSimulation, Option<PostOpGraph>)> {
     let workspace = super::workspace::load_workspace(settings, &repository.root)?;
@@ -163,6 +158,7 @@ pub(crate) async fn preview_at_operation(
         settings,
         repository,
         workspace_name: workspace.workspace_name(),
+        seen_op,
     };
     preview(&scope, request, graph_revset, cancel).await
 }
@@ -172,7 +168,7 @@ pub(crate) async fn preview_at_operation(
 async fn simulate_merge(
     tx: &mut Transaction,
     workspace_name: &WorkspaceName,
-    wc_commit_id: &CommitId,
+    context: &TargetContext,
     parents: &[RevisionSelection],
 ) -> Result<Simulated> {
     const CONFLICT_LIST_CAP: usize = 6;
@@ -180,7 +176,7 @@ async fn simulate_merge(
     let mut parent_commits: Vec<Commit> = Vec::new();
     let mut seen: HashSet<CommitId> = HashSet::new();
     for selection in parents {
-        let commit = resolve_mutation_target(tx.repo(), wc_commit_id, selection).await?;
+        let commit = resolve_mutation_target(tx.repo(), context, selection).await?;
         if seen.insert(commit.id().clone()) {
             parent_commits.push(commit);
         }
@@ -230,7 +226,7 @@ async fn simulate_merge(
 /// [`SIMULATION_CAP`] affected commits it reports counts only.
 async fn simulate_rebase(
     tx: &mut Transaction,
-    wc_commit_id: &CommitId,
+    context: &TargetContext,
     mode: RebaseSourceMode,
     sources: &[RevisionSelection],
     destination: &Destination,
@@ -239,7 +235,7 @@ async fn simulate_rebase(
     let mut source_ids: Vec<CommitId> = Vec::new();
     let mut seen: HashSet<CommitId> = HashSet::new();
     for selection in sources {
-        let commit = resolve_mutation_target(tx.repo(), wc_commit_id, selection).await?;
+        let commit = resolve_mutation_target(tx.repo(), context, selection).await?;
         if seen.insert(commit.id().clone()) {
             source_ids.push(commit.id().clone());
         }
@@ -248,7 +244,7 @@ async fn simulate_rebase(
         bail!("rebase needs at least one source revision");
     }
     let (new_parent_ids, mut new_child_ids, _anchor) =
-        resolve_rebase_location(tx.repo(), wc_commit_id, destination).await?;
+        resolve_rebase_location(tx.repo(), context, destination).await?;
     new_child_ids.retain(|id| !seen.contains(id));
     let Some(target) = resolve_move_target(tx.repo(), mode, &source_ids, &new_parent_ids).await?
     else {
@@ -361,12 +357,12 @@ async fn simulate_rebase(
 /// conflicts appear.
 async fn simulate_parallelize(
     tx: &mut Transaction,
-    wc_commit_id: &CommitId,
+    context: &TargetContext,
     targets: &[RevisionSelection],
 ) -> Result<Simulated> {
     let mut ids: Vec<CommitId> = Vec::new();
     for selection in targets {
-        let commit = resolve_mutation_target(tx.repo(), wc_commit_id, selection).await?;
+        let commit = resolve_mutation_target(tx.repo(), context, selection).await?;
         if !ids.contains(commit.id()) {
             ids.push(commit.id().clone());
         }
@@ -422,7 +418,7 @@ async fn simulate_parallelize(
 /// way the confirm path does.
 async fn simulate_squash(
     tx: &mut Transaction,
-    wc_commit_id: &CommitId,
+    context: &TargetContext,
     sources: &[RevisionSelection],
     into: &RevisionSelection,
     selection: Option<&DiffSelection>,
@@ -431,12 +427,12 @@ async fn simulate_squash(
     let mut source_commits: Vec<Commit> = Vec::new();
     let mut seen: HashSet<CommitId> = HashSet::new();
     for selection in sources {
-        let commit = resolve_mutation_target(tx.repo(), wc_commit_id, selection).await?;
+        let commit = resolve_mutation_target(tx.repo(), context, selection).await?;
         if seen.insert(commit.id().clone()) {
             source_commits.push(commit);
         }
     }
-    let destination = resolve_mutation_target(tx.repo(), wc_commit_id, into).await?;
+    let destination = resolve_mutation_target(tx.repo(), context, into).await?;
     if seen.contains(destination.id()) {
         bail!("can't squash a revision into itself");
     }
@@ -479,7 +475,7 @@ async fn simulate_squash(
 async fn simulate_insert(
     scope: &PreviewScope<'_>,
     tx: &mut Transaction,
-    wc_commit_id: &CommitId,
+    context: &TargetContext,
     op: &MutationOp,
     cancel: &CancelFlag,
 ) -> Result<Simulated> {
@@ -489,14 +485,7 @@ async fn simulate_insert(
         workspace_name: scope.workspace_name,
         allow_immutable: true,
     };
-    super::revops::apply(
-        tx.repo_mut(),
-        &guard,
-        scope.workspace_name,
-        wc_commit_id,
-        op,
-    )
-    .await?;
+    super::revops::apply(tx.repo_mut(), &guard, scope.workspace_name, context, op).await?;
     tx.repo_mut()
         .rebase_descendants()
         .await

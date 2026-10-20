@@ -327,6 +327,7 @@ impl TestRepo {
             job,
             op,
             allow_immutable: false,
+            seen_op: None,
         });
         match events.into_iter().next_back() {
             Some(Payload::MutationDone { outcome, .. }) => Ok(outcome),
@@ -590,6 +591,27 @@ pub fn set_bookmark(root: &Path, base: OpBase, name: &str, commit_id: &str) {
             jj_lib::op_store::RefTarget::normal(target.id().clone()),
         );
         tx.commit("test: set bookmark")
+            .await
+            .expect("commit the op");
+    })
+}
+
+/// `name@remote` at `commit_id`, tracked: where a fetch or a push would
+/// leave it, without a remote to talk to.
+pub fn set_remote_bookmark(root: &Path, name: &str, remote: &str, commit_id: &str) {
+    at_head(root, async |_loader, repo| {
+        let target = commit_at(&repo, commit_id).await;
+        let mut tx = repo.start_transaction();
+        let symbol = jj_lib::ref_name::RefName::new(name)
+            .to_remote_symbol(jj_lib::ref_name::RemoteName::new(remote));
+        tx.repo_mut().set_remote_bookmark(
+            symbol,
+            jj_lib::op_store::RemoteRef {
+                target: jj_lib::op_store::RefTarget::normal(target.id().clone()),
+                state: jj_lib::op_store::RemoteRefState::Tracked,
+            },
+        );
+        tx.commit("test: set remote bookmark")
             .await
             .expect("commit the op");
     })

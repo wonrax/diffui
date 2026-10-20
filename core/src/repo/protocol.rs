@@ -198,6 +198,10 @@ pub enum Command {
         job: JobId,
         op: MutationOp,
         allow_immutable: bool,
+        /// The operation the sender's rows reflect. A target hidden now but
+        /// visible there is a stale row and follows its change; one already
+        /// hidden there was picked as is and stays that commit.
+        seen_op: Option<String>,
     },
     Preview {
         job: JobId,
@@ -206,6 +210,8 @@ pub enum Command {
         /// carries the graph the operation would leave; `None` for the
         /// summary alone.
         graph: Option<String>,
+        /// As [`Command::Mutate`]'s.
+        seen_op: Option<String>,
     },
     Fetch {
         job: JobId,
@@ -245,6 +251,8 @@ pub enum Command {
         job: JobId,
         name: String,
         to: RevisionSelection,
+        /// As [`Command::Mutate`]'s.
+        seen_op: Option<String>,
     },
     /// The conflicted paths of `revision`, with jj's labels for their sides
     /// — what the resolve actions are offered from.

@@ -34,8 +34,8 @@ use super::push::{
 };
 use super::walk::*;
 use super::workspace::{
-    LockOutcome, LockedWorkingCopy, SnapshotContext, follow_rewritten, lock_working_copy,
-    resolve_revision,
+    LockOutcome, LockedWorkingCopy, SnapshotContext, TargetContext, follow_rewritten,
+    lock_working_copy,
 };
 use crate::model::{LoadProgress, RevisionSelection};
 use crate::mutations::{Destination, MutationOp, MutationOutcome, RebaseSourceMode, SquashTarget};
@@ -54,6 +54,7 @@ pub(crate) async fn check_bookmark_move_backwards(
     workspace_name: &WorkspaceName,
     name: &str,
     to: &RevisionSelection,
+    seen_op: Option<&str>,
 ) -> Result<bool> {
     let current = repo.view().get_local_bookmark(RefName::new(name));
     if current.is_absent() {
@@ -63,11 +64,17 @@ pub(crate) async fn check_bookmark_move_backwards(
         return Ok(true);
     };
 
-    let new_target = resolve_revision(repo, workspace_name, to).await?;
+    let wc_id = repo
+        .view()
+        .get_wc_commit_id(workspace_name)
+        .context("jj workspace has no working-copy commit")?
+        .clone();
+    let context = TargetContext::new(repo.loader(), wc_id, seen_op);
+    let new_target = resolve_mutation_target(repo, &context, to).await?;
 
     let forward = repo
         .index()
-        .is_ancestor(current, &new_target)
+        .is_ancestor(current, new_target.id())
         .await
         .context("failed to check bookmark ancestry")?;
     Ok(!forward)
@@ -91,6 +98,10 @@ pub(crate) async fn check_bookmark_move_backwards(
 ///
 /// The flag beside the outcome says the checkout was stale and had to be
 /// recovered first, which the caller tells the user about.
+///
+/// `seen_op` is the operation the sender's rows reflect, which tells a stale
+/// row from a hidden commit picked on purpose (see [`follow_rewritten`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_mutation(
     workspace: &mut Workspace,
     settings: &UserSettings,
@@ -99,10 +110,20 @@ pub(crate) async fn apply_mutation(
     op: &MutationOp,
     progress: &LoadProgress,
     allow_immutable: bool,
+    seen_op: Option<&str>,
 ) -> Result<(MutationOutcome, bool)> {
     if is_view_only(op) {
         return Ok((
-            apply_view_only(workspace, settings, context, &repository.root, op, progress).await?,
+            apply_view_only(
+                workspace,
+                settings,
+                context,
+                &repository.root,
+                op,
+                progress,
+                seen_op,
+            )
+            .await?,
             false,
         ));
     }
@@ -119,6 +140,7 @@ pub(crate) async fn apply_mutation(
             op,
             progress,
             allow_immutable,
+            seen_op,
         )
         .await?
         {
@@ -160,6 +182,7 @@ async fn apply_view_only(
     repo_root: &Path,
     op: &MutationOp,
     progress: &LoadProgress,
+    seen_op: Option<&str>,
 ) -> Result<MutationOutcome> {
     let workspace_name = workspace.workspace_name().to_owned();
     let mut signed: Option<Signed> = None;
@@ -180,11 +203,12 @@ async fn apply_view_only(
             "args".to_owned(),
             super::op_args::op_args(base_repo.as_ref(), op, false).await,
         );
+        let targets = TargetContext::new(base_repo.loader(), wc_commit_id, seen_op);
         let push_context = PushContext {
             settings,
             repo_root,
             workspace_name: &workspace_name,
-            wc_commit_id: &wc_commit_id,
+            targets: &targets,
         };
         let (moved, planned) = stage_view_only(&push_context, tx.repo_mut(), op).await?;
         let mut output: Vec<String> = Vec::new();
@@ -199,8 +223,10 @@ async fn apply_view_only(
                         );
                     }
                     drop(tx);
-                    signed =
-                        Some(sign_before_push(workspace, settings, context, repo_root, op).await?);
+                    signed = Some(
+                        sign_before_push(workspace, settings, context, repo_root, op, seen_op)
+                            .await?,
+                    );
                     continue;
                 }
                 planned.notes.extend(
@@ -253,14 +279,13 @@ async fn stage_view_only(
     op: &MutationOp,
 ) -> Result<(Option<String>, Option<PlannedPush>)> {
     let settings = push_context.settings;
-    let wc_commit_id = push_context.wc_commit_id;
     let request = match op {
         MutationOp::MoveBookmark {
             name,
             to,
             push_remote,
         } => {
-            let commit = resolve_mutation_target(repo, wc_commit_id, to).await?;
+            let commit = resolve_mutation_target(repo, push_context.targets, to).await?;
             let short = short_change_id(&commit);
             repo.set_local_bookmark_target(
                 RefName::new(name),
@@ -309,7 +334,7 @@ async fn stage_view_only(
             return Ok((Some(format!("Tracking {name}@{remote}")), None));
         }
         MutationOp::CreateBookmark { name, to } => {
-            let commit = resolve_mutation_target(repo, wc_commit_id, to).await?;
+            let commit = resolve_mutation_target(repo, push_context.targets, to).await?;
             create_bookmark(settings, repo, name, &commit).await?;
             let message = format!("Created bookmark {name} at {}", short_change_id(&commit));
             return Ok((Some(message), None));
@@ -346,6 +371,7 @@ async fn sign_before_push(
     context: &SnapshotContext,
     repo_root: &Path,
     op: &MutationOp,
+    seen_op: Option<&str>,
 ) -> Result<Signed> {
     let workspace_name = workspace.workspace_name().to_owned();
     let repo_loader = workspace.repo_loader().clone();
@@ -358,7 +384,15 @@ async fn sign_before_push(
                 LockOutcome::Locked(locked) => locked,
                 LockOutcome::Recovered { .. } => continue,
             };
-        let result = sign_locked(&mut locked, settings, repo_root, &workspace_name, op).await;
+        let result = sign_locked(
+            &mut locked,
+            settings,
+            repo_root,
+            &workspace_name,
+            op,
+            seen_op,
+        )
+        .await;
         if result.is_err() {
             locked.abandon();
         }
@@ -374,6 +408,7 @@ async fn sign_locked(
     repo_root: &Path,
     workspace_name: &WorkspaceName,
     op: &MutationOp,
+    seen_op: Option<&str>,
 ) -> Result<Signed> {
     let base_repo = locked.repo.clone();
     let mut tx = base_repo.start_transaction();
@@ -384,11 +419,12 @@ async fn sign_locked(
         .get_wc_commit_id(workspace_name)
         .context("jj workspace has no working-copy commit")?
         .clone();
+    let targets = TargetContext::new(base_repo.loader(), wc_commit_id, seen_op);
     let push_context = PushContext {
         settings,
         repo_root,
         workspace_name,
-        wc_commit_id: &wc_commit_id,
+        targets: &targets,
     };
 
     let bookmarks_before: HashMap<RefNameBuf, RefTarget> = tx
@@ -483,6 +519,7 @@ async fn apply_mutation_attempt(
     op: &MutationOp,
     progress: &LoadProgress,
     allow_immutable: bool,
+    seen_op: Option<&str>,
 ) -> Result<Option<MutationOutcome>> {
     let workspace_name = workspace.workspace_name().to_owned();
     let repo_loader = workspace.repo_loader().clone();
@@ -503,6 +540,7 @@ async fn apply_mutation_attempt(
         op,
         progress,
         allow_immutable,
+        seen_op,
     )
     .await;
     match result {
@@ -530,6 +568,7 @@ async fn mutate_locked(
     op: &MutationOp,
     _progress: &LoadProgress,
     allow_immutable: bool,
+    seen_op: Option<&str>,
 ) -> Result<MutationOutcome> {
     let base_repo = locked.repo.clone();
     let workspace_name = workspace_name.to_owned();
@@ -604,6 +643,7 @@ async fn mutate_locked(
         .with_context(|| format!("failed to load jj commit {}", current_wc_id.hex()))?
         .change_id()
         .clone();
+    let context = TargetContext::new(repo_loader, current_wc_id.clone(), seen_op);
 
     // Captured side output: remote sideband for push, skipped/absorbed notes
     // for absorb; empty for the other mutations.
@@ -611,7 +651,7 @@ async fn mutate_locked(
     let mut rewritten_commit: Option<String> = None;
     let message = match op {
         MutationOp::New { parent } => {
-            let parent_commit = resolve_mutation_target(tx.repo(), &current_wc_id, parent).await?;
+            let parent_commit = resolve_mutation_target(tx.repo(), &context, parent).await?;
             let short = short_change_id(&parent_commit);
             // Single parent: `merge_commit_trees` returns the parent's tree.
             let tree = merge_commit_trees(tx.repo(), std::slice::from_ref(&parent_commit))
@@ -630,7 +670,7 @@ async fn mutate_locked(
             format!("New change on {short}")
         }
         MutationOp::Edit { target } => {
-            let commit = resolve_mutation_target(tx.repo(), &current_wc_id, target).await?;
+            let commit = resolve_mutation_target(tx.repo(), &context, target).await?;
             // The CLI refuses `jj edit` on immutable commits: a working copy
             // parked there would amend them on the next snapshot.
             ensure_rewritable(
@@ -653,7 +693,7 @@ async fn mutate_locked(
             let mut commits: Vec<Commit> = Vec::new();
             let mut seen: HashSet<CommitId> = HashSet::new();
             for selection in targets {
-                let commit = resolve_mutation_target(tx.repo(), &current_wc_id, selection).await?;
+                let commit = resolve_mutation_target(tx.repo(), &context, selection).await?;
                 if seen.insert(commit.id().clone()) {
                     commits.push(commit);
                 }
@@ -687,7 +727,7 @@ async fn mutate_locked(
             target,
             description,
         } => {
-            let commit = resolve_mutation_target(tx.repo(), &current_wc_id, target).await?;
+            let commit = resolve_mutation_target(tx.repo(), &context, target).await?;
             ensure_rewritable(
                 &repository.root,
                 settings,
@@ -718,7 +758,7 @@ async fn mutate_locked(
             let mut source_commits: Vec<Commit> = Vec::new();
             let mut seen: HashSet<CommitId> = HashSet::new();
             for selection in sources {
-                let commit = resolve_mutation_target(tx.repo(), &current_wc_id, selection).await?;
+                let commit = resolve_mutation_target(tx.repo(), &context, selection).await?;
                 if seen.insert(commit.id().clone()) {
                     source_commits.push(commit);
                 }
@@ -728,7 +768,7 @@ async fn mutate_locked(
             }
             let source_ids: Vec<CommitId> = source_commits.iter().map(|c| c.id().clone()).collect();
             let (new_parent_ids, mut new_child_ids, anchor) =
-                resolve_rebase_location(tx.repo(), &current_wc_id, destination).await?;
+                resolve_rebase_location(tx.repo(), &context, destination).await?;
             // `-A parent-of-X` lists X itself among the target's children;
             // moved commits can't also be insertion children (the CLI
             // subtracts the target set the same way).
@@ -788,7 +828,7 @@ async fn mutate_locked(
             let mut source_commits: Vec<Commit> = Vec::new();
             let mut seen: HashSet<CommitId> = HashSet::new();
             for selection in from {
-                let commit = resolve_mutation_target(tx.repo(), &current_wc_id, selection).await?;
+                let commit = resolve_mutation_target(tx.repo(), &context, selection).await?;
                 if seen.insert(commit.id().clone()) {
                     source_commits.push(commit);
                 }
@@ -818,7 +858,7 @@ async fn mutate_locked(
                     }
                 }
                 SquashTarget::Revision(target) => {
-                    resolve_mutation_target(tx.repo(), &current_wc_id, target).await?
+                    resolve_mutation_target(tx.repo(), &context, target).await?
                 }
             };
             if seen.contains(destination.id()) {
@@ -852,7 +892,7 @@ async fn mutate_locked(
             let mut parent_commits: Vec<Commit> = Vec::new();
             let mut seen: HashSet<CommitId> = HashSet::new();
             for selection in parents {
-                let commit = resolve_mutation_target(tx.repo(), &current_wc_id, selection).await?;
+                let commit = resolve_mutation_target(tx.repo(), &context, selection).await?;
                 if seen.insert(commit.id().clone()) {
                     parent_commits.push(commit);
                 }
@@ -878,7 +918,7 @@ async fn mutate_locked(
             format!("New merge of {}", names.join(" + "))
         }
         MutationOp::Duplicate { target } => {
-            let commit = resolve_mutation_target(tx.repo(), &current_wc_id, target).await?;
+            let commit = resolve_mutation_target(tx.repo(), &context, target).await?;
             let short = short_change_id(&commit);
             let stats = duplicate_commits_onto_parents(
                 tx.repo_mut(),
@@ -896,7 +936,7 @@ async fn mutate_locked(
             }
         }
         MutationOp::Absorb { from } => {
-            let source = resolve_mutation_target(tx.repo(), &current_wc_id, from).await?;
+            let source = resolve_mutation_target(tx.repo(), &context, from).await?;
             let short = short_change_id(&source);
             ensure_rewritable(
                 &repository.root,
@@ -967,8 +1007,7 @@ async fn mutate_locked(
                 allow_immutable,
             };
             let outcome =
-                super::revops::apply(tx.repo_mut(), &guard, &workspace_name, &current_wc_id, op)
-                    .await?;
+                super::revops::apply(tx.repo_mut(), &guard, &workspace_name, &context, op).await?;
             rewritten_commit = outcome.rewritten_commit;
             outcome.message
         }
@@ -997,7 +1036,7 @@ async fn mutate_locked(
             first_description,
             second_description,
         } => {
-            let commit = resolve_mutation_target(tx.repo(), &current_wc_id, target).await?;
+            let commit = resolve_mutation_target(tx.repo(), &context, target).await?;
             ensure_rewritable(
                 &repository.root,
                 settings,
@@ -1029,7 +1068,7 @@ async fn mutate_locked(
             selection,
             into,
         } => {
-            let source = resolve_mutation_target(tx.repo(), &current_wc_id, from).await?;
+            let source = resolve_mutation_target(tx.repo(), &context, from).await?;
             let destination = match into {
                 SquashTarget::Parent => {
                     let parents = source
@@ -1046,7 +1085,7 @@ async fn mutate_locked(
                     }
                 }
                 SquashTarget::Revision(target) => {
-                    resolve_mutation_target(tx.repo(), &current_wc_id, target).await?
+                    resolve_mutation_target(tx.repo(), &context, target).await?
                 }
             };
             if source.id() == destination.id() {
@@ -1089,7 +1128,7 @@ async fn mutate_locked(
             message
         }
         MutationOp::RestoreChanges { target, selection } => {
-            let commit = resolve_mutation_target(tx.repo(), &current_wc_id, target).await?;
+            let commit = resolve_mutation_target(tx.repo(), &context, target).await?;
             ensure_rewritable(
                 &repository.root,
                 settings,
@@ -1115,7 +1154,7 @@ async fn mutate_locked(
             path,
             resolution,
         } => {
-            let commit = resolve_mutation_target(tx.repo(), &current_wc_id, target).await?;
+            let commit = resolve_mutation_target(tx.repo(), &context, target).await?;
             ensure_rewritable(
                 &repository.root,
                 settings,
@@ -1349,16 +1388,16 @@ fn mutation_outcome(
 /// `-d` / `-A` / `-B` / `-A x -B y` resolution.
 pub(super) async fn resolve_rebase_location(
     repo: &MutableRepo,
-    current_wc_id: &CommitId,
+    context: &TargetContext,
     destination: &Destination,
 ) -> Result<(Vec<CommitId>, Vec<CommitId>, Commit)> {
     Ok(match destination {
         Destination::Onto(target) => {
-            let anchor = resolve_mutation_target(repo, current_wc_id, target).await?;
+            let anchor = resolve_mutation_target(repo, context, target).await?;
             (vec![anchor.id().clone()], Vec::new(), anchor)
         }
         Destination::After(target) => {
-            let anchor = resolve_mutation_target(repo, current_wc_id, target).await?;
+            let anchor = resolve_mutation_target(repo, context, target).await?;
             let children = RevsetExpression::commits(vec![anchor.id().clone()])
                 .children()
                 .evaluate(repo)
@@ -1370,7 +1409,7 @@ pub(super) async fn resolve_rebase_location(
             (vec![anchor.id().clone()], children, anchor)
         }
         Destination::Before(target) => {
-            let anchor = resolve_mutation_target(repo, current_wc_id, target).await?;
+            let anchor = resolve_mutation_target(repo, context, target).await?;
             (
                 anchor.parent_ids().to_vec(),
                 vec![anchor.id().clone()],
@@ -1378,8 +1417,8 @@ pub(super) async fn resolve_rebase_location(
             )
         }
         Destination::Between { parent, child } => {
-            let parent = resolve_mutation_target(repo, current_wc_id, parent).await?;
-            let child = resolve_mutation_target(repo, current_wc_id, child).await?;
+            let parent = resolve_mutation_target(repo, context, parent).await?;
+            let child = resolve_mutation_target(repo, context, child).await?;
             (vec![parent.id().clone()], vec![child.id().clone()], parent)
         }
     })
@@ -1604,16 +1643,16 @@ pub(super) async fn squash_whole(
 }
 
 /// Resolve a `RevisionSelection` to a `Commit`. The working-copy case uses
-/// `current_wc_id` (the post-snapshot `@`); a commit the caller still names by
+/// `context.wc_id` (the post-snapshot `@`); a commit the caller still names by
 /// an id that has since been rewritten resolves to its visible successor (see
 /// [`follow_rewritten`]).
 pub(super) async fn resolve_mutation_target(
-    repo: &MutableRepo,
-    current_wc_id: &CommitId,
+    repo: &dyn Repo,
+    context: &TargetContext,
     target: &RevisionSelection,
 ) -> Result<Commit> {
     let commit_id = match target {
-        RevisionSelection::WorkingCopy => current_wc_id.clone(),
+        RevisionSelection::WorkingCopy => context.wc_id.clone(),
         RevisionSelection::Commit(hex) => {
             CommitId::try_from_hex(hex).with_context(|| format!("invalid jj commit id {hex}"))?
         }
@@ -1626,7 +1665,7 @@ pub(super) async fn resolve_mutation_target(
     if matches!(target, RevisionSelection::WorkingCopy) {
         return Ok(commit);
     }
-    follow_rewritten(repo, commit).await
+    follow_rewritten(repo, commit, Some(context)).await
 }
 
 pub(super) fn short_change_id(commit: &Commit) -> String {

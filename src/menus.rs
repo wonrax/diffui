@@ -585,12 +585,9 @@ impl Diffui {
             let Some(state) = self.tab_mut(tab_id) else {
                 return Task::none();
             };
-            let job = state.session.next_job();
+            let (job, effects) = state.session.bookmark_check(name, to);
             state.jobs.bookmark_check = Some((job, pending));
-            return self.send(
-                tab_id,
-                diffui_core::Command::BookmarkCheck { job, name, to },
-            );
+            return self.run_effects(tab_id, effects);
         }
         self.run_mutation_checking_wc_push(pending)
     }

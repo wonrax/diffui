@@ -29,6 +29,7 @@ use super::mutate::{
     ensure_rewritable, resolve_mutation_target, resolve_rebase_location, reverse_topo_order,
     short_change_id,
 };
+use super::workspace::TargetContext;
 use crate::model::RevisionSelection;
 use crate::mutations::Destination;
 
@@ -78,13 +79,13 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 /// Resolve `selections` to commits, dropping duplicates, in the given order.
 async fn resolve_all(
     repo: &MutableRepo,
-    wc_id: &CommitId,
+    context: &TargetContext,
     selections: &[RevisionSelection],
 ) -> Result<Vec<Commit>> {
     let mut commits = Vec::new();
     let mut seen = HashSet::new();
     for selection in selections {
-        let commit = resolve_mutation_target(repo, wc_id, selection).await?;
+        let commit = resolve_mutation_target(repo, context, selection).await?;
         if seen.insert(commit.id().clone()) {
             commits.push(commit);
         }
@@ -130,11 +131,11 @@ async fn ensure_no_loop(
 async fn insertion_point(
     repo: &MutableRepo,
     guard: &RewriteGuard<'_>,
-    wc_id: &CommitId,
+    context: &TargetContext,
     destination: &Destination,
     what: &str,
 ) -> Result<(Vec<CommitId>, Vec<CommitId>, Commit)> {
-    let (parents, children, anchor) = resolve_rebase_location(repo, wc_id, destination).await?;
+    let (parents, children, anchor) = resolve_rebase_location(repo, context, destination).await?;
     if !children.is_empty() {
         guard.check(repo, &children).await?;
         ensure_no_loop(repo, &children, &parents, what).await?;
@@ -170,9 +171,10 @@ fn complete_newline(description: &str) -> String {
 pub(super) async fn commit(
     repo: &mut MutableRepo,
     guard: &RewriteGuard<'_>,
-    wc_id: &CommitId,
+    context: &TargetContext,
     description: &str,
 ) -> Result<RevopOutcome> {
+    let wc_id = &context.wc_id;
     let commit = repo
         .store()
         .get_commit_async(wc_id)
@@ -211,11 +213,11 @@ pub(super) async fn new_at(
     repo: &mut MutableRepo,
     guard: &RewriteGuard<'_>,
     workspace: &WorkspaceName,
-    wc_id: &CommitId,
+    context: &TargetContext,
     destination: &Destination,
 ) -> Result<RevopOutcome> {
     let (parent_ids, child_ids, anchor) =
-        insertion_point(repo, guard, wc_id, destination, "new commit").await?;
+        insertion_point(repo, guard, context, destination, "new commit").await?;
     let mut parents = Vec::new();
     for id in &parent_ids {
         parents.push(
@@ -395,10 +397,10 @@ pub(super) async fn apply_parallelize(
 pub(super) async fn parallelize(
     repo: &mut MutableRepo,
     guard: &RewriteGuard<'_>,
-    wc_id: &CommitId,
+    context: &TargetContext,
     targets: &[RevisionSelection],
 ) -> Result<RevopOutcome> {
-    let commits = resolve_all(repo, wc_id, targets).await?;
+    let commits = resolve_all(repo, context, targets).await?;
     let ids: Vec<CommitId> = commits.iter().map(|c| c.id().clone()).collect();
     let plan = plan_parallelize(repo, &ids).await?;
     guard.check(repo, &plan.needs_rewrite).await?;
@@ -421,11 +423,11 @@ pub(super) async fn parallelize(
 pub(super) async fn duplicate_to(
     repo: &mut MutableRepo,
     guard: &RewriteGuard<'_>,
-    wc_id: &CommitId,
+    context: &TargetContext,
     targets: &[RevisionSelection],
     destination: Option<&Destination>,
 ) -> Result<RevopOutcome> {
-    let commits = resolve_all(repo, wc_id, targets).await?;
+    let commits = resolve_all(repo, context, targets).await?;
     if commits.is_empty() {
         bail!("duplicate needs at least one revision");
     }
@@ -443,7 +445,7 @@ pub(super) async fn duplicate_to(
         ),
         Some(destination) => {
             let (parents, children, anchor) =
-                insertion_point(repo, guard, wc_id, destination, "duplicated commits").await?;
+                insertion_point(repo, guard, context, destination, "duplicated commits").await?;
             let stats = duplicate_commits(repo, &ordered, &HashMap::new(), &parents, &children)
                 .await
                 .context("failed to duplicate")?;
@@ -495,10 +497,10 @@ pub(super) async fn duplicate_to(
 pub(super) async fn keep_divergent(
     repo: &mut MutableRepo,
     guard: &RewriteGuard<'_>,
-    wc_id: &CommitId,
+    context: &TargetContext,
     keep: &RevisionSelection,
 ) -> Result<RevopOutcome> {
-    let kept = resolve_mutation_target(repo, wc_id, keep).await?;
+    let kept = resolve_mutation_target(repo, context, keep).await?;
     let targets = repo
         .resolve_change_id(kept.change_id())
         .await
@@ -538,12 +540,12 @@ pub(super) async fn keep_divergent(
 pub(super) async fn metaedit(
     repo: &mut MutableRepo,
     guard: &RewriteGuard<'_>,
-    wc_id: &CommitId,
+    context: &TargetContext,
     targets: &[RevisionSelection],
     update_author: bool,
     update_author_timestamp: bool,
 ) -> Result<RevopOutcome> {
-    let commits = resolve_all(repo, wc_id, targets).await?;
+    let commits = resolve_all(repo, context, targets).await?;
     if commits.is_empty() {
         bail!("pick at least one revision");
     }
@@ -630,21 +632,21 @@ pub(super) async fn apply(
     repo: &mut MutableRepo,
     guard: &RewriteGuard<'_>,
     workspace: &WorkspaceName,
-    wc_id: &CommitId,
+    context: &TargetContext,
     op: &crate::mutations::MutationOp,
 ) -> Result<RevopOutcome> {
     use crate::mutations::MutationOp;
     match op {
-        MutationOp::Commit { description } => commit(repo, guard, wc_id, description).await,
+        MutationOp::Commit { description } => commit(repo, guard, context, description).await,
         MutationOp::NewAt { destination } => {
-            new_at(repo, guard, workspace, wc_id, destination).await
+            new_at(repo, guard, workspace, context, destination).await
         }
-        MutationOp::Parallelize { targets } => parallelize(repo, guard, wc_id, targets).await,
+        MutationOp::Parallelize { targets } => parallelize(repo, guard, context, targets).await,
         MutationOp::DuplicateTo {
             targets,
             destination,
-        } => duplicate_to(repo, guard, wc_id, targets, destination.as_ref()).await,
-        MutationOp::KeepDivergent { keep } => keep_divergent(repo, guard, wc_id, keep).await,
+        } => duplicate_to(repo, guard, context, targets, destination.as_ref()).await,
+        MutationOp::KeepDivergent { keep } => keep_divergent(repo, guard, context, keep).await,
         MutationOp::Metaedit {
             targets,
             update_author,
@@ -653,7 +655,7 @@ pub(super) async fn apply(
             metaedit(
                 repo,
                 guard,
-                wc_id,
+                context,
                 targets,
                 *update_author,
                 *update_author_timestamp,

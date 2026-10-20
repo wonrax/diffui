@@ -70,6 +70,7 @@ use super::mutate::{resolve_mutation_target, short_change_id};
 use super::remote::CollectingCallback;
 use super::settings::cli_error;
 use super::walk::{parse_user_revset, with_revset_parse_context};
+use super::workspace::TargetContext;
 use crate::model::LoadProgress;
 use crate::push::{PushAllow, PushCheck, PushRejection, PushRequest, PushTarget, RejectedCommit};
 
@@ -77,12 +78,13 @@ use crate::push::{PushAllow, PushCheck, PushRejection, PushRequest, PushTarget, 
 const MAX_REJECTED: usize = 20;
 
 /// Where the push runs from: the repo's root (revsets resolve paths against
-/// it), the pushing workspace, and its `@`.
+/// it), the pushing workspace, and what its targets resolve against (`@`
+/// among it).
 pub(super) struct PushContext<'a> {
     pub settings: &'a UserSettings,
     pub repo_root: &'a Path,
     pub workspace_name: &'a WorkspaceName,
-    pub wc_commit_id: &'a CommitId,
+    pub targets: &'a TargetContext,
 }
 
 /// A finished push: the activity summary and the remote's sideband output.
@@ -153,7 +155,7 @@ pub(super) async fn plan_push(
                 });
             }
             PushTarget::SetBookmark { name, to } => {
-                let commit = resolve_mutation_target(repo, context.wc_commit_id, to).await?;
+                let commit = resolve_mutation_target(repo, context.targets, to).await?;
                 let name = RefName::new(name);
                 repo.set_local_bookmark_target(name, RefTarget::normal(commit.id().clone()));
                 named.push(Named {
@@ -183,7 +185,7 @@ pub(super) async fn plan_push(
                 });
             }
             PushTarget::Change(revision) => {
-                let commit = resolve_mutation_target(repo, context.wc_commit_id, revision).await?;
+                let commit = resolve_mutation_target(repo, context.targets, revision).await?;
                 let name = push_bookmark_name(context, repo, &commit)?;
                 let name = RefNameBuf::from(name);
                 let target = RefTarget::normal(commit.id().clone());
@@ -228,7 +230,7 @@ pub(super) async fn plan_push(
         // `jj git push` with no target flags: tracked bookmarks pointing into
         // `remote_bookmarks(remote=<remote>)..@`. Ones that can't be pushed are
         // skipped with a note rather than failing the rest.
-        let in_range = default_push_range(repo, remote, context.wc_commit_id).await?;
+        let in_range = default_push_range(repo, remote, &context.targets.wc_id).await?;
         let candidates: Vec<RefNameBuf> = repo
             .view()
             .local_remote_bookmarks(remote)
@@ -726,7 +728,7 @@ async fn check_commits(
             truncated = true;
             break;
         }
-        rejected.push(rejected_commit(&commit, reasons, context.wc_commit_id));
+        rejected.push(rejected_commit(&commit, reasons, &context.targets.wc_id));
     }
     Ok((rejected, truncated, private_revset.filter(|_| any_private)))
 }

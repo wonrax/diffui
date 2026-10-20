@@ -178,6 +178,7 @@ async fn run_mutation(
         job,
         op,
         allow_immutable,
+        seen_op: None,
     })
     .await;
     match events.into_iter().next_back() {
@@ -222,6 +223,7 @@ async fn preview(
         job,
         draft,
         graph: None,
+        seen_op: None,
     })
     .await;
     match events.into_iter().next_back() {
@@ -2938,6 +2940,7 @@ fn preview_graph(
         job,
         draft,
         graph: Some("all()".to_owned()),
+        seen_op: None,
     }));
     match events.into_iter().next_back() {
         Some(Payload::PreviewDone {
@@ -3320,6 +3323,7 @@ fn a_cancelled_preview_frees_the_actor_at_once() {
             job,
             draft,
             graph: Some("all()".to_owned()),
+            seen_op: None,
         }
     };
 

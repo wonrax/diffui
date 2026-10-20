@@ -823,6 +823,7 @@ impl Session {
                 job,
                 op,
                 allow_immutable,
+                seen_op: self.graph_fingerprint.clone(),
             })],
         )
     }
@@ -839,7 +840,27 @@ impl Session {
         let graph = Some(self.revset.clone());
         (
             job,
-            vec![Effect::Send(Command::Preview { job, draft, graph })],
+            vec![Effect::Send(Command::Preview {
+                job,
+                draft,
+                graph,
+                seen_op: self.graph_fingerprint.clone(),
+            })],
+        )
+    }
+
+    /// Ask whether moving bookmark `name` to `to` is backwards or sideways,
+    /// resolving `to` the way the move itself will.
+    pub fn bookmark_check(&mut self, name: String, to: RevisionSelection) -> (JobId, Vec<Effect>) {
+        let job = self.next_job();
+        (
+            job,
+            vec![Effect::Send(Command::BookmarkCheck {
+                job,
+                name,
+                to,
+                seen_op: self.graph_fingerprint.clone(),
+            })],
         )
     }
 
@@ -1892,6 +1913,37 @@ mod tests {
         );
         assert!(session.commits.find_by_commit_id("rewritten").is_some());
         assert_eq!(session.graph_fingerprint.as_deref(), Some("b"));
+    }
+
+    /// Every command that resolves revision targets tells the actor which op
+    /// the rows reflect, so a hidden commit picked off them resolves exactly
+    /// and a stale one follows its change.
+    #[test]
+    fn commands_that_resolve_targets_carry_the_rows_op() {
+        let mut session = Session::unloaded(String::new());
+        session.graph_fingerprint = Some("seen".to_owned());
+        let target = RevisionSelection::Commit("abc".to_owned());
+        let (_, mutate) = session.mutate(
+            MutationOp::Edit {
+                target: target.clone(),
+            },
+            false,
+        );
+        let (_, preview) = session.preview(PreviewRequest::Merge {
+            parents: vec![target.clone()],
+        });
+        let (_, check) = session.bookmark_check("main".to_owned(), target);
+        for effects in [mutate, preview, check] {
+            let seen = effects.iter().find_map(|effect| match effect {
+                Effect::Send(
+                    Command::Mutate { seen_op, .. }
+                    | Command::Preview { seen_op, .. }
+                    | Command::BookmarkCheck { seen_op, .. },
+                ) => Some(seen_op.clone()),
+                _ => None,
+            });
+            assert_eq!(seen, Some(Some("seen".to_owned())), "{effects:?}");
+        }
     }
 
     #[test]

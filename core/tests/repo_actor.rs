@@ -210,6 +210,7 @@ fn a_mutation_lands_on_the_tab_that_asked_for_it() {
             parent: RevisionSelection::WorkingCopy,
         },
         allow_immutable: false,
+        seen_op: None,
     });
     for payload in repo.drain(job) {
         let event = Event::new(repo_id(&root), payload);
@@ -243,6 +244,7 @@ fn a_fetch_queues_behind_a_mutation() {
             parent: RevisionSelection::WorkingCopy,
         },
         allow_immutable: false,
+        seen_op: None,
     });
     let fetch = repo.send(|job| Command::Fetch {
         job,
@@ -672,6 +674,146 @@ fn a_mutation_on_a_rewritten_id_follows_the_change() {
             ..
         }) => assert_ne!(id, &stale_child),
         other => panic!("expected a diff under the followed id, got {other:?}"),
+    }
+}
+
+/// Run the command `effects` sends and return its events.
+fn run_sent(repo: &mut TestRepo, effects: &[Effect]) -> Vec<Payload> {
+    let command = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::Send(command) => Some(command.clone()),
+            _ => None,
+        })
+        .expect("the projection should have sent a command");
+    let job = command.job().expect("a command with a job");
+    repo.handle.send(command);
+    repo.drain(job)
+}
+
+/// Where the local bookmark `name` points, as the menus read it.
+fn local_targets(repo: &mut TestRepo, name: &str) -> Vec<String> {
+    let events = repo.run(|job| Command::LoadGraph {
+        job,
+        revset: "all()".to_owned(),
+    });
+    let tail = events
+        .into_iter()
+        .find_map(|payload| match payload {
+            Payload::GraphLoaded { tail, .. } => Some(tail),
+            _ => None,
+        })
+        .expect("graph load produced no tail");
+    tail.bookmarks
+        .entry(name)
+        .map(|entry| entry.local_targets.clone())
+        .unwrap_or_default()
+}
+
+/// The owner's report: `feature@origin` kept the pre-rewrite commit of the
+/// change the local bookmark sits on, and moving the bookmark there did
+/// nothing. The hidden commit was followed back to its change's visible
+/// commit, the bookmark's own, so the move and its backwards check both
+/// resolved to where the bookmark already was. Hidden when the session saw
+/// it, the commit is the user's pick and resolves exactly, as `jj` resolves
+/// a commit id.
+#[test]
+fn moving_a_bookmark_to_its_hidden_remote_position_lands_there() {
+    let root = scratch_repo("bookmark-to-hidden-remote");
+    let mut repo = TestRepo::open(&root);
+    repo.snapshot();
+    commit_file(&mut repo, "a.txt", "one\n", "pushed");
+    let pushed = one(&mut repo, "@-");
+    harness::set_bookmark(&root, harness::OpBase::Head, "feature", &pushed);
+    harness::set_remote_bookmark(&root, "feature", "origin", &pushed);
+    harness::describe(&root, harness::OpBase::Head, &pushed, "pushed, reworded");
+    let rewritten = one(&mut repo, "@-");
+    assert_eq!(local_targets(&mut repo, "feature"), vec![rewritten.clone()]);
+
+    // The session's walk reads the op where `pushed` is already hidden.
+    let mut session = Session::unloaded(String::new());
+    session.capabilities = repo.handle.capabilities();
+    let effects = session.load_graph(true);
+    settle(&mut session, &mut repo, &root, &effects);
+
+    let to = RevisionSelection::Commit(pushed.clone());
+    let (_, effects) = session.bookmark_check("feature".to_owned(), to.clone());
+    match run_sent(&mut repo, &effects).last() {
+        Some(Payload::BookmarkChecked { backwards, .. }) => assert!(
+            backwards,
+            "the old position is a sibling of the bookmark's, so the move is sideways"
+        ),
+        other => panic!("expected BookmarkChecked, got {other:?}"),
+    }
+
+    let (_, effects) = session.mutate(
+        MutationOp::MoveBookmark {
+            name: "feature".to_owned(),
+            to,
+            push_remote: None,
+        },
+        false,
+    );
+    match run_sent(&mut repo, &effects).last() {
+        Some(Payload::MutationDone { .. }) => {}
+        other => panic!("expected MutationDone, got {other:?}"),
+    }
+    assert_eq!(local_targets(&mut repo, "feature"), vec![pushed]);
+}
+
+/// The stale-row side of the same rule: a commit the session saw visible,
+/// rewritten after its walk, is a row that hasn't caught up, and still acts
+/// on the change it stands for.
+#[test]
+fn a_target_rewritten_after_the_session_saw_it_still_follows() {
+    let root = scratch_repo("seen-then-rewritten");
+    let mut repo = TestRepo::open(&root);
+    repo.snapshot();
+    commit_file(&mut repo, "a.txt", "one\n", "first");
+
+    let mut session = Session::unloaded(String::new());
+    session.capabilities = repo.handle.capabilities();
+    let effects = session.load_graph(true);
+    settle(&mut session, &mut repo, &root, &effects);
+    let stale = row_commit_id(&session, "first");
+    harness::describe(&root, harness::OpBase::Head, &stale, "first, reworded");
+    let rewritten = one(&mut repo, "@-");
+
+    let to = RevisionSelection::Commit(stale.clone());
+    let (_, effects) = session.bookmark_check("feature".to_owned(), to.clone());
+    assert!(matches!(
+        run_sent(&mut repo, &effects).last(),
+        Some(Payload::BookmarkChecked {
+            backwards: false,
+            ..
+        })
+    ));
+    let (_, effects) = session.mutate(
+        MutationOp::MoveBookmark {
+            name: "feature".to_owned(),
+            to,
+            push_remote: None,
+        },
+        false,
+    );
+    match run_sent(&mut repo, &effects).last() {
+        Some(Payload::MutationDone { .. }) => {}
+        other => panic!("expected MutationDone, got {other:?}"),
+    }
+    assert_eq!(local_targets(&mut repo, "feature"), vec![rewritten]);
+    assert!(
+        repo.graph("all()")
+            .iter()
+            .all(|row| !row.summary.is_divergent),
+        "following the change must not resurrect the stale commit"
+    );
+}
+
+/// The id of the one commit `revset` names.
+fn one(repo: &mut TestRepo, revset: &str) -> String {
+    match repo.graph(revset).as_slice() {
+        [row] => row.summary.commit_id.clone(),
+        rows => panic!("{revset} must name one commit, got {}", rows.len()),
     }
 }
 

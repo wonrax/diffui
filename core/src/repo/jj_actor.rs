@@ -431,9 +431,19 @@ impl Actor {
                 job,
                 op,
                 allow_immutable,
-            } => self.mutate(repository, job, &op, allow_immutable).await,
-            Command::Preview { job, draft, graph } => {
-                self.preview(repository, job, draft, graph, cancel).await
+                seen_op,
+            } => {
+                self.mutate(repository, job, &op, allow_immutable, seen_op.as_deref())
+                    .await
+            }
+            Command::Preview {
+                job,
+                draft,
+                graph,
+                seen_op,
+            } => {
+                self.preview(repository, job, draft, graph, seen_op, cancel)
+                    .await
             }
             Command::Fetch { job, target } => {
                 self.reload_settings_if_changed(repository);
@@ -534,12 +544,22 @@ impl Actor {
                 });
                 Ok(())
             }
-            Command::BookmarkCheck { job, name, to } => {
+            Command::BookmarkCheck {
+                job,
+                name,
+                to,
+                seen_op,
+            } => {
                 let repo = self.repo_at_head(repository).await?;
                 let workspace_name = self.slot(repository)?.name.clone();
-                let backwards =
-                    jj::check_bookmark_move_backwards(repo.as_ref(), &workspace_name, &name, &to)
-                        .await?;
+                let backwards = jj::check_bookmark_move_backwards(
+                    repo.as_ref(),
+                    &workspace_name,
+                    &name,
+                    &to,
+                    seen_op.as_deref(),
+                )
+                .await?;
                 self.emit(Payload::BookmarkChecked { job, backwards });
                 Ok(())
             }
@@ -760,6 +780,7 @@ impl Actor {
         job: JobId,
         op: &MutationOp,
         allow_immutable: bool,
+        seen_op: Option<&str>,
     ) -> Result<()> {
         self.reload_settings_if_changed(repository);
         let progress = LoadProgress::default();
@@ -779,6 +800,7 @@ impl Actor {
                 op,
                 &progress,
                 allow_immutable,
+                seen_op,
             )
             .await?
         };
@@ -802,6 +824,7 @@ impl Actor {
         job: JobId,
         draft: PreviewRequest,
         graph: Option<String>,
+        seen_op: Option<String>,
         cancel: &CancelFlag,
     ) -> Result<()> {
         let operation = self.repo_at_head(repository).await?.op_id().hex();
@@ -821,6 +844,7 @@ impl Actor {
                         &operation,
                         &draft,
                         graph.as_deref(),
+                        seen_op.as_deref(),
                         &cancel,
                     )),
                     Err(error) => Err(error.into()),
