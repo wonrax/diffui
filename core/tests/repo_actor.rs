@@ -759,3 +759,65 @@ fn a_panicking_command_fails_its_job_and_the_actor_keeps_serving() {
             .any(|row| row.summary.description.starts_with("first"))
     );
 }
+
+/// A CLI run streams its output, then announces the operation it wrote
+/// right after it exits, without waiting on the watcher. `sh` stands in for
+/// the app binary (it ignores the `jj` argv[0]); the "CLI's" write is made by
+/// the test while the child is still running.
+#[cfg(unix)]
+#[test]
+fn a_cli_run_announces_the_operation_it_wrote() {
+    use diffui_core::CliInvocation;
+    use diffui_core::cli::{CliLine, CliStream};
+
+    let root = scratch_repo("cli-run-writes");
+    let mut repo = TestRepo::open(&root);
+    repo.snapshot();
+    let marker = std::env::temp_dir().join(format!("diffui-cli-run-{}", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let script = format!(
+        "pwd; while [ ! -e '{}' ]; do sleep 0.02; done; echo finished >&2",
+        marker.display()
+    );
+    let job = repo.send(|job| Command::RunCli {
+        job,
+        invocation: CliInvocation::new("/bin/sh", vec!["-c".into(), script]),
+    });
+    let head = commit_ids(&root)[0].clone();
+    harness::describe(&root, harness::OpBase::Head, &head, "written by the cli");
+    std::fs::write(&marker, "").unwrap();
+
+    let events = repo.drain(job);
+    let _ = std::fs::remove_file(&marker);
+    let lines: Vec<CliLine> = events
+        .iter()
+        .flat_map(|payload| match payload {
+            Payload::CliOutput { lines, .. } => lines.clone(),
+            _ => Vec::new(),
+        })
+        .collect();
+    // It ran in the workspace root.
+    let cwd = std::fs::canonicalize(&root).unwrap();
+    assert_eq!(
+        lines,
+        [
+            CliLine {
+                stream: CliStream::Stdout,
+                text: cwd.display().to_string(),
+            },
+            CliLine {
+                stream: CliStream::Stderr,
+                text: "finished".to_owned(),
+            },
+        ]
+    );
+    assert!(matches!(
+        events.last(),
+        Some(Payload::CliExited { code: Some(0), .. })
+    ));
+    let moved = repo.wait_for(|payload| matches!(payload, Payload::OpHeadChanged { .. }));
+    let Payload::OpHeadChanged { fingerprint } = moved else {
+        unreachable!()
+    };
+    assert_eq!(fingerprint, harness::operation_log(&root)[0].1);
+}

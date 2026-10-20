@@ -206,7 +206,8 @@ async fn run(repository: &Repository, command: Command, cancel: &CancelFlag) -> 
         | Command::History { job, .. }
         | Command::ExpandFile { job, .. }
         | Command::ResolveRevset { job, .. }
-        | Command::ResolveDiff { job, .. } => vec![Payload::Failed {
+        | Command::ResolveDiff { job, .. }
+        | Command::RunCli { job, .. } => vec![Payload::Failed {
             job,
             error: RepoError::Unsupported,
         }],

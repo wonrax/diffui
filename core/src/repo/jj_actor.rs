@@ -338,6 +338,21 @@ impl Actor {
         self.op_head = jj::read_op_head_with(&settings, &root).await.ok();
     }
 
+    /// After a CLI run: it may have written operations (or edited the jj
+    /// config), so take the head now rather than waiting on the watcher.
+    /// Announcing it here puts the reload right after the run's exit, and
+    /// the watcher's later signal for the same head dedups against it.
+    async fn notice_cli_writes(&mut self, repository: &Repository) {
+        let before = self.op_head.clone();
+        self.reload_settings_if_changed(repository);
+        self.adopt_written_op(repository).await;
+        if self.op_head != before
+            && let Some(fingerprint) = self.op_head.clone()
+        {
+            self.emit(Payload::OpHeadChanged { fingerprint });
+        }
+    }
+
     async fn dispatch(
         &mut self,
         repository: &Repository,
@@ -589,6 +604,18 @@ impl Actor {
                     revision,
                     base,
                 });
+                Ok(())
+            }
+            Command::RunCli { job, invocation } => {
+                crate::cli::passthrough::run(
+                    job,
+                    &invocation,
+                    &repository.root,
+                    cancel,
+                    |payload| self.emit(payload),
+                )
+                .await?;
+                self.notice_cli_writes(repository).await;
                 Ok(())
             }
             Command::Cancel { .. } => Ok(()),
@@ -906,6 +933,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::ExpandFile { .. } => "expand_file",
         Command::ResolveRevset { .. } => "resolve_revset",
         Command::ResolveDiff { .. } => "resolve_diff",
+        Command::RunCli { .. } => "run_cli",
         Command::Cancel { .. } => "cancel",
     }
 }

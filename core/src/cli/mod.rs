@@ -40,6 +40,7 @@ pub use command::{
 };
 pub use lower::{LowerContext, LowerError, NativeAction, lower};
 pub use parse::{CliConfig, ParseError, ParsedCommand};
+pub use passthrough::{CliInvocation, CliLine, CliStream};
 pub use render::{CliEquivalent, CommitIds, RevisionNames, jj_args_tag};
 
 use crate::completion::{Completion, ValueCompleter};

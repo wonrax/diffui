@@ -8,6 +8,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use crate::cli::{CliInvocation, CliLine};
 use crate::history::{HistoryRequest, HistoryResponse, OperationEntry};
 use crate::model::{
     BookmarksInfo, BranchStatus, DiffBase, DiffDocument, DiffFile, DiffRequest, RevisionDetails,
@@ -267,6 +268,14 @@ pub enum Command {
         job: JobId,
         request: DiffRequest,
     },
+    /// Run the jj CLI in the workspace root (a typed command diffui doesn't
+    /// run itself). Output streams back as [`Payload::CliOutput`], then
+    /// [`Payload::CliExited`]; a cancel kills the child. Serialized with
+    /// everything else, so the CLI never races one of diffui's own writes.
+    RunCli {
+        job: JobId,
+        invocation: CliInvocation,
+    },
     /// Ask the actor to stop `job`. A cancelled job reports
     /// [`Payload::Cancelled`] and never its success event, so the caller's
     /// inflight slot is always cleared by exactly one terminal event.
@@ -297,7 +306,8 @@ impl Command {
             | Self::History { job, .. }
             | Self::ExpandFile { job, .. }
             | Self::ResolveRevset { job, .. }
-            | Self::ResolveDiff { job, .. } => Some(*job),
+            | Self::ResolveDiff { job, .. }
+            | Self::RunCli { job, .. } => Some(*job),
             Self::Cancel { .. } => None,
         }
     }
@@ -483,6 +493,17 @@ pub enum Payload {
         revision: RevisionSelection,
         base: DiffBase,
     },
+    /// Output of a [`Command::RunCli`], in order. Not terminal.
+    CliOutput {
+        job: JobId,
+        lines: Vec<CliLine>,
+    },
+    /// The CLI exited; `code` is `None` when a signal ended it. A run that
+    /// wrote an operation is followed by [`Payload::OpHeadChanged`].
+    CliExited {
+        job: JobId,
+        code: Option<i32>,
+    },
     Failed {
         job: JobId,
         error: RepoError,
@@ -516,6 +537,8 @@ impl Payload {
             | Self::History { job, .. }
             | Self::RevsetResolved { job, .. }
             | Self::DiffResolved { job, .. }
+            | Self::CliOutput { job, .. }
+            | Self::CliExited { job, .. }
             | Self::Failed { job, .. }
             | Self::Cancelled { job, .. } => Some(*job),
             Self::Ready { .. }
@@ -535,6 +558,7 @@ impl Payload {
             Self::Batch { .. }
                 | Self::Progress { .. }
                 | Self::OpLogBatch { .. }
+                | Self::CliOutput { .. }
                 | Self::Ready { .. }
                 | Self::OpHeadChanged { .. }
                 | Self::WorkingCopyChanged

@@ -16,7 +16,7 @@
 //! is that stream's life, so the frontend can key it on a subscription and let
 //! the last tab closing take the actor with it.
 
-mod cancel;
+pub(crate) mod cancel;
 mod git_actor;
 mod jj_actor;
 mod pr_actor;

@@ -242,6 +242,28 @@ impl TestRepo {
         }
     }
 
+    /// The first event `pick` accepts, parked ones first; everything else
+    /// seen on the way is parked. Gives up after ten seconds.
+    pub fn wait_for(&mut self, pick: impl Fn(&Payload) -> bool) -> Payload {
+        if let Some(i) = self.parked.iter().position(|e| pick(&e.payload)) {
+            return self.parked.remove(i).payload;
+        }
+        loop {
+            let events = &mut self.events;
+            let event = self
+                .runtime
+                .block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(10), events.next()).await
+                })
+                .expect("timed out waiting for an event")
+                .expect("the actor's event stream ended early");
+            if pick(&event.payload) {
+                return event.payload;
+            }
+            self.parked.push(event);
+        }
+    }
+
     /// Every event seen so far that isn't `job`'s — what a test inspects to
     /// prove something *else* happened (a cancellation, an op-head move).
     pub fn parked(&self) -> &[diffui_core::Event] {

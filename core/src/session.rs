@@ -756,6 +756,8 @@ impl Session {
             | Payload::MergeToolPrepared { .. }
             | Payload::OpLogBatch { .. }
             | Payload::History { .. }
+            | Payload::CliOutput { .. }
+            | Payload::CliExited { .. }
             | Payload::RevsetResolved { .. } => Vec::new(),
         }
     }
