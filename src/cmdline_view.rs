@@ -9,12 +9,12 @@ use diffui_core::cli::{CommandKind, tokenize};
 use diffui_core::completion::{Completion, CompletionKind};
 use iced::advanced::text::{Ellipsis, Wrapping};
 use iced::widget::text::Span;
-use iced::widget::{column, container, mouse_area, rich_text, stack, text};
+use iced::widget::{Space, column, container, mouse_area, rich_text, text};
 use iced::{Background, Border, Color, Element, Length, Padding};
 
 use crate::cmdline::{CommandLine, PlanState};
 use crate::icons;
-use crate::palette::{self, CONTENT_X, GLYPH_GAP, INPUT_HEIGHT, PaletteMessage, RESULTS_INSET};
+use crate::palette::{self, CONTENT_X, GLYPH_GAP, PaletteMessage, RESULTS_INSET};
 use crate::theme::{self, ThemeSpec, text_size};
 use crate::typography::{self, Aligned};
 use crate::{Diffui, Message};
@@ -63,27 +63,21 @@ pub(crate) fn input<'a>(
     } else {
         crate::input::single_line(field, query, mono)
     };
-    let content: Element<'a, Message> = if overlay {
-        let spans = colored_spans(ui, theme, query, command);
-        let painted = container(
-            rich_text(spans)
+    let painted: Element<'a, Message> = if overlay {
+        container(
+            rich_text(colored_spans(ui, theme, query, command))
                 .size(text_size::TITLE)
                 .font(mono)
                 .wrapping(Wrapping::None),
         )
         .padding(padding)
         .width(Length::Fill)
-        .center_y(Length::Fill);
-        stack![painted, field].into()
-    } else {
-        field
-    };
-    container(content)
-        .padding(RESULTS_INSET)
-        .height(Length::Fixed(INPUT_HEIGHT + 2.0 * RESULTS_INSET))
-        .width(Length::Fill)
-        .center_y(Length::Fixed(INPUT_HEIGHT + 2.0 * RESULTS_INSET))
+        .center_y(Length::Fill)
         .into()
+    } else {
+        Space::new().into()
+    };
+    palette::input_band(painted, field)
 }
 
 /// What a stretch of the line is, for its colour.

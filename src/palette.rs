@@ -1133,16 +1133,26 @@ fn build_input<'a>(
             .on_submit(Message::Palette(PaletteMessage::Accept));
     }
 
-    container(crate::input::single_line(
-        input,
-        &column_state.query,
-        ui.config.ui_font,
-    ))
-    .padding(RESULTS_INSET)
-    .height(Length::Fixed(INPUT_HEIGHT + 2.0 * RESULTS_INSET))
-    .width(Length::Fill)
-    .center_y(Length::Fixed(INPUT_HEIGHT + 2.0 * RESULTS_INSET))
-    .into()
+    input_band(
+        Space::new().into(),
+        crate::input::single_line(input, &column_state.query, ui.config.ui_font),
+    )
+}
+
+/// The band the query input sits in, with `under` drawn beneath the input
+/// (the command line's coloured copy of its text). Search and command line
+/// build the same tree, so the input keeps its focus and caret when typing
+/// `jj ` switches one into the other.
+pub(crate) fn input_band<'a>(
+    under: Element<'a, Message>,
+    input: Element<'a, Message>,
+) -> Element<'a, Message> {
+    container(stack![under, input])
+        .padding(RESULTS_INSET)
+        .height(Length::Fixed(INPUT_HEIGHT + 2.0 * RESULTS_INSET))
+        .width(Length::Fill)
+        .center_y(Length::Fixed(INPUT_HEIGHT + 2.0 * RESULTS_INSET))
+        .into()
 }
 
 fn build_results<'a>(

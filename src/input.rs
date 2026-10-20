@@ -231,7 +231,12 @@ impl<'a, Message: Clone + 'a> Widget<Message, Theme, iced::Renderer> for SingleL
         );
         // The stock widget reports its caret to the input method on each
         // redraw; that rectangle is the caret it would have painted.
-        if self.caret.is_some() && matches!(event, Event::Window(iced::window::Event::RedrawRequested(_))) {
+        if self.caret.is_some()
+            && matches!(
+                event,
+                Event::Window(iced::window::Event::RedrawRequested(_))
+            )
+        {
             let seen = tree.state.downcast_mut::<Seen>();
             let caret = match shell.input_method() {
                 iced::advanced::InputMethod::Enabled { cursor, .. }
