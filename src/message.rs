@@ -46,6 +46,9 @@ pub(crate) enum Message {
     /// `jj --version` answered (or there is no `jj`) — see
     /// [`crate::jj_version`].
     JjCliVersion(Option<String>),
+    /// The command line's and the revset field's plumbing — see
+    /// [`crate::cmdline::CmdEvent`].
+    CommandLine(crate::cmdline::CmdEvent),
 }
 
 /// Everything a widget reports that is *not* an intent: positions, hovers,

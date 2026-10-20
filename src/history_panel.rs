@@ -189,6 +189,11 @@ pub(crate) struct HistoryState {
 }
 
 impl HistoryState {
+    /// Whether the source view shows its blame gutter.
+    pub(crate) fn annotating(&self) -> bool {
+        self.annotate
+    }
+
     /// Whether `job` is one of this view's reads.
     pub(crate) fn owns(&self, job: JobId) -> bool {
         self.ops_job == Some(job)

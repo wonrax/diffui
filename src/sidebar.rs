@@ -1043,6 +1043,12 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
     let config = ui.config;
     let draft = tab.op_draft();
     let tags = &tab.session.bookmarks.tags;
+    // While the palette holds a command line, the rows its focused revset
+    // argument matches wear the target-mode wash, labelled with the flag.
+    let tint = ui
+        .command_line()
+        .filter(|_| draft.is_none())
+        .and_then(|command| command.tint());
     // While a draft is previewed the list's rows are the post-op graph's.
     let preview = tab.shown_preview().cloned();
     let row_count = preview
@@ -1078,6 +1084,26 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
         let ghost = slot.preview.is_some_and(|row| row.role.is_ghost());
         let commit_id = slot.commit.commit_id();
         let mut row = build_revision_row(slot, theme, config, &graph_style, multi_selection, draft);
+        if let Some((flag, matched)) = &tint
+            && !row.draft_source
+            && matched.contains(commit_id)
+        {
+            row.draft_source = true;
+            if !flag.is_empty() {
+                row.status_chips.insert(
+                    0,
+                    Chip {
+                        label: flag.clone(),
+                        font: config.mono_font,
+                        background: Color::TRANSPARENT,
+                        text_color: theme.accent,
+                        border_color: Some(theme.accent),
+                        border_dashed: true,
+                        icon: None,
+                    },
+                );
+            }
+        }
         // Tags trail the bookmarks, so the rail's `+N` overflow sheds them
         // first.
         if !ghost && let Some(tags) = tags.get(commit_id) {

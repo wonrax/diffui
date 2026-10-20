@@ -12,6 +12,9 @@ mod bookmarks;
 mod changes;
 mod chip;
 mod chrome;
+mod cli_output;
+mod cmdline;
+mod cmdline_view;
 mod commands;
 mod commit_info;
 mod compare;
@@ -789,6 +792,8 @@ pub(crate) struct TabState {
     pub(crate) history: history_panel::HistoryState,
     /// The post-op graph the sidebar draws in place of the loaded one.
     pub(crate) graph_preview: graph_preview::GraphPreviewState,
+    /// The command line's per-repository state: its grammar and CLI runs.
+    pub(crate) cmdline: cmdline::TabCommandLine,
 }
 
 impl TabState {
@@ -829,6 +834,7 @@ impl TabState {
             changes: Default::default(),
             history: Default::default(),
             graph_preview: Default::default(),
+            cmdline: Default::default(),
         }
     }
 
@@ -1007,6 +1013,10 @@ pub(crate) struct PendingJobs {
     /// Full file sources requested for background syntax highlighting, keyed
     /// by job: `(document id, file index)`.
     pub(crate) file_pairs: HashMap<JobId, (u64, usize)>,
+    /// The command line's revset resolutions in flight.
+    pub(crate) cmdline: HashSet<JobId>,
+    /// Passthrough jj CLI runs, with their activity rows.
+    pub(crate) cli: HashMap<JobId, activity::ActivityId>,
 }
 
 impl PendingJobs {
@@ -1023,6 +1033,8 @@ impl PendingJobs {
                 .is_some_and(|(id, _)| *id == job)
             || self.trunk_rebase.as_ref().is_some_and(|(id, _)| *id == job)
             || self.file_pairs.contains_key(&job)
+            || self.cmdline.contains(&job)
+            || self.cli.contains_key(&job)
     }
 
     /// Release whichever slot `job` holds — the cancelled-job path, where
@@ -1038,6 +1050,8 @@ impl PendingJobs {
         self.bookmark_check.take_if(|(id, _)| *id == job);
         self.trunk_rebase.take_if(|(id, _)| *id == job);
         self.file_pairs.remove(&job);
+        self.cmdline.remove(&job);
+        self.cli.remove(&job);
     }
 }
 

@@ -177,6 +177,8 @@ pub(crate) enum Action {
 
     /// Answer the credential prompt — see [`crate::credentials`].
     Credential(crate::credentials::CredentialAction),
+    /// The palette's command line and the CLI output panel.
+    CommandLine(crate::cmdline::CmdAction),
 
     /// Commit, placed new / duplicate, batch drafts — see [`crate::revops`].
     Revops(crate::revops::RevopsAction),

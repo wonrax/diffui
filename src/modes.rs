@@ -46,6 +46,8 @@ pub(crate) enum Mode {
     Shortcuts,
     /// git or ssh asking for a credential.
     Credential(crate::credentials::CredentialDialog),
+    /// A jj CLI run's output.
+    CliOutput(crate::cli_output::OutputView),
 }
 
 /// A mode bound to one tab: it names rows, files, or text that belong to that
@@ -76,6 +78,7 @@ pub(crate) enum ModeKind {
     NamePrompt,
     Lines,
     Credential,
+    CliOutput,
 }
 
 impl Mode {
@@ -89,6 +92,7 @@ impl Mode {
             Mode::NamePrompt(_) => ModeKind::NamePrompt,
             Mode::Shortcuts => ModeKind::Shortcuts,
             Mode::Credential(_) => ModeKind::Credential,
+            Mode::CliOutput(_) => ModeKind::CliOutput,
         }
     }
 
@@ -102,6 +106,7 @@ impl Mode {
             Mode::NamePrompt(_) => Context::Prompt,
             Mode::Shortcuts => Context::Shortcuts,
             Mode::Credential(_) => Context::Credential,
+            Mode::CliOutput(_) => Context::Output,
         }
     }
 }

@@ -747,6 +747,28 @@ const STATUS_ICON_BOX: f32 = 14.0;
 /// title text (status box + the head row's spacing).
 const TITLE_INDENT: f32 = STATUS_ICON_BOX + 8.0;
 
+/// The "Output" pill on a jj CLI run's row.
+fn output_pill<'a>(ui: &Diffui, theme: ThemeSpec, id: ActivityId) -> Aligned<'a, Message> {
+    let font = ui.config.ui_font;
+    let padding =
+        crate::typography::trimmed_padding(Padding::from([1, 7]), font, text_size::CAPTION);
+    Aligned::boxed(
+        button(
+            text("Output")
+                .size(text_size::CAPTION)
+                .font(font)
+                .color(theme.accent),
+        )
+        .padding(padding)
+        .on_press(Message::Action(Action::CommandLine(
+            crate::cmdline::CmdAction::Output(crate::cli_output::OutputAction::Open(id)),
+        )))
+        .style(move |_, status| ghost_button_style(theme, status)),
+        padding,
+        crate::typography::TextBox::default_line(font, text_size::CAPTION),
+    )
+}
+
 fn activity_row<'a>(
     ui: &'a Diffui,
     theme: ThemeSpec,
@@ -822,6 +844,17 @@ fn activity_row<'a>(
                 padding,
                 crate::typography::TextBox::default_line(font, text_size::CAPTION),
             ));
+        }
+        // A jj CLI run reopens its output panel.
+        if ui
+            .active()
+            .cmdline
+            .runs
+            .iter()
+            .any(|run| run.activity == activity.id)
+        {
+            head.push(Aligned::gap(8.0));
+            head.push(output_pill(ui, theme, activity.id));
         }
         head.extend(caption(
             format_duration(duration),

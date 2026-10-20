@@ -85,21 +85,21 @@ const RESULTS_VIEWPORT_HEIGHT: f32 = COLUMN_HEIGHT
 /// Fixed width per column. The stack lays columns out in a horizontal row;
 /// the rightmost is centered in the viewport and earlier columns shift left,
 /// clipping off the leading edge once the stack is deep enough.
-const COLUMN_WIDTH: f32 = 520.0;
+pub(crate) const COLUMN_WIDTH: f32 = 520.0;
 const COLUMN_HEIGHT: f32 = 460.0;
 const COLUMN_HORIZONTAL_GAP: f32 = 16.0;
-const INPUT_HEIGHT: f32 = 48.0;
-const ROW_HEIGHT: f32 = 34.0;
-const FOOTER_HEIGHT: f32 = 36.0;
+pub(crate) const INPUT_HEIGHT: f32 = 48.0;
+pub(crate) const ROW_HEIGHT: f32 = 34.0;
+pub(crate) const FOOTER_HEIGHT: f32 = 36.0;
 /// Inset of the results list inside the card. A result row pads its content
 /// by `CONTENT_X - RESULTS_INSET`, so row glyphs, the input text and the
 /// header label all start on the one [`CONTENT_X`] edge.
-const RESULTS_INSET: f32 = theme::space::XS;
-const CONTENT_X: f32 = theme::space::XL;
+pub(crate) const RESULTS_INSET: f32 = theme::space::XS;
+pub(crate) const CONTENT_X: f32 = theme::space::XL;
 /// Fixed box for a row's leading glyph, so icon and `@` rows start their
 /// labels at the same x.
 const GLYPH_BOX: f32 = 16.0;
-const GLYPH_GAP: f32 = 10.0;
+pub(crate) const GLYPH_GAP: f32 = 10.0;
 const GLYPH_ICON_SIZE: f32 = 14.0;
 /// The footer's scope pills (All / Commands / Files / Commits).
 const SCOPE_HEIGHT: f32 = 24.0;
@@ -188,6 +188,8 @@ pub struct PaletteColumn {
     /// query resets it so the "press ⏎ to search" prompt comes back. Ignored in
     /// other modes (they search live).
     pub searched: bool,
+    /// The command line, while the query starts with `jj `.
+    pub command: Option<Box<crate::cmdline::CommandLine>>,
 }
 
 #[derive(Debug, Clone)]
@@ -257,6 +259,10 @@ pub struct PaletteMatch {
 pub struct Recents {
     pub revisions: VecDeque<String>,
     pub commands: VecDeque<CommandId>,
+    /// Command lines run from the palette, newest first.
+    pub cli: VecDeque<String>,
+    /// Revsets typed (the revset field, command-line arguments), newest first.
+    pub revsets: VecDeque<String>,
 }
 
 impl Recents {
@@ -273,6 +279,16 @@ impl Recents {
         self.commands.push_front(command);
         if self.commands.len() > RECENTS_CAPACITY {
             self.commands.truncate(RECENTS_CAPACITY);
+        }
+    }
+
+    pub fn push_cli(&mut self, line: String) {
+        push_text(&mut self.cli, line);
+    }
+
+    pub fn push_revset(&mut self, revset: String) {
+        if !revset.trim().is_empty() {
+            push_text(&mut self.revsets, revset);
         }
     }
 
@@ -336,11 +352,26 @@ impl Recents {
         if commands.len() > RECENTS_CAPACITY {
             commands.truncate(RECENTS_CAPACITY);
         }
+        let mut cli: VecDeque<String> = p.cli.into_iter().collect();
+        cli.truncate(TEXT_RECENTS_CAPACITY);
+        let mut revsets: VecDeque<String> = p.revsets.into_iter().collect();
+        revsets.truncate(TEXT_RECENTS_CAPACITY);
         Self {
             revisions,
             commands,
+            cli,
+            revsets,
         }
     }
+}
+
+/// How many typed lines (commands, revsets) the recents keep.
+const TEXT_RECENTS_CAPACITY: usize = 50;
+
+fn push_text(list: &mut VecDeque<String>, entry: String) {
+    list.retain(|seen| *seen != entry);
+    list.push_front(entry);
+    list.truncate(TEXT_RECENTS_CAPACITY);
 }
 
 /// The id a pre-registry recents file called this command, when it called it
@@ -378,6 +409,10 @@ struct PersistedRecents {
     revisions: Vec<String>,
     #[serde(default)]
     commands: Vec<String>,
+    #[serde(default)]
+    cli: Vec<String>,
+    #[serde(default)]
+    revsets: Vec<String>,
 }
 
 impl From<&Recents> for PersistedRecents {
@@ -385,6 +420,8 @@ impl From<&Recents> for PersistedRecents {
         Self {
             revisions: r.revisions.iter().cloned().collect(),
             commands: r.commands.iter().map(|id| (*id).to_owned()).collect(),
+            cli: r.cli.iter().cloned().collect(),
+            revsets: r.revsets.iter().cloned().collect(),
         }
     }
 }
@@ -492,6 +529,7 @@ impl PaletteState {
             query_version: 0,
             dirty: false,
             searched: false,
+            command: None,
         };
         recompute_matches(&mut column, ui, false);
         // The first column doesn't animate — it just appears. Push/pop
@@ -535,6 +573,7 @@ impl PaletteState {
             query_version: 0,
             dirty: false,
             searched: false,
+            command: None,
         };
         recompute_matches(&mut column, ui, false);
         self.stack.push(column);
@@ -581,6 +620,12 @@ impl PaletteState {
 /// In `:` (commit) mode with `false`, candidates stay empty and the results
 /// view shows the "press ⏎ to search" prompt. Other modes ignore the flag.
 pub fn recompute_matches(column: &mut PaletteColumn, ui: &Diffui, search_revisions: bool) {
+    // A command line lists completions, not matches.
+    if matches!(column.source, ColumnSource::Root) && crate::cmdline::is_command(&column.query) {
+        column.matches.clear();
+        column.selected = 0;
+        return;
+    }
     let (mode, needle) = parse_query(&column.query);
     let mut matcher = Matcher::new(Config::DEFAULT);
     let needle_utf32 = Utf32String::from(needle);
@@ -779,12 +824,20 @@ pub fn build_overlay<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Messag
     let Some(state) = ui.palette() else {
         return Space::new().into();
     };
+    let command_mode = ui.command_line().is_some();
 
     let scrim = mouse_area(
         container(Space::new().width(Length::Fill).height(Length::Fill))
             .width(Length::Fill)
             .height(Length::Fill)
-            .style(|_| theme::scrim_style()),
+            .style(move |_| {
+                let mut style = theme::scrim_style();
+                // A command line tints graph rows: let them read through.
+                if command_mode && let Some(Background::Color(color)) = &mut style.background {
+                    color.a = 0.12;
+                }
+                style
+            }),
     )
     .on_press(Message::Action(Action::ClosePalette));
 
@@ -860,17 +913,41 @@ fn build_column<'a>(
     // Only worth marking when there are columns to tell apart.
     outline_focus: bool,
 ) -> Element<'a, Message> {
-    let input = build_input(ui, theme, column_state, is_focused);
-    let results = build_results(ui, theme, column_state, depth);
-    let footer = column_footer(ui, theme, column_state);
-
     let rule = || {
         container(Space::new())
             .width(Length::Fill)
             .height(Length::Fixed(1.0))
             .style(move |_| container::Style::default().background(theme.border))
     };
-    let body = column![input, rule(), results, rule(), footer].spacing(0);
+    let body = if let Some(command) = column_state.command.as_deref() {
+        let mut body = column![crate::cmdline_view::input(
+            ui,
+            theme,
+            &column_state.query,
+            command,
+            is_focused
+        )]
+        .spacing(0);
+        if let Some(strip) =
+            crate::cmdline_view::args_strip(ui, theme, &column_state.query, command)
+        {
+            body = body.push(strip);
+        }
+        body.push(rule())
+            .push(crate::cmdline_view::results(
+                ui,
+                theme,
+                &column_state.query,
+                command,
+            ))
+            .push(rule())
+            .push(crate::cmdline_view::footer(ui, theme, command))
+    } else {
+        let input = build_input(ui, theme, column_state, is_focused);
+        let results = build_results(ui, theme, column_state, depth);
+        let footer = column_footer(ui, theme, column_state);
+        column![input, rule(), results, rule(), footer].spacing(0)
+    };
 
     container(body)
         .width(Length::Fixed(COLUMN_WIDTH))
@@ -991,7 +1068,14 @@ fn column_footer<'a>(
     .width(Length::Fill)
     .height(Length::Fixed(FOOTER_HEIGHT))
     .center_y(Length::Fixed(FOOTER_HEIGHT))
-    .style(move |_| container::Style {
+    .style(move |_| footer_style(theme))
+    .into()
+}
+
+/// The footer strip's surface: the panel colour, rounded into the card's
+/// bottom corners.
+pub(crate) fn footer_style(theme: ThemeSpec) -> container::Style {
+    container::Style {
         background: Some(Background::Color(theme.panel_background)),
         border: Border {
             width: 0.0,
@@ -999,8 +1083,13 @@ fn column_footer<'a>(
             radius: border::Radius::default().bottom(theme::radius::SURFACE - 1.0),
         },
         ..container::Style::default()
-    })
-    .into()
+    }
+}
+
+/// The command line's results viewport: the plain one less the argument
+/// strip under the input.
+pub(crate) fn command_results_viewport() -> f32 {
+    RESULTS_VIEWPORT_HEIGHT - crate::cmdline_view::ARGS_HEIGHT
 }
 
 fn build_input<'a>(
@@ -1131,16 +1220,29 @@ fn build_result_row<'a>(
     m: &'a PaletteMatch,
 ) -> Element<'a, Message> {
     let selected = index == column_state.selected;
+    let root = matches!(column_state.source, ColumnSource::Root);
+    let body = result_row_body(ui, theme, &m.item, root, m.disabled);
+    let row_el = row_shell(body, selected, theme);
+
+    mouse_area(row_el)
+        .on_press(Message::Palette(PaletteMessage::AcceptIndex(depth, index)))
+        .on_enter(Message::Palette(PaletteMessage::SelectIndex(depth, index)))
+        .into()
+}
+
+/// A result row's cell: fixed height, the label inset on the content edge,
+/// washed when highlighted.
+pub(crate) fn row_shell<'a>(
+    body: impl Into<Element<'a, Message>>,
+    selected: bool,
+    theme: ThemeSpec,
+) -> Element<'a, Message> {
     let row_bg = if selected {
         theme.selected_file
     } else {
         Color::TRANSPARENT
     };
-
-    let root = matches!(column_state.source, ColumnSource::Root);
-    let body = result_row_body(ui, theme, &m.item, root, m.disabled);
-
-    let row_el = container(body)
+    container(body)
         .padding([0.0, CONTENT_X - RESULTS_INSET])
         .width(Length::Fill)
         .height(Length::Fixed(ROW_HEIGHT))
@@ -1158,11 +1260,7 @@ fn build_result_row<'a>(
                 radius: theme::radius::CONTROL.into(),
             },
             ..container::Style::default()
-        });
-
-    mouse_area(row_el)
-        .on_press(Message::Palette(PaletteMessage::AcceptIndex(depth, index)))
-        .on_enter(Message::Palette(PaletteMessage::SelectIndex(depth, index)))
+        })
         .into()
 }
 
@@ -1361,7 +1459,7 @@ fn verb_label<'a>(ui: &'a Diffui, theme: ThemeSpec, id: CommandId) -> Aligned<'a
 
 /// A row's leading icon, centred in the [`GLYPH_BOX`] column and on the
 /// label's caps.
-fn glyph_icon<'a>(glyph: &'static str, color: Color) -> Aligned<'a, Message> {
+pub(crate) fn glyph_icon<'a>(glyph: &'static str, color: Color) -> Aligned<'a, Message> {
     Aligned::glyph(
         glyph_box(icons::icon(glyph, GLYPH_ICON_SIZE, color)),
         GLYPH_ICON_SIZE,
@@ -1524,6 +1622,8 @@ mod tests {
     fn recents_written_before_the_registry_still_resolve() {
         let persisted = PersistedRecents {
             revisions: Vec::new(),
+            cli: Vec::new(),
+            revsets: Vec::new(),
             commands: vec![
                 "refresh-repository".to_owned(),
                 "copy-change-id".to_owned(),

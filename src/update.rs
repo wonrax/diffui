@@ -499,6 +499,16 @@ impl Diffui {
             Payload::FilePairRead { old, new, .. } => {
                 self.apply_file_pair(tab, job, old.clone(), new.clone())
             }
+            Payload::RevsetResolved { revset, result, .. } => {
+                self.command_revset_resolved(tab, job, revset, result.clone())
+            }
+            Payload::CliOutput { lines, .. } => {
+                self.cli_output(tab, job, lines);
+                Task::none()
+            }
+            Payload::CliExited { code, .. } => {
+                self.finish_cli_run(tab, job, crate::cli_output::Exit::Code(*code))
+            }
             Payload::DetailsLoaded { details, .. } => {
                 let field = self
                     .tab_mut(tab)
@@ -536,6 +546,9 @@ impl Diffui {
                                 .map(|(_, pending)| pending.activity_id)
                         })
                 });
+                if self.tab_mut(tab)?.jobs.cli.contains_key(&job) {
+                    return Some(self.finish_cli_run(tab, job, crate::cli_output::Exit::Cancelled));
+                }
                 if let Some(activity_id) = activity
                     && let Some(log) = self.activity_log_for(tab)
                 {
@@ -568,6 +581,12 @@ impl Diffui {
         let jobs = &mut target.jobs;
         if jobs.trunk_rebase.as_ref().is_some_and(|(id, _)| *id == job) {
             return self.finish_trunk_preview(tab, job, Err(error.to_string()));
+        }
+        if jobs.cli.contains_key(&job) {
+            return self.fail_cli_run(tab, job, error);
+        }
+        if jobs.cmdline.remove(&job) {
+            return Task::none();
         }
         if jobs.preview == Some(job) {
             jobs.preview = None;
@@ -702,6 +721,7 @@ impl Diffui {
             Message::Changes(message) => self.on_changes(message),
             Message::JjCliVersion(version) => self.on_jj_cli_version(version),
             Message::Askpass(event) => self.on_askpass_event(event),
+            Message::CommandLine(event) => self.on_cmd_event(event),
         };
         // A mode that isn't on screen must not keep the keyboard.
         self.prune_stale_modes();
@@ -898,6 +918,9 @@ impl Diffui {
                 }
             }
             Action::PaletteMove(delta) => self.palette_move(delta),
+            Action::PaletteActions if self.command_line().is_some() => {
+                self.command_line_complete().unwrap_or_else(Task::none)
+            }
             Action::PaletteActions => {
                 let Some(mut state) = self.take_palette() else {
                     return Task::none();
@@ -1192,6 +1215,7 @@ impl Diffui {
             Action::Bookmark(action) => self.update_bookmark(action),
             Action::Revops(action) => self.perform_revops(action),
             Action::Credential(action) => self.update_credential(action),
+            Action::CommandLine(action) => self.on_command_line_action(action),
             Action::RebaseOntoTrunk(source) => self.rebase_onto_trunk(source),
             Action::Changes(message) => self.on_changes(message),
             Action::History(action) => self.perform_history(action),
@@ -1829,6 +1853,9 @@ impl Diffui {
             return Task::none();
         };
         let context = self.key_context();
+        if context == Context::Palette && crate::cmdline::caret_key(key) {
+            self.command_line_key(key, modifiers);
+        }
         let Some(id) = self.resolve_chord(context, &chord, consumed) else {
             return Task::none();
         };
@@ -1869,7 +1896,15 @@ impl Diffui {
                 let depth = state.stack.len().saturating_sub(1);
                 let mut task = Task::none();
                 if let Some(column) = state.top_mut() {
-                    column.query = query;
+                    let old = std::mem::replace(&mut column.query, query);
+                    if depth == 0
+                        && let Some(settle) = self.command_line_edited(column, &old)
+                    {
+                        column.matches.clear();
+                        column.dirty = false;
+                        self.push_mode(Mode::Palette(state));
+                        return settle;
+                    }
                     column.dirty = true;
                     // Editing resets `:` commit-search back to its "press ⏎"
                     // prompt (the prior results are for a stale query).
@@ -1912,6 +1947,13 @@ impl Diffui {
                 }
                 self.push_mode(Mode::Palette(state));
                 task
+            }
+            PaletteMessage::SelectIndex(_, index) if self.command_line().is_some() => {
+                self.command_line_select(index);
+                Task::none()
+            }
+            PaletteMessage::AcceptIndex(_, index) if self.command_line().is_some() => {
+                self.command_line_accept_index(index)
             }
             PaletteMessage::SelectIndex(depth, index) => {
                 if let Some(state) = self.palette_mut()
@@ -2130,7 +2172,7 @@ impl Diffui {
     /// Lift the palette out of the mode stack so the matcher can borrow `&self`
     /// — the commits, files and recents it ranks against. The caller must push
     /// it back.
-    fn take_palette(&mut self) -> Option<PaletteState> {
+    pub(crate) fn take_palette(&mut self) -> Option<PaletteState> {
         match self.pop_mode(ModeKind::Palette) {
             Some(Mode::Palette(state)) => Some(state),
             _ => None,
@@ -2140,6 +2182,9 @@ impl Diffui {
     /// Move the palette's highlighted row, scrolling it back into view when the
     /// move pushed it out.
     fn palette_move(&mut self, delta: i32) -> Task<Message> {
+        if let Some(task) = self.command_line_move(delta) {
+            return task;
+        }
         let Some(state) = self.palette_mut() else {
             return Task::none();
         };
@@ -2737,6 +2782,11 @@ impl Diffui {
                 .retain(|mode| matches!(mode.kind(), ModeKind::OpenRepo | ModeKind::Shortcuts));
             self.no_tab.modes.clear();
             return;
+        }
+        if let Some(&Mode::CliOutput(view)) = self.mode(ModeKind::CliOutput)
+            && !self.tabs.iter().any(|tab| tab.id == view.tab)
+        {
+            self.pop_mode(ModeKind::CliOutput);
         }
         let stale = {
             let tab = self.active();
@@ -3565,6 +3615,9 @@ impl Diffui {
     /// the first ⏎ runs the scan and shows results; once searched, ⏎ accepts the
     /// highlighted row like any other mode.
     pub(crate) fn palette_submit(&mut self) -> Task<Message> {
+        if self.command_line().is_some() {
+            return self.command_line_submit();
+        }
         let Some(mut state) = self.take_palette() else {
             return Task::none();
         };
@@ -4698,6 +4751,7 @@ impl Diffui {
             || self.mode(ModeKind::Confirm).is_some()
             || self.mode(ModeKind::NamePrompt).is_some()
             || self.mode(ModeKind::Credential).is_some()
+            || self.mode(ModeKind::CliOutput).is_some()
             || self.mode(ModeKind::Shortcuts).is_some()
             || crate::changes::split_shown(self)
         {
@@ -4717,6 +4771,7 @@ impl Diffui {
             crate::bookmarks::build_name_prompt(self, theme),
             crate::changes::split_modal(self, theme),
             tab_bar::build_confirm_dialog(self, theme),
+            crate::cli_output::build_overlay(self, theme),
             crate::credentials::build_overlay(self, theme),
             crate::shortcuts::build_overlay(self, theme),
             activity::toast_layer(self, theme),

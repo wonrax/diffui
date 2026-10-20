@@ -20,6 +20,8 @@ use diffui_core::{FetchTarget, RevisionSelection};
 
 use crate::action::Action;
 use crate::bookmarks::BookmarkAction;
+use crate::cli_output::OutputAction;
+use crate::cmdline::CmdAction;
 use crate::compare::CompareAction;
 use crate::history_panel::HistoryAction;
 use crate::palette::{self, ResultRef};
@@ -56,6 +58,8 @@ pub(crate) enum Context {
     Split,
     /// The credential prompt git or ssh raised.
     Credential,
+    /// A jj CLI run's output panel.
+    Output,
 }
 
 impl Context {
@@ -75,6 +79,7 @@ impl Context {
         Context::Lines,
         Context::Split,
         Context::Credential,
+        Context::Output,
     ];
 
     /// The name this context goes by in `config.toml`'s `[keys.<name>]`.
@@ -94,6 +99,7 @@ impl Context {
             Context::Lines => "lines",
             Context::Split => "split",
             Context::Credential => "credential",
+            Context::Output => "output",
         }
     }
 
@@ -1798,7 +1804,6 @@ pub(crate) static REGISTRY: &[Command] = &[
         build: |_ui, _arg| Some(Action::DraftToggleSource),
         palette: PaletteScope::Hidden,
     },
-    // ── Overlays ────────────────────────────────────────────────────────
     Command {
         id: "palette.toggle",
         label: "Command palette",
@@ -1859,6 +1864,47 @@ pub(crate) static REGISTRY: &[Command] = &[
         mac_chords: &[],
         enabled: always,
         build: |_ui, _arg| Some(Action::PalettePop),
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "palette.command-line",
+        label: "Run a jj command",
+        hint: "Type a jj command, as in a terminal, with completion",
+        contexts: &[Context::Base],
+        chords: &[":"],
+        mac_chords: &[],
+        enabled: |ui, _arg| {
+            require(
+                ui.active()
+                    .repository
+                    .as_ref()
+                    .is_some_and(|repository| repository.vcs == crate::repository::Vcs::Jj),
+                "Only in a jj repository",
+            )
+        },
+        build: |_ui, _arg| Some(Action::CommandLine(CmdAction::Open)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "output.close",
+        label: "Close",
+        hint: "Close the jj output",
+        contexts: &[Context::Output],
+        chords: &["esc"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::CommandLine(CmdAction::Output(OutputAction::Close))),
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "output.copy",
+        label: "Copy output",
+        hint: "Copy everything the jj command printed",
+        contexts: &[Context::Output],
+        chords: &["cmd+c"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::CommandLine(CmdAction::Output(OutputAction::Copy))),
         palette: PaletteScope::Hidden,
     },
     Command {
