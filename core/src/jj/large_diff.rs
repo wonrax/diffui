@@ -36,7 +36,17 @@ pub(crate) struct DiffLimits {
     /// Past this many bytes (both sides together) a file is diffed by line,
     /// without word-level emphasis.
     pub word_diff_bytes: usize,
+    /// An image side larger than this comes back collapsed, its bytes left
+    /// out; an SVG keeps only its text diff.
+    pub preview_bytes: usize,
+    /// Once the previews kept add up to this many bytes, further images come
+    /// back collapsed.
+    pub preview_total: usize,
 }
+
+/// No preview past this many bytes a side, even one the user asked for: the
+/// decode alone would hold hundreds of megabytes.
+pub(crate) const PREVIEW_HARD_LIMIT: usize = 64 * 1024 * 1024;
 
 impl Default for DiffLimits {
     fn default() -> Self {
@@ -44,6 +54,8 @@ impl Default for DiffLimits {
             file_rows: 3_000,
             total_rows: 30_000,
             word_diff_bytes: 512 * 1024,
+            preview_bytes: 16 * 1024 * 1024,
+            preview_total: 64 * 1024 * 1024,
         }
     }
 }
@@ -54,6 +66,8 @@ impl DiffLimits {
         Self {
             file_rows: usize::MAX,
             total_rows: usize::MAX,
+            preview_bytes: PREVIEW_HARD_LIMIT,
+            preview_total: usize::MAX,
             ..Self::default()
         }
     }
@@ -64,11 +78,17 @@ impl DiffLimits {
 pub(crate) struct RowBudget {
     limits: DiffLimits,
     spent: usize,
+    /// Preview bytes kept so far, against [`DiffLimits::preview_total`].
+    preview_spent: usize,
 }
 
 impl RowBudget {
     pub fn new(limits: DiffLimits) -> Self {
-        Self { limits, spent: 0 }
+        Self {
+            limits,
+            spent: 0,
+            preview_spent: 0,
+        }
     }
 
     pub fn limits(&self) -> DiffLimits {
@@ -85,6 +105,27 @@ impl RowBudget {
             return Err(DiffCollapse::OverBudget);
         }
         self.spent += changed;
+        Ok(())
+    }
+
+    /// Whether a file whose sides weigh `sides` bytes keeps them for a
+    /// preview, and if it does, charge them. `expanded` (the user asked for
+    /// this file) skips the caps short of [`PREVIEW_HARD_LIMIT`].
+    pub fn admit_preview(&mut self, sides: [usize; 2], expanded: bool) -> Result<(), DiffCollapse> {
+        let largest = sides[0].max(sides[1]);
+        let total = sides[0] + sides[1];
+        if largest > PREVIEW_HARD_LIMIT {
+            return Err(DiffCollapse::LargeFile);
+        }
+        if !expanded {
+            if largest > self.limits.preview_bytes {
+                return Err(DiffCollapse::LargeFile);
+            }
+            if self.preview_spent.saturating_add(total) > self.limits.preview_total {
+                return Err(DiffCollapse::OverBudget);
+            }
+        }
+        self.preview_spent += total;
         Ok(())
     }
 }
@@ -211,6 +252,17 @@ fn line_hunks<'a>(before: &'a [u8], after: &'a [u8], context: usize) -> Vec<Unif
 }
 
 /// The header of a collapsed file's single placeholder hunk.
+/// The header of an image held back by the preview caps: the action, then
+/// the sizes it would show.
+pub(crate) fn collapsed_preview_header(reason: DiffCollapse, sizes: &str) -> String {
+    match reason {
+        DiffCollapse::LargeFile => format!("Show large image · {sizes}"),
+        DiffCollapse::OverBudget => {
+            format!("Show image · {sizes} (held back: this revision is large)")
+        }
+    }
+}
+
 pub(crate) fn collapsed_header(reason: DiffCollapse, changed: usize) -> String {
     let lines = format_count(changed);
     // Action first: a narrow pane clips the tail of the header.
@@ -291,6 +343,31 @@ mod tests {
     }
 
     #[test]
+    fn previews_are_capped_per_side_and_per_document() {
+        let limits = DiffLimits {
+            preview_bytes: 100,
+            preview_total: 150,
+            ..DiffLimits::default()
+        };
+        let mut budget = RowBudget::new(limits);
+        assert_eq!(
+            budget.admit_preview([101, 0], false),
+            Err(DiffCollapse::LargeFile)
+        );
+        assert_eq!(budget.admit_preview([60, 60], false), Ok(()));
+        assert_eq!(
+            budget.admit_preview([20, 20], false),
+            Err(DiffCollapse::OverBudget)
+        );
+        // A file the user expanded skips both caps, short of the hard one.
+        assert_eq!(budget.admit_preview([101, 101], true), Ok(()));
+        assert_eq!(
+            budget.admit_preview([PREVIEW_HARD_LIMIT + 1, 0], true),
+            Err(DiffCollapse::LargeFile)
+        );
+    }
+
+    #[test]
     fn counts_changed_lines_without_rows() {
         assert_eq!(count_changed_lines(b"", b"a\nb\nc"), (3, 0));
         assert_eq!(count_changed_lines(b"a\nb\n", b""), (0, 2));
@@ -303,6 +380,7 @@ mod tests {
             file_rows: 10,
             total_rows: 15,
             word_diff_bytes: 0,
+            ..DiffLimits::default()
         });
         assert_eq!(budget.admit(11), Err(DiffCollapse::LargeFile));
         assert_eq!(budget.admit(8), Ok(()));

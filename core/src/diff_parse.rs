@@ -65,6 +65,7 @@ impl DiffStreamParser {
                 additions: 0,
                 deletions: 0,
                 collapsed: None,
+                blob: None,
             });
             return finished;
         }

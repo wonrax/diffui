@@ -15,6 +15,7 @@ pub mod graph;
 pub mod graph_layout;
 pub mod history;
 pub mod jj;
+pub mod media;
 pub mod model;
 pub mod mutations;
 pub mod partial;

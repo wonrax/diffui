@@ -8,7 +8,7 @@ use jj_lib::{
         materialized_diff_stream,
     },
     copies::CopyRecords,
-    diff_presentation::unified::{DiffLineType, git_diff_part},
+    diff_presentation::unified::{DiffLineType, GitDiffPart, git_diff_part},
     files::FileMergeHunkLevel,
     matchers::{EverythingMatcher, FilesMatcher, Matcher, PrefixMatcher},
     merge::{Diff, SameChange},
@@ -25,9 +25,10 @@ use super::large_diff::{self, DiffLimits, RowBudget};
 use super::walk::*;
 use super::workspace::resolve_revision;
 use crate::diff_parse::format_hunk_header;
+use crate::media;
 use crate::model::{
-    DiffBase, DiffDocument, DiffFile, DiffFileStatus, DiffHunkView, DiffLine, DiffLineKind,
-    ParentBrief, RevisionDetails, SignatureInfo,
+    BlobChange, BlobKind, DiffBase, DiffDocument, DiffFile, DiffFileStatus, DiffHunkView, DiffLine,
+    DiffLineKind, ParentBrief, RevisionDetails, SignatureInfo,
 };
 use crate::repository::Repository;
 
@@ -258,6 +259,7 @@ pub(crate) async fn diff_trees(
             additions: 0,
             deletions: 0,
             collapsed: None,
+            blob: None,
         };
 
         let binary = before.content.is_binary || after.content.is_binary;
@@ -265,9 +267,38 @@ pub(crate) async fn diff_trees(
             before.content.contents.as_slice(),
             after.content.contents.as_slice(),
         );
+        let expanded = options.expand.contains(&file.path);
+        let kind = media::kind_of(
+            &file.path,
+            binary,
+            if after_absent {
+                before_bytes
+            } else {
+                after_bytes
+            },
+        );
+        // Images and SVGs keep their bytes for a preview within the caps; a
+        // held-back image collapses like a large text file does.
+        let preview = match kind {
+            Some(BlobKind::Image | BlobKind::Svg) => {
+                Some(budget.admit_preview([before_bytes.len(), after_bytes.len()], expanded))
+            }
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            let keep = matches!(preview, Some(Ok(())));
+            let side = |part: &GitDiffPart, absent: bool| {
+                (!absent).then(|| media::side(kind, &part.hash, &part.content.contents, keep))
+            };
+            file.blob = Some(Box::new(BlobChange {
+                kind,
+                before: side(&before, before_absent),
+                after: side(&after, after_absent),
+            }));
+        }
         // Past the caps a file keeps its counts but gets no rows (see
         // `large_diff`); one the user already expanded is exempt.
-        let collapse = if binary || options.expand.contains(&file.path) {
+        let collapse = if binary || expanded {
             None
         } else {
             let (additions, deletions) = large_diff::count_changed_lines(before_bytes, after_bytes);
@@ -278,8 +309,23 @@ pub(crate) async fn diff_trees(
         };
 
         if binary {
+            let sizes = (
+                (!before_absent).then_some(before_bytes.len() as u64),
+                (!after_absent).then_some(after_bytes.len() as u64),
+            );
+            let header = match (kind, preview) {
+                (Some(BlobKind::Image), Some(Err(reason))) => {
+                    file.collapsed = Some(reason);
+                    large_diff::collapsed_preview_header(
+                        reason,
+                        &media::size_span(sizes.0, sizes.1),
+                    )
+                }
+                (Some(BlobKind::Image), _) => media::summary_line("Image", sizes.0, sizes.1),
+                _ => media::summary_line("Binary file", sizes.0, sizes.1),
+            };
             file.hunks.push(DiffHunkView {
-                header: "binary files differ".to_owned(),
+                header,
                 lines: Vec::new(),
             });
         } else if let Some((reason, additions, deletions)) = collapse {
@@ -397,6 +443,7 @@ pub(crate) async fn diff_trees(
                 additions: 0,
                 deletions: 0,
                 collapsed: None,
+                blob: None,
             };
             if part.content.is_binary {
                 file.hunks.push(DiffHunkView {

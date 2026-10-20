@@ -231,6 +231,52 @@ pub struct DiffFile {
     /// then a single header-only placeholder, the counts are still real, and
     /// the full diff is one `ExpandFile` away.
     pub collapsed: Option<DiffCollapse>,
+    /// Set for binary, image and SVG files: each side's size and, within the
+    /// preview caps, its bytes (see [`crate::media`]). Boxed: text files are
+    /// the common case and carry none of it.
+    pub blob: Option<Box<BlobChange>>,
+}
+
+/// The two sides of a file whose diff isn't (only) text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobChange {
+    pub kind: BlobKind,
+    /// `None` where the file is absent: before an add, after a delete.
+    pub before: Option<BlobSide>,
+    pub after: Option<BlobSide>,
+}
+
+impl BlobChange {
+    /// Whether any side carries bytes to preview.
+    pub fn previewable(&self) -> bool {
+        [&self.before, &self.after]
+            .into_iter()
+            .flatten()
+            .any(|side| side.bytes.is_some())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BlobKind {
+    /// Any binary the app can't render: shown as its sizes.
+    Binary,
+    /// A raster image (png, jpeg, gif, webp, ico, bmp).
+    Image,
+    /// SVG: text with a text diff, previewable rendered.
+    Svg,
+}
+
+/// One side of a [`BlobChange`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobSide {
+    pub size: u64,
+    /// Content identity (`<blob hash>:<size>`): keys decodes, so a reload or
+    /// another tab showing the same blob doesn't decode it again.
+    pub id: String,
+    /// Natural pixel size, when the content parses as its kind.
+    pub dimensions: Option<(u32, u32)>,
+    /// The content, kept only for a previewable side within the caps.
+    pub bytes: Option<Arc<[u8]>>,
 }
 
 /// Why a file's diff came back without rows.
@@ -1236,6 +1282,7 @@ mod tests {
             additions: 0,
             deletions: 0,
             collapsed: None,
+            blob: None,
         }
     }
 

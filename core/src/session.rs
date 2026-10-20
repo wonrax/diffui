@@ -1647,6 +1647,7 @@ mod tests {
             additions: 1,
             deletions: 0,
             collapsed: None,
+            blob: None,
         };
         let mut session = Session::unloaded(String::new());
         let job = session
@@ -2317,6 +2318,7 @@ mod tests {
             additions: 5_000,
             deletions: 0,
             collapsed: Some(crate::model::DiffCollapse::LargeFile),
+            blob: None,
         }
     }
 

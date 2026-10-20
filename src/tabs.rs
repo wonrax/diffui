@@ -477,6 +477,7 @@ pub(crate) mod tests {
                 deletions: 0,
                 hunks: Vec::new(),
                 collapsed: None,
+                blob: None,
             }],
             total_additions: 1,
             total_deletions: 0,

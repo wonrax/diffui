@@ -5325,6 +5325,7 @@ mod tests {
                         .collect(),
                 }],
                 collapsed: None,
+                blob: None,
             }],
             total_additions: 0,
             total_deletions: 0,

@@ -160,6 +160,7 @@ pub fn synthesize_source_file(path: &str, content: &str) -> DiffFile {
         additions: 0,
         deletions: 0,
         collapsed: None,
+        blob: None,
     }
 }
 
@@ -172,6 +173,7 @@ fn empty_source_file(path: &str) -> DiffFile {
         additions: 0,
         deletions: 0,
         collapsed: None,
+        blob: None,
     }
 }
 

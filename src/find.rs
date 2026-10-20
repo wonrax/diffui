@@ -403,6 +403,7 @@ mod tests {
             additions: 0,
             deletions: 0,
             collapsed: None,
+            blob: None,
         }
     }
 

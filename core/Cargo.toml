@@ -157,3 +157,7 @@ jj-cli = { version = "0.45.1", default-features = false, features = ["git"] }
 # config for `core.excludesFile` the way jj-cli does.
 gix = { version = "0.87.1", default-features = false }
 clap = "4.5"
+# Image and SVG previews in diffs (`media`). The same versions iced's image and
+# svg features build; codecs are limited to the formats a repo commonly holds.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "ico", "bmp"] }
+resvg = { version = "0.45", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }

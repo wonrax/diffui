@@ -3218,3 +3218,81 @@ fn preview_graph_of_a_new_change_matches_the_log_after_apply() {
 
     assert_applies_as_previewed(&root, &loaded, &post, MutationOp::NewAt { destination });
 }
+
+fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+    let image = image::RgbaImage::from_pixel(width, height, image::Rgba([0, 128, 255, 64]));
+    let mut bytes = Vec::new();
+    image::DynamicImage::ImageRgba8(image)
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .expect("encode png");
+    bytes
+}
+
+/// Images, SVG and other binaries carry their sides' sizes, and the
+/// previewable ones their bytes and pixel dimensions; binaries read as a
+/// one-line size summary.
+#[test]
+fn binary_and_image_files_carry_their_sides() {
+    use diffui_core::BlobKind;
+
+    let root = scratch_repo("media-sides");
+    std::fs::write(root.join("logo.png"), png_bytes(4, 2)).unwrap();
+    std::fs::write(root.join("blob.bin"), [0u8, 1, 2, 3]).unwrap();
+    write(
+        &root,
+        "icon.svg",
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"/>"#,
+    );
+    commit(&root, "first");
+    std::fs::write(root.join("logo.png"), png_bytes(6, 3)).unwrap();
+    std::fs::write(root.join("blob.bin"), [0u8; 2000]).unwrap();
+    write(
+        &root,
+        "icon.svg",
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="8"/>"#,
+    );
+    snapshot(&root);
+
+    let (document, _) = block_on(load_jj_diff(
+        repository(&root),
+        RevisionSelection::WorkingCopy,
+    ))
+    .unwrap();
+    let file = |path: &str| {
+        document
+            .files
+            .iter()
+            .find(|file| file.path == path)
+            .unwrap_or_else(|| panic!("{path} in the diff"))
+    };
+
+    let logo = file("logo.png");
+    let blob = logo.blob.as_deref().expect("an image carries its sides");
+    assert_eq!(blob.kind, BlobKind::Image);
+    let (before, after) = (blob.before.as_ref().unwrap(), blob.after.as_ref().unwrap());
+    assert_eq!(
+        (before.dimensions, after.dimensions),
+        (Some((4, 2)), Some((6, 3)))
+    );
+    assert!(before.bytes.is_some() && after.bytes.is_some());
+    assert_ne!(before.id, after.id);
+    assert!(logo.collapsed.is_none());
+
+    let bin = file("blob.bin");
+    assert_eq!(
+        bin.blob.as_deref().map(|blob| blob.kind),
+        Some(BlobKind::Binary)
+    );
+    assert_eq!(bin.hunks[0].header, "Binary file · 4 B → 2.0 KB");
+    assert!(!bin.blob.as_deref().unwrap().previewable());
+
+    let svg = file("icon.svg");
+    let blob = svg.blob.as_deref().expect("an SVG carries its sides");
+    assert_eq!(blob.kind, BlobKind::Svg);
+    assert_eq!(blob.after.as_ref().unwrap().dimensions, Some((16, 8)));
+    // Still a text diff underneath.
+    assert!(svg.hunks.iter().any(|hunk| !hunk.lines.is_empty()));
+}
