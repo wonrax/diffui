@@ -740,14 +740,14 @@ pub(crate) static REGISTRY: &[Command] = &[
     Command {
         id: "repo.fetch",
         label: "Fetch",
-        hint: "Fetch from the tracked remotes",
+        hint: "Fetch like jj git fetch: git.fetch remotes, else origin",
         contexts: &[Context::Base],
         chords: &["f"],
         mac_chords: &[],
         enabled: can_fetch,
         build: |_ui, arg| match arg {
             CommandArg::Fetch(target) => Some(Action::Fetch(target)),
-            _ => Some(Action::Fetch(FetchTarget::AllRemotes)),
+            _ => Some(Action::Fetch(FetchTarget::Default)),
         },
         palette: PaletteScope::Root,
     },

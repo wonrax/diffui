@@ -392,13 +392,22 @@ impl Diffui {
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn fetch_menu_entries(&self) -> Vec<menu::MenuEntry> {
         use menu::MenuEntry;
-        let mut items = vec![MenuEntry::Item {
-            label: "Fetch all remotes".to_owned(),
-            detail: None,
-            emphasized: true,
-            command: "repo.fetch",
-            arg: CommandArg::Fetch(FetchTarget::AllRemotes),
-        }];
+        let mut items = vec![
+            MenuEntry::Item {
+                label: "Fetch".to_owned(),
+                detail: None,
+                emphasized: true,
+                command: "repo.fetch",
+                arg: CommandArg::Fetch(FetchTarget::Default),
+            },
+            MenuEntry::Item {
+                label: "Fetch all remotes".to_owned(),
+                detail: None,
+                emphasized: false,
+                command: "repo.fetch",
+                arg: CommandArg::Fetch(FetchTarget::AllRemotes),
+            },
+        ];
         let branches = self.remote_branches_by_proximity();
         if !branches.is_empty() {
             items.push(MenuEntry::Separator);
@@ -891,10 +900,14 @@ impl Diffui {
 
         match which {
             ToolbarMenu::FetchBranches => {
-                // id 0 = all remotes; each known `name@remote` follows, ordered
-                // by proximity to the working copy.
-                let mut targets = vec![FetchTarget::AllRemotes];
-                let mut items = vec![MenuItem::entry("Fetch all remotes", 0)];
+                // id 0 = `jj git fetch`, 1 = all remotes; each known
+                // `name@remote` follows, ordered by proximity to the working
+                // copy.
+                let mut targets = vec![FetchTarget::Default, FetchTarget::AllRemotes];
+                let mut items = vec![
+                    MenuItem::entry("Fetch", 0),
+                    MenuItem::entry("Fetch all remotes", 1),
+                ];
                 let branches = self.remote_branches_by_proximity();
                 if !branches.is_empty() {
                     items.push(MenuItem::Separator);

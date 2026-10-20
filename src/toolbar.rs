@@ -485,7 +485,7 @@ fn fetch_split_button(
         font,
         theme,
     )
-    .on_press(Message::Action(Action::Fetch(FetchTarget::AllRemotes)));
+    .on_press(Message::Action(Action::Fetch(FetchTarget::Default)));
 
     // A `mouse_area` (not a `button`) with no press handler: the press falls
     // through to the wrapping `AnchorArea` (the main "Fetch" `button` captures
