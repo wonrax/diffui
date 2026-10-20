@@ -436,6 +436,14 @@ fn annotate_attributes_each_line_to_the_commit_that_wrote_it() {
     assert_eq!(origin(2).commit_id, first);
     assert_eq!(origin(1).summary, "second");
     assert_eq!(annotation.origins.len(), 2, "origins are deduplicated");
+    // Each origin's unique prefix is short and tells it from the other.
+    assert_eq!(annotation.unique_prefix_lens.len(), 2);
+    for (index, len) in annotation.unique_prefix_lens.iter().enumerate() {
+        let id = &annotation.origins[index].change_id;
+        assert!((1..id.len()).contains(len), "{len}");
+        let other = &annotation.origins[1 - index].change_id;
+        assert!(!other.starts_with(&id[..*len]));
+    }
 
     let events = repo.run(|job| Command::History {
         job,

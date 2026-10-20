@@ -48,7 +48,6 @@ const OP_LOG_PAGE: usize = 300;
 
 /// Width of the blame column, in monospace cells: change id, author, age.
 const ANNOTATION_CHARS: usize = 25;
-const ANNOTATION_AUTHOR_CHARS: usize = 10;
 
 /// Height of every row in an operation's changed-commit and moved-ref
 /// lists: a compact icon button on an even inset, so a row without the
@@ -670,7 +669,7 @@ impl Diffui {
                 }
                 HistoryResponse::Annotation(annotation) => {
                     history.annotation_job = None;
-                    let labels = annotation_labels(annotation, &self.resolved_theme().spec());
+                    let labels = annotation_labels(annotation);
                     self.tab_mut(tab)?.history.annotation = Some(AnnotationView {
                         annotation: annotation.clone(),
                         labels,
@@ -882,7 +881,8 @@ pub(crate) fn file_filter_active(ui: &Diffui) -> bool {
         .is_some_and(|filter| filter.revset == ui.active().session.revset)
 }
 
-fn annotation_labels(annotation: &FileAnnotation, theme: &ThemeSpec) -> Vec<AnnotationLabel> {
+/// One blame entry per line of `annotation`.
+fn annotation_labels(annotation: &FileAnnotation) -> Vec<AnnotationLabel> {
     let now = now_millis();
     let mut previous: Option<u32> = None;
     annotation
@@ -891,30 +891,25 @@ fn annotation_labels(annotation: &FileAnnotation, theme: &ThemeSpec) -> Vec<Anno
         .map(|&origin| {
             let first = previous != Some(origin);
             previous = Some(origin);
-            let Some(commit) = annotation.origins.get(origin as usize).filter(|_| first) else {
-                return AnnotationLabel {
-                    text: String::new(),
-                    color: theme.subtle_text,
-                };
+            let Some(commit) = annotation.origins.get(origin as usize) else {
+                return AnnotationLabel::default();
             };
-            let author: String = commit
-                .author
-                .chars()
-                .take(ANNOTATION_AUTHOR_CHARS)
-                .collect();
+            if !first {
+                return AnnotationLabel {
+                    hidden: !commit.visible,
+                    ..AnnotationLabel::default()
+                };
+            }
+            let id = commit.short_change_id().to_owned();
             AnnotationLabel {
-                text: format!(
-                    "{} {:<width$} {:>4}",
-                    commit.short_change_id(),
-                    author,
-                    relative_age(commit.time_millis, now),
-                    width = ANNOTATION_AUTHOR_CHARS
-                ),
-                color: if commit.visible {
-                    theme.muted_text
-                } else {
-                    theme.subtle_text
+                unique: match annotation.unique_prefix_lens.get(origin as usize) {
+                    Some(&len) if len > 0 => len.min(id.len()),
+                    _ => id.len(),
                 },
+                id,
+                author: commit.author.clone(),
+                age: relative_age(commit.time_millis, now),
+                hidden: !commit.visible,
             }
         })
         .collect()
@@ -934,10 +929,19 @@ pub(crate) fn source_annotations<'a>(ui: &'a Diffui) -> Option<AnnotationGutter<
     {
         return None;
     }
+    let theme = ui.resolved_theme().spec();
     Some(AnnotationGutter {
         labels: &view.labels,
         width_chars: ANNOTATION_CHARS,
         on_click: |line| Message::Action(Action::History(HistoryAction::AnnotationClicked(line))),
+        style: crate::diff_view::AnnotationStyle {
+            font: ui.config.ui_font,
+            id: theme.accent,
+            id_rest: theme.subtle_text,
+            author: theme.muted_text,
+            age: theme.subtle_text,
+            hidden: theme.subtle_text,
+        },
     })
 }
 

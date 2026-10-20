@@ -234,6 +234,9 @@ pub struct FileAnnotation {
     pub lines: Vec<u32>,
     /// The distinct commits lines came from.
     pub origins: Vec<CommitBrief>,
+    /// Each origin's shortest unique change id prefix, as `jj log` brightens
+    /// it.
+    pub unique_prefix_lens: Vec<usize>,
 }
 
 /// A coarse "how long ago" for a timestamp, the way a log column shows it:

@@ -446,12 +446,33 @@ pub struct DiffView<'a, Message> {
     hunk_actions: Option<crate::hunk_actions::HunkActions<'a, Message>>,
 }
 
-/// One line's entry in the blame column of a plain document.
-#[derive(Debug, Clone)]
+/// One line's entry in the blame column of a plain document: the change id,
+/// author and age of the commit it came from, on the first line of each run
+/// from one commit.
+#[derive(Debug, Clone, Default)]
 pub struct AnnotationLabel {
-    /// Empty on the continuation lines of a run from one commit.
-    pub text: String,
-    pub color: Color,
+    /// Empty on the continuation lines of a run.
+    pub id: String,
+    /// How much of `id` is its shortest unique prefix, drawn brighter.
+    pub unique: usize,
+    pub author: String,
+    pub age: String,
+    /// The commit is no longer visible: drawn receding.
+    pub hidden: bool,
+}
+
+/// Type and colours of the blame column. The id is mono, as the graph
+/// draws it; the author and age are in `font`.
+#[derive(Debug, Clone, Copy)]
+pub struct AnnotationStyle {
+    pub font: Font,
+    /// The id's unique prefix, and the rest of it.
+    pub id: Color,
+    pub id_rest: Color,
+    pub author: Color,
+    pub age: Color,
+    /// Every part of a hidden commit's entry.
+    pub hidden: Color,
 }
 
 /// A blame column drawn left of a plain document's line numbers: one label
@@ -461,6 +482,7 @@ pub struct AnnotationGutter<'a, Message> {
     /// Column width, in monospace cells.
     pub width_chars: usize,
     pub on_click: fn(usize) -> Message,
+    pub style: AnnotationStyle,
 }
 
 /// Per-render find-match data fed into `DiffView::with_find`. The widget
@@ -2872,26 +2894,9 @@ impl<'a, Message> DiffView<'a, Message> {
             && let Some(label) = line
                 .new_line
                 .and_then(|number| gutter.labels.get(number.saturating_sub(1)))
-            && !label.text.is_empty()
+            && !label.id.is_empty()
         {
-            self.draw_text(
-                renderer,
-                &label.text,
-                TextRenderParams {
-                    width: (annotation_width - GUTTER_HORIZONTAL_PADDING).max(1.0),
-                    height: self.metrics.row_height,
-                    position: Point::new(
-                        bounds.x + GUTTER_HORIZONTAL_PADDING,
-                        render.y + self.metrics.text_y_pad,
-                    ),
-                    color: label.color,
-                    clip_bounds: Rectangle {
-                        width: annotation_width,
-                        ..bounds
-                    },
-                    wrapping: text::Wrapping::None,
-                },
-            );
+            self.draw_annotation(renderer, gutter, label, bounds, render.y);
         }
 
         self.draw_text(
@@ -5619,6 +5624,101 @@ impl<Message> DiffView<'_, Message> {
     /// Draw one file's header strip (background + bottom border + title +
     /// stats) at screen-y `y`. Shared by the normal scrolling draw and the
     /// pinned sticky draw.
+    /// One blame entry on the row at screen-y `y`: the id as the graph
+    /// draws it, the author after it (cut short with an ellipsis), and the
+    /// age right-aligned at the column's end, all on the code's baseline.
+    fn draw_annotation<Renderer>(
+        &self,
+        renderer: &mut Renderer,
+        gutter: &AnnotationGutter<'_, Message>,
+        label: &AnnotationLabel,
+        bounds: Rectangle,
+        y: f32,
+    ) where
+        Renderer: text::Renderer,
+    {
+        let style = &gutter.style;
+        let width = self.annotation_width();
+        let clip = Rectangle { width, ..bounds };
+        let row = self.metrics.row_height;
+        let size = self.typography.size;
+        let baseline = y
+            + self.metrics.text_y_pad
+            + crate::typography::TextBox::new(self.font, size, row).baseline();
+        let paint = |renderer: &mut Renderer,
+                     content: &str,
+                     font: Font,
+                     x: f32,
+                     max_width: f32,
+                     color: Color| {
+            let top = baseline - crate::typography::TextBox::new(font, size, row).baseline();
+            renderer.fill_text(
+                text::Text {
+                    content: content.to_owned(),
+                    bounds: Size::new(max_width.max(1.0), row),
+                    size: Pixels(size),
+                    line_height: text::LineHeight::Absolute(Pixels(row)),
+                    font,
+                    align_x: text::Alignment::Left,
+                    align_y: alignment::Vertical::Top,
+                    shaping: text::Shaping::Advanced,
+                    wrapping: text::Wrapping::None,
+                    ellipsis: text::Ellipsis::End,
+                    hint_factor: None,
+                },
+                Point::new(x, top),
+                color,
+                clip,
+            );
+        };
+        let colors = |color: Color| if label.hidden { style.hidden } else { color };
+        let x = bounds.x + GUTTER_HORIZONTAL_PADDING;
+        let unique = label
+            .id
+            .char_indices()
+            .nth(label.unique)
+            .map_or(label.id.len(), |(at, _)| at);
+        let (prefix, rest) = label.id.split_at(unique);
+        let cell = self.metrics.char_width;
+        let prefix_width = prefix.chars().count() as f32 * cell;
+        paint(
+            renderer,
+            prefix,
+            self.font,
+            x,
+            prefix_width + cell,
+            colors(style.id),
+        );
+        paint(
+            renderer,
+            rest,
+            self.font,
+            x + prefix_width,
+            rest.chars().count() as f32 * cell + cell,
+            colors(style.id_rest),
+        );
+        let end = bounds.x + width - GUTTER_HORIZONTAL_PADDING;
+        let age_width = crate::measure::line_width(&label.age, size, style.font);
+        paint(
+            renderer,
+            &label.age,
+            style.font,
+            end - age_width,
+            age_width + 1.0,
+            colors(style.age),
+        );
+        let author_x = x + label.id.chars().count() as f32 * cell + cell;
+        let author_end = end - age_width - cell;
+        paint(
+            renderer,
+            &label.author,
+            style.font,
+            author_x,
+            author_end - author_x,
+            colors(style.author),
+        );
+    }
+
     /// A file strip at screen-y `y`: a hunk strip's band washed in the
     /// conflict colour, its text where a hunk header's is, its tools after
     /// that and its buttons right-aligned.

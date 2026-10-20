@@ -510,6 +510,7 @@ pub(crate) async fn annotate(
     let annotation = annotator.to_annotation();
 
     let mut origins: Vec<CommitBrief> = Vec::new();
+    let mut unique_prefix_lens = Vec::new();
     let mut index_of: HashMap<CommitId, u32> = HashMap::new();
     let mut lines = Vec::new();
     // Lines whose origin lies outside the searched domain point at the commit
@@ -526,6 +527,11 @@ pub(crate) async fn annotate(
                 // empty, and the check costs a tree diff per origin.
                 let commit = load_commit_id(repo, id).await?;
                 origins.push(brief_without_emptiness(repo, &commit).await?);
+                unique_prefix_lens.push(
+                    repo.shortest_unique_change_id_prefix_len(commit.change_id())
+                        .await
+                        .unwrap_or(0),
+                );
                 index_of.insert(id.clone(), index);
                 index
             }
@@ -537,6 +543,7 @@ pub(crate) async fn annotate(
         path: path.to_owned(),
         lines,
         origins,
+        unique_prefix_lens,
     })
 }
 
