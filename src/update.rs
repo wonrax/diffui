@@ -734,6 +734,7 @@ impl Diffui {
         self.prune_stale_modes();
         crate::app_menu::refresh_availability(self);
         self.keep_graph_anchor();
+        let preview = self.cancel_unwanted_preview();
         let welcome = self.ensure_welcome_prompt();
         let conflicts = self.sync_conflicts();
         let history = self.sync_history();
@@ -750,7 +751,7 @@ impl Diffui {
             }
             None => Task::none(),
         };
-        Task::batch([task, refresh, welcome, conflicts, history, media])
+        Task::batch([task, refresh, preview, welcome, conflicts, history, media])
     }
 
     /// With no repository open the welcome screen *is* the open prompt, so

@@ -8,7 +8,8 @@ use std::rc::Rc;
 use diffui_core::{JobId, PreviewGraph};
 
 use crate::revision_list::{self, DropSpot};
-use crate::{Diffui, TabState};
+use crate::{Diffui, Message, TabId, TabState};
+use iced::Task;
 
 /// A preview laid over the rows of one graph load. Stale (and not drawn)
 /// once the session's graph is replaced.
@@ -102,6 +103,35 @@ impl Diffui {
                 .flatten()
         });
         tab.graph_preview.applied = laid;
+    }
+
+    /// Run after every update: cancel a draft simulation nobody is waiting
+    /// for any more (the draft ended, or its destination was dropped), so the
+    /// repository stops spending time on it.
+    pub(crate) fn cancel_unwanted_preview(&mut self) -> Task<Message> {
+        let mut tasks = Vec::new();
+        let ids: Vec<TabId> = self.tabs.iter().map(|tab| tab.id).collect();
+        for id in ids {
+            let Some(tab) = self.tab_mut(id) else {
+                continue;
+            };
+            let wanted = tab
+                .op_draft()
+                .is_some_and(|draft| matches!(draft.preview, crate::DraftPreviewState::Loading));
+            if wanted {
+                continue;
+            }
+            let Some(job) = tab.jobs.preview.take() else {
+                continue;
+            };
+            tasks.push(self.run_effects(
+                id,
+                vec![diffui_core::Effect::Send(diffui_core::Command::Cancel {
+                    job,
+                })],
+            ));
+        }
+        Task::batch(tasks)
     }
 
     /// Run after every update: when the sidebar is about to draw a different
