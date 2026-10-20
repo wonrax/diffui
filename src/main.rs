@@ -24,6 +24,7 @@ mod credentials;
 mod diff_panel;
 mod diff_view;
 mod editor_drag;
+mod ellipsis;
 mod empty_states;
 mod field;
 mod find;

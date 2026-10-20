@@ -9,14 +9,15 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use iced::{
-    Element,
-    widget::{button, text},
+    Element, Length,
+    widget::{button, responsive, text},
 };
 
 use diffui_core::cli::highlight::{self, Mark};
 use diffui_core::plan::{self, Phrase};
 use diffui_core::{JjCli, MutationOp, RevisionSelection, Vcs};
 
+use crate::ellipsis;
 use crate::prose::Prose;
 use crate::theme::{ThemeSpec, ghost_button_style, text_size};
 use crate::typography::{self, Aligned};
@@ -132,15 +133,102 @@ fn marked_prose(text: &str, marks: &[highlight::Marked]) -> Prose {
     prose.code(&text[at..])
 }
 
+/// Width of a command line's glyph, gaps and copy button around the
+/// command.
+const CHROME: f32 = GLYPH + 6.0 + 4.0 + GLYPH + 4.0;
+
+/// The command's text, highlighted.
+fn command_text(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    command: &str,
+    size: f32,
+) -> ellipsis::Line<'static> {
+    let mono = ui.config.mono_font;
+    command_prose(command).line(mono, mono, theme.muted_text, theme, size)
+}
+
+/// Whether the command fits `width` on one line, glyph and copy button
+/// included.
+pub(crate) fn command_fits(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    command: &str,
+    size: f32,
+    width: f32,
+) -> bool {
+    let line = command_text(ui, theme, command, size);
+    !line.is_multiline() && line.fits(width - CHROME)
+}
+
 /// The command on one line: a terminal glyph, the command in mono (cut
-/// short with an ellipsis when it doesn't fit) and a copy button.
+/// short with an ellipsis when it doesn't fit) and a copy button, which
+/// copies the whole command.
 pub(crate) fn command_line<'a>(
     ui: &Diffui,
     theme: ThemeSpec,
     command: &str,
     size: f32,
 ) -> Element<'a, Message> {
-    let mono = ui.config.mono_font;
+    let (ui_font, mono) = (ui.config.ui_font, ui.config.mono_font);
+    let line = command_text(ui, theme, command, size);
+    let command = command.to_owned();
+    responsive(move |bounds| {
+        laid_out(
+            line.cut(bounds.width - CHROME),
+            &command,
+            mono,
+            size,
+            ui_font,
+            theme,
+        )
+    })
+    .height(Length::Shrink)
+    .into()
+}
+
+/// The whole command, wrapped to the width it gets, its later lines under
+/// the command's first rather than under the glyph, the copy button after
+/// it.
+pub(crate) fn wrapped_command_line<'a>(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    command: &str,
+    size: f32,
+) -> Element<'a, Message> {
+    let (ui_font, mono) = (ui.config.ui_font, ui.config.mono_font);
+    let line = command_text(ui, theme, command, size);
+    let command = command.to_owned();
+    responsive(move |bounds| {
+        let room = (bounds.width - CHROME).max(0.0);
+        let width = if !line.is_multiline() && line.fits(room) {
+            Length::Shrink
+        } else {
+            // Wrapped: as wide as its widest line, at most the room, so the
+            // copy button stays by the text.
+            Length::Fixed((line.natural_width() + 1.0).ceil().min(room))
+        };
+        laid_out(
+            line.wrapped().width(width),
+            &command,
+            mono,
+            size,
+            ui_font,
+            theme,
+        )
+    })
+    .height(Length::Shrink)
+    .into()
+}
+
+fn laid_out<'a>(
+    text: text::Rich<'a, (), Message>,
+    command: &str,
+    mono: iced::Font,
+    size: f32,
+    ui_font: iced::Font,
+    theme: ThemeSpec,
+) -> Element<'a, Message> {
     let copy = ui::tooltip(
         button(icons::icon(icons::COPY, GLYPH, theme.subtle_text))
             .padding(2)
@@ -148,7 +236,7 @@ pub(crate) fn command_line<'a>(
             .style(move |_, status| ghost_button_style(theme, status)),
         "Copy command",
         iced::widget::tooltip::Position::Top,
-        ui.config.ui_font,
+        ui_font,
         theme,
     );
     typography::baseline_row(
@@ -158,14 +246,7 @@ pub(crate) fn command_line<'a>(
                 GLYPH,
             ),
             Aligned::gap(6.0),
-            Aligned::text(
-                command_prose(command)
-                    .view(mono, mono, theme.muted_text, theme)
-                    .size(size)
-                    .wrapping(text::Wrapping::None),
-                mono,
-                size,
-            ),
+            Aligned::text(text, mono, size),
             Aligned::gap(4.0),
             Aligned::glyph(copy, GLYPH + 4.0),
         ],

@@ -9,6 +9,7 @@ use std::fmt;
 use iced::widget::text::{Rich, Span};
 use iced::{Color, Font};
 
+use crate::ellipsis;
 use crate::theme::ThemeSpec;
 use crate::typography::Aligned;
 
@@ -139,8 +140,26 @@ impl Prose {
         color: Color,
         theme: ThemeSpec,
     ) -> Rich<'a, (), Message> {
-        let spans: Vec<Span<'a, ()>> = self
-            .parts
+        Rich::with_spans(self.spans(mono, theme))
+            .font(font)
+            .color(color)
+    }
+
+    /// The same text as an [`ellipsis::Line`] at `size`: one line cut to
+    /// fit, or wrapped in full.
+    pub(crate) fn line(
+        &self,
+        font: Font,
+        mono: Font,
+        color: Color,
+        theme: ThemeSpec,
+        size: f32,
+    ) -> ellipsis::Line<'static> {
+        ellipsis::Line::new(self.spans(mono, theme), font, size, color)
+    }
+
+    fn spans<'a>(&self, mono: Font, theme: ThemeSpec) -> Vec<Span<'a, ()>> {
+        self.parts
             .iter()
             .map(|(kind, text)| {
                 let span = Span::new(text.clone());
@@ -151,8 +170,7 @@ impl Prose {
                     Kind::Path | Kind::Operation | Kind::Remote | Kind::Code => span.font(mono),
                 }
             })
-            .collect();
-        Rich::with_spans(spans).font(font).color(color)
+            .collect()
     }
 
     /// The same text as one [`Aligned`] run per name, for a line that has
