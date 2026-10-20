@@ -5421,6 +5421,31 @@ mod tests {
         assert!(!ui.active().activities.any_running());
     }
 
+    /// A typed `--allow-backwards` is the user's answer to the confirmation,
+    /// so the move runs without the check; without it, the check comes first.
+    #[test]
+    fn allow_backwards_skips_the_backwards_check() {
+        let mut ui = app();
+        let tab = push_tab(&mut ui, "/tmp/repo");
+        ui.tab_mut(tab).unwrap().session.capabilities.mutate = true;
+        let op = || mutations::MutationOp::MoveBookmark {
+            name: "main".to_owned(),
+            to: RevisionSelection::Commit("abc".to_owned()),
+            push_remote: None,
+        };
+
+        let _ = ui.start_mutation(op(), false);
+        let state = ui.tab_mut(tab).unwrap();
+        assert!(state.jobs.bookmark_check.is_some());
+        assert!(state.jobs.mutation.is_none());
+        state.jobs.bookmark_check = None;
+
+        let _ = ui.start_mutation(op(), true);
+        let state = ui.tab_mut(tab).unwrap();
+        assert!(state.jobs.bookmark_check.is_none());
+        assert!(state.jobs.mutation.is_some(), "the move runs straight away");
+    }
+
     #[test]
     fn a_confirmation_swallows_every_key_but_its_own() {
         let mut ui = app();

@@ -1060,7 +1060,14 @@ impl Diffui {
         {
             return task;
         }
-        self.start_mutation_op(op)
+        let allow_backwards = matches!(
+            command,
+            MutationCommand::BookmarkSet {
+                allow_backwards: true,
+                ..
+            }
+        );
+        self.start_mutation(op, allow_backwards)
     }
 
     /// Land a typed rebase / squash / placed new or duplicate / parallelize

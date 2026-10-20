@@ -461,6 +461,16 @@ impl Diffui {
     /// mutation entry point — context menu, target-mode confirm, drag & drop —
     /// funnels through here so labels and guards can't drift apart.
     pub(crate) fn start_mutation_op(&mut self, op: mutations::MutationOp) -> Task<Message> {
+        self.start_mutation(op, false)
+    }
+
+    /// [`Self::start_mutation_op`], where `allow_backwards` is a typed
+    /// `--allow-backwards`: a bookmark move then runs without asking first.
+    pub(crate) fn start_mutation(
+        &mut self,
+        op: mutations::MutationOp,
+        allow_backwards: bool,
+    ) -> Task<Message> {
         use mutations::MutationOp;
         let Some(tab_id) = self.active_tab_id() else {
             return Task::none();
@@ -577,7 +587,7 @@ impl Diffui {
         // runs the move directly (fast-forward) or raises a confirmation
         // dialog. The activity sits Queued meanwhile so the
         // action stays visible (and is resolved on cancel).
-        if let MutationOp::MoveBookmark { name, to, .. } = &pending.op {
+        if !allow_backwards && let MutationOp::MoveBookmark { name, to, .. } = &pending.op {
             if let Some(log) = self.activity_log_for(pending.tab_id) {
                 log.set_status(pending.activity_id, activity::ActivityStatus::Queued);
             }
