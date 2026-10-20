@@ -29,7 +29,9 @@ use crate::repo::{
     Capabilities, Command, Event, JobId, Payload, PreviewRequest, RepoError, RepoId,
 };
 use crate::repository::{FetchTarget, RepositorySnapshot};
-use crate::revset::{RevsetCompleter, RevsetQuery, RevsetSymbols};
+use crate::revset::{
+    RevsetCompleter, RevsetError, RevsetExpect, RevsetMatch, RevsetQuery, RevsetSymbols,
+};
 
 /// A parked diff document for a source that flips between several documents —
 /// a PR's "all changes" view vs its per-commit diffs — so flipping back is an
@@ -217,6 +219,13 @@ pub struct Session {
     /// The base `document` was actually loaded against — what the diff
     /// pane's header describes and what full-context reads must match.
     pub document_base: DiffBase,
+    /// "Diff since": while set (`trunk()`), browsing a revision X shows the
+    /// range `base..X`, so the mode follows the graph's cursor the way a
+    /// comparison's base does. See [`Self::diff_since`].
+    pub diff_since: Option<String>,
+    /// A span of graph rows shown as one diff (`jj diff -r` over them). See
+    /// [`Self::diff_span`].
+    pub span: Option<DiffSpan>,
     /// Files of the shown diff the user expanded past the size caps. Sent
     /// with every reload of the same diff so a refresh doesn't fold them
     /// back; dropped when the revision or the base changes.
@@ -295,6 +304,21 @@ pub struct Session {
     expand_jobs: Vec<(JobId, String)>,
     /// A typed `jj diff` being resolved into a revision and base.
     diff_resolve_job: Option<JobId>,
+    /// The check that a [`DiffSpan`] has no gaps.
+    span_job: Option<JobId>,
+}
+
+/// Several graph rows picked to be shown as one diff, the way `jj diff -r`
+/// shows a set of commits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffSpan {
+    /// The rows as a revset: their union.
+    pub revset: String,
+    /// How many rows were picked.
+    pub count: usize,
+    /// Why they can't be one diff: jj's refusal of a set with gaps, once the
+    /// check has answered. The pane then says so instead of guessing.
+    pub refused: Option<RevsetError>,
 }
 
 impl Session {
@@ -343,6 +367,7 @@ impl Session {
             || self.mutation_job == Some(job)
             || self.expand_jobs.iter().any(|(id, _)| *id == job)
             || self.diff_resolve_job == Some(job)
+            || self.span_job == Some(job)
     }
 
     /// Whether a mutation is running. Gates the actions a half-applied
@@ -503,6 +528,13 @@ impl Session {
     /// --from`). The base sticks: selecting another revision afterwards
     /// compares that one against the same base, until [`Self::exit_compare`].
     pub fn compare(&mut self, base: DiffBase, to: RevisionSelection) -> Vec<Effect> {
+        self.diff_since = None;
+        self.drop_span();
+        self.load_against(base, to)
+    }
+
+    /// [`Self::compare`] without leaving "diff since" or a span.
+    fn load_against(&mut self, base: DiffBase, to: RevisionSelection) -> Vec<Effect> {
         if !self.capabilities.compare && base.is_compare()
             || !self.capabilities.range_diff && base.range().is_some()
         {
@@ -514,8 +546,16 @@ impl Session {
 
     /// Back to the selected revision's own diff.
     pub fn exit_compare(&mut self) -> Vec<Effect> {
+        let had_span = self.span.is_some();
+        self.diff_since = None;
+        self.drop_span();
         if !self.diff_base.is_compare() && !self.document_base.is_compare() {
-            return Vec::new();
+            // A refused span showed no diff of its own; leaving it is enough.
+            return if had_span {
+                vec![Effect::RepaintDocument]
+            } else {
+                Vec::new()
+            };
         }
         self.diff_base = DiffBase::Parents;
         let revision = self.selected_revision.clone();
@@ -544,6 +584,128 @@ impl Session {
         };
         let to = self.selected_revision.clone();
         self.compare(base, to)
+    }
+
+    // ── ranges that follow the graph ────────────────────────────────────
+
+    /// How a revset names `revision`: `@`, its change id as the graph
+    /// shows it, or a commit id prefix where the change id doesn't single
+    /// it out (a divergent change, a hidden commit, a row not loaded).
+    pub fn revision_symbol(&self, revision: &RevisionSelection) -> String {
+        use crate::cli::RevisionNames as _;
+        match revision {
+            RevisionSelection::WorkingCopy => "@".to_owned(),
+            RevisionSelection::Commit(hex) => self
+                .commits
+                .change_id(hex)
+                .unwrap_or_else(|| hex.chars().take(12).collect()),
+        }
+    }
+
+    /// Show `base..X` for `target` X ("Diff since trunk"), and keep doing so
+    /// for whatever revision is browsed next (see [`Self::browse`]), until
+    /// [`Self::exit_compare`]. `symbol` names X in the revset when the user
+    /// picked it by name (a bookmark), so the range reads as they'd type it.
+    /// A revision already in `base` gives the empty range.
+    pub fn diff_since(
+        &mut self,
+        base: impl Into<String>,
+        target: RevisionSelection,
+        symbol: Option<String>,
+    ) -> Vec<Effect> {
+        if !self.capabilities.range_diff {
+            return Vec::new();
+        }
+        let base = base.into();
+        self.drop_span();
+        let symbol = symbol.unwrap_or_else(|| self.revision_symbol(&target));
+        let revset = format!("{base}..{symbol}");
+        self.diff_since = Some(base);
+        self.load_against(DiffBase::Range(revset), target)
+    }
+
+    /// Browse `revision` (a click on its row, a keyboard move): show its
+    /// diff, as the diff pane's mode has it. A comparison compares it with
+    /// the same base; "diff since" re-targets its range at it; a fixed range
+    /// or a span has nothing to say about it, so it leaves them.
+    pub fn browse(&mut self, revision: RevisionSelection) -> Vec<Effect> {
+        if let Some(base) = self.diff_since.clone() {
+            let revset = format!("{base}..{}", self.revision_symbol(&revision));
+            self.diff_base = DiffBase::Range(revset);
+        } else if self.span.take().is_some() || matches!(self.diff_base, DiffBase::Range(_)) {
+            self.span_job = None;
+            self.diff_base = DiffBase::Parents;
+        }
+        self.load_diff(revision)
+    }
+
+    /// Show `revisions` (rows picked on the graph) as one diff: `jj diff -r`
+    /// over their union, once the actor confirms the set has no gaps. A set
+    /// with gaps keeps the pane as it was and records jj's refusal in
+    /// [`Self::span`]. Fewer than two rows is no span: it leaves one.
+    pub fn diff_span(&mut self, revisions: &[RevisionSelection]) -> Vec<Effect> {
+        if !self.capabilities.range_diff {
+            return Vec::new();
+        }
+        if revisions.len() < 2 {
+            return if self.span.is_some() {
+                self.exit_compare()
+            } else {
+                Vec::new()
+            };
+        }
+        let revset = revisions
+            .iter()
+            .map(|revision| self.revision_symbol(revision))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let mut effects = Vec::new();
+        if let Some(job) = self.span_job.take() {
+            effects.push(Effect::Send(Command::Cancel { job }));
+        }
+        let job = self.next_job();
+        self.span_job = Some(job);
+        self.span = Some(DiffSpan {
+            revset: revset.clone(),
+            count: revisions.len(),
+            refused: None,
+        });
+        let mut query = RevsetQuery::new(revset).expect(RevsetExpect::Contiguous);
+        query.limit = 0;
+        effects.push(Effect::Send(Command::ResolveRevset { job, query }));
+        effects
+    }
+
+    fn on_span_checked(
+        &mut self,
+        job: JobId,
+        result: Result<RevsetMatch, RevsetError>,
+    ) -> Vec<Effect> {
+        if self.span_job != Some(job) {
+            return Vec::new();
+        }
+        self.span_job = None;
+        let Some(span) = self.span.as_mut() else {
+            return Vec::new();
+        };
+        match result {
+            Ok(_) => {
+                self.diff_since = None;
+                let revset = span.revset.clone();
+                let to = self.selected_revision.clone();
+                self.load_against(DiffBase::Range(revset), to)
+            }
+            Err(error) => {
+                span.refused = Some(error);
+                vec![Effect::RepaintDocument]
+            }
+        }
+    }
+
+    /// Forget the span, and the check still running for it.
+    fn drop_span(&mut self) {
+        self.span = None;
+        self.span_job = None;
     }
 
     // ── typed revsets ───────────────────────────────────────────────────
@@ -769,8 +931,8 @@ impl Session {
             | Payload::OpLogBatch { .. }
             | Payload::History { .. }
             | Payload::CliOutput { .. }
-            | Payload::CliExited { .. }
-            | Payload::RevsetResolved { .. } => Vec::new(),
+            | Payload::CliExited { .. } => Vec::new(),
+            Payload::RevsetResolved { job, result, .. } => self.on_span_checked(job, result),
         }
     }
 
@@ -1129,6 +1291,8 @@ impl Session {
         }
         if failed_compare && self.diff_base.is_compare() {
             self.diff_base = DiffBase::Parents;
+            self.diff_since = None;
+            self.drop_span();
             let revision = self.selected_revision.clone();
             effects.extend(self.load_diff(revision));
             return effects;
@@ -1157,6 +1321,9 @@ impl Session {
         }
         if self.diff_resolve_job == Some(job) {
             self.diff_resolve_job = None;
+        }
+        if self.span_job == Some(job) {
+            self.span_job = None;
         }
         self.expand_jobs.retain(|(id, _)| *id != job);
     }
@@ -2242,5 +2409,136 @@ mod tests {
         session.document.files = vec![collapsed_file("huge.rs"), small, big];
         session.reset_highlights(1);
         assert_eq!(Vec::from(session.highlight_pending.clone()), vec![1]);
+    }
+
+    // ── ranges that follow the graph ────────────────────────────────────
+
+    fn sent_resolve(effects: &[Effect]) -> Option<(JobId, RevsetQuery)> {
+        effects.iter().find_map(|effect| match effect {
+            Effect::Send(Command::ResolveRevset { job, query }) => Some((*job, query.clone())),
+            _ => None,
+        })
+    }
+
+    /// "Diff since trunk" shows `trunk()..X` and re-targets as the cursor
+    /// moves, like a comparison's sticky base; exit ends it.
+    #[test]
+    fn diff_since_follows_the_browsed_revision() {
+        let mut session = range_session();
+        let effects = session.diff_since("trunk()", commit("aaa"), Some("alpha".to_owned()));
+        let (_, revision, base) = sent_diff(&effects).expect("a range load");
+        assert_eq!(revision, commit("aaa"));
+        assert_eq!(base, DiffBase::Range("trunk()..alpha".to_owned()));
+
+        let effects = session.browse(RevisionSelection::WorkingCopy);
+        let (_, revision, base) = sent_diff(&effects).expect("re-targeted");
+        assert_eq!(revision, RevisionSelection::WorkingCopy);
+        assert_eq!(base, DiffBase::Range("trunk()..@".to_owned()));
+
+        // A row the graph doesn't hold is named by commit id.
+        let effects = session.browse(commit("0123456789abcdef"));
+        let (.., base) = sent_diff(&effects).expect("re-targeted");
+        assert_eq!(base, DiffBase::Range("trunk()..0123456789ab".to_owned()));
+
+        // Picking a comparison leaves the mode.
+        session.compare(DiffBase::Revision(commit("aaa")), commit("bbb"));
+        assert_eq!(session.diff_since, None);
+
+        session.diff_since("trunk()", commit("aaa"), None);
+        let effects = session.exit_compare();
+        let (.., base) = sent_diff(&effects).expect("the plain diff");
+        assert_eq!(base, DiffBase::Parents);
+        assert_eq!(session.diff_since, None);
+    }
+
+    /// Browsing away from a fixed range shows the browsed revision itself;
+    /// a comparison keeps its base.
+    #[test]
+    fn browsing_leaves_a_fixed_range_but_not_a_comparison() {
+        let mut session = range_session();
+        session.diff_range("aaa|bbb");
+        let effects = session.browse(commit("ccc"));
+        let (.., base) = sent_diff(&effects).expect("a load");
+        assert_eq!(base, DiffBase::Parents);
+
+        session.compare(DiffBase::Revision(commit("aaa")), commit("bbb"));
+        let effects = session.browse(commit("ccc"));
+        let (.., base) = sent_diff(&effects).expect("a load");
+        assert_eq!(base, DiffBase::Revision(commit("aaa")));
+    }
+
+    /// A span is checked for gaps first: a connected one becomes a range
+    /// diff, one with gaps is refused in jj's words and the pane stays put.
+    #[test]
+    fn a_span_shows_as_one_diff_only_without_gaps() {
+        let mut session = range_session();
+        let effects = session.diff_span(&[commit("aaa"), commit("bbb")]);
+        assert!(
+            sent_diff(&effects).is_none(),
+            "nothing loads before the check"
+        );
+        let (job, query) = sent_resolve(&effects).expect("a gap check");
+        assert_eq!(query.expect, RevsetExpect::Contiguous);
+        assert_eq!(query.revset, "aaa | bbb");
+        assert!(session.owns_job(job));
+
+        let effects = session.apply(Event::new(
+            test_repo(),
+            Payload::RevsetResolved {
+                job,
+                revset: query.revset.clone(),
+                result: Ok(RevsetMatch::default()),
+            },
+        ));
+        let (.., base) = sent_diff(&effects).expect("the span loads");
+        assert_eq!(base, DiffBase::Range("aaa | bbb".to_owned()));
+        assert!(session.span.is_some(), "the span stays while it is shown");
+
+        let effects = session.diff_span(&[commit("aaa"), commit("ccc")]);
+        let (job, query) = sent_resolve(&effects).expect("a gap check");
+        let effects = session.apply(Event::new(
+            test_repo(),
+            Payload::RevsetResolved {
+                job,
+                revset: query.revset,
+                result: Err(RevsetError::new("Cannot diff revsets with gaps in.")),
+            },
+        ));
+        assert!(sent_diff(&effects).is_none(), "the pane stays as it was");
+        let refused = session.span.as_ref().and_then(|span| span.refused.as_ref());
+        assert_eq!(
+            refused.map(|error| error.message.as_str()),
+            Some("Cannot diff revsets with gaps in.")
+        );
+
+        // A plain click leaves the span for the clicked revision.
+        let effects = session.browse(commit("ccc"));
+        let (.., base) = sent_diff(&effects).expect("a load");
+        assert_eq!(base, DiffBase::Parents);
+        assert_eq!(session.span, None);
+    }
+
+    /// A newer span supersedes the check of an older one, whose answer is
+    /// then ignored.
+    #[test]
+    fn a_stale_span_check_is_ignored() {
+        let mut session = range_session();
+        let first = sent_resolve(&session.diff_span(&[commit("aaa"), commit("bbb")]))
+            .expect("a check")
+            .0;
+        let effects = session.diff_span(&[commit("aaa"), commit("ccc")]);
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Send(Command::Cancel { job }) if *job == first
+        )));
+        let effects = session.apply(Event::new(
+            test_repo(),
+            Payload::RevsetResolved {
+                job: first,
+                revset: "aaa | bbb".to_owned(),
+                result: Ok(RevsetMatch::default()),
+            },
+        ));
+        assert!(effects.is_empty());
     }
 }

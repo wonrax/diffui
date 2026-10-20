@@ -17,8 +17,8 @@ pub mod history;
 pub mod jj;
 pub mod model;
 pub mod mutations;
-pub mod plan;
 pub mod partial;
+pub mod plan;
 pub mod preview_graph;
 pub mod push;
 pub mod repo;
@@ -53,8 +53,8 @@ pub use revset::{
     RevsetCompleter, RevsetError, RevsetExpect, RevsetMatch, RevsetQuery, RevsetSymbols,
 };
 pub use session::{
-    ColdBatchFold, ColdCursor, Effect, LoadStatus, RefreshOrigin, Session, coalesce_refresh,
-    fold_cold_batch,
+    ColdBatchFold, ColdCursor, DiffSpan, Effect, LoadStatus, RefreshOrigin, Session,
+    coalesce_refresh, fold_cold_batch,
 };
 pub use source_browse::{
     SourceEntry, SourceEntryStatus, SourceFileLoad, SourceTreeRow, build_source_file,
