@@ -20,6 +20,7 @@ use jj_lib::{
     },
     settings::UserSettings,
     ui_path::RepoPathUiConverter,
+    view::View,
 };
 
 use super::settings::*;
@@ -304,23 +305,7 @@ pub async fn walk_jj_with_repo(
     // matching jj log's template order (working_copies before bookmarks), so
     // the chip rail's tail-dropping `+N` overflow sheds bookmarks before it
     // sheds a working-copy marker.
-    let mut bookmarks_by_commit: HashMap<CommitId, Vec<String>> = HashMap::new();
-    for (name, id) in repo.view().wc_commit_ids() {
-        if name.as_str() != workspace_name.as_str() {
-            bookmarks_by_commit
-                .entry(id.clone())
-                .or_default()
-                .push(format!("{}@", name.as_str()));
-        }
-    }
-    for (name, target) in repo.view().bookmarks() {
-        collect_bookmark_labels(name.as_str(), &target, |id, label| {
-            bookmarks_by_commit
-                .entry(id.clone())
-                .or_default()
-                .push(label);
-        });
-    }
+    let bookmarks_by_commit = ref_labels(repo.view(), workspace_name);
 
     // Membership test for `immutable()`, resolved through the same alias map
     // as the log revset so a user override of `immutable_heads()` is honored.
@@ -525,6 +510,31 @@ pub async fn walk_jj_with_repo(
     let mut bookmarks = compute_bookmarks_info(repo, wc_commit_id);
     bookmarks.trunk = trunk_id.map(|id| id.hex());
     Ok(Some((empty_updates, branch_status, bookmarks)))
+}
+
+/// Every commit's ref chips, in the order the log shows them: other
+/// workspaces' working copies as `name@`, then bookmarks (see
+/// [`collect_bookmark_labels`]). This workspace's own `@` gets its marker
+/// instead, so it isn't listed.
+pub(super) fn ref_labels(
+    view: &View,
+    workspace_name: &WorkspaceName,
+) -> HashMap<CommitId, Vec<String>> {
+    let mut labels: HashMap<CommitId, Vec<String>> = HashMap::new();
+    for (name, id) in view.wc_commit_ids() {
+        if name.as_str() != workspace_name.as_str() {
+            labels
+                .entry(id.clone())
+                .or_default()
+                .push(format!("{}@", name.as_str()));
+        }
+    }
+    for (name, target) in view.bookmarks() {
+        collect_bookmark_labels(name.as_str(), &target, |id, label| {
+            labels.entry(id.clone()).or_default().push(label);
+        });
+    }
+    labels
 }
 
 /// Emit the bookmark chip label(s) for one bookmark onto the commit(s) they sit

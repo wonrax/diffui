@@ -831,33 +831,14 @@ async fn mutate_locked(
             .await?;
             let source_names: Vec<String> = source_commits.iter().map(short_change_id).collect();
             let short_dest = short_change_id(&destination);
-            let combined = combined_squash_description(&destination, &source_commits);
-            let mut selections: Vec<CommitWithSelection> = Vec::new();
-            for source in source_commits {
-                selections.push(CommitWithSelection {
-                    selected_tree: source.tree(),
-                    parent_tree: source
-                        .parent_tree(tx.repo())
-                        .await
-                        .context("failed to load squash source parent tree")?,
-                    commit: source,
-                });
-            }
-            let Some(squashed) = squash_commits(tx.repo_mut(), &selections, &destination, false)
-                .await
-                .context("failed to squash")?
+            let Some(new_destination) =
+                squash_whole(tx.repo_mut(), source_commits, &destination).await?
             else {
                 bail!(
                     "nothing to squash from {}: it has no changes",
                     source_names.join(", ")
                 );
             };
-            let new_destination = squashed
-                .commit_builder
-                .set_description(combined)
-                .write()
-                .await
-                .context("failed to write squashed commit")?;
             rewritten_commit = Some(new_destination.id().hex());
             format!("Squashed {} into {short_dest}", source_names.join(", "))
         }
@@ -1567,6 +1548,41 @@ pub(super) fn combined_squash_description(destination: &Commit, sources: &[Commi
     let mut combined = parts.join("\n\n");
     combined.push('\n');
     combined
+}
+
+/// Fold every change of `sources` into `destination` and abandon the
+/// emptied sources, combining the descriptions (`jj squash --from … --into`).
+/// `None` when the sources have nothing to move.
+pub(super) async fn squash_whole(
+    repo: &mut MutableRepo,
+    sources: Vec<Commit>,
+    destination: &Commit,
+) -> Result<Option<Commit>> {
+    let combined = combined_squash_description(destination, &sources);
+    let mut selections: Vec<CommitWithSelection> = Vec::new();
+    for source in sources {
+        selections.push(CommitWithSelection {
+            selected_tree: source.tree(),
+            parent_tree: source
+                .parent_tree(repo)
+                .await
+                .context("failed to load squash source parent tree")?,
+            commit: source,
+        });
+    }
+    let Some(squashed) = squash_commits(repo, &selections, destination, false)
+        .await
+        .context("failed to squash")?
+    else {
+        return Ok(None);
+    };
+    let new_destination = squashed
+        .commit_builder
+        .set_description(combined)
+        .write()
+        .await
+        .context("failed to write squashed commit")?;
+    Ok(Some(new_destination))
 }
 
 /// Resolve a `RevisionSelection` to a `Commit`. The working-copy case uses
