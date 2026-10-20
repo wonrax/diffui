@@ -25,6 +25,16 @@ pub struct Token {
 }
 
 impl Token {
+    /// A word not typed yet, at `at`: where completion inserts one.
+    pub(crate) fn empty_at(at: usize) -> Self {
+        Self {
+            value: String::new(),
+            span: at..at,
+            offsets: vec![at],
+            unterminated: None,
+        }
+    }
+
     /// Map `range`, byte offsets into [`value`](Self::value), onto the input.
     pub fn input_range(&self, range: Range<usize>) -> Range<usize> {
         let at = |i: usize| self.offsets[i.min(self.value.len())];

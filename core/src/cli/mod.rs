@@ -19,8 +19,12 @@
 //! [`MutationOp::cli_equivalent`](crate::MutationOp::cli_equivalent), and
 //! [`OpDraft::cli_prefix`](crate::OpDraft::cli_prefix) for a target-mode
 //! draft still picking its destination.
+//!
+//! [`JjCli::complete`] completes subcommands and flags and hands value
+//! positions to a [`ValueCompleter`](crate::completion::ValueCompleter).
 
 mod command;
+mod complete;
 mod grammar;
 mod lower;
 mod parse;
@@ -37,6 +41,8 @@ pub use command::{
 pub use lower::{LowerContext, LowerError, NativeAction, lower};
 pub use parse::{CliConfig, ParseError, ParsedCommand};
 pub use render::{CliEquivalent, CommitIds, RevisionNames, jj_args_tag};
+
+use crate::completion::{Completion, ValueCompleter};
 
 /// The command line for one repository: jj's grammar plus that
 /// repository's aliases. Cheap to clone; the grammar is shared.
@@ -64,4 +70,19 @@ impl JjCli {
     pub fn parse(&self, line: &str) -> Result<ParsedCommand, ParseError> {
         parse::parse(&self.config, line)
     }
+
+    /// Candidates for the word at `cursor` (a byte offset into `line`).
+    pub fn complete(
+        &self,
+        line: &str,
+        cursor: usize,
+        values: &dyn ValueCompleter,
+    ) -> Vec<Completion> {
+        complete::complete(&self.config, line, cursor, values)
+    }
+}
+
+/// [`JjCli::complete`] with jj's default aliases only.
+pub fn complete_command(line: &str, cursor: usize, values: &dyn ValueCompleter) -> Vec<Completion> {
+    complete::complete(&CliConfig::builtin(), line, cursor, values)
 }

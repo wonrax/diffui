@@ -10,6 +10,8 @@ use std::ops::Range;
 pub enum CompletionKind {
     Subcommand,
     Flag,
+    /// One of a flag's fixed choices (`--color never`).
+    Value,
     /// A revset function such as `trunk()` or `ancestors(x, depth)`.
     Function,
     /// A `[revset-aliases]` entry.
