@@ -5,13 +5,17 @@
 //! The command itself comes from core ([`diffui_core::plan`]); this module
 //! names revisions from the loaded graph and draws the line.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use iced::{
     Element,
     widget::{button, text},
 };
 
+use diffui_core::cli::highlight::{self, Mark};
 use diffui_core::plan::{self, Phrase};
-use diffui_core::{MutationOp, RevisionSelection, Vcs};
+use diffui_core::{JjCli, MutationOp, RevisionSelection, Vcs};
 
 use crate::prose::Prose;
 use crate::theme::{ThemeSpec, ghost_button_style, text_size};
@@ -82,48 +86,50 @@ pub(crate) fn op_sentence(
     )
 }
 
-/// A command line (or a revset) with the revisions in it marked, so they
-/// render in the graph's colour: `'trunk()..xyz'` marks `xyz`.
+/// A command line with the names in it marked by what jj's grammar says
+/// each argument is, so they render in the graph's colours: the revisions
+/// in its revsets, its bookmark and remote arguments. `jj bookmark set
+/// push-xyz` marks `push-xyz` whole, as a bookmark.
 pub(crate) fn command_prose(command: &str) -> Prose {
-    let mut prose = Prose::new();
-    let mut previous: Option<char> = None;
-    let mut rest = command;
-    while let Some(first) = rest.chars().next() {
-        let len = if is_id_char(first) {
-            rest.find(|c: char| !is_id_char(c)).unwrap_or(rest.len())
-        } else {
-            first.len_utf8()
-        };
-        let (run, tail) = rest.split_at(len);
-        // `@` alone is the working copy; in `main@origin` it's a remote.
-        let working_copy = run == "@" && !previous.is_some_and(char::is_alphanumeric);
-        prose = if working_copy || names_revision(run) {
-            prose.rev(run)
-        } else {
-            prose.code(run)
-        };
-        previous = run.chars().last();
-        rest = tail;
+    /// Lines drawn recently. Each one is a walk through jj's clap tree, and
+    /// the op log draws hundreds of them on every frame.
+    const CAPACITY: usize = 1024;
+    thread_local! {
+        static MEMO: RefCell<HashMap<String, Prose>> = RefCell::new(HashMap::new());
     }
+    if let Some(prose) = MEMO.with_borrow(|memo| memo.get(command).cloned()) {
+        return prose;
+    }
+    let marks = highlight::command(&JjCli::default(), command);
+    let prose = marked_prose(command, &marks);
+    MEMO.with_borrow_mut(|memo| {
+        if memo.len() >= CAPACITY {
+            memo.clear();
+        }
+        memo.insert(command.to_owned(), prose.clone());
+    });
     prose
 }
 
-fn is_id_char(c: char) -> bool {
-    c.is_ascii_digit() || c.is_ascii_lowercase()
+/// A revset with the names in it marked (see [`highlight::revset`]).
+pub(crate) fn revset_prose(revset: &str) -> Prose {
+    marked_prose(revset, &highlight::revset(revset))
 }
 
-/// Whether a word of a command names a revision the way diffui writes them:
-/// `@`, a short change id (jj's `k`–`z` alphabet) or a commit id prefix.
-fn names_revision(word: &str) -> bool {
-    let len = word.len();
-    let change_id =
-        (plan::NAME_CHARS..=32).contains(&len) && word.bytes().all(|b| (b'k'..=b'z').contains(&b));
-    let commit_id = len == 12
-        && word
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-        && word.bytes().any(|b| b.is_ascii_digit());
-    change_id || commit_id
+fn marked_prose(text: &str, marks: &[highlight::Marked]) -> Prose {
+    let mut prose = Prose::new();
+    let mut at = 0;
+    for marked in marks {
+        prose = prose.code(&text[at..marked.range.start]);
+        let name = &text[marked.range.clone()];
+        prose = match marked.mark {
+            Mark::Revision => prose.rev(name),
+            Mark::Bookmark => prose.bookmark(name),
+            Mark::Remote => prose.remote(name),
+        };
+        at = marked.range.end;
+    }
+    prose.code(&text[at..])
 }
 
 /// The command on one line: a terminal glyph, the command in mono (cut
@@ -181,33 +187,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn revisions_are_told_from_the_rest_of_the_command() {
-        for word in ["kmnopqrs", "qtmsuqtzlkps", "0123456789ab"] {
-            assert!(names_revision(word), "{word}");
-        }
-        for word in [
-            "jj",
-            "rebase",
-            "--ignore-immutable",
-            "main",
-            "squash",
-            "'trunk()'",
-        ] {
-            assert!(!names_revision(word), "{word}");
-        }
+    fn a_command_marks_what_its_arguments_name() {
+        let prose = command_prose("jj bookmark set push-sknyzssrnkun -r ed200ca71ab8");
         assert_eq!(
-            command_prose("jj new kmnopqrs").to_string(),
-            "jj new kmnopqrs"
+            prose.to_string(),
+            "jj bookmark set push-sknyzssrnkun -r ed200ca71ab8"
         );
-        let revisions = |command: &str| -> Vec<String> {
-            command_prose(command)
-                .revisions()
-                .map(str::to_owned)
-                .collect()
-        };
-        assert_eq!(
-            revisions("jj diff -r 'trunk()..kmnopqrs' @ main@origin"),
-            vec!["kmnopqrs", "@"]
-        );
+        assert_eq!(prose.revisions().collect::<Vec<_>>(), ["ed200ca71ab8"]);
+        assert_eq!(prose.bookmarks().collect::<Vec<_>>(), ["push-sknyzssrnkun"]);
+        // A multi-line message is text, whatever it holds, and stays as
+        // written (the one-line views fold its breaks).
+        let line = "jj describe -r @ --message 'fix(ui): kmnopqrs\n\nAlign zzzzzzzz'";
+        let prose = command_prose(line);
+        assert_eq!(prose.to_string(), line);
+        assert_eq!(prose.revisions().collect::<Vec<_>>(), ["@"]);
+    }
+
+    #[test]
+    fn a_revset_marks_whole_symbols() {
+        let prose = revset_prose("push-sknyzssrnkun@origin | trunk()..kmnopqrs");
+        assert_eq!(prose.revisions().collect::<Vec<_>>(), ["kmnopqrs"]);
+        assert_eq!(prose.bookmarks().collect::<Vec<_>>(), ["push-sknyzssrnkun"]);
     }
 }

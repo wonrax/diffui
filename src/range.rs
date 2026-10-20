@@ -208,7 +208,7 @@ pub(crate) fn banner<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Option<Element<'a,
                 text_size::UI,
             )),
             _ => line.push(Aligned::text(
-                crate::plan::command_prose(&revset)
+                crate::plan::revset_prose(&revset)
                     .view(mono, mono, theme.text, theme)
                     .size(text_size::UI)
                     .wrapping(text::Wrapping::None)

@@ -117,6 +117,15 @@ impl Prose {
             .map(|(_, text)| text.as_str())
     }
 
+    /// The bookmark names named, in order.
+    #[cfg(test)]
+    pub(crate) fn bookmarks(&self) -> impl Iterator<Item = &str> {
+        self.parts
+            .iter()
+            .filter(|(kind, _)| *kind == Kind::Bookmark)
+            .map(|(_, text)| text.as_str())
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.parts.is_empty()
     }
