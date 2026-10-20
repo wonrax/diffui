@@ -136,6 +136,9 @@ impl Diffui {
         if !field.open {
             return None;
         }
+        // ⌃N/⌃P walk the list like ↓/↑, as in the palette.
+        let list_key = crate::ui::cocoa_list_key(key, modifiers);
+        let key = list_key.as_ref().unwrap_or(key);
         // A plain key nobody typed means the field lost focus.
         if !consumed
             && !matches!(

@@ -449,6 +449,24 @@ pub fn cocoa_key_event(event: &iced::Event) -> Option<iced::Event> {
     }))
 }
 
+/// On macOS, ⌃N/⌃P as the ↓/↑ they stand for in a list a one-line field
+/// drives (a completion dropdown), the way Spotlight and Raycast read them.
+pub fn cocoa_list_key(
+    key: &keyboard::Key,
+    modifiers: keyboard::Modifiers,
+) -> Option<keyboard::Key> {
+    use keyboard::key::Named;
+    if !cfg!(target_os = "macos") || modifiers != keyboard::Modifiers::CTRL {
+        return None;
+    }
+    let named = match key.as_ref() {
+        keyboard::Key::Character("n") => Named::ArrowDown,
+        keyboard::Key::Character("p") => Named::ArrowUp,
+        _ => return None,
+    };
+    Some(keyboard::Key::Named(named))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

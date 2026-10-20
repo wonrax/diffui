@@ -1862,7 +1862,8 @@ pub(crate) static REGISTRY: &[Command] = &[
         hint: "Highlight the next palette result",
         contexts: &[Context::Palette],
         chords: &["down"],
-        mac_chords: &[],
+        // Spotlight's and Raycast's: ⌃N/⌃P walk the list.
+        mac_chords: &["down", "ctrl+n"],
         enabled: always,
         build: |_ui, _arg| Some(Action::PaletteMove(1)),
         palette: PaletteScope::Hidden,
@@ -1873,7 +1874,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         hint: "Highlight the previous palette result",
         contexts: &[Context::Palette],
         chords: &["up"],
-        mac_chords: &[],
+        mac_chords: &["up", "ctrl+p"],
         enabled: always,
         build: |_ui, _arg| Some(Action::PaletteMove(-1)),
         palette: PaletteScope::Hidden,
