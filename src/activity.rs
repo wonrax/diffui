@@ -106,6 +106,9 @@ pub struct Activity {
     /// one-click "Revert" (reverts exactly this op, not just the latest).
     /// Cleared when fired, so it can't double-revert.
     pub undo_op: Option<String>,
+    /// The jj command the operation is equivalent to, shown under the title
+    /// (jj repositories only).
+    pub command: Option<String>,
 }
 
 impl Activity {
@@ -198,6 +201,7 @@ impl ActivityLog {
             expanded: false,
             detail_editor: None,
             undo_op: None,
+            command: None,
         });
         progress
     }
@@ -232,6 +236,7 @@ impl ActivityLog {
             expanded: false,
             detail_editor: None,
             undo_op: None,
+            command: None,
         });
     }
 
@@ -264,6 +269,13 @@ impl ActivityLog {
     pub fn set_status(&mut self, id: ActivityId, status: ActivityStatus) {
         if let Some(activity) = self.get_mut(id) {
             activity.status = status;
+        }
+    }
+
+    /// Show the jj command the entry's operation is equivalent to.
+    pub fn set_command(&mut self, id: ActivityId, command: Option<String>) {
+        if let Some(activity) = self.get_mut(id) {
+            activity.command = command;
         }
     }
 
@@ -835,6 +847,19 @@ fn activity_row<'a>(
     // click target that toggles the detail; the detail itself sits *outside*
     // it, so dragging to select text there doesn't collapse the row.
     let mut header = column![head].spacing(3);
+    if let Some(command) = activity.command.as_deref() {
+        header = header.push(
+            container(crate::plan::caption_command_line(ui, theme, command))
+                .width(Length::Fill)
+                .clip(true)
+                .padding(Padding {
+                    top: 0.0,
+                    right: 0.0,
+                    bottom: 0.0,
+                    left: TITLE_INDENT,
+                }),
+        );
+    }
     if let Some(result) = activity.result.as_deref() {
         header = header.push(
             container(

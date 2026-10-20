@@ -44,6 +44,7 @@ mod mode_hints;
 mod modes;
 mod palette;
 mod path_browse;
+mod plan;
 mod pointer;
 mod prose;
 mod resize_handle;

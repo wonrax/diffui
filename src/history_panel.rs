@@ -1260,12 +1260,34 @@ fn op_row<'a>(
     if op.is_current {
         meta.push(chip("current", theme.accent, ui));
     }
-    meta.push(caption_on_line(
-        caption(op.user.as_str(), theme.subtle_text, ui)
-            .ellipsis(text::Ellipsis::End)
-            .width(Length::Fill),
-        ui,
-    ));
+    // The command that wrote the op, when one was recorded (the jj CLI's,
+    // or diffui's equivalent), says more than who ran it; the header below
+    // the list still names the user.
+    match &op.args {
+        Some(args) => meta.push(Aligned::text(
+            container(
+                crate::plan::command_prose(args)
+                    .view(
+                        ui.config.mono_font,
+                        ui.config.mono_font,
+                        theme.subtle_text,
+                        theme,
+                    )
+                    .size(CAPTION_TEXT_SIZE)
+                    .wrapping(text::Wrapping::None),
+            )
+            .width(Length::Fill)
+            .clip(true),
+            ui.config.mono_font,
+            CAPTION_TEXT_SIZE,
+        )),
+        None => meta.push(caption_on_line(
+            caption(op.user.as_str(), theme.subtle_text, ui)
+                .ellipsis(text::Ellipsis::End)
+                .width(Length::Fill),
+            ui,
+        )),
+    }
     meta.push(caption_on_line(caption(age, theme.subtle_text, ui), ui));
     let meta = typography::baseline_row(meta, space::SM);
     let title = meta_line::description(
@@ -1952,20 +1974,11 @@ fn operation_header<'a>(
     ]
     .spacing(space::XS);
     if let Some(args) = &op.args {
-        block = block.push(typography::baseline_row(
-            [
-                Aligned::glyph(icons::icon(icons::TERMINAL, 12.0, theme.subtle_text), 12.0),
-                Aligned::text(
-                    caption(args.as_str(), theme.subtle_text, ui)
-                        .font(ui.config.mono_font)
-                        .ellipsis(text::Ellipsis::End)
-                        .width(Length::Fill),
-                    ui.config.mono_font,
-                    text_size::CAPTION,
-                ),
-            ],
-            space::XS,
-        ));
+        block = block.push(
+            container(crate::plan::caption_command_line(ui, theme, args))
+                .width(Length::Fill)
+                .clip(true),
+        );
     }
     container(block)
         .width(Length::Fill)

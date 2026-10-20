@@ -732,13 +732,70 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     )
     .on_press_maybe(can_apply.then_some(Message::Action(Action::DraftConfirm)));
 
+    // ---- The plan: what Apply will do, in words and as the jj command.
+    // Until a destination is armed the command stops where it goes.
+    let planned_op = if merge_ready || parallel_ready {
+        draft.op_from_sources()
+    } else if let Some((parent, child)) = gap_sides.filter(|_| !gap_invalid) {
+        ui.selection_at_index(parent)
+            .zip(ui.selection_at_index(child))
+            .and_then(|(parent, child)| draft.op_for_gap(parent, child))
+    } else {
+        let placement = if hover_row.is_some() {
+            PlacementKind::Onto
+        } else {
+            draft.placement
+        };
+        target
+            .and_then(|index| ui.selection_at_index(index))
+            .and_then(|target| draft.op_for(target, placement))
+    };
+    // Everything the simulation moves besides the picked sources.
+    let descendants = sim_rebase.map(|preview| {
+        (preview.moved as usize + preview.descendants as usize).saturating_sub(draft.sources.len())
+    });
+    let sentence = planned_op
+        .as_ref()
+        .and_then(|op| crate::plan::op_sentence(ui, op, descendants));
+    let command = match &planned_op {
+        Some(op) => crate::plan::op_command(ui, op, false),
+        None => ui.active().repository.as_ref().map(|_| {
+            let prefix = draft.cli_prefix(&ui.active().session.commits);
+            if prefix.ends_with(' ') {
+                format!("{prefix}\u{2026}")
+            } else {
+                prefix
+            }
+        }),
+    };
+    let mut plan = column![].spacing(3).width(Length::Fill);
+    if let Some(sentence) = sentence {
+        plan = plan.push(
+            sentence
+                .view(ui_font, mono_font, theme.text, theme)
+                .size(theme::text_size::UI)
+                .wrapping(text::Wrapping::WordOrGlyph),
+        );
+    }
+    if let Some(command) = command {
+        plan = plan.push(
+            container(crate::plan::caption_command_line(ui, theme, &command))
+                .width(Length::Fill)
+                .clip(true),
+        );
+    }
+
     // The mode's other keys are in the hint strip docked under the diff
     // (see `crate::mode_hints`); the rows carry their own keycaps and Apply
     // its ↵.
     let band = container(
-        row![summary, apply]
-            .spacing(8)
-            .align_y(alignment::Vertical::Center),
+        column![
+            row![summary, apply]
+                .spacing(8)
+                .align_y(alignment::Vertical::Center),
+            plan,
+        ]
+        .spacing(8),
     )
     .width(Length::Fill)
     .padding([8, 12])

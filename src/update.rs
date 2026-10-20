@@ -4234,6 +4234,12 @@ impl Diffui {
     /// loaded graph raises the confirmation dialog instead of dispatching
     /// (unless the dialog's accept already armed the override).
     pub(crate) fn run_mutation(&mut self, pending: PendingMutation) -> Task<Message> {
+        // Every mutation's row shows its jj command, with
+        // `--ignore-immutable` once the confirmation turned the guards off.
+        let command = crate::plan::op_command(self, &pending.op, pending.allow_immutable);
+        if let Some(log) = self.activity_log_for(pending.tab_id) {
+            log.set_command(pending.activity_id, command);
+        }
         if !pending.allow_immutable {
             let immutable = self.immutable_op_targets(&pending.op);
             if !immutable.is_empty() {
@@ -4440,6 +4446,10 @@ impl Diffui {
             }
         };
         let (activity_id, _) = self.begin_activity(tab, label, true);
+        let command = crate::plan::fetch_command(self, &target);
+        if let Some(log) = self.activity_log_for(tab) {
+            log.set_command(activity_id, command);
+        }
         let Some(state) = self.tab_mut(tab) else {
             return Task::none();
         };
