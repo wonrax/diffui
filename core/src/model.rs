@@ -134,6 +134,24 @@ impl DiffBase {
     }
 }
 
+/// `jj diff`'s revision arguments as typed, before anything resolved them.
+/// [`crate::Session::diff_revsets`] resolves them with jj's rules and shows
+/// the result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiffRequest {
+    /// `jj diff -r REVSET…`: several are their union, none means `@`. One
+    /// commit is that commit's own diff; several are a [`DiffBase::Range`],
+    /// refused when the set has gaps.
+    Revisions(Vec<String>),
+    /// `jj diff --from A --to B`, or `jj interdiff` with `interdiff`. Each
+    /// side must resolve to exactly one commit; a missing one is `@`.
+    FromTo {
+        from: Option<String>,
+        to: Option<String>,
+        interdiff: bool,
+    },
+}
+
 /// The commits a range diff covers, carried on its [`DiffDocument`] so the
 /// view can label the range and tint its rows.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

@@ -578,6 +578,19 @@ impl Actor {
                 }
                 Ok(())
             }
+            Command::ResolveDiff { job, request } => {
+                let repo = self.repo_at_head(repository).await?;
+                let name = self.slot(repository)?.name.clone();
+                let (revision, base) = revset_scope(&repo, &name, repository)
+                    .diff_request(&request)
+                    .await?;
+                self.emit(Payload::DiffResolved {
+                    job,
+                    revision,
+                    base,
+                });
+                Ok(())
+            }
             Command::Cancel { .. } => Ok(()),
         }
     }
@@ -892,6 +905,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::History { .. } => "history",
         Command::ExpandFile { .. } => "expand_file",
         Command::ResolveRevset { .. } => "resolve_revset",
+        Command::ResolveDiff { .. } => "resolve_diff",
         Command::Cancel { .. } => "cancel",
     }
 }

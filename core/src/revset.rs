@@ -129,6 +129,19 @@ impl fmt::Display for RevsetError {
 
 impl std::error::Error for RevsetError {}
 
+/// `jj diff -r a -r b`: several revision arguments are their union.
+pub fn union_revsets(revsets: &[String]) -> String {
+    match revsets {
+        [] => "@".to_owned(),
+        [only] => only.clone(),
+        many => many
+            .iter()
+            .map(|revset| format!("({revset})"))
+            .collect::<Vec<_>>()
+            .join(" | "),
+    }
+}
+
 // ── the symbol snapshot ─────────────────────────────────────────────────
 
 /// A `[revset-aliases]` entry, jj's defaults included.
@@ -1479,6 +1492,16 @@ mod tests {
         assert_eq!(quote_symbol("trailing-"), "\"trailing-\"");
         assert_eq!(quote_symbol("a..b"), "\"a..b\"");
         assert_eq!(quote_symbol("say \"hi\""), "\"say \\\"hi\\\"\"");
+    }
+
+    #[test]
+    fn union_wraps_each_revset() {
+        assert_eq!(union_revsets(&[]), "@");
+        assert_eq!(union_revsets(&["x".to_owned()]), "x");
+        assert_eq!(
+            union_revsets(&["a".to_owned(), "b | c".to_owned()]),
+            "(a) | (b | c)"
+        );
     }
 
     #[test]

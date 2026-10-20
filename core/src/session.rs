@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use crate::graph_layout::{GraphLayout, LaneFoldState};
 use crate::model::{
-    BookmarksInfo, BranchStatus, CommitStore, DiffBase, DiffDocument, LoadProgress,
+    BookmarksInfo, BranchStatus, CommitStore, DiffBase, DiffDocument, DiffRequest, LoadProgress,
     RevisionDetails, RevisionSelection, StreamRow,
 };
 use crate::mutations::{MutationOp, MutationOutcome};
@@ -293,6 +293,8 @@ pub struct Session {
     graph_fingerprint: Option<String>,
     /// Collapsed files being fetched in full, by path.
     expand_jobs: Vec<(JobId, String)>,
+    /// A typed `jj diff` being resolved into a revision and base.
+    diff_resolve_job: Option<JobId>,
 }
 
 impl Session {
@@ -340,6 +342,7 @@ impl Session {
             || self.empty_status_job.is_some_and(|(id, _)| id == job)
             || self.mutation_job == Some(job)
             || self.expand_jobs.iter().any(|(id, _)| *id == job)
+            || self.diff_resolve_job == Some(job)
     }
 
     /// Whether a mutation is running. Gates the actions a half-applied
@@ -556,6 +559,38 @@ impl Session {
         self.compare(DiffBase::Range(revset.into()), to)
     }
 
+    /// Show what `jj diff` with these arguments would: one commit from `-r`
+    /// is selected and shown as itself, several are a [`Self::diff_range`],
+    /// `--from`/`--to` a comparison. Revsets are resolved by the actor with
+    /// jj's rules first; one jj would refuse (a gap, a `--from` matching two
+    /// commits) ends in a toast with jj's message, leaving the pane as it was.
+    pub fn diff_revsets(&mut self, request: DiffRequest) -> Vec<Effect> {
+        if !self.capabilities.range_diff {
+            return Vec::new();
+        }
+        let mut effects = Vec::new();
+        if let Some(job) = self.diff_resolve_job.take() {
+            effects.push(Effect::Send(Command::Cancel { job }));
+        }
+        let job = self.next_job();
+        self.diff_resolve_job = Some(job);
+        effects.push(Effect::Send(Command::ResolveDiff { job, request }));
+        effects
+    }
+
+    fn on_diff_resolved(
+        &mut self,
+        job: JobId,
+        revision: RevisionSelection,
+        base: DiffBase,
+    ) -> Vec<Effect> {
+        if self.diff_resolve_job != Some(job) {
+            return Vec::new();
+        }
+        self.diff_resolve_job = None;
+        self.compare(base, revision)
+    }
+
     /// Parse and resolve a revset against the repository, for live feedback
     /// as it is typed: a count, the rows to tint, or jj's error with its span.
     /// The answer is a [`Payload::RevsetResolved`] the frontend routes by the
@@ -697,6 +732,11 @@ impl Session {
             }
             Payload::RepositoryChanged => self.snapshot(RefreshOrigin::Focus),
             Payload::OpHeadChanged { fingerprint } => self.on_op_head(&fingerprint),
+            Payload::DiffResolved {
+                job,
+                revision,
+                base,
+            } => self.on_diff_resolved(job, revision, base),
             Payload::Failed { job, error } => self.on_failed(repo, job, error),
             Payload::Cancelled { job } => {
                 self.clear_slot(job);
@@ -1038,6 +1078,7 @@ impl Session {
             .diff_job
             .as_ref()
             .is_some_and(|(id, _, base)| *id == job && base.range().is_some());
+        let failed_resolve = self.diff_resolve_job == Some(job);
         // A mutation's failure is reported by whoever started it (an immutable
         // rejection turns into an offer, not a toast), so only the slot is
         // cleared here.
@@ -1064,6 +1105,8 @@ impl Session {
                     "Range diff ended".to_owned()
                 } else if failed_compare {
                     "Comparison ended".to_owned()
+                } else if failed_resolve {
+                    "Can't diff that".to_owned()
                 } else {
                     "Operation failed".to_owned()
                 },
@@ -1097,6 +1140,9 @@ impl Session {
         }
         if self.mutation_job == Some(job) {
             self.mutation_job = None;
+        }
+        if self.diff_resolve_job == Some(job) {
+            self.diff_resolve_job = None;
         }
         self.expand_jobs.retain(|(id, _)| *id != job);
     }
@@ -1939,6 +1985,11 @@ mod tests {
     fn ranges_are_gated_on_the_capability() {
         let mut session = compare_session();
         assert!(session.diff_range("aaa|bbb").is_empty());
+        assert!(
+            session
+                .diff_revsets(DiffRequest::Revisions(vec!["x".to_owned()]))
+                .is_empty()
+        );
         assert_eq!(session.diff_base, DiffBase::Parents);
     }
 
@@ -1979,6 +2030,77 @@ mod tests {
             Effect::Activity(Activity::Toast { title, body, .. })
                 if title == "Range diff ended" && body.starts_with("Cannot diff")
         )));
+    }
+
+    /// `jj diff` arguments resolve on the actor first; only the newest
+    /// request's answer loads anything.
+    #[test]
+    fn typed_diff_arguments_resolve_then_load() {
+        let mut session = range_session();
+        let resolve_job = |effects: &[Effect]| {
+            effects
+                .iter()
+                .find_map(|effect| match effect {
+                    Effect::Send(Command::ResolveDiff { job, .. }) => Some(*job),
+                    _ => None,
+                })
+                .expect("a resolve")
+        };
+        let first =
+            resolve_job(&session.diff_revsets(DiffRequest::Revisions(vec!["aaa".to_owned()])));
+        assert!(session.owns_job(first));
+        let effects = session.diff_revsets(DiffRequest::Revisions(vec!["aaa|bbb".to_owned()]));
+        assert!(
+            effects.iter().any(
+                |effect| matches!(effect, Effect::Send(Command::Cancel { job }) if *job == first)
+            ),
+            "the superseded resolve is cancelled"
+        );
+        let second = resolve_job(&effects);
+
+        let stale = session.apply(Event::new(
+            test_repo(),
+            Payload::DiffResolved {
+                job: first,
+                revision: commit("aaa"),
+                base: DiffBase::Parents,
+            },
+        ));
+        assert!(stale.is_empty());
+
+        let effects = session.apply(Event::new(
+            test_repo(),
+            Payload::DiffResolved {
+                job: second,
+                revision: commit("bbb"),
+                base: DiffBase::Range("aaa|bbb".to_owned()),
+            },
+        ));
+        let (_, revision, base) = sent_diff(&effects).expect("the range loads");
+        assert_eq!(revision, commit("bbb"));
+        assert_eq!(base, DiffBase::Range("aaa|bbb".to_owned()));
+        assert!(!session.owns_job(second));
+
+        // A refusal is the user's to read.
+        let job = resolve_job(&session.diff_revsets(DiffRequest::FromTo {
+            from: Some("all()".to_owned()),
+            to: None,
+            interdiff: false,
+        }));
+        let effects = session.apply(Event::new(
+            test_repo(),
+            Payload::Failed {
+                job,
+                error: RepoError::Revset(
+                    "Revset `all()` resolved to more than one revision".to_owned(),
+                ),
+            },
+        ));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Activity(Activity::Toast { title, .. }) if title == "Can't diff that"
+        )));
+        assert!(sent_diff(&effects).is_none(), "the pane stays as it was");
     }
 
     #[test]

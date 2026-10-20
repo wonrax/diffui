@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use crate::history::{HistoryRequest, HistoryResponse, OperationEntry};
 use crate::model::{
-    BookmarksInfo, BranchStatus, DiffBase, DiffDocument, DiffFile, RevisionDetails,
+    BookmarksInfo, BranchStatus, DiffBase, DiffDocument, DiffFile, DiffRequest, RevisionDetails,
     RevisionSelection, StreamRow,
 };
 use crate::mutations::{
@@ -73,8 +73,8 @@ pub struct Capabilities {
     /// Can diff against something other than the parents ([`DiffBase`]),
     /// and expand a file its diff collapsed for size.
     pub compare: bool,
-    /// Can parse and resolve revsets: range diffs ([`DiffBase::Range`]) and
-    /// [`Command::ResolveRevset`] (jj only).
+    /// Can parse and resolve revsets: range diffs ([`DiffBase::Range`]),
+    /// [`Command::ResolveRevset`] and [`Command::ResolveDiff`] (jj only).
     pub range_diff: bool,
 }
 
@@ -260,6 +260,13 @@ pub enum Command {
         job: JobId,
         query: RevsetQuery,
     },
+    /// Resolve `jj diff`'s revision arguments with jj's rules into what the
+    /// diff pane should load. Answered by [`Payload::DiffResolved`]; a revset
+    /// jj would refuse fails the job with jj's message.
+    ResolveDiff {
+        job: JobId,
+        request: DiffRequest,
+    },
     /// Ask the actor to stop `job`. A cancelled job reports
     /// [`Payload::Cancelled`] and never its success event, so the caller's
     /// inflight slot is always cleared by exactly one terminal event.
@@ -289,7 +296,8 @@ impl Command {
             | Self::PrepareMergeTool { job, .. }
             | Self::History { job, .. }
             | Self::ExpandFile { job, .. }
-            | Self::ResolveRevset { job, .. } => Some(*job),
+            | Self::ResolveRevset { job, .. }
+            | Self::ResolveDiff { job, .. } => Some(*job),
             Self::Cancel { .. } => None,
         }
     }
@@ -468,6 +476,13 @@ pub enum Payload {
         revset: String,
         result: Result<RevsetMatch, RevsetError>,
     },
+    /// The answer to a [`Command::ResolveDiff`]: the diff to load, as the
+    /// session's revision and base.
+    DiffResolved {
+        job: JobId,
+        revision: RevisionSelection,
+        base: DiffBase,
+    },
     Failed {
         job: JobId,
         error: RepoError,
@@ -500,6 +515,7 @@ impl Payload {
             | Self::OpLogBatch { job, .. }
             | Self::History { job, .. }
             | Self::RevsetResolved { job, .. }
+            | Self::DiffResolved { job, .. }
             | Self::Failed { job, .. }
             | Self::Cancelled { job, .. } => Some(*job),
             Self::Ready { .. }

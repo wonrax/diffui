@@ -1,6 +1,6 @@
 //! Typed revsets against a live repository actor: resolution with jj's errors
-//! and spans, and range diffs checked against what jj 0.45.1's own
-//! `jj diff --git -r` prints.
+//! and spans, `jj diff`'s argument rules, and range diffs checked against what
+//! jj 0.45.1's own `jj diff --git -r` prints.
 //!
 //! The expected diffs are golden text captured from the real CLI on these
 //! exact fixtures. Set `DIFFUI_GOLDEN_JJ` to a jj 0.45.1 binary to have each
@@ -14,7 +14,8 @@ use std::path::Path;
 use diffui_core::repo::{Command, Payload, RepoError};
 use diffui_core::revset::{RevsetError, RevsetExpect, RevsetMatch, RevsetQuery};
 use diffui_core::{
-    DiffBase, DiffDocument, DiffFileStatus, MutationOp, RevisionSelection, parse_unified_diff,
+    DiffBase, DiffDocument, DiffFileStatus, DiffRequest, MutationOp, RevisionSelection,
+    parse_unified_diff,
 };
 use harness::{TestRepo, commit_file, commit_ids, full_description, scratch_repo, write};
 
@@ -110,6 +111,18 @@ impl Fixture {
             }
             Some(Payload::Failed { error, .. }) => Err(error),
             other => panic!("expected a diff, got {other:?}"),
+        }
+    }
+
+    fn resolve_diff(
+        &mut self,
+        request: DiffRequest,
+    ) -> Result<(RevisionSelection, DiffBase), RepoError> {
+        let events = self.repo.run(|job| Command::ResolveDiff { job, request });
+        match events.into_iter().next_back() {
+            Some(Payload::DiffResolved { revision, base, .. }) => Ok((revision, base)),
+            Some(Payload::Failed { error, .. }) => Err(error),
+            other => panic!("expected DiffResolved, got {other:?}"),
         }
     }
 
@@ -467,6 +480,91 @@ fn revset_errors_carry_jj_wording_and_spans() {
         fixture
             .resolve(RevsetQuery::new("@").expect(RevsetExpect::Single))
             .is_ok()
+    );
+}
+
+#[test]
+fn diff_arguments_resolve_like_jj_diff() {
+    let mut fixture = fixture("revset-diff-request");
+    let (a, b, c) = (fixture.a.clone(), fixture.b.clone(), fixture.c.clone());
+
+    // One commit is that commit's own diff.
+    let resolved = fixture.resolve_diff(DiffRequest::Revisions(vec![b.clone()]));
+    assert_eq!(
+        resolved.unwrap(),
+        (RevisionSelection::Commit(b.clone()), DiffBase::Parents)
+    );
+    // No `-r` is `@`, addressed as the working copy.
+    let resolved = fixture.resolve_diff(DiffRequest::Revisions(Vec::new()));
+    assert_eq!(
+        resolved.unwrap(),
+        (RevisionSelection::WorkingCopy, DiffBase::Parents)
+    );
+    // Several `-r`s are a range of their union, the cursor on its newest.
+    let resolved = fixture.resolve_diff(DiffRequest::Revisions(vec![a.clone(), b.clone()]));
+    assert_eq!(
+        resolved.unwrap(),
+        (
+            RevisionSelection::Commit(b.clone()),
+            DiffBase::Range(format!("({a}) | ({b})"))
+        )
+    );
+    let resolved = fixture.resolve_diff(DiffRequest::Revisions(vec![format!("{c}::")]));
+    assert_eq!(
+        resolved.unwrap(),
+        (
+            RevisionSelection::WorkingCopy,
+            DiffBase::Range(format!("{c}::"))
+        )
+    );
+    // A gap is refused up front.
+    let resolved = fixture.resolve_diff(DiffRequest::Revisions(vec![format!("{a}|{c}")]));
+    assert!(
+        matches!(resolved, Err(RepoError::Revset(message)) if message.starts_with("Cannot diff revsets with gaps in."))
+    );
+
+    // `--from`/`--to` take revsets naming one commit each.
+    let resolved = fixture.resolve_diff(DiffRequest::FromTo {
+        from: Some(format!("{c}-")),
+        to: None,
+        interdiff: false,
+    });
+    assert_eq!(
+        resolved.unwrap(),
+        (
+            RevisionSelection::WorkingCopy,
+            DiffBase::Revision(RevisionSelection::Commit(b.clone()))
+        )
+    );
+    let resolved = fixture.resolve_diff(DiffRequest::FromTo {
+        from: Some(a.clone()),
+        to: Some(c.clone()),
+        interdiff: true,
+    });
+    assert_eq!(
+        resolved.unwrap(),
+        (
+            RevisionSelection::Commit(c.clone()),
+            DiffBase::Interdiff(RevisionSelection::Commit(a.clone()))
+        )
+    );
+    let resolved = fixture.resolve_diff(DiffRequest::FromTo {
+        from: Some("all()".to_owned()),
+        to: None,
+        interdiff: false,
+    });
+    assert!(
+        matches!(&resolved, Err(RepoError::Revset(message)) if message == "Revset `all()` resolved to more than one revision"),
+        "{resolved:?}"
+    );
+    let resolved = fixture.resolve_diff(DiffRequest::FromTo {
+        from: None,
+        to: Some("nope".to_owned()),
+        interdiff: false,
+    });
+    assert!(
+        matches!(&resolved, Err(RepoError::Revset(message)) if message == "Revision `nope` doesn't exist"),
+        "{resolved:?}"
     );
 }
 

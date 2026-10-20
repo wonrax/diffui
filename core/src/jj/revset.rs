@@ -24,10 +24,11 @@ use jj_lib::{
 };
 
 use super::walk::{DEFAULT_REVSET_ALIASES, parse_revset_raw, revset_aliases_map};
-use crate::model::DiffRange;
+use crate::model::{DiffBase, DiffRange, DiffRequest, RevisionSelection};
 use crate::repo::CancelFlag;
 use crate::revset::{
     COUNT_CAP, RevsetAlias, RevsetError, RevsetExpect, RevsetMatch, RevsetQuery, RevsetSymbols,
+    union_revsets,
 };
 
 /// Where a revset is parsed and resolved: the repo at head, the workspace
@@ -201,6 +202,28 @@ impl RevsetScope<'_> {
         Some(Ok(found))
     }
 
+    /// `src` as exactly one commit, refused in jj's words otherwise.
+    async fn single(&self, src: &str) -> Result<Commit, RevsetError> {
+        let expression = self.parse(src)?;
+        let resolved = self.resolve(src, &expression)?;
+        let revset = resolved.evaluate(self.repo).map_err(evaluation_error)?;
+        // Two is all it takes to know there are too many.
+        let ids: Vec<CommitId> = revset
+            .stream()
+            .take(2)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<_, _>>()
+            .map_err(evaluation_error)?;
+        single(src, ids.len())?;
+        self.repo
+            .store()
+            .get_commit_async(&ids[0])
+            .await
+            .map_err(|error| RevsetError::new(error.to_string()))
+    }
+
     /// The two trees of `jj diff -r src` and what the set holds, following
     /// jj-cli 0.45.1's `cmd_diff`: refuse a set with gaps, then diff the
     /// merged parents of its roots against its merged heads.
@@ -256,6 +279,59 @@ impl RevsetScope<'_> {
             );
         }
         Ok(commits)
+    }
+
+    /// What `jj diff` with these arguments shows, as the session's revision
+    /// and base. One commit from `-r` is that commit's own diff, so partial
+    /// picks keep working on it; several are a range.
+    pub async fn diff_request(
+        &self,
+        request: &DiffRequest,
+    ) -> Result<(RevisionSelection, DiffBase)> {
+        let working_copy = self
+            .repo
+            .view()
+            .get_wc_commit_id(self.workspace_name)
+            .map(|id| id.hex());
+        let selection = |commit: &Commit| {
+            crate::repo::canonical_selection(&commit.id().hex(), working_copy.as_deref())
+        };
+        match request {
+            DiffRequest::Revisions(revsets) => {
+                let src = union_revsets(revsets);
+                let expression = self.parse(&src)?;
+                self.check_gaps(&src, &expression).await?;
+                let members = self.members(&src, &expression, 1).await?;
+                let newest = members.ids.first();
+                let as_selection = |id: &CommitId| {
+                    crate::repo::canonical_selection(&id.hex(), working_copy.as_deref())
+                };
+                if let (1, Some(only)) = (members.count, newest) {
+                    return Ok((as_selection(only), DiffBase::Parents));
+                }
+                // The graph's cursor goes to `@` when the range holds it, so
+                // a working-copy edit is visibly part of it, else its newest.
+                let revision = match newest {
+                    Some(id) if !members.has_working_copy => as_selection(id),
+                    _ => RevisionSelection::WorkingCopy,
+                };
+                Ok((revision, DiffBase::Range(src)))
+            }
+            DiffRequest::FromTo {
+                from,
+                to,
+                interdiff,
+            } => {
+                let from = self.single(from.as_deref().unwrap_or("@")).await?;
+                let to = self.single(to.as_deref().unwrap_or("@")).await?;
+                let base = if *interdiff {
+                    DiffBase::Interdiff(selection(&from))
+                } else {
+                    DiffBase::Revision(selection(&from))
+                };
+                Ok((selection(&to), base))
+            }
+        }
     }
 }
 
