@@ -166,7 +166,11 @@ pub(crate) fn passes_through(context: Context, chord: &Chord) -> bool {
 /// key. The revset box is an inline text input with no overlay of its own, so
 /// without this its keystrokes would also drive file navigation. Escape is
 /// exempt in target mode: leaving the mode has to work from inside that box.
+/// In every context, a field keeps the ⌃ chords it edits with.
 pub(crate) fn needs_unconsumed(context: Context, chord: &Chord) -> bool {
+    if is_cocoa_text_chord(chord) {
+        return true;
+    }
     match context {
         Context::Base | Context::Lines => !chord.mods.any_command_like() || is_text_undo(chord),
         Context::Draft => {
@@ -176,6 +180,31 @@ pub(crate) fn needs_unconsumed(context: Context, chord: &Chord) -> bool {
         }
         _ => false,
     }
+}
+
+/// ⌃A, ⌃E, ⌃K, …: on macOS a focused text field takes them as caret and
+/// delete keys ([`crate::ui::cocoa_text_key`]) and reports the key consumed,
+/// so a command bound to one yields while a field has it, as in native apps.
+fn is_cocoa_text_chord(chord: &Chord) -> bool {
+    let ChordKey::Char(key) = &chord.key else {
+        return false;
+    };
+    let mut chars = key.chars();
+    let (Some(latin), None) = (chars.next(), chars.next()) else {
+        return false;
+    };
+    let mut modifiers = keyboard::Modifiers::empty();
+    for (held, modifier) in [
+        (chord.mods.control, keyboard::Modifiers::CTRL),
+        (chord.mods.shift, keyboard::Modifiers::SHIFT),
+        (chord.mods.alt, keyboard::Modifiers::ALT),
+        (chord.mods.command, keyboard::Modifiers::LOGO),
+    ] {
+        if held {
+            modifiers |= modifier;
+        }
+    }
+    cfg!(target_os = "macos") && crate::ui::cocoa_text_key(latin, modifiers, true).is_some()
 }
 
 /// ⌘Z / ⌘⇧Z: a focused text field (the revset box) takes them as its own
@@ -441,6 +470,20 @@ mod tests {
         // An overlay owns its keys outright; its own input is the focused one.
         assert!(!needs_unconsumed(Context::Palette, &chord("esc")));
         assert!(!needs_unconsumed(Context::Find, &chord("enter")));
+    }
+
+    /// A command bound to ⌃A must not take it from the field moving its caret.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_focused_input_keeps_its_cocoa_chords() {
+        for context in [Context::Base, Context::Palette, Context::Draft] {
+            for raw in ["ctrl+a", "ctrl+e", "ctrl+k", "ctrl+n", "ctrl+shift+a"] {
+                assert!(needs_unconsumed(context, &chord(raw)), "{raw}");
+            }
+            assert!(!needs_unconsumed(context, &chord("ctrl+x")));
+            assert!(!needs_unconsumed(context, &chord("cmd+a")));
+            assert!(!needs_unconsumed(context, &chord("ctrl+alt+a")));
+        }
     }
 }
 
