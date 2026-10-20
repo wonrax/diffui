@@ -1,8 +1,10 @@
 //! Buttons riding a diff hunk's header strip, right-aligned: what a conflict
-//! region's take-a-side controls are drawn with. The diff view is one custom
-//! widget, so these are painted and hit-tested by it rather than being iced
-//! buttons; this module holds their model and geometry, and paints them in
-//! the raised button's colours the caller resolves from the theme.
+//! region's take-a-side controls are drawn with. A file strip under a file's
+//! header carries the same buttons for the whole file, after ghost tools
+//! that follow its own text. The diff view is one custom widget, so these
+//! are painted and hit-tested by it rather than being iced buttons; this
+//! module holds their model and geometry, and paints them in the button
+//! colours the caller resolves from the theme.
 
 use iced::advanced::{renderer, text};
 use iced::{Border, Color, Font, Pixels, Point, Rectangle, Shadow, Size, alignment};
@@ -47,12 +49,35 @@ pub struct Row {
     pub buttons: Vec<Button>,
 }
 
+/// A ghost button (no fill or border at rest) following a file strip's
+/// text. The first run is kept when the strip is too narrow for the whole
+/// label.
+#[derive(Debug, Clone)]
+pub struct Tool {
+    pub runs: Vec<Run>,
+    pub enabled: bool,
+}
+
+/// The strip of its own a file gets under its header, above its first
+/// hunk: what a conflicted file's whole-file controls ride on.
+#[derive(Debug, Clone)]
+pub struct FileStrip {
+    pub file: usize,
+    /// Its text, at the left where a hunk strip has its header.
+    pub label: String,
+    pub tools: Vec<Tool>,
+    /// The right-aligned buttons, as on a hunk strip (`hunk` unused).
+    pub row: Row,
+}
+
 /// Colours and type, resolved by the caller from the theme.
 #[derive(Debug, Clone, Copy)]
 pub struct Style {
     pub size: f32,
     pub fill: Color,
     pub hover_fill: Color,
+    /// A hovered tool's fill.
+    pub ghost_hover_fill: Color,
     pub border: Color,
     pub focus: Color,
     pub radius: f32,
@@ -65,6 +90,11 @@ pub struct HunkActions<'a, Message> {
     pub style: Style,
     /// `(row, button)` of a press to the message it sends.
     pub on_press: Box<dyn Fn(usize, usize) -> Message + 'a>,
+    /// Sorted by `file`.
+    pub files: Vec<FileStrip>,
+    /// `(strip, button)` of a press on a file strip, its tools counted
+    /// before its row's buttons.
+    pub on_file_press: Box<dyn Fn(usize, usize) -> Message + 'a>,
     /// Scroll this `(file, hunk)` into view whenever the token changes.
     pub reveal: Option<(usize, usize, u64)>,
 }
@@ -75,6 +105,122 @@ impl<Message> HunkActions<'_, Message> {
         self.rows
             .binary_search_by(|row| (row.file, row.hunk).cmp(&(file, hunk)))
             .ok()
+    }
+
+    /// The strip under `file`'s header, by index.
+    pub fn file_strip(&self, file: usize) -> Option<usize> {
+        self.files
+            .binary_search_by(|strip| strip.file.cmp(&file))
+            .ok()
+    }
+}
+
+/// A file strip laid out: whether its label shows, its tools' boxes, then
+/// its row's buttons.
+pub struct FilePlaced {
+    pub label: bool,
+    pub tools: Vec<Placed>,
+    pub buttons: Vec<Placed>,
+}
+
+impl FilePlaced {
+    /// The enabled button under `point`, tools counted first.
+    pub fn hit(&self, strip: &FileStrip, point: Point) -> Option<usize> {
+        let tool = self
+            .tools
+            .iter()
+            .zip(&strip.tools)
+            .position(|(placed, tool)| tool.enabled && placed.rect.contains(point));
+        tool.or_else(|| {
+            self.buttons
+                .iter()
+                .position(|placed| placed.rect.contains(point))
+                .map(|button| strip.tools.len() + button)
+        })
+    }
+}
+
+fn runs_width(runs: &[Run], size: f32, compact: bool) -> f32 {
+    let runs = if compact { &runs[..1] } else { runs };
+    runs.iter().map(|run| run_width(run, size)).sum::<f32>() + 2.0 * PAD_X
+}
+
+/// Lay a file strip out in `strip`: its label at `text_x`, `label_width`
+/// wide, its tools left-aligned after it, its row's buttons as [`place`]
+/// puts them. When they don't all fit whole, the label goes first (the
+/// buttons and the region strips below say as much), then the buttons
+/// shrink to their first runs (the change ids, named in full on the region
+/// strips), then the tools to their icons.
+pub fn place_file(
+    file: &FileStrip,
+    style: &Style,
+    strip: Rectangle,
+    right_inset: f32,
+    text_x: f32,
+    label_width: f32,
+) -> FilePlaced {
+    let lay = |label: bool, compact: bool| {
+        let start = if label {
+            text_x + label_width + LEAD_GAP
+        } else {
+            text_x
+        };
+        let mut x = start;
+        let tools: Vec<Placed> = file
+            .tools
+            .iter()
+            .map(|tool| {
+                let width = runs_width(&tool.runs, style.size, compact);
+                let rect = Rectangle {
+                    x,
+                    width,
+                    ..button_box(strip)
+                };
+                x += width + GAP;
+                Placed { rect, compact }
+            })
+            .collect();
+        let end = tools
+            .last()
+            .map_or(start - LEAD_GAP, |tool| tool.rect.x + tool.rect.width);
+        let buttons = place(&file.row, style, strip, right_inset, end);
+        FilePlaced {
+            label,
+            tools,
+            buttons,
+        }
+    };
+    let whole = |placed: &FilePlaced| placed.buttons.first().is_none_or(|first| !first.compact);
+    let lead = file
+        .row
+        .lead
+        .as_ref()
+        .map_or(0.0, |lead| run_width(lead, style.size) + GAP);
+    let fits = |placed: &FilePlaced| match (placed.tools.last(), placed.buttons.first()) {
+        (Some(tool), Some(first)) => {
+            tool.rect.x + tool.rect.width + LEAD_GAP <= first.rect.x - lead
+        }
+        _ => true,
+    };
+    let with_label = lay(true, false);
+    if whole(&with_label) {
+        return with_label;
+    }
+    let without = lay(false, false);
+    if fits(&without) {
+        return without;
+    }
+    lay(false, true)
+}
+
+/// A button's box in `strip`, before its x and width.
+fn button_box(strip: Rectangle) -> Rectangle {
+    let height = (strip.height - 6.0).clamp(1.0, MAX_HEIGHT);
+    Rectangle {
+        x: strip.x,
+        y: strip.y + (strip.height - height) / 2.0,
+        width: 0.0,
+        height,
     }
 }
 
@@ -90,12 +236,7 @@ fn run_width(run: &Run, size: f32) -> f32 {
 }
 
 fn button_width(button: &Button, size: f32, compact: bool) -> f32 {
-    let runs = if compact {
-        &button.runs[..1]
-    } else {
-        &button.runs
-    };
-    runs.iter().map(|run| run_width(run, size)).sum::<f32>() + 2.0 * PAD_X
+    runs_width(&button.runs, size, compact)
 }
 
 /// Lay `row`'s buttons out right-aligned in `strip`, ending `right_inset`
@@ -109,8 +250,7 @@ pub fn place(
     right_inset: f32,
     min_x: f32,
 ) -> Vec<Placed> {
-    let height = (strip.height - 6.0).clamp(1.0, MAX_HEIGHT);
-    let y = strip.y + (strip.height - height) / 2.0;
+    let Rectangle { y, height, .. } = button_box(strip);
     let right = strip.x + strip.width - right_inset;
     let lead = row
         .lead
@@ -158,8 +298,7 @@ pub fn draw_row<Renderer: text::Renderer>(
             renderer,
             lead,
             Point::new(first.rect.x - GAP - width, baseline(row, style, first.rect)),
-            width,
-            first.rect.height,
+            first.rect,
             style.size,
             clip,
         );
@@ -189,9 +328,44 @@ pub fn baseline(row: &Row, style: &Style, rect: Rectangle) -> f32 {
         .lead
         .iter()
         .chain(row.buttons.iter().flat_map(|button| &button.runs))
+        .filter(|run| !is_glyph(run))
         .map(|run| TextBox::new(run.font, style.size, rect.height).cap_height())
         .fold(0.0, f32::max);
     rect.center_y() + cap_height / 2.0
+}
+
+/// An icon: centred on the caps rather than set on the baseline.
+fn is_glyph(run: &Run) -> bool {
+    run.font == crate::icons::ICON_FONT
+}
+
+/// Paint one placed tool of a file strip, its text on `baseline` (the
+/// strip's row's).
+pub fn draw_tool<Renderer: text::Renderer>(
+    renderer: &mut Renderer,
+    tool: &Tool,
+    placed: &Placed,
+    style: &Style,
+    baseline: f32,
+    hovered: bool,
+    clip: Rectangle,
+) {
+    let rect = placed.rect;
+    if hovered && tool.enabled {
+        renderer.fill_quad(
+            renderer::Quad {
+                bounds: rect,
+                border: Border {
+                    radius: style.radius.into(),
+                    ..Border::default()
+                },
+                shadow: Shadow::default(),
+                snap: true,
+            },
+            style.ghost_hover_fill,
+        );
+    }
+    draw_runs(renderer, &tool.runs, placed, style, baseline, clip);
 }
 
 /// Paint one placed button of `row`.
@@ -222,44 +396,64 @@ pub fn draw_button<Renderer: text::Renderer>(
             style.fill
         },
     );
-    let runs = if placed.compact {
-        &button.runs[..1]
-    } else {
-        &button.runs[..]
-    };
-    let baseline = baseline(row, style, rect);
-    let mut x = rect.x + PAD_X;
+    draw_runs(
+        renderer,
+        &button.runs,
+        placed,
+        style,
+        baseline(row, style, rect),
+        clip,
+    );
+}
+
+/// A placed button's label runs, from its inset on, on `baseline`.
+fn draw_runs<Renderer: text::Renderer>(
+    renderer: &mut Renderer,
+    runs: &[Run],
+    placed: &Placed,
+    style: &Style,
+    baseline: f32,
+    clip: Rectangle,
+) {
+    let runs = if placed.compact { &runs[..1] } else { runs };
+    let mut x = placed.rect.x + PAD_X;
     for run in runs {
-        let width = run_width(run, style.size);
         draw_run(
             renderer,
             run,
             Point::new(x, baseline),
-            width,
-            rect.height,
+            placed.rect,
             style.size,
             clip,
         );
-        x += width;
+        x += run_width(run, style.size);
     }
 }
 
-/// Where a run's `height`-tall line box starts for its baseline to land on
-/// `baseline`.
-fn run_top(run: &Run, size: f32, height: f32, baseline: f32) -> f32 {
-    baseline - TextBox::new(run.font, size, height).baseline()
+/// Where a run's line box starts, `height` tall, for its baseline to land
+/// on `baseline`; an icon's, for it to centre on `center_y` instead.
+fn run_top(run: &Run, size: f32, height: f32, baseline: f32, center_y: f32) -> f32 {
+    let line = TextBox::new(run.font, size, height);
+    let baseline = if is_glyph(run) {
+        line.baseline_for_center(center_y)
+    } else {
+        baseline
+    };
+    baseline - line.baseline()
 }
 
-/// One run, left-aligned at `at.x` with its baseline on `at.y`.
+/// One run, left-aligned at `at.x` with its baseline on `at.y`, in a line
+/// box as tall as `button` and centred on it if it's an icon.
 fn draw_run<Renderer: text::Renderer>(
     renderer: &mut Renderer,
     run: &Run,
     at: Point,
-    width: f32,
-    height: f32,
+    button: Rectangle,
     size: f32,
     clip: Rectangle,
 ) {
+    let width = run_width(run, size);
+    let height = button.height;
     renderer.fill_text(
         text::Text {
             content: run.text.clone(),
@@ -274,7 +468,7 @@ fn draw_run<Renderer: text::Renderer>(
             ellipsis: text::Ellipsis::None,
             hint_factor: None,
         },
-        Point::new(at.x, run_top(run, size, height, at.y)),
+        Point::new(at.x, run_top(run, size, height, at.y, button.center_y())),
         run.color,
         clip,
     );
@@ -311,6 +505,7 @@ mod tests {
             size: 12.0,
             fill: Color::WHITE,
             hover_fill: Color::WHITE,
+            ghost_hover_fill: Color::WHITE,
             border: Color::BLACK,
             focus: Color::BLACK,
             radius: 7.0,
@@ -347,12 +542,80 @@ mod tests {
         let mut tallest: f32 = 0.0;
         for run in runs {
             let line = TextBox::new(run.font, style.size, rect.height);
-            let top = run_top(run, style.size, rect.height, shared);
+            let top = run_top(run, style.size, rect.height, shared, rect.center_y());
             assert!((top + line.baseline() - shared).abs() < 1e-4);
             tallest = tallest.max(line.cap_height());
         }
         // The tallest caps are centred in the button.
         assert!((shared - tallest / 2.0 - rect.center_y()).abs() < 1e-4);
+    }
+
+    fn file(tools: &[&[&str]], buttons: &[&[&str]]) -> FileStrip {
+        let tools = row(tools)
+            .buttons
+            .into_iter()
+            .map(|button| Tool {
+                runs: button.runs,
+                enabled: true,
+            })
+            .collect();
+        FileStrip {
+            file: 0,
+            label: "2 sides".to_owned(),
+            tools,
+            row: row(buttons),
+        }
+    }
+
+    #[test]
+    fn a_file_strip_drops_its_label_then_shrinks_its_buttons_then_its_tools() {
+        let strip = file(
+            &[&["E", " Edit markers"], &["M", " Merge tool"]],
+            &[&["abc", " rebase destination"], &["Base"]],
+        );
+        let at = |width: f32| {
+            place_file(
+                &strip,
+                &style(),
+                Rectangle::new(Point::ORIGIN, Size::new(width, 30.0)),
+                16.0,
+                100.0,
+                50.0,
+            )
+        };
+        let wide = at(2000.0);
+        assert!(wide.label);
+        assert!(wide.tools.iter().chain(&wide.buttons).all(|p| !p.compact));
+        assert!((wide.tools[0].rect.x - 166.0).abs() < 0.01);
+        let tools_end = |placed: &FilePlaced| {
+            let last = placed.tools.last().unwrap().rect;
+            last.x + last.width
+        };
+        assert!(tools_end(&wide) < wide.buttons[0].rect.x);
+        let full = wide.buttons.iter().map(|p| p.rect.width).sum::<f32>();
+        let tools = wide.tools.iter().map(|p| p.rect.width).sum::<f32>();
+        // Whole with the label: 100 + 50 + 16 + tools + 6 + 16 + full + 6
+        // + 16. Without it, 50 + 16 less.
+        let no_label = at(100.0 + tools + full + 50.0);
+        assert!(!no_label.label);
+        assert!((no_label.tools[0].rect.x - 100.0).abs() < 0.01);
+        assert!(
+            no_label
+                .tools
+                .iter()
+                .chain(&no_label.buttons)
+                .all(|p| !p.compact)
+        );
+        // Narrower still: the buttons go to their ids, then the tools to
+        // their icons.
+        let short = at(100.0 + tools + full + 20.0);
+        assert!(!short.label);
+        assert!(short.tools.iter().all(|p| !p.compact));
+        assert!(short.buttons.iter().all(|p| p.compact));
+        assert!(tools_end(&short) < short.buttons[0].rect.x);
+        let narrow = at(100.0 + full);
+        assert!(narrow.tools.iter().all(|p| p.compact));
+        assert!(narrow.buttons.iter().all(|p| p.compact));
     }
 
     #[test]

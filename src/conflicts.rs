@@ -13,14 +13,14 @@ use diffui_core::{
     ConflictFile, ConflictPick, ConflictResolution, DiffFileStatus, JobId, MergeToolInvocation,
     MutationOp, RevisionSelection, hunk_conflict_region,
 };
-use iced::widget::{Space, column, container, responsive, row, text, text_editor};
-use iced::{Element, Length, Padding, Task, alignment};
+use iced::widget::{column, container, responsive, text, text_editor};
+use iced::{Element, Length, Task, alignment};
 
 use crate::changes::{ChangesMsg, editable};
 use crate::commands::CommandArg;
 use crate::prose::Prose;
 use crate::theme::{ThemeSpec, text_size};
-use crate::typography::{self, Aligned};
+use crate::typography;
 use crate::{Action, Diffui, Message, PendingMutation, TabId, TabState, activity, icons, ui};
 
 #[derive(Debug, Clone)]
@@ -874,7 +874,133 @@ fn resolve(path: &str, resolution: ConflictResolution) -> Message {
     }))
 }
 
-/// The take-a-side buttons on every conflict region's hunk header.
+/// A file strip's button, in the strip's order: its tools, then its takes.
+#[derive(Debug, Clone, Copy)]
+enum FileButton {
+    EditMarkers,
+    MergeTool,
+    Take(ConflictPick),
+}
+
+/// What the strip under a conflicted file's header says, at its left.
+fn file_label(conflict: &ConflictFile) -> String {
+    if !conflict.pickable {
+        return "a term is a symlink, directory or submodule. Resolve it in a terminal".to_owned();
+    }
+    let sides = conflict.sides.len();
+    match conflict.regions {
+        0 => format!("{sides} sides"),
+        1 => format!("{sides} sides, 1 region"),
+        regions => format!("{sides} sides, {regions} regions"),
+    }
+}
+
+/// A term's button runs: its change id in mono, then its name.
+fn term_runs(
+    conflict: &ConflictFile,
+    pick: ConflictPick,
+    font: iced::Font,
+    mono: iced::Font,
+    theme: ThemeSpec,
+) -> Vec<crate::hunk_actions::Run> {
+    use crate::hunk_actions::Run;
+    let run = |text: String, font, color| Run { text, font, color };
+    match pick {
+        ConflictPick::Side(side) => match term_label(&conflict.sides[side], side) {
+            (Some(change), name) => {
+                vec![run(change, mono, theme.accent), run(name, font, theme.text)]
+            }
+            (None, name) => vec![run(name, font, theme.text)],
+        },
+        ConflictPick::Base(base) => vec![run(base_label(conflict, base), font, theme.text)],
+    }
+}
+
+/// The strip under a conflicted file's header: what the conflict is, Edit
+/// markers and Merge tool, and a take-a-side button per term for the whole
+/// file.
+fn file_strip(
+    ui: &Diffui,
+    file: usize,
+    conflict: &ConflictFile,
+    theme: ThemeSpec,
+) -> (crate::hunk_actions::FileStrip, Vec<FileButton>) {
+    use crate::hunk_actions::{Button, FileStrip, Row, Run, Tool};
+    let font = ui.config.ui_font;
+    let mono = ui.config.mono_font;
+    let path = conflict.path.as_str();
+    let tool = |icon: &str, label: &str, enabled: bool| Tool {
+        runs: vec![
+            Run {
+                text: icon.to_owned(),
+                font: icons::ICON_FONT,
+                color: theme.muted_text,
+            },
+            Run {
+                text: format!(" {label}"),
+                font,
+                color: if enabled {
+                    theme.text
+                } else {
+                    theme.muted_text
+                },
+            },
+        ],
+        enabled,
+    };
+    let mut tools = Vec::new();
+    let mut buttons = Vec::new();
+    let mut takes = Vec::new();
+    if conflict.pickable {
+        tools.push(tool(icons::PENCIL, "Edit markers", true));
+        buttons.push(FileButton::EditMarkers);
+        if conflict.merge_tool_blocker.is_none() {
+            let conflicts = &ui.active().changes.conflicts;
+            let running = conflicts.tool_running.as_deref() == Some(path)
+                || conflicts
+                    .tool_job
+                    .as_ref()
+                    .is_some_and(|(_, job_path)| job_path == path);
+            tools.push(if running {
+                tool(
+                    icons::GIT_MERGE,
+                    "Waiting for the merge tool\u{2026}",
+                    false,
+                )
+            } else {
+                tool(icons::GIT_MERGE, "Merge tool", true)
+            });
+            buttons.push(FileButton::MergeTool);
+        }
+        for pick in picks(conflict) {
+            takes.push(Button {
+                runs: term_runs(conflict, pick, font, mono, theme),
+            });
+            buttons.push(FileButton::Take(pick));
+        }
+    }
+    let strip = FileStrip {
+        file,
+        label: file_label(conflict),
+        tools,
+        row: Row {
+            file,
+            hunk: 0,
+            focused: false,
+            lead: (!takes.is_empty()).then(|| Run {
+                text: "Take all".to_owned(),
+                font,
+                color: theme.muted_text,
+            }),
+            buttons: takes,
+        },
+    };
+    (strip, buttons)
+}
+
+/// The conflict controls the diff paints: a strip under each conflicted
+/// file's header, and take-a-side buttons on every conflict region's hunk
+/// header.
 pub(crate) fn hunk_actions<'a>(
     ui: &'a Diffui,
     theme: ThemeSpec,
@@ -884,15 +1010,23 @@ pub(crate) fn hunk_actions<'a>(
     if !editable(tab) || editor_shown(ui).is_some() {
         return None;
     }
+    let conflicts = tab.changes.conflicts.current(tab)?;
+    let mut files = Vec::new();
+    let mut file_targets = Vec::new();
+    for (index, file) in tab.session.document.files.iter().enumerate() {
+        if let Some(conflict) = conflicts.iter().find(|conflict| conflict.path == file.path) {
+            let (strip, buttons) = file_strip(ui, index, conflict, theme);
+            files.push(strip);
+            file_targets.push((conflict.path.clone(), buttons));
+        }
+    }
     let all = regions(tab);
-    if all.is_empty() {
+    if all.is_empty() && files.is_empty() {
         return None;
     }
-    let conflicts = tab.changes.conflicts.current(tab)?;
     let font = ui.config.ui_font;
     let mono = ui.config.mono_font;
     let focus = focused(tab, &all);
-    let run = |text: String, font, color| Run { text, font, color };
     let mut rows = Vec::with_capacity(all.len());
     let mut targets = Vec::with_capacity(all.len());
     for (index, at) in all.iter().enumerate() {
@@ -901,24 +1035,18 @@ pub(crate) fn hunk_actions<'a>(
         let buttons = picks(conflict)
             .into_iter()
             .map(|pick| Button {
-                runs: match pick {
-                    ConflictPick::Side(side) => match term_label(&conflict.sides[side], side) {
-                        (Some(change), name) => {
-                            vec![run(change, mono, theme.accent), run(name, font, theme.text)]
-                        }
-                        (None, name) => vec![run(name, font, theme.text)],
-                    },
-                    ConflictPick::Base(base) => {
-                        vec![run(base_label(conflict, base), font, theme.text)]
-                    }
-                },
+                runs: term_runs(conflict, pick, font, mono, theme),
             })
             .collect();
         rows.push(Row {
             file: at.file,
             hunk: at.hunk,
             focused: focus == Some(index),
-            lead: Some(run("Take".to_owned(), font, theme.muted_text)),
+            lead: Some(Run {
+                text: "Take".to_owned(),
+                font,
+                color: theme.muted_text,
+            }),
             buttons,
         });
         targets.push((path.to_owned(), at.region, at.regions, picks(conflict)));
@@ -927,12 +1055,20 @@ pub(crate) fn hunk_actions<'a>(
         Some(iced::Background::Color(color)) => color,
         _ => theme.panel_background,
     };
+    let ghost_hover_fill =
+        match crate::theme::ghost_button_style(theme, iced::widget::button::Status::Hovered)
+            .background
+        {
+            Some(iced::Background::Color(color)) => color,
+            _ => theme.panel_background,
+        };
     Some(crate::hunk_actions::HunkActions {
         rows,
         style: crate::hunk_actions::Style {
             size: text_size::UI,
             fill: fill(iced::widget::button::Status::Active),
             hover_fill: fill(iced::widget::button::Status::Hovered),
+            ghost_hover_fill,
             border: theme.border,
             focus: theme.accent,
             radius: crate::theme::radius::BUTTON,
@@ -947,6 +1083,21 @@ pub(crate) fn hunk_actions<'a>(
                     pick: picks[button],
                 },
             )
+        }),
+        files,
+        on_file_press: Box::new(move |strip, button| {
+            let (path, buttons) = &file_targets[strip];
+            let msg = match buttons[button] {
+                FileButton::EditMarkers => ConflictMsg::EditMarkers(path.clone()),
+                FileButton::MergeTool => ConflictMsg::OpenMergeTool(path.clone()),
+                FileButton::Take(ConflictPick::Side(side)) => {
+                    return resolve(path, ConflictResolution::Side(side));
+                }
+                FileButton::Take(ConflictPick::Base(base)) => {
+                    return resolve(path, ConflictResolution::Base(base));
+                }
+            };
+            Message::Changes(ChangesMsg::Conflict(msg))
         }),
         reveal: focus.map(|index| {
             (
@@ -967,8 +1118,22 @@ pub(crate) fn marker_editor<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Option<Elem
     let saving = editor.saving.is_some();
     let mono = ui.config.mono_font;
     let size = ui.config.code_type.size;
+    let font = ui.config.ui_font;
     let input = responsive(move |bounds| {
-        let height = (bounds.height - crate::theme::control::COMPACT - GAP).max(60.0);
+        let bar = crate::theme::control::COMPACT;
+        let height = (bounds.height - 2.0 * (bar + GAP)).max(60.0);
+        let title = container(typography::centered(
+            Prose::new()
+                .text("Editing ")
+                .path(editor.path.as_str())
+                .view(font, mono, theme.text, theme)
+                .size(text_size::UI)
+                .wrapping(text::Wrapping::None),
+            font,
+            text_size::UI,
+        ))
+        .height(Length::Fixed(bar))
+        .align_y(alignment::Vertical::Center);
         let on_action =
             |action| Message::Changes(ChangesMsg::Conflict(ConflictMsg::EditorAction(action)));
         let input = crate::input::multi_line(
@@ -983,7 +1148,7 @@ pub(crate) fn marker_editor<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Option<Elem
             theme,
             (!saving).then_some(on_action),
         );
-        column![input, editor_footer(ui, theme, editor)].spacing(GAP)
+        column![title, input, editor_footer(ui, theme, editor)].spacing(GAP)
     });
     Some(
         container(input)
@@ -1042,185 +1207,6 @@ fn editor_footer<'a>(
         [keyed(cancel, "Esc"), keyed(save, "\u{2318}\u{21b5}")],
     )
     .into()
-}
-
-/// The resolve strip above the diff when the selected file is conflicted.
-pub(crate) fn conflict_banner<'a>(
-    ui: &'a Diffui,
-    theme: ThemeSpec,
-) -> Option<Element<'a, Message>> {
-    let tab = ui.active();
-    if !editable(tab) {
-        return None;
-    }
-    let file = tab.session.document.files.get(tab.selected_file)?;
-    let conflict = conflict_of(tab, &file.path)?;
-    let font = ui.config.ui_font;
-    let mono = ui.config.mono_font;
-    let path = conflict.path.as_str();
-    let tip = |content: Element<'a, Message>, label: String| {
-        ui::tooltip(
-            content,
-            label,
-            iced::widget::tooltip::Position::Bottom,
-            font,
-            theme,
-        )
-    };
-    let mut buttons = row![].spacing(6).align_y(alignment::Vertical::Center);
-    if conflict.pickable {
-        for (index, side) in conflict.sides.iter().enumerate() {
-            let label = match term_label(side, index) {
-                (Some(change), name) => Prose::new().rev(change).text(name),
-                (None, name) => Prose::from(name),
-            };
-            let button = ui::button(
-                label
-                    .view(font, mono, theme.text, theme)
-                    .size(text_size::UI)
-                    .wrapping(text::Wrapping::None),
-                ui::Variant::Raised,
-                ui::Size::Compact,
-                theme,
-            )
-            .on_press(resolve(path, ConflictResolution::Side(index)));
-            buttons = buttons.push(tip(
-                button.into(),
-                format!("Take side {} as the whole file: {}", index + 1, side.label),
-            ));
-        }
-        for (index, base) in conflict.bases.iter().enumerate() {
-            let button = ui::text_button(
-                None,
-                base_label(conflict, index),
-                ui::Variant::Raised,
-                ui::Size::Compact,
-                font,
-                theme,
-            )
-            .on_press(resolve(path, ConflictResolution::Base(index)));
-            buttons = buttons.push(tip(
-                button.into(),
-                format!("Drop every side's change: {}", base.label),
-            ));
-        }
-    }
-    let conflicts = &tab.changes.conflicts;
-    let running = conflicts.tool_running.as_deref() == Some(path)
-        || conflicts
-            .tool_job
-            .as_ref()
-            .is_some_and(|(_, job_path)| job_path == path);
-    let mut tool = ui::text_button(
-        Some((icons::GIT_MERGE, theme.muted_text)),
-        if running {
-            "Waiting for the merge tool\u{2026}"
-        } else {
-            "Merge tool"
-        },
-        ui::Variant::Ghost,
-        ui::Size::Compact,
-        font,
-        theme,
-    );
-    if conflict.merge_tool_blocker.is_none() && !running {
-        tool = tool.on_press(Message::Changes(ChangesMsg::Conflict(
-            ConflictMsg::OpenMergeTool(path.to_owned()),
-        )));
-    }
-    let editing = editor_shown(ui).is_some();
-    let mut edit = ui::text_button(
-        Some((icons::PENCIL, theme.muted_text)),
-        "Edit markers",
-        ui::Variant::Ghost,
-        ui::Size::Compact,
-        font,
-        theme,
-    );
-    if conflict.pickable && !editing {
-        edit = edit.on_press(Message::Changes(ChangesMsg::Conflict(
-            ConflictMsg::EditMarkers(path.to_owned()),
-        )));
-    }
-    buttons = buttons
-        .push(Space::new().width(Length::Fixed(6.0)))
-        .push(tip(
-            edit.into(),
-            if conflict.pickable {
-                "Edit the file with jj's conflict markers. Markers left in keep it conflicted"
-                    .to_owned()
-            } else {
-                "A term isn't a regular file".to_owned()
-            },
-        ))
-        .push(tip(
-            tool.into(),
-            conflict.merge_tool_blocker.clone().unwrap_or_else(|| {
-                "Runs ui.merge-editor from your jj config and writes the result back".to_owned()
-            }),
-        ));
-
-    let regions = if conflict.regions > 0 {
-        format!(
-            ", {} region{}",
-            conflict.regions,
-            if conflict.regions == 1 { "" } else { "s" }
-        )
-    } else {
-        String::new()
-    };
-    let headline = typography::baseline_row(
-        [
-            Aligned::glyph(
-                icons::icon(icons::ALERT_TRIANGLE, ui::ICON_SIZE, theme.conflict_marker),
-                ui::ICON_SIZE,
-            ),
-            Aligned::text(
-                Prose::new()
-                    .path(path)
-                    .text(format!(
-                        " is conflicted: {} sides{regions}.",
-                        conflict.sides.len()
-                    ))
-                    .view(font, mono, theme.text, theme)
-                    .size(text_size::UI),
-                font,
-                text_size::UI,
-            ),
-        ],
-        6.0,
-    );
-    let hint = if editing {
-        "Editing the markers below."
-    } else if !conflict.pickable {
-        "A term is a symlink, directory or submodule. Resolve it in a terminal."
-    } else if conflict.regions > 0 {
-        "Take a side for the whole file, or for each region below."
-    } else {
-        "This conflict only resolves whole: take a side, or edit the markers."
-    };
-    let hint = text(hint)
-        .size(text_size::CAPTION)
-        .font(font)
-        .color(theme.muted_text);
-    Some(
-        container(column![headline, buttons.wrap().vertical_spacing(6), hint].spacing(6))
-            .width(Length::Fill)
-            .padding(Padding::from([8.0, 16.0]))
-            .style(move |_| {
-                container::Style::default()
-                    .background(iced::Color {
-                        a: 0.08,
-                        ..theme.conflict_marker
-                    })
-                    .border(iced::Border {
-                        width: 1.0,
-                        color: theme.border,
-                        radius: 0.0.into(),
-                    })
-            })
-            .into(),
-    )
 }
 
 #[cfg(test)]

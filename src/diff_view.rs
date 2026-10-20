@@ -947,7 +947,7 @@ struct ParagraphKey {
 #[derive(Debug, Default)]
 struct HeightIndex {
     /// Rebuild key: `(layout_version, files.len(), header height bits, wrap
-    /// width bits, wrap, side_by_side, media key)`. The file/header counts are part of
+    /// width bits, wrap, side_by_side, media key, file strips key)`. The file/header counts are part of
     /// the key because streaming PR loads *append* files (and the header
     /// appears when `gh pr view` lands) without replacing the document —
     /// appends leave existing rows in place, but they extend the layout.
@@ -998,10 +998,13 @@ struct HeightIndex {
     total_height: f32,
     /// `(file, top, height)` of each image preview block, in document order.
     media_bands: Vec<(usize, f32, f32)>,
+    /// `(file, top)` of each file strip (see [`DiffView::file_strip_height`]),
+    /// in document order.
+    file_strips: Vec<(usize, f32)>,
 }
 
 /// The shape of [`HeightIndex::key`].
-type HeightKey = (u64, usize, usize, u32, bool, bool, Option<u64>);
+type HeightKey = (u64, usize, usize, u32, bool, bool, Option<u64>, u64);
 
 /// `pair_lines` sentinel: this side of the row has no line (padding).
 const NO_LINE: u32 = u32::MAX;
@@ -1177,8 +1180,8 @@ struct State<Paragraph> {
     last_line_reveal: Option<u64>,
     /// A line to scroll into view on the next `update()`.
     pending_line_reveal: Option<LineAt>,
-    /// The hunk-strip button under the cursor: `(row, button)`.
-    hovered_hunk_action: Option<(usize, usize)>,
+    /// The hunk- or file-strip button under the cursor.
+    hovered_hunk_action: Option<ActionHit>,
     /// Last [`crate::hunk_actions::HunkActions::reveal`] token acted on.
     last_hunk_reveal: Option<u64>,
     /// A hunk header to scroll into view on the next `update()`.
@@ -1283,6 +1286,14 @@ struct TextRenderParams {
     color: Color,
     clip_bounds: Rectangle,
     wrapping: text::Wrapping,
+}
+
+/// A strip button: `(row, button)` of a hunk strip, or `(strip, button)` of
+/// a file strip (see [`crate::hunk_actions::HunkActions`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionHit {
+    Hunk(usize, usize),
+    File(usize, usize),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1503,11 +1514,71 @@ impl<'a, Message> DiffView<'a, Message> {
         self
     }
 
-    /// Draw buttons at the right end of some hunks' header strips: a
-    /// conflict region's take-a-side controls. Ignored for plain documents.
+    /// Draw buttons at the right end of some hunks' header strips (a
+    /// conflict region's take-a-side controls), and a strip of controls
+    /// under some files' headers (a conflicted file's). Ignored for plain
+    /// documents.
     pub fn hunk_actions(mut self, actions: crate::hunk_actions::HunkActions<'a, Message>) -> Self {
         self.hunk_actions = Some(actions);
         self
+    }
+
+    /// Height of the strip `file` gets under its header, above its first
+    /// hunk (zero for none): as tall as a hunk strip.
+    fn file_strip_height(&self, file: usize) -> f32 {
+        match &self.hunk_actions {
+            Some(actions) if !self.plain && actions.file_strip(file).is_some() => {
+                self.metrics.hunk_header_height
+            }
+            _ => 0.0,
+        }
+    }
+
+    /// Names which files have a strip, for [`HeightIndex::key`].
+    fn file_strips_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        if let Some(actions) = &self.hunk_actions {
+            for strip in &actions.files {
+                strip.file.hash(&mut hasher);
+            }
+        }
+        hasher.finish()
+    }
+
+    /// Where a strip's own text starts in `file`: the hunk headers' x.
+    fn strip_text_x(&self, index: &HeightIndex, file: usize, bounds: Rectangle) -> f32 {
+        let region_x = match self.side_by_side && !index.is_full_width(file) {
+            true => self.split_layout(bounds.width).gutter_width + PREFIX_WIDTH,
+            false => self.metrics.gutter_width + PREFIX_WIDTH,
+        };
+        bounds.x + region_x + TEXT_X_PADDING
+    }
+
+    /// File strip `strip` laid out with its top at screen-y `y`.
+    fn file_strip_layout(
+        &self,
+        index: &HeightIndex,
+        strip: usize,
+        y: f32,
+        bounds: Rectangle,
+    ) -> Option<crate::hunk_actions::FilePlaced> {
+        let actions = self.hunk_actions.as_ref()?;
+        let spec = actions.files.get(strip)?;
+        let rect = Rectangle {
+            x: bounds.x,
+            y,
+            width: bounds.width,
+            height: self.metrics.hunk_header_height,
+        };
+        Some(crate::hunk_actions::place_file(
+            spec,
+            &actions.style,
+            rect,
+            HEADER_HORIZONTAL_PADDING,
+            self.strip_text_x(index, spec.file, bounds),
+            self.text_width(&spec.label),
+        ))
     }
 
     /// The hunk-strip buttons of `(file, hunk)` when its header is drawn at
@@ -1550,24 +1621,54 @@ impl<'a, Message> DiffView<'a, Message> {
         ))
     }
 
-    /// The hunk-strip button under `point`: `(row, button)`.
+    /// The hunk- or file-strip button under `point`.
     fn hunk_action_at<P>(
         &self,
         state: &State<P>,
         bounds: Rectangle,
         point: Point,
-    ) -> Option<(usize, usize)> {
-        self.hunk_actions.as_ref()?;
-        let index = state.height_index.borrow();
+    ) -> Option<ActionHit> {
+        self.strip_action_at(
+            &state.height_index.borrow(),
+            bounds,
+            state.vertical_offset,
+            point,
+        )
+    }
+
+    /// [`Self::hunk_action_at`] against the layout `index`, scrolled to
+    /// `vertical_offset`.
+    fn strip_action_at(
+        &self,
+        index: &HeightIndex,
+        bounds: Rectangle,
+        vertical_offset: f32,
+        point: Point,
+    ) -> Option<ActionHit> {
+        let actions = self.hunk_actions.as_ref()?;
         // A (sticky) file header drawn over the strip wins.
-        let headers = self.visible_file_header_positions(&index, bounds, state.vertical_offset);
+        let headers = self.visible_file_header_positions(index, bounds, vertical_offset);
         if headers
             .iter()
             .any(|&(_, y)| point.y >= y && point.y < y + self.metrics.file_header_height)
         {
             return None;
         }
-        let content_y = point.y - bounds.y + state.vertical_offset;
+        let content_y = point.y - bounds.y + vertical_offset;
+        if let Some(slot) = index
+            .file_strips
+            .partition_point(|&(_, top)| top <= content_y)
+            .checked_sub(1)
+            && let (file, top) = index.file_strips[slot]
+            && content_y < top + self.metrics.hunk_header_height
+        {
+            let strip = actions.file_strip(file)?;
+            let y = bounds.y + (top - vertical_offset);
+            let placed = self.file_strip_layout(index, strip, y, bounds)?;
+            return placed
+                .hit(&actions.files[strip], point)
+                .map(|button| ActionHit::File(strip, button));
+        }
         let slot = index
             .hunk_tops
             .partition_point(|&top| top <= content_y)
@@ -1577,12 +1678,12 @@ impl<'a, Message> DiffView<'a, Message> {
             return None;
         }
         let (file, hunk) = index.hunk_ids[slot];
-        let y = bounds.y + (top - state.vertical_offset);
+        let y = bounds.y + (top - vertical_offset);
         let (row, placed) = self.hunk_action_layout(file as usize, hunk as usize, y, bounds)?;
         placed
             .iter()
             .position(|button| button.rect.contains(point))
-            .map(|button| (row, button))
+            .map(|button| ActionHit::Hunk(row, button))
     }
 
     fn is_collapsed(&self, file_index: usize) -> bool {
@@ -2028,6 +2129,7 @@ impl<'a, Message> DiffView<'a, Message> {
             self.wrap,
             self.side_by_side,
             self.media_key,
+            self.file_strips_key(),
         ));
         if cell.borrow().key == key {
             return;
@@ -2059,6 +2161,7 @@ impl<'a, Message> DiffView<'a, Message> {
             index.pair_lines.reserve(row_count);
         }
         index.media_bands.clear();
+        index.file_strips.clear();
         index.max_columns = 0.0;
         index.full_width_files = if self.side_by_side {
             self.files.iter().map(Self::file_is_single_sided).collect()
@@ -2072,6 +2175,11 @@ impl<'a, Message> DiffView<'a, Message> {
         for (file_index, file) in self.files.iter().enumerate() {
             index.file_tops.push(y);
             y += self.metrics.file_header_height;
+            let strip = self.file_strip_height(file_index);
+            if strip > 0.0 {
+                index.file_strips.push((file_index, y));
+                y += strip;
+            }
             if let Some(media) = self.media_of(file_index) {
                 // The preview stands in for the file's rows.
                 let height = media::layout(media, width, self.metrics.row_height).height;
@@ -4223,10 +4331,13 @@ where
                     shell.capture_event();
                     return;
                 }
-                if let Some((row, button)) = self.hunk_action_at(state, bounds, point)
+                if let Some(hit) = self.hunk_action_at(state, bounds, point)
                     && let Some(actions) = &self.hunk_actions
                 {
-                    shell.publish((actions.on_press)(row, button));
+                    shell.publish(match hit {
+                        ActionHit::Hunk(row, button) => (actions.on_press)(row, button),
+                        ActionHit::File(strip, button) => (actions.on_file_press)(strip, button),
+                    });
                     shell.capture_event();
                     return;
                 }
@@ -4935,10 +5046,32 @@ where
                             button,
                             placed,
                             &actions.style,
-                            state.hovered_hunk_action == Some((row, index)),
+                            state.hovered_hunk_action == Some(ActionHit::Hunk(row, index)),
                             bounds,
                         );
                     }
+                }
+            }
+
+            if let Some(actions) = self.hunk_actions.as_ref().filter(|_| !self.plain) {
+                let first = height_index.file_strips.partition_point(|&(_, top)| {
+                    top + self.metrics.hunk_header_height < visible_top
+                });
+                for &(file_index, top) in &height_index.file_strips[first..] {
+                    if top > visible_bottom {
+                        break;
+                    }
+                    let Some(strip) = actions.file_strip(file_index) else {
+                        continue;
+                    };
+                    self.draw_file_strip(
+                        renderer,
+                        &height_index,
+                        strip,
+                        bounds.y + (top - visible_top),
+                        bounds,
+                        state.hovered_hunk_action,
+                    );
                 }
             }
 
@@ -5461,6 +5594,114 @@ impl<Message> DiffView<'_, Message> {
     /// Draw one file's header strip (background + bottom border + title +
     /// stats) at screen-y `y`. Shared by the normal scrolling draw and the
     /// pinned sticky draw.
+    /// A file strip at screen-y `y`: a hunk strip's band washed in the
+    /// conflict colour, its text where a hunk header's is, its tools after
+    /// that and its buttons right-aligned.
+    fn draw_file_strip<Renderer>(
+        &self,
+        renderer: &mut Renderer,
+        index: &HeightIndex,
+        strip: usize,
+        y: f32,
+        bounds: Rectangle,
+        hovered: Option<ActionHit>,
+    ) where
+        Renderer: text::Renderer,
+    {
+        let Some(actions) = &self.hunk_actions else {
+            return;
+        };
+        let spec = &actions.files[strip];
+        let height = self.metrics.hunk_header_height;
+        self.draw_background(
+            renderer,
+            bounds.x,
+            y,
+            bounds.width,
+            height,
+            self.palette.hunk_header,
+        );
+        self.draw_background(
+            renderer,
+            bounds.x,
+            y,
+            bounds.width,
+            height,
+            Color {
+                a: 0.08,
+                ..self.palette.conflict_marker
+            },
+        );
+        let Some(placed) = self.file_strip_layout(index, strip, y, bounds) else {
+            return;
+        };
+        if placed.label {
+            let text_x = self.strip_text_x(index, spec.file, bounds);
+            self.draw_text(
+                renderer,
+                &spec.label,
+                TextRenderParams {
+                    width: self.text_width(&spec.label),
+                    height: self.metrics.row_height,
+                    position: Point::new(
+                        text_x,
+                        centered_text_y(y, height, self.metrics.row_height)
+                            + self.metrics.text_y_pad,
+                    ),
+                    color: self.palette.text_muted,
+                    clip_bounds: Rectangle {
+                        x: text_x,
+                        width: (bounds.x + bounds.width - text_x).max(1.0),
+                        ..bounds
+                    },
+                    wrapping: text::Wrapping::None,
+                },
+            );
+        }
+        let rect = Rectangle {
+            x: bounds.x,
+            y,
+            width: bounds.width,
+            height,
+        };
+        crate::hunk_actions::draw_row(
+            renderer,
+            &spec.row,
+            &placed.buttons,
+            &actions.style,
+            rect,
+            bounds,
+        );
+        let baseline = placed
+            .buttons
+            .first()
+            .or(placed.tools.first())
+            .map(|first| crate::hunk_actions::baseline(&spec.row, &actions.style, first.rect));
+        for (button, (tool, at)) in spec.tools.iter().zip(&placed.tools).enumerate() {
+            crate::hunk_actions::draw_tool(
+                renderer,
+                tool,
+                at,
+                &actions.style,
+                baseline.unwrap_or(at.rect.center_y()),
+                hovered == Some(ActionHit::File(strip, button)),
+                bounds,
+            );
+        }
+        for (button, (spec_button, at)) in spec.row.buttons.iter().zip(&placed.buttons).enumerate()
+        {
+            crate::hunk_actions::draw_button(
+                renderer,
+                &spec.row,
+                spec_button,
+                at,
+                &actions.style,
+                hovered == Some(ActionHit::File(strip, spec.tools.len() + button)),
+                bounds,
+            );
+        }
+    }
+
     fn draw_file_header<Renderer>(
         &self,
         renderer: &mut Renderer,
@@ -6813,6 +7054,141 @@ mod tests {
         // A y above the first row (in the file-0 header band) still resolves
         // to no candidate row... the candidate is `None` only above row 0.
         assert_eq!(index.row_at(index.row_tops[0] - 1.0), None);
+    }
+
+    /// File 1 conflicted: a strip with one tool and two take buttons.
+    fn conflict_strip(file: usize) -> crate::hunk_actions::HunkActions<'static, ()> {
+        use crate::hunk_actions::{Button, FileStrip, HunkActions, Row, Run, Style, Tool};
+        let run = |text: &str| Run {
+            text: text.to_owned(),
+            font: Font::DEFAULT,
+            color: Color::BLACK,
+        };
+        HunkActions {
+            rows: Vec::new(),
+            style: Style {
+                size: 12.0,
+                fill: Color::WHITE,
+                hover_fill: Color::WHITE,
+                ghost_hover_fill: Color::WHITE,
+                border: Color::BLACK,
+                focus: Color::BLACK,
+                radius: 4.0,
+            },
+            on_press: Box::new(|_, _| ()),
+            files: vec![FileStrip {
+                file,
+                label: "file conflict, 2 sides".to_owned(),
+                tools: vec![Tool {
+                    runs: vec![run("Edit markers")],
+                    enabled: true,
+                }],
+                row: Row {
+                    file,
+                    hunk: 0,
+                    focused: false,
+                    lead: Some(run("Take all")),
+                    buttons: vec![
+                        Button {
+                            runs: vec![run("one")],
+                        },
+                        Button {
+                            runs: vec![run("two")],
+                        },
+                    ],
+                },
+            }],
+            on_file_press: Box::new(|_, _| ()),
+            reveal: None,
+        }
+    }
+
+    #[test]
+    fn a_file_strip_sits_between_its_header_and_first_hunk() {
+        let hunks = test_hunks();
+        let width = 800.0;
+        let plain = TestCaches::default();
+        test_view(&hunks).ensure_height_index(&plain.index, &plain.geometry, width);
+        let plain = plain.index.borrow();
+
+        let mut view = test_view(&hunks);
+        view.hunk_actions = Some(conflict_strip(1));
+        let cells = TestCaches::default();
+        view.ensure_height_index(&cells.index, &cells.geometry, width);
+        let index = cells.index.borrow();
+        let strip = view.metrics.hunk_header_height;
+
+        // File 0 is untouched; file 1's header, then its strip, then its
+        // hunks, everything after moved down by one strip.
+        assert_eq!(index.file_tops[..2], plain.file_tops[..2]);
+        let strip_top = index.file_tops[1] + view.metrics.file_header_height;
+        assert_eq!(index.file_strips, vec![(1, strip_top)]);
+        let first_hunk = index.hunk_ids.iter().position(|id| id.0 == 1).unwrap();
+        assert_eq!(index.hunk_tops[first_hunk], strip_top + strip);
+        assert_eq!(index.total_height, plain.total_height + strip);
+        for (row, top) in index.row_tops.iter().enumerate() {
+            let shift = if index.row_ids[row].0 == 1 {
+                strip
+            } else {
+                0.0
+            };
+            assert_eq!(*top, plain.row_tops[row] + shift);
+        }
+
+        // Its buttons hit-test where they're laid out; the rest of the
+        // strip, and file 1's hunk strip (no region buttons), don't.
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(width, 600.0));
+        let placed = view
+            .file_strip_layout(&index, 0, strip_top, bounds)
+            .unwrap();
+        let center = |rect: Rectangle| Point::new(rect.center_x(), rect.center_y());
+        let hit = |point| view.strip_action_at(&index, bounds, 0.0, point);
+        assert_eq!(
+            hit(center(placed.tools[0].rect)),
+            Some(ActionHit::File(0, 0))
+        );
+        assert_eq!(
+            hit(center(placed.buttons[1].rect)),
+            Some(ActionHit::File(0, 2))
+        );
+        assert!(placed.tools[0].rect.x + placed.tools[0].rect.width < placed.buttons[0].rect.x);
+        assert_eq!(
+            hit(Point::new(bounds.x + 2.0, strip_top + strip / 2.0)),
+            None
+        );
+        let hunk_y = index.hunk_tops[first_hunk] + 2.0;
+        assert_eq!(
+            hit(Point::new(placed.buttons[1].rect.center_x(), hunk_y)),
+            None
+        );
+
+        // Scrolled so file 1's header is pinned over the strip: the header
+        // wins.
+        let offset = strip_top - 4.0;
+        let under_header = Point::new(center(placed.buttons[1].rect).x, 6.0);
+        assert_eq!(
+            view.strip_action_at(&index, bounds, offset, under_header),
+            None
+        );
+    }
+
+    #[test]
+    fn height_index_rebuilds_when_the_file_strips_change() {
+        let hunks = test_hunks();
+        let mut view = test_view(&hunks);
+        let cells = TestCaches::default();
+        view.ensure_height_index(&cells.index, &cells.geometry, 800.0);
+        let total = cells.index.borrow().total_height;
+        view.hunk_actions = Some(conflict_strip(0));
+        view.ensure_height_index(&cells.index, &cells.geometry, 800.0);
+        assert_eq!(
+            cells.index.borrow().total_height,
+            total + view.metrics.hunk_header_height
+        );
+        assert_eq!(cells.index.borrow().file_strips[0].0, 0);
+        // Plain documents draw no strips.
+        view.plain = true;
+        assert_eq!(view.file_strip_height(0), 0.0);
     }
 
     #[test]
