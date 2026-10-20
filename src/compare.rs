@@ -42,6 +42,11 @@ impl Diffui {
         if !target.session.capabilities.compare {
             return Task::none();
         }
+        target.range_edit = None;
+        // Leaving a span leaves the marks it showed.
+        if matches!(action, CompareAction::Exit) && target.session.span.is_some() {
+            target.revision_multi_selection.clear();
+        }
         let interdiff = matches!(target.session.diff_base, DiffBase::Interdiff(_));
         let base_for = |from: RevisionSelection| {
             if interdiff {
@@ -138,6 +143,9 @@ pub(crate) fn build_compare_banner<'a>(
     ui: &'a Diffui,
     theme: ThemeSpec,
 ) -> Option<Element<'a, Message>> {
+    if let Some(banner) = crate::range::banner(ui, theme) {
+        return Some(banner);
+    }
     let session = &ui.active().session;
     // While a switch is in flight the requested base is what's coming; once it
     // lands the two agree. Showing the requested one makes Exit/Swap respond

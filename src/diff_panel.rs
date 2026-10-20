@@ -304,7 +304,15 @@ pub fn build_diff_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mes
 }
 
 fn build_diff_panel_body<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
-    let body: Element<'a, Message> = if matches!(ui.active().session.status, LoadStatus::Loading)
+    let range = crate::range::shown_range(ui);
+    let body: Element<'a, Message> = if let Some(error) = crate::range::refused_span(ui) {
+        // The marked rows aren't one diff; say so rather than show the
+        // browsed revision's as if it were theirs.
+        match crate::mode_hints::strip(ui, theme) {
+            Some(hints) => column![crate::range::refused_state(ui, theme, error), hints].into(),
+            None => crate::range::refused_state(ui, theme, error),
+        }
+    } else if matches!(ui.active().session.status, LoadStatus::Loading)
         && ui.active().session.document.files.is_empty()
     {
         container(text(""))
@@ -315,6 +323,7 @@ fn build_diff_panel_body<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Me
             .into()
     } else if ui.active().session.document.files.is_empty()
         && ui.active().session.revision_details.is_none()
+        && range.is_none()
     {
         let message = match &ui.active().session.status {
             LoadStatus::Failed(_) => "Failed to load changes",
@@ -358,6 +367,62 @@ fn build_diff_panel_body<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Me
 
         let editable_description = ui.active().session.capabilities.mutate;
         let summary = build_revision_summary(ui, theme);
+
+        if files.is_empty()
+            && let Some(range) = range
+        {
+            let message = crate::range::empty_message(ui, range);
+            let lines = crate::range::header_lines(ui, range, theme);
+            let mut stack = column![].push(crate::compare::build_compare_banner(ui, theme));
+            // An empty range has nothing to count; the message says it all.
+            if range.count > 0 {
+                stack = stack.push(summary);
+            }
+            if !lines.is_empty() {
+                let height = diff_view::header_block_height(&lines, ui.config.code_type);
+                stack = stack.push(
+                    container(
+                        DiffView::new(
+                            Vec::new(),
+                            0,
+                            format!("header:{}", ui.active().session.document_id),
+                            diff_palette(theme),
+                            ui.config.mono_font,
+                            ui.config.code_type,
+                            ui.config.multi_click_ms,
+                            |index| Message::Action(Action::SelectFile(index)),
+                        )
+                        .on_copy(|text| Message::Action(Action::Copy(text)))
+                        .on_header_action(crate::commit_info::header_action)
+                        .content_version(ui.document_version)
+                        .with_header(lines),
+                    )
+                    .height(Length::Fixed(height)),
+                );
+            }
+            let empty = container(
+                text(message)
+                    .size(text_size::TITLE)
+                    .font(crate::theme::emphasis_font(
+                        ui.config.ui_font,
+                        iced::font::Weight::Medium,
+                    ))
+                    .color(theme.muted_text),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(crate::theme::space::XXL)
+            .center(Length::Fill);
+            stack = stack.push(empty);
+            if let Some(hints) = crate::mode_hints::strip(ui, theme) {
+                stack = stack.push(hints);
+            }
+            return container(stack)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(move |_| diff_panel_style(theme))
+                .into();
+        }
 
         if files.is_empty() {
             let mut actions = row![]
@@ -500,7 +565,9 @@ fn build_diff_panel_body<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Me
         .wrap(ui.diff_wrap)
         .side_by_side(split_in_effect(ui))
         .on_header_action(crate::commit_info::header_action);
-        if let Some(details) = ui.active().session.revision_details.as_ref() {
+        if let Some(range) = range {
+            dv = dv.with_header(crate::range::header_lines(ui, range, theme));
+        } else if let Some(details) = ui.active().session.revision_details.as_ref() {
             dv = dv.with_header(crate::commit_info::header_lines(
                 ui,
                 details,

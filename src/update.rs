@@ -754,6 +754,10 @@ impl Diffui {
             }
             Action::ClearMultiSelection => {
                 self.active_mut().revision_multi_selection.clear();
+                // A span is the marks shown as one diff; it goes with them.
+                if self.active().session.span.is_some() {
+                    return self.perform_compare(crate::compare::CompareAction::Exit);
+                }
                 Task::none()
             }
             Action::Mutate(op) => self.start_mutation_op(op),
@@ -1197,6 +1201,7 @@ impl Diffui {
             }
             Action::OpenConfigFile => crate::app_menu::open_config_file(),
             Action::Compare(action) => self.perform_compare(action),
+            Action::Range(action) => self.perform_range(action),
             Action::ExpandFile(index) => self.expand_collapsed_file(index),
         }
     }
@@ -1322,6 +1327,11 @@ impl Diffui {
                 }
             }
             UiEvent::RevsetChanged(value) => self.active_mut().session.revset = value,
+            UiEvent::RangeEditChanged(value) => {
+                if let Some(edit) = self.active_mut().range_edit.as_mut() {
+                    *edit = value;
+                }
+            }
             UiEvent::SidebarWidthChanged(width) => {
                 if width <= self.sidebar_min_width + f32::EPSILON {
                     self.active_mut().history_panel_collapsed = true;
@@ -2176,12 +2186,16 @@ impl Diffui {
             }
             target.pop_mode(ModeKind::Description);
         }
-        if target.session.selected_revision == selection {
+        // A fixed range or a span says nothing about the clicked revision,
+        // so a click leaves it even on the row already selected.
+        let leaves_range = crate::range::browsing_leaves(&target.session);
+        if target.session.selected_revision == selection && !leaves_range {
             // The selected row remains stable; files live in the review pane.
-        } else if target.session.diff_pending() == Some(&selection) {
+        } else if target.session.diff_pending() == Some(&selection) && !leaves_range {
             // Already loading this revision — let it land.
         } else if let Some(tab) = self.active_tab_id() {
-            let effects = self.active_mut().session.load_diff(selection);
+            self.active_mut().range_edit = None;
+            let effects = self.active_mut().session.browse(selection);
             return self.run_effects(tab, effects);
         }
         Task::none()
@@ -2271,7 +2285,8 @@ impl Diffui {
                                 .to_owned()
                         })
                         .collect();
-                    return Task::none();
+                    // The span shows as one diff, `jj diff -r` over it.
+                    return self.sync_span(true);
                 }
                 // No anchor to span from — fall through to a toggle.
             }
@@ -2285,7 +2300,7 @@ impl Diffui {
             } else {
                 self.active_mut().revision_multi_selection.push(commit_id);
             }
-            return Task::none();
+            return self.sync_span(false);
         }
         self.select_revision(selection)
     }
@@ -3693,22 +3708,25 @@ impl Diffui {
         }
         let state = self.active_mut();
 
+        let leaves_range = crate::range::browsing_leaves(&state.session);
+
         // Already current — no load, no async wait, bump the token now so
         // the next render scrolls the sidebar row into view.
-        if state.session.selected_revision == selection {
+        if state.session.selected_revision == selection && !leaves_range {
             state.revision_reveal_token = state.revision_reveal_token.wrapping_add(1);
             return Task::none();
         }
 
         // A load is already in flight for the same revision; piggyback so the
         // eventual `DiffLoaded` bumps the token for us.
-        if state.session.diff_pending() == Some(&selection) {
+        if state.session.diff_pending() == Some(&selection) && !leaves_range {
             state.pending_revision_reveal = true;
             return Task::none();
         }
         // Deferred bump — see the comment on `pending_revision_reveal`.
         state.pending_revision_reveal = true;
-        let effects = state.session.load_diff(selection);
+        state.range_edit = None;
+        let effects = state.session.browse(selection);
         self.run_effects(tab, effects)
     }
 

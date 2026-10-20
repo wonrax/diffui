@@ -530,6 +530,7 @@ impl Diffui {
                 }
             }
         }
+        rows.push(self.menu_item("diff.since-trunk", bookmark(None)));
         rows.push(self.menu_item("bookmark.rename", bookmark(None)));
         rows.push(self.menu_item("bookmark.delete", bookmark(None)));
         for remote in entry.remotes.iter().filter(|r| r.tracked) {

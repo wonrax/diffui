@@ -149,6 +149,7 @@ impl Diffui {
                 items: vec![
                     self.menu_item("compare.with", on()),
                     self.menu_item("compare.with-working-copy", on()),
+                    self.menu_item("diff.since-trunk", on()),
                 ],
             },
         ]);

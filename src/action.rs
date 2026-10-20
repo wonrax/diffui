@@ -199,6 +199,8 @@ pub(crate) enum Action {
     // ── Comparing ───────────────────────────────────────────────────────
     /// Diff two revisions against each other (see [`crate::compare`]).
     Compare(crate::compare::CompareAction),
+    /// Range diffs: diff since trunk, and the range banner's edit.
+    Range(crate::range::RangeAction),
     /// Load the full diff of a file (by index) the backend collapsed for size.
     ExpandFile(usize),
 }

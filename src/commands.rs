@@ -437,6 +437,49 @@ fn comparing(ui: &Diffui, _: &CommandArg) -> Availability {
     require(crate::compare::comparing(ui), reason::NOT_COMPARING)
 }
 
+/// Swap and interdiff need two sides; a range has one set.
+fn comparing_two(ui: &Diffui, arg: &CommandArg) -> Availability {
+    comparing(ui, arg)?;
+    require(crate::range::mode(ui).is_none(), "Not for a range")
+}
+
+/// "Diff since trunk" on a revision, or on a bookmark's revision (named by
+/// the bookmark in the range, `trunk()..main`).
+fn since_trunk_target(
+    ui: &Diffui,
+    arg: &CommandArg,
+) -> Option<(RevisionSelection, Option<String>)> {
+    match arg {
+        CommandArg::Bookmark {
+            name, remote: None, ..
+        } => {
+            let target = ui
+                .active()
+                .session
+                .bookmarks
+                .entry(name)?
+                .local_target()?
+                .to_owned();
+            Some((
+                ui.active().session.canonical_selection(&target),
+                Some(diffui_core::revset::quote_symbol(name)),
+            ))
+        }
+        _ => target_revision(ui, arg).map(|target| (target, None)),
+    }
+}
+
+fn can_diff_since_trunk(ui: &Diffui, arg: &CommandArg) -> Availability {
+    let session = &ui.active().session;
+    require(session.capabilities.range_diff, reason::NOT_JJ)?;
+    require(
+        session.bookmarks.trunk.is_some(),
+        "trunk() doesn't resolve to a bookmark",
+    )?;
+    let (target, _) = since_trunk_target(ui, arg).ok_or(reason::GONE)?;
+    require(row_present(ui, &target), reason::GONE)
+}
+
 /// The local bookmark a bookmark command names: a menu row's, or a palette
 /// bookmark result's (`main`, `main*`, `main??` — never `main@origin`).
 fn local_bookmark(ui: &Diffui, arg: &CommandArg) -> Option<String> {
@@ -2610,7 +2653,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: comparing,
+        enabled: comparing_two,
         build: |_ui, _arg| Some(Action::Compare(CompareAction::Swap)),
         palette: PaletteScope::Root,
     },
@@ -2621,7 +2664,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: comparing,
+        enabled: comparing_two,
         build: |ui, _arg| {
             let interdiff = matches!(
                 ui.active().session.diff_base,
@@ -2629,6 +2672,37 @@ pub(crate) static REGISTRY: &[Command] = &[
             );
             Some(Action::Compare(CompareAction::SetInterdiff(!interdiff)))
         },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "diff.since-trunk",
+        label: "Diff since trunk",
+        hint: "Everything since trunk() up to this revision; click another to move the end",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: can_diff_since_trunk,
+        build: |ui, arg| {
+            since_trunk_target(ui, &arg).map(|(target, symbol)| {
+                Action::Range(crate::range::RangeAction::SinceTrunk { target, symbol })
+            })
+        },
+        palette: PaletteScope::RevisionVerb,
+    },
+    Command {
+        id: "range.edit",
+        label: "Edit range revset",
+        hint: "Type the revset of the range on screen",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| {
+            require(
+                crate::range::mode(ui).is_some() && crate::range::refused_span(ui).is_none(),
+                "No range on screen",
+            )
+        },
+        build: |_ui, _arg| Some(Action::Range(crate::range::RangeAction::Edit)),
         palette: PaletteScope::Root,
     },
     Command {

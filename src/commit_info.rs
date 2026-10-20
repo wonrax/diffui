@@ -34,6 +34,39 @@ const STAT_BAR_MIN_SHARE: f32 = 0.08;
 pub(crate) fn view<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
     let session = &ui.active().session;
     let stats = (!session.document.files.is_empty()).then(|| diff_stats(ui, theme));
+    // A range has no one revision to describe: its title counts the
+    // commits, which the list under it names.
+    if let Some(range) = crate::range::shown_range(ui) {
+        let title_font = emphasis_font(ui.config.ui_font, iced::font::Weight::Semibold);
+        let mut title_row = row![crate::typography::centered(
+            text(crate::range::title(range))
+                .size(TITLE_SIZE)
+                .font(title_font)
+                .color(theme.text)
+                .wrapping(text::Wrapping::None)
+                .width(Length::Fill),
+            title_font,
+            TITLE_SIZE,
+        )]
+        .spacing(space::SM)
+        .align_y(alignment::Vertical::Center);
+        if let Some(stats) = stats {
+            title_row = title_row.push(container(stats).padding(Padding {
+                right: space::SM,
+                ..Padding::ZERO
+            }));
+        }
+        return container(title_row)
+            .width(Length::Fill)
+            .padding(Padding {
+                top: space::MD,
+                right: space::LG,
+                bottom: space::MD,
+                left: space::XL,
+            })
+            .style(move |_| container::Style::default().background(theme.panel_background))
+            .into();
+    }
     let Some(details) = session.revision_details.as_ref() else {
         return container(stats.unwrap_or_else(|| Space::new().into()))
             .width(Length::Fill)

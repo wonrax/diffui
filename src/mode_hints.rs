@@ -74,6 +74,22 @@ fn active_hints(ui: &Diffui) -> Option<(Context, Vec<Hint>)> {
             ],
         ));
     }
+    if let Some(mode) = crate::range::mode(ui) {
+        use crate::range::RangeMode;
+        let mut hints = Vec::new();
+        let leave = match mode {
+            RangeMode::Since => {
+                hints.push(hint(&[], "Click a revision to move the end"));
+                "stop diffing since trunk"
+            }
+            RangeMode::Span(_) => "clear the marks",
+            RangeMode::Fixed => "leave the range",
+        };
+        hints.push(hint(&["range.edit"], "edit revset"));
+        hints.push(hint(&["compare.exit"], leave));
+        hints.push(hint(&["selection.clear"], leave));
+        return Some((Context::Base, hints));
+    }
     if crate::compare::comparing(ui) {
         let mut hints = vec![
             hint(&["compare.swap"], "swap sides"),
