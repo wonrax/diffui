@@ -136,7 +136,7 @@ impl RevsetScope<'_> {
                 Err(
                     RevsetError::new("Cannot diff revsets with gaps in.").with_hint(format!(
                         "Revision {} would need to be in the set.",
-                        short_hash(&id)
+                        jj_cli::cli_util::short_commit_hash(&id)
                     )),
                 )
             }
@@ -361,11 +361,6 @@ fn single(src: &str, count: usize) -> Result<(), RevsetError> {
             "Revset `{src}` resolved to more than one revision"
         ))),
     }
-}
-
-/// jj's `short_commit_hash`: the first 12 hex digits.
-fn short_hash(id: &CommitId) -> String {
-    id.hex().chars().take(12).collect()
 }
 
 fn evaluation_error(error: jj_lib::revset::RevsetEvaluationError) -> RevsetError {

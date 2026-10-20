@@ -1177,8 +1177,10 @@ async fn mutate_locked(
                 restore_target.expect("a restore resolves its target before the fold");
             let restored = super::history::restored_view(&view, tx.base_repo().view().store_view());
             tx.repo_mut().set_view(restored);
-            let hex = operation.id().hex();
-            format!("Restored to operation {}", &hex[..hex.len().min(12)])
+            format!(
+                "Restored to operation {}",
+                jj_cli::cli_util::short_operation_hash(operation.id())
+            )
         }
     };
 

@@ -9,14 +9,17 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use jj_cli::{cli_util::export_working_copy_changes_to_git, ui::Ui};
 use jj_lib::{
-    git::{GitResetHeadError, export_refs, get_git_backend, reset_head, update_intent_to_add},
+    git::{GitResetHeadError, export_refs, get_git_backend, reset_head},
     git_backend::GitRepoAtWorkdirError,
     merged_tree::MergedTree,
     ref_name::WorkspaceName,
     repo::{MutableRepo, Repo},
     store::Store,
 };
+
+use super::settings::cli_error;
 
 /// Whether `workspace_root` is a git worktree of the repo jj stores into —
 /// jj-cli's `is_colocated_git_workspace`. Each git worktree has its own `HEAD`,
@@ -72,7 +75,9 @@ pub(crate) async fn sync_git_after_transaction(
 
 /// A snapshot in a colocated workspace: mark newly tracked files
 /// intent-to-add in git's index (so `git diff` shows them) and export the
-/// bookmarks the snapshot's descendant rebase may have moved.
+/// bookmarks the snapshot's descendant rebase may have moved. That's jj-cli's
+/// `export_working_copy_changes_to_git`, which the CLI also runs only when
+/// colocated.
 pub(crate) async fn sync_git_after_snapshot(
     mut_repo: &mut MutableRepo,
     workspace_root: &Path,
@@ -82,10 +87,8 @@ pub(crate) async fn sync_git_after_snapshot(
     if !is_colocated(mut_repo.store(), workspace_root)? {
         return Ok(());
     }
-    let base = mut_repo.base_repo().clone();
-    update_intent_to_add(base.as_ref(), workspace_root, old_tree, new_tree)
+    export_working_copy_changes_to_git(&Ui::null(), mut_repo, workspace_root, old_tree, new_tree)
         .await
-        .context("failed to update the colocated git index")?;
-    export_refs(mut_repo).context("failed to export bookmarks to the git backend")?;
-    Ok(())
+        .map_err(cli_error)
+        .context("failed to update the colocated git index")
 }

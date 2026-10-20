@@ -559,7 +559,7 @@ pub(super) fn describe_resolution_error(
     error: jj_lib::revset::RevsetResolutionError,
 ) -> anyhow::Error {
     use jj_lib::revset::RevsetResolutionError as E;
-    let short = |id: &CommitId| id.hex().chars().take(12).collect::<String>();
+    let short = jj_cli::cli_util::short_commit_hash;
     match &error {
         E::ConflictedRef {
             kind: "bookmark",

@@ -25,7 +25,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 use futures::{StreamExt, TryStreamExt};
 use jj_cli::{
-    cli_util::load_template_aliases,
+    cli_util::{has_tracked_remote_bookmarks, load_template_aliases, short_commit_hash},
     commit_templater::{CommitTemplateLanguage, CommitTemplateLanguageExtension},
     revset_util::parse_immutable_heads_expression,
     template_builder,
@@ -722,7 +722,7 @@ async fn check_commits(
 fn rejected_commit(commit: &Commit, reasons: Vec<PushCheck>, wc: &CommitId) -> RejectedCommit {
     RejectedCommit {
         change_id: short_change_id(commit),
-        commit_id: commit.id().hex().chars().take(12).collect(),
+        commit_id: short_commit_hash(commit.id()),
         subject: commit
             .description()
             .lines()
@@ -764,7 +764,7 @@ async fn describe_updates(
     repo: &MutableRepo,
     updates: &[(RefNameBuf, Diff<Option<CommitId>>)],
 ) -> Vec<String> {
-    let short = |id: &CommitId| id.hex().chars().take(12).collect::<String>();
+    let short = short_commit_hash;
     let mut lines = Vec::new();
     for (name, update) in updates {
         let what = match (&update.before, &update.after) {
@@ -786,18 +786,6 @@ async fn describe_updates(
         lines.push(format!("bookmark: {} [{what}]", name.as_str()));
     }
     lines
-}
-
-/// Whether any real remote (not the colocated `git` pseudo-remote) tracks
-/// `name` — the CLI's `has_tracked_remote_bookmarks`.
-pub(super) fn has_tracked_remote_bookmarks(repo: &dyn Repo, name: &RefName) -> bool {
-    repo.view()
-        .all_remote_bookmarks()
-        .any(|(symbol, remote_ref)| {
-            symbol.name == name
-                && symbol.remote != REMOTE_NAME_FOR_LOCAL_GIT_REPO
-                && remote_ref.is_tracked()
-        })
 }
 
 /// The CLI's `ensure_new_bookmark_name` for `--change`.
