@@ -108,11 +108,12 @@ impl Diffui {
         ui.preview = DraftPreviewState::Loading;
         // The request is destination-shaped for rebases; parallelize ignores
         // the slot (see `parked_preview_request`).
-        ui.preview_request = Some(PreviewRequest {
+        ui.preview_request = Some(Box::new(PreviewRequest {
             kind: ui.draft.kind,
             destination: mutations::Destination::Onto(sources[0].clone()),
             sources,
-        });
+            selection: None,
+        }));
         Task::perform(tokio::time::sleep(Duration::from_millis(250)), move |()| {
             Message::Ui(UiEvent::DraftPreviewKick(version))
         })
@@ -663,6 +664,13 @@ mod tests {
 
     #[test]
     fn insert_new_change_somewhere_else_arms_the_clicked_row() {
+        // An armed draft kicks the debounced preview, whose timer needs a
+        // runtime to be created in.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("a test runtime");
+        let _context = runtime.enter();
         let mut ui = loaded(graph());
         let b = RevisionSelection::Commit("b".repeat(8));
         let _ = ui.run_command("revision.new.start", CommandArg::Revision(b));

@@ -351,6 +351,8 @@ pub(crate) fn empty_revision_row(theme: ThemeSpec) -> RevisionRowView {
         draft_source: false,
         multi_selected: false,
         draft_marker: None,
+        inert: false,
+        ghost: false,
     }
 }
 

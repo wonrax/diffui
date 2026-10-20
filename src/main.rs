@@ -24,6 +24,7 @@ mod editor_drag;
 mod empty_states;
 mod field;
 mod find;
+mod graph_preview;
 mod graph_view;
 mod history_panel;
 mod icons;
@@ -474,7 +475,11 @@ pub(crate) struct DraftUi {
     /// so rapid candidate hops expire here without ever reaching the
     /// backend (each stale hop would otherwise run a full simulation and
     /// write throwaway objects).
-    pub(crate) preview_request: Option<PreviewRequest>,
+    pub(crate) preview_request: Option<Box<PreviewRequest>>,
+    /// The graph the last simulation would leave, laid over the loaded rows.
+    /// Kept until the next one lands, like `moved_highlight`, so j/k sweeps
+    /// don't flash the plain graph between candidates.
+    pub(crate) graph: Option<graph_preview::Laid>,
 }
 
 /// A ready-to-run draft simulation: everything `kick_draft_preview` resolved
@@ -485,6 +490,8 @@ pub(crate) struct PreviewRequest {
     pub(crate) kind: diffui_core::DraftKind,
     pub(crate) sources: Vec<diffui_core::RevisionSelection>,
     pub(crate) destination: diffui_core::Destination,
+    /// A squash draft's picked changes ("Move selected into…").
+    pub(crate) selection: Option<Box<diffui_core::DiffSelection>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -507,6 +514,7 @@ impl DraftUi {
             preview: DraftPreviewState::Idle,
             moved_highlight: HashSet::new(),
             preview_request: None,
+            graph: None,
         }
     }
 }
@@ -775,6 +783,8 @@ pub(crate) struct TabState {
     pub(crate) changes: changes::ChangesState,
     /// The history views: op log, evolog, file filter, annotate.
     pub(crate) history: history_panel::HistoryState,
+    /// The post-op graph the sidebar draws in place of the loaded one.
+    pub(crate) graph_preview: graph_preview::GraphPreviewState,
 }
 
 impl TabState {
@@ -813,6 +823,7 @@ impl TabState {
             pending_commit: false,
             changes: Default::default(),
             history: Default::default(),
+            graph_preview: Default::default(),
         }
     }
 

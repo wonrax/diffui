@@ -479,9 +479,11 @@ impl Diffui {
             {
                 self.finish_trunk_preview(tab, job, Ok(simulation))
             }
-            Payload::PreviewDone { simulation, .. } => {
+            Payload::PreviewDone {
+                simulation, graph, ..
+            } => {
                 self.tab_mut(tab)?.jobs.preview = None;
-                self.apply_draft_preview(tab, Ok(simulation.clone()))
+                self.apply_draft_preview(tab, Ok((simulation.clone(), graph.clone())))
             }
             Payload::TreeListed {
                 revision, entries, ..
@@ -653,6 +655,7 @@ impl Diffui {
                         draft.hover_spot = None;
                         draft.preview = DraftPreviewState::Idle;
                         draft.preview_request = None;
+                        draft.graph = None;
                     }
                 }
                 Effect::RevealSelection => {
@@ -703,6 +706,7 @@ impl Diffui {
         // A mode that isn't on screen must not keep the keyboard.
         self.prune_stale_modes();
         crate::app_menu::refresh_availability(self);
+        self.keep_graph_anchor();
         let welcome = self.ensure_welcome_prompt();
         let conflicts = self.sync_conflicts();
         let history = self.sync_history();
@@ -832,6 +836,7 @@ impl Diffui {
                     .op_draft()
                     .and_then(|ui| ui.draft.op_from_sources())
                 {
+                    self.hold_applied_preview();
                     self.active_mut().pop_mode(ModeKind::Draft);
                     return self.start_mutation_op(op);
                 }
@@ -1419,8 +1424,24 @@ impl Diffui {
                 let path = file.path.clone();
                 return self.open_source_browser(revision, Some(path));
             }
-            UiEvent::RevisionDragStart(index) => return self.on_drag_start(index),
+            UiEvent::RevisionDragStart(row) => {
+                // A ghost or landed row drags the commit it stands for.
+                let Some(index) = self.active().origin_row(row) else {
+                    return Task::none();
+                };
+                return self.on_drag_start(index);
+            }
             UiEvent::RevisionDragHover(spot) => {
+                // Over a preview-only row (a ghost, where the moved commits
+                // land), the spot stays where it was: the preview put those
+                // rows under the cursor, they aren't somewhere new to aim.
+                let spot = match spot {
+                    Some(spot) => match self.active().loaded_spot(spot) {
+                        Some(spot) => Some(spot),
+                        None => return Task::none(),
+                    },
+                    None => None,
+                };
                 let Some(draft) = self.active_mut().op_draft_mut() else {
                     return Task::none();
                 };
@@ -1434,12 +1455,21 @@ impl Diffui {
                 };
                 return self.kick_draft_preview();
             }
-            UiEvent::RevisionDragDrop(spot) => return self.on_drag_drop(spot),
+            UiEvent::RevisionDragDrop(spot) => {
+                // Released over a preview-only row: drop where the preview
+                // shows it landing.
+                let spot = spot.and_then(|spot| {
+                    self.active()
+                        .loaded_spot(spot)
+                        .or_else(|| self.active().op_draft().and_then(|draft| draft.hover_spot))
+                });
+                return self.on_drag_drop(spot);
+            }
             UiEvent::DraftHoverCandidate(index) => {
                 // Mouse-hover targeting: arm the hovered row as the candidate,
                 // exactly like j/k. Leaving the rows (`None`) keeps the last
                 // candidate armed — same persistence the keyboard gets.
-                let Some(index) = index else {
+                let Some(index) = index.and_then(|row| self.active().target_row(row)) else {
                     return Task::none();
                 };
                 let target = self.active_mut();
@@ -2516,6 +2546,8 @@ impl Diffui {
             return Task::none();
         };
         let mut draft = ui.draft.clone();
+        // The preview on screen is of this drop unless ⌥ changes the move.
+        let previewed = ui.hover_spot == Some(spot) && !self.modifiers.alt();
         // ⌥ held at drop upgrades the move to "with descendants".
         if self.modifiers.alt()
             && let mutations::DraftKind::Rebase { mode } = &mut draft.kind
@@ -2548,6 +2580,9 @@ impl Diffui {
         };
         match op {
             Some(op) => {
+                if previewed {
+                    self.hold_applied_preview();
+                }
                 self.active_mut().pop_mode(ModeKind::Draft);
                 self.start_mutation_op(op)
             }
@@ -2571,7 +2606,7 @@ impl Diffui {
         if draft.preview_version != version {
             return Task::none();
         }
-        let Some(request) = draft.preview_request.take() else {
+        let Some(request) = draft.preview_request.take().map(|request| *request) else {
             return Task::none();
         };
         let draft = match request.kind {
@@ -2589,8 +2624,19 @@ impl Diffui {
                     parents: request.sources.into_iter().chain([anchor]).collect(),
                 }
             }
-            // Filtered out before the request was parked.
-            mutations::DraftKind::Squash => return Task::none(),
+            // Gap drops squash into the gap's parent side, the anchor.
+            mutations::DraftKind::Squash => diffui_core::PreviewRequest::Squash {
+                into: request.destination.anchor().clone(),
+                sources: request.sources,
+                selection: request.selection.map(|selection| *selection),
+            },
+            mutations::DraftKind::New => diffui_core::PreviewRequest::NewAt {
+                destination: request.destination,
+            },
+            mutations::DraftKind::Duplicate => diffui_core::PreviewRequest::Duplicate {
+                targets: request.sources,
+                destination: request.destination,
+            },
             _ => match crate::revops::parked_preview_request(request) {
                 Some(draft) => draft,
                 None => return Task::none(),
@@ -2696,12 +2742,35 @@ impl Diffui {
     fn apply_draft_preview(
         &mut self,
         tab: TabId,
-        result: Result<mutations::DraftSimulation, String>,
+        result: Result<
+            (
+                mutations::DraftSimulation,
+                Option<std::sync::Arc<diffui_core::PostOpGraph>>,
+            ),
+            String,
+        >,
     ) -> Task<Message> {
-        let Some(ui) = self.tab_mut(tab).and_then(|target| target.op_draft_mut()) else {
+        let Some(target) = self.tab_mut(tab) else {
             return Task::none();
         };
-        ui.preview = match result {
+        // Laid over the rows on screen now; a graph load that replaces them
+        // also drops this (see `Effect::GraphReplaced`).
+        let laid = match &result {
+            Ok((_, Some(post))) => {
+                diffui_core::PreviewGraph::arrange(post, &target.session.commits).map(|graph| {
+                    crate::graph_preview::Laid {
+                        version: target.session.graph_version(),
+                        graph: std::rc::Rc::new(graph),
+                    }
+                })
+            }
+            _ => None,
+        };
+        let Some(ui) = target.op_draft_mut() else {
+            return Task::none();
+        };
+        ui.graph = laid;
+        ui.preview = match result.map(|(simulation, _)| simulation) {
             Ok(preview) => {
                 // Refresh the whole-moved-set wash (branch mode's "which
                 // branch is this?" answer); merge simulations and failures
@@ -3944,10 +4013,15 @@ impl Diffui {
         let Some(ui) = self.active().op_draft() else {
             return Task::none();
         };
+        let previewed = placement_override.is_none_or(|placement| placement == ui.draft.placement)
+            && ui.hover_spot.is_none();
         let placement = placement_override.unwrap_or(ui.draft.placement);
         let Some(op) = ui.draft.op_for(target, placement) else {
             return Task::none();
         };
+        if previewed {
+            self.hold_applied_preview();
+        }
         self.active_mut().pop_mode(ModeKind::Draft);
         self.start_mutation_op(op)
     }
@@ -4113,27 +4187,16 @@ impl Diffui {
         // The Idle paths must also drop any parked request: they don't bump
         // the version, so a still-running debounce timer would otherwise
         // pick the stale request up and revive a destination the user left.
-        if matches!(
-            ui.draft.kind,
-            mutations::DraftKind::Squash
-                | mutations::DraftKind::New
-                | mutations::DraftKind::Duplicate
-        ) {
-            // Squash has no simulation (it rarely conflicts and the op bar
-            // already names the fold target); neither does inserting an
-            // empty change, and duplicate's copies are left unsimulated.
-            ui.preview = DraftPreviewState::Idle;
-            ui.preview_request = None;
-            return Task::none();
-        }
         let Some(destination) = destination else {
             ui.preview = DraftPreviewState::Idle;
             ui.preview_request = None;
+            ui.graph = None;
             return Task::none();
         };
         if anchor_blocked {
             ui.preview = DraftPreviewState::Idle;
             ui.preview_request = None;
+            ui.graph = None;
             return Task::none();
         }
         let mut sources: Vec<RevisionSelection> = ui
@@ -4148,11 +4211,12 @@ impl Diffui {
         ui.preview_version = ui.preview_version.wrapping_add(1);
         let version = ui.preview_version;
         ui.preview = DraftPreviewState::Loading;
-        ui.preview_request = Some(crate::PreviewRequest {
+        ui.preview_request = Some(Box::new(crate::PreviewRequest {
             kind: ui.draft.kind,
             sources,
             destination,
-        });
+            selection: ui.draft.selection.clone(),
+        }));
         // Debounce: only the version crosses the timer. `DraftPreviewKick`
         // spawns the parked simulation iff the version is still current, so
         // rapid j/j/j candidate hops expire without touching the backend.

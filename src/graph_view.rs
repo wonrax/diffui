@@ -285,6 +285,9 @@ pub fn draw_revision_row<R>(
     // of which lane it happens to live in. Edges still wear their lane
     // colors — only the disc gets overridden.
     node_color_override: Option<Color>,
+    // A ghost row (a previewed commit's old place): the node is a hollow
+    // ring filled with this background instead of a disc.
+    hollow_node: Option<Color>,
     // When `Some(lane)`, the incoming (top-half) strokes for that lane
     // render thicker. Separate from `emphasized_lane_after` because a
     // merge can reuse a lane index for an unrelated outgoing branch,
@@ -465,7 +468,21 @@ pub fn draw_revision_row<R>(
         );
     }
     let disc_path = Path::new(|b| b.circle(Point::new(x_node, mid), NODE_RADIUS));
-    frame.fill(&disc_path, disc_color);
+    match hollow_node {
+        Some(background) => {
+            frame.fill(&disc_path, background);
+            frame.stroke(
+                &disc_path,
+                Stroke::default()
+                    .with_color(Color {
+                        a: 0.7,
+                        ..disc_color
+                    })
+                    .with_width(1.25),
+            );
+        }
+        None => frame.fill(&disc_path, disc_color),
+    }
 
     renderer.draw_geometry(frame.into_geometry());
 }

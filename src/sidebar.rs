@@ -16,7 +16,7 @@ use crate::revision_list::{
 use crate::theme::{self, ThemeSpec, chip_background, emphasis_font, sidebar_panel_style};
 use crate::typography::{self, Aligned};
 use crate::{Action, Diffui, HoverTarget, LoadStatus, Message, ToolbarMenu, UiEvent};
-use diffui_core::{CommitStore, DiffFile, FileTreeRow, RevisionSelection, RowView, file_tree_rows};
+use diffui_core::{DiffFile, FileTreeRow, RevisionSelection, RowView, file_tree_rows};
 use std::collections::HashSet;
 use std::rc::Rc;
 
@@ -969,16 +969,16 @@ fn thousands(n: usize) -> String {
 
 fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
     let graph_style = revision_graph_style(theme);
-    let reveal_target = ui
-        .active()
+    let tab = ui.active();
+    let reveal_target = tab
         .op_draft()
         .as_ref()
-        .and_then(|draft| draft.draft.candidate);
+        .and_then(|draft| draft.draft.candidate)
+        .and_then(|candidate| tab.list_row(candidate));
 
     // The per-row lane fold + prefix lengths are precomputed once and held in
     // `Diffui`; the closures below build a single visible row's view from them
     // on demand, so the widget never materializes all ~N rows.
-    let tab = ui.active();
     let graph = &tab.session.graph;
     let prefix_lens = &tab.session.sidebar_prefix_lens;
     let commits = &tab.session.commits;
@@ -986,21 +986,44 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
     let config = ui.config;
     let draft = tab.op_draft();
     let tags = &tab.session.bookmarks.tags;
-    let build_revision = Box::new(move |index: usize| {
-        let mut row = build_revision_row(
-            commits,
-            graph,
-            prefix_lens,
-            theme,
-            config,
-            &graph_style,
-            multi_selection,
-            draft,
-            index,
-        );
+    // While a draft is previewed the list's rows are the post-op graph's.
+    let preview = tab.shown_preview().cloned();
+    let row_count = preview
+        .as_ref()
+        .map_or(commits.len(), |preview| preview.len());
+    let build_revision = Box::new(move |row: usize| {
+        let prefix_len = |index: usize| prefix_lens.get(index).copied();
+        let slot = match &preview {
+            Some(preview) => {
+                let role = preview.rows[row];
+                let commit = preview.commit(commits, row);
+                RowSlot {
+                    commit,
+                    layout: &preview.layout,
+                    row,
+                    unique_len: match role.source {
+                        diffui_core::RowSource::Loaded(index) => prefix_len(index),
+                        diffui_core::RowSource::Extra(_) => commit.shortest_change_id_len(),
+                    },
+                    target: preview.target_at(row),
+                    preview: Some(role),
+                }
+            }
+            None => RowSlot {
+                commit: commits.row(row),
+                layout: graph,
+                row,
+                unique_len: prefix_len(row),
+                target: Some(row),
+                preview: None,
+            },
+        };
+        let ghost = slot.preview.is_some_and(|row| row.role.is_ghost());
+        let commit_id = slot.commit.commit_id();
+        let mut row = build_revision_row(slot, theme, config, &graph_style, multi_selection, draft);
         // Tags trail the bookmarks, so the rail's `+N` overflow sheds them
         // first.
-        if let Some(tags) = tags.get(commits.row(index).commit_id()) {
+        if !ghost && let Some(tags) = tags.get(commit_id) {
             row.bookmark_chips
                 .extend(tag_chips_for(tags, theme, config));
         }
@@ -1021,13 +1044,15 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
         list_style.background = draft_panel_background(theme);
     }
     let mut list = RevisionList::new(
-        ui.active().session.commits.len(),
+        row_count,
         None,
         build_revision,
         build_file,
         selected_row,
         None,
-        ui.active().session.selected_commit_index,
+        tab.session
+            .selected_commit_index
+            .and_then(|index| tab.list_row(index)),
         list_style,
         |key| Message::Ui(UiEvent::SelectRowKey(key)),
         |row| Message::Ui(UiEvent::SidebarFileRow(row)),
@@ -1050,32 +1075,75 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
                 hover: |spot| Message::Ui(UiEvent::RevisionDragHover(spot)),
                 drop: |spot| Message::Ui(UiEvent::RevisionDragDrop(spot)),
             })
-            .gap_edges(Box::new(|index| {
-                ui.active().session.commits.row(index).next_row_is_parent()
+            .gap_edges(Box::new(move |row| {
+                // A gap is a real parent edge between two loaded rows that are
+                // neighbours in the list too.
+                match (tab.target_row(row), tab.target_row(row + 1)) {
+                    (Some(above), Some(below)) => {
+                        below == above + 1 && commits.row(above).next_row_is_parent()
+                    }
+                    _ => false,
+                }
             }));
         if ui.active().op_draft().is_some() {
             list = list.on_target_hover(|index| Message::Ui(UiEvent::DraftHoverCandidate(index)));
+        }
+        // A preview rearranges the rows under a still cursor: draw the drop
+        // where the draft has it, not where the cursor last reported it.
+        if tab.shown_preview().is_some()
+            && let Some(spot) = tab.op_draft().and_then(|draft| draft.hover_spot)
+        {
+            let shown = match spot {
+                revision_list::DropSpot::OnRow(index) => {
+                    tab.list_row(index).map(revision_list::DropSpot::OnRow)
+                }
+                revision_list::DropSpot::Gap { above, below } => tab
+                    .list_row(above)
+                    .zip(tab.list_row(below))
+                    .map(|(above, below)| revision_list::DropSpot::Gap { above, below }),
+            };
+            list = list.drop_indicator(shown);
         }
     }
     list.into()
 }
 
+/// One list row's inputs: its commit data, where its lanes live, and how it
+/// relates to the loaded graph.
+struct RowSlot<'a> {
+    commit: RowView<'a>,
+    layout: &'a GraphLayout,
+    /// The row's index in `layout` (and in the list).
+    row: usize,
+    unique_len: Option<usize>,
+    /// The loaded row this row aims at as a draft destination.
+    target: Option<usize>,
+    /// What the previewed operation does to it, while a preview is drawn.
+    preview: Option<diffui_core::PreviewRow>,
+}
+
 /// Build the display view for one revision row from the precomputed fold +
 /// store. Called only for on-screen rows.
-#[allow(clippy::too_many_arguments)]
 fn build_revision_row(
-    commits: &CommitStore,
-    graph: &GraphLayout,
-    prefix_lens: &[usize],
+    slot: RowSlot<'_>,
     theme: ThemeSpec,
     config: AppConfig,
     graph_style: &RevisionGraphStyle,
     multi_selection: &[String],
     draft: Option<&crate::DraftUi>,
-    index: usize,
 ) -> RevisionRowView {
-    let commit = commits.row(index);
-    let change_id = commit.change_id();
+    let RowSlot {
+        commit,
+        layout: graph,
+        row: index,
+        unique_len,
+        target,
+        preview,
+    } = slot;
+    let role = preview.map(|row| row.role);
+    let ghost = role.is_some_and(diffui_core::PreviewRole::is_ghost);
+    let created = role == Some(diffui_core::PreviewRole::Created);
+    let change_id = if created { "" } else { commit.change_id() };
     let lane_frame = graph.frame(index, usize::MAX);
     // Warped display columns for this row and the one above (row 0 has no
     // transition, so its own packing stands in).
@@ -1085,8 +1153,8 @@ fn build_revision_row(
     } else {
         columns.clone()
     };
-    let bookmarks = commit.bookmarks();
-    let unique_len = prefix_lens.get(index).copied().unwrap_or(REVISION_ID_CHARS);
+    let bookmarks = if ghost { &[] } else { commit.bookmarks() };
+    let unique_len = unique_len.unwrap_or(REVISION_ID_CHARS);
     let label_len = revision_id_display_len(unique_len, change_id);
     let id_prefix: String = change_id.chars().take(unique_len).collect();
     let mut id_suffix: String = change_id
@@ -1103,8 +1171,9 @@ fn build_revision_row(
     // Git has no change ids: its rows carry the commit hash in both slots, and
     // its synthesized working copy a placeholder in both. Show the hash once,
     // and nothing but the `@` marker on the working copy.
-    let single_id =
-        commit.commit_id().starts_with(change_id) || change_id.starts_with(commit.commit_id());
+    let single_id = created
+        || commit.commit_id().starts_with(change_id)
+        || change_id.starts_with(commit.commit_id());
     let (id_prefix, id_suffix) = if single_id && commit.is_working_copy() {
         (String::new(), String::new())
     } else {
@@ -1118,9 +1187,25 @@ fn build_revision_row(
 
     let lane_color = graph_style.lane_color(lane_frame.node_lane);
     let bookmark_chips = bookmark_chips_for(bookmarks, lane_color, theme, config);
-    let mut status_chips = status_chips_for(commit, theme, config);
+    let mut status_chips = if ghost {
+        Vec::new()
+    } else {
+        status_chips_for(commit, theme, config)
+    };
+    // A conflict the operation would cause wears the outlined (forecast)
+    // form of the conflict chip.
+    if preview.is_some_and(|row| row.new_conflict) {
+        for chip in status_chips
+            .iter_mut()
+            .filter(|chip| chip.label == "conflict")
+        {
+            chip.background = Color::TRANSPARENT;
+            chip.border_color = Some(theme.conflict_marker);
+            chip.border_dashed = true;
+        }
+    }
 
-    let selection_key = if commit.is_working_copy() {
+    let selection_key = if commit.is_working_copy() && !ghost {
         RowSelectionKey::WorkingCopy
     } else {
         RowSelectionKey::Commit(commit.commit_id().to_owned())
@@ -1132,9 +1217,12 @@ fn build_revision_row(
     // so a branch-mode draft shows the whole branch that would move. The
     // keyboard candidate wears its destination marker (the widget draws live
     // *drag* indicators itself, so they're suppressed here mid-drag).
-    let draft_source = draft.is_some_and(|ui| {
-        ui.draft.is_source(commit.commit_id()) || ui.moved_highlight.contains(commit.commit_id())
-    });
+    let draft_source = !ghost
+        && !created
+        && draft.is_some_and(|ui| {
+            ui.draft.is_source(commit.commit_id())
+                || ui.moved_highlight.contains(commit.commit_id())
+        });
     let draft_marker = draft.and_then(|ui| {
         use diffui_core::{DraftKind, PlacementKind};
         use revision_list::DraftMarker;
@@ -1151,7 +1239,7 @@ fn build_revision_row(
             return None;
         }
         let candidate = ui.draft.candidate?;
-        (candidate == index).then_some(match ui.draft.kind {
+        (Some(candidate) == target).then_some(match ui.draft.kind {
             DraftKind::Squash | DraftKind::Merge | DraftKind::Parallelize => DraftMarker::Ring,
             DraftKind::Rebase { .. } | DraftKind::New | DraftKind::Duplicate => {
                 match ui.draft.placement {
@@ -1207,7 +1295,7 @@ fn build_revision_row(
                 None
             } else {
                 match ui.hover_spot {
-                    Some(revision_list::DropSpot::OnRow(spot)) if spot == index => {
+                    Some(revision_list::DropSpot::OnRow(spot)) if Some(spot) == target => {
                         Some(match ui.draft.kind {
                             // Drops land Onto regardless of the armed placement.
                             DraftKind::Rebase { .. }
@@ -1219,7 +1307,11 @@ fn build_revision_row(
                         })
                     }
                     Some(_) => None,
-                    None => (ui.draft.candidate == Some(index)).then_some(match ui.draft.kind {
+                    None => (ui
+                        .draft
+                        .candidate
+                        .is_some_and(|candidate| Some(candidate) == target))
+                    .then_some(match ui.draft.kind {
                         DraftKind::Rebase { .. }
                         | DraftKind::New
                         | DraftKind::Duplicate
@@ -1249,6 +1341,28 @@ fn build_revision_row(
             }
         }
     }
+    // A commit the operation creates says which kind, in the same outlined
+    // language as the moving rows.
+    if created && let Some(ui) = draft {
+        use diffui_core::DraftKind;
+        status_chips.insert(
+            0,
+            Chip {
+                label: match ui.draft.kind {
+                    DraftKind::Merge => "merge",
+                    DraftKind::Duplicate => "copy",
+                    _ => "new",
+                }
+                .to_owned(),
+                font: config.mono_font,
+                background: Color::TRANSPARENT,
+                text_color: theme.accent,
+                border_color: Some(theme.accent),
+                border_dashed: true,
+                icon: None,
+            },
+        );
+    }
 
     let lane = graph.fold(index, usize::MAX);
     RevisionRowView {
@@ -1270,8 +1384,10 @@ fn build_revision_row(
         lane_segments_after: lane.segments_after,
         collapse_chevron: None,
         draft_source,
-        multi_selected,
+        multi_selected: multi_selected && !ghost,
         draft_marker,
+        inert: role.is_some_and(|role| !role.is_target()),
+        ghost,
     }
 }
 
@@ -1525,7 +1641,7 @@ fn commit_description_color(commit: RowView, theme: ThemeSpec) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use diffui_core::{CommitStoreBuilder, CommitSummary};
+    use diffui_core::{CommitStore, CommitStoreBuilder, CommitSummary};
 
     fn commit_summary(change_id: &str) -> CommitSummary {
         CommitSummary {

@@ -84,6 +84,9 @@ const TOOLTIP_RADIUS: f32 = crate::theme::radius::SURFACE;
 const TOOLTIP_PADDING_X: f32 = 9.0;
 const TOOLTIP_PADDING_Y: f32 = 6.0;
 const TOOLTIP_GAP: f32 = 8.0;
+/// How much of a ghost row's text shows through (see
+/// [`RevisionRowView::ghost`]).
+const GHOST_TEXT_ALPHA: f32 = 0.4;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RevisionListStyle {
@@ -169,6 +172,12 @@ pub struct RevisionRowView {
     pub multi_selected: bool,
     /// Target mode: the keyboard candidate's destination decoration.
     pub draft_marker: Option<DraftMarker>,
+    /// A previewed row that only shows the result (where commits land, a
+    /// created commit, a ghost): it can't be selected or aimed at.
+    pub inert: bool,
+    /// A previewed ghost: where a moved or abandoned commit used to be,
+    /// drawn faded with a hollow node.
+    pub ghost: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -351,6 +360,9 @@ pub struct RevisionList<'a, Message> {
     /// Extra leading inset for the row cards — see
     /// [`RevisionList::at_window_edge`].
     leading_edge: f32,
+    /// The drop spot to draw while dragging, when the caller knows better
+    /// than the cursor — see [`RevisionList::drop_indicator`].
+    drop_indicator: Option<Option<DropSpot>>,
 }
 
 /// Callbacks for the drag-to-rebase gesture. All `fn` pointers, like the
@@ -404,7 +416,17 @@ impl<'a, Message> RevisionList<'a, Message> {
             on_target_hover: None,
             slot: ListSlot::Revisions,
             leading_edge: 0.0,
+            drop_indicator: None,
         }
+    }
+
+    /// Draw the live drag's drop decoration at `spot` (list rows) instead of
+    /// at the spot under the cursor. For when the rows were rearranged under
+    /// a still cursor (a previewed result), so the spot it last reported is
+    /// stale while the drop itself stays where it was.
+    pub fn drop_indicator(mut self, spot: Option<DropSpot>) -> Self {
+        self.drop_indicator = Some(spot);
+        self
     }
 
     /// Mark this list as the source browser's file tree, so it keeps its own
@@ -1197,7 +1219,9 @@ where
                                 // drag): publishing on press meant starting a
                                 // drag on the selected row toggled its file list
                                 // before the drag ever armed.
-                                if let Item::Revision(rev) = self.item_at(row_idx) {
+                                if let Item::Revision(rev) = self.item_at(row_idx)
+                                    && !rev.inert
+                                {
                                     state.pending_click = Some((row_idx, rev.selection_key));
                                 }
                                 shell.capture_event();
@@ -1533,7 +1557,7 @@ where
                         height: REVISION_ROW_HEIGHT,
                     })
                 };
-                match drag.spot {
+                match self.drop_indicator.unwrap_or(drag.spot) {
                     Some(DropSpot::OnRow(commit)) => {
                         if let Some(rect) = row_rect(commit) {
                             let card = Rectangle {
@@ -1749,11 +1773,13 @@ impl<'a, Message> RevisionList<'a, Message> {
     ) where
         R: text::Renderer + iced::advanced::graphics::geometry::Renderer,
     {
-        let selected = self
-            .selected_row
-            .as_ref()
-            .map(|key| key == &rev.selection_key)
-            .unwrap_or(false);
+        let selected = !rev.inert
+            && self
+                .selected_row
+                .as_ref()
+                .map(|key| key == &rev.selection_key)
+                .unwrap_or(false);
+        let hovered = hovered && !rev.inert;
         let is_working_copy = matches!(rev.selection_key, RowSelectionKey::WorkingCopy);
 
         // Row chrome is an inset rounded card rather than an edge-to-edge
@@ -1958,13 +1984,25 @@ impl<'a, Message> RevisionList<'a, Message> {
             (has_commit_id && !show_commit_id) || (!show_author && !rev.author.is_empty());
 
         // === Color selection ===
+        // A ghost's text recedes; its lanes (other branches passing through)
+        // stay at full strength.
+        let fade = |color: Color| {
+            if rev.ghost {
+                Color {
+                    a: color.a * GHOST_TEXT_ALPHA,
+                    ..color
+                }
+            } else {
+                color
+            }
+        };
         let (col_at, col_id_prefix, col_id_suffix, col_commit, col_author, col_ellipsis) = (
-            self.style.accent,
-            self.style.accent_text,
-            self.style.subtle_text,
-            self.style.muted_text,
-            self.style.subtle_text,
-            self.style.subtle_text,
+            fade(self.style.accent),
+            fade(self.style.accent_text),
+            fade(self.style.subtle_text),
+            fade(self.style.muted_text),
+            fade(self.style.subtle_text),
+            fade(self.style.subtle_text),
         );
 
         // === Draw left-side flowing content ===
@@ -2162,7 +2200,7 @@ impl<'a, Message> RevisionList<'a, Message> {
             desc_mid_y,
             description_width,
             desc_size,
-            rev.description_color,
+            fade(rev.description_color),
             self.style.primary_font,
             row_clip,
         );
@@ -2205,6 +2243,7 @@ impl<'a, Message> RevisionList<'a, Message> {
             &rev.prev_columns,
             &self.style.graph,
             node_override,
+            rev.ghost.then_some(self.style.background),
             emphasized_lane_before,
             emphasized_lane_after,
         );
