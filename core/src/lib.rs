@@ -29,6 +29,7 @@ pub mod syntax;
 pub mod watcher;
 
 // Curated flat surface a frontend builds against.
+pub use cli::{CliCommand, JjCli, ParsedCommand};
 pub use diff_parse::{DiffStreamParser, format_hunk_header, parse_unified_diff};
 pub use model::*;
 pub use mutations::{
