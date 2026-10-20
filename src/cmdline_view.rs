@@ -58,7 +58,11 @@ pub(crate) fn input<'a>(
             .on_input(|q| Message::Palette(PaletteMessage::QueryChanged(q)))
             .on_submit(Message::Palette(PaletteMessage::Accept));
     }
-    let field = crate::input::single_line(field, query, mono);
+    let field = if overlay {
+        crate::input::single_line_with_caret(field, query, mono, theme.text)
+    } else {
+        crate::input::single_line(field, query, mono)
+    };
     let content: Element<'a, Message> = if overlay {
         let spans = colored_spans(ui, theme, query, command);
         let painted = container(

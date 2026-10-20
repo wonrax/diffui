@@ -42,6 +42,24 @@ pub(crate) fn single_line<'a, Message: Clone + 'a>(
         input: Some(input),
         value: value.to_owned(),
         font,
+        caret: None,
+    })
+}
+
+/// [`single_line`] for an input whose value is drawn by something else (the
+/// command line's coloured copy) and styled transparent. The stock widget
+/// paints its caret in the value's colour, so this one paints it in `caret`.
+pub(crate) fn single_line_with_caret<'a, Message: Clone + 'a>(
+    input: TextInput<'a, Message>,
+    value: &str,
+    font: Font,
+    caret: iced::Color,
+) -> Element<'a, Message> {
+    Element::new(SingleLine {
+        input: Some(input),
+        value: value.to_owned(),
+        font,
+        caret: Some(caret),
     })
 }
 
@@ -51,11 +69,21 @@ struct SingleLine<'a, Message> {
     input: Option<TextInput<'a, Message>>,
     value: String,
     font: Font,
+    /// Paint the caret in this colour (see [`single_line_with_caret`]).
+    caret: Option<iced::Color>,
 }
 
-/// The value the input was last laid out with.
+/// The value the input was last laid out with, and where its caret is.
 #[derive(Default)]
-struct Seen(Option<String>);
+struct Seen {
+    value: Option<String>,
+    /// The caret the input last reported to the input method, and when it
+    /// moved there (it blinks from then).
+    caret: Option<(Rectangle, std::time::Instant)>,
+}
+
+/// The stock caret's blink half-period.
+const CARET_BLINK: std::time::Duration = std::time::Duration::from_millis(500);
 
 impl<'a, Message: Clone + 'a> SingleLine<'a, Message> {
     fn input(&self) -> &dyn Widget<Message, Theme, iced::Renderer> {
@@ -108,9 +136,9 @@ impl<'a, Message: Clone + 'a> Widget<Message, Theme, iced::Renderer> for SingleL
         limits: &layout::Limits,
     ) -> layout::Node {
         let seen = tree.state.downcast_mut::<Seen>();
-        let changed = seen.0.as_deref() != Some(self.value.as_str());
+        let changed = seen.value.as_deref() != Some(self.value.as_str());
         if changed {
-            seen.0 = Some(self.value.clone());
+            seen.value = Some(self.value.clone());
             // Any font but the real one: the editor only re-applies its font
             // when it differs from the last one it was laid out with.
             let stand_in = if self.font == Font::MONOSPACE {
@@ -149,6 +177,20 @@ impl<'a, Message: Clone + 'a> Widget<Message, Theme, iced::Renderer> for SingleL
             cursor,
             viewport,
         );
+        if let Some(color) = self.caret
+            && let Some((caret, moved)) = tree.state.downcast_ref::<Seen>().caret
+            && (moved.elapsed().as_millis() / CARET_BLINK.as_millis()).is_multiple_of(2)
+            && let Some(caret) = caret.intersection(&layout.bounds())
+        {
+            use iced::advanced::Renderer as _;
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: caret,
+                    ..renderer::Quad::default()
+                },
+                color,
+            );
+        }
     }
 
     fn operate(
@@ -187,6 +229,24 @@ impl<'a, Message: Clone + 'a> Widget<Message, Theme, iced::Renderer> for SingleL
             shell,
             viewport,
         );
+        // The stock widget reports its caret to the input method on each
+        // redraw; that rectangle is the caret it would have painted.
+        if self.caret.is_some() && matches!(event, Event::Window(iced::window::Event::RedrawRequested(_))) {
+            let seen = tree.state.downcast_mut::<Seen>();
+            let caret = match shell.input_method() {
+                iced::advanced::InputMethod::Enabled { cursor, .. }
+                    if layout.bounds().contains(cursor.center()) =>
+                {
+                    Some(*cursor)
+                }
+                _ => None,
+            };
+            seen.caret = match (caret, seen.caret) {
+                (Some(caret), Some((old, moved))) if old == caret => Some((caret, moved)),
+                (Some(caret), _) => Some((caret, std::time::Instant::now())),
+                (None, _) => None,
+            };
+        }
     }
 
     fn mouse_interaction(
