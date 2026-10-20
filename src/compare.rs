@@ -42,7 +42,6 @@ impl Diffui {
         if !target.session.capabilities.compare {
             return Task::none();
         }
-        target.range_edit = None;
         // Leaving a span leaves the marks it showed.
         if matches!(action, CompareAction::Exit) && target.session.span.is_some() {
             target.revision_multi_selection.clear();

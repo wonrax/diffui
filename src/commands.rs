@@ -2750,7 +2750,7 @@ pub(crate) static REGISTRY: &[Command] = &[
     Command {
         id: "range.edit",
         label: "Edit range revset",
-        hint: "Type the revset of the range on screen",
+        hint: "Edit the range on screen as its jj diff command",
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],

@@ -1359,11 +1359,6 @@ impl Diffui {
                 }
             }
             UiEvent::RevsetChanged(value) => return self.revset_field_edited(value),
-            UiEvent::RangeEditChanged(value) => {
-                if let Some(edit) = self.active_mut().range_edit.as_mut() {
-                    *edit = value;
-                }
-            }
             UiEvent::SidebarWidthChanged(width) => {
                 if width <= self.sidebar_min_width + f32::EPSILON {
                     self.active_mut().history_panel_collapsed = true;
@@ -2252,7 +2247,6 @@ impl Diffui {
         } else if target.session.diff_pending() == Some(&selection) && !leaves_range {
             // Already loading this revision — let it land.
         } else if let Some(tab) = self.active_tab_id() {
-            self.active_mut().range_edit = None;
             let effects = self.active_mut().session.browse(selection);
             return self.run_effects(tab, effects);
         }
@@ -3791,7 +3785,6 @@ impl Diffui {
         }
         // Deferred bump — see the comment on `pending_revision_reveal`.
         state.pending_revision_reveal = true;
-        state.range_edit = None;
         let effects = state.session.browse(selection);
         self.run_effects(tab, effects)
     }

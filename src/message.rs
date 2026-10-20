@@ -118,8 +118,6 @@ pub(crate) enum UiEvent {
     OpenRepoListed(crate::path_browse::Listing),
     /// Revset input edited.
     RevsetChanged(String),
-    /// The range banner's revset field changed.
-    RangeEditChanged(String),
     SidebarWidthChanged(f32),
     ChangedFilesWidthChanged(f32),
     ChangedFilesScrolled(f64),

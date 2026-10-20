@@ -782,8 +782,6 @@ pub(crate) struct TabState {
     /// Cleared on plain click, Esc, and draft start; ids whose rows left the
     /// loaded graph are ignored at use rather than eagerly pruned.
     pub(crate) revision_multi_selection: Vec<String>,
-    /// The range banner's revset while it is being edited.
-    pub(crate) range_edit: Option<String>,
     /// The pending description edit is a "Commit…" — the editor opens in
     /// commit mode.
     pub(crate) pending_commit: bool,
@@ -831,7 +829,6 @@ impl TabState {
             pending_description_edit: None,
             pending_detail_copy: None,
             revision_multi_selection: Vec::new(),
-            range_edit: None,
             pending_commit: false,
             changes: Default::default(),
             history: Default::default(),

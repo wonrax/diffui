@@ -15,7 +15,7 @@ use diffui_core::{DiffBase, DiffRange, DiffSpan, RevisionSelection};
 
 use crate::action::Action;
 use crate::diff_view::{HeaderAction, HeaderField, HeaderLine};
-use crate::message::{Message, UiEvent};
+use crate::message::Message;
 use crate::prose::Prose;
 use crate::theme::{ThemeSpec, emphasis_font, text_size};
 use crate::typography::Aligned;
@@ -23,9 +23,6 @@ use crate::{Diffui, icons, ui};
 
 /// The revset "diff since trunk" measures from.
 pub(crate) const TRUNK: &str = "trunk()";
-
-/// Focus target of the banner's revset field.
-pub(crate) const RANGE_INPUT_ID: &str = "range-revset-input";
 
 /// Commits the list under the banner names before it counts the rest.
 const LISTED_COMMITS: usize = 30;
@@ -38,11 +35,8 @@ pub(crate) enum RangeAction {
         target: RevisionSelection,
         symbol: Option<String>,
     },
-    /// Turn the banner's revset into a field.
+    /// Edit the range as its `jj diff -r` in the palette's command line.
     Edit,
-    /// Show the field's revset as a fixed range.
-    EditSubmit,
-    EditCancel,
 }
 
 /// Which kind of range the pane is on.
@@ -52,7 +46,7 @@ pub(crate) enum RangeMode<'a> {
     Since,
     /// Marked rows shown as one diff, or refused as one.
     Span(&'a DiffSpan),
-    /// A range that stays put: typed, or edited in the banner.
+    /// A range that stays put: typed or edited as a `jj diff` command.
     Fixed,
 }
 
@@ -125,7 +119,6 @@ impl Diffui {
         };
         match action {
             RangeAction::SinceTrunk { target, symbol } => {
-                self.active_mut().range_edit = None;
                 self.active_mut().revision_multi_selection.clear();
                 let effects = self.active_mut().session.diff_since(TRUNK, target, symbol);
                 self.run_effects(tab, effects)
@@ -134,25 +127,8 @@ impl Diffui {
                 let Some(mode) = mode(self) else {
                     return Task::none();
                 };
-                let revset = display_revset(self, mode);
-                self.active_mut().range_edit = Some(revset);
-                iced::widget::operation::focus(RANGE_INPUT_ID)
-            }
-            RangeAction::EditSubmit => {
-                let Some(revset) = self.active_mut().range_edit.take() else {
-                    return Task::none();
-                };
-                let revset = revset.trim();
-                if revset.is_empty() {
-                    return Task::none();
-                }
-                self.active_mut().revision_multi_selection.clear();
-                let effects = self.active_mut().session.diff_range(revset);
-                self.run_effects(tab, effects)
-            }
-            RangeAction::EditCancel => {
-                self.active_mut().range_edit = None;
-                Task::none()
+                let command = diff_command(&display_revset(self, mode));
+                self.open_command_line(command)
             }
         }
     }
@@ -175,7 +151,6 @@ impl Diffui {
             .filter(|hex| state.session.commits.find_by_commit_id(hex).is_some())
             .map(|hex| state.session.canonical_selection(hex))
             .collect();
-        self.active_mut().range_edit = None;
         let effects = self.active_mut().session.diff_span(&marked);
         self.run_effects(tab, effects)
     }
@@ -189,7 +164,7 @@ fn diff_command(revset: &str) -> String {
     )
 }
 
-/// The banner for a range: what it is, the revset (a field while editing),
+/// The banner for a range: what it is, the revset,
 /// the jj command, and edit and exit. `None` when no range is on.
 pub(crate) fn banner<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Option<Element<'a, Message>> {
     let mode = mode(ui)?;
@@ -205,11 +180,14 @@ pub(crate) fn banner<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Option<Element<'a,
         RangeMode::Span(_) | RangeMode::Fixed => (icons::FILE_DIFF, "Range"),
     };
     let revset = display_revset(ui, mode);
-    let editing = ui.active().range_edit.as_deref();
 
-    let headline: Element<'a, Message> = match editing {
-        Some(value) => row![
-            crate::typography::centered(
+    let headline: Element<'a, Message> = {
+        let mut line = vec![
+            Aligned::glyph(
+                icons::icon(glyph, ui::ICON_SIZE, theme.accent),
+                ui::ICON_SIZE,
+            ),
+            Aligned::text(
                 text(label)
                     .size(text_size::UI)
                     .font(medium)
@@ -218,61 +196,28 @@ pub(crate) fn banner<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Option<Element<'a,
                 medium,
                 text_size::UI,
             ),
-            crate::field::filter_field(
-                theme,
+        ];
+        match (mode, refused) {
+            (RangeMode::Span(span), Some(_)) => line.push(Aligned::text(
+                text(format!("{} revisions", span.count))
+                    .size(text_size::UI)
+                    .font(font)
+                    .color(theme.muted_text)
+                    .wrapping(text::Wrapping::None),
+                font,
+                text_size::UI,
+            )),
+            _ => line.push(Aligned::text(
+                crate::plan::command_prose(&revset)
+                    .view(mono, mono, theme.text, theme)
+                    .size(text_size::UI)
+                    .wrapping(text::Wrapping::None)
+                    .ellipsis(text::Ellipsis::End),
                 mono,
-                crate::field::FilterField {
-                    id: RANGE_INPUT_ID,
-                    leading_icon: None,
-                    placeholder: "Revset, e.g. trunk()..@",
-                    value,
-                    on_input: |value| Message::Ui(UiEvent::RangeEditChanged(value)),
-                    on_submit: Some(Message::Action(Action::Range(RangeAction::EditSubmit))),
-                    caret: None,
-                },
-            ),
-        ]
-        .spacing(8)
-        .align_y(alignment::Vertical::Center)
-        .into(),
-        None => {
-            let mut line = vec![
-                Aligned::glyph(
-                    icons::icon(glyph, ui::ICON_SIZE, theme.accent),
-                    ui::ICON_SIZE,
-                ),
-                Aligned::text(
-                    text(label)
-                        .size(text_size::UI)
-                        .font(medium)
-                        .color(theme.text)
-                        .wrapping(text::Wrapping::None),
-                    medium,
-                    text_size::UI,
-                ),
-            ];
-            match (mode, refused) {
-                (RangeMode::Span(span), Some(_)) => line.push(Aligned::text(
-                    text(format!("{} revisions", span.count))
-                        .size(text_size::UI)
-                        .font(font)
-                        .color(theme.muted_text)
-                        .wrapping(text::Wrapping::None),
-                    font,
-                    text_size::UI,
-                )),
-                _ => line.push(Aligned::text(
-                    crate::plan::command_prose(&revset)
-                        .view(mono, mono, theme.text, theme)
-                        .size(text_size::UI)
-                        .wrapping(text::Wrapping::None)
-                        .ellipsis(text::Ellipsis::End),
-                    mono,
-                    text_size::UI,
-                )),
-            }
-            crate::typography::baseline_row(line, 8.0)
+                text_size::UI,
+            )),
         }
+        crate::typography::baseline_row(line, 8.0)
     };
 
     let subline: Element<'a, Message> = match refused {
@@ -288,39 +233,29 @@ pub(crate) fn banner<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Option<Element<'a,
 
     let action = |action: RangeAction| Message::Action(Action::Range(action));
     let mut controls = row![].spacing(4).align_y(alignment::Vertical::Center);
-    if editing.is_some() {
+    if refused.is_none() {
         controls = controls.push(ui::tooltip(
-            ui::close_button(theme.muted_text, theme).on_press(action(RangeAction::EditCancel)),
-            "Stop editing",
-            iced::widget::tooltip::Position::Left,
-            font,
-            theme,
-        ));
-    } else {
-        if refused.is_none() {
-            controls = controls.push(ui::tooltip(
-                ui::icon_button(icons::PENCIL, theme.muted_text, ui::Size::Compact, theme)
-                    .on_press(action(RangeAction::Edit)),
-                "Edit the revset",
-                iced::widget::tooltip::Position::Bottom,
-                font,
-                theme,
-            ));
-        }
-        controls = controls.push(ui::tooltip(
-            ui::close_button(theme.muted_text, theme).on_press(Message::Action(Action::Compare(
-                crate::compare::CompareAction::Exit,
-            ))),
-            match mode {
-                RangeMode::Since => "Stop diffing since trunk",
-                RangeMode::Span(_) => "Clear the marks",
-                RangeMode::Fixed => "Leave the range",
-            },
-            iced::widget::tooltip::Position::Left,
+            ui::icon_button(icons::PENCIL, theme.muted_text, ui::Size::Compact, theme)
+                .on_press(action(RangeAction::Edit)),
+            "Edit as a jj command",
+            iced::widget::tooltip::Position::Bottom,
             font,
             theme,
         ));
     }
+    controls = controls.push(ui::tooltip(
+        ui::close_button(theme.muted_text, theme).on_press(Message::Action(Action::Compare(
+            crate::compare::CompareAction::Exit,
+        ))),
+        match mode {
+            RangeMode::Since => "Stop diffing since trunk",
+            RangeMode::Span(_) => "Clear the marks",
+            RangeMode::Fixed => "Leave the range",
+        },
+        iced::widget::tooltip::Position::Left,
+        font,
+        theme,
+    ));
 
     let strip = row![
         container(sides).width(Length::Fill).clip(true),
