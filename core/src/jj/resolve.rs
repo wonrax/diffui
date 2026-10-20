@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result, anyhow, bail};
+use bstr::BString;
 use jj_lib::{
     backend::{CopyId, MergedTreeValueExt as _, TreeValue},
     commit::Commit,
@@ -13,6 +14,7 @@ use jj_lib::{
         materialize_merge_result_to_bytes, try_materialize_file_conflict_value,
         update_from_content,
     },
+    files::{self, MergeResult},
     merge::Merge,
     merged_tree::MergedTree,
     merged_tree_builder::MergedTreeBuilder,
@@ -26,7 +28,8 @@ use super::partial::repo_path;
 use super::workspace::resolve_revision;
 use crate::model::RevisionSelection;
 use crate::resolve::{
-    ConflictFile, ConflictResolution, ConflictTerm, MergeToolInvocation, merge_tool_from_settings,
+    ConflictFile, ConflictPick, ConflictResolution, ConflictTerm, MergeToolInvocation,
+    merge_tool_from_settings,
 };
 
 /// The conflicted path's tree value and its file-level view, when every term
@@ -107,6 +110,7 @@ pub(crate) async fn conflict_files(commit: &Commit) -> Result<Vec<ConflictFile>>
                     bases,
                     pickable: true,
                     merge_tool_blocker: blocker,
+                    regions: region_count(&file),
                 }
             }
             None => {
@@ -131,12 +135,84 @@ pub(crate) async fn conflict_files(commit: &Commit) -> Result<Vec<ConflictFile>>
                          working copy"
                             .to_owned(),
                     ),
+                    regions: 0,
                 }
             }
         };
         files.push(entry);
     }
     Ok(files)
+}
+
+/// How many conflict regions `file` shows in the diff, when they can be
+/// resolved one at a time: not when a term is absent (taking the deleting
+/// side of one region would leave an empty file, not a deleted one) or
+/// binary.
+fn region_count(file: &MaterializedFileConflictValue) -> usize {
+    if file.ids.iter().any(Option::is_none)
+        || file.contents.iter().any(|content| content.contains(&0))
+    {
+        return 0;
+    }
+    match files::merge_hunks(&file.contents, &super::diff::conflict_merge_options()) {
+        MergeResult::Resolved(_) => 0,
+        MergeResult::Conflict(hunks) => hunks.iter().filter(|hunk| !hunk.is_resolved()).count(),
+    }
+}
+
+/// `contents` with conflict region `region` (0-based, of `regions`) taken
+/// from `pick` in every term, and the other regions left as they were.
+/// Regions are cut the way the diff cuts them, so `region` is the
+/// `conflict k of n` the user saw.
+pub(crate) fn resolve_region(
+    contents: &Merge<BString>,
+    region: usize,
+    regions: usize,
+    pick: ConflictPick,
+) -> Result<Merge<BString>> {
+    let hunks = match files::merge_hunks(contents, &super::diff::conflict_merge_options()) {
+        MergeResult::Conflict(hunks) => hunks,
+        MergeResult::Resolved(_) => bail!("the file has no conflict regions left"),
+    };
+    let found = hunks.iter().filter(|hunk| !hunk.is_resolved()).count();
+    if found != regions {
+        bail!("the conflict changed ({found} regions, not {regions}). Resolve it again.");
+    }
+    if region >= found {
+        bail!("there is no conflict {} of {found}", region + 1);
+    }
+    let mut terms: Vec<Vec<u8>> = contents.iter().map(|_| Vec::new()).collect();
+    let mut conflicts = 0;
+    for hunk in &hunks {
+        let taken = match hunk.as_resolved() {
+            Some(text) => Some(text),
+            None if conflicts == region => {
+                conflicts += 1;
+                let text = match pick {
+                    ConflictPick::Side(side) => hunk.get_add(side),
+                    ConflictPick::Base(base) => hunk.get_remove(base),
+                };
+                Some(text.ok_or_else(|| anyhow!("conflict {conflicts} has no {pick:?}"))?)
+            }
+            None => {
+                conflicts += 1;
+                None
+            }
+        };
+        match taken {
+            Some(text) => terms
+                .iter_mut()
+                .for_each(|term| term.extend_from_slice(text)),
+            None => {
+                for (term, text) in terms.iter_mut().zip(hunk.iter()) {
+                    term.extend_from_slice(text);
+                }
+            }
+        }
+    }
+    Ok(Merge::from_vec(
+        terms.into_iter().map(BString::from).collect::<Vec<_>>(),
+    ))
 }
 
 /// `jj resolve` on one path of `commit`, writing the rewritten commit.
@@ -211,6 +287,46 @@ pub(super) async fn resolve_conflict(
                 Err(ids) => conflict.with_new_file_ids(&ids),
             }
         }
+        ConflictResolution::Region {
+            region,
+            regions,
+            pick,
+        } => {
+            if region_count(&file) == 0 {
+                bail!("{path} can only be resolved whole");
+            }
+            let terms = resolve_region(&file.contents, *region, *regions, *pick)
+                .with_context(|| format!("can't resolve {path} by region"))?;
+            let store = tree.store();
+            if *regions == 1 {
+                // The last region: every term now reads the same.
+                let content = terms.first();
+                let id = store
+                    .write_file(&repo_path, &mut content.as_slice())
+                    .await
+                    .with_context(|| format!("failed to write the resolved {path}"))?;
+                file_value(Some(id), file.executable.unwrap_or(false))
+            } else {
+                let mut ids = Vec::new();
+                for content in terms.iter() {
+                    ids.push(Some(
+                        store
+                            .write_file(&repo_path, &mut content.as_slice())
+                            .await
+                            .with_context(|| format!("failed to write {path}"))?,
+                    ));
+                }
+                let ids = Merge::from_vec(ids);
+                // Back to the shape of the tree's conflict when jj simplified
+                // it for materializing.
+                let ids = if ids.iter().len() == file.unsimplified_ids.iter().len() {
+                    ids
+                } else {
+                    file.unsimplified_ids.clone().update_from_simplified(ids)
+                };
+                conflict.with_new_file_ids(&ids)
+            }
+        }
     };
     let mut builder = MergedTreeBuilder::new(tree);
     builder.set_or_remove(repo_path, new_value);
@@ -238,6 +354,40 @@ fn side_executable(
         return *executable;
     }
     file.executable.unwrap_or(false)
+}
+
+/// `path` at `revision` with jj's conflict markers, as `jj` writes it into a
+/// working copy (`ui.conflict-marker-style`), and the marker length to parse
+/// an edit of it back with ([`ConflictResolution::Content`]).
+pub(crate) async fn conflict_text(
+    repo: &ReadonlyRepo,
+    settings: &UserSettings,
+    workspace_name: &WorkspaceName,
+    revision: &RevisionSelection,
+    path: &str,
+) -> Result<(String, usize)> {
+    let commit_id = resolve_revision(repo, workspace_name, revision).await?;
+    let commit = repo
+        .store()
+        .get_commit_async(&commit_id)
+        .await
+        .context("failed to load the conflicted revision")?;
+    let repo_path = repo_path(path)?;
+    let (_, file) = conflict_at(&commit.tree(), &repo_path, path).await?;
+    let file = file
+        .ok_or_else(|| anyhow!("{path}'s conflict involves a symlink, directory or submodule"))?;
+    let marker_len = choose_materialized_conflict_marker_len(&file.contents);
+    let options = ConflictMaterializeOptions {
+        marker_style: settings
+            .get("ui.conflict-marker-style")
+            .unwrap_or(ConflictMarkerStyle::Diff),
+        marker_len: Some(marker_len),
+        merge: repo.store().merge_options().clone(),
+    };
+    let bytes = materialize_merge_result_to_bytes(&file.contents, &file.labels, &options);
+    let text = String::from_utf8(bytes.into())
+        .map_err(|_| anyhow!("{path} isn't text, so it can't be edited here"))?;
+    Ok((text, marker_len))
 }
 
 /// Write the merge tool's input files for `path` at `revision` and build its

@@ -132,6 +132,7 @@ async fn run(
         | Command::BookmarkCheck { job, .. }
         | Command::ConflictInfo { job, .. }
         | Command::PrepareMergeTool { job, .. }
+        | Command::ConflictText { job, .. }
         | Command::History { job, .. }
         | Command::ExpandFile { job, .. }
         | Command::ResolveRevset { job, .. }

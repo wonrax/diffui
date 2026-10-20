@@ -1153,6 +1153,13 @@ async fn mutate_locked(
                     format!("took base {}", index + 1)
                 }
                 crate::resolve::ConflictResolution::Content { .. } => "merged".to_owned(),
+                crate::resolve::ConflictResolution::Region { region, pick, .. } => {
+                    let term = match pick {
+                        crate::resolve::ConflictPick::Side(index) => format!("side {}", index + 1),
+                        crate::resolve::ConflictPick::Base(index) => format!("base {}", index + 1),
+                    };
+                    format!("took {term} for conflict {}", region + 1)
+                }
             };
             let path_conflicted = !resolved
                 .tree()

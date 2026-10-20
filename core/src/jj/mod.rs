@@ -43,7 +43,7 @@ pub(crate) use diff::{
 pub(crate) use mutate::{ImmutableRewriteError, apply_mutation, check_bookmark_move_backwards};
 pub(crate) use preview::{PreviewScope, preview};
 pub(crate) use remote::fetch_jj;
-pub(crate) use resolve::{conflict_files, prepare_merge_tool};
+pub(crate) use resolve::{conflict_files, conflict_text, prepare_merge_tool};
 pub(crate) use walk::{WorkspaceView, compute_jj_empty_status, walk_jj_with_repo};
 pub(crate) use workspace::{
     SnapshotContext, load_workspace, read_op_head_with, resolve_revision, snapshot_working_copy,

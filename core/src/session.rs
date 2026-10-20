@@ -928,6 +928,7 @@ impl Session {
             | Payload::BookmarkChecked { .. }
             | Payload::ConflictInfoLoaded { .. }
             | Payload::MergeToolPrepared { .. }
+            | Payload::ConflictTextLoaded { .. }
             | Payload::OpLogBatch { .. }
             | Payload::History { .. }
             | Payload::CliOutput { .. }

@@ -203,6 +203,7 @@ async fn run(repository: &Repository, command: Command, cancel: &CancelFlag) -> 
         | Command::BookmarkCheck { job, .. }
         | Command::ConflictInfo { job, .. }
         | Command::PrepareMergeTool { job, .. }
+        | Command::ConflictText { job, .. }
         | Command::History { job, .. }
         | Command::ExpandFile { job, .. }
         | Command::ResolveRevset { job, .. }

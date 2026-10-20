@@ -260,6 +260,13 @@ pub enum Command {
         revision: RevisionSelection,
         path: String,
     },
+    /// `path` at `revision` with jj's conflict markers, for editing in place;
+    /// the edit goes back as a [`crate::ConflictResolution::Content`].
+    ConflictText {
+        job: JobId,
+        revision: RevisionSelection,
+        path: String,
+    },
     /// A history view's read: the op log, an operation's changes, an
     /// evolog, an interdiff, or a file's annotation. See
     /// [`HistoryRequest`].
@@ -326,6 +333,7 @@ impl Command {
             | Self::BookmarkCheck { job, .. }
             | Self::ConflictInfo { job, .. }
             | Self::PrepareMergeTool { job, .. }
+            | Self::ConflictText { job, .. }
             | Self::History { job, .. }
             | Self::ExpandFile { job, .. }
             | Self::ResolveRevset { job, .. }
@@ -505,6 +513,13 @@ pub enum Payload {
         job: JobId,
         invocation: MergeToolInvocation,
     },
+    ConflictTextLoaded {
+        job: JobId,
+        path: String,
+        text: String,
+        /// The marker length to parse an edit of `text` back with.
+        marker_len: usize,
+    },
     /// The answer to a [`Command::ResolveRevset`]: what `revset` matched, or
     /// why it doesn't parse or resolve.
     RevsetResolved {
@@ -559,6 +574,7 @@ impl Payload {
             | Self::Progress { job, .. }
             | Self::ConflictInfoLoaded { job, .. }
             | Self::MergeToolPrepared { job, .. }
+            | Self::ConflictTextLoaded { job, .. }
             | Self::OpLogBatch { job, .. }
             | Self::History { job, .. }
             | Self::RevsetResolved { job, .. }

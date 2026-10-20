@@ -45,6 +45,22 @@ pub enum ConflictResolution {
         content: Vec<u8>,
         marker_len: Option<usize>,
     },
+    /// Take a side or base for one conflict region only, leaving the others
+    /// conflicted: `region` is the 0-based `k - 1` of jj's
+    /// `<<<<<<< conflict k of n` marker. `regions` is the `n` the caller saw;
+    /// a conflict with a different count has changed since, and is refused.
+    Region {
+        region: usize,
+        regions: usize,
+        pick: ConflictPick,
+    },
+}
+
+/// A term of a conflict to take, 0-based.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictPick {
+    Side(usize),
+    Base(usize),
 }
 
 /// One term of a conflict, labeled the way jj labels it in conflict markers
@@ -72,6 +88,40 @@ pub struct ConflictFile {
     /// Why the merge tool can't take this conflict (more than two sides, a
     /// non-file term, an executable-bit conflict), or `None` when it can.
     pub merge_tool_blocker: Option<String>,
+    /// How many conflict regions the diff shows, each resolvable on its own
+    /// ([`ConflictResolution::Region`]). Zero when the file only resolves
+    /// whole: a side deleted it, it's binary, or a term isn't a file.
+    pub regions: usize,
+}
+
+/// The region a jj conflict marker line opens: `<<<<<<< conflict 2 of 3` is
+/// `Some((1, 3))`, 0-based. `None` for any other line.
+pub fn conflict_region(line: &str) -> Option<(usize, usize)> {
+    let run = line.bytes().take_while(|&byte| byte == b'<').count();
+    if run < 7 {
+        return None;
+    }
+    let mut words = line[run..].strip_prefix(' ')?.split_whitespace();
+    if !words.next()?.eq_ignore_ascii_case("conflict") {
+        return None;
+    }
+    let index: usize = words.next()?.parse().ok()?;
+    if words.next()? != "of" {
+        return None;
+    }
+    let count: usize = words.next()?.parse().ok()?;
+    (words.next().is_none() && (1..=count).contains(&index)).then(|| (index - 1, count))
+}
+
+/// The conflict region a diff hunk carries: the one its first new-side
+/// `<<<<<<<` marker opens. jj's diff gives every region a hunk of its own
+/// ([`crate::DiffFileStatus::Conflicted`] files, and the conflicted side of
+/// any other diff), so that hunk's header can hold the region's controls.
+pub fn hunk_conflict_region(hunk: &crate::model::DiffHunkView) -> Option<(usize, usize)> {
+    hunk.lines
+        .iter()
+        .filter(|line| line.new_line.is_some())
+        .find_map(|line| conflict_region(&line.content))
 }
 
 /// A prepared merge-tool run: the input files are written, the arguments
@@ -352,5 +402,17 @@ mod tests {
             merge_tool_from_settings(&settings("ui.merge-editor = \"mergiraf\"")).unwrap();
         assert_eq!(mergiraf.conflict_exit_codes, vec![1]);
         assert!(mergiraf.uses_marker_length());
+    }
+
+    #[test]
+    fn region_markers_parse_to_zero_based_indices() {
+        assert_eq!(conflict_region("<<<<<<< conflict 2 of 3"), Some((1, 3)));
+        assert_eq!(conflict_region("<<<<<<<<<<< Conflict 1 of 1"), Some((0, 1)));
+        assert_eq!(conflict_region("<<<<<<< conflict 1 of 1 ends"), None);
+        assert_eq!(conflict_region("<<<<<< conflict 1 of 1"), None);
+        assert_eq!(conflict_region("<<<<<<< conflict 3 of 2"), None);
+        assert_eq!(conflict_region("<<<<<<< conflict 0 of 2"), None);
+        assert_eq!(conflict_region("<<<<<<< side #1"), None);
+        assert_eq!(conflict_region("plain line"), None);
     }
 }

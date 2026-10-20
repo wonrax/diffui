@@ -576,6 +576,26 @@ impl Actor {
                 self.emit(Payload::MergeToolPrepared { job, invocation });
                 Ok(())
             }
+            Command::ConflictText {
+                job,
+                revision,
+                path,
+            } => {
+                let repo = self.repo_at_head(repository).await?;
+                let (settings, name) = {
+                    let slot = self.slot(repository)?;
+                    (slot.settings.clone(), slot.name.clone())
+                };
+                let (text, marker_len) =
+                    jj::conflict_text(repo.as_ref(), &settings, &name, &revision, &path).await?;
+                self.emit(Payload::ConflictTextLoaded {
+                    job,
+                    path,
+                    text,
+                    marker_len,
+                });
+                Ok(())
+            }
             Command::History { job, request } => {
                 self.history(repository, job, request, cancel).await
             }
@@ -924,6 +944,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::BookmarkCheck { .. } => "bookmark_check",
         Command::ConflictInfo { .. } => "conflict_info",
         Command::PrepareMergeTool { .. } => "prepare_merge_tool",
+        Command::ConflictText { .. } => "conflict_text",
         Command::History { .. } => "history",
         Command::ExpandFile { .. } => "expand_file",
         Command::ResolveRevset { .. } => "resolve_revset",

@@ -169,6 +169,16 @@ fn diff_matcher(repository: &Repository, options: &DiffOptions<'_>) -> Result<Bo
     })
 }
 
+/// How the diff cuts a conflicted file into regions. Resolving one region
+/// ([`crate::ConflictResolution::Region`]) cuts with the same options, so its
+/// `conflict k of n` is the one the pane showed.
+pub(super) fn conflict_merge_options() -> MergeOptions {
+    MergeOptions {
+        hunk_level: FileMergeHunkLevel::Line,
+        same_change: SameChange::Accept,
+    }
+}
+
 /// Diff two trees into a [`DiffDocument`], within `options`' caps, and —
 /// with `surface_conflicts` — list the new side's conflicts. Shared by the
 /// revision diff and the history views' interdiffs, which compare trees that
@@ -189,10 +199,7 @@ pub(crate) async fn diff_trees(
     let materialize_options = ConflictMaterializeOptions {
         marker_style: ConflictMarkerStyle::Diff,
         marker_len: None,
-        merge: MergeOptions {
-            hunk_level: FileMergeHunkLevel::Line,
-            same_change: SameChange::Accept,
-        },
+        merge: conflict_merge_options(),
     };
     let mut files = Vec::new();
 
@@ -219,6 +226,13 @@ pub(crate) async fn diff_trees(
         } else {
             DiffFileStatus::Modified
         };
+        // The conflicted side of a diff gets a hunk per conflict region, like
+        // a `Conflicted` entry (see `split_conflict_regions`).
+        let after_conflicted = surface_conflicts
+            && matches!(
+                values.after,
+                jj_lib::conflicts::MaterializedTreeValue::FileConflict(_)
+            );
         let before = git_diff_part(entry.path.source(), values.before, &materialize_options)
             .await
             .with_context(|| {
@@ -331,6 +345,9 @@ pub(crate) async fn diff_trees(
                     header: format_hunk_header(&hunk.left_line_range, &hunk.right_line_range),
                     lines: rows,
                 });
+            }
+            if after_conflicted {
+                file.hunks = split_conflict_regions(std::mem::take(&mut file.hunks));
             }
         }
 
@@ -574,17 +591,26 @@ pub(super) fn conflict_hunks(text: &str) -> (Vec<DiffHunkView>, usize, usize) {
         blocks.push((0, last));
     }
 
-    // Expand each block by the context margin and merge windows that touch,
-    // so no hunk ever begins inside a block — the classification below
-    // re-walks marker state from each hunk's first line.
+    // Every block is a hunk of its own, so its header can carry that
+    // region's resolve controls: expand each by the context margin, and split
+    // the lines between two blocks closer than two margins apart rather than
+    // merging them. No hunk ever begins inside a block, which the
+    // classification below relies on (it re-walks marker state from each
+    // hunk's first line).
     let mut ranges: Vec<(usize, usize)> = Vec::new();
-    for (block_start, block_end) in blocks {
-        let start = block_start.saturating_sub(CONTEXT_LINES);
-        let end = (block_end + CONTEXT_LINES).min(last);
-        match ranges.last_mut() {
-            Some((_, prev_end)) if start <= *prev_end + 1 => *prev_end = (*prev_end).max(end),
-            _ => ranges.push((start, end)),
+    for (index, &(block_start, block_end)) in blocks.iter().enumerate() {
+        let start = match ranges.last() {
+            Some(&(_, prev_end)) => block_start.saturating_sub(CONTEXT_LINES).max(prev_end + 1),
+            None => block_start.saturating_sub(CONTEXT_LINES),
+        };
+        let mut end = (block_end + CONTEXT_LINES).min(last);
+        if let Some(&(next_start, _)) = blocks.get(index + 1) {
+            let between = next_start - block_end - 1;
+            if between < 2 * CONTEXT_LINES {
+                end = block_end + between / 2;
+            }
         }
+        ranges.push((start, end));
     }
 
     let mut hunks = Vec::new();
@@ -646,6 +672,65 @@ pub(super) fn conflict_hunks(text: &str) -> (Vec<DiffHunkView>, usize, usize) {
         });
     }
     (hunks, additions, deletions)
+}
+
+/// Cut diff hunks so none holds more than one conflict region's opening
+/// marker: the conflicted side of a file's diff, given the hunk-per-region
+/// shape `conflict_hunks` gives a `Conflicted` entry. A cut falls halfway
+/// between one region's closing marker and the next one's opening marker,
+/// and the pieces get `@@` headers of their own.
+pub(super) fn split_conflict_regions(hunks: Vec<DiffHunkView>) -> Vec<DiffHunkView> {
+    let mut out = Vec::with_capacity(hunks.len());
+    for hunk in hunks {
+        let new_side = |line: &DiffLine| line.new_line.is_some();
+        let openers: Vec<usize> = hunk
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| {
+                new_side(line) && crate::resolve::conflict_region(&line.content).is_some()
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if openers.len() < 2 {
+            out.push(hunk);
+            continue;
+        }
+        let mut cuts = vec![0];
+        for pair in openers.windows(2) {
+            let (open, next) = (pair[0], pair[1]);
+            let close = (open + 1..next).rev().find(|&index| {
+                let line = &hunk.lines[index];
+                new_side(line) && conflict_marker_char(&line.content) == Some(b'>')
+            });
+            cuts.push(match close {
+                Some(close) => close + 1 + (next - close - 1) / 2,
+                None => next,
+            });
+        }
+        cuts.push(hunk.lines.len());
+        // 0-based positions of the hunk's first old and new lines.
+        let first = |pick: fn(&DiffLine) -> Option<usize>| {
+            hunk.lines
+                .iter()
+                .find_map(pick)
+                .map_or(0, |line| line.saturating_sub(1))
+        };
+        let mut old_at = first(|line| line.old_line);
+        let mut new_at = first(|line| line.new_line);
+        for cut in cuts.windows(2) {
+            let lines = hunk.lines[cut[0]..cut[1]].to_vec();
+            let olds = lines.iter().filter(|line| line.old_line.is_some()).count();
+            let news = lines.iter().filter(|line| line.new_line.is_some()).count();
+            out.push(DiffHunkView {
+                header: format_hunk_header(&(old_at..old_at + olds), &(new_at..new_at + news)),
+                lines,
+            });
+            old_at += olds;
+            new_at += news;
+        }
+    }
+    out
 }
 
 /// The marker character opening `line` when it is a jj conflict-marker line:
@@ -749,7 +834,7 @@ mod conflict_hunk_tests {
     }
 
     #[test]
-    fn adjacent_blocks_merge_into_one_hunk() {
+    fn adjacent_blocks_get_a_hunk_each() {
         let text = "\
             <<<<<<< Conflict 1 of 2\n\
             +++++++ Contents of side #1\n\
@@ -761,9 +846,82 @@ mod conflict_hunk_tests {
             b\n\
             >>>>>>> Conflict 2 of 2 ends\n";
         let (hunks, _, _) = conflict_hunks(text);
-        assert_eq!(hunks.len(), 1, "touching context windows merge");
+        assert_eq!(hunks.len(), 2, "a region per hunk");
         assert_eq!(hunks[0].header, "Conflict 1 of 2");
-        assert_eq!(hunks[0].lines.len(), 9);
+        assert_eq!(hunks[1].header, "Conflict 2 of 2");
+        // The line between the blocks goes to the second; nothing repeats.
+        assert_eq!(hunks[0].lines.len(), 4);
+        assert_eq!(hunks[1].lines.len(), 5);
+        assert_eq!(hunks[1].lines[0].content, "between");
+        assert_eq!(hunks[1].lines[0].new_line, Some(5));
+    }
+
+    #[test]
+    fn context_between_close_blocks_is_shared_out() {
+        let text = "\
+            <<<<<<< conflict 1 of 2\n\
+            a\n\
+            >>>>>>> conflict 1 of 2 ends\n\
+            one\n\
+            two\n\
+            three\n\
+            four\n\
+            five\n\
+            <<<<<<< conflict 2 of 2\n\
+            b\n\
+            >>>>>>> conflict 2 of 2 ends\n";
+        let (hunks, _, _) = conflict_hunks(text);
+        assert_eq!(hunks.len(), 2);
+        let contents = |hunk: &DiffHunkView| -> Vec<String> {
+            hunk.lines.iter().map(|line| line.content.clone()).collect()
+        };
+        assert_eq!(contents(&hunks[0])[3..], ["one", "two"]);
+        assert_eq!(contents(&hunks[1])[..3], ["three", "four", "five"]);
+    }
+
+    fn line(kind: DiffLineKind, old: Option<usize>, new: Option<usize>, content: &str) -> DiffLine {
+        DiffLine {
+            kind,
+            old_line: old,
+            new_line: new,
+            content: content.to_owned(),
+            syntax: Vec::new(),
+            emphasis: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_diff_hunk_with_two_regions_is_cut_between_them() {
+        use DiffLineKind::{Addition, Context, Deletion};
+        let lines = vec![
+            line(Context, Some(1), Some(1), "top"),
+            line(Deletion, Some(2), None, "old"),
+            line(Addition, None, Some(2), "<<<<<<< conflict 1 of 2"),
+            line(Addition, None, Some(3), "x"),
+            line(Addition, None, Some(4), ">>>>>>> conflict 1 of 2 ends"),
+            line(Context, Some(3), Some(5), "mid 1"),
+            line(Context, Some(4), Some(6), "mid 2"),
+            line(Addition, None, Some(7), "<<<<<<< conflict 2 of 2"),
+            line(Addition, None, Some(8), "y"),
+            line(Addition, None, Some(9), ">>>>>>> conflict 2 of 2 ends"),
+            line(Context, Some(5), Some(10), "bottom"),
+        ];
+        let hunks = split_conflict_regions(vec![DiffHunkView {
+            header: "@@ -1,5 +1,10 @@".to_owned(),
+            lines,
+        }]);
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks[0].header, "@@ -1,3 +1,5 @@");
+        assert_eq!(hunks[1].header, "@@ -4,2 +6,5 @@");
+        assert_eq!(hunks[1].lines[0].content, "mid 2");
+        assert_eq!(
+            crate::resolve::hunk_conflict_region(&hunks[1]),
+            Some((1, 2))
+        );
+        // One region or none: left alone.
+        let single = split_conflict_regions(vec![hunks[0].clone()]);
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].header, "@@ -1,3 +1,5 @@");
     }
 
     #[test]

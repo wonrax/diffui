@@ -10,8 +10,9 @@ mod harness;
 
 use diffui_core::repo::{Command, Payload};
 use diffui_core::{
-    ConflictFile, ConflictResolution, DiffSelection, FileSelection, HunkPick, HunkRef, LineRef,
-    MergeToolInvocation, MutationOp, RepoError, RevisionSelection, SquashTarget,
+    ConflictFile, ConflictPick, ConflictResolution, Destination, DiffSelection, FileSelection,
+    HunkPick, HunkRef, LineRef, MergeToolInvocation, MutationOp, RebaseSourceMode, RepoError,
+    RevisionSelection, SquashTarget, hunk_conflict_region,
 };
 use harness::{TestRepo, file_at, file_at_or_absent, full_description, scratch_repo, write};
 
@@ -739,4 +740,278 @@ fn an_unconfigured_merge_tool_says_how_to_configure_one() {
     let mut repo = conflicted_merge("merge-tool-missing");
     let error = prepare(&mut repo, "file.txt").expect_err("no tool configured");
     assert!(error.to_string().contains("ui.merge-editor"), "{error}");
+}
+
+// ── Conflict regions ─────────────────────────────────────────────────────
+
+/// base → one child per entry of `sides`, each writing its content to
+/// file.txt (`None` deletes it) → `@` = their merge.
+fn merge_of(name: &str, base: &str, sides: &[Option<&str>]) -> TestRepo {
+    let root = scratch_repo(name);
+    let mut repo = TestRepo::open(&root);
+    write(&root, "file.txt", base);
+    commit(&mut repo, "base");
+    let base_id = commit_of(&mut repo, "@-");
+    let mut parents = Vec::new();
+    for (index, content) in sides.iter().enumerate() {
+        repo.mutate(MutationOp::New {
+            parent: RevisionSelection::Commit(base_id.clone()),
+        })
+        .expect("new on base");
+        match content {
+            Some(content) => write(&root, "file.txt", content),
+            None => std::fs::remove_file(root.join("file.txt")).expect("delete"),
+        }
+        commit(&mut repo, &format!("side{}", index + 1));
+        parents.push(RevisionSelection::Commit(commit_of(&mut repo, "@-")));
+    }
+    repo.mutate(MutationOp::Merge { parents }).expect("merge");
+    repo
+}
+
+fn region(region: usize, regions: usize, pick: ConflictPick) -> ConflictResolution {
+    ConflictResolution::Region {
+        region,
+        regions,
+        pick,
+    }
+}
+
+fn resolve(
+    repo: &mut TestRepo,
+    target: RevisionSelection,
+    resolution: ConflictResolution,
+) -> Result<String, RepoError> {
+    repo.mutate(MutationOp::ResolveConflict {
+        target,
+        path: "file.txt".to_owned(),
+        resolution,
+    })
+    .map(|outcome| outcome.message)
+}
+
+/// The conflict regions the diff's hunks carry for file.txt, in order.
+fn diff_regions(repo: &mut TestRepo, revision: RevisionSelection) -> Vec<(usize, usize)> {
+    let document = repo.diff(revision);
+    let file = document
+        .files
+        .iter()
+        .find(|file| file.path == "file.txt")
+        .expect("file.txt is in the diff");
+    file.hunks.iter().filter_map(hunk_conflict_region).collect()
+}
+
+fn two_region_merge(name: &str) -> TestRepo {
+    merge_of(
+        name,
+        &numbered(&[]),
+        &[
+            Some(&numbered(&[(3, "A3"), (15, "A15")])),
+            Some(&numbered(&[(3, "B3"), (15, "B15")])),
+        ],
+    )
+}
+
+#[test]
+fn regions_resolve_one_at_a_time() {
+    let wc = || RevisionSelection::WorkingCopy;
+    let mut repo = two_region_merge("regions");
+    assert_eq!(conflict_info(&mut repo, wc())[0].regions, 2);
+    // Each region is a hunk of its own in the diff.
+    assert_eq!(diff_regions(&mut repo, wc()), [(0, 2), (1, 2)]);
+
+    // Region 2 takes side 2; region 1 stays conflicted, on disk too.
+    let message = resolve(&mut repo, wc(), region(1, 2, ConflictPick::Side(1))).expect("resolve");
+    assert!(message.contains("still conflicted"), "{message}");
+    assert_eq!(conflict_info(&mut repo, wc())[0].regions, 1);
+    assert_eq!(diff_regions(&mut repo, wc()), [(0, 1)]);
+    let on_disk = std::fs::read_to_string(repo.root.join("file.txt")).unwrap();
+    assert!(
+        on_disk.contains("B15") && !on_disk.contains("A15"),
+        "{on_disk}"
+    );
+    assert!(
+        on_disk.contains("<<<<<<<") && on_disk.contains("A3"),
+        "{on_disk}"
+    );
+
+    // A count that no longer matches is refused rather than guessed at.
+    let error = resolve(&mut repo, wc(), region(0, 2, ConflictPick::Side(0))).expect_err("stale");
+    assert!(error.to_string().contains("changed"), "{error}");
+
+    // The last region resolves the file.
+    resolve(&mut repo, wc(), region(0, 1, ConflictPick::Base(0))).expect("resolve");
+    assert!(conflict_info(&mut repo, wc()).is_empty());
+    let commit = commit_of(&mut repo, "@");
+    assert_eq!(
+        file_at(&repo.root, &commit, "file.txt"),
+        numbered(&[(15, "B15")])
+    );
+}
+
+#[test]
+fn a_three_sided_region_takes_any_side() {
+    let wc = || RevisionSelection::WorkingCopy;
+    let mut repo = merge_of(
+        "regions-3way",
+        &numbered(&[]),
+        &[
+            Some(&numbered(&[(3, "A3")])),
+            Some(&numbered(&[(3, "B3")])),
+            Some(&numbered(&[(3, "C3")])),
+        ],
+    );
+    let info = conflict_info(&mut repo, wc());
+    assert_eq!((info[0].sides.len(), info[0].bases.len()), (3, 2));
+    assert_eq!(info[0].regions, 1);
+    resolve(&mut repo, wc(), region(0, 1, ConflictPick::Side(2))).expect("resolve");
+    assert!(conflict_info(&mut repo, wc()).is_empty());
+    let commit = commit_of(&mut repo, "@");
+    assert_eq!(
+        file_at(&repo.root, &commit, "file.txt"),
+        numbered(&[(3, "C3")])
+    );
+}
+
+#[test]
+fn a_modify_delete_conflict_only_resolves_whole() {
+    let wc = || RevisionSelection::WorkingCopy;
+    let mut repo = merge_of(
+        "regions-delete",
+        &numbered(&[]),
+        &[Some(&numbered(&[(3, "A3")])), None],
+    );
+    let info = conflict_info(&mut repo, wc());
+    assert_eq!(info[0].regions, 0);
+    assert!(info[0].sides[1].absent);
+    let error = resolve(&mut repo, wc(), region(0, 1, ConflictPick::Side(1))).expect_err("whole");
+    assert!(error.to_string().contains("whole"), "{error}");
+    // Taking the deleting side whole deletes the file.
+    resolve(&mut repo, wc(), ConflictResolution::Side(1)).expect("resolve");
+    assert!(conflict_info(&mut repo, wc()).is_empty());
+    let commit = commit_of(&mut repo, "@");
+    assert_eq!(file_at_or_absent(&repo.root, &commit, "file.txt"), "");
+}
+
+#[test]
+fn a_rebase_conflict_shows_a_hunk_per_region_in_its_diff() {
+    let root = scratch_repo("regions-rebase");
+    let mut repo = TestRepo::open(&root);
+    write(&root, "file.txt", &numbered(&[]));
+    commit(&mut repo, "base");
+    let base = commit_of(&mut repo, "@-");
+    write(&root, "file.txt", &numbered(&[(3, "P3"), (9, "P9")]));
+    commit(&mut repo, "parent");
+    let parent = commit_of(&mut repo, "@-");
+    repo.mutate(MutationOp::New {
+        parent: RevisionSelection::Commit(base),
+    })
+    .expect("new on base");
+    write(&root, "file.txt", &numbered(&[(3, "C3"), (9, "C9")]));
+    commit(&mut repo, "child");
+    let child = commit_of(&mut repo, "description(exact:\"child\\n\")");
+    repo.mutate(MutationOp::Rebase {
+        mode: RebaseSourceMode::Revisions,
+        sources: vec![RevisionSelection::Commit(child)],
+        destination: Destination::Onto(RevisionSelection::Commit(parent)),
+    })
+    .expect("rebase");
+    let child = RevisionSelection::Commit(commit_of(&mut repo, "description(exact:\"child\\n\")"));
+    assert_eq!(conflict_info(&mut repo, child.clone())[0].regions, 2);
+    // The regions sit close enough to share one diff hunk; the diff cuts it.
+    assert_eq!(diff_regions(&mut repo, child.clone()), [(0, 2), (1, 2)]);
+
+    // Region 1 takes side 2, the rebased revision's.
+    resolve(&mut repo, child, region(0, 2, ConflictPick::Side(1))).expect("resolve");
+    let child = RevisionSelection::Commit(commit_of(&mut repo, "description(exact:\"child\\n\")"));
+    assert_eq!(diff_regions(&mut repo, child.clone()), [(0, 1)]);
+    let document = repo.diff(child);
+    let new_side: Vec<&str> = document.files[0]
+        .hunks
+        .iter()
+        .flat_map(|hunk| &hunk.lines)
+        .filter(|line| line.new_line.is_some())
+        .map(|line| line.content.as_str())
+        .collect();
+    assert!(new_side.contains(&"C3"), "{new_side:?}");
+    assert!(
+        !new_side.iter().any(|line| line.contains("P3")),
+        "{new_side:?}"
+    );
+}
+
+fn conflict_text(repo: &mut TestRepo) -> (String, usize) {
+    let events = repo.run(|job| Command::ConflictText {
+        job,
+        revision: RevisionSelection::WorkingCopy,
+        path: "file.txt".to_owned(),
+    });
+    match events.into_iter().next_back() {
+        Some(Payload::ConflictTextLoaded {
+            text, marker_len, ..
+        }) => (text, marker_len),
+        other => panic!("expected ConflictTextLoaded, got {other:?}"),
+    }
+}
+
+/// `text` with its first conflict (opening to closing marker) replaced by
+/// `with`.
+fn edit_first_conflict(text: &str, with: &str) -> String {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let open = lines
+        .iter()
+        .position(|line| line.starts_with("<<<<<<<"))
+        .expect("a conflict");
+    let close = open
+        + lines[open..]
+            .iter()
+            .position(|line| line.starts_with(">>>>>>>"))
+            .expect("its end");
+    let mut out: String = lines[..open].concat();
+    out.push_str(with);
+    out.push_str(&lines[close + 1..].concat());
+    out
+}
+
+#[test]
+fn edited_markers_write_back_and_leftovers_stay_conflicted() {
+    let wc = || RevisionSelection::WorkingCopy;
+    let mut repo = two_region_merge("regions-raw");
+    let (text, marker_len) = conflict_text(&mut repo);
+    assert!(text.contains("conflict 1 of 2"), "{text}");
+
+    let edited = edit_first_conflict(&text, "EDIT3\n");
+    let message = resolve(
+        &mut repo,
+        wc(),
+        ConflictResolution::Content {
+            content: edited.into_bytes(),
+            marker_len: Some(marker_len),
+        },
+    )
+    .expect("save");
+    assert!(message.contains("still conflicted"), "{message}");
+    assert_eq!(conflict_info(&mut repo, wc())[0].regions, 1);
+
+    let (text, marker_len) = conflict_text(&mut repo);
+    assert!(
+        text.contains("EDIT3") && text.contains("conflict 1 of 1"),
+        "{text}"
+    );
+    let edited = edit_first_conflict(&text, "EDIT15\n");
+    resolve(
+        &mut repo,
+        wc(),
+        ConflictResolution::Content {
+            content: edited.into_bytes(),
+            marker_len: Some(marker_len),
+        },
+    )
+    .expect("save");
+    assert!(conflict_info(&mut repo, wc()).is_empty());
+    let commit = commit_of(&mut repo, "@");
+    assert_eq!(
+        file_at(&repo.root, &commit, "file.txt"),
+        numbered(&[(3, "EDIT3"), (15, "EDIT15")])
+    );
 }

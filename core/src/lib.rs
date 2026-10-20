@@ -48,7 +48,10 @@ pub use repo::{
     RepoId, canonical_selection, rewritten_targets,
 };
 pub use repository::{FetchTarget, Repository, RepositorySnapshot, Vcs, prepare_repository};
-pub use resolve::{ConflictFile, ConflictResolution, ConflictTerm, MergeToolInvocation};
+pub use resolve::{
+    ConflictFile, ConflictPick, ConflictResolution, ConflictTerm, MergeToolInvocation,
+    conflict_region, hunk_conflict_region,
+};
 pub use revset::{
     RevsetCompleter, RevsetError, RevsetExpect, RevsetMatch, RevsetQuery, RevsetSymbols,
 };
