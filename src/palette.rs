@@ -824,20 +824,12 @@ pub fn build_overlay<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Messag
     let Some(state) = ui.palette() else {
         return Space::new().into();
     };
-    let command_mode = ui.command_line().is_some();
 
     let scrim = mouse_area(
         container(Space::new().width(Length::Fill).height(Length::Fill))
             .width(Length::Fill)
             .height(Length::Fill)
-            .style(move |_| {
-                let mut style = theme::scrim_style();
-                // A command line tints graph rows: let them read through.
-                if command_mode && let Some(Background::Color(color)) = &mut style.background {
-                    color.a = 0.12;
-                }
-                style
-            }),
+            .style(|_| theme::scrim_style()),
     )
     .on_press(Message::Action(Action::ClosePalette));
 
