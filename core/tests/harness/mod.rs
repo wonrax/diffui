@@ -775,3 +775,28 @@ pub async fn settle_watch(watcher: &mut diffui_core::watcher::RepoWatcher, label
     }
     panic!("{label}: the watch never went quiet after setup");
 }
+
+/// A linear stack of `count` empty commits on `parent`, written in one
+/// operation (a stack built one op at a time takes minutes at this size).
+/// Returns the ids bottom first.
+pub fn new_chain(root: &Path, parent: &str, count: usize) -> Vec<String> {
+    use jj_lib::object_id::ObjectId as _;
+
+    at_head(root, async |_loader, repo| {
+        let mut tip = commit_at(&repo, parent).await;
+        let mut tx = repo.start_transaction();
+        let mut ids = Vec::with_capacity(count);
+        for index in 0..count {
+            tip = tx
+                .repo_mut()
+                .new_commit(vec![tip.id().clone()], tip.tree())
+                .set_description(format!("chain {index}\n"))
+                .write()
+                .await
+                .expect("write a chain commit");
+            ids.push(tip.id().hex());
+        }
+        tx.commit("test: new chain").await.expect("commit the op");
+        ids
+    })
+}

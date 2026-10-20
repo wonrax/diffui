@@ -3296,3 +3296,57 @@ fn binary_and_image_files_carry_their_sides() {
     // Still a text diff underneath.
     assert!(svg.hunks.iter().any(|hunk| !hunk.lines.is_empty()));
 }
+
+/// A big rebase simulation runs off the actor: cancelled straight away, it
+/// ends cancelled and the command sent behind it answers without waiting for
+/// the simulation it would otherwise have queued behind.
+#[test]
+fn a_cancelled_preview_frees_the_actor_at_once() {
+    let root = scratch_repo("preview-cancel");
+    write(&root, "a.txt", "a\n");
+    commit(&root, "base");
+    let base = commit_id(&root, "description(exact:\"base\\n\")");
+    let target = new_leaf(&root, std::slice::from_ref(&base), "target");
+    let chain = harness::new_chain(&root, &base, 390);
+    let request = PreviewRequest::Rebase {
+        mode: RebaseSourceMode::WithDescendants,
+        sources: vec![RevisionSelection::Commit(chain[0].clone())],
+        destination: Destination::Onto(RevisionSelection::Commit(target.clone())),
+    };
+    let mut repo = harness::TestRepo::open(&root);
+    let preview = |request: &PreviewRequest| {
+        let draft = request.clone();
+        move |job| Command::Preview {
+            job,
+            draft,
+            graph: Some("all()".to_owned()),
+        }
+    };
+
+    // Uncancelled, for scale: the whole simulation and graph walk.
+    let started = std::time::Instant::now();
+    let full = repo.run(preview(&request));
+    let simulated = started.elapsed();
+    assert!(
+        matches!(
+            full.last(),
+            Some(Payload::PreviewDone { graph: Some(_), .. })
+        ),
+        "{full:?}"
+    );
+
+    let started = std::time::Instant::now();
+    let job = repo.send(preview(&request));
+    repo.handle.send(Command::Cancel { job });
+    repo.diff(RevisionSelection::Commit(target));
+    let answered = started.elapsed();
+    eprintln!("simulated in {simulated:?}, next command answered in {answered:?}");
+    assert!(
+        answered < simulated / 2,
+        "the diff waited {answered:?} on a {simulated:?} simulation"
+    );
+    assert!(
+        matches!(repo.drain(job).last(), Some(Payload::Cancelled { .. })),
+        "the cancelled preview reports itself cancelled"
+    );
+}

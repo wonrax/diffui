@@ -790,6 +790,12 @@ impl Actor {
         Ok(())
     }
 
+    /// Simulate a draft on a thread of its own, against the operation the
+    /// actor is at. A big rebase takes seconds to simulate and jj-lib can't
+    /// be interrupted inside one, so on the actor it held up every diff and
+    /// load behind it even after the draft was gone; detached, a cancel only
+    /// has to stop the thread, and the actor answers the next command at
+    /// once. The thread sends the terminal event itself.
     async fn preview(
         &mut self,
         repository: &Repository,
@@ -798,27 +804,42 @@ impl Actor {
         graph: Option<String>,
         cancel: &CancelFlag,
     ) -> Result<()> {
-        let repo = self.repo_at_head(repository).await?;
-        let (settings, name) = {
-            let slot = self.slot(repository)?;
-            (slot.settings.clone(), slot.name.clone())
-        };
-        let scope = jj::PreviewScope {
-            repo: &repo,
-            settings: &settings,
-            repository,
-            workspace_name: &name,
-        };
-        let (simulation, graph) = jj::preview(&scope, &draft, graph.as_deref(), cancel).await?;
-        if cancel.is_cancelled() {
-            self.emit(Payload::Cancelled { job });
-            return Ok(());
-        }
-        self.emit(Payload::PreviewDone {
-            job,
-            simulation,
-            graph: graph.map(Arc::new),
-        });
+        let operation = self.repo_at_head(repository).await?.op_id().hex();
+        let settings = self.slot(repository)?.settings.clone();
+        let repository = repository.clone();
+        let (events, id, cancel) = (self.events.clone(), self.id.clone(), cancel.clone());
+        std::thread::Builder::new()
+            .name("diffui-preview".to_owned())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build();
+                let result = match runtime {
+                    Ok(runtime) => runtime.block_on(jj::preview_at_operation(
+                        &settings,
+                        &repository,
+                        &operation,
+                        &draft,
+                        graph.as_deref(),
+                        &cancel,
+                    )),
+                    Err(error) => Err(error.into()),
+                };
+                let payload = match result {
+                    _ if cancel.is_cancelled() => Payload::Cancelled { job },
+                    Ok((simulation, graph)) => Payload::PreviewDone {
+                        job,
+                        simulation,
+                        graph: graph.map(Arc::new),
+                    },
+                    Err(error) => Payload::Failed {
+                        job,
+                        error: classify(error),
+                    },
+                };
+                let _ = events.send(Event::new(id, payload));
+            })
+            .context("failed to spawn the preview thread")?;
         Ok(())
     }
 }

@@ -81,7 +81,7 @@ pub(crate) async fn preview(
             mode,
             sources,
             destination,
-        } => simulate_rebase(&mut tx, &wc_commit_id, *mode, sources, destination).await?,
+        } => simulate_rebase(&mut tx, &wc_commit_id, *mode, sources, destination, cancel).await?,
         PreviewRequest::Merge { parents } => {
             simulate_merge(&mut tx, scope.workspace_name, &wc_commit_id, parents).await?
         }
@@ -92,12 +92,22 @@ pub(crate) async fn preview(
             sources,
             into,
             selection,
-        } => simulate_squash(&mut tx, &wc_commit_id, sources, into, selection.as_ref()).await?,
+        } => {
+            simulate_squash(
+                &mut tx,
+                &wc_commit_id,
+                sources,
+                into,
+                selection.as_ref(),
+                cancel,
+            )
+            .await?
+        }
         PreviewRequest::NewAt { destination } => {
             let op = MutationOp::NewAt {
                 destination: destination.clone(),
             };
-            simulate_insert(scope, &mut tx, &wc_commit_id, &op).await?
+            simulate_insert(scope, &mut tx, &wc_commit_id, &op, cancel).await?
         }
         PreviewRequest::Duplicate {
             targets,
@@ -107,14 +117,14 @@ pub(crate) async fn preview(
                 targets: targets.clone(),
                 destination: Some(destination.clone()),
             };
-            simulate_insert(scope, &mut tx, &wc_commit_id, &op).await?
+            simulate_insert(scope, &mut tx, &wc_commit_id, &op, cancel).await?
         }
     };
     let graph = match (graph_revset, simulated.walk) {
         (Some(revset), Some(moved)) if !cancel.is_cancelled() => {
             let diff = match simulated.diff {
                 Some(diff) => Some(diff),
-                None => tx_diff(&tx).await?,
+                None => tx_diff(&tx, cancel).await?,
             };
             match diff {
                 Some(diff) => post_op_graph(scope, &tx, revset, &moved, &diff, cancel).await?,
@@ -125,6 +135,36 @@ pub(crate) async fn preview(
     };
     // Dropping `tx` discards the simulation: no op is committed.
     Ok((simulated.simulation, graph))
+}
+
+/// [`preview`] against the repo as it was at `operation_hex`, opened afresh
+/// so it can run off the repository actor's thread: a simulation that takes
+/// seconds must not hold up the diffs and loads queued behind it, and the
+/// jj-lib types it works with can't cross threads.
+pub(crate) async fn preview_at_operation(
+    settings: &UserSettings,
+    repository: &Repository,
+    operation_hex: &str,
+    request: &PreviewRequest,
+    graph_revset: Option<&str>,
+    cancel: &CancelFlag,
+) -> Result<(DraftSimulation, Option<PostOpGraph>)> {
+    let workspace = super::workspace::load_workspace(settings, &repository.root)?;
+    let loader = workspace.repo_loader();
+    let operation = super::history::load_operation(loader, operation_hex).await?;
+    checkpoint(cancel)?;
+    let repo = loader
+        .load_at(&operation)
+        .await
+        .context("failed to load the repo to simulate the draft on")?;
+    checkpoint(cancel)?;
+    let scope = PreviewScope {
+        repo: &repo,
+        settings,
+        repository,
+        workspace_name: workspace.workspace_name(),
+    };
+    preview(&scope, request, graph_revset, cancel).await
 }
 
 /// Merge the parents' trees and write the merge as the new `@`, like the real
@@ -194,6 +234,7 @@ async fn simulate_rebase(
     mode: RebaseSourceMode,
     sources: &[RevisionSelection],
     destination: &Destination,
+    cancel: &CancelFlag,
 ) -> Result<Simulated> {
     let mut source_ids: Vec<CommitId> = Vec::new();
     let mut seen: HashSet<CommitId> = HashSet::new();
@@ -274,6 +315,7 @@ async fn simulate_rebase(
     }
     let moved_commit_ids: Vec<String> = moved_ids.iter().map(|id| id.hex()).collect();
 
+    checkpoint(cancel)?;
     let location = MoveCommitsLocation {
         new_parent_ids,
         new_child_ids,
@@ -285,6 +327,7 @@ async fn simulate_rebase(
 
     let mut new_conflicts: Vec<String> = Vec::new();
     for (old_id, rebased) in &stats.rebased_commits {
+        checkpoint(cancel)?;
         let RebasedCommit::Rewritten(new_commit) = rebased else {
             continue;
         };
@@ -383,6 +426,7 @@ async fn simulate_squash(
     sources: &[RevisionSelection],
     into: &RevisionSelection,
     selection: Option<&DiffSelection>,
+    cancel: &CancelFlag,
 ) -> Result<Simulated> {
     let mut source_commits: Vec<Commit> = Vec::new();
     let mut seen: HashSet<CommitId> = HashSet::new();
@@ -417,7 +461,7 @@ async fn simulate_squash(
         .rebase_descendants()
         .await
         .context("failed to rebase descendants after the squash")?;
-    let diff = tx_diff(tx).await?;
+    let diff = tx_diff(tx, cancel).await?;
     let new_conflicts = diff.as_ref().map(TxDiff::new_conflicts).unwrap_or_default();
     Ok(Simulated {
         simulation: DraftSimulation::Squash(SquashPreview {
@@ -437,6 +481,7 @@ async fn simulate_insert(
     tx: &mut Transaction,
     wc_commit_id: &CommitId,
     op: &MutationOp,
+    cancel: &CancelFlag,
 ) -> Result<Simulated> {
     let guard = super::revops::RewriteGuard {
         repo_root: &scope.repository.root,
@@ -456,7 +501,7 @@ async fn simulate_insert(
         .rebase_descendants()
         .await
         .context("failed to rebase descendants")?;
-    let diff = tx_diff(tx).await?;
+    let diff = tx_diff(tx, cancel).await?;
     let (created, rebased) = diff.as_ref().map_or((0, 0), |diff| {
         let created = diff
             .written
@@ -507,7 +552,7 @@ impl TxDiff {
 
 /// Diff `tx` against its base. `None` past [`SIMULATION_CAP`] commits on
 /// either side.
-async fn tx_diff(tx: &Transaction) -> Result<Option<TxDiff>> {
+async fn tx_diff(tx: &Transaction, cancel: &CancelFlag) -> Result<Option<TxDiff>> {
     let repo = tx.repo();
     let before = RevsetExpression::commits(tx.base_repo().view().heads().iter().cloned().collect())
         .ancestors();
@@ -530,12 +575,14 @@ async fn tx_diff(tx: &Transaction) -> Result<Option<TxDiff>> {
     }
     let mut replaced: HashMap<ChangeId, Commit> = HashMap::new();
     for id in &removed {
+        checkpoint(cancel)?;
         let commit = load_commit(repo, id).await?;
         replaced.insert(commit.change_id().clone(), commit);
     }
     let mut written: Vec<(Option<Commit>, Commit)> = Vec::new();
     let mut living: HashSet<ChangeId> = HashSet::new();
     for id in &added {
+        checkpoint(cancel)?;
         let commit = load_commit(repo, id).await?;
         living.insert(commit.change_id().clone());
         written.push((replaced.get(commit.change_id()).cloned(), commit));
@@ -606,12 +653,7 @@ async fn post_op_graph(
             if nodes.len() > GRAPH_CAP {
                 return Ok(None);
             }
-            if nodes.len().is_multiple_of(256) {
-                if cancel.is_cancelled() {
-                    return Ok(None);
-                }
-                tokio::task::yield_now().await;
-            }
+            checkpoint(cancel)?;
         }
     }
 
@@ -648,6 +690,7 @@ async fn post_op_graph(
     let mut missing: HashMap<CommitId, usize> = HashMap::new();
     let mut rows: Vec<PostOpRow> = Vec::with_capacity(nodes.len());
     for (id, edges) in &nodes {
+        checkpoint(cancel)?;
         let edges = edges
             .iter()
             .map(|edge| match (edge.edge_type, row_of.get(&edge.target)) {
@@ -769,4 +812,14 @@ async fn load_commit(repo: &dyn Repo, id: &CommitId) -> Result<Commit> {
         .get_commit_async(id)
         .await
         .with_context(|| format!("failed to load jj commit {}", id.hex()))
+}
+
+/// Bail out of a preview whose job was cancelled: a superseded candidate or
+/// a draft that ended. Cheap (one atomic load), so the loops call it per
+/// commit or row.
+fn checkpoint(cancel: &CancelFlag) -> Result<()> {
+    if cancel.is_cancelled() {
+        bail!("preview cancelled");
+    }
+    Ok(())
 }
