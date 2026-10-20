@@ -218,7 +218,12 @@ async fn preview(
     root: &Path,
     draft: PreviewRequest,
 ) -> Result<diffui_core::DraftSimulation, String> {
-    let events = run_one(root, |job| Command::Preview { job, draft }).await;
+    let events = run_one(root, |job| Command::Preview {
+        job,
+        draft,
+        graph: None,
+    })
+    .await;
     match events.into_iter().next_back() {
         Some(Payload::PreviewDone { simulation, .. }) => Ok(simulation),
         Some(Payload::Failed { error, .. }) => Err(error.to_string()),
@@ -2850,4 +2855,296 @@ fn a_big_rewrite_skips_word_level_emphasis() {
     // token; past it nothing is.
     assert!(before.len() + after.len() > 512 * 1024);
     assert!(!emphasized);
+}
+
+// ── Post-op graph previews ──────────────────────────────────────────────────
+
+/// Simulate `draft` asking for the graph over `all()`.
+fn preview_graph(
+    root: &Path,
+    draft: PreviewRequest,
+) -> (diffui_core::DraftSimulation, diffui_core::PostOpGraph) {
+    let events = block_on(run_one(root, |job| Command::Preview {
+        job,
+        draft,
+        graph: Some("all()".to_owned()),
+    }));
+    match events.into_iter().next_back() {
+        Some(Payload::PreviewDone {
+            simulation,
+            graph: Some(graph),
+            ..
+        }) => (simulation, (*graph).clone()),
+        other => panic!("expected a preview with a graph, got {other:?}"),
+    }
+}
+
+fn load_all(root: &Path) -> (CommitStore, diffui_core::graph_layout::GraphLayout) {
+    let (store, layout, ..) = block_on(load_jj_commits(
+        root.to_owned(),
+        "all()".to_owned(),
+        LoadProgress::default(),
+    ))
+    .expect("load all()");
+    (store, layout)
+}
+
+/// The change ids of the rows the preview shows for real (not ghosts), top
+/// to bottom. A created commit's change id is random, so it reads `new`.
+fn previewed_change_ids(graph: &diffui_core::PreviewGraph, loaded: &CommitStore) -> Vec<String> {
+    (0..graph.len())
+        .filter(|&row| !graph.rows[row].role.is_ghost())
+        .map(|row| match graph.rows[row].role {
+            diffui_core::PreviewRole::Created => "new".to_owned(),
+            _ => graph.commit(loaded, row).change_id().to_owned(),
+        })
+        .collect()
+}
+
+/// Apply `op` and check the log it leaves is the one `post` previewed: the
+/// same changes in the same order, joined by the same edges.
+fn assert_applies_as_previewed(
+    root: &Path,
+    loaded: &CommitStore,
+    post: &diffui_core::PostOpGraph,
+    op: MutationOp,
+) {
+    let graph = diffui_core::PreviewGraph::arrange(post, loaded).expect("arranges");
+    let previewed = previewed_change_ids(&graph, loaded);
+    run(root, op);
+    let (after, layout) = load_all(root);
+    let actual: Vec<String> = after
+        .iter()
+        .map(|row| match loaded.find_by_change_id(row.change_id()) {
+            Some(_) => row.change_id().to_owned(),
+            None => "new".to_owned(),
+        })
+        .collect();
+    assert_eq!(previewed, actual, "rows land where the preview put them");
+    let frames = diffui_core::graph::assign_lanes(
+        post.rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| (index, row.edges.clone())),
+    );
+    for (index, frame) in frames.iter().enumerate() {
+        assert_eq!(
+            *frame,
+            layout.frame(index, usize::MAX),
+            "row {index} draws the edges it will have"
+        );
+    }
+}
+
+/// A three-commit stack rebased onto another branch: the stack lands on the
+/// branch, ghosts mark where it was, and applying it gives exactly that log.
+#[test]
+fn preview_graph_of_a_stack_rebase_matches_the_log_after_apply() {
+    let root = scratch_repo("preview-graph-stack");
+    write(&root, "base.txt", "base\n");
+    commit(&root, "base");
+    let base = commit_id(&root, "description(exact:\"base\\n\")");
+    let t1 = new_leaf(&root, std::slice::from_ref(&base), "t1");
+    let t2 = new_leaf(&root, &[t1], "t2");
+    let s1 = new_leaf(&root, std::slice::from_ref(&base), "s1");
+    let s2 = new_leaf(&root, std::slice::from_ref(&s1), "s2");
+    let s3 = new_leaf(&root, std::slice::from_ref(&s2), "s3");
+    let (loaded, _) = load_all(&root);
+    let head_before = block_on(read_jj_op_head(repository(&root))).expect("read op head");
+
+    let request = PreviewRequest::Rebase {
+        mode: RebaseSourceMode::WithDescendants,
+        sources: vec![RevisionSelection::Commit(s1.clone())],
+        destination: Destination::Onto(RevisionSelection::Commit(t2.clone())),
+    };
+    let (simulation, post) = preview_graph(&root, request);
+    assert!(matches!(
+        simulation,
+        diffui_core::DraftSimulation::Rebase(ref rebase) if rebase.moved == 3
+    ));
+    assert_eq!(
+        block_on(read_jj_op_head(repository(&root))).expect("read op head"),
+        head_before,
+        "a graph preview writes no operation"
+    );
+
+    let graph = diffui_core::PreviewGraph::arrange(&post, &loaded).expect("arranges");
+    let index_of = |id: &str| {
+        loaded
+            .find_by_commit_id(id)
+            .map(|row| row.index())
+            .expect("loaded")
+    };
+    for id in [&s1, &s2, &s3] {
+        let landed = graph.display_of(index_of(id)).expect("shown");
+        assert_eq!(graph.rows[landed].role, diffui_core::PreviewRole::Moved);
+    }
+    let ghosts = graph
+        .rows
+        .iter()
+        .filter(|row| row.role == diffui_core::PreviewRole::MovedFrom)
+        .count();
+    assert_eq!(ghosts, 3, "each moved commit leaves a ghost");
+    let t2_row = graph.display_of(index_of(&t2)).expect("t2 shown");
+    assert_eq!(graph.target_at(t2_row), Some(index_of(&t2)));
+    // The stack sits right on top of its new parent.
+    let s1_row = graph.display_of(index_of(&s1)).expect("s1 shown");
+    assert_eq!(s1_row + 1, t2_row);
+
+    assert_applies_as_previewed(
+        &root,
+        &loaded,
+        &post,
+        MutationOp::Rebase {
+            mode: RebaseSourceMode::WithDescendants,
+            sources: vec![RevisionSelection::Commit(s1)],
+            destination: Destination::Onto(RevisionSelection::Commit(t2)),
+        },
+    );
+}
+
+/// `-r` out of the middle of a stack: the commit lands on the destination,
+/// its child follows its old parent, and the conflict that causes is
+/// forecast on the row that will carry it.
+#[test]
+fn preview_graph_of_a_single_revision_move_forecasts_its_conflict() {
+    let root = scratch_repo("preview-graph-single");
+    write(&root, "file.txt", "one\n");
+    commit(&root, "base");
+    let base = commit_id(&root, "description(exact:\"base\\n\")");
+    write(&root, "file.txt", "two\n");
+    commit(&root, "a");
+    write(&root, "file.txt", "three\n");
+    commit(&root, "b");
+    write(&root, "file.txt", "four\n");
+    commit(&root, "c");
+    let b = commit_id(&root, "description(exact:\"b\\n\")");
+    let c = commit_id(&root, "description(exact:\"c\\n\")");
+    let (loaded, _) = load_all(&root);
+
+    let (_, post) = preview_graph(
+        &root,
+        PreviewRequest::Rebase {
+            mode: RebaseSourceMode::Revisions,
+            sources: vec![RevisionSelection::Commit(b.clone())],
+            destination: Destination::Onto(RevisionSelection::Commit(base.clone())),
+        },
+    );
+    let graph = diffui_core::PreviewGraph::arrange(&post, &loaded).expect("arranges");
+    let index_of = |id: &str| {
+        loaded
+            .find_by_commit_id(id)
+            .map(|row| row.index())
+            .expect("loaded")
+    };
+    let b_row = graph.display_of(index_of(&b)).expect("b shown");
+    assert_eq!(graph.rows[b_row].role, diffui_core::PreviewRole::Moved);
+    let c_row = graph.display_of(index_of(&c)).expect("c shown");
+    assert_eq!(graph.rows[c_row].role, diffui_core::PreviewRole::Rewritten);
+    assert!(
+        graph.rows[c_row].new_conflict,
+        "c's edit no longer applies on a"
+    );
+    assert!(graph.commit(&loaded, c_row).has_conflict());
+
+    assert_applies_as_previewed(
+        &root,
+        &loaded,
+        &post,
+        MutationOp::Rebase {
+            mode: RebaseSourceMode::Revisions,
+            sources: vec![RevisionSelection::Commit(b)],
+            destination: Destination::Onto(RevisionSelection::Commit(base)),
+        },
+    );
+}
+
+/// A squash: the source is abandoned (a ghost where it was), the destination
+/// is rewritten in place, and the summary says the source empties.
+#[test]
+fn preview_graph_of_a_squash_matches_the_log_after_apply() {
+    let root = scratch_repo("preview-graph-squash");
+    write(&root, "a.txt", "a\n");
+    commit(&root, "base");
+    write(&root, "b.txt", "b\n");
+    commit(&root, "b");
+    write(&root, "c.txt", "c\n");
+    commit(&root, "c");
+    let b = commit_id(&root, "description(exact:\"b\\n\")");
+    let c = commit_id(&root, "description(exact:\"c\\n\")");
+    let (loaded, _) = load_all(&root);
+
+    let (simulation, post) = preview_graph(
+        &root,
+        PreviewRequest::Squash {
+            sources: vec![RevisionSelection::Commit(c.clone())],
+            into: RevisionSelection::Commit(b.clone()),
+            selection: None,
+        },
+    );
+    assert_eq!(
+        simulation,
+        diffui_core::DraftSimulation::Squash(diffui_core::SquashPreview {
+            abandons_sources: true,
+            new_conflicts: Vec::new(),
+        })
+    );
+    let graph = diffui_core::PreviewGraph::arrange(&post, &loaded).expect("arranges");
+    let c_index = loaded.find_by_commit_id(&c).expect("c").index();
+    let ghost = graph.display_of(c_index).expect("c's ghost");
+    assert_eq!(graph.rows[ghost].role, diffui_core::PreviewRole::Abandoned);
+    let b_row = graph
+        .display_of(loaded.find_by_commit_id(&b).expect("b").index())
+        .expect("b shown");
+    assert_eq!(graph.rows[b_row].role, diffui_core::PreviewRole::Rewritten);
+
+    assert_applies_as_previewed(
+        &root,
+        &loaded,
+        &post,
+        MutationOp::Squash {
+            from: vec![RevisionSelection::Commit(c)],
+            into: SquashTarget::Revision(RevisionSelection::Commit(b)),
+        },
+    );
+}
+
+/// A new change inserted after a revision shows up as a created row, with
+/// the revision's child rebased onto it.
+#[test]
+fn preview_graph_of_a_new_change_matches_the_log_after_apply() {
+    let root = scratch_repo("preview-graph-new");
+    write(&root, "a.txt", "a\n");
+    commit(&root, "base");
+    write(&root, "b.txt", "b\n");
+    commit(&root, "b");
+    let base = commit_id(&root, "description(exact:\"base\\n\")");
+    let (loaded, _) = load_all(&root);
+
+    let destination = Destination::After(RevisionSelection::Commit(base));
+    let (simulation, post) = preview_graph(
+        &root,
+        PreviewRequest::NewAt {
+            destination: destination.clone(),
+        },
+    );
+    let diffui_core::DraftSimulation::Insert(insert) = simulation else {
+        panic!("a new change previews insert-shaped, got {simulation:?}");
+    };
+    assert_eq!(insert.created, 1);
+    assert!(
+        insert.rebased >= 1,
+        "base's child moves onto the new change"
+    );
+    let graph = diffui_core::PreviewGraph::arrange(&post, &loaded).expect("arranges");
+    assert_eq!(
+        graph
+            .rows
+            .iter()
+            .filter(|row| row.role == diffui_core::PreviewRole::Created)
+            .count(),
+        1
+    );
+
+    assert_applies_as_previewed(&root, &loaded, &post, MutationOp::NewAt { destination });
 }

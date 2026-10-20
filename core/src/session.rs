@@ -670,9 +670,21 @@ impl Session {
         (job, vec![Effect::Send(Command::Fetch { job, target })])
     }
 
+    /// Simulate `draft`, asking for the graph it would leave over the loaded
+    /// revset too.
     pub fn preview(&mut self, draft: PreviewRequest) -> (JobId, Vec<Effect>) {
         let job = self.next_job();
-        (job, vec![Effect::Send(Command::Preview { job, draft })])
+        let graph = Some(self.revset.clone());
+        (
+            job,
+            vec![Effect::Send(Command::Preview { job, draft, graph })],
+        )
+    }
+
+    /// The job of the graph on screen: the identity a result laid over the
+    /// loaded rows is checked against.
+    pub fn graph_version(&self) -> Option<JobId> {
+        self.graph_version
     }
 
     /// Cancel the graph load in flight, if any. A superseded walk that runs to

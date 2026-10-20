@@ -28,7 +28,7 @@ use super::{Envelope, Jobs, SettingsSource, catch_panic, route_commands};
 use crate::history::{HistoryRequest, HistoryResponse};
 use crate::jj;
 use crate::model::{DiffBase, LoadProgress, RevisionSelection, StreamRow};
-use crate::mutations::{DraftSimulation, MutationOp};
+use crate::mutations::MutationOp;
 use crate::repository::Repository;
 use crate::watcher::WatchBatch;
 
@@ -432,7 +432,9 @@ impl Actor {
                 op,
                 allow_immutable,
             } => self.mutate(repository, job, &op, allow_immutable).await,
-            Command::Preview { job, draft } => self.preview(repository, job, draft).await,
+            Command::Preview { job, draft, graph } => {
+                self.preview(repository, job, draft, graph, cancel).await
+            }
             Command::Fetch { job, target } => {
                 self.reload_settings_if_changed(repository);
                 let progress = LoadProgress::default();
@@ -773,37 +775,30 @@ impl Actor {
         repository: &Repository,
         job: JobId,
         draft: PreviewRequest,
+        graph: Option<String>,
+        cancel: &CancelFlag,
     ) -> Result<()> {
         let repo = self.repo_at_head(repository).await?;
         let (settings, name) = {
             let slot = self.slot(repository)?;
             (slot.settings.clone(), slot.name.clone())
         };
-        let simulation = match draft {
-            PreviewRequest::Merge { parents } => {
-                DraftSimulation::Merge(jj::preview_merge(&repo, &name, &parents).await?)
-            }
-            PreviewRequest::Rebase {
-                mode,
-                sources,
-                destination,
-            } => DraftSimulation::Rebase(
-                jj::preview_rebase(
-                    &repo,
-                    &settings,
-                    repository,
-                    &name,
-                    mode,
-                    &sources,
-                    &destination,
-                )
-                .await?,
-            ),
-            PreviewRequest::Parallelize { targets } => {
-                DraftSimulation::Rebase(jj::preview_parallelize(&repo, &name, &targets).await?)
-            }
+        let scope = jj::PreviewScope {
+            repo: &repo,
+            settings: &settings,
+            repository,
+            workspace_name: &name,
         };
-        self.emit(Payload::PreviewDone { job, simulation });
+        let (simulation, graph) = jj::preview(&scope, &draft, graph.as_deref(), cancel).await?;
+        if cancel.is_cancelled() {
+            self.emit(Payload::Cancelled { job });
+            return Ok(());
+        }
+        self.emit(Payload::PreviewDone {
+            job,
+            simulation,
+            graph: graph.map(Arc::new),
+        });
         Ok(())
     }
 }

@@ -257,6 +257,31 @@ pub struct MutationOutcome {
 pub enum DraftSimulation {
     Rebase(RebasePreview),
     Merge(MergePreview),
+    Squash(SquashPreview),
+    /// A new change or copies placed into the graph.
+    Insert(InsertPreview),
+}
+
+/// Predicted outcome of a squash draft (whole revisions or picked changes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SquashPreview {
+    /// Whether the sources end up empty and abandoned.
+    pub abandons_sources: bool,
+    /// Short change ids of commits that end up conflicted that weren't
+    /// before, sorted.
+    pub new_conflicts: Vec<String>,
+}
+
+/// Predicted outcome of a new-change or duplicate draft.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InsertPreview {
+    /// Commits created.
+    pub created: u32,
+    /// Existing commits rebased onto them (an insert's far side).
+    pub rebased: u32,
+    /// Short change ids of commits that end up conflicted that weren't
+    /// before (copies included), sorted.
+    pub new_conflicts: Vec<String>,
 }
 
 /// Predicted outcome of a merge draft: which paths the merged tree would

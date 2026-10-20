@@ -18,6 +18,7 @@ pub mod jj;
 pub mod model;
 pub mod mutations;
 pub mod partial;
+pub mod preview_graph;
 pub mod push;
 pub mod repo;
 pub mod repository;
@@ -34,10 +35,12 @@ pub use cli::{CliCommand, CliInvocation, JjCli, ParsedCommand};
 pub use diff_parse::{DiffStreamParser, format_hunk_header, parse_unified_diff};
 pub use model::*;
 pub use mutations::{
-    Destination, DraftKind, DraftSimulation, DraftSource, MergePreview, MutationOp,
-    MutationOutcome, OpDraft, PlacementKind, RebasePreview, RebaseSourceMode, SquashTarget,
+    Destination, DraftKind, DraftSimulation, DraftSource, InsertPreview, MergePreview, MutationOp,
+    MutationOutcome, OpDraft, PlacementKind, RebasePreview, RebaseSourceMode, SquashPreview,
+    SquashTarget,
 };
 pub use partial::{DiffSelection, FileSelection, HunkPick, HunkRef, LineRef};
+pub use preview_graph::{PostOpGraph, PreviewGraph, PreviewRole, PreviewRow, RowSource};
 pub use push::{PushAllow, PushCheck, PushRejection, PushRequest, PushTarget, RejectedCommit};
 pub use repo::{
     Capabilities, Command, Event, JobId, OpenSpec, Payload, PreviewRequest, RepoError, RepoHandle,

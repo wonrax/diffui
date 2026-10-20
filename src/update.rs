@@ -2710,7 +2710,7 @@ impl Diffui {
                     diffui_core::DraftSimulation::Rebase(rebase) => {
                         rebase.moved_commit_ids.iter().cloned().collect()
                     }
-                    diffui_core::DraftSimulation::Merge(_) => HashSet::new(),
+                    _ => HashSet::new(),
                 };
                 DraftPreviewState::Ready(preview)
             }

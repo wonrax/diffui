@@ -7,6 +7,7 @@
 
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::cli::{CliInvocation, CliLine};
 use crate::history::{HistoryRequest, HistoryResponse, OperationEntry};
@@ -17,6 +18,8 @@ use crate::model::{
 use crate::mutations::{
     Destination, DraftSimulation, MutationOp, MutationOutcome, RebaseSourceMode,
 };
+use crate::partial::DiffSelection;
+use crate::preview_graph::PostOpGraph;
 use crate::repository::{FetchTarget, RepositorySnapshot};
 use crate::resolve::{ConflictFile, MergeToolInvocation};
 use crate::revset::{RevsetError, RevsetMatch, RevsetQuery, RevsetSymbols};
@@ -148,6 +151,22 @@ pub enum PreviewRequest {
     Parallelize {
         targets: Vec<RevisionSelection>,
     },
+    /// `jj squash --from <sources> --into <into>`, or only `selection` of a
+    /// single source.
+    Squash {
+        sources: Vec<RevisionSelection>,
+        into: RevisionSelection,
+        selection: Option<DiffSelection>,
+    },
+    /// `jj new` placed at `destination`.
+    NewAt {
+        destination: Destination,
+    },
+    /// `jj duplicate` of `targets` placed at `destination`.
+    Duplicate {
+        targets: Vec<RevisionSelection>,
+        destination: Destination,
+    },
 }
 
 /// Work asked of a repository. Every variant that does work carries a
@@ -183,6 +202,10 @@ pub enum Command {
     Preview {
         job: JobId,
         draft: PreviewRequest,
+        /// The log revset to walk over the simulated result, so the answer
+        /// carries the graph the operation would leave; `None` for the
+        /// summary alone.
+        graph: Option<String>,
     },
     Fetch {
         job: JobId,
@@ -394,6 +417,9 @@ pub enum Payload {
     PreviewDone {
         job: JobId,
         simulation: DraftSimulation,
+        /// The post-op graph, when one was asked for and the result was
+        /// small enough to walk.
+        graph: Option<Arc<PostOpGraph>>,
     },
     FetchDone {
         job: JobId,

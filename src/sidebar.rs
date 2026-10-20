@@ -654,6 +654,23 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
                 )
             }
         }
+        crate::DraftPreviewState::Ready(diffui_core::DraftSimulation::Squash(preview)) => {
+            let counts = preview
+                .abandons_sources
+                .then(|| format!("Abandons {names}, now empty"));
+            conflict_verdict(&preview.new_conflicts, counts, theme)
+        }
+        crate::DraftPreviewState::Ready(diffui_core::DraftSimulation::Insert(preview)) => {
+            let mut counts = format!(
+                "Adds {} change{}",
+                preview.created,
+                if preview.created == 1 { "" } else { "s" }
+            );
+            if preview.rebased > 0 {
+                counts.push_str(&format!(" · rebases {}", preview.rebased));
+            }
+            conflict_verdict(&preview.new_conflicts, Some(counts), theme)
+        }
         crate::DraftPreviewState::Failed(error) => (
             Some(icons::ALERT_TRIANGLE),
             format!("Preview failed: {error}"),
@@ -769,6 +786,30 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         band,
     ]
     .into()
+}
+
+/// The op bar's verdict for a simulation that only forecasts conflicts:
+/// "No new conflicts" or which revisions would conflict, over `counts`.
+fn conflict_verdict(
+    new_conflicts: &[String],
+    counts: Option<String>,
+    theme: ThemeSpec,
+) -> (Option<&'static str>, String, Color, Option<String>) {
+    if new_conflicts.is_empty() {
+        (
+            Some(icons::CHECK),
+            "No new conflicts".to_owned(),
+            theme.added_text,
+            counts,
+        )
+    } else {
+        (
+            Some(icons::ALERT_TRIANGLE),
+            format!("Conflicts in {}", commit_list_summary(new_conflicts)),
+            theme.conflict_marker,
+            counts,
+        )
+    }
 }
 
 /// Focus target id for the revset input.
