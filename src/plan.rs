@@ -37,6 +37,25 @@ pub(crate) fn op_command(ui: &Diffui, op: &MutationOp, allow_immutable: bool) ->
     Some(equivalent.to_shell())
 }
 
+/// The jj command a target-mode draft stands for: the whole command once
+/// its destination is armed (`op`), else the command up to where the
+/// destination goes. The draft banner shows it and `:` opens the palette on
+/// it, so the two always read the same.
+pub(crate) fn draft_command(
+    ui: &Diffui,
+    draft: &diffui_core::OpDraft,
+    op: Option<&MutationOp>,
+) -> Option<String> {
+    match op {
+        Some(op) => op_command(ui, op, false),
+        None => ui
+            .active()
+            .repository
+            .as_ref()
+            .map(|_| draft.cli_prefix(&ui.active().session.commits)),
+    }
+}
+
 /// `jj git fetch …` for a fetch, in a jj repository.
 pub(crate) fn fetch_command(ui: &Diffui, target: &diffui_core::FetchTarget) -> Option<String> {
     let repository = ui.active().repository.as_ref()?;

@@ -1805,6 +1805,18 @@ pub(crate) static REGISTRY: &[Command] = &[
         palette: PaletteScope::Hidden,
     },
     Command {
+        id: "draft.command-line",
+        label: "Edit as command",
+        hint: "Open the draft in the palette as its jj command",
+        contexts: &[Context::Draft],
+        chords: &[":"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::CommandLine(CmdAction::FromDraft)),
+        palette: PaletteScope::Hidden,
+    },
+    // ── Overlays ────────────────────────────────────────────────────────
+    Command {
         id: "palette.toggle",
         label: "Command palette",
         hint: "Search revisions, files and commands",

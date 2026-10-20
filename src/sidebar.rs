@@ -757,17 +757,14 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     let sentence = planned_op
         .as_ref()
         .and_then(|op| crate::plan::op_sentence(ui, op, descendants));
-    let command = match &planned_op {
-        Some(op) => crate::plan::op_command(ui, op, false),
-        None => ui.active().repository.as_ref().map(|_| {
-            let prefix = draft.cli_prefix(&ui.active().session.commits);
-            if prefix.ends_with(' ') {
-                format!("{prefix}\u{2026}")
-            } else {
-                prefix
-            }
-        }),
-    };
+    let command = crate::plan::draft_command(ui, draft, planned_op.as_ref()).map(|command| {
+        // Still missing its destination: say so.
+        if command.ends_with(' ') {
+            format!("{command}\u{2026}")
+        } else {
+            command
+        }
+    });
     let mut plan = column![].spacing(3).width(Length::Fill);
     if let Some(sentence) = sentence {
         plan = plan.push(

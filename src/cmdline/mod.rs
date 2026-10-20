@@ -88,6 +88,8 @@ pub(crate) fn is_command(query: &str) -> bool {
 pub(crate) enum CmdAction {
     /// Open the palette as a command line, `jj ` or the given line typed.
     Open,
+    /// From target mode: open it on the draft's own command.
+    FromDraft,
     /// The CLI output panel.
     Output(crate::cli_output::OutputAction),
 }
@@ -384,6 +386,10 @@ impl Diffui {
     pub(crate) fn on_command_line_action(&mut self, action: CmdAction) -> Task<Message> {
         match action {
             CmdAction::Open => self.open_command_line(PREFIX.to_owned()),
+            CmdAction::FromDraft => match self.draft_command_line() {
+                Some(line) => self.open_command_line(line),
+                None => Task::none(),
+            },
             CmdAction::Output(action) => self.on_output_action(action),
         }
     }
@@ -1014,6 +1020,24 @@ impl Diffui {
                 Task::batch([show, select, file])
             }
         }
+    }
+
+    // ── the draft → command bridge ──────────────────────────────────────
+
+    /// The active draft as a command line, exactly as its banner shows it:
+    /// the whole command when a destination is armed, else up to where the
+    /// destination goes.
+    pub(crate) fn draft_command_line(&self) -> Option<String> {
+        let ui = self.active().op_draft()?;
+        let armed = ui
+            .draft
+            .candidate
+            .and_then(|index| self.selection_at_index(index))
+            .filter(|target| !self.draft_blocks_target(target))
+            .and_then(|target| ui.draft.op_for(target, ui.draft.placement));
+        let rendered = crate::plan::draft_command(self, &ui.draft, armed.as_ref())?;
+        let rendered = rendered.strip_prefix(PREFIX).unwrap_or(&rendered);
+        Some(format!("{PREFIX}{rendered}"))
     }
 }
 
