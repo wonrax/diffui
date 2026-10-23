@@ -44,6 +44,15 @@
             hash = "sha256-681MVdcC81+rEC+MNLwYwjOOFzaEcO1YqsSfj7Kl1HY=";
           };
 
+          # The same for the highlights module core/build.rs fetches, through
+          # its `HIGHLIGHTS_WASM_PATH` escape hatch. Keep in lockstep with the
+          # HIGHLIGHTS_* constants there; the hash is the SRI form of
+          # HIGHLIGHTS_SHA256.
+          highlightsWasm = pkgs.fetchurl {
+            url = "https://cdn.jsdelivr.net/npm/@pierre/highlights@0.2.0/dist/highlights.wasm";
+            hash = "sha256-z1/E2D58HdqxnRY94Jb3h/h+/mFQSQmqRpQ09h71Hi4=";
+          };
+
           diffui = pkgs.rustPlatform.buildRustPackage {
             pname = "diffui";
             inherit version;
@@ -79,6 +88,12 @@
 
             # Point build.rs at the sandbox-fetched font instead of the network.
             LUCIDE_TTF_PATH = lucideTtf;
+
+            # core/build.rs translates the highlighter's wasm to C with wabt's
+            # wasm2c and compiles it against SIMDe's headers.
+            HIGHLIGHTS_WASM_PATH = highlightsWasm;
+            WABT_DIR = pkgs.wabt;
+            SIMDE_DIR = pkgs.simde;
 
             # Linux: wrap for the runtime libs and install the XDG desktop entry
             # (+ icon) so launchers/app grids list it, not just the CLI. macOS:
@@ -240,6 +255,8 @@
             buildInputs = lib.optionals pkgs.stdenv.hostPlatform.isDarwin darwinBuildInputs;
 
             RUST_BACKTRACE = "1";
+            WABT_DIR = pkgs.wabt;
+            SIMDE_DIR = pkgs.simde;
 
             shellHook =
               lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''

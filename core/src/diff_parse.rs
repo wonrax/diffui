@@ -110,9 +110,9 @@ impl DiffStreamParser {
     fn take_file(&mut self) -> Option<DiffFile> {
         let mut file = self.current_file.take()?;
         flush_current_hunk(&mut file, &mut self.current_hunk);
-        // No highlighting here: tree-sitter over whole documents is seconds of
-        // CPU on big files, so it runs in the background after the document is
-        // already on screen (see `syntax::highlight_file`).
+        // No highlighting here: it reads each file's full sources, so it runs
+        // in the background after the document is already on screen (see
+        // `syntax::highlight_file`).
         Some(file)
     }
 }

@@ -2960,8 +2960,7 @@ impl Diffui {
     }
 
     /// Full file sources for one background highlight job: hand them to the
-    /// tree-sitter parse, which is seconds of CPU on a large file and so stays
-    /// off the actor's thread.
+    /// highlighter on a blocking thread, off the actor's.
     fn apply_file_pair(
         &mut self,
         tab: TabId,
@@ -2981,8 +2980,9 @@ impl Diffui {
         let Some(file) = target.session.document.files.get(file_index).cloned() else {
             return Task::none();
         };
-        // The parse is seconds of CPU on a large file, which is exactly why it
-        // isn't on the UI thread — and why it isn't on the actor's either.
+        // Tens of milliseconds on a large file, plus mapping every span back
+        // to its diff line: too long for the UI thread, and the actor's has
+        // commands to serve.
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {

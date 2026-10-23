@@ -397,10 +397,10 @@ pub(crate) async fn diff_trees(
             }
         }
 
-        // Highlighting is deliberately NOT applied here: it's tree-sitter
-        // over whole documents — seconds of CPU on big files — and runs in
-        // the background instead (see `syntax::highlight_file`), so the diff
-        // paints plain immediately and colorizes progressively.
+        // Highlighting is deliberately NOT applied here: it reads each file's
+        // full sources, so it runs in the background instead (see
+        // `syntax::highlight_file`) and the diff paints plain immediately,
+        // then colorizes progressively.
         files.push(file);
     }
     drop(stream);

@@ -85,8 +85,8 @@ pub struct SourceFileData {
 
 /// Files larger than this aren't loaded into the browser at all.
 pub const MAX_SOURCE_FILE_BYTES: usize = 8 * 1024 * 1024;
-/// Files larger than this load but skip tree-sitter highlighting — the parse
-/// would cost more than the colors are worth.
+/// Files larger than this load but skip syntax highlighting: their spans would
+/// cost more memory than the colors are worth.
 const MAX_HIGHLIGHT_BYTES: usize = 2 * 1024 * 1024;
 
 /// Sort a backend's raw listing the way the tree renders it.

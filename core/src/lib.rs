@@ -13,6 +13,7 @@ pub mod git;
 pub mod github;
 pub mod graph;
 pub mod graph_layout;
+pub mod highlights;
 pub mod history;
 pub mod jj;
 pub mod media;

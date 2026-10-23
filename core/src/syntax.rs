@@ -1,18 +1,13 @@
-//! Tree-sitter (arborium) syntax highlighting for diff lines: reconstruct each
-//! side of a file as one document, parse once, map captures back to per-line
-//! spans. Quarantines the arborium dependency.
+//! Syntax highlighting for diff lines: reconstruct each side of a file as one
+//! document, highlight it once, map the spans back to per-line spans. The
+//! highlighter itself lives in [`crate::highlights`].
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, OnceLock},
+use std::collections::HashMap;
+
+use crate::{
+    highlights::{self, Language},
+    model::{DiffFile, DiffLineKind, SyntaxSpan},
 };
-
-use arborium::{
-    GrammarStore,
-    advanced::{CompiledGrammar, ParseContext},
-};
-
-use crate::model::{DiffFile, DiffLineKind, SyntaxKind, SyntaxSpan};
 
 /// Apply syntax highlighting to all visible diff lines for `file`, from the
 /// diff's own lines alone. Equivalent to
@@ -24,23 +19,22 @@ pub fn apply_syntax_highlighting(file: &mut DiffFile) {
 
 /// Apply syntax highlighting to all visible diff lines for `file`.
 ///
-/// We previously fed each line to tree-sitter individually, which was
-/// fundamentally wrong: tree-sitter expects a complete document, so a line
-/// like `fn foo(` parses as an error, `}` on its own gets no captures, and
-/// every multi-line construct (string literals, function bodies, doc
-/// comments, raw strings) is invisible to the parser.
+/// We previously fed each line to the highlighter individually, which was
+/// fundamentally wrong: the lexer carries state from line to line, so every
+/// multi-line construct (string literals, doc comments, raw strings) was
+/// invisible to it.
 ///
 /// When a side's **full source** is provided, that side is parsed as the real
-/// document and the captures are mapped to the diff's lines by their source
+/// document and the spans are mapped to the diff's lines by their source
 /// line numbers — the correct result even for constructs that span hunk
 /// boundaries (a string opened above the hunk, an enclosing class, a block
 /// comment cut mid-diff).
 ///
 /// Without a source, the side is *reconstructed* from the diff's own lines:
 /// one contiguous document with blank lines filling the gaps between hunks so
-/// each surviving line sits at its true line number. Tree-sitter is
-/// reasonably tolerant of the missing code and recovers local syntax within
-/// each hunk, but anything depending on the elided regions parses wrong —
+/// each surviving line sits at its true line number. The lexer recovers
+/// local syntax within each hunk, but anything depending on the elided
+/// regions comes out wrong —
 /// which is why callers should prefer passing sources when they have them.
 ///
 /// Context lines are highlighted from the new side (they're identical on
@@ -52,23 +46,17 @@ pub fn apply_syntax_highlighting_with_sources(
     old_source: Option<&str>,
     new_source: Option<&str>,
 ) {
-    static GRAMMAR_STORE: OnceLock<GrammarStore> = OnceLock::new();
-
-    let Some(language) = arborium::detect_language(&file.path) else {
-        return;
-    };
-    let store = GRAMMAR_STORE.get_or_init(GrammarStore::new);
-    let Some(grammar) = store.get(language) else {
+    let Some(language) = highlights::detect_language(&file.path) else {
         return;
     };
 
     let new_spans = match new_source {
-        Some(source) => parse_full_side(&grammar, file, Side::New, source),
-        None => parse_side(&grammar, file, Side::New),
+        Some(source) => parse_full_side(language, file, Side::New, source),
+        None => parse_side(language, file, Side::New),
     };
     let old_spans = match old_source {
-        Some(source) => parse_full_side(&grammar, file, Side::Old, source),
-        None => parse_side(&grammar, file, Side::Old),
+        Some(source) => parse_full_side(language, file, Side::Old, source),
+        None => parse_side(language, file, Side::Old),
     };
 
     for (hunk_index, hunk) in file.hunks.iter_mut().enumerate() {
@@ -114,14 +102,14 @@ enum Side {
     New,
 }
 
-/// Parse one side's **real, complete source** and slice its captures into
+/// Highlight one side's **real, complete source** and slice its spans into
 /// per-line span lists keyed by `(hunk_index, line_index)` — only for the
 /// lines the diff actually shows on that side. Line numbers anchor the
 /// mapping: the diff's `old_line`/`new_line` index straight into the
-/// source's line table, so offsets agree even though the parse saw the
+/// source's line table, so offsets agree even though the highlighter saw the
 /// whole document.
 fn parse_full_side(
-    grammar: &Arc<CompiledGrammar>,
+    language: Language,
     file: &DiffFile,
     side: Side,
     source: &str,
@@ -160,26 +148,10 @@ fn parse_full_side(
     }
     line_starts.push(source.len() + 1);
 
-    let Ok(mut context) = ParseContext::for_grammar(grammar) else {
-        return HashMap::new();
-    };
-    let result = grammar.parse(&mut context, source);
-
     let mut per_line: HashMap<(usize, usize), Vec<SyntaxSpan>> = HashMap::new();
-    for span in result.spans {
-        let Some(kind) = syntax_kind_for_capture(&span.capture) else {
-            continue;
-        };
-        let (Ok(start), Ok(end)) = (usize::try_from(span.start), usize::try_from(span.end)) else {
-            continue;
-        };
-        if start >= end || end > source.len() {
-            continue;
-        }
-
+    for SyntaxSpan { start, end, kind } in highlights::highlight(language, source) {
         // First source line the span touches (0-based into `line_starts`),
-        // then walk forward over every covered line — multi-line constructs
-        // (block comments, raw strings) highlight each one.
+        // then walk forward over every covered line.
         let first = line_starts
             .partition_point(|&line_start| line_start <= start)
             .saturating_sub(1);
@@ -213,23 +185,19 @@ fn parse_full_side(
                 });
         }
     }
-
-    for spans in per_line.values_mut() {
-        *spans = normalize_syntax_spans(std::mem::take(spans));
-    }
     per_line
 }
 
-/// Reconstruct one side of `file` as a single document, parse it, and slice
-/// the resulting captures into per-line span lists keyed by
+/// Reconstruct one side of `file` as a single document, highlight it, and
+/// slice the resulting spans into per-line span lists keyed by
 /// `(hunk_index, line_index)`.
 fn parse_side(
-    grammar: &Arc<CompiledGrammar>,
+    language: Language,
     file: &DiffFile,
     side: Side,
 ) -> HashMap<(usize, usize), Vec<SyntaxSpan>> {
     // For each line we keep on this side, record its byte range in the
-    // reconstructed buffer so we can map captures back later.
+    // reconstructed buffer so we can map spans back later.
     struct LineRange {
         hunk_index: usize,
         line_index: usize,
@@ -262,8 +230,6 @@ fn parse_side(
             };
 
             // Pad blank lines so this content sits at its true line number.
-            // Tree-sitter will see structurally-meaningless gaps but its
-            // error-recovery handles that cleanly for most languages.
             while current_source_line < target {
                 buf.push('\n');
                 current_source_line += 1;
@@ -288,31 +254,10 @@ fn parse_side(
         return HashMap::new();
     }
 
-    let Ok(mut context) = ParseContext::for_grammar(grammar) else {
-        return HashMap::new();
-    };
-    let result = grammar.parse(&mut context, &buf);
-
     let mut per_line: HashMap<(usize, usize), Vec<SyntaxSpan>> = HashMap::new();
 
-    for span in result.spans {
-        let Some(kind) = syntax_kind_for_capture(&span.capture) else {
-            continue;
-        };
-        let (Ok(start), Ok(end)) = (usize::try_from(span.start), usize::try_from(span.end)) else {
-            continue;
-        };
-        if start >= end || end > buf.len() {
-            continue;
-        }
-        if !buf.is_char_boundary(start) || !buf.is_char_boundary(end) {
-            continue;
-        }
-
-        // Walk every line that the span overlaps. Most spans live entirely
-        // within one line so this loop usually fires once, but multi-line
-        // constructs (block comments, raw strings) need to highlight every
-        // covered line.
+    for SyntaxSpan { start, end, kind } in highlights::highlight(language, &buf) {
+        // Walk every line that the span overlaps.
         // `ranges` is sorted by start and end (the buffer only grows as lines
         // are appended), so the ranges overlapping this span form one contiguous
         // run. Binary-search to the first range ending past the span's start,
@@ -338,64 +283,7 @@ fn parse_side(
                 });
         }
     }
-
-    for spans in per_line.values_mut() {
-        *spans = normalize_syntax_spans(std::mem::take(spans));
-    }
     per_line
-}
-
-fn syntax_kind_for_capture(capture: &str) -> Option<SyntaxKind> {
-    if capture.starts_with("comment") {
-        Some(SyntaxKind::Comment)
-    } else if capture.starts_with("string") || capture == "character" {
-        Some(SyntaxKind::String)
-    } else if capture.starts_with("number")
-        || capture.starts_with("constant")
-        || capture == "boolean"
-    {
-        Some(SyntaxKind::Number)
-    } else if capture.starts_with("keyword")
-        || capture == "operator"
-        || capture == "include"
-        || capture == "storageclass"
-    {
-        Some(SyntaxKind::Keyword)
-    } else if capture.starts_with("function") || capture == "constructor" || capture == "method" {
-        Some(SyntaxKind::Function)
-    } else if capture.starts_with("type") || capture == "variable.builtin" {
-        Some(SyntaxKind::Type)
-    } else if capture.starts_with("property")
-        || capture == "variable.parameter"
-        || capture == "field"
-        || capture == "attribute"
-        || capture == "tag"
-    {
-        Some(SyntaxKind::Property)
-    } else if capture.starts_with("punctuation") {
-        Some(SyntaxKind::Punctuation)
-    } else {
-        None
-    }
-}
-
-fn normalize_syntax_spans(mut spans: Vec<SyntaxSpan>) -> Vec<SyntaxSpan> {
-    spans.sort_by_key(|span| (span.start, span.end));
-
-    let mut normalized: Vec<SyntaxSpan> = Vec::with_capacity(spans.len());
-    for mut span in spans {
-        if let Some(previous) = normalized.last()
-            && span.start < previous.end
-        {
-            span.start = previous.end;
-        }
-
-        if span.start < span.end {
-            normalized.push(span);
-        }
-    }
-
-    normalized
 }
 
 /// Highlight one diff file against its full old/new sources and return the
@@ -404,8 +292,8 @@ fn normalize_syntax_spans(mut spans: Vec<SyntaxSpan>) -> Vec<SyntaxSpan> {
 ///
 /// Sparse because the caller applies these into a document it still owns —
 /// shipping the whole file back would copy every line for the handful that
-/// gained colour. Seconds of CPU on a large file, so callers run it off their
-/// UI thread.
+/// gained colour. Tens of milliseconds on a large file, so callers run it off
+/// their UI thread.
 pub fn highlight_file(
     mut file: DiffFile,
     old_source: Option<&str>,
@@ -428,7 +316,7 @@ pub fn highlight_file(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{DiffFile, DiffFileStatus, DiffHunkView, DiffLine};
+    use crate::model::{DiffFile, DiffFileStatus, DiffHunkView, DiffLine, SyntaxKind};
 
     fn context_line(old: usize, new: usize, content: &str) -> DiffLine {
         DiffLine {
@@ -444,11 +332,12 @@ mod tests {
     /// The bug full-context highlighting fixes: a multi-line string opened
     /// above the hunk. The diff shows only a line from the string's middle —
     /// the reconstruction parses it as bare code, the real source knows it's
-    /// string interior.
+    /// string interior. A raw string, because highlights' Rust lexer drops a
+    /// plain `"…"` string's state at the line break.
     #[test]
     fn full_source_highlights_across_hunk_boundaries() {
         let source =
-            "const GREETING: &str = \"hello\nworld of let keywords\nbye\";\nfn main() {}\n";
+            "const GREETING: &str = r#\"hello\nworld of let keywords\nbye\"#;\nfn main() {}\n";
         let make_file = || DiffFile {
             path: "test.rs".to_owned(),
             old_path: None,

@@ -12,10 +12,6 @@ resolver = "3"
 # launch) plus an offer to `cargo install` comet. Useful while profiling the
 # UI, noise for everyone else, so it stays out of default builds.
 iced-debug = ["iced/debug"]
-# Restores every tree-sitter grammar arborium ships. The default build carries
-# only the languages a diff is likely to contain, because the rest of the parse
-# tables cost more than half the binary; enable this if your repos are wider.
-lang-all = ["diffui-core/lang-all"]
 # Profiling-only: swaps in a global allocator that tracks current/peak bytes.
 # Adds atomic bookkeeping to every alloc, so never enable it for normal builds.
 track-alloc = ["diffui-core/track-alloc"]
