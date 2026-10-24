@@ -13,6 +13,7 @@
 
 use std::rc::Rc;
 
+use diffui_core::graph_layout::GraphEdgeType;
 use iced::advanced::{
     Layout, Shell, Widget, layout, mouse, overlay, renderer,
     text::{self, Text},
@@ -22,7 +23,6 @@ use iced::{
     Background, Border, Color, Element, Event, Font, Length, Pixels, Point, Radians, Rectangle,
     Shadow, Size, Theme, Vector, alignment, gradient,
 };
-use jj_lib::graph::GraphEdgeType;
 
 use crate::chip::{self, Chip};
 use crate::graph::LaneFrame;

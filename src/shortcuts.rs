@@ -293,11 +293,12 @@ pub(crate) fn build_overlay(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
             ..Padding::from(crate::ui::DIALOG_PADDING)
         })
         .height(Length::Fixed(
-            (ui.window_size.height - theme::modal_top() - theme::space::XXL)
+            (ui.window_size.height - crate::toolbar::modal_top() - theme::space::XXL)
                 .clamp(240.0, CARD_MAX_HEIGHT),
         ));
     crate::ui::modal(
         card,
+        crate::toolbar::modal_top(),
         Message::Action(Action::CloseShortcuts),
         Message::Ui(UiEvent::ConfirmNoOp),
     )

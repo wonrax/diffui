@@ -1350,7 +1350,7 @@ pub(crate) fn split_modal<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, M
     let size = ui.config.code_type.size;
     let width = SPLIT_WIDTH - 2.0 * ui::DIALOG_PADDING;
     // Two editors share what the window leaves under the card's fixed parts.
-    let max = ((ui.window_size.height - crate::theme::modal_top() - SPLIT_CHROME_HEIGHT) / 2.0)
+    let max = ((ui.window_size.height - crate::toolbar::modal_top() - SPLIT_CHROME_HEIGHT) / 2.0)
         .clamp(88.0, crate::input::editor_max_height(ui.window_size.height));
     let field = |caption: Prose,
                  content: &'a text_editor::Content,
@@ -1420,6 +1420,7 @@ pub(crate) fn split_modal<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, M
 
     ui::modal(
         ui::dialog_card(body, SPLIT_WIDTH, theme),
+        crate::toolbar::modal_top(),
         Message::Ui(crate::UiEvent::ConfirmNoOp),
         Message::Ui(crate::UiEvent::ConfirmNoOp),
     )

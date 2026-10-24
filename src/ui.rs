@@ -218,11 +218,12 @@ pub const DIALOG_SPACING: f32 = theme::space::LG;
 /// Width of a dialog that asks one question.
 pub const DIALOG_WIDTH: f32 = 460.0;
 
-/// A card over the scrim, hung from [`theme::modal_top`]. A press on the
-/// scrim sends `dismiss`; one on the card sends `swallow`, which must do
-/// nothing (it only keeps the press from reaching the scrim).
+/// A card over the scrim, hung `top` px below the window's top edge. A press
+/// on the scrim sends `dismiss`; one on the card sends `swallow`, which must
+/// do nothing (it only keeps the press from reaching the scrim).
 pub fn modal<'a, Message: Clone + 'a>(
     card: impl Into<Element<'a, Message>>,
+    top: f32,
     dismiss: Message,
     swallow: Message,
 ) -> Element<'a, Message> {
@@ -238,7 +239,7 @@ pub fn modal<'a, Message: Clone + 'a>(
         .height(Length::Fill)
         .align_x(alignment::Horizontal::Center)
         .padding(Padding {
-            top: theme::modal_top(),
+            top,
             ..Padding::ZERO
         });
     // `opaque` keeps wheel events and the cursor from bleeding through to the

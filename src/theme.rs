@@ -471,14 +471,6 @@ pub fn centered_control_content_fill<'a, Message: 'a>(
         .into()
 }
 
-/// Where every modal surface (command palette, open-repo and confirm
-/// dialogs) hangs from: a fixed distance under the window chrome rather than
-/// centered, so a card doesn't jump as its content grows and stacked
-/// takeovers line up with one another.
-pub fn modal_top() -> f32 {
-    crate::toolbar::chrome_bottom() + space::XXL * 2.0
-}
-
 /// Corner radii shared across the chrome. Chips keep their own tighter
 /// rounding ([`crate::chip::RADIUS`]).
 pub mod radius {

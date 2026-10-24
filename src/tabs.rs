@@ -382,8 +382,9 @@ impl Diffui {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::config::{AppConfig, CodeTypography};
+    use crate::config::AppConfig;
     use crate::theme::ThemePreference;
+    use crate::typography::CodeTypography;
     use diffui_core::DiffDocument;
 
     /// A blank app with no tabs. Built field-by-field rather than through

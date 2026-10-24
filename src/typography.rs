@@ -188,6 +188,33 @@ impl TextBox {
 /// iced's default `LineHeight::Relative` for a `text` widget.
 pub const DEFAULT_LINE_HEIGHT: f32 = 1.3;
 
+/// Default row-height factor of the code grid — 1.85 × the font size gives
+/// the historical 22px rows at the default 12px code font.
+pub const DEFAULT_CODE_LINE_HEIGHT: f32 = 1.85;
+
+/// Typography of the code surfaces, resolved and clamped at load. One value
+/// object so the diff view's metrics take the whole set at once.
+#[derive(Debug, Clone, Copy)]
+pub struct CodeTypography {
+    /// Font size in px (`code_font_size`).
+    pub size: f32,
+    /// Row height as a multiple of `size` (`code_line_height`).
+    pub line_height: f32,
+    /// Vertical nudge of text within its row, px, positive = down
+    /// (`code_baseline_offset`).
+    pub baseline_offset: f32,
+}
+
+impl Default for CodeTypography {
+    fn default() -> Self {
+        Self {
+            size: 12.0,
+            line_height: DEFAULT_CODE_LINE_HEIGHT,
+            baseline_offset: 0.0,
+        }
+    }
+}
+
 /// Asymmetric padding that moves a line box down by `shift` while keeping
 /// it centred in whatever centres it: the box grows by `2 × |shift|` on one
 /// side only, so centring the grown box moves the text by exactly `shift`.

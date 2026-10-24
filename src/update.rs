@@ -5317,7 +5317,8 @@ mod tests {
     /// recompute them; they used to stay stale until the next keystroke.
     #[test]
     fn a_replaced_document_recomputes_find_matches() {
-        use crate::find::{FindMatch, FindState};
+        use crate::diff_view::FindMatch;
+        use crate::find::FindState;
         use crate::modes::TabMode;
         use diffui_core::{
             DiffDocument, DiffFile, DiffFileStatus, DiffHunkView, DiffLine, DiffLineKind,

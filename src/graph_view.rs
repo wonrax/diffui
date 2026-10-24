@@ -13,10 +13,10 @@
 //!   through, used under expanded file rows so the gutter stays unbroken
 //!   between one revision and the next.
 
+use diffui_core::graph_layout::GraphEdgeType;
 use iced::advanced::graphics::geometry::{self, Frame, LineCap, LineJoin, Path, Stroke};
 use iced::advanced::renderer;
 use iced::{Color, Point, Rectangle, Size};
-use jj_lib::graph::GraphEdgeType;
 
 use crate::graph::LaneFrame;
 

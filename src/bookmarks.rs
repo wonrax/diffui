@@ -722,6 +722,7 @@ pub(crate) fn build_name_prompt(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Me
 
     ui::modal(
         ui::dialog_card(body, ui::DIALOG_WIDTH, theme),
+        crate::toolbar::modal_top(),
         cancel,
         Message::Ui(crate::UiEvent::ConfirmNoOp),
     )

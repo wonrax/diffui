@@ -20,6 +20,7 @@ use iced::{
 };
 use regex::{Regex, RegexBuilder};
 
+use crate::diff_view::FindMatch;
 use crate::icons;
 use crate::theme::{self, ThemeSpec, popover_style, text_size};
 use crate::{Action, Diffui, Message};
@@ -61,16 +62,6 @@ pub struct FindState {
     /// debounced recompute carries a snapshot and drops itself if the
     /// version has moved past it.
     pub query_version: u64,
-}
-
-#[derive(Debug, Clone)]
-pub struct FindMatch {
-    pub file_index: usize,
-    pub hunk_index: usize,
-    pub line_index: usize,
-    /// Byte range within `DiffLine::content`. Inclusive-start, exclusive-end.
-    pub byte_start: usize,
-    pub byte_end: usize,
 }
 
 /// Compute matches for `state.query` across every line of `files` (the diff

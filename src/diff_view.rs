@@ -15,7 +15,6 @@ use iced::{
 };
 
 use crate::chip::{self, Chip};
-use crate::find::FindMatch;
 use crate::icons;
 use crate::measure;
 use crate::scrollbar::{self, ScrollbarState, ScrollbarStyle};
@@ -26,7 +25,7 @@ pub use media::{Media, MediaImage, MediaSide};
 // Row height is `text_size * line_height` rounded to the nearest int, so
 // glyphs (which iced renders at `text_size * 1.4` line height) sit inside
 // the row with a few px of breathing room above and below. The default
-// factor (`config::DEFAULT_CODE_LINE_HEIGHT`, 1.85) gives the historical
+// factor (`typography::DEFAULT_CODE_LINE_HEIGHT`, 1.85) gives the historical
 // fixed row height at the default code font size; the user can widen or
 // tighten it via `code_line_height`.
 // Padding above and below the centered title row inside the file-header strip.
@@ -238,7 +237,7 @@ pub enum HeaderLine {
 /// Height a header-only diff view needs to show `header` whole.
 pub fn header_block_height(
     header: &[HeaderLine],
-    typography: crate::config::CodeTypography,
+    typography: crate::typography::CodeTypography,
 ) -> f32 {
     if header.is_empty() {
         return 0.0;
@@ -379,7 +378,7 @@ pub struct DiffView<'a, Message> {
     revision_key: String,
     palette: Palette,
     font: Font,
-    typography: crate::config::CodeTypography,
+    typography: crate::typography::CodeTypography,
     multi_click_ms: u64,
     metrics: LayoutMetrics,
     header: Vec<HeaderLine>,
@@ -503,13 +502,24 @@ pub struct AnnotationGutter<'a, Message> {
     pub style: AnnotationStyle,
 }
 
+/// One find hit: a byte range on one line of the document.
+#[derive(Debug, Clone)]
+pub struct FindMatch {
+    pub file_index: usize,
+    pub hunk_index: usize,
+    pub line_index: usize,
+    /// Byte range within `DiffLine::content`. Inclusive-start, exclusive-end.
+    pub byte_start: usize,
+    pub byte_end: usize,
+}
+
 /// Per-render find-match data fed into `DiffView::with_find`. The widget
 /// renders one rectangle per match on the lines it overlaps and scrolls
 /// the active match into view when `scroll_token` changes between
 /// renders.
 #[derive(Debug, Clone)]
 pub struct FindOverlay<'a> {
-    pub matches: &'a [crate::find::FindMatch],
+    pub matches: &'a [FindMatch],
     pub active: Option<usize>,
     /// Bumped by the caller whenever the active match changes. The widget
     /// keeps the previous token in its `State` and scrolls when the two
@@ -553,7 +563,7 @@ struct LayoutMetrics {
 
 impl LayoutMetrics {
     fn new(
-        typography: crate::config::CodeTypography,
+        typography: crate::typography::CodeTypography,
         gutter_digit_count: usize,
         font: Font,
         plain: bool,
@@ -1437,7 +1447,7 @@ impl<'a, Message> DiffView<'a, Message> {
         revision_key: impl Into<String>,
         palette: Palette,
         font: Font,
-        typography: crate::config::CodeTypography,
+        typography: crate::typography::CodeTypography,
         multi_click_ms: u64,
         on_selected_file_changed: fn(usize) -> Message,
     ) -> Self {
@@ -7077,7 +7087,7 @@ mod tests {
     /// shifts them verbatim.
     #[test]
     fn layout_metrics_follow_code_typography() {
-        use crate::config::CodeTypography;
+        use crate::typography::CodeTypography;
         let metrics = |typography| LayoutMetrics::new(typography, 3, Font::MONOSPACE, false);
 
         let default = metrics(CodeTypography::default());
@@ -7205,9 +7215,9 @@ mod tests {
             "test",
             test_palette(),
             Font::MONOSPACE,
-            crate::config::CodeTypography {
+            crate::typography::CodeTypography {
                 size: 13.0,
-                ..crate::config::CodeTypography::default()
+                ..crate::typography::CodeTypography::default()
             },
             500,
             |_| (),
@@ -8230,9 +8240,9 @@ mod height_profile {
             "profile",
             tests::test_palette(),
             Font::MONOSPACE,
-            crate::config::CodeTypography {
+            crate::typography::CodeTypography {
                 size: 13.0,
-                ..crate::config::CodeTypography::default()
+                ..crate::typography::CodeTypography::default()
             },
             500,
             |_| (),

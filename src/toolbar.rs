@@ -34,6 +34,14 @@ pub fn chrome_bottom() -> f32 {
     crate::tab_bar::height() + HEIGHT + activity::PROGRESS_LINE_HEIGHT + 1.0
 }
 
+/// Where every modal surface (command palette, open-repo and confirm
+/// dialogs) hangs from: a fixed distance under the window chrome rather than
+/// centered, so a card doesn't jump as its content grows and stacked
+/// takeovers line up with one another.
+pub fn modal_top() -> f32 {
+    chrome_bottom() + theme::space::XXL * 2.0
+}
+
 /// Size of the dropdown carets (fetch split button, revset presets). A touch
 /// smaller than the action icons so the caret reads as a subordinate affordance.
 const CARET_ICON_SIZE: f32 = 12.0;
