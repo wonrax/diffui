@@ -37,7 +37,7 @@ use crate::theme::ThemeSpec;
 
 /// `input` must have been built with `value` and `font` — the wrapper reads
 /// them back from here because the stock widget doesn't expose them.
-pub(crate) fn single_line<'a, Message: Clone + 'a>(
+pub fn single_line<'a, Message: Clone + 'a>(
     input: TextInput<'a, Message>,
     value: &str,
     font: Font,
@@ -230,7 +230,7 @@ fn child(layout: Layout<'_>) -> Layout<'_> {
 }
 
 /// Inset of a [`multi_line`] editor's text from its border.
-pub(crate) const EDITOR_PADDING: Padding = Padding {
+pub const EDITOR_PADDING: Padding = Padding {
     top: 10.0,
     right: 12.0,
     bottom: 10.0,
@@ -242,7 +242,7 @@ pub(crate) const EDITOR_PADDING: Padding = Padding {
 /// the form ([`crate::ui::editor_key_binding`]), and word/line drag selection
 /// ([`crate::editor_drag`]). `on_action` is `None` while the text is being
 /// saved, which leaves the editor read-only.
-pub(crate) fn multi_line<'a, Message: Clone + 'a>(
+pub fn multi_line<'a, Message: Clone + 'a>(
     content: &'a text_editor::Content,
     spec: MultiLine,
     theme: ThemeSpec,
@@ -275,7 +275,7 @@ pub(crate) fn multi_line<'a, Message: Clone + 'a>(
 }
 
 /// What varies between [`multi_line`] editors.
-pub(crate) struct MultiLine {
+pub struct MultiLine {
     pub id: Option<&'static str>,
     pub placeholder: &'static str,
     pub font: Font,
@@ -286,14 +286,7 @@ pub(crate) struct MultiLine {
 
 /// The height that shows all of `content` wrapped at `width` (the editor's
 /// outer width), between `min` and `max`; past `max` the editor scrolls.
-pub(crate) fn fit_height(
-    content: &str,
-    font: Font,
-    size: f32,
-    width: f32,
-    min: f32,
-    max: f32,
-) -> f32 {
+pub fn fit_height(content: &str, font: Font, size: f32, width: f32, min: f32, max: f32) -> f32 {
     let line_height = (size * crate::measure::LINE_HEIGHT_MULTIPLIER).max(1.0);
     let text_width = (width - EDITOR_PADDING.left - EDITOR_PADDING.right).max(1.0);
     let lines = crate::measure::wrapped_line_count(content, size, font, line_height, text_width);
@@ -303,12 +296,12 @@ pub(crate) fn fit_height(
 
 /// The tallest a [`multi_line`] editor grows before it scrolls: room for a
 /// commit message's body, never most of the window.
-pub(crate) fn editor_max_height(window_height: f32) -> f32 {
+pub fn editor_max_height(window_height: f32) -> f32 {
     (window_height * 0.45).clamp(160.0, 420.0)
 }
 
 /// The multi-line editor's box: exactly the single-line input's.
-pub(crate) fn editor_style(theme: ThemeSpec) -> text_editor::Style {
+pub fn editor_style(theme: ThemeSpec) -> text_editor::Style {
     let input = crate::theme::input_style(theme);
     text_editor::Style {
         background: input.background,

@@ -57,10 +57,10 @@ const GUTTER_MIN_WIDTH: f32 = 56.0;
 // Padding flanking the gutter text on both sides.
 const GUTTER_HORIZONTAL_PADDING: f32 = 8.0;
 // Padding above and below the revision-header block when it's present.
-pub(crate) const HEADER_VERTICAL_PADDING: f32 = 12.0;
+pub const HEADER_VERTICAL_PADDING: f32 = 12.0;
 // Left/right padding inside the header block (between the panel edge and
 // the first character of label/description text).
-pub(crate) const HEADER_HORIZONTAL_PADDING: f32 = 16.0;
+pub const HEADER_HORIZONTAL_PADDING: f32 = 16.0;
 // Space drawn between the label column and the value column.
 const HEADER_LABEL_GAP: f32 = 8.0;
 /// Gap between a rich field's value, its badges and its buttons.
@@ -6985,7 +6985,7 @@ impl<Message> DiffView<'_, Message> {
 /// `fill` and shape and differ only in the mark: a tick, or the short bar of
 /// a macOS mixed checkbox (drawn, so it can't be read as the diff's `−`
 /// prefix).
-pub(crate) fn draw_checkbox<Renderer>(
+pub fn draw_checkbox<Renderer>(
     renderer: &mut Renderer,
     rect: Rectangle,
     state: CheckState,
@@ -8195,7 +8195,7 @@ mod tests {
 }
 
 /// Height-index scaling profile on a synthetic ~1M-line diff:
-///   cargo test -p diffui profile_height_index -- --ignored --nocapture
+///   cargo test -p diffui-widgets profile_height_index -- --ignored --nocapture
 #[cfg(test)]
 mod height_profile {
     use super::*;

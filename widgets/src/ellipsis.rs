@@ -30,7 +30,7 @@ thread_local! {
 /// Spans in a base font, size and colour, drawn on one line cut to fit, or
 /// in full.
 #[derive(Clone)]
-pub(crate) struct Line<'a> {
+pub struct Line<'a> {
     spans: Vec<Span<'a>>,
     font: Font,
     size: f32,
@@ -38,7 +38,7 @@ pub(crate) struct Line<'a> {
 }
 
 impl<'a> Line<'a> {
-    pub(crate) fn new(spans: Vec<Span<'a>>, font: Font, size: f32, color: Color) -> Self {
+    pub fn new(spans: Vec<Span<'a>>, font: Font, size: f32, color: Color) -> Self {
         Self {
             spans,
             font,
@@ -48,19 +48,19 @@ impl<'a> Line<'a> {
     }
 
     /// Whether the text spans several lines of its own (newlines in it).
-    pub(crate) fn is_multiline(&self) -> bool {
+    pub fn is_multiline(&self) -> bool {
         self.spans
             .iter()
             .any(|span| span.text.contains(['\n', '\r']))
     }
 
     /// Whether it fits `width` on one line, uncut.
-    pub(crate) fn fits(&self, width: f32) -> bool {
+    pub fn fits(&self, width: f32) -> bool {
         self.cut_point(width).is_none()
     }
 
     /// Its width unwrapped: the widest of its own lines.
-    pub(crate) fn natural_width(&self) -> f32 {
+    pub fn natural_width(&self) -> f32 {
         let mut widest: f32 = 0.0;
         let mut line = 0.0;
         for span in &self.spans {
@@ -78,7 +78,7 @@ impl<'a> Line<'a> {
 
     /// One line, newlines read as spaces, cut with an ellipsis where it
     /// doesn't fit `width`.
-    pub(crate) fn cut<Message: 'a>(&self, width: f32) -> Rich<'a, (), Message> {
+    pub fn cut<Message: 'a>(&self, width: f32) -> Rich<'a, (), Message> {
         let mut spans = self.single();
         if let Some((index, keep)) = self.cut_point(width) {
             spans.truncate(index + 1);
@@ -93,14 +93,14 @@ impl<'a> Line<'a> {
     }
 
     /// The whole text, wrapping wherever it is laid out.
-    pub(crate) fn wrapped<Message: 'a>(&self) -> Rich<'a, (), Message> {
+    pub fn wrapped<Message: 'a>(&self) -> Rich<'a, (), Message> {
         self.rich(self.spans.clone())
             .wrapping(Wrapping::WordOrGlyph)
     }
 
     /// [`Line::cut`] at whatever width the line is given: it fills its
     /// row's free space.
-    pub(crate) fn view<Message: 'a>(self) -> Element<'a, Message> {
+    pub fn view<Message: 'a>(self) -> Element<'a, Message> {
         responsive(move |size| self.cut::<Message>(size.width))
             .height(Length::Shrink)
             .into()
@@ -148,7 +148,7 @@ impl<'a> Line<'a> {
 
 /// The width of one line of plain `content`, from the same memo the lines
 /// measure with: for sizing what sits beside a [`Line`].
-pub(crate) fn text_width(content: &str, size: f32, font: Font) -> f32 {
+pub fn text_width(content: &str, size: f32, font: Font) -> f32 {
     WIDTHS.with(|widths| widths.width(content, size, font))
 }
 

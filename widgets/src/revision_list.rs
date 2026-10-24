@@ -25,7 +25,6 @@ use iced::{
 };
 
 use crate::chip::{self, Chip};
-use crate::graph::LaneFrame;
 use crate::graph_view::{
     LANE_WIDTH, RevisionGraphStyle, draw_continuation_row, draw_revision_row, lane_strip_width,
 };
@@ -35,6 +34,7 @@ use crate::scrollbar::{self, ScrollbarState, ScrollbarStyle};
 use crate::theme::chip_background;
 use crate::typography::TextBox;
 use crate::width_memo::WidthMemo;
+use diffui_core::graph::LaneFrame;
 
 pub const REVISION_ROW_HEIGHT: f32 = 46.0;
 pub const FILE_ROW_HEIGHT: f32 = 26.0;
@@ -44,11 +44,11 @@ pub const FILE_ROW_HEIGHT: f32 = 26.0;
 /// into a column; the X-inset equals the resulting card-to-card gap
 /// (2 × Y) so the margin against the pane edges reads the same as the
 /// spacing between rows.
-pub(crate) const ROW_CARD_INSET_X: f32 = 2.0 * ROW_CARD_INSET_Y;
-pub(crate) const ROW_CARD_INSET_Y: f32 = 1.0;
+pub const ROW_CARD_INSET_X: f32 = 2.0 * ROW_CARD_INSET_Y;
+pub const ROW_CARD_INSET_Y: f32 = 1.0;
 /// Corner radius of a row's card — and of the highlight a context menu puts
 /// over it, which must sit exactly on the card.
-pub(crate) const ROW_CARD_RADIUS: f32 = crate::theme::radius::PUSH;
+pub const ROW_CARD_RADIUS: f32 = crate::theme::radius::PUSH;
 /// Horizontal indent per tree depth level for file/directory rows.
 pub const FILE_TREE_INDENT: f32 = 14.0;
 /// Width of the collapse-chevron column in file/directory rows (empty for
@@ -63,11 +63,11 @@ pub const GUTTER_LEFT_PADDING: f32 = 8.0;
 pub const GUTTER_PADDING: f32 = 8.0;
 /// Right inset of row content: the scrollbar's gutter, so text stays clear
 /// of the bar the row cards run under.
-pub(crate) const CONTENT_PADDING: f32 = crate::scrollbar::GUTTER;
-pub(crate) const SMALL_TEXT_SIZE: f32 = crate::theme::text_size::BODY_LG;
-pub(crate) const CAPTION_TEXT_SIZE: f32 = crate::theme::text_size::CAPTION;
+pub const CONTENT_PADDING: f32 = crate::scrollbar::GUTTER;
+pub const SMALL_TEXT_SIZE: f32 = crate::theme::text_size::BODY_LG;
+pub const CAPTION_TEXT_SIZE: f32 = crate::theme::text_size::CAPTION;
 /// Gap between a revision row's description and its id line.
-pub(crate) const ROW_LINE_GAP: f32 = 4.0;
+pub const ROW_LINE_GAP: f32 = 4.0;
 /// Text size for the collapse/expand chevron on the selected revision row. The
 /// old `▾` triangle needed an oversize bump to stay legible (it shrank to ~5px
 /// of actual ink); the Lucide glyph fills its box, so a near-text size reads

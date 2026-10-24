@@ -1203,6 +1203,7 @@ dependencies = [
  "anyhow",
  "clap",
  "diffui-core",
+ "diffui-widgets",
  "futures",
  "iced",
  "jj-lib",
@@ -1217,12 +1218,10 @@ dependencies = [
  "raw-window-handle",
  "regex",
  "serde",
- "sha2 0.11.0",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
- "ureq",
 ]
 
 [[package]]
@@ -1248,6 +1247,19 @@ dependencies = [
  "tokio",
  "tracing",
  "unicode-ident",
+ "ureq",
+]
+
+[[package]]
+name = "diffui-widgets"
+version = "0.1.0"
+dependencies = [
+ "diffui-core",
+ "iced",
+ "objc2 0.6.4",
+ "objc2-foundation 0.3.2",
+ "raw-window-handle",
+ "sha2 0.11.0",
  "ureq",
 ]
 

@@ -4,8 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["core"]
+members = ["core", "widgets"]
 resolver = "3"
+
+[workspace.dependencies]
+# Pinned to a rev, not a branch: without one `cargo update` walks us onto iced
+# master, and 0.15 is still unreleased and still breaking its API weekly. Shared
+# so the app and the widget crate can't drift onto different revs.
+iced = { git = "https://github.com/iced-rs/iced.git", rev = "81324eb2beb3765d4cd30635bfc2a8e64900f781", features = ["advanced", "tokio", "canvas", "svg", "image-without-codecs"] }
+objc2 = "0.6"
+objc2-foundation = "0.3"
 
 [features]
 # iced's devtools: an F12 metrics overlay (and a "Press F12" toast on every
@@ -22,10 +30,9 @@ trajectory-debug = []
 [dependencies]
 anyhow = "1.0"
 diffui-core = { path = "core" }
+diffui-widgets = { path = "widgets" }
 clap = { version = "4.5", features = ["derive"] }
-# Pinned to a rev, not a branch: without one `cargo update` walks us onto iced
-# master, and 0.15 is still unreleased and still breaking its API weekly.
-iced = { git = "https://github.com/iced-rs/iced.git", rev = "81324eb2beb3765d4cd30635bfc2a8e64900f781", features = ["advanced", "tokio", "canvas", "svg", "image-without-codecs"] }
+iced = { workspace = true }
 jj-lib = "0.45.1"
 mimalloc = "0.1"
 futures = "0.3"
@@ -40,20 +47,14 @@ toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Build-time only: fetch + checksum the Lucide icon font (see build.rs). `ureq`
-# rides on rustls so the download needs no system TLS libs on any platform.
-[build-dependencies]
-ureq = "3"
-sha2 = "0.11"
-
-# macOS-only AppKit bridges: `chrome` repositions the native traffic lights to
-# the center of our tab strip, and `macos_native` shows real `NSMenu` popups for
-# the revision context menu. We only talk to AppKit through `msg_send!` on raw
-# pointers / generated bindings (never across the winit boundary), so our objc2
-# version is independent of whatever winit pulls in.
+# macOS-only AppKit bridges: `macos_native` shows real `NSMenu` popups for the
+# revision context menu and `app_menu` builds the menu bar (the widget crate's
+# `chrome` has its own, for the traffic lights). We only talk to AppKit through
+# `msg_send!` on raw pointers / generated bindings (never across the winit
+# boundary), so our objc2 version is independent of whatever winit pulls in.
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSString", "NSGeometry", "NSObjCRuntime", "NSValue"] }
+objc2 = { workspace = true }
+objc2-foundation = { workspace = true, features = ["NSString", "NSGeometry", "NSObjCRuntime", "NSValue"] }
 objc2-app-kit = { version = "0.3", features = [
     "NSMenu",
     "NSMenuItem",

@@ -18,7 +18,7 @@ use iced::advanced::graphics::geometry::{self, Frame, LineCap, LineJoin, Path, S
 use iced::advanced::renderer;
 use iced::{Color, Point, Rectangle, Size};
 
-use crate::graph::LaneFrame;
+use diffui_core::graph::LaneFrame;
 
 /// Horizontal width occupied by one lane in the gutter. `lane_x` centers
 /// the node disc in the middle of its lane, so adjacent lanes sit at

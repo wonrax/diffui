@@ -32,13 +32,13 @@
 
           version = "0.1.0";
 
-          # `build.rs` fetches the Lucide icon font over the network, which the
-          # Nix build sandbox forbids. Fetch it here instead as a fixed-output
-          # derivation (the one thing allowed network access, since its hash is
-          # pinned up front) and feed the build the local file through the
-          # `LUCIDE_TTF_PATH` escape hatch build.rs already honors. Keep the url
-          # and hash in lockstep with the LUCIDE_* constants in build.rs — the
-          # hash is the SRI form of LUCIDE_SHA256.
+          # `widgets/build.rs` fetches the Lucide icon font over the network,
+          # which the Nix build sandbox forbids. Fetch it here instead as a
+          # fixed-output derivation (the one thing allowed network access, since
+          # its hash is pinned up front) and feed the build the local file
+          # through the `LUCIDE_TTF_PATH` escape hatch that build script already
+          # honors. Keep the url and hash in lockstep with the LUCIDE_* constants
+          # there — the hash is the SRI form of LUCIDE_SHA256.
           lucideTtf = pkgs.fetchurl {
             url = "https://cdn.jsdelivr.net/npm/lucide-static@1.21.0/font/lucide.ttf";
             hash = "sha256-681MVdcC81+rEC+MNLwYwjOOFzaEcO1YqsSfj7Kl1HY=";
@@ -86,7 +86,8 @@
 
             doCheck = false;
 
-            # Point build.rs at the sandbox-fetched font instead of the network.
+            # Point widgets/build.rs at the sandbox-fetched font instead of the
+            # network.
             LUCIDE_TTF_PATH = lucideTtf;
 
             # core/build.rs translates the highlighter's wasm to C with wabt's
