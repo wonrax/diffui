@@ -271,6 +271,23 @@
 
                 unset diffui_runtime_libs existing_ld_library_path
               ''
+              # The clang wrapper links with nixpkgs' ld64, the last open-source
+              # release of Apple's old linker; on the app binary it takes ~2 s,
+              # most of an incremental rebuild. Apple's current linker
+              # (ld-prime, shipped with Xcode and the Command Line Tools) does
+              # the same link in under 1 s, so hand it to rustc when it's
+              # installed. Shell only: the package build stays on the pure
+              # toolchain. `/usr/bin/ld` won't do, it's an xcrun shim that
+              # resolves back to ld64 under the SDK's DEVELOPER_DIR.
+              + lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
+                apple_ld="$(env -u DEVELOPER_DIR -u SDKROOT /usr/bin/xcrun --find ld 2>/dev/null)"
+                if [ -x "$apple_ld" ]; then
+                  rustflags_var=CARGO_TARGET_${pkgs.stdenv.hostPlatform.rust.cargoEnvVarTarget}_RUSTFLAGS
+                  export "$rustflags_var=''${!rustflags_var:+''${!rustflags_var} }-C link-arg=--ld-path=$apple_ld"
+                  unset rustflags_var
+                fi
+                unset apple_ld
+              ''
               + ''
                 export ICED_BACKEND="''${ICED_BACKEND:-wgpu}"
                 export WGPU_POWER_PREF="''${WGPU_POWER_PREF:-none}"
