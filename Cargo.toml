@@ -84,6 +84,13 @@ objc2-core-graphics = { version = "0.3", features = ["CGColor"] }
 [profile.dev]
 debug = 1
 
+# Dependencies build optimized even in dev: unoptimized iced, wgpu, cosmic-text
+# and jj-lib make the debug app too slow to judge by hand, while our own crates
+# stay at opt-level 0 so an edit still rebuilds in seconds. The cost is a
+# slower first build, paid again only when a dependency changes.
+[profile.dev.package."*"]
+opt-level = 3
+
 [profile.release]
 strip = true
 lto = "thin"
@@ -94,4 +101,14 @@ inherits = "release"
 debug = true
 # Undo the release profile's `strip`, or every frame in a profile comes back as
 # a bare address and the build is useless for what it exists to do.
+strip = false
+
+# Optimized like release, for checking a change's performance without
+# release's link-time cost: a one-line edit rebuilds in ~10 s here against ~2
+# min with thin LTO and a single codegen unit. `cargo build --profile fastrel`.
+[profile.fastrel]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
 strip = false
