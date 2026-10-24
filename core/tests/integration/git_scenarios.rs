@@ -5,7 +5,7 @@
 //! jj-only checkout. Each test rebuilds its repo from scratch, so reruns are
 //! deterministic; the repos are left behind for inspection.
 
-mod harness;
+use crate::harness;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

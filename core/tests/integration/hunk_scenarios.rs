@@ -6,7 +6,7 @@
 //! headers of the revision's loaded diff — so these also pin down that the
 //! backend cuts hunks exactly where the pane does.
 
-mod harness;
+use crate::harness;
 
 use diffui_core::repo::{Command, Payload};
 use diffui_core::{

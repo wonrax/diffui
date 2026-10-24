@@ -3,7 +3,7 @@
 //! The fixtures are built with jj-lib alone (`Workspace::init_internal_git` in
 //! a temp dir), so these need no `jj` on PATH and run in the normal test pass.
 
-mod harness;
+use crate::harness;
 
 use diffui_core::repo::{Command, JobId, Payload};
 use diffui_core::{

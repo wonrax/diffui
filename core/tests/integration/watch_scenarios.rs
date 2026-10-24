@@ -9,7 +9,7 @@
 //! works over inotify too, so it can be exercised somewhere tests run rather
 //! than only on the machine it ships to.
 
-mod harness;
+use crate::harness;
 
 use std::time::Duration;
 

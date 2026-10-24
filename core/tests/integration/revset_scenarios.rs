@@ -7,7 +7,7 @@
 //! test run it again and compare, which is how the goldens were made and how
 //! to refresh them after a jj bump.
 
-mod harness;
+use crate::harness;
 
 use std::path::Path;
 
