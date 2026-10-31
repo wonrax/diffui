@@ -441,11 +441,12 @@ pub(crate) fn welcome_hints(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
     ]
     .spacing(theme::space::XL)
     .align_y(Alignment::Center);
-    let gestures =
-        text("Right-click a revision for its actions  \u{b7}  drag one onto another to rebase")
-            .size(text_size::UI)
-            .color(theme.subtle_text)
-            .font(ui.config.ui_font);
+    let gestures = text(
+        "Right-click a revision for its actions  \u{b7}  drag a revision or marked set onto another to rebase",
+    )
+    .size(text_size::UI)
+    .color(theme.subtle_text)
+    .font(ui.config.ui_font);
     let all = crate::ui::button(
         text("Keyboard shortcuts")
             .size(text_size::UI)

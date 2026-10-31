@@ -360,6 +360,10 @@ pub struct RevisionList<'a, Message> {
     /// The drop spot to draw while dragging, when the caller knows better
     /// than the cursor — see [`RevisionList::drop_indicator`].
     drop_indicator: Option<Option<DropSpot>>,
+    /// How many rows the caller currently marks. The drag ghost names the
+    /// count when a drag starts on one of them — see
+    /// [`RevisionList::multi_selection_count`].
+    multi_selection_count: usize,
 }
 
 /// Callbacks for the drag-to-rebase gesture. All `fn` pointers, like the
@@ -414,7 +418,16 @@ impl<'a, Message> RevisionList<'a, Message> {
             slot: ListSlot::Revisions,
             leading_edge: 0.0,
             drop_indicator: None,
+            multi_selection_count: 0,
         }
+    }
+
+    /// Tell the list how many rows are marked, so a drag that starts on one
+    /// of them can name the batch ("3 revisions") instead of the grabbed
+    /// row's change id.
+    pub fn multi_selection_count(mut self, count: usize) -> Self {
+        self.multi_selection_count = count;
+        self
     }
 
     /// Draw the live drag's drop decoration at `spot` (list rows) instead of
@@ -823,6 +836,10 @@ struct DragState {
     active: bool,
     /// The spot currently under the cursor, mirrored to the app on change.
     spot: Option<DropSpot>,
+    /// How many marked rows this drag moves. 1 for a single-row drag;
+    /// captured at activation because the app clears the marks when the
+    /// draft's source wash takes over.
+    batch_count: usize,
     /// Live cursor position (screen space) for the ghost chip.
     cursor: Point,
 }
@@ -1072,6 +1089,19 @@ where
                             let dy = position.y - drag.origin.y;
                             if (dx * dx + dy * dy).sqrt() >= 6.0 {
                                 drag.active = true;
+                                // A grab on a marked row carries the whole
+                                // batch; remember its size before the app
+                                // clears the marks for the draft.
+                                drag.batch_count = match self
+                                    .item_at(self.commit_flat(drag.source_commit))
+                                {
+                                    Item::Revision(rev)
+                                        if rev.multi_selected && self.multi_selection_count > 1 =>
+                                    {
+                                        self.multi_selection_count
+                                    }
+                                    _ => 1,
+                                };
                                 // The drag owns spot publishing from here; reset
                                 // the plain-hover dedupe so the first post-drag
                                 // hover re-publishes whatever it lands on.
@@ -1202,6 +1232,7 @@ where
                                         origin: cursor_pos,
                                         active: false,
                                         spot: None,
+                                        batch_count: 1,
                                         cursor: cursor_pos,
                                     });
                                 }
@@ -1570,13 +1601,18 @@ where
                     }
                     None => {}
                 }
-                // Ghost chip: the dragged revision's change id, trailing the
-                // cursor. Materialized per frame only while dragging.
+                // Ghost chip: the dragged revision's change id — or the size
+                // of the marked batch it carries — trailing the cursor.
+                // Materialized per frame only while dragging.
                 let source_flat = self.commit_flat(drag.source_commit);
                 if source_flat < self.row_count()
                     && let Item::Revision(rev) = self.item_at(source_flat)
                 {
-                    let label = format!("{}{}", rev.change_id_prefix, rev.change_id_suffix);
+                    let label = if drag.batch_count > 1 {
+                        format!("{} revisions", drag.batch_count)
+                    } else {
+                        format!("{}{}", rev.change_id_prefix, rev.change_id_suffix)
+                    };
                     let text_bounds =
                         measure::line_bounds(&label, CAPTION_TEXT_SIZE, self.style.mono_font);
                     let pad_x = 8.0;

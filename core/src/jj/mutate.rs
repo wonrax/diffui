@@ -1445,6 +1445,14 @@ pub(super) async fn reverse_topo_order(
 /// `roots(destination..sources)` (the CLI's `-b`): every commit reachable
 /// from the picked revisions but not from the new parents, entered at its
 /// fork-point roots.
+///
+/// `-s` likewise enters at the *roots* of the picked set: a source whose
+/// ancestor is also picked is already inside that ancestor's subtree, so
+/// keeping both as roots would tear the selected descendant out of the
+/// subtree it belongs to (and diverge from the union-of-subtrees reading the
+/// mode documents). `jj`'s CLI repeats `-s` per argument and can express
+/// that tear; a picked set can't.
+///
 /// `None` means the branch has no commits outside the destination (the
 /// destination is the branch itself or one of its descendants) — a benign
 /// nothing-to-do, mirroring the CLI's "Nothing changed", not an error.
@@ -1458,7 +1466,17 @@ pub(super) async fn resolve_move_target(
         RebaseSourceMode::Revisions => {
             MoveCommitsTarget::Commits(reverse_topo_order(repo, source_ids).await?)
         }
-        RebaseSourceMode::WithDescendants => MoveCommitsTarget::Roots(source_ids.to_vec()),
+        RebaseSourceMode::WithDescendants => {
+            let roots: Vec<CommitId> = RevsetExpression::commits(source_ids.to_vec())
+                .roots()
+                .evaluate(repo)
+                .context("failed to resolve the rebase roots")?
+                .stream()
+                .map(|entry| entry.context("failed to walk the rebase roots"))
+                .try_collect()
+                .await?;
+            MoveCommitsTarget::Roots(roots)
+        }
         RebaseSourceMode::Branch => {
             let roots: Vec<CommitId> = RevsetExpression::commits(new_parent_ids.to_vec())
                 .range(&RevsetExpression::commits(source_ids.to_vec()))

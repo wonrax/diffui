@@ -589,6 +589,15 @@ fn draft(ui: &Diffui, arg: CommandArg, kind: mutations::DraftKind) -> Option<Act
     target_revision(ui, &arg).map(|source| Action::StartDraft { kind, source })
 }
 
+/// The revisions a "rebase onto trunk" command moves: the batch it carried,
+/// or the single revision it names (the browsed one for a bare chord).
+fn trunk_targets(ui: &Diffui, arg: CommandArg) -> Option<Vec<RevisionSelection>> {
+    match arg {
+        CommandArg::Revisions(targets) => (!targets.is_empty()).then_some(targets),
+        other => target_revision(ui, &other).map(|target| vec![target]),
+    }
+}
+
 /// The commit backing a palette result, for the copy-from-the-graph commands.
 fn result_row<'a>(ui: &'a Diffui, arg: &CommandArg) -> Option<diffui_core::RowView<'a>> {
     let commits = &ui.active().session.commits;
@@ -1011,7 +1020,7 @@ pub(crate) static REGISTRY: &[Command] = &[
             can_mutate(ui, arg)?;
             crate::trunk::blocker(ui, arg).map_or(Ok(()), Err)
         },
-        build: |ui, arg| target_revision(ui, &arg).map(Action::RebaseOntoTrunk),
+        build: |ui, arg| trunk_targets(ui, arg).map(Action::RebaseOntoTrunk),
         palette: PaletteScope::RevisionVerb,
     },
     Command {
@@ -1356,6 +1365,42 @@ pub(crate) static REGISTRY: &[Command] = &[
                     mode: mutations::RebaseSourceMode::WithDescendants,
                 },
             )
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "selection.rebase.branch.start",
+        label: "Rebase branches of marked revisions onto\u{2026}",
+        hint: "Move the whole branch every marked revision sits on",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: revops::batch_of_one,
+        build: |ui, arg| {
+            revops::batch_draft(
+                ui,
+                &arg,
+                mutations::DraftKind::Rebase {
+                    mode: mutations::RebaseSourceMode::Branch,
+                },
+            )
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "selection.rebase.onto-trunk",
+        label: "Rebase branches of marked revisions onto trunk",
+        hint: "Move every marked revision's branch onto trunk()",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| {
+            revops::batch_of_one(ui, arg)?;
+            crate::trunk::blocker_for(ui, &revops::batch(ui, arg)).map_or(Ok(()), Err)
+        },
+        build: |ui, arg| {
+            let targets = revops::batch(ui, &arg);
+            (!targets.is_empty()).then_some(Action::RebaseOntoTrunk(targets))
         },
         palette: PaletteScope::Root,
     },

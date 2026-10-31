@@ -1154,6 +1154,7 @@ fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Mess
         |row| Message::Ui(UiEvent::SidebarFileRow(row)),
     )
     .at_window_edge()
+    .multi_selection_count(multi_selection.len())
     .width(Length::Fill)
     .reveal_selected(ui.active().revision_reveal_token)
     .reveal_file(ui.sidebar_file_reveal_token, reveal_target)

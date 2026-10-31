@@ -18,46 +18,61 @@ use crate::{ConfirmDialog, Diffui, Message, PendingMutation, activity};
 
 /// Why X's branch can't be rebased onto trunk, or `None` when it can.
 pub(crate) fn blocker(ui: &Diffui, arg: &CommandArg) -> Option<&'static str> {
+    let targets = match arg {
+        CommandArg::Revisions(targets) => targets.clone(),
+        _ => commands::target_revision(ui, arg).into_iter().collect(),
+    };
+    blocker_for(ui, &targets)
+}
+
+/// [`blocker`] over a batch: the first marked revision that would refuse
+/// blocks the whole gesture, with the same wording a single one gets.
+pub(crate) fn blocker_for(ui: &Diffui, targets: &[RevisionSelection]) -> Option<&'static str> {
+    if targets.is_empty() {
+        return Some("No revisions marked");
+    }
     let session = &ui.active().session;
-    let target = commands::target_revision(ui, arg)?;
-    let row = match &target {
-        RevisionSelection::WorkingCopy => session.commits.working_copy(),
-        RevisionSelection::Commit(hex) => session.commits.find_by_commit_id(hex),
-    };
-    let Some(row) = row else {
-        return Some("Revision isn't in the log");
-    };
     if session.bookmarks.trunk.is_none() {
         return Some("trunk() doesn't resolve to a bookmark");
     }
-    if row.is_immutable() {
-        return Some("Revision is immutable");
-    }
-    if row.on_trunk() {
-        return Some("Already on trunk");
+    for target in targets {
+        let row = match target {
+            RevisionSelection::WorkingCopy => session.commits.working_copy(),
+            RevisionSelection::Commit(hex) => session.commits.find_by_commit_id(hex),
+        };
+        let Some(row) = row else {
+            return Some("Revision isn't in the log");
+        };
+        if row.is_immutable() {
+            return Some("Revision is immutable");
+        }
+        if row.on_trunk() {
+            return Some("Already on trunk");
+        }
     }
     None
 }
 
-/// The op the command runs: the whole branch `source` sits on, onto trunk.
-fn rebase_op(source: RevisionSelection, trunk: String) -> MutationOp {
+/// The op the command runs: the whole branches the `sources` sit on, onto
+/// trunk.
+fn rebase_op(sources: Vec<RevisionSelection>, trunk: String) -> MutationOp {
     MutationOp::Rebase {
         mode: RebaseSourceMode::Branch,
-        sources: vec![source],
+        sources,
         destination: Destination::Onto(RevisionSelection::Commit(trunk)),
     }
 }
 
 impl Diffui {
     /// Preview the rebase, then run it (or ask first, if it would conflict).
-    pub(crate) fn rebase_onto_trunk(&mut self, source: RevisionSelection) -> Task<Message> {
+    pub(crate) fn rebase_onto_trunk(&mut self, sources: Vec<RevisionSelection>) -> Task<Message> {
         let Some(tab) = self.active_tab_id() else {
             return Task::none();
         };
         let Some(trunk) = self.active().session.bookmarks.trunk.clone() else {
             return Task::none();
         };
-        let op = rebase_op(source.clone(), trunk.clone());
+        let op = rebase_op(sources.clone(), trunk.clone());
         let Some(state) = self.tab_mut(tab) else {
             return Task::none();
         };
@@ -69,7 +84,7 @@ impl Diffui {
         }
         let (job, preview) = state.session.preview(PreviewRequest::Rebase {
             mode: RebaseSourceMode::Branch,
-            sources: vec![source],
+            sources,
             destination: Destination::Onto(RevisionSelection::Commit(trunk)),
         });
         state.jobs.trunk_rebase = Some((job, op));
@@ -105,9 +120,16 @@ impl Diffui {
         let MutationOp::Rebase { sources, .. } = &op else {
             return Task::none();
         };
-        let title = Prose::from("Rebase ")
-            .then(self.revision_prose(&sources[0]))
-            .text(" onto trunk?");
+        let title = if let [source] = sources.as_slice() {
+            Prose::from("Rebase ")
+                .then(self.revision_prose(source))
+                .text(" onto trunk?")
+        } else {
+            Prose::from(format!(
+                "Rebase the branches of {} revisions onto trunk?",
+                sources.len()
+            ))
+        };
         let mut body = Prose::from(if conflicts.len() == 1 {
             "This leaves "
         } else {
@@ -217,7 +239,7 @@ mod tests {
             mode,
             sources,
             destination,
-        } = rebase_op(source.clone(), "t".repeat(8))
+        } = rebase_op(vec![source.clone()], "t".repeat(8))
         else {
             panic!("a rebase");
         };
@@ -227,5 +249,18 @@ mod tests {
             destination,
             Destination::Onto(RevisionSelection::Commit("t".repeat(8)))
         );
+    }
+
+    #[test]
+    fn a_batch_blocks_on_the_first_revision_that_cannot_move() {
+        let ui = ui(Some("t"));
+        let f = RevisionSelection::Commit("f".repeat(8));
+        let s = RevisionSelection::Commit("s".repeat(8));
+        let o = RevisionSelection::Commit("o".repeat(8));
+
+        assert_eq!(blocker_for(&ui, std::slice::from_ref(&f)), None);
+        assert_eq!(blocker_for(&ui, &[]), Some("No revisions marked"));
+        assert_eq!(blocker_for(&ui, &[f, s]), Some("Already on trunk"));
+        assert_eq!(blocker_for(&ui, &[o]), Some("Revision is immutable"));
     }
 }
