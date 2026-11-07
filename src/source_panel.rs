@@ -6,16 +6,19 @@
 //! file/hunk header strips), so selection, copy, find, and wrap all behave
 //! exactly like the diff view.
 
-use crate::Cx;
-use gpui_kit::{AnyElement, Window};
+use gpui_kit::prelude::*;
+use gpui_kit::{AnyElement, App, Window, div, px};
 use jj_lib::graph::GraphEdgeType;
 use nucleo_matcher::{Config, Matcher, Utf32String};
 use std::collections::HashSet;
 use std::rc::Rc;
 
+use crate::geometry::{Point, Rectangle};
 use crate::revision_list::{FileRowView, RevisionRowView, RowSelectionKey};
-use crate::theme::{ThemeSpec, chip_background, text_size};
-use crate::{Diffui, SourceState};
+use crate::seam::revision_list::{self, RevisionListProps};
+use crate::theme::{Color, Padding, ThemeSpec, chip_background, text_size};
+use crate::typography::{self, Aligned};
+use crate::{Cx, Diffui, SourceState, ellipsis, icons};
 use diffui_core::{
     RevisionSelection, SourceEntry, SourceEntryStatus, SourceTreeRow, source_tree_rows,
 };
@@ -326,24 +329,448 @@ fn format_lines(count: usize) -> String {
     }
 }
 
-/// Stub: the source_panel view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+/// The fuzzy file-search box at the top of the source sidebar — the source
+/// view's counterpart of the diff sidebar's revset input, built from the
+/// same [`crate::field::filter_field`] (caretless variant) so both sidebars'
+/// top bars match. Typing filters the tree into a ranked match list;
+/// Enter opens the best match.
+fn build_source_filter(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::field::sidebar_filter_field(
+        theme,
+        ui.config.mono_font,
+        crate::field::FilterField {
+            id: SOURCE_FILTER_INPUT_ID,
+            leading_icon: Some(icons::SEARCH),
+            placeholder: "Search files",
+            value: &ui.active().source.filter,
+            on_input: |this, query, cx| this.on_source_filter_changed(query, cx),
+            on_submit: Some(|this, cx| this.on_source_filter_submit(cx)),
+            caret: None,
+        },
+        window,
+        cx,
+    )
+}
+
+/// Sidebar for the source browser: the fuzzy file-search box, then the full
+/// file tree — no revision rows, no revset filter, no branch footer.
 pub(crate) fn build_source_sidebar(
     ui: &Diffui,
     theme: ThemeSpec,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    crate::stub::panel("source_panel::build_source_sidebar")
+    let source = &ui.active().source;
+    let mut body = div()
+        .flex()
+        .flex_col()
+        .size_full()
+        .bg(theme.panel_background)
+        .child(
+            div()
+                .w_full()
+                .flex_none()
+                .min_h(px(crate::field::PANEL_HEADER_HEIGHT))
+                .child(build_source_filter(ui, theme, window, cx)),
+        );
+
+    if let Some(error) = &source.tree_error {
+        body = body.child(
+            div()
+                .w_full()
+                .flex_none()
+                .py(px(8.0))
+                .px(px(12.0))
+                .font(ui.config.ui_font.gpui())
+                .text_size(px(text_size::BODY))
+                .text_color(theme.removed_text)
+                .child(format!("Failed to list files: {error}")),
+        );
+    }
+
+    let (entries, rows) = ui
+        .active()
+        .source_tree_cache
+        .borrow_mut()
+        .entries_and_rows(source);
+    let row_count = rows.len();
+
+    let selected_entry = source.selected.as_deref().and_then(|path| {
+        entries
+            .iter()
+            .position(|entry| !entry.is_dir && entry.path == path)
+    });
+    // Flat sidebar row of the selected file, for the jump-into-browser
+    // reveal — file rows fill the whole list, so display index == flat index.
+    let reveal_file_flat = selected_entry.and_then(|entry_index| {
+        rows.iter().position(
+            |row| matches!(row, SourceTreeRow::File { entry_index: e, .. } if *e == entry_index),
+        )
+    });
+
+    // Status chips only exist at the working copy; reserve the badge column
+    // there so names align whether or not a given row carries one.
+    let badge_width = if matches!(browsed_revision(source), RevisionSelection::WorkingCopy) {
+        crate::chip::width("M", None, ui.config.mono_font)
+    } else {
+        0.0
+    };
+
+    let empty_continuation: Rc<[Option<GraphEdgeType>]> = Vec::new().into();
+    let empty_columns: Rc<[Option<usize>]> = Vec::new().into();
+    let empty_labels: Rc<[Vec<String>]> = Vec::new().into();
+    let empty_segments: Rc<[Option<usize>]> = Vec::new().into();
+    // Rows are built at paint, for on-screen rows only. The cache hands out the
+    // pair the list was sized from, so these can't disagree with each other.
+    let build_file = Rc::new(move |display: usize, _: &App| {
+        source_file_row(
+            &rows[display],
+            &entries,
+            theme,
+            empty_continuation.clone(),
+            empty_columns.clone(),
+            empty_labels.clone(),
+            empty_segments.clone(),
+        )
+    });
+
+    let props = RevisionListProps::new(
+        0,
+        (row_count > 0).then_some((0, row_count)),
+        crate::sidebar::revision_list_style(theme, ui.config, badge_width),
+    )
+    .files(
+        build_file,
+        selected_entry,
+        Diffui::listen(cx, |this, row: &usize, _, cx| {
+            this.on_source_sidebar_row(*row, cx);
+        }),
+    )
+    .at_window_edge()
+    .reveal_file(source.reveal_token, reveal_file_flat)
+    // Every scroll tick: stored, with no reconcile and no redraw.
+    .on_scroll(cx.listener(|this: &mut Diffui, offset: &f64, _, cx| {
+        this.on_source_tree_scrolled(*offset, cx);
+    }))
+    .restore_scroll(source.tree_scroll_offset, ui.scroll_restore_token)
+    .on_file_context_menu(Diffui::listen(
+        cx,
+        |this, (row, rect, point): &(usize, Rectangle, Point), _, cx| {
+            this.on_sidebar_file_context_menu(*row, *rect, *point, cx);
+        },
+    ));
+
+    body = body.child(div().flex_1().min_h_0().w_full().child(revision_list::view(
+        "source-tree",
+        props,
+        window,
+        cx,
+    )));
+
+    // A thin status line while the listing loads (the list above shows just
+    // the header row meanwhile).
+    if source.tree.is_none() && source.tree_error.is_none() {
+        body = body.child(div().w_full().flex_none().py(px(6.0)).px(px(12.0)).child(
+            typography::line(
+                "Listing files…",
+                ui.config.ui_font,
+                text_size::UI,
+                theme.subtle_text,
+            ),
+        ));
+    }
+
+    body.into_any_element()
 }
 
-/// Stub: the source_panel view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+/// The main source pane: an info bar (revision · path · counts) above the
+/// plain code view, with the find bar overlaid like the diff panel's.
 pub(crate) fn build_source_panel(
     ui: &Diffui,
     theme: ThemeSpec,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    crate::stub::panel("source_panel::build_source_panel")
+    let source = &ui.active().source;
+    let info_bar = build_info_bar(ui, theme, window, cx);
+
+    let body: AnyElement = if let Some(error) = &source.file_error {
+        centered_note(
+            ui,
+            format!("Couldn't load file: {error}"),
+            theme.removed_text,
+        )
+    } else if let Some(view) = &source.file {
+        if view.binary {
+            centered_note(
+                ui,
+                format!("Binary file ({}), not shown", format_bytes(view.byte_len)),
+                theme.subtle_text,
+            )
+        } else if view.too_large {
+            centered_note(
+                ui,
+                format!(
+                    "File is too large to display ({})",
+                    format_bytes(view.byte_len)
+                ),
+                theme.subtle_text,
+            )
+        } else {
+            source_code(ui, view, theme, window, cx)
+        }
+    } else if source.loading.is_some() {
+        // Content on its way; a blank pane beats a flash of placeholder text.
+        div().into_any_element()
+    } else {
+        centered_note(
+            ui,
+            "Select a file to view its source".to_owned(),
+            theme.subtle_text,
+        )
+    };
+
+    div()
+        .flex()
+        .flex_col()
+        .size_full()
+        .overflow_hidden()
+        .bg(theme.panel_background)
+        .child(info_bar)
+        .child(
+            div()
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .child(body)
+                .child(crate::seam::find_overlay(ui, theme, window, cx)),
+        )
+        .into_any_element()
+}
+
+/// The file through the shared diff view, in its plain mode.
+#[cfg(any())]
+fn source_code(
+    ui: &Diffui,
+    view: &crate::SourceFileView,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    use crate::diff_view::{self, DiffFileView, DiffProps, DocSource};
+    let source = &ui.active().source;
+    let files = vec![DiffFileView {
+        title: view.file.path.clone(),
+        status: diffui_core::DiffFileStatus::Modified,
+        status_color: theme.info,
+        status_fill: chip_background(theme.info),
+        additions: 0,
+        deletions: 0,
+    }];
+    let revision_key = format!(
+        "source:{}:{}",
+        browsed_revision(source).view_key(),
+        view.file.path
+    );
+    // The source document is a single file; the diff view's scroll-driven file
+    // tracking has nothing to report, so `on_selected_file_changed` stays unset.
+    let doc = DocSource::new(cx.entity(), |ui: &Diffui, _| {
+        ui.active()
+            .source
+            .file
+            .as_ref()
+            .map_or(&[][..], |view| &view.file.hunks)
+    });
+    let mut props = DiffProps::new(
+        files,
+        doc,
+        0,
+        revision_key,
+        crate::theme::diff_palette(theme),
+        ui.config.mono_font,
+        ui.config.code_type,
+        ui.config.multi_click_ms,
+    )
+    .plain(true)
+    .wrap(ui.diff_wrap)
+    .on_copy(Diffui::listen(cx, |this, text: &String, _, cx| {
+        this.perform(Action::Copy(text.clone()), cx);
+    }))
+    .on_scroll(cx.listener(|this: &mut Diffui, offset: &f32, _, cx| {
+        this.on_source_scrolled(*offset, cx);
+    }))
+    .restore_scroll(source.scroll_offset, ui.scroll_restore_token)
+    .content_version(ui.document_version)
+    .layout_version(view.doc_id);
+    if let Some(gutter) = crate::history_panel::source_annotations(ui, cx) {
+        props = props.annotations(gutter);
+    }
+    // Soft wash for every match, strong fill for the active one: the diff
+    // panel's find colours.
+    if let Some(find) = crate::diff_panel::find_overlay(ui, theme, cx) {
+        props = props.with_find(find);
+    }
+    diff_view::view("source-code", props, window, cx)
+}
+
+/// Stand-in until `diff_view::view` is in this tree; see `seam.rs`.
+fn source_code(
+    ui: &Diffui,
+    view: &crate::SourceFileView,
+    theme: ThemeSpec,
+    _window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::seam::code_lines(ui, view, theme, cx)
+}
+
+fn centered_note(ui: &Diffui, message: String, color: Color) -> AnyElement {
+    div()
+        .size_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(typography::line(
+            message,
+            ui.config.ui_font,
+            EMPTY_STATE_TEXT_SIZE,
+            color,
+        ))
+        .into_any_element()
+}
+
+/// The strip above the code: the selected path on the left (directory
+/// dimmed, like a diff file header), line/byte counts and an
+/// ignored/untracked marker on the right. The browsed revision is already
+/// in the toolbar, so it isn't repeated here.
+fn build_info_bar(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> AnyElement {
+    let source = &ui.active().source;
+    let mono = ui.config.mono_font;
+
+    // The path (mono), the size and status captions (sans) and the status
+    // chip sit on the caps' centre line (see `crate::typography`).
+    let font = ui.config.ui_font;
+    let caption = |value: String, color: Color| {
+        Aligned::text(
+            typography::line(value, font, text_size::UI, color),
+            font,
+            text_size::UI,
+        )
+    };
+
+    // Right side: the selected entry's status (when notable) + size counts.
+    let mut right: Vec<Aligned> = Vec::new();
+    let status = source.selected.as_deref().and_then(|path| {
+        let (entries, _) = ui
+            .active()
+            .source_tree_cache
+            .borrow_mut()
+            .entries_and_rows(source);
+        entries
+            .iter()
+            .find(|entry| !entry.is_dir && entry.path == path)
+            .map(|entry| entry.status)
+    });
+    match status {
+        Some(SourceEntryStatus::Ignored) => {
+            right.push(status_chip_text("ignored", theme.subtle_text, ui));
+        }
+        Some(SourceEntryStatus::Untracked) => {
+            right.push(status_chip_text("untracked", theme.added_text, ui));
+        }
+        _ => {}
+    }
+    if let Some((status, failed)) = crate::history_panel::annotation_status(ui) {
+        right.push(caption(
+            status,
+            if failed {
+                theme.removed_text
+            } else {
+                theme.subtle_text
+            },
+        ));
+    }
+    if let Some(view) = &source.file {
+        let detail = if view.binary || view.too_large {
+            format_bytes(view.byte_len)
+        } else {
+            format!(
+                "{} · {}",
+                format_lines(view.line_count),
+                format_bytes(view.byte_len)
+            )
+        };
+        right.push(caption(detail, theme.subtle_text));
+    } else if source.loading.is_some() {
+        right.push(caption("Loading…".to_owned(), theme.subtle_text));
+    }
+
+    let mut bar = div()
+        .flex_none()
+        .w_full()
+        .h(px(crate::field::PANEL_HEADER_HEIGHT))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .px(px(crate::diff_view::HEADER_HORIZONTAL_PADDING))
+        .bg(theme.panel_background);
+    match &source.selected {
+        Some(path) => {
+            let (dir, name) = match path.rfind('/') {
+                Some(slash) => path.split_at(slash + 1),
+                None => ("", path.as_str()),
+            };
+            bar = bar
+                .child(icons::icon(icons::FILE, BAR_TEXT_SIZE, theme.subtle_text))
+                .child(
+                    typography::centered(
+                        ellipsis::Line::new(
+                            vec![
+                                ellipsis::Span::new(dir.to_owned()).color(theme.subtle_text),
+                                ellipsis::Span::new(name.to_owned()),
+                            ],
+                            mono,
+                            BAR_TEXT_SIZE,
+                            theme.text,
+                        )
+                        .view(),
+                        mono,
+                        BAR_TEXT_SIZE,
+                    )
+                    .flex_1()
+                    .min_w_0(),
+                );
+        }
+        None => bar = bar.child(div().flex_1()),
+    }
+    bar = bar.child(
+        div()
+            .flex_none()
+            .child(typography::baseline_row(right, 8.0)),
+    );
+    if crate::history_panel::can_annotate(ui) {
+        bar = bar.child(crate::seam::source_bar_actions(ui, theme, window, cx));
+    }
+    bar.into_any_element()
+}
+
+fn status_chip_text(label: &'static str, color: Color, ui: &Diffui) -> Aligned {
+    let mono = ui.config.mono_font;
+    Aligned::chip(
+        typography::line(label, mono, text_size::CAPTION, color),
+        mono,
+        text_size::CAPTION,
+        Padding::from([1.0, 6.0]),
+        move |chip| {
+            chip.bg(chip_background(color))
+                .rounded(px(crate::chip::RADIUS))
+        },
+    )
 }
