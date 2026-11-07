@@ -1,4 +1,4 @@
-//! Cross-platform popup-menu overlay: the iced rendering + interaction for the
+//! Cross-platform popup-menu overlay: the rendering + interaction for the
 //! toolbar dropdowns (fetch branches / revset presets) and the revision
 //! right-click context menu. macOS uses a real `NSMenu` (see [`crate::macos_native`]);
 //! every other platform — and any future one — uses this.
@@ -7,28 +7,35 @@
 //! as `menu: Option<OverlayMenu>`, holding both the tree and the live
 //! interaction state (which flyout is open, what's highlighted, the
 //! anchor/glow rects). The renderer walks the open submenu path, placing one
-//! card per level with `pin` at absolute window coordinates so flyouts sit
-//! beside their parent row.
+//! card per level at absolute window coordinates so flyouts sit beside their
+//! parent row.
 //!
 //! Interaction is click-to-open, click-to-pick: the press that opens the menu
 //! keeps it open, and a *later* press-release on a row picks it.
-//! `mouse_area::on_release` fires on any mouse-up over a row regardless of where
-//! the press began, so the opening press's own release is swallowed
+//! A mouse-up listener fires on any mouse-up over a row regardless of where the
+//! press began, so the opening press's own release is swallowed
 //! ([`OverlayMenu::opening_release`]) — without that, a right-click near the
 //! window's bottom edge would open the menu and run the row it landed on in the
 //! same gesture. Drag-over-and-release from the opening press therefore does not
 //! pick; every release after it does.
 
-use crate::Cx;
-use crate::geometry::{Point, Rectangle, Size};
-use crate::modes::ModeKind;
-use gpui_kit::{AnyElement, Window};
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::Instant;
 
-use crate::Diffui;
+use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::prelude::*;
+use gpui_kit::{
+    AnyElement, BoxShadow, ElementId, Hsla, MouseButton, MouseMoveEvent, MouseUpEvent, ScrollEvent,
+    ScrollHandle, SharedString, Window, canvas, div, point, px,
+};
+
 use crate::commands::{CommandArg, CommandId};
+use crate::geometry::{Point, Rectangle, Size};
 use crate::measure;
-use crate::theme::{self, ThemeSpec, emphasis_font, text_size};
+use crate::theme::{self, Color, ThemeSpec, emphasis_font, text_size};
+use crate::typography::{self, Aligned};
+use crate::{Cx, Diffui, icons};
 
 // ── Card geometry ───────────────────────────────────────────────────────────
 const MENU_MIN_WIDTH: f32 = 200.0;
@@ -100,7 +107,7 @@ impl MenuEntry {
     }
 }
 
-/// Where a menu opens from. Only constructed by the non-macOS iced overlay menu
+/// Where a menu opens from. Only constructed by the non-macOS overlay menu
 /// (macOS uses a native `NSMenu`); the enum and the `anchor_origin` match are
 /// still compiled on both platforms, so suppress the macOS "never constructed"
 /// lint rather than cfg-gate the whole overlay subsystem out.
@@ -168,7 +175,7 @@ pub(crate) struct OverlayMenu {
 }
 
 impl OverlayMenu {
-    // Constructed only for the non-macOS iced overlay menu; macOS uses a native
+    // Constructed only for the non-macOS overlay menu; macOS uses a native
     // `NSMenu` and never builds an `OverlayMenu`.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn new(
@@ -199,8 +206,8 @@ impl OverlayMenu {
     /// the menu, and consumes it — every later release answers `false`. That
     /// first release belongs to the opening gesture, not to whatever the menu
     /// drew under the cursor, so callers must let it pass without picking a row
-    /// or dismissing: `mouse_area` publishes a release on any button-up over a
-    /// row without tracking where the press began, so a right-click low in the
+    /// or dismissing: a row hears a release on any button-up over it without
+    /// knowing where the press began, so a right-click low in the
     /// window would otherwise open the context menu and run the row that landed
     /// under the cursor — Abandon, Edit — on the way back up.
     pub(crate) fn opening_release(&mut self, button: gpui_kit::MouseButton) -> bool {
@@ -560,15 +567,377 @@ fn card_width(ui: &Diffui, entries: &[MenuEntry]) -> f32 {
 /// both the chevron's rendered size and the width the menu-width calc reserves.
 const CHEVRON_WIDTH: f32 = 13.0;
 
-/// Stub: the menu view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+/// An element that records its own bounds as it lays out, and the cell it records
+/// them in: how a dropdown anchors to its whole trigger. Make it an absolute child
+/// of the (`relative`) trigger; a listener built in the same frame reads the cell.
+pub(crate) fn anchor_tracker() -> (Rc<Cell<Rectangle>>, impl IntoElement) {
+    let anchor = Rc::new(Cell::new(Rectangle::new(Point::ORIGIN, Size::ZERO)));
+    let recorded = anchor.clone();
+    let tracker = canvas(
+        move |bounds, _, _| recorded.set(bounds.into()),
+        |_, _, _, _| {},
+    )
+    .absolute()
+    .size_full();
+    (anchor, tracker)
+}
+
+/// The whole popup overlay (scrim + glow + cards), or nothing when no menu is
+/// open. Stacked over the app shell.
+///
+/// The backdrop is the event sink: it dismisses on a press outside the cards,
+/// arms/closes on release, and hears the cursor move everywhere, over the cards
+/// too, so the trajectory guard always has the latest position. It occludes, so
+/// the app underneath stays inert (no hover, tooltip or cursor bleed-through); the
+/// cards are its children and don't occlude it.
 pub(crate) fn build_overlay(
     ui: &Diffui,
     theme: ThemeSpec,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    crate::stub::overlay("menu::build_overlay", ui.mode(ModeKind::Menu).is_some())
+    let Some(menu) = ui.menu() else {
+        return div().into_any_element();
+    };
+
+    fn release(
+        button: MouseButton,
+        cx: &mut Cx,
+    ) -> impl Fn(&MouseUpEvent, &mut Window, &mut gpui_kit::App) + 'static {
+        Diffui::listen(cx, move |this, _, _, cx| {
+            this.menu_on_scrim_release(button, cx)
+        })
+    }
+    let mut layer = div()
+        .id("menu-overlay")
+        .absolute()
+        .inset_0()
+        .occlude()
+        .on_any_mouse_down(Diffui::listen(cx, |this, _, _, cx| {
+            this.menu_on_dismiss(cx)
+        }))
+        .on_mouse_up(MouseButton::Left, release(MouseButton::Left, cx))
+        .on_mouse_up(MouseButton::Right, release(MouseButton::Right, cx))
+        .on_mouse_move(Diffui::listen(cx, |this, event: &MouseMoveEvent, _, cx| {
+            this.menu_on_mouse_moved(event.position.into(), cx)
+        }))
+        .on_scroll(|_, _, cx| cx.stop_propagation());
+
+    if let Some(rect) = menu.glow {
+        layer = layer.child(glow_card(theme, rect, menu.opened_at));
+    }
+    for (prefix, rect) in card_rects(ui, menu) {
+        let entries = entries_at(&menu.root, &prefix).unwrap_or(&[]);
+        layer = layer.child(build_card(
+            ui, theme, menu, entries, &prefix, rect, window, cx,
+        ));
+    }
+    push_trajectory_debug(layer, ui, menu).into_any_element()
+}
+
+/// Draws the submenu trajectory triangle over the open menu: the apex (blue), its
+/// wedge to the flyout's near edge, and the live cursor (green inside the triangle,
+/// red outside). Compiled in only under the `trajectory-debug` feature; a no-op
+/// otherwise.
+#[cfg(feature = "trajectory-debug")]
+fn push_trajectory_debug(
+    layer: gpui_kit::Stateful<gpui_kit::Div>,
+    ui: &Diffui,
+    menu: &OverlayMenu,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
+    let (Some(origin), Some(cursor), Some(fly)) =
+        (menu.flyout_origin, menu.cursor, flyout_rect(ui, menu))
+    else {
+        return layer;
+    };
+    let (apex, base_top, base_bottom) = flyout_triangle(origin, fly);
+    let inside = point_in_triangle(cursor, apex, base_top, base_bottom);
+    let vertex = |at: Point| point(px(at.x), px(at.y));
+    let dot = |at: Point, color: u32| {
+        div()
+            .absolute()
+            .left(px(at.x - 3.5))
+            .top(px(at.y - 3.5))
+            .size(px(7.0))
+            .rounded(px(3.5))
+            .bg(gpui_kit::rgb(color))
+    };
+    layer
+        .child(
+            canvas(
+                |_, _, _| {},
+                move |_, _, window, _| {
+                    let mut wedge = gpui_kit::PathBuilder::fill();
+                    wedge.move_to(vertex(apex));
+                    wedge.line_to(vertex(base_top));
+                    wedge.line_to(vertex(base_bottom));
+                    wedge.close();
+                    if let Ok(path) = wedge.build() {
+                        window.paint_path(path, gpui_kit::rgba(0xf58c3830));
+                    }
+                },
+            )
+            .absolute()
+            .size_full(),
+        )
+        .child(dot(apex, 0x66b3ff))
+        .child(dot(cursor, if inside { 0x4de673 } else { 0xff4d4d }))
+}
+
+#[cfg(not(feature = "trajectory-debug"))]
+fn push_trajectory_debug(
+    layer: gpui_kit::Stateful<gpui_kit::Div>,
+    _ui: &Diffui,
+    _menu: &OverlayMenu,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
+    layer
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_card(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    menu: &OverlayMenu,
+    entries: &[MenuEntry],
+    prefix: &[usize],
+    rect: Rectangle,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> impl IntoElement {
+    let mut list = div().flex().flex_col().w_full();
+    for (idx, entry) in entries.iter().enumerate() {
+        let mut path = prefix.to_vec();
+        path.push(idx);
+        let active = row_active(menu, &path);
+        list = list.child(build_row(ui, theme, entry, path, active, cx));
+    }
+
+    let content_h: f32 = entries.iter().map(MenuEntry::height).sum();
+    let scrolls = content_h + MENU_CARD_PAD * 2.0 > menu_max_height(ui);
+    // The card swallows presses (either button) so a click inside it never reaches
+    // the dismiss backdrop; rows carry their own hover/release handlers.
+    let card = theme::popover(div(), theme)
+        .absolute()
+        .left(px(rect.x))
+        .top(px(rect.y))
+        .w(px(rect.width))
+        .h(px(rect.height))
+        .overflow_hidden()
+        .pt(px(MENU_CARD_PAD))
+        .pb(px(MENU_CARD_PAD))
+        .pl(px(MENU_CARD_PAD))
+        .on_any_mouse_down(|_, _, cx| cx.stop_propagation());
+    if !scrolls {
+        return card.pr(px(MENU_CARD_PAD)).child(list).into_any_element();
+    }
+
+    // The id is per *branch*, not per depth: switching between sibling submenus at
+    // the same depth must not inherit the old one's scroll state. The offsets it
+    // records feed [`card_rects`]'s flyout anchoring.
+    let depth = prefix.len();
+    let id_path: Vec<String> = prefix.iter().map(usize::to_string).collect();
+    let id = format!("menu-card-{}", id_path.join("-"));
+    let handle = window
+        .use_keyed_state(
+            ElementId::Name(SharedString::from(id.clone())),
+            cx,
+            |_, _| ScrollHandle::new(),
+        )
+        .read(cx)
+        .clone();
+    let scrolled = handle.clone();
+    // Out to the card's right edge, like every scroll view's bar; the card's right
+    // inset moves inside the list.
+    card.on_scroll(Diffui::listen(cx, move |this, _: &ScrollEvent, _, cx| {
+        this.menu_on_card_scrolled(depth, -f32::from(scrolled.offset().y), cx)
+    }))
+    .child(
+        div()
+            .id(ElementId::Name(SharedString::from(id)))
+            .size_full()
+            .track_scroll(&handle)
+            .overflow_y_scroll()
+            .vertical_scrollbar(&handle)
+            .child(div().pr(px(MENU_CARD_PAD)).child(list)),
+    )
+    .into_any_element()
+}
+
+fn build_row(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    entry: &MenuEntry,
+    path: Vec<usize>,
+    active: bool,
+    cx: &mut Cx,
+) -> AnyElement {
+    let font = ui.config.ui_font;
+    let mono = ui.config.mono_font;
+
+    let label_line = |label: &str, label_font, color: Color| {
+        typography::line(label.to_owned(), label_font, MENU_LABEL_SIZE, color)
+    };
+    // Labels centre their caps in the row; a detail or chevron joins on the
+    // label's baseline.
+    let detail_line = |detail: &str, detail_font| {
+        Aligned::text(
+            div().w_full().flex().justify_end().child(
+                typography::line(
+                    detail.to_owned(),
+                    detail_font,
+                    MENU_DETAIL_SIZE,
+                    theme.subtle_text,
+                )
+                .min_w_0()
+                .text_ellipsis(),
+            ),
+            detail_font,
+            MENU_DETAIL_SIZE,
+        )
+        .fill()
+    };
+    let inner = match entry {
+        MenuEntry::Separator => {
+            return div()
+                .flex()
+                .items_center()
+                .h(px(MENU_SEP_HEIGHT))
+                .px(px(MENU_ITEM_PAD_X))
+                .child(div().w_full().h(px(1.0)).bg(theme.border))
+                .into_any_element();
+        }
+        MenuEntry::Disabled { label, reason } => {
+            let label = Aligned::text(
+                label_line(label, font, theme.subtle_text),
+                font,
+                MENU_LABEL_SIZE,
+            );
+            match reason {
+                // Why it's greyed, where an enabled row shows its chord.
+                Some(reason) => {
+                    typography::baseline_row([label, detail_line(reason, font)], MENU_ROW_GAP)
+                }
+                None => typography::baseline_row([label], 0.0),
+            }
+        }
+        MenuEntry::Item {
+            label,
+            detail,
+            emphasized,
+            ..
+        } => {
+            let label_font = if *emphasized {
+                emphasis_font(font, crate::theme::Weight::MEDIUM)
+            } else {
+                font
+            };
+            let label = Aligned::text(
+                label_line(label, label_font, theme.text),
+                label_font,
+                MENU_LABEL_SIZE,
+            );
+            match detail {
+                Some(detail) => {
+                    typography::baseline_row([label, detail_line(detail, mono)], MENU_ROW_GAP)
+                }
+                None => typography::baseline_row([label], 0.0),
+            }
+        }
+        MenuEntry::Submenu { label, .. } => typography::baseline_row(
+            [
+                Aligned::text(
+                    label_line(label, font, theme.text).text_ellipsis(),
+                    font,
+                    MENU_LABEL_SIZE,
+                )
+                .fill(),
+                Aligned::glyph(
+                    icons::icon(icons::CHEVRON_RIGHT, CHEVRON_WIDTH, theme.muted_text),
+                    CHEVRON_WIDTH,
+                ),
+            ],
+            MENU_ROW_GAP,
+        ),
+    };
+
+    let id: Vec<String> = path.iter().map(usize::to_string).collect();
+    let hover_path = path.clone();
+    fn pick(
+        path: Vec<usize>,
+        button: MouseButton,
+        cx: &mut Cx,
+    ) -> impl Fn(&MouseUpEvent, &mut Window, &mut gpui_kit::App) + 'static {
+        Diffui::listen(cx, move |this, _, _, cx| {
+            this.menu_on_select(path.clone(), button, cx);
+            cx.stop_propagation();
+        })
+    }
+    // Hover highlights / opens; a release of *either* button selects, so the
+    // right-click menu is picked from with either hand. Which button released
+    // is carried along: the opening gesture's own release is dropped by the update
+    // side. No press listener: presses fall through to the card's capture so they
+    // don't reach the dismiss backdrop.
+    div()
+        .id(ElementId::Name(SharedString::from(format!(
+            "menu-row-{}",
+            id.join("-")
+        ))))
+        .flex()
+        .items_center()
+        .w_full()
+        .h(px(MENU_ROW_HEIGHT))
+        .px(px(MENU_ITEM_PAD_X))
+        .rounded(px(MENU_ROW_RADIUS))
+        .cursor_pointer()
+        // Same solid selection fill the palette's rows use, so "the row you're on"
+        // looks identical across every list overlay.
+        .when(active, |row| row.bg(theme.selected_file))
+        .child(inner)
+        .on_hover(Diffui::listen(cx, move |this, entered: &bool, _, cx| {
+            if *entered {
+                this.menu_on_hover(hover_path.clone(), cx);
+            }
+        }))
+        .on_mouse_up(MouseButton::Left, pick(path.clone(), MouseButton::Left, cx))
+        .on_mouse_up(MouseButton::Right, pick(path, MouseButton::Right, cx))
+        .into_any_element()
+}
+
+fn glow_card(theme: ThemeSpec, rect: Rectangle, opened_at: Instant) -> impl IntoElement {
+    let elapsed = Instant::now()
+        .saturating_duration_since(opened_at)
+        .as_secs_f32();
+    let pulse = 0.5 + 0.5 * (elapsed * GLOW_PULSE_SPEED).sin();
+    let accent = theme.accent;
+    div()
+        .absolute()
+        .left(px(rect.x))
+        .top(px(rect.y))
+        .w(px(rect.width))
+        .h(px(rect.height))
+        .bg(Color {
+            a: 0.10 + 0.14 * pulse,
+            ..accent
+        })
+        .border(px(1.5))
+        .border_color(Color {
+            a: 0.55 + 0.45 * pulse,
+            ..accent
+        })
+        // Traces the row card it sits on.
+        .rounded(px(crate::revision_list::ROW_CARD_RADIUS))
+        // A soft accent halo: the "glow" half of the effect, pulsing with the
+        // border.
+        .shadow(vec![BoxShadow {
+            color: Hsla::from(Color {
+                a: 0.5 + 0.4 * pulse,
+                ..accent
+            }),
+            offset: point(px(0.0), px(0.0)),
+            blur_radius: px(8.0),
+            spread_radius: px(0.0),
+            inset: false,
+        }])
 }
 
 #[cfg(test)]
