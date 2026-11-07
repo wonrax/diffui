@@ -157,6 +157,27 @@ pub fn wrapped_line_starts(
     starts
 }
 
+/// `content` shaped as one line, wrapped at `wrap_width` if there is one: glyph
+/// positions and break points, for geometry that has to land on what's painted.
+pub fn shape_wrapped(
+    content: &str,
+    size: f32,
+    font: Font,
+    wrap_width: Option<f32>,
+) -> Option<gpui_kit::WrappedLine> {
+    let lines = with_shaper(|shaper| {
+        shaper.shape_text(
+            SharedString::new(content),
+            px(size),
+            &[run(content.len(), font)],
+            wrap_width.map(|width| px(width.max(1.0))),
+            None,
+        )
+    })
+    .ok()?;
+    lines.into_iter().next()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -6,8 +6,14 @@ edition = "2024"
 [dependencies]
 diffui-core = { path = "../core" }
 gpui-kit = { workspace = true }
+# Already in the tree through GPUI: the diff's no-shaping wrap breaks lines where the
+# engine would.
+icu_segmenter = "2.3"
 raw-window-handle = "0.6"
 tracing = "0.1"
+
+[dev-dependencies]
+gpui-kit = { workspace = true, features = ["test-support"] }
 
 # Build-time only: fetch + checksum the Lucide icon font (see build.rs). `ureq`
 # rides on rustls so the download needs no system TLS libs on any platform.

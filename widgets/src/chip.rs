@@ -19,9 +19,9 @@ pub const PAD_X: f32 = 6.0;
 pub const RADIUS: f32 = 6.0;
 /// Chip icon glyph size — a step under the label size so the glyph's optical
 /// weight matches the text next to it.
-const ICON_SIZE: f32 = 11.0;
+pub const ICON_SIZE: f32 = 11.0;
 /// Gap between a chip's icon and its label.
-const ICON_GAP: f32 = 3.0;
+pub const ICON_GAP: f32 = 3.0;
 
 /// Tight box: just enough vertical room for the cap-height plus a hair of
 /// breathing room. Anything more makes the chip dwarf the text around it.
