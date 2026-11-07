@@ -6,12 +6,14 @@
 //! command with no key isn't advertised at all.
 
 use crate::Cx;
+use crate::typography::{self, Aligned};
 use diffui_core::DraftKind;
-use gpui_kit::{AnyElement, Window};
+use gpui_kit::prelude::*;
+use gpui_kit::{AnyElement, Window, div, px};
 
 use crate::Diffui;
 use crate::commands::{CommandId, Context};
-use crate::theme::ThemeSpec;
+use crate::theme::{self, ThemeSpec, text_size};
 
 /// A hint: the commands whose keys it shows (several for a pair like `j k`),
 /// and what pressing them does. No commands: a pointer gesture, shown as
@@ -140,15 +142,64 @@ fn keys(ui: &Diffui, context: Context, commands: &[CommandId]) -> Vec<String> {
     keys
 }
 
-/// Stub: the mode_hints view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+/// The strip for the active mode, or `None` when no mode with keys is on.
 pub(crate) fn strip(
     ui: &Diffui,
     theme: ThemeSpec,
     window: &mut Window,
     cx: &mut Cx,
 ) -> Option<AnyElement> {
-    None
+    let (context, hints) = active_hints(ui)?;
+    let font = ui.config.ui_font;
+    let mut line: Vec<Aligned> = Vec::new();
+    let mut seen_what: Vec<&str> = Vec::new();
+    let mut any_key = false;
+    for hint in hints {
+        let keys = keys(ui, context, hint.commands);
+        // An unbound command has nothing to teach; a second binding of the same
+        // thing (Esc and compare.exit both stopping a comparison) would only
+        // repeat it.
+        if (keys.is_empty() && !hint.commands.is_empty()) || seen_what.contains(&hint.what) {
+            continue;
+        }
+        seen_what.push(hint.what);
+        if !line.is_empty() {
+            line.push(Aligned::gap(theme::space::LG));
+        }
+        let gesture = keys.is_empty();
+        any_key |= !gesture;
+        for (index, key) in keys.into_iter().enumerate() {
+            if index > 0 {
+                line.push(Aligned::gap(theme::space::XS));
+            }
+            line.push(crate::shortcuts::keycap(ui, theme, key, window, cx));
+        }
+        if !gesture {
+            line.push(Aligned::gap(theme::space::SM));
+        }
+        line.push(Aligned::text(
+            typography::line(hint.what, font, text_size::CAPTION, theme.muted_text),
+            font,
+            text_size::CAPTION,
+        ));
+    }
+    // Gestures alone don't earn a strip: the mode has no keys left bound.
+    if !any_key {
+        return None;
+    }
+    Some(
+        div()
+            .w_full()
+            .flex_none()
+            .overflow_hidden()
+            .px(px(crate::diff_view::HEADER_HORIZONTAL_PADDING))
+            .py(px(theme::space::SM))
+            .bg(theme.file_header)
+            .border_1()
+            .border_color(theme.border)
+            .child(typography::baseline_row(line, 0.0))
+            .into_any_element(),
+    )
 }
 
 #[cfg(test)]

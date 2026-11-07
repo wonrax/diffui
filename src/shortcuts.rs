@@ -6,13 +6,14 @@
 //! `[keys]` override shows up here as bound, and a default it shadowed does
 //! not.
 
-use crate::Cx;
-use crate::Diffui;
+use gpui_kit::prelude::*;
+use gpui_kit::{AnyElement, Window, div, px};
+
 use crate::commands::{self, CommandArg, CommandId, Context, REGISTRY};
 use crate::modes::{Mode, ModeKind};
-use crate::theme::ThemeSpec;
-use crate::typography::Aligned;
-use gpui_kit::{AnyElement, Window};
+use crate::theme::{self, ThemeSpec, Weight, emphasis_font, text_size};
+use crate::typography::{self, Aligned};
+use crate::{Action, Cx, Diffui, ui};
 
 const CARD_WIDTH: f32 = 760.0;
 const CARD_MAX_HEIGHT: f32 = 720.0;
@@ -174,41 +175,322 @@ impl Diffui {
     }
 }
 
-/// Stub: the shortcuts view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+/// The sheet over a scrim, or nothing when it is closed.
 pub(crate) fn build_overlay(
     ui: &Diffui,
     theme: ThemeSpec,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    crate::stub::overlay(
-        "shortcuts::build_overlay",
-        ui.mode(ModeKind::Shortcuts).is_some(),
+    if ui.mode(ModeKind::Shortcuts).is_none() {
+        return div().into_any_element();
+    }
+
+    let column = || {
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .gap(px(theme::space::XL))
+    };
+    let (mut left, mut right) = (column(), column());
+    let rows_of = |entries: Vec<Entry>, window: &mut Window, cx: &mut Cx| -> Vec<AnyElement> {
+        entries
+            .into_iter()
+            .map(|entry| {
+                binding_row(
+                    ui,
+                    theme,
+                    entry.label,
+                    entry.keys,
+                    entry.disabled,
+                    window,
+                    cx,
+                )
+            })
+            .collect()
+    };
+    // Revisions is the long one: it and the repository keys go left, the rest
+    // balances against them on the right.
+    let base = entries(ui, Context::Base);
+    for title in [
+        "General",
+        "Revisions",
+        "Diff pane and files",
+        "Repository and history",
+    ] {
+        let rows: Vec<Entry> = base
+            .iter()
+            .filter(|entry| base_group(entry.id) == title)
+            .cloned()
+            .collect();
+        if rows.is_empty() {
+            continue;
+        }
+        let block = section(ui, theme, title, rows_of(rows, window, cx));
+        if matches!(title, "Revisions" | "Repository and history") {
+            left = left.child(block);
+        } else {
+            right = right.child(block);
+        }
+    }
+    for (context, title) in SECTIONS {
+        let rows = entries(ui, *context);
+        if rows.is_empty() {
+            continue;
+        }
+        right = right.child(section(ui, theme, title, rows_of(rows, window, cx)));
+    }
+    let gestures = GESTURES
+        .iter()
+        .map(|(gesture, what)| {
+            binding_row(
+                ui,
+                theme,
+                (*what).to_owned(),
+                vec![(*gesture).to_owned()],
+                None,
+                window,
+                cx,
+            )
+        })
+        .collect();
+    let left = left.child(section(ui, theme, "Mouse", gestures));
+
+    let font = ui.config.ui_font;
+    let title_font = emphasis_font(font, Weight::MEDIUM);
+    let header = div()
+        .flex_none()
+        .pr(px(ui::DIALOG_PADDING))
+        .child(typography::baseline_row(
+            [
+                Aligned::text(
+                    typography::line(
+                        "Keyboard shortcuts",
+                        title_font,
+                        text_size::TITLE,
+                        theme.text,
+                    ),
+                    title_font,
+                    text_size::TITLE,
+                )
+                .fill(),
+                Aligned::text(
+                    typography::line(
+                        "Rebind in config.toml [keys]   \u{b7}   esc to close",
+                        font,
+                        text_size::CAPTION,
+                        theme.subtle_text,
+                    ),
+                    font,
+                    text_size::CAPTION,
+                ),
+            ],
+            0.0,
+        ));
+
+    let columns = div()
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap(px(theme::space::XXL * 1.5))
+        // The list scrolls out to the card's right edge, so the bar sits where
+        // every other scroll view's does; the inset moves inside.
+        .pr(px(ui::DIALOG_PADDING))
+        .child(left)
+        .child(right);
+
+    let height = (ui.window_size.height - crate::toolbar::modal_top() - theme::space::XXL)
+        .clamp(240.0, CARD_MAX_HEIGHT);
+    let card = ui::dialog_card(CARD_WIDTH, theme)
+        .h(px(height))
+        .pr(px(0.0))
+        .gap(px(theme::space::XL))
+        .child(header)
+        .child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .child(ui::scrollable("shortcuts-list", columns)),
+        );
+    let dismiss = Diffui::on_action::<()>(Action::CloseShortcuts, cx);
+    ui::modal(
+        "shortcuts-sheet",
+        card,
+        crate::toolbar::modal_top(),
+        move |window, cx| dismiss(&(), window, cx),
     )
+    .into_any_element()
 }
 
-/// Stub: the shortcuts view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+fn section(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    title: &'static str,
+    rows: Vec<AnyElement>,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .child(div().pb(px(theme::space::XS)).child(typography::line(
+            title,
+            emphasis_font(ui.config.ui_font, Weight::SEMIBOLD),
+            text_size::CAPTION,
+            theme.subtle_text,
+        )))
+        .children(rows)
+}
+
+fn binding_row(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    label: String,
+    keys: Vec<String>,
+    disabled: Option<commands::Reason>,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    let font = ui.config.ui_font;
+    // The label and the mono keycaps share a baseline (see `crate::typography`). A
+    // command that can't run right now greys out and says why after its label.
+    let mut line = match disabled {
+        None => vec![
+            Aligned::text(
+                typography::line(label, font, text_size::UI, theme.text).text_ellipsis(),
+                font,
+                text_size::UI,
+            )
+            .fill(),
+        ],
+        Some(reason) => vec![
+            Aligned::text(
+                typography::line(label, font, text_size::UI, theme.subtle_text).text_ellipsis(),
+                font,
+                text_size::UI,
+            ),
+            Aligned::gap(theme::space::SM),
+            Aligned::text(
+                typography::line(reason, font, text_size::CAPTION, theme.subtle_text)
+                    .text_ellipsis(),
+                font,
+                text_size::CAPTION,
+            )
+            .fill(),
+        ],
+    };
+    for (index, key) in keys.into_iter().enumerate() {
+        line.push(Aligned::gap(if index == 0 {
+            theme::space::MD
+        } else {
+            theme::space::XS
+        }));
+        line.push(keycap(ui, theme, key, window, cx));
+    }
+    div()
+        .flex()
+        .items_center()
+        .w_full()
+        .h(px(ROW_HEIGHT))
+        .child(typography::baseline_row(line, 0.0))
+        .into_any_element()
+}
+
+/// A key rendered like the tab strip's `⌘K` control: hairline border, mono.
 pub(crate) fn keycap(
     ui: &Diffui,
     theme: ThemeSpec,
     key: String,
-    window: &mut Window,
-    cx: &mut Cx,
+    _window: &mut Window,
+    _cx: &mut Cx,
 ) -> Aligned {
-    crate::stub::aligned("shortcuts::keycap")
+    let mono = ui.config.mono_font;
+    Aligned::chip(
+        typography::line(key, mono, text_size::CAPTION, theme.muted_text),
+        mono,
+        text_size::CAPTION,
+        [1.0, 5.0].into(),
+        move |chip| {
+            chip.bg(theme::chip_background(theme.muted_text))
+                .border_1()
+                .border_color(theme.border)
+                .rounded(px(4.0))
+        },
+    )
 }
 
-/// Stub: the shortcuts view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+/// The welcome screen's tips: the few keys and gestures that make the rest
+/// discoverable, under the open prompt. Chords come from the keymap so an override
+/// shows up here too.
 pub(crate) fn welcome_hints(
     ui: &Diffui,
     theme: ThemeSpec,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    crate::stub::panel("shortcuts::welcome_hints")
+    let font = ui.config.ui_font;
+    let chord = |id: CommandId| {
+        ui.keymap
+            .chord_for(Context::Base, id)
+            .map(|chord| chord.display())
+    };
+    let mut tip = |key: Option<String>, what: &'static str| {
+        let mut line = Vec::new();
+        if let Some(key) = key {
+            line.push(keycap(ui, theme, key, window, cx));
+        }
+        line.push(Aligned::text(
+            typography::line(what, font, text_size::UI, theme.subtle_text),
+            font,
+            text_size::UI,
+        ));
+        typography::baseline_row(line, theme::space::SM)
+    };
+    // The prompt above owns the keyboard here, and the palette needs a repository,
+    // so these read as "once one is open".
+    let keys = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(theme::space::XL))
+        .child(tip(chord("palette.toggle"), "Command palette"))
+        .child(tip(chord("help.shortcuts"), "All shortcuts"))
+        .child(tip(chord("repo.open-dialog"), "Open another"));
+    let all = ui::button(
+        "welcome-shortcuts",
+        ui::Variant::Ghost,
+        ui::Size::Compact,
+        theme,
+        cx,
+    )
+    .child(typography::line(
+        "Keyboard shortcuts",
+        font,
+        text_size::UI,
+        theme.muted_text,
+    ))
+    .on_click(Diffui::on_action(Action::ToggleShortcuts, cx));
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(theme::space::MD))
+        .child(typography::line(
+            "Once a repository is open",
+            emphasis_font(font, Weight::MEDIUM),
+            text_size::CAPTION,
+            theme.subtle_text,
+        ))
+        .child(keys)
+        .child(typography::line(
+            "Right-click a revision for its actions  \u{b7}  drag a revision or marked set onto another to rebase",
+            font,
+            text_size::UI,
+            theme.subtle_text,
+        ))
+        .child(all)
+        .into_any_element()
 }
 
 #[cfg(test)]

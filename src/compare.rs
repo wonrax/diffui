@@ -9,12 +9,15 @@
 //! banner above the diff says what is being compared and carries the swap,
 //! interdiff and exit controls.
 
-use crate::Cx;
 use diffui_core::{DiffBase, RevisionSelection};
-use gpui_kit::{AnyElement, Window};
+use gpui_kit::prelude::*;
+use gpui_kit::{AnyElement, Window, div, px};
 
-use crate::Diffui;
-use crate::theme::ThemeSpec;
+use crate::action::Action;
+use crate::commit_info::with_tooltip;
+use crate::theme::{Color, ThemeSpec, Weight, text_size};
+use crate::typography::{self, Aligned};
+use crate::{Cx, Diffui, ellipsis, icons, ui};
 
 #[derive(Debug, Clone)]
 pub(crate) enum CompareAction {
@@ -154,13 +157,168 @@ impl Diffui {
     }
 }
 
-/// Stub: the compare view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+/// The strip a comparison or a range wears atop the diff pane: what it is on the
+/// left, clipped by a narrow pane before the controls are, and the controls.
+pub(crate) fn banner_strip(
+    sides: gpui_kit::Div,
+    controls: gpui_kit::Div,
+    theme: ThemeSpec,
+) -> AnyElement {
+    div()
+        .w_full()
+        .flex_none()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .py(px(8.0))
+        .px(px(crate::theme::space::XL))
+        .bg(Color {
+            a: 0.10,
+            ..theme.accent
+        })
+        .child(
+            sides
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .flex()
+                .flex_col()
+                .gap(px(3.0)),
+        )
+        .child(
+            controls
+                .flex_none()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.0)),
+        )
+        .into_any_element()
+}
+
+/// The "Comparing A → B" strip atop the diff pane, or `None` when the pane
+/// shows a plain revision diff.
 pub(crate) fn build_compare_banner(
     ui: &Diffui,
     theme: ThemeSpec,
     window: &mut Window,
     cx: &mut Cx,
 ) -> Option<AnyElement> {
-    None
+    if let Some(banner) = crate::range::banner(ui, theme, window, cx) {
+        return Some(banner);
+    }
+    let session = &ui.active().session;
+    // While a switch is in flight the requested base is what's coming; once it
+    // lands the two agree. Showing the requested one makes Exit/Swap respond
+    // at once instead of on the next load.
+    let base = if session.diff_in_flight() {
+        &session.diff_base
+    } else {
+        &session.document_base
+    };
+    let from = base.revision()?;
+    let to = session.diff_pending().unwrap_or(&session.selected_revision);
+    let interdiff = matches!(base, DiffBase::Interdiff(_));
+    let font = ui.config.ui_font;
+    let mono = ui.config.mono_font;
+
+    let (from_id, from_title) = revision_label(ui, from);
+    let (to_id, to_title) = revision_label(ui, to);
+    let id = |id: String| {
+        Aligned::text(
+            typography::line(id, mono, text_size::UI, theme.accent),
+            mono,
+            text_size::UI,
+        )
+    };
+    let glyph = |glyph: &'static str, color| {
+        Aligned::glyph(icons::icon(glyph, ui::ICON_SIZE, color), ui::ICON_SIZE)
+    };
+    let label = if interdiff { "Interdiff" } else { "Comparing" };
+    let medium = crate::theme::emphasis_font(font, Weight::MEDIUM);
+    // The label and the mono ids share a baseline, the icons centre on the
+    // caps (see `crate::typography`).
+    let headline = typography::baseline_row(
+        [
+            glyph(icons::GIT_COMPARE, theme.accent),
+            Aligned::text(
+                typography::line(label, medium, text_size::UI, theme.text),
+                medium,
+                text_size::UI,
+            ),
+            id(from_id),
+            glyph(icons::ARROW_RIGHT, theme.muted_text),
+            id(to_id),
+        ],
+        8.0,
+    );
+    // The titles ride on a quieter second line so the ids and controls never
+    // get clipped by a narrow pane; a revision compared with itself turns the
+    // line into the hint for picking the other side.
+    let subline = if from == to {
+        "Click another revision in the graph to compare against this one".to_owned()
+    } else {
+        format!("{from_title}  \u{2192}  {to_title}")
+    };
+    let sides = div().child(headline).child(
+        ellipsis::Line::new(
+            vec![ellipsis::Span::new(subline)],
+            font,
+            text_size::CAPTION,
+            theme.subtle_text,
+        )
+        .view(),
+    );
+
+    let controls = div()
+        .child(with_tooltip(
+            "compare-swap-tip",
+            "Swap the two sides",
+            font,
+            theme,
+            ui::icon_button(
+                "compare-swap",
+                icons::ARROW_LEFT_RIGHT,
+                theme.muted_text,
+                ui::Size::Compact,
+                theme,
+                cx,
+            )
+            .on_click(Diffui::on_action(Action::Compare(CompareAction::Swap), cx)),
+        ))
+        .child(with_tooltip(
+            "compare-mode-tip",
+            if interdiff {
+                "Diff the two trees (jj diff --from)"
+            } else {
+                "Diff the two versions of the change itself (jj interdiff)"
+            },
+            font,
+            theme,
+            ui::text_button(
+                "compare-mode",
+                None,
+                if interdiff { "Tree diff" } else { "Interdiff" },
+                ui::Variant::Ghost,
+                ui::Size::Compact,
+                font,
+                theme,
+                cx,
+            )
+            .on_click(Diffui::on_action(
+                Action::Compare(CompareAction::SetInterdiff(!interdiff)),
+                cx,
+            )),
+        ))
+        .child(with_tooltip(
+            "compare-exit-tip",
+            "Stop comparing",
+            font,
+            theme,
+            ui::close_button("compare-exit", theme.muted_text, theme, cx)
+                .on_click(Diffui::on_action(Action::Compare(CompareAction::Exit), cx)),
+        ));
+
+    Some(banner_strip(sides, controls, theme))
 }

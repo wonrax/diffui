@@ -5,8 +5,10 @@
 //! The command itself comes from core ([`diffui_core::plan`]); this module
 //! names revisions from the loaded graph and draws the line.
 
-use crate::Cx;
-use gpui_kit::{AnyElement, Window};
+use crate::typography::{self, Aligned};
+use crate::{Action, Cx, icons, ui};
+use gpui_kit::prelude::*;
+use gpui_kit::{AnyElement, Window, div, px};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -17,7 +19,7 @@ use diffui_core::{JjCli, MutationOp, RevisionSelection, Vcs};
 use crate::Diffui;
 use crate::ellipsis;
 use crate::prose::Prose;
-use crate::theme::ThemeSpec;
+use crate::theme::{ThemeSpec, text_size};
 
 /// Size of the line's glyphs.
 const GLYPH: f32 = 12.0;
@@ -157,34 +159,90 @@ pub(crate) fn command_fits(
     !line.is_multiline() && line.fits(width - CHROME)
 }
 
-/// Stub: the plan view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+/// The command on one line: a terminal glyph, the command in mono (cut short
+/// with an ellipsis when it doesn't fit) and a copy button, which copies the
+/// whole command.
 pub(crate) fn command_line(
     ui: &Diffui,
     theme: ThemeSpec,
     command: &str,
     size: f32,
-    window: &mut Window,
+    _window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    crate::stub::panel("plan::command_line")
+    // Width-free: the line gives up what its row can't hold, so it fits anywhere it
+    // is placed and the copy button stays right behind the text.
+    let text = command_text(ui, theme, command, size).view();
+    laid_out(text, command, size, ui, theme, cx)
 }
 
-/// Stub: the plan view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+/// The whole command, wrapped to the width it gets, its later lines under the
+/// command's first rather than under the glyph, the copy button after it.
 pub(crate) fn wrapped_command_line(
     ui: &Diffui,
     theme: ThemeSpec,
     command: &str,
     size: f32,
-    window: &mut Window,
+    _window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    crate::stub::panel("plan::wrapped_command_line")
+    let text = command_text(ui, theme, command, size).wrapped();
+    laid_out(text, command, size, ui, theme, cx)
 }
 
-/// Stub: the plan view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+fn laid_out(
+    text: gpui_kit::Div,
+    command: &str,
+    size: f32,
+    ui: &Diffui,
+    theme: ThemeSpec,
+    cx: &mut Cx,
+) -> AnyElement {
+    let (ui_font, mono) = (ui.config.ui_font, ui.config.mono_font);
+    // Commands repeat across a list: the text says which one this is.
+    let id = {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        command.hash(&mut hasher);
+        hasher.finish() as usize
+    };
+    let copy = div()
+        .id(("copy-command-tip", id))
+        .tooltip(ui::tooltip("Copy command", ui_font, theme))
+        // Above a row that opens on press, a press here is the button's alone.
+        .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| {
+            cx.stop_propagation()
+        })
+        .child(
+            ui::button(
+                ("copy-command", id),
+                ui::Variant::Ghost,
+                ui::Size::Compact,
+                theme,
+                cx,
+            )
+            .size(px(GLYPH + 4.0))
+            .p(px(0.0))
+            .child(icons::icon(icons::COPY, GLYPH, theme.subtle_text))
+            .on_click(Diffui::on_action(Action::Copy(command.to_owned()), cx)),
+        );
+    typography::baseline_row(
+        [
+            Aligned::glyph(
+                icons::icon(icons::TERMINAL, GLYPH, theme.subtle_text),
+                GLYPH,
+            ),
+            Aligned::gap(6.0),
+            Aligned::text(text, mono, size).shrink(),
+            Aligned::gap(4.0),
+            Aligned::glyph(copy, GLYPH + 4.0),
+        ],
+        0.0,
+    )
+    .into_any_element()
+}
+
+/// [`command_line`] at caption size, the size the logs use.
 pub(crate) fn caption_command_line(
     ui: &Diffui,
     theme: ThemeSpec,
@@ -192,7 +250,7 @@ pub(crate) fn caption_command_line(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    crate::stub::panel("plan::caption_command_line")
+    command_line(ui, theme, command, text_size::CAPTION, window, cx)
 }
 
 #[cfg(test)]

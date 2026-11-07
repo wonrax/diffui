@@ -1,17 +1,19 @@
-use crate::Cx;
-use crate::Diffui;
 use crate::chip::{self, Chip};
 use crate::config::AppConfig;
-use crate::graph_layout::GraphLayout;
+use crate::field;
 use crate::graph_view::{self, RevisionGraphStyle};
-use crate::icons;
 use crate::measure;
-use crate::revision_list::RevisionListStyle;
-use crate::revision_list::{self};
-use crate::theme::Color;
-use crate::theme::{self, ThemeSpec, chip_background};
+use crate::repository::Vcs;
+use crate::revision_list::{self, DropSpot, RevisionListStyle};
+use crate::theme::{
+    self, Color, Padding, ThemeSpec, Weight, chip_background, emphasis_font, text_size,
+};
+use crate::typography::{self, Aligned};
+use crate::{Action, Cx, Diffui, HoverTarget, LoadStatus, ToolbarMenu, icons, ui};
 use diffui_core::{DiffFile, FileTreeRow, RowView, file_tree_rows};
-use gpui_kit::{AnyElement, Window};
+use gpui_kit::base::TestSupportExt as _;
+use gpui_kit::prelude::*;
+use gpui_kit::{AnyElement, Window, div, px};
 use std::collections::HashSet;
 use std::rc::Rc;
 
@@ -74,7 +76,7 @@ pub(crate) const COMMIT_ID_CHARS: usize = 8;
 /// tint over the panel, so "a draft is in progress" reads from anywhere in
 /// the pane — not just the op bar. Also fed to the revision list's own
 /// background fill (the widget paints over the container).
-fn draft_panel_background(theme: ThemeSpec) -> Color {
+pub(crate) fn draft_panel_background(theme: ThemeSpec) -> Color {
     theme::mix(theme.panel_background, theme.accent, 0.05)
 }
 
@@ -131,20 +133,6 @@ fn thousands(n: usize) -> String {
     out
 }
 
-/// One list row's inputs: its commit data, where its lanes live, and how it
-/// relates to the loaded graph.
-struct RowSlot<'a> {
-    commit: RowView<'a>,
-    layout: &'a GraphLayout,
-    /// The row's index in `layout` (and in the list).
-    row: usize,
-    unique_len: Option<usize>,
-    /// The loaded row this row aims at as a draft destination.
-    target: Option<usize>,
-    /// What the previewed operation does to it, while a preview is drawn.
-    preview: Option<diffui_core::PreviewRow>,
-}
-
 /// Bookmark chips for a revision row, wearing `lane_color`. Shared with the
 /// source browser's revision-header row so both rails style identically.
 ///
@@ -157,7 +145,7 @@ struct RowSlot<'a> {
 /// sharing the rail. Remotes render outlined (transparent fill + 1px
 /// lane-color border) so they read as "tracking" rather than "live".
 /// The graph's lane colours for `theme`.
-fn revision_graph_style(theme: ThemeSpec) -> RevisionGraphStyle {
+pub(crate) fn revision_graph_style(theme: ThemeSpec) -> RevisionGraphStyle {
     RevisionGraphStyle {
         lane_base_color: theme.lane_base,
         missing_color: theme.subtle_text,
@@ -380,7 +368,7 @@ pub(crate) fn truncate_end(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 
-fn commit_description_color(commit: RowView, theme: ThemeSpec) -> Color {
+pub(crate) fn commit_description_color(commit: RowView, theme: ThemeSpec) -> Color {
     if commit.has_description() {
         return theme.text;
     }
@@ -392,26 +380,964 @@ fn commit_description_color(commit: RowView, theme: ThemeSpec) -> Color {
     }
 }
 
-/// Stub: the sidebar view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
 pub(crate) fn build_sidebar(
     ui: &Diffui,
     theme: ThemeSpec,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    crate::stub::panel("sidebar::build_sidebar")
+    // The "Changes" header is gone; the list starts flush at the top of the
+    // pane. Each row carries its own internal vertical padding, so the first
+    // row's content isn't cramped against the top edge — adding a panel-colored
+    // gap above it instead just reads as a stray strip above the selected row.
+    let revision_list = crate::seam::revision_list(ui, theme, window, cx);
+
+    let draft_active = ui.active().op_draft().is_some();
+    let mut body = div()
+        .flex()
+        .flex_col()
+        .size_full()
+        .bg(if draft_active {
+            draft_panel_background(theme)
+        } else {
+            theme.panel_background
+        })
+        // The revset / revision-range filter sits at the very top of the pane.
+        .child(
+            field::PANEL_HEADER_PADDING
+                .apply(div())
+                .w_full()
+                .flex_none()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(field::PANEL_TOGGLE_INSET))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h(px(field::FIELD_HEIGHT))
+                        .child(build_revset_filter(ui, theme, window, cx)),
+                )
+                .child(div().flex_none().size(px(theme::control::COMPACT)).child(
+                    field::panel_toggle_button(
+                        ui.config.ui_font,
+                        theme,
+                        icons::MINUS,
+                        "Hide revision history",
+                        Action::ToggleHistoryPanel,
+                        window,
+                        cx,
+                    ),
+                )),
+        )
+        .children(crate::revset_assist::error_strip(ui, theme, window, cx))
+        .children(crate::history_panel::file_filter_banner(
+            ui, theme, window, cx,
+        ));
+    // Load failures no longer have a header to live under — surface them as a
+    // soft alert card above the list rather than bare red text.
+    // A revset error is told once: by the field, under it, when its own
+    // check has it; the card only for what that check couldn't foresee.
+    if let LoadStatus::Failed(error) = &ui.active().session.status
+        && !(crate::empty_states::is_revset_error(error)
+            && crate::revset_assist::explains_revset_error(ui))
+    {
+        body = body.child(crate::empty_states::load_error(ui, theme, error, cx));
+    }
+    let list =
+        crate::empty_states::revision_list_placeholder(ui, theme, cx).unwrap_or(revision_list);
+    // The revset field's completions hang over the top of the list.
+    body = body.child(
+        div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .child(list)
+            .children(
+                crate::revset_assist::dropdown(ui, theme, window, cx)
+                    .map(|dropdown| div().absolute().top_0().left_0().right_0().child(dropdown)),
+            ),
+    );
+    // Target mode: the op bar floats between the list and the footer while a
+    // rebase/squash draft is picking its destination.
+    if draft_active {
+        body = body.child(build_op_bar(ui, theme, window, cx));
+    }
+    body.child(build_footer(ui, theme)).into_any_element()
 }
 
-/// Stub: the sidebar view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
 pub(crate) fn build_collapsed_sidebar(
     ui: &Diffui,
     theme: ThemeSpec,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    crate::stub::panel("sidebar::build_collapsed_sidebar")
+    div()
+        .w(px(theme::COLLAPSED_PANEL_WIDTH))
+        .h_full()
+        .p(px(field::COLLAPSED_RAIL_PADDING))
+        .bg(theme.panel_background)
+        .child(
+            div()
+                .size(px(theme::control::COMPACT))
+                .child(field::panel_toggle_button(
+                    ui.config.ui_font,
+                    theme,
+                    icons::GIT_BRANCH,
+                    "Show revision history",
+                    Action::ToggleHistoryPanel,
+                    window,
+                    cx,
+                )),
+        )
+        .into_any_element()
+}
+
+/// How a target row of the op bar reads.
+#[derive(Clone, Copy, PartialEq)]
+enum RowTone {
+    /// What would actually happen.
+    Armed,
+    /// A chosen placement still waiting on a target.
+    Chosen,
+    Idle,
+}
+
+/// One way the operation can land: its label, keycap and what it means for the
+/// armed target.
+///
+/// Armed is a light accent tint with accent ink, not a solid fill — a
+/// full-width solid bar next to the washed sidebar was glaring. It still
+/// outranks Chosen (accent ink, no row fill) by owning the only tinted row
+/// surface.
+#[allow(clippy::too_many_arguments)]
+fn op_target_row(
+    id: &'static str,
+    label: &'static str,
+    key: Option<String>,
+    tone: RowTone,
+    description: Option<String>,
+    on_press: Option<Action>,
+    ui: &Diffui,
+    theme: ThemeSpec,
+    cx: &mut Cx,
+) -> AnyElement {
+    let (ui_font, mono_font) = (ui.config.ui_font, ui.config.mono_font);
+    let (label_color, key_color, key_bg, desc_color) = match tone {
+        RowTone::Armed => (
+            theme.accent,
+            theme.accent,
+            chip_background(theme.accent),
+            theme.accent,
+        ),
+        RowTone::Chosen => (
+            theme.accent,
+            theme.accent,
+            chip_background(theme.accent),
+            theme.muted_text,
+        ),
+        RowTone::Idle => (
+            theme.muted_text,
+            theme.subtle_text,
+            chip_background(theme.subtle_text),
+            theme.subtle_text,
+        ),
+    };
+    // The label, the keycap and the description share a baseline (see
+    // `crate::typography`).
+    let label_font = emphasis_font(ui_font, Weight::SEMIBOLD);
+    let mut content = vec![
+        Aligned::text(
+            typography::line(label, label_font, text_size::UI, label_color),
+            label_font,
+            text_size::UI,
+        )
+        .map(|label| div().w(px(52.0)).child(label).into_any_element()),
+    ];
+    if let Some(key) = key {
+        content.push(Aligned::chip(
+            typography::line(key, mono_font, text_size::CAPTION, key_color),
+            mono_font,
+            text_size::CAPTION,
+            Padding::from([0.0, 5.0]),
+            move |chip| chip.bg(key_bg).rounded(px(4.0)),
+        ));
+    }
+    if let Some(description) = description {
+        content.push(Aligned::text(
+            typography::line(description, ui_font, text_size::UI, desc_color),
+            ui_font,
+            text_size::UI,
+        ));
+    }
+    let hover = chip_background(theme.subtle_text);
+    let mut row = div()
+        .id(id)
+        .w_full()
+        .overflow_hidden()
+        .py(px(6.0))
+        .px(px(10.0))
+        .rounded(px(theme::radius::CONTROL))
+        .when(tone == RowTone::Armed, |row| {
+            row.bg(chip_background(theme.accent))
+        })
+        .when(tone != RowTone::Armed, |row| {
+            row.hover(move |row| row.bg(hover))
+        })
+        .test_support()
+        .child(typography::baseline_row(content, 8.0));
+    if let Some(action) = on_press {
+        row = row.on_click(Diffui::on_action(action, cx));
+    }
+    row.into_any_element()
+}
+
+/// The target-mode strip: what's being moved, the placement toggle
+/// (rebase only), the live preview line, and the key hints.
+fn build_op_bar(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> AnyElement {
+    use diffui_core::{DraftKind, PlacementKind};
+    let Some(draft_ui) = ui.active().op_draft() else {
+        return div().into_any_element();
+    };
+    let draft = &draft_ui.draft;
+    // Row-index helpers against the loaded graph.
+    let commits = &ui.active().session.commits;
+    let len = commits.len();
+    let short_id = |index: usize| -> Option<String> {
+        (index < len).then(|| {
+            commits
+                .row(index)
+                .change_id()
+                .chars()
+                .take(8)
+                .collect::<String>()
+        })
+    };
+    let is_source_index =
+        |index: usize| -> bool { index < len && draft.is_source(commits.row(index).commit_id()) };
+
+    // The armed target: the row under a live drag, else the candidate
+    // (hover / click / j-k all arm it). A gap spot has no single row.
+    let hover_row = match draft_ui.hover_spot {
+        Some(DropSpot::OnRow(index)) => Some(index),
+        _ => None,
+    };
+    let gap_sides = match draft_ui.hover_spot {
+        Some(DropSpot::Gap { above, below }) => Some((below, above)),
+        _ => None,
+    };
+    let armed = hover_row.or(draft.candidate).filter(|&index| index < len);
+    let armed_invalid = armed.is_some_and(is_source_index);
+    let gap_invalid =
+        gap_sides.is_some_and(|(parent, child)| is_source_index(parent) || is_source_index(child));
+    // The valid target row a confirm would land on.
+    let target = armed.filter(|&index| !is_source_index(index));
+    let merge_ready = matches!(draft.kind, DraftKind::Merge) && draft.sources.len() >= 2;
+    let parallel_ready = matches!(draft.kind, DraftKind::Parallelize) && draft.sources.len() >= 2;
+    // Squash/merge gap drops resolve to the gap's parent side.
+    let fold_target = target.or_else(|| {
+        gap_sides
+            .map(|(parent, _)| parent)
+            .filter(|&parent| !is_source_index(parent))
+    });
+
+    // ---- Header: op glyph, what moves, live enrichment, state, cancel.
+    let sim_rebase = match &draft_ui.preview {
+        crate::DraftPreviewState::Ready(diffui_core::DraftSimulation::Rebase(preview)) => {
+            Some(preview)
+        }
+        _ => None,
+    };
+    let (glyph, verb) = match draft.kind {
+        DraftKind::Rebase {
+            mode: diffui_core::RebaseSourceMode::Branch,
+        } => (icons::GIT_MERGE, "Rebase branch of"),
+        DraftKind::Rebase { .. } => (icons::GIT_MERGE, "Rebase"),
+        DraftKind::Squash => (icons::FOLD_VERTICAL, "Squash"),
+        DraftKind::Merge => (icons::GIT_FORK, "Merge"),
+        DraftKind::New => (icons::SQUARE_PLUS, "New change"),
+        DraftKind::Duplicate => (icons::COPY, "Duplicate"),
+        DraftKind::Parallelize => (icons::COLUMNS_3, "Parallelize"),
+    };
+    let mut names = draft
+        .sources
+        .iter()
+        .map(|source| source.label.clone())
+        .collect::<Vec<_>>();
+    if matches!(draft.kind, DraftKind::Merge)
+        && !merge_ready
+        && let Some(target_name) = target.and_then(short_id)
+    {
+        names.push(target_name);
+    }
+    let names = names.join(", ");
+    // "+ N descendants": exact once the simulation lands; with-descendants
+    // mode promises them even before it does.
+    let descendants_suffix = match (draft.kind, sim_rebase) {
+        (DraftKind::Rebase { .. } | DraftKind::Parallelize, Some(preview))
+            if preview.descendants > 0 =>
+        {
+            Some(format!(
+                "+ {} descendant{}",
+                preview.descendants,
+                if preview.descendants == 1 { "" } else { "s" }
+            ))
+        }
+        (
+            DraftKind::Rebase {
+                mode: diffui_core::RebaseSourceMode::WithDescendants,
+            },
+            _,
+        ) => Some("+ descendants".to_owned()),
+        _ => None,
+    };
+    // The idle instruction lives in the verdict band below; the headline
+    // only speaks up to refuse a target.
+    let state_hint: Option<(&'static str, Color)> = ((armed_invalid || gap_invalid)
+        && !matches!(draft.kind, DraftKind::Parallelize))
+    .then_some(("Can't target the revision being moved", theme.removed_text));
+    // The verb, the mono names and the suffix share a baseline; the glyph
+    // and the close button centre on the caps (see `crate::typography`).
+    let (ui_font, mono_font) = (ui.config.ui_font, ui.config.mono_font);
+    let verb_font = emphasis_font(ui_font, Weight::SEMIBOLD);
+    let names_font = emphasis_font(mono_font, Weight::MEDIUM);
+    let mut operation = vec![
+        Aligned::glyph(icons::icon(glyph, 15.0, theme.accent), 15.0),
+        Aligned::gap(7.0),
+        Aligned::text(
+            typography::line(verb, verb_font, text_size::BODY, theme.text),
+            verb_font,
+            text_size::BODY,
+        ),
+        Aligned::gap(7.0),
+        Aligned::text(
+            typography::line(names.clone(), names_font, text_size::BODY, theme.text),
+            names_font,
+            text_size::BODY,
+        ),
+    ];
+    if let Some(suffix) = descendants_suffix {
+        operation.push(Aligned::gap(7.0));
+        operation.push(Aligned::text(
+            typography::line(suffix, ui_font, text_size::BODY, theme.muted_text),
+            ui_font,
+            text_size::BODY,
+        ));
+    }
+    let operation = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(theme::space::SM))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .child(typography::baseline_row(operation, 0.0)),
+        )
+        .child(
+            ui::icon_button(
+                "op-bar-cancel",
+                icons::CLOSE,
+                theme.muted_text,
+                ui::Size::Compact,
+                theme,
+                cx,
+            )
+            .on_click(Diffui::on_action(Action::DraftCancel, cx)),
+        );
+    let headline = div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .gap(px(2.0))
+        .child(operation)
+        .children(state_hint.map(|(hint, color)| {
+            div()
+                .pl(px(22.0))
+                .child(typography::line(hint, ui_font, text_size::BODY, color))
+        }));
+
+    // ---- Target rows: every way the op can land, each resolving what it
+    // means for the armed target ("After → between llpz and kymz"). The row
+    // that would actually happen wears the solid accent fill; a chosen
+    // placement still waiting on a target wears a quiet tint. Keycaps ride
+    // inside the rows, so the hints line below stays short.
+    let mut rows_column = div().flex().flex_col().w_full().gap(px(2.0));
+    match draft.kind {
+        DraftKind::Rebase { .. } | DraftKind::New | DraftKind::Duplicate => {
+            // While a drag is live the fill mirrors what a drop would do —
+            // a row means onto, a gap means between — and reverts to the
+            // sticky keyboard placement when the drag ends.
+            let live_placement: Option<PlacementKind> = if gap_sides.is_some() {
+                None
+            } else if hover_row.is_some() {
+                Some(PlacementKind::Onto)
+            } else {
+                Some(draft.placement)
+            };
+            // Display-adjacent neighbors, confirmed as real edges by the
+            // same bit that legitimizes gap drops.
+            let child_of = |index: usize| -> Option<usize> {
+                let above = index.checked_sub(1)?;
+                commits.row(above).next_row_is_parent().then_some(above)
+            };
+            let parent_of = |index: usize| -> Option<usize> {
+                (index + 1 < len && commits.row(index).next_row_is_parent()).then_some(index + 1)
+            };
+            let describe = |placement: PlacementKind| -> Option<String> {
+                let target = target?;
+                let id = short_id(target)?;
+                Some(match placement {
+                    PlacementKind::Onto => format!("new child of {id}"),
+                    PlacementKind::After => match child_of(target).and_then(short_id) {
+                        Some(child) => format!("between {id} and {child}"),
+                        None => format!("directly after {id}"),
+                    },
+                    PlacementKind::Before => match parent_of(target).and_then(short_id) {
+                        Some(parent) => format!("between {parent} and {id}"),
+                        None => format!("directly before {id}"),
+                    },
+                })
+            };
+            let tone = |placement: PlacementKind| {
+                if live_placement != Some(placement) {
+                    RowTone::Idle
+                } else if target.is_some() {
+                    RowTone::Armed
+                } else {
+                    RowTone::Chosen
+                }
+            };
+            for (id, label, command, placement) in [
+                (
+                    "op-place-onto",
+                    "Onto",
+                    "draft.place.onto",
+                    PlacementKind::Onto,
+                ),
+                (
+                    "op-place-after",
+                    "After",
+                    "draft.place.after",
+                    PlacementKind::After,
+                ),
+                (
+                    "op-place-before",
+                    "Before",
+                    "draft.place.before",
+                    PlacementKind::Before,
+                ),
+            ] {
+                // The key as bound, so a rebinding shows here too.
+                let key = ui
+                    .keymap
+                    .chord_for(crate::commands::Context::Draft, command)
+                    .map(crate::keymap::Chord::display);
+                rows_column = rows_column.child(op_target_row(
+                    id,
+                    label,
+                    key,
+                    tone(placement),
+                    describe(placement),
+                    Some(Action::DraftPlacement(placement)),
+                    ui,
+                    theme,
+                    cx,
+                ));
+            }
+            // A drag over a gap is its own, transient way to land: exactly
+            // between the two rows around it.
+            if let Some((parent, child)) = gap_sides
+                && !gap_invalid
+                && let (Some(parent), Some(child)) = (short_id(parent), short_id(child))
+            {
+                rows_column = rows_column.child(op_target_row(
+                    "op-place-between",
+                    "Between",
+                    None,
+                    RowTone::Armed,
+                    Some(format!("{parent} and {child}")),
+                    None,
+                    ui,
+                    theme,
+                    cx,
+                ));
+            }
+        }
+        DraftKind::Squash => {
+            let tone = if fold_target.is_some() {
+                RowTone::Armed
+            } else {
+                RowTone::Idle
+            };
+            let description = fold_target
+                .and_then(short_id)
+                .map(|id| format!("folds {names} into {id} · descriptions combine"));
+            rows_column = rows_column.child(op_target_row(
+                "op-place-into",
+                "Into",
+                None,
+                tone,
+                description,
+                None,
+                ui,
+                theme,
+                cx,
+            ));
+        }
+        DraftKind::Merge | DraftKind::Parallelize => {}
+    }
+
+    // ---- Footer band: live verdict + counts on the left, Apply on the
+    // right, key hints underneath.
+    let is_branch = matches!(
+        draft.kind,
+        DraftKind::Rebase {
+            mode: diffui_core::RebaseSourceMode::Branch,
+        }
+    );
+    let (status_icon, status_text, status_color, counts): (
+        Option<&'static str>,
+        String,
+        Color,
+        Option<String>,
+    ) = match &draft_ui.preview {
+        crate::DraftPreviewState::Idle => (
+            None,
+            match draft.kind {
+                DraftKind::Squash => "Pick the revision to fold into".to_owned(),
+                DraftKind::Merge => "Pick the other parent".to_owned(),
+                DraftKind::New => "Pick where the new change goes".to_owned(),
+                DraftKind::Duplicate => "Pick where the copies land".to_owned(),
+                DraftKind::Parallelize => "Add another revision to parallelize".to_owned(),
+                _ if is_branch => "Pick a destination to resolve the branch".to_owned(),
+                _ => "Pick the destination".to_owned(),
+            },
+            theme.subtle_text,
+            None,
+        ),
+        crate::DraftPreviewState::Loading => {
+            (None, "Simulating…".to_owned(), theme.subtle_text, None)
+        }
+        crate::DraftPreviewState::Ready(diffui_core::DraftSimulation::Rebase(preview)) => {
+            // The candidate sits inside the branch itself (a descendant of
+            // the source): the branch has nothing outside it to move.
+            if is_branch && preview.simulated && preview.moved == 0 {
+                (
+                    None,
+                    "Nothing to move: the branch is already there".to_owned(),
+                    theme.muted_text,
+                    None,
+                )
+            } else {
+                let total = preview.moved + preview.descendants;
+                let mut counts = if is_branch && !preview.entry_points.is_empty() {
+                    format!(
+                        "Moves the branch from {} · {} revision{}",
+                        commit_list_summary(&preview.entry_points),
+                        preview.moved,
+                        if preview.moved == 1 { "" } else { "s" },
+                    )
+                } else {
+                    format!(
+                        "Rebases {total} commit{}",
+                        if total == 1 { "" } else { "s" }
+                    )
+                };
+                if preview.abandoned_empty > 0 {
+                    counts.push_str(&format!(" · {} emptied", preview.abandoned_empty));
+                }
+                if !preview.simulated {
+                    (
+                        None,
+                        "Too large to simulate conflicts".to_owned(),
+                        theme.muted_text,
+                        Some(counts),
+                    )
+                } else if preview.new_conflicts.is_empty() {
+                    (
+                        Some(icons::CHECK),
+                        "No new conflicts".to_owned(),
+                        theme.added_text,
+                        Some(counts),
+                    )
+                } else {
+                    (
+                        Some(icons::ALERT_TRIANGLE),
+                        format!(
+                            "Conflicts in {}",
+                            commit_list_summary(&preview.new_conflicts)
+                        ),
+                        theme.conflict_marker,
+                        Some(counts),
+                    )
+                }
+            }
+        }
+        crate::DraftPreviewState::Ready(diffui_core::DraftSimulation::Merge(preview)) => {
+            let parents = draft.sources.len() + usize::from(!merge_ready);
+            let counts = format!("Merges {parents} parents");
+            if preview.conflicts.is_empty() {
+                (
+                    Some(icons::CHECK),
+                    "Clean merge".to_owned(),
+                    theme.added_text,
+                    Some(counts),
+                )
+            } else {
+                let mut status = format!("Will conflict in {}", preview.conflicts.join(", "));
+                if preview.truncated {
+                    status.push_str(", …");
+                }
+                (
+                    Some(icons::ALERT_TRIANGLE),
+                    status,
+                    theme.conflict_marker,
+                    Some(counts),
+                )
+            }
+        }
+        crate::DraftPreviewState::Ready(diffui_core::DraftSimulation::Squash(preview)) => {
+            let counts = preview
+                .abandons_sources
+                .then(|| format!("Abandons {names}, now empty"));
+            conflict_verdict(&preview.new_conflicts, counts, theme)
+        }
+        crate::DraftPreviewState::Ready(diffui_core::DraftSimulation::Insert(preview)) => {
+            let mut counts = format!(
+                "Adds {} change{}",
+                preview.created,
+                if preview.created == 1 { "" } else { "s" }
+            );
+            if preview.rebased > 0 {
+                counts.push_str(&format!(" · rebases {}", preview.rebased));
+            }
+            conflict_verdict(&preview.new_conflicts, Some(counts), theme)
+        }
+        crate::DraftPreviewState::Failed(error) => (
+            Some(icons::ALERT_TRIANGLE),
+            format!("Preview failed: {error}"),
+            theme.removed_text,
+            None,
+        ),
+    };
+    let mut verdict = Vec::new();
+    if let Some(status_glyph) = status_icon {
+        verdict.push(Aligned::glyph(
+            icons::icon(status_glyph, 13.0, status_color),
+            13.0,
+        ));
+    }
+    verdict.push(Aligned::text(
+        typography::line(status_text, ui_font, text_size::UI, status_color),
+        ui_font,
+        text_size::UI,
+    ));
+    let summary = div()
+        .flex_1()
+        .min_w_0()
+        .overflow_hidden()
+        .flex()
+        .flex_col()
+        .gap(px(2.0))
+        .child(typography::baseline_row(verdict, 6.0))
+        .children(
+            counts.map(|counts| typography::line(counts, ui_font, text_size::UI, theme.muted_text)),
+        );
+
+    // Merge can be complete from its selected parents alone; other drafts
+    // execute on the armed candidate. Gap spots only exist mid-drag, where
+    // the drop itself is the confirm.
+    let can_apply = merge_ready || parallel_ready || target.is_some();
+    let apply_color = if can_apply {
+        theme.background
+    } else {
+        theme.subtle_text
+    };
+    let apply_font = emphasis_font(ui_font, Weight::MEDIUM);
+    let mut apply = ui::primary_button(
+        "op-bar-apply",
+        "Apply",
+        can_apply,
+        ui::Size::Compact,
+        apply_font,
+        theme,
+        cx,
+    )
+    .gap(px(6.0))
+    .child(icons::icon(icons::ENTER, 12.0, apply_color));
+    if can_apply {
+        apply = apply.on_click(Diffui::on_action(Action::DraftConfirm, cx));
+    }
+
+    // ---- The plan: what Apply will do, in words and as the jj command.
+    // Until a destination is armed the command stops where it goes.
+    let planned_op = if merge_ready || parallel_ready {
+        draft.op_from_sources()
+    } else if let Some((parent, child)) = gap_sides.filter(|_| !gap_invalid) {
+        ui.selection_at_index(parent)
+            .zip(ui.selection_at_index(child))
+            .and_then(|(parent, child)| draft.op_for_gap(parent, child))
+    } else {
+        let placement = if hover_row.is_some() {
+            PlacementKind::Onto
+        } else {
+            draft.placement
+        };
+        target
+            .and_then(|index| ui.selection_at_index(index))
+            .and_then(|target| draft.op_for(target, placement))
+    };
+    // Everything the simulation moves besides the picked sources.
+    let descendants = sim_rebase.map(|preview| {
+        (preview.moved as usize + preview.descendants as usize).saturating_sub(draft.sources.len())
+    });
+    let sentence = planned_op
+        .as_ref()
+        .and_then(|op| crate::plan::op_sentence(ui, op, descendants));
+    let command = crate::plan::draft_command(ui, draft, planned_op.as_ref()).map(|command| {
+        // Still missing its destination: say so.
+        if command.ends_with(' ') {
+            format!("{command}\u{2026}")
+        } else {
+            command
+        }
+    });
+    let plan = div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .gap(px(3.0))
+        .children(sentence.map(|sentence| {
+            div()
+                .w_full()
+                .text_size(px(text_size::UI))
+                .child(sentence.view(ui_font, mono_font, theme.text, theme))
+        }))
+        .children(command.map(|command| {
+            div()
+                .w_full()
+                .overflow_hidden()
+                .child(crate::plan::caption_command_line(
+                    ui, theme, &command, window, cx,
+                ))
+        }));
+
+    // The mode's other keys are in the hint strip docked under the diff
+    // (see `crate::mode_hints`); the rows carry their own keycaps and Apply
+    // its ↵.
+    let band = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .py(px(8.0))
+        .px(px(12.0))
+        .bg(theme.panel_background)
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(summary)
+                .child(apply),
+        )
+        .child(plan);
+
+    // Hairline on top so the bar reads as its own surface pinned above the
+    // footer; the rows sit on the elevated surface, the verdict band on the
+    // plain panel below them.
+    let shows_target_rows = !matches!(draft.kind, DraftKind::Merge | DraftKind::Parallelize);
+    div()
+        .flex_none()
+        .w_full()
+        .flex()
+        .flex_col()
+        .child(crate::root::horizontal_divider(theme))
+        .child(
+            div()
+                .w_full()
+                .bg(theme.panel_background_elevated)
+                .child(
+                    Padding {
+                        top: 8.0,
+                        right: 12.0,
+                        bottom: if shows_target_rows { 4.0 } else { 8.0 },
+                        left: 12.0,
+                    }
+                    .apply(div())
+                    .w_full()
+                    .child(headline),
+                )
+                .child(
+                    Padding {
+                        top: 0.0,
+                        right: 6.0,
+                        bottom: if shows_target_rows { 8.0 } else { 0.0 },
+                        left: 6.0,
+                    }
+                    .apply(div())
+                    .w_full()
+                    .child(rows_column),
+                ),
+        )
+        .child(band)
+        .into_any_element()
+}
+
+/// The monospace revset (jj) / revision-range (git) input at the top of the
+/// sidebar, with a caret that opens the presets menu. Submitting (Enter) or
+/// picking a preset re-evaluates the log.
+fn build_revset_filter(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    let placeholder = match ui.active().repository.as_ref().map(|r| r.vcs) {
+        Some(Vcs::Git) => "Revisions, e.g. --all",
+        _ => "Revset, e.g. all()",
+    };
+    field::filter_field(
+        theme,
+        ui.config.mono_font,
+        field::FilterField {
+            id: REVSET_INPUT_ID,
+            leading_icon: Some(icons::GIT_BRANCH),
+            placeholder,
+            value: &ui.active().session.revset,
+            on_input: |this, value, cx| this.on_revset_changed(value, cx),
+            on_submit: Some(|this, cx| this.perform(Action::SubmitRevset, cx)),
+            caret: Some(field::FilterCaret {
+                hovered: ui.hovered == Some(HoverTarget::RevsetCaret),
+                target: HoverTarget::RevsetCaret,
+                menu: ToolbarMenu::RevsetPresets,
+            }),
+        },
+        window,
+        cx,
+    )
+}
+
+/// Thin status bar pinned to the bottom of the commit-log pane: the working
+/// copy's branch + ahead/behind on the left, the total change count on the
+/// right. Monospace, dim, with a hairline top border. The "uncommitted files"
+/// count common to git tools is deliberately omitted — jj's `@` is always a
+/// commit, so it would be semantically wrong here.
+fn build_footer(ui: &Diffui, theme: ThemeSpec) -> AnyElement {
+    let font = ui.config.mono_font;
+    let dim = theme.subtle_text;
+    // Every run sits on one baseline and the arrows centre on the digits'
+    // caps (see `crate::typography`).
+    let label = |value: String, color: Color| {
+        Aligned::text(
+            typography::line(value, font, FOOTER_TEXT_SIZE, color),
+            font,
+            FOOTER_TEXT_SIZE,
+        )
+    };
+    let glyph = |glyph: &'static str, color: Color| {
+        Aligned::glyph(
+            icons::icon(glyph, FOOTER_TEXT_SIZE, color),
+            FOOTER_TEXT_SIZE,
+        )
+    };
+
+    let mut left: Vec<Aligned> = Vec::new();
+    if let Some(status) = &ui.active().session.branch_status {
+        // Branch glyph + name; the tracked upstream rides along as a tooltip.
+        let name = typography::group(
+            [
+                glyph(icons::GIT_BRANCH, dim),
+                label(status.branch.clone(), dim),
+            ],
+            5.0,
+        );
+        left.push(match &status.upstream {
+            Some(upstream) => {
+                let upstream = upstream.clone();
+                name.map(move |name| {
+                    div()
+                        .id("footer-branch")
+                        .tooltip(ui::tooltip(upstream, font, theme))
+                        .child(name)
+                        .into_any_element()
+                })
+            }
+            None => name,
+        });
+        // Ahead/behind only mean something against a tracked upstream.
+        if status.upstream.is_some() {
+            if status.ahead == 0 && status.behind == 0 {
+                left.push(label("in sync".to_owned(), dim));
+            } else {
+                if status.ahead > 0 {
+                    left.push(typography::group(
+                        [
+                            glyph(icons::ARROW_UP, theme.added_text),
+                            label(status.ahead.to_string(), theme.added_text),
+                        ],
+                        1.0,
+                    ));
+                }
+                if status.behind > 0 {
+                    left.push(typography::group(
+                        [
+                            glyph(icons::ARROW_DOWN, theme.removed_text),
+                            label(status.behind.to_string(), theme.removed_text),
+                        ],
+                        1.0,
+                    ));
+                }
+            }
+        }
+    }
+
+    // jj counts changes; git has only commits.
+    let noun = match ui.active().repository.as_ref().map(|r| r.vcs) {
+        Some(Vcs::Git) => "commits",
+        _ => "changes",
+    };
+    let right = label(
+        format!("{} {noun}", thousands(ui.active().session.commits.len())),
+        dim,
+    );
+
+    div()
+        .flex_none()
+        .w_full()
+        .flex()
+        .flex_col()
+        .child(crate::root::horizontal_divider(theme))
+        .child(
+            div()
+                .w_full()
+                .h(px(FOOTER_HEIGHT))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .px(px(theme::space::LG))
+                .bg(theme.panel_background)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .child(typography::baseline_row(left, 8.0)),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .child(typography::baseline_row([right], 0.0)),
+                ),
+        )
+        .into_any_element()
 }
 
 #[cfg(test)]

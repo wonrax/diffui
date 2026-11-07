@@ -9,16 +9,18 @@
 //! carry the same header. Folded, the block is the title and the shared
 //! [`crate::meta_line`] line, the line the History view's headers use.
 
-use crate::Cx;
 use diffui_core::history::{human_timestamp, now_millis, parse_timestamp_millis};
 use diffui_core::{RevisionDetails, SignatureInfo};
-use gpui_kit::{AnyElement, Window};
+use gpui_kit::prelude::*;
+use gpui_kit::{AnyElement, Window, div, px};
 
 use crate::diff_view::{HeaderAction, HeaderField, HeaderLine};
-use crate::meta_line::{self, Badge};
+use crate::meta_line::{self, Badge, Id, Meta};
 use crate::sidebar::{COMMIT_ID_CHARS, REVISION_ID_CHARS, revision_id_display_len};
-use crate::theme::{ThemeSpec, text_size};
-use crate::{Action, Diffui, icons};
+use crate::theme::{
+    Color, Font, Padding, ThemeSpec, Weight, chip_background, emphasis_font, space, text_size,
+};
+use crate::{Action, Cx, Diffui, ellipsis, icons, typography, ui};
 
 /// The title leads the pane at the dialog-title step, one above the graph
 /// row's description (`BODY_LG`).
@@ -345,10 +347,297 @@ fn signature_field(label: &str, signature: &SignatureInfo, theme: ThemeSpec) -> 
     field
 }
 
-/// Stub: the commit_info view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+/// `child` with the app's hover label, for a control in a banner or a title row.
+pub(crate) fn with_tooltip(
+    id: &'static str,
+    label: &'static str,
+    font: Font,
+    theme: ThemeSpec,
+    child: impl IntoElement,
+) -> AnyElement {
+    div()
+        .id(id)
+        .flex_none()
+        .tooltip(ui::tooltip(label, font, theme))
+        .child(child)
+        .into_any_element()
+}
+
 pub(crate) fn view(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> AnyElement {
-    crate::stub::panel("commit_info::view")
+    let session = &ui.active().session;
+    let stats = (!session.document.files.is_empty()).then(|| diff_stats(ui, theme));
+    let font = ui.config.ui_font;
+    let title_font = emphasis_font(font, Weight::SEMIBOLD);
+    let block = || {
+        Padding {
+            top: space::MD,
+            right: space::LG,
+            bottom: space::MD,
+            left: space::XL,
+        }
+        .apply(div())
+        .w_full()
+        .flex_none()
+        .bg(theme.panel_background)
+    };
+    let title_row = |title: String, color: Color| {
+        // Centred on its caps against the buttons beside it.
+        div()
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(space::SM))
+            .child(
+                typography::centered(
+                    ellipsis::Line::new(
+                        vec![ellipsis::Span::new(title)],
+                        title_font,
+                        TITLE_SIZE,
+                        color,
+                    )
+                    .view(),
+                    title_font,
+                    TITLE_SIZE,
+                )
+                .flex_1()
+                .min_w_0(),
+            )
+    };
+    // A range has no one revision to describe: its title counts the
+    // commits, which the list under it names.
+    if let Some(range) = crate::range::shown_range(ui) {
+        let row = title_row(crate::range::title(range), theme.text)
+            .children(stats.map(|stats| div().flex_none().pr(px(space::SM)).child(stats)));
+        return block().child(row).into_any_element();
+    }
+    let Some(details) = session.revision_details.as_ref() else {
+        return div()
+            .w_full()
+            .flex_none()
+            .h(px(crate::field::PANEL_HEADER_HEIGHT))
+            .flex()
+            .items_center()
+            .px(px(space::XL))
+            .bg(theme.panel_background)
+            .children(stats)
+            .into_any_element();
+    };
+
+    let title = details
+        .description
+        .lines()
+        .find(|line| !line.trim().is_empty());
+    let mut row = title_row(
+        title.unwrap_or("No description").to_owned(),
+        if title.is_some() {
+            theme.text
+        } else {
+            theme.subtle_text
+        },
+    )
+    .children(stats.map(|stats| div().flex_none().pr(px(space::SM)).child(stats)));
+    if session.capabilities.mutate {
+        row = row.child(with_tooltip(
+            "commit-edit-tip",
+            "Edit description",
+            font,
+            theme,
+            ui::icon_button(
+                "commit-edit",
+                icons::PENCIL,
+                theme.muted_text,
+                ui::Size::Compact,
+                theme,
+                cx,
+            )
+            .on_click(Diffui::on_action(
+                Action::EditDescription { target: None },
+                cx,
+            )),
+        ));
+    }
+    let folded = ui.commit_details_collapsed;
+    row = row.child(with_tooltip(
+        "commit-fold-tip",
+        if folded {
+            "Show the description and details"
+        } else {
+            "Show just the title"
+        },
+        font,
+        theme,
+        ui::icon_button(
+            "commit-fold",
+            if folded {
+                icons::UNFOLD_VERTICAL
+            } else {
+                icons::FOLD_VERTICAL
+            },
+            theme.muted_text,
+            ui::Size::Compact,
+            theme,
+            cx,
+        )
+        .on_click(Diffui::on_action(Action::ToggleCommitDetails, cx)),
+    ));
+
+    block()
+        .flex()
+        .flex_col()
+        .gap(px(space::XXS))
+        .child(row)
+        .when(folded, |block| {
+            block.child(revision_meta(ui, details, theme, window, cx))
+        })
+        .into_any_element()
+}
+
+/// `+N −M` on one small line with a bar under it, as wide as the line,
+/// split between them. The file count and exact totals are on hover.
+fn diff_stats(ui: &Diffui, theme: ThemeSpec) -> AnyElement {
+    let document = &ui.active().session.document;
+    let (additions, deletions) = (document.total_additions, document.total_deletions);
+    let font = ui.config.ui_font;
+    let count =
+        |value: String, color: Color| typography::line(value, font, text_size::CAPTION, color);
+    let counts = div()
+        .flex()
+        .flex_row()
+        .gap(px(space::SM))
+        .child(count(
+            format!("+{}", compact_count(additions)),
+            crate::diff_panel::stat_color(additions, theme.added_text, theme),
+        ))
+        .child(count(
+            format!("\u{2212}{}", compact_count(deletions)),
+            crate::diff_panel::stat_color(deletions, theme.removed_text, theme),
+        ));
+
+    let segment = |portion: u16, color: Color| {
+        div()
+            .w(gpui_kit::relative(f32::from(portion) / 1000.0))
+            .min_w_0()
+            .h(px(STAT_BAR_HEIGHT))
+            .rounded(px(STAT_BAR_HEIGHT / 2.0))
+            .bg(color)
+    };
+    let (added, removed) = bar_portions(additions, deletions);
+    let mut bar = div().flex().flex_row().gap(px(1.0)).w_full();
+    if added > 0 {
+        bar = bar.child(segment(added, theme.added_text));
+    }
+    if removed > 0 {
+        bar = bar.child(segment(removed, theme.removed_text));
+    }
+    if added == 0 && removed == 0 {
+        bar = bar.child(segment(1000, chip_background(theme.muted_text)));
+    }
+
+    let files = document.files.len();
+    let summary = format!(
+        "{files} {}, {additions} added, {deletions} removed",
+        if files == 1 { "file" } else { "files" }
+    );
+    div()
+        .id("commit-stats")
+        .flex()
+        .flex_col()
+        .gap(px(space::XXS))
+        .tooltip(ui::tooltip(summary, font, theme))
+        .child(counts)
+        .child(bar)
+        .into_any_element()
+}
+
+/// The folded block's identity line: the change id as the graph draws it
+/// (the shortest unique prefix bright), the commit id dimmed, then the
+/// author and a relative date with the exact one on hover.
+fn revision_meta(
+    ui: &Diffui,
+    details: &RevisionDetails,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    let row_of = ui
+        .active()
+        .session
+        .commits
+        .find_by_commit_id(&details.commit_id);
+    let mut ids = Vec::new();
+    match details.change_id.as_deref() {
+        Some(change_id) => {
+            let unique = unique_prefix(ui, row_of);
+            let mut id: String = change_id
+                .chars()
+                .take(revision_id_display_len(unique, change_id))
+                .collect();
+            // How jj log addresses one copy of a divergent or hidden change.
+            if let Some(offset) = row_of.and_then(|row| row.change_offset()) {
+                id.push_str(&format!("/{offset}"));
+            }
+            ids.push(Id {
+                text: id,
+                bright: unique,
+                bright_color: theme.accent,
+                color: theme.subtle_text,
+            });
+            ids.push(Id::plain(
+                details
+                    .commit_id
+                    .chars()
+                    .take(COMMIT_ID_CHARS)
+                    .collect::<String>(),
+                theme.muted_text,
+            ));
+        }
+        None if !details.commit_id.starts_with('#') => ids.push(Id {
+            text: details
+                .commit_id
+                .chars()
+                .take(COMMIT_ID_CHARS)
+                .collect::<String>(),
+            bright: unique_prefix(ui, row_of),
+            bright_color: theme.accent,
+            color: theme.subtle_text,
+        }),
+        // A PR's one id is its number.
+        None => ids.push(Id::plain(
+            details
+                .commit_id
+                .chars()
+                .take(COMMIT_ID_CHARS)
+                .collect::<String>(),
+            theme.muted_text,
+        )),
+    }
+    let author = &details.author;
+    let who = if !author.name.is_empty() {
+        Some((author.name.clone(), Some(author.email.clone())))
+    } else if !author.email.is_empty() {
+        Some((author.email.clone(), None))
+    } else {
+        None
+    };
+    let when = author
+        .timestamp
+        .as_ref()
+        .filter(|timestamp| !timestamp.is_empty())
+        .map(|timestamp| (parse_timestamp_millis(timestamp), timestamp.clone()));
+    meta_line::view(
+        Meta {
+            ids,
+            badges: status_badges(row_of, theme),
+            who,
+            when,
+            operation: None,
+        },
+        ui,
+        theme,
+        window,
+        cx,
+    )
 }
 
 #[cfg(test)]

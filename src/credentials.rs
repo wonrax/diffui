@@ -7,8 +7,10 @@
 //! asker went away (git gave up, the op finished) is withdrawn without the
 //! user doing anything.
 
-use crate::Cx;
-use gpui_kit::{AnyElement, Window};
+use crate::theme::text_size;
+use crate::{Action, Cx, input, typography, ui};
+use gpui_kit::prelude::*;
+use gpui_kit::{AnyElement, Window, div};
 use std::collections::VecDeque;
 
 use diffui_core::askpass::{self, AskpassEvent, PromptKind, PromptRequest};
@@ -34,7 +36,7 @@ pub(crate) enum CredentialAction {
 #[derive(Debug)]
 pub(crate) struct CredentialDialog {
     current: PromptRequest,
-    value: String,
+    pub(crate) value: String,
     queue: VecDeque<PromptRequest>,
 }
 
@@ -199,18 +201,133 @@ fn title(request: &PromptRequest) -> Prose {
     }
 }
 
-/// Stub: the credentials view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+/// The modal card. Empty when no prompt is open.
 pub(crate) fn build_overlay(
     ui: &Diffui,
     theme: ThemeSpec,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    crate::stub::overlay(
-        "credentials::build_overlay",
-        ui.mode(ModeKind::Credential).is_some(),
+    let Some(dialog) = ui.credential_dialog() else {
+        return div().into_any_element();
+    };
+    let (font, mono) = (ui.config.ui_font, ui.config.mono_font);
+    let prompt = &dialog.current.prompt;
+
+    let mut card = ui::dialog_card(ui::DIALOG_WIDTH, theme).child(ui::dialog_title(
+        &title(&dialog.current),
+        font,
+        mono,
+        theme,
+    ));
+    let accept_label = match prompt.kind {
+        PromptKind::Secret | PromptKind::Text => {
+            // The title already says what goes here.
+            let on_input = Diffui::listen(cx, |this, value: &String, _, cx| {
+                this.perform(
+                    Action::Credential(CredentialAction::Input(value.clone())),
+                    cx,
+                );
+            });
+            let on_submit =
+                Diffui::on_action::<()>(Action::Credential(CredentialAction::Submit), cx);
+            let spec = input::FieldSpec::new(INPUT_ID, &dialog.value)
+                .masked(prompt.kind == PromptKind::Secret)
+                .on_input(move |value, window, cx| on_input(&value, window, cx))
+                .on_submit(move |window, cx| on_submit(&(), window, cx));
+            card = card.child(crate::field::dialog_input(spec, mono, theme, window, cx));
+            Some("Continue")
+        }
+        PromptKind::YesNo => {
+            let mut text = Prose::from("First connection to this host. Check the fingerprint.");
+            if let Some(detail) = &prompt.detail {
+                text = text.text("\n").code(detail.clone());
+            }
+            card = card.child(ui::dialog_text(&text, font, mono, theme));
+            Some("Yes")
+        }
+        PromptKind::Confirm => {
+            card = card.child(ui::dialog_text(
+                &Prose::from(prompt.text.clone()),
+                font,
+                mono,
+                theme,
+            ));
+            Some("Yes")
+        }
+        PromptKind::Notice => {
+            card = card.child(ui::dialog_text(
+                &Prose::from(prompt.text.clone()),
+                font,
+                mono,
+                theme,
+            ));
+            None
+        }
+    };
+
+    let queued = dialog.queue.len();
+    let leading = (queued > 0).then(|| {
+        typography::line(
+            format!("{queued} more waiting"),
+            font,
+            text_size::UI,
+            theme.muted_text,
+        )
+        .into_any_element()
+    });
+    let raised = |label: &'static str, cx: &mut Cx| {
+        ui::text_button(
+            "credential-decline",
+            None,
+            label,
+            ui::Variant::Raised,
+            ui::Size::Standard,
+            font,
+            theme,
+            cx,
+        )
+    };
+    let decline = match prompt.kind {
+        PromptKind::YesNo | PromptKind::Confirm => raised("No", cx),
+        PromptKind::Notice => raised("Dismiss", cx),
+        PromptKind::Secret | PromptKind::Text => {
+            ui::cancel_button("credential-decline", ui::Size::Standard, font, theme, cx)
+        }
+    }
+    .on_click(Diffui::on_action(
+        Action::Credential(CredentialAction::Cancel),
+        cx,
+    ));
+    let mut buttons: Vec<AnyElement> = vec![decline.into_any_element()];
+    if let Some(label) = accept_label {
+        buttons.push(
+            ui::text_button(
+                "credential-accept",
+                None,
+                label,
+                ui::Variant::Primary,
+                ui::Size::Standard,
+                font,
+                theme,
+                cx,
+            )
+            .on_click(Diffui::on_action(
+                Action::Credential(CredentialAction::Submit),
+                cx,
+            ))
+            .into_any_element(),
+        );
+    }
+    let card = card.child(ui::button_row(leading, buttons));
+    // A stray click on the scrim must not cancel a push.
+    ui::modal(
+        "credential-modal",
+        card,
+        crate::toolbar::modal_top(),
+        |_, _| {},
     )
+    .into_any_element()
 }
 
 #[cfg(test)]

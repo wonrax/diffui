@@ -12,8 +12,8 @@ use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as
 use gpui_kit::component::scroll::{Scrollable, ScrollableElement as _};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    AnyElement, AnyView, App, Context, Div, ElementId, MouseButton, SharedString, Stateful, Window,
-    div, px,
+    AnyElement, AnyView, App, Context, Div, ElementId, Entity, MouseButton, ScrollHandle,
+    SharedString, Stateful, Window, div, px,
 };
 
 use crate::icons;
@@ -323,6 +323,43 @@ pub fn scrollable(
         .size_full()
         .child(content)
         .overflow_y_scrollbar()
+}
+
+/// [`scrollable`] on a handle the caller holds, for a list that scrolls itself
+/// to a row. The handle usually lives in [`scroll_handle`].
+pub fn scrollable_with(
+    id: impl Into<ElementId>,
+    handle: &ScrollHandle,
+    content: impl IntoElement,
+) -> Stateful<Div> {
+    let id = id.into();
+    div()
+        .id(id.clone())
+        .relative()
+        .size_full()
+        .flex()
+        .flex_col()
+        .overflow_hidden()
+        .child(
+            div()
+                .id((id, "area"))
+                .size_full()
+                .flex()
+                .flex_col()
+                .track_scroll(handle)
+                .overflow_y_scroll()
+                .child(div().w_full().flex_none().child(content)),
+        )
+        .vertical_scrollbar(handle)
+}
+
+/// The scroll handle of list `id`, kept while the list is on screen.
+pub fn scroll_handle(
+    id: impl Into<ElementId>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<ScrollHandle> {
+    window.use_keyed_state(id, cx, |_, _| ScrollHandle::default())
 }
 
 /// A scroll view's text column: its content keeps the bar's footprint clear.

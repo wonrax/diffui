@@ -14,10 +14,12 @@
 //! the user has recently jumped to / commands they recently ran. Recents
 //! are kept in-memory in `Recents` and persisted to the XDG data dir.
 
-use crate::Cx;
-use crate::modes::ModeKind;
-use crate::theme::Color;
-use gpui_kit::{AnyElement, Window};
+use crate::theme::{Color, Font, Weight, text_size};
+use crate::{Action, Cx, icons, input, ui};
+use gpui_kit::prelude::*;
+use gpui_kit::{
+    AnyElement, Div, ElementId, MouseButton, MouseMoveEvent, ScrollHandle, Window, div, point, px,
+};
 use nucleo_matcher::{Config, Matcher, Utf32String};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -25,7 +27,7 @@ use std::time::{Duration, Instant};
 use crate::Diffui;
 use crate::commands::{self, CommandArg, CommandId, PaletteScope};
 use crate::theme::{self, ThemeSpec};
-use crate::typography::Aligned;
+use crate::typography::{self, Aligned};
 use diffui_core::RevisionSelection;
 
 /// `Id` for the active palette text input. Refocused whenever the
@@ -33,10 +35,8 @@ use diffui_core::RevisionSelection;
 /// the column the user is steering.
 pub const PALETTE_INPUT_ID: &str = "palette-input";
 
-/// Build the scrollable id for column at `depth`. Each column gets its
-/// own id so `scroll_to(...)` only operates on the targeted one — iced
-/// routes widget operations by id, so reusing the same id across multiple
-/// scrollables would non-deterministically scroll any of them.
+/// The scrollable id for column at `depth`. Each column gets its own, so each
+/// keeps its own scroll handle.
 pub fn results_scrollable_id(depth: usize) -> String {
     format!("palette-results-{depth}")
 }
@@ -74,6 +74,8 @@ const GLYPH_BOX: f32 = 16.0;
 pub(crate) const GLYPH_GAP: f32 = 10.0;
 const GLYPH_ICON_SIZE: f32 = 14.0;
 /// The footer's scope pills (All / Commands / Files / Commits).
+/// The most a row's tail takes, so a long one leaves the label room.
+const TAIL_MAX_WIDTH: f32 = COLUMN_WIDTH * 0.45;
 const SCOPE_HEIGHT: f32 = 24.0;
 const SCOPE_PAD_X: f32 = 8.0;
 
@@ -93,7 +95,7 @@ const COLUMN_SLIDE_DURATION: Duration = Duration::from_millis(140);
 /// Easing curve for the slide. `EaseOutExpo` does most of its travel in
 /// the first ~25% of the duration, so the column appears to *whip* into
 /// place and gently settles — the snappy feel you want for "navigation
-/// happened, now show me where I am". `EaseInOut` (iced's default) is
+/// happened, now show me where I am". `EaseInOut` is
 /// the opposite: slow start, slow end, which reads as sluggish even at
 /// short durations.
 
@@ -171,12 +173,9 @@ pub struct PaletteColumn {
     pub source: ColumnSource,
     pub matches: Vec<PaletteMatch>,
     pub selected: usize,
-    /// Cached Y offset of this column's result scrollable. Tracked
-    /// app-side because iced's `scrollable::scroll_to` operation needs an
-    /// absolute target — we can't ask the widget "where are you now?"
-    /// from outside, so we maintain our own approximation and update it
-    /// whenever a keyboard move pushes the selected row out of the
-    /// visible window.
+    /// Y offset the view moves this column's results to. Updated whenever a
+    /// keyboard move pushes the selected row out of the visible window; the
+    /// wheel moves the list without touching it.
     pub scroll_y: f32,
     /// Bumped on every query edit; the debounced recompute carries the value
     /// it was scheduled for and is dropped if the user has typed past it.
@@ -490,9 +489,8 @@ pub fn revision_mode_needle(query: &str) -> Option<&str> {
 
 impl PaletteColumn {
     /// Adjust `scroll_y` so the highlighted row is inside the visible
-    /// window. Returns `true` when the offset actually changed — the
-    /// caller uses that signal to decide whether to dispatch a
-    /// `scroll_to` task. Mirrors the "keep cursor visible" math every
+    /// window. Returns `true` when the offset actually changed. Mirrors the
+    /// "keep cursor visible" math every
     /// editor uses: only scroll when the selection has left the window,
     /// snap just enough to bring it back.
     pub fn ensure_selected_visible(&mut self) -> bool {
@@ -930,41 +928,666 @@ pub fn change_id_for_recents(item: &ResultRef, ui: &Diffui) -> Option<String> {
     }
 }
 
-/// Stub: the palette view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+/// Build the palette overlay. Empty when closed so the caller can stack it
+/// unconditionally into the top-level view.
+///
+/// Every column is pinned at an absolute x inside a clipping layer, so a column
+/// off-screen left keeps its true width and is cut by the layer. The animation
+/// offset is added to each column uniformly: on push it starts at `+(COL+GAP)`,
+/// so every column sits right of its final spot and slides left into place; on
+/// pop it starts at `-(COL+GAP)` and the remaining columns slide right back.
 pub(crate) fn build_overlay(
     ui: &Diffui,
     theme: ThemeSpec,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    crate::stub::overlay(
-        "palette::build_overlay",
-        ui.mode(ModeKind::Palette).is_some(),
-    )
+    let Some(state) = ui.palette() else {
+        return div().into_any_element();
+    };
+    let close = Diffui::on_action(Action::ClosePalette, cx);
+    let viewport = f32::from(window.viewport_size().width);
+    let offset = state.shift_anim.offset(Instant::now());
+    let count = state.stack.len();
+    let mut layer = div()
+        .id("palette")
+        .absolute()
+        .inset_0()
+        .overflow_hidden()
+        .occlude()
+        .child(
+            div()
+                .absolute()
+                .inset_0()
+                .bg(theme::SCRIM)
+                .on_mouse_down(MouseButton::Left, close),
+        );
+    for (depth, column) in state.stack.iter().enumerate() {
+        let focused = depth + 1 == count;
+        let x = (viewport - COLUMN_WIDTH) / 2.0
+            - (count - 1 - depth) as f32 * (COLUMN_WIDTH + COLUMN_HORIZONTAL_GAP)
+            + offset;
+        // Anchored near the top (rather than centered), like VS Code / Raycast,
+        // so the input keeps its y as columns push and pop.
+        layer = layer.child(
+            div()
+                .absolute()
+                .left(px(x))
+                .top(px(crate::toolbar::modal_top()))
+                .child(build_column(
+                    ui,
+                    theme,
+                    column,
+                    depth,
+                    focused,
+                    focused && count > 1,
+                    window,
+                    cx,
+                )),
+        );
+    }
+    layer.into_any_element()
 }
 
-/// Stub: the palette view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+#[allow(clippy::too_many_arguments)]
+fn build_column(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    column: &PaletteColumn,
+    depth: usize,
+    focused: bool,
+    // Only worth marking when there are columns to tell apart.
+    outline_focus: bool,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    let card = theme::modal_card(div(), theme)
+        .id(("palette-column", depth))
+        .w(px(COLUMN_WIDTH))
+        .h(px(COLUMN_HEIGHT))
+        .flex()
+        .flex_col()
+        .overflow_hidden()
+        .occlude()
+        .when(outline_focus, |card| card.border_color(theme.accent));
+    let body = |slot: AnyElement| div().flex_1().min_h_0().w_full().child(slot);
+    if let Some(command) = column.command.as_deref() {
+        let input =
+            crate::cmdline_view::input(ui, theme, &column.query, command, focused, window, cx);
+        let strip = crate::cmdline_view::args_strip(ui, theme, &column.query, command, window, cx);
+        let results = crate::cmdline_view::results(ui, theme, &column.query, command, window, cx);
+        let footer = crate::cmdline_view::footer(ui, theme, command, window, cx);
+        card.child(input)
+            .children(strip)
+            .child(crate::root::horizontal_divider(theme))
+            .child(body(results))
+            .child(crate::root::horizontal_divider(theme))
+            .child(footer)
+            .into_any_element()
+    } else {
+        let input = build_input(ui, theme, column, focused, window, cx);
+        let results = build_results(ui, theme, column, depth, window, cx);
+        let footer = column_footer(ui, theme, column, cx);
+        card.child(input)
+            .child(crate::root::horizontal_divider(theme))
+            .child(body(results))
+            .child(crate::root::horizontal_divider(theme))
+            .child(footer)
+            .into_any_element()
+    }
+}
+
+/// One half of a footer hint, centred with the pills beside it.
+fn key_hint(ui: &Diffui, theme: ThemeSpec, key: &'static str, label: &'static str) -> Div {
+    let font = ui.config.ui_font;
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(theme::space::XS))
+        .child(typography::centered(
+            typography::line(key, font, text_size::CAPTION, theme.muted_text),
+            font,
+            text_size::CAPTION,
+        ))
+        .child(typography::centered(
+            typography::line(label, font, text_size::CAPTION, theme.subtle_text),
+            font,
+            text_size::CAPTION,
+        ))
+}
+
+/// The strip under the results: on the root column the scope pills (All /
+/// Commands / Files / Commits) and the keys that act on the highlight; on an
+/// actions column, what the actions are for.
+fn column_footer(ui: &Diffui, theme: ThemeSpec, column: &PaletteColumn, cx: &mut Cx) -> AnyElement {
+    let font = ui.config.ui_font;
+    let (lead, hints, lead_inset): (AnyElement, [Div; 2], f32) = match &column.source {
+        ColumnSource::Root => {
+            let active_prefix = column.query.chars().next().filter(|c| ">@:".contains(*c));
+            let mut scopes = div().flex().flex_row().gap(px(theme::space::XXS));
+            for (index, (label, prefix)) in [
+                ("All", None),
+                ("Commands", Some('>')),
+                ("Files", Some('@')),
+                ("Commits", Some(':')),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let active = active_prefix == prefix;
+                let color = if active {
+                    theme.text
+                } else {
+                    theme.subtle_text
+                };
+                let query = prefix.map(|value| value.to_string()).unwrap_or_default();
+                scopes = scopes.child(
+                    ui::button(
+                        ("palette-scope", index),
+                        ui::Variant::Ghost,
+                        ui::Size::Compact,
+                        theme,
+                        cx,
+                    )
+                    .h(px(SCOPE_HEIGHT))
+                    .px(px(SCOPE_PAD_X))
+                    .when(active, |pill| pill.bg(theme.selected_file))
+                    .child(typography::centered(
+                        typography::line(label, font, text_size::CAPTION, color),
+                        font,
+                        text_size::CAPTION,
+                    ))
+                    .on_click(Diffui::listen(cx, move |this, _, _, cx| {
+                        this.palette_on_query_changed(query.clone(), cx);
+                    })),
+                );
+            }
+            (
+                scopes.into_any_element(),
+                [
+                    key_hint(ui, theme, "\u{21e5}", "Actions"),
+                    key_hint(ui, theme, "\u{21b5}", "Open"),
+                ],
+                // The first pill's label, not its wash, starts on the edge.
+                CONTENT_X - SCOPE_PAD_X,
+            )
+        }
+        ColumnSource::Actions(target) => {
+            let font = theme::emphasis_font(font, Weight::MEDIUM);
+            (
+                typography::centered(
+                    filling(
+                        target_label(target, ui),
+                        font,
+                        text_size::CAPTION,
+                        theme.subtle_text,
+                    ),
+                    font,
+                    text_size::CAPTION,
+                )
+                .flex_1()
+                .min_w_0()
+                .into_any_element(),
+                [
+                    key_hint(ui, theme, "esc", "Back"),
+                    key_hint(ui, theme, "\u{21b5}", "Run"),
+                ],
+                CONTENT_X,
+            )
+        }
+    };
+    let [first, second] = hints;
+    footer_strip(theme)
+        .pl(px(lead_inset))
+        .pr(px(CONTENT_X))
+        .justify_between()
+        .gap(px(theme::space::MD))
+        .child(lead)
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(theme::space::LG))
+                .child(first)
+                .child(second),
+        )
+        .into_any_element()
+}
+
+/// The footer strip's surface: the panel colour, rounded into the card's
+/// bottom corners.
+pub(crate) fn footer_strip(theme: ThemeSpec) -> Div {
+    div()
+        .w_full()
+        .h(px(FOOTER_HEIGHT))
+        .flex_none()
+        .flex()
+        .flex_row()
+        .items_center()
+        .bg(theme.panel_background)
+        .rounded_b(px(theme::radius::SURFACE - 1.0))
+}
+
+fn build_input(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    column: &PaletteColumn,
+    focused: bool,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    let placeholder = match &column.source {
+        ColumnSource::Root => "Search commands, files, commits\u{2026}",
+        ColumnSource::Actions(_) => "Filter actions\u{2026}",
+    };
+    let font = ui.config.ui_font;
+    let band = div()
+        .w_full()
+        .flex_none()
+        .h(px(INPUT_HEIGHT + 2.0 * RESULTS_INSET))
+        .flex()
+        .items_center()
+        .font(font.gpui());
+    if !focused {
+        // Older (left-of-center) columns are read-only previews. Only the rightmost
+        // holds the input: a field's state is keyed by its id.
+        let (text, color) = if column.query.is_empty() {
+            (placeholder.to_owned(), theme.subtle_text)
+        } else {
+            (column.query.clone(), theme.text)
+        };
+        return band
+            .px(px(CONTENT_X))
+            .child(typography::line(text, font, text_size::TITLE, color))
+            .into_any_element();
+    }
+    let on_input = Diffui::listen(cx, |this, query: &String, _, cx| {
+        let same = this
+            .palette()
+            .and_then(PaletteState::top)
+            .is_some_and(|column| column.query == *query);
+        if !same {
+            this.palette_on_query_changed(query.clone(), cx);
+        }
+    });
+    let on_submit = Diffui::listen(cx, |this, _: &(), _, cx| this.palette_on_accept(cx));
+    let spec = input::FieldSpec::new(PALETTE_INPUT_ID, &column.query)
+        .placeholder(placeholder)
+        .on_input(move |query, window, cx| on_input(&query, window, cx))
+        .on_submit(move |window, cx| on_submit(&(), window, cx));
+    band.child(
+        input::single_line(spec, font, window, cx)
+            .appearance(false)
+            .text_size(px(text_size::TITLE))
+            .h_full()
+            .px(px(CONTENT_X))
+            .py(px(0.0)),
+    )
+    .into_any_element()
+}
+
+/// A list's handle, moved to `target` whenever `target` moves. Between those,
+/// the wheel owns the offset.
+pub(crate) fn list_scroll(
+    id: impl Into<ElementId>,
+    target: f32,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> ScrollHandle {
+    struct Applied(ScrollHandle, f32);
+    let entry = window.use_keyed_state(id, cx, |_, _| Applied(ScrollHandle::default(), 0.0));
+    let handle = entry.read(cx).0.clone();
+    if (entry.read(cx).1 - target).abs() > f32::EPSILON {
+        handle.set_offset(point(px(0.0), px(-target)));
+        entry.update(cx, |entry, _| entry.1 = target);
+    }
+    handle
+}
+
+fn build_results(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    column: &PaletteColumn,
+    depth: usize,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    // `:` commit-search defers the all-commits scan to ⏎: show a prompt until it
+    // runs, instead of an empty "No matches".
+    let revision_prompt = revision_mode_needle(&column.query)
+        .filter(|_| !column.searched)
+        .map(|needle| {
+            let needle = needle.trim();
+            if needle.is_empty() {
+                "Type a query, then press ⏎ to search commits".to_owned()
+            } else {
+                format!("Press ⏎ to search commits for “{needle}”")
+            }
+        });
+    if revision_prompt.is_some() || column.matches.is_empty() {
+        let label = revision_prompt.unwrap_or_else(|| {
+            if column.dirty {
+                "Searching…".to_owned()
+            } else {
+                "No matches".to_owned()
+            }
+        });
+        return empty_results(ui, theme, label).into_any_element();
+    }
+
+    let mut list = div().w_full().flex().flex_col().p(px(RESULTS_INSET));
+    for (index, row) in column.matches.iter().enumerate() {
+        let selected = index == column.selected;
+        let root = matches!(column.source, ColumnSource::Root);
+        let body = result_row_body(ui, theme, &row.item, root, row.disabled, window, cx);
+        list = list.child(
+            div()
+                .id(("palette-row", index))
+                .child(row_shell(body, selected, theme, window, cx))
+                .on_mouse_move(
+                    cx.listener(move |this: &mut Diffui, _: &MouseMoveEvent, _, cx| {
+                        let selected = this
+                            .palette()
+                            .and_then(|state| state.stack.get(depth))
+                            .is_some_and(|column| column.selected == index);
+                        if !selected {
+                            this.act(cx, |this, cx| {
+                                this.palette_on_select_index(depth, index, cx)
+                            });
+                        }
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    Diffui::listen(cx, move |this, _, _, cx| {
+                        this.palette_on_accept_index(depth, index, cx);
+                    }),
+                ),
+        );
+    }
+    // The bar floats over the rows' right inset like the graph's does; the rows'
+    // text padding keeps every label and hint clear of it.
+    let id = results_scrollable_id(depth);
+    let handle = list_scroll(
+        ElementId::Name(format!("{id}-scroll").into()),
+        column.scroll_y,
+        window,
+        cx,
+    );
+    ui::scrollable_with(ElementId::Name(id.into()), &handle, list).into_any_element()
+}
+
+/// What a results list says when it has no rows.
+pub(crate) fn empty_results(ui: &Diffui, theme: ThemeSpec, label: String) -> Div {
+    div()
+        .size_full()
+        .flex()
+        .justify_center()
+        .px(px(16.0))
+        .py(px(24.0))
+        .bg(theme.panel_background_elevated)
+        .child(typography::line(
+            label,
+            ui.config.ui_font,
+            text_size::BODY,
+            theme.subtle_text,
+        ))
+}
+
+/// A result row's cell: fixed height, the label inset on the content edge,
+/// washed when highlighted.
 pub(crate) fn row_shell(
     body: impl gpui_kit::IntoElement,
     selected: bool,
     theme: ThemeSpec,
+    _window: &mut Window,
+    _cx: &mut Cx,
+) -> AnyElement {
+    div()
+        .w_full()
+        .h(px(ROW_HEIGHT))
+        .flex()
+        .items_center()
+        .px(px(CONTENT_X - RESULTS_INSET))
+        .rounded(px(theme::radius::CONTROL))
+        .when(selected, |row| row.bg(theme.selected_file))
+        .child(body)
+        .into_any_element()
+}
+
+fn result_row_body(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    item: &ResultRef,
+    root: bool,
+    disabled: Option<commands::Reason>,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    crate::stub::panel("palette::row_shell")
+    let primary = theme.text;
+    let muted = theme.subtle_text;
+    let mono = ui.config.mono_font;
+
+    // Tail elements (author / hint) keep their width, up to a limit, and align
+    // right; the middle label takes what's left and ellipsises, so a long commit
+    // message truncates instead of shoving the tail off-screen.
+    let tail = |value: String| {
+        Aligned::text(
+            typography::line(value, ui.config.ui_font, text_size::CAPTION, muted)
+                .max_w(px(TAIL_MAX_WIDTH))
+                .overflow_hidden()
+                .text_ellipsis(),
+            ui.config.ui_font,
+            text_size::CAPTION,
+        )
+    };
+    let (lead, label, tail): (Aligned, Aligned, Aligned) = match item {
+        ResultRef::WorkingCopy => (
+            Aligned::text(
+                typography::line("@", mono, text_size::BODY, theme.accent),
+                mono,
+                text_size::BODY,
+            )
+            .map(glyph_box),
+            primary_label(ui, primary, "Working copy"),
+            tail(String::new()),
+        ),
+        ResultRef::Commit { change, commit } => {
+            let commit = ui.active().session.commits.find_by_commit_id(commit);
+            let prefix = revision_prefix(commit.as_ref(), change);
+            let description = commit
+                .map(|c| {
+                    if c.has_description() {
+                        c.description().lines().next().unwrap_or("").to_owned()
+                    } else {
+                        "(no description)".to_owned()
+                    }
+                })
+                .unwrap_or_default();
+            let author = commit.map(|c| c.author().to_owned()).unwrap_or_default();
+            (
+                Aligned::text(
+                    typography::line(prefix, mono, text_size::BODY, theme.accent),
+                    mono,
+                    text_size::BODY,
+                ),
+                primary_label(ui, primary, description),
+                tail(author),
+            )
+        }
+        ResultRef::Bookmark(name) => {
+            // Find the owning commit so we can show the destination in the tail.
+            // Bookmarks without a matching commit (stale data races between
+            // snapshots) still render; the tail just goes empty.
+            let commit = ui.active().session.commits.find_by_bookmark(name);
+            let destination = commit
+                .map(|c| {
+                    if c.has_description() {
+                        c.description().lines().next().unwrap_or("").to_owned()
+                    } else {
+                        c.change_id().chars().take(8).collect::<String>()
+                    }
+                })
+                .unwrap_or_default();
+            (
+                glyph_icon(icons::HASH, theme.modified_token, window, cx),
+                mono_primary_label(ui, primary, name.clone()),
+                tail(destination),
+            )
+        }
+        ResultRef::File(path) => (
+            glyph_icon(icons::FILE, theme.info, window, cx),
+            mono_primary_label(ui, primary, path.clone()),
+            // The glyph already says "file".
+            tail(String::new()),
+        ),
+        // A command that can't run: greyed, with the reason where the shortcut
+        // would be.
+        ResultRef::Command(id) if let Some(reason) = disabled => (
+            glyph_icon(icons::CHEVRON_RIGHT, muted, window, cx),
+            primary_label(ui, muted, command_label(id)),
+            tail(reason.to_owned()),
+        ),
+        ResultRef::Command(id) => (
+            glyph_icon(icons::CHEVRON_RIGHT, theme.modified_token, window, cx),
+            if root && is_revision_verb(id) {
+                verb_label(ui, theme, id)
+            } else {
+                primary_label(ui, primary, command_label(id))
+            },
+            // The shortcut, where there is one: what the palette teaches.
+            tail(
+                ui.keymap
+                    .chord_for(commands::Context::Base, id)
+                    .map(crate::keymap::Chord::display)
+                    .unwrap_or_default(),
+            ),
+        ),
+    };
+    // The lead, the label and the hint are different fonts and sizes: they share
+    // a baseline (see `crate::typography`).
+    typography::baseline_row(
+        [
+            lead,
+            Aligned::gap(GLYPH_GAP),
+            label,
+            Aligned::gap(theme::space::MD),
+            tail,
+        ],
+        0.0,
+    )
+    .into_any_element()
 }
 
-/// Stub: the palette view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+/// A top-level revision verb's label: the verb, then the revision it will act
+/// on (the selected one) so a pick never lands somewhere unexpected.
+fn verb_label(ui: &Diffui, theme: ThemeSpec, id: CommandId) -> Aligned {
+    let selection = &ui.active().session.selected_revision;
+    let commits = &ui.active().session.commits;
+    let row = match selection {
+        RevisionSelection::WorkingCopy => commits.working_copy(),
+        RevisionSelection::Commit(hex) => commits.find_by_commit_id(hex),
+    };
+    let (target, summary) = match row {
+        Some(row) => {
+            let prefix = revision_prefix(Some(&row), &ChangeId(row.change_id().to_owned()));
+            let summary = if row.has_description() {
+                row.description().lines().next().unwrap_or("").to_owned()
+            } else {
+                "(no description)".to_owned()
+            };
+            (prefix, summary)
+        }
+        None => (ui.revision_short_label(selection), String::new()),
+    };
+    let font = ui.config.ui_font;
+    let mono = ui.config.mono_font;
+    typography::group(
+        [
+            Aligned::text(
+                typography::line(command_label(id), font, text_size::BODY_LG, theme.text),
+                font,
+                text_size::BODY_LG,
+            ),
+            Aligned::text(
+                typography::line(target, mono, text_size::BODY, theme.accent),
+                mono,
+                text_size::BODY,
+            ),
+            Aligned::text(
+                filling(summary, font, text_size::BODY, theme.subtle_text),
+                font,
+                text_size::BODY,
+            )
+            .fill(),
+        ],
+        theme::space::SM,
+    )
+    .fill()
+}
+
+/// A row's leading icon, centred in the [`GLYPH_BOX`] column and on the
+/// label's caps.
 pub(crate) fn glyph_icon(
     glyph: &'static str,
     color: Color,
-    window: &mut Window,
-    cx: &mut Cx,
+    _window: &mut Window,
+    _cx: &mut Cx,
 ) -> Aligned {
-    crate::stub::aligned("palette::glyph_icon")
+    Aligned::glyph(
+        glyph_box(icons::icon(glyph, GLYPH_ICON_SIZE, color).into_any_element()),
+        GLYPH_ICON_SIZE,
+    )
+}
+
+/// Center a row's leading glyph in the shared [`GLYPH_BOX`] column.
+fn glyph_box(glyph: AnyElement) -> AnyElement {
+    div()
+        .w(px(GLYPH_BOX))
+        .flex()
+        .justify_center()
+        .child(glyph)
+        .into_any_element()
+}
+
+/// One line that takes the width it's given and cuts itself with an ellipsis.
+pub(crate) fn filling(
+    content: impl Into<gpui_kit::SharedString>,
+    font: Font,
+    size: f32,
+    color: Color,
+) -> Div {
+    typography::line(content, font, size, color)
+        .w_full()
+        .overflow_hidden()
+        .text_ellipsis()
+}
+
+/// Single-line truncating label that takes the row's flexible space.
+fn primary_label(ui: &Diffui, color: Color, label: impl Into<String>) -> Aligned {
+    let font = ui.config.ui_font;
+    Aligned::text(
+        filling(label.into(), font, text_size::BODY_LG, color),
+        font,
+        text_size::BODY_LG,
+    )
+    .fill()
+}
+
+/// [`primary_label`] in the mono font, a step smaller: mono faces run wide
+/// and tall, so at the same size a path reads louder than the sans labels
+/// in the rows around it.
+fn mono_primary_label(ui: &Diffui, color: Color, label: impl Into<String>) -> Aligned {
+    let mono = ui.config.mono_font;
+    Aligned::text(
+        filling(label.into(), mono, text_size::BODY, color),
+        mono,
+        text_size::BODY,
+    )
+    .fill()
 }
 
 #[cfg(test)]

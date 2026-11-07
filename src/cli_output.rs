@@ -5,8 +5,12 @@
 //! format diffui writes. Its output streams into the tab's [`CliRun`] and the
 //! panel follows it live; the run's activity row reopens the panel later.
 
-use crate::Cx;
-use gpui_kit::{AnyElement, Window};
+use crate::cmdline::CmdAction;
+use crate::theme::{self, Font, text_size};
+use crate::{Action, Cx, icons, input, typography, ui};
+use gpui_kit::component::Sizable as _;
+use gpui_kit::prelude::*;
+use gpui_kit::{AnyElement, ClickEvent, Window, div, px};
 use std::time::Instant;
 
 use diffui_core::cli::tokenize::shell_quote;
@@ -290,16 +294,203 @@ impl Diffui {
 /// Wide enough for a `jj log` line without wrapping most of them.
 const OUTPUT_WIDTH: f32 = 680.0;
 
-/// Stub: the cli_output view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+/// The output panel: the command, its output (stderr set apart), how it ended,
+/// and Copy. The output is one read-only editor, so a drag selects across lines
+/// and ⌘C copies the sweep; with nothing selected ⌘C copies all of it.
 pub(crate) fn build_overlay(
     ui: &Diffui,
     theme: ThemeSpec,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    crate::stub::overlay(
-        "cli_output::build_overlay",
-        ui.mode(ModeKind::CliOutput).is_some(),
+    let Some(run) = ui.shown_cli_run() else {
+        return div().into_any_element();
+    };
+    let font = ui.config.ui_font;
+    let mono = ui.config.mono_font;
+
+    let title = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(theme::space::SM))
+        .child(div().flex_1().min_w_0().child(ui::dialog_title(
+            &Prose::new().code(run.command()),
+            font,
+            mono,
+            theme,
+        )))
+        .child(
+            ui::close_button("cli-output-close", theme.muted_text, theme, cx).on_click(send::<
+                ClickEvent,
+            >(
+                OutputAction::Close,
+                cx,
+            )),
+        );
+
+    let content = if run.lines.is_empty() && run.dropped == 0 {
+        div()
+            .p(px(theme::space::SM))
+            .child(typography::line(
+                if run.exit.is_none() {
+                    "Waiting for output\u{2026}"
+                } else {
+                    "No output"
+                },
+                font,
+                text_size::UI,
+                theme.subtle_text,
+            ))
+            .into_any_element()
+    } else {
+        output_text(run, theme, mono, window, cx)
+    };
+    let output = div()
+        .w_full()
+        .bg(theme.panel_background)
+        .border_1()
+        .border_color(theme.border)
+        .rounded(px(theme::radius::CONTROL))
+        .overflow_hidden()
+        .child(content);
+
+    let (status, status_color) = match &run.exit {
+        None => (
+            format!("Running for {}s", run.started.elapsed().as_secs()),
+            theme.muted_text,
+        ),
+        Some(Exit::Code(Some(0))) => ("Exit status 0".to_owned(), theme.added_text),
+        Some(Exit::Code(Some(code))) => (format!("Exit status {code}"), theme.removed_text),
+        Some(Exit::Code(None)) => ("Killed".to_owned(), theme.removed_text),
+        Some(Exit::Cancelled) => ("Cancelled".to_owned(), theme.muted_text),
+        Some(Exit::Failed(error)) => (format!("Didn't run: {error}"), theme.removed_text),
+    };
+    let leading = typography::line(status, font, text_size::UI, status_color).into_any_element();
+    let mut buttons: Vec<AnyElement> = vec![
+        ui::text_button(
+            "cli-output-copy",
+            Some((icons::COPY, theme.muted_text)),
+            "Copy",
+            ui::Variant::Raised,
+            ui::Size::Standard,
+            font,
+            theme,
+            cx,
+        )
+        .on_click(send::<ClickEvent>(OutputAction::Copy, cx))
+        .into_any_element(),
+    ];
+    if run.exit.is_none() {
+        buttons.push(
+            ui::text_button(
+                "cli-output-stop",
+                None,
+                "Stop",
+                ui::Variant::Raised,
+                ui::Size::Standard,
+                font,
+                theme,
+                cx,
+            )
+            .on_click(send::<ClickEvent>(OutputAction::Stop, cx))
+            .into_any_element(),
+        );
+    } else {
+        buttons.push(
+            ui::text_button(
+                "cli-output-done",
+                None,
+                "Close",
+                ui::Variant::Primary,
+                ui::Size::Standard,
+                font,
+                theme,
+                cx,
+            )
+            .on_click(send::<ClickEvent>(OutputAction::Close, cx))
+            .into_any_element(),
+        );
+    }
+    let card = ui::dialog_card(OUTPUT_WIDTH, theme)
+        .child(title)
+        .child(output)
+        .child(ui::button_row(Some(leading), buttons));
+    let dismiss = send::<()>(OutputAction::Close, cx);
+    ui::modal(
+        "cli-output-modal",
+        card,
+        crate::toolbar::modal_top(),
+        move |window, cx| dismiss(&(), window, cx),
     )
+    .into_any_element()
 }
+
+fn send<E: 'static>(
+    action: OutputAction,
+    cx: &mut Cx,
+) -> impl Fn(&E, &mut Window, &mut gpui_kit::App) + 'static {
+    Diffui::on_action(Action::CommandLine(CmdAction::Output(action)), cx)
+}
+
+/// The lines as one text, each stream in its colour. stderr carries a rule in the
+/// gutter, so the two streams read apart even where jj's informational stderr
+/// looks like output.
+fn output_text(
+    run: &CliRun,
+    theme: ThemeSpec,
+    mono: Font,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    let mut text = String::new();
+    let mut colors = Vec::new();
+    let mut marks = Vec::new();
+    if run.dropped > 0 {
+        let line = format!("\u{2026} {} earlier lines", run.dropped);
+        colors.push((0..line.len(), theme.subtle_text));
+        text.push_str(&line);
+    }
+    let rule = theme::mix(theme.border, theme.muted_text, 0.3);
+    for line in &run.lines {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        let range = text.len()..text.len() + line.text.len();
+        text.push_str(&line.text);
+        match line.stream {
+            CliStream::Stdout => colors.push((range, theme.text)),
+            CliStream::Stderr => {
+                colors.push((range.clone(), theme.muted_text));
+                marks.push((range, rule));
+            }
+        }
+    }
+    let inner = OUTPUT_WIDTH - 2.0 * ui::DIALOG_PADDING - 2.0 - OUTPUT_INSET * 2.0 - RULE_ROOM;
+    let line_height = (text_size::UI * typography::DEFAULT_LINE_HEIGHT).ceil();
+    let lines = crate::measure::wrapped_line_count(&text, text_size::UI, mono, line_height, inner);
+    let height = (lines as f32 * line_height + 2.0 * OUTPUT_INSET).min(OUTPUT_MAX_HEIGHT);
+    let look = input::StyledLook {
+        wrap: true,
+        follow: true,
+        mark_width: Some(RULE_WIDTH),
+        colors,
+        marks,
+        ..Default::default()
+    };
+    let spec = input::FieldSpec::new(OUTPUT_TEXT_ID, &text);
+    input::styled_text(spec, look, mono, text_size::UI, window, cx)
+        .with_size(gpui_kit::component::Size::XSmall)
+        .line_height(px(line_height))
+        .h(px(height))
+        .py(px(OUTPUT_INSET))
+        .into_any_element()
+}
+
+const OUTPUT_TEXT_ID: &str = "cli-output-text";
+/// The panel grows with its output up to here, then scrolls.
+const OUTPUT_MAX_HEIGHT: f32 = 360.0;
+const OUTPUT_INSET: f32 = theme::space::SM;
+const RULE_WIDTH: f32 = 2.0;
+/// What the rule's strip takes from the text's width.
+const RULE_ROOM: f32 = 16.0;

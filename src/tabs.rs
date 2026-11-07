@@ -445,6 +445,7 @@ pub(crate) mod tests {
             recent_repos: Vec::new(),
             next_activity_id: 0,
             hovered: None,
+            tab_strip: Default::default(),
             changed_files_peek_open: false,
             changed_files_trigger_hovered: false,
             changed_files_rail_hovered: false,

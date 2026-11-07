@@ -13,25 +13,33 @@
 //! module owns the per-tab state, routes its own jobs, and builds the panes.
 
 use crate::Cx;
-use gpui_kit::{AnyElement, Window};
+use gpui_kit::component::Disableable as _;
+use gpui_kit::prelude::*;
+use gpui_kit::{AnyElement, Div, ElementId, SharedString, Stateful, Window, div, px};
 use std::collections::HashSet;
 
 use diffui_core::history::{
-    ChangedCommit, CommitBrief, EvologEntry, FileAnnotation, HistoryDiffTarget, HistoryRequest,
-    HistoryResponse, OperationChanges, OperationEntry, file_history_revset, now_millis,
-    relative_age,
+    ChangedCommit, CommitBrief, CommitChangeKind, EvologEntry, FileAnnotation, HistoryDiffTarget,
+    HistoryRequest, HistoryResponse, OperationChanges, OperationEntry, RefChange, RefKind,
+    file_history_revset, now_millis, relative_age,
 };
 use diffui_core::{DiffDocument, JobId, MutationOp, RevisionDetails, RevisionSelection, Vcs};
 
 use crate::diff_view::AnnotationLabel;
+use crate::ellipsis::{Line, Span};
 use crate::prose::Prose;
 use crate::revision_list::{
-    CAPTION_TEXT_SIZE, GUTTER_LEFT_PADDING, GUTTER_PADDING, ROW_LINE_GAP, SMALL_TEXT_SIZE,
+    CAPTION_TEXT_SIZE, CONTENT_PADDING, FILE_ROW_HEIGHT, GUTTER_LEFT_PADDING, GUTTER_PADDING,
+    REVISION_ROW_HEIGHT, ROW_CARD_INSET_X, ROW_CARD_INSET_Y, ROW_CARD_RADIUS, ROW_LINE_GAP,
+    SMALL_TEXT_SIZE,
 };
-use crate::theme::{ThemeSpec, space};
+use crate::theme::{
+    Color, Font, ThemeSpec, Weight, chip_background, emphasis_font, radius, space, text_size,
+};
+use crate::typography::{self, Aligned};
 use crate::{
-    Action, ConfirmDialog, Diffui, MainView, PendingMutation, TabId, activity, meta_line,
-    modes::Mode,
+    Action, ConfirmDialog, Diffui, MainView, PendingMutation, TabId, activity, icons, meta_line,
+    modes::Mode, ui,
 };
 
 /// Operations read per page of the op log.
@@ -44,6 +52,9 @@ const ANNOTATION_CHARS: usize = 25;
 /// lists: a compact icon button on an even inset, so a row without the
 /// button is just as tall as one with it.
 const CHANGE_ROW_HEIGHT: f32 = crate::theme::control::COMPACT + 2.0 * space::XXS;
+
+/// Tallest an operation's changes get above the diff.
+const OP_CHANGES_MAX_HEIGHT: f32 = 260.0;
 
 /// What the History view lists.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -979,7 +990,7 @@ pub(crate) fn annotate_on(ui: &Diffui) -> bool {
 
 /// Where row content starts, from the pane's leading edge.
 const ROW_CONTENT_LEFT: f32 = GUTTER_LEFT_PADDING + GUTTER_PADDING;
-/// iced centres text in a line box 1.3× its size; the graph stacks bare
+/// GPUI centres text in a line box 1.3× its size; the graph stacks bare
 /// text boxes [`ROW_LINE_GAP`] apart, so a two-line row's spacing gives
 /// back both lines' half-leading.
 const TWO_LINE_SPACING: f32 = ROW_LINE_GAP - 0.15 * (SMALL_TEXT_SIZE + CAPTION_TEXT_SIZE);
@@ -1081,48 +1092,1360 @@ fn op_rows<'a>(history: &'a HistoryState) -> Vec<OpRow<'a>> {
     rows
 }
 
-/// Stub: the history_panel view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+/// The source info bar's history controls: the blame toggle and the browsed
+/// file's history.
 pub(crate) fn source_bar_actions(
     ui: &Diffui,
     theme: ThemeSpec,
-    window: &mut Window,
+    _window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    crate::stub::panel("history_panel::source_bar_actions")
+    let on = annotate_on(ui);
+    let blame = ui::text_button(
+        "source-blame",
+        Some((
+            icons::SCROLL_TEXT,
+            if on { theme.accent } else { theme.muted_text },
+        )),
+        "Blame",
+        if on {
+            ui::Variant::Raised
+        } else {
+            ui::Variant::Ghost
+        },
+        ui::Size::Compact,
+        ui.config.ui_font,
+        theme,
+        cx,
+    )
+    .on_click(Diffui::on_action(
+        Action::History(HistoryAction::ToggleAnnotate),
+        cx,
+    ));
+    let history = ui::text_button(
+        "source-file-history",
+        Some((icons::FILE_CLOCK, theme.muted_text)),
+        "History",
+        ui::Variant::Ghost,
+        ui::Size::Compact,
+        ui.config.ui_font,
+        theme,
+        cx,
+    )
+    .on_click(Diffui::on_action(
+        Action::History(HistoryAction::CurrentFileHistory),
+        cx,
+    ));
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(space::XS))
+        .child(with_tooltip(
+            "source-blame-tip",
+            blame,
+            "Show which change last touched each line",
+            ui,
+            theme,
+        ))
+        .child(with_tooltip(
+            "source-file-history-tip",
+            history,
+            "Show the revisions that touched this file",
+            ui,
+            theme,
+        ))
+        .into_any_element()
 }
 
-/// Stub: the history_panel view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+/// `control` with the app's hover label.
+fn with_tooltip(
+    id: &'static str,
+    control: impl IntoElement,
+    label: &'static str,
+    ui: &Diffui,
+    theme: ThemeSpec,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex_none()
+        .tooltip(ui::tooltip(label, ui.config.ui_font, theme))
+        .child(control)
+}
+
+/// The banner above the revision list while the graph shows one file's
+/// history.
 pub(crate) fn file_filter_banner(
     ui: &Diffui,
     theme: ThemeSpec,
-    window: &mut Window,
+    _window: &mut Window,
     cx: &mut Cx,
 ) -> Option<AnyElement> {
-    None
+    if !file_filter_active(ui) {
+        return None;
+    }
+    let filter = ui.active().history.file_filter.as_ref()?;
+    // The icon and the close button centre on the text's caps (see
+    // `crate::typography`).
+    let title = Prose::from("History of ")
+        .path(&filter.path)
+        .line(
+            ui.config.ui_font,
+            ui.config.mono_font,
+            theme.text,
+            theme,
+            text_size::UI,
+        )
+        .view();
+    let close = ui::close_button("file-filter-close", theme.muted_text, theme, cx).on_click(
+        Diffui::on_action(Action::History(HistoryAction::ClearFileFilter), cx),
+    );
+    let content = typography::baseline_row(
+        [
+            Aligned::glyph(
+                icons::icon(icons::FILE_CLOCK, ui::ICON_SIZE, theme.accent),
+                ui::ICON_SIZE,
+            ),
+            Aligned::text(title, ui.config.ui_font, text_size::UI).fill(),
+            Aligned::glyph(
+                with_tooltip(
+                    "file-filter-close-tip",
+                    close,
+                    "Show the whole graph again",
+                    ui,
+                    theme,
+                ),
+                ui::CLOSE_SIDE,
+            ),
+        ],
+        space::SM,
+    );
+    Some(
+        div()
+            .w_full()
+            .flex_none()
+            .px(px(space::MD))
+            .py(px(space::XS))
+            .child(
+                div()
+                    .w_full()
+                    .pl(px(space::MD))
+                    .pr(px(ui::BANNER_INSET))
+                    .py(px(ui::BANNER_INSET))
+                    .bg(chip_background(theme.accent))
+                    .rounded(px(radius::CONTROL))
+                    .child(content),
+            )
+            .into_any_element(),
+    )
 }
 
-/// Stub: the history_panel view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+// The lists' rows sit like the revision graph's: row cards inset from the
+// row by the graph's card insets, content starting where a lane-less graph
+// row's would and stopping at the scrollbar gutter, two-line rows as tall
+// as a revision row and one-line rows as a file row.
+
+/// Left inset of a list of rows: the graph's card inset, plus the window border
+/// at the leading edge as the graph adds it.
+fn list_left() -> f32 {
+    ROW_CARD_INSET_X + crate::chrome::window_border()
+}
+
+/// Padding inside a row card, putting content at [`ROW_CONTENT_LEFT`].
+fn card_left() -> f32 {
+    ROW_CONTENT_LEFT - ROW_CARD_INSET_X - crate::chrome::window_border()
+}
+
+/// A clickable row card, `height` tall: the app's selection and hover washes.
+fn row_card(
+    id: impl Into<ElementId>,
+    height: f32,
+    selected: bool,
+    action: Action,
+    theme: ThemeSpec,
+    cx: &mut Cx,
+) -> Stateful<Div> {
+    let mut card = div()
+        .id(id)
+        .w_full()
+        .h(px(height))
+        .flex_none()
+        .flex()
+        .flex_row()
+        .items_center()
+        .rounded(px(ROW_CARD_RADIUS))
+        .cursor_pointer()
+        .text_color(theme.text)
+        .on_click(Diffui::on_action(action, cx));
+    if selected {
+        card = card.bg(theme.selected_file);
+    } else {
+        let wash = chip_background(theme.muted_text);
+        card = card.hover(move |style| style.bg(wash));
+    }
+    card
+}
+
+/// A row card holding one or two lines of content at the graph's inset.
+fn list_row(
+    id: impl Into<ElementId>,
+    row_height: f32,
+    selected: bool,
+    action: Action,
+    theme: ThemeSpec,
+    cx: &mut Cx,
+) -> Stateful<Div> {
+    row_card(
+        id,
+        row_height - 2.0 * ROW_CARD_INSET_Y,
+        selected,
+        action,
+        theme,
+        cx,
+    )
+    .pl(px(card_left()))
+    .pr(px(CONTENT_PADDING - ROW_CARD_INSET_X))
+}
+
+/// The graph's two-line stack: a title, and a caption-size line of ids and
+/// meta under it.
+fn two_line(title: impl IntoElement, meta: impl IntoElement) -> Div {
+    div()
+        .flex_1()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap(px(TWO_LINE_SPACING))
+        .child(title)
+        .child(meta)
+}
+
+fn caption(value: impl Into<SharedString>, color: Color, ui: &Diffui) -> Div {
+    typography::line(value, ui.config.ui_font, text_size::CAPTION, color)
+}
+
+/// [`caption`] taking what's left of its row, cut to fit.
+fn caption_fill(value: impl Into<String>, color: Color, ui: &Diffui) -> AnyElement {
+    let value: String = value.into();
+    Line::new(
+        vec![Span::new(value)],
+        ui.config.ui_font,
+        text_size::CAPTION,
+        color,
+    )
+    .view()
+    .into_any_element()
+}
+
+/// A mono id placed on its line's baseline.
+fn mono_on_line(value: impl Into<SharedString>, color: Color, ui: &Diffui) -> Aligned {
+    Aligned::text(
+        typography::line(value, ui.config.mono_font, CAPTION_TEXT_SIZE, color),
+        ui.config.mono_font,
+        CAPTION_TEXT_SIZE,
+    )
+}
+
+/// A [`caption`] (or anything at its font and size), placed on its line's
+/// baseline.
+fn caption_on_line(caption: impl IntoElement, ui: &Diffui) -> Aligned {
+    Aligned::text(caption, ui.config.ui_font, text_size::CAPTION)
+}
+
+/// A caption that takes what's left of a baseline row, cut to fit.
+fn fill_on_line(element: impl IntoElement, font: Font, size: f32) -> Aligned {
+    Aligned::text(element, font, size).fill()
+}
+
+fn select_op(id: &str) -> Action {
+    Action::History(HistoryAction::SelectOperation(id.to_owned()))
+}
+
+fn op_row(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    op: &OperationEntry,
+    now: i64,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    if op.is_snapshot {
+        return snapshot_row(ui, theme, op, now, window, cx);
+    }
+    let history = &ui.active().history;
+    let selected = history.selected_op.as_deref() == Some(op.id.as_str());
+    let age = relative_age(op.time_millis, now);
+    let id_color = if op.is_current {
+        theme.accent
+    } else {
+        theme.muted_text
+    };
+    let mut meta = vec![mono_on_line(op.short_id().to_owned(), id_color, ui)];
+    if op.is_current {
+        meta.push(meta_line::badge("current", theme.accent, ui, window, cx));
+    }
+    // The command that wrote the op, when one was recorded (the jj CLI's,
+    // or diffui's equivalent), says more than who ran it; the header below
+    // the list still names the user.
+    // One line whatever the command holds (a message's line breaks read as
+    // spaces), cut short before the age.
+    match &op.args {
+        Some(args) => meta.push(fill_on_line(
+            crate::plan::command_prose(args)
+                .line(
+                    ui.config.mono_font,
+                    ui.config.mono_font,
+                    theme.subtle_text,
+                    theme,
+                    CAPTION_TEXT_SIZE,
+                )
+                .view(),
+            ui.config.mono_font,
+            CAPTION_TEXT_SIZE,
+        )),
+        None => meta.push(fill_on_line(
+            caption_fill(op.user.clone(), theme.subtle_text, ui),
+            ui.config.ui_font,
+            text_size::CAPTION,
+        )),
+    }
+    meta.push(caption_on_line(caption(age, theme.subtle_text, ui), ui));
+    let meta = typography::baseline_row(meta, space::SM);
+    let title = meta_line::description(
+        op.summary(),
+        SMALL_TEXT_SIZE,
+        ui.config.ui_font,
+        theme.text,
+        ui,
+        theme,
+    )
+    .view();
+    list_row(
+        SharedString::from(format!("op-{}", op.id)),
+        REVISION_ROW_HEIGHT,
+        selected,
+        select_op(&op.id),
+        theme,
+        cx,
+    )
+    .child(two_line(title, meta))
+    .into_any_element()
+}
+
+/// A snapshot on one quiet line, on its own or inside an unfolded run.
+fn snapshot_row(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    op: &OperationEntry,
+    now: i64,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    let selected = ui.active().history.selected_op.as_deref() == Some(op.id.as_str());
+    let mut line = vec![mono_on_line(
+        op.short_id().to_owned(),
+        if op.is_current {
+            theme.accent
+        } else {
+            theme.subtle_text
+        },
+        ui,
+    )];
+    if op.is_current {
+        line.push(meta_line::badge("current", theme.accent, ui, window, cx));
+    }
+    line.push(fill_on_line(
+        caption_fill(op.summary().to_owned(), theme.subtle_text, ui),
+        ui.config.ui_font,
+        text_size::CAPTION,
+    ));
+    line.push(caption_on_line(
+        caption(relative_age(op.time_millis, now), theme.subtle_text, ui),
+        ui,
+    ));
+    list_row(
+        SharedString::from(format!("op-{}", op.id)),
+        FILE_ROW_HEIGHT,
+        selected,
+        select_op(&op.id),
+        theme,
+        cx,
+    )
+    .child(typography::baseline_row(line, space::SM).flex_1().min_w_0())
+    .into_any_element()
+}
+
+/// A folded run of snapshots, and its operations under it when unfolded:
+/// indented behind a guide line dropped from the chevron, the way the file
+/// tree nests a folder's files.
+#[allow(clippy::too_many_arguments)]
+fn run_row(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    first: &OperationEntry,
+    count: usize,
+    oldest: &OperationEntry,
+    children: Option<&[OperationEntry]>,
+    now: i64,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    let chevron = if children.is_some() {
+        icons::CHEVRON_DOWN
+    } else {
+        icons::CHEVRON_RIGHT
+    };
+    let (from, to) = (
+        relative_age(oldest.time_millis, now),
+        relative_age(first.time_millis, now),
+    );
+    let span = if from == to {
+        to
+    } else {
+        format!("{from}\u{2013}{to}")
+    };
+    let header = list_row(
+        SharedString::from(format!("run-{}", first.id)),
+        FILE_ROW_HEIGHT,
+        false,
+        Action::History(HistoryAction::ToggleSnapshotRun(first.id.clone())),
+        theme,
+        cx,
+    )
+    .child(
+        typography::baseline_row(
+            [
+                Aligned::glyph(
+                    icons::icon(chevron, RUN_CHEVRON, theme.subtle_text),
+                    RUN_CHEVRON,
+                ),
+                fill_on_line(
+                    caption(
+                        format!("{count} working-copy snapshots"),
+                        theme.subtle_text,
+                        ui,
+                    ),
+                    ui.config.ui_font,
+                    text_size::CAPTION,
+                ),
+                caption_on_line(caption(span, theme.subtle_text, ui), ui),
+            ],
+            space::SM,
+        )
+        .flex_1()
+        .min_w_0(),
+    );
+    let Some(children) = children else {
+        return header.into_any_element();
+    };
+
+    let mut rows = div()
+        .flex_1()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap(px(2.0 * ROW_CARD_INSET_Y));
+    for op in children {
+        rows = rows.child(snapshot_row(ui, theme, op, now, window, cx));
+    }
+    // The guide hangs from the chevron's centre; the children's ids line up
+    // with the run's label. Positions are within the list's padding, where
+    // a card's content starts at the card padding's left.
+    let content = card_left();
+    let guide_x = content + RUN_CHEVRON / 2.0 - 0.5;
+    let label_x = content + RUN_CHEVRON + space::SM;
+    let child_x = label_x - content;
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(2.0 * ROW_CARD_INSET_Y))
+        .child(header)
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .child(div().flex_none().w(px(guide_x)))
+                .child(div().flex_none().w(px(1.0)).bg(theme.border))
+                .child(div().flex_none().w(px(child_x - guide_x - 1.0)))
+                .child(rows),
+        )
+        .into_any_element()
+}
+
+fn version_row(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    index: usize,
+    entry: &EvologEntry,
+    now: i64,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    let selected = ui.active().history.selected_version == Some(index);
+    let mut meta = vec![mono_on_line(
+        entry.commit.short_commit_id().to_owned(),
+        theme.muted_text,
+        ui,
+    )];
+    if entry.commit.visible {
+        meta.push(meta_line::badge("current", theme.accent, ui, window, cx));
+    }
+    if entry.commit.empty {
+        meta.push(meta_line::badge("empty", theme.subtle_text, ui, window, cx));
+    }
+    let operation = entry.operation.as_ref().map_or_else(
+        || "(operation no longer in the log)".to_owned(),
+        |op| meta_line::shorten_ids(&op.summary),
+    );
+    meta.push(fill_on_line(
+        caption_fill(operation, theme.subtle_text, ui),
+        ui.config.ui_font,
+        text_size::CAPTION,
+    ));
+    meta.push(caption_on_line(
+        caption(
+            relative_age(entry.commit.time_millis, now),
+            theme.subtle_text,
+            ui,
+        ),
+        ui,
+    ));
+    let meta = typography::baseline_row(meta, space::SM);
+    let title = summary_line(&entry.commit, SMALL_TEXT_SIZE, ui.config.ui_font, theme);
+    list_row(
+        SharedString::from(format!("version-{index}")),
+        REVISION_ROW_HEIGHT,
+        selected,
+        Action::History(HistoryAction::SelectVersion(index)),
+        theme,
+        cx,
+    )
+    .child(two_line(title, meta))
+    .into_any_element()
+}
+
+/// A commit's first line, `(no description set)` in a quieter colour when it has
+/// none, cut to fit.
+fn summary_line(commit: &CommitBrief, size: f32, font: Font, theme: ThemeSpec) -> Div {
+    let (summary, color) = if commit.summary.is_empty() {
+        ("(no description set)".to_owned(), theme.subtle_text)
+    } else {
+        (commit.summary.clone(), theme.text)
+    };
+    Line::new(vec![Span::new(summary)], font, size, color).view()
+}
+
+/// A list's header, its leading glyph on the rows' content edge and its
+/// trailing button's glyph on their right edge. `leading_button`: the
+/// header starts with an icon button, whose glyph sits centred in it.
+fn header_bar(content: impl IntoElement, leading_button: bool, theme: ThemeSpec) -> Div {
+    let glyph_inset = (ui::Size::Compact.height() - ui::ICON_SIZE) / 2.0;
+    div()
+        .w_full()
+        .flex_none()
+        .h(px(crate::field::PANEL_HEADER_HEIGHT))
+        .flex()
+        .items_center()
+        .pl(px(
+            ROW_CONTENT_LEFT - if leading_button { glyph_inset } else { 0.0 }
+        ))
+        .pr(px((CONTENT_PADDING - glyph_inset).max(0.0)))
+        .bg(theme.panel_background)
+        .child(content)
+}
+
+fn note(message: impl Into<SharedString>, color: Color, ui: &Diffui) -> Div {
+    div()
+        .w_full()
+        .flex_none()
+        .px(px(space::LG))
+        .py(px(space::SM))
+        .font(ui.config.ui_font.gpui())
+        .text_size(px(text_size::UI))
+        .text_color(color)
+        .child(message.into())
+}
+
+/// The History view's left pane: the op log, or the evolog it was switched to.
 pub(crate) fn build_history_sidebar(
     ui: &Diffui,
     theme: ThemeSpec,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    crate::stub::panel("history_panel::build_history_sidebar")
+    let history = &ui.active().history;
+    let now = now_millis();
+    let reload = with_tooltip(
+        "history-reload-tip",
+        ui::icon_button(
+            "history-reload",
+            icons::REFRESH,
+            theme.muted_text,
+            ui::Size::Compact,
+            theme,
+            cx,
+        )
+        .on_click(Diffui::on_action(
+            Action::History(HistoryAction::Reload),
+            cx,
+        )),
+        "Reload",
+        ui,
+        theme,
+    );
+    let title_font = emphasis_font(ui.config.ui_font, Weight::MEDIUM);
+    let mut rows = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(2.0 * ROW_CARD_INSET_Y))
+        .pt(px(ROW_CARD_INSET_Y))
+        .pb(px(ROW_CARD_INSET_Y))
+        .pl(px(list_left()))
+        .pr(px(ROW_CARD_INSET_X));
+
+    let (header, list_id): (Div, &'static str) = match &history.kind {
+        HistoryKind::OpLog => {
+            let header = div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(space::SM))
+                .child(icons::icon(
+                    icons::HISTORY,
+                    ui::ICON_SIZE,
+                    theme.subtle_text,
+                ))
+                .child(div().flex_1().child(typography::centered(
+                    typography::line("Operations", title_font, text_size::UI, theme.text),
+                    title_font,
+                    text_size::UI,
+                )))
+                .child(reload);
+            for entry in op_rows(history) {
+                rows = rows.child(match entry {
+                    OpRow::Op(op) => op_row(ui, theme, op, now, window, cx),
+                    OpRow::Run {
+                        first,
+                        count,
+                        oldest,
+                        children,
+                    } => run_row(ui, theme, first, count, oldest, children, now, window, cx),
+                });
+            }
+            if history.ops_job.is_some() {
+                rows = rows.child(note(
+                    "Reading the operation log\u{2026}",
+                    theme.subtle_text,
+                    ui,
+                ));
+            } else if history.ops_truncated {
+                rows = rows.child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .justify_center()
+                        .p(px(space::SM))
+                        .child(
+                            ui::text_button(
+                                "history-load-older",
+                                None,
+                                "Load older operations",
+                                ui::Variant::Ghost,
+                                ui::Size::Compact,
+                                ui.config.ui_font,
+                                theme,
+                                cx,
+                            )
+                            .on_click(Diffui::on_action(
+                                Action::History(HistoryAction::LoadMoreOperations),
+                                cx,
+                            )),
+                        ),
+                );
+            }
+            (header, "history-op-log")
+        }
+        HistoryKind::Evolog { label, .. } => {
+            let back = with_tooltip(
+                "history-back-tip",
+                ui::icon_button(
+                    "history-back",
+                    icons::ARROW_LEFT,
+                    theme.muted_text,
+                    ui::Size::Compact,
+                    theme,
+                    cx,
+                )
+                .on_click(Diffui::on_action(
+                    Action::History(HistoryAction::ShowOpLog),
+                    cx,
+                )),
+                "Back to the operation log",
+                ui,
+                theme,
+            );
+            let header = div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(space::XS))
+                .child(back)
+                .child(div().flex_1().min_w_0().child(typography::baseline_row(
+                    [
+                        Aligned::text(
+                            typography::line(
+                                "Evolution of ",
+                                title_font,
+                                text_size::UI,
+                                theme.text,
+                            ),
+                            title_font,
+                            text_size::UI,
+                        ),
+                        mono_on_line(label.clone(), theme.accent, ui),
+                    ],
+                    0.0,
+                )))
+                .child(reload);
+            for (index, entry) in history.evolog.iter().enumerate() {
+                rows = rows.child(version_row(ui, theme, index, entry, now, window, cx));
+            }
+            if history.evolog_job.is_some() {
+                rows = rows.child(note(
+                    "Reading the change's history\u{2026}",
+                    theme.subtle_text,
+                    ui,
+                ));
+            }
+            (header, "history-evolog")
+        }
+    };
+
+    let leading_button = matches!(history.kind, HistoryKind::Evolog { .. });
+    div()
+        .size_full()
+        .flex()
+        .flex_col()
+        .bg(theme.panel_background)
+        .child(header_bar(header, leading_button, theme))
+        .child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .child(ui::scrollable(list_id, rows)),
+        )
+        .into_any_element()
 }
 
-/// Stub: the history_panel view is the lane's to port (see the iced source).
+/// A commit's change id, commit id, its states and its first line.
+fn commit_line(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    commit: &CommitBrief,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> Vec<Aligned> {
+    let mut line = vec![
+        mono_on_line(commit.short_change_id().to_owned(), theme.accent, ui),
+        mono_on_line(commit.short_commit_id().to_owned(), theme.subtle_text, ui),
+    ];
+    if !commit.visible {
+        line.push(meta_line::badge(
+            "hidden",
+            theme.subtle_text,
+            ui,
+            window,
+            cx,
+        ));
+    }
+    if commit.empty {
+        line.push(meta_line::badge("empty", theme.subtle_text, ui, window, cx));
+    }
+    line.push(fill_on_line(
+        summary_line(commit, text_size::UI, ui.config.ui_font, theme),
+        ui.config.ui_font,
+        text_size::UI,
+    ));
+    line
+}
+
+fn change_row(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    index: usize,
+    change: &ChangedCommit,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    let selected = ui.active().history.selected_change == Some(index);
+    let (glyph, color, verb) = match change.kind {
+        CommitChangeKind::Created => ("+", theme.added_text, "created"),
+        CommitChangeKind::Rewritten if change.rebased => ("~", theme.subtle_text, "rebased"),
+        CommitChangeKind::Rewritten => ("~", theme.modified_token, "rewritten"),
+        CommitChangeKind::Abandoned => ("\u{2212}", theme.removed_text, "abandoned"),
+    };
+    // A hidden commit has nothing to open, but keeps the slot so every
+    // row's verb ends at the same edge.
+    let open: AnyElement = if change.commit.visible {
+        let id = SharedString::from(format!("change-open-{index}"));
+        div()
+            .id(SharedString::from(format!("change-open-tip-{index}")))
+            .flex_none()
+            .tooltip(ui::tooltip(
+                "Show in the diff view",
+                ui.config.ui_font,
+                theme,
+            ))
+            // The row is a button too: this one mustn't also select it.
+            .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation()
+            })
+            .child(
+                ui::icon_button(
+                    id,
+                    icons::FILE_DIFF,
+                    theme.muted_text,
+                    ui::Size::Compact,
+                    theme,
+                    cx,
+                )
+                .on_click(Diffui::on_action(
+                    Action::History(HistoryAction::OpenRevision(change.commit.commit_id.clone())),
+                    cx,
+                )),
+            )
+            .into_any_element()
+    } else {
+        div()
+            .flex_none()
+            .w(px(ui::Size::Compact.height()))
+            .into_any_element()
+    };
+    let mut line: Vec<Aligned> = vec![mono_on_line(glyph, color, ui).map(|glyph| {
+        div()
+            .flex_none()
+            .w(px(12.0))
+            .child(glyph)
+            .into_any_element()
+    })];
+    line.extend(commit_line(ui, theme, &change.commit, window, cx));
+    line.push(caption_on_line(caption(verb, theme.subtle_text, ui), ui));
+    row_card(
+        SharedString::from(format!("change-{index}")),
+        CHANGE_ROW_HEIGHT,
+        selected,
+        Action::History(HistoryAction::SelectChange(index)),
+        theme,
+        cx,
+    )
+    .px(px(space::SM))
+    .gap(px(space::SM))
+    .child(typography::baseline_row(line, space::SM).flex_1().min_w_0())
+    .child(open)
+    .into_any_element()
+}
+
+/// A moved ref, laid out like a changed commit's row: a kind marker in the
+/// glyph column, the ref, where it moved from and to, and the kind where a
+/// commit row has its verb.
+fn ref_row(ui: &Diffui, theme: ThemeSpec, change: &RefChange) -> AnyElement {
+    let glyph =
+        |glyph: &'static str| Aligned::glyph(icons::icon(glyph, 12.0, theme.subtle_text), 12.0);
+    let (marker, kind): (Aligned, &str) = match change.kind {
+        RefKind::WorkingCopy => (mono_on_line("@", theme.subtle_text, ui), "working copy"),
+        RefKind::Bookmark => (glyph(icons::GIT_BRANCH), "bookmark"),
+        RefKind::RemoteBookmark => (glyph(icons::GIT_BRANCH), "remote bookmark"),
+        RefKind::Tag => (glyph(icons::TAG), "tag"),
+    };
+    let side = |commits: &[CommitBrief], color: Color| -> Aligned {
+        if commits.is_empty() {
+            caption_on_line(caption("(absent)", theme.subtle_text, ui), ui)
+        } else {
+            mono_on_line(ref_side_label(commits), color, ui)
+        }
+    };
+    // Mono names and ids, sans captions and the glyphs on one line (see
+    // `crate::typography`).
+    div()
+        .w_full()
+        .flex_none()
+        .h(px(CHANGE_ROW_HEIGHT))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(space::SM))
+        .px(px(space::SM))
+        .child(typography::baseline_row(
+            [
+                marker.map(|marker| {
+                    div()
+                        .flex_none()
+                        .w(px(12.0))
+                        .child(marker)
+                        .into_any_element()
+                }),
+                mono_on_line(change.name.clone(), theme.text, ui),
+                side(&change.from, theme.removed_text),
+                glyph(icons::ARROW_RIGHT),
+                side(&change.to, theme.added_text),
+            ],
+            space::SM,
+        ))
+        .child(div().flex_1())
+        .child(typography::baseline_row(
+            [caption_on_line(caption(kind, theme.subtle_text, ui), ui)],
+            0.0,
+        ))
+        .child(div().flex_none().w(px(ui::Size::Compact.height())))
+        .into_any_element()
+}
+
+fn section_title(label: String, ui: &Diffui, theme: ThemeSpec) -> Div {
+    div()
+        .flex_none()
+        .pt(px(space::SM))
+        .pr(px(space::SM))
+        .pb(px(space::XXS))
+        .pl(px(space::SM))
+        .child(typography::line(
+            label,
+            emphasis_font(ui.config.ui_font, Weight::MEDIUM),
+            text_size::CAPTION,
+            theme.muted_text,
+        ))
+}
+
+/// The operation's header: description, metadata, and the two actions.
+fn operation_header(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    op: &OperationEntry,
+    changes: Option<&OperationChanges>,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> Div {
+    let mut badges = Vec::new();
+    if op.is_current {
+        badges.push(meta_line::Badge {
+            label: "current",
+            color: theme.accent,
+        });
+    }
+    if op.is_snapshot {
+        badges.push(meta_line::Badge {
+            label: "snapshot",
+            color: theme.subtle_text,
+        });
+    }
+    let meta = meta_line::view(
+        meta_line::Meta {
+            ids: vec![meta_line::Id::plain(
+                op.short_id(),
+                if op.is_current {
+                    theme.accent
+                } else {
+                    theme.muted_text
+                },
+            )],
+            badges,
+            who: Some((op.user.clone(), None)),
+            when: Some((Some(op.time_millis), op.time.clone())),
+            operation: None,
+        },
+        ui,
+        theme,
+        window,
+        cx,
+    );
+
+    let can_mutate = ui.active().session.capabilities.mutate;
+    let has_parent = !op.parent_ids.is_empty();
+    let is_merge = changes.is_some_and(|changes| changes.is_merge) || op.parent_ids.len() > 1;
+    let action_button = |id: &'static str,
+                         glyph: &'static str,
+                         label: &'static str,
+                         action: Option<HistoryAction>,
+                         cx: &mut Cx| {
+        let mut button = ui::text_button(
+            id,
+            Some((glyph, theme.muted_text)),
+            label,
+            ui::Variant::Raised,
+            ui::Size::Compact,
+            ui.config.ui_font,
+            theme,
+            cx,
+        )
+        .disabled(action.is_none());
+        if let Some(action) = action {
+            button = button.on_click(Diffui::on_action(Action::History(action), cx));
+        }
+        button
+    };
+    let restore = action_button(
+        "op-restore",
+        icons::ROTATE_CCW,
+        "Restore to here",
+        (can_mutate && !op.is_current && has_parent)
+            .then(|| HistoryAction::RestoreOperation(op.id.clone())),
+        cx,
+    );
+    let revert = action_button(
+        "op-revert",
+        icons::UNDO,
+        "Revert",
+        (can_mutate && has_parent && !is_merge)
+            .then(|| HistoryAction::RevertOperation(op.id.clone())),
+        cx,
+    );
+
+    let title_font = emphasis_font(ui.config.ui_font, Weight::MEDIUM);
+    let mut block = div()
+        .w_full()
+        .flex_none()
+        .flex()
+        .flex_col()
+        .gap(px(space::XS))
+        .px(px(space::LG))
+        .py(px(space::MD))
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(space::SM))
+                // Centred on its caps against the buttons beside it.
+                .child(div().flex_1().min_w_0().child(typography::centered(
+                    meta_line::description(
+                        op.summary(),
+                        text_size::BODY_LG,
+                        title_font,
+                        theme.text,
+                        ui,
+                        theme,
+                    )
+                    .wrapped(),
+                    title_font,
+                    text_size::BODY_LG,
+                )))
+                .child(with_tooltip(
+                    "op-restore-tip",
+                    restore,
+                    "Put every revision and bookmark back to how this operation left them (jj op restore)",
+                    ui,
+                    theme,
+                ))
+                .child(with_tooltip(
+                    "op-revert-tip",
+                    revert,
+                    "Undo just this operation, keeping later work (jj op revert)",
+                    ui,
+                    theme,
+                )),
+        )
+        .child(meta);
+    if let Some(args) = &op.args {
+        block = block.child(crate::plan::wrapped_command_line(
+            ui,
+            theme,
+            args,
+            text_size::CAPTION,
+            window,
+            cx,
+        ));
+    }
+    block
+}
+
+fn operation_changes(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    changes: &OperationChanges,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> Div {
+    let mut list = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(1.0))
+        .px(px(space::SM))
+        .pb(px(space::SM));
+    if changes.is_merge {
+        list = list.child(note(
+            "A merge of concurrent operations. Like the jj CLI, it lists no changes.",
+            theme.subtle_text,
+            ui,
+        ));
+    }
+    if !changes.commits.is_empty() {
+        let mut title = format!("Changed commits ({})", changes.commits.len());
+        if changes.commits_truncated {
+            title.push_str(", more not listed");
+        }
+        list = list.child(section_title(title, ui, theme));
+        for (index, change) in changes.commits.iter().enumerate() {
+            list = list.child(change_row(ui, theme, index, change, window, cx));
+        }
+    }
+    if !changes.refs.is_empty() {
+        list = list.child(section_title(
+            format!("Moved refs ({})", changes.refs.len()),
+            ui,
+            theme,
+        ));
+        for change in &changes.refs {
+            list = list.child(ref_row(ui, theme, change));
+        }
+    }
+    if changes.commits.is_empty() && changes.refs.is_empty() && !changes.is_merge {
+        list = list.child(note(
+            "This operation changed no commits or refs.",
+            theme.subtle_text,
+            ui,
+        ));
+    }
+    // As tall as its rows, up to a limit: the diff below keeps the rest.
+    div()
+        .w_full()
+        .flex_none()
+        .max_h(px(OP_CHANGES_MAX_HEIGHT))
+        .child(ui::scrollable("op-changes", list))
+}
+
+fn evolog_header(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> Option<Div> {
+    let history = &ui.active().history;
+    let entry = history.evolog.get(history.selected_version?)?;
+    let has_previous = !entry.predecessor_ids.is_empty();
+    let meta = meta_line::view(
+        meta_line::Meta {
+            who: Some((entry.commit.author.clone(), None)),
+            when: entry
+                .operation
+                .as_ref()
+                .map(|op| (Some(op.time_millis), String::new())),
+            operation: entry
+                .operation
+                .as_ref()
+                .map(|op| (op.short_id().to_owned(), op.summary.clone())),
+            ..meta_line::Meta::default()
+        },
+        ui,
+        theme,
+        window,
+        cx,
+    );
+    // The first version has nothing before it, so it can only show its
+    // full diff (which is what it loads).
+    let shown = if has_previous {
+        history.evolog_diff
+    } else {
+        EvologDiff::Parents
+    };
+    let segment = |icon, label, mode: EvologDiff, enabled: bool| crate::toolbar::Segment {
+        icon: Some(icon),
+        label,
+        active: shown == mode,
+        on_press: enabled.then_some(Action::History(HistoryAction::SetEvologDiff(mode))),
+    };
+    let mut actions = div()
+        .w_full()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(space::XS))
+        .child(crate::toolbar::segmented(
+            vec![
+                segment(
+                    icons::GIT_COMPARE,
+                    "Since previous version",
+                    EvologDiff::Previous,
+                    has_previous,
+                ),
+                segment(icons::FILE_DIFF, "Full diff", EvologDiff::Parents, true),
+            ],
+            ui.config.ui_font,
+            theme,
+            window,
+            cx,
+        ));
+    if entry.commit.visible {
+        actions = actions.child(div().flex_1()).child(
+            ui::text_button(
+                "evolog-open",
+                Some((icons::FILE_DIFF, theme.muted_text)),
+                "Show in diff view",
+                ui::Variant::Ghost,
+                ui::Size::Compact,
+                ui.config.ui_font,
+                theme,
+                cx,
+            )
+            .on_click(Diffui::on_action(
+                Action::History(HistoryAction::OpenRevision(entry.commit.commit_id.clone())),
+                cx,
+            )),
+        );
+    }
+    let title_font = emphasis_font(ui.config.ui_font, Weight::MEDIUM);
+    Some(
+        div()
+            .w_full()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap(px(space::XS))
+            .px(px(space::LG))
+            .py(px(space::MD))
+            .child(typography::baseline_row(
+                [
+                    mono_on_line(
+                        entry.commit.short_commit_id().to_owned(),
+                        theme.muted_text,
+                        ui,
+                    ),
+                    fill_on_line(
+                        summary_line(&entry.commit, text_size::BODY_LG, title_font, theme)
+                            .text_color(theme.text),
+                        title_font,
+                        text_size::BODY_LG,
+                    ),
+                ],
+                space::SM,
+            ))
+            .child(meta)
+            .child(actions),
+    )
+}
+
+/// A message filling the diff's slot.
+fn diff_message(message: String, padded: bool, ui: &Diffui, theme: ThemeSpec) -> AnyElement {
+    let mut slot = div()
+        .w_full()
+        .flex_1()
+        .min_h_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .font(ui.config.ui_font.gpui())
+        .text_size(px(text_size::BODY_LG))
+        .text_color(theme.subtle_text)
+        .child(message);
+    if padded {
+        slot = slot.p(px(space::XXL));
+    }
+    slot.into_any_element()
+}
+
+fn history_diff_view(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    let history = &ui.active().history;
+    let Some(diff) = &history.diff else {
+        let no_commits = history.kind == HistoryKind::OpLog
+            && history
+                .op_changes
+                .as_ref()
+                .is_some_and(|changes| changes.commits.is_empty());
+        let message = if history.diff_job.is_some() || no_commits {
+            ""
+        } else {
+            "Select a change to see its diff"
+        };
+        return diff_message(message.to_owned(), false, ui, theme);
+    };
+    if diff.document.files.is_empty() {
+        let message = match description_change(history) {
+            Some((old, new)) => format!(
+                "No file changes. The description changed from \u{201c}{old}\u{201d} to \u{201c}{new}\u{201d}"
+            ),
+            None => "No file changes".to_owned(),
+        };
+        return diff_message(message, true, ui, theme);
+    }
+    history_diff(ui, theme, window, cx)
+}
+
+/// The selected change's diff, through the diff lane's widget.
 #[allow(unused_variables)]
+fn history_diff(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> AnyElement {
+    div()
+        .w_full()
+        .flex_1()
+        .min_h_0()
+        .child(crate::stub::panel("history_panel::history_diff"))
+        .into_any_element()
+}
+
+/// The History view's right pane.
 pub(crate) fn build_history_panel(
     ui: &Diffui,
     theme: ThemeSpec,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    crate::stub::panel("history_panel::build_history_panel")
+    let history = &ui.active().history;
+    let divider = || div().w_full().flex_none().h(px(1.0)).bg(theme.border);
+    let mut body = div()
+        .size_full()
+        .flex()
+        .flex_col()
+        .overflow_hidden()
+        .bg(theme.panel_background);
+    if let Some(error) = &history.error {
+        body = body.child(note(error.clone(), theme.removed_text, ui));
+    }
+    match &history.kind {
+        HistoryKind::OpLog => match history.selected_operation() {
+            Some(op) => {
+                let changes = history
+                    .op_changes
+                    .as_ref()
+                    .filter(|changes| changes.operation.id == op.id);
+                body = body.child(operation_header(ui, theme, op, changes, window, cx));
+                match changes {
+                    Some(changes) => {
+                        body = body.child(operation_changes(ui, theme, changes, window, cx));
+                    }
+                    None if history.op_job.is_some() => {
+                        body = body.child(note(
+                            "Reading the operation\u{2026}",
+                            theme.subtle_text,
+                            ui,
+                        ));
+                    }
+                    None => {}
+                }
+                body = body.child(divider());
+                body = body.child(history_diff_view(ui, theme, window, cx));
+            }
+            None => {
+                let message = if history.ops_job.is_some() {
+                    ""
+                } else {
+                    "Select an operation"
+                };
+                body = body.child(diff_message(message.to_owned(), false, ui, theme));
+            }
+        },
+        HistoryKind::Evolog { .. } => {
+            if let Some(header) = evolog_header(ui, theme, window, cx) {
+                body = body.child(header);
+                body = body.child(divider());
+            }
+            body = body.child(history_diff_view(ui, theme, window, cx));
+        }
+    }
+    body.into_any_element()
 }
 
 #[cfg(test)]
@@ -1360,5 +2683,224 @@ mod tests {
         assert_eq!(shape(&history), ["a", "bx2", "d", "e", "f"]);
         history.expanded_runs.insert("b".to_owned());
         assert_eq!(shape(&history), ["a", "bx2[b,c]", "d", "e", "f"]);
+    }
+}
+
+#[cfg(test)]
+mod scenes {
+    use diffui_core::RevisionSelection;
+    use gpui_kit::test::TestWindowExt as _;
+    use gpui_kit::{div, point, px};
+
+    use super::*;
+    use crate::harness::{Harness, fixture_repo};
+    use crate::theme::ThemePreference;
+
+    const LANE: &str = "history";
+    const SIZE: (f32, f32) = (1440.0, 900.0);
+
+    fn history_view() -> Harness {
+        let mut h = Harness::open_sized(Some(&fixture_repo()), SIZE);
+        h.wait_for_graph();
+        h.perform(Action::History(HistoryAction::ShowOpLog));
+        h.wait_until("the op log", |ui| {
+            let history = &ui.active().history;
+            history.ops_job.is_none() && !history.ops.is_empty()
+        });
+        h.settle();
+        h
+    }
+
+    #[test]
+    fn the_operation_log() {
+        let mut h = history_view();
+        h.shot(LANE, "history-oplog");
+        h.shot(LANE, "view-switcher-main-view");
+        h.perform(Action::SetTheme(ThemePreference::Dark));
+        h.shot(LANE, "history-dark");
+    }
+
+    #[test]
+    fn selecting_an_older_operation_by_clicking_its_row() {
+        let mut h = history_view();
+        // A rewrite that lists changed commits and refs, from the list itself.
+        let (id, row) = h.read(|ui| {
+            let history = &ui.active().history;
+            let rows = op_rows(history);
+            rows.iter()
+                .enumerate()
+                .find_map(|(row, entry)| match entry {
+                    OpRow::Op(op)
+                        if !op.is_current && !op.is_snapshot && op.summary().contains("rebase") =>
+                    {
+                        Some((op.id.clone(), row))
+                    }
+                    _ => None,
+                })
+                .or_else(|| {
+                    rows.iter()
+                        .enumerate()
+                        .find_map(|(row, entry)| match entry {
+                            OpRow::Op(op) if !op.is_current && !op.is_snapshot => {
+                                Some((op.id.clone(), row))
+                            }
+                            _ => None,
+                        })
+                })
+                .expect("an older operation")
+        });
+        let before = h.read(|ui| {
+            op_rows(&ui.active().history)
+                .iter()
+                .take(row)
+                .map(|entry| match entry {
+                    OpRow::Op(op) if !op.is_snapshot => REVISION_ROW_HEIGHT,
+                    _ => FILE_ROW_HEIGHT,
+                })
+                .sum::<f32>()
+        });
+        // Under the chrome and the list's header, if the row is in view; a long
+        // list goes through the action.
+        let top = crate::toolbar::chrome_bottom() + crate::field::PANEL_HEADER_HEIGHT;
+        let y = top + before + row as f32 * 2.0 * ROW_CARD_INSET_Y + REVISION_ROW_HEIGHT / 2.0;
+        if y < SIZE.1 - 20.0 {
+            h.click_point(point(px(150.0), px(y)));
+        } else {
+            h.perform(select_op(&id));
+        }
+        h.wait_until("the operation", |ui| {
+            let history = &ui.active().history;
+            history.selected_op.as_deref() == Some(id.as_str()) && history.op_job.is_none()
+        });
+        h.settle();
+        h.shot(LANE, "history-op-selected");
+
+        // The row's own button opens the commit rather than selecting the row.
+        let visible = h.read(|ui| {
+            let changes = ui.active().history.op_changes.as_ref();
+            changes.is_some_and(|changes| changes.commits.first().is_some_and(|c| c.commit.visible))
+        });
+        if visible {
+            h.click("change-open-0");
+            h.settle();
+            assert_eq!(h.read(|ui| ui.active().main_view), MainView::Diff);
+        }
+    }
+
+    #[test]
+    fn a_revisions_evolution() {
+        let mut h = Harness::open_sized(Some(&fixture_repo()), SIZE);
+        h.wait_for_graph();
+        h.perform(Action::SetRevset("all()".to_owned()));
+        h.wait_for_graph();
+        let id = h.read(|ui| {
+            ui.active()
+                .session
+                .commits
+                .iter()
+                .find(|row| row.description().contains("retry with backoff"))
+                .expect("the rewritten revision")
+                .commit_id()
+                .to_owned()
+        });
+        h.perform(Action::History(HistoryAction::ShowEvolog(
+            RevisionSelection::Commit(id),
+        )));
+        h.wait_until("the evolog", |ui| {
+            let history = &ui.active().history;
+            history.evolog_job.is_none() && !history.evolog.is_empty()
+        });
+        h.settle();
+        h.shot(LANE, "history-evolog");
+        let older = h.read(|ui| ui.active().history.evolog.len() - 1);
+        h.perform(Action::History(HistoryAction::SelectVersion(older)));
+        h.settle();
+        assert_eq!(
+            h.read(|ui| ui.active().history.selected_version),
+            Some(older)
+        );
+        h.shot(LANE, "history-evolog-selected");
+    }
+
+    #[test]
+    fn a_files_history_narrows_the_list_under_a_banner() {
+        let mut h = Harness::open_sized(Some(&fixture_repo()), SIZE);
+        h.wait_for_graph();
+        crate::revision_rows::scenes::show_list(&mut h);
+        h.show(|ui, theme, window, cx| {
+            let banner = file_filter_banner(ui, theme, window, cx);
+            let list = crate::revision_rows::build_revision_list(ui, theme, window, cx);
+            div()
+                .w(px(ui.sidebar_width))
+                .h_full()
+                .pt(px(80.0))
+                .flex()
+                .flex_col()
+                .bg(theme.panel_background)
+                .children(banner)
+                .child(div().flex_1().min_h_0().child(list))
+                .into_any_element()
+        });
+        assert!(
+            h.read(|ui| !file_filter_active(ui)),
+            "no banner before there's a filter"
+        );
+        let revision = h.read(|ui| {
+            let commit = ui
+                .active()
+                .session
+                .commits
+                .iter()
+                .find(|row| row.description().contains("rework the pipeline"))
+                .expect("the revision");
+            RevisionSelection::Commit(commit.commit_id().to_owned())
+        });
+        h.perform(Action::SelectRevision(revision.clone()));
+        h.settle();
+        h.perform(Action::History(HistoryAction::FileHistory {
+            revision,
+            path: "src/main.rs".to_owned(),
+        }));
+        h.wait_for_graph();
+        assert!(h.read(file_filter_active));
+        h.shot(LANE, "file-history");
+    }
+
+    /// What a frame of the op log costs: it isn't virtualized, as it wasn't
+    /// before the port. See `frame_timing_over_a_large_graph` for how to run it.
+    #[test]
+    #[ignore = "a benchmark: run on demand, optimized"]
+    fn frame_timing_of_a_full_op_log_page() {
+        let mut h = history_view();
+        h.act(|ui, _| {
+            let history = &mut ui.active_mut().history;
+            let template = history
+                .ops
+                .iter()
+                .find(|op| !op.is_snapshot && !op.is_current)
+                .expect("an operation")
+                .clone();
+            history.ops = (0..OP_LOG_PAGE)
+                .map(|index| OperationEntry {
+                    id: format!("{index:0128x}"),
+                    is_current: false,
+                    ..template.clone()
+                })
+                .collect();
+        });
+        h.settle();
+        let mut samples: Vec<_> = (0..100)
+            .map(|_| {
+                h.timed(|window, cx| {
+                    window.refresh();
+                    window.render_frame(cx);
+                })
+            })
+            .collect();
+        samples.sort();
+        println!(
+            "op log, {OP_LOG_PAGE} rows, full redraw: p50={:.2?} p99={:.2?}",
+            samples[50], samples[98]
+        );
     }
 }

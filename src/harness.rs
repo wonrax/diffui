@@ -61,7 +61,7 @@ const QUIET: Duration = Duration::from_millis(250);
 
 /// The process-wide scratch `HOME`: window state, recents and config all derive
 /// from it, and the owner's real session must survive a test run.
-fn scratch_home() -> &'static Path {
+pub(crate) fn scratch_home() -> &'static Path {
     static HOME: OnceLock<PathBuf> = OnceLock::new();
     HOME.get_or_init(|| {
         let home = std::env::temp_dir().join(format!("diffui-harness-{}", std::process::id()));
@@ -281,6 +281,16 @@ impl Harness {
         out
     }
 
+    /// Times one update of the window, including the draw it flushes on return.
+    /// No pumping and no settling: what the user's frame costs.
+    pub(crate) fn timed(&mut self, f: impl FnOnce(&mut Window, &mut App)) -> Duration {
+        let started = Instant::now();
+        self.cx
+            .update_window(self.window, |_, window, cx| f(window, cx))
+            .expect("the window is open");
+        started.elapsed()
+    }
+
     /// Presses a key through the real dispatch path: `"cmd-k"`, `"escape"`, `"j"`.
     pub(crate) fn press(&mut self, key: &str) {
         self.with_window(|window, cx| window.press(key, cx));
@@ -325,6 +335,11 @@ impl Harness {
     /// workspace, returning the path. Settles first.
     pub(crate) fn shot(&mut self, lane: &str, scene: &str) -> PathBuf {
         self.settle();
+        self.shot_now(lane, scene)
+    }
+
+    /// [`Self::shot`] of the state right now, for a scene that's mid-flight.
+    pub(crate) fn shot_now(&mut self, lane: &str, scene: &str) -> PathBuf {
         let image = self
             .cx
             .capture_screenshot(self.window)
