@@ -1,11 +1,8 @@
 //! The panels' baseline scenes: `shots/panels/<scene-id>.png`, each compared
 //! against `shots/iced/<scene-id>.png`, and the panels' controls driven by real
-//! clicks. The diff body, the revision rows and the overlays are stubs here; a
-//! scene that needs its banners in place shows them through [`diff_shell`].
+//! clicks.
 
 use diffui_core::{DraftSimulation, RevisionSelection};
-use gpui_kit::prelude::*;
-use gpui_kit::{AnyElement, Window, div, px};
 
 use crate::changes::{ChangesMsg, LineMsg};
 use crate::commands::CommandArg;
@@ -14,8 +11,8 @@ use crate::diff_view::HeaderLine;
 use crate::harness::{Harness, at, fixture_repo};
 use crate::range::RangeAction;
 use crate::revision_list::RowSelectionKey;
-use crate::theme::{self, ThemePreference, ThemeSpec};
-use crate::{Action, Cx, Diffui, MainView, root, typography, ui};
+use crate::theme::ThemePreference;
+use crate::{Action, MainView};
 
 const LANE: &str = "panels";
 const BASELINE: (f32, f32) = (1440.0, 900.0);
@@ -26,19 +23,11 @@ fn open() -> Harness {
     let mut h = Harness::open_sized(Some(&fixture_repo()), BASELINE);
     h.wait_for_graph();
     h.settle();
-    quiet_toasts(&mut h);
     h
-}
-
-/// The owner's jj CLI differs from the library, which raises a sticky toast, and
-/// the toast stub blocks the pointer and covers the shot.
-fn quiet_toasts(h: &mut Harness) {
-    h.act(|ui, _| ui.toasts.clear());
 }
 
 fn shot(h: &mut Harness, scene: &str) {
     h.settle();
-    quiet_toasts(h);
     h.shot(LANE, scene);
 }
 
@@ -58,7 +47,6 @@ fn commit_with(h: &mut Harness, description: &str) -> String {
 fn loaded(h: &mut Harness) {
     h.wait_until("the diff", |ui| !ui.active().session.diff_in_flight());
     h.settle();
-    quiet_toasts(h);
 }
 
 fn select(h: &mut Harness, description: &str) -> String {
@@ -72,7 +60,6 @@ fn select(h: &mut Harness, description: &str) -> String {
 fn run(h: &mut Harness, command: &'static str) {
     h.act(|ui, cx| ui.run_command(command, CommandArg::None, cx));
     h.settle();
-    quiet_toasts(h);
 }
 
 fn run_line(h: &mut Harness, line: &str) {
@@ -82,116 +69,6 @@ fn run_line(h: &mut Harness, line: &str) {
         ui.run_command_line(cx);
     });
     loaded(h);
-}
-
-/// The window's layout with the diff body stubbed: banners, the commit info and
-/// the selection strip where the diff panel docks them, and the document's header
-/// as text where the diff view draws it.
-fn diff_shell(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> AnyElement {
-    let session = &ui.active().session;
-    let mut pane = div()
-        .flex_1()
-        .min_w_0()
-        .h_full()
-        .flex()
-        .flex_col()
-        .overflow_hidden()
-        .bg(theme.background);
-    if let Some(error) = crate::range::refused_span(ui) {
-        pane = pane
-            .children(crate::compare::build_compare_banner(ui, theme, window, cx))
-            .child(crate::range::refused_state(ui, theme, error, window, cx));
-    } else {
-        let header = match (crate::range::shown_range(ui), &session.revision_details) {
-            (Some(range), _) => crate::range::header_lines(ui, range, theme),
-            (None, Some(details)) => crate::commit_info::header_lines(
-                ui,
-                details,
-                theme,
-                true,
-                crate::diff_panel::diff_pane_width(ui),
-            ),
-            _ => Vec::new(),
-        };
-        let empty = crate::range::shown_range(ui)
-            .filter(|_| session.document.files.is_empty())
-            .map(|range| crate::range::empty_message(ui, range));
-        pane = pane
-            .children(crate::empty_states::outside_view_banner(ui, theme, cx))
-            .children(crate::compare::build_compare_banner(ui, theme, window, cx))
-            .child(crate::commit_info::view(ui, theme, window, cx))
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .p(px(16.0))
-                    .children(header.iter().map(|line| {
-                        typography::line(
-                            header_text(line),
-                            ui.config.mono_font,
-                            ui.config.code_type.size,
-                            theme.muted_text,
-                        )
-                    }))
-                    .children(empty.map(|message| {
-                        typography::line(
-                            message,
-                            ui.config.ui_font,
-                            theme::text_size::BODY_LG,
-                            theme.subtle_text,
-                        )
-                    })),
-            )
-            .children(crate::changes::selection_bar(ui, theme, window, cx));
-    }
-    let mut row = div().flex_1().min_h_0().w_full().flex().flex_row().child(
-        div()
-            .h_full()
-            .w(px(ui.sidebar_width))
-            .flex_none()
-            .child(crate::sidebar::build_sidebar(ui, theme, window, cx)),
-    );
-    row = row.child(root::vertical_divider(theme));
-    if !session.document.files.is_empty() {
-        row = row
-            .child(div().h_full().w(px(ui.file_nav_width)).flex_none().child(
-                crate::diff_panel::build_file_navigator(ui, theme, window, cx),
-            ))
-            .child(root::vertical_divider(theme));
-    }
-    div()
-        .relative()
-        .size_full()
-        .flex()
-        .flex_col()
-        .bg(theme.background)
-        .child(div().flex_none().h(px(crate::toolbar::chrome_bottom())))
-        .child(root::horizontal_divider(theme))
-        .child(row.child(pane))
-        .into_any_element()
-}
-
-fn header_text(line: &HeaderLine) -> String {
-    match line {
-        HeaderLine::Description(value) => value.clone(),
-        HeaderLine::Rich(field) => format!("{:<10} {}", field.label, field.value),
-        HeaderLine::Bookmarks { label, chips } => format!(
-            "{label:<10} {}",
-            chips
-                .iter()
-                .map(|chip| chip.label.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        _ => String::new(),
-    }
-}
-
-fn show_shell(h: &mut Harness) {
-    h.show(diff_shell);
 }
 
 #[test]
@@ -205,7 +82,7 @@ fn panels_collapse_and_peek() {
     shot(&mut h, "panel-both-collapsed");
     h.perform(Action::ToggleHistoryPanel);
     shot(&mut h, "panel-files-collapsed");
-    h.act(|ui, cx| ui.on_changed_files_trigger_entered(cx));
+    h.act(|ui, _| ui.on_changed_files_trigger_entered());
     assert!(h.read(|ui| ui.changed_files_peek_open));
     shot(&mut h, "panel-files-peek");
 }
@@ -214,7 +91,6 @@ fn panels_collapse_and_peek() {
 fn the_commit_block() {
     let mut h = open();
     select(&mut h, REWORK);
-    show_shell(&mut h);
     shot(&mut h, "diff-kitchen-sink");
 
     // The fold control, by a real click.
@@ -260,7 +136,6 @@ fn commit_header_actions_reach_the_clipboard_and_the_graph() {
 #[test]
 fn revisions_without_a_description() {
     let mut h = open();
-    show_shell(&mut h);
     // The working copy of the fixture has nothing written yet.
     h.act(|ui, cx| ui.on_select_row_key(RowSelectionKey::WorkingCopy, cx));
     loaded(&mut h);
@@ -453,7 +328,6 @@ fn drafts_from_marks_and_from_changes() {
 fn picks_and_line_selection() {
     let mut h = open();
     loaded(&mut h);
-    show_shell(&mut h);
     h.perform(Action::Changes(ChangesMsg::ToggleFile(0)));
     shot(&mut h, "picks-files-hunks");
     h.perform(Action::Changes(ChangesMsg::Lines(LineMsg::Toggle)));
@@ -480,7 +354,6 @@ fn the_selection_strip_wraps_in_a_narrow_pane() {
     let mut h = Harness::open_sized(Some(&fixture_repo()), (900.0, 620.0));
     h.wait_for_graph();
     select(&mut h, CLAMP);
-    show_shell(&mut h);
     h.perform(Action::Changes(ChangesMsg::ToggleFile(0)));
     h.perform(Action::Changes(ChangesMsg::Lines(LineMsg::Toggle)));
     shot(&mut h, "narrow-selection-strip");
@@ -501,7 +374,9 @@ fn the_split_modal() {
     let mut h = open();
     loaded(&mut h);
     h.perform(Action::Changes(ChangesMsg::ToggleFile(0)));
-    h.click_or_act_split();
+    h.settle();
+    h.click("picks-split");
+    h.settle();
     assert!(h.read(crate::changes::split_shown));
     shot(&mut h, "split-modal");
 
@@ -521,65 +396,10 @@ fn the_split_modal() {
     assert!(!h.read(crate::changes::split_shown));
 }
 
-impl Harness {
-    fn click_or_act_split(&mut self) {
-        show_shell(self);
-        self.settle();
-        self.click("picks-split");
-        self.settle();
-        // The real root, with the dialog over it.
-        self.act(|app, _| app.background.scene = None);
-        self.settle();
-    }
-}
-
-/// `tab_bar::build_confirm_dialog` is a stub in this tree. This is the same card
-/// from the same primitives over the same state, for the look of the copy.
-fn confirm_stand_in(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> AnyElement {
-    let shell = diff_shell(ui, theme, window, cx);
-    let Some(dialog) = ui.confirm() else {
-        return shell;
-    };
-    let (font, mono) = (ui.config.ui_font, ui.config.mono_font);
-    let card = ui::dialog_card(ui::DIALOG_WIDTH, theme)
-        .child(ui::dialog_title(&dialog.title, font, mono, theme))
-        .child(ui::dialog_text(&dialog.body, font, mono, theme))
-        .child(ui::button_row(
-            None,
-            [
-                ui::cancel_button("confirm-cancel", ui::Size::Standard, font, theme, cx)
-                    .into_any_element(),
-                ui::text_button(
-                    "confirm-accept",
-                    None,
-                    dialog.confirm_label.clone(),
-                    ui::Variant::Destructive,
-                    ui::Size::Standard,
-                    font,
-                    theme,
-                    cx,
-                )
-                .into_any_element(),
-            ],
-        ));
-    div()
-        .relative()
-        .size_full()
-        .child(shell)
-        .child(ui::modal(
-            "confirm-dialog",
-            card,
-            crate::toolbar::modal_top(),
-            |_, _| {},
-        ))
-        .into_any_element()
-}
-
 #[test]
 fn discard_flows() {
     let mut h = open();
     loaded(&mut h);
-    show_shell(&mut h);
     let path = h.read(|ui| ui.active().session.document.files[0].path.clone());
     h.perform(Action::Changes(ChangesMsg::ToggleFile(0)));
     h.settle();
@@ -592,7 +412,6 @@ fn discard_flows() {
     let (title, label) = dialog.expect("a confirm dialog");
     assert!(title.contains(&path), "{title}");
     assert_eq!(label, "Discard");
-    h.show(confirm_stand_in);
     shot(&mut h, "discard-confirm");
     h.perform(Action::ConfirmCancel);
     h.settle();
@@ -613,7 +432,6 @@ fn discard_flows() {
 fn compare_scenes() {
     let mut h = open();
     let id = select(&mut h, CLAMP);
-    show_shell(&mut h);
     h.perform(Action::Compare(CompareAction::WithWorkingCopy(
         RevisionSelection::Commit(id.clone()),
     )));
@@ -672,7 +490,6 @@ fn since_trunk(h: &mut Harness, target: RevisionSelection) {
 fn range_scenes() {
     let mut h = open();
     let id = select(&mut h, CLAMP);
-    show_shell(&mut h);
     since_trunk(&mut h, RevisionSelection::Commit(id));
     assert!(h.read(|ui| crate::range::shown_range(ui).is_some()));
     shot(&mut h, "range-since-trunk");
@@ -707,9 +524,9 @@ fn range_scenes() {
     // Two connected rows, as a ⇧-click marks them.
     let older = commit_with(&mut h, "perf(render): cache resolved bindings");
     let newer = commit_with(&mut h, CLAMP);
-    h.act(|ui, cx| {
+    h.act(|ui, _| {
         ui.active_mut().revision_multi_selection = vec![newer, older];
-        ui.sync_span(true, cx);
+        ui.sync_span(true);
     });
     loaded(&mut h);
     assert!(h.read(|ui| crate::range::refused_span(ui).is_none()));
@@ -723,9 +540,9 @@ fn range_scenes() {
     // Rows with a revision missing between them can't be one diff.
     let one = commit_with(&mut h, CLAMP);
     let other = commit_with(&mut h, "feat(render): rework the pipeline");
-    h.act(|ui, cx| {
+    h.act(|ui, _| {
         ui.active_mut().revision_multi_selection = vec![one, other];
-        ui.sync_span(true, cx);
+        ui.sync_span(true);
     });
     h.wait_until("the refusal", |ui| crate::range::refused_span(ui).is_some());
     shot(&mut h, "range-disconnected");
@@ -752,7 +569,6 @@ fn source_loaded(h: &mut Harness) {
         source.tree.is_some() && source.loading.is_none()
     });
     h.settle();
-    quiet_toasts(h);
 }
 
 #[test]
@@ -795,10 +611,10 @@ fn the_source_filter_ranks_and_opens_the_best_match() {
     let mut h = open();
     h.perform(Action::SetMainView(MainView::Source));
     source_loaded(&mut h);
-    h.act(|ui, cx| ui.on_source_filter_changed("frameloop".to_owned(), cx));
+    h.act(|ui, _| ui.on_source_filter_changed("frameloop".to_owned()));
     h.settle();
     shot(&mut h, "source-filter");
-    h.act(|ui, cx| ui.on_source_filter_submit(cx));
+    h.act(|ui, _| ui.on_source_filter_submit());
     source_loaded(&mut h);
     let selected = h.read(|ui| ui.active().source.selected.clone());
     assert_eq!(selected.as_deref(), Some("src/renderer/frame_loop.rs"));

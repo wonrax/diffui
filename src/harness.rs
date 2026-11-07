@@ -2,7 +2,7 @@
 //! through the offscreen renderer, on a scratch repository with a scratch `HOME`.
 //!
 //! ```ignore
-//! let mut h = Harness::open(Some(&fixture_repo()));
+//! let mut h = Harness::open(Some(&fixture_repo())); // a fresh copy of the fixture
 //! h.wait_for_graph();
 //! h.press("cmd-k");
 //! h.perform(Action::ToggleWrap);
@@ -23,13 +23,16 @@
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
-use gpui_kit::test::{TestEventExt as _, TestWindowExt as _};
+use gpui_kit::InputEvent as _;
+use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
-    AnyElement, AnyWindowHandle, App, AppContext as _, Entity, HeadlessAppContext, Pixels, Point,
-    ScrollDelta, Window, point, px, size,
+    AnyElement, AnyWindowHandle, App, AppContext as _, Entity, HeadlessAppContext, KeyDownEvent,
+    KeyUpEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, PlatformInput, Point, ScrollDelta, ScrollEvent, Window, point, px, size,
 };
 
 use crate::theme::ThemeSpec;
@@ -44,13 +47,13 @@ pub(crate) struct Harness {
     cx: HeadlessAppContext,
     window: AnyWindowHandle,
     app: Entity<Diffui>,
-    /// One at a time: they share `HOME` and the fixture.
-    _turn: MutexGuard<'static, ()>,
+    /// One at a time: they share `HOME`.
+    _turn: Turn,
     /// The UI thread runs inside the tokio runtime, as `main` does.
     _tokio: tokio::runtime::EnterGuard<'static>,
 }
 
-/// The window size of the iced baselines.
+/// A scene's window, unless it asks for another.
 const DEFAULT_SIZE: (f32, f32) = (1280.0, 800.0);
 /// How long a settle or a wait may take before the test fails.
 const TIMEOUT: Duration = Duration::from_secs(60);
@@ -82,6 +85,12 @@ pub(crate) fn scratch_home() -> &'static Path {
             )
             .expect("write the jj config");
             std::env::set_var("JJ_CONFIG", config);
+            // The app warns when the jj on PATH doesn't match its jj-lib, with a
+            // toast that sits over every shot.
+            if let Some(dir) = fixture_jj().parent() {
+                let path = std::env::var("PATH").unwrap_or_default();
+                std::env::set_var("PATH", format!("{}:{path}", dir.display()));
+            }
         }
         // `Diffui::new` opens the repository it's started in, and these tests start
         // inside a workspace: that must not become the repo under test.
@@ -90,15 +99,22 @@ pub(crate) fn scratch_home() -> &'static Path {
     })
 }
 
-/// The shared fixture: the repository `fixtures/make-fixture.sh` builds, made once
-/// per test run under the scratch home. `DIFFUI_FIXTURE_REPO` names an existing one
-/// instead (it is opened, and never written to by the harness itself).
-pub(crate) fn fixture_repo() -> PathBuf {
-    if let Some(repo) = std::env::var_os("DIFFUI_FIXTURE_REPO") {
-        return PathBuf::from(repo);
-    }
+/// The jj the fixture needs: `$JJ`, or where the baseline keeps one.
+pub(crate) fn fixture_jj() -> PathBuf {
+    std::env::var_os("JJ")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp/diffui-fix/uikit/jj"))
+}
+
+/// The master copy of what `fixtures/make-fixture.sh` builds, made once per test run
+/// under the scratch home, or the existing one `DIFFUI_FIXTURE_REPO` names. Nothing
+/// opens it: see [`fixture_repo`].
+fn master_fixture() -> &'static Path {
     static REPO: OnceLock<PathBuf> = OnceLock::new();
     REPO.get_or_init(|| {
+        if let Some(repo) = std::env::var_os("DIFFUI_FIXTURE_REPO") {
+            return PathBuf::from(repo);
+        }
         let home = scratch_home();
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/make-fixture.sh");
         let repo = home.join("fixture");
@@ -116,12 +132,82 @@ pub(crate) fn fixture_repo() -> PathBuf {
         );
         repo
     })
-    .clone()
 }
 
-fn turn() -> MutexGuard<'static, ()> {
+/// A fresh copy of the fixture, the caller's to do anything to. A key press can apply
+/// a rebase, and a shared repository would carry that into whatever opens it next.
+pub(crate) fn fixture_repo() -> PathBuf {
+    fresh_repo_named("repo")
+}
+
+/// [`fixture_repo`] at `<a new directory>/<name>`, for a scene that shows the path.
+pub(crate) fn fresh_repo_named(name: &str) -> PathBuf {
+    static COPIES: AtomicUsize = AtomicUsize::new(0);
+    let master = master_fixture();
+    let copy = COPIES.fetch_add(1, Ordering::Relaxed);
+    let repo = scratch_home()
+        .join("repos")
+        .join(copy.to_string())
+        .join(name);
+    std::fs::create_dir_all(repo.parent().expect("a new directory")).expect("make the copy's home");
+    let status = std::process::Command::new("cp")
+        .arg("-a")
+        .arg(master)
+        .arg(&repo)
+        .status()
+        .expect("run cp");
+    assert!(status.success(), "copy the fixture to {}", repo.display());
+    // The copy's remote must not be the master's, or a push would reach every later copy.
+    let config = repo.join(".git/config");
+    let text = std::fs::read_to_string(&config).expect("the copy's git config");
+    std::fs::write(
+        &config,
+        text.replace(
+            master.to_str().expect("a UTF-8 path"),
+            repo.to_str().expect("a UTF-8 path"),
+        ),
+    )
+    .expect("point the copy's remote at itself");
+    repo
+}
+
+/// The right to run a harness. Harnesses on other threads wait for it. One on the
+/// thread that already holds it would wait forever, so that fails instead.
+struct Turn {
+    _guard: MutexGuard<'static, ()>,
+}
+
+static TURN_HOLDER: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
+
+fn turn() -> Turn {
     static TURN: Mutex<()> = Mutex::new(());
-    TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    let me = std::thread::current().id();
+    let holder = |value: Option<std::thread::ThreadId>| {
+        let mut slot = TURN_HOLDER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::replace(&mut *slot, value)
+    };
+    let current = *TURN_HOLDER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_ne!(
+        current,
+        Some(me),
+        "Harness::open while this thread's harness is alive: only one runs at a time, so this \
+         would wait for itself forever. Drop the first one before opening another."
+    );
+    let guard = TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    holder(Some(me));
+    Turn { _guard: guard }
+}
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        *TURN_HOLDER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
 }
 
 impl Harness {
@@ -130,8 +216,37 @@ impl Harness {
         Self::open_sized(repo, DEFAULT_SIZE)
     }
 
-    pub(crate) fn open_sized(repo: Option<&Path>, (width, height): (f32, f32)) -> Self {
+    pub(crate) fn open_sized(repo: Option<&Path>, size: (f32, f32)) -> Self {
         let turn = turn();
+        Self::start(turn, repo, size)
+    }
+
+    /// [`Self::open_sized`] on a `HOME` with no saved session or recents and `config`
+    /// as its config file, as a first launch would see it.
+    pub(crate) fn open_fresh(repo: Option<&Path>, size: (f32, f32), config: &str) -> Self {
+        let turn = turn();
+        let home = scratch_home();
+        for entry in std::fs::read_dir(home).expect("list the scratch home") {
+            let path = entry.expect("a scratch home entry").path();
+            let keep = ["fixture", "repos", "jj-config.toml"]
+                .iter()
+                .any(|name| path.file_name().is_some_and(|file| file == *name));
+            if !keep {
+                let removed = if path.is_dir() {
+                    std::fs::remove_dir_all(&path)
+                } else {
+                    std::fs::remove_file(&path)
+                };
+                removed.expect("clear the scratch home");
+            }
+        }
+        let dir = home.join(".config/diffui");
+        std::fs::create_dir_all(&dir).expect("make the config directory");
+        std::fs::write(dir.join("config.toml"), config).expect("write the config");
+        Self::start(turn, repo, size)
+    }
+
+    fn start(turn: Turn, repo: Option<&Path>, (width, height): (f32, f32)) -> Self {
         let tokio = crate::spawn::runtime().enter();
         scratch_home();
         let mut cx = HeadlessAppContext::with_platform(
@@ -170,7 +285,7 @@ impl Harness {
     }
 
     /// Runs what's queued on the dispatcher, once.
-    fn pump(&mut self) {
+    pub(crate) fn pump(&mut self) {
         self.cx.run_until_parked();
     }
 
@@ -258,7 +373,7 @@ impl Harness {
     }
 
     /// Fills the window with `view` instead of the app, against the same state. For
-    /// shooting or driving one view before the views around it exist.
+    /// driving one view by itself, or what a real scene can't reach.
     pub(crate) fn show(
         &mut self,
         view: impl Fn(&Diffui, ThemeSpec, &mut Window, &mut Cx) -> AnyElement + 'static,
@@ -291,44 +406,154 @@ impl Harness {
         started.elapsed()
     }
 
+    /// Dispatches one platform event in its own update, as the platform would: it
+    /// draws what it dirtied and nothing more. kit's own test helpers redraw the whole
+    /// window around each event, which would hide a cached pane that went stale.
+    fn event(&mut self, input: PlatformInput) {
+        self.with_window(|window, cx| {
+            window.dispatch_event(input, cx);
+        });
+    }
+
+    /// [`Self::timed`] around a change to the app.
+    pub(crate) fn timed_app(&mut self, f: impl FnOnce(&mut Diffui, &mut Cx)) -> Duration {
+        let app = self.app.clone();
+        let started = Instant::now();
+        self.cx.update(|cx| app.update(cx, f));
+        started.elapsed()
+    }
+
+    /// Changes app state with no notify at all, as a bug would.
+    pub(crate) fn with_app(&mut self, f: impl FnOnce(&mut Diffui)) {
+        let app = self.app.clone();
+        self.cx.update(|cx| app.update(cx, |app, _| f(app)));
+    }
+
     /// Presses a key through the real dispatch path: `"cmd-k"`, `"escape"`, `"j"`.
     pub(crate) fn press(&mut self, key: &str) {
-        self.with_window(|window, cx| window.press(key, cx));
+        let keystroke = self
+            .cx
+            .update(|cx| Keystroke::parse_with_os(key, cx.platform_info().os))
+            .unwrap_or_else(|error| panic!("invalid keystroke {key}: {error}"));
+        let keystroke = if matches!(keystroke.key.as_str(), "enter" | "tab") {
+            // GPUI's simulated IME would type these as text as well.
+            self.event(
+                KeyDownEvent {
+                    keystroke: keystroke.clone(),
+                    is_held: false,
+                    prefer_character_input: false,
+                }
+                .to_platform_input(),
+            );
+            keystroke
+        } else {
+            let keystroke = keystroke.with_simulated_ime();
+            let sent = keystroke.clone();
+            self.with_window(|window, cx| {
+                window.dispatch_keystroke(sent, cx);
+            });
+            keystroke
+        };
+        self.event(KeyUpEvent { keystroke }.to_platform_input());
     }
 
     /// Types text at the current focus.
     pub(crate) fn type_text(&mut self, text: &str) {
-        self.with_window(|window, cx| window.input(text, cx));
+        for character in text.chars() {
+            let text = character.to_string();
+            let mut keystroke = self
+                .cx
+                .update(|cx| Keystroke::parse_with_os(&text, cx.platform_info().os))
+                .expect("a character is a valid keystroke");
+            keystroke.key_char = Some(text);
+            self.with_window(|window, cx| {
+                window.dispatch_keystroke(keystroke, cx);
+            });
+        }
     }
 
     /// Clicks an element by id. kit components register themselves; your own
     /// element needs `gpui_kit::base::TestSupportExt::test_support()` before its
-    /// listeners, which is free outside tests.
+    /// listeners, which is free outside tests. kit redraws everything around this one.
     pub(crate) fn click(&mut self, id: &'static str) {
         self.with_window(|window, cx| window.click(id, cx));
     }
 
     /// Clicks a window position (logical pixels, top-left origin).
     pub(crate) fn click_point(&mut self, position: Point<Pixels>) {
-        self.with_window(|window, cx| {
-            window.pointer_down(position, gpui_kit::MouseButton::Left, cx);
-            window.pointer_up(position, gpui_kit::MouseButton::Left, cx);
-        });
+        self.hover_point(position);
+        self.pointer_down(position, MouseButton::Left);
+        self.pointer_up(position, MouseButton::Left);
     }
 
     /// Moves the pointer without a button held.
     pub(crate) fn hover_point(&mut self, position: Point<Pixels>) {
-        self.with_window(|window, cx| window.pointer_move(position, None, cx));
+        self.pointer_move(position, None);
+    }
+
+    pub(crate) fn pointer_move(&mut self, position: Point<Pixels>, pressed: Option<MouseButton>) {
+        self.event(
+            MouseMoveEvent {
+                position,
+                pressed_button: pressed,
+                modifiers: Modifiers::default(),
+            }
+            .to_platform_input(),
+        );
+    }
+
+    pub(crate) fn pointer_down(&mut self, position: Point<Pixels>, button: MouseButton) {
+        self.event(
+            MouseDownEvent {
+                button,
+                position,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            }
+            .to_platform_input(),
+        );
+    }
+
+    pub(crate) fn pointer_up(&mut self, position: Point<Pixels>, button: MouseButton) {
+        self.event(
+            MouseUpEvent {
+                button,
+                position,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            }
+            .to_platform_input(),
+        );
     }
 
     /// Drags with the left button.
     pub(crate) fn drag(&mut self, from: Point<Pixels>, to: Point<Pixels>) {
-        self.with_window(|window, cx| window.drag(from, to, cx));
+        self.hover_point(from);
+        self.pointer_down(from, MouseButton::Left);
+        for step in 1..=8 {
+            let fraction = step as f32 / 8.0;
+            self.pointer_move(
+                point(
+                    from.x + (to.x - from.x) * fraction,
+                    from.y + (to.y - from.y) * fraction,
+                ),
+                Some(MouseButton::Left),
+            );
+        }
+        self.pointer_up(to, MouseButton::Left);
     }
 
-    /// Scrolls the element named `id`.
-    pub(crate) fn scroll(&mut self, id: &'static str, by: Point<Pixels>) {
-        self.with_window(|window, cx| window.scroll(id, ScrollDelta::Pixels(by), cx));
+    /// Rolls the wheel at a window position.
+    pub(crate) fn wheel(&mut self, position: Point<Pixels>, by: f32) {
+        self.event(
+            ScrollEvent {
+                position,
+                delta: ScrollDelta::Pixels(point(px(0.0), px(by))),
+                ..Default::default()
+            }
+            .to_platform_input(),
+        );
     }
 
     /// Renders the window and writes it to `shots/<lane>/<scene>.png` beside the
@@ -349,6 +574,39 @@ impl Harness {
         let path = dir.join(format!("{scene}.png"));
         image.save(&path).expect("write the screenshot");
         path
+    }
+}
+
+impl Harness {
+    /// Draws the window with every cache dropped and compares it with what the cached
+    /// frames show. `Err` says where they differ: a view reading state that didn't
+    /// notify it, which a user would see as a stale pane.
+    pub(crate) fn same_after_a_refresh(&mut self) -> Result<(), String> {
+        let cached = self
+            .cx
+            .capture_screenshot(self.window)
+            .map_err(|error| error.to_string())?;
+        self.with_window(|window, cx| window.render_frame(cx));
+        let fresh = self
+            .cx
+            .capture_screenshot(self.window)
+            .map_err(|error| error.to_string())?;
+        if cached.dimensions() != fresh.dimensions() {
+            return Err("the window changed size".to_owned());
+        }
+        let mut bounds: Option<(u32, u32, u32, u32)> = None;
+        let mut pixels = 0usize;
+        for (x, y, pixel) in cached.enumerate_pixels() {
+            if pixel != fresh.get_pixel(x, y) {
+                pixels += 1;
+                let (x0, y0, x1, y1) = bounds.unwrap_or((x, y, x, y));
+                bounds = Some((x0.min(x), y0.min(y), x1.max(x), y1.max(y)));
+            }
+        }
+        match bounds {
+            None => Ok(()),
+            Some(bounds) => Err(format!("{pixels} pixels differ, within {bounds:?}")),
+        }
     }
 }
 
@@ -385,8 +643,31 @@ mod scenes {
         h.shot("foundation", "welcome");
     }
 
+    /// A second harness on one thread fails with a message, rather than waiting for a
+    /// turn it holds itself.
+    #[test]
+    #[should_panic(expected = "Drop the first one")]
+    fn a_second_harness_on_a_thread_says_so() {
+        let _first = Harness::open(None);
+        let _second = Harness::open(None);
+    }
+
+    /// Two copies of the fixture share nothing, their remotes included.
+    #[test]
+    fn each_copy_of_the_fixture_is_its_own() {
+        let (one, two) = (fixture_repo(), fixture_repo());
+        assert_ne!(one, two);
+        std::fs::write(one.join("poison"), "").expect("write to the first copy");
+        assert!(!two.join("poison").exists());
+        let config = std::fs::read_to_string(two.join(".git/config")).expect("its git config");
+        assert!(
+            !config.contains(one.to_str().expect("a UTF-8 path")),
+            "{config}"
+        );
+    }
+
     /// The real actor loads a real repository through the real event loop, and the
-    /// root layout renders with every lane still a stub.
+    /// root layout renders.
     #[test]
     fn repository_shell() {
         let repo = fixture_repo();

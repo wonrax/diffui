@@ -1,6 +1,6 @@
 //! The diff surface's parity scenes against `shots/iced/scenes.md`, and what can only
 //! be checked with the real element on a real document. Everything goes through the
-//! real root on the fixture; other lanes' panels are stubs until they land.
+//! real root on the fixture.
 
 use std::path::Path;
 
@@ -48,8 +48,6 @@ fn select(h: &mut Harness, repo: &Path, name: &str) {
         session.selected_revision == selection && !session.diff_in_flight()
     });
     h.settle();
-    // The toast layer is a stub until the overlays lane lands, and it occludes the window.
-    h.act(|ui, _| ui.toasts.clear());
 }
 
 fn select_file(h: &mut Harness, path: &str) {
@@ -98,10 +96,6 @@ fn nothing(_: &mut Harness) {}
 
 fn dark(h: &mut Harness) {
     h.perform(Action::SetTheme(ThemePreference::Dark));
-}
-
-fn nowrap(h: &mut Harness) {
-    h.perform(Action::ToggleWrap);
 }
 
 fn split(h: &mut Harness) {
@@ -298,7 +292,7 @@ fn find_states() {
     h.frames();
     h.shot(LANE, "find-no-matches");
     h.act(|ui, cx| {
-        ui.find_on_toggle_regex(cx);
+        ui.find_on_toggle_regex();
         ui.find_on_query_changed("ren(der".to_owned(), cx);
     });
     h.wait_until("the regex error", |ui| {

@@ -85,14 +85,7 @@ fn plain_git() -> &'static Path {
 fn open_fixture() -> Harness {
     let mut h = Harness::open_sized(Some(&render_toolkit()), BASELINE);
     h.wait_for_graph();
-    quiet_toasts(&mut h);
     h
-}
-
-/// The owner's jj CLI differs from the library, which raises a sticky toast, and
-/// the toast layer is still a stub that blocks the pointer and covers the shot.
-fn quiet_toasts(h: &mut Harness) {
-    h.act(|ui, _| ui.toasts.clear());
 }
 
 fn open_second(h: &mut Harness, path: &Path) {
@@ -100,7 +93,6 @@ fn open_second(h: &mut Harness, path: &Path) {
     h.perform(Action::OpenRepo(path.to_string_lossy().into_owned()));
     h.wait_until("the new tab", |ui| ui.tabs.len() == before + 1);
     h.wait_for_graph();
-    quiet_toasts(h);
 }
 
 fn commit_with(h: &mut Harness, description: &str) -> RevisionSelection {
@@ -235,7 +227,6 @@ fn shell_scenes() {
 fn a_plain_git_toolbar_has_no_jj_actions() {
     let mut h = Harness::open_sized(Some(plain_git()), BASELINE);
     h.wait_for_graph();
-    quiet_toasts(&mut h);
     h.shot(LANE, "toolbar-plain-git");
 }
 
@@ -447,7 +438,7 @@ fn confirm_scenes() {
     confirm_scene(&mut h, "confirm-push-refused");
 
     // A bookmark that goes out as asked has nothing to confirm: this push simply
-    // runs. The iced baseline shows the same, despite the scene's name.
+    // runs. The baseline shows the same, despite the scene's name.
     h.perform(Action::Bookmark(crate::bookmarks::BookmarkAction::Push {
         name: "fix/changelog-note".to_owned(),
         remote: None,
@@ -483,7 +474,6 @@ fn confirm_scenes() {
 fn a_confirm_fits_a_narrow_window() {
     let mut h = Harness::open_sized(Some(&render_toolkit()), (640.0, 480.0));
     h.wait_for_graph();
-    quiet_toasts(&mut h);
     h.press("a");
     confirm_scene(&mut h, "narrow-confirm");
 }
@@ -564,7 +554,7 @@ fn menu_scenes() {
         .iter()
         .position(|entry| matches!(entry, MenuEntry::Submenu { label, .. } if label == "Rebase"))
         .expect("the rebase submenu");
-    h.act(|ui, cx| ui.menu_on_hover(vec![rebase], cx));
+    h.act(|ui, _| ui.menu_on_hover(vec![rebase]));
     h.settle();
     h.shot(LANE, "menu-revision-submenu");
     h.perform(Action::DismissMenu);

@@ -705,8 +705,8 @@ pub(crate) fn toast_layer(
                 .fill(),
                 Aligned::glyph(
                     ui::close_button(("toast-close", id as usize), theme.muted_text, theme, cx)
-                        .on_click(Diffui::listen(cx, move |this, _, _, cx| {
-                            this.on_toast_dismiss(id, cx);
+                        .on_click(Diffui::listen(cx, move |this, _, _, _| {
+                            this.on_toast_dismiss(id);
                         })),
                     ui::CLOSE_SIDE,
                 ),
@@ -1072,7 +1072,7 @@ fn activity_header(
         let id = activity.id;
         header = header.cursor_pointer().on_mouse_down(
             MouseButton::Left,
-            Diffui::listen(cx, move |this, _, _, cx| this.on_activity_expand(id, cx)),
+            Diffui::listen(cx, move |this, _, _, _| this.on_activity_expand(id)),
         );
     }
     header.into_any_element()
@@ -1145,6 +1145,17 @@ const POPOVER_LIST_MAX_HEIGHT: f32 = 520.0 + 14.0;
 /// A row's width in the popover: the card less its border and the list's insets.
 const ROW_WIDTH: f32 = POPOVER_WIDTH - 2.0 - 8.0 - 8.0;
 const BLOCK_PAD_X: f32 = 10.0;
+
+#[cfg(test)]
+impl ActivityLog {
+    /// The first row with captured output, for scenes that expand one.
+    pub(crate) fn first_with_output(&self) -> Option<ActivityId> {
+        self.activities
+            .iter()
+            .find(|activity| !activity.detail.is_empty())
+            .map(|activity| activity.id)
+    }
+}
 
 #[cfg(test)]
 mod tests {
