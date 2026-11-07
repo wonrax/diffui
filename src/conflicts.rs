@@ -15,13 +15,16 @@ use diffui_core::{
     ConflictFile, ConflictPick, ConflictResolution, DiffFileStatus, JobId, MergeToolInvocation,
     MutationOp, RevisionSelection, hunk_conflict_region,
 };
-use gpui_kit::{AnyElement, Window};
+use gpui_kit::prelude::*;
+use gpui_kit::{AnyElement, Window, div, px};
 
 use crate::changes::{ChangesMsg, editable};
 use crate::commands::CommandArg;
 use crate::prose::Prose;
-use crate::theme::ThemeSpec;
-use crate::{Action, Diffui, PendingMutation, TabId, TabState, activity, icons};
+use crate::theme::{self, ThemeSpec, text_size};
+use crate::{
+    Action, Diffui, PendingMutation, TabId, TabState, activity, icons, input, typography, ui,
+};
 
 #[derive(Debug, Clone)]
 pub(crate) enum ConflictMsg {
@@ -1014,15 +1017,130 @@ fn file_strip(
     (strip, buttons)
 }
 
-/// Stub: the conflicts view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+/// The marker editor in place of the diff: the file with jj's conflict
+/// markers in the app's editor, and a footer saying how many conflicts are
+/// left in it.
 pub(crate) fn marker_editor(
     ui: &Diffui,
     theme: ThemeSpec,
     window: &mut Window,
     cx: &mut Cx,
 ) -> Option<AnyElement> {
-    None
+    const GAP: f32 = 8.0;
+    let editor = editor_shown(ui)?;
+    let saving = editor.saving.is_some();
+    let mono = ui.config.mono_font;
+    let size = ui.config.code_type.size;
+    let font = ui.config.ui_font;
+    let title = div()
+        .h(px(theme::control::COMPACT))
+        .flex_none()
+        .flex()
+        .items_center()
+        .child(typography::centered(
+            div()
+                .whitespace_nowrap()
+                .text_size(px(text_size::UI))
+                .child(
+                    Prose::new()
+                        .text("Editing ")
+                        .path(editor.path.as_str())
+                        .view(font, mono, theme.text, theme),
+                ),
+            font,
+            text_size::UI,
+        ));
+    let mut spec = input::FieldSpec::new(MARKER_EDITOR_ID, &editor.content);
+    if !saving {
+        let on_input = Diffui::listen(cx, |this, text: &String, _, cx| {
+            this.on_conflict(ConflictMsg::EditorEdited(text.clone()), cx);
+        });
+        spec = spec.on_input(move |text, window, cx| on_input(&text, window, cx));
+    }
+    // The well is ours: kit's own would draw a focus ring the app's inputs don't have.
+    let field = div()
+        .size_full()
+        .bg(theme.panel_background)
+        .border_1()
+        .border_color(theme.border)
+        .rounded(px(theme::radius::CONTROL))
+        .child(
+            input::multi_line(spec, mono, window, cx)
+                .appearance(false)
+                .text_size(px(size))
+                .h_full(),
+        );
+    Some(
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .gap(px(GAP))
+            .py(px(10.0))
+            .px(px(theme::space::XL))
+            .bg(theme.panel_background)
+            .child(title)
+            .child(div().flex_1().min_h_0().w_full().child(field))
+            .child(editor_footer(ui, theme, editor, cx))
+            .into_any_element(),
+    )
+}
+
+/// How many conflicts the edit still holds, Cancel and Save.
+fn editor_footer(ui: &Diffui, theme: ThemeSpec, editor: &MarkerEditor, cx: &mut Cx) -> AnyElement {
+    let font = ui.config.ui_font;
+    let saving = editor.saving.is_some();
+    let hint = match markers_left(&editor.content, editor.marker_len) {
+        0 => "No conflict markers left: saving resolves the file".to_owned(),
+        1 => "1 conflict left: saving keeps it conflicted".to_owned(),
+        n => format!("{n} conflicts left: saving keeps them conflicted"),
+    };
+    let hint = typography::centered(
+        typography::line(hint, font, text_size::UI, theme.subtle_text),
+        font,
+        text_size::UI,
+    );
+    let keyed = |id: &'static str, button: AnyElement, key: &'static str| {
+        div()
+            .id(id)
+            .tooltip(ui::tooltip(key, font, theme))
+            .child(button)
+            .into_any_element()
+    };
+    let mut cancel = ui::cancel_button("marker-cancel", ui::Size::Compact, font, theme, cx);
+    if !saving {
+        cancel = cancel.on_click(Diffui::listen(cx, |this, _, _, cx| {
+            this.on_conflict(ConflictMsg::EditorCancel, cx);
+        }));
+    }
+    let mut save = ui::text_button(
+        "marker-save",
+        None,
+        if saving { "Saving\u{2026}" } else { "Save" },
+        ui::Variant::Primary,
+        ui::Size::Compact,
+        font,
+        theme,
+        cx,
+    );
+    if !saving {
+        save = save.on_click(Diffui::listen(cx, |this, _, _, cx| {
+            this.on_conflict(ConflictMsg::EditorSave, cx);
+        }));
+    }
+    ui::button_row(
+        Some(hint.into_any_element()),
+        [
+            keyed("marker-cancel-tip", cancel.into_any_element(), "Esc"),
+            keyed(
+                "marker-save-tip",
+                save.into_any_element(),
+                "\u{2318}\u{21b5}",
+            ),
+        ],
+    )
+    .flex_none()
+    .into_any_element()
 }
 
 #[cfg(test)]
