@@ -42,8 +42,8 @@ pub(crate) fn start(cx: &mut Cx) {
     let _ = cx;
 }
 
-/// Install the menu bar. Called once the window is open, after winit has put
-/// up its default one.
+/// Install the menu bar. Called once the window is open. Why this isn't GPUI's
+/// `cx.set_menus` is in [`crate::macos_native`].
 pub(crate) fn install(ui: &Diffui) {
     #[cfg(all(target_os = "macos", not(test)))]
     {
