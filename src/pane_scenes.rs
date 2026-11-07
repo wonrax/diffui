@@ -483,3 +483,19 @@ fn frames_through_the_app() {
         |h| app_notify(h, 100),
     );
 }
+
+/// A press on a row and a move past the threshold starts a draft, through raw events
+/// and with the list's pane cached until the press.
+#[test]
+fn a_row_drag_starts_a_draft() {
+    let (mut h, _repo) = open();
+    h.frames();
+    let from = at(IN_LIST.0, 200.0);
+    h.hover_point(from);
+    h.pointer_down(from, gpui_kit::MouseButton::Left);
+    for y in [210.0, 240.0, 330.0] {
+        h.pointer_move(at(IN_LIST.0, y), Some(gpui_kit::MouseButton::Left));
+    }
+    assert!(h.read(|ui| ui.active().op_draft().is_some()), "no draft");
+    h.pointer_up(at(IN_LIST.0, 330.0), gpui_kit::MouseButton::Left);
+}

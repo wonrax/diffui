@@ -34,8 +34,12 @@ pub(crate) struct Scene {
     theme: &'static str,
     config: &'static str,
     open_repo: bool,
-    /// Mid-flight: no settling around the steps.
+    /// Mid-flight: no settling after the steps, and no stale check.
     raw: bool,
+    /// Looks before the first load is done.
+    cold: bool,
+    /// Something on screen moves with time, so two draws can't be compared.
+    animated: bool,
     prepare: fn(&Path),
     steps: fn(&mut Ctx),
 }
@@ -65,6 +69,15 @@ impl Scene {
         self.raw = true;
         self
     }
+    fn cold(mut self) -> Self {
+        self.raw = true;
+        self.cold = true;
+        self
+    }
+    fn animated(mut self) -> Self {
+        self.animated = true;
+        self
+    }
     fn prepare(mut self, prepare: fn(&Path)) -> Self {
         self.prepare = prepare;
         self
@@ -91,6 +104,8 @@ fn s(id: &'static str, _state: &'static str, _steps: &'static str, steps: fn(&mu
         config: "",
         open_repo: true,
         raw: false,
+        cold: false,
+        animated: false,
         prepare: |_| {},
         steps,
     }
@@ -526,7 +541,7 @@ fn all() -> Vec<Scene> {
     }).raw());
     t.add(s("toolbar-source-view", "Toolbar in the Source view: view switcher plus the browsed revision's id and description instead of the repo actions.", "Press the Source segment of the view switcher.", |c| { c.cmd("view.source"); }));
     t.add(s("toolbar-plain-git", "A plain git repository: no jj-only actions (no Undo, no Push), revset placeholder and git graph.", "Open a repository that has .git and no .jj.", |_c| {}).prepare(plain_git));
-    t.add(s("load-cold", "A cold load mid-flight: the list growing or 'Loading revisions…', progress line on the toolbar.", "Open a repository and look immediately.", |c| { c.pump_ms(30); }).raw());
+    t.add(s("load-cold", "A cold load mid-flight: the list growing or 'Loading revisions…', progress line on the toolbar.", "Open a repository and look immediately.", |c| { c.pump_ms(30); }).cold());
 
     t.group("Revision list");
     t.add(s("graph-all", "Revset all(): branching graph, merges, the octopus merge, immutable diamonds, conflict marks, bookmarks, tags, remote bookmarks, divergent ids.", "Type all() in the revset field, Enter.", all_revs));
@@ -1076,6 +1091,31 @@ fn all() -> Vec<Scene> {
             c.key("enter");
             c.pump_ms(1500);
             c.settle();
+            // A real run is this binary started as jj, which under test is the test
+            // runner, so its lines go in by hand: one of each stream.
+            c.h.act(|ui, _| {
+                use diffui_core::cli::{
+                    CliLine,
+                    CliStream::{Stderr, Stdout},
+                };
+                let line = |stream, text: &str| CliLine {
+                    stream,
+                    text: text.to_owned(),
+                };
+                ui.active_mut().cmdline.runs.last_mut().unwrap().lines = vec![
+                    line(Stdout, "Working copy changes:"),
+                    line(Stdout, "A assets/working-copy.png"),
+                    line(Stdout, "D docs/empty-file.txt"),
+                    line(Stdout, "M src/main.rs"),
+                    line(
+                        Stdout,
+                        "Working copy  (@) : lvtsvnkk fa52156f (no description set)",
+                    ),
+                    line(Stderr, "Warning: These bookmarks have conflicts:"),
+                    line(Stderr, "  release/conflicted"),
+                ];
+            });
+            c.settle();
         },
     ));
 
@@ -1091,7 +1131,9 @@ fn all() -> Vec<Scene> {
             c.key("r");
             c.key("j");
             c.key("j");
-            c.key("a");
+            // With a candidate armed the key applies the draft, which is what the
+            // baseline's shot shows; the scene is about the placement.
+            c.act(Action::DraftPlacement(diffui_core::PlacementKind::After));
             c.pump_ms(600);
             c.settle();
         },
@@ -1105,7 +1147,9 @@ fn all() -> Vec<Scene> {
             c.key("r");
             c.key("j");
             c.key("j");
-            c.key("b");
+            // With a candidate armed the key applies the draft, which is what the
+            // baseline's shot shows; the scene is about the placement.
+            c.act(Action::DraftPlacement(diffui_core::PlacementKind::Before));
             c.pump_ms(600);
             c.settle();
         },
@@ -1949,9 +1993,16 @@ fn all() -> Vec<Scene> {
         "A span over rows that aren't connected: 'Not a connected range'.",
         "Click a row, shift-click rows on other branches.",
         |c| {
-            c.select("many-files");
-            c.shift_mark("empty-revision");
-            c.shift_mark("cache-bindings");
+            // The baseline's rows turned out connected. These two skip the one between.
+            let marked = vec![
+                c.commit_of("feature/render-pipeline"),
+                c.commit_of("kitchen-sink"),
+            ];
+            c.h.act(|ui, _| {
+                ui.active_mut().revision_multi_selection = marked;
+                ui.sync_span(true);
+            });
+            c.settle();
         },
     ));
 
@@ -2045,36 +2096,45 @@ fn all() -> Vec<Scene> {
     ));
 
     t.group("Menus (the overlay; macOS shows native NSMenus)");
-    t.add(s("menu-revision", "Revision context menu at a row, row glow. Content and order match the native menu; the look is the non-macOS overlay.", "Right-click a revision row.", |c| { c.right_click(180.0, 180.0); }));
-    t.add(s(
-        "menu-revision-submenu",
-        "The same menu with a flyout open.",
-        "Right-click, hover a submenu row.",
-        |c| {
-            c.right_click(180.0, 180.0);
-            c.open_first_submenu();
-        },
-    ));
-    t.add(s(
-        "menu-revision-immutable",
-        "The menu on an immutable revision. The glow's position is nominal here.",
-        "Right-click main's row.",
-        |c| {
-            c.select("main");
-            c.right_click_selected();
-        },
-    ));
-    t.add(s(
-        "menu-revision-marked",
-        "The menu with several rows marked: batch verbs.",
-        "Mark rows, right-click one.",
-        |c| {
-            c.select("cache-bindings");
-            c.mark("cache-bindings");
-            c.mark("many-files");
-            c.right_click_selected();
-        },
-    ));
+    t.add(s("menu-revision", "Revision context menu at a row, row glow. Content and order match the native menu; the look is the non-macOS overlay.", "Right-click a revision row.", |c| { c.right_click(180.0, 180.0); }).animated());
+    t.add(
+        s(
+            "menu-revision-submenu",
+            "The same menu with a flyout open.",
+            "Right-click, hover a submenu row.",
+            |c| {
+                c.right_click(180.0, 180.0);
+                c.open_first_submenu();
+            },
+        )
+        .animated(),
+    );
+    t.add(
+        s(
+            "menu-revision-immutable",
+            "The menu on an immutable revision. The glow's position is nominal here.",
+            "Right-click main's row.",
+            |c| {
+                c.select("main");
+                c.right_click_selected();
+            },
+        )
+        .animated(),
+    );
+    t.add(
+        s(
+            "menu-revision-marked",
+            "The menu with several rows marked: batch verbs.",
+            "Mark rows, right-click one.",
+            |c| {
+                c.select("cache-bindings");
+                c.mark("cache-bindings");
+                c.mark("many-files");
+                c.right_click_selected();
+            },
+        )
+        .animated(),
+    );
     t.add(s(
         "menu-file",
         "File context menu in the tree.",
@@ -2279,7 +2339,7 @@ fn run(scene: &Scene) -> Result<(), String> {
         repo,
         held: None,
     };
-    if !scene.raw {
+    if !scene.cold {
         c.wait_for_load();
     }
     (scene.steps)(&mut c);
@@ -2287,7 +2347,7 @@ fn run(scene: &Scene) -> Result<(), String> {
         c.settle();
     }
     c.h.shot_now(LANE, scene.id);
-    if scene.raw {
+    if scene.raw || scene.animated {
         return Ok(());
     }
     c.h.same_after_a_refresh()

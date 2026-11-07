@@ -2259,16 +2259,19 @@ impl RevisionList {
         .center_for_baseline(name_baseline);
         let name =
             ellipsis::cut_middle(&file.primary, columns.path_w, FILE_NAME_TEXT_SIZE, primary);
-        paint_centered(
-            &name,
-            columns.path_x,
-            row_mid_y,
-            FILE_NAME_TEXT_SIZE,
-            primary,
-            file.primary_color,
-            window,
-            cx,
-        );
+        // Too narrow for even the ellipsis: nothing, rather than a mark over the stats.
+        if crate::measure::line_width(&name, FILE_NAME_TEXT_SIZE, primary) <= columns.path_w + 1.0 {
+            paint_centered(
+                &name,
+                columns.path_x,
+                row_mid_y,
+                FILE_NAME_TEXT_SIZE,
+                primary,
+                file.primary_color,
+                window,
+                cx,
+            );
+        }
 
         // Status chip, right-aligned in the rightmost column (single-letter
         // labels center within it so mixed labels still line up). An empty

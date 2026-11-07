@@ -455,9 +455,8 @@ fn the_browse_button_opens_the_source_view() {
     select(&mut h, &repo, "kitchen-sink");
     select_file(&mut h, "src/renderer/frame_loop.rs");
     h.frames();
-    // Left of the summary, at the header's height: the `<>` icon. (A file far enough up
-    // that the scroll can park its header at the top.)
-    h.click_point(at(1295.0, 108.0));
+    // Left of the summary, on the header parked under the commit title: the `<>` icon.
+    h.click_point(at(1295.0, 139.0));
     h.settle();
     assert_eq!(h.read(|ui| ui.active().main_view), crate::MainView::Source);
 }

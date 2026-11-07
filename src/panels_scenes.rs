@@ -165,7 +165,10 @@ fn revisions_without_a_description() {
 fn the_revset_field_states() {
     let mut h = open();
     h.perform(Action::SetRevset("none()".to_owned()));
-    h.wait_for_graph();
+    h.wait_until("the empty list", |ui| {
+        let session = &ui.active().session;
+        session.commits.is_empty() && matches!(session.status, crate::LoadStatus::Loaded)
+    });
     shot(&mut h, "revset-empty-result");
     h.click("reset-revset");
     h.wait_for_graph();
