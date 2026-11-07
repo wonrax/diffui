@@ -252,6 +252,18 @@ pub fn centered(content: impl IntoElement, font: Font, size: f32) -> Div {
 pub struct Aligned {
     element: AnyElement,
     line: Line,
+    flex: Flex,
+}
+
+/// How a child of a [`group`] shares the row's width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flex {
+    /// Its own width, always.
+    None,
+    /// All the row has left.
+    Fill,
+    /// Its own width, less what doesn't fit.
+    Shrink,
 }
 
 /// The vertical facts [`baseline_row`] needs about a child.
@@ -281,6 +293,7 @@ impl Aligned {
                 height: padding.top + text.line_height() + padding.bottom,
                 glyph: false,
             },
+            flex: Flex::None,
         }
     }
 
@@ -308,7 +321,22 @@ impl Aligned {
         Self {
             element: wrap(self.element),
             line: self.line,
+            flex: self.flex,
         }
+    }
+
+    /// Takes whatever width its row has left; the row fills its parent. For
+    /// a label that ellipsises before the things after it.
+    pub fn fill(mut self) -> Self {
+        self.flex = Flex::Fill;
+        self
+    }
+
+    /// Keeps its own width until the row runs out, then gives up what doesn't
+    /// fit. What follows stays right after it.
+    pub fn shrink(mut self) -> Self {
+        self.flex = Flex::Shrink;
+        self
     }
 
     /// Fixed horizontal space between two children.
@@ -327,6 +355,7 @@ impl Aligned {
                 height,
                 glyph: true,
             },
+            flex: Flex::None,
         }
     }
 }
@@ -340,7 +369,10 @@ impl Aligned {
 pub fn baseline_row(items: impl IntoIterator<Item = Aligned>, spacing: f32) -> Div {
     let line = group(items, spacing);
     let shift = line.line.height / 2.0 - (line.line.baseline - line.line.cap_height / 2.0);
-    shift_padding(shift).apply(div()).child(line.element)
+    shift_padding(shift)
+        .apply(div())
+        .when(line.flex != Flex::None, |row| row.w_full().min_w_0())
+        .child(line.element)
 }
 
 /// [`baseline_row`] without the centring, as one [`Aligned`] child of an outer
@@ -350,13 +382,29 @@ pub fn group(items: impl IntoIterator<Item = Aligned>, spacing: f32) -> Aligned 
     let items: Vec<Aligned> = items.into_iter().collect();
     let lines: Vec<Line> = items.iter().map(|item| item.line).collect();
     let layout = line_layout(&lines);
-    let mut row = div().flex().flex_row().items_start().gap(px(spacing));
+    let flex = if items.iter().any(|item| item.flex != Flex::None) {
+        Flex::Fill
+    } else {
+        Flex::None
+    };
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap(px(spacing))
+        .when(flex != Flex::None, |row| row.w_full().min_w_0());
     for (item, top) in items.into_iter().zip(&layout.tops) {
-        row = row.child(div().flex_none().pt(px(*top)).child(item.element));
+        let slot = div().pt(px(*top)).child(item.element);
+        row = row.child(match item.flex {
+            Flex::None => slot.flex_none(),
+            Flex::Fill => slot.flex_1().min_w_0().overflow_hidden(),
+            Flex::Shrink => slot.flex_shrink(1.0).min_w_0().overflow_hidden(),
+        });
     }
     Aligned {
         element: row.into_any_element(),
         line: layout.line,
+        flex,
     }
 }
 
