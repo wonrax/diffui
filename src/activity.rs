@@ -13,9 +13,12 @@
 //! Entries are **persistent**: running and finished alike stay until the user
 //! clears them or the app restarts — nothing auto-dismisses.
 
-use crate::Cx;
-use crate::modes::ModeKind;
-use gpui_kit::{AnyElement, Window};
+use crate::theme::{self, Color, Font, Padding, Weight, chip_background, emphasis_font, text_size};
+use crate::typography::{self, Aligned, TextBox};
+use crate::{Action, Cx, ellipsis, icons, input, ui};
+use gpui_kit::component::Sizable as _;
+use gpui_kit::prelude::*;
+use gpui_kit::{AnyElement, Div, MouseButton, Window, div, px, relative};
 use std::time::{Duration, Instant};
 
 use crate::Diffui;
@@ -397,52 +400,751 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
-/// Stub: the activity view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+/// The right-edge toolbar control: a clickable chip that shows the first
+/// running task (spinner + label + `+N`) while work is in flight, or a quiet
+/// "Activity" affordance otherwise. Click → open/close the popover.
 pub(crate) fn activity_indicator(
     ui: &Diffui,
     theme: ThemeSpec,
-    window: &mut Window,
+    _window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    crate::stub::panel("activity::activity_indicator")
+    let mono = ui.config.mono_font;
+    let activities = &ui.active().activities;
+    let running = activities.running_count();
+    let queued = activities.queued_count();
+
+    // Spinner, label and count badges on one baseline (see `crate::typography`).
+    let font = ui.config.ui_font;
+    let badge = |label: String, color: Color| {
+        Aligned::chip(
+            typography::line(label, mono, text_size::BADGE, color),
+            mono,
+            text_size::BADGE,
+            Padding::from([1.0, 5.0]),
+            move |chip| {
+                chip.bg(chip_background(color))
+                    .rounded(px(crate::theme::radius::CONTROL))
+            },
+        )
+    };
+    let body = if let Some(active) = activities.first_running_visible() {
+        let mut chips = vec![
+            Aligned::text(
+                typography::line(
+                    spinner_glyph(active.started),
+                    mono,
+                    text_size::UI,
+                    theme.accent,
+                ),
+                mono,
+                text_size::UI,
+            ),
+            Aligned::text(
+                div()
+                    .whitespace_nowrap()
+                    .text_size(px(text_size::UI))
+                    .child(active.label.view(font, mono, theme.text, theme)),
+                font,
+                text_size::UI,
+            ),
+        ];
+        if running > 1 {
+            chips.push(badge(format!("+{}", running - 1), theme.muted_text));
+        }
+        if queued > 0 {
+            chips.push(badge(format!("{queued} queued"), theme.subtle_text));
+        }
+        typography::baseline_row(chips, 6.0)
+    } else {
+        // Idle: a muted glyph that still opens the popover so finished entries
+        // remain reachable.
+        let glyph = if ui.active().activities.is_empty() {
+            icons::CIRCLE // no activity yet
+        } else {
+            icons::CHECK // idle: everything finished
+        };
+        typography::baseline_row(
+            [
+                Aligned::glyph(
+                    icons::icon(glyph, ui::ICON_SIZE, theme.subtle_text),
+                    ui::ICON_SIZE,
+                ),
+                Aligned::text(
+                    typography::line("Activity", font, text_size::UI, theme.subtle_text),
+                    font,
+                    text_size::UI,
+                ),
+            ],
+            6.0,
+        )
+    };
+
+    ui::button(
+        "activity-indicator",
+        ui::Variant::Ghost,
+        ui::Size::Compact,
+        theme,
+        cx,
+    )
+    .child(body)
+    .on_click(Diffui::on_action(Action::ToggleActivityPopover, cx))
+    .into_any_element()
 }
 
-/// Stub: the activity view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+/// The thin progress line drawn along the toolbar's bottom edge. Tracks the
+/// first running activity (determinate → fractional fill; otherwise a pulsing
+/// accent bar). `diff_loading` lights the line for a transient revision-switch
+/// diff load that isn't a logged activity. A fixed 2px height keeps the toolbar
+/// from shifting when idle.
 pub(crate) fn activity_progress_line(
     ui: &Diffui,
     theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
+    _window: &mut Window,
+    _cx: &mut Cx,
 ) -> AnyElement {
-    crate::stub::panel("activity::activity_progress_line")
+    let line = div().w_full().flex_none().h(px(PROGRESS_LINE_HEIGHT));
+    // Both visuals are held back until the work has run past the display delay,
+    // so short ops don't flash. `loading_since` times the (un-logged)
+    // revision-switch diff load the same way an activity's `started` does.
+    let active = ui.active().activities.first_running_visible();
+    let diff_loading = ui
+        .active()
+        .session
+        .loading_since
+        .is_some_and(|since| since.elapsed() >= ACTIVITY_DISPLAY_DELAY);
+
+    // Determinate fill: only when the running op reports a real total.
+    if let Some(activity) = active {
+        let (loaded, total, determinate) = activity.progress_snapshot();
+        if determinate {
+            let fraction = (loaded as f32 / total as f32).clamp(0.0, 1.0);
+            return line
+                .child(
+                    div()
+                        .h(px(PROGRESS_LINE_HEIGHT))
+                        .w(relative(fraction))
+                        .bg(theme.accent),
+                )
+                .into_any_element();
+        }
+    }
+
+    // Indeterminate (running with no total, or a diff load): a pulsing accent
+    // bar. Opacity oscillates off elapsed time; the toolbar tick re-renders.
+    if active.is_some() || diff_loading {
+        let phase = active.map(|a| a.started.elapsed().as_millis()).unwrap_or(0) as f32 / 1000.0;
+        // 0.30..0.85 sine pulse.
+        let alpha = 0.30 + 0.55 * (0.5 + 0.5 * (phase * std::f32::consts::TAU * 0.8).sin());
+        return line
+            .bg(Color {
+                a: alpha,
+                ..theme.accent
+            })
+            .into_any_element();
+    }
+
+    // Idle: an invisible spacer so the toolbar height is stable.
+    line.into_any_element()
 }
 
-/// Stub: the activity view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+/// The activity popover: a scrim + a top-right card listing every entry. Empty
+/// when closed.
 pub(crate) fn activity_popover(
     ui: &Diffui,
     theme: ThemeSpec,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    crate::stub::overlay(
-        "activity::activity_popover",
-        ui.mode(ModeKind::ActivityPopover).is_some(),
-    )
+    if !ui.activity_popover_open() {
+        return div().into_any_element();
+    }
+    let font = emphasis_font(ui.config.ui_font, Weight::SEMIBOLD);
+    let header = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .child(typography::centered(
+            typography::line("Activity", font, text_size::BODY_LG, theme.text),
+            font,
+            text_size::BODY_LG,
+        ))
+        .child(div().flex_1())
+        .child(clear_button(ui, theme, cx));
+
+    let mut list = div().w_full().flex().flex_col().gap(px(2.0));
+    if ui.active().activities.is_empty() {
+        list = list.child(div().py(px(6.0)).px(px(8.0)).child(typography::line(
+            "No activity yet.",
+            ui.config.ui_font,
+            text_size::UI,
+            theme.subtle_text,
+        )));
+    } else {
+        // Newest first so the latest op is on top.
+        for activity in ui.active().activities.activities.iter().rev() {
+            list = list.child(activity_row(ui, theme, activity, window, cx));
+        }
+    }
+
+    // The card carries no padding of its own so the divider can run edge to
+    // edge; the header/list insets are chosen so the rows' status icons (list
+    // pad 8 + row pad 8) sit exactly under the header text (pad 16). The header
+    // row is one control step tall for the Clear button, whose label (pad 6 +
+    // button pad 10) ends over the durations.
+    let card = theme::popover(div(), theme)
+        .id("activity-popover-card")
+        .w(px(POPOVER_WIDTH))
+        .flex()
+        .flex_col()
+        .overflow_hidden()
+        .occlude()
+        .child(
+            div()
+                .w_full()
+                .pt(px(8.0))
+                .pr(px(6.0))
+                .pb(px(8.0))
+                .pl(px(16.0))
+                .child(header),
+        )
+        .child(crate::root::horizontal_divider(theme))
+        // The list scrolls out to the card's right edge, where the bar sits as in
+        // every scroll view; its right inset moves inside.
+        .child(
+            div()
+                .w_full()
+                .max_h(px(POPOVER_LIST_MAX_HEIGHT))
+                .flex()
+                .flex_col()
+                .pt(px(6.0))
+                .pb(px(8.0))
+                .pl(px(8.0))
+                .child(ui::scrollable(
+                    "activity-list",
+                    div().pr(px(8.0)).child(list),
+                )),
+        );
+
+    // Hang just under the toolbar, its right edge on the toolbar's own edge inset
+    // so the card lines up under the controls that opened it. `occlude` keeps the
+    // wheel and the cursor from reaching the shell underneath.
+    div()
+        .id("activity-popover")
+        .absolute()
+        .inset_0()
+        .occlude()
+        .on_mouse_down(
+            MouseButton::Left,
+            Diffui::on_action(Action::ToggleActivityPopover, cx),
+        )
+        .child(
+            div()
+                .absolute()
+                .top(px(crate::toolbar::chrome_bottom() + theme::space::XS))
+                .right(px(theme::space::MD))
+                .child(card.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())),
+        )
+        .into_any_element()
 }
 
-/// Stub: the activity view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+/// The floating error-toast stack: bottom-right cards for failed operations,
+/// so a failure is visible without the activity popover open. Click a card's ✕
+/// to dismiss; a slow tick prunes the rest after [`crate::TOAST_TTL`].
 pub(crate) fn toast_layer(
     ui: &Diffui,
     theme: ThemeSpec,
+    _window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    if ui.toasts.is_empty() {
+        return div().into_any_element();
+    }
+    let title_font = emphasis_font(ui.config.ui_font, Weight::SEMIBOLD);
+    // Only the stack occludes: it owns the cursor and wheel over its area, while
+    // the rest of the window keeps working.
+    let mut cards = div()
+        .id("toasts")
+        .absolute()
+        .right(px(theme::space::LG))
+        .bottom(px(theme::space::LG))
+        .w(px(380.0))
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .occlude();
+    for toast in &ui.toasts {
+        let id = toast.id;
+        // The error color lives in the glyph + title; the card itself keeps the
+        // shared quiet popover chrome so the stack doesn't read as four screaming
+        // outlines. The title row is the close button's height, so the top and
+        // right insets give up the margin its wash keeps around the glyph: the
+        // warning glyph and the close glyph both sit 14px in from their card edges.
+        let title = typography::baseline_row(
+            [
+                // A warning triangle, deliberately not an ✕: that glyph reads as
+                // a dismiss button, not severity.
+                Aligned::glyph(
+                    icons::icon(icons::ALERT_TRIANGLE, 15.0, theme.removed_text),
+                    15.0,
+                ),
+                Aligned::text(
+                    div()
+                        .w_full()
+                        .text_size(px(text_size::BODY))
+                        .child(toast.title.view(
+                            title_font,
+                            ui.config.mono_font,
+                            theme.removed_text,
+                            theme,
+                        )),
+                    title_font,
+                    text_size::BODY,
+                )
+                .fill(),
+                Aligned::glyph(
+                    ui::close_button(("toast-close", id as usize), theme.muted_text, theme, cx)
+                        .on_click(Diffui::listen(cx, move |this, _, _, cx| {
+                            this.on_toast_dismiss(id, cx);
+                        })),
+                    ui::CLOSE_SIDE,
+                ),
+            ],
+            8.0,
+        );
+        let detail = div()
+            .w_full()
+            .text_size(px(text_size::UI))
+            .child(toast.detail.view(
+                ui.config.ui_font,
+                ui.config.mono_font,
+                theme.muted_text,
+                theme,
+            ));
+        cards = cards.child(
+            theme::popover(div(), theme)
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(5.0))
+                .pt(px(10.0))
+                .pr(px(10.0))
+                .pb(px(12.0))
+                .pl(px(14.0))
+                .child(title)
+                .child(detail),
+        );
+    }
+    cards.into_any_element()
+}
+
+/// A small ghost pill on the title line ("Revert", "Output"), and its width.
+fn pill(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    id: (&'static str, u64),
+    label: &'static str,
+    on_press: Action,
+    cx: &mut Cx,
+) -> (Aligned, f32) {
+    let font = ui.config.ui_font;
+    let padding = typography::trimmed_padding(Padding::from([1.0, 7.0]), font, text_size::CAPTION);
+    let width =
+        ellipsis::text_width(label, text_size::CAPTION, font) + padding.left + padding.right;
+    let button = ui::button(
+        (id.0, id.1 as usize),
+        ui::Variant::Ghost,
+        ui::Size::Compact,
+        theme,
+        cx,
+    )
+    .h_auto()
+    .p(px(0.0))
+    .child(padding.apply(div()).child(typography::line(
+        label,
+        font,
+        text_size::CAPTION,
+        theme.accent,
+    )))
+    .on_click(Diffui::on_action(on_press, cx));
+    let pill = Aligned::boxed(
+        press_stays(button),
+        padding,
+        TextBox::default_line(font, text_size::CAPTION),
+    );
+    (pill, width)
+}
+
+/// A control inside a row that toggles on press: the press is the control's alone.
+fn press_stays(control: impl IntoElement) -> Div {
+    div()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .child(control)
+}
+
+/// The output field of a row. Fields are keyed by a static name, and rows come
+/// and go, so names are shared out once per activity id.
+fn detail_id(id: ActivityId) -> &'static str {
+    thread_local! {
+        static NAMES: std::cell::RefCell<std::collections::HashMap<u64, &'static str>> =
+            Default::default();
+    }
+    NAMES.with(|names| {
+        *names
+            .borrow_mut()
+            .entry(id.0)
+            .or_insert_with(|| Box::leak(format!("activity-detail-{}", id.0).into_boxed_str()))
+    })
+}
+
+fn activity_row(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    activity: &Activity,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    crate::stub::overlay("activity::toast_layer", !ui.toasts.is_empty())
+    let header = activity_header(ui, theme, activity, ROW_WIDTH, window, cx);
+
+    // Expanded: the captured output in a code block under the header: one
+    // read-only editor holding every line, so drag-selection sweeps across lines
+    // and ⌘C copies the sweep. Long lines wrap instead of panning individually.
+    // URLs in the output stay plain selectable text; each one also gets a
+    // one-click link under the buffer.
+    let Some(detail) = activity
+        .detail_editor
+        .as_ref()
+        .filter(|_| activity.expanded)
+    else {
+        return header;
+    };
+    let mono = ui.config.mono_font;
+    let inner = ROW_WIDTH - 8.0 - 8.0 - TITLE_INDENT - 2.0 * BLOCK_PAD_X;
+    let line_height = (text_size::CAPTION * typography::DEFAULT_LINE_HEIGHT).ceil();
+    let lines =
+        crate::measure::wrapped_line_count(detail, text_size::CAPTION, mono, line_height, inner);
+    let field = input::multi_line(
+        input::FieldSpec::new(detail_id(activity.id), detail),
+        mono,
+        window,
+        cx,
+    )
+    .appearance(false)
+    .with_size(gpui_kit::component::Size::XSmall)
+    .text_size(px(text_size::CAPTION))
+    .line_height(px(line_height))
+    .text_color(theme.muted_text)
+    .h(px(lines as f32 * line_height));
+    let mut block = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .py(px(8.0))
+        .px(px(BLOCK_PAD_X))
+        .overflow_hidden()
+        .bg(chip_background(theme.subtle_text))
+        .rounded(px(crate::theme::radius::CONTROL))
+        .child(field);
+    if !activity.urls.is_empty() {
+        let mut links = div().flex().flex_col().gap(px(2.0));
+        for (index, url) in activity.urls.iter().enumerate() {
+            links = links.child(
+                div()
+                    .id(("activity-link", index))
+                    .cursor_pointer()
+                    .on_click(Diffui::on_action(Action::OpenUrl(url.clone()), cx))
+                    .child(typography::line(
+                        url.clone(),
+                        mono,
+                        text_size::CAPTION,
+                        theme.info,
+                    )),
+            );
+        }
+        block = block.child(links);
+    }
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .child(header)
+        .child(
+            div()
+                .w_full()
+                .pt(px(2.0))
+                .pr(px(8.0))
+                .pb(px(8.0))
+                .pl(px(8.0 + TITLE_INDENT))
+                .child(block),
+        )
+        .into_any_element()
 }
+
+/// The row's header: the title line, the command, the result and the
+/// progress bar, `width` wide. A click on it toggles the row open when it
+/// has output, or a line cut short; open, every line shows in full. The
+/// detail sits outside it, so dragging to select text there doesn't
+/// collapse the row.
+fn activity_header(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    activity: &Activity,
+    width: f32,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    let mono = ui.config.mono_font;
+    let ui_font = ui.config.ui_font;
+    let (loaded, total, determinate) = activity.progress_snapshot();
+
+    // What sits right of the title: the counters, the Revert and Output pills,
+    // the timing; each with its width, so the title knows its room.
+    let mut trailing: Vec<(Aligned, f32)> = Vec::new();
+    let caption = |value: String, font: Font, color: Color| {
+        let width = ellipsis::text_width(&value, text_size::CAPTION, font);
+        (
+            Aligned::text(
+                typography::line(value, font, text_size::CAPTION, color),
+                font,
+                text_size::CAPTION,
+            ),
+            width,
+        )
+    };
+    if matches!(activity.status, ActivityStatus::Running) {
+        if determinate {
+            let pct = (loaded * 100 / total.max(1)).min(100);
+            trailing.push(caption(format!("{pct}%"), mono, theme.muted_text));
+        } else if loaded > 0 {
+            // Indeterminate but counting (the jj lazy walk has no known total):
+            // surface the running count.
+            trailing.push(caption(loaded.to_string(), mono, theme.muted_text));
+        }
+    } else if let Some(duration) = activity.duration {
+        // A finished mutation offers a one-click revert of exactly its op
+        // (`jj op revert`). Labelled apart from the toolbar's Undo, which steps
+        // back through the op log instead.
+        if matches!(activity.status, ActivityStatus::Done)
+            && let Some(operation_id) = activity.undo_op.clone()
+        {
+            trailing.push(pill(
+                ui,
+                theme,
+                ("activity-revert", activity.id.0),
+                "Revert",
+                Action::UndoOperation(activity.id, operation_id),
+                cx,
+            ));
+        }
+        // A jj CLI run reopens its output panel.
+        if ui
+            .active()
+            .cmdline
+            .runs
+            .iter()
+            .any(|run| run.activity == activity.id)
+        {
+            trailing.push(pill(
+                ui,
+                theme,
+                ("activity-output", activity.id.0),
+                "Output",
+                Action::CommandLine(crate::cmdline::CmdAction::Output(
+                    crate::cli_output::OutputAction::Open(activity.id),
+                )),
+                cx,
+            ));
+        }
+        trailing.push(caption(
+            format_duration(duration),
+            ui_font,
+            theme.subtle_text,
+        ));
+    }
+
+    // Collapsed, each line is cut to its room; whether any had to be is what makes
+    // the row expandable without output.
+    let text_width = width - 2.0 * ROW_PAD_X - TITLE_INDENT;
+    let trailing_width: f32 = trailing.iter().map(|(_, width)| TRAILING_GAP + width).sum();
+    let title_font = emphasis_font(ui_font, Weight::MEDIUM);
+    let title = activity
+        .label
+        .line(title_font, mono, theme.text, theme, text_size::UI);
+    let result = activity.result.as_deref().map(|result| {
+        crate::prose::Prose::from(result).line(
+            ui_font,
+            mono,
+            theme.muted_text,
+            theme,
+            text_size::UI,
+        )
+    });
+    let cut_short = !title.fits(text_width - trailing_width)
+        || activity.command.as_deref().is_some_and(|command| {
+            !crate::plan::command_fits(ui, theme, command, text_size::CAPTION, text_width)
+        })
+        || result
+            .as_ref()
+            .is_some_and(|result| !result.fits(text_width));
+    let expandable = !activity.detail.is_empty() || cut_short;
+    let open = activity.expanded && expandable;
+    let chevron_width = if expandable {
+        TRAILING_GAP + CHEVRON
+    } else {
+        0.0
+    };
+
+    // The title, the mono counters, the Revert pill and the timing share a
+    // baseline; the status glyph and chevron centre on the caps (see
+    // `crate::typography`).
+    let title = if open {
+        title.wrapped().w_full()
+    } else {
+        title.cut(text_width - trailing_width - chevron_width)
+    };
+    let mut head: Vec<Aligned> = vec![
+        Aligned::glyph(status_icon(activity, theme, mono), STATUS_ICON_BOX),
+        Aligned::gap(8.0),
+        Aligned::text(title, title_font, text_size::UI).fill(),
+    ];
+    for (item, _) in trailing {
+        head.push(Aligned::gap(TRAILING_GAP));
+        head.push(item);
+    }
+    if expandable {
+        let chevron = if open {
+            icons::CHEVRON_UP
+        } else {
+            icons::CHEVRON_DOWN
+        };
+        head.push(Aligned::gap(TRAILING_GAP));
+        head.push(Aligned::glyph(
+            icons::icon(chevron, CHEVRON, theme.subtle_text),
+            CHEVRON,
+        ));
+    }
+    let indented = || div().w_full().pl(px(TITLE_INDENT));
+    let mut header = div()
+        .id(("activity-header", activity.id.0 as usize))
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(3.0))
+        .py(px(6.0))
+        .px(px(ROW_PAD_X))
+        .child(typography::baseline_row(head, 0.0));
+    if let Some(command) = activity.command.as_deref() {
+        header = header.child(indented().child(if open {
+            crate::plan::wrapped_command_line(ui, theme, command, text_size::CAPTION, window, cx)
+        } else {
+            crate::plan::caption_command_line(ui, theme, command, window, cx)
+        }));
+    }
+    if let Some(result) = result {
+        header = header.child(indented().child(if open {
+            result.wrapped().w_full()
+        } else {
+            result.cut(text_width)
+        }));
+    }
+    if matches!(activity.status, ActivityStatus::Running) && determinate {
+        let fraction = (loaded as f32 / total as f32).clamp(0.0, 1.0);
+        header = header.child(
+            indented().pt(px(1.0)).child(
+                div()
+                    .w_full()
+                    .h(px(4.0))
+                    .rounded(px(2.0))
+                    .bg(chip_background(theme.muted_text))
+                    .child(
+                        div()
+                            .h_full()
+                            .w(relative(fraction))
+                            .rounded(px(2.0))
+                            .bg(theme.accent),
+                    ),
+            ),
+        );
+    }
+    if expandable {
+        let id = activity.id;
+        header = header.cursor_pointer().on_mouse_down(
+            MouseButton::Left,
+            Diffui::listen(cx, move |this, _, _, cx| this.on_activity_expand(id, cx)),
+        );
+    }
+    header.into_any_element()
+}
+
+/// Status glyph centered in the fixed [`STATUS_ICON_BOX`] square.
+fn status_icon(activity: &Activity, theme: ThemeSpec, mono: Font) -> AnyElement {
+    match activity.status {
+        ActivityStatus::Queued => mono_glyph("\u{2026}", mono, theme.subtle_text), // … waiting
+        ActivityStatus::Running => mono_glyph(spinner_glyph(activity.started), mono, theme.accent),
+        ActivityStatus::Done => {
+            icons::icon(icons::CHECK, STATUS_ICON_BOX, theme.added_text).into_any_element()
+        }
+        ActivityStatus::Cancelled => mono_glyph("\u{2298}", mono, theme.subtle_text),
+        ActivityStatus::Error => {
+            icons::icon(icons::CLOSE, STATUS_ICON_BOX, theme.removed_text).into_any_element()
+        }
+    }
+}
+
+/// A mono-font glyph boxed like [`icons::icon`] so both glyph sources center
+/// identically.
+fn mono_glyph(glyph: &'static str, mono: Font, color: Color) -> AnyElement {
+    div()
+        .size(px(STATUS_ICON_BOX))
+        .flex()
+        .items_center()
+        .justify_center()
+        .font(mono.gpui())
+        .text_size(px(text_size::UI))
+        .line_height(relative(1.0))
+        .text_color(color)
+        .child(glyph)
+        .into_any_element()
+}
+
+fn clear_button(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> AnyElement {
+    let enabled = ui.active().activities.activities.iter().any(|a| {
+        matches!(
+            a.status,
+            ActivityStatus::Done | ActivityStatus::Cancelled | ActivityStatus::Error
+        )
+    });
+    let color = if enabled {
+        theme.muted_text
+    } else {
+        theme.subtle_text
+    };
+    let mut button = ui::button(
+        "activity-clear",
+        ui::Variant::Ghost,
+        ui::Size::Compact,
+        theme,
+        cx,
+    )
+    .child(typography::line(
+        "Clear",
+        ui.config.ui_font,
+        text_size::UI,
+        color,
+    ));
+    if enabled {
+        button = button.on_click(Diffui::on_action(Action::ClearActivities, cx));
+    }
+    button.into_any_element()
+}
+
+const POPOVER_WIDTH: f32 = 420.0;
+const POPOVER_LIST_MAX_HEIGHT: f32 = 520.0 + 14.0;
+/// A row's width in the popover: the card less its border and the list's insets.
+const ROW_WIDTH: f32 = POPOVER_WIDTH - 2.0 - 8.0 - 8.0;
+const BLOCK_PAD_X: f32 = 10.0;
 
 #[cfg(test)]
 mod tests {
