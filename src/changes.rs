@@ -21,7 +21,9 @@ use diffui_core::{
 };
 
 use crate::commands::CommandArg;
-use crate::diff_view::{CheckState, LineAt, LinePress};
+use crate::diff_view::{
+    ChangeMarks, CheckState, FileMark, HunkMark, HunkMarks, LineAt, LineMode, LinePress,
+};
 use crate::modes::{ModeKind, TabMode};
 use crate::palette::ResultRef;
 use crate::prose::Prose;
@@ -657,6 +659,92 @@ pub(crate) fn command_file(ui: &Diffui, arg: &CommandArg) -> Option<usize> {
 pub(crate) fn command_file_path(ui: &Diffui, arg: &CommandArg) -> Option<String> {
     let index = command_file(ui, arg)?;
     Some(ui.active().session.document.files[index].path.clone())
+}
+
+/// Checkbox marks for the diff view, or `None` when nothing can be picked.
+pub(crate) fn diff_marks(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> Option<ChangeMarks> {
+    let tab = ui.active();
+    if !editable(tab) {
+        return None;
+    }
+    let revision = &tab.session.selected_revision;
+    let picks = tab.changes.picks_for(revision);
+    let files = tab
+        .session
+        .document
+        .files
+        .iter()
+        .map(|file| {
+            let pick = picks.and_then(|picks| picks.get(&file.path));
+            let conflicted = crate::conflicts::is_conflicted(tab, &file.path);
+            let hunks = if !hunk_pickable(file, conflicted) {
+                HunkMarks::None
+            } else if pick.is_none() {
+                HunkMarks::Unpicked
+            } else {
+                HunkMarks::Picked(
+                    (0..file.hunks.len())
+                        .map(|hunk| match tab.changes.hunk_state(revision, file, hunk) {
+                            CheckState::Off => HunkMark::Off,
+                            CheckState::On => HunkMark::On,
+                            CheckState::Partial => HunkMark::Lines(
+                                file.hunks[hunk]
+                                    .lines
+                                    .iter()
+                                    .map(|line| {
+                                        LineRef::of(line).is_some_and(|line| {
+                                            tab.changes.line_picked(revision, file, hunk, line)
+                                        })
+                                    })
+                                    .collect(),
+                            ),
+                        })
+                        .collect(),
+                )
+            };
+            FileMark {
+                state: file_check(file, pick),
+                hunks,
+            }
+        })
+        .collect();
+    let on_press = crate::Diffui::listen(cx, |this, press: &LinePress, _, cx| {
+        this.perform(
+            crate::Action::Changes(ChangesMsg::Lines(LineMsg::Press(*press))),
+            cx,
+        );
+    });
+    let on_paint = crate::Diffui::listen(cx, |this, line: &LineAt, _, cx| {
+        this.perform(
+            crate::Action::Changes(ChangesMsg::Lines(LineMsg::Paint(*line))),
+            cx,
+        );
+    });
+    let lines = live_line_select(tab).map(|mode| LineMode {
+        cursor: mode
+            .cursor
+            .filter(|_| mode.document == tab.session.document_id),
+        reveal: mode.reveal,
+        on_press: std::rc::Rc::new(on_press),
+        on_paint: std::rc::Rc::new(on_paint),
+    });
+    Some(ChangeMarks {
+        files,
+        control: theme.info,
+        on_toggle_file: std::rc::Rc::new(crate::Diffui::listen(cx, |this, file: &usize, _, cx| {
+            this.perform(crate::Action::Changes(ChangesMsg::ToggleFile(*file)), cx);
+        })),
+        on_toggle_hunk: std::rc::Rc::new(crate::Diffui::listen(
+            cx,
+            |this, &(file, hunk): &(usize, usize), _, cx| {
+                this.perform(
+                    crate::Action::Changes(ChangesMsg::ToggleHunk(file, hunk)),
+                    cx,
+                );
+            },
+        )),
+        lines,
+    })
 }
 
 /// The active tab's line-select mode, if it is on and still applies: the

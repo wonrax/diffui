@@ -11,14 +11,14 @@
 //! has typed past it. This keeps regex over large diffs (50k+ lines) from
 //! re-running on every char.
 
-use crate::Cx;
-use gpui_kit::{AnyElement, Window};
+use gpui_kit::prelude::*;
+use gpui_kit::{AnyElement, Window, div, px};
 use regex::{Regex, RegexBuilder};
 use std::time::Duration;
 
-use crate::Diffui;
 use crate::diff_view::FindMatch;
-use crate::theme::ThemeSpec;
+use crate::theme::{self, Font, ThemeSpec, Weight, text_size};
+use crate::{Action, Cx, Diffui, icons};
 use diffui_core::DiffFile;
 
 pub const FIND_INPUT_ID: &str = "find-input";
@@ -212,15 +212,195 @@ const CONTROL: crate::ui::Size = crate::ui::Size::Compact;
 const COUNT_WIDTH: f32 = 56.0;
 const CARD_MAX_WIDTH: f32 = 460.0;
 
-/// Stub: the find view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+/// The find bar pinned to the top-right of the diff viewport. Empty when `find` is
+/// `None`, so it can be unconditionally stacked into the diff panel.
 pub(crate) fn build_overlay(
     ui: &Diffui,
     theme: ThemeSpec,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    crate::stub::panel("find::build_overlay")
+    let Some(state) = ui.active().find() else {
+        return div().into_any_element();
+    };
+
+    let count_label = if state.matches.is_empty() {
+        if state.query.is_empty() {
+            String::new()
+        } else if state.error.is_some() {
+            "\u{2014}".to_owned()
+        } else {
+            "0 of 0".to_owned()
+        }
+    } else {
+        let active = state.active.map(|i| i + 1).unwrap_or(0);
+        format!("{} of {}", active, state.matches.len())
+    };
+
+    // Intentionally no `on_submit`: that would route Enter to FindNext unconditionally and
+    // steal Shift+Enter from the keymap, which is what handles forward/backward.
+    let input = div()
+        .flex_1()
+        .min_w_0()
+        .h(px(CONTROL.height()))
+        .child(crate::field::filter_field(
+            theme,
+            ui.config.ui_font,
+            crate::field::FilterField {
+                id: FIND_INPUT_ID,
+                leading_icon: Some(icons::SEARCH),
+                placeholder: "Find in diff",
+                value: &state.query,
+                on_input: |ui, query, cx| ui.find_on_query_changed(query, cx),
+                on_submit: None,
+                caret: None,
+            },
+            window,
+            cx,
+        ));
+
+    let case_button = toggle_button(
+        "find-case",
+        "Aa",
+        state.case_sensitive,
+        theme,
+        ui.config.ui_font,
+        cx,
+    )
+    .on_click(Diffui::listen(
+        cx,
+        |this, _: &gpui_kit::ClickEvent, _, cx| {
+            this.find_on_toggle_case(cx);
+        },
+    ));
+    let regex_button = toggle_button(
+        "find-regex",
+        ".*",
+        state.regex,
+        theme,
+        ui.config.mono_font,
+        cx,
+    )
+    .on_click(Diffui::listen(
+        cx,
+        |this, _: &gpui_kit::ClickEvent, _, cx| {
+            this.find_on_toggle_regex(cx);
+        },
+    ));
+
+    let nav = |id: &'static str, glyph, action, cx: &mut Cx| {
+        crate::ui::icon_button(id, glyph, theme.muted_text, CONTROL, theme, cx)
+            .on_click(Diffui::on_action(action, cx))
+    };
+    let prev_button = nav("find-prev", icons::CHEVRON_UP, Action::FindPrevious, cx);
+    let next_button = nav("find-next", icons::CHEVRON_DOWN, Action::FindNext, cx);
+    let close_button = nav("find-close", icons::CLOSE, Action::CloseFind, cx);
+    let cluster = || {
+        div()
+            .flex()
+            .flex_row()
+            .flex_none()
+            .items_center()
+            .gap(px(theme::space::XXS))
+    };
+
+    // Every control is one step tall, so the row centers them without help; the count gets
+    // a fixed slot so stepping through matches doesn't nudge the arrows sideways as its
+    // digits change.
+    let bar = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .w_full()
+        .h(px(CONTROL.height()))
+        .gap(px(theme::space::SM))
+        .child(input)
+        .child(cluster().child(case_button).child(regex_button))
+        .child(
+            div()
+                .w(px(COUNT_WIDTH))
+                .flex_none()
+                .flex()
+                .justify_center()
+                .child(crate::typography::centered(
+                    crate::typography::line(
+                        count_label,
+                        ui.config.ui_font,
+                        text_size::CAPTION,
+                        theme.subtle_text,
+                    ),
+                    ui.config.ui_font,
+                    text_size::CAPTION,
+                )),
+        )
+        .child(
+            cluster()
+                .child(prev_button)
+                .child(next_button)
+                .child(close_button),
+        );
+
+    // Floating rounded card hovering over the diff's top-right corner: shares the popover
+    // elevation language so it reads as a transient control, not as pane chrome. A regex
+    // error joins inside the card.
+    let mut card = theme::popover(div(), theme)
+        .id("find-bar")
+        .flex()
+        .flex_col()
+        .gap(px(theme::space::XS))
+        // The field flexes, so the card narrows with the pane instead of clipping its
+        // trailing buttons.
+        .w_full()
+        .max_w(px(CARD_MAX_WIDTH))
+        .p(px(theme::space::SM))
+        .occlude()
+        .child(bar);
+    if let Some(err) = &state.error {
+        card = card.child(crate::typography::line(
+            format!("Regex error: {err}"),
+            ui.config.ui_font,
+            text_size::CAPTION,
+            theme.removed_text,
+        ));
+    }
+
+    // Inset from the pane's top-right corner like the diff's own headers, which also keeps
+    // the card clear of the overlay scrollbar.
+    div()
+        .absolute()
+        .top(px(theme::space::MD))
+        .left(px(crate::diff_view::HEADER_HORIZONTAL_PADDING))
+        .right(px(crate::diff_view::HEADER_HORIZONTAL_PADDING))
+        .flex()
+        .justify_end()
+        .child(card)
+        .into_any_element()
+}
+
+/// A match-option toggle: the toolbar toggles' look, quiet at rest, an accent wash and
+/// accent label while on.
+fn toggle_button(
+    id: &'static str,
+    label: &'static str,
+    on: bool,
+    theme: ThemeSpec,
+    font: Font,
+    cx: &mut Cx,
+) -> gpui_kit::component::button::Button {
+    let side = px(CONTROL.height());
+    let font = theme::emphasis_font(font, Weight::MEDIUM);
+    let mut button = crate::ui::button(id, crate::ui::Variant::Ghost, CONTROL, theme, cx)
+        .size(side)
+        .p(px(0.0));
+    if on {
+        button = button.bg(theme::chip_background(theme.accent));
+    }
+    button.child(crate::typography::line(
+        label,
+        font,
+        text_size::CAPTION,
+        if on { theme.accent } else { theme.muted_text },
+    ))
 }
 
 #[cfg(test)]

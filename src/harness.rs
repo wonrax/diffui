@@ -230,6 +230,17 @@ impl Harness {
         self.settle();
     }
 
+    /// Delivers the frames something asked for (an animation, a deferred scroll), a
+    /// few times over.
+    pub(crate) fn frames(&mut self) {
+        for _ in 0..3 {
+            self.with_window(|window, cx| {
+                window.simulate_next_frame(cx);
+            });
+            self.pump();
+        }
+    }
+
     /// Reads app state.
     pub(crate) fn read<R>(&mut self, read: impl FnOnce(&Diffui) -> R) -> R {
         let app = self.app.clone();

@@ -900,6 +900,51 @@ fn annotation_labels(annotation: &FileAnnotation) -> Vec<AnnotationLabel> {
         .collect()
 }
 
+/// The blame labels of the active tab's source browser.
+fn shown_annotation_labels(ui: &Diffui) -> &[AnnotationLabel] {
+    ui.active()
+        .history
+        .annotation
+        .as_ref()
+        .map_or(&[], |view| view.labels.as_slice())
+}
+
+/// The blame column for the source browser's code view, when annotate is on and the
+/// annotation for the shown file has landed.
+pub(crate) fn source_annotations(
+    ui: &Diffui,
+    cx: &mut crate::Cx,
+) -> Option<crate::diff_view::AnnotationGutter> {
+    let tab = ui.active();
+    if !tab.history.annotate {
+        return None;
+    }
+    let view = tab.history.annotation.as_ref()?;
+    let revision = crate::source_panel::browsed_revision(&tab.source);
+    if view.annotation.revision != revision
+        || tab.source.selected.as_deref() != Some(view.annotation.path.as_str())
+    {
+        return None;
+    }
+    let theme = ui.resolved_theme().spec();
+    Some(crate::diff_view::AnnotationGutter {
+        labels: crate::diff_view::Slice::new(cx.entity(), shown_annotation_labels),
+        width_chars: ANNOTATION_CHARS,
+        on_click: std::rc::Rc::new(Diffui::listen(cx, |this, line: &usize, _, cx| {
+            this.perform(Action::History(HistoryAction::AnnotationClicked(*line)), cx);
+        })),
+        style: crate::diff_view::AnnotationStyle {
+            font: ui.config.ui_font,
+            id: theme.accent,
+            id_rest: theme.subtle_text,
+            author: theme.muted_text,
+            age: theme.subtle_text,
+            hidden: theme.subtle_text,
+            hover: crate::theme::chip_background(theme.muted_text),
+        },
+    })
+}
+
 /// The source info bar's blame status, when there is something to say.
 pub(crate) fn annotation_status(ui: &Diffui) -> Option<(String, bool)> {
     let tab = ui.active();

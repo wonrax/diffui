@@ -1014,6 +1014,118 @@ fn file_strip(
     (strip, buttons)
 }
 
+/// The conflict controls the diff paints: a strip under each conflicted file's header,
+/// and take-a-side buttons on every conflict region's hunk header.
+pub(crate) fn hunk_actions(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    cx: &mut Cx,
+) -> Option<crate::hunk_actions::HunkActions> {
+    use crate::hunk_actions::{Button, Row, Run};
+    let tab = ui.active();
+    if !editable(tab) || editor_shown(ui).is_some() {
+        return None;
+    }
+    let conflicts = tab.changes.conflicts.current(tab)?;
+    let mut files = Vec::new();
+    let mut file_targets = Vec::new();
+    for (index, file) in tab.session.document.files.iter().enumerate() {
+        if let Some(conflict) = conflicts.iter().find(|conflict| conflict.path == file.path) {
+            let (strip, buttons) = file_strip(ui, index, conflict, theme);
+            files.push(strip);
+            file_targets.push((conflict.path.clone(), buttons));
+        }
+    }
+    let all = regions(tab);
+    if all.is_empty() && files.is_empty() {
+        return None;
+    }
+    let font = ui.config.ui_font;
+    let mono = ui.config.mono_font;
+    let focus = focused(tab, &all);
+    let mut rows = Vec::with_capacity(all.len());
+    let mut targets = Vec::with_capacity(all.len());
+    for (index, at) in all.iter().enumerate() {
+        let path = region_path(tab, at);
+        let conflict = conflicts.iter().find(|conflict| conflict.path == path)?;
+        let buttons = picks(conflict)
+            .into_iter()
+            .map(|pick| Button {
+                runs: term_runs(conflict, pick, font, mono, theme),
+            })
+            .collect();
+        rows.push(Row {
+            file: at.file,
+            hunk: at.hunk,
+            focused: focus == Some(index),
+            lead: Some(Run {
+                text: "Take".to_owned(),
+                font,
+                color: theme.muted_text,
+            }),
+            buttons,
+        });
+        targets.push((path.to_owned(), at.region, at.regions, picks(conflict)));
+    }
+    let raised = crate::theme::raised_button_style(theme);
+    Some(crate::hunk_actions::HunkActions {
+        rows,
+        style: crate::hunk_actions::Style {
+            size: crate::theme::text_size::UI,
+            fill: raised.rest.unwrap_or(theme.panel_background),
+            hover_fill: raised.hover,
+            ghost_hover_fill: crate::theme::ghost_button_style(theme).hover,
+            border: theme.border,
+            focus: theme.accent,
+            radius: crate::theme::radius::BUTTON,
+        },
+        on_press: std::rc::Rc::new(Diffui::listen(
+            cx,
+            move |this, &(row, button): &(usize, usize), _, cx| {
+                let (path, region, regions, picks) = &targets[row];
+                let action = resolve(
+                    path,
+                    ConflictResolution::Region {
+                        region: *region,
+                        regions: *regions,
+                        pick: picks[button],
+                    },
+                );
+                this.perform(action, cx);
+            },
+        )),
+        files,
+        on_file_press: std::rc::Rc::new(Diffui::listen(
+            cx,
+            move |this, &(strip, button): &(usize, usize), _, cx| {
+                let (path, buttons) = &file_targets[strip];
+                let action = match buttons[button] {
+                    FileButton::EditMarkers => Action::Changes(ChangesMsg::Conflict(
+                        ConflictMsg::EditMarkers(path.clone()),
+                    )),
+                    FileButton::MergeTool => Action::Changes(ChangesMsg::Conflict(
+                        ConflictMsg::OpenMergeTool(path.clone()),
+                    )),
+                    FileButton::Take(ConflictPick::Side(side)) => {
+                        resolve(path, ConflictResolution::Side(side))
+                    }
+                    FileButton::Take(ConflictPick::Base(base)) => {
+                        resolve(path, ConflictResolution::Base(base))
+                    }
+                };
+                this.perform(action, cx);
+            },
+        )),
+        reveal: focus.map(|index| {
+            (
+                all[index].file,
+                all[index].hunk,
+                tab.changes.conflicts.reveal,
+            )
+        }),
+    })
+}
+
 /// Stub: the conflicts view is the lane's to port (see the iced source).
 #[allow(unused_variables)]
 pub(crate) fn marker_editor(
