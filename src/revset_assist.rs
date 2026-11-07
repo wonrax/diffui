@@ -5,8 +5,15 @@
 
 use crate::Cx;
 use crate::keys::{self as keyboard, Named};
-use gpui_kit::AnyElement;
+use crate::theme::{self, Font, text_size};
+use crate::typography::{self, Aligned};
+use crate::{icons, ui};
 use gpui_kit::Window as GpuiWindow;
+use gpui_kit::prelude::*;
+use gpui_kit::{
+    AnyElement, HighlightStyle, MouseButton, MouseMoveEvent, ScrollHandle, StyledText,
+    UnderlineStyle, div, point, px,
+};
 use std::ops::Range;
 use std::time::Duration;
 
@@ -15,7 +22,7 @@ use diffui_core::completion::Completion;
 use diffui_core::revset::{RevsetError, RevsetMatch, RevsetQuery};
 
 use crate::cmdline::{apply_completion, cursor_after_edit, cursor_after_key, place_caret};
-use crate::palette::ROW_HEIGHT;
+use crate::palette::{RESULTS_INSET, ROW_HEIGHT};
 use crate::theme::ThemeSpec;
 use crate::{Diffui, TabId};
 
@@ -176,9 +183,6 @@ impl Diffui {
         let len = field.completions.len() as i32;
         field.selected = (field.selected as i32 + delta).rem_euclid(len) as usize;
         field.navigated = true;
-        let top = field.selected as f32 * ROW_HEIGHT;
-        let viewport = VISIBLE_ROWS as f32 * ROW_HEIGHT;
-        let y = (top + ROW_HEIGHT - viewport).max(0.0);
     }
 
     pub(crate) fn accept_revset_field(&mut self, index: usize, cx: &mut Cx) {
@@ -370,26 +374,243 @@ fn window(text: &str, span: Range<usize>, room: f32, width: impl Fn(&str) -> f32
     shown(from, to)
 }
 
-/// Stub: the revset_assist view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+/// The completion list under the field, hanging over the top of the list. The
+/// highlight stays in sight as ↑/↓ walk past the fold.
 pub(crate) fn dropdown(
     ui: &Diffui,
     theme: ThemeSpec,
     window: &mut GpuiWindow,
     cx: &mut Cx,
 ) -> Option<AnyElement> {
-    None
+    let field = &ui.active().cmdline.field;
+    if !field.open || field.completions.is_empty() {
+        return None;
+    }
+    let mut list = div().w_full().flex().flex_col().p(px(RESULTS_INSET));
+    for (index, completion) in field.completions.iter().enumerate() {
+        let body = crate::cmdline_view::completion_row(ui, theme, completion, window, cx);
+        list = list.child(
+            div()
+                .id(("revset-row", index))
+                .child(crate::palette::row_shell(
+                    body,
+                    index == field.selected,
+                    theme,
+                    window,
+                    cx,
+                ))
+                .on_mouse_move(
+                    cx.listener(move |this: &mut Diffui, _: &MouseMoveEvent, _, cx| {
+                        if this.active().cmdline.field.selected != index {
+                            this.act(cx, |this, cx| this.cmd_on_field_select(index, cx));
+                        }
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    Diffui::listen(cx, move |this, _, _, cx| {
+                        this.cmd_on_field_accept(index, cx);
+                    }),
+                ),
+        );
+    }
+    let rows = field.completions.len().min(VISIBLE_ROWS);
+    let height = rows as f32 * ROW_HEIGHT + 2.0 * RESULTS_INSET;
+    let selected = field.navigated.then_some(field.selected);
+    let handle = dropdown_scroll(selected, height, window, cx);
+    Some(
+        div()
+            .w_full()
+            .pt(px(theme::space::XXS))
+            .px(px(crate::field::PANEL_TOGGLE_INSET))
+            .child(
+                theme::popover(div(), theme)
+                    .id("revset-dropdown-card")
+                    .w_full()
+                    .h(px(height))
+                    .overflow_hidden()
+                    .occlude()
+                    .child(ui::scrollable_with(DROPDOWN_ID, &handle, list)),
+            )
+            .into_any_element(),
+    )
 }
 
-/// Stub: the revset_assist view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+/// The dropdown's handle, moved just enough to show the row ↑/↓ landed on. Only
+/// when that row changes: the wheel owns the offset otherwise, and a row the
+/// pointer picks is one it can already see.
+fn dropdown_scroll(
+    selected: Option<usize>,
+    viewport: f32,
+    window: &mut GpuiWindow,
+    cx: &mut Cx,
+) -> ScrollHandle {
+    struct Reveal(ScrollHandle, Option<usize>);
+    let entry = window.use_keyed_state("revset-dropdown-scroll", cx, |_, _| {
+        Reveal(ScrollHandle::default(), None)
+    });
+    let handle = entry.read(cx).0.clone();
+    if entry.read(cx).1 != selected {
+        entry.update(cx, |entry, _| entry.1 = selected);
+        if let Some(row) = selected {
+            let current = -f32::from(handle.offset().y);
+            let y = reveal_offset(row, current, viewport);
+            handle.set_offset(point(px(0.0), px(-y)));
+        }
+    }
+    handle
+}
+
+/// The list offset that shows `row`, moving from `current` as little as it can.
+fn reveal_offset(row: usize, current: f32, viewport: f32) -> f32 {
+    let top = RESULTS_INSET + row as f32 * ROW_HEIGHT;
+    let bottom = top + ROW_HEIGHT;
+    if top - RESULTS_INSET < current {
+        (top - RESULTS_INSET).max(0.0)
+    } else if bottom + RESULTS_INSET > current + viewport {
+        bottom + RESULTS_INSET - viewport
+    } else {
+        current
+    }
+}
+
+/// jj's error under the field: the message, the revset with the bad part
+/// underlined, and the way back to the default. The icon hangs in the
+/// field's icon column and the rest starts where the field's text does.
 pub(crate) fn error_strip(
     ui: &Diffui,
     theme: ThemeSpec,
-    window: &mut GpuiWindow,
+    _window: &mut GpuiWindow,
     cx: &mut Cx,
 ) -> Option<AnyElement> {
-    None
+    use crate::field::{LEADING_ICON_INSET, LEADING_ICON_SIZE, LEADING_TEXT_X, PANEL_HEADER_LEAD};
+    let error = shown_error(ui)?;
+    let value = &ui.active().session.revset;
+    let font = ui.config.ui_font;
+    let mono = ui.config.mono_font;
+    let message = typography::baseline_row(
+        [
+            Aligned::glyph(
+                div()
+                    .w(px(LEADING_ICON_SIZE))
+                    .flex()
+                    .justify_center()
+                    .child(icons::icon(icons::ALERT_TRIANGLE, 12.0, theme.removed_text)),
+                12.0,
+            ),
+            Aligned::gap(LEADING_TEXT_X - LEADING_ICON_INSET - LEADING_ICON_SIZE),
+            Aligned::text(
+                div().w_full().text_size(px(text_size::UI)).child(
+                    crate::prose::Prose::from_backticks(&crate::cmdline::sentence(
+                        &error.message,
+                        error.hint.as_deref(),
+                    ))
+                    .view(font, mono, theme.removed_text, theme),
+                ),
+                font,
+                text_size::UI,
+            )
+            .fill(),
+        ],
+        0.0,
+    );
+    let column_inset = LEADING_TEXT_X - LEADING_ICON_INSET;
+    let mut body = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(theme::space::SM))
+        .child(message);
+    if let Some(span) = error.span.clone() {
+        let room = ui.sidebar_width - PANEL_HEADER_LEAD - LEADING_TEXT_X - PANEL_HEADER_LEAD;
+        if let Some(echo) = echo(value, span, room, mono, theme) {
+            body = body.child(div().pl(px(column_inset)).overflow_hidden().child(echo));
+        }
+    }
+    // The way back, beside the only place the error is told.
+    if let Some(reset) = crate::empty_states::reset_button(ui, theme, cx) {
+        // A column stretches its children; the button keeps its own width.
+        body = body.child(div().pl(px(column_inset)).flex().child(reset));
+    }
+    Some(
+        div()
+            .w_full()
+            .pr(px(PANEL_HEADER_LEAD))
+            .pb(px(theme::space::SM))
+            .pl(px(PANEL_HEADER_LEAD + LEADING_ICON_INSET))
+            .child(body)
+            .into_any_element(),
+    )
+}
+
+/// The revset on one line, `span` underlined (or a caret where something is
+/// missing), cut to what fits in `room` around it.
+fn echo(
+    value: &str,
+    span: Range<usize>,
+    room: f32,
+    mono: Font,
+    theme: ThemeSpec,
+) -> Option<AnyElement> {
+    let start = span.start.min(value.len());
+    let end = span.end.min(value.len()).max(start);
+    if !value.is_char_boundary(start) || !value.is_char_boundary(end) {
+        return None;
+    }
+    // Nothing to underline: a caret marks where something is missing.
+    let (line, span) = if start == end {
+        const CARET: &str = "\u{2038}";
+        (
+            format!("{}{CARET}{}", &value[..start], &value[start..]),
+            start..start + CARET.len(),
+        )
+    } else {
+        (value.to_owned(), start..end)
+    };
+    let shown = window(&line, span.clone(), room, |text| {
+        crate::measure::line_width(text, text_size::UI, mono)
+    });
+    let bad = span.start.max(shown.range.start)..span.end.min(shown.range.end);
+    let mut text = String::new();
+    let mut runs: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+    let mut push = |part: &str, style: HighlightStyle| {
+        if !part.is_empty() {
+            runs.push((text.len()..text.len() + part.len(), style));
+            text.push_str(part);
+        }
+    };
+    let plain = HighlightStyle {
+        color: Some(theme.muted_text.into()),
+        ..Default::default()
+    };
+    if shown.lead {
+        push(ELLIPSIS, plain);
+    }
+    push(&line[shown.range.start..bad.start], plain);
+    push(
+        &line[bad.clone()],
+        HighlightStyle {
+            color: Some(theme.removed_text.into()),
+            underline: (end > start).then(|| UnderlineStyle {
+                thickness: px(1.0),
+                color: Some(theme.removed_text.into()),
+                wavy: false,
+            }),
+            ..Default::default()
+        },
+    );
+    push(&line[bad.end..shown.range.end], plain);
+    if shown.trail {
+        push(ELLIPSIS, plain);
+    }
+    Some(
+        div()
+            .whitespace_nowrap()
+            .font(mono.gpui())
+            .text_size(px(text_size::UI))
+            .child(StyledText::new(text).with_highlights(runs))
+            .into_any_element(),
+    )
 }
 
 #[cfg(test)]
