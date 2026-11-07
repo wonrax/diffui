@@ -102,9 +102,15 @@ fn init_keys(cx: &mut App) {
                 app.on_key_pressed(&key, modifiers, consumed, cx)
             })
         });
+        // A field with a selection of its own copies that; otherwise a live diff
+        // selection copies, whichever element holds focus by now.
+        let copied = !taken
+            && !consumed
+            && crate::input::is_copy(&key, modifiers)
+            && crate::diff_view::copy_selection(window, cx);
         // Tab means nothing unless the keymap says so: no walking focus through
         // the buttons, which never hold it here.
-        if taken || key == keys::Key::Named(keys::Named::Tab) {
+        if taken || copied || key == keys::Key::Named(keys::Named::Tab) {
             cx.stop_propagation();
         }
     })

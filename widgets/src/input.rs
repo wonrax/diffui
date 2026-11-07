@@ -116,7 +116,8 @@ pub fn field_takes_key(window: &mut Window, key: &Key, modifiers: Modifiers, cx:
     takes_key(key, modifiers, multi_line)
 }
 
-fn is_copy(key: &Key, modifiers: Modifiers) -> bool {
+/// Whether this is the copy shortcut.
+pub fn is_copy(key: &Key, modifiers: Modifiers) -> bool {
     modifiers.command() && matches!(key.as_ref(), Key::Character("c" | "C"))
 }
 

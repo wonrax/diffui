@@ -20,7 +20,9 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use gpui_kit::prelude::*;
-use gpui_kit::{AnyElement, App, Context, ElementId, Entity, FocusHandle, Window};
+use gpui_kit::{
+    AnyElement, App, Context, ElementId, Entity, FocusHandle, Global, WeakEntity, Window,
+};
 
 use crate::chip::Chip;
 use crate::hunk_actions::HunkActions;
@@ -689,8 +691,35 @@ pub struct DiffView {
     focus: FocusHandle,
 }
 
+/// The diff views alive right now, so the copy shortcut can reach a selection
+/// from wherever focus has gone since it was made.
+#[derive(Default)]
+struct LiveViews(Vec<WeakEntity<DiffView>>);
+
+impl Global for LiveViews {}
+
+/// Copies the selection of whichever diff view holds one, wherever focus is: GPUI
+/// runs a key listener only on the focused element's path, and a selection outlives
+/// the diff's focus (the palette, the find field). Says whether anything was copied.
+pub fn copy_selection(window: &mut Window, cx: &mut App) -> bool {
+    let live = cx.default_global::<LiveViews>();
+    live.0.retain(|view| view.upgrade().is_some());
+    let views = live.0.clone();
+    let selected = views
+        .iter()
+        .filter_map(WeakEntity::upgrade)
+        .find_map(|view| view.read(cx).copy(cx));
+    let Some((text, callback)) = selected else {
+        return false;
+    };
+    callback(&text, window, cx);
+    true
+}
+
 impl DiffView {
     fn new(cx: &mut Context<Self>) -> Self {
+        let weak = cx.weak_entity();
+        cx.default_global::<LiveViews>().0.push(weak);
         Self {
             props: None,
             state: State::default(),

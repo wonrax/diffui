@@ -633,6 +633,59 @@ fn a_drag_ending_on_a_header_selects_no_further_than_the_nearest_row() {
     }
 }
 
+/// A live selection copies wherever focus went after it was made, and a field holding
+/// a selection of its own still copies that.
+#[test]
+fn copy_takes_a_live_selection_after_the_diff_lost_focus() {
+    let (mut h, repo) = open_sized((1440.0, 900.0));
+    select(&mut h, &repo, "kitchen-sink");
+    select_file(&mut h, "src/main.rs");
+    let clear = |h: &mut Harness| {
+        h.with_window(|_, cx| {
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("old".to_owned()))
+        })
+    };
+    let clipboard = |h: &mut Harness| {
+        h.with_window(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()))
+            .unwrap_or_default()
+    };
+    h.drag(at(800.0, 300.0), at(1000.0, 400.0));
+    h.frames();
+    clear(&mut h);
+    h.press("cmd-c");
+    h.settle();
+    let selected = clipboard(&mut h);
+    assert_ne!(selected, "old", "the plain case copies");
+
+    // Through the palette and back.
+    clear(&mut h);
+    h.press("cmd-k");
+    h.settle();
+    h.press("escape");
+    h.settle();
+    h.press("cmd-c");
+    h.settle();
+    assert_eq!(clipboard(&mut h), selected, "after the palette");
+
+    // From the empty find field.
+    clear(&mut h);
+    h.press("cmd-f");
+    h.settle();
+    h.press("cmd-c");
+    h.settle();
+    assert_eq!(clipboard(&mut h), selected, "from an empty find field");
+
+    // A selection in the field wins over the diff's.
+    h.type_text("render");
+    h.settle();
+    h.press("cmd-a");
+    h.settle();
+    clear(&mut h);
+    h.press("cmd-c");
+    h.settle();
+    assert_eq!(clipboard(&mut h), "render", "the field's own selection");
+}
+
 /// A selection in a split column stays in that column, from text and from a padded side.
 #[test]
 fn split_selection_holds_its_column() {

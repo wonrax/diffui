@@ -10,9 +10,8 @@ use std::time::Instant;
 
 use gpui_kit::{
     App, Bounds, Context, CursorStyle, DispatchPhase, Element, ElementId, Entity, GlobalElementId,
-    Hitbox, HitboxBehavior, InspectorElementId, IntoElement, KeyDownEvent, LayoutId, Modifiers,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollEvent, Style, Window,
-    px, relative,
+    Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId, Modifiers, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollEvent, Style, Window, px, relative,
 };
 
 use super::layout::{
@@ -1115,7 +1114,7 @@ impl DiffView {
     }
 
     /// Selection's text under the view's current state, for the copy shortcut.
-    fn copy(&self, cx: &App) -> Option<(String, Callback<String>)> {
+    pub(super) fn copy(&self, cx: &App) -> Option<(String, Callback<String>)> {
         let props: &DiffProps = self.props.as_ref()?;
         let callback = props.on_copy.clone()?;
         let view = View::read(props, cx);
@@ -1242,21 +1241,6 @@ impl Element for DiffElement {
                 return;
             }
             DiffView::handle(&entity, window, cx, |_, state, _| state.on_release());
-        });
-
-        let entity = self.view.clone();
-        window.on_key_event(move |event: &KeyDownEvent, phase, window, cx| {
-            if phase != DispatchPhase::Bubble {
-                return;
-            }
-            let keystroke = &event.keystroke;
-            if !keystroke.modifiers.secondary(cx) || !keystroke.key.eq_ignore_ascii_case("c") {
-                return;
-            }
-            if let Some((text, callback)) = entity.read(cx).copy(cx) {
-                callback(&text, window, cx);
-                cx.stop_propagation();
-            }
         });
     }
 }
