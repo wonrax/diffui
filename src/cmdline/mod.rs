@@ -28,6 +28,7 @@ use crate::palette;
 use crate::{Action, Diffui, MainView, TabId};
 
 mod plan;
+pub(crate) use plan::sentence;
 
 pub(crate) use plan::{PlanState, ResolvedView, Run};
 
