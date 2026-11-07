@@ -146,7 +146,14 @@ impl Diffui {
         if self.app_focused {
             return;
         }
-        // GPUI has no bounce-the-dock call; activating is the closest it offers.
+        // Only a bounce on macOS: activating would hand the password field whatever
+        // the user is typing in the app they switched to. GPUI has no such call.
+        #[cfg(target_os = "macos")]
+        {
+            let _ = cx;
+            crate::macos_native::request_attention();
+        }
+        #[cfg(not(target_os = "macos"))]
         self.with_window(cx, |window, _| window.activate_window());
     }
 

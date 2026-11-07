@@ -20,6 +20,15 @@ use objc2_foundation::{
 };
 use objc2_quartz_core::{CABasicAnimation, CALayer, CAMediaTiming, CATransaction};
 
+/// Bounces the Dock icon once, leaving focus with whichever app has it.
+pub fn request_attention() {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    NSApplication::sharedApplication(mtm)
+        .requestUserAttention(objc2_app_kit::NSRequestUserAttentionType::InformationalRequest);
+}
+
 /// Show the system directory picker and return the selected working-copy path.
 pub fn choose_repository_folder() -> Option<String> {
     let mtm = MainThreadMarker::new()?;
