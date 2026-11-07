@@ -48,6 +48,7 @@ mod palette;
 mod path_browse;
 mod plan;
 mod range;
+mod revision_rows;
 mod revops;
 mod revset_assist;
 mod root;

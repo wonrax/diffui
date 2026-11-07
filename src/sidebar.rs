@@ -2,7 +2,6 @@ use crate::Cx;
 use crate::Diffui;
 use crate::chip::{self, Chip};
 use crate::config::AppConfig;
-use crate::graph_layout::GraphLayout;
 use crate::graph_view::{self, RevisionGraphStyle};
 use crate::icons;
 use crate::measure;
@@ -74,7 +73,7 @@ pub(crate) const COMMIT_ID_CHARS: usize = 8;
 /// tint over the panel, so "a draft is in progress" reads from anywhere in
 /// the pane — not just the op bar. Also fed to the revision list's own
 /// background fill (the widget paints over the container).
-fn draft_panel_background(theme: ThemeSpec) -> Color {
+pub(crate) fn draft_panel_background(theme: ThemeSpec) -> Color {
     theme::mix(theme.panel_background, theme.accent, 0.05)
 }
 
@@ -131,20 +130,6 @@ fn thousands(n: usize) -> String {
     out
 }
 
-/// One list row's inputs: its commit data, where its lanes live, and how it
-/// relates to the loaded graph.
-struct RowSlot<'a> {
-    commit: RowView<'a>,
-    layout: &'a GraphLayout,
-    /// The row's index in `layout` (and in the list).
-    row: usize,
-    unique_len: Option<usize>,
-    /// The loaded row this row aims at as a draft destination.
-    target: Option<usize>,
-    /// What the previewed operation does to it, while a preview is drawn.
-    preview: Option<diffui_core::PreviewRow>,
-}
-
 /// Bookmark chips for a revision row, wearing `lane_color`. Shared with the
 /// source browser's revision-header row so both rails style identically.
 ///
@@ -157,7 +142,7 @@ struct RowSlot<'a> {
 /// sharing the rail. Remotes render outlined (transparent fill + 1px
 /// lane-color border) so they read as "tracking" rather than "live".
 /// The graph's lane colours for `theme`.
-fn revision_graph_style(theme: ThemeSpec) -> RevisionGraphStyle {
+pub(crate) fn revision_graph_style(theme: ThemeSpec) -> RevisionGraphStyle {
     RevisionGraphStyle {
         lane_base_color: theme.lane_base,
         missing_color: theme.subtle_text,
@@ -380,7 +365,7 @@ pub(crate) fn truncate_end(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 
-fn commit_description_color(commit: RowView, theme: ThemeSpec) -> Color {
+pub(crate) fn commit_description_color(commit: RowView, theme: ThemeSpec) -> Color {
     if commit.has_description() {
         return theme.text;
     }
