@@ -64,15 +64,16 @@
                 let
                   base = baseNameOf path;
                 in
-                base != "target" && base != "result" && base != ".direnv";
+                !builtins.elem base [
+                  "target"
+                  "result"
+                  ".direnv"
+                  ".jj"
+                ];
             };
 
             cargoLock = {
               lockFile = ./Cargo.lock;
-              # iced is pulled from git in Cargo.toml; let nix fetch by the
-              # commits already pinned in Cargo.lock instead of forcing us to
-              # maintain an outputHashes table.
-              allowBuiltinFetchGit = true;
             };
 
             nativeBuildInputs = [
@@ -144,7 +145,7 @@
           # on PATH too, so the bare name resolves.
           #
           # `startupWMClass` must match the Wayland `app_id` / X11 `WM_CLASS`
-          # the window actually reports, which is set in `src/chrome.rs`. That's
+          # the window actually reports, which is set in `src/root.rs`. That's
           # what lets a compositor tie a live window back to this entry, so the
           # taskbar and alt-tab pick up the name and icon from here rather than
           # showing an anonymous window.
@@ -289,10 +290,7 @@
                 fi
                 unset apple_ld
               ''
-              + ''
-                export ICED_BACKEND="''${ICED_BACKEND:-wgpu}"
-                export WGPU_POWER_PREF="''${WGPU_POWER_PREF:-none}"
-              '';
+;
           };
 
           formatter = pkgs.nixfmt;
