@@ -118,6 +118,56 @@ fn names(renders: Renders) -> Vec<&'static str> {
     .collect()
 }
 
+/// A file's text and its highlighting arrive after the diff does, a file at a time
+/// as the diff shows them. They redraw the diff's pane, not the lists beside it,
+/// and leave nothing stale.
+#[test]
+fn highlighting_redraws_the_diff_alone() {
+    let (mut h, repo) = open();
+    select(&mut h, &repo, "kitchen-sink");
+    let highlighted = |ui: &crate::Diffui| {
+        let session = &ui.active().session;
+        session.highlight_in_flight == 0
+            && session
+                .document
+                .files
+                .iter()
+                .flat_map(|file| &file.hunks)
+                .flat_map(|hunk| &hunk.lines)
+                .any(|line| !line.syntax.is_empty())
+    };
+    h.wait_until("the first highlighting", highlighted);
+    // Highlight again from scratch, with nothing drawn yet, so every read and
+    // result lands from here on.
+    h.with_app(|ui| {
+        let session = &mut ui.active_mut().session;
+        for line in session
+            .document
+            .files
+            .iter_mut()
+            .flat_map(|file| &mut file.hunks)
+            .flat_map(|hunk| &mut hunk.lines)
+        {
+            line.syntax.clear();
+        }
+        let document_id = session.document_id;
+        session.reset_highlights(document_id);
+        ui.spawn_highlights(document_id);
+    });
+    let before = renders(&mut h);
+    h.wait_until("the highlighting", highlighted);
+    h.settle();
+    h.frames();
+    let delta = renders(&mut h) - before;
+    assert!(delta.main > 0, "the diff redrew: {delta:?}");
+    assert_eq!(
+        (delta.tab_bar, delta.left, delta.files),
+        (0, 0, 0),
+        "{delta:?}"
+    );
+    h.same_after_a_refresh().unwrap();
+}
+
 /// A wheel tick over the diff draws the diff, and no other region runs.
 #[test]
 fn a_diff_scroll_leaves_the_other_panes_alone() {

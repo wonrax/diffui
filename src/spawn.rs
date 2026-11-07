@@ -36,13 +36,37 @@ impl Diffui {
         cx: &mut Cx,
         done: impl FnOnce(&mut Diffui, T, &mut Cx) + 'static,
     ) {
+        Self::run_async_in(future, false, cx, done);
+    }
+
+    /// [`Diffui::run_async`] for a result only the main pane shows: `done` runs
+    /// in [`Diffui::act_on_main`].
+    pub(crate) fn run_async_on_main<T: Send + 'static>(
+        future: impl Future<Output = T> + Send + 'static,
+        cx: &mut Cx,
+        done: impl FnOnce(&mut Diffui, T, &mut Cx) + 'static,
+    ) {
+        Self::run_async_in(future, true, cx, done);
+    }
+
+    fn run_async_in<T: Send + 'static>(
+        future: impl Future<Output = T> + Send + 'static,
+        main_only: bool,
+        cx: &mut Cx,
+        done: impl FnOnce(&mut Diffui, T, &mut Cx) + 'static,
+    ) {
         let handle = runtime().spawn(future);
         cx.spawn(async move |this, cx| {
             let Ok(output) = handle.await else {
                 return;
             };
             let _ = this.update(cx, |this, cx| {
-                this.act(cx, |this, cx| done(this, output, cx));
+                let done = |this: &mut Diffui, cx: &mut Cx| done(this, output, cx);
+                if main_only {
+                    this.act_on_main(cx, done);
+                } else {
+                    this.act(cx, done);
+                }
             });
         })
         .detach();

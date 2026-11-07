@@ -241,6 +241,33 @@ impl Diffui {
         })
     }
 
+    /// [`Diffui::act`] for a change that only the main pane shows, such as a
+    /// file's text or highlighting arriving for the diff: the other panes keep
+    /// their last frame. Rebuilding all of them costs several milliseconds in a
+    /// real window, and these changes land while the diff scrolls. Anything
+    /// another pane reads must go through [`Diffui::act`] instead, or that pane
+    /// goes stale.
+    pub(crate) fn act_on_main<R>(
+        &mut self,
+        cx: &mut Cx,
+        change: impl FnOnce(&mut Self, &mut Cx) -> R,
+    ) -> R {
+        frame_log::time(std::any::type_name_of_val(&change), || {
+            let out = change(self, cx);
+            self.reconcile(cx);
+            self.notify_panes(cx, |panes| &panes.main);
+            out
+        })
+    }
+
+    /// Redraws one pane, or the whole window before the panes exist.
+    pub(crate) fn notify_panes(&self, cx: &mut Cx, pane: impl Fn(&Panes) -> &Entity<Pane>) {
+        match &self.panes {
+            Some(panes) => pane(panes).update(cx, |_, cx| cx.notify()),
+            None => cx.notify(),
+        }
+    }
+
     /// A listener that runs `change` inside [`Diffui::act`].
     pub(crate) fn listen<E: 'static>(
         cx: &mut Cx,
@@ -311,12 +338,16 @@ impl Diffui {
         let work_in_flight = active.session.loading_since.is_some()
             || active.session.diff_in_flight()
             || active.activities.any_running();
+        // Only the toolbar draws progress, and the activity log floats over it.
         sync_ticker(
             &mut self.background.loading,
             work_in_flight,
             Duration::from_millis(120),
             cx,
-            |_, cx| cx.notify(),
+            |this, cx| {
+                this.notify_panes(cx, |panes| &panes.toolbar);
+                this.notify_panes(cx, |panes| &panes.floats);
+            },
         );
 
         // The overlay menu's fixed clock: the trajectory apex and the sweep stall.
@@ -329,10 +360,10 @@ impl Diffui {
             |this, cx| this.act(cx, |this, _| this.menu_on_tick()),
         );
 
-        // Prunes expired error toasts; only while any are up.
+        // Prunes expired error toasts; only while one that expires is up.
         sync_ticker(
             &mut self.background.toasts,
-            !self.toasts.is_empty(),
+            self.toasts.iter().any(|toast| !toast.sticky),
             Duration::from_millis(500),
             cx,
             |this, cx| this.act(cx, |this, _| this.on_toast_tick()),
@@ -451,12 +482,25 @@ fn repository_loop(spec: OpenSpec, cx: &mut Cx) -> Task<()> {
             while let Some(Some(next)) = events.next().now_or_never() {
                 batch.push(next);
             }
+            // A file's text read for highlighting changes nothing the other panes
+            // show, and these arrive one per file as the diff scrolls.
+            let main_only = batch.iter().all(|event| {
+                matches!(
+                    event.payload,
+                    diffui_core::repo::Payload::FilePairRead { .. }
+                )
+            });
             let updated = this.update(cx, |this, cx| {
-                this.act(cx, |this, cx| {
+                let apply = |this: &mut Diffui, cx: &mut Cx| {
                     for event in batch {
                         this.on_repo_event(event, cx);
                     }
-                });
+                };
+                if main_only {
+                    this.act_on_main(cx, apply);
+                } else {
+                    this.act(cx, apply);
+                }
             });
             if updated.is_err() {
                 return;
