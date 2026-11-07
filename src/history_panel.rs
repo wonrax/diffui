@@ -25,7 +25,7 @@ use diffui_core::history::{
 };
 use diffui_core::{DiffDocument, JobId, MutationOp, RevisionDetails, RevisionSelection, Vcs};
 
-use crate::diff_view::AnnotationLabel;
+use crate::diff_view::{AnnotationLabel, DiffProps, DocSource};
 use crate::ellipsis::{Line, Span};
 use crate::prose::Prose;
 use crate::revision_list::{
@@ -34,7 +34,8 @@ use crate::revision_list::{
     SMALL_TEXT_SIZE,
 };
 use crate::theme::{
-    Color, Font, ThemeSpec, Weight, chip_background, emphasis_font, radius, space, text_size,
+    Color, Font, ThemeSpec, Weight, chip_background, diff_palette, emphasis_font, radius, space,
+    text_size,
 };
 use crate::typography::{self, Aligned};
 use crate::{
@@ -101,7 +102,6 @@ pub(crate) enum HistoryAction {
     RevertOperation(String),
     /// Show a (visible) commit in the diff view.
     OpenRevision(String),
-    DiffScrolled(f32),
     /// The history diff scrolled onto another file.
     DiffFileChanged(usize),
     /// Narrow the graph to the revisions that touched `path`, up to
@@ -251,7 +251,7 @@ impl Diffui {
                     if let Some(index) = history.selected_change {
                         return {
                             self.enter_history_view(cx);
-                            self.history_select_change(tab, index, cx);
+                            self.history_select_change(tab, index);
                         };
                     }
                 }
@@ -271,11 +271,11 @@ impl Diffui {
                 let job = JobId::next();
                 history.evolog_job = Some(job);
                 self.enter_history_view(cx);
-                self.history_send(tab, job, HistoryRequest::Evolog { revision }, cx);
+                self.history_send(tab, job, HistoryRequest::Evolog { revision });
                 {}
             }
             HistoryAction::Reload => match self.active().history.kind.clone() {
-                HistoryKind::OpLog => self.reload_op_log(tab, cx),
+                HistoryKind::OpLog => self.reload_op_log(tab),
                 HistoryKind::Evolog { revision, .. } => {
                     self.perform_history(HistoryAction::ShowEvolog(revision), cx)
                 }
@@ -283,26 +283,25 @@ impl Diffui {
             HistoryAction::LoadMoreOperations => {
                 let history = &mut self.active_mut().history;
                 history.ops_limit += OP_LOG_PAGE;
-                self.reload_op_log(tab, cx)
+                self.reload_op_log(tab)
             }
-            HistoryAction::SelectOperation(id) => self.history_select_operation(tab, id, cx),
+            HistoryAction::SelectOperation(id) => self.history_select_operation(tab, id),
             HistoryAction::ToggleSnapshotRun(id) => {
                 let runs = &mut self.active_mut().history.expanded_runs;
                 if !runs.remove(&id) {
                     runs.insert(id);
                 }
             }
-            HistoryAction::SelectChange(index) => self.history_select_change(tab, index, cx),
-            HistoryAction::SelectVersion(index) => self.history_select_version(tab, index, cx),
+            HistoryAction::SelectChange(index) => self.history_select_change(tab, index),
+            HistoryAction::SelectVersion(index) => self.history_select_version(tab, index),
             HistoryAction::SetEvologDiff(mode) => {
                 self.active_mut().history.evolog_diff = mode;
-                match self.active().history.selected_version {
-                    Some(index) => self.history_select_version(tab, index, cx),
-                    None => {}
+                if let Some(index) = self.active().history.selected_version {
+                    self.history_select_version(tab, index)
                 }
             }
-            HistoryAction::RestoreOperation(id) => self.confirm_operation(tab, id, true, cx),
-            HistoryAction::RevertOperation(id) => self.confirm_operation(tab, id, false, cx),
+            HistoryAction::RestoreOperation(id) => self.confirm_operation(tab, id, true),
+            HistoryAction::RevertOperation(id) => self.confirm_operation(tab, id, false),
             HistoryAction::OpenRevision(commit_id) => {
                 let selection = self.active().session.canonical_selection(&commit_id);
                 {
@@ -310,19 +309,17 @@ impl Diffui {
                     self.perform(Action::SelectRevision(selection), cx);
                 }
             }
-            HistoryAction::DiffScrolled(offset) => {
-                self.active_mut().history.diff_scroll = offset;
-            }
             HistoryAction::DiffFileChanged(index) => {
                 self.active_mut().history.diff_file = index;
             }
             HistoryAction::FileHistory { revision, path } => {
                 self.show_file_history(revision, path, cx)
             }
-            HistoryAction::CurrentFileHistory => match current_file(self) {
-                Some((revision, path)) => self.show_file_history(revision, path, cx),
-                None => {}
-            },
+            HistoryAction::CurrentFileHistory => {
+                if let Some((revision, path)) = current_file(self) {
+                    self.show_file_history(revision, path, cx)
+                }
+            }
             HistoryAction::ClearFileFilter => {
                 let Some(filter) = self.active_mut().history.file_filter.take() else {
                     return;
@@ -350,18 +347,15 @@ impl Diffui {
                         .visible
                         .then(|| (origin.commit_id.clone(), view.annotation.path.clone()))
                 });
-                match target {
-                    Some((commit_id, path)) => {
-                        // Already showing that revision: no new diff will
-                        // land, so jump in the one on screen.
-                        let session = &self.active().session;
-                        let seen = (session.selected_revision
-                            != session.canonical_selection(&commit_id))
-                        .then_some(session.document_id);
-                        self.active_mut().history.blame_jump = Some((path, seen));
-                        self.perform_history(HistoryAction::OpenRevision(commit_id), cx)
-                    }
-                    None => {}
+                if let Some((commit_id, path)) = target {
+                    // Already showing that revision: no new diff will
+                    // land, so jump in the one on screen.
+                    let session = &self.active().session;
+                    let seen = (session.selected_revision
+                        != session.canonical_selection(&commit_id))
+                    .then_some(session.document_id);
+                    self.active_mut().history.blame_jump = Some((path, seen));
+                    self.perform_history(HistoryAction::OpenRevision(commit_id), cx)
                 }
             }
         }
@@ -388,7 +382,7 @@ impl Diffui {
         self.sync_history_for(tab, cx)
     }
 
-    fn reload_op_log(&mut self, tab: TabId, cx: &mut Cx) {
+    fn reload_op_log(&mut self, tab: TabId) {
         let Some(state) = self.tab_mut(tab) else {
             return;
         };
@@ -408,16 +402,16 @@ impl Diffui {
         }
         let limit = history.ops_limit;
         if let Some(old) = cancel {
-            self.send(tab, diffui_core::Command::Cancel { job: old }, cx);
+            self.send(tab, diffui_core::Command::Cancel { job: old });
         }
-        self.history_send(tab, job, HistoryRequest::OpLog { limit }, cx);
+        self.history_send(tab, job, HistoryRequest::OpLog { limit });
     }
 
-    fn history_send(&mut self, tab: TabId, job: JobId, request: HistoryRequest, cx: &mut Cx) {
-        self.send(tab, diffui_core::Command::History { job, request }, cx)
+    fn history_send(&mut self, tab: TabId, job: JobId, request: HistoryRequest) {
+        self.send(tab, diffui_core::Command::History { job, request })
     }
 
-    fn history_select_operation(&mut self, tab: TabId, id: String, cx: &mut Cx) {
+    fn history_select_operation(&mut self, tab: TabId, id: String) {
         let Some(state) = self.tab_mut(tab) else {
             return;
         };
@@ -432,15 +426,10 @@ impl Diffui {
         history.error = None;
         let job = JobId::next();
         history.op_job = Some(job);
-        self.history_send(
-            tab,
-            job,
-            HistoryRequest::ShowOperation { operation_id: id },
-            cx,
-        )
+        self.history_send(tab, job, HistoryRequest::ShowOperation { operation_id: id })
     }
 
-    fn history_select_change(&mut self, tab: TabId, index: usize, cx: &mut Cx) {
+    fn history_select_change(&mut self, tab: TabId, index: usize) {
         let Some(state) = self.tab_mut(tab) else {
             return;
         };
@@ -454,10 +443,10 @@ impl Diffui {
             return;
         };
         history.selected_change = Some(index);
-        self.history_load_diff(tab, target, cx)
+        self.history_load_diff(tab, target)
     }
 
-    fn history_select_version(&mut self, tab: TabId, index: usize, cx: &mut Cx) {
+    fn history_select_version(&mut self, tab: TabId, index: usize) {
         let Some(state) = self.tab_mut(tab) else {
             return;
         };
@@ -472,10 +461,10 @@ impl Diffui {
             },
         };
         history.selected_version = Some(index);
-        self.history_load_diff(tab, target, cx)
+        self.history_load_diff(tab, target)
     }
 
-    fn history_load_diff(&mut self, tab: TabId, target: HistoryDiffTarget, cx: &mut Cx) {
+    fn history_load_diff(&mut self, tab: TabId, target: HistoryDiffTarget) {
         let Some(state) = self.tab_mut(tab) else {
             return;
         };
@@ -495,14 +484,14 @@ impl Diffui {
         let job = JobId::next();
         history.diff_job = Some((job, target.clone()));
         if let Some(old) = cancel {
-            self.send(tab, diffui_core::Command::Cancel { job: old }, cx);
+            self.send(tab, diffui_core::Command::Cancel { job: old });
         }
-        self.history_send(tab, job, HistoryRequest::Diff { target }, cx);
+        self.history_send(tab, job, HistoryRequest::Diff { target });
     }
 
     /// Raise the confirmation for a restore or a revert, holding the
     /// mutation (and its queued activity row) until the user answers.
-    fn confirm_operation(&mut self, tab: TabId, id: String, restore: bool, cx: &mut Cx) {
+    fn confirm_operation(&mut self, tab: TabId, id: String, restore: bool) {
         if !self.active().session.capabilities.mutate {
             return;
         }
@@ -695,19 +684,19 @@ impl Diffui {
             Payload::Cancelled { .. } => clear_job(history, job),
             _ => {}
         }
-        Some(match follow_up {
+        let _: () = match follow_up {
             Some(action) if self.is_active(tab) => self.perform_history(action, cx),
             _ => {}
-        })
+        };
+        Some(())
     }
 
     /// Bring the active tab's history views in line with what is on screen:
     /// re-read a stale op log, ask for a missing annotation, and keep the
     /// file filter pointed at its file. Called once per update.
     pub(crate) fn sync_history(&mut self, cx: &mut Cx) {
-        match self.active_tab_id() {
-            Some(tab) => self.sync_history_for(tab, cx),
-            None => {}
+        if let Some(tab) = self.active_tab_id() {
+            self.sync_history_for(tab, cx)
         }
     }
 
@@ -730,7 +719,7 @@ impl Diffui {
             && state.history.ops_job.is_none()
             && state.history.ops_read_at.as_ref() != Some(&fingerprint)
         {
-            self.reload_op_log(tab, cx);
+            self.reload_op_log(tab);
         }
 
         // The blame column follows the file the source browser shows.
@@ -747,7 +736,7 @@ impl Diffui {
                 let job = JobId::next();
                 state.history.annotation = None;
                 state.history.annotation_job = Some((job, revision.clone(), path.clone()));
-                self.history_send(tab, job, HistoryRequest::Annotate { revision, path }, cx);
+                self.history_send(tab, job, HistoryRequest::Annotate { revision, path });
             }
         }
 
@@ -2375,14 +2364,70 @@ fn history_diff_view(
     history_diff(ui, theme, window, cx)
 }
 
-/// The selected change's diff, through the diff lane's widget.
-#[allow(unused_variables)]
+/// The selected change's diff.
 fn history_diff(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> AnyElement {
+    let history = &ui.active().history;
+    let Some(diff) = &history.diff else {
+        return div().into_any_element();
+    };
+    let doc = DocSource::new(cx.entity(), |ui: &Diffui, file| {
+        ui.active()
+            .history
+            .diff
+            .as_ref()
+            .and_then(|diff| diff.document.files.get(file))
+            .map_or(&[][..], |file| &file.hunks)
+    });
+    let mut props = DiffProps::new(
+        crate::diff_panel::file_views(&diff.document.files, theme),
+        doc,
+        history.diff_file,
+        format!("history:{}", diff.doc_id),
+        diff_palette(theme),
+        ui.config.mono_font,
+        ui.config.code_type,
+        ui.config.multi_click_ms,
+    )
+    .on_selected_file_changed(Diffui::listen(cx, |this, index: &usize, _, cx| {
+        this.perform(Action::History(HistoryAction::DiffFileChanged(*index)), cx);
+    }))
+    .on_copy(Diffui::listen(cx, |this, text: &String, _, cx| {
+        this.perform(Action::Copy(text.clone()), cx);
+    }))
+    // Every scroll tick: stored, with no reconcile and no redraw.
+    .on_scroll(cx.listener(|this: &mut Diffui, offset: &f32, _, _| {
+        this.active_mut().history.diff_scroll = *offset;
+    }))
+    .restore_scroll(history.diff_scroll, ui.scroll_restore_token)
+    .content_version(ui.document_version)
+    .layout_version(diff.doc_id)
+    .wrap(ui.diff_wrap)
+    .side_by_side(ui.diff_split);
+    if let Some((media, key)) = crate::media::document_media(ui, &diff.document) {
+        props = props.media(media, key);
+    }
+    if let Some(details) = &diff.details {
+        props = props
+            .with_header(crate::commit_info::header_lines(
+                ui,
+                details,
+                theme,
+                false,
+                // The History view's right pane: the window less its list.
+                ui.window_size.width - ui.sidebar_width - 1.0,
+            ))
+            .on_header_action(Diffui::listen(
+                cx,
+                |this, action: &crate::diff_view::HeaderAction, _, cx| {
+                    this.perform(crate::commit_info::header_action(action.clone()), cx);
+                },
+            ));
+    }
     div()
         .w_full()
         .flex_1()
         .min_h_0()
-        .child(crate::stub::panel("history_panel::history_diff"))
+        .child(crate::diff_view::view("history-diff", props, window, cx))
         .into_any_element()
 }
 
@@ -2902,5 +2947,13 @@ mod scenes {
             "op log, {OP_LOG_PAGE} rows, full redraw: p50={:.2?} p99={:.2?}",
             samples[50], samples[98]
         );
+    }
+}
+
+#[cfg(test)]
+impl HistoryState {
+    /// The `nth` operation's id, for scenes that pick one.
+    pub(crate) fn operation_id(&self, nth: usize) -> Option<String> {
+        self.ops.get(nth).map(|op| op.id.clone())
     }
 }

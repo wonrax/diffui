@@ -14,11 +14,12 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use crate::geometry::{Point, Rectangle};
-use crate::revision_list::{FileRowView, RevisionRowView, RowSelectionKey};
-use crate::seam::revision_list::{self, RevisionListProps};
+use crate::revision_list::{
+    self, FileRowView, RevisionListProps, RevisionRowView, RowSelectionKey,
+};
 use crate::theme::{Color, Padding, ThemeSpec, chip_background, text_size};
 use crate::typography::{self, Aligned};
-use crate::{Cx, Diffui, SourceState, ellipsis, icons};
+use crate::{Action, Cx, Diffui, SourceState, ellipsis, icons};
 use diffui_core::{
     RevisionSelection, SourceEntry, SourceEntryStatus, SourceTreeRow, source_tree_rows,
 };
@@ -348,8 +349,8 @@ fn build_source_filter(
             leading_icon: Some(icons::SEARCH),
             placeholder: "Search files",
             value: &ui.active().source.filter,
-            on_input: |this, query, cx| this.on_source_filter_changed(query, cx),
-            on_submit: Some(|this, cx| this.on_source_filter_submit(cx)),
+            on_input: |this, query, _| this.on_source_filter_changed(query),
+            on_submit: Some(|this, _| this.on_source_filter_submit()),
             caret: None,
         },
         window,
@@ -447,15 +448,15 @@ pub(crate) fn build_source_sidebar(
     .files(
         build_file,
         selected_entry,
-        Diffui::listen(cx, |this, row: &usize, _, cx| {
-            this.on_source_sidebar_row(*row, cx);
+        Diffui::listen(cx, |this, row: &usize, _, _| {
+            this.on_source_sidebar_row(*row);
         }),
     )
     .at_window_edge()
     .reveal_file(source.reveal_token, reveal_file_flat)
     // Every scroll tick: stored, with no reconcile and no redraw.
-    .on_scroll(cx.listener(|this: &mut Diffui, offset: &f64, _, cx| {
-        this.on_source_tree_scrolled(*offset, cx);
+    .on_scroll(cx.listener(|this: &mut Diffui, offset: &f64, _, _| {
+        this.on_source_tree_scrolled(*offset);
     }))
     .restore_scroll(source.tree_scroll_offset, ui.scroll_restore_token)
     .on_file_context_menu(Diffui::listen(
@@ -549,13 +550,12 @@ pub(crate) fn build_source_panel(
                 .min_h_0()
                 .w_full()
                 .child(body)
-                .child(crate::seam::find_overlay(ui, theme, window, cx)),
+                .child(crate::find::build_overlay(ui, theme, window, cx)),
         )
         .into_any_element()
 }
 
 /// The file through the shared diff view, in its plain mode.
-#[cfg(any())]
 fn source_code(
     ui: &Diffui,
     view: &crate::SourceFileView,
@@ -602,8 +602,8 @@ fn source_code(
     .on_copy(Diffui::listen(cx, |this, text: &String, _, cx| {
         this.perform(Action::Copy(text.clone()), cx);
     }))
-    .on_scroll(cx.listener(|this: &mut Diffui, offset: &f32, _, cx| {
-        this.on_source_scrolled(*offset, cx);
+    .on_scroll(cx.listener(|this: &mut Diffui, offset: &f32, _, _| {
+        this.on_source_scrolled(*offset);
     }))
     .restore_scroll(source.scroll_offset, ui.scroll_restore_token)
     .content_version(ui.document_version)
@@ -617,17 +617,6 @@ fn source_code(
         props = props.with_find(find);
     }
     diff_view::view("source-code", props, window, cx)
-}
-
-/// Stand-in until `diff_view::view` is in this tree; see `seam.rs`.
-fn source_code(
-    ui: &Diffui,
-    view: &crate::SourceFileView,
-    theme: ThemeSpec,
-    _window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    crate::seam::code_lines(ui, view, theme, cx)
 }
 
 fn centered_note(ui: &Diffui, message: String, color: Color) -> AnyElement {
@@ -756,7 +745,9 @@ fn build_info_bar(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut C
             .child(typography::baseline_row(right, 8.0)),
     );
     if crate::history_panel::can_annotate(ui) {
-        bar = bar.child(crate::seam::source_bar_actions(ui, theme, window, cx));
+        bar = bar.child(crate::history_panel::source_bar_actions(
+            ui, theme, window, cx,
+        ));
     }
     bar.into_any_element()
 }

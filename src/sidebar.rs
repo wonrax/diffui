@@ -390,7 +390,7 @@ pub(crate) fn build_sidebar(
     // pane. Each row carries its own internal vertical padding, so the first
     // row's content isn't cramped against the top edge — adding a panel-colored
     // gap above it instead just reads as a stray strip above the selected row.
-    let revision_list = crate::seam::revision_list(ui, theme, window, cx);
+    let revision_list = crate::revision_rows::build_revision_list(ui, theme, window, cx);
 
     let draft_active = ui.active().op_draft().is_some();
     let mut body = div()

@@ -1,10 +1,11 @@
+use crate::changes::ChangesMsg;
 use crate::diff_view::{
     self, DiffFileView, DiffHunkView, DiffProps, DocSource, HeaderAction, HeaderLine, Slice,
 };
-use crate::revision_list::FileRowView;
+use crate::geometry::{Point, Rectangle};
+use crate::revision_list::{self, FileRowView, RevisionListProps};
 use crate::theme::{
-    self, Color, Font, ThemeSpec, Weight, chip_background, diff_palette, file_status_color,
-    text_size,
+    Color, Font, ThemeSpec, Weight, chip_background, diff_palette, file_status_color, text_size,
 };
 use crate::{Action, Cx, Diffui, LoadStatus, icons, ui};
 use diffui_core::FileTreeRow;
@@ -82,17 +83,21 @@ fn changed_file_row(
             label,
             depth,
         } => {
-            let file = &files[*file_index];
+            // Read at paint against live state: an event can land between a new
+            // document and the render that replaces these rows.
+            let file = files.get(*file_index);
             (
                 label.clone(),
-                file.path.clone(),
+                file.map_or_else(String::new, |file| file.path.clone()),
                 *depth as f32 * crate::revision_list::FILE_TREE_INDENT,
                 None,
                 *file_index,
-                file.status.short_label().to_owned(),
-                file_status_color(file.status, theme),
-                file.additions,
-                file.deletions,
+                file.map_or("", |file| file.status.short_label()).to_owned(),
+                file.map_or(theme.subtle_text, |file| {
+                    file_status_color(file.status, theme)
+                }),
+                file.map_or(0, |file| file.additions),
+                file.map_or(0, |file| file.deletions),
             )
         }
     };
@@ -216,7 +221,7 @@ pub(crate) fn build_file_navigator_peek(
     let tree = build_file_navigator_surface(ui, theme, FILE_NAV_PEEK_WIDTH, false, window, cx);
     let hover = Diffui::listen(cx, |this, entered: &bool, _, cx| {
         if *entered {
-            this.on_changed_files_popup_entered(cx);
+            this.on_changed_files_popup_entered();
         } else {
             this.on_changed_files_popup_exited(cx);
         }
@@ -311,9 +316,9 @@ fn build_file_navigator_surface(
         .into_any_element()
 }
 
-/// The file tree's rows. A plain virtual list until `revision_list::view` lands in
-/// this tree (history lane); see `reports/diff.md` for the one-call swap.
-fn file_tree(ui: &Diffui, theme: ThemeSpec, _window: &mut Window, cx: &mut Cx) -> AnyElement {
+/// The changed files on the shared list: folding, stat columns, checkboxes, scroll
+/// restore and reveal. Rows are built at paint, for on-screen rows only.
+fn file_tree(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> AnyElement {
     let tab = ui.active();
     let files = &tab.session.document.files;
     let tree_rows = ui.sidebar_file_cache.borrow_mut().tree_rows(
@@ -322,212 +327,68 @@ fn file_tree(ui: &Diffui, theme: ThemeSpec, _window: &mut Window, cx: &mut Cx) -
         &tab.collapsed_dirs,
         files,
     );
+    let row_count = tree_rows.len();
+    let selected_display = tree_rows.iter().position(|row| {
+        matches!(row, FileTreeRow::File { file_index, .. } if *file_index == tab.selected_file)
+    });
     let max_additions = files.iter().map(|file| file.additions).max().unwrap_or(0);
     let max_deletions = files.iter().map(|file| file.deletions).max().unwrap_or(0);
     let additions_width = changed_file_stat_width('+', max_additions, ui.config.ui_font);
     let deletions_width = changed_file_stat_width('\u{2212}', max_deletions, ui.config.ui_font);
-    let lanes = EmptyFileTreeLanes::default();
-    let rows: Vec<FileRowView> = tree_rows
-        .iter()
-        .map(|row| {
-            let mut view =
-                changed_file_row(row, files, theme, additions_width, deletions_width, &lanes);
-            view.check = match row {
-                FileTreeRow::File { file_index, .. } => {
-                    crate::changes::tree_check(ui, Some(*file_index), None)
-                }
-                FileTreeRow::Dir { path, .. } => crate::changes::tree_check(
-                    ui,
-                    None,
-                    Some(&format!("{}/", path.trim_end_matches('/'))),
-                ),
-            };
-            view
-        })
-        .collect();
-    let selected_file = tab.selected_file;
     let badge_width = crate::chip::width("M", None, ui.config.mono_font);
-    let selected_background =
-        crate::sidebar::revision_list_style(theme, ui.config, badge_width).selected_background;
-    let font = ui.config.ui_font;
-    let mono = ui.config.mono_font;
-    let select = Rc::new(Diffui::listen(cx, |this, row: &usize, _, cx| {
-        this.on_sidebar_file_row(*row, cx);
-    }));
-    let menu = Rc::new(Diffui::listen(
-        cx,
-        |this, (row, cursor): &(usize, crate::geometry::Point), _, cx| {
-            let rect = crate::geometry::Rectangle::new(
-                *cursor,
-                crate::geometry::Size::new(1.0, crate::revision_list::FILE_ROW_HEIGHT),
-            );
-            this.on_sidebar_file_context_menu(*row, rect, *cursor, cx);
-        },
-    ));
-    let count = rows.len();
-    let rows = Rc::new(rows);
-    gpui_kit::uniform_list("file-navigator", count, move |range, _, _| {
-        range
-            .map(|index| {
-                file_tree_row(
-                    index,
-                    &rows[index],
-                    selected_file,
-                    selected_background,
-                    font,
-                    mono,
-                    theme,
-                    select.clone(),
-                    menu.clone(),
-                )
-            })
-            .collect::<Vec<_>>()
-    })
-    .size_full()
-    .into_any_element()
-}
-
-#[allow(clippy::too_many_arguments)]
-fn file_tree_row(
-    index: usize,
-    row: &FileRowView,
-    selected_file: usize,
-    selected: Color,
-    font: Font,
-    mono: Font,
-    theme: ThemeSpec,
-    select: Rc<impl Fn(&usize, &mut Window, &mut gpui_kit::App) + 'static>,
-    menu: Rc<impl Fn(&(usize, crate::geometry::Point), &mut Window, &mut gpui_kit::App) + 'static>,
-) -> AnyElement {
-    use crate::revision_list::{
-        FILE_ROW_GAP, FILE_ROW_HEIGHT, FILE_ROW_RIGHT_PAD, ROW_CARD_INSET_X, ROW_CARD_RADIUS,
-    };
-    let is_file = row.chevron.is_none();
-    let mut body = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(FILE_ROW_GAP))
-        .h_full()
-        .pl(px(theme::space::LG + row.indent))
-        .pr(px(FILE_ROW_RIGHT_PAD))
-        .rounded(px(ROW_CARD_RADIUS));
-    if is_file && row.file_index == selected_file {
-        body = body.bg(selected);
-    } else {
-        body = body.hover(|style| style.bg(chip_background(theme.muted_text)));
-    }
-    if let Some(check) = row.check {
-        body = body.child(tree_check_box(check, theme));
-    }
-    match row.chevron {
-        Some(collapsed) => {
-            body = body.child(icons::icon(
-                if collapsed {
-                    icons::CHEVRON_RIGHT
-                } else {
-                    icons::CHEVRON_DOWN
-                },
-                12.0,
-                theme.subtle_text,
-            ));
-        }
-        None => {}
-    }
-    body = body.child(
-        div().flex_1().min_w_0().overflow_hidden().child(
-            crate::ellipsis::Line::new(
-                vec![crate::ellipsis::Span::new(row.primary.as_str())],
-                font,
-                text_size::UI,
-                row.primary_color,
-            )
-            .view(),
-        ),
-    );
-    if is_file {
-        let stat = |text: String, width: f32, color: Color| {
-            div()
-                .w(px(width))
-                .flex()
-                .justify_end()
-                .flex_none()
-                .child(crate::typography::line(
-                    text,
-                    font,
-                    text_size::CAPTION,
-                    color,
-                ))
+    let lanes = EmptyFileTreeLanes::default();
+    let this = cx.entity();
+    let build_file = Rc::new(move |display: usize, cx: &gpui_kit::App| {
+        let ui = this.read(cx);
+        let row = &tree_rows[display];
+        let mut view = changed_file_row(
+            row,
+            &ui.active().session.document.files,
+            theme,
+            additions_width,
+            deletions_width,
+            &lanes,
+        );
+        view.check = match row {
+            FileTreeRow::File { file_index, .. } => {
+                crate::changes::tree_check(ui, Some(*file_index), None)
+            }
+            FileTreeRow::Dir { path, .. } => crate::changes::tree_check(
+                ui,
+                None,
+                Some(&format!("{}/", path.trim_end_matches('/'))),
+            ),
         };
-        body = body
-            .child(stat(
-                format!("+{}", row.additions),
-                row.additions_width,
-                row.additions_text,
-            ))
-            .child(stat(
-                format!("\u{2212}{}", row.deletions),
-                row.deletions_width,
-                row.deletions_text,
-            ))
-            .child(crate::chip::view(&crate::chip::Chip {
-                label: row.status_label.clone(),
-                font: mono,
-                background: row.status_background,
-                text_color: row.status_text,
-                border_color: None,
-                border_dashed: false,
-                icon: None,
-            }));
-    }
-    div()
-        .id(("file-row", index))
-        .h(px(FILE_ROW_HEIGHT))
-        .px(px(ROW_CARD_INSET_X))
-        .py(px(crate::revision_list::ROW_CARD_INSET_Y))
-        .cursor_pointer()
-        .on_click(move |_, window, cx| select(&index, window, cx))
-        .on_mouse_down(gpui_kit::MouseButton::Right, move |event, window, cx| {
-            menu(&(index, event.position.into()), window, cx);
-        })
-        .child(body)
-        .into_any_element()
-}
-
-fn tree_check_box(state: diff_view::CheckState, theme: ThemeSpec) -> gpui_kit::Div {
-    let checked = state != diff_view::CheckState::Off;
-    let side = 14.0;
-    let mut check = div()
-        .size(px(side))
-        .flex_none()
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(3.0))
-        .border_1();
-    if checked {
-        check = check.bg(theme.info).border_color(theme.info);
-    } else {
-        check = check.border_color(Color {
-            a: 0.55,
-            ..theme.subtle_text
-        });
-    }
-    match state {
-        diff_view::CheckState::Off => check,
-        diff_view::CheckState::On => check.child(icons::icon(
-            icons::CHECK,
-            side - 3.0,
-            theme.panel_background,
-        )),
-        diff_view::CheckState::Partial => check.child(
-            div()
-                .w(px(7.0))
-                .h(px(2.0))
-                .rounded(px(1.0))
-                .bg(theme.panel_background),
-        ),
-    }
+        view
+    });
+    let props = RevisionListProps::new(
+        0,
+        Some((0, row_count)),
+        crate::sidebar::revision_list_style(theme, ui.config, badge_width),
+    )
+    .files(
+        build_file,
+        Some(tab.selected_file),
+        Diffui::listen(cx, |this, row: &usize, _, _| {
+            this.on_sidebar_file_row(*row);
+        }),
+    )
+    .reveal_file(ui.sidebar_file_reveal_token, selected_display)
+    // Every scroll tick: stored, with no reconcile and no redraw.
+    .on_scroll(cx.listener(|this: &mut Diffui, offset: &f64, _, _| {
+        this.on_changed_files_scrolled(*offset);
+    }))
+    .restore_scroll(tab.file_tree_scroll_offset, ui.scroll_restore_token)
+    .on_file_context_menu(Diffui::listen(
+        cx,
+        |this, (row, rect, point): &(usize, Rectangle, Point), _, cx| {
+            this.on_sidebar_file_context_menu(*row, *rect, *point, cx);
+        },
+    ))
+    .on_file_check(Diffui::listen(cx, |this, row: &usize, _, cx| {
+        this.perform(Action::Changes(ChangesMsg::ToggleTreeRow(*row)), cx);
+    }));
+    revision_list::view("file-navigator", props, window, cx)
 }
 
 pub(crate) fn build_collapsed_file_navigator(
@@ -549,14 +410,14 @@ pub(crate) fn build_collapsed_file_navigator(
     );
     let trigger_hover = Diffui::listen(cx, |this, entered: &bool, _, cx| {
         if *entered {
-            this.on_changed_files_trigger_entered(cx);
+            this.on_changed_files_trigger_entered();
         } else {
             this.on_changed_files_trigger_exited(cx);
         }
     });
     let rail_hover = Diffui::listen(cx, |this, entered: &bool, _, cx| {
         if *entered {
-            this.on_changed_files_rail_entered(cx);
+            this.on_changed_files_rail_entered();
         } else {
             this.on_changed_files_rail_exited(cx);
         }
@@ -585,7 +446,7 @@ pub(crate) fn build_diff_panel(
     cx: &mut Cx,
 ) -> AnyElement {
     let body = build_diff_panel_body(ui, theme, window, cx);
-    match crate::empty_states::outside_view_banner(ui, theme, cx) {
+    match crate::empty_states::outside_view_banner(ui, theme) {
         Some(banner) => div()
             .flex()
             .flex_col()
@@ -936,8 +797,8 @@ fn diff_props(
     }))
     .on_copy(on_copy(cx))
     // Every scroll tick: store the offset, and leave the app out of it.
-    .on_scroll(cx.listener(|this: &mut Diffui, offset: &f32, _, cx| {
-        this.on_diff_scrolled(*offset, cx);
+    .on_scroll(cx.listener(|this: &mut Diffui, offset: &f32, _, _| {
+        this.on_diff_scrolled(*offset);
     }))
     .restore_scroll(tab.diff_scroll_offset, ui.scroll_restore_token)
     .content_version(ui.document_version)
@@ -978,8 +839,8 @@ fn diff_props(
     // Per-file "browse source" affordance: repo tabs only (a PR tab has no local tree to
     // browse).
     if tab.repository.is_some() {
-        props = props.on_browse_file(Diffui::listen(cx, |this, index: &usize, _, cx| {
-            this.on_browse_file_from_diff(*index, cx);
+        props = props.on_browse_file(Diffui::listen(cx, |this, index: &usize, _, _| {
+            this.on_browse_file_from_diff(*index);
         }));
     }
 
@@ -1019,8 +880,8 @@ fn build_description_editor(
     );
     // Read-only while saving.
     if !saving {
-        let on_edit = Diffui::listen(cx, |this, text: &String, _, cx| {
-            this.on_description_edited(text.clone(), cx);
+        let on_edit = Diffui::listen(cx, |this, text: &String, _, _| {
+            this.on_description_edited(text.clone());
         });
         spec = spec.on_input(move |text, window, cx| on_edit(&text, window, cx));
     }
