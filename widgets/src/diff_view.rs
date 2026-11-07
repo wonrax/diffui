@@ -420,8 +420,7 @@ pub struct Palette {
     pub scrollbar: ScrollbarStyle,
 }
 
-/// Everything the app decides about a [`DiffView`], set from a render. The builder
-/// names are the iced widget's.
+/// Everything the app decides about a [`DiffView`], set from a render.
 pub struct DiffProps {
     files: Vec<DiffFileView>,
     source: DocSource,
@@ -677,6 +676,10 @@ impl DiffProps {
         self
     }
 }
+
+/// Frames planned, across every diff view: lets a benchmark tell real frames from
+/// cached ones.
+pub static PAINTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// The retained half of the diff: its props, and the scroll offset, selection and
 /// caches that outlive a frame.

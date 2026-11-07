@@ -239,7 +239,7 @@ impl State {
         self.selection_unit = SelectionUnit::Character;
     }
 
-    /// New props against what the state last saw: what iced's `diff` did. Runs at
+    /// New props against what the state last saw. Runs at
     /// prepaint rather than when the props are set, because the document can be read
     /// only then.
     fn sync(&mut self, view: &View<'_>) {
@@ -1045,6 +1045,7 @@ impl DiffView {
             let view = View::read(props, app);
             let state = &mut self.state;
             state.frames += 1;
+            super::PAINTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             state.sync(&view);
             let started = Instant::now();
             let key = state.height_index.borrow().key;

@@ -931,7 +931,7 @@ pub fn view(
     cx: &mut App,
 ) -> AnyElement {
     let list = window.use_keyed_state(id, cx, |_, cx| RevisionList::new(cx));
-    list.update(cx, |list, cx| list.set_props(props, cx));
+    list.update(cx, |list, _| list.set_props(props));
     list.into_any_element()
 }
 
@@ -978,7 +978,7 @@ impl RevisionList {
     /// Takes this render's props, noticing the tokens that schedule a scroll.
     /// The scroll itself waits for prepaint, which knows the bounds it clamps
     /// and centres against.
-    fn set_props(&mut self, props: RevisionListProps, cx: &mut Context<Self>) {
+    fn set_props(&mut self, props: RevisionListProps) {
         if props.reveal_token != self.last_reveal_token {
             self.last_reveal_token = props.reveal_token;
             self.pending_reveal_row = props.selected_flat;
@@ -998,10 +998,10 @@ impl RevisionList {
             // over a re-centred selection when both land in the same render.
             self.pending_set_offset = Some(props.restore_offset);
         }
+        // No notify: this runs in the render that's about to draw the element, and a
+        // notify during a draw would dirty the view, and every view above it, for the
+        // next frame too.
         self.props = Rc::new(props);
-        // During a draw this only marks the view dirty, so its element is
-        // rebuilt with these props in the frame being drawn.
-        cx.notify();
     }
 
     fn max_offset(&self) -> f64 {

@@ -1,5 +1,4 @@
-//! The root view: the window, its layout, and the wiring that stands in for
-//! iced's runtime.
+//! The root view: the window, its layout, and the wiring around them.
 //!
 //! Three things every lane leans on:
 //!
@@ -18,8 +17,8 @@ use std::time::Duration;
 
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    AnyElement, App, Bounds, Context, Div, Entity, Render, Subscription, Task, Window,
-    WindowBounds, WindowOptions, div, point, px, relative, size,
+    AnyElement, App, Bounds, Context, Div, Entity, Render, StyleRefinement, Subscription, Task,
+    WeakEntity, Window, WindowBounds, WindowOptions, div, point, px, relative, size,
 };
 
 use crate::keys;
@@ -32,9 +31,9 @@ use crate::{
 };
 use diffui_core::OpenSpec;
 
-/// The loops that stand in for iced's subscriptions. Each lives while its
-/// condition holds; [`Diffui::sync_background`] starts and drops them. Dropping
-/// the task cancels the loop, as a subscription leaving the batch did.
+/// The loops that run in the background. Each lives while its condition holds;
+/// [`Diffui::sync_background`] starts and drops them. Dropping the task cancels
+/// the loop.
 #[derive(Default)]
 pub(crate) struct Background {
     /// One event loop per open repository. Dropping it drops the actor's stream,
@@ -160,6 +159,8 @@ pub(crate) fn build_root(
         app.attach_window(window, cx);
         app
     });
+    let panes = Panes::new(app.clone(), cx);
+    app.update(cx, |app, _| app.panes = Some(panes));
     cx.set_global(RootView(app.downgrade()));
     app
 }
@@ -206,9 +207,9 @@ impl Diffui {
         self.prune_stale_modes();
         crate::app_menu::refresh_availability(self);
         self.keep_graph_anchor();
-        self.cancel_unwanted_preview(cx);
+        self.cancel_unwanted_preview();
         self.ensure_welcome_prompt(cx);
-        self.sync_conflicts(cx);
+        self.sync_conflicts();
         self.sync_history(cx);
         self.sync_media(cx);
         // Chokepoint: if the active tab coalesced a refresh while busy and it's
@@ -218,7 +219,7 @@ impl Diffui {
                 Some(target) => target.session.take_pending_refresh(),
                 None => Vec::new(),
             };
-            self.run_effects(tab, effects, cx);
+            self.run_effects(tab, effects);
         }
         self.sync_background(cx);
     }
@@ -261,7 +262,7 @@ impl Diffui {
             menu_open,
             Duration::from_millis(16),
             cx,
-            |this, cx| this.act(cx, |this, cx| this.menu_on_tick(cx)),
+            |this, cx| this.act(cx, |this, _| this.menu_on_tick()),
         );
 
         // Prunes expired error toasts; only while any are up.
@@ -270,7 +271,7 @@ impl Diffui {
             !self.toasts.is_empty(),
             Duration::from_millis(500),
             cx,
-            |this, cx| this.act(cx, |this, cx| this.on_toast_tick(cx)),
+            |this, cx| this.act(cx, |this, _| this.on_toast_tick()),
         );
 
         // Drives the debounced geometry save. Active only while a change is
@@ -303,7 +304,7 @@ impl Diffui {
             }),
             cx.observe_window_activation(window, |this, window, cx| {
                 let focused = window.is_window_active();
-                this.act(cx, |this, cx| this.on_window_focus_changed(focused, cx));
+                this.act(cx, |this, _| this.on_window_focus_changed(focused));
             }),
             cx.observe_window_appearance(window, |this, window, cx| {
                 this.act(cx, |this, cx| {
@@ -400,21 +401,15 @@ fn repository_loop(spec: OpenSpec, cx: &mut Cx) -> Task<()> {
 
 impl Render for Diffui {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.resolved_theme().spec();
-        // Per-frame animations: the palette's push/pop, a menu's glow and the
-        // submenu trajectory apex. A frame request keeps redrawing while they run.
-        let palette_animating = self
-            .palette()
-            .is_some_and(|palette| palette.is_animating(std::time::Instant::now()));
-        let menu_ticking = self
-            .menu()
-            .is_some_and(|menu| menu.glow.is_some() || !menu.open_path.is_empty());
-        if palette_animating || menu_ticking {
-            window.request_animation_frame();
+        #[cfg(test)]
+        {
+            self.renders += 1;
         }
+        let theme = self.resolved_theme().spec();
 
         #[cfg(test)]
         if let Some(scene) = self.background.scene.clone() {
+            request_overlay_frames(self, window);
             return self
                 .frame(theme, cx)
                 .child(scene(self, theme, window, cx))
@@ -429,7 +424,8 @@ impl Render for Diffui {
                 .child(empty_states::welcome(self, theme, window, cx))
                 .child(crate::shortcuts::build_overlay(self, theme, window, cx))
         } else {
-            self.shell(theme, window, cx)
+            let panes = self.panes.clone().expect("a drawn app has its panes");
+            self.shell(&panes, theme, window, cx)
         };
         self.frame(theme, cx).child(body).into_any_element()
     }
@@ -458,6 +454,169 @@ impl Diffui {
     }
 }
 
+/// A [`Pane`] in the shell. It fills what it's given, since a cached view isn't
+/// measured from its contents.
+fn embed(pane: &Entity<Pane>) -> AnyElement {
+    // What the frame benchmark compares against.
+    #[cfg(test)]
+    if std::env::var_os("DIFFUI_UNCACHED_PANES").is_some() {
+        return pane.clone().into_any_element();
+    }
+    pane.clone()
+        .cached(StyleRefinement::default().size_full())
+        .into_any_element()
+}
+
+/// Per-frame animations: the palette's push/pop, a menu's glow and the submenu
+/// trajectory apex. Called from the view showing them, which is what the request
+/// redraws.
+fn request_overlay_frames(ui: &Diffui, window: &mut Window) {
+    let palette_animating = ui
+        .palette()
+        .is_some_and(|palette| palette.is_animating(std::time::Instant::now()));
+    let menu_ticking = ui
+        .menu()
+        .is_some_and(|menu| menu.glow.is_some() || !menu.open_path.is_empty());
+    if palette_animating || menu_ticking {
+        window.request_animation_frame();
+    }
+}
+
+/// One region of the window as a view of its own, reused from frame to frame.
+///
+/// GPUI marks a notified view's ancestors dirty too, so [`Diffui::render`] runs
+/// whenever anything in the window notifies: a scroll tick in the diff, a hover in
+/// the list. Without panes that rebuilt every other region for each such frame. A
+/// pane is an entity under the root, drawn with [`Entity::cached`]: its output is
+/// replayed until it's notified itself. That leaves the skeleton and the one pane
+/// holding the notifying view to run.
+///
+/// A cached view is only as fresh as its notifications, and an ancestor re-rendering
+/// doesn't refresh it. A pane reads [`Diffui`], so it observes [`Diffui`]: every
+/// `cx.notify()` there reaches all of them, and state a view reads has to change
+/// behind one (`act`, `listen` and `on_action` do this). A focus change refreshes the
+/// whole window on its own. Anything else a view reads has to arrange its own
+/// notification.
+pub(crate) struct Pane {
+    app: WeakEntity<Diffui>,
+    build: PaneBuild,
+    #[cfg(test)]
+    pub(crate) renders: usize,
+    _app_changed: Subscription,
+}
+
+type PaneBuild = fn(&Diffui, ThemeSpec, &mut Window, &mut Cx) -> AnyElement;
+
+impl Pane {
+    fn new(app: Entity<Diffui>, build: PaneBuild, cx: &mut App) -> Entity<Self> {
+        cx.new(|cx| Self {
+            app: app.downgrade(),
+            build,
+            #[cfg(test)]
+            renders: 0,
+            _app_changed: cx.observe(&app, |_, _, cx| cx.notify()),
+        })
+    }
+}
+
+impl Render for Pane {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        {
+            self.renders += 1;
+        }
+        let build = self.build;
+        match self.app.upgrade() {
+            Some(app) => app.update(cx, |ui, cx| {
+                let theme = ui.resolved_theme().spec();
+                build(ui, theme, window, cx)
+            }),
+            None => div().into_any_element(),
+        }
+    }
+}
+
+/// The window's regions.
+#[derive(Clone)]
+pub(crate) struct Panes {
+    pub(crate) tab_bar: Entity<Pane>,
+    pub(crate) toolbar: Entity<Pane>,
+    pub(crate) left: Entity<Pane>,
+    pub(crate) files: Entity<Pane>,
+    pub(crate) main: Entity<Pane>,
+    pub(crate) floats: Entity<Pane>,
+}
+
+impl std::fmt::Debug for Panes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Panes").finish_non_exhaustive()
+    }
+}
+
+impl Panes {
+    fn new(app: Entity<Diffui>, cx: &mut App) -> Self {
+        Self {
+            tab_bar: Pane::new(app.clone(), tab_bar::build_tab_bar, cx),
+            toolbar: Pane::new(app.clone(), toolbar::build_toolbar, cx),
+            left: Pane::new(app.clone(), left_pane, cx),
+            files: Pane::new(app.clone(), files_pane, cx),
+            main: Pane::new(app.clone(), main_pane, cx),
+            floats: Pane::new(app, floats_pane, cx),
+        }
+    }
+}
+
+/// The revision list, or what the view shows in its place.
+fn left_pane(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> AnyElement {
+    match ui.active().main_view {
+        MainView::Diff if ui.active().history_panel_collapsed => {
+            sidebar::build_collapsed_sidebar(ui, theme, window, cx)
+        }
+        MainView::Diff => sidebar::build_sidebar(ui, theme, window, cx),
+        MainView::Source => source_panel::build_source_sidebar(ui, theme, window, cx),
+        MainView::History => history_panel::build_history_sidebar(ui, theme, window, cx),
+    }
+}
+
+/// The changed files, in the Diff view.
+fn files_pane(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> AnyElement {
+    if ui.active().files_panel_collapsed {
+        diff_panel::build_collapsed_file_navigator(theme, window, cx)
+    } else {
+        diff_panel::build_file_navigator(ui, theme, window, cx)
+    }
+}
+
+/// What the view is about: the diff, a source file, the history.
+fn main_pane(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> AnyElement {
+    match ui.active().main_view {
+        MainView::Diff => diff_panel::build_diff_panel(ui, theme, window, cx),
+        MainView::Source => source_panel::build_source_panel(ui, theme, window, cx),
+        MainView::History => history_panel::build_history_panel(ui, theme, window, cx),
+    }
+}
+
+/// Everything that floats above the shell. Each is empty when inactive, so they can
+/// always be stacked.
+fn floats_pane(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> AnyElement {
+    request_overlay_frames(ui, window);
+    div()
+        .relative()
+        .size_full()
+        .child(palette::build_overlay(ui, theme, window, cx))
+        .child(activity::activity_popover(ui, theme, window, cx))
+        .child(menu::build_overlay(ui, theme, window, cx))
+        .child(tab_bar::build_open_repo_dialog(ui, theme, window, cx))
+        .child(crate::bookmarks::build_name_prompt(ui, theme, window, cx))
+        .child(crate::changes::split_modal(ui, theme, window, cx))
+        .child(tab_bar::build_confirm_dialog(ui, theme, window, cx))
+        .child(crate::cli_output::build_overlay(ui, theme, window, cx))
+        .child(crate::credentials::build_overlay(ui, theme, window, cx))
+        .child(crate::shortcuts::build_overlay(ui, theme, window, cx))
+        .child(activity::toast_layer(ui, theme, window, cx))
+        .into_any_element()
+}
+
 /// A 1px divider between panes.
 pub(crate) fn vertical_divider(theme: ThemeSpec) -> Div {
     div().w(px(1.0)).h_full().flex_none().bg(theme.border)
@@ -469,12 +628,9 @@ pub(crate) fn horizontal_divider(theme: ThemeSpec) -> Div {
 }
 
 impl Diffui {
-    /// The whole window with a tab open.
-    fn shell(&mut self, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> Div {
-        let tab_bar = tab_bar::build_tab_bar(self, theme, window, cx);
-        let toolbar = toolbar::build_toolbar(self, theme, window, cx);
-        let body = self.panes(theme, window, cx);
-
+    /// The whole window with a tab open: the skeleton, cheap enough to run on every
+    /// frame, with the regions in it as cached [`Pane`]s.
+    fn shell(&self, panes: &Panes, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> Div {
         let modal_open = [
             ModeKind::ActivityPopover,
             ModeKind::Palette,
@@ -494,32 +650,33 @@ impl Diffui {
             .flex()
             .flex_col()
             .size_full()
-            .child(tab_bar)
-            .child(toolbar)
+            .child(
+                div()
+                    .w_full()
+                    .flex_none()
+                    .h(px(tab_bar::height()))
+                    .child(embed(&panes.tab_bar)),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .flex_none()
+                    .h(px(toolbar::HEIGHT + activity::PROGRESS_LINE_HEIGHT))
+                    .child(embed(&panes.toolbar)),
+            )
             .child(horizontal_divider(theme))
-            .child(body);
+            .child(self.panes(panes, theme, window, cx));
         // While something floats above, nothing below it hovers or takes presses.
         if modal_open {
             shell = shell.child(div().absolute().inset_0().occlude());
         }
 
-        // Overlays float above the whole shell. Each is empty when inactive, so
-        // they can always be stacked.
+        // Overlays float above the whole shell.
         div()
             .relative()
             .size_full()
             .child(shell)
-            .child(palette::build_overlay(self, theme, window, cx))
-            .child(activity::activity_popover(self, theme, window, cx))
-            .child(menu::build_overlay(self, theme, window, cx))
-            .child(tab_bar::build_open_repo_dialog(self, theme, window, cx))
-            .child(crate::bookmarks::build_name_prompt(self, theme, window, cx))
-            .child(crate::changes::split_modal(self, theme, window, cx))
-            .child(tab_bar::build_confirm_dialog(self, theme, window, cx))
-            .child(crate::cli_output::build_overlay(self, theme, window, cx))
-            .child(crate::credentials::build_overlay(self, theme, window, cx))
-            .child(crate::shortcuts::build_overlay(self, theme, window, cx))
-            .child(activity::toast_layer(self, theme, window, cx))
+            .child(div().absolute().inset_0().child(embed(&panes.floats)))
     }
 
     /// The panes under the toolbar: the history pane, the changed files and the
@@ -528,7 +685,7 @@ impl Diffui {
     /// no diff-pane spinner. On a cold load the sidebar simply grows from empty as
     /// batches arrive, and a revision switch keeps the prior diff until the new one
     /// replaces it.
-    fn panes(&mut self, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> Div {
+    fn panes(&self, panes: &Panes, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> Div {
         let has_files = !self.active().session.document.files.is_empty();
         let history_collapsed = self.active().history_panel_collapsed;
         let files_collapsed = self.active().files_panel_collapsed;
@@ -548,69 +705,31 @@ impl Diffui {
             self.file_nav_width
         };
 
-        let pane = |width: f32, child: AnyElement| {
+        let fixed = |width: f32, pane: &Entity<Pane>| {
             div()
                 .h_full()
                 .w(px(width))
                 .flex_none()
                 .overflow_hidden()
-                .child(child)
+                .child(embed(pane))
         };
-        let fill = |child: AnyElement| {
+        let divider = || vertical_divider(theme);
+
+        let mut row = div().flex().flex_row().size_full();
+        row = row
+            .child(fixed(history_width, &panes.left))
+            .child(divider());
+        if main_view == MainView::Diff && has_files {
+            row = row.child(fixed(files_width, &panes.files)).child(divider());
+        }
+        row = row.child(
             div()
                 .h_full()
                 .flex_1()
                 .min_w_0()
                 .overflow_hidden()
-                .child(child)
-        };
-
-        let mut row = div().flex().flex_row().size_full();
-        match main_view {
-            MainView::Diff => {
-                let sidebar_view = if history_collapsed {
-                    sidebar::build_collapsed_sidebar(self, theme, window, cx)
-                } else {
-                    sidebar::build_sidebar(self, theme, window, cx)
-                };
-                row = row
-                    .child(pane(history_width, sidebar_view))
-                    .child(vertical_divider(theme));
-                if has_files {
-                    let navigator = if files_collapsed {
-                        diff_panel::build_collapsed_file_navigator(theme, window, cx)
-                    } else {
-                        diff_panel::build_file_navigator(self, theme, window, cx)
-                    };
-                    row = row
-                        .child(pane(files_width, navigator))
-                        .child(vertical_divider(theme));
-                }
-                row = row.child(fill(diff_panel::build_diff_panel(self, theme, window, cx)));
-            }
-            MainView::Source => {
-                row = row
-                    .child(pane(
-                        self.sidebar_width,
-                        source_panel::build_source_sidebar(self, theme, window, cx),
-                    ))
-                    .child(vertical_divider(theme))
-                    .child(fill(source_panel::build_source_panel(
-                        self, theme, window, cx,
-                    )));
-            }
-            MainView::History => {
-                row = row
-                    .child(pane(
-                        self.sidebar_width,
-                        history_panel::build_history_sidebar(self, theme, window, cx),
-                    ))
-                    .child(vertical_divider(theme))
-                    .child(fill(history_panel::build_history_panel(
-                        self, theme, window, cx,
-                    )));
-            }
-        }
+                .child(embed(&panes.main)),
+        );
 
         let mut body = div().relative().flex_1().min_h_0().w_full().child(row);
 
@@ -620,7 +739,7 @@ impl Diffui {
                 + if files_width == 0.0 { 1.0 } else { 2.0 }
                 + resize_handle::MIN_DIFF_PANE_WIDTH;
             let on_resize = cx.listener(|this: &mut Diffui, width: &f32, _, cx| {
-                this.act(cx, |this, cx| this.on_sidebar_width_changed(*width, cx));
+                this.act(cx, |this, _| this.on_sidebar_width_changed(*width));
             });
             body = body.child(
                 resize_handle::ResizeHandle::new(
@@ -638,9 +757,7 @@ impl Diffui {
         if main_view == MainView::Diff && has_files && !files_collapsed {
             let handle_x = history_width + 1.0 + self.file_nav_width;
             let on_resize = cx.listener(|this: &mut Diffui, position: &f32, _, cx| {
-                this.act(cx, |this, cx| {
-                    this.on_changed_files_width_changed(*position, cx)
-                });
+                this.act(cx, |this, _| this.on_changed_files_width_changed(*position));
             });
             body = body.child(
                 resize_handle::ResizeHandle::new(
