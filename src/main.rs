@@ -51,6 +51,7 @@ mod range;
 mod revops;
 mod revset_assist;
 mod root;
+mod seam;
 mod shortcuts;
 mod sidebar;
 mod source_panel;
