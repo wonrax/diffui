@@ -253,6 +253,7 @@ pub fn cocoa_list_key(key: &Key, modifiers: Modifiers) -> Option<Key> {
 
 #[cfg(test)]
 mod tests {
+    use super::Named::*;
     use super::*;
 
     #[test]
@@ -292,7 +293,8 @@ mod tests {
 
     #[test]
     fn keystrokes_read_as_keys() {
-        let key = |text: &str| Key::from_keystroke(&Keystroke::parse(text).expect("keystroke"));
+        let key =
+            |text: &'static str| Key::from_keystroke(&Keystroke::parse(text).expect("keystroke"));
         assert_eq!(key("enter"), Key::Named(Enter));
         assert_eq!(key("cmd-up"), Key::Named(ArrowUp));
         assert_eq!(key("a"), Key::Character("a".to_owned()));

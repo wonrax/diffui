@@ -1240,27 +1240,30 @@ mod tests {
     /// type into its editors instead of driving the graph behind it.
     #[test]
     fn the_split_prompt_owns_the_keyboard() {
-        use crate::commands::Context;
-        use crate::keymap::Chord;
-        let mut ui = crate::tabs::tests::app();
-        let tab = crate::tabs::tests::push_tab(&mut ui, "/tmp/repo");
-        let state = ui.tab_mut(tab).unwrap();
-        state.session.capabilities.mutate = true;
-        state.session.document.files = vec![file("a.rs", &[H1]), file("b.rs", &[H1])];
-        let _ = ui.open_split(
-            RevisionSelection::WorkingCopy,
-            whole_file("a.rs"),
-            Prose::from("Keep a.rs"),
-            cx,
-        );
-        assert!(split_shown(&ui));
-        let context = ui.key_context();
-        assert_eq!(context, Context::Split);
-        let resolve =
-            |chord: &str| ui.resolve_chord(context, &Chord::parse(chord).expect("a chord"), false);
-        assert_eq!(resolve("esc"), Some("split.cancel"));
-        assert_eq!(resolve("cmd+enter"), Some("split.confirm"));
-        assert_eq!(resolve("j"), None);
+        crate::tabs::tests::with_cx(|cx| {
+            use crate::commands::Context;
+            use crate::keymap::Chord;
+            let mut ui = crate::tabs::tests::app();
+            let tab = crate::tabs::tests::push_tab(&mut ui, "/tmp/repo");
+            let state = ui.tab_mut(tab).unwrap();
+            state.session.capabilities.mutate = true;
+            state.session.document.files = vec![file("a.rs", &[H1]), file("b.rs", &[H1])];
+            ui.open_split(
+                RevisionSelection::WorkingCopy,
+                whole_file("a.rs"),
+                Prose::from("Keep a.rs"),
+                cx,
+            );
+            assert!(split_shown(&ui));
+            let context = ui.key_context();
+            assert_eq!(context, Context::Split);
+            let resolve = |chord: &str| {
+                ui.resolve_chord(context, &Chord::parse(chord).expect("a chord"), false)
+            };
+            assert_eq!(resolve("esc"), Some("split.cancel"));
+            assert_eq!(resolve("cmd+enter"), Some("split.confirm"));
+            assert_eq!(resolve("j"), None);
+        });
     }
 
     #[test]

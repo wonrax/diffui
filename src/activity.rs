@@ -451,12 +451,12 @@ mod tests {
 
         log.toggle_expand(ActivityId(1));
         let editor = log.activities[0].detail_editor.as_ref().expect("built");
-        assert_eq!(editor.text().trim_end(), "remote: hi");
+        assert_eq!(editor.trim_end(), "remote: hi");
 
         // Output landing while the row is open keeps the buffer in sync.
         log.append_output(ActivityId(1), "remote: bye");
         let editor = log.activities[0].detail_editor.as_ref().expect("kept");
-        assert_eq!(editor.text().trim_end(), "remote: hi\nremote: bye");
+        assert_eq!(editor.trim_end(), "remote: hi\nremote: bye");
 
         log.toggle_expand(ActivityId(1));
         assert!(log.activities[0].detail_editor.is_none());

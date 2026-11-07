@@ -147,19 +147,21 @@ mod tests {
 
     #[test]
     fn keys_follow_the_live_keymap() {
-        let mut ui = app();
-        push_tab(&mut ui, "/tmp/hints", cx);
-        assert_eq!(
-            keys(
-                &ui,
-                Context::Draft,
-                &["draft.candidate.next", "draft.candidate.previous"]
-            ),
-            vec!["j".to_owned(), "k".to_owned()]
-        );
-        // Unbound by default: nothing to show.
-        assert!(keys(&ui, Context::Base, &["compare.swap"]).is_empty());
-        assert!(active_hints(&ui).is_none());
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            push_tab(&mut ui, "/tmp/hints");
+            assert_eq!(
+                keys(
+                    &ui,
+                    Context::Draft,
+                    &["draft.candidate.next", "draft.candidate.previous"]
+                ),
+                vec!["j".to_owned(), "k".to_owned()]
+            );
+            // Unbound by default: nothing to show.
+            assert!(keys(&ui, Context::Base, &["compare.swap"]).is_empty());
+            assert!(active_hints(&ui).is_none());
+        });
     }
 
     #[test]

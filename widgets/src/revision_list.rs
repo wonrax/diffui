@@ -120,10 +120,6 @@ pub enum Item {
 // constructing a full widget. `expanded` is `(flat index where file rows
 // start, file count)`; revision rows fill the flats on either side.
 
-fn rows_total(commit_count: usize, expanded: Option<(usize, usize)>) -> usize {
-    commit_count + expanded.map_or(0, |(_, files)| files)
-}
-
 #[derive(Debug, Clone)]
 pub struct RevisionRowView {
     pub selection_key: RowSelectionKey,

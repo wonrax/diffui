@@ -381,10 +381,7 @@ pub const EDITOR_PADDING: crate::theme::Padding = crate::theme::Padding {
 pub fn fit_height(content: &str, font: Font, size: f32, width: f32, min: f32, max: f32) -> f32 {
     let line_height = (size * crate::measure::LINE_HEIGHT_MULTIPLIER).max(1.0);
     let text_width = (width - EDITOR_PADDING.left - EDITOR_PADDING.right).max(1.0);
-    let lines: usize = content
-        .split('\n')
-        .map(|line| crate::measure::wrapped_line_count(line, size, font, line_height, text_width))
-        .sum();
+    let lines = crate::measure::wrapped_line_count(content, size, font, line_height, text_width);
     let natural = (lines as f32 * line_height).ceil() + EDITOR_PADDING.top + EDITOR_PADDING.bottom;
     natural.clamp(min, max.max(min))
 }

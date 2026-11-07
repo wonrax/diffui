@@ -1003,6 +1003,39 @@ fn description_change(history: &HistoryState) -> Option<(&str, &str)> {
     (old.summary != new.summary).then(|| (name(old), name(new)))
 }
 
+fn op_rows<'a>(history: &'a HistoryState) -> Vec<OpRow<'a>> {
+    let mut rows = Vec::new();
+    let ops = &history.ops;
+    let mut index = 0;
+    while index < ops.len() {
+        let op = &ops[index];
+        let run_end = ops[index..]
+            .iter()
+            .position(|candidate| {
+                !candidate.is_snapshot || candidate.is_current && candidate.id != op.id
+            })
+            .map_or(ops.len(), |offset| index + offset);
+        let run = run_end - index;
+        // A lone snapshot reads fine on its own; two or more fold.
+        if op.is_snapshot && !op.is_current && run >= 2 {
+            rows.push(OpRow::Run {
+                first: op,
+                count: run,
+                oldest: &ops[run_end - 1],
+                children: history
+                    .expanded_runs
+                    .contains(&op.id)
+                    .then(|| &ops[index..run_end]),
+            });
+            index = run_end;
+        } else {
+            rows.push(OpRow::Op(op));
+            index += 1;
+        }
+    }
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1063,147 +1096,162 @@ mod tests {
         (ui, repo)
     }
 
-    fn deliver(ui: &mut Diffui, repo: &diffui_core::RepoId, payload: diffui_core::Payload) {
-        ui.TESTUPDATE(
-            Message::Repo(Box::new(diffui_core::Event::new(repo.clone(), payload))),
-            cx,
-        );
+    fn deliver(
+        ui: &mut Diffui,
+        repo: &diffui_core::RepoId,
+        payload: diffui_core::Payload,
+        cx: &mut crate::Cx,
+    ) {
+        ui.act(cx, |ui, cx| {
+            ui.on_repo_event(diffui_core::Event::new(repo.clone(), payload), cx)
+        });
     }
 
     #[test]
     fn the_op_log_streams_in_and_lands_on_the_current_operation() {
-        let (mut ui, repo) = jj_app();
-        let _ = ui.perform_history(HistoryAction::ShowOpLog, cx);
-        assert_eq!(ui.active().main_view, MainView::History);
-        // No actor in a unit test, so the view's own read never starts.
-        let _ = ui.perform_history(HistoryAction::Reload, cx);
-        let job = ui
-            .active()
-            .history
-            .ops_job
-            .expect("the op log is being read");
+        crate::tabs::tests::with_cx(|cx| {
+            let (mut ui, repo) = jj_app();
+            ui.perform_history(HistoryAction::ShowOpLog, cx);
+            assert_eq!(ui.active().main_view, MainView::History);
+            // No actor in a unit test, so the view's own read never starts.
+            ui.perform_history(HistoryAction::Reload, cx);
+            let job = ui
+                .active()
+                .history
+                .ops_job
+                .expect("the op log is being read");
 
-        deliver(
-            &mut ui,
-            &repo,
-            diffui_core::Payload::OpLogBatch {
-                job,
-                entries: vec![op("head", false, true), op("older", true, false)],
-            },
-        );
-        deliver(
-            &mut ui,
-            &repo,
-            diffui_core::Payload::History {
-                job,
-                response: HistoryResponse::OpLogDone { truncated: true },
-            },
-        );
-        let history = &ui.active().history;
-        assert_eq!(history.ops.len(), 2);
-        assert!(history.ops_truncated);
-        assert!(history.ops_job.is_none());
-        assert_eq!(history.selected_op.as_deref(), Some("head"));
-        assert!(
-            history.op_job.is_some(),
-            "selecting asks for the op's changes"
-        );
+            deliver(
+                &mut ui,
+                &repo,
+                diffui_core::Payload::OpLogBatch {
+                    job,
+                    entries: vec![op("head", false, true), op("older", true, false)],
+                },
+                cx,
+            );
+            deliver(
+                &mut ui,
+                &repo,
+                diffui_core::Payload::History {
+                    job,
+                    response: HistoryResponse::OpLogDone { truncated: true },
+                },
+                cx,
+            );
+            let history = &ui.active().history;
+            assert_eq!(history.ops.len(), 2);
+            assert!(history.ops_truncated);
+            assert!(history.ops_job.is_none());
+            assert_eq!(history.selected_op.as_deref(), Some("head"));
+            assert!(
+                history.op_job.is_some(),
+                "selecting asks for the op's changes"
+            );
+        });
     }
 
     #[test]
     fn a_failed_history_read_stays_in_its_pane() {
-        let (mut ui, repo) = jj_app();
-        let _ = ui.perform_history(HistoryAction::ShowOpLog, cx);
-        let _ = ui.perform_history(HistoryAction::Reload, cx);
-        let job = ui
-            .active()
-            .history
-            .ops_job
-            .expect("the op log is being read");
-        deliver(
-            &mut ui,
-            &repo,
-            diffui_core::Payload::Failed {
-                job,
-                error: diffui_core::RepoError::Other("boom".to_owned()),
-            },
-        );
-        assert_eq!(ui.active().history.error.as_deref(), Some("boom"));
-        assert!(ui.active().history.ops_job.is_none());
-        assert!(
-            ui.toasts.is_empty(),
-            "the projection's generic failure toast is for its own jobs"
-        );
+        crate::tabs::tests::with_cx(|cx| {
+            let (mut ui, repo) = jj_app();
+            ui.perform_history(HistoryAction::ShowOpLog, cx);
+            ui.perform_history(HistoryAction::Reload, cx);
+            let job = ui
+                .active()
+                .history
+                .ops_job
+                .expect("the op log is being read");
+            deliver(
+                &mut ui,
+                &repo,
+                diffui_core::Payload::Failed {
+                    job,
+                    error: diffui_core::RepoError::Other("boom".to_owned()),
+                },
+                cx,
+            );
+            assert_eq!(ui.active().history.error.as_deref(), Some("boom"));
+            assert!(ui.active().history.ops_job.is_none());
+            assert!(
+                ui.toasts.is_empty(),
+                "the projection's generic failure toast is for its own jobs"
+            );
+        });
     }
 
     #[test]
     fn a_file_filter_restores_the_previous_revset() {
-        let (mut ui, _repo) = jj_app();
-        ui.active_mut().session.revset = "mine()".to_owned();
-        let _ = ui.perform_history(
-            HistoryAction::FileHistory {
-                revision: RevisionSelection::WorkingCopy,
-                path: "src/main.rs".to_owned(),
-            },
-            cx,
-        );
-        assert_eq!(
-            ui.active().session.revset,
-            r#"::@ & files(root:"src/main.rs")"#
-        );
-        assert!(file_filter_active(&ui));
-        // A second file replaces the first instead of stacking on it.
-        let _ = ui.perform_history(
-            HistoryAction::FileHistory {
-                revision: RevisionSelection::WorkingCopy,
-                path: "README.md".to_owned(),
-            },
-            cx,
-        );
-        let _ = ui.perform_history(HistoryAction::ClearFileFilter, cx);
-        assert_eq!(ui.active().session.revset, "mine()");
-        assert!(!file_filter_active(&ui));
+        crate::tabs::tests::with_cx(|cx| {
+            let (mut ui, _repo) = jj_app();
+            ui.active_mut().session.revset = "mine()".to_owned();
+            ui.perform_history(
+                HistoryAction::FileHistory {
+                    revision: RevisionSelection::WorkingCopy,
+                    path: "src/main.rs".to_owned(),
+                },
+                cx,
+            );
+            assert_eq!(
+                ui.active().session.revset,
+                r#"::@ & files(root:"src/main.rs")"#
+            );
+            assert!(file_filter_active(&ui));
+            // A second file replaces the first instead of stacking on it.
+            ui.perform_history(
+                HistoryAction::FileHistory {
+                    revision: RevisionSelection::WorkingCopy,
+                    path: "README.md".to_owned(),
+                },
+                cx,
+            );
+            ui.perform_history(HistoryAction::ClearFileFilter, cx);
+            assert_eq!(ui.active().session.revset, "mine()");
+            assert!(!file_filter_active(&ui));
+        });
     }
 
     #[test]
     fn the_history_diff_keeps_the_file_it_was_scrolled_to() {
-        let (mut ui, repo) = jj_app();
-        let _ = ui.perform_history(HistoryAction::ShowOpLog, cx);
-        let land = |ui: &mut Diffui, commit_id: &str| {
-            let job = JobId::next();
-            let target = HistoryDiffTarget::Commit {
-                commit_id: commit_id.to_owned(),
-            };
-            ui.active_mut().history.diff_job = Some((job, target.clone()));
-            deliver(
-                ui,
-                &repo,
-                diffui_core::Payload::History {
-                    job,
-                    response: HistoryResponse::Diff {
-                        target,
-                        document: DiffDocument::default(),
-                        details: None,
+        crate::tabs::tests::with_cx(|cx| {
+            let (mut ui, repo) = jj_app();
+            ui.perform_history(HistoryAction::ShowOpLog, cx);
+            let land = |ui: &mut Diffui, commit_id: &str, cx: &mut crate::Cx| {
+                let job = JobId::next();
+                let target = HistoryDiffTarget::Commit {
+                    commit_id: commit_id.to_owned(),
+                };
+                ui.active_mut().history.diff_job = Some((job, target.clone()));
+                deliver(
+                    ui,
+                    &repo,
+                    diffui_core::Payload::History {
+                        job,
+                        response: HistoryResponse::Diff {
+                            target,
+                            document: DiffDocument::default(),
+                            details: None,
+                        },
                     },
-                },
+                    cx,
+                );
+            };
+            land(&mut ui, "a", cx);
+            assert_eq!(ui.active().history.diff_file, 0);
+            // The diff widget scrolls the file it is handed into view, so the
+            // file it reports scrolling onto must be what it is handed next;
+            // a fixed 0 snapped every scroll past the first file back up.
+            ui.act(cx, |ui, cx| {
+                ui.perform(Action::History(HistoryAction::DiffFileChanged(2)), cx)
+            });
+            assert_eq!(ui.active().history.diff_file, 2);
+            land(&mut ui, "b", cx);
+            assert_eq!(
+                ui.active().history.diff_file,
+                0,
+                "a new diff opens at its top"
             );
-        };
-        land(&mut ui, "a");
-        assert_eq!(ui.active().history.diff_file, 0);
-        // The diff widget scrolls the file it is handed into view, so the
-        // file it reports scrolling onto must be what it is handed next;
-        // a fixed 0 snapped every scroll past the first file back up.
-        ui.TESTUPDATE(
-            Message::Action(Action::History(HistoryAction::DiffFileChanged(2))),
-            cx,
-        );
-        assert_eq!(ui.active().history.diff_file, 2);
-        land(&mut ui, "b");
-        assert_eq!(
-            ui.active().history.diff_file,
-            0,
-            "a new diff opens at its top"
-        );
+        });
     }
 
     #[test]

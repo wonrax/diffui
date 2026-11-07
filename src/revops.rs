@@ -596,9 +596,9 @@ mod tests {
     }
 
     /// A jj-capable app over `@` = "w", then "a", "b", "c".
-    fn loaded(rows: Vec<CommitSummary>) -> Diffui {
+    fn loaded(rows: Vec<CommitSummary>, cx: &mut crate::Cx) -> Diffui {
         let mut ui = app();
-        push_tab(&mut ui, "/tmp/revops", cx);
+        push_tab(&mut ui, "/tmp/revops");
         let tab = ui.active_mut();
         tab.session.capabilities.mutate = true;
         let mut builder = CommitStoreBuilder::with_capacity(rows.len());
@@ -634,131 +634,146 @@ mod tests {
 
     #[test]
     fn marks_address_the_working_copy_as_such_and_skip_vanished_rows() {
-        let mut ui = loaded(graph());
-        ui.active_mut().revision_multi_selection =
-            vec!["w".repeat(8), "gone".to_owned(), "b".repeat(8)];
-        assert_eq!(
-            marked_selections(&ui),
-            vec![
-                RevisionSelection::WorkingCopy,
-                RevisionSelection::Commit("b".repeat(8)),
-            ]
-        );
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = loaded(graph(), cx);
+            ui.active_mut().revision_multi_selection =
+                vec!["w".repeat(8), "gone".to_owned(), "b".repeat(8)];
+            assert_eq!(
+                marked_selections(&ui),
+                vec![
+                    RevisionSelection::WorkingCopy,
+                    RevisionSelection::Commit("b".repeat(8)),
+                ]
+            );
+        });
     }
 
     #[test]
     fn dragging_a_marked_row_carries_the_whole_batch() {
-        let mut ui = loaded(graph());
-        let a = RevisionSelection::Commit("a".repeat(8));
-        let b = RevisionSelection::Commit("b".repeat(8));
-        let c = RevisionSelection::Commit("c".repeat(8));
-        ui.active_mut().revision_multi_selection = vec!["a".repeat(8), "c".repeat(8)];
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = loaded(graph(), cx);
+            let a = RevisionSelection::Commit("a".repeat(8));
+            let b = RevisionSelection::Commit("b".repeat(8));
+            let c = RevisionSelection::Commit("c".repeat(8));
+            ui.active_mut().revision_multi_selection = vec!["a".repeat(8), "c".repeat(8)];
 
-        assert_eq!(drag_sources(&ui, 1), vec![a, c]);
-        // Picking up an unmarked row stays a single-revision drag.
-        assert_eq!(drag_sources(&ui, 2), vec![b]);
+            assert_eq!(drag_sources(&ui, 1), vec![a, c]);
+            // Picking up an unmarked row stays a single-revision drag.
+            assert_eq!(drag_sources(&ui, 2), vec![b]);
+        });
     }
 
     #[test]
     fn the_batch_menu_offers_set_verbs_by_size() {
-        let ui = loaded(graph());
-        let two = ui.batch_menu_tree(vec![
-            RevisionSelection::Commit("a".repeat(8)),
-            RevisionSelection::Commit("b".repeat(8)),
-        ]);
-        let two = labels(&two);
-        for expected in [
-            "Rebase 2 revisions",
-            "Whole branches onto\u{2026}",
-            "Whole branches onto trunk",
-            "Squash 2 revisions into\u{2026}",
-            "Duplicate 2 revisions",
-            "New change on all 2 (merge)",
-            "Parallelize 2 revisions\u{2026}",
-            "Abandon 2 revisions",
-        ] {
-            assert!(
-                two.iter().any(|label| label == expected),
-                "{expected} in {two:?}"
-            );
-        }
-        let one = labels(&ui.batch_menu_tree(vec![RevisionSelection::Commit("a".repeat(8))]));
-        assert!(!one.iter().any(|label| label.starts_with("Parallelize")));
-        assert!(!one.iter().any(|label| label.starts_with("New change on")));
+        crate::tabs::tests::with_cx(|cx| {
+            let ui = loaded(graph(), cx);
+            let two = ui.batch_menu_tree(vec![
+                RevisionSelection::Commit("a".repeat(8)),
+                RevisionSelection::Commit("b".repeat(8)),
+            ]);
+            let two = labels(&two);
+            for expected in [
+                "Rebase 2 revisions",
+                "Whole branches onto\u{2026}",
+                "Whole branches onto trunk",
+                "Squash 2 revisions into\u{2026}",
+                "Duplicate 2 revisions",
+                "New change on all 2 (merge)",
+                "Parallelize 2 revisions\u{2026}",
+                "Abandon 2 revisions",
+            ] {
+                assert!(
+                    two.iter().any(|label| label == expected),
+                    "{expected} in {two:?}"
+                );
+            }
+            let one = labels(&ui.batch_menu_tree(vec![RevisionSelection::Commit("a".repeat(8))]));
+            assert!(!one.iter().any(|label| label.starts_with("Parallelize")));
+            assert!(!one.iter().any(|label| label.starts_with("New change on")));
+        });
     }
 
     #[test]
     fn parallelize_from_the_marks_enters_a_two_source_draft() {
-        // Entering the draft kicks the debounced preview, whose timer needs a
-        // runtime to be created in.
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .expect("a test runtime");
-        let _context = runtime.enter();
-        let mut ui = loaded(graph());
-        ui.active_mut().revision_multi_selection = vec!["a".repeat(8), "b".repeat(8)];
-        let _ = ui.run_command("selection.parallelize", CommandArg::None, cx);
-        let draft = &ui.active().op_draft().expect("target mode is on").draft;
-        assert_eq!(draft.kind, DraftKind::Parallelize);
-        assert_eq!(draft.sources.len(), 2);
-        assert!(
-            ui.active().revision_multi_selection.is_empty(),
-            "the draft wash replaces the marks"
-        );
-        assert!(matches!(
-            draft.op_from_sources(),
-            Some(mutations::MutationOp::Parallelize { .. })
-        ));
+        crate::tabs::tests::with_cx(|cx| {
+            // Entering the draft kicks the debounced preview, whose timer needs a
+            // runtime to be created in.
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("a test runtime");
+            let _context = runtime.enter();
+            let mut ui = loaded(graph(), cx);
+            ui.active_mut().revision_multi_selection = vec!["a".repeat(8), "b".repeat(8)];
+            ui.run_command("selection.parallelize", CommandArg::None, cx);
+            let draft = &ui.active().op_draft().expect("target mode is on").draft;
+            assert_eq!(draft.kind, DraftKind::Parallelize);
+            assert_eq!(draft.sources.len(), 2);
+            assert!(
+                ui.active().revision_multi_selection.is_empty(),
+                "the draft wash replaces the marks"
+            );
+            assert!(matches!(
+                draft.op_from_sources(),
+                Some(mutations::MutationOp::Parallelize { .. })
+            ));
+        });
     }
 
     #[test]
     fn insert_new_change_somewhere_else_arms_the_clicked_row() {
-        // An armed draft kicks the debounced preview, whose timer needs a
-        // runtime to be created in.
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .expect("a test runtime");
-        let _context = runtime.enter();
-        let mut ui = loaded(graph());
-        let b = RevisionSelection::Commit("b".repeat(8));
-        let _ = ui.run_command("revision.new.start", CommandArg::Revision(b), cx);
-        let draft = &ui.active().op_draft().expect("target mode is on").draft;
-        assert_eq!(draft.kind, DraftKind::New);
-        assert!(draft.sources.is_empty());
-        assert_eq!(draft.candidate, Some(2), "armed on b's row");
+        crate::tabs::tests::with_cx(|cx| {
+            // An armed draft kicks the debounced preview, whose timer needs a
+            // runtime to be created in.
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("a test runtime");
+            let _context = runtime.enter();
+            let mut ui = loaded(graph(), cx);
+            let b = RevisionSelection::Commit("b".repeat(8));
+            ui.run_command("revision.new.start", CommandArg::Revision(b), cx);
+            let draft = &ui.active().op_draft().expect("target mode is on").draft;
+            assert_eq!(draft.kind, DraftKind::New);
+            assert!(draft.sources.is_empty());
+            assert_eq!(draft.candidate, Some(2), "armed on b's row");
+        });
     }
 
     #[test]
     fn divergent_rows_get_the_resolution_submenu() {
-        let mut rows = graph();
-        rows[1].is_divergent = true;
-        rows[2].is_divergent = true;
-        rows[2].change_id = rows[1].change_id.clone();
-        let ui = loaded(rows);
-        let divergent = labels(&ui.revops_surgery_rows(&RevisionSelection::Commit("a".repeat(8))));
-        assert!(
-            divergent
-                .iter()
-                .any(|label| label == "Keep this copy, abandon the other one"),
-            "{divergent:?}"
-        );
-        let plain = labels(&ui.revops_surgery_rows(&RevisionSelection::Commit("c".repeat(8))));
-        assert!(!plain.iter().any(|label| label == "Divergent change"));
+        crate::tabs::tests::with_cx(|cx| {
+            let mut rows = graph();
+            rows[1].is_divergent = true;
+            rows[2].is_divergent = true;
+            rows[2].change_id = rows[1].change_id.clone();
+            let ui = loaded(rows, cx);
+            let divergent =
+                labels(&ui.revops_surgery_rows(&RevisionSelection::Commit("a".repeat(8))));
+            assert!(
+                divergent
+                    .iter()
+                    .any(|label| label == "Keep this copy, abandon the other one"),
+                "{divergent:?}"
+            );
+            let plain = labels(&ui.revops_surgery_rows(&RevisionSelection::Commit("c".repeat(8))));
+            assert!(!plain.iter().any(|label| label == "Divergent change"));
+        });
     }
 
     #[test]
     fn commit_is_offered_on_the_working_copy_only() {
-        let ui = loaded(graph());
-        assert!(can_commit(&ui, &CommandArg::None).is_ok());
-        assert!(can_commit(&ui, &CommandArg::Revision(RevisionSelection::WorkingCopy)).is_ok());
-        assert_eq!(
-            can_commit(
-                &ui,
-                &CommandArg::Revision(RevisionSelection::Commit("a".repeat(8)))
-            ),
-            Err("Only the working copy commits")
-        );
+        crate::tabs::tests::with_cx(|cx| {
+            let ui = loaded(graph(), cx);
+            assert!(can_commit(&ui, &CommandArg::None).is_ok());
+            assert!(can_commit(&ui, &CommandArg::Revision(RevisionSelection::WorkingCopy)).is_ok());
+            assert_eq!(
+                can_commit(
+                    &ui,
+                    &CommandArg::Revision(RevisionSelection::Commit("a".repeat(8)))
+                ),
+                Err("Only the working copy commits")
+            );
+        });
     }
 }

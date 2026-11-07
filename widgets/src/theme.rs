@@ -607,7 +607,7 @@ pub fn modal_card<E: Styled>(element: E, theme: ThemeSpec) -> E {
 /// Dimming layer behind modal surfaces. One alpha everywhere so stacked
 /// takeovers (confirm dialog, open-repo dialog, command palette) feel equally
 /// deep.
-pub const SCRIM: Color = Color { a: 0.40, ..BLACK };
+pub const SCRIM: Color = rgba(0.0, 0.0, 0.0, 0.40);
 
 /// Text-selection tint in an input.
 pub fn input_selection(theme: ThemeSpec) -> Color {

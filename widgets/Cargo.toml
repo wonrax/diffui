@@ -19,3 +19,6 @@ ureq = "3"
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { workspace = true }
 objc2-foundation = { workspace = true, features = ["NSString", "NSGeometry"] }
+# Already in the tree through gpui-kit; named so a measurement can shape text off
+# the main thread, which building a whole platform refuses to do (tests run there).
+gpui-apple = { package = "gpui-pre-apple", version = "=0.3.11" }

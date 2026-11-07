@@ -28,12 +28,21 @@ pub fn install(system: Arc<TextSystem>) {
 /// The text system measurements go through.
 pub fn text_system() -> Arc<TextSystem> {
     TEXT_SYSTEM
-        .get_or_init(|| {
-            Arc::new(TextSystem::new(
-                gpui_kit::platform::current_platform(true).text_system(),
-            ))
-        })
+        .get_or_init(|| Arc::new(TextSystem::new(platform_text_system())))
         .clone()
+}
+
+/// A fresh platform text system, without a platform. Building a whole platform
+/// demands the main thread on macOS, which tests don't run on.
+pub fn platform_text_system() -> Arc<dyn gpui_kit::PlatformTextSystem> {
+    #[cfg(target_os = "macos")]
+    {
+        Arc::new(gpui_apple::AppleTextSystem::new())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        gpui_kit::platform::current_platform(true).text_system()
+    }
 }
 
 /// Measurements before the shaper is rebuilt. Its layout cache only drops
@@ -97,10 +106,13 @@ pub fn wrapped_line_count(
     content: &str,
     size: f32,
     font: Font,
-    _line_height: f32,
+    line_height: f32,
     max_width: f32,
 ) -> usize {
-    wrapped_line_starts(content, size, font, _line_height, max_width).len()
+    content
+        .split('\n')
+        .map(|line| wrapped_line_starts(line, size, font, line_height, max_width).len())
+        .sum()
 }
 
 /// Byte offset at which each visual line of word-wrapped `content` starts:
@@ -170,8 +182,10 @@ mod tests {
     /// hanging on the previous line), not mid-word at the width limit.
     #[test]
     fn wrap_breaks_at_word_boundaries() {
-        // 7 chars fit: "aaa bbb" + hanging blank, then "ccc".
-        assert_eq!(starts("aaa bbb ccc", 7.4), vec![0, 8]);
+        // GPUI doesn't let a trailing blank hang past the width: 8 chars fit
+        // "aaa bbb " and then "ccc", while 7 send "bbb" down to join "ccc".
+        assert_eq!(starts("aaa bbb ccc", 8.4), vec![0, 8]);
+        assert_eq!(starts("aaa bbb ccc", 7.4), vec![0, 4]);
         // 5 chars fit: one word (+ hanging blank) per visual line.
         assert_eq!(starts("aaa bbb ccc", 5.4), vec![0, 4, 8]);
     }

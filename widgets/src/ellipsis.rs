@@ -334,7 +334,7 @@ mod tests {
             ],
             Font::MONOSPACE,
             11.0,
-            Color::BLACK,
+            crate::theme::BLACK,
         );
         assert!(line.is_multiline());
         let single: String = line

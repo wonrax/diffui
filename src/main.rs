@@ -27,6 +27,8 @@ mod empty_states;
 mod field;
 mod find;
 mod graph_preview;
+#[cfg(test)]
+mod harness;
 mod history_panel;
 mod jj_version;
 mod keymap;
@@ -198,6 +200,9 @@ fn main() {
         tracing::warn!("credential prompts unavailable: {error}");
     }
 
+    // The UI thread runs inside the tokio runtime: the repository actor's channels
+    // and the core's process spawns look for one where they're called from.
+    let _tokio = spawn::runtime().enter();
     gpui_kit::application().run(move |cx| {
         root::init(cx);
         let saved = WindowState::load();

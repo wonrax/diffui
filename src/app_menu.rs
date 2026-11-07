@@ -45,13 +45,13 @@ pub(crate) fn start(cx: &mut Cx) {
 /// Install the menu bar. Called once the window is open, after winit has put
 /// up its default one.
 pub(crate) fn install(ui: &Diffui) {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", not(test)))]
     {
         let menus = mac::menus(ui);
         mac::record_bar_tags(&menus);
         crate::macos_native::install_menu_bar(&menus);
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(any(not(target_os = "macos"), test))]
     let _ = ui;
 }
 
@@ -59,7 +59,7 @@ pub(crate) fn install(ui: &Diffui) {
 /// now, so their items are greyed when a menu opens. Cheap enough to run
 /// after every update: a predicate per bar command, no repository reads.
 pub(crate) fn refresh_availability(ui: &Diffui) {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", not(test)))]
     {
         let unavailable = mac::bar_tags()
             .iter()

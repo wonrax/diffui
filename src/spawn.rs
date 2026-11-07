@@ -54,9 +54,8 @@ impl Diffui {
         cx: &mut Cx,
         run: impl FnOnce(&mut Diffui, &mut Cx) + 'static,
     ) {
-        Self::run_async(tokio::time::sleep(delay), cx, move |this, (), cx| {
-            run(this, cx)
-        });
+        let wait = async move { tokio::time::sleep(delay).await };
+        Self::run_async(wait, cx, move |this, (), cx| run(this, cx));
     }
 
     /// `run` once the current update has returned, inside its own `act`. This

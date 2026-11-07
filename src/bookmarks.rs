@@ -627,9 +627,9 @@ mod tests {
     const WC: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const MAIN: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
-    fn ui_with_bookmarks() -> (Diffui, TabId) {
+    fn ui_with_bookmarks(cx: &mut crate::Cx) -> (Diffui, TabId) {
         let mut ui = app();
-        let tab = push_tab(&mut ui, "/tmp/repo", cx);
+        let tab = push_tab(&mut ui, "/tmp/repo");
         let session = &mut ui.tab_mut(tab).unwrap().session;
         session.capabilities.mutate = true;
         session.bookmarks = BookmarksInfo {
@@ -697,158 +697,179 @@ mod tests {
 
     #[test]
     fn an_overridable_rejection_offers_the_push_with_those_allowances() {
-        let (mut ui, tab) = ui_with_bookmarks();
-        let held = pending(
-            &mut ui,
-            tab,
-            MutationOp::PushBookmark {
-                name: "main".to_owned(),
-                remote: "origin".to_owned(),
-            },
-        );
-        let _ = ui.push_rejected(held, rejection(vec![PushCheck::EmptyDescription]), cx);
-        let dialog = ui.confirm().expect("a confirmation is raised");
-        let body = dialog.body.to_string();
-        assert!(body.contains("has no description"), "{body}");
-        match &dialog.pending.op {
-            MutationOp::Push(request) => {
-                assert!(request.allow.empty_description);
-                assert!(!request.allow.private && !request.allow.conflicts);
-                assert_eq!(
-                    request.targets,
-                    vec![PushTarget::SetBookmark {
-                        name: "main".to_owned(),
-                        to: RevisionSelection::WorkingCopy,
-                    }],
-                    "the rerun carries the move the refusal rolled back"
-                );
+        crate::tabs::tests::with_cx(|cx| {
+            let (mut ui, tab) = ui_with_bookmarks(cx);
+            let held = pending(
+                &mut ui,
+                tab,
+                MutationOp::PushBookmark {
+                    name: "main".to_owned(),
+                    remote: "origin".to_owned(),
+                },
+            );
+            ui.push_rejected(held, rejection(vec![PushCheck::EmptyDescription]), cx);
+            let dialog = ui.confirm().expect("a confirmation is raised");
+            let body = dialog.body.to_string();
+            assert!(body.contains("has no description"), "{body}");
+            match &dialog.pending.op {
+                MutationOp::Push(request) => {
+                    assert!(request.allow.empty_description);
+                    assert!(!request.allow.private && !request.allow.conflicts);
+                    assert_eq!(
+                        request.targets,
+                        vec![PushTarget::SetBookmark {
+                            name: "main".to_owned(),
+                            to: RevisionSelection::WorkingCopy,
+                        }],
+                        "the rerun carries the move the refusal rolled back"
+                    );
+                }
+                other => panic!("expected a push rerun, got {other:?}"),
             }
-            other => panic!("expected a push rerun, got {other:?}"),
-        }
+        });
     }
 
     #[test]
     fn a_rejection_without_an_escape_hatch_is_just_an_error() {
-        let (mut ui, tab) = ui_with_bookmarks();
-        let held = pending(
-            &mut ui,
-            tab,
-            MutationOp::PushBookmark {
-                name: "main".to_owned(),
-                remote: "origin".to_owned(),
-            },
-        );
-        let _ = ui.push_rejected(
-            held,
-            rejection(vec![
-                PushCheck::EmptyDescription,
-                PushCheck::MissingIdentity,
-            ]),
-            cx,
-        );
-        assert!(ui.confirm().is_none(), "no override for a missing author");
-        assert!(!ui.active().activities.any_running());
+        crate::tabs::tests::with_cx(|cx| {
+            let (mut ui, tab) = ui_with_bookmarks(cx);
+            let held = pending(
+                &mut ui,
+                tab,
+                MutationOp::PushBookmark {
+                    name: "main".to_owned(),
+                    remote: "origin".to_owned(),
+                },
+            );
+            ui.push_rejected(
+                held,
+                rejection(vec![
+                    PushCheck::EmptyDescription,
+                    PushCheck::MissingIdentity,
+                ]),
+                cx,
+            );
+            assert!(ui.confirm().is_none(), "no override for a missing author");
+            assert!(!ui.active().activities.any_running());
+        });
     }
 
     #[test]
     fn pushing_the_working_copy_asks_first() {
-        let (mut ui, tab) = ui_with_bookmarks();
-        let wc_push = MutationOp::Push(PushRequest {
-            remote: "origin".to_owned(),
-            targets: vec![PushTarget::Bookmark("wip".to_owned())],
-            allow: PushAllow::default(),
-            confirm: false,
-        });
-        assert!(ui.publishes_working_copy(&wc_push));
-        assert!(!ui.publishes_working_copy(&MutationOp::PushBookmark {
-            name: "main".to_owned(),
-            remote: "origin".to_owned(),
-        }));
-        assert!(ui.publishes_working_copy(&MutationOp::MoveBookmark {
-            name: "main".to_owned(),
-            to: RevisionSelection::Commit(WC.to_owned()),
-            push_remote: Some("origin".to_owned()),
-        }));
-        assert!(!ui.publishes_working_copy(&MutationOp::MoveBookmark {
-            name: "main".to_owned(),
-            to: RevisionSelection::WorkingCopy,
-            push_remote: None,
-        }));
+        crate::tabs::tests::with_cx(|cx| {
+            let (mut ui, tab) = ui_with_bookmarks(cx);
+            let wc_push = MutationOp::Push(PushRequest {
+                remote: "origin".to_owned(),
+                targets: vec![PushTarget::Bookmark("wip".to_owned())],
+                allow: PushAllow::default(),
+                confirm: false,
+            });
+            assert!(ui.publishes_working_copy(&wc_push));
+            assert!(!ui.publishes_working_copy(&MutationOp::PushBookmark {
+                name: "main".to_owned(),
+                remote: "origin".to_owned(),
+            }));
+            assert!(ui.publishes_working_copy(&MutationOp::MoveBookmark {
+                name: "main".to_owned(),
+                to: RevisionSelection::Commit(WC.to_owned()),
+                push_remote: Some("origin".to_owned()),
+            }));
+            assert!(!ui.publishes_working_copy(&MutationOp::MoveBookmark {
+                name: "main".to_owned(),
+                to: RevisionSelection::WorkingCopy,
+                push_remote: None,
+            }));
 
-        let held = pending(&mut ui, tab, wc_push);
-        let _ = ui.run_mutation_checking_wc_push(held, cx);
-        assert!(ui.confirm().is_some());
-        assert!(ui.tab_mut(tab).unwrap().jobs.mutation.is_none());
+            let held = pending(&mut ui, tab, wc_push);
+            ui.run_mutation_checking_wc_push(held, cx);
+            assert!(ui.confirm().is_some());
+            assert!(ui.tab_mut(tab).unwrap().jobs.mutation.is_none());
+        });
     }
 
     #[test]
     fn the_prompt_moves_an_existing_name_and_refuses_bad_ones() {
-        let (mut ui, _tab) = ui_with_bookmarks();
-        let _ = ui.update_bookmark(
-            BookmarkAction::Create {
-                at: RevisionSelection::WorkingCopy,
-            },
-            cx,
-        );
-        let verdict = |ui: &mut Diffui, value: &str| {
-            let _ = ui.update_bookmark(BookmarkAction::PromptInput(value.to_owned()), cx);
-            ui.prompt_verdict(ui.name_prompt().unwrap())
-        };
-        assert!(
-            matches!(verdict(&mut ui, "feature"), PromptVerdict::Create(name) if name == "feature")
-        );
-        assert!(matches!(verdict(&mut ui, "main"), PromptVerdict::Move(name) if name == "main"));
-        assert!(matches!(verdict(&mut ui, "a b"), PromptVerdict::Invalid(_)));
-        assert!(matches!(verdict(&mut ui, ""), PromptVerdict::Invalid(_)));
+        crate::tabs::tests::with_cx(|cx| {
+            let (mut ui, _tab) = ui_with_bookmarks(cx);
+            ui.update_bookmark(
+                BookmarkAction::Create {
+                    at: RevisionSelection::WorkingCopy,
+                },
+                cx,
+            );
+            let verdict = |ui: &mut Diffui, value: &str, cx: &mut crate::Cx| {
+                ui.update_bookmark(BookmarkAction::PromptInput(value.to_owned()), cx);
+                ui.prompt_verdict(ui.name_prompt().unwrap())
+            };
+            assert!(
+                matches!(verdict(&mut ui, "feature", cx), PromptVerdict::Create(name) if name == "feature")
+            );
+            assert!(
+                matches!(verdict(&mut ui, "main", cx), PromptVerdict::Move(name) if name == "main")
+            );
+            assert!(matches!(
+                verdict(&mut ui, "a b", cx),
+                PromptVerdict::Invalid(_)
+            ));
+            assert!(matches!(
+                verdict(&mut ui, "", cx),
+                PromptVerdict::Invalid(_)
+            ));
 
-        let _ = ui.update_bookmark(BookmarkAction::PromptCancel, cx);
-        let _ = ui.update_bookmark(
-            BookmarkAction::Rename {
-                name: "wip".to_owned(),
-            },
-            cx,
-        );
-        assert!(matches!(
-            verdict(&mut ui, "main"),
-            PromptVerdict::Invalid(_)
-        ));
-        assert!(matches!(verdict(&mut ui, "wip"), PromptVerdict::Invalid(_)));
-        assert!(matches!(
-            verdict(&mut ui, "done"),
-            PromptVerdict::Rename { old, new } if old == "wip" && new == "done"
-        ));
+            ui.update_bookmark(BookmarkAction::PromptCancel, cx);
+            ui.update_bookmark(
+                BookmarkAction::Rename {
+                    name: "wip".to_owned(),
+                },
+                cx,
+            );
+            assert!(matches!(
+                verdict(&mut ui, "main", cx),
+                PromptVerdict::Invalid(_)
+            ));
+            assert!(matches!(
+                verdict(&mut ui, "wip", cx),
+                PromptVerdict::Invalid(_)
+            ));
+            assert!(matches!(
+                verdict(&mut ui, "done", cx),
+                PromptVerdict::Rename { old, new } if old == "wip" && new == "done"
+            ));
+        });
     }
 
     #[test]
     fn several_remotes_without_a_default_get_a_chooser() {
-        let (ui, _tab) = ui_with_bookmarks();
-        assert_eq!(ui.active().session.bookmarks.default_push_remote(), None);
-        let rows = ui.revision_bookmark_rows(&RevisionSelection::WorkingCopy);
-        assert!(
+        crate::tabs::tests::with_cx(|cx| {
+            let (ui, _tab) = ui_with_bookmarks(cx);
+            assert_eq!(ui.active().session.bookmarks.default_push_remote(), None);
+            let rows = ui.revision_bookmark_rows(&RevisionSelection::WorkingCopy);
+            assert!(
             rows.iter().any(|row| matches!(
                 row,
                 MenuEntry::Submenu { label, items } if label == "Push as new bookmark" && items.len() == 2
             )),
             "{rows:?}"
         );
-        // A bookmark no remote tracks can still be pushed: one row per remote.
-        let wip = ui.active().session.bookmarks.entry("wip").unwrap().clone();
-        let labels: Vec<String> = ui
-            .local_bookmark_rows(&wip)
-            .into_iter()
-            .filter_map(|row| match row {
-                MenuEntry::Item { label, .. } => Some(label),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            labels.contains(&"Push to fork (new)".to_owned()),
-            "{labels:?}"
-        );
-        assert!(
-            labels.contains(&"Push to upstream (new)".to_owned()),
-            "{labels:?}"
-        );
+            // A bookmark no remote tracks can still be pushed: one row per remote.
+            let wip = ui.active().session.bookmarks.entry("wip").unwrap().clone();
+            let labels: Vec<String> = ui
+                .local_bookmark_rows(&wip)
+                .into_iter()
+                .filter_map(|row| match row {
+                    MenuEntry::Item { label, .. } => Some(label),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                labels.contains(&"Push to fork (new)".to_owned()),
+                "{labels:?}"
+            );
+            assert!(
+                labels.contains(&"Push to upstream (new)".to_owned()),
+                "{labels:?}"
+            );
+        });
     }
 
     #[test]

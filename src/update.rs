@@ -4551,110 +4551,115 @@ mod tests {
     use super::*;
     use crate::commands::Context;
     use crate::modes::{Mode, ModeKind};
-    use crate::palette::PaletteMessage;
     use crate::tabs::tests::{app, push_tab};
 
     #[test]
     fn dragging_history_to_its_minimum_collapses_and_keeps_its_width() {
-        let mut ui = app();
-        ui.sidebar_min_width = 220.0;
-        ui.sidebar_width = 340.0;
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            ui.sidebar_min_width = 220.0;
+            ui.sidebar_width = 340.0;
 
-        ui.TESTUPDATE(Message::Ui(UiEvent::SidebarWidthChanged(220.0)), cx);
+            ui.act(cx, |ui, cx| ui.on_sidebar_width_changed(220.0, cx));
 
-        assert!(ui.active().history_panel_collapsed);
-        assert_eq!(ui.sidebar_width, 340.0);
+            assert!(ui.active().history_panel_collapsed);
+            assert_eq!(ui.sidebar_width, 340.0);
+        });
     }
 
     #[test]
     fn changed_files_resize_and_minimum_collapse_keep_the_last_width() {
-        let mut ui = app();
-        ui.sidebar_width = 340.0;
-        ui.file_nav_width = diff_panel::DEFAULT_FILE_NAV_WIDTH;
-        let prefix = ui.sidebar_width + 1.0;
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            ui.sidebar_width = 340.0;
+            ui.file_nav_width = diff_panel::DEFAULT_FILE_NAV_WIDTH;
+            let prefix = ui.sidebar_width + 1.0;
 
-        ui.TESTUPDATE(
-            Message::Ui(UiEvent::ChangedFilesWidthChanged(prefix + 280.0)),
-            cx,
-        );
-        assert_eq!(ui.file_nav_width, 280.0);
-        assert!(!ui.active().files_panel_collapsed);
+            ui.act(cx, |ui, cx| {
+                ui.on_changed_files_width_changed(prefix + 280.0, cx)
+            });
+            assert_eq!(ui.file_nav_width, 280.0);
+            assert!(!ui.active().files_panel_collapsed);
 
-        ui.TESTUPDATE(
-            Message::Ui(UiEvent::ChangedFilesWidthChanged(
-                prefix + diff_panel::MIN_FILE_NAV_WIDTH,
-            )),
-            cx,
-        );
-        assert!(ui.active().files_panel_collapsed);
-        assert_eq!(ui.file_nav_width, 280.0);
+            ui.act(cx, |ui, cx| {
+                ui.on_changed_files_width_changed(prefix + diff_panel::MIN_FILE_NAV_WIDTH, cx)
+            });
+            assert!(ui.active().files_panel_collapsed);
+            assert_eq!(ui.file_nav_width, 280.0);
+        });
     }
 
     #[test]
     fn changed_files_peek_survives_trigger_exit_after_popup_entry() {
-        let mut ui = app();
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
 
-        let _ = ui.on_ui_event(UiEvent::ChangedFilesTriggerEntered, cx);
-        let _ = ui.on_ui_event(UiEvent::ChangedFilesPopupEntered, cx);
-        // The rail exit can arrive after the popup enter at their shared seam.
-        ui.changed_files_trigger_hovered = false;
-        let _ = ui.on_ui_event(UiEvent::CloseChangedFilesPeek, cx);
-        assert!(ui.changed_files_peek_open);
+            ui.on_changed_files_trigger_entered(cx);
+            ui.on_changed_files_popup_entered(cx);
+            // The rail exit can arrive after the popup enter at their shared seam.
+            ui.changed_files_trigger_hovered = false;
+            ui.on_close_changed_files_peek(cx);
+            assert!(ui.changed_files_peek_open);
 
-        ui.changed_files_popup_hovered = false;
-        let _ = ui.on_ui_event(UiEvent::CloseChangedFilesPeek, cx);
-        assert!(!ui.changed_files_peek_open);
+            ui.changed_files_popup_hovered = false;
+            ui.on_close_changed_files_peek(cx);
+            assert!(!ui.changed_files_peek_open);
+        });
     }
 
     /// The rail is a corridor, not a trigger: crossing it on the way somewhere
     /// else opens nothing, but it holds a peek the icon already opened.
     #[test]
     fn the_changed_files_rail_holds_a_peek_but_never_opens_one() {
-        let mut ui = app();
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
 
-        let _ = ui.on_ui_event(UiEvent::ChangedFilesRailEntered, cx);
-        let _ = ui.on_ui_event(UiEvent::CloseChangedFilesPeek, cx);
-        assert!(!ui.changed_files_peek_open);
+            ui.on_changed_files_rail_entered(cx);
+            ui.on_close_changed_files_peek(cx);
+            assert!(!ui.changed_files_peek_open);
 
-        let _ = ui.on_ui_event(UiEvent::ChangedFilesTriggerEntered, cx);
-        assert!(ui.changed_files_peek_open);
-        // Off the icon but still on the rail, heading for a file far down the
-        // tree. (The exit events themselves arm a tokio timer, which needs a
-        // runtime this test doesn't have.)
-        ui.changed_files_trigger_hovered = false;
-        let _ = ui.on_ui_event(UiEvent::CloseChangedFilesPeek, cx);
-        assert!(ui.changed_files_peek_open);
+            ui.on_changed_files_trigger_entered(cx);
+            assert!(ui.changed_files_peek_open);
+            // Off the icon but still on the rail, heading for a file far down the
+            // tree. (The exit events themselves arm a tokio timer, which needs a
+            // runtime this test doesn't have.)
+            ui.changed_files_trigger_hovered = false;
+            ui.on_close_changed_files_peek(cx);
+            assert!(ui.changed_files_peek_open);
 
-        ui.changed_files_rail_hovered = false;
-        let _ = ui.on_ui_event(UiEvent::CloseChangedFilesPeek, cx);
-        assert!(!ui.changed_files_peek_open);
+            ui.changed_files_rail_hovered = false;
+            ui.on_close_changed_files_peek(cx);
+            assert!(!ui.changed_files_peek_open);
+        });
     }
 
     #[test]
     fn window_state_keeps_each_repositories_panel_visibility() {
-        let mut ui = app();
-        push_tab(&mut ui, "/tmp/first", cx);
-        push_tab(&mut ui, "/tmp/second", cx);
-        ui.tabs[0].state.history_panel_collapsed = true;
-        ui.tabs[1].state.files_panel_collapsed = true;
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            push_tab(&mut ui, "/tmp/first");
+            push_tab(&mut ui, "/tmp/second");
+            ui.tabs[0].state.history_panel_collapsed = true;
+            ui.tabs[1].state.files_panel_collapsed = true;
 
-        let saved = ui.current_window_state();
+            let saved = ui.current_window_state();
 
-        assert_eq!(saved.history_panel_collapsed.get("/tmp/first"), Some(&true));
-        assert_eq!(saved.files_panel_collapsed.get("/tmp/first"), Some(&false));
-        assert_eq!(
-            saved.history_panel_collapsed.get("/tmp/second"),
-            Some(&false)
-        );
-        assert_eq!(saved.files_panel_collapsed.get("/tmp/second"), Some(&true));
+            assert_eq!(saved.history_panel_collapsed.get("/tmp/first"), Some(&true));
+            assert_eq!(saved.files_panel_collapsed.get("/tmp/first"), Some(&false));
+            assert_eq!(
+                saved.history_panel_collapsed.get("/tmp/second"),
+                Some(&false)
+            );
+            assert_eq!(saved.files_panel_collapsed.get("/tmp/second"), Some(&true));
+        });
     }
 
-    fn press(ui: &mut Diffui, chord: &str) {
+    fn press(ui: &mut Diffui, chord: &str, cx: &mut crate::Cx) {
         let chord = Chord::parse(chord).expect("a parsable chord");
         let id = ui
             .resolve_chord(ui.key_context(), &chord, false)
             .unwrap_or_else(|| panic!("{chord:?} is bound to nothing"));
-        let _ = ui.run_command(id, CommandArg::None, cx);
+        ui.run_command(id, CommandArg::None, cx);
     }
 
     /// Matching is debounced, so between a keystroke and its recompute the
@@ -4663,36 +4668,37 @@ mod tests {
     /// highlighted.
     #[test]
     fn accepting_a_dirty_palette_runs_what_the_query_names() {
-        let mut ui = app();
-        // The palette only renders with a repository open, so it only stays
-        // open with one — see `prune_stale_modes`.
-        push_tab(&mut ui, "/tmp/repo", cx);
-        let _ = ui.perform(Action::OpenPalette, cx);
-        let stale = ui
-            .palette()
-            .and_then(|state| state.top())
-            .and_then(|column| column.matches.first())
-            .map(|m| m.item.clone())
-            .expect("the empty query lists the root commands");
-        assert!(
-            !matches!(&stale, ResultRef::Command(id) if *id == "theme.contrast"),
-            "the stale highlight must differ from the answer, or the test proves nothing"
-        );
-
-        ui.TESTUPDATE(
-            Message::Palette(PaletteMessage::QueryChanged(">high contrast".to_owned())),
-            cx,
-        );
-        assert!(
-            ui.palette()
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            // The palette only renders with a repository open, so it only stays
+            // open with one — see `prune_stale_modes`.
+            push_tab(&mut ui, "/tmp/repo");
+            ui.perform(Action::OpenPalette, cx);
+            let stale = ui
+                .palette()
                 .and_then(|state| state.top())
-                .is_some_and(|column| column.dirty),
-            "the debounced recompute has not run yet"
-        );
+                .and_then(|column| column.matches.first())
+                .map(|m| m.item.clone())
+                .expect("the empty query lists the root commands");
+            assert!(
+                !matches!(&stale, ResultRef::Command(id) if *id == "theme.contrast"),
+                "the stale highlight must differ from the answer, or the test proves nothing"
+            );
 
-        let _ = ui.palette_accept_current(cx);
-        assert_eq!(ui.selected_theme, ThemePreference::HighContrast);
-        assert!(ui.palette().is_none(), "accepting closes the palette");
+            ui.act(cx, |ui, cx| {
+                ui.palette_on_query_changed(">high contrast".to_owned(), cx)
+            });
+            assert!(
+                ui.palette()
+                    .and_then(|state| state.top())
+                    .is_some_and(|column| column.dirty),
+                "the debounced recompute has not run yet"
+            );
+
+            ui.palette_accept_current(cx);
+            assert_eq!(ui.selected_theme, ThemePreference::HighContrast);
+            assert!(ui.palette().is_none(), "accepting closes the palette");
+        });
     }
 
     /// A replaced document leaves the find bar's matches indexing text that
@@ -4700,148 +4706,156 @@ mod tests {
     /// recompute them; they used to stay stale until the next keystroke.
     #[test]
     fn a_replaced_document_recomputes_find_matches() {
-        use crate::diff_view::FindMatch;
-        use crate::find::FindState;
-        use crate::modes::TabMode;
-        use diffui_core::{
-            DiffDocument, DiffFile, DiffFileStatus, DiffHunkView, DiffLine, DiffLineKind,
-        };
+        crate::tabs::tests::with_cx(|cx| {
+            use crate::diff_view::FindMatch;
+            use crate::find::FindState;
+            use crate::modes::TabMode;
+            use diffui_core::{
+                DiffDocument, DiffFile, DiffFileStatus, DiffHunkView, DiffLine, DiffLineKind,
+            };
 
-        let document = |lines: &[&str]| DiffDocument {
-            files: vec![DiffFile {
-                path: "f.rs".to_owned(),
-                old_path: None,
-                status: DiffFileStatus::Modified,
-                additions: 0,
-                deletions: 0,
-                hunks: vec![DiffHunkView {
-                    header: "@@".to_owned(),
-                    lines: lines
-                        .iter()
-                        .map(|content| DiffLine {
-                            kind: DiffLineKind::Context,
-                            old_line: None,
-                            new_line: None,
-                            content: (*content).to_owned(),
-                            syntax: Vec::new(),
-                            emphasis: Vec::new(),
-                        })
-                        .collect(),
+            let document = |lines: &[&str]| DiffDocument {
+                files: vec![DiffFile {
+                    path: "f.rs".to_owned(),
+                    old_path: None,
+                    status: DiffFileStatus::Modified,
+                    additions: 0,
+                    deletions: 0,
+                    hunks: vec![DiffHunkView {
+                        header: "@@".to_owned(),
+                        lines: lines
+                            .iter()
+                            .map(|content| DiffLine {
+                                kind: DiffLineKind::Context,
+                                old_line: None,
+                                new_line: None,
+                                content: (*content).to_owned(),
+                                syntax: Vec::new(),
+                                emphasis: Vec::new(),
+                            })
+                            .collect(),
+                    }],
+                    collapsed: None,
+                    blob: None,
                 }],
-                collapsed: None,
-                blob: None,
-            }],
-            total_additions: 0,
-            total_deletions: 0,
-            range: None,
-        };
+                total_additions: 0,
+                total_deletions: 0,
+                range: None,
+            };
 
-        let mut ui = app();
-        let tab = push_tab(&mut ui, "/tmp/repo", cx);
-        ui.active_mut().push_mode(TabMode::Find(FindState {
-            query: "needle".to_owned(),
-            // Matches against the document being replaced: they point at a
-            // file that isn't even in the incoming one.
-            matches: vec![FindMatch {
-                file_index: 9,
-                hunk_index: 9,
-                line_index: 9,
-                byte_start: 0,
-                byte_end: 6,
-            }],
-            active: Some(0),
-            ..FindState::default()
-        }));
+            let mut ui = app();
+            let tab = push_tab(&mut ui, "/tmp/repo");
+            ui.active_mut().push_mode(TabMode::Find(FindState {
+                query: "needle".to_owned(),
+                // Matches against the document being replaced: they point at a
+                // file that isn't even in the incoming one.
+                matches: vec![FindMatch {
+                    file_index: 9,
+                    hunk_index: 9,
+                    line_index: 9,
+                    byte_start: 0,
+                    byte_end: 6,
+                }],
+                active: Some(0),
+                ..FindState::default()
+            }));
 
-        let revision = RevisionSelection::Commit("abc".to_owned());
-        let effects = ui.tab_mut(tab).unwrap().session.load_diff(revision.clone());
-        let job = match effects.first() {
-            Some(diffui_core::Effect::Send(diffui_core::Command::LoadDiff { job, .. })) => *job,
-            other => panic!("expected a diff load, got {other:?}"),
-        };
-        let repo = ui.tabs[0].repo_id().expect("a repo tab has an id");
-        ui.TESTUPDATE(
-            Message::Repo(Box::new(diffui_core::Event::new(
-                repo,
-                diffui_core::Payload::DiffLoaded {
-                    job,
-                    revision,
-                    document: document(&["no hits here", "a needle and a needle"]),
-                    details: None,
-                },
-            ))),
-            cx,
-        );
+            let revision = RevisionSelection::Commit("abc".to_owned());
+            let effects = ui.tab_mut(tab).unwrap().session.load_diff(revision.clone());
+            let job = match effects.first() {
+                Some(diffui_core::Effect::Send(diffui_core::Command::LoadDiff { job, .. })) => *job,
+                other => panic!("expected a diff load, got {other:?}"),
+            };
+            let repo = ui.tabs[0].repo_id().expect("a repo tab has an id");
+            ui.act(cx, |ui, cx| {
+                ui.on_repo_event(
+                    diffui_core::Event::new(
+                        repo,
+                        diffui_core::Payload::DiffLoaded {
+                            job,
+                            revision,
+                            document: document(&["no hits here", "a needle and a needle"]),
+                            details: None,
+                        },
+                    ),
+                    cx,
+                )
+            });
 
-        let state = ui.active().find().expect("the find bar is still open");
-        assert_eq!(
-            state
-                .matches
-                .iter()
-                .map(|m| (m.line_index, m.byte_start))
-                .collect::<Vec<_>>(),
-            vec![(1, 2), (1, 15)],
-            "matches must index the document that just landed"
-        );
-        assert_eq!(state.active, Some(0));
+            let state = ui.active().find().expect("the find bar is still open");
+            assert_eq!(
+                state
+                    .matches
+                    .iter()
+                    .map(|m| (m.line_index, m.byte_start))
+                    .collect::<Vec<_>>(),
+                vec![(1, 2), (1, 15)],
+                "matches must index the document that just landed"
+            );
+            assert_eq!(state.active, Some(0));
+        });
     }
 
     /// A backwards-move check that errors can't say the move is safe, so the
     /// move (and its push) doesn't run and no confirmation pretends it can.
     #[test]
     fn a_failed_backwards_check_refuses_the_move_and_push() {
-        let mut ui = app();
-        let tab = push_tab(&mut ui, "/tmp/repo", cx);
-        let (activity_id, _) = ui.begin_activity(tab, "Move main + push", false);
-        let state = ui.tab_mut(tab).unwrap();
-        let job = state.session.next_job();
-        state.jobs.bookmark_check = Some((
-            job,
-            PendingMutation {
-                op: mutations::MutationOp::MoveBookmark {
-                    name: "main".to_owned(),
-                    to: RevisionSelection::WorkingCopy,
-                    push_remote: Some("origin".to_owned()),
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            let tab = push_tab(&mut ui, "/tmp/repo");
+            let (activity_id, _) = ui.begin_activity(tab, "Move main + push", false);
+            let state = ui.tab_mut(tab).unwrap();
+            let job = state.session.next_job();
+            state.jobs.bookmark_check = Some((
+                job,
+                PendingMutation {
+                    op: mutations::MutationOp::MoveBookmark {
+                        name: "main".to_owned(),
+                        to: RevisionSelection::WorkingCopy,
+                        push_remote: Some("origin".to_owned()),
+                    },
+                    tab_id: tab,
+                    activity_id,
+                    allow_immutable: false,
                 },
-                tab_id: tab,
-                activity_id,
-                allow_immutable: false,
-            },
-        ));
+            ));
 
-        let _ = ui.apply_bookmark_check(tab, Err("index unavailable".to_owned()), cx);
+            ui.apply_bookmark_check(tab, Err("index unavailable".to_owned()), cx);
 
-        let state = ui.tab_mut(tab).unwrap();
-        assert!(state.jobs.bookmark_check.is_none());
-        assert!(state.jobs.mutation.is_none(), "nothing was sent");
-        assert!(state.queued_mutations.is_empty(), "nothing was queued");
-        assert!(ui.confirm().is_none());
-        assert!(!ui.active().activities.any_running());
+            let state = ui.tab_mut(tab).unwrap();
+            assert!(state.jobs.bookmark_check.is_none());
+            assert!(state.jobs.mutation.is_none(), "nothing was sent");
+            assert!(state.queued_mutations.is_empty(), "nothing was queued");
+            assert!(ui.confirm().is_none());
+            assert!(!ui.active().activities.any_running());
+        });
     }
 
     /// A typed `--allow-backwards` is the user's answer to the confirmation,
     /// so the move runs without the check; without it, the check comes first.
     #[test]
     fn allow_backwards_skips_the_backwards_check() {
-        let mut ui = app();
-        let tab = push_tab(&mut ui, "/tmp/repo", cx);
-        ui.tab_mut(tab).unwrap().session.capabilities.mutate = true;
-        let op = || mutations::MutationOp::MoveBookmark {
-            name: "main".to_owned(),
-            to: RevisionSelection::Commit("abc".to_owned()),
-            push_remote: None,
-        };
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            let tab = push_tab(&mut ui, "/tmp/repo");
+            ui.tab_mut(tab).unwrap().session.capabilities.mutate = true;
+            let op = || mutations::MutationOp::MoveBookmark {
+                name: "main".to_owned(),
+                to: RevisionSelection::Commit("abc".to_owned()),
+                push_remote: None,
+            };
 
-        let _ = ui.start_mutation(op(), false, cx);
-        let state = ui.tab_mut(tab).unwrap();
-        assert!(state.jobs.bookmark_check.is_some());
-        assert!(state.jobs.mutation.is_none());
-        state.jobs.bookmark_check = None;
+            ui.start_mutation(op(), false, cx);
+            let state = ui.tab_mut(tab).unwrap();
+            assert!(state.jobs.bookmark_check.is_some());
+            assert!(state.jobs.mutation.is_none());
+            state.jobs.bookmark_check = None;
 
-        let _ = ui.start_mutation(op(), true, cx);
-        let state = ui.tab_mut(tab).unwrap();
-        assert!(state.jobs.bookmark_check.is_none());
-        assert!(state.jobs.mutation.is_some(), "the move runs straight away");
+            ui.start_mutation(op(), true, cx);
+            let state = ui.tab_mut(tab).unwrap();
+            assert!(state.jobs.bookmark_check.is_none());
+            assert!(state.jobs.mutation.is_some(), "the move runs straight away");
+        });
     }
 
     #[test]
@@ -4919,14 +4933,16 @@ mod tests {
 
     #[test]
     fn the_palette_chord_toggles_the_palette_from_inside_it() {
-        let mut ui = app();
-        push_tab(&mut ui, "/tmp/repo", cx);
-        press(&mut ui, "cmd+k");
-        assert!(ui.palette().is_some());
-        assert_eq!(ui.key_context(), Context::Palette);
-        press(&mut ui, "cmd+k");
-        assert!(ui.palette().is_none());
-        assert_eq!(ui.key_context(), Context::Base);
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            push_tab(&mut ui, "/tmp/repo");
+            press(&mut ui, "cmd+k", cx);
+            assert!(ui.palette().is_some());
+            assert_eq!(ui.key_context(), Context::Palette);
+            press(&mut ui, "cmd+k", cx);
+            assert!(ui.palette().is_none());
+            assert_eq!(ui.key_context(), Context::Base);
+        });
     }
 
     /// A menu built before a graph reload names rows by commit id. `enabled`
@@ -4934,15 +4950,17 @@ mod tests {
     /// longer run its mutation.
     #[test]
     fn a_stale_menu_row_cannot_act_on_a_commit_the_graph_no_longer_has() {
-        let mut ui = app();
-        ui.push_mode(Mode::ActivityPopover);
-        let gone = RevisionSelection::Commit("deadbeef".to_owned());
-        let _ = ui.run_command("revision.abandon", CommandArg::Revision(gone), cx);
-        // Nothing was queued and nothing was logged: the command refused
-        // before it could mint an activity.
-        assert!(ui.active().activities.is_empty());
-        assert!(ui.active().queued_mutations.is_empty());
-        // The popover is still up — the pick was a no-op, not a dismissal.
-        assert!(ui.mode(ModeKind::ActivityPopover).is_some());
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            ui.push_mode(Mode::ActivityPopover);
+            let gone = RevisionSelection::Commit("deadbeef".to_owned());
+            ui.run_command("revision.abandon", CommandArg::Revision(gone), cx);
+            // Nothing was queued and nothing was logged: the command refused
+            // before it could mint an activity.
+            assert!(ui.active().activities.is_empty());
+            assert!(ui.active().queued_mutations.is_empty());
+            // The popover is still up — the pick was a no-op, not a dismissal.
+            assert!(ui.mode(ModeKind::ActivityPopover).is_some());
+        });
     }
 }

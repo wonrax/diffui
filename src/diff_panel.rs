@@ -196,14 +196,21 @@ mod tests {
         let size = 12.0;
         let line_height = size * crate::measure::LINE_HEIGHT_MULTIPLIER;
         let count = |content: &str, width: f32| {
-            crate::measure::wrapped_line_count(content, size, Font::MONOSPACE, line_height, width)
+            crate::measure::wrapped_line_count(
+                content,
+                size,
+                crate::theme::Font::MONOSPACE,
+                line_height,
+                width,
+            )
         };
         let wide = 10_000.0;
         assert_eq!(count("", wide), 1);
         assert_eq!(count("one\ntwo", wide), 2);
         assert_eq!(count("short", wide), 1);
         // A line well past the width must wrap into several visual lines.
-        let char_width = crate::measure::line_width("M", size, Font::MONOSPACE).max(1.0);
+        let char_width =
+            crate::measure::line_width("M", size, crate::theme::Font::MONOSPACE).max(1.0);
         assert!(count(&"word ".repeat(40), char_width * 12.0) > 2);
     }
 }

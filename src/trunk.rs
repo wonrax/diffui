@@ -192,9 +192,9 @@ mod tests {
 
     /// "s" sits on trunk "t", "f" is a feature branch off older history,
     /// "o" is old immutable history.
-    fn ui(trunk: Option<&str>) -> Diffui {
+    fn ui(trunk: Option<&str>, cx: &mut crate::Cx) -> Diffui {
         let mut ui = app();
-        push_tab(&mut ui, "/tmp/trunk", cx);
+        push_tab(&mut ui, "/tmp/trunk");
         let tab = ui.active_mut();
         tab.session.capabilities.mutate = true;
         tab.session.bookmarks.trunk = trunk.map(|id| id.repeat(8));
@@ -217,18 +217,20 @@ mod tests {
 
     #[test]
     fn says_why_a_branch_cannot_move_onto_trunk() {
-        let ui = ui(Some("t"));
-        assert_eq!(blocker(&ui, &on("f")), None);
-        assert_eq!(blocker(&ui, &on("s")), Some("Already on trunk"));
-        assert_eq!(blocker(&ui, &on("t")), Some("Revision is immutable"));
-        assert_eq!(blocker(&ui, &on("o")), Some("Revision is immutable"));
-        assert_eq!(blocker(&ui, &on("x")), Some("Revision isn't in the log"));
+        crate::tabs::tests::with_cx(|cx| {
+            let ui = ui(Some("t"), cx);
+            assert_eq!(blocker(&ui, &on("f")), None);
+            assert_eq!(blocker(&ui, &on("s")), Some("Already on trunk"));
+            assert_eq!(blocker(&ui, &on("t")), Some("Revision is immutable"));
+            assert_eq!(blocker(&ui, &on("o")), Some("Revision is immutable"));
+            assert_eq!(blocker(&ui, &on("x")), Some("Revision isn't in the log"));
 
-        let no_trunk = super::tests::ui(None);
-        assert_eq!(
-            blocker(&no_trunk, &on("f")),
-            Some("trunk() doesn't resolve to a bookmark")
-        );
+            let no_trunk = super::tests::ui(None, cx);
+            assert_eq!(
+                blocker(&no_trunk, &on("f")),
+                Some("trunk() doesn't resolve to a bookmark")
+            );
+        });
     }
 
     #[test]
@@ -252,14 +254,16 @@ mod tests {
 
     #[test]
     fn a_batch_blocks_on_the_first_revision_that_cannot_move() {
-        let ui = ui(Some("t"));
-        let f = RevisionSelection::Commit("f".repeat(8));
-        let s = RevisionSelection::Commit("s".repeat(8));
-        let o = RevisionSelection::Commit("o".repeat(8));
+        crate::tabs::tests::with_cx(|cx| {
+            let ui = ui(Some("t"), cx);
+            let f = RevisionSelection::Commit("f".repeat(8));
+            let s = RevisionSelection::Commit("s".repeat(8));
+            let o = RevisionSelection::Commit("o".repeat(8));
 
-        assert_eq!(blocker_for(&ui, std::slice::from_ref(&f)), None);
-        assert_eq!(blocker_for(&ui, &[]), Some("No revisions marked"));
-        assert_eq!(blocker_for(&ui, &[f, s]), Some("Already on trunk"));
-        assert_eq!(blocker_for(&ui, &[o]), Some("Revision is immutable"));
+            assert_eq!(blocker_for(&ui, std::slice::from_ref(&f)), None);
+            assert_eq!(blocker_for(&ui, &[]), Some("No revisions marked"));
+            assert_eq!(blocker_for(&ui, &[f, s]), Some("Already on trunk"));
+            assert_eq!(blocker_for(&ui, &[o]), Some("Revision is immutable"));
+        });
     }
 }

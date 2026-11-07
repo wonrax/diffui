@@ -303,7 +303,6 @@ fn named_label(named: Named) -> &'static str {
         Named::F10 => "F10",
         Named::F11 => "F11",
         Named::F12 => "F12",
-        _ => "",
     }
 }
 

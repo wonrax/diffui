@@ -43,7 +43,9 @@ pub(crate) struct Background {
     loading: Option<Task<()>>,
     toasts: Option<Task<()>>,
     geometry: Option<Task<()>>,
-    /// The window observers.
+    /// The window observers. Non-empty once the view has a window: before that
+    /// (and in tests of update code, which have none) nothing runs in the
+    /// background.
     window: Vec<Subscription>,
 }
 
@@ -208,6 +210,9 @@ impl Diffui {
 
     /// Starts the loops whose condition now holds and drops the rest.
     fn sync_background(&mut self, cx: &mut Cx) {
+        if self.background.window.is_empty() {
+            return;
+        }
         // One actor per open repository. Keyed by what it opened, so a tab keeps
         // its actor across reorders and two tabs on one repository share it.
         let specs: Vec<OpenSpec> = self.tabs.iter().map(|tab| tab.open_spec()).collect();

@@ -397,6 +397,16 @@ pub(crate) mod tests {
     /// A blank app with no tabs. Built field-by-field rather than through
     /// [`Diffui::new`], which reads the config file and the saved session and
     /// measures fonts through a renderer this headless run doesn't have.
+    /// Runs `f` with a [`Cx`] on a headless app, for tests of update code: most of
+    /// it takes one, even where a test never lets a spawned task run. The context's
+    /// entity is not the test's own `Diffui`, so nothing reaches back into it.
+    pub(crate) fn with_cx<R>(f: impl FnOnce(&mut crate::Cx) -> R) -> R {
+        use gpui_kit::{AppContext as _, TestAppContext};
+        let mut cx = TestAppContext::single();
+        let entity = cx.update(|cx| cx.new(|_| app()));
+        entity.update(&mut cx, |_, cx| f(cx))
+    }
+
     pub(crate) fn app() -> Diffui {
         Diffui {
             app_focused: true,
@@ -415,8 +425,8 @@ pub(crate) mod tests {
             window_position: None,
             geometry_dirty_since: None,
             config: AppConfig {
-                ui_font: Font::DEFAULT,
-                mono_font: Font::MONOSPACE,
+                ui_font: crate::theme::Font::DEFAULT,
+                mono_font: crate::theme::Font::MONOSPACE,
                 multi_click_ms: 350,
                 theme: ThemePreference::System,
                 code_type: CodeTypography::default(),
@@ -441,7 +451,9 @@ pub(crate) mod tests {
             changed_files_popup_hovered: false,
             toasts: Vec::new(),
             next_toast_id: 0,
-            modifiers: keyboard::Modifiers::default(),
+            window: None,
+            background: Default::default(),
+            modifiers: crate::keys::Modifiers::default(),
         }
     }
 
@@ -495,50 +507,54 @@ pub(crate) mod tests {
 
     #[test]
     fn a_diff_landing_for_a_background_tab_leaves_the_active_one_alone() {
-        let mut ui = app();
-        let first = push_tab(&mut ui, "/tmp/first", cx);
-        let second = push_tab(&mut ui, "/tmp/second", cx);
-        ui.active = 1;
-        assert_eq!(ui.active_tab_id(), Some(second));
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            let first = push_tab(&mut ui, "/tmp/first");
+            let second = push_tab(&mut ui, "/tmp/second");
+            ui.active = 1;
+            assert_eq!(ui.active_tab_id(), Some(second));
 
-        // The backgrounded tab is mid-switch to a commit; its diff lands while
-        // the other tab is on screen. Routing is by job, and the job belongs to
-        // that tab's slot — two tabs both pending on `@` can no longer swap
-        // each other's contents.
-        let revision = RevisionSelection::Commit("abc".to_owned());
-        let effects = ui
-            .tab_mut(first)
-            .unwrap()
-            .session
-            .load_diff(revision.clone());
-        let job = match effects.first() {
-            Some(diffui_core::Effect::Send(diffui_core::Command::LoadDiff { job, .. })) => *job,
-            other => panic!("expected a diff load, got {other:?}"),
-        };
-        let repo = ui.tabs[0].repo_id().expect("a repo tab has an id");
-        ui.TESTUPDATE(
-            Message::Repo(Box::new(diffui_core::Event::new(
-                repo,
-                diffui_core::Payload::DiffLoaded {
-                    job,
-                    revision: revision.clone(),
-                    document: document("a.rs"),
-                    details: None,
-                },
-            ))),
-            cx,
-        );
+            // The backgrounded tab is mid-switch to a commit; its diff lands while
+            // the other tab is on screen. Routing is by job, and the job belongs to
+            // that tab's slot — two tabs both pending on `@` can no longer swap
+            // each other's contents.
+            let revision = RevisionSelection::Commit("abc".to_owned());
+            let effects = ui
+                .tab_mut(first)
+                .unwrap()
+                .session
+                .load_diff(revision.clone());
+            let job = match effects.first() {
+                Some(diffui_core::Effect::Send(diffui_core::Command::LoadDiff { job, .. })) => *job,
+                other => panic!("expected a diff load, got {other:?}"),
+            };
+            let repo = ui.tabs[0].repo_id().expect("a repo tab has an id");
+            ui.act(cx, |ui, cx| {
+                ui.on_repo_event(
+                    diffui_core::Event::new(
+                        repo,
+                        diffui_core::Payload::DiffLoaded {
+                            job,
+                            revision: revision.clone(),
+                            document: document("a.rs"),
+                            details: None,
+                        },
+                    ),
+                    cx,
+                )
+            });
 
-        let background = ui.tab_mut(first).unwrap();
-        assert_eq!(background.session.selected_revision, revision);
-        assert_eq!(background.session.document.files.len(), 1);
-        assert_eq!(background.session.document.files[0].path, "a.rs");
-        // The tab on screen never saw it.
-        assert_eq!(
-            ui.active().session.selected_revision,
-            RevisionSelection::WorkingCopy
-        );
-        assert!(ui.active().session.document.files.is_empty());
+            let background = ui.tab_mut(first).unwrap();
+            assert_eq!(background.session.selected_revision, revision);
+            assert_eq!(background.session.document.files.len(), 1);
+            assert_eq!(background.session.document.files[0].path, "a.rs");
+            // The tab on screen never saw it.
+            assert_eq!(
+                ui.active().session.selected_revision,
+                RevisionSelection::WorkingCopy
+            );
+            assert!(ui.active().session.document.files.is_empty());
+        });
     }
 
     fn details(description: &str) -> diffui_core::RevisionDetails {
@@ -556,7 +572,7 @@ pub(crate) mod tests {
 
     /// Land the diff `tab` is waiting on for `revision`, the way the actor
     /// reports it.
-    fn land_diff(ui: &mut Diffui, tab: TabId, revision: &RevisionSelection) {
+    fn land_diff(ui: &mut Diffui, tab: TabId, revision: &RevisionSelection, cx: &mut crate::Cx) {
         let effects = ui.tab_mut(tab).unwrap().session.load_diff(revision.clone());
         let job = effects
             .iter()
@@ -569,18 +585,20 @@ pub(crate) mod tests {
         let repo = ui.tabs[index.expect("the tab is open")]
             .repo_id()
             .expect("a repo tab has an id");
-        ui.TESTUPDATE(
-            Message::Repo(Box::new(diffui_core::Event::new(
-                repo,
-                diffui_core::Payload::DiffLoaded {
-                    job,
-                    revision: revision.clone(),
-                    document: document("a.rs"),
-                    details: Some(details("first line")),
-                },
-            ))),
-            cx,
-        );
+        ui.act(cx, |ui, cx| {
+            ui.on_repo_event(
+                diffui_core::Event::new(
+                    repo,
+                    diffui_core::Payload::DiffLoaded {
+                        job,
+                        revision: revision.clone(),
+                        document: document("a.rs"),
+                        details: Some(details("first line")),
+                    },
+                ),
+                cx,
+            )
+        });
     }
 
     /// "Edit description" on a row that isn't selected browses to it first and
@@ -589,33 +607,35 @@ pub(crate) mod tests {
     /// nothing.
     #[test]
     fn editing_the_description_of_another_revision_opens_once_its_diff_lands() {
-        let mut ui = app();
-        let tab = push_tab(&mut ui, "/tmp/only", cx);
-        ui.tab_mut(tab).unwrap().session.capabilities.mutate = true;
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            let tab = push_tab(&mut ui, "/tmp/only");
+            ui.tab_mut(tab).unwrap().session.capabilities.mutate = true;
 
-        let revision = RevisionSelection::Commit("abc".to_owned());
-        let _ = ui.perform(
-            Action::EditDescription {
-                target: Some(revision.clone()),
-            },
-            cx,
-        );
-        assert_eq!(
-            ui.active().pending_description_edit.as_ref(),
-            Some(&revision),
-            "the edit waits for the revision it named"
-        );
-        assert!(ui.active().description_editor().is_none());
+            let revision = RevisionSelection::Commit("abc".to_owned());
+            ui.perform(
+                Action::EditDescription {
+                    target: Some(revision.clone()),
+                },
+                cx,
+            );
+            assert_eq!(
+                ui.active().pending_description_edit.as_ref(),
+                Some(&revision),
+                "the edit waits for the revision it named"
+            );
+            assert!(ui.active().description_editor().is_none());
 
-        land_diff(&mut ui, tab, &revision);
+            land_diff(&mut ui, tab, &revision, cx);
 
-        let state = ui.active();
-        assert_eq!(state.pending_description_edit, None);
-        let editor = state
-            .description_editor()
-            .expect("the editor opened over the revision that landed");
-        assert_eq!(editor.target, revision);
-        assert_eq!(editor.text(), "first line");
+            let state = ui.active();
+            assert_eq!(state.pending_description_edit, None);
+            let editor = state
+                .description_editor()
+                .expect("the editor opened over the revision that landed");
+            assert_eq!(editor.target, revision);
+            assert_eq!(editor.text(), "first line");
+        });
     }
 
     /// The same edit, but its diff lands while another tab is on screen. The
@@ -623,110 +643,118 @@ pub(crate) mod tests {
     /// — and the pending edit must survive to open on activation instead.
     #[test]
     fn a_deferred_description_edit_opens_when_its_tab_comes_back() {
-        let mut ui = app();
-        let first = push_tab(&mut ui, "/tmp/first", cx);
-        let _second = push_tab(&mut ui, "/tmp/second", cx);
-        ui.tab_mut(first).unwrap().session.capabilities.mutate = true;
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            let first = push_tab(&mut ui, "/tmp/first");
+            let _second = push_tab(&mut ui, "/tmp/second");
+            ui.tab_mut(first).unwrap().session.capabilities.mutate = true;
 
-        let revision = RevisionSelection::Commit("abc".to_owned());
-        ui.tab_mut(first).unwrap().pending_description_edit = Some(revision.clone());
-        ui.active = 1;
-        land_diff(&mut ui, first, &revision);
+            let revision = RevisionSelection::Commit("abc".to_owned());
+            ui.tab_mut(first).unwrap().pending_description_edit = Some(revision.clone());
+            ui.active = 1;
+            land_diff(&mut ui, first, &revision, cx);
 
-        assert!(
-            ui.active().description_editor().is_none(),
-            "the tab on screen keeps the keyboard"
-        );
-        assert_eq!(
-            ui.tab_mut(first).unwrap().pending_description_edit.as_ref(),
-            Some(&revision),
-            "the edit is held, not dropped"
-        );
+            assert!(
+                ui.active().description_editor().is_none(),
+                "the tab on screen keeps the keyboard"
+            );
+            assert_eq!(
+                ui.tab_mut(first).unwrap().pending_description_edit.as_ref(),
+                Some(&revision),
+                "the edit is held, not dropped"
+            );
 
-        let _ = ui.activate_tab(first, cx);
+            ui.activate_tab(first, cx);
 
-        assert_eq!(ui.active().pending_description_edit, None);
-        assert_eq!(
-            ui.active()
-                .description_editor()
-                .expect("the editor opened on activation")
-                .target,
-            revision
-        );
+            assert_eq!(ui.active().pending_description_edit, None);
+            assert_eq!(
+                ui.active()
+                    .description_editor()
+                    .expect("the editor opened on activation")
+                    .target,
+                revision
+            );
+        });
     }
 
     #[test]
     fn moving_a_tab_reorders_the_strip_without_changing_which_is_active() {
-        let mut ui = app();
-        let first = push_tab(&mut ui, "/tmp/first", cx);
-        let second = push_tab(&mut ui, "/tmp/second", cx);
-        let third = push_tab(&mut ui, "/tmp/third", cx);
-        ui.active = 1;
-        let order = |ui: &Diffui| ui.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>();
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            let first = push_tab(&mut ui, "/tmp/first");
+            let second = push_tab(&mut ui, "/tmp/second");
+            let third = push_tab(&mut ui, "/tmp/third");
+            ui.active = 1;
+            let order = |ui: &Diffui| ui.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>();
 
-        // The active tab dragged to the end of the strip.
-        ui.move_tab(second, 2);
-        assert_eq!(order(&ui), [first, third, second]);
-        assert_eq!(ui.active_tab_id(), Some(second));
+            // The active tab dragged to the end of the strip.
+            ui.move_tab(second, 2);
+            assert_eq!(order(&ui), [first, third, second]);
+            assert_eq!(ui.active_tab_id(), Some(second));
 
-        // A background tab crossing the active one: `active` is an index, so
-        // it has to follow the tab it named.
-        ui.move_tab(first, 2);
-        assert_eq!(order(&ui), [third, second, first]);
-        assert_eq!(ui.active_tab_id(), Some(second));
+            // A background tab crossing the active one: `active` is an index, so
+            // it has to follow the tab it named.
+            ui.move_tab(first, 2);
+            assert_eq!(order(&ui), [third, second, first]);
+            assert_eq!(ui.active_tab_id(), Some(second));
 
-        // Past the end clamps to the last slot.
-        ui.move_tab(third, 9);
-        assert_eq!(order(&ui), [second, first, third]);
-        assert_eq!(ui.active_tab_id(), Some(second));
+            // Past the end clamps to the last slot.
+            ui.move_tab(third, 9);
+            assert_eq!(order(&ui), [second, first, third]);
+            assert_eq!(ui.active_tab_id(), Some(second));
 
-        // The next launch restores the strip in this order.
-        assert!(ui.geometry_dirty_since.is_some());
-        assert_eq!(
-            ui.current_window_state().open_repos,
-            ["/tmp/second", "/tmp/first", "/tmp/third"]
-        );
+            // The next launch restores the strip in this order.
+            assert!(ui.geometry_dirty_since.is_some());
+            assert_eq!(
+                ui.current_window_state().open_repos,
+                ["/tmp/second", "/tmp/first", "/tmp/third"]
+            );
+        });
     }
 
     #[test]
     fn moving_a_tab_onto_its_own_slot_changes_nothing() {
-        let mut ui = app();
-        let first = push_tab(&mut ui, "/tmp/first", cx);
-        let _second = push_tab(&mut ui, "/tmp/second", cx);
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            let first = push_tab(&mut ui, "/tmp/first");
+            let _second = push_tab(&mut ui, "/tmp/second");
 
-        ui.move_tab(first, 0);
-        ui.move_tab(TabId(99), 1);
+            ui.move_tab(first, 0);
+            ui.move_tab(TabId(99), 1);
 
-        assert_eq!(ui.tabs[0].id, first);
-        assert!(
-            ui.geometry_dirty_since.is_none(),
-            "nothing moved, so there is nothing to persist"
-        );
+            assert_eq!(ui.tabs[0].id, first);
+            assert!(
+                ui.geometry_dirty_since.is_none(),
+                "nothing moved, so there is nothing to persist"
+            );
+        });
     }
 
     #[test]
     fn closing_the_active_tab_takes_its_draft_with_it() {
-        let mut ui = app();
-        let first = push_tab(&mut ui, "/tmp/first", cx);
-        let second = push_tab(&mut ui, "/tmp/second", cx);
-        ui.active = 1;
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            let first = push_tab(&mut ui, "/tmp/first");
+            let second = push_tab(&mut ui, "/tmp/second");
+            ui.active = 1;
 
-        let draft = diffui_core::OpDraft::squash(diffui_core::DraftSource {
-            selection: RevisionSelection::Commit("abc".to_owned()),
-            commit_id: "abc".to_owned(),
-            label: "abc".to_owned(),
+            let draft = diffui_core::OpDraft::squash(diffui_core::DraftSource {
+                selection: RevisionSelection::Commit("abc".to_owned()),
+                commit_id: "abc".to_owned(),
+                label: "abc".to_owned(),
+            });
+            let state = ui.tab_mut(second).unwrap();
+            state.push_mode(TabMode::Draft(DraftUi::new(draft)));
+            state.revision_multi_selection = vec!["abc".to_owned()];
+
+            ui.close_tab(second, cx);
+
+            // The draft named rows of the closed tab; the neighbour inherits none
+            // of it — there is no shared slot for it to be left in.
+            assert_eq!(ui.active_tab_id(), Some(first));
+            assert!(ui.active().op_draft().is_none());
+            assert!(ui.active().revision_multi_selection.is_empty());
         });
-        let state = ui.tab_mut(second).unwrap();
-        state.push_mode(TabMode::Draft(DraftUi::new(draft)));
-        state.revision_multi_selection = vec!["abc".to_owned()];
-
-        let _ = ui.close_tab(second, cx);
-
-        // The draft named rows of the closed tab; the neighbour inherits none
-        // of it — there is no shared slot for it to be left in.
-        assert_eq!(ui.active_tab_id(), Some(first));
-        assert!(ui.active().op_draft().is_none());
-        assert!(ui.active().revision_multi_selection.is_empty());
     }
 
     /// Two mutations from one tab: the second waits rather than overwriting
@@ -735,110 +763,118 @@ pub(crate) mod tests {
     /// reload that should follow it never fires.
     #[test]
     fn a_second_mutation_waits_instead_of_displacing_the_first() {
-        let mut ui = app();
-        let tab = push_tab(&mut ui, "/tmp/only", cx);
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            let tab = push_tab(&mut ui, "/tmp/only");
 
-        let describe = |ui: &mut Diffui, text: &str| {
-            let (activity_id, _) = ui.begin_activity(tab, "Describe", false);
-            ui.run_mutation(
-                PendingMutation {
-                    op: mutations::MutationOp::Describe {
-                        target: RevisionSelection::WorkingCopy,
-                        description: text.to_owned(),
+            let describe = |ui: &mut Diffui, text: &str, cx: &mut crate::Cx| {
+                let (activity_id, _) = ui.begin_activity(tab, "Describe", false);
+                ui.run_mutation(
+                    PendingMutation {
+                        op: mutations::MutationOp::Describe {
+                            target: RevisionSelection::WorkingCopy,
+                            description: text.to_owned(),
+                        },
+                        tab_id: tab,
+                        activity_id,
+                        allow_immutable: false,
                     },
-                    tab_id: tab,
-                    activity_id,
-                    allow_immutable: false,
-                },
-                cx,
-            )
-        };
-        let _ = describe(&mut ui, "first");
-        let first_job = ui.tab_mut(tab).unwrap().jobs.mutation.as_ref().unwrap().0;
-        let _ = describe(&mut ui, "second");
+                    cx,
+                )
+            };
+            describe(&mut ui, "first", cx);
+            let first_job = ui.tab_mut(tab).unwrap().jobs.mutation.as_ref().unwrap().0;
+            describe(&mut ui, "second", cx);
 
-        let state = ui.tab_mut(tab).unwrap();
-        assert_eq!(
-            state.jobs.mutation.as_ref().map(|(job, _)| *job),
-            Some(first_job),
-            "the first mutation still owns the slot"
-        );
-        assert_eq!(state.queued_mutations.len(), 1);
+            let state = ui.tab_mut(tab).unwrap();
+            assert_eq!(
+                state.jobs.mutation.as_ref().map(|(job, _)| *job),
+                Some(first_job),
+                "the first mutation still owns the slot"
+            );
+            assert_eq!(state.queued_mutations.len(), 1);
 
-        // The first reports; the second takes the slot it just freed.
-        let repo = ui.tabs[0].repo_id().expect("a repo tab has an id");
-        ui.TESTUPDATE(
-            Message::Repo(Box::new(diffui_core::Event::new(
-                repo,
-                diffui_core::Payload::MutationDone {
-                    job: first_job,
-                    outcome: mutations::MutationOutcome {
-                        message: "Described".to_owned(),
-                        moved_working_copy: false,
-                        rewritten_commit: None,
-                        output: Vec::new(),
-                        operation_id: None,
-                    },
-                },
-            ))),
-            cx,
-        );
+            // The first reports; the second takes the slot it just freed.
+            let repo = ui.tabs[0].repo_id().expect("a repo tab has an id");
+            ui.act(cx, |ui, cx| {
+                ui.on_repo_event(
+                    diffui_core::Event::new(
+                        repo,
+                        diffui_core::Payload::MutationDone {
+                            job: first_job,
+                            outcome: mutations::MutationOutcome {
+                                message: "Described".to_owned(),
+                                moved_working_copy: false,
+                                rewritten_commit: None,
+                                output: Vec::new(),
+                                operation_id: None,
+                            },
+                        },
+                    ),
+                    cx,
+                )
+            });
 
-        let state = ui.tab_mut(tab).unwrap();
-        assert!(state.queued_mutations.is_empty(), "the queue drained");
-        assert!(
-            state
-                .jobs
-                .mutation
-                .as_ref()
-                .is_some_and(|(job, _)| *job != first_job),
-            "the second mutation is now in flight"
-        );
+            let state = ui.tab_mut(tab).unwrap();
+            assert!(state.queued_mutations.is_empty(), "the queue drained");
+            assert!(
+                state
+                    .jobs
+                    .mutation
+                    .as_ref()
+                    .is_some_and(|(job, _)| *job != first_job),
+                "the second mutation is now in flight"
+            );
+        });
     }
 
     #[test]
     fn a_mutation_completing_for_a_background_tab_writes_that_tabs_selection() {
-        let mut ui = app();
-        let first = push_tab(&mut ui, "/tmp/first", cx);
-        let second = push_tab(&mut ui, "/tmp/second", cx);
-        ui.active = 1;
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            let first = push_tab(&mut ui, "/tmp/first");
+            let second = push_tab(&mut ui, "/tmp/second");
+            ui.active = 1;
 
-        let on_a_commit = RevisionSelection::Commit("abc".to_owned());
-        ui.tab_mut(first).unwrap().session.selected_revision = on_a_commit.clone();
-        ui.tab_mut(second).unwrap().session.selected_revision = on_a_commit;
+            let on_a_commit = RevisionSelection::Commit("abc".to_owned());
+            ui.tab_mut(first).unwrap().session.selected_revision = on_a_commit.clone();
+            ui.tab_mut(second).unwrap().session.selected_revision = on_a_commit;
 
-        let (job, _effects) = ui.tab_mut(first).unwrap().session.mutate(
-            mutations::MutationOp::Abandon {
-                targets: vec![RevisionSelection::Commit("abc".to_owned())],
-            },
-            false,
-        );
-        let repo = ui.tabs[0].repo_id().expect("a repo tab has an id");
-        ui.TESTUPDATE(
-            Message::Repo(Box::new(diffui_core::Event::new(
-                repo,
-                diffui_core::Payload::MutationDone {
-                    job,
-                    outcome: mutations::MutationOutcome {
-                        message: "Abandoned".to_owned(),
-                        moved_working_copy: true,
-                        rewritten_commit: None,
-                        output: Vec::new(),
-                        operation_id: None,
-                    },
+            let (job, _effects) = ui.tab_mut(first).unwrap().session.mutate(
+                mutations::MutationOp::Abandon {
+                    targets: vec![RevisionSelection::Commit("abc".to_owned())],
                 },
-            ))),
-            cx,
-        );
+                false,
+            );
+            let repo = ui.tabs[0].repo_id().expect("a repo tab has an id");
+            ui.act(cx, |ui, cx| {
+                ui.on_repo_event(
+                    diffui_core::Event::new(
+                        repo,
+                        diffui_core::Payload::MutationDone {
+                            job,
+                            outcome: mutations::MutationOutcome {
+                                message: "Abandoned".to_owned(),
+                                moved_working_copy: true,
+                                rewritten_commit: None,
+                                output: Vec::new(),
+                                operation_id: None,
+                            },
+                        },
+                    ),
+                    cx,
+                )
+            });
 
-        assert_eq!(
-            ui.tab_mut(first).unwrap().session.selected_revision,
-            RevisionSelection::WorkingCopy
-        );
-        // The tab on screen keeps the revision it was browsing.
-        assert!(matches!(
-            ui.active().session.selected_revision,
-            RevisionSelection::Commit(_)
-        ));
+            assert_eq!(
+                ui.tab_mut(first).unwrap().session.selected_revision,
+                RevisionSelection::WorkingCopy
+            );
+            // The tab on screen keeps the revision it was browsing.
+            assert!(matches!(
+                ui.active().session.selected_revision,
+                RevisionSelection::Commit(_)
+            ));
+        });
     }
 }

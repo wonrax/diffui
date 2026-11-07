@@ -544,63 +544,69 @@ mod stack_tests {
 
     #[test]
     fn a_per_tab_mode_only_owns_the_keyboard_while_its_tab_is_on_screen() {
-        let mut ui = app();
-        let first = push_tab(&mut ui, "/tmp/first", cx);
-        let _second = push_tab(&mut ui, "/tmp/second", cx);
-        ui.active = 0;
-        ui.tab_mut(first)
-            .expect("the tab is open")
-            .push_mode(TabMode::Find(crate::find::FindState::default()));
-        assert_eq!(ui.key_context(), Context::Find);
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            let first = push_tab(&mut ui, "/tmp/first");
+            let _second = push_tab(&mut ui, "/tmp/second");
+            ui.active = 0;
+            ui.tab_mut(first)
+                .expect("the tab is open")
+                .push_mode(TabMode::Find(crate::find::FindState::default()));
+            assert_eq!(ui.key_context(), Context::Find);
 
-        // The find bar belongs to the tab it was opened on; switching away
-        // must not leave it holding keys for a document it isn't showing.
-        ui.active = 1;
-        assert_eq!(ui.key_context(), Context::Base);
-        ui.active = 0;
-        assert_eq!(ui.key_context(), Context::Find);
+            // The find bar belongs to the tab it was opened on; switching away
+            // must not leave it holding keys for a document it isn't showing.
+            ui.active = 1;
+            assert_eq!(ui.key_context(), Context::Base);
+            ui.active = 0;
+            assert_eq!(ui.key_context(), Context::Find);
+        });
     }
 
     #[test]
     fn a_line_select_mode_that_no_longer_applies_holds_no_keys() {
-        let mut ui = app();
-        let tab = push_tab(&mut ui, "/tmp/first", cx);
-        ui.active = 0;
-        // This tab has no diff to pick lines from.
-        ui.tab_mut(tab)
-            .expect("the tab is open")
-            .push_mode(TabMode::Lines(crate::changes::LineSelect::new(
-                diffui_core::RevisionSelection::WorkingCopy,
-                0,
-            )));
-        assert_eq!(ui.key_context(), Context::Base);
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            let tab = push_tab(&mut ui, "/tmp/first");
+            ui.active = 0;
+            // This tab has no diff to pick lines from.
+            ui.tab_mut(tab)
+                .expect("the tab is open")
+                .push_mode(TabMode::Lines(crate::changes::LineSelect::new(
+                    diffui_core::RevisionSelection::WorkingCopy,
+                    0,
+                )));
+            assert_eq!(ui.key_context(), Context::Base);
+        });
     }
 
     #[test]
     fn switching_tabs_closes_the_description_editor() {
-        let mut ui = app();
-        let first = push_tab(&mut ui, "/tmp/first", cx);
-        let second = push_tab(&mut ui, "/tmp/second", cx);
-        ui.active = 0;
-        ui.tab_mut(first)
-            .expect("the tab is open")
-            .push_mode(TabMode::Description(crate::DescriptionEditor {
-                target: diffui_core::RevisionSelection::WorkingCopy,
-                original: String::new(),
-                content: String::new(),
-                saving_activity: None,
-                switch_blocked: false,
-                commit: false,
-            }));
-
-        let _ = ui.activate_tab(second, cx);
-
-        assert_eq!(ui.active_tab_id(), Some(second));
-        assert!(
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            let first = push_tab(&mut ui, "/tmp/first");
+            let second = push_tab(&mut ui, "/tmp/second");
+            ui.active = 0;
             ui.tab_mut(first)
                 .expect("the tab is open")
-                .description_editor()
-                .is_none()
-        );
+                .push_mode(TabMode::Description(crate::DescriptionEditor {
+                    target: diffui_core::RevisionSelection::WorkingCopy,
+                    original: String::new(),
+                    content: String::new(),
+                    saving_activity: None,
+                    switch_blocked: false,
+                    commit: false,
+                }));
+
+            ui.activate_tab(second, cx);
+
+            assert_eq!(ui.active_tab_id(), Some(second));
+            assert!(
+                ui.tab_mut(first)
+                    .expect("the tab is open")
+                    .description_editor()
+                    .is_none()
+            );
+        });
     }
 }
