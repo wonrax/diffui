@@ -30,6 +30,7 @@ use crate::{
     source_panel, tab_bar, toolbar, window_state::WindowState,
 };
 use diffui_core::OpenSpec;
+use diffui_widgets::frame_log;
 
 /// The loops that run in the background. Each lives while its condition holds;
 /// [`Diffui::sync_background`] starts and drops them. Dropping the task cancels
@@ -232,10 +233,12 @@ impl Diffui {
         cx: &mut Cx,
         change: impl FnOnce(&mut Self, &mut Cx) -> R,
     ) -> R {
-        let out = change(self, cx);
-        self.reconcile(cx);
-        cx.notify();
-        out
+        frame_log::time(std::any::type_name_of_val(&change), || {
+            let out = change(self, cx);
+            self.reconcile(cx);
+            cx.notify();
+            out
+        })
     }
 
     /// A listener that runs `change` inside [`Diffui::act`].
@@ -244,9 +247,11 @@ impl Diffui {
         change: impl Fn(&mut Diffui, &E, &mut Window, &mut Cx) + 'static,
     ) -> impl Fn(&E, &mut Window, &mut App) + 'static {
         cx.listener(move |this: &mut Diffui, event: &E, window, cx| {
-            change(this, event, window, cx);
-            this.reconcile(cx);
-            cx.notify();
+            frame_log::time(std::any::type_name_of_val(&change), || {
+                change(this, event, window, cx);
+                this.reconcile(cx);
+                cx.notify();
+            });
         })
     }
 
@@ -466,6 +471,7 @@ impl Render for Diffui {
         {
             self.renders += 1;
         }
+        frame_log::begin();
         let theme = self.resolved_theme().spec();
 
         #[cfg(test)]
@@ -488,7 +494,17 @@ impl Render for Diffui {
             let panes = self.panes.clone().expect("a drawn app has its panes");
             self.shell(&panes, theme, window, cx)
         };
-        self.frame(theme, cx).child(body).into_any_element()
+        self.frame(theme, cx)
+            .child(body)
+            .when(frame_log::enabled(), |root| {
+                // Last in paint order, so it marks the end of the frame.
+                root.child(
+                    gpui_kit::canvas(|_, _, _| {}, |_, _, _, _| frame_log::end())
+                        .absolute()
+                        .size_0(),
+                )
+            })
+            .into_any_element()
     }
 }
 
@@ -580,6 +596,8 @@ fn request_overlay_frames(ui: &Diffui, window: &mut Window) {
 /// notification.
 pub(crate) struct Pane {
     app: WeakEntity<Diffui>,
+    /// The span this pane's render is logged as (`diffui_widgets::frame_log`).
+    name: &'static str,
     build: PaneBuild,
     #[cfg(test)]
     pub(crate) renders: usize,
@@ -589,9 +607,15 @@ pub(crate) struct Pane {
 type PaneBuild = fn(&Diffui, ThemeSpec, &mut Window, &mut Cx) -> AnyElement;
 
 impl Pane {
-    fn new(app: Entity<Diffui>, build: PaneBuild, cx: &mut App) -> Entity<Self> {
+    fn new(
+        app: Entity<Diffui>,
+        name: &'static str,
+        build: PaneBuild,
+        cx: &mut App,
+    ) -> Entity<Self> {
         cx.new(|cx| Self {
             app: app.downgrade(),
+            name,
             build,
             #[cfg(test)]
             renders: 0,
@@ -607,13 +631,13 @@ impl Render for Pane {
             self.renders += 1;
         }
         let build = self.build;
-        match self.app.upgrade() {
+        frame_log::time(self.name, || match self.app.upgrade() {
             Some(app) => app.update(cx, |ui, cx| {
                 let theme = ui.resolved_theme().spec();
                 build(ui, theme, window, cx)
             }),
             None => div().into_any_element(),
-        }
+        })
     }
 }
 
@@ -637,12 +661,12 @@ impl std::fmt::Debug for Panes {
 impl Panes {
     fn new(app: Entity<Diffui>, cx: &mut App) -> Self {
         Self {
-            tab_bar: Pane::new(app.clone(), tab_bar::build_tab_bar, cx),
-            toolbar: Pane::new(app.clone(), toolbar::build_toolbar, cx),
-            left: Pane::new(app.clone(), left_pane, cx),
-            files: Pane::new(app.clone(), files_pane, cx),
-            main: Pane::new(app.clone(), main_pane, cx),
-            floats: Pane::new(app, floats_pane, cx),
+            tab_bar: Pane::new(app.clone(), "tab_bar", tab_bar::build_tab_bar, cx),
+            toolbar: Pane::new(app.clone(), "toolbar", toolbar::build_toolbar, cx),
+            left: Pane::new(app.clone(), "left", left_pane, cx),
+            files: Pane::new(app.clone(), "files", files_pane, cx),
+            main: Pane::new(app.clone(), "main", main_pane, cx),
+            floats: Pane::new(app, "floats", floats_pane, cx),
         }
     }
 }

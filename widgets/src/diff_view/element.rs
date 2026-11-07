@@ -1064,7 +1064,9 @@ impl DiffView {
             state.sync(&view);
             let started = Instant::now();
             let key = state.height_index.borrow().key;
-            view.ensure_height_index(&state.height_index, &state.geometry, bounds.width);
+            crate::frame_log::time("diff.index", || {
+                view.ensure_height_index(&state.height_index, &state.geometry, bounds.width);
+            });
             if state.height_index.borrow().key != key {
                 state.last_index_build = started.elapsed();
             }
@@ -1075,7 +1077,7 @@ impl DiffView {
                 send(&mut out, &props.on_scroll, state.vertical_offset);
             }
             state.painted_offset = (state.vertical_offset * scale).round() / scale;
-            view.build_plan(state, bounds, &mut plan);
+            crate::frame_log::time("diff.plan", || view.build_plan(state, bounds, &mut plan));
             cursor = state.cursor_at(&view, bounds, mouse);
         }
         if !out.is_empty() {
@@ -1158,8 +1160,10 @@ impl Element for DiffElement {
     ) -> Frame {
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
         let rect: Rectangle = bounds.into();
-        self.view
-            .update(cx, |view, cx| view.prepare(rect, hitbox, window, cx))
+        crate::frame_log::time("diff.prepare", || {
+            self.view
+                .update(cx, |view, cx| view.prepare(rect, hitbox, window, cx))
+        })
     }
 
     fn paint(
@@ -1174,8 +1178,10 @@ impl Element for DiffElement {
     ) {
         let rect: Rectangle = bounds.into();
         let plan = std::mem::replace(&mut frame.plan, Plan::new(window.text_system().clone(), 0));
-        window.with_content_mask(Some(gpui_kit::ContentMask { bounds }), |window| {
-            plan.flush(window, cx);
+        crate::frame_log::time("diff.paint", || {
+            window.with_content_mask(Some(gpui_kit::ContentMask { bounds }), |window| {
+                plan.flush(window, cx);
+            });
         });
         window.set_cursor_style(frame.cursor, &frame.hitbox);
         if frame.animating {
@@ -1188,8 +1194,10 @@ impl Element for DiffElement {
             if phase != DispatchPhase::Bubble || !hitbox.should_handle_scroll(window) {
                 return;
             }
-            DiffView::handle(&entity, window, cx, |view, state, out| {
-                state.on_wheel(view, rect, event, out)
+            crate::frame_log::time("wheel", || {
+                DiffView::handle(&entity, window, cx, |view, state, out| {
+                    state.on_wheel(view, rect, event, out)
+                })
             });
             cx.stop_propagation();
         });

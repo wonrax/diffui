@@ -7,6 +7,7 @@ pub mod chip;
 pub mod chrome;
 pub mod diff_view;
 pub mod ellipsis;
+pub mod frame_log;
 pub mod geometry;
 pub mod graph_view;
 pub mod hunk_actions;

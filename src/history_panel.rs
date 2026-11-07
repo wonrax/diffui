@@ -1805,25 +1805,27 @@ fn op_log_list(ui: &Diffui, cx: &mut Cx) -> AnyElement {
     let app = cx.entity();
     let now = now_millis();
     let rows = gpui_kit::list(state.clone(), move |index, window, cx| {
-        app.update(cx, |ui, cx| {
-            let theme = ui.resolved_theme().spec();
-            let history = &ui.active().history;
-            let row = match op_rows(history).get(index) {
-                Some(OpRow::Op(op)) => op_row(ui, theme, op, now, window, cx),
-                Some(&OpRow::Run {
-                    first,
-                    count,
-                    oldest,
-                    children,
-                }) => run_row(ui, theme, first, count, oldest, children, now, window, cx),
-                None => op_log_footer(ui, theme, cx),
-            };
-            // Half the gap on each side of a row: the gap between rows, and
-            // half of it at either end, as a stacked column would have.
-            list_column()
-                .py(px(ROW_CARD_INSET_Y))
-                .child(row)
-                .into_any_element()
+        diffui_widgets::frame_log::time("oplog.row", || {
+            app.update(cx, |ui, cx| {
+                let theme = ui.resolved_theme().spec();
+                let history = &ui.active().history;
+                let row = match op_rows(history).get(index) {
+                    Some(OpRow::Op(op)) => op_row(ui, theme, op, now, window, cx),
+                    Some(&OpRow::Run {
+                        first,
+                        count,
+                        oldest,
+                        children,
+                    }) => run_row(ui, theme, first, count, oldest, children, now, window, cx),
+                    None => op_log_footer(ui, theme, cx),
+                };
+                // Half the gap on each side of a row: the gap between rows, and
+                // half of it at either end, as a stacked column would have.
+                list_column()
+                    .py(px(ROW_CARD_INSET_Y))
+                    .child(row)
+                    .into_any_element()
+            })
         })
     })
     .size_full();

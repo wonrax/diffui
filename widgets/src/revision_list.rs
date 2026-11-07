@@ -2849,7 +2849,7 @@ impl Element for ListElement {
         cx: &mut App,
     ) {
         let cursor = self.list.update(cx, |list, cx| {
-            list.paint(window, cx);
+            crate::frame_log::time("list.paint", || list.paint(window, cx));
             if list.drag.is_some_and(|drag| drag.active) {
                 CursorStyle::ClosedHand
             } else if scrollbar::is_dragging(&list.scrollbar)
