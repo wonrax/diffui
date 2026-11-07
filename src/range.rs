@@ -8,19 +8,27 @@
 //! `diff_since` and `span`); this module draws the banner, the commit list
 //! that stands in for the commit info, and the empty states.
 
-use crate::Cx;
 use diffui_core::{DiffBase, DiffRange, DiffSpan, RevisionSelection};
-use gpui_kit::{AnyElement, Window};
+use gpui_kit::prelude::*;
+use gpui_kit::{AnyElement, Window, div, px};
 
-use crate::Diffui;
+use crate::action::Action;
+use crate::commit_info::with_tooltip;
 use crate::diff_view::{HeaderAction, HeaderField, HeaderLine};
-use crate::theme::ThemeSpec;
+use crate::prose::Prose;
+use crate::theme::{ThemeSpec, Weight, emphasis_font, text_size};
+use crate::typography::{self, Aligned};
+use crate::{Cx, Diffui, icons, ui};
 
 /// The revset "diff since trunk" measures from.
 pub(crate) const TRUNK: &str = "trunk()";
 
 /// Commits the list under the banner names before it counts the rest.
 const LISTED_COMMITS: usize = 30;
+
+/// The banner's edit and exit controls and the gap before them, which the revset
+/// beside them leaves room for.
+const BANNER_CONTROLS_WIDTH: f32 = crate::theme::control::COMPACT + 4.0 + ui::CLOSE_SIDE + 8.0;
 
 #[derive(Debug, Clone)]
 pub(crate) enum RangeAction {
@@ -242,25 +250,180 @@ pub(crate) fn header_lines(ui: &Diffui, range: &DiffRange, theme: ThemeSpec) -> 
     lines
 }
 
-/// Stub: the range view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+/// The banner for a range: what it is, the revset,
+/// the jj command, and edit and exit. `None` when no range is on.
 pub(crate) fn banner(
     ui: &Diffui,
     theme: ThemeSpec,
     window: &mut Window,
     cx: &mut Cx,
 ) -> Option<AnyElement> {
-    None
+    let mode = mode(ui)?;
+    let font = ui.config.ui_font;
+    let mono = ui.config.mono_font;
+    let medium = emphasis_font(font, Weight::MEDIUM);
+    let refused = refused_span(ui);
+    let (glyph, label) = match mode {
+        RangeMode::Since => (icons::GIT_BRANCH, "Since trunk"),
+        RangeMode::Span(span) if span.refused.is_some() || shown_range(ui).is_none() => {
+            (icons::FILE_DIFF, "Marked")
+        }
+        RangeMode::Span(_) | RangeMode::Fixed => (icons::FILE_DIFF, "Range"),
+    };
+    let revset = display_revset(ui, mode);
+
+    let mut line = vec![
+        Aligned::glyph(
+            icons::icon(glyph, ui::ICON_SIZE, theme.accent),
+            ui::ICON_SIZE,
+        ),
+        Aligned::text(
+            typography::line(label, medium, text_size::UI, theme.text),
+            medium,
+            text_size::UI,
+        ),
+    ];
+    match (mode, refused) {
+        (RangeMode::Span(span), Some(_)) => line.push(Aligned::text(
+            typography::line(
+                format!("{} revisions", span.count),
+                font,
+                text_size::UI,
+                theme.muted_text,
+            ),
+            font,
+            text_size::UI,
+        )),
+        _ => {
+            // What the pane leaves the revset: it ellipsises before the controls.
+            let room = (crate::diff_panel::diff_pane_width(ui)
+                - 2.0 * crate::theme::space::XL
+                - BANNER_CONTROLS_WIDTH
+                - ui::ICON_SIZE
+                - 16.0
+                - crate::measure::line_width(label, text_size::UI, medium))
+            .max(0.0);
+            line.push(Aligned::text(
+                crate::plan::revset_prose(&revset)
+                    .line(mono, mono, theme.text, theme, text_size::UI)
+                    .cut(room),
+                mono,
+                text_size::UI,
+            ));
+        }
+    }
+    let headline = typography::baseline_row(line, 8.0);
+
+    let subline: AnyElement = match refused {
+        Some(_) => typography::line(
+            "Not a connected range. \u{2318}-click rows to fill the gap",
+            font,
+            text_size::CAPTION,
+            theme.conflict_marker,
+        )
+        .into_any_element(),
+        None => crate::plan::caption_command_line(ui, theme, &diff_command(&revset), window, cx),
+    };
+    let sides = div().child(headline).child(subline);
+
+    let mut controls = div();
+    if refused.is_none() {
+        controls = controls.child(with_tooltip(
+            "range-edit-tip",
+            "Edit as a jj command",
+            font,
+            theme,
+            ui::icon_button(
+                "range-edit",
+                icons::PENCIL,
+                theme.muted_text,
+                ui::Size::Compact,
+                theme,
+                cx,
+            )
+            .on_click(Diffui::on_action(Action::Range(RangeAction::Edit), cx)),
+        ));
+    }
+    controls = controls.child(with_tooltip(
+        "range-exit-tip",
+        match mode {
+            RangeMode::Since => "Stop diffing since trunk",
+            RangeMode::Span(_) => "Clear the marks",
+            RangeMode::Fixed => "Leave the range",
+        },
+        font,
+        theme,
+        ui::close_button("range-exit", theme.muted_text, theme, cx).on_click(Diffui::on_action(
+            Action::Compare(crate::compare::CompareAction::Exit),
+            cx,
+        )),
+    ));
+
+    Some(crate::compare::banner_strip(sides, controls, theme))
 }
 
-/// Stub: the range view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+/// The pane when the marked rows can't be one diff: jj's reason, with the
+/// revision it names styled as one.
 pub(crate) fn refused_state(
     ui: &Diffui,
     theme: ThemeSpec,
     error: &diffui_core::RevsetError,
-    window: &mut Window,
-    cx: &mut Cx,
+    _window: &mut Window,
+    _cx: &mut Cx,
 ) -> AnyElement {
-    crate::stub::panel("range::refused_state")
+    let font = ui.config.ui_font;
+    let mono = ui.config.mono_font;
+    let mut detail = Prose::from("jj diff -r needs the marked revisions to have no gaps.");
+    if let Some(hint) = &error.hint {
+        detail = detail.text(" ");
+        for (index, word) in hint.split(' ').enumerate() {
+            if index > 0 {
+                detail = detail.text(" ");
+            }
+            detail = if word.len() == 12 && word.bytes().all(|b| b.is_ascii_hexdigit()) {
+                // jj names the missing commit by id; the graph by change.
+                let session = &ui.active().session;
+                let name = session
+                    .commits
+                    .iter()
+                    .find(|row| row.commit_id().starts_with(word))
+                    .map(|row| {
+                        session.revision_symbol(&session.canonical_selection(row.commit_id()))
+                    })
+                    .unwrap_or_else(|| word.to_owned());
+                detail.rev(name)
+            } else {
+                detail.text(word)
+            };
+        }
+    }
+    let title_font = emphasis_font(font, Weight::MEDIUM);
+    div()
+        .size_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .p(px(crate::theme::space::XXL))
+        .child(
+            div()
+                .max_w(px(440.0))
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(crate::theme::space::SM))
+                .child(typography::line(
+                    "Not a connected range",
+                    title_font,
+                    text_size::TITLE,
+                    theme.text,
+                ))
+                .child(
+                    div()
+                        .w_full()
+                        .text_center()
+                        .text_size(px(text_size::UI))
+                        .child(detail.view(font, mono, theme.muted_text, theme)),
+                ),
+        )
+        .into_any_element()
 }
