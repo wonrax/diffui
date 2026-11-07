@@ -314,6 +314,11 @@ impl Harness {
     /// workspace, returning the path. Settles first.
     pub(crate) fn shot(&mut self, lane: &str, scene: &str) -> PathBuf {
         self.settle();
+        self.shot_now(lane, scene)
+    }
+
+    /// [`Self::shot`] of the state right now, for a scene that's mid-flight.
+    pub(crate) fn shot_now(&mut self, lane: &str, scene: &str) -> PathBuf {
         let image = self
             .cx
             .capture_screenshot(self.window)
