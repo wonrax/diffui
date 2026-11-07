@@ -25,7 +25,10 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use gpui_kit::prelude::*;
-use gpui_kit::{AnyElement, Div, IntoElement, SharedString, div, px};
+use gpui_kit::{
+    AnyElement, App, Div, Hsla, IntoElement, SharedString, TextAlign, TextRun, Window, div, point,
+    px,
+};
 
 use crate::theme::{Color, Font, Padding};
 
@@ -238,6 +241,60 @@ pub fn line(content: impl Into<SharedString>, font: Font, size: f32, color: Colo
         .child(content.into())
 }
 
+/// Paints one line of `content` for a painter that places its text by hand.
+/// `top` is the top of a line box `line_height` tall; `x` is the left edge, or
+/// the right edge when `align` is [`TextAlign::Right`]. Newlines read as spaces.
+#[allow(clippy::too_many_arguments)]
+pub fn paint_line(
+    content: &str,
+    x: f32,
+    top: f32,
+    size: f32,
+    line_height: f32,
+    font: Font,
+    color: Color,
+    align: TextAlign,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if content.is_empty() {
+        return;
+    }
+    let text: SharedString = if content.contains(['\n', '\r']) {
+        content.replace(['\n', '\r'], " ").into()
+    } else {
+        SharedString::from(content.to_owned())
+    };
+    let run = TextRun {
+        len: text.len(),
+        font: font.gpui(),
+        color: Hsla::from(color),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let shaped = window
+        .text_system()
+        .shape_line(text, px(size), &[run], None);
+    let left = match align {
+        TextAlign::Right => x - f32::from(shaped.width),
+        TextAlign::Center => x - f32::from(shaped.width) / 2.0,
+        TextAlign::Left => x,
+    };
+    // The width is taken out by hand above, so the line itself paints from
+    // its left edge whatever the alignment.
+    if let Err(error) = shaped.paint(
+        point(px(left), px(top)),
+        px(line_height),
+        TextAlign::Left,
+        None,
+        window,
+        cx,
+    ) {
+        tracing::warn!("a line didn't paint: {error}");
+    }
+}
+
 /// `content`, a single-line text in `font` at `size` with the default line
 /// height, padded so that when a container centres it the cap box is what lands
 /// in the middle (`text-box: trim-both cap alphabetic`). The building block of
@@ -252,6 +309,8 @@ pub fn centered(content: impl IntoElement, font: Font, size: f32) -> Div {
 pub struct Aligned {
     element: AnyElement,
     line: Line,
+    /// Takes the row's free width, and gets cut rather than pushing past it.
+    fills: bool,
 }
 
 /// The vertical facts [`baseline_row`] needs about a child.
@@ -281,6 +340,7 @@ impl Aligned {
                 height: padding.top + text.line_height() + padding.bottom,
                 glyph: false,
             },
+            fills: false,
         }
     }
 
@@ -308,7 +368,15 @@ impl Aligned {
         Self {
             element: wrap(self.element),
             line: self.line,
+            fills: self.fills,
         }
+    }
+
+    /// This child takes the free width of its line, which then spans what it's
+    /// given. For the one text that ellipsises so the rest keep their place.
+    pub fn fill(mut self) -> Self {
+        self.fills = true;
+        self
     }
 
     /// Fixed horizontal space between two children.
@@ -327,6 +395,7 @@ impl Aligned {
                 height,
                 glyph: true,
             },
+            fills: false,
         }
     }
 }
@@ -340,7 +409,9 @@ impl Aligned {
 pub fn baseline_row(items: impl IntoIterator<Item = Aligned>, spacing: f32) -> Div {
     let line = group(items, spacing);
     let shift = line.line.height / 2.0 - (line.line.baseline - line.line.cap_height / 2.0);
-    shift_padding(shift).apply(div()).child(line.element)
+    let outer = shift_padding(shift).apply(div());
+    let outer = if line.fills { outer.w_full() } else { outer };
+    outer.child(line.element)
 }
 
 /// [`baseline_row`] without the centring, as one [`Aligned`] child of an outer
@@ -350,13 +421,23 @@ pub fn group(items: impl IntoIterator<Item = Aligned>, spacing: f32) -> Aligned 
     let items: Vec<Aligned> = items.into_iter().collect();
     let lines: Vec<Line> = items.iter().map(|item| item.line).collect();
     let layout = line_layout(&lines);
+    let fills = items.iter().any(|item| item.fills);
     let mut row = div().flex().flex_row().items_start().gap(px(spacing));
+    if fills {
+        row = row.w_full();
+    }
     for (item, top) in items.into_iter().zip(&layout.tops) {
-        row = row.child(div().flex_none().pt(px(*top)).child(item.element));
+        let slot = if item.fills {
+            div().flex_1().min_w_0()
+        } else {
+            div().flex_none()
+        };
+        row = row.child(slot.pt(px(*top)).child(item.element));
     }
     Aligned {
         element: row.into_any_element(),
         line: layout.line,
+        fills,
     }
 }
 

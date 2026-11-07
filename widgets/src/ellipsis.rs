@@ -204,6 +204,68 @@ pub fn text_width(content: &str, size: f32, font: Font) -> f32 {
     WIDTHS.with(|widths| widths.width(content, size, font))
 }
 
+/// Plain `content` cut at its end so it and an ellipsis fit `width`; borrowed
+/// back when it fits.
+pub fn cut_end<'a>(content: &'a str, width: f32, size: f32, font: Font) -> Cow<'a, str> {
+    let measure = |_: usize, part: &str| text_width(part, size, font);
+    match cut_point(&[content], width, measure, |_| {
+        text_width(ELLIPSIS, size, font)
+    }) {
+        None => Cow::Borrowed(content),
+        Some((_, keep)) => Cow::Owned(format!("{}{ELLIPSIS}", content[..keep].trim_end())),
+    }
+}
+
+/// Plain `content` cut in the middle so it and an ellipsis fit `width`, keeping
+/// both its start and its end (a file's extension, a compacted chain's leaf).
+pub fn cut_middle<'a>(content: &'a str, width: f32, size: f32, font: Font) -> Cow<'a, str> {
+    middle_cut(
+        content,
+        width,
+        |part| text_width(part, size, font),
+        text_width(ELLIPSIS, size, font),
+    )
+}
+
+fn middle_cut<'a>(
+    content: &'a str,
+    width: f32,
+    measure: impl Fn(&str) -> f32,
+    ellipsis: f32,
+) -> Cow<'a, str> {
+    if measure(content) <= width + TOLERANCE {
+        return Cow::Borrowed(content);
+    }
+    let room = width + TOLERANCE - ellipsis;
+    let bytes: Vec<usize> = content
+        .char_indices()
+        .map(|(at, _)| at)
+        .chain([content.len()])
+        .collect();
+    let chars = bytes.len() - 1;
+    // The most chars kept, split evenly around the cut with any odd one going
+    // to the start.
+    let split = |kept: usize| {
+        let head = kept.div_ceil(2);
+        (
+            &content[..bytes[head]],
+            &content[bytes[chars - (kept - head)]..],
+        )
+    };
+    let (mut low, mut high) = (0, chars);
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        let (head, tail) = split(mid);
+        if measure(head) + measure(tail) <= room {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    let (head, tail) = split(low);
+    Cow::Owned(format!("{head}{ELLIPSIS}{tail}"))
+}
+
 /// `text` with each run of whitespace holding a line break turned into one
 /// space; borrowed back when there is none.
 fn one_line(text: &str) -> Cow<'_, str> {
@@ -347,6 +409,18 @@ mod tests {
         // One line is as wide as the folded text, and a narrow room cuts it.
         assert!(line.fits(10_000.0));
         assert!(!line.fits(20.0));
+    }
+
+    #[test]
+    fn a_middle_cut_keeps_both_ends() {
+        let count = |text: &str| text.chars().count() as f32;
+        assert_eq!(middle_cut("main.rs", 7.0, count, 1.0), "main.rs");
+        assert_eq!(middle_cut("abcdefghij", 7.0, count, 1.0), "abc…hij");
+        assert_eq!(middle_cut("abcdefghij", 6.0, count, 1.0), "abc…ij");
+        // No room for anything but the ellipsis.
+        assert_eq!(middle_cut("abcdefghij", 0.5, count, 1.0), "…");
+        // Multi-byte chars stay whole.
+        assert_eq!(middle_cut("ééééééééé", 4.0, count, 1.0), "éé…é");
     }
 
     #[test]

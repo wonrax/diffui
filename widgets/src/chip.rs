@@ -5,7 +5,7 @@
 //! treatment, and border styles by construction.
 
 use gpui_kit::prelude::*;
-use gpui_kit::{Div, div, px};
+use gpui_kit::{App, BorderStyle, Bounds, Div, TextAlign, Window, div, point, px, quad, size};
 
 use crate::icons;
 use crate::theme::{Color, Font};
@@ -76,6 +76,76 @@ pub fn width_memoized(memo: &WidthMemo, label: &str, icon: Option<&str>, font: F
 /// `baseline_y` — for a chip sitting in a line of text.
 pub fn center_for_baseline(chip: &Chip, baseline_y: f32) -> f32 {
     TextBox::new(chip.font, TEXT_SIZE, height()).center_for_baseline(baseline_y)
+}
+
+/// Paints `chip` with its left edge at `x`, centred on `center_y`: the chip of
+/// [`view`], for a painter that places its rows by hand.
+pub fn paint(
+    chip: &Chip,
+    memo: &WidthMemo,
+    x: f32,
+    center_y: f32,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let chip_h = height();
+    let width = width_memoized(memo, &chip.label, chip.icon, chip.font);
+    let top = (center_y - chip_h / 2.0).round();
+    let bounds = Bounds::new(point(px(x), px(top)), size(px(width), px(chip_h)));
+    let background = if chip.background.a > f32::EPSILON {
+        chip.background
+    } else {
+        Color {
+            a: 0.0,
+            ..chip.text_color
+        }
+    };
+    let (border_width, border_color) = chip
+        .border_color
+        .map_or((0.0, background), |color| (1.0, color));
+    window.paint_quad(quad(
+        bounds,
+        px(RADIUS),
+        background,
+        px(border_width),
+        border_color,
+        if chip.border_dashed {
+            BorderStyle::Dashed
+        } else {
+            BorderStyle::Solid
+        },
+    ));
+    let mut text_x = x + PAD_X;
+    if let Some(glyph) = chip.icon {
+        crate::typography::paint_line(
+            glyph,
+            text_x,
+            top + (chip_h - ICON_SIZE) / 2.0,
+            ICON_SIZE,
+            ICON_SIZE,
+            icons::ICON_FONT,
+            chip.text_color,
+            TextAlign::Left,
+            window,
+            cx,
+        );
+        text_x += memo.width(glyph, ICON_SIZE, icons::ICON_FONT) + ICON_GAP;
+    }
+    // Same box as `view`: the line is the chip's height, shifted so the caps
+    // sit on the mid-line.
+    let shift = TextBox::new(chip.font, TEXT_SIZE, chip_h).trim_shift();
+    crate::typography::paint_line(
+        &chip.label,
+        text_x,
+        top + shift,
+        TEXT_SIZE,
+        chip_h,
+        chip.font,
+        chip.text_color,
+        TextAlign::Left,
+        window,
+        cx,
+    );
 }
 
 /// `chip` as an element, [`height`] tall. A painter placing chips by hand (a
