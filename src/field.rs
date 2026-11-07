@@ -129,10 +129,13 @@ pub(crate) fn filter_field(
         let on_submit = Diffui::listen(cx, move |this, _: &(), _, cx| on_submit(this, cx));
         field = field.on_submit(move |window, cx| on_submit(&(), window, cx));
     }
+    // The caps, not the line box, centre in the well.
+    let trim = crate::typography::trimmed_padding(Padding::ZERO, font, theme::text_size::UI);
     let text = input::single_line(field, font, window, cx)
         .appearance(false)
         .px(px(TEXT_INSET))
-        .py(px(0.0))
+        .pt(px(trim.top))
+        .pb(px(trim.bottom))
         .h_full();
 
     // The field's bounds, for the presets menu that anchors edge-to-edge below it.
@@ -235,5 +238,25 @@ pub(crate) fn sidebar_filter_field(
         .pl(px(PANEL_HEADER_PADDING.left))
         .pr(px(PANEL_HEADER_LEAD))
         .child(filter_field(theme, font, spec, window, cx))
+        .into_any_element()
+}
+
+const DIALOG_FIELD_HEIGHT: f32 = 28.0;
+
+/// A dialog's one-line field: the shared well, at the dialog's control height.
+pub(crate) fn dialog_input(
+    spec: input::FieldSpec<'_>,
+    font: Font,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    input::single_line(spec, font, window, cx)
+        .text_size(px(theme::text_size::BODY))
+        .h(px(DIALOG_FIELD_HEIGHT))
+        .bg(theme.panel_background)
+        .border_color(theme.border)
+        .rounded(px(theme::radius::CONTROL))
+        .focus_bordered(false)
         .into_any_element()
 }

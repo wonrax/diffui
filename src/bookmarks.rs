@@ -7,16 +7,17 @@
 //! [`Diffui::start_mutation_op`], so activity rows, queueing and the
 //! confirmation stack work the way they do for every other mutation.
 
-use crate::Cx;
+use crate::{Action, Cx, input, ui};
 use diffui_core::{PushAllow, PushRejection, PushRequest, PushTarget, RevisionSelection};
-use gpui_kit::{AnyElement, Window};
+use gpui_kit::prelude::*;
+use gpui_kit::{AnyElement, Window, div, px};
 
 use crate::commands::CommandArg;
 use crate::menu::MenuEntry;
 use crate::modes::{Mode, ModeKind};
 use crate::mutations::MutationOp;
 use crate::prose::Prose;
-use crate::theme::ThemeSpec;
+use crate::theme::{self, ThemeSpec};
 use crate::{ConfirmDialog, Diffui, PendingMutation, activity};
 
 pub(crate) const NAME_PROMPT_INPUT_ID: &str = "bookmark-name-input";
@@ -617,18 +618,121 @@ pub(crate) fn local_bookmark_label(label: &str) -> Option<&str> {
     )
 }
 
-/// Stub: the bookmarks view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+/// The bookmark-name prompt: a modal card with the field, a line under it
+/// only when there is something to say (what Enter will do instead, or why
+/// it can't), and the buttons. Empty when closed.
 pub(crate) fn build_name_prompt(
     ui: &Diffui,
     theme: ThemeSpec,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    crate::stub::overlay(
-        "bookmarks::build_name_prompt",
-        ui.mode(ModeKind::NamePrompt).is_some(),
+    let Some(prompt) = ui.name_prompt() else {
+        return div().into_any_element();
+    };
+    let (font, mono) = (ui.config.ui_font, ui.config.mono_font);
+    let cancel = Action::Bookmark(BookmarkAction::PromptCancel);
+    let submit = Action::Bookmark(BookmarkAction::PromptSubmit);
+
+    let verdict = ui.prompt_verdict(prompt);
+    let (title, verb) = match &prompt.kind {
+        PromptKind::Create { at } => (
+            Prose::from("New bookmark at ").then(ui.revision_prose(at)),
+            "Create",
+        ),
+        PromptKind::Rename { old } => (Prose::from("Rename ").bookmark(old), "Rename"),
+    };
+    let (note, error, verb) = match &verdict {
+        PromptVerdict::Invalid(reason) => (reason.clone(), true, verb),
+        PromptVerdict::Create(_) => (Prose::new(), false, verb),
+        PromptVerdict::Move(name) => (
+            Prose::new()
+                .bookmark(name)
+                .text(" exists. This moves it here."),
+            false,
+            "Move here",
+        ),
+        PromptVerdict::Rename { old, .. } => {
+            let on_remote = ui
+                .active()
+                .session
+                .bookmarks
+                .entry(old)
+                .is_some_and(|entry| entry.is_tracked_anywhere());
+            let note = if on_remote {
+                Prose::new()
+                    .bookmark(old)
+                    .text(" stays on the remote until you push.")
+            } else {
+                Prose::new()
+            };
+            (note, false, verb)
+        }
+    };
+
+    let on_input = Diffui::listen(cx, |this, value: &String, _, cx| {
+        this.perform(
+            Action::Bookmark(BookmarkAction::PromptInput(value.clone())),
+            cx,
+        );
+    });
+    let on_submit = Diffui::on_action(submit.clone(), cx);
+    let spec = input::FieldSpec::new(NAME_PROMPT_INPUT_ID, &prompt.value)
+        .placeholder("bookmark name")
+        .on_input(move |value, window, cx| on_input(&value, window, cx))
+        .on_submit(move |window, cx| on_submit(&(), window, cx));
+    let mut field = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(theme::space::SM))
+        .child(crate::field::dialog_input(spec, mono, theme, window, cx));
+    if !note.is_empty() {
+        let color = if error {
+            theme.removed_text
+        } else {
+            theme.muted_text
+        };
+        field = field.child(
+            div()
+                .w_full()
+                .text_size(px(theme::text_size::UI))
+                .child(note.view(font, mono, color, theme)),
+        );
+    }
+
+    let enabled = !matches!(verdict, PromptVerdict::Invalid(_));
+    let mut accept = ui::primary_button(
+        "name-prompt-accept",
+        verb,
+        enabled,
+        ui::Size::Standard,
+        font,
+        theme,
+        cx,
+    );
+    if enabled {
+        accept = accept.on_click(Diffui::on_action(submit, cx));
+    }
+    let cancel_button =
+        ui::cancel_button("name-prompt-cancel", ui::Size::Standard, font, theme, cx)
+            .on_click(Diffui::on_action(cancel.clone(), cx));
+
+    let card = ui::dialog_card(ui::DIALOG_WIDTH, theme)
+        .child(ui::dialog_title(&title, font, mono, theme))
+        .child(field)
+        .child(ui::button_row(
+            None,
+            [cancel_button.into_any_element(), accept.into_any_element()],
+        ));
+    let dismiss = Diffui::on_action(cancel, cx);
+    ui::modal(
+        "name-prompt-modal",
+        card,
+        crate::toolbar::modal_top(),
+        move |window, cx| dismiss(&(), window, cx),
     )
+    .into_any_element()
 }
 
 #[cfg(test)]
