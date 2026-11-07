@@ -691,6 +691,16 @@ impl Diffui {
     /// no diff-pane spinner. On a cold load the sidebar simply grows from empty as
     /// batches arrive, and a revision switch keeps the prior diff until the new one
     /// replaces it.
+    /// Collapsing folds the Diff view's sidebar. Source and History have no toggle
+    /// of their own, so they keep their width whatever the flag says.
+    pub(crate) fn left_pane_width(&self) -> f32 {
+        if self.active().main_view == MainView::Diff && self.active().history_panel_collapsed {
+            theme::COLLAPSED_PANEL_WIDTH
+        } else {
+            self.sidebar_width
+        }
+    }
+
     fn panes(&self, panes: &Panes, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> Div {
         let has_files = !self.active().session.document.files.is_empty();
         let history_collapsed = self.active().history_panel_collapsed;
@@ -698,11 +708,7 @@ impl Diffui {
         let main_view = self.active().main_view;
         let collapsed = theme::COLLAPSED_PANEL_WIDTH;
 
-        let history_width = if history_collapsed {
-            collapsed
-        } else {
-            self.sidebar_width
-        };
+        let history_width = self.left_pane_width();
         let files_width = if !has_files {
             0.0
         } else if files_collapsed {

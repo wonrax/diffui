@@ -581,6 +581,13 @@ impl Harness {
     /// Draws the window with every cache dropped and compares it with what the cached
     /// frames show. `Err` says where they differ: a view reading state that didn't
     /// notify it, which a user would see as a stale pane.
+    /// The window's pixels, for a test to compare.
+    pub(crate) fn screenshot(&mut self) -> image::RgbaImage {
+        self.cx
+            .capture_screenshot(self.window)
+            .expect("capture the window")
+    }
+
     pub(crate) fn same_after_a_refresh(&mut self) -> Result<(), String> {
         let cached = self
             .cx

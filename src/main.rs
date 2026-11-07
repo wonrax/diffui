@@ -44,6 +44,8 @@ mod meta_line;
 mod mode_hints;
 mod modes;
 #[cfg(test)]
+mod field_scenes;
+#[cfg(test)]
 mod overlay_scenes;
 mod palette;
 #[cfg(test)]
