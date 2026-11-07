@@ -1278,3 +1278,130 @@ fn profile_height_index() {
     );
     eprintln!("=======================================\n");
 }
+
+/// A drag that ends on a file or hunk header selects up to the nearest row, in either
+/// direction and either layout, while a press on a band and a drag past the end keep
+/// their end-of-document snap.
+#[test]
+fn a_drag_onto_a_header_band_stops_at_the_nearest_row() {
+    let hunks = vec![
+        vec![
+            DiffHunkView {
+                header: "@@ one @@".to_owned(),
+                lines: vec![
+                    line(DiffLineKind::Context, "alpha", 1),
+                    line(DiffLineKind::Deletion, "old", 2),
+                    line(DiffLineKind::Addition, "new", 2),
+                ],
+            },
+            DiffHunkView {
+                header: "@@ two @@".to_owned(),
+                lines: vec![line(DiffLineKind::Context, "beta", 40)],
+            },
+        ],
+        vec![DiffHunkView {
+            header: "@@ three @@".to_owned(),
+            lines: vec![
+                line(DiffLineKind::Context, "gamma", 1),
+                line(DiffLineKind::Context, "omega", 2),
+            ],
+        }],
+    ];
+    let bounds = Rectangle {
+        x: 0.0,
+        y: 0.0,
+        width: 900.0,
+        height: 600.0,
+    };
+    let at_end = |file, hunk, line, text: &str| body_position(file, hunk, line, text.len());
+    for side_by_side in [false, true] {
+        let props = test_props(2).side_by_side(side_by_side);
+        let view = view_of(&props, &hunks);
+        let cells = TestCaches::default();
+        view.ensure_height_index(&cells.index, &cells.geometry, bounds.width);
+        let index = cells.index.borrow();
+        let drag_to = |y: f32| {
+            view.drag_position_at_point(
+                &index,
+                &cells.geometry,
+                Point::new(40.0, y),
+                bounds,
+                0.0,
+                0.0,
+                side_by_side.then_some(SplitSide::Left),
+            )
+            .expect("a drag always lands somewhere")
+            .0
+        };
+        let press_at = |y: f32| {
+            view.position_at_point(
+                &index,
+                &cells.geometry,
+                Point::new(40.0, y),
+                bounds,
+                0.0,
+                0.0,
+                None,
+            )
+            .expect("a press on a band lands at the end")
+            .0
+        };
+        let side = side_by_side.then_some(SplitSide::Left);
+        let first = body_position(0, 0, 0, 0);
+        let last = at_end(1, 0, 1, "omega");
+        let top = |file: usize, hunk: usize, line: usize| {
+            let row = index
+                .row_of_line(file, hunk, line)
+                .expect("the line has a row");
+            index.row_tops[row]
+        };
+
+        // The second hunk's header: its top half is nearer the row above it, its
+        // bottom half the row below.
+        let band_end = top(0, 1, 0);
+        let hunk_band = band_end - view.metrics.hunk_header_height;
+        let (hunk_near_above, hunk_near_below) = (hunk_band + 1.0, band_end - 1.0);
+        // The last line of the first hunk in this layout's left column reads "old";
+        // unified has "new" after it.
+        let above_hunk = if side_by_side {
+            body_position(0, 0, 1, "old".len())
+        } else {
+            at_end(0, 0, 2, "new")
+        };
+        assert_eq!(drag_to(hunk_near_above), above_hunk);
+        assert_eq!(drag_to(hunk_near_below), body_position(0, 1, 0, 0));
+
+        // The second file's header is nearer `beta`; its hunk header nearer `gamma`.
+        let file_band = index.file_tops[1];
+        assert_eq!(drag_to(file_band + 1.0), at_end(0, 1, 0, "beta"));
+        assert_eq!(drag_to(top(1, 0, 0) - 1.0), body_position(1, 0, 0, 0));
+
+        // Downward: everything before the band, nothing after it.
+        let down = view.collect_selected_text(first, drag_to(file_band + 1.0), side);
+        assert!(down.ends_with("beta"), "{down:?}");
+        assert!(!down.contains("gamma"), "{down:?}");
+        let down = view.collect_selected_text(first, drag_to(top(1, 0, 0) - 1.0), side);
+        assert!(down.contains("beta") && !down.contains("gamma"), "{down:?}");
+
+        // Upward: from the last line, nothing above the band.
+        let up = view.collect_selected_text(drag_to(file_band + 1.0), last, side);
+        assert_eq!(up.trim_start(), "gamma\nomega");
+        let up = view.collect_selected_text(drag_to(top(1, 0, 0) - 1.0), last, side);
+        assert_eq!(up, "gamma\nomega");
+        let up = view.collect_selected_text(drag_to(hunk_near_below), last, side);
+        assert!(up.starts_with("beta"), "{up:?}");
+        assert!(!up.contains("alpha"), "{up:?}");
+
+        // Above the first row there's only that row to go to.
+        assert_eq!(drag_to(1.0), first);
+        assert_eq!(drag_to(-50.0), first);
+
+        // Past the last row a drag still selects to the end.
+        let bottom = *index.file_tops.last().expect("a sentinel");
+        assert_eq!(drag_to(bottom + 200.0), last);
+
+        // A press on a band is what it was.
+        assert_eq!(press_at(file_band + 1.0), last);
+        assert_eq!(press_at(hunk_near_below), last);
+    }
+}

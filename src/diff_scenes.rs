@@ -582,6 +582,57 @@ fn split_columns_in_a_wide_window() {
     h.shot(LANE, "split-columns-nowrap");
 }
 
+/// A drag ending on any file or hunk header stops at the nearest row, in either layout,
+/// where it used to select to the end of the document: `ja.txt` to `zh.txt`'s header was
+/// 23KB. The bands are over 23px tall, so a step of 23 lands on each.
+#[test]
+fn a_drag_ending_on_a_header_selects_no_further_than_the_nearest_row() {
+    let (mut h, repo) = open_sized((1440.0, 900.0));
+    select(&mut h, &repo, "kitchen-sink");
+    select_file(&mut h, "i18n/ja.txt");
+    let copy = |h: &mut Harness, from: (f32, f32), to: (f32, f32)| {
+        h.with_window(|_, cx| {
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(String::new()))
+        });
+        h.drag(at(from.0, from.1), at(to.0, to.1));
+        h.frames();
+        h.press("cmd-c");
+        h.settle();
+        h.with_window(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()))
+            .unwrap_or_default()
+    };
+    for split in [false, true] {
+        if split {
+            h.perform(Action::ToggleSplit);
+            select_file(&mut h, "i18n/ja.txt");
+        }
+        // A row to start from at each end of the pane: a press on a band anchors at
+        // the document's end, so those aren't drags from text.
+        let on_text = |h: &mut Harness, y: f32| !copy(h, (900.0, y), (1000.0, y)).is_empty();
+        let top = (150..400)
+            .step_by(6)
+            .map(|y| y as f32)
+            .find(|&y| on_text(&mut h, y))
+            .expect("a row near the top");
+        let bottom = (500..880)
+            .rev()
+            .step_by(6)
+            .map(|y| y as f32)
+            .find(|&y| on_text(&mut h, y))
+            .expect("a row near the bottom");
+        for y in (150..880).step_by(23).map(|y| y as f32) {
+            for from in [top, bottom] {
+                let text = copy(&mut h, (1000.0, from), (1000.0, y));
+                assert!(
+                    text.len() < 8000,
+                    "split {split}, {from} to {y}: {} bytes",
+                    text.len()
+                );
+            }
+        }
+    }
+}
+
 /// A selection in a split column stays in that column, from text and from a padded side.
 #[test]
 fn split_selection_holds_its_column() {

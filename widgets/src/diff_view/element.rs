@@ -89,6 +89,8 @@ pub(super) struct State {
     /// other column's lines. `None` for unified mode, header, and full-width-file
     /// selections.
     pub(super) selection_lane: Option<SplitSide>,
+    /// The selection's press landed on a header band, not on text.
+    selection_from_band: bool,
     /// When the user drags after a double/triple click, the selection grows in word-
     /// or line-sized chunks instead of by character. We remember where the anchor
     /// "click unit" started/ended so the selection always covers full units in both
@@ -179,6 +181,7 @@ impl Default for State {
             selection_anchor: None,
             selection_focus: None,
             selection_lane: None,
+            selection_from_band: false,
             selection_anchor_unit_start: None,
             selection_anchor_unit_end: None,
             selection_unit: SelectionUnit::Character,
@@ -554,7 +557,15 @@ impl State {
     fn advance_drag_selection(&mut self, view: &View<'_>, cursor: Point, bounds: Rectangle) {
         let focus = {
             let index = self.height_index.borrow();
-            view.position_at_point(
+            // A press on a band anchors at the document's end, and a focus snapped
+            // to the nearest row would select everything from there to it.
+            let locate = if self.selection_from_band {
+                View::position_at_point
+            } else {
+                View::drag_position_at_point
+            };
+            locate(
+                view,
                 &index,
                 &self.geometry,
                 cursor,
@@ -767,16 +778,20 @@ impl State {
             self.selection_lane = None;
             return;
         }
-        let position = {
+        let (position, from_band) = {
             let index = self.height_index.borrow();
-            view.position_at_point(
-                &index,
-                &self.geometry,
-                point,
-                bounds,
-                offset,
-                self.horizontal_offset,
-                None,
+            (
+                view.position_at_point(
+                    &index,
+                    &self.geometry,
+                    point,
+                    bounds,
+                    offset,
+                    self.horizontal_offset,
+                    None,
+                ),
+                view.band_snap(&index, point.y - bounds.y + offset)
+                    .is_some(),
             )
         };
         let Some((position, lane)) = position else {
@@ -812,6 +827,7 @@ impl State {
         self.selection_anchor = Some(anchor_start);
         self.selection_focus = Some(anchor_end);
         self.selection_lane = lane;
+        self.selection_from_band = from_band;
         self.is_selecting = true;
         self.last_drag_cursor = Some(point);
     }

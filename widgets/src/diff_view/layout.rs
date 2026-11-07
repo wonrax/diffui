@@ -241,6 +241,27 @@ impl HeightIndex {
             .checked_sub(1)
     }
 
+    /// For a `target_y` between rows (a file or hunk header band, a media block)
+    /// or above the first one: the nearer row, and whether it lies above `target_y`.
+    /// `None` on a row and past the last one.
+    pub(super) fn nearest_row_off_band(&self, target_y: f32) -> Option<(usize, bool)> {
+        let above = self.row_at(target_y);
+        let below = above.map_or(0, |row| row + 1);
+        let below_top = *self.row_tops.get(below)?;
+        let Some(above) = above else {
+            return Some((below, false));
+        };
+        let above_bottom = self.row_tops[above] + self.row_heights[above];
+        if target_y < above_bottom {
+            return None;
+        }
+        Some(if target_y - above_bottom <= below_top - target_y {
+            (above, true)
+        } else {
+            (below, false)
+        })
+    }
+
     /// Index of row `(file, hunk, line)`, by binary search over the sorted ids.
     pub(super) fn row_index_of(&self, file: usize, hunk: usize, line: usize) -> Option<usize> {
         self.row_ids
@@ -308,6 +329,21 @@ pub(super) fn header_position(line_index: usize, byte: usize) -> TextPosition {
         hunk_index: 0,
         line_index,
         byte,
+    }
+}
+
+/// The member of a split row's `(left, right)` pair a point resolves to: the side
+/// asked for, falling back to the populated side of a padded pair.
+fn split_member(left: u32, right: u32, in_right: bool) -> (u32, SplitSide) {
+    let pick_right = if in_right {
+        right != NO_LINE || left == NO_LINE
+    } else {
+        left == NO_LINE
+    };
+    if pick_right {
+        (right, SplitSide::Right)
+    } else {
+        (left, SplitSide::Left)
     }
 }
 
@@ -1664,7 +1700,8 @@ impl<'a> View<'a> {
 
         // Candidate row by binary search: the last row starting at or above the
         // target y. The target may instead sit in a file/hunk header band (or past
-        // the end): those fall through to the end-of-document snap below.
+        // the end): those fall through to the end-of-document snap below. A drag
+        // doesn't get that far for a band: see `drag_position_at_point`.
         if let Some(row) = index.row_at(target_y) {
             let &(file_index, hunk_index, line_index) = index.row_ids.get(row)?;
             let (file_index, hunk_index, mut line_index) = (
@@ -1687,16 +1724,7 @@ impl<'a> View<'a> {
                     Some(SplitSide::Left) => false,
                     None => point.x >= bounds.x + split.divider_x,
                 };
-                let pick_right = if in_right {
-                    right != NO_LINE || left == NO_LINE
-                } else {
-                    left == NO_LINE
-                };
-                let (member, side) = if pick_right {
-                    (right, SplitSide::Right)
-                } else {
-                    (left, SplitSide::Left)
-                };
+                let (member, side) = split_member(left, right, in_right);
                 if member == NO_LINE {
                     return None;
                 }
@@ -1740,8 +1768,8 @@ impl<'a> View<'a> {
             }
         }
 
-        // Not on a row (a header band, or past the last row). Snap to the end of the
-        // document so a drag below content selects everything up to it.
+        // Not on a row (a press on a header band, or past the last row). Snap to the
+        // end of the document so a drag below content selects everything up to it.
         let &(file, hunk, line) = index.row_ids.last()?;
         let (file_index, hunk_index, mut line_index) =
             (file as usize, hunk as usize, line as usize);
@@ -1756,6 +1784,73 @@ impl<'a> View<'a> {
         Some((
             body_position(file_index, hunk_index, line_index, line.content.len()),
             None,
+        ))
+    }
+
+    /// The row nearest `target_y` when it's off every row but still among them: on a
+    /// file or hunk header band, not in the revision header or past the last row.
+    pub(super) fn band_snap(&self, index: &HeightIndex, target_y: f32) -> Option<(usize, bool)> {
+        let header_height = self.header_height();
+        if header_height > 0.0 && target_y < header_height {
+            return None;
+        }
+        index.nearest_row_off_band(target_y)
+    }
+
+    /// Where a selection drag at `point` ends. As [`Self::position_at_point`], except
+    /// that a header band between rows snaps to the nearest row: to its end when
+    /// that row is above the band, to its start when it's below, so nothing past the
+    /// band gets selected. Past the last row it still selects to the end.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn drag_position_at_point(
+        &self,
+        index: &HeightIndex,
+        memo: &RefCell<GeometryMemo>,
+        point: Point,
+        bounds: Rectangle,
+        vertical_offset: f32,
+        horizontal_offset: f32,
+        lock: Option<SplitSide>,
+    ) -> Option<(TextPosition, Option<SplitSide>)> {
+        let target_y = point.y - bounds.y + vertical_offset;
+        let Some((row, above)) = self.band_snap(index, target_y) else {
+            return self.position_at_point(
+                index,
+                memo,
+                point,
+                bounds,
+                vertical_offset,
+                horizontal_offset,
+                lock,
+            );
+        };
+        let &(file, hunk, line) = index.row_ids.get(row)?;
+        let (file_index, hunk_index, mut line_index) =
+            (file as usize, hunk as usize, line as usize);
+        let mut lane = None;
+        if !index.is_full_width(file_index)
+            && self.props.side_by_side
+            && let Some(&(left, right)) = index.pair_lines.get(row)
+        {
+            let in_right = match lock {
+                Some(side) => side == SplitSide::Right,
+                None => point.x >= bounds.x + self.split_layout(bounds.width).divider_x,
+            };
+            let (member, side) = split_member(left, right, in_right);
+            if member == NO_LINE {
+                return None;
+            }
+            line_index = member as usize;
+            lane = Some(side);
+        }
+        let byte = if above {
+            self.line(file_index, hunk_index, line_index)?.content.len()
+        } else {
+            0
+        };
+        Some((
+            body_position(file_index, hunk_index, line_index, byte),
+            lane,
         ))
     }
 
