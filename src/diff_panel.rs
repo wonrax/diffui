@@ -18,7 +18,9 @@ use std::rc::Rc;
 const EMPTY_STATE_TEXT_SIZE: f32 = text_size::BODY_LG;
 pub(crate) const DESCRIPTION_EDITOR_ID: &str = "revision-description-editor";
 const DESCRIPTION_EDITOR_GAP: f32 = 8.0;
-pub const DEFAULT_FILE_NAV_WIDTH: f32 = 236.0;
+// 12 over iced's 236: CoreText sets 13pt SF as AppKit does, about 12% wider than
+// iced's shaper did, and the stat columns measure wider with it.
+pub const DEFAULT_FILE_NAV_WIDTH: f32 = 248.0;
 pub const MIN_FILE_NAV_WIDTH: f32 = 168.0;
 pub const FILE_NAV_PEEK_WIDTH: f32 = 284.0;
 

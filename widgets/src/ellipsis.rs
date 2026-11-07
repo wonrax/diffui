@@ -243,27 +243,46 @@ fn middle_cut<'a>(
         .chain([content.len()])
         .collect();
     let chars = bytes.len() - 1;
-    // The most chars kept, split evenly around the cut with any odd one going
-    // to the start.
-    let split = |kept: usize| {
-        let head = kept.div_ceil(2);
-        (
-            &content[..bytes[head]],
-            &content[bytes[chars - (kept - head)]..],
-        )
-    };
-    let (mut low, mut high) = (0, chars);
-    while low < high {
-        let mid = (low + high).div_ceil(2);
-        let (head, tail) = split(mid);
-        if measure(head) + measure(tail) <= room {
-            low = mid;
+    let head_of = |kept: usize| &content[..bytes[kept]];
+    let tail_of = |kept: usize| &content[bytes[chars - kept]..];
+    // Split by width rather than by chars, so a run of narrow letters (`file.txt`)
+    // keeps what it has room for: the narrower side takes the next char, the start
+    // on a tie, and the other side goes on when that one doesn't fit.
+    let (mut head, mut tail) = (0, 0);
+    let (mut head_width, mut tail_width) = (0.0, 0.0);
+    while head + tail < chars {
+        let grown_head = measure(head_of(head + 1));
+        let grown_tail = measure(tail_of(tail + 1));
+        let head_fits = grown_head + tail_width <= room;
+        let tail_fits = head_width + grown_tail <= room;
+        if head_fits && (head_width <= tail_width || !tail_fits) {
+            head += 1;
+            head_width = grown_head;
+        } else if tail_fits {
+            tail += 1;
+            tail_width = grown_tail;
         } else {
-            high = mid - 1;
+            break;
         }
     }
-    let (head, tail) = split(low);
-    Cow::Owned(format!("{head}{ELLIPSIS}{tail}"))
+    // A cut against an extension's dot reads as four dots (`fra….rs`): give the
+    // tail the char before the dot, paying from the start if it has to.
+    if tail_of(tail).starts_with('.') && tail + 1 + head <= chars {
+        let grown_tail = measure(tail_of(tail + 1));
+        let mut kept = head;
+        while kept > 1 && measure(head_of(kept)) + grown_tail > room {
+            kept -= 1;
+        }
+        if measure(head_of(kept)) + grown_tail <= room {
+            head = kept;
+            tail += 1;
+        }
+    }
+    Cow::Owned(format!(
+        "{}{ELLIPSIS}{}",
+        head_of(head).trim_end_matches('.'),
+        tail_of(tail)
+    ))
 }
 
 /// `text` with each run of whitespace holding a line break turned into one
@@ -421,6 +440,22 @@ mod tests {
         assert_eq!(middle_cut("abcdefghij", 0.5, count, 1.0), "…");
         // Multi-byte chars stay whole.
         assert_eq!(middle_cut("ééééééééé", 4.0, count, 1.0), "éé…é");
+    }
+
+    #[test]
+    fn a_middle_cut_stays_off_an_extensions_dot() {
+        let count = |part: &str| part.chars().count() as f32;
+        // Even split would give `abc….txt`.
+        assert_eq!(middle_cut("abcdefgh.txt", 9.0, count, 1.0), "abc…h.txt");
+        // A dot at the end of the start goes.
+        assert_eq!(middle_cut("a.bcdefgh", 4.0, count, 1.0), "a…h");
+    }
+
+    #[test]
+    fn a_middle_cut_splits_by_width() {
+        // `i` is a third as wide as the rest: the narrow tail keeps more chars.
+        let thin = |part: &str| part.chars().map(|c| if c == 'i' { 1.0 } else { 3.0 }).sum();
+        assert_eq!(middle_cut("wwwwwwwwiiiiii", 15.0, thin, 3.0), "ww…iiiiii");
     }
 
     #[test]
