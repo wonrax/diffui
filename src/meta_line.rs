@@ -5,16 +5,14 @@
 //! with the graph's colours, then a person and a relative time, each behind
 //! a small icon and set apart by space rather than by separator glyphs.
 
-use crate::Cx;
-use crate::ellipsis::Span;
-use crate::theme::{Color, Font};
-use diffui_core::history::relative_age;
-use gpui_kit::{AnyElement, Window};
+use diffui_core::history::{human_timestamp, now_millis, relative_age};
+use gpui_kit::prelude::*;
+use gpui_kit::{AnyElement, ElementId, Window, div, px};
 
-use crate::Diffui;
-use crate::ellipsis;
-use crate::theme::ThemeSpec;
+use crate::ellipsis::{self, Span};
+use crate::theme::{Color, Font, ThemeSpec, chip_background, space, text_size};
 use crate::typography::{self, Aligned};
+use crate::{Cx, Diffui, icons, ui};
 
 /// Widest a name gets before it ellipsizes, so a long one can't push the
 /// time off the line.
@@ -144,8 +142,6 @@ pub(crate) fn description(
     ellipsis::Line::new(spans, font, size, color)
 }
 
-/// Stub: the meta_line view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
 pub(crate) fn view(
     meta: Meta,
     ui: &Diffui,
@@ -153,19 +149,153 @@ pub(crate) fn view(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    crate::stub::panel("meta_line::view")
+    // Mono ids, sans names and small badges share one baseline (see
+    // `crate::typography`), not one box centre.
+    let mut line: Vec<Aligned> = Vec::new();
+    if !meta.ids.is_empty() || !meta.badges.is_empty() {
+        let mut ids: Vec<Aligned> = Vec::new();
+        for id in meta.ids {
+            ids.push(id_text(id, ui));
+        }
+        for spec in meta.badges {
+            ids.push(badge(spec.label, spec.color, ui, window, cx));
+        }
+        line.push(typography::group(ids, space::SM));
+    }
+    if let Some((name, detail)) = meta.who {
+        let label = labelled(icons::USER, name, ui, theme);
+        line.push(
+            label
+                .map(|label| {
+                    div()
+                        .flex()
+                        .max_w(px(WHO_MAX_WIDTH))
+                        .child(label)
+                        .into_any_element()
+                })
+                .map(|label| hover("meta-who", label, detail, ui, theme)),
+        );
+    }
+    if let Some((millis, absolute)) = meta.when {
+        let (label, detail) = match millis {
+            Some(millis) => (
+                age_phrase(millis, now_millis()),
+                Some(human_timestamp(&absolute).unwrap_or(absolute)),
+            ),
+            None => (absolute, None),
+        };
+        line.push(
+            labelled(icons::CLOCK, label, ui, theme)
+                .map(|label| hover("meta-when", label, detail, ui, theme)),
+        );
+    }
+    if let Some((id, operation)) = meta.operation {
+        line.push(typography::group(
+            [
+                Aligned::glyph(
+                    icons::icon(icons::HISTORY, ICON_SIZE, theme.subtle_text),
+                    ICON_SIZE,
+                ),
+                id_text(Id::plain(id, theme.subtle_text), ui),
+                Aligned::text(
+                    typography::line(
+                        shorten_ids(&operation),
+                        ui.config.ui_font,
+                        text_size::UI,
+                        theme.muted_text,
+                    )
+                    .text_ellipsis(),
+                    ui.config.ui_font,
+                    text_size::UI,
+                )
+                .shrink(),
+            ],
+            space::XS,
+        ));
+    }
+    typography::baseline_row(line, space::LG).into_any_element()
 }
 
-/// Stub: the meta_line view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+/// A small filled badge, the look of the History view's `hidden` / `empty`
+/// markers, ready to sit on a line's baseline.
 pub(crate) fn badge(
     label: &str,
     color: Color,
     ui: &Diffui,
-    window: &mut Window,
-    cx: &mut Cx,
+    _window: &mut Window,
+    _cx: &mut Cx,
 ) -> Aligned {
-    crate::stub::aligned("meta_line::badge")
+    let font = ui.config.ui_font;
+    Aligned::chip(
+        typography::line(label.to_owned(), font, text_size::BADGE, color),
+        font,
+        text_size::BADGE,
+        [0.0, 5.0].into(),
+        move |chip| {
+            chip.bg(chip_background(color))
+                .rounded(px(crate::chip::RADIUS))
+        },
+    )
+}
+
+/// An id in mono, its bright prefix and the rest as one rich text, so the two
+/// colours can't drift apart.
+pub(crate) fn id_text(id: Id, ui: &Diffui) -> Aligned {
+    let mono = ui.config.mono_font;
+    let split = id
+        .text
+        .char_indices()
+        .nth(id.bright)
+        .map_or(id.text.len(), |(at, _)| at);
+    let (bright, rest) = id.text.split_at(split);
+    let spans = [
+        Span::new(bright.to_owned()).color(id.bright_color),
+        Span::new(rest.to_owned()).color(id.color),
+    ];
+    Aligned::text(
+        div()
+            .text_size(px(text_size::UI))
+            .whitespace_nowrap()
+            .child(ellipsis::rich_text(&spans, mono, id.color)),
+        mono,
+        text_size::UI,
+    )
+}
+
+/// An icon and its label, centred on the label's caps.
+fn labelled(glyph: &'static str, label: String, ui: &Diffui, theme: ThemeSpec) -> Aligned {
+    let font = ui.config.ui_font;
+    typography::group(
+        [
+            Aligned::glyph(icons::icon(glyph, ICON_SIZE, theme.subtle_text), ICON_SIZE),
+            Aligned::text(
+                typography::line(label, font, text_size::UI, theme.muted_text).text_ellipsis(),
+                font,
+                text_size::UI,
+            )
+            .shrink(),
+        ],
+        space::XS,
+    )
+}
+
+fn hover(
+    id: &'static str,
+    content: AnyElement,
+    detail: Option<String>,
+    ui: &Diffui,
+    theme: ThemeSpec,
+) -> AnyElement {
+    match detail.filter(|detail| !detail.is_empty()) {
+        Some(detail) => div()
+            .id(ElementId::Name(id.into()))
+            .flex()
+            .min_w_0()
+            .tooltip(ui::tooltip(detail, ui.config.ui_font, theme))
+            .child(content)
+            .into_any_element(),
+        None => content,
+    }
 }
 
 #[cfg(test)]
