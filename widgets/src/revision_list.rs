@@ -35,10 +35,11 @@ use crate::geometry::{Point, Rectangle};
 use crate::graph_view::{self, GraphFrame, LANE_WIDTH, RevisionGraphStyle, lane_strip_width};
 use crate::icons;
 use crate::measure::LINE_HEIGHT_MULTIPLIER;
-use crate::scrollbar::{self, ScrollbarState, ScrollbarStyle};
+use crate::scrollbar;
 use crate::theme::{Color, Font, chip_background};
 use crate::typography::{self, TextBox};
 use crate::width_memo::WidthMemo;
+use gpui_kit::component::scroll::ScrollableElement as _;
 
 pub const REVISION_ROW_HEIGHT: f32 = 46.0;
 pub const FILE_ROW_HEIGHT: f32 = 26.0;
@@ -117,7 +118,6 @@ pub struct RevisionListStyle {
     pub tooltip_background: Color,
     pub tooltip_text: Color,
     pub tooltip_border: Color,
-    pub scrollbar: ScrollbarStyle,
 }
 
 /// Key the widget reports back so the parent can map it to its own
@@ -891,7 +891,8 @@ pub struct RevisionList {
     /// tooltip.
     cursor_position: Option<Point>,
     over_scrollbar: bool,
-    scrollbar: ScrollbarState,
+    /// What the bar over the list reads, and where a drag on it asks to go.
+    bar: scrollbar::Shared,
     /// Most recent `reveal_token` we acted on. `None` until first reveal.
     last_reveal_token: Option<u64>,
     /// Most recent `file_reveal_token` we acted on. `None` until first reveal.
@@ -961,7 +962,7 @@ impl RevisionList {
             hovered_lane: None,
             cursor_position: None,
             over_scrollbar: false,
-            scrollbar: ScrollbarState::default(),
+            bar: scrollbar::Shared::default(),
             last_reveal_token: None,
             last_file_reveal_token: None,
             pending_reveal_row: None,
@@ -1131,22 +1132,6 @@ impl RevisionList {
     ) {
         let props = self.props.clone();
         let bounds = self.bounds;
-        if scrollbar::is_dragging(&self.scrollbar) {
-            if let scrollbar::ScrollbarEvent::OffsetChanged(new_offset) = scrollbar::on_cursor_moved(
-                &mut self.scrollbar,
-                position,
-                bounds,
-                props.content_height() as f32,
-            ) {
-                self.vertical_offset = f64::from(new_offset).clamp(0.0, self.max_offset());
-                cx.notify();
-            }
-            self.cursor_position = None;
-            if self.clear_hover() {
-                cx.notify();
-            }
-            return;
-        }
         // Drag-to-rebase tracking: past a small threshold the press becomes a
         // drag; from then on the list owns the cursor (no hover washes) and
         // mirrors spot changes to the app.
@@ -1267,21 +1252,6 @@ impl RevisionList {
     ) -> bool {
         let props = self.props.clone();
         let bounds = self.bounds;
-        match scrollbar::on_button_pressed(
-            &mut self.scrollbar,
-            cursor,
-            bounds,
-            props.content_height() as f32,
-            self.vertical_offset as f32,
-        ) {
-            scrollbar::ScrollbarEvent::OffsetChanged(new_offset) => {
-                self.vertical_offset = f64::from(new_offset).clamp(0.0, self.max_offset());
-                cx.notify();
-                return true;
-            }
-            scrollbar::ScrollbarEvent::Captured => return true,
-            scrollbar::ScrollbarEvent::None => {}
-        }
         let local_y = f64::from(cursor.y - bounds.y) + self.vertical_offset;
         let Some(row_idx) = props.row_at_offset(local_y) else {
             return false;
@@ -1360,12 +1330,6 @@ impl RevisionList {
             if released_on_same_row && let Some(on_select) = &props.on_select_revision {
                 effects.push(call(on_select, key));
             }
-        }
-        if matches!(
-            scrollbar::on_button_released(&mut self.scrollbar),
-            scrollbar::ScrollbarEvent::Captured
-        ) {
-            cx.notify();
         }
     }
 
@@ -1717,13 +1681,6 @@ impl RevisionList {
                     }
                 }
             }
-
-            let geometry = scrollbar::geometry(
-                bounds,
-                props.content_height() as f32,
-                self.vertical_offset as f32,
-            );
-            scrollbar::paint(window, &geometry, &style.scrollbar);
 
             // Live drag-to-rebase indicator: the drop decoration under the
             // cursor. The ghost chip is deferred: it follows the cursor out of
@@ -2371,10 +2328,6 @@ fn placeholder_style() -> RevisionListStyle {
         tooltip_background: color,
         tooltip_text: color,
         tooltip_border: color,
-        scrollbar: ScrollbarStyle {
-            track_color: color,
-            thumb_color: color,
-        },
     }
 }
 
@@ -2763,7 +2716,15 @@ struct FileRowColumns {
 
 impl Render for RevisionList {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        ListElement { list: cx.entity() }
+        div()
+            .id(ElementId::NamedInteger(
+                "revision-list".into(),
+                cx.entity_id().as_u64(),
+            ))
+            .relative()
+            .size_full()
+            .child(ListElement { list: cx.entity() })
+            .vertical_scrollbar(&self.bar)
     }
 }
 
@@ -2818,7 +2779,16 @@ impl Element for ListElement {
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
         let (moved, on_scroll, tooltip, ghost) = self.list.update(cx, |list, cx| {
             list.bounds = bounds.into();
-            let moved = list.settle_offset();
+            let mut moved = list.settle_offset();
+            if let Some(offset) = list.bar.take_requested() {
+                list.vertical_offset = f64::from(offset).clamp(0.0, list.max_offset());
+                moved = Some(list.vertical_offset);
+            }
+            list.bar.publish(
+                list.bounds,
+                list.props.content_height() as f32,
+                list.vertical_offset as f32,
+            );
             (
                 moved,
                 list.props.on_scroll.clone(),
@@ -2852,13 +2822,11 @@ impl Element for ListElement {
             crate::frame_log::time("list.paint", || list.paint(window, cx));
             if list.drag.is_some_and(|drag| drag.active) {
                 CursorStyle::ClosedHand
-            } else if scrollbar::is_dragging(&list.scrollbar)
-                || scrollbar::hits_container(
-                    list.bounds,
-                    window.mouse_position().into(),
-                    list.props.content_height() as f32,
-                )
-            {
+            } else if scrollbar::hits_container(
+                list.bounds,
+                window.mouse_position().into(),
+                list.props.content_height() as f32,
+            ) {
                 CursorStyle::Arrow
             } else {
                 CursorStyle::PointingHand

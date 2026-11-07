@@ -19,14 +19,14 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    AnyElement, App, Context, ElementId, Entity, FocusHandle, Global, WeakEntity, Window,
+    AnyElement, App, Context, ElementId, Entity, FocusHandle, Global, WeakEntity, Window, div,
 };
 
 use crate::chip::Chip;
 use crate::hunk_actions::HunkActions;
-use crate::scrollbar::ScrollbarStyle;
 use crate::theme::{Color, Font};
 use crate::typography::CodeTypography;
 
@@ -419,7 +419,6 @@ pub struct Palette {
     pub border: Color,
     /// Background tint drawn under selected text.
     pub selection: Color,
-    pub scrollbar: ScrollbarStyle,
 }
 
 /// Everything the app decides about a [`DiffView`], set from a render.
@@ -764,7 +763,15 @@ pub struct FrameStats {
 
 impl Render for DiffView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        DiffElement::new(cx.entity())
+        div()
+            .id(ElementId::NamedInteger(
+                "diff-view".into(),
+                cx.entity_id().as_u64(),
+            ))
+            .relative()
+            .size_full()
+            .child(DiffElement::new(cx.entity()))
+            .vertical_scrollbar(&self.state.bar)
     }
 }
 

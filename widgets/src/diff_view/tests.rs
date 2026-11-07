@@ -77,10 +77,6 @@ fn test_palette() -> Palette {
         gutter_background: c,
         border: c,
         selection: c,
-        scrollbar: crate::scrollbar::ScrollbarStyle {
-            track_color: c,
-            thumb_color: c,
-        },
     }
 }
 

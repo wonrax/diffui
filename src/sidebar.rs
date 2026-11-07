@@ -354,7 +354,6 @@ pub(crate) fn revision_list_style(
         tooltip_background: theme.panel_background_elevated,
         tooltip_text: theme.text,
         tooltip_border: theme.border,
-        scrollbar: theme::scrollbar_style(theme),
     }
 }
 

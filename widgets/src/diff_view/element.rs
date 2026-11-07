@@ -22,7 +22,7 @@ use super::line::{GeometryMemo, body_geometry_key};
 use super::paint::{CodeCache, Plan};
 use super::{Callback, DiffProps, DiffView, HeaderAction, LineAt, LinePress};
 use crate::geometry::{Point, Rectangle};
-use crate::scrollbar::{self, ScrollbarState};
+use crate::scrollbar;
 use crate::theme::Color;
 
 // A pause this long between wheel events ends a scroll gesture, unlocking the axis
@@ -109,7 +109,8 @@ pub(super) struct State {
     last_drag_cursor: Option<Point>,
     /// When auto-scroll last stepped, so its speed doesn't depend on the frame rate.
     last_auto_scroll: Option<Instant>,
-    scrollbar: ScrollbarState,
+    /// What the bar over the view reads, and where a drag on it asks to go.
+    pub(super) bar: scrollbar::Shared,
     /// Most recent `restore_token` acted on; a change schedules a one-shot jump to the
     /// caller's `restore_offset`. Starts at 0 to match the caller's initial token.
     last_restore_token: u64,
@@ -190,7 +191,7 @@ impl Default for State {
             click_count: 0,
             last_drag_cursor: None,
             last_auto_scroll: None,
-            scrollbar: ScrollbarState::default(),
+            bar: scrollbar::Shared::default(),
             last_restore_token: 0,
             pending_set_offset: None,
             last_content_version: 0,
@@ -682,27 +683,6 @@ impl State {
         out: &mut Outbox,
     ) {
         let props = view.props;
-        let content_height = self.height_index.borrow().total_height;
-        match scrollbar::on_button_pressed(
-            &mut self.scrollbar,
-            point,
-            bounds,
-            content_height,
-            self.vertical_offset,
-        ) {
-            scrollbar::ScrollbarEvent::OffsetChanged(offset) => {
-                let (max_vertical, _) = self.limits(view, bounds);
-                let prev = self.vertical_offset;
-                self.vertical_offset = offset.clamp(0.0, max_vertical);
-                self.publish_file(view, out);
-                if self.vertical_offset != prev {
-                    send(out, &props.on_scroll, self.vertical_offset);
-                }
-                return;
-            }
-            scrollbar::ScrollbarEvent::Captured => return,
-            scrollbar::ScrollbarEvent::None => {}
-        }
         let offset = self.vertical_offset;
         // A header field's link or button wins over selection too.
         if let Some((_, _, action)) = view.header_action_at(bounds, offset, point) {
@@ -840,22 +820,6 @@ impl State {
         left_held: bool,
         out: &mut Outbox,
     ) -> bool {
-        if scrollbar::is_dragging(&self.scrollbar) {
-            let content_height = self.height_index.borrow().total_height;
-            if let scrollbar::ScrollbarEvent::OffsetChanged(offset) =
-                scrollbar::on_cursor_moved(&mut self.scrollbar, position, bounds, content_height)
-            {
-                let (max_vertical, _) = self.limits(view, bounds);
-                let prev = self.vertical_offset;
-                self.vertical_offset = offset.clamp(0.0, max_vertical);
-                self.publish_file(view, out);
-                if self.vertical_offset != prev {
-                    send(out, &view.props.on_scroll, self.vertical_offset);
-                    return true;
-                }
-            }
-            return false;
-        }
         if let Some((last, lane)) = self.line_drag {
             let reached = {
                 let index = self.height_index.borrow();
@@ -902,11 +866,6 @@ impl State {
 
     /// The left button came up. Returns whether a repaint is needed.
     fn on_release(&mut self) -> bool {
-        if let scrollbar::ScrollbarEvent::Captured =
-            scrollbar::on_button_released(&mut self.scrollbar)
-        {
-            return false;
-        }
         if self.line_drag.take().is_some() {
             return false;
         }
@@ -933,9 +892,7 @@ impl State {
         let index = self.height_index.borrow();
         let index = &*index;
         let offset = self.vertical_offset;
-        if scrollbar::is_dragging(&self.scrollbar)
-            || scrollbar::hits_container(bounds, point, index.total_height)
-        {
+        if scrollbar::hits_container(bounds, point, index.total_height) {
             return CursorStyle::Arrow;
         }
         if view
@@ -1072,10 +1029,20 @@ impl DiffView {
             }
             let prev_offset = state.vertical_offset;
             state.apply_pending(&view, bounds, &mut out);
+            if let Some(offset) = state.bar.take_requested() {
+                let (max_vertical, _) = state.limits(&view, bounds);
+                state.vertical_offset = offset.clamp(0.0, max_vertical);
+                state.publish_file(&view, &mut out);
+            }
             animating = state.step_auto_scroll(&view, bounds, &mut out);
             if state.vertical_offset != prev_offset {
                 send(&mut out, &props.on_scroll, state.vertical_offset);
             }
+            state.bar.publish(
+                bounds,
+                state.height_index.borrow().total_height,
+                state.vertical_offset,
+            );
             state.painted_offset = (state.vertical_offset * scale).round() / scale;
             crate::frame_log::time("diff.plan", || view.build_plan(state, bounds, &mut plan));
             cursor = state.cursor_at(&view, bounds, mouse);

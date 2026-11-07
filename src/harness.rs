@@ -256,6 +256,15 @@ impl Harness {
         );
         cx.allow_parking();
         cx.update(crate::root::init);
+        // Kit's bars fade on a clock; shown for good, a frame doesn't depend on
+        // when it was drawn, and the stale-pane check can compare two.
+        cx.update(|cx| {
+            gpui_kit::component::Theme::set_scrollbar_mode(
+                gpui_kit::component::scroll::ScrollbarMode::Always,
+                cx,
+            );
+            crate::scrollbar::place_kit_bars(cx);
+        });
         let cli = Cli {
             paths: repo.map(Path::to_path_buf).into_iter().collect(),
             repos: Vec::new(),

@@ -366,22 +366,14 @@ pub fn diff_palette(theme: ThemeSpec) -> Palette {
             a: 0.20,
             ..theme.accent
         },
-        scrollbar: scrollbar_style(theme),
     }
 }
 
-pub fn scrollbar_style(theme: ThemeSpec) -> scrollbar::ScrollbarStyle {
-    scrollbar::ScrollbarStyle {
-        // Soft pill behind the thumb, lighter than the thumb so the two
-        // read as distinct without looking heavy on light themes.
-        track_color: Color {
-            a: 0.18,
-            ..theme.muted_text
-        },
-        thumb_color: Color {
-            a: 0.55,
-            ..theme.muted_text
-        },
+/// The scrollbar thumb, kit's and so every bar's.
+pub fn scrollbar_thumb(theme: ThemeSpec) -> Color {
+    Color {
+        a: 0.55,
+        ..theme.muted_text
     }
 }
 
@@ -637,7 +629,7 @@ pub fn apply_to_kit(resolved: ResolvedTheme, cx: &mut App) {
         let raised = raised_button_style(spec);
         let primary = primary_button_style(spec);
         let ghost = ghost_button_style(spec);
-        let scroll = scrollbar_style(spec);
+        let thumb = scrollbar_thumb(spec);
         let c = &mut theme.colors;
         c.background = hsla(spec.background);
         c.foreground = hsla(spec.text);
@@ -665,12 +657,13 @@ pub fn apply_to_kit(resolved: ResolvedTheme, cx: &mut App) {
         c.danger_active = hsla(spec.removed_text);
         c.danger_foreground = hsla(spec.background);
         c.scrollbar = hsla(TRANSPARENT);
-        c.scrollbar_thumb = hsla(scroll.thumb_color);
-        c.scrollbar_thumb_hover = hsla(scroll.thumb_color);
+        c.scrollbar_thumb = hsla(thumb);
+        c.scrollbar_thumb_hover = hsla(thumb);
         c.list_hover = hsla(ghost.hover);
         c.list_active = hsla(spec.selected_file);
         c.tab_bar = hsla(spec.background);
     });
+    scrollbar::place_kit_bars(cx);
 }
 
 #[cfg(test)]

@@ -38,7 +38,6 @@ use crate::geometry::{Point, Rectangle};
 use crate::hunk_actions::{self, FilePlaced, Placed, Run};
 use crate::icons;
 use crate::measure;
-use crate::scrollbar::{self, ScrollbarGeometry, ScrollbarStyle};
 use crate::theme::{self, Color, Font};
 use crate::typography::TextBox;
 
@@ -79,7 +78,6 @@ enum Op {
         clip: Bounds<Pixels>,
     },
     Path(Path<Pixels>, Background),
-    Scrollbar(ScrollbarGeometry, ScrollbarStyle),
 }
 
 /// What a frame draws; see the module docs.
@@ -130,7 +128,6 @@ impl Plan {
                     });
                 }
                 Op::Path(path, color) => window.paint_path(path, color),
-                Op::Scrollbar(geometry, style) => scrollbar::paint(window, &geometry, &style),
             }
         }
     }
@@ -2512,10 +2509,6 @@ impl View<'_> {
                 state.hovered_browse == Some(file_index),
             );
         }
-
-        let geometry =
-            scrollbar::geometry(bounds, height_index.total_height, state.vertical_offset);
-        plan.ops.push(Op::Scrollbar(geometry, palette.scrollbar));
     }
 }
 
