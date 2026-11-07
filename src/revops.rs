@@ -8,15 +8,13 @@
 //! [`Diffui::start_draft_with`], so labels, guards and previews stay shared
 //! with the original ops.
 
+use crate::Cx;
 use std::time::Duration;
 
-use diffui_core::{DraftKind, PlacementKind, RevisionSelection};
-use iced::Task;
-
-use crate::message::{Message, UiEvent};
 use crate::modes::{ModeKind, TabMode};
 use crate::{Diffui, PreviewRequest};
 use crate::{DraftPreviewState, DraftUi, mutations};
+use diffui_core::{DraftKind, PlacementKind, RevisionSelection};
 
 impl Diffui {
     /// Enter target mode for `kind` over `sources`, optionally with a
@@ -30,10 +28,11 @@ impl Diffui {
         kind: DraftKind,
         sources: Vec<RevisionSelection>,
         armed: Option<(RevisionSelection, PlacementKind)>,
-    ) -> Task<Message> {
+        cx: &mut Cx,
+    ) {
         // jj-only, like every mutation.
         if !self.active().session.capabilities.mutate {
-            return Task::none();
+            return;
         }
         let sources: Vec<diffui_core::DraftSource> = sources
             .iter()
@@ -48,7 +47,7 @@ impl Diffui {
                 kept
             });
         if sources.is_empty() && kind != DraftKind::New {
-            return Task::none();
+            return;
         }
         // Target mode's plain keys and a half-written description can't both
         // own the keyboard. An unsaved edit wins and says so, the same way it
@@ -56,7 +55,7 @@ impl Diffui {
         if let Some(editor) = self.active_mut().description_editor_mut() {
             if editor.is_dirty() || editor.saving_activity.is_some() {
                 editor.switch_blocked = true;
-                return Task::none();
+                return;
             }
             self.active_mut().pop_mode(ModeKind::Description);
         }
@@ -81,21 +80,21 @@ impl Diffui {
         target.push_mode(TabMode::Draft(DraftUi::new(draft)));
         self.pop_mode(ModeKind::ActivityPopover);
         self.pop_mode(ModeKind::Menu);
-        self.kick_draft_preview()
+        self.kick_draft_preview(cx)
     }
 
     /// The parallelize draft's preview depends on its sources alone, so it
     /// skips the destination plumbing [`Diffui::kick_draft_preview`] does for
     /// the other kinds. Debounced and version-guarded the same way.
-    pub(crate) fn kick_parallelize_preview(&mut self) -> Task<Message> {
+    pub(crate) fn kick_parallelize_preview(&mut self, cx: &mut Cx) {
         let Some(ui) = self.active_mut().op_draft_mut() else {
-            return Task::none();
+            return;
         };
         if ui.draft.sources.len() < 2 {
             ui.preview = DraftPreviewState::Idle;
             ui.preview_request = None;
             ui.moved_highlight.clear();
-            return Task::none();
+            return;
         }
         let sources: Vec<RevisionSelection> = ui
             .draft
@@ -114,9 +113,9 @@ impl Diffui {
             sources,
             selection: None,
         }));
-        Task::perform(tokio::time::sleep(Duration::from_millis(250)), move |()| {
-            Message::Ui(UiEvent::DraftPreviewKick(version))
-        })
+        Diffui::after(Duration::from_millis(250), cx, move |this, cx| {
+            this.on_draft_preview_kick(version, cx);
+        });
     }
 }
 
@@ -152,17 +151,16 @@ pub(crate) enum RevopsAction {
 }
 
 impl Diffui {
-    pub(crate) fn perform_revops(&mut self, action: RevopsAction) -> Task<Message> {
+    pub(crate) fn perform_revops(&mut self, action: RevopsAction, cx: &mut Cx) {
         match action {
-            RevopsAction::BeginCommit => self.begin_commit(),
+            RevopsAction::BeginCommit => self.begin_commit(cx),
             RevopsAction::StartDraft {
                 kind,
                 sources,
                 armed,
-            } => self.start_draft_with(kind, sources, armed),
+            } => self.start_draft_with(kind, sources, armed, cx),
             RevopsAction::ToggleMark(selection) => {
                 self.toggle_mark(&selection);
-                Task::none()
             }
         }
     }
@@ -187,13 +185,13 @@ impl Diffui {
     /// saving describes `@` and starts a new empty change on top in one
     /// operation. Browses to `@` first when it isn't on screen; the editor
     /// then opens when its diff lands (`open_pending_description_edit`).
-    fn begin_commit(&mut self) -> Task<Message> {
+    fn begin_commit(&mut self, cx: &mut Cx) {
         if !self.active().session.capabilities.mutate {
-            return Task::none();
+            return;
         }
         let target = RevisionSelection::WorkingCopy;
         if self.active().session.selected_revision == target {
-            let task = self.open_description_editor();
+            let task = self.open_description_editor(cx);
             if let Some(editor) = self.active_mut().description_editor_mut()
                 && editor.target == target
             {
@@ -205,12 +203,12 @@ impl Diffui {
             && (editor.is_dirty() || editor.saving_activity.is_some())
         {
             editor.switch_blocked = true;
-            return Task::none();
+            return;
         }
         let tab = self.active_mut();
         tab.pending_description_edit = Some(target.clone());
         tab.pending_commit = true;
-        self.select_revision(target)
+        self.select_revision(target, cx)
     }
 }
 
@@ -600,7 +598,7 @@ mod tests {
     /// A jj-capable app over `@` = "w", then "a", "b", "c".
     fn loaded(rows: Vec<CommitSummary>) -> Diffui {
         let mut ui = app();
-        push_tab(&mut ui, "/tmp/revops");
+        push_tab(&mut ui, "/tmp/revops", cx);
         let tab = ui.active_mut();
         tab.session.capabilities.mutate = true;
         let mut builder = CommitStoreBuilder::with_capacity(rows.len());
@@ -700,7 +698,7 @@ mod tests {
         let _context = runtime.enter();
         let mut ui = loaded(graph());
         ui.active_mut().revision_multi_selection = vec!["a".repeat(8), "b".repeat(8)];
-        let _ = ui.run_command("selection.parallelize", CommandArg::None);
+        let _ = ui.run_command("selection.parallelize", CommandArg::None, cx);
         let draft = &ui.active().op_draft().expect("target mode is on").draft;
         assert_eq!(draft.kind, DraftKind::Parallelize);
         assert_eq!(draft.sources.len(), 2);
@@ -725,7 +723,7 @@ mod tests {
         let _context = runtime.enter();
         let mut ui = loaded(graph());
         let b = RevisionSelection::Commit("b".repeat(8));
-        let _ = ui.run_command("revision.new.start", CommandArg::Revision(b));
+        let _ = ui.run_command("revision.new.start", CommandArg::Revision(b), cx);
         let draft = &ui.active().op_draft().expect("target mode is on").draft;
         assert_eq!(draft.kind, DraftKind::New);
         assert!(draft.sources.is_empty());

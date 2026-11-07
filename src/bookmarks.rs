@@ -7,20 +7,17 @@
 //! [`Diffui::start_mutation_op`], so activity rows, queueing and the
 //! confirmation stack work the way they do for every other mutation.
 
-use iced::{
-    Element, Length, Padding, Task,
-    widget::{Space, column, text_input},
-};
-
+use crate::Cx;
 use diffui_core::{PushAllow, PushRejection, PushRequest, PushTarget, RevisionSelection};
+use gpui_kit::{AnyElement, Window};
 
 use crate::commands::CommandArg;
 use crate::menu::MenuEntry;
 use crate::modes::{Mode, ModeKind};
 use crate::mutations::MutationOp;
 use crate::prose::Prose;
-use crate::theme::{self, ThemeSpec, input_style, text_size};
-use crate::{Action, ConfirmDialog, Diffui, Message, PendingMutation, activity, ui};
+use crate::theme::ThemeSpec;
+use crate::{ConfirmDialog, Diffui, PendingMutation, activity};
 
 pub(crate) const NAME_PROMPT_INPUT_ID: &str = "bookmark-name-input";
 
@@ -84,29 +81,29 @@ enum PromptVerdict {
 }
 
 impl Diffui {
-    pub(crate) fn update_bookmark(&mut self, action: BookmarkAction) -> Task<Message> {
+    pub(crate) fn update_bookmark(&mut self, action: BookmarkAction, cx: &mut Cx) {
         match action {
-            BookmarkAction::Create { at } => self.open_name_prompt(PromptKind::Create { at }, ""),
+            BookmarkAction::Create { at } => {
+                self.open_name_prompt(PromptKind::Create { at }, "", cx)
+            }
             BookmarkAction::Rename { name } => {
                 let value = name.clone();
-                self.open_name_prompt(PromptKind::Rename { old: name }, &value)
+                self.open_name_prompt(PromptKind::Rename { old: name }, &value, cx)
             }
             BookmarkAction::PromptInput(value) => {
                 if let Some(prompt) = self.name_prompt_mut() {
                     prompt.value = value;
                 }
-                Task::none()
             }
             BookmarkAction::PromptCancel => {
                 self.pop_mode(ModeKind::NamePrompt);
-                Task::none()
             }
             BookmarkAction::PromptSubmit => {
                 let Some(prompt) = self.name_prompt() else {
-                    return Task::none();
+                    return;
                 };
                 let op = match (self.prompt_verdict(prompt), &prompt.kind) {
-                    (PromptVerdict::Invalid(_), _) => return Task::none(),
+                    (PromptVerdict::Invalid(_), _) => return,
                     (PromptVerdict::Create(name), PromptKind::Create { at }) => {
                         MutationOp::CreateBookmark {
                             name,
@@ -123,10 +120,10 @@ impl Diffui {
                     (PromptVerdict::Rename { old, new }, _) => {
                         MutationOp::RenameBookmark { old, new }
                     }
-                    _ => return Task::none(),
+                    _ => return,
                 };
                 self.pop_mode(ModeKind::NamePrompt);
-                self.start_mutation_op(op)
+                self.start_mutation_op(op, cx)
             }
             BookmarkAction::Push { name, remote } => {
                 let remote = remote.or_else(|| {
@@ -137,9 +134,9 @@ impl Diffui {
                         .map(str::to_owned)
                 });
                 let Some(remote) = remote else {
-                    return self.no_push_remote();
+                    return self.no_push_remote(cx);
                 };
-                self.start_push(remote, vec![PushTarget::Bookmark(name)])
+                self.start_push(remote, vec![PushTarget::Bookmark(name)], cx)
             }
             BookmarkAction::PushChange { at, remote } => {
                 let remote = remote.or_else(|| {
@@ -150,12 +147,12 @@ impl Diffui {
                         .map(str::to_owned)
                 });
                 let Some(remote) = remote else {
-                    return self.no_push_remote();
+                    return self.no_push_remote(cx);
                 };
-                self.start_push(remote, vec![PushTarget::Change(at)])
+                self.start_push(remote, vec![PushTarget::Change(at)], cx)
             }
             BookmarkAction::DeleteEverywhere { name, remote } => {
-                self.start_push(remote, vec![PushTarget::DeleteBookmark(name)])
+                self.start_push(remote, vec![PushTarget::DeleteBookmark(name)], cx)
             }
             BookmarkAction::PushTracked => {
                 let Some(remote) = self
@@ -165,28 +162,31 @@ impl Diffui {
                     .default_push_remote()
                     .map(str::to_owned)
                 else {
-                    return self.no_push_remote();
+                    return self.no_push_remote(cx);
                 };
-                self.start_push(remote, vec![PushTarget::Tracked])
+                self.start_push(remote, vec![PushTarget::Tracked], cx)
             }
         }
     }
 
-    fn start_push(&mut self, remote: String, targets: Vec<PushTarget>) -> Task<Message> {
+    fn start_push(&mut self, remote: String, targets: Vec<PushTarget>, cx: &mut Cx) {
         // A plain push sends whatever tracked bookmarks moved, which nobody
         // picked one by one: confirm the plan first.
         let confirm = targets.contains(&PushTarget::Tracked);
-        self.start_mutation_op(MutationOp::Push(PushRequest {
-            remote,
-            targets,
-            allow: PushAllow::default(),
-            confirm,
-        }))
+        self.start_mutation_op(
+            MutationOp::Push(PushRequest {
+                remote,
+                targets,
+                allow: PushAllow::default(),
+                confirm,
+            }),
+            cx,
+        )
     }
 
     /// `jj git push` without `--remote` falls back to `origin`; with several
     /// remotes, none called that, and no `git.push`, there's nothing to guess.
-    fn no_push_remote(&mut self) -> Task<Message> {
+    fn no_push_remote(&mut self, cx: &mut Cx) {
         let remotes = &self.active().session.bookmarks.remotes;
         let body = if remotes.is_empty() {
             "This repository has no git remotes.".to_owned()
@@ -199,19 +199,17 @@ impl Diffui {
             )
         };
         self.push_error_toast("Push needs a remote", &body);
-        Task::none()
     }
 
-    fn open_name_prompt(&mut self, kind: PromptKind, value: &str) -> Task<Message> {
+    fn open_name_prompt(&mut self, kind: PromptKind, value: &str, cx: &mut Cx) {
         if !self.active().session.capabilities.mutate {
-            return Task::none();
+            return;
         }
         self.push_mode(Mode::NamePrompt(NamePrompt {
             kind,
             value: value.to_owned(),
         }));
-        iced::widget::operation::focus(NAME_PROMPT_INPUT_ID)
-            .chain(iced::widget::operation::select_all(NAME_PROMPT_INPUT_ID))
+        crate::input::focus_and_select_all(NAME_PROMPT_INPUT_ID, cx);
     }
 
     pub(crate) fn name_prompt(&self) -> Option<&NamePrompt> {
@@ -271,7 +269,8 @@ impl Diffui {
         &mut self,
         pending: PendingMutation,
         rejection: PushRejection,
-    ) -> Task<Message> {
+        cx: &mut Cx,
+    ) {
         if rejection.is_confirmation() {
             if let Some(log) = self.activity_log_for(pending.tab_id) {
                 log.set_status(pending.activity_id, activity::ActivityStatus::Queued);
@@ -287,7 +286,7 @@ impl Diffui {
                     ..pending
                 },
             }));
-            return Task::none();
+            return;
         }
         let lines = rejection.lines();
         let Some(allow) = rejection.allowances() else {
@@ -295,7 +294,7 @@ impl Diffui {
                 "jj git push would refuse this, and has no override for it:\n{}",
                 lines.join("\n")
             );
-            return self.finish_mutation_error(pending, error);
+            return self.finish_mutation_error(pending, error, cx);
         };
         if let Some(log) = self.activity_log_for(pending.tab_id) {
             log.extend_output(pending.activity_id, lines);
@@ -358,10 +357,9 @@ impl Diffui {
                 ..pending
             },
         }));
-        Task::none()
     }
 
-    fn finish_mutation_error(&mut self, pending: PendingMutation, error: String) -> Task<Message> {
+    fn finish_mutation_error(&mut self, pending: PendingMutation, error: String, cx: &mut Cx) {
         let mut failure = None;
         if let Some(log) = self.activity_log_for(pending.tab_id) {
             let title = log
@@ -379,7 +377,6 @@ impl Diffui {
         if let Some(title) = failure {
             self.push_error_toast(title, &error);
         }
-        Task::none()
     }
 
     /// Run `pending`, unless it publishes the working-copy commit: then ask
@@ -387,12 +384,9 @@ impl Diffui {
     /// push is snapshotted into it and the bookmark moves off what the remote
     /// has. The CLI doesn't refuse it outright, so this is a warning, not a
     /// guard (an undescribed `@` is refused by the push checks regardless).
-    pub(crate) fn run_mutation_checking_wc_push(
-        &mut self,
-        pending: PendingMutation,
-    ) -> Task<Message> {
+    pub(crate) fn run_mutation_checking_wc_push(&mut self, pending: PendingMutation, cx: &mut Cx) {
         if !self.publishes_working_copy(&pending.op) {
-            return self.run_mutation(pending);
+            return self.run_mutation(pending, cx);
         }
         if let Some(log) = self.activity_log_for(pending.tab_id) {
             log.set_status(pending.activity_id, activity::ActivityStatus::Queued);
@@ -403,7 +397,6 @@ impl Diffui {
             confirm_label: "Push anyway".to_owned(),
             pending,
         }));
-        Task::none()
     }
 
     /// Whether `op` would put the working-copy commit on a remote.
@@ -624,110 +617,6 @@ pub(crate) fn local_bookmark_label(label: &str) -> Option<&str> {
     )
 }
 
-// ── Name prompt view ────────────────────────────────────────────────────
-
-/// The bookmark-name prompt: a modal card with the field, a line under it
-/// only when there is something to say (what Enter will do instead, or why
-/// it can't), and the buttons. Empty when closed.
-pub(crate) fn build_name_prompt(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
-    let Some(prompt) = ui.name_prompt() else {
-        return Space::new().into();
-    };
-    let (font, mono) = (ui.config.ui_font, ui.config.mono_font);
-    let cancel = Message::Action(Action::Bookmark(BookmarkAction::PromptCancel));
-    let submit = Message::Action(Action::Bookmark(BookmarkAction::PromptSubmit));
-
-    let verdict = ui.prompt_verdict(prompt);
-    let (title, verb) = match &prompt.kind {
-        PromptKind::Create { at } => (
-            Prose::from("New bookmark at ").then(ui.revision_prose(at)),
-            "Create",
-        ),
-        PromptKind::Rename { old } => (Prose::from("Rename ").bookmark(old), "Rename"),
-    };
-    let (note, error, verb) = match &verdict {
-        PromptVerdict::Invalid(reason) => (reason.clone(), true, verb),
-        PromptVerdict::Create(_) => (Prose::new(), false, verb),
-        PromptVerdict::Move(name) => (
-            Prose::new()
-                .bookmark(name)
-                .text(" exists. This moves it here."),
-            false,
-            "Move here",
-        ),
-        PromptVerdict::Rename { old, .. } => {
-            let on_remote = ui
-                .active()
-                .session
-                .bookmarks
-                .entry(old)
-                .is_some_and(|entry| entry.is_tracked_anywhere());
-            let note = if on_remote {
-                Prose::new()
-                    .bookmark(old)
-                    .text(" stays on the remote until you push.")
-            } else {
-                Prose::new()
-            };
-            (note, false, verb)
-        }
-    };
-
-    let input = text_input("bookmark name", &prompt.value)
-        .id(NAME_PROMPT_INPUT_ID)
-        .padding(crate::typography::trimmed_padding(
-            Padding::from([theme::space::SM, theme::space::MD]),
-            mono,
-            text_size::BODY,
-        ))
-        .size(text_size::BODY)
-        .font(mono)
-        .on_input(|value| Message::Action(Action::Bookmark(BookmarkAction::PromptInput(value))))
-        .on_submit(submit.clone())
-        .style(move |_, _| input_style(theme));
-    let mut field =
-        column![crate::input::single_line(input, &prompt.value, mono)].spacing(theme::space::SM);
-    if !note.is_empty() {
-        let color = if error {
-            theme.removed_text
-        } else {
-            theme.muted_text
-        };
-        field = field.push(
-            note.view(font, mono, color, theme)
-                .size(text_size::UI)
-                .width(Length::Fill),
-        );
-    }
-
-    let mut accept = ui::text_button(
-        None,
-        verb,
-        ui::Variant::Primary,
-        ui::Size::Standard,
-        font,
-        theme,
-    );
-    if !matches!(verdict, PromptVerdict::Invalid(_)) {
-        accept = accept.on_press(submit);
-    }
-    let cancel_button = ui::cancel_button(ui::Size::Standard, font, theme).on_press(cancel.clone());
-
-    let body = column![
-        ui::dialog_title(&title, font, mono, theme),
-        field,
-        ui::button_row(None, [cancel_button.into(), accept.into()]),
-    ]
-    .spacing(ui::DIALOG_SPACING);
-
-    ui::modal(
-        ui::dialog_card(body, ui::DIALOG_WIDTH, theme),
-        crate::toolbar::modal_top(),
-        cancel,
-        Message::Ui(crate::UiEvent::ConfirmNoOp),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -740,7 +629,7 @@ mod tests {
 
     fn ui_with_bookmarks() -> (Diffui, TabId) {
         let mut ui = app();
-        let tab = push_tab(&mut ui, "/tmp/repo");
+        let tab = push_tab(&mut ui, "/tmp/repo", cx);
         let session = &mut ui.tab_mut(tab).unwrap().session;
         session.capabilities.mutate = true;
         session.bookmarks = BookmarksInfo {
@@ -817,7 +706,7 @@ mod tests {
                 remote: "origin".to_owned(),
             },
         );
-        let _ = ui.push_rejected(held, rejection(vec![PushCheck::EmptyDescription]));
+        let _ = ui.push_rejected(held, rejection(vec![PushCheck::EmptyDescription]), cx);
         let dialog = ui.confirm().expect("a confirmation is raised");
         let body = dialog.body.to_string();
         assert!(body.contains("has no description"), "{body}");
@@ -855,6 +744,7 @@ mod tests {
                 PushCheck::EmptyDescription,
                 PushCheck::MissingIdentity,
             ]),
+            cx,
         );
         assert!(ui.confirm().is_none(), "no override for a missing author");
         assert!(!ui.active().activities.any_running());
@@ -886,7 +776,7 @@ mod tests {
         }));
 
         let held = pending(&mut ui, tab, wc_push);
-        let _ = ui.run_mutation_checking_wc_push(held);
+        let _ = ui.run_mutation_checking_wc_push(held, cx);
         assert!(ui.confirm().is_some());
         assert!(ui.tab_mut(tab).unwrap().jobs.mutation.is_none());
     }
@@ -894,11 +784,14 @@ mod tests {
     #[test]
     fn the_prompt_moves_an_existing_name_and_refuses_bad_ones() {
         let (mut ui, _tab) = ui_with_bookmarks();
-        let _ = ui.update_bookmark(BookmarkAction::Create {
-            at: RevisionSelection::WorkingCopy,
-        });
+        let _ = ui.update_bookmark(
+            BookmarkAction::Create {
+                at: RevisionSelection::WorkingCopy,
+            },
+            cx,
+        );
         let verdict = |ui: &mut Diffui, value: &str| {
-            let _ = ui.update_bookmark(BookmarkAction::PromptInput(value.to_owned()));
+            let _ = ui.update_bookmark(BookmarkAction::PromptInput(value.to_owned()), cx);
             ui.prompt_verdict(ui.name_prompt().unwrap())
         };
         assert!(
@@ -908,10 +801,13 @@ mod tests {
         assert!(matches!(verdict(&mut ui, "a b"), PromptVerdict::Invalid(_)));
         assert!(matches!(verdict(&mut ui, ""), PromptVerdict::Invalid(_)));
 
-        let _ = ui.update_bookmark(BookmarkAction::PromptCancel);
-        let _ = ui.update_bookmark(BookmarkAction::Rename {
-            name: "wip".to_owned(),
-        });
+        let _ = ui.update_bookmark(BookmarkAction::PromptCancel, cx);
+        let _ = ui.update_bookmark(
+            BookmarkAction::Rename {
+                name: "wip".to_owned(),
+            },
+            cx,
+        );
         assert!(matches!(
             verdict(&mut ui, "main"),
             PromptVerdict::Invalid(_)
@@ -963,4 +859,18 @@ mod tests {
         assert_eq!(local_bookmark_label("main@origin"), None);
         assert_eq!(local_bookmark_label("ws@"), None);
     }
+}
+
+/// Stub: the bookmarks view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn build_name_prompt(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::overlay(
+        "bookmarks::build_name_prompt",
+        ui.mode(ModeKind::NamePrompt).is_some(),
+    )
 }

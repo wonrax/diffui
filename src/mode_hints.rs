@@ -5,17 +5,13 @@
 //! Keys come from the live keymap, so a rebinding shows here as bound, and a
 //! command with no key isn't advertised at all.
 
-use iced::{
-    Element, Length, Padding,
-    widget::{container, text},
-};
-
+use crate::Cx;
 use diffui_core::DraftKind;
+use gpui_kit::{AnyElement, Window};
 
+use crate::Diffui;
 use crate::commands::{CommandId, Context};
-use crate::theme::{self, ThemeSpec, text_size};
-use crate::typography::{self, Aligned};
-use crate::{Diffui, Message};
+use crate::theme::ThemeSpec;
 
 /// A hint: the commands whose keys it shows (several for a pair like `j k`),
 /// and what pressing them does. No commands: a pointer gesture, shown as
@@ -144,71 +140,6 @@ fn keys(ui: &Diffui, context: Context, commands: &[CommandId]) -> Vec<String> {
     keys
 }
 
-/// The strip for the active mode, or `None` when no mode with keys is on.
-pub(crate) fn strip<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Option<Element<'a, Message>> {
-    let (context, hints) = active_hints(ui)?;
-    let font = ui.config.ui_font;
-    let mut line: Vec<Aligned<'a, Message>> = Vec::new();
-    let mut seen_what: Vec<&str> = Vec::new();
-    let mut any_key = false;
-    for hint in hints {
-        let keys = keys(ui, context, hint.commands);
-        // An unbound command has nothing to teach; a second binding of the
-        // same thing (Esc and compare.exit both stopping a comparison)
-        // would only repeat it.
-        if (keys.is_empty() && !hint.commands.is_empty()) || seen_what.contains(&hint.what) {
-            continue;
-        }
-        seen_what.push(hint.what);
-        if !line.is_empty() {
-            line.push(Aligned::gap(theme::space::LG));
-        }
-        let gesture = keys.is_empty();
-        any_key |= !gesture;
-        for (index, key) in keys.into_iter().enumerate() {
-            if index > 0 {
-                line.push(Aligned::gap(theme::space::XS));
-            }
-            line.push(crate::shortcuts::keycap(ui, theme, key));
-        }
-        if !gesture {
-            line.push(Aligned::gap(theme::space::SM));
-        }
-        line.push(Aligned::text(
-            text(hint.what)
-                .size(text_size::CAPTION)
-                .font(font)
-                .color(theme.muted_text)
-                .wrapping(text::Wrapping::None),
-            font,
-            text_size::CAPTION,
-        ));
-    }
-    // Gestures alone don't earn a strip: the mode has no keys left bound.
-    if !any_key {
-        return None;
-    }
-    Some(
-        container(typography::baseline_row(line, 0.0))
-            .width(Length::Fill)
-            .clip(true)
-            .padding(Padding::from([
-                theme::space::SM,
-                crate::diff_view::HEADER_HORIZONTAL_PADDING,
-            ]))
-            .style(move |_| {
-                container::Style::default()
-                    .background(theme.file_header)
-                    .border(iced::Border {
-                        width: 1.0,
-                        color: theme.border,
-                        radius: 0.0.into(),
-                    })
-            })
-            .into(),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,7 +148,7 @@ mod tests {
     #[test]
     fn keys_follow_the_live_keymap() {
         let mut ui = app();
-        push_tab(&mut ui, "/tmp/hints");
+        push_tab(&mut ui, "/tmp/hints", cx);
         assert_eq!(
             keys(
                 &ui,
@@ -253,4 +184,15 @@ mod tests {
         );
         assert!(keys(&ui, Context::Lines, &["lines.exit"]).is_empty());
     }
+}
+
+/// Stub: the mode_hints view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn strip(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> Option<AnyElement> {
+    None
 }

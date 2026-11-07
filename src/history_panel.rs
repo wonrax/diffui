@@ -12,35 +12,26 @@
 //! All the repository work is `Command::History` on the tab's actor; this
 //! module owns the per-tab state, routes its own jobs, and builds the panes.
 
+use crate::Cx;
+use gpui_kit::{AnyElement, Window};
 use std::collections::HashSet;
 
-use iced::{
-    Background, Border, Color, Element, Length, Padding, alignment,
-    widget::{Space, button, column, container, row, text},
-};
-
 use diffui_core::history::{
-    ChangedCommit, CommitBrief, CommitChangeKind, EvologEntry, FileAnnotation, HistoryDiffTarget,
-    HistoryRequest, HistoryResponse, OperationChanges, OperationEntry, RefChange, RefKind,
-    file_history_revset, now_millis, relative_age,
+    ChangedCommit, CommitBrief, EvologEntry, FileAnnotation, HistoryDiffTarget, HistoryRequest,
+    HistoryResponse, OperationChanges, OperationEntry, file_history_revset, now_millis,
+    relative_age,
 };
 use diffui_core::{DiffDocument, JobId, MutationOp, RevisionDetails, RevisionSelection, Vcs};
 
-use crate::diff_view::{AnnotationGutter, AnnotationLabel, DiffFileView, DiffView};
+use crate::diff_view::AnnotationLabel;
 use crate::prose::Prose;
 use crate::revision_list::{
-    CAPTION_TEXT_SIZE, CONTENT_PADDING, FILE_ROW_HEIGHT, GUTTER_LEFT_PADDING, GUTTER_PADDING,
-    REVISION_ROW_HEIGHT, ROW_CARD_INSET_X, ROW_CARD_INSET_Y, ROW_CARD_RADIUS, ROW_LINE_GAP,
-    SMALL_TEXT_SIZE,
+    CAPTION_TEXT_SIZE, GUTTER_LEFT_PADDING, GUTTER_PADDING, ROW_LINE_GAP, SMALL_TEXT_SIZE,
 };
-use crate::theme::{
-    ThemeSpec, chip_background, diff_palette, diff_panel_style, emphasis_font, file_status_color,
-    radius, sidebar_panel_style, space, text_size,
-};
-use crate::typography::{self, Aligned};
+use crate::theme::{ThemeSpec, space};
 use crate::{
-    Action, ConfirmDialog, Diffui, MainView, Message, PendingMutation, TabId, activity, icons,
-    meta_line, modes::Mode, ui,
+    Action, ConfirmDialog, Diffui, MainView, PendingMutation, TabId, activity, meta_line,
+    modes::Mode,
 };
 
 /// Operations read per page of the op log.
@@ -234,9 +225,9 @@ impl HistoryState {
 }
 
 impl Diffui {
-    pub(crate) fn perform_history(&mut self, action: HistoryAction) -> Task {
+    pub(crate) fn perform_history(&mut self, action: HistoryAction, cx: &mut Cx) {
         let Some(tab) = self.active_tab_id() else {
-            return iced::Task::none();
+            return;
         };
         match action {
             HistoryAction::ShowOpLog => {
@@ -247,13 +238,13 @@ impl Diffui {
                     history.error = None;
                     // Back from an evolog: the op's own diff comes back.
                     if let Some(index) = history.selected_change {
-                        return iced::Task::batch([
-                            self.enter_history_view(),
-                            self.history_select_change(tab, index),
-                        ]);
+                        return {
+                            self.enter_history_view(cx);
+                            self.history_select_change(tab, index, cx);
+                        };
                     }
                 }
-                self.enter_history_view()
+                self.enter_history_view(cx)
             }
             HistoryAction::ShowEvolog(revision) => {
                 let label = self.revision_short_label(&revision);
@@ -268,68 +259,66 @@ impl Diffui {
                 history.error = None;
                 let job = JobId::next();
                 history.evolog_job = Some(job);
-                let enter = self.enter_history_view();
-                let send = self.history_send(tab, job, HistoryRequest::Evolog { revision });
-                iced::Task::batch([enter, send])
+                let enter = self.enter_history_view(cx);
+                let send = self.history_send(tab, job, HistoryRequest::Evolog { revision }, cx);
+                {}
             }
             HistoryAction::Reload => match self.active().history.kind.clone() {
-                HistoryKind::OpLog => self.reload_op_log(tab),
+                HistoryKind::OpLog => self.reload_op_log(tab, cx),
                 HistoryKind::Evolog { revision, .. } => {
-                    self.perform_history(HistoryAction::ShowEvolog(revision))
+                    self.perform_history(HistoryAction::ShowEvolog(revision), cx)
                 }
             },
             HistoryAction::LoadMoreOperations => {
                 let history = &mut self.active_mut().history;
                 history.ops_limit += OP_LOG_PAGE;
-                self.reload_op_log(tab)
+                self.reload_op_log(tab, cx)
             }
-            HistoryAction::SelectOperation(id) => self.history_select_operation(tab, id),
+            HistoryAction::SelectOperation(id) => self.history_select_operation(tab, id, cx),
             HistoryAction::ToggleSnapshotRun(id) => {
                 let runs = &mut self.active_mut().history.expanded_runs;
                 if !runs.remove(&id) {
                     runs.insert(id);
                 }
-                iced::Task::none()
             }
-            HistoryAction::SelectChange(index) => self.history_select_change(tab, index),
-            HistoryAction::SelectVersion(index) => self.history_select_version(tab, index),
+            HistoryAction::SelectChange(index) => self.history_select_change(tab, index, cx),
+            HistoryAction::SelectVersion(index) => self.history_select_version(tab, index, cx),
             HistoryAction::SetEvologDiff(mode) => {
                 self.active_mut().history.evolog_diff = mode;
                 match self.active().history.selected_version {
-                    Some(index) => self.history_select_version(tab, index),
-                    None => iced::Task::none(),
+                    Some(index) => self.history_select_version(tab, index, cx),
+                    None => {}
                 }
             }
-            HistoryAction::RestoreOperation(id) => self.confirm_operation(tab, id, true),
-            HistoryAction::RevertOperation(id) => self.confirm_operation(tab, id, false),
+            HistoryAction::RestoreOperation(id) => self.confirm_operation(tab, id, true, cx),
+            HistoryAction::RevertOperation(id) => self.confirm_operation(tab, id, false, cx),
             HistoryAction::OpenRevision(commit_id) => {
                 let selection = self.active().session.canonical_selection(&commit_id);
-                iced::Task::batch([
-                    self.perform(Action::SetMainView(MainView::Diff)),
-                    self.perform(Action::SelectRevision(selection)),
-                ])
+                {
+                    self.perform(Action::SetMainView(MainView::Diff), cx);
+                    self.perform(Action::SelectRevision(selection), cx);
+                }
             }
             HistoryAction::DiffScrolled(offset) => {
                 self.active_mut().history.diff_scroll = offset;
-                iced::Task::none()
             }
             HistoryAction::DiffFileChanged(index) => {
                 self.active_mut().history.diff_file = index;
-                iced::Task::none()
             }
-            HistoryAction::FileHistory { revision, path } => self.show_file_history(revision, path),
+            HistoryAction::FileHistory { revision, path } => {
+                self.show_file_history(revision, path, cx)
+            }
             HistoryAction::CurrentFileHistory => match current_file(self) {
-                Some((revision, path)) => self.show_file_history(revision, path),
-                None => iced::Task::none(),
+                Some((revision, path)) => self.show_file_history(revision, path, cx),
+                None => {}
             },
             HistoryAction::ClearFileFilter => {
                 let Some(filter) = self.active_mut().history.file_filter.take() else {
-                    return iced::Task::none();
+                    return;
                 };
                 if self.active().session.revset == filter.revset {
-                    return self.perform(Action::SetRevset(filter.previous));
+                    return self.perform(Action::SetRevset(filter.previous), cx);
                 }
-                iced::Task::none()
             }
             HistoryAction::ToggleAnnotate => {
                 let history = &mut self.active_mut().history;
@@ -340,7 +329,7 @@ impl Diffui {
                 }
                 // Widening the gutter reflows every line.
                 self.document_version = self.document_version.wrapping_add(1);
-                self.sync_history()
+                self.sync_history(cx)
             }
             HistoryAction::AnnotationClicked(line) => {
                 let target = self.active().history.annotation.as_ref().and_then(|view| {
@@ -359,9 +348,9 @@ impl Diffui {
                             != session.canonical_selection(&commit_id))
                         .then_some(session.document_id);
                         self.active_mut().history.blame_jump = Some((path, seen));
-                        self.perform_history(HistoryAction::OpenRevision(commit_id))
+                        self.perform_history(HistoryAction::OpenRevision(commit_id), cx)
                     }
-                    None => iced::Task::none(),
+                    None => {}
                 }
             }
         }
@@ -369,12 +358,12 @@ impl Diffui {
 
     /// Switch the active tab to the History view, reading the op log when
     /// it has never been read or the repository moved since.
-    pub(crate) fn enter_history_view(&mut self) -> Task {
+    pub(crate) fn enter_history_view(&mut self, cx: &mut Cx) {
         let Some(tab) = self.active_tab_id() else {
-            return iced::Task::none();
+            return;
         };
         if !is_jj(self) {
-            return iced::Task::none();
+            return;
         }
         let target = self.active_mut();
         let entering = target.main_view != MainView::History;
@@ -385,12 +374,12 @@ impl Diffui {
             self.scroll_restore_token = self.scroll_restore_token.wrapping_add(1);
             self.document_version = self.document_version.wrapping_add(1);
         }
-        self.sync_history_for(tab)
+        self.sync_history_for(tab, cx)
     }
 
-    fn reload_op_log(&mut self, tab: TabId) -> Task {
+    fn reload_op_log(&mut self, tab: TabId, cx: &mut Cx) {
         let Some(state) = self.tab_mut(tab) else {
-            return iced::Task::none();
+            return;
         };
         let fingerprint = state
             .session
@@ -407,25 +396,23 @@ impl Diffui {
             history.ops_limit = OP_LOG_PAGE;
         }
         let limit = history.ops_limit;
-        let mut tasks = Vec::new();
         if let Some(old) = cancel {
-            tasks.push(self.send(tab, diffui_core::Command::Cancel { job: old }));
+            self.send(tab, diffui_core::Command::Cancel { job: old }, cx);
         }
-        tasks.push(self.history_send(tab, job, HistoryRequest::OpLog { limit }));
-        iced::Task::batch(tasks)
+        self.history_send(tab, job, HistoryRequest::OpLog { limit }, cx);
     }
 
-    fn history_send(&mut self, tab: TabId, job: JobId, request: HistoryRequest) -> Task {
-        self.send(tab, diffui_core::Command::History { job, request })
+    fn history_send(&mut self, tab: TabId, job: JobId, request: HistoryRequest, cx: &mut Cx) {
+        self.send(tab, diffui_core::Command::History { job, request }, cx)
     }
 
-    fn history_select_operation(&mut self, tab: TabId, id: String) -> Task {
+    fn history_select_operation(&mut self, tab: TabId, id: String, cx: &mut Cx) {
         let Some(state) = self.tab_mut(tab) else {
-            return iced::Task::none();
+            return;
         };
         let history = &mut state.history;
         if history.selected_op.as_deref() == Some(id.as_str()) && history.op_changes.is_some() {
-            return iced::Task::none();
+            return;
         }
         history.selected_op = Some(id.clone());
         history.op_changes = None;
@@ -434,12 +421,17 @@ impl Diffui {
         history.error = None;
         let job = JobId::next();
         history.op_job = Some(job);
-        self.history_send(tab, job, HistoryRequest::ShowOperation { operation_id: id })
+        self.history_send(
+            tab,
+            job,
+            HistoryRequest::ShowOperation { operation_id: id },
+            cx,
+        )
     }
 
-    fn history_select_change(&mut self, tab: TabId, index: usize) -> Task {
+    fn history_select_change(&mut self, tab: TabId, index: usize, cx: &mut Cx) {
         let Some(state) = self.tab_mut(tab) else {
-            return iced::Task::none();
+            return;
         };
         let history = &mut state.history;
         let Some(target) = history
@@ -448,19 +440,19 @@ impl Diffui {
             .and_then(|changes| changes.commits.get(index))
             .map(ChangedCommit::diff_target)
         else {
-            return iced::Task::none();
+            return;
         };
         history.selected_change = Some(index);
-        self.history_load_diff(tab, target)
+        self.history_load_diff(tab, target, cx)
     }
 
-    fn history_select_version(&mut self, tab: TabId, index: usize) -> Task {
+    fn history_select_version(&mut self, tab: TabId, index: usize, cx: &mut Cx) {
         let Some(state) = self.tab_mut(tab) else {
-            return iced::Task::none();
+            return;
         };
         let history = &mut state.history;
         let Some(entry) = history.evolog.get(index) else {
-            return iced::Task::none();
+            return;
         };
         let target = match (history.evolog_diff, entry.interdiff_target()) {
             (EvologDiff::Previous, Some(target)) => target,
@@ -469,12 +461,12 @@ impl Diffui {
             },
         };
         history.selected_version = Some(index);
-        self.history_load_diff(tab, target)
+        self.history_load_diff(tab, target, cx)
     }
 
-    fn history_load_diff(&mut self, tab: TabId, target: HistoryDiffTarget) -> Task {
+    fn history_load_diff(&mut self, tab: TabId, target: HistoryDiffTarget, cx: &mut Cx) {
         let Some(state) = self.tab_mut(tab) else {
-            return iced::Task::none();
+            return;
         };
         let history = &mut state.history;
         if history
@@ -486,24 +478,22 @@ impl Diffui {
                 .as_ref()
                 .is_some_and(|(_, pending)| *pending == target)
         {
-            return iced::Task::none();
+            return;
         }
         let cancel = history.diff_job.take().map(|(job, _)| job);
         let job = JobId::next();
         history.diff_job = Some((job, target.clone()));
-        let mut tasks = Vec::new();
         if let Some(old) = cancel {
-            tasks.push(self.send(tab, diffui_core::Command::Cancel { job: old }));
+            self.send(tab, diffui_core::Command::Cancel { job: old }, cx);
         }
-        tasks.push(self.history_send(tab, job, HistoryRequest::Diff { target }));
-        iced::Task::batch(tasks)
+        self.history_send(tab, job, HistoryRequest::Diff { target }, cx);
     }
 
     /// Raise the confirmation for a restore or a revert, holding the
     /// mutation (and its queued activity row) until the user answers.
-    fn confirm_operation(&mut self, tab: TabId, id: String, restore: bool) -> Task {
+    fn confirm_operation(&mut self, tab: TabId, id: String, restore: bool, cx: &mut Cx) {
         if !self.active().session.capabilities.mutate {
-            return iced::Task::none();
+            return;
         }
         let short = &id[..id.len().min(12)];
         let summary = self
@@ -555,12 +545,11 @@ impl Diffui {
                 allow_immutable: false,
             },
         }));
-        iced::Task::none()
     }
 
-    fn show_file_history(&mut self, revision: RevisionSelection, path: String) -> Task {
+    fn show_file_history(&mut self, revision: RevisionSelection, path: String, cx: &mut Cx) {
         if !is_jj(self) {
-            return iced::Task::none();
+            return;
         }
         let symbol = match &revision {
             RevisionSelection::WorkingCopy => "@".to_owned(),
@@ -580,15 +569,20 @@ impl Diffui {
             previous,
         });
         target.history.filter_jumped = None;
-        let view = self.perform(Action::SetMainView(MainView::Diff));
-        let load = self.perform(Action::SetRevset(revset));
+        let view = self.perform(Action::SetMainView(MainView::Diff), cx);
+        let load = self.perform(Action::SetRevset(revset), cx);
         let target = self.active_mut();
         target.history.filter_loading = target.session.streaming();
-        iced::Task::batch([view, load])
+        {}
     }
 
     /// Route a history job's event. `None` when the event isn't one.
-    pub(crate) fn history_event(&mut self, tab: TabId, event: &diffui_core::Event) -> Option<Task> {
+    pub(crate) fn history_event(
+        &mut self,
+        tab: TabId,
+        event: &diffui_core::Event,
+        cx: &mut Cx,
+    ) -> Option<()> {
         use diffui_core::Payload;
         let job = event.job()?;
         let state = self.tab_mut(tab)?;
@@ -691,34 +685,33 @@ impl Diffui {
             _ => {}
         }
         Some(match follow_up {
-            Some(action) if self.is_active(tab) => self.perform_history(action),
-            _ => iced::Task::none(),
+            Some(action) if self.is_active(tab) => self.perform_history(action, cx),
+            _ => {}
         })
     }
 
     /// Bring the active tab's history views in line with what is on screen:
     /// re-read a stale op log, ask for a missing annotation, and keep the
     /// file filter pointed at its file. Called once per update.
-    pub(crate) fn sync_history(&mut self) -> Task {
+    pub(crate) fn sync_history(&mut self, cx: &mut Cx) {
         match self.active_tab_id() {
-            Some(tab) => self.sync_history_for(tab),
-            None => iced::Task::none(),
+            Some(tab) => self.sync_history_for(tab, cx),
+            None => {}
         }
     }
 
-    fn sync_history_for(&mut self, tab: TabId) -> Task {
+    fn sync_history_for(&mut self, tab: TabId, cx: &mut Cx) {
         let Some(state) = self.tab_mut(tab) else {
-            return iced::Task::none();
+            return;
         };
         if state.handle.is_none() {
-            return iced::Task::none();
+            return;
         }
         let fingerprint = state
             .session
             .repository_snapshot
             .as_ref()
             .map(|snapshot| snapshot.fingerprint.clone());
-        let mut tasks = Vec::new();
 
         // The op log is current while the view shows it.
         if state.main_view == MainView::History
@@ -726,12 +719,12 @@ impl Diffui {
             && state.history.ops_job.is_none()
             && state.history.ops_read_at.as_ref() != Some(&fingerprint)
         {
-            tasks.push(self.reload_op_log(tab));
+            self.reload_op_log(tab, cx);
         }
 
         // The blame column follows the file the source browser shows.
         let Some(state) = self.tab_mut(tab) else {
-            return iced::Task::batch(tasks);
+            return;
         };
         if state.main_view == MainView::Source
             && state.history.annotate
@@ -743,18 +736,14 @@ impl Diffui {
                 let job = JobId::next();
                 state.history.annotation = None;
                 state.history.annotation_job = Some((job, revision.clone(), path.clone()));
-                tasks.push(self.history_send(
-                    tab,
-                    job,
-                    HistoryRequest::Annotate { revision, path },
-                ));
+                self.history_send(tab, job, HistoryRequest::Annotate { revision, path }, cx);
             }
         }
 
         // A file filter the user replaced by typing another revset is gone;
         // a live one opens its file in each diff it lands on.
         let Some(state) = self.tab_mut(tab) else {
-            return iced::Task::batch(tasks);
+            return;
         };
         if let Some(filter) = &state.history.file_filter
             && state.session.revset != filter.revset
@@ -767,11 +756,11 @@ impl Diffui {
             if state.history.file_filter.is_some() && !state.session.commits.is_empty() {
                 let commit_id = state.session.commits.row(0).commit_id().to_owned();
                 let selection = state.session.canonical_selection(&commit_id);
-                tasks.push(self.perform(Action::SelectRevision(selection)));
+                self.perform(Action::SelectRevision(selection), cx);
             }
         }
         let Some(state) = self.tab_mut(tab) else {
-            return iced::Task::batch(tasks);
+            return;
         };
         let wanted = state
             .history
@@ -798,16 +787,12 @@ impl Diffui {
             // A beat later: the code view only scrolls to a selected file
             // once it has laid the new document out, and a selection made in
             // the same pass that swapped the document in is lost to that.
-            tasks.push(iced::Task::perform(
-                tokio::time::sleep(std::time::Duration::from_millis(80)),
-                move |()| Message::Action(Action::JumpToFile(path.clone())),
-            ));
+            Self::after(std::time::Duration::from_millis(80), cx, move |this, cx| {
+                this.perform(Action::JumpToFile(path), cx);
+            });
         }
-        iced::Task::batch(tasks)
     }
 }
-
-type Task = iced::Task<Message>;
 
 fn clear_job(history: &mut HistoryState, job: JobId) {
     if history.ops_job == Some(job) {
@@ -915,37 +900,6 @@ fn annotation_labels(annotation: &FileAnnotation) -> Vec<AnnotationLabel> {
         .collect()
 }
 
-/// The blame column for the source browser's code view, when annotate is on
-/// and the annotation for the shown file has landed.
-pub(crate) fn source_annotations<'a>(ui: &'a Diffui) -> Option<AnnotationGutter<'a, Message>> {
-    let tab = ui.active();
-    if !tab.history.annotate {
-        return None;
-    }
-    let view = tab.history.annotation.as_ref()?;
-    let revision = crate::source_panel::browsed_revision(&tab.source);
-    if view.annotation.revision != revision
-        || tab.source.selected.as_deref() != Some(view.annotation.path.as_str())
-    {
-        return None;
-    }
-    let theme = ui.resolved_theme().spec();
-    Some(AnnotationGutter {
-        labels: &view.labels,
-        width_chars: ANNOTATION_CHARS,
-        on_click: |line| Message::Action(Action::History(HistoryAction::AnnotationClicked(line))),
-        style: crate::diff_view::AnnotationStyle {
-            font: ui.config.ui_font,
-            id: theme.accent,
-            id_rest: theme.subtle_text,
-            author: theme.muted_text,
-            age: theme.subtle_text,
-            hidden: theme.subtle_text,
-            hover: crate::theme::chip_background(theme.muted_text),
-        },
-    })
-}
-
 /// The source info bar's blame status, when there is something to say.
 pub(crate) fn annotation_status(ui: &Diffui) -> Option<(String, bool)> {
     let tab = ui.active();
@@ -973,151 +927,6 @@ pub(crate) fn annotate_on(ui: &Diffui) -> bool {
     ui.active().history.annotate
 }
 
-// ── View ────────────────────────────────────────────────────────────────
-
-/// The source info bar's history controls: the blame toggle and the browsed
-/// file's history.
-pub(crate) fn source_bar_actions<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
-    let on = annotate_on(ui);
-    let blame = ui::text_button(
-        Some((
-            icons::SCROLL_TEXT,
-            if on { theme.accent } else { theme.muted_text },
-        )),
-        "Blame",
-        if on {
-            ui::Variant::Raised
-        } else {
-            ui::Variant::Ghost
-        },
-        ui::Size::Compact,
-        ui.config.ui_font,
-        theme,
-    )
-    .on_press(Message::Action(Action::History(
-        HistoryAction::ToggleAnnotate,
-    )));
-    let history = ui::text_button(
-        Some((icons::FILE_CLOCK, theme.muted_text)),
-        "History",
-        ui::Variant::Ghost,
-        ui::Size::Compact,
-        ui.config.ui_font,
-        theme,
-    )
-    .on_press(Message::Action(Action::History(
-        HistoryAction::CurrentFileHistory,
-    )));
-    row![
-        ui::tooltip(
-            blame,
-            "Show which change last touched each line",
-            iced::widget::tooltip::Position::Bottom,
-            ui.config.ui_font,
-            theme,
-        ),
-        ui::tooltip(
-            history,
-            "Show the revisions that touched this file",
-            iced::widget::tooltip::Position::Bottom,
-            ui.config.ui_font,
-            theme,
-        ),
-    ]
-    .spacing(space::XS)
-    .align_y(alignment::Vertical::Center)
-    .into()
-}
-
-/// The banner above the revision list while the graph shows one file's
-/// history.
-pub(crate) fn file_filter_banner<'a>(
-    ui: &'a Diffui,
-    theme: ThemeSpec,
-) -> Option<Element<'a, Message>> {
-    if !file_filter_active(ui) {
-        return None;
-    }
-    let filter = ui.active().history.file_filter.as_ref()?;
-    // The icon and the close button centre on the text's caps (see
-    // `crate::typography`).
-    let content = typography::baseline_row(
-        [
-            Aligned::glyph(
-                icons::icon(icons::FILE_CLOCK, ui::ICON_SIZE, theme.accent),
-                ui::ICON_SIZE,
-            ),
-            Aligned::text(
-                Prose::from("History of ")
-                    .path(&filter.path)
-                    .view(ui.config.ui_font, ui.config.mono_font, theme.text, theme)
-                    .size(text_size::UI)
-                    .wrapping(text::Wrapping::None)
-                    .ellipsis(text::Ellipsis::End)
-                    .width(Length::Fill),
-                ui.config.ui_font,
-                text_size::UI,
-            ),
-            Aligned::glyph(
-                ui::tooltip(
-                    ui::close_button(theme.muted_text, theme).on_press(Message::Action(
-                        Action::History(HistoryAction::ClearFileFilter),
-                    )),
-                    "Show the whole graph again",
-                    iced::widget::tooltip::Position::Bottom,
-                    ui.config.ui_font,
-                    theme,
-                ),
-                ui::CLOSE_SIDE,
-            ),
-        ],
-        space::SM,
-    );
-    Some(
-        container(
-            container(content)
-                .width(Length::Fill)
-                .padding(Padding {
-                    left: space::MD,
-                    ..Padding::from(ui::BANNER_INSET)
-                })
-                .style(move |_| container::Style {
-                    background: Some(Background::Color(chip_background(theme.accent))),
-                    border: Border {
-                        width: 0.0,
-                        color: Color::TRANSPARENT,
-                        radius: radius::CONTROL.into(),
-                    },
-                    ..container::Style::default()
-                }),
-        )
-        .width(Length::Fill)
-        .padding(Padding::from([space::XS, space::MD]))
-        .into(),
-    )
-}
-
-fn row_style(theme: ThemeSpec, selected: bool, status: button::Status) -> button::Style {
-    let background = if selected {
-        Some(Background::Color(theme.selected_file))
-    } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
-        Some(Background::Color(chip_background(theme.muted_text)))
-    } else {
-        None
-    };
-    button::Style {
-        background,
-        text_color: theme.text,
-        border: Border {
-            width: 0.0,
-            color: Color::TRANSPARENT,
-            radius: ROW_CARD_RADIUS.into(),
-        },
-        shadow: iced::Shadow::default(),
-        snap: true,
-    }
-}
-
 // The lists' rows sit like the revision graph's: row cards inset from the
 // row by the graph's card insets, content starting where a lane-less graph
 // row's would and stopping at the scrollbar gutter, two-line rows as tall
@@ -1129,82 +938,6 @@ const ROW_CONTENT_LEFT: f32 = GUTTER_LEFT_PADDING + GUTTER_PADDING;
 /// text boxes [`ROW_LINE_GAP`] apart, so a two-line row's spacing gives
 /// back both lines' half-leading.
 const TWO_LINE_SPACING: f32 = ROW_LINE_GAP - 0.15 * (SMALL_TEXT_SIZE + CAPTION_TEXT_SIZE);
-
-/// Padding of a list of rows: the graph's card insets, plus the window
-/// border at the leading edge as the graph adds it.
-fn list_padding() -> Padding {
-    Padding {
-        top: ROW_CARD_INSET_Y,
-        right: ROW_CARD_INSET_X,
-        bottom: ROW_CARD_INSET_Y,
-        left: ROW_CARD_INSET_X + crate::chrome::window_border(),
-    }
-}
-
-/// Padding inside a row card, putting content at [`ROW_CONTENT_LEFT`].
-fn card_padding() -> Padding {
-    Padding {
-        top: 0.0,
-        right: CONTENT_PADDING - ROW_CARD_INSET_X,
-        bottom: 0.0,
-        left: ROW_CONTENT_LEFT - ROW_CARD_INSET_X - crate::chrome::window_border(),
-    }
-}
-
-/// A row card's height: the row's, less the card insets.
-fn card_height(row_height: f32) -> Length {
-    Length::Fixed(row_height - 2.0 * ROW_CARD_INSET_Y)
-}
-
-/// The graph's two-line stack: a title, and a caption-size line of ids and
-/// meta under it.
-fn two_line<'a>(
-    title: impl Into<Element<'a, Message>>,
-    meta: impl Into<Element<'a, Message>>,
-) -> Element<'a, Message> {
-    container(column![title.into(), meta.into()].spacing(TWO_LINE_SPACING))
-        .height(Length::Fill)
-        .center_y(Length::Fill)
-        .into()
-}
-
-fn caption<'a>(value: impl text::IntoFragment<'a>, color: Color, ui: &Diffui) -> text::Text<'a> {
-    text(value)
-        .size(text_size::CAPTION)
-        .font(ui.config.ui_font)
-        .color(color)
-        .wrapping(text::Wrapping::None)
-}
-
-fn mono<'a>(value: impl text::IntoFragment<'a>, color: Color, ui: &Diffui) -> text::Text<'a> {
-    text(value)
-        .size(CAPTION_TEXT_SIZE)
-        .font(ui.config.mono_font)
-        .color(color)
-        .wrapping(text::Wrapping::None)
-}
-
-/// [`mono`], placed on its line's baseline.
-fn mono_on_line<'a>(
-    value: impl text::IntoFragment<'a>,
-    color: Color,
-    ui: &Diffui,
-) -> Aligned<'a, Message> {
-    Aligned::text(
-        mono(value, color, ui),
-        ui.config.mono_font,
-        CAPTION_TEXT_SIZE,
-    )
-}
-
-/// A [`caption`] (or anything at its font and size), placed on its line's
-/// baseline.
-fn caption_on_line<'a>(
-    caption: impl Into<Element<'a, Message>>,
-    ui: &Diffui,
-) -> Aligned<'a, Message> {
-    Aligned::text(caption, ui.config.ui_font, text_size::CAPTION)
-}
 
 /// One displayed op-log row: an operation, or a folded run of snapshots.
 enum OpRow<'a> {
@@ -1218,591 +951,8 @@ enum OpRow<'a> {
     },
 }
 
-fn op_rows<'a>(history: &'a HistoryState) -> Vec<OpRow<'a>> {
-    let mut rows = Vec::new();
-    let ops = &history.ops;
-    let mut index = 0;
-    while index < ops.len() {
-        let op = &ops[index];
-        let run_end = ops[index..]
-            .iter()
-            .position(|candidate| {
-                !candidate.is_snapshot || candidate.is_current && candidate.id != op.id
-            })
-            .map_or(ops.len(), |offset| index + offset);
-        let run = run_end - index;
-        // A lone snapshot reads fine on its own; two or more fold.
-        if op.is_snapshot && !op.is_current && run >= 2 {
-            rows.push(OpRow::Run {
-                first: op,
-                count: run,
-                oldest: &ops[run_end - 1],
-                children: history
-                    .expanded_runs
-                    .contains(&op.id)
-                    .then(|| &ops[index..run_end]),
-            });
-            index = run_end;
-        } else {
-            rows.push(OpRow::Op(op));
-            index += 1;
-        }
-    }
-    rows
-}
-
 /// Width of the chevron column in a snapshot run's row.
 const RUN_CHEVRON: f32 = 12.0;
-
-fn op_row<'a>(
-    ui: &'a Diffui,
-    theme: ThemeSpec,
-    op: &'a OperationEntry,
-    now: i64,
-) -> Element<'a, Message> {
-    if op.is_snapshot {
-        return snapshot_row(ui, theme, op, now);
-    }
-    let history = &ui.active().history;
-    let selected = history.selected_op.as_deref() == Some(op.id.as_str());
-    let age = relative_age(op.time_millis, now);
-    let id_color = if op.is_current {
-        theme.accent
-    } else {
-        theme.muted_text
-    };
-    let mut meta = vec![mono_on_line(op.short_id(), id_color, ui)];
-    if op.is_current {
-        meta.push(chip("current", theme.accent, ui));
-    }
-    // The command that wrote the op, when one was recorded (the jj CLI's,
-    // or diffui's equivalent), says more than who ran it; the header below
-    // the list still names the user.
-    // One line whatever the command holds (a message's line breaks read as
-    // spaces), cut short before the age.
-    match &op.args {
-        Some(args) => meta.push(Aligned::text(
-            crate::plan::command_prose(args)
-                .line(
-                    ui.config.mono_font,
-                    ui.config.mono_font,
-                    theme.subtle_text,
-                    theme,
-                    CAPTION_TEXT_SIZE,
-                )
-                .view(),
-            ui.config.mono_font,
-            CAPTION_TEXT_SIZE,
-        )),
-        None => meta.push(caption_on_line(
-            caption(op.user.as_str(), theme.subtle_text, ui)
-                .ellipsis(text::Ellipsis::End)
-                .width(Length::Fill),
-            ui,
-        )),
-    }
-    meta.push(caption_on_line(caption(age, theme.subtle_text, ui), ui));
-    let meta = typography::baseline_row(meta, space::SM);
-    let title = meta_line::description(
-        op.summary(),
-        SMALL_TEXT_SIZE,
-        ui.config.ui_font,
-        theme.text,
-        ui,
-        theme,
-    )
-    .view();
-    button(two_line(title, meta))
-        .width(Length::Fill)
-        .height(card_height(REVISION_ROW_HEIGHT))
-        .padding(card_padding())
-        .on_press(Message::Action(Action::History(
-            HistoryAction::SelectOperation(op.id.clone()),
-        )))
-        .style(move |_, status| row_style(theme, selected, status))
-        .into()
-}
-
-/// A snapshot on one quiet line, on its own or inside an unfolded run.
-fn snapshot_row<'a>(
-    ui: &'a Diffui,
-    theme: ThemeSpec,
-    op: &'a OperationEntry,
-    now: i64,
-) -> Element<'a, Message> {
-    let selected = ui.active().history.selected_op.as_deref() == Some(op.id.as_str());
-    let mut line = vec![mono_on_line(
-        op.short_id(),
-        if op.is_current {
-            theme.accent
-        } else {
-            theme.subtle_text
-        },
-        ui,
-    )];
-    if op.is_current {
-        line.push(chip("current", theme.accent, ui));
-    }
-    line.push(caption_on_line(
-        caption(op.summary(), theme.subtle_text, ui)
-            .ellipsis(text::Ellipsis::End)
-            .width(Length::Fill),
-        ui,
-    ));
-    line.push(caption_on_line(
-        caption(relative_age(op.time_millis, now), theme.subtle_text, ui),
-        ui,
-    ));
-    let line = container(typography::baseline_row(line, space::SM))
-        .height(Length::Fill)
-        .center_y(Length::Fill);
-    button(line)
-        .width(Length::Fill)
-        .height(card_height(FILE_ROW_HEIGHT))
-        .padding(card_padding())
-        .on_press(Message::Action(Action::History(
-            HistoryAction::SelectOperation(op.id.clone()),
-        )))
-        .style(move |_, status| row_style(theme, selected, status))
-        .into()
-}
-
-/// A folded run of snapshots, and its operations under it when unfolded:
-/// indented behind a guide line dropped from the chevron, the way the file
-/// tree nests a folder's files.
-fn run_row<'a>(
-    ui: &'a Diffui,
-    theme: ThemeSpec,
-    first: &'a OperationEntry,
-    count: usize,
-    oldest: &'a OperationEntry,
-    children: Option<&'a [OperationEntry]>,
-    now: i64,
-) -> Element<'a, Message> {
-    let chevron = if children.is_some() {
-        icons::CHEVRON_DOWN
-    } else {
-        icons::CHEVRON_RIGHT
-    };
-    let (from, to) = (
-        relative_age(oldest.time_millis, now),
-        relative_age(first.time_millis, now),
-    );
-    let span = if from == to {
-        to
-    } else {
-        format!("{from}\u{2013}{to}")
-    };
-    let header = button(
-        container(typography::baseline_row(
-            [
-                Aligned::glyph(
-                    icons::icon(chevron, RUN_CHEVRON, theme.subtle_text),
-                    RUN_CHEVRON,
-                ),
-                caption_on_line(
-                    caption(
-                        format!("{count} working-copy snapshots"),
-                        theme.subtle_text,
-                        ui,
-                    )
-                    .width(Length::Fill),
-                    ui,
-                ),
-                caption_on_line(caption(span, theme.subtle_text, ui), ui),
-            ],
-            space::SM,
-        ))
-        .height(Length::Fill)
-        .center_y(Length::Fill),
-    )
-    .width(Length::Fill)
-    .height(card_height(FILE_ROW_HEIGHT))
-    .padding(card_padding())
-    .on_press(Message::Action(Action::History(
-        HistoryAction::ToggleSnapshotRun(first.id.clone()),
-    )))
-    .style(move |_, status| row_style(theme, false, status));
-    let Some(children) = children else {
-        return header.into();
-    };
-
-    let guide = container(Space::new())
-        .width(Length::Fixed(1.0))
-        .height(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(Background::Color(theme.border)),
-            ..container::Style::default()
-        });
-    let mut rows = column![].spacing(2.0 * ROW_CARD_INSET_Y);
-    for op in children {
-        rows = rows.push(snapshot_row(ui, theme, op, now));
-    }
-    // The guide hangs from the chevron's centre; the children's ids line up
-    // with the run's label. Positions are within the list's padding, where
-    // a card's content starts at the card padding's left.
-    let content = card_padding().left;
-    let guide_x = content + RUN_CHEVRON / 2.0 - 0.5;
-    let label_x = content + RUN_CHEVRON + space::SM;
-    let child_x = label_x - content;
-    column![
-        header,
-        row![
-            Space::new().width(Length::Fixed(guide_x)),
-            guide,
-            Space::new().width(Length::Fixed(child_x - guide_x - 1.0)),
-            rows,
-        ],
-    ]
-    .spacing(2.0 * ROW_CARD_INSET_Y)
-    .into()
-}
-
-fn chip<'a>(label: &'a str, color: Color, ui: &Diffui) -> Aligned<'a, Message> {
-    meta_line::badge(label, color, ui)
-}
-
-fn version_row<'a>(
-    ui: &'a Diffui,
-    theme: ThemeSpec,
-    index: usize,
-    entry: &'a EvologEntry,
-    now: i64,
-) -> Element<'a, Message> {
-    let selected = ui.active().history.selected_version == Some(index);
-    let mut meta = vec![mono_on_line(
-        entry.commit.short_commit_id(),
-        theme.muted_text,
-        ui,
-    )];
-    if entry.commit.visible {
-        meta.push(chip("current", theme.accent, ui));
-    }
-    if entry.commit.empty {
-        meta.push(chip("empty", theme.subtle_text, ui));
-    }
-    let operation = entry.operation.as_ref().map_or_else(
-        || "(operation no longer in the log)".to_owned(),
-        |op| meta_line::shorten_ids(&op.summary),
-    );
-    meta.push(caption_on_line(
-        caption(operation, theme.subtle_text, ui)
-            .ellipsis(text::Ellipsis::End)
-            .width(Length::Fill),
-        ui,
-    ));
-    meta.push(caption_on_line(
-        caption(
-            relative_age(entry.commit.time_millis, now),
-            theme.subtle_text,
-            ui,
-        ),
-        ui,
-    ));
-    let meta = typography::baseline_row(meta, space::SM);
-    let summary = if entry.commit.summary.is_empty() {
-        "(no description set)"
-    } else {
-        entry.commit.summary.as_str()
-    };
-    let title = text(summary)
-        .size(SMALL_TEXT_SIZE)
-        .font(ui.config.ui_font)
-        .color(if entry.commit.summary.is_empty() {
-            theme.subtle_text
-        } else {
-            theme.text
-        })
-        .wrapping(text::Wrapping::None)
-        .ellipsis(text::Ellipsis::End)
-        .width(Length::Fill);
-    button(two_line(title, meta))
-        .width(Length::Fill)
-        .height(card_height(REVISION_ROW_HEIGHT))
-        .padding(card_padding())
-        .on_press(Message::Action(Action::History(
-            HistoryAction::SelectVersion(index),
-        )))
-        .style(move |_, status| row_style(theme, selected, status))
-        .into()
-}
-
-/// A list's header, its leading glyph on the rows' content edge and its
-/// trailing button's glyph on their right edge. `leading_button`: the
-/// header starts with an icon button, whose glyph sits centred in it.
-fn header_bar<'a>(
-    content: impl Into<Element<'a, Message>>,
-    leading_button: bool,
-    theme: ThemeSpec,
-) -> Element<'a, Message> {
-    let glyph_inset = (ui::Size::Compact.height() - ui::ICON_SIZE) / 2.0;
-    container(content)
-        .width(Length::Fill)
-        .height(Length::Fixed(crate::field::PANEL_HEADER_HEIGHT))
-        .padding(Padding {
-            top: 0.0,
-            right: (CONTENT_PADDING - glyph_inset).max(0.0),
-            bottom: 0.0,
-            left: ROW_CONTENT_LEFT - if leading_button { glyph_inset } else { 0.0 },
-        })
-        .center_y(Length::Fixed(crate::field::PANEL_HEADER_HEIGHT))
-        .style(move |_| container::Style {
-            background: Some(Background::Color(theme.panel_background)),
-            ..container::Style::default()
-        })
-        .into()
-}
-
-fn note<'a>(
-    message: impl text::IntoFragment<'a>,
-    color: Color,
-    ui: &Diffui,
-) -> Element<'a, Message> {
-    container(
-        text(message)
-            .size(text_size::UI)
-            .font(ui.config.ui_font)
-            .color(color),
-    )
-    .width(Length::Fill)
-    .padding(Padding::from([space::SM, space::LG]))
-    .into()
-}
-
-/// The History view's left pane: the op log, or the evolog it was switched to.
-pub(crate) fn build_history_sidebar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
-    let history = &ui.active().history;
-    let now = now_millis();
-    let reload = ui::tooltip(
-        ui::icon_button(icons::REFRESH, theme.muted_text, ui::Size::Compact, theme)
-            .on_press(Message::Action(Action::History(HistoryAction::Reload))),
-        "Reload",
-        iced::widget::tooltip::Position::Bottom,
-        ui.config.ui_font,
-        theme,
-    );
-    let title_font = emphasis_font(ui.config.ui_font, iced::font::Weight::Medium);
-
-    let (header, list): (Element<'a, Message>, Element<'a, Message>) = match &history.kind {
-        HistoryKind::OpLog => {
-            let header = row![
-                icons::icon(icons::HISTORY, ui::ICON_SIZE, theme.subtle_text),
-                container(typography::centered(
-                    text("Operations")
-                        .size(text_size::UI)
-                        .font(title_font)
-                        .color(theme.text),
-                    title_font,
-                    text_size::UI,
-                ))
-                .width(Length::Fill),
-                reload,
-            ]
-            .spacing(space::SM)
-            .align_y(alignment::Vertical::Center);
-            let mut rows = column![]
-                .spacing(2.0 * ROW_CARD_INSET_Y)
-                .padding(list_padding());
-            for entry in op_rows(history) {
-                rows = rows.push(match entry {
-                    OpRow::Op(op) => op_row(ui, theme, op, now),
-                    OpRow::Run {
-                        first,
-                        count,
-                        oldest,
-                        children,
-                    } => run_row(ui, theme, first, count, oldest, children, now),
-                });
-            }
-            if history.ops_job.is_some() {
-                rows = rows.push(note(
-                    "Reading the operation log\u{2026}",
-                    theme.subtle_text,
-                    ui,
-                ));
-            } else if history.ops_truncated {
-                rows = rows.push(
-                    container(
-                        ui::text_button(
-                            None,
-                            "Load older operations",
-                            ui::Variant::Ghost,
-                            ui::Size::Compact,
-                            ui.config.ui_font,
-                            theme,
-                        )
-                        .on_press(Message::Action(Action::History(
-                            HistoryAction::LoadMoreOperations,
-                        ))),
-                    )
-                    .width(Length::Fill)
-                    .center_x(Length::Fill)
-                    .padding(space::SM),
-                );
-            }
-            (
-                header.into(),
-                ui::scrollable(rows, theme).height(Length::Fill).into(),
-            )
-        }
-        HistoryKind::Evolog { label, .. } => {
-            let header = row![
-                ui::tooltip(
-                    ui::icon_button(
-                        icons::ARROW_LEFT,
-                        theme.muted_text,
-                        ui::Size::Compact,
-                        theme
-                    )
-                    .on_press(Message::Action(Action::History(HistoryAction::ShowOpLog))),
-                    "Back to the operation log",
-                    iced::widget::tooltip::Position::Bottom,
-                    ui.config.ui_font,
-                    theme,
-                ),
-                container(typography::baseline_row(
-                    [
-                        Aligned::text(
-                            text("Evolution of ")
-                                .size(text_size::UI)
-                                .font(title_font)
-                                .color(theme.text),
-                            title_font,
-                            text_size::UI,
-                        ),
-                        mono_on_line(label.as_str(), theme.accent, ui),
-                    ],
-                    0.0,
-                ))
-                .width(Length::Fill),
-                reload,
-            ]
-            .spacing(space::XS)
-            .align_y(alignment::Vertical::Center);
-            let mut rows = column![]
-                .spacing(2.0 * ROW_CARD_INSET_Y)
-                .padding(list_padding());
-            for (index, entry) in history.evolog.iter().enumerate() {
-                rows = rows.push(version_row(ui, theme, index, entry, now));
-            }
-            if history.evolog_job.is_some() {
-                rows = rows.push(note(
-                    "Reading the change's history\u{2026}",
-                    theme.subtle_text,
-                    ui,
-                ));
-            }
-            (
-                header.into(),
-                ui::scrollable(rows, theme).height(Length::Fill).into(),
-            )
-        }
-    };
-
-    let leading_button = matches!(history.kind, HistoryKind::Evolog { .. });
-    container(column![header_bar(header, leading_button, theme), list])
-        .width(Length::Fixed(ui.sidebar_width))
-        .height(Length::Fill)
-        .style(move |_| sidebar_panel_style(theme))
-        .into()
-}
-
-fn commit_line<'a>(
-    ui: &'a Diffui,
-    theme: ThemeSpec,
-    commit: &'a CommitBrief,
-) -> Aligned<'a, Message> {
-    let summary = if commit.summary.is_empty() {
-        "(no description set)"
-    } else {
-        commit.summary.as_str()
-    };
-    let mut line = vec![
-        mono_on_line(commit.short_change_id(), theme.accent, ui),
-        mono_on_line(commit.short_commit_id(), theme.subtle_text, ui),
-    ];
-    if !commit.visible {
-        line.push(chip("hidden", theme.subtle_text, ui));
-    }
-    if commit.empty {
-        line.push(chip("empty", theme.subtle_text, ui));
-    }
-    line.push(Aligned::text(
-        text(summary)
-            .size(text_size::UI)
-            .font(ui.config.ui_font)
-            .color(if commit.summary.is_empty() {
-                theme.subtle_text
-            } else {
-                theme.text
-            })
-            .wrapping(text::Wrapping::None)
-            .ellipsis(text::Ellipsis::End)
-            .width(Length::Fill),
-        ui.config.ui_font,
-        text_size::UI,
-    ));
-    typography::group(line, space::SM)
-}
-
-fn change_row<'a>(
-    ui: &'a Diffui,
-    theme: ThemeSpec,
-    index: usize,
-    change: &'a ChangedCommit,
-) -> Element<'a, Message> {
-    let selected = ui.active().history.selected_change == Some(index);
-    let (glyph, color, verb) = match change.kind {
-        CommitChangeKind::Created => ("+", theme.added_text, "created"),
-        CommitChangeKind::Rewritten if change.rebased => ("~", theme.subtle_text, "rebased"),
-        CommitChangeKind::Rewritten => ("~", theme.modified_token, "rewritten"),
-        CommitChangeKind::Abandoned => ("\u{2212}", theme.removed_text, "abandoned"),
-    };
-    // A hidden commit has nothing to open, but keeps the slot so every
-    // row's verb ends at the same edge.
-    let open: Element<'a, Message> = if change.commit.visible {
-        ui::tooltip(
-            ui::icon_button(icons::FILE_DIFF, theme.muted_text, ui::Size::Compact, theme).on_press(
-                Message::Action(Action::History(HistoryAction::OpenRevision(
-                    change.commit.commit_id.clone(),
-                ))),
-            ),
-            "Show in the diff view",
-            iced::widget::tooltip::Position::Left,
-            ui.config.ui_font,
-            theme,
-        )
-    } else {
-        Space::new()
-            .width(Length::Fixed(ui::Size::Compact.height()))
-            .into()
-    };
-    let line = row![
-        container(typography::baseline_row(
-            [
-                mono_on_line(glyph, color, ui)
-                    .map(|glyph| container(glyph).width(Length::Fixed(12.0)).into()),
-                commit_line(ui, theme, &change.commit),
-                caption_on_line(caption(verb, theme.subtle_text, ui), ui),
-            ],
-            space::SM,
-        ))
-        .width(Length::Fill),
-        open,
-    ]
-    .spacing(space::SM)
-    .height(Length::Fill)
-    .align_y(alignment::Vertical::Center);
-    button(line)
-        .width(Length::Fill)
-        .height(Length::Fixed(CHANGE_ROW_HEIGHT))
-        .padding(Padding::from([0.0, space::SM]))
-        .on_press(Message::Action(Action::History(
-            HistoryAction::SelectChange(index),
-        )))
-        .style(move |_, status| row_style(theme, selected, status))
-        .into()
-}
 
 fn ref_side_label(side: &[CommitBrief]) -> String {
     match side {
@@ -1816,344 +966,6 @@ fn ref_side_label(side: &[CommitBrief]) -> String {
                 .join(", ")
         ),
     }
-}
-
-/// A moved ref, laid out like a changed commit's row: a kind marker in the
-/// glyph column, the ref, where it moved from and to, and the kind where a
-/// commit row has its verb.
-fn ref_row<'a>(ui: &'a Diffui, theme: ThemeSpec, change: &'a RefChange) -> Element<'a, Message> {
-    let glyph =
-        |glyph: &'static str| Aligned::glyph(icons::icon(glyph, 12.0, theme.subtle_text), 12.0);
-    let (marker, kind): (Aligned<'a, Message>, &str) = match change.kind {
-        RefKind::WorkingCopy => (mono_on_line("@", theme.subtle_text, ui), "working copy"),
-        RefKind::Bookmark => (glyph(icons::GIT_BRANCH), "bookmark"),
-        RefKind::RemoteBookmark => (glyph(icons::GIT_BRANCH), "remote bookmark"),
-        RefKind::Tag => (glyph(icons::TAG), "tag"),
-    };
-    let side = |commits: &'a [CommitBrief], color: Color| -> Aligned<'a, Message> {
-        if commits.is_empty() {
-            caption_on_line(caption("(absent)", theme.subtle_text, ui), ui)
-        } else {
-            mono_on_line(ref_side_label(commits), color, ui)
-        }
-    };
-    // Mono names and ids, sans captions and the glyphs on one line (see
-    // `crate::typography`).
-    container(
-        row![
-            typography::baseline_row(
-                [
-                    marker.map(|marker| container(marker).width(Length::Fixed(12.0)).into()),
-                    mono_on_line(change.name.as_str(), theme.text, ui),
-                    side(&change.from, theme.removed_text),
-                    glyph(icons::ARROW_RIGHT),
-                    side(&change.to, theme.added_text),
-                ],
-                space::SM,
-            ),
-            Space::new().width(Length::Fill),
-            typography::baseline_row(
-                [caption_on_line(caption(kind, theme.subtle_text, ui), ui)],
-                0.0,
-            ),
-            Space::new().width(Length::Fixed(ui::Size::Compact.height())),
-        ]
-        .spacing(space::SM)
-        .height(Length::Fill)
-        .align_y(alignment::Vertical::Center),
-    )
-    .padding(Padding::from([0.0, space::SM]))
-    .center_y(Length::Fixed(CHANGE_ROW_HEIGHT))
-    .into()
-}
-
-fn section_title<'a>(label: String, ui: &Diffui, theme: ThemeSpec) -> Element<'a, Message> {
-    container(
-        text(label)
-            .size(text_size::CAPTION)
-            .font(emphasis_font(ui.config.ui_font, iced::font::Weight::Medium))
-            .color(theme.muted_text),
-    )
-    .padding(Padding {
-        top: space::SM,
-        right: space::SM,
-        bottom: space::XXS,
-        left: space::SM,
-    })
-    .into()
-}
-
-/// The operation's header: description, metadata, and the two actions.
-fn operation_header<'a>(
-    ui: &'a Diffui,
-    theme: ThemeSpec,
-    op: &'a OperationEntry,
-    changes: Option<&'a OperationChanges>,
-) -> Element<'a, Message> {
-    let mut badges = Vec::new();
-    if op.is_current {
-        badges.push(meta_line::Badge {
-            label: "current",
-            color: theme.accent,
-        });
-    }
-    if op.is_snapshot {
-        badges.push(meta_line::Badge {
-            label: "snapshot",
-            color: theme.subtle_text,
-        });
-    }
-    let meta = meta_line::view(
-        meta_line::Meta {
-            ids: vec![meta_line::Id::plain(
-                op.short_id(),
-                if op.is_current {
-                    theme.accent
-                } else {
-                    theme.muted_text
-                },
-            )],
-            badges,
-            who: Some((op.user.clone(), None)),
-            when: Some((Some(op.time_millis), op.time.clone())),
-            operation: None,
-        },
-        ui,
-        theme,
-    );
-
-    let can_mutate = ui.active().session.capabilities.mutate;
-    let has_parent = !op.parent_ids.is_empty();
-    let is_merge = changes.is_some_and(|changes| changes.is_merge) || op.parent_ids.len() > 1;
-    let restore = ui::text_button(
-        Some((icons::ROTATE_CCW, theme.muted_text)),
-        "Restore to here",
-        ui::Variant::Raised,
-        ui::Size::Compact,
-        ui.config.ui_font,
-        theme,
-    )
-    .on_press_maybe((can_mutate && !op.is_current && has_parent).then(|| {
-        Message::Action(Action::History(HistoryAction::RestoreOperation(
-            op.id.clone(),
-        )))
-    }));
-    let revert = ui::text_button(
-        Some((icons::UNDO, theme.muted_text)),
-        "Revert",
-        ui::Variant::Raised,
-        ui::Size::Compact,
-        ui.config.ui_font,
-        theme,
-    )
-    .on_press_maybe((can_mutate && has_parent && !is_merge).then(|| {
-        Message::Action(Action::History(HistoryAction::RevertOperation(
-            op.id.clone(),
-        )))
-    }));
-
-    let mut block = column![
-        row![
-            // Centred on its caps against the buttons beside it.
-            typography::centered(
-                meta_line::description(
-                    op.summary(),
-                    text_size::BODY_LG,
-                    emphasis_font(ui.config.ui_font, iced::font::Weight::Medium),
-                    theme.text,
-                    ui,
-                    theme,
-                )
-                .wrapped()
-                .width(Length::Fill),
-                emphasis_font(ui.config.ui_font, iced::font::Weight::Medium),
-                text_size::BODY_LG,
-            ),
-            ui::tooltip(
-                restore,
-                "Put every revision and bookmark back to how this operation left them (jj op restore)",
-                iced::widget::tooltip::Position::Bottom,
-                ui.config.ui_font,
-                theme,
-            ),
-            ui::tooltip(
-                revert,
-                "Undo just this operation, keeping later work (jj op revert)",
-                iced::widget::tooltip::Position::Bottom,
-                ui.config.ui_font,
-                theme,
-            ),
-        ]
-        .spacing(space::SM)
-        .align_y(alignment::Vertical::Center),
-        meta,
-    ]
-    .spacing(space::XS);
-    if let Some(args) = &op.args {
-        block = block.push(crate::plan::wrapped_command_line(
-            ui,
-            theme,
-            args,
-            text_size::CAPTION,
-        ));
-    }
-    container(block)
-        .width(Length::Fill)
-        .padding(Padding::from([space::MD, space::LG]))
-        .into()
-}
-
-fn operation_changes<'a>(
-    ui: &'a Diffui,
-    theme: ThemeSpec,
-    changes: &'a OperationChanges,
-) -> Element<'a, Message> {
-    let mut list = column![].spacing(1);
-    if changes.is_merge {
-        list = list.push(note(
-            "A merge of concurrent operations. Like the jj CLI, it lists no changes.",
-            theme.subtle_text,
-            ui,
-        ));
-    }
-    if !changes.commits.is_empty() {
-        let mut title = format!("Changed commits ({})", changes.commits.len());
-        if changes.commits_truncated {
-            title.push_str(", more not listed");
-        }
-        list = list.push(section_title(title, ui, theme));
-        for (index, change) in changes.commits.iter().enumerate() {
-            list = list.push(change_row(ui, theme, index, change));
-        }
-    }
-    if !changes.refs.is_empty() {
-        list = list.push(section_title(
-            format!("Moved refs ({})", changes.refs.len()),
-            ui,
-            theme,
-        ));
-        for change in &changes.refs {
-            list = list.push(ref_row(ui, theme, change));
-        }
-    }
-    if changes.commits.is_empty() && changes.refs.is_empty() && !changes.is_merge {
-        list = list.push(note(
-            "This operation changed no commits or refs.",
-            theme.subtle_text,
-            ui,
-        ));
-    }
-    ui::scrollable(
-        list.padding(Padding {
-            bottom: space::SM,
-            ..Padding::from([0.0, space::SM])
-        }),
-        theme,
-    )
-    .width(Length::Fill)
-    .height(Length::Shrink.max(260.0))
-    .into()
-}
-
-fn evolog_header<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Option<Element<'a, Message>> {
-    let history = &ui.active().history;
-    let entry = history.evolog.get(history.selected_version?)?;
-    let has_previous = !entry.predecessor_ids.is_empty();
-    let meta = meta_line::view(
-        meta_line::Meta {
-            who: Some((entry.commit.author.clone(), None)),
-            when: entry
-                .operation
-                .as_ref()
-                .map(|op| (Some(op.time_millis), String::new())),
-            operation: entry
-                .operation
-                .as_ref()
-                .map(|op| (op.short_id().to_owned(), op.summary.clone())),
-            ..meta_line::Meta::default()
-        },
-        ui,
-        theme,
-    );
-    // The first version has nothing before it, so it can only show its
-    // full diff (which is what it loads).
-    let shown = if has_previous {
-        history.evolog_diff
-    } else {
-        EvologDiff::Parents
-    };
-    let segment = |icon, label, mode: EvologDiff, enabled: bool| crate::toolbar::Segment {
-        icon: Some(icon),
-        label,
-        active: shown == mode,
-        on_press: enabled.then_some(Message::Action(Action::History(
-            HistoryAction::SetEvologDiff(mode),
-        ))),
-    };
-    let mut actions = row![crate::toolbar::segmented(
-        vec![
-            segment(
-                icons::GIT_COMPARE,
-                "Since previous version",
-                EvologDiff::Previous,
-                has_previous,
-            ),
-            segment(icons::FILE_DIFF, "Full diff", EvologDiff::Parents, true),
-        ],
-        ui.config.ui_font,
-        theme,
-    )]
-    .spacing(space::XS)
-    .align_y(alignment::Vertical::Center);
-    if entry.commit.visible {
-        actions = actions.push(Space::new().width(Length::Fill));
-        actions = actions.push(
-            ui::text_button(
-                Some((icons::FILE_DIFF, theme.muted_text)),
-                "Show in diff view",
-                ui::Variant::Ghost,
-                ui::Size::Compact,
-                ui.config.ui_font,
-                theme,
-            )
-            .on_press(Message::Action(Action::History(
-                HistoryAction::OpenRevision(entry.commit.commit_id.clone()),
-            ))),
-        );
-    }
-    Some(
-        container(
-            column![
-                typography::baseline_row(
-                    [
-                        mono_on_line(entry.commit.short_commit_id(), theme.muted_text, ui),
-                        Aligned::text(
-                            text(if entry.commit.summary.is_empty() {
-                                "(no description set)"
-                            } else {
-                                entry.commit.summary.as_str()
-                            })
-                            .size(text_size::BODY_LG)
-                            .font(emphasis_font(ui.config.ui_font, iced::font::Weight::Medium))
-                            .color(theme.text)
-                            .wrapping(text::Wrapping::None)
-                            .ellipsis(text::Ellipsis::End)
-                            .width(Length::Fill),
-                            emphasis_font(ui.config.ui_font, iced::font::Weight::Medium),
-                            text_size::BODY_LG,
-                        ),
-                    ],
-                    space::SM,
-                ),
-                meta,
-                actions,
-            ]
-            .spacing(space::XS),
-        )
-        .width(Length::Fill)
-        .padding(Padding::from([space::MD, space::LG]))
-        .into(),
-    )
 }
 
 /// First-line descriptions before and after the selected rewrite, when they
@@ -2189,172 +1001,6 @@ fn description_change(history: &HistoryState) -> Option<(&str, &str)> {
         }
     }
     (old.summary != new.summary).then(|| (name(old), name(new)))
-}
-
-fn history_diff_view<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
-    let history = &ui.active().history;
-    let Some(diff) = &history.diff else {
-        let no_commits = history.kind == HistoryKind::OpLog
-            && history
-                .op_changes
-                .as_ref()
-                .is_some_and(|changes| changes.commits.is_empty());
-        let message = if history.diff_job.is_some() || no_commits {
-            ""
-        } else {
-            "Select a change to see its diff"
-        };
-        return container(
-            text(message)
-                .size(text_size::BODY_LG)
-                .color(theme.subtle_text),
-        )
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center(Length::Fill)
-        .into();
-    };
-    if diff.document.files.is_empty() {
-        let message = match description_change(history) {
-            Some((old, new)) => format!(
-                "No file changes. The description changed from \u{201c}{old}\u{201d} to \u{201c}{new}\u{201d}"
-            ),
-            None => "No file changes".to_owned(),
-        };
-        return container(
-            text(message)
-                .size(text_size::BODY_LG)
-                .color(theme.subtle_text),
-        )
-        .padding(space::XXL)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center(Length::Fill)
-        .into();
-    }
-    let files = diff
-        .document
-        .files
-        .iter()
-        .map(|file| {
-            let status_color = file_status_color(file.status, theme);
-            DiffFileView {
-                title: match &file.old_path {
-                    Some(old_path) if old_path != &file.path => {
-                        format!("{old_path} -> {}", file.path)
-                    }
-                    _ => file.path.clone(),
-                },
-                status: file.status,
-                status_color,
-                status_fill: chip_background(status_color),
-                hunks: &file.hunks,
-                additions: file.additions,
-                deletions: file.deletions,
-            }
-        })
-        .collect::<Vec<_>>();
-    let mut view = DiffView::new(
-        files,
-        history.diff_file,
-        format!("history:{}", diff.doc_id),
-        diff_palette(theme),
-        ui.config.mono_font,
-        ui.config.code_type,
-        ui.config.multi_click_ms,
-        |index| Message::Action(Action::History(HistoryAction::DiffFileChanged(index))),
-    )
-    .on_copy(|text| Message::Action(Action::Copy(text)))
-    .on_scroll(|offset| Message::Action(Action::History(HistoryAction::DiffScrolled(offset))))
-    .restore_scroll(history.diff_scroll, ui.scroll_restore_token)
-    .content_version(ui.document_version)
-    .layout_version(diff.doc_id)
-    .wrap(ui.diff_wrap)
-    .side_by_side(ui.diff_split);
-    if let Some((media, key)) = crate::media::document_media(ui, &diff.document) {
-        view = view.media(media, key);
-    }
-    if let Some(details) = &diff.details {
-        view = view
-            .with_header(crate::commit_info::header_lines(
-                ui,
-                details,
-                theme,
-                false,
-                // The History view's right pane: the window less its list.
-                ui.window_size.width - ui.sidebar_width - 1.0,
-            ))
-            .on_header_action(crate::commit_info::header_action);
-    }
-    view.into()
-}
-
-/// The History view's right pane.
-pub(crate) fn build_history_panel<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
-    let history = &ui.active().history;
-    let divider = || {
-        container(Space::new())
-            .width(Length::Fill)
-            .height(Length::Fixed(1.0))
-            .style(move |_| container::Style {
-                background: Some(Background::Color(theme.border)),
-                ..container::Style::default()
-            })
-    };
-    let mut body = column![].spacing(0);
-    if let Some(error) = &history.error {
-        body = body.push(note(error.as_str(), theme.removed_text, ui));
-    }
-    match &history.kind {
-        HistoryKind::OpLog => match history.selected_operation() {
-            Some(op) => {
-                let changes = history
-                    .op_changes
-                    .as_ref()
-                    .filter(|changes| changes.operation.id == op.id);
-                body = body.push(operation_header(ui, theme, op, changes));
-                match changes {
-                    Some(changes) => body = body.push(operation_changes(ui, theme, changes)),
-                    None if history.op_job.is_some() => {
-                        body =
-                            body.push(note("Reading the operation\u{2026}", theme.subtle_text, ui));
-                    }
-                    None => {}
-                }
-                body = body.push(divider());
-                body = body.push(history_diff_view(ui, theme));
-            }
-            None => {
-                body = body.push(
-                    container(
-                        text(if history.ops_job.is_some() {
-                            ""
-                        } else {
-                            "Select an operation"
-                        })
-                        .size(text_size::BODY_LG)
-                        .color(theme.subtle_text),
-                    )
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .center(Length::Fill),
-                );
-            }
-        },
-        HistoryKind::Evolog { .. } => {
-            if let Some(header) = evolog_header(ui, theme) {
-                body = body.push(header);
-                body = body.push(divider());
-            }
-            body = body.push(history_diff_view(ui, theme));
-        }
-    }
-    container(body)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .clip(true)
-        .style(move |_| diff_panel_style(theme))
-        .into()
 }
 
 #[cfg(test)]
@@ -2418,19 +1064,19 @@ mod tests {
     }
 
     fn deliver(ui: &mut Diffui, repo: &diffui_core::RepoId, payload: diffui_core::Payload) {
-        let _ = ui.update(Message::Repo(Box::new(diffui_core::Event::new(
-            repo.clone(),
-            payload,
-        ))));
+        ui.TESTUPDATE(
+            Message::Repo(Box::new(diffui_core::Event::new(repo.clone(), payload))),
+            cx,
+        );
     }
 
     #[test]
     fn the_op_log_streams_in_and_lands_on_the_current_operation() {
         let (mut ui, repo) = jj_app();
-        let _ = ui.perform_history(HistoryAction::ShowOpLog);
+        let _ = ui.perform_history(HistoryAction::ShowOpLog, cx);
         assert_eq!(ui.active().main_view, MainView::History);
         // No actor in a unit test, so the view's own read never starts.
-        let _ = ui.perform_history(HistoryAction::Reload);
+        let _ = ui.perform_history(HistoryAction::Reload, cx);
         let job = ui
             .active()
             .history
@@ -2467,8 +1113,8 @@ mod tests {
     #[test]
     fn a_failed_history_read_stays_in_its_pane() {
         let (mut ui, repo) = jj_app();
-        let _ = ui.perform_history(HistoryAction::ShowOpLog);
-        let _ = ui.perform_history(HistoryAction::Reload);
+        let _ = ui.perform_history(HistoryAction::ShowOpLog, cx);
+        let _ = ui.perform_history(HistoryAction::Reload, cx);
         let job = ui
             .active()
             .history
@@ -2494,21 +1140,27 @@ mod tests {
     fn a_file_filter_restores_the_previous_revset() {
         let (mut ui, _repo) = jj_app();
         ui.active_mut().session.revset = "mine()".to_owned();
-        let _ = ui.perform_history(HistoryAction::FileHistory {
-            revision: RevisionSelection::WorkingCopy,
-            path: "src/main.rs".to_owned(),
-        });
+        let _ = ui.perform_history(
+            HistoryAction::FileHistory {
+                revision: RevisionSelection::WorkingCopy,
+                path: "src/main.rs".to_owned(),
+            },
+            cx,
+        );
         assert_eq!(
             ui.active().session.revset,
             r#"::@ & files(root:"src/main.rs")"#
         );
         assert!(file_filter_active(&ui));
         // A second file replaces the first instead of stacking on it.
-        let _ = ui.perform_history(HistoryAction::FileHistory {
-            revision: RevisionSelection::WorkingCopy,
-            path: "README.md".to_owned(),
-        });
-        let _ = ui.perform_history(HistoryAction::ClearFileFilter);
+        let _ = ui.perform_history(
+            HistoryAction::FileHistory {
+                revision: RevisionSelection::WorkingCopy,
+                path: "README.md".to_owned(),
+            },
+            cx,
+        );
+        let _ = ui.perform_history(HistoryAction::ClearFileFilter, cx);
         assert_eq!(ui.active().session.revset, "mine()");
         assert!(!file_filter_active(&ui));
     }
@@ -2516,7 +1168,7 @@ mod tests {
     #[test]
     fn the_history_diff_keeps_the_file_it_was_scrolled_to() {
         let (mut ui, repo) = jj_app();
-        let _ = ui.perform_history(HistoryAction::ShowOpLog);
+        let _ = ui.perform_history(HistoryAction::ShowOpLog, cx);
         let land = |ui: &mut Diffui, commit_id: &str| {
             let job = JobId::next();
             let target = HistoryDiffTarget::Commit {
@@ -2541,9 +1193,10 @@ mod tests {
         // The diff widget scrolls the file it is handed into view, so the
         // file it reports scrolling onto must be what it is handed next;
         // a fixed 0 snapped every scroll past the first file back up.
-        let _ = ui.update(Message::Action(Action::History(
-            HistoryAction::DiffFileChanged(2),
-        )));
+        ui.TESTUPDATE(
+            Message::Action(Action::History(HistoryAction::DiffFileChanged(2))),
+            cx,
+        );
         assert_eq!(ui.active().history.diff_file, 2);
         land(&mut ui, "b");
         assert_eq!(
@@ -2571,4 +1224,48 @@ mod tests {
         history.expanded_runs.insert("b".to_owned());
         assert_eq!(shape(&history), ["a", "bx2[b,c]", "d", "e", "f"]);
     }
+}
+
+/// Stub: the history_panel view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn source_bar_actions(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::panel("history_panel::source_bar_actions")
+}
+
+/// Stub: the history_panel view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn file_filter_banner(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> Option<AnyElement> {
+    None
+}
+
+/// Stub: the history_panel view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn build_history_sidebar(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::panel("history_panel::build_history_sidebar")
+}
+
+/// Stub: the history_panel view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn build_history_panel(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::panel("history_panel::build_history_panel")
 }

@@ -1,295 +1,390 @@
-//! The app's single-line text input: iced's `text_input`, with presses in its
-//! vertical padding resolved by x, and its font kept across programmatic
-//! value changes.
+//! The app's text fields: kit's inputs, driven like controlled components.
 //!
-//! The stock widget hit-tests through a multi-line editor, where a press above
-//! the first line means "start of text" and one below the last means "end". A
-//! one-line field is mostly padding, so those bands cover a third of its
-//! height and a slightly high click throws the caret to index 0. Native fields
-//! place the caret by x wherever the press lands vertically; this wrapper does
-//! the same by pinning the cursor's y to the text line before the stock widget
-//! sees it. A drag that leaves the field still selects to the start or end,
-//! as it does natively.
+//! kit's inputs own their text in an entity created against a `Window`, which
+//! is awkward for update code that has neither and thinks of a field as a
+//! `String` in app state. So the wrappers here keep that view: app state holds
+//! the text, a panel passes it in each render along with what to do on an edit,
+//! and if the two differ (update code set it: a restored revset, a picked
+//! preset, a chosen folder) the input is rewritten to match. The entity lives
+//! in the window's element state under the field's id, so it exists exactly
+//! while the field is on screen, as the iced widget state did.
 //!
-//! The font: when the value changes from outside (a restored revset, a picked
-//! preset, a palette scope pill, a chosen folder) the stock widget rewrites
-//! its editor buffer with default attributes — the platform sans — and only
-//! re-applies its own font when that font *changes*. So a mono field showed
-//! typed text in mono and every other value in sans. On such a change this
-//! wrapper lays the input out once with a stand-in font before the real one,
-//! which makes the editor re-apply it.
-//!
-//! The keys: the stock widget takes no key binding, so the macOS ⌃ chords
-//! every native field honours (⌃A, ⌃E, ⌃K, …) reach it rewritten as the named
-//! keys they stand for ([`crate::ui::cocoa_key_event`]).
-//!
-//! This replaces the `text_input` vendored from iced `4255f61` for its missing
-//! stateful horizontal scroll, which upstream has since grown.
+//! Focus works the same way: update code asks with [`focus`] and no window, and
+//! the field applies it the next time it renders.
 
-use iced::advanced::{
-    Layout, Shell, Widget, layout, mouse, overlay, renderer,
-    widget::{Operation, Tree, tree},
-};
-use iced::widget::{TextInput, text, text_editor};
-use iced::{Element, Event, Font, Length, Padding, Point, Rectangle, Size, Theme, Vector};
+use std::cell::RefCell;
+use std::rc::Rc;
 
-use crate::theme::ThemeSpec;
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_kit::prelude::*;
+use gpui_kit::{App, Context, Entity, Global, Subscription, Window};
 
-/// `input` must have been built with `value` and `font` — the wrapper reads
-/// them back from here because the stock widget doesn't expose them.
-pub fn single_line<'a, Message: Clone + 'a>(
-    input: TextInput<'a, Message>,
-    value: &str,
-    font: Font,
-) -> Element<'a, Message> {
-    Element::new(SingleLine {
-        input: Some(input),
-        value: value.to_owned(),
-        font,
+use crate::theme::Font;
+
+/// What a field does with an edit.
+pub type OnInput = Rc<dyn Fn(String, &mut Window, &mut App)>;
+/// What a field does when its text or caret moves: the text, and the caret's
+/// byte offset.
+pub type OnEdit = Rc<dyn Fn(String, usize, &mut Window, &mut App)>;
+/// What a field does on Enter (⌘⏎ in a multi-line one).
+pub type OnSubmit = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// What to do to a field the next time it renders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusRequest {
+    /// Take focus, leaving the caret where it is.
+    Focus,
+    /// Take focus and select all the text.
+    SelectAll,
+    /// Put the caret at this byte offset.
+    Caret(usize),
+}
+
+/// Focus asked for by update code, waiting for the field to render.
+#[derive(Default)]
+struct PendingFocus(Vec<(&'static str, FocusRequest)>);
+
+impl Global for PendingFocus {}
+
+/// Asks the field named `id` to take focus when it next renders. Call from
+/// update code; the `act` that wraps it notifies, so the render happens.
+pub fn focus(id: &'static str, cx: &mut App) {
+    request(id, FocusRequest::Focus, cx);
+}
+
+/// Puts the caret of the field named `id` at byte `at` when it next renders.
+pub fn set_caret(id: &'static str, at: usize, cx: &mut App) {
+    request(id, FocusRequest::Caret(at), cx);
+}
+
+/// [`focus`], with the text selected.
+pub fn focus_and_select_all(id: &'static str, cx: &mut App) {
+    request(id, FocusRequest::SelectAll, cx);
+}
+
+fn request(id: &'static str, kind: FocusRequest, cx: &mut App) {
+    cx.default_global::<PendingFocus>().0.push((id, kind));
+}
+
+fn take_requests(id: &'static str, cx: &mut App) -> Vec<FocusRequest> {
+    if !cx.has_global::<PendingFocus>() {
+        return Vec::new();
+    }
+    let pending = cx.global_mut::<PendingFocus>();
+    let mut taken = Vec::new();
+    pending.0.retain(|(other, request)| {
+        let mine = *other == id;
+        if mine {
+            taken.push(*request);
+        }
+        !mine
+    });
+    taken
+}
+
+/// Whether a kit text input has the keyboard. Replaces iced's `consumed` flag:
+/// such an input takes the plain keys it types with, so the keymap leaves those
+/// alone. `context_stack` is the focused element's path; kit's inputs all put
+/// `Input` on it.
+pub fn input_has_focus(window: &Window) -> bool {
+    window
+        .context_stack()
+        .iter()
+        .any(|context| context.contains("Input"))
+}
+
+/// What varies between single-line and multi-line fields.
+pub struct FieldSpec<'a> {
+    /// Names the field: its element id, and what [`focus`] takes.
+    pub id: &'static str,
+    pub value: &'a str,
+    pub placeholder: &'a str,
+    /// Echo the text as dots (credential prompts).
+    pub masked: bool,
+    pub on_input: Option<OnInput>,
+    pub on_edit: Option<OnEdit>,
+    pub on_submit: Option<OnSubmit>,
+}
+
+impl<'a> FieldSpec<'a> {
+    pub fn new(id: &'static str, value: &'a str) -> Self {
+        Self {
+            id,
+            value,
+            placeholder: "",
+            masked: false,
+            on_input: None,
+            on_edit: None,
+            on_submit: None,
+        }
+    }
+
+    pub fn placeholder(mut self, placeholder: &'a str) -> Self {
+        self.placeholder = placeholder;
+        self
+    }
+
+    pub fn masked(mut self, masked: bool) -> Self {
+        self.masked = masked;
+        self
+    }
+
+    pub fn on_input(mut self, on_input: impl Fn(String, &mut Window, &mut App) + 'static) -> Self {
+        self.on_input = Some(Rc::new(on_input));
+        self
+    }
+
+    /// For a field that also cares where the caret is (the command line, the
+    /// revset box): runs when the text or the caret moves, with both.
+    pub fn on_edit(
+        mut self,
+        on_edit: impl Fn(String, usize, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_edit = Some(Rc::new(on_edit));
+        self
+    }
+
+    pub fn on_submit(mut self, on_submit: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+        self.on_submit = Some(Rc::new(on_submit));
+        self
+    }
+}
+
+/// The callbacks of the latest render, read by the one subscription the field
+/// holds for its whole life.
+#[derive(Default)]
+struct Callbacks {
+    on_input: Option<OnInput>,
+    on_edit: Option<OnEdit>,
+    on_submit: Option<OnSubmit>,
+    placeholder: String,
+    masked: bool,
+    /// The text and caret last reported to `on_edit`.
+    reported: (String, usize),
+}
+
+struct Controlled<S: 'static> {
+    state: Entity<S>,
+    callbacks: Rc<RefCell<Callbacks>>,
+    _events: Subscription,
+    _caret: Subscription,
+}
+
+/// Reports caret moves: the input notifies on them but raises no event.
+fn observe_caret<S: 'static>(
+    state: &Entity<S>,
+    window: &mut Window,
+    cx: &mut Context<Controlled<S>>,
+    callbacks: Rc<RefCell<Callbacks>>,
+    read: impl Fn(&S) -> (String, usize) + 'static,
+) -> Subscription {
+    cx.observe_in(state, window, move |_, state, window, cx| {
+        let on_edit = callbacks.borrow().on_edit.clone();
+        let Some(on_edit) = on_edit else {
+            return;
+        };
+        let now = read(state.read(cx));
+        if callbacks.borrow().reported == now {
+            return;
+        }
+        callbacks.borrow_mut().reported = now.clone();
+        on_edit(now.0, now.1, window, cx);
     })
 }
 
-struct SingleLine<'a, Message> {
-    /// Always `Some` outside of [`SingleLine::layout`], which briefly takes it
-    /// to swap the font (the builder consumes the widget).
-    input: Option<TextInput<'a, Message>>,
-    value: String,
-    font: Font,
-}
-
-/// The value the input was last laid out with.
-#[derive(Default)]
-struct Seen(Option<String>);
-
-impl<'a, Message: Clone + 'a> SingleLine<'a, Message> {
-    fn input(&self) -> &dyn Widget<Message, Theme, iced::Renderer> {
-        self.input
-            .as_ref()
-            .expect("input is present outside layout")
-    }
-
-    fn input_mut(&mut self) -> &mut (dyn Widget<Message, Theme, iced::Renderer> + 'a) {
-        self.input
-            .as_mut()
-            .expect("input is present outside layout")
-    }
-
-    fn set_font(&mut self, font: Font) {
-        self.input = self.input.take().map(|input| input.font(font));
-    }
-}
-
-/// `cursor`, moved onto the text line when it is over `bounds`. The line is
-/// vertically centered by the input's padding, so the center is always on it.
-fn on_line(cursor: mouse::Cursor, bounds: Rectangle) -> mouse::Cursor {
-    match cursor.position_over(bounds) {
-        Some(point) => mouse::Cursor::Available(Point::new(point.x, bounds.center_y())),
-        None => cursor,
-    }
-}
-
-impl<'a, Message: Clone + 'a> Widget<Message, Theme, iced::Renderer> for SingleLine<'a, Message> {
-    fn tag(&self) -> tree::Tag {
-        tree::Tag::of::<Seen>()
-    }
-
-    fn state(&self) -> tree::State {
-        tree::State::new(Seen::default())
-    }
-
-    fn diff(&mut self, tree: &mut Tree) {
-        tree.diff_children(&mut [self.input_mut()]);
-    }
-
-    fn size(&self) -> Size<Length> {
-        self.input().size()
-    }
-
-    fn layout(
-        &mut self,
-        tree: &mut Tree,
-        renderer: &iced::Renderer,
-        limits: &layout::Limits,
-    ) -> layout::Node {
-        let seen = tree.state.downcast_mut::<Seen>();
-        let changed = seen.0.as_deref() != Some(self.value.as_str());
-        if changed {
-            seen.0 = Some(self.value.clone());
-            // Any font but the real one: the editor only re-applies its font
-            // when it differs from the last one it was laid out with.
-            let stand_in = if self.font == Font::MONOSPACE {
-                Font::DEFAULT
-            } else {
-                Font::MONOSPACE
-            };
-            self.set_font(stand_in);
-            let _ = self
-                .input_mut()
-                .layout(&mut tree.children[0], renderer, limits);
-            self.set_font(self.font);
+fn subscribe<S>(
+    state: &Entity<S>,
+    window: &mut Window,
+    cx: &mut Context<Controlled<S>>,
+    callbacks: Rc<RefCell<Callbacks>>,
+    value: impl Fn(&S) -> String + 'static,
+) -> Subscription
+where
+    S: gpui_kit::EventEmitter<InputEvent> + 'static,
+{
+    cx.subscribe_in(state, window, move |_, state, event, window, cx| {
+        let (on_input, on_submit) = {
+            let callbacks = callbacks.borrow();
+            (callbacks.on_input.clone(), callbacks.on_submit.clone())
+        };
+        match event {
+            InputEvent::Change => {
+                if let Some(on_input) = on_input {
+                    let text = value(state.read(cx));
+                    on_input(text, window, cx);
+                }
+            }
+            InputEvent::PressEnter { .. } => {
+                if let Some(on_submit) = on_submit {
+                    on_submit(window, cx);
+                }
+            }
+            InputEvent::Focus | InputEvent::Blur => {}
         }
-        let node = self
-            .input_mut()
-            .layout(&mut tree.children[0], renderer, limits);
-        layout::Node::with_children(node.size(), vec![node])
-    }
-
-    fn draw(
-        &self,
-        tree: &Tree,
-        renderer: &mut iced::Renderer,
-        theme: &Theme,
-        style: &renderer::Style,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        viewport: &Rectangle,
-    ) {
-        self.input().draw(
-            &tree.children[0],
-            renderer,
-            theme,
-            style,
-            child(layout),
-            cursor,
-            viewport,
-        );
-    }
-
-    fn operate(
-        &mut self,
-        tree: &mut Tree,
-        layout: Layout<'_>,
-        viewport: &Rectangle,
-        renderer: &iced::Renderer,
-        operation: &mut dyn Operation,
-    ) {
-        self.input_mut().operate(
-            &mut tree.children[0],
-            child(layout),
-            viewport,
-            renderer,
-            operation,
-        );
-    }
-
-    fn update(
-        &mut self,
-        tree: &mut Tree,
-        event: &Event,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        renderer: &iced::Renderer,
-        shell: &mut Shell<'_, Message>,
-        viewport: &Rectangle,
-    ) {
-        let cocoa = crate::ui::cocoa_key_event(event);
-        self.input_mut().update(
-            &mut tree.children[0],
-            cocoa.as_ref().unwrap_or(event),
-            child(layout),
-            on_line(cursor, layout.bounds()),
-            renderer,
-            shell,
-            viewport,
-        );
-    }
-
-    fn mouse_interaction(
-        &self,
-        tree: &Tree,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        viewport: &Rectangle,
-        renderer: &iced::Renderer,
-    ) -> mouse::Interaction {
-        self.input()
-            .mouse_interaction(&tree.children[0], child(layout), cursor, viewport, renderer)
-    }
-
-    fn overlay<'b>(
-        &'b mut self,
-        tree: &'b mut Tree,
-        layout: Layout<'b>,
-        renderer: &iced::Renderer,
-        viewport: &Rectangle,
-        translation: Vector,
-    ) -> Vec<overlay::Element<'b, Message, Theme, iced::Renderer>> {
-        self.input_mut().overlay(
-            &mut tree.children[0],
-            child(layout),
-            renderer,
-            viewport,
-            translation,
-        )
-    }
+    })
 }
 
-/// The input's own layout inside the wrapper's.
-fn child(layout: Layout<'_>) -> Layout<'_> {
-    layout.children().next().expect("the input's layout")
+/// A single-line field. The chrome (height, border, leading icon) is the
+/// caller's: `.appearance(false)` on the result leaves a bare input to set in a
+/// well, as [`field`](crate) does in the app's filter fields.
+pub fn single_line(spec: FieldSpec<'_>, font: Font, window: &mut Window, cx: &mut App) -> Input {
+    let id = spec.id;
+    let controlled = window.use_keyed_state(id, cx, |window, cx| {
+        let state = cx.new(|cx| InputState::new(window, cx));
+        let callbacks = Rc::new(RefCell::new(Callbacks::default()));
+        let events = subscribe(
+            &state,
+            window,
+            cx,
+            callbacks.clone(),
+            |state: &InputState| state.value().to_string(),
+        );
+        let caret = observe_caret(
+            &state,
+            window,
+            cx,
+            callbacks.clone(),
+            |state: &InputState| (state.value().to_string(), state.cursor()),
+        );
+        Controlled {
+            state,
+            callbacks,
+            _events: events,
+            _caret: caret,
+        }
+    });
+    let (state, callbacks) = {
+        let controlled = controlled.read(cx);
+        (controlled.state.clone(), controlled.callbacks.clone())
+    };
+    let (replace_placeholder, mask) = {
+        let mut callbacks = callbacks.borrow_mut();
+        callbacks.on_input = spec.on_input;
+        callbacks.on_edit = spec.on_edit;
+        callbacks.on_submit = spec.on_submit;
+        let replace = callbacks.placeholder != spec.placeholder;
+        let mask = callbacks.masked != spec.masked;
+        if replace {
+            callbacks.placeholder = spec.placeholder.to_owned();
+        }
+        callbacks.masked = spec.masked;
+        (replace.then(|| spec.placeholder.to_owned()), mask)
+    };
+    let value = spec.value.to_owned();
+    state.update(cx, |state, cx| {
+        if state.value().as_ref() != value {
+            state.set_value(value, window, cx);
+        }
+        if let Some(placeholder) = replace_placeholder {
+            state.set_placeholder(placeholder, window, cx);
+        }
+        if mask {
+            state.toggle_masked(window, cx);
+        }
+    });
+    for request in take_requests(id, cx) {
+        let state = state.clone();
+        window.defer(cx, move |window, cx| {
+            state.update(cx, |state, cx| match request {
+                FocusRequest::Focus => state.focus(window, cx),
+                FocusRequest::SelectAll => {
+                    state.focus(window, cx);
+                    state.select_all(window, cx);
+                }
+                FocusRequest::Caret(at) => state.set_selected_range(at..at, cx),
+            });
+        });
+    }
+    Input::new(&state).id(id).font(font.gpui())
+}
+
+/// A multi-line field that wraps its text. With no `on_input` it is read-only,
+/// which is how the description editor behaves while it saves and how captured
+/// output stays selectable.
+pub fn multi_line(spec: FieldSpec<'_>, font: Font, window: &mut Window, cx: &mut App) -> Textarea {
+    let id = spec.id;
+    let controlled = window.use_keyed_state(id, cx, |window, cx| {
+        let state = cx.new(|cx| TextareaState::new(window, cx));
+        let callbacks = Rc::new(RefCell::new(Callbacks::default()));
+        let events = subscribe(
+            &state,
+            window,
+            cx,
+            callbacks.clone(),
+            |state: &TextareaState| state.value().to_string(),
+        );
+        let caret = observe_caret(
+            &state,
+            window,
+            cx,
+            callbacks.clone(),
+            |state: &TextareaState| (state.value().to_string(), state.cursor()),
+        );
+        Controlled {
+            state,
+            callbacks,
+            _events: events,
+            _caret: caret,
+        }
+    });
+    let (state, callbacks) = {
+        let controlled = controlled.read(cx);
+        (controlled.state.clone(), controlled.callbacks.clone())
+    };
+    let readonly = spec.on_input.is_none() && spec.on_edit.is_none();
+    let replace_placeholder = {
+        let mut callbacks = callbacks.borrow_mut();
+        callbacks.on_input = spec.on_input;
+        callbacks.on_edit = spec.on_edit;
+        callbacks.on_submit = spec.on_submit;
+        let replace = callbacks.placeholder != spec.placeholder;
+        if replace {
+            callbacks.placeholder = spec.placeholder.to_owned();
+        }
+        replace.then(|| spec.placeholder.to_owned())
+    };
+    let value = spec.value.to_owned();
+    state.update(cx, |state, cx| {
+        if state.value().as_ref() != value {
+            state.set_value(value, window, cx);
+        }
+        if let Some(placeholder) = replace_placeholder {
+            state.set_placeholder(placeholder, window, cx);
+        }
+    });
+    for request in take_requests(id, cx) {
+        let state = state.clone();
+        window.defer(cx, move |window, cx| {
+            state.update(cx, |state, cx| match request {
+                FocusRequest::Focus => state.focus(window, cx),
+                FocusRequest::SelectAll => {
+                    state.focus(window, cx);
+                    state.select_all(window, cx);
+                }
+                FocusRequest::Caret(at) => state.set_selected_range(at..at, cx),
+            });
+        });
+    }
+    Textarea::new(&state).readonly(readonly).font(font.gpui())
 }
 
 /// Inset of a [`multi_line`] editor's text from its border.
-pub const EDITOR_PADDING: Padding = Padding {
+pub const EDITOR_PADDING: crate::theme::Padding = crate::theme::Padding {
     top: 10.0,
     right: 12.0,
     bottom: 10.0,
     left: 12.0,
 };
 
-/// The app's multi-line editor (revision descriptions, the split prompt):
-/// the code font at the code size, word wrap, the input outline, ⌘⏎ left to
-/// the form ([`crate::ui::editor_key_binding`]), and word/line drag selection
-/// ([`crate::editor_drag`]). `on_action` is `None` while the text is being
-/// saved, which leaves the editor read-only.
-pub fn multi_line<'a, Message: Clone + 'a>(
-    content: &'a text_editor::Content,
-    spec: MultiLine,
-    theme: ThemeSpec,
-    on_action: Option<impl Fn(text_editor::Action) -> Message + Clone + 'a>,
-) -> Element<'a, Message> {
-    let mut editor = text_editor(content)
-        .key_binding(crate::ui::editor_key_binding)
-        .placeholder(spec.placeholder)
-        .size(spec.size)
-        .font(spec.font)
-        .line_height(text::LineHeight::Relative(
-            crate::measure::LINE_HEIGHT_MULTIPLIER,
-        ))
-        .height(Length::Fixed(spec.height))
-        .padding(EDITOR_PADDING)
-        .wrapping(text::Wrapping::WordOrGlyph)
-        .style(move |_, _| editor_style(theme));
-    if let Some(id) = spec.id {
-        editor = editor.id(iced::widget::Id::new(id));
-    }
-    match on_action {
-        Some(on_action) => {
-            editor = editor.on_action(on_action.clone());
-            let line_height = spec.size * crate::measure::LINE_HEIGHT_MULTIPLIER;
-            crate::editor_drag::editor_drag_area(editor, EDITOR_PADDING, line_height, on_action)
-                .into()
-        }
-        None => editor.into(),
-    }
-}
-
-/// What varies between [`multi_line`] editors.
-pub struct MultiLine {
-    pub id: Option<&'static str>,
-    pub placeholder: &'static str,
-    pub font: Font,
-    pub size: f32,
-    /// Fixed, usually from [`fit_height`] so the box grows with its text.
-    pub height: f32,
-}
-
 /// The height that shows all of `content` wrapped at `width` (the editor's
 /// outer width), between `min` and `max`; past `max` the editor scrolls.
 pub fn fit_height(content: &str, font: Font, size: f32, width: f32, min: f32, max: f32) -> f32 {
     let line_height = (size * crate::measure::LINE_HEIGHT_MULTIPLIER).max(1.0);
     let text_width = (width - EDITOR_PADDING.left - EDITOR_PADDING.right).max(1.0);
-    let lines = crate::measure::wrapped_line_count(content, size, font, line_height, text_width);
+    let lines: usize = content
+        .split('\n')
+        .map(|line| crate::measure::wrapped_line_count(line, size, font, line_height, text_width))
+        .sum();
     let natural = (lines as f32 * line_height).ceil() + EDITOR_PADDING.top + EDITOR_PADDING.bottom;
     natural.clamp(min, max.max(min))
 }
@@ -298,16 +393,4 @@ pub fn fit_height(content: &str, font: Font, size: f32, width: f32, min: f32, ma
 /// commit message's body, never most of the window.
 pub fn editor_max_height(window_height: f32) -> f32 {
     (window_height * 0.45).clamp(160.0, 420.0)
-}
-
-/// The multi-line editor's box: exactly the single-line input's.
-pub fn editor_style(theme: ThemeSpec) -> text_editor::Style {
-    let input = crate::theme::input_style(theme);
-    text_editor::Style {
-        background: input.background,
-        border: input.border,
-        placeholder: input.placeholder,
-        value: input.value,
-        selection: input.selection,
-    }
 }

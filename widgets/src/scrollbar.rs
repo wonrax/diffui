@@ -1,14 +1,15 @@
 //! Vertical scrollbar geometry, drawing, and drag handling shared by
 //! `RevisionList` and `DiffView`.
 //!
-//! The scrollable widgets already own their `vertical_offset` in tree
-//! state; this module just supplies pure helpers so they don't each
-//! reinvent the same hit-testing and pill drawing. The scrollbar is an
-//! overlay — it draws on top of content rather than reserving layout
-//! space, matching the macOS / VS Code feel.
+//! The scrollable widgets own their offset; this module just supplies pure
+//! helpers so they don't each reinvent the same hit-testing and pill drawing.
+//! The scrollbar is an overlay: it draws on top of content rather than
+//! reserving layout space, matching the macOS / VS Code feel.
 
-use iced::advanced::renderer;
-use iced::{Background, Border, Color, Point, Rectangle, Shadow, border};
+use gpui_kit::{Window, fill, px};
+
+use crate::geometry::{Point, Rectangle};
+use crate::theme::Color;
 
 /// Width of the outer (transparent) container holding the track.
 const WIDTH: f32 = 12.0;
@@ -92,40 +93,17 @@ pub fn geometry(bounds: Rectangle, content_height: f32, offset: f32) -> Scrollba
     }
 }
 
-pub fn draw<R: renderer::Renderer>(
-    renderer: &mut R,
-    geometry: &ScrollbarGeometry,
-    style: &ScrollbarStyle,
-) {
+/// Paints the bar. For painters that place their own content (the diff, the
+/// graph); everything else scrolls through [`crate::ui::scrollable`].
+pub fn paint(window: &mut Window, geometry: &ScrollbarGeometry, style: &ScrollbarStyle) {
     let Some(thumb) = geometry.thumb else {
         return;
     };
-    let track_radius = (geometry.track.width.min(geometry.track.height)) / 2.0;
-    renderer.fill_quad(
-        renderer::Quad {
-            bounds: geometry.track,
-            border: Border {
-                radius: border::Radius::from(track_radius),
-                ..Border::default()
-            },
-            shadow: Shadow::default(),
-            snap: true,
-        },
-        Background::Color(style.track_color),
-    );
-    let thumb_radius = (thumb.width.min(thumb.height)) / 2.0;
-    renderer.fill_quad(
-        renderer::Quad {
-            bounds: thumb,
-            border: Border {
-                radius: border::Radius::from(thumb_radius),
-                ..Border::default()
-            },
-            shadow: Shadow::default(),
-            snap: true,
-        },
-        Background::Color(style.thumb_color),
-    );
+    let pill = |rect: Rectangle, color: Color| {
+        fill(rect.bounds(), color).corner_radii(px(rect.width.min(rect.height) / 2.0))
+    };
+    window.paint_quad(pill(geometry.track, style.track_color));
+    window.paint_quad(pill(thumb, style.thumb_color));
 }
 
 #[derive(Debug, Clone, Copy)]

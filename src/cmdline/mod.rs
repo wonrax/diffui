@@ -5,10 +5,13 @@
 //! what Enter will do. Enter runs it through whatever diffui already has: a
 //! view, the target-mode draft, a mutation, an editor, or the jj CLI itself.
 //!
-//! The line is edited in a one-line `text_editor`: its text, caret and
+//! The line is edited in a one-line field: its text, caret and
 //! selection come from one layout, the words are coloured by a highlighter
 //! over that same layout, and its cursor is the command line's cursor.
 
+use crate::Cx;
+use crate::keys as keyboard;
+use crate::keys::Named;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::time::Duration;
@@ -19,16 +22,14 @@ use diffui_core::cli::{
 use diffui_core::completion::{Completion, CompletionKind};
 use diffui_core::revset::{RevsetError, RevsetMatch, RevsetQuery};
 use diffui_core::{DraftKind, JobId, MutationOp, PlacementKind, RevisionSelection, mutations};
-use iced::Task;
-use iced::keyboard::{self, key::Named};
 
 use crate::modes::ModeKind;
 use crate::palette;
-use crate::{Action, Diffui, MainView, Message, TabId};
+use crate::{Action, Diffui, MainView, TabId};
 
 mod plan;
 
-pub(crate) use plan::{PlanState, ResolvedView, Run, sentence};
+pub(crate) use plan::{PlanState, ResolvedView, Run};
 
 /// Focus target of the command line's editor.
 pub(crate) const COMMAND_INPUT_ID: &str = "palette-command-input";
@@ -110,19 +111,6 @@ pub(crate) enum CmdAction {
     Output(crate::cli_output::OutputAction),
 }
 
-/// Widget plumbing for the command line and the revset field.
-#[derive(Debug, Clone)]
-pub(crate) enum CmdEvent {
-    /// Typing paused: resolve the revsets of this version of the line.
-    Settle(u64),
-    /// The revset field's typing paused.
-    FieldSettle(u64),
-    /// Hover over a revset field candidate.
-    FieldSelect(usize),
-    /// Click on a revset field candidate.
-    FieldAccept(usize),
-}
-
 /// How a revset argument resolved, kept by its text so it survives edits
 /// elsewhere on the line.
 #[derive(Debug, Clone)]
@@ -143,58 +131,40 @@ pub(crate) struct HistoryWalk {
     pub(crate) typed: String,
 }
 
-/// The command line's one-line editor. `Content` is neither `Clone` nor
-/// worth printing; the palette state is both.
-pub(crate) struct LineEditor(pub(crate) iced::widget::text_editor::Content);
+/// The command line's one-line editor: what the field shows and where its caret
+/// is. The field reports both ([`crate::input::FieldSpec::on_edit`]) and is told
+/// back through [`place_caret`].
+#[derive(Debug, Clone)]
+pub(crate) struct LineEditor {
+    line: String,
+    cursor: usize,
+}
 
 impl LineEditor {
     fn new(line: &str, cursor: usize) -> Self {
-        let mut editor = Self(iced::widget::text_editor::Content::with_text(line));
-        editor.place(cursor);
-        editor
+        Self {
+            line: line.replace(['\n', '\r'], " "),
+            cursor,
+        }
     }
 
     /// The caret's byte offset into the (one-line) text.
     pub(crate) fn cursor(&self) -> usize {
-        self.0.cursor().position.index
+        self.cursor
     }
 
     /// One line, whatever was pasted.
     pub(crate) fn text(&self) -> String {
-        self.0.text().replace(['\n', '\r'], " ")
+        self.line.clone()
     }
 
-    fn place(&mut self, cursor: usize) {
-        use iced::advanced::text::editor::Cursor;
-        self.0.move_to(Cursor {
-            position: iced::advanced::text::Position {
-                line: 0,
-                index: cursor,
-            },
-            selection: None,
-        });
-    }
-
-    /// Show `line` with the caret at `cursor`, leaving the editor (and its
-    /// undo history) alone when it already does.
+    /// Show `line` with the caret at `cursor`.
     fn sync(&mut self, line: &str, cursor: usize) {
-        if self.text() != line {
+        if self.line != line {
             *self = Self::new(line, cursor);
-        } else if self.cursor() != cursor && self.0.selection().is_none() {
-            self.place(cursor);
+        } else {
+            self.cursor = cursor;
         }
-    }
-}
-
-impl Clone for LineEditor {
-    fn clone(&self) -> Self {
-        Self::new(&self.text(), self.cursor())
-    }
-}
-
-impl std::fmt::Debug for LineEditor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("LineEditor").field(&self.text()).finish()
     }
 }
 
@@ -403,8 +373,7 @@ pub(crate) fn cursor_after_key(
             .map_or(word.len(), |(i, _)| i);
         at + skipped + len
     };
-    let physical = keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Unidentified);
-    let cocoa = crate::ui::cocoa_key(key, physical, modifiers, false);
+    let cocoa = crate::keys::cocoa_key(key, modifiers, false);
     let (key, modifiers) = cocoa
         .as_ref()
         .map_or((key, modifiers), |(key, modifiers)| (key, *modifiers));
@@ -434,19 +403,13 @@ pub(crate) fn apply_completion(line: &str, completion: &Completion) -> (String, 
 }
 
 /// Focus the command line's editor.
-fn focus_command_input() -> Task<Message> {
-    iced::widget::operation::focus(iced::widget::Id::new(COMMAND_INPUT_ID))
+fn focus_command_input(cx: &mut Cx) {
+    crate::input::focus(COMMAND_INPUT_ID, cx)
 }
 
-/// The text-input operation that puts the caret at byte `at` of `line`.
-pub(crate) fn place_caret(id: &'static str, line: &str, at: usize) -> Task<Message> {
-    iced::widget::operation::move_cursor_to(
-        iced::widget::Id::new(id),
-        iced::advanced::text::Position {
-            line: 0,
-            index: floor_boundary(line, at),
-        },
-    )
+/// Puts the caret of field `id` at byte `at` of `line`.
+pub(crate) fn place_caret(id: &'static str, line: &str, at: usize, cx: &mut Cx) {
+    crate::input::set_caret(id, floor_boundary(line, at), cx);
 }
 
 // ── refresh ─────────────────────────────────────────────────────────────
@@ -472,27 +435,31 @@ fn history_candidates(line: &str, cursor: usize, history: &[String]) -> Vec<Comp
 }
 
 impl Diffui {
-    pub(crate) fn on_command_line_action(&mut self, action: CmdAction) -> Task<Message> {
+    pub(crate) fn on_command_line_action(&mut self, action: CmdAction, cx: &mut Cx) {
         match action {
-            CmdAction::Open => self.open_command_line(PREFIX.to_owned()),
+            CmdAction::Open => self.open_command_line(PREFIX.to_owned(), cx),
             CmdAction::FromDraft => match self.draft_command_line() {
-                Some(line) => self.open_command_line(line),
-                None => Task::none(),
+                Some(line) => self.open_command_line(line, cx),
+                None => {}
             },
-            CmdAction::Output(action) => self.on_output_action(action),
+            CmdAction::Output(action) => self.on_output_action(action, cx),
         }
     }
 
-    pub(crate) fn on_cmd_event(&mut self, event: CmdEvent) -> Task<Message> {
-        match event {
-            CmdEvent::Settle(version) => self.settle_command_line(version),
-            CmdEvent::FieldSettle(version) => self.settle_revset_field(version),
-            CmdEvent::FieldSelect(index) => {
-                self.revset_field_select(index);
-                Task::none()
-            }
-            CmdEvent::FieldAccept(index) => self.accept_revset_field(index),
-        }
+    pub(crate) fn cmd_on_settle(&mut self, version: u64, cx: &mut Cx) {
+        self.settle_command_line(version, cx);
+    }
+
+    pub(crate) fn cmd_on_field_settle(&mut self, version: u64, cx: &mut Cx) {
+        self.settle_revset_field(version, cx);
+    }
+
+    pub(crate) fn cmd_on_field_select(&mut self, index: usize, cx: &mut Cx) {
+        self.revset_field_select(index);
+    }
+
+    pub(crate) fn cmd_on_field_accept(&mut self, index: usize, cx: &mut Cx) {
+        self.accept_revset_field(index, cx);
     }
 
     /// The jj grammar and aliases for the active tab's repository, loaded
@@ -545,7 +512,8 @@ impl Diffui {
         &mut self,
         column: &mut palette::PaletteColumn,
         old: &str,
-    ) -> Option<Task<Message>> {
+        cx: &mut Cx,
+    ) -> Option<()> {
         if !is_command(&column.query) {
             if let Some(command) = column.command.take() {
                 self.cancel_command_jobs(&command);
@@ -556,11 +524,12 @@ impl Diffui {
         // command line, typed at its end.
         let entering = column.command.is_none();
         let cursor = cursor_after_edit(old, &column.query, old.len());
-        let task = self.command_line_changed(column, cursor)?;
+        let task = self.command_line_changed(column, cursor, cx)?;
         Some(if entering {
-            Task::batch([task, focus_command_input()])
+            {
+                focus_command_input(cx);
+            }
         } else {
-            task
         })
     }
 
@@ -570,7 +539,8 @@ impl Diffui {
         &mut self,
         column: &mut palette::PaletteColumn,
         cursor: usize,
-    ) -> Option<Task<Message>> {
+        cx: &mut Cx,
+    ) -> Option<()> {
         let walk = column.command.as_ref().and_then(|c| c.history.clone());
         self.refresh_command_line(column, cursor);
         let command = column.command.as_mut()?;
@@ -579,24 +549,20 @@ impl Diffui {
         command.navigated = false;
         command.settled = false;
         command.run_when_ready = false;
-        Some(self.schedule_settle(command))
+        Some(self.schedule_settle(command, cx))
     }
 
     /// An edit or a caret move in the command line's editor.
-    pub(crate) fn command_line_edit(
-        &mut self,
-        action: iced::widget::text_editor::Action,
-    ) -> Task<Message> {
+    pub(crate) fn command_line_edit(&mut self, line: String, cursor: usize, cx: &mut Cx) {
         let Some(mut state) = self.take_palette() else {
-            return Task::none();
+            return;
         };
-        let mut task = Task::none();
         if let Some(column) = state.top_mut()
             && let Some(command) = column.command.as_mut()
         {
-            command.editor.0.perform(action);
-            let line = command.editor.text();
-            let cursor = command.editor.cursor().min(line.len());
+            let line = line.replace(['\n', '\r'], " ");
+            let cursor = cursor.min(line.len());
+            command.editor.sync(&line, cursor);
             if line == column.query {
                 // Only the caret moved: complete what is under it now.
                 if cursor != command.cursor {
@@ -605,9 +571,7 @@ impl Diffui {
             } else {
                 column.query = line.clone();
                 if is_command(&line) {
-                    task = self
-                        .command_line_changed(column, cursor)
-                        .unwrap_or_else(Task::none);
+                    self.command_line_changed(column, cursor, cx).unwrap_or(());
                 } else {
                     // Back to a search: the search input takes over, caret
                     // and all.
@@ -617,40 +581,35 @@ impl Diffui {
                     column.dirty = true;
                     column.query_version = column.query_version.wrapping_add(1);
                     let version = column.query_version;
-                    task = Task::batch([
-                        iced::widget::operation::focus(iced::widget::Id::new(
-                            palette::PALETTE_INPUT_ID,
-                        )),
-                        place_caret(palette::PALETTE_INPUT_ID, &line, cursor),
-                        Task::done(Message::Palette(palette::PaletteMessage::Recompute(
-                            0, version,
-                        ))),
-                    ]);
+                    crate::input::focus(palette::PALETTE_INPUT_ID, cx);
+                    place_caret(palette::PALETTE_INPUT_ID, &line, cursor, cx);
+                    Self::later(cx, move |this, cx| {
+                        this.palette_on_recompute(0, version, cx)
+                    });
                 }
             }
         }
         self.push_mode(crate::modes::Mode::Palette(state));
-        task
     }
 
-    fn schedule_settle(&self, command: &mut CommandLine) -> Task<Message> {
+    fn schedule_settle(&self, command: &mut CommandLine, cx: &mut Cx) {
         command.version = command.version.wrapping_add(1);
         let version = command.version;
-        Task::perform(tokio::time::sleep(SETTLE), move |()| {
-            Message::CommandLine(CmdEvent::Settle(version))
-        })
+        Self::after(SETTLE, cx, move |this, cx| {
+            this.settle_command_line(version, cx)
+        });
     }
 
     /// Typing paused: show errors, and resolve the revsets nobody has yet.
-    pub(crate) fn settle_command_line(&mut self, version: u64) -> Task<Message> {
+    pub(crate) fn settle_command_line(&mut self, version: u64, cx: &mut Cx) {
         let Some(tab) = self.active_tab_id() else {
-            return Task::none();
+            return;
         };
         let Some(command) = self.command_line() else {
-            return Task::none();
+            return;
         };
         if command.version != version {
-            return Task::none();
+            return;
         }
         let wanted: Vec<String> = command.slots().iter().map(|slot| slot.revset.clone()).fold(
             Vec::new(),
@@ -690,18 +649,14 @@ impl Diffui {
                 tasks.push(effects);
             }
         }
-        let task = Task::batch(
-            tasks
-                .into_iter()
-                .map(|effects| self.run_effects(tab, effects))
-                .collect::<Vec<_>>(),
-        );
+        for effects in tasks {
+            self.run_effects(tab, effects, cx);
+        }
         if let Some(command) = self.command_line_mut() {
             command.settled = true;
             command.in_flight.retain(|(job, _)| !stale.contains(job));
             command.in_flight.extend(sent);
         }
-        task
     }
 
     /// A revset the command line asked about resolved.
@@ -711,18 +666,19 @@ impl Diffui {
         job: JobId,
         revset: &str,
         result: Result<RevsetMatch, RevsetError>,
-    ) -> Task<Message> {
+        cx: &mut Cx,
+    ) {
         if let Some(state) = self.tab_mut(tab) {
             state.jobs.cmdline.remove(&job);
         }
         if !self.is_active(tab) {
-            return Task::none();
+            return;
         }
         let Some(command) = self.command_line_mut() else {
-            return Task::none();
+            return;
         };
         let Some(position) = command.in_flight.iter().position(|(id, _)| *id == job) else {
-            return Task::none();
+            return;
         };
         command.in_flight.remove(position);
         let set = result
@@ -734,9 +690,8 @@ impl Diffui {
             .insert(revset.to_owned(), Resolution { result, set });
         if command.run_when_ready && command.in_flight.is_empty() {
             command.run_when_ready = false;
-            return self.run_command_line();
+            return self.run_command_line(cx);
         }
-        Task::none()
     }
 
     fn cancel_command_jobs(&mut self, command: &CommandLine) {
@@ -770,37 +725,38 @@ impl Diffui {
     }
 
     /// Open the palette with `line` typed and the caret at its end.
-    pub(crate) fn open_command_line(&mut self, line: String) -> Task<Message> {
-        let open = self.perform(Action::OpenPalette);
+    pub(crate) fn open_command_line(&mut self, line: String, cx: &mut Cx) {
+        let open = self.perform(Action::OpenPalette, cx);
         let Some(mut state) = self.take_palette() else {
             return open;
         };
-        let mut settle = Task::none();
         if let Some(column) = state.top_mut() {
             column.query = line.clone();
             column.matches.clear();
             self.refresh_command_line(column, line.len());
             if let Some(command) = column.command.as_mut() {
-                settle = self.schedule_settle(command);
+                self.schedule_settle(command, cx);
             }
         }
         self.push_mode(crate::modes::Mode::Palette(state));
-        Task::batch([open, focus_command_input(), settle])
+        {
+            focus_command_input(cx);
+        }
     }
 
     /// ↑/↓ in command mode: walk history from an untouched line, else move
     /// through the candidates.
-    pub(crate) fn command_line_move(&mut self, delta: i32) -> Option<Task<Message>> {
+    pub(crate) fn command_line_move(&mut self, delta: i32, cx: &mut Cx) -> Option<()> {
         let command = self.command_line()?;
         let line = self.palette()?.top()?.query.clone();
         let walking = command.history.is_some();
         let untouched = line == PREFIX && !command.navigated;
         if walking || (untouched && delta < 0) {
-            return Some(self.walk_history(delta));
+            return Some(self.walk_history(delta, cx));
         }
         let command = self.command_line_mut()?;
         if command.completions.is_empty() {
-            return Some(Task::none());
+            return Some(());
         }
         let len = command.completions.len() as i32;
         command.selected = (command.selected as i32 + delta).rem_euclid(len) as usize;
@@ -813,25 +769,17 @@ impl Diffui {
         } else if bottom > command.scroll_y + viewport {
             bottom - viewport
         } else {
-            return Some(Task::none());
+            return Some(());
         };
         command.scroll_y = y.max(0.0);
-        Some(iced::widget::operation::scroll_to(
-            // The command line is always the root column.
-            palette::results_scrollable_id(0),
-            iced::widget::scrollable::AbsoluteOffset {
-                x: 0.0,
-                y: command.scroll_y,
-            },
-        ))
+        Some(())
     }
 
-    fn walk_history(&mut self, delta: i32) -> Task<Message> {
+    fn walk_history(&mut self, delta: i32, cx: &mut Cx) {
         let history: Vec<String> = self.recents.cli.iter().cloned().collect();
         let Some(mut state) = self.take_palette() else {
-            return Task::none();
+            return;
         };
-        let mut task = Task::none();
         if let Some(column) = state.top_mut()
             && let Some(command) = column.command.as_ref()
         {
@@ -862,30 +810,29 @@ impl Diffui {
                 command.history = walk;
                 command.navigated = false;
                 command.settled = false;
-                task = self.schedule_settle(command);
+                self.schedule_settle(command, cx);
             }
         }
         self.push_mode(crate::modes::Mode::Palette(state));
-        task
     }
 
     /// Tab: take the highlighted candidate.
-    pub(crate) fn command_line_complete(&mut self) -> Option<Task<Message>> {
+    pub(crate) fn command_line_complete(&mut self, cx: &mut Cx) -> Option<()> {
         let command = self.command_line()?;
         let completion = command.completions.get(command.selected)?.clone();
-        Some(self.accept_completion(completion))
+        Some(self.accept_completion(completion, cx))
     }
 
     /// Accept the candidate at `index` (a click).
-    pub(crate) fn command_line_accept_index(&mut self, index: usize) -> Task<Message> {
+    pub(crate) fn command_line_accept_index(&mut self, index: usize, cx: &mut Cx) {
         let Some(completion) = self
             .command_line()
             .and_then(|command| command.completions.get(index))
             .cloned()
         else {
-            return Task::none();
+            return;
         };
-        self.accept_completion(completion)
+        self.accept_completion(completion, cx)
     }
 
     pub(crate) fn command_line_select(&mut self, index: usize) {
@@ -896,11 +843,10 @@ impl Diffui {
         }
     }
 
-    fn accept_completion(&mut self, completion: Completion) -> Task<Message> {
+    fn accept_completion(&mut self, completion: Completion, cx: &mut Cx) {
         let Some(mut state) = self.take_palette() else {
-            return Task::none();
+            return;
         };
-        let mut task = Task::none();
         if let Some(column) = state.top_mut() {
             let (line, cursor) = apply_completion(&column.query, &completion);
             column.query = line.clone();
@@ -909,40 +855,39 @@ impl Diffui {
                 command.history = None;
                 command.navigated = false;
                 command.settled = false;
-                task = self.schedule_settle(command);
+                self.schedule_settle(command, cx);
             }
         }
         self.push_mode(crate::modes::Mode::Palette(state));
-        task
     }
 
     /// Enter: take the highlighted candidate when the user went looking for
     /// one or the line can't run as it is; otherwise run the line.
-    pub(crate) fn command_line_submit(&mut self) -> Task<Message> {
+    pub(crate) fn command_line_submit(&mut self, cx: &mut Cx) {
         let Some(command) = self.command_line() else {
-            return Task::none();
+            return;
         };
         let picked = command.completions.get(command.selected).cloned();
         let runnable = command.parsed.is_ok();
         if let Some(completion) = picked
             && (command.navigated || !runnable)
         {
-            return self.accept_completion(completion);
+            return self.accept_completion(completion, cx);
         }
-        self.run_command_line()
+        self.run_command_line(cx)
     }
 
     /// Run the line, or wait for its revsets and run then.
-    pub(crate) fn run_command_line(&mut self) -> Task<Message> {
+    pub(crate) fn run_command_line(&mut self, cx: &mut Cx) {
         let Some(command) = self.command_line() else {
-            return Task::none();
+            return;
         };
         let Some(line) = self
             .palette()
             .and_then(|s| s.top())
             .map(|c| c.query.clone())
         else {
-            return Task::none();
+            return;
         };
         // Errors show at once on Enter, settled or not.
         let pending_settle = !command.settled;
@@ -954,16 +899,14 @@ impl Diffui {
                     command.settled = true;
                     command.insisted = true;
                 }
-                Task::none()
             }
             PlanState::Pending => {
                 if let Some(command) = self.command_line_mut() {
                     command.run_when_ready = true;
                 }
                 if pending_settle {
-                    self.settle_command_line(version)
+                    self.settle_command_line(version, cx)
                 } else {
-                    Task::none()
                 }
             }
             PlanState::Ready(run) => {
@@ -984,79 +927,85 @@ impl Diffui {
                     self.cancel_command_jobs(&command);
                 }
                 self.pop_mode(ModeKind::Palette);
-                self.execute(run)
+                self.execute(run, cx)
             }
         }
     }
 
-    fn execute(&mut self, run: Run) -> Task<Message> {
+    fn execute(&mut self, run: Run, cx: &mut Cx) {
         // What the typed line does replaces a draft in progress; a view
         // leaves it alone.
         if !matches!(run, Run::View(_)) {
             self.active_mut().pop_mode(ModeKind::Draft);
         }
         match run {
-            Run::View(view) => self.run_view(view),
-            Run::Native { action, command } => self.run_native(action, command),
-            Run::Ui { command, target } => self.run_ui(command, target),
-            Run::Cli { args } => self.start_cli_run(args),
+            Run::View(view) => self.run_view(view, cx),
+            Run::Native { action, command } => self.run_native(action, command, cx),
+            Run::Ui { command, target } => self.run_ui(command, target, cx),
+            Run::Cli { args } => self.start_cli_run(args, cx),
         }
     }
 
-    fn show_diff_view(&mut self) -> Task<Message> {
+    fn show_diff_view(&mut self, cx: &mut Cx) {
         if self.active().main_view == MainView::Diff {
-            Task::none()
         } else {
-            self.perform(Action::SetMainView(MainView::Diff))
+            self.perform(Action::SetMainView(MainView::Diff), cx)
         }
     }
 
-    fn run_view(&mut self, view: ResolvedView) -> Task<Message> {
+    fn run_view(&mut self, view: ResolvedView, cx: &mut Cx) {
         let Some(tab) = self.active_tab_id() else {
-            return Task::none();
+            return;
         };
         match view {
             ResolvedView::Diff(request) => {
-                let show = self.show_diff_view();
+                let show = self.show_diff_view(cx);
                 let state = self.active_mut();
                 state.pending_revision_reveal = true;
                 let effects = state.session.diff_revsets(request);
-                Task::batch([show, self.run_effects(tab, effects)])
+                {
+                    self.run_effects(tab, effects, cx);
+                }
             }
             ResolvedView::Log(revset) => {
                 let revset = revset.unwrap_or_else(|| self.active().default_revset.clone());
-                self.perform(Action::SetRevset(revset))
+                self.perform(Action::SetRevset(revset), cx)
             }
-            ResolvedView::Evolog(revision) => self.perform(Action::History(
-                crate::history_panel::HistoryAction::ShowEvolog(revision),
-            )),
-            ResolvedView::OpLog => self.perform(Action::History(
-                crate::history_panel::HistoryAction::ShowOpLog,
-            )),
+            ResolvedView::Evolog(revision) => self.perform(
+                Action::History(crate::history_panel::HistoryAction::ShowEvolog(revision)),
+                cx,
+            ),
+            ResolvedView::OpLog => self.perform(
+                Action::History(crate::history_panel::HistoryAction::ShowOpLog),
+                cx,
+            ),
             ResolvedView::Annotate { revision, path } => {
-                let browse = self.perform(Action::BrowseSource {
-                    revision,
-                    path: Some(path),
-                });
+                let browse = self.perform(
+                    Action::BrowseSource {
+                        revision,
+                        path: Some(path),
+                    },
+                    cx,
+                );
                 let annotate = if self.active().history.annotating() {
-                    Task::none()
                 } else {
-                    self.perform(Action::History(
-                        crate::history_panel::HistoryAction::ToggleAnnotate,
-                    ))
+                    self.perform(
+                        Action::History(crate::history_panel::HistoryAction::ToggleAnnotate),
+                        cx,
+                    )
                 };
-                Task::batch([browse, annotate])
+                {}
             }
         }
     }
 
-    fn run_native(&mut self, action: NativeAction, command: MutationCommand) -> Task<Message> {
+    fn run_native(&mut self, action: NativeAction, command: MutationCommand, cx: &mut Cx) {
         let op = match action {
-            NativeAction::Fetch(target) => return self.start_fetch(target),
+            NativeAction::Fetch(target) => return self.start_fetch(target, cx),
             NativeAction::Mutate(op) => op,
         };
         if let Some((kind, placement)) = command.draft_kind()
-            && let Some(task) = self.draft_from_op(kind, placement, &op)
+            && let Some(task) = self.draft_from_op(kind, placement, &op, cx)
         {
             return task;
         }
@@ -1067,7 +1016,7 @@ impl Diffui {
                 ..
             }
         );
-        self.start_mutation(op, allow_backwards)
+        self.start_mutation(op, allow_backwards, cx)
     }
 
     /// Land a typed rebase / squash / placed new or duplicate / parallelize
@@ -1080,7 +1029,8 @@ impl Diffui {
         kind: DraftKind,
         placement: PlacementKind,
         op: &MutationOp,
-    ) -> Option<Task<Message>> {
+        cx: &mut Cx,
+    ) -> Option<()> {
         use mutations::{Destination, SquashTarget};
         let (sources, destination) = match op {
             MutationOp::Rebase {
@@ -1093,7 +1043,7 @@ impl Diffui {
                 into: SquashTarget::Revision(into),
             } => {
                 let armed = Some((into.clone(), PlacementKind::Onto));
-                return self.arm_draft(kind, from.clone(), armed);
+                return self.arm_draft(kind, from.clone(), armed, cx);
             }
             MutationOp::NewAt { destination } => (Vec::new(), Some(destination)),
             MutationOp::DuplicateTo {
@@ -1112,7 +1062,7 @@ impl Diffui {
                 | Destination::Before(target),
             ) => Some((target.clone(), placement)),
         };
-        self.arm_draft(kind, sources, armed)
+        self.arm_draft(kind, sources, armed, cx)
     }
 
     fn arm_draft(
@@ -1120,36 +1070,42 @@ impl Diffui {
         kind: DraftKind,
         sources: Vec<RevisionSelection>,
         armed: Option<(RevisionSelection, PlacementKind)>,
-    ) -> Option<Task<Message>> {
+        cx: &mut Cx,
+    ) -> Option<()> {
         let loaded = |selection: &RevisionSelection| self.draft_source_for(selection).is_some();
         if !sources.iter().all(loaded) || armed.as_ref().is_some_and(|(target, _)| !loaded(target))
         {
             return None;
         }
-        let task = self.start_draft_with(kind, sources, armed);
+        let task = self.start_draft_with(kind, sources, armed, cx);
         self.active().op_draft().is_some().then_some(task)
     }
 
-    fn run_ui(&mut self, command: UiCommand, target: RevisionSelection) -> Task<Message> {
+    fn run_ui(&mut self, command: UiCommand, target: RevisionSelection, cx: &mut Cx) {
         match command {
-            UiCommand::Describe { .. } => self.perform(Action::EditDescription {
-                target: Some(target),
-            }),
+            UiCommand::Describe { .. } => self.perform(
+                Action::EditDescription {
+                    target: Some(target),
+                },
+                cx,
+            ),
             UiCommand::Commit => {
-                self.perform(Action::Revops(crate::revops::RevopsAction::BeginCommit))
+                self.perform(Action::Revops(crate::revops::RevopsAction::BeginCommit), cx)
             }
             UiCommand::Split { .. } => {
-                let show = self.show_diff_view();
-                Task::batch([show, self.perform(Action::SelectRevision(target))])
+                let show = self.show_diff_view(cx);
+                {
+                    self.perform(Action::SelectRevision(target), cx);
+                }
             }
             UiCommand::Resolve { paths, .. } => {
-                let show = self.show_diff_view();
-                let select = self.perform(Action::SelectRevision(target));
+                let show = self.show_diff_view(cx);
+                let select = self.perform(Action::SelectRevision(target), cx);
                 let file = match paths.first() {
-                    Some(path) => self.perform(Action::JumpToFile(path.value.clone())),
-                    None => Task::none(),
+                    Some(path) => self.perform(Action::JumpToFile(path.value.clone()), cx),
+                    None => {}
                 };
-                Task::batch([show, select, file])
+                {}
             }
         }
     }

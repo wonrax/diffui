@@ -6,17 +6,13 @@
 //! `[keys]` override shows up here as bound, and a default it shadowed does
 //! not.
 
-use iced::{
-    Alignment, Background, Border, Element, Length, Padding, Task, alignment,
-    font::Weight,
-    widget::{Space, column, container, row, text},
-};
-
+use crate::Cx;
+use crate::Diffui;
 use crate::commands::{self, CommandArg, CommandId, Context, REGISTRY};
 use crate::modes::{Mode, ModeKind};
-use crate::theme::{self, ThemeSpec, emphasis_font, text_size};
-use crate::typography::{self, Aligned};
-use crate::{Action, Diffui, Message, UiEvent};
+use crate::theme::ThemeSpec;
+use crate::typography::Aligned;
+use gpui_kit::{AnyElement, Window};
 
 const CARD_WIDTH: f32 = 760.0;
 const CARD_MAX_HEIGHT: f32 = 720.0;
@@ -166,7 +162,7 @@ fn label(id: CommandId) -> String {
 }
 
 impl Diffui {
-    pub(crate) fn toggle_shortcuts(&mut self) -> Task<Message> {
+    pub(crate) fn toggle_shortcuts(&mut self, cx: &mut Cx) {
         if self.pop_mode(ModeKind::Shortcuts).is_none() {
             // It replaces the transient overlays rather than stacking over
             // them: they share one keyboard.
@@ -175,292 +171,7 @@ impl Diffui {
             self.pop_mode(ModeKind::ActivityPopover);
             self.push_mode(Mode::Shortcuts);
         }
-        Task::none()
     }
-}
-
-/// The sheet over a scrim, or an empty `Space` when it is closed.
-pub(crate) fn build_overlay(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
-    if ui.mode(ModeKind::Shortcuts).is_none() {
-        return Space::new().into();
-    }
-
-    let mut left = column![].spacing(theme::space::XL);
-    let mut right = column![].spacing(theme::space::XL);
-    let rows_of = |entries: Vec<Entry>| -> Vec<Element<'_, Message>> {
-        entries
-            .into_iter()
-            .map(|entry| binding_row(ui, theme, entry.label, entry.keys, entry.disabled))
-            .collect()
-    };
-    // Revisions is the long one: it and the repository keys go left, the
-    // rest balances against them on the right.
-    let base = entries(ui, Context::Base);
-    for title in [
-        "General",
-        "Revisions",
-        "Diff pane and files",
-        "Repository and history",
-    ] {
-        let rows: Vec<Entry> = base
-            .iter()
-            .filter(|entry| base_group(entry.id) == title)
-            .cloned()
-            .collect();
-        if rows.is_empty() {
-            continue;
-        }
-        let block = section(ui, theme, title, rows_of(rows));
-        if matches!(title, "Revisions" | "Repository and history") {
-            left = left.push(block);
-        } else {
-            right = right.push(block);
-        }
-    }
-    for (context, title) in SECTIONS {
-        let rows = entries(ui, *context);
-        if rows.is_empty() {
-            continue;
-        }
-        right = right.push(section(ui, theme, title, rows_of(rows)));
-    }
-    let gestures = GESTURES
-        .iter()
-        .map(|(gesture, what)| {
-            binding_row(
-                ui,
-                theme,
-                (*what).to_owned(),
-                vec![(*gesture).to_owned()],
-                None,
-            )
-        })
-        .collect();
-    left = left.push(section(ui, theme, "Mouse", gestures));
-
-    let title_font = emphasis_font(ui.config.ui_font, Weight::Medium);
-    let header = row![typography::baseline_row(
-        [
-            Aligned::text(
-                text("Keyboard shortcuts")
-                    .size(text_size::TITLE)
-                    .color(theme.text)
-                    .font(title_font)
-                    .width(Length::Fill),
-                title_font,
-                text_size::TITLE,
-            ),
-            Aligned::text(
-                text("Rebind in config.toml [keys]   \u{b7}   esc to close")
-                    .size(text_size::CAPTION)
-                    .color(theme.subtle_text)
-                    .font(ui.config.ui_font),
-                ui.config.ui_font,
-                text_size::CAPTION,
-            ),
-        ],
-        0.0,
-    )]
-    .padding(Padding {
-        right: crate::ui::DIALOG_PADDING,
-        ..Padding::ZERO
-    });
-
-    let columns = row![
-        left.width(Length::FillPortion(1)),
-        right.width(Length::FillPortion(1))
-    ]
-    .spacing(theme::space::XXL * 1.5);
-
-    let body = column![
-        header,
-        // The list scrolls out to the card's right edge, so the bar sits
-        // where every other scroll view's does; the inset moves inside.
-        crate::ui::scrollable(
-            container(columns).padding(Padding {
-                right: crate::ui::DIALOG_PADDING,
-                ..Padding::ZERO
-            }),
-            theme,
-        )
-        .height(Length::Fill),
-    ]
-    .spacing(theme::space::XL);
-
-    let card = crate::ui::dialog_card(body, CARD_WIDTH, theme)
-        .padding(Padding {
-            right: 0.0,
-            ..Padding::from(crate::ui::DIALOG_PADDING)
-        })
-        .height(Length::Fixed(
-            (ui.window_size.height - crate::toolbar::modal_top() - theme::space::XXL)
-                .clamp(240.0, CARD_MAX_HEIGHT),
-        ));
-    crate::ui::modal(
-        card,
-        crate::toolbar::modal_top(),
-        Message::Action(Action::CloseShortcuts),
-        Message::Ui(UiEvent::ConfirmNoOp),
-    )
-}
-
-fn section<'a>(
-    ui: &'a Diffui,
-    theme: ThemeSpec,
-    title: &'a str,
-    rows: Vec<Element<'a, Message>>,
-) -> Element<'a, Message> {
-    let mut block = column![
-        container(
-            text(title)
-                .size(text_size::CAPTION)
-                .color(theme.subtle_text)
-                .font(emphasis_font(ui.config.ui_font, Weight::Semibold)),
-        )
-        .padding(Padding {
-            bottom: theme::space::XS,
-            ..Padding::ZERO
-        })
-    ]
-    .spacing(0);
-    for row in rows {
-        block = block.push(row);
-    }
-    block.into()
-}
-
-fn binding_row<'a>(
-    ui: &'a Diffui,
-    theme: ThemeSpec,
-    label: String,
-    keys: Vec<String>,
-    disabled: Option<commands::Reason>,
-) -> Element<'a, Message> {
-    let font = ui.config.ui_font;
-    let label = text(label)
-        .size(text_size::UI)
-        .font(font)
-        .wrapping(text::Wrapping::None)
-        .ellipsis(text::Ellipsis::End);
-    // The label and the mono keycaps share a baseline (see
-    // `crate::typography`). A command that can't run right now greys out
-    // and says why after its label.
-    let mut line = match disabled {
-        None => vec![Aligned::text(
-            label.color(theme.text).width(Length::Fill),
-            font,
-            text_size::UI,
-        )],
-        Some(reason) => vec![
-            Aligned::text(label.color(theme.subtle_text), font, text_size::UI),
-            Aligned::gap(theme::space::SM),
-            Aligned::text(
-                text(reason)
-                    .size(text_size::CAPTION)
-                    .color(theme.subtle_text)
-                    .font(font)
-                    .width(Length::Fill)
-                    .wrapping(text::Wrapping::None)
-                    .ellipsis(text::Ellipsis::End),
-                font,
-                text_size::CAPTION,
-            ),
-        ],
-    };
-    for (index, key) in keys.into_iter().enumerate() {
-        line.push(Aligned::gap(if index == 0 {
-            theme::space::MD
-        } else {
-            theme::space::XS
-        }));
-        line.push(keycap(ui, theme, key));
-    }
-    container(typography::baseline_row(line, 0.0))
-        .height(Length::Fixed(ROW_HEIGHT))
-        .center_y(Length::Fixed(ROW_HEIGHT))
-        .into()
-}
-
-/// A key rendered like the tab strip's `⌘K` control: hairline border, mono.
-pub(crate) fn keycap<'a>(ui: &'a Diffui, theme: ThemeSpec, key: String) -> Aligned<'a, Message> {
-    let mono = ui.config.mono_font;
-    Aligned::chip(
-        text(key)
-            .size(text_size::CAPTION)
-            .color(theme.muted_text)
-            .font(mono),
-        mono,
-        text_size::CAPTION,
-        Padding::from([1, 5]),
-        move |_| container::Style {
-            background: Some(Background::Color(theme::chip_background(theme.muted_text))),
-            border: Border {
-                width: 1.0,
-                color: theme.border,
-                radius: 4.0.into(),
-            },
-            ..container::Style::default()
-        },
-    )
-}
-
-/// The welcome screen's tips: the few keys and gestures that make the rest
-/// discoverable, under the open prompt. Chords come from the keymap so an
-/// override shows up here too.
-pub(crate) fn welcome_hints(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
-    let chord = |id: CommandId| {
-        ui.keymap
-            .chord_for(Context::Base, id)
-            .map(|chord| chord.display())
-    };
-    let tip = |key: Option<String>, what: &'static str| -> Element<'_, Message> {
-        let mut line = Vec::new();
-        if let Some(key) = key {
-            line.push(keycap(ui, theme, key));
-        }
-        line.push(Aligned::text(
-            text(what)
-                .size(text_size::UI)
-                .color(theme.subtle_text)
-                .font(ui.config.ui_font),
-            ui.config.ui_font,
-            text_size::UI,
-        ));
-        typography::baseline_row(line, theme::space::SM)
-    };
-    // The prompt above owns the keyboard here, and the palette needs a
-    // repository, so these read as "once one is open".
-    let heading = text("Once a repository is open")
-        .size(text_size::CAPTION)
-        .color(theme.subtle_text)
-        .font(emphasis_font(ui.config.ui_font, Weight::Medium));
-    let keys = row![
-        tip(chord("palette.toggle"), "Command palette"),
-        tip(chord("help.shortcuts"), "All shortcuts"),
-        tip(chord("repo.open-dialog"), "Open another"),
-    ]
-    .spacing(theme::space::XL)
-    .align_y(Alignment::Center);
-    let gestures = text(
-        "Right-click a revision for its actions  \u{b7}  drag a revision or marked set onto another to rebase",
-    )
-    .size(text_size::UI)
-    .color(theme.subtle_text)
-    .font(ui.config.ui_font);
-    let all = crate::ui::button(
-        text("Keyboard shortcuts")
-            .size(text_size::UI)
-            .color(theme.muted_text)
-            .font(ui.config.ui_font),
-        crate::ui::Variant::Ghost,
-        crate::ui::Size::Compact,
-        theme,
-    )
-    .on_press(Message::Action(Action::ToggleShortcuts));
-    column![heading, keys, gestures, all]
-        .spacing(theme::space::MD)
-        .align_x(alignment::Horizontal::Center)
-        .into()
 }
 
 #[cfg(test)]
@@ -518,4 +229,41 @@ mod tests {
         assert_eq!(base_group("palette.toggle"), "General");
         assert_eq!(base_group("tab.select"), "General");
     }
+}
+
+/// Stub: the shortcuts view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn build_overlay(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::overlay(
+        "shortcuts::build_overlay",
+        ui.mode(ModeKind::Shortcuts).is_some(),
+    )
+}
+
+/// Stub: the shortcuts view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn keycap(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    key: String,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> Aligned {
+    crate::stub::aligned("shortcuts::keycap")
+}
+
+/// Stub: the shortcuts view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn welcome_hints(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::panel("shortcuts::welcome_hints")
 }

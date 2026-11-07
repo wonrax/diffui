@@ -3,13 +3,13 @@
 //! is up, the list's rows are its display rows, so every index the list
 //! reports goes through here on its way back to a loaded row.
 
+use crate::Cx;
 use std::rc::Rc;
 
 use diffui_core::{JobId, PreviewGraph};
 
 use crate::revision_list::{self, DropSpot};
-use crate::{Diffui, Message, TabId, TabState};
-use iced::Task;
+use crate::{Diffui, TabId, TabState};
 
 /// A preview laid over the rows of one graph load. Stale (and not drawn)
 /// once the session's graph is replaced.
@@ -108,8 +108,7 @@ impl Diffui {
     /// Run after every update: cancel a draft simulation nobody is waiting
     /// for any more (the draft ended, or its destination was dropped), so the
     /// repository stops spending time on it.
-    pub(crate) fn cancel_unwanted_preview(&mut self) -> Task<Message> {
-        let mut tasks = Vec::new();
+    pub(crate) fn cancel_unwanted_preview(&mut self, cx: &mut Cx) {
         let ids: Vec<TabId> = self.tabs.iter().map(|tab| tab.id).collect();
         for id in ids {
             let Some(tab) = self.tab_mut(id) else {
@@ -124,14 +123,14 @@ impl Diffui {
             let Some(job) = tab.jobs.preview.take() else {
                 continue;
             };
-            tasks.push(self.run_effects(
+            self.run_effects(
                 id,
                 vec![diffui_core::Effect::Send(diffui_core::Command::Cancel {
                     job,
                 })],
-            ));
+                cx,
+            );
         }
-        Task::batch(tasks)
     }
 
     /// Run after every update: when the sidebar is about to draw a different

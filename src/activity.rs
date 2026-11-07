@@ -13,26 +13,14 @@
 //! Entries are **persistent**: running and finished alike stay until the user
 //! clears them or the app restarts — nothing auto-dismisses.
 
+use crate::Cx;
+use crate::modes::ModeKind;
+use gpui_kit::{AnyElement, Window};
 use std::time::{Duration, Instant};
 
-use iced::{
-    Background, Border, Color, Element, Length, Padding, alignment,
-    font::Weight,
-    widget::{
-        Space, button, column, container, mouse_area, opaque, responsive, row, stack, text,
-        text_editor,
-    },
-};
-
-use crate::chip;
-use crate::ellipsis;
-use crate::icons;
+use crate::Diffui;
 use crate::prose::Prose;
-use crate::theme::{
-    ThemeSpec, chip_background, emphasis_font, ghost_button_style, popover_style, text_size,
-};
-use crate::typography::Aligned;
-use crate::{Action, Diffui, Message, UiEvent};
+use crate::theme::ThemeSpec;
 use diffui_core::LoadProgress;
 
 /// Frames for the running spinner. Braille-dot frames read as a smooth orbit
@@ -106,7 +94,7 @@ pub struct Activity {
     /// single buffer so a selection can sweep across lines (separate per-line
     /// widgets each hold their own). `Some` exactly while `expanded` with any
     /// `detail`; rebuilt from `detail` by [`Activity::sync_detail_editor`].
-    pub detail_editor: Option<text_editor::Content>,
+    pub detail_editor: Option<String>,
     /// The jj operation a finished mutation committed — arms the row's
     /// one-click "Revert" (reverts exactly this op, not just the latest).
     /// Cleared when fired, so it can't double-revert.
@@ -137,7 +125,7 @@ impl Activity {
                 ));
             }
             text.push_str(&self.detail.join("\n"));
-            text_editor::Content::with_text(&text)
+            (&text).to_owned()
         });
     }
 
@@ -314,20 +302,6 @@ impl ActivityLog {
         }
     }
 
-    /// Apply a `text_editor` action to an expanded row's output buffer.
-    /// Edit actions are dropped here — the buffer is a read-only view of the
-    /// captured output; only caret, selection, and scroll go through.
-    pub fn perform_detail_action(&mut self, id: ActivityId, action: text_editor::Action) {
-        if action.is_edit() {
-            return;
-        }
-        if let Some(activity) = self.get_mut(id)
-            && let Some(editor) = activity.detail_editor.as_mut()
-        {
-            editor.perform(action);
-        }
-    }
-
     /// Drop finished entries, keeping anything still running or queued (so the
     /// log never hides pending work). Bound to the popover's "Clear".
     pub fn clear_finished(&mut self) {
@@ -395,355 +369,6 @@ fn spinner_glyph(started: Instant) -> &'static str {
 /// Height of [`activity_progress_line`], which the toolbar always reserves.
 pub const PROGRESS_LINE_HEIGHT: f32 = 2.0;
 
-/// The right-edge toolbar control: a clickable chip that shows the first
-/// running task (spinner + label + `+N`) while work is in flight, or a quiet
-/// "Activity" affordance otherwise. Click → open/close the popover.
-pub fn activity_indicator(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
-    let mono = ui.config.mono_font;
-    let activities = &ui.active().activities;
-    let running = activities.running_count();
-    let queued = activities.queued_count();
-
-    // Spinner, label and count badges on one baseline (see
-    // `crate::typography`).
-    let font = ui.config.ui_font;
-    let badge = |label: String, color: Color| {
-        Aligned::chip(
-            text(label).size(text_size::BADGE).font(mono).color(color),
-            mono,
-            text_size::BADGE,
-            Padding::from([1, 5]),
-            move |_| chip::container_style(color),
-        )
-    };
-    let body: Element<'_, Message> = if let Some(active) = activities.first_running_visible() {
-        let mut chips = vec![
-            Aligned::text(
-                text(spinner_glyph(active.started))
-                    .size(text_size::UI)
-                    .font(mono)
-                    .color(theme.accent),
-                mono,
-                text_size::UI,
-            ),
-            Aligned::text(
-                active
-                    .label
-                    .view(font, mono, theme.text, theme)
-                    .size(text_size::UI),
-                font,
-                text_size::UI,
-            ),
-        ];
-        if running > 1 {
-            chips.push(badge(format!("+{}", running - 1), theme.muted_text));
-        }
-        if queued > 0 {
-            chips.push(badge(format!("{queued} queued"), theme.subtle_text));
-        }
-        crate::typography::baseline_row(chips, 6.0)
-    } else {
-        // Idle: a muted glyph that still opens the popover so finished entries
-        // remain reachable.
-        let glyph = if ui.active().activities.is_empty() {
-            icons::CIRCLE // no activity yet
-        } else {
-            icons::CHECK // idle — everything finished
-        };
-        crate::typography::baseline_row(
-            [
-                Aligned::glyph(
-                    icons::icon(glyph, crate::ui::ICON_SIZE, theme.subtle_text),
-                    crate::ui::ICON_SIZE,
-                ),
-                Aligned::text(
-                    text("Activity")
-                        .size(text_size::UI)
-                        .font(font)
-                        .color(theme.subtle_text),
-                    font,
-                    text_size::UI,
-                ),
-            ],
-            6.0,
-        )
-    };
-
-    crate::ui::button(
-        body,
-        crate::ui::Variant::Ghost,
-        crate::ui::Size::Compact,
-        theme,
-    )
-    .on_press(Message::Action(Action::ToggleActivityPopover))
-    .into()
-}
-
-/// The thin progress line drawn along the toolbar's bottom edge. Tracks the
-/// first running activity (determinate → fractional fill; otherwise a pulsing
-/// accent bar). `diff_loading` lights the line for a transient revision-switch
-/// diff load that isn't a logged activity. A fixed 2px height keeps the toolbar
-/// from shifting when idle.
-pub fn activity_progress_line(ui: &Diffui, theme: ThemeSpec) -> Element<'static, Message> {
-    // Both visuals are held back until the work has run past the display delay,
-    // so short ops don't flash. `loading_since` times the (un-logged)
-    // revision-switch diff load the same way an activity's `started` does.
-    let active = ui.active().activities.first_running_visible();
-    let diff_loading = ui
-        .active()
-        .session
-        .loading_since
-        .is_some_and(|since| since.elapsed() >= ACTIVITY_DISPLAY_DELAY);
-
-    // Determinate fill — only when the running op reports a real total.
-    if let Some(activity) = active {
-        let (loaded, total, determinate) = activity.progress_snapshot();
-        if determinate {
-            let fraction = (loaded as f32 / total as f32).clamp(0.0, 1.0);
-            let fill = (fraction * 1000.0) as u16;
-            let rest = 1000u16.saturating_sub(fill);
-            let accent = theme.accent;
-            let mut bar = row![].height(Length::Fixed(PROGRESS_LINE_HEIGHT));
-            if fill > 0 {
-                bar = bar.push(
-                    container(Space::new())
-                        .width(Length::FillPortion(fill))
-                        .height(Length::Fixed(PROGRESS_LINE_HEIGHT))
-                        .style(move |_| solid(accent)),
-                );
-            }
-            if rest > 0 {
-                bar = bar.push(Space::new().width(Length::FillPortion(rest)));
-            }
-            return bar.into();
-        }
-    }
-
-    // Indeterminate (running with no total, or a diff load): a pulsing accent
-    // bar. Opacity oscillates off elapsed time; the toolbar tick re-renders.
-    if active.is_some() || diff_loading {
-        let phase = active.map(|a| a.started.elapsed().as_millis()).unwrap_or(0) as f32 / 1000.0;
-        // 0.30..0.85 sine pulse.
-        let alpha = 0.30 + 0.55 * (0.5 + 0.5 * (phase * std::f32::consts::TAU * 0.8).sin());
-        let color = Color {
-            a: alpha,
-            ..theme.accent
-        };
-        return container(Space::new())
-            .width(Length::Fill)
-            .height(Length::Fixed(PROGRESS_LINE_HEIGHT))
-            .style(move |_| solid(color))
-            .into();
-    }
-
-    // Idle: an invisible spacer so the toolbar height is stable.
-    Space::new()
-        .height(Length::Fixed(PROGRESS_LINE_HEIGHT))
-        .into()
-}
-
-/// The activity popover: a scrim + a top-right card listing every entry. Empty
-/// `Space` when closed.
-pub fn activity_popover(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
-    if !ui.activity_popover_open() {
-        return Space::new().into();
-    }
-
-    let scrim = mouse_area(
-        container(Space::new().width(Length::Fill).height(Length::Fill))
-            .width(Length::Fill)
-            .height(Length::Fill),
-    )
-    .on_press(Message::Action(Action::ToggleActivityPopover));
-
-    let header = row![
-        crate::typography::centered(
-            text("Activity")
-                .size(text_size::BODY_LG)
-                .font(emphasis_font(ui.config.ui_font, Weight::Semibold))
-                .color(theme.text),
-            emphasis_font(ui.config.ui_font, Weight::Semibold),
-            text_size::BODY_LG,
-        ),
-        Space::new().width(Length::Fill),
-        clear_button(ui, theme),
-    ]
-    .align_y(alignment::Vertical::Center)
-    .spacing(8);
-
-    let mut list = column![].spacing(2);
-    if ui.active().activities.is_empty() {
-        list = list.push(
-            container(
-                text("No activity yet.")
-                    .size(text_size::UI)
-                    .font(ui.config.ui_font)
-                    .color(theme.subtle_text),
-            )
-            .padding(Padding::from([6, 8])),
-        );
-    } else {
-        // Newest first so the latest op is on top.
-        for activity in ui.active().activities.activities.iter().rev() {
-            list = list.push(activity_row(ui, theme, activity));
-        }
-    }
-
-    // The card carries no padding of its own so the divider can run edge to
-    // edge; the header/list insets are chosen so the rows' status icons (list
-    // pad 8 + row pad 8) sit exactly under the header text (pad 16). The
-    // header row is one control step tall for the Clear button, whose label
-    // (pad 6 + button pad 10) ends over the durations.
-    let body = column![
-        container(header).width(Length::Fill).padding(Padding {
-            top: 8.0,
-            right: 6.0,
-            bottom: 8.0,
-            left: 16.0,
-        }),
-        container(Space::new())
-            .width(Length::Fill)
-            .height(Length::Fixed(1.0))
-            .style(move |_| solid(theme.border)),
-        // The list scrolls out to the card's right edge, where the bar sits
-        // as in every scroll view; its right inset moves inside.
-        container(
-            crate::ui::scrollable(
-                container(list).padding(Padding {
-                    right: 8.0,
-                    ..Padding::ZERO
-                }),
-                theme,
-            )
-            .height(Length::Shrink),
-        )
-        .height(Length::Fit.max(520.0))
-        .padding(Padding {
-            top: 6.0,
-            right: 0.0,
-            bottom: 8.0,
-            left: 8.0,
-        }),
-    ];
-
-    let card = mouse_area(
-        container(body)
-            .width(Length::Fixed(420.0))
-            .style(move |_| popover_style(theme)),
-    )
-    .on_press(Message::Ui(UiEvent::ActivityNoOp));
-
-    // Hang just under the toolbar, its right edge on the toolbar's own edge
-    // inset so the card lines up under the controls that opened it.
-    let anchored = container(card)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .align_x(alignment::Horizontal::Right)
-        .padding(Padding {
-            top: crate::toolbar::chrome_bottom() + crate::theme::space::XS,
-            right: crate::theme::space::MD,
-            bottom: 0.0,
-            left: 0.0,
-        });
-
-    // `opaque` makes the whole layer report a mouse interaction, which the
-    // view's outer `stack!` uses to levitate the cursor away from the shell
-    // underneath. Without it the popover was mouse-transparent wherever it
-    // didn't handle events itself: wheel scrolling over the card scrolled the
-    // diff view behind it, and the diff text's I-beam cursor bled through.
-    opaque(stack![scrim, anchored])
-}
-
-/// The floating error-toast stack: bottom-right cards for failed operations,
-/// so a failure is visible without the activity popover open. Click a card
-/// to dismiss; a slow tick prunes the rest after [`crate::TOAST_TTL`].
-pub fn toast_layer(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
-    if ui.toasts.is_empty() {
-        return Space::new().into();
-    }
-    let mut cards = column![].spacing(8).width(Length::Fixed(380.0));
-    for toast in &ui.toasts {
-        // The error color lives in the glyph + title; the card itself keeps
-        // the shared quiet popover chrome so the stack doesn't read as four
-        // screaming outlines.
-        let body = column![
-            // The glyphs centre on the title's caps (see `crate::typography`).
-            crate::typography::baseline_row(
-                [
-                    // A warning triangle, deliberately not an ✕ — that glyph
-                    // reads as a dismiss button, not severity.
-                    Aligned::glyph(
-                        icons::icon(icons::ALERT_TRIANGLE, 15.0, theme.removed_text),
-                        15.0,
-                    ),
-                    Aligned::text(
-                        toast
-                            .title
-                            .view(
-                                emphasis_font(ui.config.ui_font, Weight::Semibold),
-                                ui.config.mono_font,
-                                theme.removed_text,
-                                theme,
-                            )
-                            .size(text_size::BODY)
-                            .width(Length::Fill),
-                        emphasis_font(ui.config.ui_font, Weight::Semibold),
-                        text_size::BODY,
-                    ),
-                    Aligned::glyph(
-                        crate::ui::close_button(theme.muted_text, theme)
-                            .on_press(Message::Ui(UiEvent::ToastDismiss(toast.id))),
-                        crate::ui::CLOSE_SIDE,
-                    ),
-                ],
-                8.0,
-            ),
-            toast
-                .detail
-                .view(
-                    ui.config.ui_font,
-                    ui.config.mono_font,
-                    theme.muted_text,
-                    theme,
-                )
-                .size(text_size::UI),
-        ]
-        .spacing(5);
-        cards = cards.push(
-            // The title row is the close button's height, so the top and
-            // right insets give up the margin its wash keeps around the glyph:
-            // the warning glyph and the close glyph both sit 14px in from
-            // their card edges.
-            container(body)
-                .width(Length::Fill)
-                .padding(Padding {
-                    top: 10.0,
-                    right: 10.0,
-                    bottom: 12.0,
-                    left: 14.0,
-                })
-                .style(move |_| popover_style(theme)),
-        );
-    }
-    // Anchored bottom-right, an even inset from both window edges. Only the card
-    // stack is `opaque` — it must own the cursor and wheel over its area
-    // (without it the diff view's I-beam and scrolling bled through, like
-    // the activity popover once did) — while the full-size aligning wrapper
-    // stays transparent so the rest of the window keeps working.
-    container(opaque(cards))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .align_x(alignment::Horizontal::Right)
-        .align_y(alignment::Vertical::Bottom)
-        .padding(Padding {
-            top: 0.0,
-            right: crate::theme::space::LG,
-            bottom: crate::theme::space::LG,
-            left: 0.0,
-        })
-        .into()
-}
-
 /// Side of the fixed square box the status glyph is centered in, so every
 /// row's title starts at the same x whether the glyph comes from the mono
 /// font (spinner, queued `…`) or the icon font (check / cross).
@@ -758,376 +383,6 @@ const ROW_PAD_X: f32 = 8.0;
 const TRAILING_GAP: f32 = 8.0;
 const CHEVRON: f32 = 13.0;
 
-/// A small ghost pill on the title line ("Revert", "Output"), and its width.
-fn pill<'a>(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    label: &'a str,
-    on_press: Message,
-) -> (Aligned<'a, Message>, f32) {
-    let font = ui.config.ui_font;
-    let padding =
-        crate::typography::trimmed_padding(Padding::from([1, 7]), font, text_size::CAPTION);
-    let width =
-        ellipsis::text_width(label, text_size::CAPTION, font) + padding.left + padding.right;
-    let pill = Aligned::boxed(
-        button(
-            text(label)
-                .size(text_size::CAPTION)
-                .font(font)
-                .color(theme.accent),
-        )
-        .padding(padding)
-        .on_press(on_press)
-        .style(move |_, status| ghost_button_style(theme, status)),
-        padding,
-        crate::typography::TextBox::default_line(font, text_size::CAPTION),
-    );
-    (pill, width)
-}
-
-fn activity_row<'a>(
-    ui: &'a Diffui,
-    theme: ThemeSpec,
-    activity: &'a Activity,
-) -> Element<'a, Message> {
-    // Laid out at the width it gets, so each line can be cut to fit and the
-    // row knows whether it has more to show.
-    let header: Element<'a, Message> =
-        responsive(move |bounds| activity_header(ui, theme, activity, bounds.width))
-            .height(Length::Shrink)
-            .into();
-
-    // Expanded: the captured output in a code block under the header — one
-    // read-only text_editor holding every line, so drag-selection sweeps
-    // across lines and ⌘C copies the sweep (per-line widgets each trapped
-    // the selection). Long lines wrap instead of panning individually. URLs
-    // in the output stay plain selectable text; each one also gets a
-    // one-click link under the buffer.
-    let Some(editor) = activity
-        .detail_editor
-        .as_ref()
-        .filter(|_| activity.expanded)
-    else {
-        return header;
-    };
-    let mono = ui.config.mono_font;
-    let id = activity.id;
-    // The drag wrapper adds word/line extension to double/triple-click drags,
-    // publishing through the same action pipeline (the log's read-only filter
-    // applies to those like any other action).
-    let mut block_body = column![crate::editor_drag::editor_drag_area(
-        text_editor(editor)
-            .size(text_size::CAPTION)
-            .font(mono)
-            .padding(0)
-            .wrapping(text::Wrapping::WordOrGlyph)
-            .key_binding(|press| {
-                text_editor::Binding::from_key_press(crate::ui::cocoa_key_press(press, true))
-            })
-            .on_action(move |action| Message::Ui(UiEvent::ActivityDetailAction(id, action)))
-            .style(move |_, _| text_editor::Style {
-                background: Background::Color(Color::TRANSPARENT),
-                border: Border {
-                    width: 0.0,
-                    color: Color::TRANSPARENT,
-                    radius: 0.0.into(),
-                },
-                placeholder: theme.subtle_text,
-                value: theme.muted_text,
-                selection: Color {
-                    a: 0.25,
-                    ..theme.accent
-                },
-            }),
-        0,
-        // The editor's default line box: 1.3 × its size.
-        text_size::CAPTION * 1.3,
-        move |action| Message::Ui(UiEvent::ActivityDetailAction(id, action)),
-    ),]
-    .spacing(6);
-    if !activity.urls.is_empty() {
-        let mut links = column![].spacing(2);
-        for url in activity.urls.iter().cloned() {
-            links = links.push(
-                button(
-                    text(url.clone())
-                        .size(text_size::CAPTION)
-                        .font(mono)
-                        .color(theme.info),
-                )
-                .padding(0)
-                .on_press(Message::Action(Action::OpenUrl(url)))
-                .style(move |_, _| button::Style {
-                    background: None,
-                    text_color: theme.info,
-                    border: Border {
-                        width: 0.0,
-                        color: Color::TRANSPARENT,
-                        radius: 0.0.into(),
-                    },
-                    shadow: Default::default(),
-                    snap: true,
-                }),
-            );
-        }
-        block_body = block_body.push(links);
-    }
-    let block = container(block_body)
-        .width(Length::Fill)
-        .padding(Padding::from([8, 10]))
-        .clip(true)
-        .style(move |_| code_block_style(theme));
-    column![
-        header,
-        container(block).width(Length::Fill).padding(Padding {
-            top: 2.0,
-            right: 8.0,
-            bottom: 8.0,
-            left: 8.0 + TITLE_INDENT,
-        }),
-    ]
-    .into()
-}
-
-/// The row's header: the title line, the command, the result and the
-/// progress bar, `width` wide. A click on it toggles the row open when it
-/// has output, or a line cut short; open, every line shows in full. The
-/// detail sits outside it, so dragging to select text there doesn't
-/// collapse the row.
-fn activity_header<'a>(
-    ui: &'a Diffui,
-    theme: ThemeSpec,
-    activity: &'a Activity,
-    width: f32,
-) -> Element<'a, Message> {
-    let mono = ui.config.mono_font;
-    let ui_font = ui.config.ui_font;
-    let (loaded, total, determinate) = activity.progress_snapshot();
-
-    // What sits right of the title: the counters, the Revert and Output
-    // pills, the timing; each with its width, so the title knows its room.
-    let mut trailing: Vec<(Aligned<'a, Message>, f32)> = Vec::new();
-    let caption = |value: String, font: iced::Font, color: Color| {
-        let width = ellipsis::text_width(&value, text_size::CAPTION, font);
-        (
-            Aligned::text(
-                text(value).size(text_size::CAPTION).font(font).color(color),
-                font,
-                text_size::CAPTION,
-            ),
-            width,
-        )
-    };
-    if matches!(activity.status, ActivityStatus::Running) {
-        if determinate {
-            let pct = (loaded * 100 / total.max(1)).min(100);
-            trailing.push(caption(format!("{pct}%"), mono, theme.muted_text));
-        } else if loaded > 0 {
-            // Indeterminate but counting (the jj lazy walk has no known total):
-            // surface the running count.
-            trailing.push(caption(loaded.to_string(), mono, theme.muted_text));
-        }
-    } else if let Some(duration) = activity.duration {
-        // A finished mutation offers a one-click revert of exactly its op
-        // (`jj op revert`). Labelled apart from the toolbar's Undo, which
-        // steps back through the op log instead.
-        if matches!(activity.status, ActivityStatus::Done)
-            && let Some(operation_id) = activity.undo_op.clone()
-        {
-            trailing.push(pill(
-                ui,
-                theme,
-                "Revert",
-                Message::Action(Action::UndoOperation(activity.id, operation_id)),
-            ));
-        }
-        // A jj CLI run reopens its output panel.
-        if ui
-            .active()
-            .cmdline
-            .runs
-            .iter()
-            .any(|run| run.activity == activity.id)
-        {
-            trailing.push(pill(
-                ui,
-                theme,
-                "Output",
-                Message::Action(Action::CommandLine(crate::cmdline::CmdAction::Output(
-                    crate::cli_output::OutputAction::Open(activity.id),
-                ))),
-            ));
-        }
-        trailing.push(caption(
-            format_duration(duration),
-            ui_font,
-            theme.subtle_text,
-        ));
-    }
-
-    // Collapsed, each line is cut to its room; whether any had to be is
-    // what makes the row expandable without output.
-    let text_width = width - 2.0 * ROW_PAD_X - TITLE_INDENT;
-    let trailing_width: f32 = trailing.iter().map(|(_, width)| TRAILING_GAP + width).sum();
-    let title_font = emphasis_font(ui_font, Weight::Medium);
-    let title = activity
-        .label
-        .line(title_font, mono, theme.text, theme, text_size::UI);
-    let result = activity.result.as_deref().map(|result| {
-        crate::prose::Prose::from(result).line(
-            ui_font,
-            mono,
-            theme.muted_text,
-            theme,
-            text_size::UI,
-        )
-    });
-    let cut_short = !title.fits(text_width - trailing_width)
-        || activity.command.as_deref().is_some_and(|command| {
-            !crate::plan::command_fits(ui, theme, command, text_size::CAPTION, text_width)
-        })
-        || result
-            .as_ref()
-            .is_some_and(|result| !result.fits(text_width));
-    let expandable = !activity.detail.is_empty() || cut_short;
-    let open = activity.expanded && expandable;
-    let chevron_width = if expandable {
-        TRAILING_GAP + CHEVRON
-    } else {
-        0.0
-    };
-
-    // The title, the mono counters, the Revert pill and the timing share a
-    // baseline; the status glyph and chevron centre on the caps (see
-    // `crate::typography`).
-    let title: Element<'a, Message> = if open {
-        title.wrapped().width(Length::Fill).into()
-    } else {
-        title
-            .cut(text_width - trailing_width - chevron_width)
-            .width(Length::Fill)
-            .into()
-    };
-    let mut head: Vec<Aligned<'a, Message>> = vec![
-        Aligned::glyph(status_icon(activity, theme, mono), STATUS_ICON_BOX),
-        Aligned::gap(8.0),
-        Aligned::text(title, title_font, text_size::UI),
-    ];
-    for (item, _) in trailing {
-        head.push(Aligned::gap(TRAILING_GAP));
-        head.push(item);
-    }
-    if expandable {
-        let chevron = if open {
-            icons::CHEVRON_UP
-        } else {
-            icons::CHEVRON_DOWN
-        };
-        head.push(Aligned::gap(TRAILING_GAP));
-        head.push(Aligned::glyph(
-            icons::icon(chevron, CHEVRON, theme.subtle_text),
-            CHEVRON,
-        ));
-    }
-    let head = crate::typography::baseline_row(head, 0.0);
-
-    let indented = |content: Element<'a, Message>| {
-        container(content).width(Length::Fill).padding(Padding {
-            top: 0.0,
-            right: 0.0,
-            bottom: 0.0,
-            left: TITLE_INDENT,
-        })
-    };
-    let mut header = column![head].spacing(3);
-    if let Some(command) = activity.command.as_deref() {
-        header = header.push(indented(if open {
-            crate::plan::wrapped_command_line(ui, theme, command, text_size::CAPTION)
-        } else {
-            crate::plan::caption_command_line(ui, theme, command)
-        }));
-    }
-    if let Some(result) = result {
-        header = header.push(indented(if open {
-            result.wrapped().width(Length::Fill).into()
-        } else {
-            result.cut(text_width).into()
-        }));
-    }
-    if matches!(activity.status, ActivityStatus::Running) && determinate {
-        let accent = theme.accent;
-        let fill = ((loaded as f32 / total as f32).clamp(0.0, 1.0) * 1000.0) as u16;
-        let rest = 1000u16.saturating_sub(fill);
-        let mut bar = row![].height(Length::Fixed(4.0));
-        if fill > 0 {
-            bar = bar.push(
-                container(Space::new())
-                    .width(Length::FillPortion(fill))
-                    .height(Length::Fixed(4.0))
-                    .style(move |_| rounded(accent)),
-            );
-        }
-        if rest > 0 {
-            bar = bar.push(
-                container(Space::new())
-                    .width(Length::FillPortion(rest))
-                    .height(Length::Fixed(4.0))
-                    .style(move |_| rounded(chip_background(theme.muted_text))),
-            );
-        }
-        header = header.push(container(bar).width(Length::Fill).padding(Padding {
-            top: 1.0,
-            right: 0.0,
-            bottom: 0.0,
-            left: TITLE_INDENT,
-        }));
-    }
-
-    let header_area = mouse_area(
-        container(header)
-            .width(Length::Fill)
-            .padding(Padding::from([6.0, ROW_PAD_X])),
-    );
-    if expandable {
-        header_area
-            .on_press(Message::Ui(UiEvent::ActivityExpand(activity.id)))
-            .into()
-    } else {
-        header_area.into()
-    }
-}
-
-/// Status glyph centered in the fixed [`STATUS_ICON_BOX`] square.
-fn status_icon<'a>(
-    activity: &Activity,
-    theme: ThemeSpec,
-    mono: iced::Font,
-) -> Element<'a, Message> {
-    match activity.status {
-        ActivityStatus::Queued => mono_glyph("\u{2026}", mono, theme.subtle_text), // … waiting
-        ActivityStatus::Running => mono_glyph(spinner_glyph(activity.started), mono, theme.accent),
-        ActivityStatus::Done => icons::icon(icons::CHECK, STATUS_ICON_BOX, theme.added_text),
-        ActivityStatus::Cancelled => mono_glyph("\u{2298}", mono, theme.subtle_text),
-        ActivityStatus::Error => icons::icon(icons::CLOSE, STATUS_ICON_BOX, theme.removed_text),
-    }
-}
-
-/// A mono-font glyph boxed like [`icons::icon`] so both glyph sources center
-/// identically.
-fn mono_glyph<'a>(glyph: &'a str, mono: iced::Font, color: Color) -> Element<'a, Message> {
-    container(
-        text(glyph)
-            .font(mono)
-            .size(text_size::UI)
-            .color(color)
-            .line_height(text::LineHeight::Relative(1.0)),
-    )
-    .center_x(Length::Fixed(STATUS_ICON_BOX))
-    .center_y(Length::Fixed(STATUS_ICON_BOX))
-    .into()
-}
-
 /// Compact elapsed-time label: "340ms", "1.5s", "42s", "1m 12s".
 fn format_duration(duration: Duration) -> String {
     let ms = duration.as_millis();
@@ -1139,66 +394,6 @@ fn format_duration(duration: Duration) -> String {
         format!("{}s", duration.as_secs())
     } else {
         format!("{}m {}s", duration.as_secs() / 60, duration.as_secs() % 60)
-    }
-}
-
-fn clear_button(ui: &Diffui, theme: ThemeSpec) -> Element<'static, Message> {
-    let enabled = ui.active().activities.activities.iter().any(|a| {
-        matches!(
-            a.status,
-            ActivityStatus::Done | ActivityStatus::Cancelled | ActivityStatus::Error
-        )
-    });
-    let label = text("Clear")
-        .size(text_size::UI)
-        .font(ui.config.ui_font)
-        .color(if enabled {
-            theme.muted_text
-        } else {
-            theme.subtle_text
-        });
-    let mut b = crate::ui::button(
-        label,
-        crate::ui::Variant::Ghost,
-        crate::ui::Size::Compact,
-        theme,
-    );
-    if enabled {
-        b = b.on_press(Message::Action(Action::ClearActivities));
-    }
-    b.into()
-}
-
-fn solid(color: Color) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(color)),
-        ..container::Style::default()
-    }
-}
-
-/// The expanded row's code block: a soft rounded wash behind the `$ command`
-/// and output lines.
-fn code_block_style(theme: ThemeSpec) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(chip_background(theme.subtle_text))),
-        border: Border {
-            width: 0.0,
-            color: Color::TRANSPARENT,
-            radius: crate::theme::radius::CONTROL.into(),
-        },
-        ..container::Style::default()
-    }
-}
-
-fn rounded(color: Color) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(color)),
-        border: Border {
-            width: 0.0,
-            color: Color::TRANSPARENT,
-            radius: 2.0.into(),
-        },
-        ..container::Style::default()
     }
 }
 
@@ -1340,4 +535,51 @@ mod tests {
             Some("queued".to_owned())
         );
     }
+}
+
+/// Stub: the activity view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn activity_indicator(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::panel("activity::activity_indicator")
+}
+
+/// Stub: the activity view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn activity_progress_line(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::panel("activity::activity_progress_line")
+}
+
+/// Stub: the activity view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn activity_popover(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::overlay(
+        "activity::activity_popover",
+        ui.mode(ModeKind::ActivityPopover).is_some(),
+    )
+}
+
+/// Stub: the activity view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn toast_layer(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::overlay("activity::toast_layer", !ui.toasts.is_empty())
 }

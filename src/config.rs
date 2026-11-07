@@ -55,10 +55,9 @@
 //! configurable: the text stack (iced/cosmic-text) exposes no per-run feature
 //! or letter-spacing control today.
 
-use std::{env, path::PathBuf, sync::OnceLock};
-
-use iced::Font;
+use crate::theme::Font;
 use serde::Deserialize;
+use std::{env, path::PathBuf, sync::OnceLock};
 
 use crate::keymap::RawKeys;
 use crate::theme::ThemePreference;
@@ -267,10 +266,7 @@ fn resolve_font(name: &str, fallback: Font) -> Font {
 /// like `InterVariable` vs `Inter Variable`. `None` means no installed face
 /// carries the family.
 fn installed_family(name: &str) -> Option<String> {
-    let Ok(mut system) = iced::advanced::graphics::text::font_system().write() else {
-        // Can't inspect the database — trust the config rather than override.
-        return Some(name.to_owned());
-    };
+    let families = crate::measure::text_system().all_font_names();
     let normalize = |s: &str| {
         s.chars()
             .filter(|c| !c.is_whitespace())
@@ -279,26 +275,18 @@ fn installed_family(name: &str) -> Option<String> {
     };
     let target = normalize(name);
     let mut loose_hit = None;
-    for face in system.raw().db().faces() {
-        for (family, _) in &face.families {
-            if family.eq_ignore_ascii_case(name) {
-                return Some(family.clone());
-            }
-            if loose_hit.is_none() && normalize(family) == target {
-                loose_hit = Some(family.clone());
-            }
+    for family in families {
+        if family.eq_ignore_ascii_case(name) {
+            return Some(family);
+        }
+        if loose_hit.is_none() && normalize(&family) == target {
+            loose_hit = Some(family);
         }
     }
     loose_hit
 }
 
 fn default_mono_font() -> Font {
-    // `Font::MONOSPACE` is the generic monospace family — cosmic-text routes
-    // it through the platform's font matcher (fontconfig on Linux,
-    // DirectWrite on Windows, CoreText on macOS), so users get whatever
-    // their OS considers the default fixed-width font without us guessing
-    // bundled names. Hardcoding "Menlo" / "Cascadia Code" was fragile:
-    // Cascadia Code only ships on Windows 11+ and isn't on Linux at all.
     Font::MONOSPACE
 }
 

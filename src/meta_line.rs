@@ -5,16 +5,16 @@
 //! with the graph's colours, then a person and a relative time, each behind
 //! a small icon and set apart by space rather than by separator glyphs.
 
-use diffui_core::history::{human_timestamp, now_millis, relative_age};
-use iced::{
-    Background, Border, Color, Element, Length, Padding,
-    widget::{container, text},
-};
+use crate::Cx;
+use crate::ellipsis::Span;
+use crate::theme::{Color, Font};
+use diffui_core::history::relative_age;
+use gpui_kit::{AnyElement, Window};
 
+use crate::Diffui;
 use crate::ellipsis;
-use crate::theme::{ThemeSpec, chip_background, space, text_size};
-use crate::typography::{self, Aligned, TextBox};
-use crate::{Diffui, Message, icons, ui};
+use crate::theme::ThemeSpec;
+use crate::typography::{self, Aligned};
 
 /// Widest a name gets before it ellipsizes, so a long one can't push the
 /// time off the line.
@@ -61,163 +61,11 @@ pub(crate) struct Meta {
     pub(crate) operation: Option<(String, String)>,
 }
 
-pub(crate) fn view<'a>(meta: Meta, ui: &Diffui, theme: ThemeSpec) -> Element<'a, Message> {
-    // Mono ids, sans names and small badges share one baseline (see
-    // `crate::typography`), not one box centre.
-    let mut line: Vec<Aligned<'a, Message>> = Vec::new();
-    if !meta.ids.is_empty() || !meta.badges.is_empty() {
-        let mut ids: Vec<Aligned<'a, Message>> = Vec::new();
-        for id in meta.ids {
-            ids.push(id_text(id, ui));
-        }
-        for badge_spec in meta.badges {
-            ids.push(badge(badge_spec.label, badge_spec.color, ui));
-        }
-        line.push(typography::group(ids, space::SM));
-    }
-    if let Some((name, detail)) = meta.who {
-        let label = labelled(icons::USER, name, ui, theme).map(|label| {
-            container(label)
-                .width(Length::Shrink.max(WHO_MAX_WIDTH))
-                .into()
-        });
-        line.push(label.map(|label| hover(label, detail, ui, theme)));
-    }
-    if let Some((millis, absolute)) = meta.when {
-        let (label, detail) = match millis {
-            Some(millis) => (
-                age_phrase(millis, now_millis()),
-                Some(human_timestamp(&absolute).unwrap_or(absolute)),
-            ),
-            None => (absolute, None),
-        };
-        line.push(
-            labelled(icons::CLOCK, label, ui, theme).map(|label| hover(label, detail, ui, theme)),
-        );
-    }
-    if let Some((id, operation)) = meta.operation {
-        line.push(typography::group(
-            [
-                Aligned::glyph(
-                    icons::icon(icons::HISTORY, ICON_SIZE, theme.subtle_text),
-                    ICON_SIZE,
-                ),
-                id_text(Id::plain(id, theme.subtle_text), ui),
-                Aligned::text(
-                    text(shorten_ids(&operation))
-                        .size(text_size::UI)
-                        .font(ui.config.ui_font)
-                        .color(theme.muted_text)
-                        .wrapping(text::Wrapping::None)
-                        .ellipsis(text::Ellipsis::End),
-                    ui.config.ui_font,
-                    text_size::UI,
-                ),
-            ],
-            space::XS,
-        ));
-    }
-    typography::baseline_row(line, space::LG)
-}
-
 /// "5m ago", or "just now".
 pub(crate) fn age_phrase(then: i64, now: i64) -> String {
     match relative_age(then, now).as_str() {
         "now" => "just now".to_owned(),
         age => format!("{age} ago"),
-    }
-}
-
-/// A small filled badge, the look of the History view's `hidden` / `empty`
-/// markers, ready to sit on a line's baseline.
-pub(crate) fn badge<'a>(label: &'a str, color: Color, ui: &Diffui) -> Aligned<'a, Message> {
-    let padding =
-        typography::trimmed_padding(Padding::from([0, 5]), ui.config.ui_font, text_size::BADGE);
-    Aligned::boxed(
-        container(
-            text(label)
-                .size(text_size::BADGE)
-                .font(ui.config.ui_font)
-                .color(color),
-        )
-        .padding(padding)
-        .style(move |_| container::Style {
-            background: Some(Background::Color(chip_background(color))),
-            border: Border {
-                width: 0.0,
-                color: Color::TRANSPARENT,
-                radius: crate::chip::RADIUS.into(),
-            },
-            ..container::Style::default()
-        }),
-        padding,
-        TextBox::default_line(ui.config.ui_font, text_size::BADGE),
-    )
-}
-
-/// An id in mono, its bright prefix and the rest as one rich text, so the
-/// two colours can't drift apart.
-pub(crate) fn id_text<'a>(id: Id, ui: &Diffui) -> Aligned<'a, Message> {
-    let split = id
-        .text
-        .char_indices()
-        .nth(id.bright)
-        .map_or(id.text.len(), |(at, _)| at);
-    let (bright, rest) = id.text.split_at(split);
-    let spans = vec![
-        iced::widget::span(bright.to_owned()).color(id.bright_color),
-        iced::widget::span(rest.to_owned()).color(id.color),
-    ];
-    Aligned::text(
-        iced::widget::rich_text::<(), Message, iced::Theme>(spans)
-            .size(text_size::UI)
-            .font(ui.config.mono_font)
-            .wrapping(text::Wrapping::None),
-        ui.config.mono_font,
-        text_size::UI,
-    )
-}
-
-/// An icon and its label, centred on the label's caps.
-fn labelled<'a>(
-    glyph: &'static str,
-    label: String,
-    ui: &Diffui,
-    theme: ThemeSpec,
-) -> Aligned<'a, Message> {
-    typography::group(
-        [
-            Aligned::glyph(icons::icon(glyph, ICON_SIZE, theme.subtle_text), ICON_SIZE),
-            Aligned::text(
-                text(label)
-                    .size(text_size::UI)
-                    .font(ui.config.ui_font)
-                    .color(theme.muted_text)
-                    .wrapping(text::Wrapping::None)
-                    .ellipsis(text::Ellipsis::End),
-                ui.config.ui_font,
-                text_size::UI,
-            ),
-        ],
-        space::XS,
-    )
-}
-
-fn hover<'a>(
-    content: impl Into<Element<'a, Message>>,
-    detail: Option<String>,
-    ui: &Diffui,
-    theme: ThemeSpec,
-) -> Element<'a, Message> {
-    match detail.filter(|detail| !detail.is_empty()) {
-        Some(detail) => ui::tooltip(
-            content,
-            detail,
-            iced::widget::tooltip::Position::Bottom,
-            ui.config.ui_font,
-            theme,
-        ),
-        None => content.into(),
     }
 }
 
@@ -273,7 +121,7 @@ pub(crate) fn shorten_ids(description: &str) -> String {
 pub(crate) fn description(
     description: &str,
     size: f32,
-    font: iced::Font,
+    font: Font,
     color: Color,
     ui: &Diffui,
     theme: ThemeSpec,
@@ -286,14 +134,11 @@ pub(crate) fn description(
     let mut spans = Vec::new();
     for (index, part) in split_ids(description).into_iter().enumerate() {
         if index > 0 {
-            spans.push(iced::widget::span(" ".to_owned()));
+            spans.push(Span::new(" ".to_owned()));
         }
         spans.push(match part {
-            Part::Prose(prose) => iced::widget::span(prose),
-            Part::Id(id) => iced::widget::span(id)
-                .font(mono)
-                .size(id_size)
-                .color(theme.muted_text),
+            Part::Prose(prose) => Span::new(prose),
+            Part::Id(id) => Span::new(id).font(mono).color(theme.muted_text),
         });
     }
     ellipsis::Line::new(spans, font, size, color)
@@ -329,4 +174,28 @@ mod tests {
         );
         assert_eq!(shorten_ids("add deadbeef"), "add deadbeef");
     }
+}
+
+/// Stub: the meta_line view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn view(
+    meta: Meta,
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::panel("meta_line::view")
+}
+
+/// Stub: the meta_line view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn badge(
+    label: &str,
+    color: Color,
+    ui: &Diffui,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> Aligned {
+    crate::stub::aligned("meta_line::badge")
 }

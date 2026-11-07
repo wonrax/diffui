@@ -7,19 +7,16 @@
 //! asker went away (git gave up, the op finished) is withdrawn without the
 //! user doing anything.
 
+use crate::Cx;
+use gpui_kit::{AnyElement, Window};
 use std::collections::VecDeque;
-
-use iced::{
-    Element, Length, Padding, Subscription, Task,
-    widget::{Space, column, text_input},
-};
 
 use diffui_core::askpass::{self, AskpassEvent, PromptKind, PromptRequest};
 
+use crate::Diffui;
 use crate::modes::{Mode, ModeKind};
 use crate::prose::Prose;
-use crate::theme::{self, ThemeSpec, input_style, text_size};
-use crate::{Action, Diffui, Message, ui};
+use crate::theme::ThemeSpec;
 
 const INPUT_ID: &str = "credential-input";
 
@@ -41,57 +38,61 @@ pub(crate) struct CredentialDialog {
     queue: VecDeque<PromptRequest>,
 }
 
-/// The relay's prompts, as messages. Empty when the relay isn't running.
-pub(crate) fn subscription() -> Subscription<Message> {
-    Subscription::run(|| {
-        use futures::StreamExt;
-        match askpass::take_events() {
-            Some(events) => events.map(Message::Askpass).boxed(),
-            None => futures::stream::pending().boxed(),
+/// Starts the loop that brings git's and ssh's credential prompts to the app.
+pub(crate) fn start(cx: &mut Cx) {
+    use futures::StreamExt as _;
+    let Some(mut events) = askpass::take_events() else {
+        return;
+    };
+    cx.spawn(async move |this, cx| {
+        while let Some(event) = events.next().await {
+            let updated = this.update(cx, |this, cx| {
+                this.act(cx, |this, cx| this.on_askpass_event(event, cx));
+            });
+            if updated.is_err() {
+                return;
+            }
         }
     })
+    .detach();
 }
 
 impl Diffui {
-    pub(crate) fn on_askpass_event(&mut self, event: AskpassEvent) -> Task<Message> {
+    pub(crate) fn on_askpass_event(&mut self, event: AskpassEvent, cx: &mut Cx) {
         match event {
             AskpassEvent::Prompt(request) => {
                 if let Some(dialog) = self.credential_dialog_mut() {
                     dialog.queue.push_back(request);
-                    return Task::none();
+                    return;
                 }
                 self.push_mode(Mode::Credential(CredentialDialog {
                     current: request,
                     value: String::new(),
                     queue: VecDeque::new(),
                 }));
-                Task::batch([
-                    iced::widget::operation::focus(INPUT_ID),
-                    self.raise_window(),
-                ])
+                crate::input::focus(INPUT_ID, cx);
+                self.raise_window(cx);
             }
             AskpassEvent::Withdrawn(id) => {
                 let Some(dialog) = self.credential_dialog_mut() else {
-                    return Task::none();
+                    return;
                 };
                 if dialog.current.id == id {
-                    self.next_credential()
+                    self.next_credential(cx)
                 } else {
                     dialog.queue.retain(|request| request.id != id);
-                    Task::none()
                 }
             }
         }
     }
 
-    pub(crate) fn update_credential(&mut self, action: CredentialAction) -> Task<Message> {
+    pub(crate) fn update_credential(&mut self, action: CredentialAction, cx: &mut Cx) {
         let Some(dialog) = self.credential_dialog_mut() else {
-            return Task::none();
+            return;
         };
         match action {
             CredentialAction::Input(value) => {
                 dialog.value = value;
-                Task::none()
             }
             CredentialAction::Submit => {
                 let reply = match dialog.current.prompt.kind {
@@ -100,32 +101,31 @@ impl Diffui {
                     PromptKind::Confirm | PromptKind::Notice => String::new(),
                 };
                 askpass::answer(dialog.current.id, Some(reply));
-                self.next_credential()
+                self.next_credential(cx)
             }
             CredentialAction::Cancel => {
                 // A notice has nothing to decline; dismissing it must not
                 // fail the operation it is about.
                 let reply = (dialog.current.prompt.kind == PromptKind::Notice).then(String::new);
                 askpass::answer(dialog.current.id, reply);
-                self.next_credential()
+                self.next_credential(cx)
             }
         }
     }
 
     /// Show the next queued prompt, or close the dialog.
-    fn next_credential(&mut self) -> Task<Message> {
+    fn next_credential(&mut self, cx: &mut Cx) {
         let Some(dialog) = self.credential_dialog_mut() else {
-            return Task::none();
+            return;
         };
         match dialog.queue.pop_front() {
             Some(next) => {
                 dialog.current = next;
                 dialog.value.clear();
-                iced::widget::operation::focus(INPUT_ID)
+                crate::input::focus(INPUT_ID, cx)
             }
             None => {
                 self.pop_mode(ModeKind::Credential);
-                Task::none()
             }
         }
     }
@@ -140,16 +140,12 @@ impl Diffui {
     }
 
     /// A fetch started before switching away is waiting on the user.
-    fn raise_window(&self) -> Task<Message> {
+    fn raise_window(&self, cx: &mut Cx) {
         if self.app_focused {
-            return Task::none();
+            return;
         }
-        iced::window::latest().and_then(|id| {
-            iced::window::request_user_attention(
-                id,
-                Some(iced::window::UserAttention::Informational),
-            )
-        })
+        // GPUI has no bounce-the-dock call; activating is the closest it offers.
+        self.with_window(cx, |window, _| window.activate_window());
     }
 
     pub(crate) fn credential_dialog(&self) -> Option<&CredentialDialog> {
@@ -203,119 +199,6 @@ fn title(request: &PromptRequest) -> Prose {
     }
 }
 
-/// The modal card. Empty when no prompt is open.
-pub(crate) fn build_overlay(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
-    let Some(dialog) = ui.credential_dialog() else {
-        return Space::new().into();
-    };
-    let (font, mono) = (ui.config.ui_font, ui.config.mono_font);
-    let send = |action| Message::Action(Action::Credential(action));
-    let prompt = &dialog.current.prompt;
-
-    let mut body = column![ui::dialog_title(&title(&dialog.current), font, mono, theme)]
-        .spacing(ui::DIALOG_SPACING);
-
-    let accept_label = match prompt.kind {
-        PromptKind::Secret | PromptKind::Text => {
-            // The title already says what goes here.
-            let input = text_input("", &dialog.value)
-                .id(INPUT_ID)
-                .secure(prompt.kind == PromptKind::Secret)
-                .padding(crate::typography::trimmed_padding(
-                    Padding::from([theme::space::SM, theme::space::MD]),
-                    mono,
-                    text_size::BODY,
-                ))
-                .size(text_size::BODY)
-                .font(mono)
-                .on_input(move |value| send(CredentialAction::Input(value)))
-                .on_submit(send(CredentialAction::Submit))
-                .style(move |_, _| input_style(theme));
-            body = body.push(crate::input::single_line(input, &dialog.value, mono));
-            Some("Continue")
-        }
-        PromptKind::YesNo => {
-            let mut text = Prose::from("First connection to this host. Check the fingerprint.");
-            if let Some(detail) = &prompt.detail {
-                text = text.text("\n").code(detail.clone());
-            }
-            body = body.push(ui::dialog_text(&text, font, mono, theme));
-            Some("Yes")
-        }
-        PromptKind::Confirm => {
-            body = body.push(ui::dialog_text(
-                &Prose::from(prompt.text.clone()),
-                font,
-                mono,
-                theme,
-            ));
-            Some("Yes")
-        }
-        PromptKind::Notice => {
-            body = body.push(ui::dialog_text(
-                &Prose::from(prompt.text.clone()),
-                font,
-                mono,
-                theme,
-            ));
-            None
-        }
-    };
-
-    let queued = dialog.queue.len();
-    let leading = (queued > 0).then(|| {
-        iced::widget::text(format!("{queued} more waiting"))
-            .size(text_size::UI)
-            .font(font)
-            .color(theme.muted_text)
-            .into()
-    });
-    let decline = match prompt.kind {
-        PromptKind::YesNo | PromptKind::Confirm => ui::text_button(
-            None,
-            "No",
-            ui::Variant::Raised,
-            ui::Size::Standard,
-            font,
-            theme,
-        ),
-        PromptKind::Notice => ui::text_button(
-            None,
-            "Dismiss",
-            ui::Variant::Raised,
-            ui::Size::Standard,
-            font,
-            theme,
-        ),
-        PromptKind::Secret | PromptKind::Text => ui::cancel_button(ui::Size::Standard, font, theme),
-    }
-    .on_press(send(CredentialAction::Cancel));
-    let mut buttons: Vec<Element<'_, Message>> = vec![decline.into()];
-    if let Some(label) = accept_label {
-        buttons.push(
-            ui::text_button(
-                None,
-                label,
-                ui::Variant::Primary,
-                ui::Size::Standard,
-                font,
-                theme,
-            )
-            .on_press(send(CredentialAction::Submit))
-            .into(),
-        );
-    }
-    body = body.push(ui::button_row(leading, buttons));
-
-    ui::modal(
-        ui::dialog_card(body.width(Length::Fill), ui::DIALOG_WIDTH, theme),
-        crate::toolbar::modal_top(),
-        // A stray click on the scrim must not cancel a push.
-        Message::Ui(crate::UiEvent::ConfirmNoOp),
-        Message::Ui(crate::UiEvent::ConfirmNoOp),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,4 +229,18 @@ mod tests {
             Prose::from("Trust host ").remote("h").text("?")
         );
     }
+}
+
+/// Stub: the credentials view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn build_overlay(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::overlay(
+        "credentials::build_overlay",
+        ui.mode(ModeKind::Credential).is_some(),
+    )
 }

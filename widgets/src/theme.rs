@@ -1,41 +1,113 @@
-use iced::{
-    Background, Border, Color, Element, Font, Length, Shadow, Theme, Vector, border,
-    font::{Family, Weight},
-    theme,
-    widget::{button, container, scrollable, text, text_input},
-};
+//! diffui's palette and shared geometry tokens.
+//!
+//! [`ThemeSpec`] is the source of truth for every colour on screen. kit's own
+//! theme is derived from it ([`apply_to_kit`]), so kit components drawn with
+//! their stock variants read as diffui's: there is one palette, not two.
+
+use gpui_kit::component::{Theme, ThemeMode};
+use gpui_kit::{App, BoxShadow, Hsla, Rgba, Styled, WindowAppearance, point, px};
 
 use crate::diff_view::Palette;
 use crate::scrollbar;
 
-/// Apply a `Medium` (or other emphasized) weight to a font *only* when
-/// the font is a specific named family the OS can actually look up.
-///
-/// On macOS, asking the platform font matcher for a generic family
-/// (`Family::SansSerif`, `Family::Monospace`) at a non-default weight
-/// frequently returns nothing — the matcher resolves the generic to the
-/// platform UI font but doesn't enumerate weights under it, so the
-/// renderer falls back to `.notdef` glyphs (the empty-box "tofu").
-/// Specific named families (`Family::Name("Cascadia Code")` etc.) round-
-/// trip through fontdb's family→weight index correctly, so weight
-/// overrides are safe there.
-///
-/// Use this for any label that wants to emphasize itself with a
-/// heavier weight; pass-through to the platform default when the family
-/// is generic and trust the OS's UI typography defaults.
-pub fn emphasis_font(base: Font, weight: Weight) -> Font {
-    match base.family {
-        Family::Name(_) => Font { weight, ..base },
-        // Generic families: don't override weight — the platform will
-        // pick a sensible default and we'd otherwise risk tofu.
-        _ => base,
+/// A palette colour. Plain sRGB channels in 0..=1, so tokens can be mixed and
+/// re-alpha'd with struct update (`Color { a: 0.2, ..theme.accent }`). It goes
+/// straight into `.bg()`, `.text_color()` and `.border_color()`.
+pub type Color = Rgba;
+
+const fn rgb(r: f32, g: f32, b: f32) -> Color {
+    Rgba { r, g, b, a: 1.0 }
+}
+
+const fn rgba(r: f32, g: f32, b: f32, a: f32) -> Color {
+    Rgba { r, g, b, a }
+}
+
+pub const BLACK: Color = rgb(0.0, 0.0, 0.0);
+pub const WHITE: Color = rgb(1.0, 1.0, 1.0);
+pub const TRANSPARENT: Color = rgba(0.0, 0.0, 0.0, 0.0);
+
+/// Font weight, with GPUI's named constants (`Weight::MEDIUM`, …).
+pub type Weight = gpui_kit::FontWeight;
+
+/// A font, by value. GPUI's own `Font` holds shared strings and has to be
+/// cloned at every use; this is `Copy`, so a theme or a config can hand it
+/// around like a colour, and [`Font::gpui`] makes the real one where it's drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Font {
+    pub family: &'static str,
+    pub weight: Weight,
+}
+
+impl Font {
+    /// The platform UI font.
+    pub const DEFAULT: Self = Self::new(".SystemUIFont");
+    /// The platform's monospaced font.
+    pub const MONOSPACE: Self = Self::new("Menlo");
+
+    pub const fn new(family: &'static str) -> Self {
+        Self {
+            family,
+            weight: Weight::NORMAL,
+        }
+    }
+
+    pub fn gpui(self) -> gpui_kit::Font {
+        gpui_kit::Font {
+            weight: self.weight,
+            ..gpui_kit::font(self.family)
+        }
     }
 }
 
-/// Geometry of [`crate::ui::scrollable`]'s bar. Mirrors `crate::scrollbar`
-/// (a 12px footprint, 2px clear of every edge → an 8px pill) so the iced
-/// scroll views read as the same widget as the hand-drawn ones in
-/// `RevisionList` and `DiffView`.
+/// `base` at `weight`. Unlike iced's matcher, CoreText resolves weights of the
+/// system font too, so this no longer has to pass generic families through.
+pub fn emphasis_font(base: Font, weight: Weight) -> Font {
+    Font { weight, ..base }
+}
+
+/// Insets of a box. Used where padding is computed rather than a fixed token
+/// ([`crate::typography`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Padding {
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+    pub left: f32,
+}
+
+impl Padding {
+    pub const ZERO: Self = Self {
+        top: 0.0,
+        right: 0.0,
+        bottom: 0.0,
+        left: 0.0,
+    };
+
+    /// Applies this padding to an element.
+    pub fn apply<E: Styled>(self, element: E) -> E {
+        element
+            .pt(px(self.top))
+            .pr(px(self.right))
+            .pb(px(self.bottom))
+            .pl(px(self.left))
+    }
+}
+
+/// `[vertical, horizontal]`.
+impl From<[f32; 2]> for Padding {
+    fn from([y, x]: [f32; 2]) -> Self {
+        Self {
+            top: y,
+            right: x,
+            bottom: y,
+            left: x,
+        }
+    }
+}
+
+/// Geometry of the scrollbar pill. Mirrors `crate::scrollbar` (a 12px
+/// footprint, 2px clear of every edge → an 8px pill).
 pub const SCROLLBAR_WIDTH: f32 = 8.0;
 pub const SCROLLBAR_MARGIN: f32 = 2.0;
 pub const COLLAPSED_PANEL_WIDTH: f32 = 36.0;
@@ -49,15 +121,31 @@ pub enum ThemePreference {
 }
 
 impl ThemePreference {
-    pub fn active(self, system_theme: theme::Mode) -> ResolvedTheme {
+    pub fn active(self, system_theme: SystemAppearance) -> ResolvedTheme {
         match self {
             Self::System => match system_theme {
-                theme::Mode::Light => ResolvedTheme::Light,
-                theme::Mode::Dark | theme::Mode::None => ResolvedTheme::Dark,
+                SystemAppearance::Light => ResolvedTheme::Light,
+                SystemAppearance::Dark => ResolvedTheme::Dark,
             },
             Self::Dark => ResolvedTheme::Dark,
             Self::Light => ResolvedTheme::Light,
             Self::HighContrast => ResolvedTheme::HighContrast,
+        }
+    }
+}
+
+/// What the OS is showing, which is what [`ThemePreference::System`] follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemAppearance {
+    Light,
+    Dark,
+}
+
+impl From<WindowAppearance> for SystemAppearance {
+    fn from(appearance: WindowAppearance) -> Self {
+        match appearance {
+            WindowAppearance::Light | WindowAppearance::VibrantLight => Self::Light,
+            WindowAppearance::Dark | WindowAppearance::VibrantDark => Self::Dark,
         }
     }
 }
@@ -80,35 +168,35 @@ impl ResolvedTheme {
             // the graph rides on a violet base so coral doesn't fight the
             // green/red diff signals.
             Self::Dark => ThemeSpec {
-                background: Color::from_rgb(0.043, 0.051, 0.071),
-                panel_background: Color::from_rgb(0.067, 0.078, 0.106),
-                panel_background_elevated: Color::from_rgb(0.094, 0.110, 0.145),
-                selected_file: Color::from_rgb(0.160, 0.178, 0.255),
-                text: Color::from_rgb(0.902, 0.910, 0.933),
-                muted_text: Color::from_rgb(0.690, 0.710, 0.761),
-                subtle_text: Color::from_rgb(0.563, 0.584, 0.643),
-                accent: Color::from_rgb(1.000, 0.400, 0.245),
-                added_line: Color::from_rgba(0.263, 0.843, 0.463, 0.11),
-                removed_line: Color::from_rgba(1.000, 0.408, 0.349, 0.10),
-                added_text: Color::from_rgb(0.263, 0.843, 0.463),
-                removed_text: Color::from_rgb(1.000, 0.408, 0.349),
-                modified_token: Color::from_rgb(1.000, 0.706, 0.220),
-                info: Color::from_rgb(0.310, 0.655, 1.000),
+                background: rgb(0.043, 0.051, 0.071),
+                panel_background: rgb(0.067, 0.078, 0.106),
+                panel_background_elevated: rgb(0.094, 0.110, 0.145),
+                selected_file: rgb(0.160, 0.178, 0.255),
+                text: rgb(0.902, 0.910, 0.933),
+                muted_text: rgb(0.690, 0.710, 0.761),
+                subtle_text: rgb(0.563, 0.584, 0.643),
+                accent: rgb(1.000, 0.400, 0.245),
+                added_line: rgba(0.263, 0.843, 0.463, 0.11),
+                removed_line: rgba(1.000, 0.408, 0.349, 0.10),
+                added_text: rgb(0.263, 0.843, 0.463),
+                removed_text: rgb(1.000, 0.408, 0.349),
+                modified_token: rgb(1.000, 0.706, 0.220),
+                info: rgb(0.310, 0.655, 1.000),
                 // A step *lighter* than the elevated code surface so the
                 // strip reads as a raised header rather than a hole cut
                 // into the scroll body.
-                file_header: Color::from_rgb(0.122, 0.141, 0.184),
-                hunk_header: Color::from_rgba(0.310, 0.655, 1.000, 0.12),
-                conflict_marker: Color::from_rgb(1.000, 0.408, 0.443),
-                border: Color::from_rgb(0.137, 0.153, 0.196),
-                note_background: Color::from_rgba(1.000, 0.706, 0.220, 0.17),
-                note_text: Color::from_rgb(1.000, 0.706, 0.220),
-                lane_base: Color::from_rgb(0.690, 0.510, 1.000),
-                syntax_keyword: Color::from_rgb(0.760, 0.610, 1.000),
-                syntax_type: Color::from_rgb(0.260, 0.840, 0.755),
-                syntax_function: Color::from_rgb(0.480, 0.725, 1.000),
-                syntax_literal: Color::from_rgb(1.000, 0.706, 0.220),
-                syntax_property: Color::from_rgb(0.460, 0.820, 0.930),
+                file_header: rgb(0.122, 0.141, 0.184),
+                hunk_header: rgba(0.310, 0.655, 1.000, 0.12),
+                conflict_marker: rgb(1.000, 0.408, 0.443),
+                border: rgb(0.137, 0.153, 0.196),
+                note_background: rgba(1.000, 0.706, 0.220, 0.17),
+                note_text: rgb(1.000, 0.706, 0.220),
+                lane_base: rgb(0.690, 0.510, 1.000),
+                syntax_keyword: rgb(0.760, 0.610, 1.000),
+                syntax_type: rgb(0.260, 0.840, 0.755),
+                syntax_function: rgb(0.480, 0.725, 1.000),
+                syntax_literal: rgb(1.000, 0.706, 0.220),
+                syntax_property: rgb(0.460, 0.820, 0.930),
             },
             // Neutral whites — panes are pure white, canvas is a faint
             // gray so the panes still read as elevated. Coral accent stays
@@ -123,73 +211,72 @@ impl ResolvedTheme {
             // surface each ink lands on — usually the selected row, not the
             // white pane. `every_pairing_meets_wcag_aa` holds the line.
             Self::Light => ThemeSpec {
-                background: Color::from_rgb(0.957, 0.957, 0.961),
-                panel_background: Color::from_rgb(1.000, 1.000, 1.000),
-                panel_background_elevated: Color::from_rgb(0.976, 0.976, 0.980),
-                selected_file: Color::from_rgb(0.923, 0.910, 0.957),
-                text: Color::from_rgb(0.106, 0.114, 0.133),
-                muted_text: Color::from_rgb(0.314, 0.337, 0.380),
-                subtle_text: Color::from_rgb(0.392, 0.410, 0.451),
-                accent: Color::from_rgb(0.690, 0.160, 0.055),
-                added_line: Color::from_rgba(0.020, 0.410, 0.190, 0.10),
-                removed_line: Color::from_rgba(0.670, 0.130, 0.105, 0.09),
-                added_text: Color::from_rgb(0.020, 0.410, 0.190),
-                removed_text: Color::from_rgb(0.670, 0.130, 0.105),
-                modified_token: Color::from_rgb(0.490, 0.290, 0.000),
-                info: Color::from_rgb(0.050, 0.310, 0.700),
+                background: rgb(0.957, 0.957, 0.961),
+                panel_background: rgb(1.000, 1.000, 1.000),
+                panel_background_elevated: rgb(0.976, 0.976, 0.980),
+                selected_file: rgb(0.923, 0.910, 0.957),
+                text: rgb(0.106, 0.114, 0.133),
+                muted_text: rgb(0.314, 0.337, 0.380),
+                subtle_text: rgb(0.392, 0.410, 0.451),
+                accent: rgb(0.690, 0.160, 0.055),
+                added_line: rgba(0.020, 0.410, 0.190, 0.10),
+                removed_line: rgba(0.670, 0.130, 0.105, 0.09),
+                added_text: rgb(0.020, 0.410, 0.190),
+                removed_text: rgb(0.670, 0.130, 0.105),
+                modified_token: rgb(0.490, 0.290, 0.000),
+                info: rgb(0.050, 0.310, 0.700),
                 // Same role as in the dark theme: distinct from the white
                 // code surface so file headers stand out as the scroll
                 // body slides past, but not so dark that it overpowers
                 // the body content.
-                file_header: Color::from_rgb(0.949, 0.953, 0.961),
-                hunk_header: Color::from_rgba(0.050, 0.310, 0.700, 0.09),
-                conflict_marker: Color::from_rgb(0.690, 0.115, 0.150),
-                border: Color::from_rgb(0.882, 0.886, 0.898),
-                note_background: Color::from_rgba(0.490, 0.290, 0.000, 0.17),
-                note_text: Color::from_rgb(0.490, 0.290, 0.000),
-                lane_base: Color::from_rgb(0.430, 0.235, 0.890),
-                syntax_keyword: Color::from_rgb(0.420, 0.145, 0.850),
-                syntax_type: Color::from_rgb(0.000, 0.405, 0.350),
-                syntax_function: Color::from_rgb(0.070, 0.315, 0.690),
-                syntax_literal: Color::from_rgb(0.490, 0.290, 0.000),
-                syntax_property: Color::from_rgb(0.000, 0.365, 0.540),
+                file_header: rgb(0.949, 0.953, 0.961),
+                hunk_header: rgba(0.050, 0.310, 0.700, 0.09),
+                conflict_marker: rgb(0.690, 0.115, 0.150),
+                border: rgb(0.882, 0.886, 0.898),
+                note_background: rgba(0.490, 0.290, 0.000, 0.17),
+                note_text: rgb(0.490, 0.290, 0.000),
+                lane_base: rgb(0.430, 0.235, 0.890),
+                syntax_keyword: rgb(0.420, 0.145, 0.850),
+                syntax_type: rgb(0.000, 0.405, 0.350),
+                syntax_function: rgb(0.070, 0.315, 0.690),
+                syntax_literal: rgb(0.490, 0.290, 0.000),
+                syntax_property: rgb(0.000, 0.365, 0.540),
             },
             Self::HighContrast => ThemeSpec {
-                background: Color::BLACK,
-                panel_background: Color::from_rgb(0.030, 0.030, 0.030),
-                panel_background_elevated: Color::from_rgb(0.070, 0.070, 0.070),
-                selected_file: Color::from_rgb(0.000, 0.180, 0.240),
-                text: Color::WHITE,
-                muted_text: Color::from_rgb(0.780, 0.820, 0.840),
-                subtle_text: Color::from_rgb(0.620, 0.660, 0.690),
-                accent: Color::from_rgb(1.000, 0.478, 0.349),
-                added_line: Color::from_rgb(0.000, 0.235, 0.080),
-                removed_line: Color::from_rgb(0.300, 0.000, 0.045),
-                added_text: Color::from_rgb(0.500, 1.000, 0.600),
-                removed_text: Color::from_rgb(1.000, 0.520, 0.560),
-                modified_token: Color::from_rgb(1.000, 0.920, 0.000),
-                info: Color::from_rgb(0.380, 0.770, 1.000),
-                file_header: Color::from_rgb(0.120, 0.120, 0.120),
-                hunk_header: Color::from_rgb(0.000, 0.220, 0.310),
-                conflict_marker: Color::from_rgb(1.000, 0.445, 0.445),
-                border: Color::from_rgb(0.570, 0.620, 0.660),
-                note_background: Color::from_rgb(0.260, 0.210, 0.000),
-                note_text: Color::from_rgb(1.000, 0.940, 0.500),
-                lane_base: Color::from_rgb(0.760, 0.620, 1.000),
-                syntax_keyword: Color::from_rgb(0.870, 0.740, 1.000),
-                syntax_type: Color::from_rgb(0.400, 1.000, 0.920),
-                syntax_function: Color::from_rgb(0.600, 0.840, 1.000),
-                syntax_literal: Color::from_rgb(1.000, 0.880, 0.420),
-                syntax_property: Color::from_rgb(0.720, 0.920, 1.000),
+                background: BLACK,
+                panel_background: rgb(0.030, 0.030, 0.030),
+                panel_background_elevated: rgb(0.070, 0.070, 0.070),
+                selected_file: rgb(0.000, 0.180, 0.240),
+                text: WHITE,
+                muted_text: rgb(0.780, 0.820, 0.840),
+                subtle_text: rgb(0.620, 0.660, 0.690),
+                accent: rgb(1.000, 0.478, 0.349),
+                added_line: rgb(0.000, 0.235, 0.080),
+                removed_line: rgb(0.300, 0.000, 0.045),
+                added_text: rgb(0.500, 1.000, 0.600),
+                removed_text: rgb(1.000, 0.520, 0.560),
+                modified_token: rgb(1.000, 0.920, 0.000),
+                info: rgb(0.380, 0.770, 1.000),
+                file_header: rgb(0.120, 0.120, 0.120),
+                hunk_header: rgb(0.000, 0.220, 0.310),
+                conflict_marker: rgb(1.000, 0.445, 0.445),
+                border: rgb(0.570, 0.620, 0.660),
+                note_background: rgb(0.260, 0.210, 0.000),
+                note_text: rgb(1.000, 0.940, 0.500),
+                lane_base: rgb(0.760, 0.620, 1.000),
+                syntax_keyword: rgb(0.870, 0.740, 1.000),
+                syntax_type: rgb(0.400, 1.000, 0.920),
+                syntax_function: rgb(0.600, 0.840, 1.000),
+                syntax_literal: rgb(1.000, 0.880, 0.420),
+                syntax_property: rgb(0.720, 0.920, 1.000),
             },
         }
     }
 
-    pub fn iced_theme(self) -> Theme {
+    fn kit_mode(self) -> ThemeMode {
         match self {
-            Self::Dark => Theme::Dark,
-            Self::Light => Theme::Light,
-            Self::HighContrast => Theme::Dark,
+            Self::Light => ThemeMode::Light,
+            Self::Dark | Self::HighContrast => ThemeMode::Dark,
         }
     }
 }
@@ -299,88 +386,6 @@ pub fn scrollbar_style(theme: ThemeSpec) -> scrollbar::ScrollbarStyle {
     }
 }
 
-/// Style closure for `iced::widget::scrollable`. Reuses the
-/// `scrollbar_style` colors and a fully-rounded pill border so the iced
-/// scrollbar visually matches the hand-drawn one in `RevisionList` /
-/// `DiffView`. Status is ignored — the custom widgets don't react to hover
-/// either, and matching that keeps the two indistinguishable side by side.
-pub fn iced_scrollable_style(theme: ThemeSpec, _status: scrollable::Status) -> scrollable::Style {
-    let colors = scrollbar_style(theme);
-    let pill = border::rounded(SCROLLBAR_WIDTH / 2.0);
-    let rail = scrollable::Rail {
-        background: Some(Background::Color(colors.track_color)),
-        border: pill,
-        scroller: scrollable::Scroller {
-            background: Background::Color(colors.thumb_color),
-            border: pill,
-        },
-    };
-    scrollable::Style {
-        container: container::Style::default(),
-        vertical_rail: rail,
-        horizontal_rail: rail,
-        gap: None,
-        auto_scroll: scrollable::AutoScroll {
-            background: Background::Color(Color::TRANSPARENT),
-            border: Border::default(),
-            shadow: Shadow::default(),
-            icon: theme.muted_text,
-        },
-    }
-}
-
-pub fn app_shell_style(theme: ThemeSpec) -> container::Style {
-    container::Style::default()
-        .background(theme.background)
-        .color(theme.text)
-}
-
-pub fn vertical_divider<Message: 'static>(theme: ThemeSpec) -> Element<'static, Message> {
-    container(text(""))
-        .width(Length::Fixed(1.0))
-        .height(Length::Fill)
-        .style(move |_| {
-            container::Style::default()
-                .background(theme.border)
-                .border(Border {
-                    width: 0.0,
-                    color: Color::TRANSPARENT,
-                    radius: 0.0.into(),
-                })
-        })
-        .into()
-}
-
-pub fn horizontal_divider<Message: 'static>(theme: ThemeSpec) -> Element<'static, Message> {
-    container(text(""))
-        .width(Length::Fill)
-        .height(Length::Fixed(1.0))
-        .style(move |_| {
-            container::Style::default()
-                .background(theme.border)
-                .border(Border {
-                    width: 0.0,
-                    color: Color::TRANSPARENT,
-                    radius: 0.0.into(),
-                })
-        })
-        .into()
-}
-
-pub fn sidebar_panel_style(theme: ThemeSpec) -> container::Style {
-    container::Style::default().background(theme.panel_background)
-}
-
-pub fn diff_panel_style(theme: ThemeSpec) -> container::Style {
-    container::Style::default()
-        .background(theme.panel_background)
-        .border(Border {
-            width: 0.0,
-            color: Color::TRANSPARENT,
-            radius: 0.0.into(),
-        })
-}
-
 /// Translucent chip background derived from the chip's text color. This way
 /// the chip reads independently of whether the row is selected — its visual
 /// frame comes from the tint rather than from the row's solid background.
@@ -446,31 +451,6 @@ pub mod control {
     pub const STANDARD: f32 = 32.0;
 }
 
-/// Centers a control's content in its fixed height. Text inside should be
-/// optically centred itself ([`crate::typography::centered`], which
-/// [`crate::ui::label`] does), so this centres boxes and nothing more.
-pub fn centered_control_content<'a, Message: 'a>(
-    content: impl Into<Element<'a, Message>>,
-) -> Element<'a, Message> {
-    container(content)
-        .height(Length::Fill)
-        .center_y(Length::Fill)
-        .into()
-}
-
-/// [`centered_control_content`] for a control whose outer button/container
-/// has an explicit width: it fills the width too, so icon-only controls
-/// center horizontally.
-pub fn centered_control_content_fill<'a, Message: 'a>(
-    content: impl Into<Element<'a, Message>>,
-) -> Element<'a, Message> {
-    container(content)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center(Length::Fill)
-        .into()
-}
-
 /// Corner radii shared across the chrome. Chips keep their own tighter
 /// rounding ([`crate::chip::RADIUS`]).
 pub mod radius {
@@ -486,31 +466,6 @@ pub mod radius {
     pub const SURFACE: f32 = 12.0;
 }
 
-/// Ghost button: invisible at rest, translucent wash on hover/press. The
-/// wash is [`chip_background`] of `muted_text` so it reads the same on
-/// panel and elevated backgrounds. For icon-only and small-label controls
-/// embedded in framed surfaces (tab strip, find card, popover footers) —
-/// standalone actions use [`raised_button_style`] so they stay visible at
-/// rest.
-pub fn ghost_button_style(theme: ThemeSpec, status: button::Status) -> button::Style {
-    button::Style {
-        background: match status {
-            button::Status::Hovered | button::Status::Pressed => {
-                Some(Background::Color(chip_background(theme.muted_text)))
-            }
-            _ => None,
-        },
-        text_color: theme.text,
-        border: Border {
-            width: 0.0,
-            color: Color::TRANSPARENT,
-            radius: radius::BUTTON.into(),
-        },
-        shadow: Shadow::default(),
-        snap: true,
-    }
-}
-
 /// Blend `a` toward `b` by `t` (0..=1), ignoring alpha. Used to derive the
 /// raised buttons' bezel stops from surface tokens without growing the spec,
 /// and the sidebar's target-mode wash.
@@ -523,10 +478,6 @@ pub fn mix(a: Color, b: Color, t: f32) -> Color {
     }
 }
 
-/// Fill for [`raised_button_style`] at rest: a flat step from the toolbar
-/// surface toward the selection tone, so the button separates from the
-/// (also elevated) bar it sits on. Lighter on dark themes, darker on
-/// light — both the conventional direction.
 fn raised_fill(theme: ThemeSpec, t: f32) -> Color {
     mix(theme.panel_background_elevated, theme.selected_file, t)
 }
@@ -536,177 +487,191 @@ fn raised_fill(theme: ThemeSpec, t: f32) -> Color {
 /// both the canvas and the elevated bar it sits on — recessed surfaces
 /// deepen in both dark and light themes.
 pub fn well_fill(theme: ThemeSpec) -> Color {
-    mix(theme.background, Color::BLACK, 0.06)
+    mix(theme.background, BLACK, 0.06)
 }
 
-/// The standard button: a flat fill one step above its surface, a crisp
-/// 1px border. Hover and press states deepen the fill without moving the
-/// control or adding elevation.
-pub fn raised_button_style(theme: ThemeSpec, status: button::Status) -> button::Style {
-    let fill = match status {
-        button::Status::Pressed => raised_fill(theme, 0.9),
-        button::Status::Hovered => raised_fill(theme, 0.65),
-        _ => raised_fill(theme, 0.35),
-    };
-    button::Style {
-        background: Some(Background::Color(fill)),
-        text_color: theme.text,
-        border: Border {
-            width: 1.0,
-            color: theme.border,
-            radius: radius::BUTTON.into(),
-        },
-        shadow: Shadow::default(),
-        snap: true,
+/// Colours of a button in each state. Geometry lives in [`crate::ui`].
+#[derive(Debug, Clone, Copy)]
+pub struct ButtonStyle {
+    pub rest: Option<Color>,
+    pub hover: Color,
+    pub active: Color,
+    pub label: Color,
+    pub border: Option<Color>,
+}
+
+/// Ghost button: invisible at rest, translucent wash on hover and press. The
+/// wash is [`chip_background`] of `muted_text`, so it reads the same on panel
+/// and elevated backgrounds. For icon-only and small-label controls embedded
+/// in framed surfaces (tab strip, find card, popover footers); standalone
+/// actions use [`raised_button_style`] so they stay visible at rest.
+pub fn ghost_button_style(theme: ThemeSpec) -> ButtonStyle {
+    let wash = chip_background(theme.muted_text);
+    ButtonStyle {
+        rest: None,
+        hover: wash,
+        active: wash,
+        label: theme.text,
+        border: None,
+    }
+}
+
+/// The standard button: a flat fill one step above its surface, a crisp 1px
+/// border. Hover and press deepen the fill without moving the control or
+/// adding elevation.
+pub fn raised_button_style(theme: ThemeSpec) -> ButtonStyle {
+    ButtonStyle {
+        rest: Some(raised_fill(theme, 0.35)),
+        hover: raised_fill(theme, 0.65),
+        active: raised_fill(theme, 0.9),
+        label: theme.text,
+        border: Some(theme.border),
     }
 }
 
 /// Primary call-to-action: informational blue fill with an inverted label.
-/// Keeping actions blue leaves coral
-/// for selection and working-copy state, away from destructive red.
-pub fn primary_button_style(theme: ThemeSpec, status: button::Status) -> button::Style {
-    if matches!(status, button::Status::Disabled) {
-        return button::Style {
-            background: Some(Background::Color(raised_fill(theme, 0.2))),
-            text_color: theme.subtle_text,
-            border: Border {
-                width: 1.0,
-                color: theme.border,
-                radius: radius::BUTTON.into(),
-            },
-            shadow: Shadow::default(),
-            snap: true,
-        };
+/// Keeping actions blue leaves coral for selection and working-copy state,
+/// away from destructive red.
+pub fn primary_button_style(theme: ThemeSpec) -> ButtonStyle {
+    ButtonStyle {
+        rest: Some(theme.info),
+        hover: mix(theme.info, theme.text, 0.08),
+        active: mix(theme.info, theme.background, 0.12),
+        label: theme.background,
+        border: None,
     }
-    let fill = match status {
-        button::Status::Hovered => mix(theme.info, theme.text, 0.08),
-        button::Status::Pressed => mix(theme.info, theme.background, 0.12),
-        _ => theme.info,
-    };
-    button::Style {
-        background: Some(Background::Color(fill)),
-        text_color: theme.background,
-        border: Border {
-            width: 0.0,
-            color: Color::TRANSPARENT,
-            radius: radius::BUTTON.into(),
-        },
-        shadow: Shadow::default(),
-        snap: true,
+}
+
+/// The primary button while it can't be pressed.
+pub fn disabled_button_style(theme: ThemeSpec) -> ButtonStyle {
+    let fill = raised_fill(theme, 0.2);
+    ButtonStyle {
+        rest: Some(fill),
+        hover: fill,
+        active: fill,
+        label: theme.subtle_text,
+        border: Some(theme.border),
     }
 }
 
 /// Destructive call-to-action for confirm dialogs: flat red fill so the
 /// dangerous choice is unmistakable next to the neutral cancel button.
-pub fn destructive_button_style(theme: ThemeSpec) -> button::Style {
-    button::Style {
-        background: Some(Background::Color(theme.removed_text)),
-        text_color: theme.background,
-        border: Border {
-            width: 0.0,
-            color: Color::TRANSPARENT,
-            radius: radius::BUTTON.into(),
-        },
-        shadow: Shadow::default(),
-        snap: true,
+pub fn destructive_button_style(theme: ThemeSpec) -> ButtonStyle {
+    ButtonStyle {
+        rest: Some(theme.removed_text),
+        hover: theme.removed_text,
+        active: theme.removed_text,
+        label: theme.background,
+        border: None,
     }
 }
 
-/// Floating card anchored to a trigger with nothing dimming the content
-/// behind it (dropdown menus, the activity popover). The heavy drop shadow
-/// is what separates it from the busy panel underneath.
-pub fn popover_style(theme: ThemeSpec) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(theme.panel_background_elevated)),
-        border: Border {
-            width: 1.0,
-            color: theme.border,
-            radius: radius::SURFACE.into(),
-        },
-        shadow: floating_shadow(8.0, 16.0),
-        ..container::Style::default()
-    }
-}
-
-/// The drop shadow every floating surface shares — same tint and alpha
+/// The drop shadow every floating surface shares: same tint and alpha
 /// everywhere, geometry scaled to the surface (popovers are bigger than
 /// tooltips).
-pub fn floating_shadow(offset_y: f32, blur_radius: f32) -> Shadow {
-    Shadow {
-        color: Color {
-            a: 0.05,
-            ..Color::BLACK
-        },
-        offset: Vector::new(0.0, offset_y),
-        blur_radius,
+pub fn floating_shadow(offset_y: f32, blur_radius: f32) -> BoxShadow {
+    BoxShadow {
+        color: Hsla::from(Color { a: 0.05, ..BLACK }),
+        offset: point(px(0.0), px(offset_y)),
+        blur_radius: px(blur_radius),
+        spread_radius: px(0.0),
+        inset: false,
     }
+}
+
+/// Floating card anchored to a trigger with nothing dimming the content behind
+/// it (dropdown menus, the activity popover). The heavy drop shadow is what
+/// separates it from the busy panel underneath.
+pub fn popover<E: Styled>(element: E, theme: ThemeSpec) -> E {
+    element
+        .bg(theme.panel_background_elevated)
+        .border_1()
+        .border_color(theme.border)
+        .rounded(px(radius::SURFACE))
+        .shadow(vec![floating_shadow(8.0, 16.0)])
 }
 
 /// Centered card over a scrim (confirm dialog, open-repo dialog, command
 /// palette). The scrim already darkens what's behind the modal, so a heavy
-/// shadow would just look like double dimming — soft, just enough to
-/// suggest the card is lifted.
-pub fn modal_style(theme: ThemeSpec) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(theme.panel_background_elevated)),
-        border: Border {
-            width: 1.0,
-            color: theme.border,
-            radius: radius::SURFACE.into(),
-        },
-        shadow: floating_shadow(4.0, 12.0),
-        ..container::Style::default()
-    }
+/// shadow would just look like double dimming: soft, just enough to suggest
+/// the card is lifted.
+pub fn modal_card<E: Styled>(element: E, theme: ThemeSpec) -> E {
+    element
+        .bg(theme.panel_background_elevated)
+        .border_1()
+        .border_color(theme.border)
+        .rounded(px(radius::SURFACE))
+        .shadow(vec![floating_shadow(4.0, 12.0)])
 }
 
 /// Dimming layer behind modal surfaces. One alpha everywhere so stacked
-/// takeovers (confirm dialog, open-repo dialog, command palette) feel
-/// equally deep.
-pub fn scrim_style() -> container::Style {
-    container::Style {
-        background: Some(Background::Color(Color {
-            a: 0.40,
-            ..Color::BLACK
-        })),
-        ..container::Style::default()
+/// takeovers (confirm dialog, open-repo dialog, command palette) feel equally
+/// deep.
+pub const SCRIM: Color = Color { a: 0.40, ..BLACK };
+
+/// Text-selection tint in an input.
+pub fn input_selection(theme: ThemeSpec) -> Color {
+    Color {
+        a: 0.25,
+        ..theme.accent
     }
 }
 
-/// Text-input field: a 1px outline carrying the input identity colors
-/// (placeholder / value / selection). Structural variants — the palette's
-/// borderless embedded input — override background and border but keep the
-/// colors, so every input hints and selects identically.
-pub fn input_style(theme: ThemeSpec) -> text_input::Style {
-    text_input::Style {
-        background: Background::Color(theme.panel_background),
-        border: Border {
-            width: 1.0,
-            color: theme.border,
-            radius: radius::CONTROL.into(),
-        },
-        placeholder: theme.subtle_text,
-        value: theme.text,
-        selection: Color {
-            a: 0.25,
-            ..theme.accent
-        },
-    }
+/// Hover tooltip card.
+pub fn tooltip_card<E: Styled>(element: E, theme: ThemeSpec) -> E {
+    element
+        .bg(theme.panel_background_elevated)
+        .text_color(theme.text)
+        .border_1()
+        .border_color(theme.border)
+        .rounded(px(radius::SURFACE))
 }
 
-/// Hover tooltip card. The revision list's custom-drawn tooltip overlay
-/// mirrors these colors through `RevisionListStyle` and its radius through
-/// [`radius::SURFACE`].
-pub fn tooltip_style(theme: ThemeSpec) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(theme.panel_background_elevated)),
-        text_color: Some(theme.text),
-        border: Border {
-            color: theme.border,
-            width: 1.0,
-            radius: radius::SURFACE.into(),
-        },
-        ..container::Style::default()
-    }
+/// Makes kit's theme speak diffui's palette, so a stock kit component (a
+/// button variant, an input, a scrollbar, a popover) looks native here. Call
+/// after any change to the resolved theme.
+pub fn apply_to_kit(resolved: ResolvedTheme, cx: &mut App) {
+    let spec = resolved.spec();
+    Theme::change(resolved.kit_mode(), None, cx);
+    let hsla = |color: Color| Hsla::from(color);
+    Theme::update(cx, |theme| {
+        let raised = raised_button_style(spec);
+        let primary = primary_button_style(spec);
+        let ghost = ghost_button_style(spec);
+        let scroll = scrollbar_style(spec);
+        let c = &mut theme.colors;
+        c.background = hsla(spec.background).into();
+        c.foreground = hsla(spec.text).into();
+        c.border = hsla(spec.border).into();
+        c.input = hsla(spec.border).into();
+        c.ring = hsla(spec.info).into();
+        c.muted = hsla(spec.panel_background_elevated).into();
+        c.muted_foreground = hsla(spec.muted_text).into();
+        c.popover = hsla(spec.panel_background_elevated).into();
+        c.popover_foreground = hsla(spec.text).into();
+        c.accent = hsla(ghost.hover).into();
+        c.accent_foreground = hsla(spec.text).into();
+        c.selection = hsla(input_selection(spec)).into();
+        c.caret = hsla(spec.text).into();
+        c.primary = hsla(primary.rest.unwrap_or(spec.info)).into();
+        c.primary_hover = hsla(primary.hover).into();
+        c.primary_active = hsla(primary.active).into();
+        c.primary_foreground = hsla(primary.label).into();
+        c.secondary = hsla(raised.rest.unwrap_or(spec.panel_background_elevated)).into();
+        c.secondary_hover = hsla(raised.hover).into();
+        c.secondary_active = hsla(raised.active).into();
+        c.secondary_foreground = hsla(raised.label).into();
+        c.danger = hsla(spec.removed_text).into();
+        c.danger_hover = hsla(spec.removed_text).into();
+        c.danger_active = hsla(spec.removed_text).into();
+        c.danger_foreground = hsla(spec.background).into();
+        c.scrollbar = hsla(TRANSPARENT).into();
+        c.scrollbar_thumb = hsla(scroll.thumb_color).into();
+        c.scrollbar_thumb_hover = hsla(scroll.thumb_color).into();
+        c.list_hover = hsla(ghost.hover).into();
+        c.list_active = hsla(spec.selected_file).into();
+        c.tab_bar = hsla(spec.background).into();
+    });
 }
 
 #[cfg(test)]

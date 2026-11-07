@@ -22,10 +22,9 @@
 //! matches its uppercase form (so `cmd+k` fires with caps lock on); an
 //! uppercase one matches only the shifted key.
 
-use std::collections::BTreeMap;
-
-use iced::keyboard::{self, key::Named};
+use crate::keys::{self as keyboard, Named};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 
 use crate::commands::{CommandId, Context, REGISTRY, command};
 

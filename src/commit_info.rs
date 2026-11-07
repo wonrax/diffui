@@ -9,18 +9,16 @@
 //! carry the same header. Folded, the block is the title and the shared
 //! [`crate::meta_line`] line, the line the History view's headers use.
 
+use crate::Cx;
 use diffui_core::history::{human_timestamp, now_millis, parse_timestamp_millis};
 use diffui_core::{RevisionDetails, SignatureInfo};
-use iced::{
-    Background, Border, Color, Element, Length, Padding, alignment,
-    widget::{Column, Row, Space, container, row, text},
-};
+use gpui_kit::{AnyElement, Window};
 
 use crate::diff_view::{HeaderAction, HeaderField, HeaderLine};
-use crate::meta_line::{self, Badge, Id, Meta};
+use crate::meta_line::{self, Badge};
 use crate::sidebar::{COMMIT_ID_CHARS, REVISION_ID_CHARS, revision_id_display_len};
-use crate::theme::{ThemeSpec, chip_background, emphasis_font, space, text_size};
-use crate::{Action, Diffui, Message, icons, ui};
+use crate::theme::{ThemeSpec, text_size};
+use crate::{Action, Diffui, icons};
 
 /// The title leads the pane at the dialog-title step, one above the graph
 /// row's description (`BODY_LG`).
@@ -30,194 +28,6 @@ const STAT_BAR_HEIGHT: f32 = 3.0;
 /// The smallest share of the bar a non-zero side gets, so one deletion
 /// against thousands of additions still shows.
 const STAT_BAR_MIN_SHARE: f32 = 0.08;
-
-pub(crate) fn view<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
-    let session = &ui.active().session;
-    let stats = (!session.document.files.is_empty()).then(|| diff_stats(ui, theme));
-    // A range has no one revision to describe: its title counts the
-    // commits, which the list under it names.
-    if let Some(range) = crate::range::shown_range(ui) {
-        let title_font = emphasis_font(ui.config.ui_font, iced::font::Weight::Semibold);
-        let mut title_row = row![crate::typography::centered(
-            text(crate::range::title(range))
-                .size(TITLE_SIZE)
-                .font(title_font)
-                .color(theme.text)
-                .wrapping(text::Wrapping::None)
-                .width(Length::Fill),
-            title_font,
-            TITLE_SIZE,
-        )]
-        .spacing(space::SM)
-        .align_y(alignment::Vertical::Center);
-        if let Some(stats) = stats {
-            title_row = title_row.push(container(stats).padding(Padding {
-                right: space::SM,
-                ..Padding::ZERO
-            }));
-        }
-        return container(title_row)
-            .width(Length::Fill)
-            .padding(Padding {
-                top: space::MD,
-                right: space::LG,
-                bottom: space::MD,
-                left: space::XL,
-            })
-            .style(move |_| container::Style::default().background(theme.panel_background))
-            .into();
-    }
-    let Some(details) = session.revision_details.as_ref() else {
-        return container(stats.unwrap_or_else(|| Space::new().into()))
-            .width(Length::Fill)
-            .height(Length::Fixed(crate::field::PANEL_HEADER_HEIGHT))
-            .padding([0.0, space::XL])
-            .center_y(Length::Fixed(crate::field::PANEL_HEADER_HEIGHT))
-            .style(move |_| container::Style::default().background(theme.panel_background))
-            .into();
-    };
-
-    let title = details
-        .description
-        .lines()
-        .find(|line| !line.trim().is_empty());
-
-    let title_font = emphasis_font(ui.config.ui_font, iced::font::Weight::Semibold);
-    // Centred on its caps against the buttons beside it.
-    let mut title_row = row![crate::typography::centered(
-        text(title.unwrap_or("No description").to_owned())
-            .size(TITLE_SIZE)
-            .font(title_font)
-            .color(if title.is_some() {
-                theme.text
-            } else {
-                theme.subtle_text
-            })
-            .wrapping(text::Wrapping::None)
-            .ellipsis(text::Ellipsis::End)
-            .width(Length::Fill),
-        title_font,
-        TITLE_SIZE,
-    )]
-    .spacing(space::SM)
-    .align_y(alignment::Vertical::Center);
-    if let Some(stats) = stats {
-        title_row = title_row.push(container(stats).padding(Padding {
-            right: space::SM,
-            ..Padding::ZERO
-        }));
-    }
-    if session.capabilities.mutate {
-        title_row = title_row.push(ui::tooltip(
-            ui::icon_button(icons::PENCIL, theme.muted_text, ui::Size::Compact, theme)
-                .on_press(Message::Action(Action::EditDescription { target: None })),
-            "Edit description",
-            iced::widget::tooltip::Position::Bottom,
-            ui.config.ui_font,
-            theme,
-        ));
-    }
-    let folded = ui.commit_details_collapsed;
-    title_row = title_row.push(ui::tooltip(
-        ui::icon_button(
-            if folded {
-                icons::UNFOLD_VERTICAL
-            } else {
-                icons::FOLD_VERTICAL
-            },
-            theme.muted_text,
-            ui::Size::Compact,
-            theme,
-        )
-        .on_press(Message::Action(Action::ToggleCommitDetails)),
-        if folded {
-            "Show the description and details"
-        } else {
-            "Show just the title"
-        },
-        iced::widget::tooltip::Position::Bottom,
-        ui.config.ui_font,
-        theme,
-    ));
-
-    let mut block = Column::new().push(title_row).spacing(space::XXS);
-    if folded {
-        block = block.push(revision_meta(ui, details, theme));
-    }
-    container(block)
-        .width(Length::Fill)
-        .padding(Padding {
-            top: space::MD,
-            right: space::LG,
-            bottom: space::MD,
-            left: space::XL,
-        })
-        .style(move |_| container::Style::default().background(theme.panel_background))
-        .into()
-}
-
-/// `+N −M` on one small line with a bar under it, as wide as the line,
-/// split between them. The file count and exact totals are on hover.
-fn diff_stats<'a>(ui: &Diffui, theme: ThemeSpec) -> Element<'a, Message> {
-    let document = &ui.active().session.document;
-    let (additions, deletions) = (document.total_additions, document.total_deletions);
-    let font = ui.config.ui_font;
-    let count =
-        |value: String, color: Color| text(value).size(text_size::CAPTION).font(font).color(color);
-    let counts = row![
-        count(
-            format!("+{}", compact_count(additions)),
-            crate::diff_panel::stat_color(additions, theme.added_text, theme)
-        ),
-        count(
-            format!("\u{2212}{}", compact_count(deletions)),
-            crate::diff_panel::stat_color(deletions, theme.removed_text, theme)
-        ),
-    ]
-    .spacing(space::SM);
-
-    let segment = |portion: u16, color: Color| {
-        container(Space::new())
-            .width(Length::FillPortion(portion))
-            .height(Length::Fixed(STAT_BAR_HEIGHT))
-            .style(move |_| container::Style {
-                background: Some(Background::Color(color)),
-                border: Border {
-                    radius: (STAT_BAR_HEIGHT / 2.0).into(),
-                    ..Border::default()
-                },
-                ..container::Style::default()
-            })
-    };
-    let (added, removed) = bar_portions(additions, deletions);
-    let mut bar = Row::new().spacing(1).width(Length::Fill);
-    if added > 0 {
-        bar = bar.push(segment(added, theme.added_text));
-    }
-    if removed > 0 {
-        bar = bar.push(segment(removed, theme.removed_text));
-    }
-    if added == 0 && removed == 0 {
-        bar = bar.push(segment(1, chip_background(theme.muted_text)));
-    }
-
-    let files = document.files.len();
-    let summary = format!(
-        "{files} {}, {additions} added, {deletions} removed",
-        if files == 1 { "file" } else { "files" }
-    );
-    ui::tooltip(
-        Column::new()
-            .push(counts)
-            .push(bar)
-            .spacing(space::XXS)
-            .width(Length::Shrink),
-        summary,
-        iced::widget::tooltip::Position::Bottom,
-        font,
-        theme,
-    )
-}
 
 /// A count short enough for the stats line: thousands abbreviated past
 /// four digits.
@@ -276,92 +86,6 @@ fn unique_prefix(ui: &Diffui, row: Option<diffui_core::RowView<'_>>) -> usize {
     })
     .filter(|&len| len > 0)
     .unwrap_or(REVISION_ID_CHARS)
-}
-
-/// The folded block's identity line: the change id as the graph draws it
-/// (the shortest unique prefix bright), the commit id dimmed, then the
-/// author and a relative date with the exact one on hover.
-fn revision_meta<'a>(
-    ui: &'a Diffui,
-    details: &'a RevisionDetails,
-    theme: ThemeSpec,
-) -> Element<'a, Message> {
-    let row_of = ui
-        .active()
-        .session
-        .commits
-        .find_by_commit_id(&details.commit_id);
-    let mut ids = Vec::new();
-    match details.change_id.as_deref() {
-        Some(change_id) => {
-            let unique = unique_prefix(ui, row_of);
-            let mut id: String = change_id
-                .chars()
-                .take(revision_id_display_len(unique, change_id))
-                .collect();
-            // How jj log addresses one copy of a divergent or hidden change.
-            if let Some(offset) = row_of.and_then(|row| row.change_offset()) {
-                id.push_str(&format!("/{offset}"));
-            }
-            ids.push(Id {
-                text: id,
-                bright: unique,
-                bright_color: theme.accent,
-                color: theme.subtle_text,
-            });
-            ids.push(Id::plain(
-                details
-                    .commit_id
-                    .chars()
-                    .take(COMMIT_ID_CHARS)
-                    .collect::<String>(),
-                theme.muted_text,
-            ));
-        }
-        None if !details.commit_id.starts_with('#') => ids.push(Id {
-            text: details
-                .commit_id
-                .chars()
-                .take(COMMIT_ID_CHARS)
-                .collect::<String>(),
-            bright: unique_prefix(ui, row_of),
-            bright_color: theme.accent,
-            color: theme.subtle_text,
-        }),
-        // A PR's one id is its number.
-        None => ids.push(Id::plain(
-            details
-                .commit_id
-                .chars()
-                .take(COMMIT_ID_CHARS)
-                .collect::<String>(),
-            theme.muted_text,
-        )),
-    }
-    let author = &details.author;
-    let who = if !author.name.is_empty() {
-        Some((author.name.clone(), Some(author.email.clone())))
-    } else if !author.email.is_empty() {
-        Some((author.email.clone(), None))
-    } else {
-        None
-    };
-    let when = author
-        .timestamp
-        .as_ref()
-        .filter(|timestamp| !timestamp.is_empty())
-        .map(|timestamp| (parse_timestamp_millis(timestamp), timestamp.clone()));
-    meta_line::view(
-        Meta {
-            ids,
-            badges: status_badges(row_of, theme),
-            who,
-            when,
-            operation: None,
-        },
-        ui,
-        theme,
-    )
 }
 
 /// The diff view's header for `details`: the description's body, then the
@@ -543,12 +267,12 @@ pub(crate) fn header_lines(
 }
 
 /// What the diff view's header links and buttons do.
-pub(crate) fn header_action(action: HeaderAction) -> Message {
+pub(crate) fn header_action(action: HeaderAction) -> Action {
     match action {
-        HeaderAction::Copy(value) => Message::Action(Action::Copy(value)),
-        HeaderAction::Open(commit_id) => Message::Action(Action::History(
-            crate::history_panel::HistoryAction::OpenRevision(commit_id),
-        )),
+        HeaderAction::Copy(value) => Action::Copy(value),
+        HeaderAction::Open(commit_id) => {
+            Action::History(crate::history_panel::HistoryAction::OpenRevision(commit_id))
+        }
     }
 }
 
@@ -744,4 +468,10 @@ mod tests {
             lines.len()
         );
     }
+}
+
+/// Stub: the commit_info view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn view(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> AnyElement {
+    crate::stub::panel("commit_info::view")
 }

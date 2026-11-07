@@ -1,7 +1,10 @@
+// The port's lanes fill the views in; until they land, a lot of state and
+// plumbing here is written ahead of its reader. Remove these with the last stub.
+#![allow(dead_code, unused_variables)]
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
-    pin::Pin,
     time::{Duration, Instant},
 };
 
@@ -34,7 +37,6 @@ mod macos_native;
 mod media;
 mod menu;
 mod menus;
-mod message;
 mod meta_line;
 mod mode_hints;
 mod modes;
@@ -44,9 +46,12 @@ mod plan;
 mod range;
 mod revops;
 mod revset_assist;
+mod root;
 mod shortcuts;
 mod sidebar;
 mod source_panel;
+mod spawn;
+mod stub;
 mod tab_bar;
 mod tabs;
 mod toolbar;
@@ -61,13 +66,12 @@ pub(crate) use action::Action;
 pub(crate) use diffui_core::{
     FetchTarget, JobId, RepoHandle, github, graph_layout, jj, mutations, repository,
 };
-pub(crate) use message::{Message, UiEvent, WindowEvent};
 // The same for the widget layer in `diffui-widgets`: `crate::theme`,
 // `crate::ui`, `crate::diff_view` and the rest resolve as they did when they
 // were modules of this crate.
 pub(crate) use diffui_widgets::{
-    chip, chrome, diff_view, editor_drag, ellipsis, graph_view, hunk_actions, icons, input,
-    measure, pointer, prose, resize_handle, revision_list, scrollbar, theme, typography, ui, wheel,
+    chip, chrome, diff_view, ellipsis, geometry, graph_view, hunk_actions, icons, input, keys,
+    measure, prose, resize_handle, revision_list, scrollbar, theme, typography, ui,
 };
 
 /// Profiling-only global allocator (enabled by the `track-alloc` feature). It
@@ -145,28 +149,21 @@ use commands::{CommandArg, Context};
 use config::AppConfig;
 use diffui_core::{DiffFile, LoadProgress, RevisionDetails, RevisionSelection, SignatureInfo};
 use find::FindState;
-use futures::{Stream, StreamExt};
-use iced::theme as iced_theme;
-use iced::{
-    Element, Length, Padding, Point, Size, Subscription, Task, Theme, alignment,
-    event::{self, Event},
-    font::Weight,
-    keyboard, system, time,
-    widget::{self, column, container, row, stack, text},
-    window,
-};
+use geometry::{Point, Rectangle, Size};
 use keymap::{Chord, Keymap};
 use modes::{Mode, ModeKind, TabMode};
 use palette::{
     ColumnSource, PaletteState, Recents, ResultRef, change_id_for_recents, revision_selection,
 };
 use repository::{Repository, Vcs, prepare_repository};
-use resize_handle::ResizeHandle;
-use theme::{
-    ResolvedTheme, ThemePreference, ThemeSpec, app_shell_style, emphasis_font, horizontal_divider,
-    text_size, vertical_divider,
-};
+use theme::{ResolvedTheme, SystemAppearance, ThemePreference};
 use window_state::WindowState;
+
+/// What every piece of update code takes: the root entity's context.
+pub(crate) type Cx<'a> = gpui_kit::Context<'a, Diffui>;
+
+/// The window's size when nothing better is known.
+const DEFAULT_WINDOW_SIZE: Size = Size::new(1280.0, 800.0);
 
 /// Debounce before re-running the palette matcher. It scans every commit, so
 /// coalescing fast typing keeps the input responsive on large repos.
@@ -181,27 +178,7 @@ const WINDOW_STATE_DEBOUNCE: Duration = Duration::from_millis(400);
 /// quick-pick list. Bounded so the persisted state file stays small.
 const RECENT_REPOS_MAX: usize = 12;
 
-/// Fallback duration for the custom zoom animation when AppKit's own
-/// `animationResizeTime:` isn't available (e.g. un-zooming with no saved
-/// duration). The real path queries the native value so the timing matches a
-/// native zoom exactly; this is only a sane default.
-pub(crate) const ZOOM_FALLBACK_SECS: f64 = 0.25;
-
-/// True when two window frames (`[x, y, w, h]`) match within a pixel or two —
-/// used to tell whether the window is already sitting at its zoom target.
-pub(crate) fn frames_approx_eq(a: [f64; 4], b: [f64; 4]) -> bool {
-    a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() < 2.0)
-}
-
-/// The frame to un-zoom to when we have no saved pre-zoom frame (e.g. the window
-/// opened already maximized): a centered 70% of the screen's visible area.
-pub(crate) fn zoom_default_restore(visible: [f64; 4]) -> [f64; 4] {
-    let [vx, vy, vw, vh] = visible;
-    let (w, h) = (vw * 0.7, vh * 0.7);
-    [vx + (vw - w) / 2.0, vy + (vh - h) / 2.0, w, h]
-}
-
-fn main() -> iced::Result {
+fn main() {
     // Started by git or ssh to ask for a credential: relay it and exit.
     if let Some(code) = diffui_core::askpass::run_helper() {
         std::process::exit(code);
@@ -221,47 +198,14 @@ fn main() -> iced::Result {
         tracing::warn!("credential prompts unavailable: {error}");
     }
 
-    // Restore the last window geometry before the window is created. The
-    // sidebar split lives in app state, so it's restored later in
-    // `Diffui::new`; `saved` is handed to the boot closure for that.
-    let saved = WindowState::load();
-    let mut window_settings = window::Settings::default();
-    if let Some((width, height)) = saved.size() {
-        window_settings.size = Size::new(width, height);
-    } else if let Some((width, height)) = window_state::default_window_size(screen_visible_size()) {
-        window_settings.size = Size::new(width, height);
-        window_settings.position = window::Position::Centered;
-    }
-    if let Some((x, y)) = saved.position() {
-        window_settings.position = window::Position::Specific(Point::new(x, y));
-    }
-    // Platform window chrome (e.g. macOS transparent title bar so the tab strip
-    // sits inline with the traffic lights). See `chrome`.
-    chrome::apply_window_settings(&mut window_settings);
-
-    iced::application(
-        move || Diffui::new(cli.clone(), saved.clone()),
-        Diffui::update,
-        view,
-    )
-    .title("diffui")
-    .fonts([icons::ICON_FONT_BYTES])
-    // iced's default moved to 1.375; the layout (toolbar fills, icon boxes) is
-    // measured against 1.3 line boxes.
-    .line_height(iced::widget::text::LineHeight::Relative(1.3))
-    .window(window_settings)
-    // The close is ours to perform: `Message::WindowCloseRequested` flushes the
-    // pending window state before exiting, which winit gives us no other chance
-    // to do (⌘Q and the close button raise no `Unfocused`).
-    .exit_on_close_request(false)
-    .subscription(Diffui::subscription)
-    .theme(Diffui::theme)
-    .run()
-}
-
-/// The app's view, with wheel deltas normalized for the window's scale factor.
-fn view(app: &Diffui) -> Element<'_, Message> {
-    wheel::normalized(app.view(), app.scale_factor)
+    gpui_kit::application().run(move |cx| {
+        root::init(cx);
+        let saved = WindowState::load();
+        if let Err(error) = root::open_window(cli, saved, cx) {
+            tracing::error!("couldn't open the window: {error}");
+            cx.quit();
+        }
+    });
 }
 
 /// The primary display's usable size, where the platform can tell us before
@@ -314,7 +258,7 @@ pub(crate) struct PendingMutation {
 pub(crate) struct Diffui {
     pub(crate) app_focused: bool,
     pub(crate) selected_theme: ThemePreference,
-    pub(crate) system_theme: iced_theme::Mode,
+    pub(crate) system_theme: SystemAppearance,
     /// Last usable widths for the two resizable navigation panes. Collapsing a
     /// pane keeps its width here so reopening restores the user's split.
     pub(crate) sidebar_width: f32,
@@ -357,26 +301,11 @@ pub(crate) struct Diffui {
     /// doesn't report window positions).
     pub(crate) window_size: Size,
     pub(crate) window_position: Option<Point>,
-    /// The window's display scale factor, from `Opened` and `Rescaled`;
-    /// [`wheel::normalized`] divides trackpad deltas by it.
-    pub(crate) scale_factor: f32,
     /// Set when the window geometry or sidebar width changes; cleared once the
     /// new value is persisted. While it's `Some`, the subscription runs a
     /// debounce timer whose tick flushes the geometry to disk after the
     /// changes settle. `None` when nothing is pending.
     pub(crate) geometry_dirty_since: Option<Instant>,
-    /// In-flight custom double-click zoom animation (macOS), or `None` when idle.
-    /// We drive the zoom ourselves frame-by-frame instead of using AppKit's
-    /// `performZoom:` so the layout re-flows each step like an edge-drag resize
-    /// rather than the whole GPU surface morphing mid-animation. While `Some`,
-    /// the subscription ticks it.
-    pub(crate) zoom_anim: Option<ZoomAnim>,
-    /// The pre-zoom window frame to restore on the next un-zoom (AppKit screen
-    /// coords `[x, y, w, h]`) paired with the native animation duration used to
-    /// zoom in — reused for the symmetric un-zoom so its timing matches without a
-    /// second `animationResizeTime:` round-trip. `None` when not in our zoomed
-    /// state.
-    pub(crate) zoom_restore: Option<([f64; 4], f64)>,
     pub(crate) config: AppConfig,
     /// Chord → command id per context, built from the registry's defaults
     /// with the `[keys]` section of `config.toml` layered on top.
@@ -458,7 +387,12 @@ pub(crate) struct Diffui {
     /// Live keyboard modifier state, tracked from the event subscription so
     /// pointer gestures can read it at decision time (⌥-drop = rebase with
     /// descendants).
-    pub(crate) modifiers: keyboard::Modifiers,
+    pub(crate) modifiers: keys::Modifiers,
+    /// The window this view lives in, once it has one. Update code holds no
+    /// `Window`; see [`Diffui::with_window`].
+    pub(crate) window: Option<gpui_kit::AnyWindowHandle>,
+    /// The loops that stand in for iced's subscriptions.
+    pub(crate) background: root::Background,
 }
 
 /// Frontend wrapper around the core [`diffui_core::OpDraft`]: the draft
@@ -551,7 +485,7 @@ pub(crate) const TOAST_TTL: Duration = Duration::from_secs(7);
 pub(crate) struct DescriptionEditor {
     pub(crate) target: RevisionSelection,
     pub(crate) original: String,
-    pub(crate) content: widget::text_editor::Content,
+    pub(crate) content: String,
     /// The mutation activity that owns an in-flight save. `None` means the
     /// draft is editable.
     pub(crate) saving_activity: Option<activity::ActivityId>,
@@ -563,7 +497,7 @@ pub(crate) struct DescriptionEditor {
 
 impl DescriptionEditor {
     pub(crate) fn text(&self) -> String {
-        self.content.text()
+        self.content.clone()
     }
 
     pub(crate) fn is_dirty(&self) -> bool {
@@ -681,21 +615,6 @@ pub(crate) enum HoverTarget {
     /// A title-bar tab, keyed by id — drives its inset hover fill. At most one is
     /// hovered at a time.
     Tab(TabId),
-}
-
-/// One in-flight custom zoom animation: interpolate the window frame from `from`
-/// to `to` (AppKit screen coords `[x, y, w, h]`) over `duration` seconds, applying
-/// each step as a non-animated `setFrame:` so the resize routes through the same
-/// live-repaint path an edge-drag uses. `duration` is AppKit's own
-/// `animationResizeTime:` for this resize, so the timing matches a native zoom;
-/// `start` is the wall-clock the animation began and the tick handler eases
-/// `elapsed / duration`.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ZoomAnim {
-    pub(crate) start: Instant,
-    pub(crate) from: [f64; 4],
-    pub(crate) to: [f64; 4],
-    pub(crate) duration: f64,
 }
 
 /// Everything one tab owns: its core [`Session`] (all domain + orchestration
@@ -1111,9 +1030,8 @@ pub(crate) use diffui_core::{LoadStatus, Session};
 /// (which the sidebar resolves from the current file tree) into view on the
 /// next render. The scroll itself is a no-op when the file list is closed — the
 /// sidebar passes `None` as the reveal target in that case.
-fn scroll_sidebar_to_file(ui: &mut Diffui) -> Task<Message> {
+fn scroll_sidebar_to_file(ui: &mut Diffui) {
     ui.sidebar_file_reveal_token = ui.sidebar_file_reveal_token.wrapping_add(1);
-    Task::none()
 }
 
 /// Map a sidebar row key back to the app's revision selection enum.
@@ -1122,53 +1040,6 @@ fn selection_from_key(key: &revision_list::RowSelectionKey) -> RevisionSelection
         revision_list::RowSelectionKey::WorkingCopy => RevisionSelection::WorkingCopy,
         revision_list::RowSelectionKey::Commit(id) => RevisionSelection::Commit(id.clone()),
     }
-}
-
-/// Welcome screen shown whenever no repository is open: a fresh launch with
-/// nothing to restore (including from the macOS/Spotlight launcher, where cwd is
-/// `/`), or after the last tab is closed. It is the open prompt itself — the
-/// same card ⌘O raises over a tab, inline and focused, with the recent
-/// repositories — under the wordmark, then a few tips.
-/// Only an explicit `--path` that failed to resolve surfaces an error; the
-/// session and cwd fallbacks resolve silently to this screen instead.
-fn empty_state<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
-    // The wordmark alone is the identity: big enough to anchor the page.
-    let identity = text("Diffui")
-        .size(text_size::DISPLAY)
-        .color(theme.text)
-        .font(emphasis_font(ui.config.ui_font, Weight::Semibold));
-    let mut body = column![identity]
-        .spacing(theme::space::XXL)
-        .align_x(alignment::Horizontal::Center);
-
-    // A `Failed` status can now only come from an explicit `--path` (the session
-    // and cwd fallbacks resolve silently), so it's always worth surfacing.
-    if let LoadStatus::Failed(error) = &ui.active().session.status {
-        body = body.push(
-            text(format!("Couldn't open repository: {error}"))
-                .size(text_size::UI)
-                .color(theme.removed_text)
-                .font(ui.config.ui_font),
-        );
-    }
-
-    // `update` keeps the prompt's state alive whenever no tab is open.
-    if let Some(dialog) = ui.open_repo_dialog() {
-        body = body.push(tab_bar::open_repo_card(ui, theme, dialog));
-    }
-    body = body.push(shortcuts::welcome_hints(ui, theme));
-
-    // Optically centered: a touch above the true middle, where a centered
-    // block reads as centered rather than as sinking.
-    container(body)
-        .center_x(Length::Fill)
-        .height(Length::Fill)
-        .align_y(alignment::Vertical::Center)
-        .padding(Padding {
-            bottom: theme::space::XXL * 3.0,
-            ..Padding::ZERO
-        })
-        .into()
 }
 
 /// Split a repository root into a dimmed `owner` (the parent directory name)
@@ -1329,6 +1200,11 @@ fn open_url(url: &str) {
     let _ = command.spawn();
 }
 
+/// Put `text` on the system clipboard.
+pub(crate) fn write_clipboard(text: String, cx: &mut gpui_kit::App) {
+    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text));
+}
+
 /// Sort key for ordering a bookmark by how close its `target` commit sits to a
 /// reference revision in the loaded log: the absolute index distance, or
 /// `usize::MAX` when either commit isn't loaded (so unknowns sink to the bottom
@@ -1374,21 +1250,6 @@ fn current_file_diff_text(ui: &Diffui) -> Option<String> {
         }
     }
     Some(out)
-}
-
-/// One repository's actor and its event stream.
-///
-/// Spawning the actor *inside* the subscription is what bounds its lifetime:
-/// iced keeps the subscription alive while a tab names it and drops it when the
-/// last one closes, and dropping the stream shuts the actor down with it. The
-/// first event carries the command sender back to the app.
-// `&OpenSpec` (not `OpenSpec`) is required: `Subscription::run_with` keys on
-// `D = OpenSpec` and hands the builder a `fn(&D)`.
-#[allow(clippy::ptr_arg)]
-fn open_repository(spec: &diffui_core::OpenSpec) -> Pin<Box<dyn Stream<Item = Message> + Send>> {
-    diffui_core::repo::open(spec.clone())
-        .map(|event| Message::Repo(Box::new(event)))
-        .boxed()
 }
 
 #[cfg(test)]

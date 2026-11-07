@@ -19,52 +19,16 @@
 //! same gesture. Drag-over-and-release from the opening press therefore does not
 //! pick; every release after it does.
 
+use crate::Cx;
+use crate::geometry::{Point, Rectangle, Size};
+use crate::modes::ModeKind;
+use gpui_kit::{AnyElement, Window};
 use std::time::Instant;
 
-use iced::advanced::{
-    Layout, Shell, Widget, layout, mouse, overlay, renderer,
-    widget::{Operation, Tree},
-};
-use iced::{
-    Background, Border, Color, Element, Event, Length, Padding, Point, Rectangle, Size, Theme,
-    alignment,
-    widget::{Space, column, container, mouse_area, opaque, pin, stack, text},
-};
-
+use crate::Diffui;
 use crate::commands::{CommandArg, CommandId};
-use crate::icons;
 use crate::measure;
-use crate::theme::{self, ThemeSpec, emphasis_font, popover_style, text_size};
-use crate::typography::{self, Aligned};
-use crate::{Diffui, Message};
-
-/// Messages from an open popup menu, nested under [`Message::Menu`].
-#[derive(Debug, Clone)]
-pub enum MenuMessage {
-    /// Hovered a row (path of indices through submenus): highlight it and open
-    /// its flyout if it's a submenu.
-    Hover(Vec<usize>),
-    /// Cursor moved while a menu is open (window coords) — drives the submenu
-    /// trajectory guard and keeps the app underneath inert.
-    MouseMoved(iced::Point),
-    /// Released over a row with this button: pick it (if a leaf). The button
-    /// travels with the message so the opening gesture's release can be told
-    /// apart from a later one (see [`OverlayMenu::opening_release`]).
-    Select(Vec<usize>, mouse::Button),
-    /// A press inside the card — swallowed so it doesn't dismiss.
-    CapturePress,
-    /// A card scrolled: `(depth, y offset)`. Recorded so flyout placement —
-    /// which keys off a parent *row's on-screen* position — tracks the rows
-    /// as they slide, instead of assuming the unscrolled layout.
-    CardScrolled(usize, f32),
-    /// Dismiss the open menu (press outside, or Esc).
-    Dismiss,
-    /// A release of this button on the dismiss scrim — dismisses, unless it is
-    /// the opening gesture's own release.
-    ScrimRelease(mouse::Button),
-    /// No-op tick that keeps `view` re-running so the right-click glow pulses.
-    Tick,
-}
+use crate::theme::{self, ThemeSpec, emphasis_font, text_size};
 
 // ── Card geometry ───────────────────────────────────────────────────────────
 const MENU_MIN_WIDTH: f32 = 200.0;
@@ -161,7 +125,7 @@ pub(crate) struct OverlayMenu {
     /// The button whose press opened the menu, until that press's release has
     /// been seen — see [`Self::opening_release`]. `None` once it has, or when
     /// the menu was opened by something other than a mouse press.
-    pub opened_by: Option<mouse::Button>,
+    pub opened_by: Option<gpui_kit::MouseButton>,
     /// Whether the cursor has entered the menu at least once — lets a
     /// drag-out-and-release dismiss while a click-in-place stays open.
     pub entered: bool,
@@ -210,7 +174,7 @@ impl OverlayMenu {
     pub(crate) fn new(
         root: Vec<MenuEntry>,
         anchor: AnchorSpec,
-        opened_by: Option<mouse::Button>,
+        opened_by: Option<gpui_kit::MouseButton>,
     ) -> Self {
         OverlayMenu {
             root,
@@ -239,7 +203,7 @@ impl OverlayMenu {
     /// row without tracking where the press began, so a right-click low in the
     /// window would otherwise open the context menu and run the row that landed
     /// under the cursor — Abandon, Edit — on the way back up.
-    pub(crate) fn opening_release(&mut self, button: mouse::Button) -> bool {
+    pub(crate) fn opening_release(&mut self, button: gpui_kit::MouseButton) -> bool {
         if self.opened_by == Some(button) {
             self.opened_by = None;
             true
@@ -348,144 +312,6 @@ fn row_active(menu: &OverlayMenu, path: &[usize]) -> bool {
     }
     // An open submenu parent: `open_path` starts with this row's path.
     path.len() <= menu.open_path.len() && menu.open_path[..path.len()] == *path
-}
-
-// ── Renderer ──────────────────────────────────────────────────────────────────
-
-/// The whole popup overlay (scrim + glow + cards), or an empty `Space` when no
-/// menu is open. Stacked over the app shell in `view`.
-pub(crate) fn build_overlay(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
-    let Some(menu) = ui.menu() else {
-        return Space::new().into();
-    };
-
-    // Full-screen event sink behind the cards: dismisses on a press outside the
-    // cards, arms/closes on release, and — crucially — captures cursor moves and
-    // scrolls so the app underneath stays inert (no hover/tooltip bleed-through)
-    // and the latest cursor reaches the trajectory guard. Cards sit above it, so
-    // they see events first; only what they ignore reaches here.
-    let mut layers: Vec<Element<'_, Message>> = vec![
-        Backdrop {
-            on_press: Message::Menu(MenuMessage::Dismiss),
-            on_release: |b| Message::Menu(MenuMessage::ScrimRelease(b)),
-            on_move: |p| Message::Menu(MenuMessage::MouseMoved(p)),
-        }
-        .into(),
-    ];
-
-    if let Some(rect) = menu.glow {
-        layers.push(
-            pin(glow_card(theme, rect.width, rect.height, menu.opened_at))
-                .x(rect.x)
-                .y(rect.y)
-                .into(),
-        );
-    }
-
-    for (prefix, rect) in card_rects(ui, menu) {
-        let entries = entries_at(&menu.root, &prefix).unwrap_or(&[]);
-        layers.push(
-            pin(build_card(ui, theme, menu, entries, &prefix, rect.width))
-                .x(rect.x)
-                .y(rect.y)
-                .into(),
-        );
-    }
-
-    push_trajectory_debug(&mut layers, ui, menu);
-
-    // The Backdrop swallows *events*, but `mouse_interaction` is a separate
-    // per-layer query that ignores event capture — without `opaque`, the app
-    // underneath still painted its own cursor (the diff view's I-beam)
-    // through the menu scrim.
-    opaque(stack(layers).width(Length::Fill).height(Length::Fill))
-}
-
-/// Draws the submenu trajectory triangle over the open menu: the apex (blue),
-/// its wedge to the flyout's near edge, and the live cursor (green inside the
-/// triangle, red outside). Compiled in only under the `trajectory-debug`
-/// feature; a no-op otherwise.
-#[cfg(feature = "trajectory-debug")]
-fn push_trajectory_debug<'a>(
-    layers: &mut Vec<Element<'a, Message>>,
-    ui: &Diffui,
-    menu: &OverlayMenu,
-) {
-    use iced::widget::canvas;
-
-    let (Some(origin), Some(cur), Some(fly)) =
-        (menu.flyout_origin, menu.cursor, flyout_rect(ui, menu))
-    else {
-        return;
-    };
-    let (apex, base_top, base_bottom) = flyout_triangle(origin, fly);
-
-    struct Triangle {
-        apex: Point,
-        base_top: Point,
-        base_bottom: Point,
-        cursor: Point,
-        inside: bool,
-    }
-
-    impl canvas::Program<Message> for Triangle {
-        type State = ();
-
-        fn draw(
-            &self,
-            _state: &(),
-            renderer: &iced::Renderer,
-            _theme: &Theme,
-            bounds: Rectangle,
-            _cursor: mouse::Cursor,
-        ) -> Vec<canvas::Geometry> {
-            let mut frame = canvas::Frame::new(renderer, bounds.size());
-            let accent = Color::from_rgb(0.96, 0.55, 0.22);
-            let triangle = canvas::Path::new(|p| {
-                p.move_to(self.apex);
-                p.line_to(self.base_top);
-                p.line_to(self.base_bottom);
-                p.close();
-            });
-            frame.fill(&triangle, Color { a: 0.18, ..accent });
-            frame.stroke(
-                &triangle,
-                canvas::Stroke::default().with_color(accent).with_width(1.0),
-            );
-            frame.fill(
-                &canvas::Path::circle(self.apex, 3.5),
-                Color::from_rgb(0.40, 0.70, 1.0),
-            );
-            let cursor_color = if self.inside {
-                Color::from_rgb(0.30, 0.90, 0.45)
-            } else {
-                Color::from_rgb(1.0, 0.30, 0.30)
-            };
-            frame.fill(&canvas::Path::circle(self.cursor, 3.5), cursor_color);
-            vec![frame.into_geometry()]
-        }
-    }
-
-    layers.push(
-        canvas(Triangle {
-            apex,
-            base_top,
-            base_bottom,
-            cursor: cur,
-            inside: point_in_triangle(cur, apex, base_top, base_bottom),
-        })
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into(),
-    );
-}
-
-#[cfg(not(feature = "trajectory-debug"))]
-fn push_trajectory_debug(
-    _layers: &mut Vec<Element<'_, Message>>,
-    _ui: &Diffui,
-    _menu: &OverlayMenu,
-) {
 }
 
 /// The entries of the submenu reached by `prefix` (each index steps into a
@@ -699,7 +525,7 @@ fn card_width(ui: &Diffui, entries: &[MenuEntry]) -> f32 {
                 ..
             } => {
                 let label_font = if *emphasized {
-                    emphasis_font(font, iced::font::Weight::Medium)
+                    emphasis_font(font, crate::theme::Weight::MEDIUM)
                 } else {
                     font
                 };
@@ -734,520 +560,6 @@ fn card_width(ui: &Diffui, entries: &[MenuEntry]) -> f32 {
 /// both the chevron's rendered size and the width the menu-width calc reserves.
 const CHEVRON_WIDTH: f32 = 13.0;
 
-fn build_card<'a>(
-    ui: &'a Diffui,
-    theme: ThemeSpec,
-    menu: &'a OverlayMenu,
-    entries: &'a [MenuEntry],
-    prefix: &[usize],
-    width: f32,
-) -> Element<'a, Message> {
-    let rows = entries.iter().enumerate().map(|(idx, entry)| {
-        let mut path = prefix.to_vec();
-        path.push(idx);
-        let active = row_active(menu, &path);
-        build_row(ui, theme, entry, path, active)
-    });
-    let list = column(rows.collect::<Vec<_>>()).spacing(0);
-
-    let max_h = menu_max_height(ui);
-    let content_h: f32 = entries.iter().map(MenuEntry::height).sum();
-    let body: Element<'a, Message> = if content_h + MENU_CARD_PAD * 2.0 > max_h {
-        let depth = prefix.len();
-        // The id is per *branch*, not per depth: switching between sibling
-        // submenus at the same depth must not inherit the old one's scroll
-        // state. The reported offsets feed [`card_rects`]'s flyout anchoring.
-        let id_path: Vec<String> = prefix.iter().map(usize::to_string).collect();
-        // Out to the card's right edge, like every scroll view's bar; the
-        // card's right inset moves inside the list.
-        crate::ui::scrollable(
-            container(list).padding(Padding {
-                right: MENU_CARD_PAD,
-                ..Padding::ZERO
-            }),
-            theme,
-        )
-        .id(format!("menu-card-{}", id_path.join("-")))
-        .on_scroll(move |viewport| {
-            Message::Menu(MenuMessage::CardScrolled(
-                depth,
-                viewport.absolute_offset().y,
-            ))
-        })
-        .width(Length::Fill)
-        .height(Length::Shrink)
-        .into()
-    } else {
-        list.into()
-    };
-    let scrolls = content_h + MENU_CARD_PAD * 2.0 > max_h;
-
-    // The card swallows presses (either button) so a click inside it never
-    // reaches the dismiss backdrop; rows carry their own hover/release handlers.
-    mouse_area(
-        container(body)
-            .width(Length::Fixed(width))
-            .height(Length::Fit.max(max_h))
-            .padding(Padding {
-                right: if scrolls { 0.0 } else { MENU_CARD_PAD },
-                ..Padding::from(MENU_CARD_PAD)
-            })
-            .style(move |_| popover_style(theme)),
-    )
-    .on_press(Message::Menu(MenuMessage::CapturePress))
-    .on_right_press(Message::Menu(MenuMessage::CapturePress))
-    .into()
-}
-
-fn build_row<'a>(
-    ui: &'a Diffui,
-    theme: ThemeSpec,
-    entry: &'a MenuEntry,
-    path: Vec<usize>,
-    active: bool,
-) -> Element<'a, Message> {
-    let font = ui.config.ui_font;
-    let mono = ui.config.mono_font;
-
-    let inner: Element<'a, Message> = match entry {
-        MenuEntry::Separator => {
-            return container(
-                container(Space::new())
-                    .width(Length::Fill)
-                    .height(Length::Fixed(1.0))
-                    .style(move |_| container::Style {
-                        background: Some(Background::Color(theme.border)),
-                        ..container::Style::default()
-                    }),
-            )
-            .height(Length::Fixed(MENU_SEP_HEIGHT))
-            .padding(Padding::from([0.0, MENU_ITEM_PAD_X]))
-            .align_y(alignment::Vertical::Center)
-            .into();
-        }
-        // Labels centre their caps in the row; a detail or chevron joins on
-        // the label's baseline (see `crate::typography`).
-        MenuEntry::Disabled { label, reason } => {
-            let label_widget = text(label)
-                .size(MENU_LABEL_SIZE)
-                .color(theme.subtle_text)
-                .font(font)
-                .wrapping(iced::advanced::text::Wrapping::None);
-            match reason {
-                // Why it's greyed, where an enabled row shows its chord.
-                Some(reason) => typography::baseline_row(
-                    [
-                        Aligned::text(label_widget, font, MENU_LABEL_SIZE),
-                        Aligned::text(
-                            text(reason)
-                                .size(MENU_DETAIL_SIZE)
-                                .color(theme.subtle_text)
-                                .font(font)
-                                .width(Length::Fill)
-                                .align_x(iced::advanced::text::Alignment::Right)
-                                .wrapping(iced::advanced::text::Wrapping::None)
-                                .ellipsis(iced::advanced::text::Ellipsis::End),
-                            font,
-                            MENU_DETAIL_SIZE,
-                        ),
-                    ],
-                    MENU_ROW_GAP,
-                ),
-                None => typography::centered(
-                    label_widget
-                        .width(Length::Fill)
-                        .ellipsis(iced::advanced::text::Ellipsis::End),
-                    font,
-                    MENU_LABEL_SIZE,
-                ),
-            }
-        }
-        MenuEntry::Item {
-            label,
-            detail,
-            emphasized,
-            ..
-        } => {
-            let label_font = if *emphasized {
-                emphasis_font(font, iced::font::Weight::Medium)
-            } else {
-                font
-            };
-            let label_widget = text(label)
-                .size(MENU_LABEL_SIZE)
-                .color(theme.text)
-                .font(label_font)
-                .wrapping(iced::advanced::text::Wrapping::None);
-            match detail {
-                Some(detail) => typography::baseline_row(
-                    [
-                        Aligned::text(label_widget, label_font, MENU_LABEL_SIZE),
-                        Aligned::text(
-                            text(detail)
-                                .size(MENU_DETAIL_SIZE)
-                                .color(theme.subtle_text)
-                                .font(mono)
-                                .width(Length::Fill)
-                                .align_x(iced::advanced::text::Alignment::Right)
-                                .wrapping(iced::advanced::text::Wrapping::None)
-                                .ellipsis(iced::advanced::text::Ellipsis::End),
-                            mono,
-                            MENU_DETAIL_SIZE,
-                        ),
-                    ],
-                    MENU_ROW_GAP,
-                ),
-                None => typography::centered(
-                    label_widget.width(Length::Fill),
-                    label_font,
-                    MENU_LABEL_SIZE,
-                ),
-            }
-        }
-        MenuEntry::Submenu { label, .. } => typography::baseline_row(
-            [
-                Aligned::text(
-                    text(label)
-                        .size(MENU_LABEL_SIZE)
-                        .color(theme.text)
-                        .font(font)
-                        .width(Length::Fill)
-                        .wrapping(iced::advanced::text::Wrapping::None)
-                        .ellipsis(iced::advanced::text::Ellipsis::End),
-                    font,
-                    MENU_LABEL_SIZE,
-                ),
-                Aligned::glyph(
-                    icons::icon(icons::CHEVRON_RIGHT, CHEVRON_WIDTH, theme.muted_text),
-                    CHEVRON_WIDTH,
-                ),
-            ],
-            MENU_ROW_GAP,
-        ),
-    };
-
-    let bg = if active {
-        // Same solid selection fill the palette's rows use, so "the row
-        // you're on" looks identical across every list overlay.
-        Some(Background::Color(theme.selected_file))
-    } else {
-        None
-    };
-    let styled = container(inner)
-        .width(Length::Fill)
-        .height(Length::Fixed(MENU_ROW_HEIGHT))
-        .padding(Padding::from([0.0, MENU_ITEM_PAD_X]))
-        .align_y(alignment::Vertical::Center)
-        .style(move |_| container::Style {
-            background: bg,
-            border: Border {
-                radius: MENU_ROW_RADIUS.into(),
-                ..Border::default()
-            },
-            ..container::Style::default()
-        });
-
-    // Hover highlights / opens; a release of *either* button selects, so the
-    // right-click menu is picked from with either hand. Which button released
-    // is carried along — the opening gesture's own release is dropped by the
-    // update side. No `on_press` — presses fall through to the card's capture so
-    // they don't reach the dismiss backdrop.
-    mouse_area(styled)
-        .on_enter(Message::Menu(MenuMessage::Hover(path.clone())))
-        .on_release(Message::Menu(MenuMessage::Select(
-            path.clone(),
-            mouse::Button::Left,
-        )))
-        .on_right_release(Message::Menu(MenuMessage::Select(
-            path,
-            mouse::Button::Right,
-        )))
-        .interaction(mouse::Interaction::Pointer)
-        .into()
-}
-
-fn glow_card(
-    theme: ThemeSpec,
-    width: f32,
-    height: f32,
-    opened_at: Instant,
-) -> Element<'static, Message> {
-    let elapsed = Instant::now()
-        .saturating_duration_since(opened_at)
-        .as_secs_f32();
-    let pulse = 0.5 + 0.5 * (elapsed * GLOW_PULSE_SPEED).sin();
-    let accent = theme.accent;
-    let fill = Color {
-        a: 0.10 + 0.14 * pulse,
-        ..accent
-    };
-    let border = Color {
-        a: 0.55 + 0.45 * pulse,
-        ..accent
-    };
-    container(Space::new())
-        .width(Length::Fixed(width))
-        .height(Length::Fixed(height))
-        .style(move |_| container::Style {
-            background: Some(Background::Color(fill)),
-            border: Border {
-                width: 1.5,
-                color: border,
-                // Traces the row card it sits on.
-                radius: crate::revision_list::ROW_CARD_RADIUS.into(),
-            },
-            // A soft accent halo — the "glow" half of the effect, pulsing with
-            // the border.
-            shadow: iced::Shadow {
-                color: Color {
-                    a: 0.5 + 0.4 * pulse,
-                    ..accent
-                },
-                offset: iced::Vector::new(0.0, 0.0),
-                blur_radius: 8.0,
-            },
-            ..container::Style::default()
-        })
-        .into()
-}
-
-// ── AnchorArea: report a trigger's bounds on press ───────────────────────────
-
-/// A transparent wrapper that reports its own layout rectangle when pressed —
-/// used to anchor a dropdown edge-to-edge under its trigger. Events reach the
-/// content first, so a real `button`/`text_input` inside captures its own
-/// press; only a press the content ignores (the inert caret) fires `on_press`,
-/// carrying the *whole wrapper's* bounds.
-pub(crate) struct AnchorArea<'a, Message> {
-    content: Element<'a, Message, Theme>,
-    on_press: Box<dyn Fn(Rectangle) -> Message + 'a>,
-}
-
-pub(crate) fn anchor_area<'a, Message>(
-    content: impl Into<Element<'a, Message, Theme>>,
-    on_press: impl Fn(Rectangle) -> Message + 'a,
-) -> AnchorArea<'a, Message> {
-    AnchorArea {
-        content: content.into(),
-        on_press: Box::new(on_press),
-    }
-}
-
-impl<Message> Widget<Message, Theme, iced::Renderer> for AnchorArea<'_, Message> {
-    fn diff(&mut self, tree: &mut Tree) {
-        tree.diff_children(std::slice::from_mut(&mut self.content));
-    }
-
-    fn size(&self) -> Size<Length> {
-        self.content.as_widget().size()
-    }
-
-    fn layout(
-        &mut self,
-        tree: &mut Tree,
-        renderer: &iced::Renderer,
-        limits: &layout::Limits,
-    ) -> layout::Node {
-        self.content
-            .as_widget_mut()
-            .layout(&mut tree.children[0], renderer, limits)
-    }
-
-    fn operate(
-        &mut self,
-        tree: &mut Tree,
-        layout: Layout<'_>,
-        viewport: &Rectangle,
-        renderer: &iced::Renderer,
-        operation: &mut dyn Operation,
-    ) {
-        self.content.as_widget_mut().operate(
-            &mut tree.children[0],
-            layout,
-            viewport,
-            renderer,
-            operation,
-        );
-    }
-
-    fn update(
-        &mut self,
-        tree: &mut Tree,
-        event: &Event,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        renderer: &iced::Renderer,
-        shell: &mut Shell<'_, Message>,
-        viewport: &Rectangle,
-    ) {
-        self.content.as_widget_mut().update(
-            &mut tree.children[0],
-            event,
-            layout,
-            cursor,
-            renderer,
-            shell,
-            viewport,
-        );
-
-        if shell.is_event_captured() {
-            return;
-        }
-
-        if let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event
-            && cursor.is_over(layout.bounds())
-        {
-            shell.publish((self.on_press)(layout.bounds()));
-            shell.capture_event();
-        }
-    }
-
-    fn mouse_interaction(
-        &self,
-        tree: &Tree,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        viewport: &Rectangle,
-        renderer: &iced::Renderer,
-    ) -> mouse::Interaction {
-        self.content.as_widget().mouse_interaction(
-            &tree.children[0],
-            layout,
-            cursor,
-            viewport,
-            renderer,
-        )
-    }
-
-    fn draw(
-        &self,
-        tree: &Tree,
-        renderer: &mut iced::Renderer,
-        theme: &Theme,
-        style: &renderer::Style,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        viewport: &Rectangle,
-    ) {
-        self.content.as_widget().draw(
-            &tree.children[0],
-            renderer,
-            theme,
-            style,
-            layout,
-            cursor,
-            viewport,
-        );
-    }
-
-    fn overlay<'b>(
-        &'b mut self,
-        tree: &'b mut Tree,
-        layout: Layout<'b>,
-        renderer: &iced::Renderer,
-        viewport: &Rectangle,
-        translation: iced::Vector,
-    ) -> Vec<overlay::Element<'b, Message, Theme, iced::Renderer>> {
-        self.content.as_widget_mut().overlay(
-            &mut tree.children[0],
-            layout,
-            renderer,
-            viewport,
-            translation,
-        )
-    }
-}
-
-impl<'a, Message: 'a> From<AnchorArea<'a, Message>> for Element<'a, Message, Theme> {
-    fn from(area: AnchorArea<'a, Message>) -> Self {
-        Element::new(area)
-    }
-}
-
-// ── Backdrop: the modal event sink behind the cards ──────────────────────────
-
-/// A transparent full-screen leaf that swallows every mouse event the cards
-/// above it don't handle. Presses dismiss, releases arm/close, and moves +
-/// scrolls are captured (publishing the cursor for the trajectory guard) so the
-/// app underneath the open menu never hovers, tooltips, or scrolls.
-struct Backdrop {
-    on_press: Message,
-    on_release: fn(mouse::Button) -> Message,
-    on_move: fn(Point) -> Message,
-}
-
-impl Widget<Message, Theme, iced::Renderer> for Backdrop {
-    fn size(&self) -> Size<Length> {
-        Size {
-            width: Length::Fill,
-            height: Length::Fill,
-        }
-    }
-
-    fn layout(
-        &mut self,
-        _tree: &mut Tree,
-        _renderer: &iced::Renderer,
-        limits: &layout::Limits,
-    ) -> layout::Node {
-        layout::Node::new(limits.resolve(Length::Fill, Length::Fill, Size::ZERO))
-    }
-
-    fn update(
-        &mut self,
-        _tree: &mut Tree,
-        event: &Event,
-        _layout: Layout<'_>,
-        _cursor: mouse::Cursor,
-        _renderer: &iced::Renderer,
-        shell: &mut Shell<'_, Message>,
-        _viewport: &Rectangle,
-    ) {
-        // Capture unconditionally — no `cursor.is_over` gate. The cards above
-        // capture their own presses, so whatever reaches this full-screen sink
-        // belongs to it. The gate would wrongly bail when the cursor is over a
-        // card: the stack "levitates" the cursor for layers beneath an
-        // interactive one, so `is_over` reads false there — exactly when we must
-        // still swallow the move so it can't bleed to the app's hover/tooltips.
-        match event {
-            Event::Mouse(mouse::Event::ButtonPressed(_)) => {
-                shell.publish(self.on_press.clone());
-                shell.capture_event();
-            }
-            Event::Mouse(mouse::Event::ButtonReleased(button)) => {
-                shell.publish((self.on_release)(*button));
-                shell.capture_event();
-            }
-            Event::Mouse(mouse::Event::CursorMoved { position }) => {
-                shell.publish((self.on_move)(*position));
-                shell.capture_event();
-            }
-            Event::Mouse(mouse::Event::WheelScrolled { .. }) => {
-                shell.capture_event();
-            }
-            _ => {}
-        }
-    }
-
-    fn draw(
-        &self,
-        _tree: &Tree,
-        _renderer: &mut iced::Renderer,
-        _theme: &Theme,
-        _style: &renderer::Style,
-        _layout: Layout<'_>,
-        _cursor: mouse::Cursor,
-        _viewport: &Rectangle,
-    ) {
-    }
-}
-
-impl<'a> From<Backdrop> for Element<'a, Message, Theme> {
-    fn from(backdrop: Backdrop) -> Self {
-        Element::new(backdrop)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1266,7 +578,7 @@ mod tests {
         Size::new(width, height)
     }
 
-    fn opened_by(button: mouse::Button) -> OverlayMenu {
+    fn opened_by(button: gpui_kit::MouseButton) -> OverlayMenu {
         OverlayMenu::new(Vec::new(), AnchorSpec::At(Point::ORIGIN), Some(button))
     }
 
@@ -1330,25 +642,36 @@ mod tests {
 
     #[test]
     fn the_opening_release_is_swallowed_exactly_once() {
-        let mut menu = opened_by(mouse::Button::Right);
-        assert!(menu.opening_release(mouse::Button::Right));
+        let mut menu = opened_by(gpui_kit::MouseButton::Right);
+        assert!(menu.opening_release(gpui_kit::MouseButton::Right));
         // Spent: the next right-release is a click of its own and picks.
-        assert!(!menu.opening_release(mouse::Button::Right));
+        assert!(!menu.opening_release(gpui_kit::MouseButton::Right));
     }
 
     #[test]
     fn the_other_button_picks_without_waiting() {
         // A left-click on a row of a right-click menu is a whole press-release
         // of its own, so it selects at once...
-        let mut menu = opened_by(mouse::Button::Right);
-        assert!(!menu.opening_release(mouse::Button::Left));
+        let mut menu = opened_by(gpui_kit::MouseButton::Right);
+        assert!(!menu.opening_release(gpui_kit::MouseButton::Left));
         // ...and leaves the right button still owing its opening release.
-        assert!(menu.opening_release(mouse::Button::Right));
+        assert!(menu.opening_release(gpui_kit::MouseButton::Right));
     }
 
     #[test]
     fn a_menu_with_no_opening_press_picks_on_the_first_release() {
         let mut menu = OverlayMenu::new(Vec::new(), AnchorSpec::At(Point::ORIGIN), None);
-        assert!(!menu.opening_release(mouse::Button::Left));
+        assert!(!menu.opening_release(gpui_kit::MouseButton::Left));
     }
+}
+
+/// Stub: the menu view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn build_overlay(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::overlay("menu::build_overlay", ui.mode(ModeKind::Menu).is_some())
 }

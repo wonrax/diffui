@@ -4,6 +4,7 @@
 //! core.
 
 use super::*;
+use crate::Cx;
 
 impl Diffui {
     /// The active tab's state, or [`Diffui::no_tab`] when none is open.
@@ -84,21 +85,24 @@ impl Diffui {
     /// hasn't loaded yet (or its load was abandoned while backgrounded). A
     /// fully-loaded tab is switched to instantly and losslessly — its state was
     /// never moved out from under it.
-    pub(crate) fn activate_tab(&mut self, id: TabId) -> Task<Message> {
+    pub(crate) fn activate_tab(&mut self, id: TabId, cx: &mut Cx) {
         let Some(target) = self.tabs.iter().position(|tab| tab.id == id) else {
-            return Task::none();
+            return;
         };
         if target == self.active {
-            return Task::none();
+            return;
         }
         if self.description_editor_blocks_switch() {
-            return Task::none();
+            return;
         }
         self.leave_active_tab();
         // Persist the new active tab so it's re-focused next launch.
         self.mark_geometry_dirty();
         self.active = target;
-        Task::batch([self.on_active_tab_changed(), self.ensure_active_loaded()])
+        {
+            self.on_active_tab_changed(cx);
+            self.ensure_active_loaded(cx);
+        }
     }
 
     /// Shared tail of every path that changes which tab is on screen. The
@@ -110,12 +114,12 @@ impl Diffui {
     /// It is also where a description edit deferred while its tab was off
     /// screen finally opens: the diff it was waiting for has already landed,
     /// so the editor has details to show and the keyboard is now this tab's.
-    fn on_active_tab_changed(&mut self) -> Task<Message> {
+    fn on_active_tab_changed(&mut self, cx: &mut Cx) {
         self.scroll_restore_token = self.scroll_restore_token.wrapping_add(1);
         self.document_version = self.document_version.wrapping_add(1);
         match self.active_tab_id() {
-            Some(tab) => self.open_pending_description_edit(tab),
-            None => Task::none(),
+            Some(tab) => self.open_pending_description_edit(tab, cx),
+            None => {}
         }
     }
 
@@ -127,31 +131,31 @@ impl Diffui {
     /// but a `Focus` snapshot reconciles anything the projection coalesced
     /// while nothing was rendering. Its op-fingerprint dedup makes that a
     /// no-op when nothing changed.
-    pub(crate) fn ensure_active_loaded(&mut self) -> Task<Message> {
+    pub(crate) fn ensure_active_loaded(&mut self, cx: &mut Cx) {
         let Some(tab) = self.active_tab_id() else {
-            return Task::none();
+            return;
         };
         // The actor hands the handle over on its first event; until then there
         // is nothing to send to, and that event kicks the load itself.
         if self.active().handle.is_none() {
-            return Task::none();
+            return;
         }
         self.active_mut().session.pending_refresh = None;
-        self.start_tab_load(tab)
+        self.start_tab_load(tab, cx)
     }
 
     /// Close the tab `id`. Closing an inactive tab just drops it — and with it
     /// everything it owned, so a draft or a set of marks can never outlive the
     /// rows they name. Closing the active tab activates a neighbour (previous,
     /// else next), or falls back to the empty state when it was the last tab.
-    pub(crate) fn close_tab(&mut self, id: TabId) -> Task<Message> {
+    pub(crate) fn close_tab(&mut self, id: TabId, cx: &mut Cx) {
         let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
-            return Task::none();
+            return;
         };
         let closing_active = index == self.active;
         if closing_active {
             if self.description_editor_blocks_switch() {
-                return Task::none();
+                return;
             }
             self.leave_active_tab();
         }
@@ -163,7 +167,7 @@ impl Diffui {
             if index < self.active {
                 self.active -= 1;
             }
-            return Task::none();
+            return;
         }
 
         // Prefer the previous neighbour, matching the design's close behaviour.
@@ -177,7 +181,10 @@ impl Diffui {
             // stint there (a failed `--path`, say) doesn't resurface behind it.
             self.no_tab = TabState::empty();
         }
-        Task::batch([self.on_active_tab_changed(), self.ensure_active_loaded()])
+        {
+            self.on_active_tab_changed(cx);
+            self.ensure_active_loaded(cx);
+        }
     }
 
     /// Move the tab `id` to position `to` (clamped to the strip), shifting the
@@ -206,10 +213,10 @@ impl Diffui {
     /// Resolve `raw` to a repository — or a GitHub PR reference — and open it
     /// as a tab (or focus it if it's already open). On failure the dialog
     /// stays open with the reason shown.
-    pub(crate) fn open_repository(&mut self, raw: &str) -> Task<Message> {
+    pub(crate) fn open_repository(&mut self, raw: &str, cx: &mut Cx) {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
-            return Task::none();
+            return;
         }
         // A PR URL / `owner/repo#123` opens a PR tab; anything else is a path.
         if let Some(spec) = github::PrSpec::parse(trimmed) {
@@ -222,7 +229,7 @@ impl Diffui {
                 .map(|repository| github::remote_urls(&repository.root))
                 .unwrap_or_default();
             let spec = spec.with_host_from_remotes(remotes.iter().map(String::as_str));
-            return self.open_github_pr(spec);
+            return self.open_github_pr(spec, cx);
         }
         match prepare_repository(&expand_user_path(trimmed)) {
             Ok(repository) => {
@@ -236,7 +243,7 @@ impl Diffui {
                     .find(|tab| tab.root() == Some(repository.root.as_path()))
                 {
                     let id = existing.id;
-                    return self.activate_tab(id);
+                    return self.activate_tab(id, cx);
                 }
                 let (owner, name) = repo_label(&repository.root);
                 let source = TabSource::Repo {
@@ -248,6 +255,7 @@ impl Diffui {
                     name,
                     source,
                     TabState::unloaded(Some(repository), None),
+                    cx,
                 )
             }
             Err(error) => {
@@ -255,7 +263,6 @@ impl Diffui {
                 if let Some(dialog) = self.open_repo_dialog_mut() {
                     dialog.error = Some(message);
                 }
-                Task::none()
             }
         }
     }
@@ -263,15 +270,15 @@ impl Diffui {
     /// The open-repo prompt's path changed: drop the stale error and
     /// highlight, and read the folder it now points into unless that listing
     /// is already here or on its way.
-    pub(crate) fn set_open_repo_path(&mut self, path: String) -> Task<Message> {
+    pub(crate) fn set_open_repo_path(&mut self, path: String, cx: &mut Cx) {
         let Some(dialog) = self.open_repo_dialog_mut() else {
-            return Task::none();
+            return;
         };
         dialog.path = path;
         dialog.error = None;
         dialog.selected = None;
         let Some(query) = path_browse::Query::parse(&dialog.path) else {
-            return Task::none();
+            return;
         };
         if dialog
             .listing
@@ -279,16 +286,16 @@ impl Diffui {
             .is_some_and(|listing| listing.dir == query.dir)
         {
             dialog.listed_query = Some(query);
-            return Task::none();
+            return;
         }
         let dir = query.dir;
         if dialog.listing_pending.as_ref() == Some(&dir) {
-            return Task::none();
+            return;
         }
         dialog.listing_pending = Some(dir.clone());
         // A folder can be slow to read (a network mount, a huge directory),
         // and each entry is stat'ed to spot repositories.
-        Task::perform(
+        Self::run_async(
             async move {
                 let fallback = dir.clone();
                 tokio::task::spawn_blocking(move || path_browse::list(dir))
@@ -298,25 +305,21 @@ impl Diffui {
                         entries: Vec::new(),
                     })
             },
-            |listing| Message::Ui(UiEvent::OpenRepoListed(listing)),
-        )
+            cx,
+            |this, listing, cx| this.on_open_repo_listed(listing, cx),
+        );
     }
 
     /// Replace the prompt's path from outside the field (a completion, a
     /// clicked folder), keeping the field focused with the caret at the end.
-    pub(crate) fn browse_open_repo_path(&mut self, path: String) -> Task<Message> {
-        let list = self.set_open_repo_path(path);
-        Task::batch([
-            list,
-            widget::operation::focus(tab_bar::OPEN_REPO_INPUT_ID).chain(
-                widget::operation::move_cursor_to_end(tab_bar::OPEN_REPO_INPUT_ID),
-            ),
-        ])
+    pub(crate) fn browse_open_repo_path(&mut self, path: String, cx: &mut Cx) {
+        self.set_open_repo_path(path, cx);
+        crate::input::focus(tab_bar::OPEN_REPO_INPUT_ID, cx);
     }
 
     /// Act on folder suggestion `row`: open it when it is a repository,
     /// otherwise browse into it.
-    pub(crate) fn pick_open_repo_suggestion(&mut self, row: usize) -> Task<Message> {
+    pub(crate) fn pick_open_repo_suggestion(&mut self, row: usize, cx: &mut Cx) {
         let picked = self.open_repo_dialog().and_then(|dialog| {
             let (query, rows) = dialog.suggestions()?;
             let entry = rows.get(row)?;
@@ -326,9 +329,9 @@ impl Diffui {
             })
         });
         match picked {
-            Some(Ok(repository)) => self.open_repository(&repository),
-            Some(Err(folder)) => self.browse_open_repo_path(folder),
-            None => Task::none(),
+            Some(Ok(repository)) => self.open_repository(&repository, cx),
+            Some(Err(folder)) => self.browse_open_repo_path(folder, cx),
+            None => {}
         }
     }
 
@@ -336,18 +339,18 @@ impl Diffui {
     /// streams from the `gh` CLI; the tab has no local repository, so the
     /// graph/watcher/mutation machinery stays disabled (`repository`
     /// is `None`) and only the streamed document renders.
-    pub(crate) fn open_github_pr(&mut self, spec: github::PrSpec) -> Task<Message> {
+    pub(crate) fn open_github_pr(&mut self, spec: github::PrSpec, cx: &mut Cx) {
         self.pop_mode(ModeKind::OpenRepo);
         self.mark_geometry_dirty();
         let source = TabSource::GitHubPr(spec.clone());
         if let Some(existing) = self.tabs.iter().find(|tab| tab.source == source) {
             let id = existing.id;
-            return self.activate_tab(id);
+            return self.activate_tab(id, cx);
         }
         let owner = spec.owner.clone();
         let name = spec.label();
         let state = TabState::unloaded_pr();
-        self.push_tab(owner, name, source, state)
+        self.push_tab(owner, name, source, state, cx)
     }
 
     /// Append a new tab and make it active, kicking its load. Shared tail of
@@ -358,7 +361,8 @@ impl Diffui {
         name: String,
         source: TabSource,
         state: TabState,
-    ) -> Task<Message> {
+        cx: &mut Cx,
+    ) {
         let id = TabId(self.next_tab_id);
         self.next_tab_id += 1;
         let was_empty = self.tabs.is_empty();
@@ -372,9 +376,12 @@ impl Diffui {
         if was_empty {
             // No active tab to switch from — the new one is simply it.
             self.active = 0;
-            Task::batch([self.on_active_tab_changed(), self.ensure_active_loaded()])
+            {
+                self.on_active_tab_changed(cx);
+                self.ensure_active_loaded(cx);
+            }
         } else {
-            self.activate_tab(id)
+            self.activate_tab(id, cx)
         }
     }
 }
@@ -394,7 +401,7 @@ pub(crate) mod tests {
         Diffui {
             app_focused: true,
             selected_theme: ThemePreference::System,
-            system_theme: iced_theme::Mode::None,
+            system_theme: crate::theme::SystemAppearance::Dark,
             sidebar_width: sidebar::DEFAULT_WIDTH,
             file_nav_width: diff_panel::DEFAULT_FILE_NAV_WIDTH,
             diff_wrap: true,
@@ -406,13 +413,10 @@ pub(crate) mod tests {
             sidebar_min_width: 0.0,
             window_size: Size::new(1280.0, 800.0),
             window_position: None,
-            scale_factor: 1.0,
             geometry_dirty_since: None,
-            zoom_anim: None,
-            zoom_restore: None,
             config: AppConfig {
-                ui_font: iced::Font::DEFAULT,
-                mono_font: iced::Font::MONOSPACE,
+                ui_font: Font::DEFAULT,
+                mono_font: Font::MONOSPACE,
                 multi_click_ms: 350,
                 theme: ThemePreference::System,
                 code_type: CodeTypography::default(),
@@ -492,8 +496,8 @@ pub(crate) mod tests {
     #[test]
     fn a_diff_landing_for_a_background_tab_leaves_the_active_one_alone() {
         let mut ui = app();
-        let first = push_tab(&mut ui, "/tmp/first");
-        let second = push_tab(&mut ui, "/tmp/second");
+        let first = push_tab(&mut ui, "/tmp/first", cx);
+        let second = push_tab(&mut ui, "/tmp/second", cx);
         ui.active = 1;
         assert_eq!(ui.active_tab_id(), Some(second));
 
@@ -512,15 +516,18 @@ pub(crate) mod tests {
             other => panic!("expected a diff load, got {other:?}"),
         };
         let repo = ui.tabs[0].repo_id().expect("a repo tab has an id");
-        let _ = ui.update(Message::Repo(Box::new(diffui_core::Event::new(
-            repo,
-            diffui_core::Payload::DiffLoaded {
-                job,
-                revision: revision.clone(),
-                document: document("a.rs"),
-                details: None,
-            },
-        ))));
+        ui.TESTUPDATE(
+            Message::Repo(Box::new(diffui_core::Event::new(
+                repo,
+                diffui_core::Payload::DiffLoaded {
+                    job,
+                    revision: revision.clone(),
+                    document: document("a.rs"),
+                    details: None,
+                },
+            ))),
+            cx,
+        );
 
         let background = ui.tab_mut(first).unwrap();
         assert_eq!(background.session.selected_revision, revision);
@@ -562,15 +569,18 @@ pub(crate) mod tests {
         let repo = ui.tabs[index.expect("the tab is open")]
             .repo_id()
             .expect("a repo tab has an id");
-        let _ = ui.update(Message::Repo(Box::new(diffui_core::Event::new(
-            repo,
-            diffui_core::Payload::DiffLoaded {
-                job,
-                revision: revision.clone(),
-                document: document("a.rs"),
-                details: Some(details("first line")),
-            },
-        ))));
+        ui.TESTUPDATE(
+            Message::Repo(Box::new(diffui_core::Event::new(
+                repo,
+                diffui_core::Payload::DiffLoaded {
+                    job,
+                    revision: revision.clone(),
+                    document: document("a.rs"),
+                    details: Some(details("first line")),
+                },
+            ))),
+            cx,
+        );
     }
 
     /// "Edit description" on a row that isn't selected browses to it first and
@@ -580,13 +590,16 @@ pub(crate) mod tests {
     #[test]
     fn editing_the_description_of_another_revision_opens_once_its_diff_lands() {
         let mut ui = app();
-        let tab = push_tab(&mut ui, "/tmp/only");
+        let tab = push_tab(&mut ui, "/tmp/only", cx);
         ui.tab_mut(tab).unwrap().session.capabilities.mutate = true;
 
         let revision = RevisionSelection::Commit("abc".to_owned());
-        let _ = ui.perform(Action::EditDescription {
-            target: Some(revision.clone()),
-        });
+        let _ = ui.perform(
+            Action::EditDescription {
+                target: Some(revision.clone()),
+            },
+            cx,
+        );
         assert_eq!(
             ui.active().pending_description_edit.as_ref(),
             Some(&revision),
@@ -611,8 +624,8 @@ pub(crate) mod tests {
     #[test]
     fn a_deferred_description_edit_opens_when_its_tab_comes_back() {
         let mut ui = app();
-        let first = push_tab(&mut ui, "/tmp/first");
-        let _second = push_tab(&mut ui, "/tmp/second");
+        let first = push_tab(&mut ui, "/tmp/first", cx);
+        let _second = push_tab(&mut ui, "/tmp/second", cx);
         ui.tab_mut(first).unwrap().session.capabilities.mutate = true;
 
         let revision = RevisionSelection::Commit("abc".to_owned());
@@ -630,7 +643,7 @@ pub(crate) mod tests {
             "the edit is held, not dropped"
         );
 
-        let _ = ui.activate_tab(first);
+        let _ = ui.activate_tab(first, cx);
 
         assert_eq!(ui.active().pending_description_edit, None);
         assert_eq!(
@@ -645,9 +658,9 @@ pub(crate) mod tests {
     #[test]
     fn moving_a_tab_reorders_the_strip_without_changing_which_is_active() {
         let mut ui = app();
-        let first = push_tab(&mut ui, "/tmp/first");
-        let second = push_tab(&mut ui, "/tmp/second");
-        let third = push_tab(&mut ui, "/tmp/third");
+        let first = push_tab(&mut ui, "/tmp/first", cx);
+        let second = push_tab(&mut ui, "/tmp/second", cx);
+        let third = push_tab(&mut ui, "/tmp/third", cx);
         ui.active = 1;
         let order = |ui: &Diffui| ui.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>();
 
@@ -678,8 +691,8 @@ pub(crate) mod tests {
     #[test]
     fn moving_a_tab_onto_its_own_slot_changes_nothing() {
         let mut ui = app();
-        let first = push_tab(&mut ui, "/tmp/first");
-        let _second = push_tab(&mut ui, "/tmp/second");
+        let first = push_tab(&mut ui, "/tmp/first", cx);
+        let _second = push_tab(&mut ui, "/tmp/second", cx);
 
         ui.move_tab(first, 0);
         ui.move_tab(TabId(99), 1);
@@ -694,8 +707,8 @@ pub(crate) mod tests {
     #[test]
     fn closing_the_active_tab_takes_its_draft_with_it() {
         let mut ui = app();
-        let first = push_tab(&mut ui, "/tmp/first");
-        let second = push_tab(&mut ui, "/tmp/second");
+        let first = push_tab(&mut ui, "/tmp/first", cx);
+        let second = push_tab(&mut ui, "/tmp/second", cx);
         ui.active = 1;
 
         let draft = diffui_core::OpDraft::squash(diffui_core::DraftSource {
@@ -707,7 +720,7 @@ pub(crate) mod tests {
         state.push_mode(TabMode::Draft(DraftUi::new(draft)));
         state.revision_multi_selection = vec!["abc".to_owned()];
 
-        let _ = ui.close_tab(second);
+        let _ = ui.close_tab(second, cx);
 
         // The draft named rows of the closed tab; the neighbour inherits none
         // of it — there is no shared slot for it to be left in.
@@ -723,19 +736,22 @@ pub(crate) mod tests {
     #[test]
     fn a_second_mutation_waits_instead_of_displacing_the_first() {
         let mut ui = app();
-        let tab = push_tab(&mut ui, "/tmp/only");
+        let tab = push_tab(&mut ui, "/tmp/only", cx);
 
         let describe = |ui: &mut Diffui, text: &str| {
             let (activity_id, _) = ui.begin_activity(tab, "Describe", false);
-            ui.run_mutation(PendingMutation {
-                op: mutations::MutationOp::Describe {
-                    target: RevisionSelection::WorkingCopy,
-                    description: text.to_owned(),
+            ui.run_mutation(
+                PendingMutation {
+                    op: mutations::MutationOp::Describe {
+                        target: RevisionSelection::WorkingCopy,
+                        description: text.to_owned(),
+                    },
+                    tab_id: tab,
+                    activity_id,
+                    allow_immutable: false,
                 },
-                tab_id: tab,
-                activity_id,
-                allow_immutable: false,
-            })
+                cx,
+            )
         };
         let _ = describe(&mut ui, "first");
         let first_job = ui.tab_mut(tab).unwrap().jobs.mutation.as_ref().unwrap().0;
@@ -751,19 +767,22 @@ pub(crate) mod tests {
 
         // The first reports; the second takes the slot it just freed.
         let repo = ui.tabs[0].repo_id().expect("a repo tab has an id");
-        let _ = ui.update(Message::Repo(Box::new(diffui_core::Event::new(
-            repo,
-            diffui_core::Payload::MutationDone {
-                job: first_job,
-                outcome: mutations::MutationOutcome {
-                    message: "Described".to_owned(),
-                    moved_working_copy: false,
-                    rewritten_commit: None,
-                    output: Vec::new(),
-                    operation_id: None,
+        ui.TESTUPDATE(
+            Message::Repo(Box::new(diffui_core::Event::new(
+                repo,
+                diffui_core::Payload::MutationDone {
+                    job: first_job,
+                    outcome: mutations::MutationOutcome {
+                        message: "Described".to_owned(),
+                        moved_working_copy: false,
+                        rewritten_commit: None,
+                        output: Vec::new(),
+                        operation_id: None,
+                    },
                 },
-            },
-        ))));
+            ))),
+            cx,
+        );
 
         let state = ui.tab_mut(tab).unwrap();
         assert!(state.queued_mutations.is_empty(), "the queue drained");
@@ -780,8 +799,8 @@ pub(crate) mod tests {
     #[test]
     fn a_mutation_completing_for_a_background_tab_writes_that_tabs_selection() {
         let mut ui = app();
-        let first = push_tab(&mut ui, "/tmp/first");
-        let second = push_tab(&mut ui, "/tmp/second");
+        let first = push_tab(&mut ui, "/tmp/first", cx);
+        let second = push_tab(&mut ui, "/tmp/second", cx);
         ui.active = 1;
 
         let on_a_commit = RevisionSelection::Commit("abc".to_owned());
@@ -795,19 +814,22 @@ pub(crate) mod tests {
             false,
         );
         let repo = ui.tabs[0].repo_id().expect("a repo tab has an id");
-        let _ = ui.update(Message::Repo(Box::new(diffui_core::Event::new(
-            repo,
-            diffui_core::Payload::MutationDone {
-                job,
-                outcome: mutations::MutationOutcome {
-                    message: "Abandoned".to_owned(),
-                    moved_working_copy: true,
-                    rewritten_commit: None,
-                    output: Vec::new(),
-                    operation_id: None,
+        ui.TESTUPDATE(
+            Message::Repo(Box::new(diffui_core::Event::new(
+                repo,
+                diffui_core::Payload::MutationDone {
+                    job,
+                    outcome: mutations::MutationOutcome {
+                        message: "Abandoned".to_owned(),
+                        moved_working_copy: true,
+                        rewritten_commit: None,
+                        output: Vec::new(),
+                        operation_id: None,
+                    },
                 },
-            },
-        ))));
+            ))),
+            cx,
+        );
 
         assert_eq!(
             ui.tab_mut(first).unwrap().session.selected_revision,

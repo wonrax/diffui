@@ -6,12 +6,11 @@
 
 use std::fmt;
 
-use iced::widget::text::{Rich, Span};
-use iced::{Color, Font};
+use gpui_kit::StyledText;
 
-use crate::ellipsis;
-use crate::theme::ThemeSpec;
-use crate::typography::Aligned;
+use crate::ellipsis::{self, Span};
+use crate::theme::{Color, Font, ThemeSpec};
+use crate::typography::{self, Aligned};
 
 /// What a run of text names, which decides how it renders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,17 +129,9 @@ impl Prose {
     }
 
     /// Rich text in `font` and `color`, with the names in `mono` and their
-    /// own colours. Size, wrapping and width are the caller's.
-    pub fn view<'a, Message: 'a>(
-        &self,
-        font: Font,
-        mono: Font,
-        color: Color,
-        theme: ThemeSpec,
-    ) -> Rich<'a, (), Message> {
-        Rich::with_spans(self.spans(mono, theme))
-            .font(font)
-            .color(color)
+    /// own colours. Size, wrapping and width are the container's.
+    pub fn view(&self, font: Font, mono: Font, color: Color, theme: ThemeSpec) -> StyledText {
+        ellipsis::rich_text(&self.spans(mono, theme), font, color)
     }
 
     /// The same text as an [`ellipsis::Line`] at `size`: one line cut to
@@ -156,7 +147,7 @@ impl Prose {
         ellipsis::Line::new(self.spans(mono, theme), font, size, color)
     }
 
-    fn spans<'a>(&self, mono: Font, theme: ThemeSpec) -> Vec<Span<'a, ()>> {
+    fn spans<'a>(&self, mono: Font, theme: ThemeSpec) -> Vec<Span<'a>> {
         self.parts
             .iter()
             .map(|(kind, text)| {
@@ -175,14 +166,14 @@ impl Prose {
     /// to share a baseline with chips and glyphs (a rich text's runs aren't
     /// placed by [`crate::typography`], and drift off it). One line, no
     /// wrapping; the caller clips it.
-    pub fn runs<'a, Message: 'a>(
+    pub fn runs(
         &self,
         font: Font,
         mono: Font,
         color: Color,
         theme: ThemeSpec,
         size: f32,
-    ) -> Vec<Aligned<'a, Message>> {
+    ) -> Vec<Aligned> {
         self.parts
             .iter()
             .map(|(kind, part)| {
@@ -193,11 +184,7 @@ impl Prose {
                     Kind::Path | Kind::Operation | Kind::Remote | Kind::Code => (mono, color),
                 };
                 Aligned::text(
-                    iced::widget::text(part.clone())
-                        .size(size)
-                        .font(font)
-                        .color(color)
-                        .wrapping(iced::widget::text::Wrapping::None),
+                    typography::line(part.clone(), font, size, color),
                     font,
                     size,
                 )

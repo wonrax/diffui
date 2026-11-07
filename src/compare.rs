@@ -9,15 +9,12 @@
 //! banner above the diff says what is being compared and carries the swap,
 //! interdiff and exit controls.
 
+use crate::Cx;
 use diffui_core::{DiffBase, RevisionSelection};
-use iced::widget::{Space, container, row, text};
-use iced::{Background, Border, Color, Element, Length, Task, alignment};
+use gpui_kit::{AnyElement, Window};
 
-use crate::action::Action;
-use crate::message::Message;
-use crate::theme::{ThemeSpec, text_size};
-use crate::typography::Aligned;
-use crate::{Diffui, icons, ui};
+use crate::Diffui;
+use crate::theme::ThemeSpec;
 
 #[derive(Debug, Clone)]
 pub(crate) enum CompareAction {
@@ -34,13 +31,13 @@ pub(crate) enum CompareAction {
 }
 
 impl Diffui {
-    pub(crate) fn perform_compare(&mut self, action: CompareAction) -> Task<Message> {
+    pub(crate) fn perform_compare(&mut self, action: CompareAction, cx: &mut Cx) {
         let Some(tab) = self.active_tab_id() else {
-            return Task::none();
+            return;
         };
         let target = self.active_mut();
         if !target.session.capabilities.compare {
-            return Task::none();
+            return;
         }
         // Leaving a span leaves the marks it showed.
         if matches!(action, CompareAction::Exit) && target.session.span.is_some() {
@@ -64,7 +61,7 @@ impl Diffui {
                 .compare(base_for(from), RevisionSelection::WorkingCopy),
             CompareAction::Marked => {
                 let Some((from, to)) = marked_pair(target) else {
-                    return Task::none();
+                    return;
                 };
                 target.revision_multi_selection.clear();
                 target.session.compare(base_for(from), to)
@@ -73,7 +70,7 @@ impl Diffui {
             CompareAction::SetInterdiff(on) => target.session.set_interdiff(on),
             CompareAction::Exit => target.session.exit_compare(),
         };
-        self.run_effects(tab, effects)
+        self.run_effects(tab, effects, cx)
     }
 }
 
@@ -136,163 +133,11 @@ fn revision_label(ui: &Diffui, revision: &RevisionSelection) -> (String, String)
     (id, title)
 }
 
-/// The "Comparing A → B" strip atop the diff pane, or `None` when the pane
-/// shows a plain revision diff.
-pub(crate) fn build_compare_banner<'a>(
-    ui: &'a Diffui,
-    theme: ThemeSpec,
-) -> Option<Element<'a, Message>> {
-    if let Some(banner) = crate::range::banner(ui, theme) {
-        return Some(banner);
-    }
-    let session = &ui.active().session;
-    // While a switch is in flight the requested base is what's coming; once it
-    // lands the two agree. Showing the requested one makes Exit/Swap respond
-    // at once instead of on the next load.
-    let base = if session.diff_in_flight() {
-        &session.diff_base
-    } else {
-        &session.document_base
-    };
-    let from = base.revision()?;
-    let to = session.diff_pending().unwrap_or(&session.selected_revision);
-    let interdiff = matches!(base, DiffBase::Interdiff(_));
-    let font = ui.config.ui_font;
-    let mono = ui.config.mono_font;
-
-    let (from_id, from_title) = revision_label(ui, from);
-    let (to_id, to_title) = revision_label(ui, to);
-    let id = |id: String| {
-        Aligned::text(
-            text(id)
-                .size(text_size::UI)
-                .font(mono)
-                .color(theme.accent)
-                .wrapping(text::Wrapping::None),
-            mono,
-            text_size::UI,
-        )
-    };
-    let glyph = |glyph: &'static str, color| {
-        Aligned::glyph(icons::icon(glyph, ui::ICON_SIZE, color), ui::ICON_SIZE)
-    };
-    let label = if interdiff { "Interdiff" } else { "Comparing" };
-    let medium = crate::theme::emphasis_font(font, iced::font::Weight::Medium);
-    // The label and the mono ids share a baseline, the icons centre on the
-    // caps (see `crate::typography`).
-    let headline = crate::typography::baseline_row(
-        [
-            glyph(icons::GIT_COMPARE, theme.accent),
-            Aligned::text(
-                text(label)
-                    .size(text_size::UI)
-                    .font(medium)
-                    .color(theme.text)
-                    .wrapping(text::Wrapping::None),
-                medium,
-                text_size::UI,
-            ),
-            id(from_id),
-            glyph(icons::ARROW_RIGHT, theme.muted_text),
-            id(to_id),
-        ],
-        8.0,
-    );
-    // The titles ride on a quieter second line so the ids and controls never
-    // get clipped by a narrow pane; a revision compared with itself turns the
-    // line into the hint for picking the other side.
-    let subline = if from == to {
-        "Click another revision in the graph to compare against this one".to_owned()
-    } else {
-        format!("{from_title}  →  {to_title}")
-    };
-    let sides = iced::widget::column![
-        headline,
-        text(subline)
-            .size(text_size::CAPTION)
-            .font(font)
-            .color(theme.subtle_text)
-            .wrapping(text::Wrapping::None),
-    ]
-    .spacing(3);
-
-    let action = |action: CompareAction| Message::Action(Action::Compare(action));
-    let controls = row![
-        ui::tooltip(
-            ui::icon_button(
-                icons::ARROW_LEFT_RIGHT,
-                theme.muted_text,
-                ui::Size::Compact,
-                theme
-            )
-            .on_press(action(CompareAction::Swap)),
-            "Swap the two sides",
-            iced::widget::tooltip::Position::Bottom,
-            font,
-            theme,
-        ),
-        ui::tooltip(
-            ui::text_button(
-                None,
-                if interdiff { "Tree diff" } else { "Interdiff" },
-                ui::Variant::Ghost,
-                ui::Size::Compact,
-                font,
-                theme,
-            )
-            .on_press(action(CompareAction::SetInterdiff(!interdiff))),
-            if interdiff {
-                "Diff the two trees (jj diff --from)"
-            } else {
-                "Diff the two versions of the change itself (jj interdiff)"
-            },
-            iced::widget::tooltip::Position::Bottom,
-            font,
-            theme,
-        ),
-        ui::tooltip(
-            ui::close_button(theme.muted_text, theme).on_press(action(CompareAction::Exit)),
-            "Stop comparing",
-            iced::widget::tooltip::Position::Left,
-            font,
-            theme,
-        ),
-    ]
-    .spacing(4)
-    .align_y(alignment::Vertical::Center);
-
-    let strip = row![
-        container(sides).width(Length::Fill).clip(true),
-        Space::new().width(Length::Fixed(8.0)),
-        controls,
-    ]
-    .align_y(alignment::Vertical::Center);
-
-    Some(
-        container(strip)
-            .width(Length::Fill)
-            .padding([8.0, crate::theme::space::XL])
-            .style(move |_| container::Style {
-                background: Some(Background::Color(Color {
-                    a: 0.10,
-                    ..theme.accent
-                })),
-                border: Border {
-                    width: 0.0,
-                    color: Color::TRANSPARENT,
-                    radius: 0.0.into(),
-                },
-                ..Default::default()
-            })
-            .into(),
-    )
-}
-
 impl Diffui {
     /// Fetch the full diff of a file the backend collapsed for size.
-    pub(crate) fn expand_collapsed_file(&mut self, index: usize) -> Task<Message> {
+    pub(crate) fn expand_collapsed_file(&mut self, index: usize, cx: &mut Cx) {
         let Some(tab) = self.active_tab_id() else {
-            return Task::none();
+            return;
         };
         let target = self.active_mut();
         let Some(path) = target
@@ -302,9 +147,20 @@ impl Diffui {
             .get(index)
             .map(|file| file.path.clone())
         else {
-            return Task::none();
+            return;
         };
         let effects = target.session.expand_file(&path);
-        self.run_effects(tab, effects)
+        self.run_effects(tab, effects, cx)
     }
+}
+
+/// Stub: the compare view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn build_compare_banner(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> Option<AnyElement> {
+    None
 }

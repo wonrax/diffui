@@ -11,6 +11,7 @@
 //! [`crate::Action`].
 
 use super::*;
+use crate::Cx;
 use crate::commands::{self, CommandId};
 use crate::prose::Prose;
 
@@ -444,24 +445,24 @@ impl Diffui {
     /// The single funnel every non-keyboard producer goes through. `enabled` is
     /// evaluated *here*, not when the surface was built, so a menu that has been
     /// open across a graph reload can no longer act on a row that reload hid.
-    pub(crate) fn run_command(&mut self, id: CommandId, arg: CommandArg) -> Task<Message> {
+    pub(crate) fn run_command(&mut self, id: CommandId, arg: CommandArg, cx: &mut Cx) {
         let Some(command) = commands::command(id) else {
-            return Task::none();
+            return;
         };
         if (command.enabled)(self, &arg).is_err() {
-            return Task::none();
+            return;
         }
         match (command.build)(self, arg) {
-            Some(action) => self.perform(action),
-            None => Task::none(),
+            Some(action) => self.perform(action, cx),
+            None => {}
         }
     }
 
     /// Wrap `op` in an activity and send it to the repository actor. Every
     /// mutation entry point — context menu, target-mode confirm, drag & drop —
     /// funnels through here so labels and guards can't drift apart.
-    pub(crate) fn start_mutation_op(&mut self, op: mutations::MutationOp) -> Task<Message> {
-        self.start_mutation(op, false)
+    pub(crate) fn start_mutation_op(&mut self, op: mutations::MutationOp, cx: &mut Cx) {
+        self.start_mutation(op, false, cx)
     }
 
     /// [`Self::start_mutation_op`], where `allow_backwards` is a typed
@@ -470,13 +471,14 @@ impl Diffui {
         &mut self,
         op: mutations::MutationOp,
         allow_backwards: bool,
-    ) -> Task<Message> {
+        cx: &mut Cx,
+    ) {
         use mutations::MutationOp;
         let Some(tab_id) = self.active_tab_id() else {
-            return Task::none();
+            return;
         };
         if !self.active().session.capabilities.mutate {
-            return Task::none();
+            return;
         }
         // Surface the mutation as an activity (push captures its remote output).
         let label: Prose = match &op {
@@ -593,29 +595,29 @@ impl Diffui {
             }
             let (name, to) = (name.clone(), to.clone());
             let Some(state) = self.tab_mut(tab_id) else {
-                return Task::none();
+                return;
             };
             let (job, effects) = state.session.bookmark_check(name, to);
             state.jobs.bookmark_check = Some((job, pending));
-            return self.run_effects(tab_id, effects);
+            return self.run_effects(tab_id, effects, cx);
         }
-        self.run_mutation_checking_wc_push(pending)
+        self.run_mutation_checking_wc_push(pending, cx)
     }
 
     /// Raise a confirmation for `op` and run it on accept. Only abandon asks
     /// today (reached from a single key or the palette); anything else runs
     /// straight away. The activity row is opened now and sits queued, so a
     /// cancel resolves it the same way the other confirmations do.
-    pub(crate) fn confirm_mutation_op(&mut self, op: mutations::MutationOp) -> Task<Message> {
+    pub(crate) fn confirm_mutation_op(&mut self, op: mutations::MutationOp, cx: &mut Cx) {
         use mutations::MutationOp;
         let MutationOp::Abandon { targets } = &op else {
-            return self.start_mutation_op(op);
+            return self.start_mutation_op(op, cx);
         };
         let Some(tab_id) = self.active_tab_id() else {
-            return Task::none();
+            return;
         };
         if !self.active().session.capabilities.mutate || targets.is_empty() {
-            return Task::none();
+            return;
         }
         let (title, label, body) = match targets.as_slice() {
             [target] => (
@@ -649,7 +651,6 @@ impl Diffui {
                 allow_immutable: false,
             },
         }));
-        Task::none()
     }
 
     /// Context-menu tree for a file-tree row (`display_index` into the
@@ -790,12 +791,13 @@ impl Diffui {
     pub(crate) fn open_file_context_menu(
         &mut self,
         display_index: usize,
-        row_rect: iced::Rectangle,
-        _cursor: iced::Point,
-    ) -> Task<Message> {
+        row_rect: Rectangle,
+        _cursor: Point,
+        cx: &mut Cx,
+    ) {
         let tree = self.file_context_menu_tree(display_index);
         if tree.is_empty() {
-            return Task::none();
+            return;
         }
         let mut picks: Vec<(CommandId, CommandArg)> = Vec::new();
         let items = lower_menu_to_native(&tree, &mut picks);
@@ -807,12 +809,12 @@ impl Diffui {
             radius: crate::revision_list::ROW_CARD_RADIUS,
         };
         let Some(chosen) = macos_native::popup_menu(&items, Some(glow)) else {
-            return Task::none();
+            return;
         };
         let Some((command, arg)) = picks.get(chosen as usize).cloned() else {
-            return Task::none();
+            return;
         };
-        self.run_command(command, arg)
+        self.run_command(command, arg, cx)
     }
 
     /// Non-macOS: open the file context menu as the iced overlay at the
@@ -821,12 +823,13 @@ impl Diffui {
     pub(crate) fn open_file_context_menu(
         &mut self,
         display_index: usize,
-        row_rect: iced::Rectangle,
-        cursor: iced::Point,
-    ) -> Task<Message> {
+        row_rect: Rectangle,
+        cursor: Point,
+        cx: &mut Cx,
+    ) {
         let tree = self.file_context_menu_tree(display_index);
         if tree.is_empty() {
-            return Task::none();
+            return;
         }
         let mut overlay = menu::OverlayMenu::new(
             tree,
@@ -836,7 +839,6 @@ impl Diffui {
         overlay.glow = Some(row_rect);
         self.pop_mode(ModeKind::ActivityPopover);
         self.push_mode(Mode::Menu(overlay));
-        Task::none()
     }
 
     /// macOS: lower the shared tree to a native `NSMenu`, pop it (blocking, with
@@ -846,9 +848,10 @@ impl Diffui {
         &mut self,
         _repository: Repository,
         selection: RevisionSelection,
-        row_rect: iced::Rectangle,
-        _cursor: iced::Point,
-    ) -> Task<Message> {
+        row_rect: Rectangle,
+        _cursor: Point,
+        cx: &mut Cx,
+    ) {
         let tree = self.revision_menu_tree(&selection);
         let mut picks: Vec<(CommandId, CommandArg)> = Vec::new();
         let items = lower_menu_to_native(&tree, &mut picks);
@@ -860,12 +863,12 @@ impl Diffui {
             radius: crate::revision_list::ROW_CARD_RADIUS,
         };
         let Some(chosen) = macos_native::popup_menu(&items, Some(glow)) else {
-            return Task::none();
+            return;
         };
         let Some((command, arg)) = picks.get(chosen as usize).cloned() else {
-            return Task::none();
+            return;
         };
-        self.run_command(command, arg)
+        self.run_command(command, arg, cx)
     }
 
     /// Non-macOS: open the iced overlay menu at the cursor, pulsing `row_rect`.
@@ -874,9 +877,10 @@ impl Diffui {
         &mut self,
         _repository: Repository,
         selection: RevisionSelection,
-        row_rect: iced::Rectangle,
-        cursor: iced::Point,
-    ) -> Task<Message> {
+        row_rect: Rectangle,
+        cursor: Point,
+        cx: &mut Cx,
+    ) {
         let tree = self.revision_menu_tree(&selection);
         // Opened by the right button: its release is the one that opened the
         // menu, so it neither picks a row nor dismisses (see
@@ -889,7 +893,6 @@ impl Diffui {
         overlay.glow = Some(row_rect);
         self.pop_mode(ModeKind::ActivityPopover);
         self.push_mode(Mode::Menu(overlay));
-        Task::none()
     }
 
     /// Open a toolbar dropdown (fetch branches / revset presets) as a native
@@ -901,8 +904,9 @@ impl Diffui {
     pub(crate) fn open_toolbar_menu(
         &mut self,
         which: ToolbarMenu,
-        _anchor: iced::Rectangle,
-    ) -> Task<Message> {
+        _anchor: Rectangle,
+        cx: &mut Cx,
+    ) {
         use macos_native::MenuItem;
 
         match which {
@@ -925,12 +929,12 @@ impl Diffui {
                     }
                 }
                 let Some(chosen) = macos_native::popup_menu(&items, None) else {
-                    return Task::none();
+                    return;
                 };
                 let Some(target) = targets.get(chosen as usize).cloned() else {
-                    return Task::none();
+                    return;
                 };
-                self.run_command("repo.fetch", CommandArg::Fetch(target))
+                self.run_command("repo.fetch", CommandArg::Fetch(target), cx)
             }
             ToolbarMenu::RevsetPresets => {
                 let entries = self.revset_menu_entries();
@@ -942,12 +946,12 @@ impl Diffui {
                     })
                     .collect();
                 let Some(chosen) = macos_native::popup_menu(&items, None) else {
-                    return Task::none();
+                    return;
                 };
                 let Some((_, expr)) = entries.get(chosen as usize) else {
-                    return Task::none();
+                    return;
                 };
-                self.run_command("repo.set-revset", CommandArg::Revset(expr.clone()))
+                self.run_command("repo.set-revset", CommandArg::Revset(expr.clone()), cx)
             }
         }
     }
@@ -955,11 +959,7 @@ impl Diffui {
     /// Non-macOS: open the iced overlay dropdown, anchored edge-to-edge below
     /// the trigger's reported rect.
     #[cfg(not(target_os = "macos"))]
-    pub(crate) fn open_toolbar_menu(
-        &mut self,
-        which: ToolbarMenu,
-        anchor: iced::Rectangle,
-    ) -> Task<Message> {
+    pub(crate) fn open_toolbar_menu(&mut self, which: ToolbarMenu, anchor: Rectangle, cx: &mut Cx) {
         let root = match which {
             ToolbarMenu::FetchBranches => self.fetch_menu_entries(),
             ToolbarMenu::RevsetPresets => self.revset_menu_entry_tree(),
@@ -971,6 +971,5 @@ impl Diffui {
             menu::AnchorSpec::Below(anchor),
             Some(iced::mouse::Button::Left),
         )));
-        Task::none()
     }
 }

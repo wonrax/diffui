@@ -11,27 +11,22 @@
 //! Everything lands as an ordinary [`MutationOp`] through the same activity /
 //! immutable-guard pipeline every other mutation uses.
 
+use crate::Cx;
+use gpui_kit::{AnyElement, Window};
 use std::collections::{BTreeMap, BTreeSet};
 
 use diffui_core::{
     DiffFile, DiffFileStatus, DiffHunkView, DiffSelection, FileSelection, HunkPick, HunkRef,
     LineRef, MutationOp, RevisionSelection, SquashTarget,
 };
-use iced::widget::{Space, column, container, text, text_editor};
-use iced::{Element, Length, Padding, Task};
 
 use crate::commands::CommandArg;
-use crate::diff_view::{
-    ChangeMarks, CheckState, FileMark, HunkMark, HunkMarks, LineAt, LineMode, LinePress,
-};
+use crate::diff_view::{CheckState, LineAt, LinePress};
 use crate::modes::{ModeKind, TabMode};
 use crate::palette::ResultRef;
 use crate::prose::Prose;
-use crate::theme::{self, ThemeSpec, text_size};
-use crate::typography::{self, Aligned};
-use crate::{
-    ConfirmDialog, Diffui, MainView, Message, PendingMutation, TabState, activity, icons, ui,
-};
+use crate::theme::ThemeSpec;
+use crate::{ConfirmDialog, Diffui, MainView, PendingMutation, TabState, activity, ui};
 
 /// A change-selection intent or event.
 #[derive(Debug, Clone)]
@@ -53,8 +48,8 @@ pub(crate) enum ChangesMsg {
     Discard,
     /// Open the split prompt for the selection.
     OpenSplit,
-    SplitFirstEdited(text_editor::Action),
-    SplitSecondEdited(text_editor::Action),
+    SplitFirstEdited(String),
+    SplitSecondEdited(String),
     SplitConfirm,
     SplitCancel,
     // ── One file, from its context menu or the palette ──────────────────
@@ -158,8 +153,8 @@ pub(crate) struct SplitPrompt {
     /// What stays and what moves, under the title.
     summary: Prose,
     original: String,
-    first: text_editor::Content,
-    second: text_editor::Content,
+    first: String,
+    second: String,
 }
 
 /// Per-tab change-selection state.
@@ -664,70 +659,6 @@ pub(crate) fn command_file_path(ui: &Diffui, arg: &CommandArg) -> Option<String>
     Some(ui.active().session.document.files[index].path.clone())
 }
 
-/// Checkbox marks for the diff view, or `None` when nothing can be picked.
-pub(crate) fn diff_marks(ui: &Diffui, theme: ThemeSpec) -> Option<ChangeMarks<Message>> {
-    let tab = ui.active();
-    if !editable(tab) {
-        return None;
-    }
-    let revision = &tab.session.selected_revision;
-    let picks = tab.changes.picks_for(revision);
-    let files = tab
-        .session
-        .document
-        .files
-        .iter()
-        .map(|file| {
-            let pick = picks.and_then(|picks| picks.get(&file.path));
-            let conflicted = crate::conflicts::is_conflicted(tab, &file.path);
-            let hunks = if !hunk_pickable(file, conflicted) {
-                HunkMarks::None
-            } else if pick.is_none() {
-                HunkMarks::Unpicked
-            } else {
-                HunkMarks::Picked(
-                    (0..file.hunks.len())
-                        .map(|hunk| match tab.changes.hunk_state(revision, file, hunk) {
-                            CheckState::Off => HunkMark::Off,
-                            CheckState::On => HunkMark::On,
-                            CheckState::Partial => HunkMark::Lines(
-                                file.hunks[hunk]
-                                    .lines
-                                    .iter()
-                                    .map(|line| {
-                                        LineRef::of(line).is_some_and(|line| {
-                                            tab.changes.line_picked(revision, file, hunk, line)
-                                        })
-                                    })
-                                    .collect(),
-                            ),
-                        })
-                        .collect(),
-                )
-            };
-            FileMark {
-                state: file_check(file, pick),
-                hunks,
-            }
-        })
-        .collect();
-    let lines = live_line_select(tab).map(|mode| LineMode {
-        cursor: mode
-            .cursor
-            .filter(|_| mode.document == tab.session.document_id),
-        reveal: mode.reveal,
-        on_press: |press| Message::Changes(ChangesMsg::Lines(LineMsg::Press(press))),
-        on_paint: |line| Message::Changes(ChangesMsg::Lines(LineMsg::Paint(line))),
-    });
-    Some(ChangeMarks {
-        files,
-        control: theme.info,
-        on_toggle_file: |file| Message::Changes(ChangesMsg::ToggleFile(file)),
-        on_toggle_hunk: |file, hunk| Message::Changes(ChangesMsg::ToggleHunk(file, hunk)),
-        lines,
-    })
-}
-
 /// The active tab's line-select mode, if it is on and still applies: the
 /// diff is pickable and shows the revision the mode was entered in.
 pub(crate) fn live_line_select(tab: &TabState) -> Option<&LineSelect> {
@@ -785,112 +716,110 @@ pub(crate) fn tree_check(
 // ── Update ──────────────────────────────────────────────────────────────
 
 impl Diffui {
-    pub(crate) fn on_changes(&mut self, msg: ChangesMsg) -> Task<Message> {
+    pub(crate) fn on_changes(&mut self, msg: ChangesMsg, cx: &mut Cx) {
         match msg {
             ChangesMsg::ToggleFile(index) => {
                 self.toggle_file(index);
-                Task::none()
             }
             ChangesMsg::ToggleHunk(file, hunk) => {
                 self.toggle_hunk(file, hunk);
-                Task::none()
             }
             ChangesMsg::ToggleTreeRow(display) => {
                 self.toggle_tree_row(display);
-                Task::none()
             }
             ChangesMsg::Lines(message) => {
                 self.on_lines(message);
-                Task::none()
             }
             ChangesMsg::Clear => {
                 let tab = self.active_mut();
                 tab.changes.picks.clear();
                 tab.changes.split = None;
-                Task::none()
             }
             ChangesMsg::SquashIntoParent => {
                 let Some((revision, selection)) = self.current_selection() else {
-                    return Task::none();
+                    return;
                 };
-                self.start_changes_op(MutationOp::SquashChanges {
-                    from: revision,
-                    selection,
-                    into: SquashTarget::Parent,
-                })
+                self.start_changes_op(
+                    MutationOp::SquashChanges {
+                        from: revision,
+                        selection,
+                        into: SquashTarget::Parent,
+                    },
+                    cx,
+                )
             }
             ChangesMsg::MoveInto => {
                 let Some((revision, selection)) = self.current_selection() else {
-                    return Task::none();
+                    return;
                 };
-                self.move_into(revision, selection)
+                self.move_into(revision, selection, cx)
             }
             ChangesMsg::Discard => {
                 let Some((revision, selection)) = self.current_selection() else {
-                    return Task::none();
+                    return;
                 };
-                self.confirm_discard(revision, selection)
+                self.confirm_discard(revision, selection, cx)
             }
             ChangesMsg::OpenSplit => {
                 let Some((revision, selection)) = self.current_selection() else {
-                    return Task::none();
+                    return;
                 };
                 let summary = Prose::from("Keep ")
                     .then(selection_prose(&selection))
                     .text(", move the rest to a new change.");
-                self.open_split(revision, selection, summary)
+                self.open_split(revision, selection, summary, cx)
             }
-            ChangesMsg::SplitFirstEdited(action) => {
+            ChangesMsg::SplitFirstEdited(text) => {
                 if let Some(prompt) = self.active_mut().changes.split.as_mut() {
-                    prompt.first.perform(action);
+                    prompt.first = text;
                 }
-                Task::none()
             }
-            ChangesMsg::SplitSecondEdited(action) => {
+            ChangesMsg::SplitSecondEdited(text) => {
                 if let Some(prompt) = self.active_mut().changes.split.as_mut() {
-                    prompt.second.perform(action);
+                    prompt.second = text;
                 }
-                Task::none()
             }
             ChangesMsg::SplitCancel => {
                 self.active_mut().changes.split = None;
-                Task::none()
             }
             ChangesMsg::SplitConfirm => {
                 let Some(prompt) = self.active_mut().changes.split.take() else {
-                    return Task::none();
+                    return;
                 };
                 if prompt.revision != self.active().session.selected_revision {
-                    return Task::none();
+                    return;
                 }
-                let first = stored_description(&prompt.first.text());
+                let first = stored_description(&prompt.first);
                 let first_description =
                     (first != stored_description(&prompt.original)).then_some(first);
-                self.start_changes_op(MutationOp::Split {
-                    target: prompt.revision,
-                    selection: prompt.selection,
-                    first_description,
-                    second_description: stored_description(&prompt.second.text()),
-                })
+                self.start_changes_op(
+                    MutationOp::Split {
+                        target: prompt.revision,
+                        selection: prompt.selection,
+                        first_description,
+                        second_description: stored_description(&prompt.second),
+                    },
+                    cx,
+                )
             }
             ChangesMsg::RestoreFile(path) => {
                 if !editable(self.active()) {
-                    return Task::none();
+                    return;
                 }
                 let revision = self.active().session.selected_revision.clone();
-                self.confirm_discard(revision, whole_file(&path))
+                self.confirm_discard(revision, whole_file(&path), cx)
             }
             ChangesMsg::MoveFile(path) => {
                 if !editable(self.active()) {
-                    return Task::none();
+                    return;
                 }
                 let revision = self.active().session.selected_revision.clone();
-                self.move_into(revision, whole_file(&path))
+                self.move_into(revision, whole_file(&path), cx)
             }
             ChangesMsg::SplitFile(path) => {
                 let tab = self.active();
                 if !editable(tab) {
-                    return Task::none();
+                    return;
                 }
                 // Everything but this file stays; the file becomes the new
                 // change (`jj split` keeps the selection in the original).
@@ -910,16 +839,17 @@ impl Diffui {
                         "Nothing to split",
                         &format!("`{path}` is the only change here, so nothing would stay."),
                     );
-                    return Task::none();
+                    return;
                 }
                 let revision = tab.session.selected_revision.clone();
                 self.open_split(
                     revision,
                     DiffSelection { files: rest },
                     Prose::from("Move ").path(&path).text(" to a new change."),
+                    cx,
                 )
             }
-            ChangesMsg::Conflict(message) => self.on_conflict(message),
+            ChangesMsg::Conflict(message) => self.on_conflict(message, cx),
         }
     }
 
@@ -1078,7 +1008,8 @@ impl Diffui {
         revision: RevisionSelection,
         selection: DiffSelection,
         summary: Prose,
-    ) -> Task<Message> {
+        cx: &mut Cx,
+    ) {
         let tab = self.active_mut();
         let original = tab
             .session
@@ -1092,24 +1023,19 @@ impl Diffui {
             revision,
             selection,
             summary,
-            first: text_editor::Content::with_text(original.trim_end()),
-            second: text_editor::Content::with_text(original.trim_end()),
+            first: (original.trim_end().to_owned()),
+            second: (original.trim_end().to_owned()),
             original,
         });
-        iced::widget::operation::focus(iced::widget::Id::new(SPLIT_FIRST_EDITOR_ID))
+        crate::input::focus(SPLIT_FIRST_EDITOR_ID, cx)
     }
 
     /// Target mode for moving `selection` out of `revision`.
-    fn move_into(
-        &mut self,
-        revision: RevisionSelection,
-        selection: DiffSelection,
-    ) -> Task<Message> {
-        let task = self.start_draft(diffui_core::DraftKind::Squash, revision);
+    fn move_into(&mut self, revision: RevisionSelection, selection: DiffSelection, cx: &mut Cx) {
+        let task = self.start_draft(diffui_core::DraftKind::Squash, revision, cx);
         if let Some(draft) = self.active_mut().op_draft_mut() {
             draft.draft.selection = Some(Box::new(selection));
         }
-        task
     }
 
     /// Discarding destroys changes: ask first, and say how to get them back.
@@ -1117,9 +1043,10 @@ impl Diffui {
         &mut self,
         revision: RevisionSelection,
         selection: DiffSelection,
-    ) -> Task<Message> {
+        cx: &mut Cx,
+    ) {
         let Some(tab_id) = self.active_tab_id() else {
-            return Task::none();
+            return;
         };
         let label = revision_label(self.active(), &revision);
         let (activity_id, _) = self.begin_activity(
@@ -1148,165 +1075,15 @@ impl Diffui {
                 allow_immutable: false,
             },
         }));
-        Task::none()
     }
 
     /// Run a partial-change op on the active tab, dropping the pick it used.
-    pub(crate) fn start_changes_op(&mut self, op: MutationOp) -> Task<Message> {
+    pub(crate) fn start_changes_op(&mut self, op: MutationOp, cx: &mut Cx) {
         let state = self.active_mut();
         state.changes.picks.clear();
         state.changes.split = None;
-        self.start_mutation_op(op)
+        self.start_mutation_op(op, cx)
     }
-}
-
-// ── Views ───────────────────────────────────────────────────────────────
-
-/// The strip docked under the diff while anything is picked or lines are
-/// being selected: what is picked, the actions on it, and the way out of
-/// line-select mode. It takes layout space, so it never covers code.
-pub(crate) fn selection_bar<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Option<Element<'a, Message>> {
-    let tab = ui.active();
-    if !editable(tab) || split_prompt_shown(ui).is_some() {
-        return None;
-    }
-    let selection = selection_of(tab);
-    let selecting = live_line_select(tab).is_some();
-    if selection.is_empty() && !selecting {
-        return None;
-    }
-    let font = ui.config.ui_font;
-    let mono = ui.config.mono_font;
-    let medium = crate::theme::emphasis_font(font, iced::font::Weight::Medium);
-
-    let picked = picked_prose(&selection);
-    // The icon centres on the caps and the runs share a baseline (see
-    // `crate::typography`).
-    let (lead_text, lead_icon): (Vec<Aligned<'a, Message>>, _) = if selecting {
-        let status = if selection.is_empty() {
-            Prose::from("Nothing selected yet")
-        } else {
-            picked
-        };
-        (
-            vec![
-                Aligned::text(
-                    text("Selecting lines")
-                        .size(text_size::UI)
-                        .font(medium)
-                        .color(theme.text),
-                    medium,
-                    text_size::UI,
-                ),
-                Aligned::gap(theme::space::MD),
-                Aligned::text(
-                    status
-                        .view(font, mono, theme.muted_text, theme)
-                        .size(text_size::UI),
-                    font,
-                    text_size::UI,
-                ),
-            ],
-            icons::LIST_CHECKS,
-        )
-    } else {
-        (
-            vec![Aligned::text(
-                picked
-                    .text(" selected")
-                    .view(font, mono, theme.text, theme)
-                    .size(text_size::UI),
-                font,
-                text_size::UI,
-            )],
-            icons::CHECK,
-        )
-    };
-    let mut lead_items = vec![
-        Aligned::glyph(
-            icons::icon(lead_icon, ui::ICON_SIZE, theme.info),
-            ui::ICON_SIZE,
-        ),
-        Aligned::gap(theme::space::SM),
-    ];
-    lead_items.extend(lead_text);
-    let lead = typography::baseline_row(lead_items, 0.0);
-
-    let mut labels: Vec<(&'static str, ChangesMsg, ui::Variant)> = Vec::new();
-    if !selection.is_empty() {
-        labels.extend([
-            ("Clear", ChangesMsg::Clear, ui::Variant::Ghost),
-            ("Split\u{2026}", ChangesMsg::OpenSplit, ui::Variant::Raised),
-            (
-                "Squash into parent",
-                ChangesMsg::SquashIntoParent,
-                ui::Variant::Raised,
-            ),
-            (
-                "Move into\u{2026}",
-                ChangesMsg::MoveInto,
-                ui::Variant::Raised,
-            ),
-            ("Discard\u{2026}", ChangesMsg::Discard, ui::Variant::Raised),
-        ]);
-    }
-    if selecting {
-        labels.push((
-            "Done",
-            ChangesMsg::Lines(LineMsg::Exit),
-            ui::Variant::Primary,
-        ));
-    }
-    // Whether the summary and every button share one line in this pane.
-    let buttons_width: f32 = labels
-        .iter()
-        .map(|(label, _, _)| {
-            crate::measure::line_width(label, text_size::UI, font) + 2.0 * ui::Size::Compact.pad_x()
-        })
-        .sum::<f32>()
-        + ui::BUTTON_GAP * labels.len() as f32;
-    let lead_width = ui::ICON_SIZE
-        + theme::space::SM
-        + crate::measure::line_width(
-            &format!("Selecting lines  {} selected", selection.summary()),
-            text_size::UI,
-            font,
-        );
-    let one_line = lead_width + buttons_width + 2.0 * crate::diff_view::HEADER_HORIZONTAL_PADDING
-        <= crate::diff_panel::diff_pane_width(ui);
-    let buttons = || {
-        labels.iter().map(|(label, msg, variant)| {
-            ui::text_button(None, *label, *variant, ui::Size::Compact, font, theme)
-                .on_press(Message::Changes(msg.clone()))
-                .into()
-        })
-    };
-    // Line selection's keys are in the hint strip docked under this one
-    // (see `crate::mode_hints`).
-    let strip = if one_line {
-        column![ui::button_row(Some(lead), buttons())]
-    } else {
-        column![lead, ui::button_row(None, buttons())]
-    }
-    .spacing(theme::space::SM);
-    Some(
-        container(strip)
-            .width(Length::Fill)
-            .padding(Padding::from([
-                theme::space::MD,
-                crate::diff_view::HEADER_HORIZONTAL_PADDING,
-            ]))
-            .style(move |_| {
-                container::Style::default()
-                    .background(theme.file_header)
-                    .border(iced::Border {
-                        width: 1.0,
-                        color: theme.border,
-                        radius: 0.0.into(),
-                    })
-            })
-            .into(),
-    )
 }
 
 /// "3 lines in `src/a.rs`" with the path styled as one.
@@ -1334,96 +1111,6 @@ fn split_prompt_shown(ui: &Diffui) -> Option<&SplitPrompt> {
         .split
         .as_ref()
         .filter(|prompt| editable(tab) && prompt.revision == tab.session.selected_revision)
-}
-
-/// The split prompt as a modal: what stays and what moves, the two
-/// descriptions in the app's editor, and the footer. Empty when closed. A
-/// stray click outside doesn't throw the typed descriptions away; Esc and
-/// Cancel do.
-pub(crate) fn split_modal<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
-    use iced::widget::tooltip::Position;
-    let Some(prompt) = split_prompt_shown(ui) else {
-        return Space::new().into();
-    };
-    let (font, mono) = (ui.config.ui_font, ui.config.mono_font);
-    let label = revision_label(ui.active(), &prompt.revision);
-    let size = ui.config.code_type.size;
-    let width = SPLIT_WIDTH - 2.0 * ui::DIALOG_PADDING;
-    // Two editors share what the window leaves under the card's fixed parts.
-    let max = ((ui.window_size.height - crate::toolbar::modal_top() - SPLIT_CHROME_HEIGHT) / 2.0)
-        .clamp(88.0, crate::input::editor_max_height(ui.window_size.height));
-    let field = |caption: Prose,
-                 content: &'a text_editor::Content,
-                 id: Option<&'static str>,
-                 placeholder: &'static str,
-                 on_edit: fn(text_editor::Action) -> ChangesMsg| {
-        column![
-            caption
-                .view(font, mono, theme.muted_text, theme)
-                .size(text_size::UI),
-            crate::input::multi_line(
-                content,
-                crate::input::MultiLine {
-                    id,
-                    placeholder,
-                    font: mono,
-                    size,
-                    height: crate::input::fit_height(&content.text(), mono, size, width, 88.0, max),
-                },
-                theme,
-                Some(move |action| Message::Changes(on_edit(action))),
-            ),
-        ]
-        .spacing(crate::theme::space::SM)
-    };
-    let cancel = ui::cancel_button(ui::Size::Standard, font, theme)
-        .on_press(Message::Changes(ChangesMsg::SplitCancel));
-    let split = ui::text_button(
-        None,
-        "Split",
-        ui::Variant::Primary,
-        ui::Size::Standard,
-        font,
-        theme,
-    )
-    .on_press(Message::Changes(ChangesMsg::SplitConfirm));
-
-    let body = column![
-        column![
-            ui::dialog_title(&Prose::from("Split ").rev(label.clone()), font, mono, theme),
-            ui::dialog_text(&prompt.summary, font, mono, theme),
-        ]
-        .spacing(crate::theme::space::SM),
-        field(
-            Prose::from("Stays in ").rev(label),
-            &prompt.first,
-            Some(SPLIT_FIRST_EDITOR_ID),
-            "Description of the changes that stay",
-            ChangesMsg::SplitFirstEdited,
-        ),
-        field(
-            Prose::from("New change on top"),
-            &prompt.second,
-            None,
-            "Description of the new change (empty is fine)",
-            ChangesMsg::SplitSecondEdited,
-        ),
-        ui::button_row(
-            None,
-            [
-                ui::tooltip(cancel, "Esc", Position::Bottom, font, theme),
-                ui::tooltip(split, "\u{2318}\u{21b5}", Position::Bottom, font, theme),
-            ],
-        ),
-    ]
-    .spacing(ui::DIALOG_SPACING);
-
-    ui::modal(
-        ui::dialog_card(body, SPLIT_WIDTH, theme),
-        crate::toolbar::modal_top(),
-        Message::Ui(crate::UiEvent::ConfirmNoOp),
-        Message::Ui(crate::UiEvent::ConfirmNoOp),
-    )
 }
 
 /// The split card's height without its two editors: insets, title and
@@ -1564,6 +1251,7 @@ mod tests {
             RevisionSelection::WorkingCopy,
             whole_file("a.rs"),
             Prose::from("Keep a.rs"),
+            cx,
         );
         assert!(split_shown(&ui));
         let context = ui.key_context();
@@ -1789,4 +1477,26 @@ mod tests {
         };
         assert_eq!(picked_prose(&whole), Prose::new().path("src/a.rs"));
     }
+}
+
+/// Stub: the changes view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn selection_bar(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> Option<AnyElement> {
+    None
+}
+
+/// Stub: the changes view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn split_modal(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::overlay("changes::split_modal", crate::changes::split_shown(ui))
 }

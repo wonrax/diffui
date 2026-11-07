@@ -5,23 +5,19 @@
 //! The command itself comes from core ([`diffui_core::plan`]); this module
 //! names revisions from the loaded graph and draws the line.
 
+use crate::Cx;
+use gpui_kit::{AnyElement, Window};
 use std::cell::RefCell;
 use std::collections::HashMap;
-
-use iced::{
-    Element, Length,
-    widget::{button, responsive, text},
-};
 
 use diffui_core::cli::highlight::{self, Mark};
 use diffui_core::plan::{self, Phrase};
 use diffui_core::{JjCli, MutationOp, RevisionSelection, Vcs};
 
+use crate::Diffui;
 use crate::ellipsis;
 use crate::prose::Prose;
-use crate::theme::{ThemeSpec, ghost_button_style, text_size};
-use crate::typography::{self, Aligned};
-use crate::{Action, Diffui, Message, icons, ui};
+use crate::theme::ThemeSpec;
 
 /// Size of the line's glyphs.
 const GLYPH: f32 = 12.0;
@@ -161,108 +157,6 @@ pub(crate) fn command_fits(
     !line.is_multiline() && line.fits(width - CHROME)
 }
 
-/// The command on one line: a terminal glyph, the command in mono (cut
-/// short with an ellipsis when it doesn't fit) and a copy button, which
-/// copies the whole command.
-pub(crate) fn command_line<'a>(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    command: &str,
-    size: f32,
-) -> Element<'a, Message> {
-    let (ui_font, mono) = (ui.config.ui_font, ui.config.mono_font);
-    let line = command_text(ui, theme, command, size);
-    let command = command.to_owned();
-    responsive(move |bounds| {
-        laid_out(
-            line.cut(bounds.width - CHROME),
-            &command,
-            mono,
-            size,
-            ui_font,
-            theme,
-        )
-    })
-    .height(Length::Shrink)
-    .into()
-}
-
-/// The whole command, wrapped to the width it gets, its later lines under
-/// the command's first rather than under the glyph, the copy button after
-/// it.
-pub(crate) fn wrapped_command_line<'a>(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    command: &str,
-    size: f32,
-) -> Element<'a, Message> {
-    let (ui_font, mono) = (ui.config.ui_font, ui.config.mono_font);
-    let line = command_text(ui, theme, command, size);
-    let command = command.to_owned();
-    responsive(move |bounds| {
-        let room = (bounds.width - CHROME).max(0.0);
-        let width = if !line.is_multiline() && line.fits(room) {
-            Length::Shrink
-        } else {
-            // Wrapped: as wide as its widest line, at most the room, so the
-            // copy button stays by the text.
-            Length::Fixed((line.natural_width() + 1.0).ceil().min(room))
-        };
-        laid_out(
-            line.wrapped().width(width),
-            &command,
-            mono,
-            size,
-            ui_font,
-            theme,
-        )
-    })
-    .height(Length::Shrink)
-    .into()
-}
-
-fn laid_out<'a>(
-    text: text::Rich<'a, (), Message>,
-    command: &str,
-    mono: iced::Font,
-    size: f32,
-    ui_font: iced::Font,
-    theme: ThemeSpec,
-) -> Element<'a, Message> {
-    let copy = ui::tooltip(
-        button(icons::icon(icons::COPY, GLYPH, theme.subtle_text))
-            .padding(2)
-            .on_press(Message::Action(Action::Copy(command.to_owned())))
-            .style(move |_, status| ghost_button_style(theme, status)),
-        "Copy command",
-        iced::widget::tooltip::Position::Top,
-        ui_font,
-        theme,
-    );
-    typography::baseline_row(
-        [
-            Aligned::glyph(
-                icons::icon(icons::TERMINAL, GLYPH, theme.subtle_text),
-                GLYPH,
-            ),
-            Aligned::gap(6.0),
-            Aligned::text(text, mono, size),
-            Aligned::gap(4.0),
-            Aligned::glyph(copy, GLYPH + 4.0),
-        ],
-        0.0,
-    )
-}
-
-/// [`command_line`] at caption size, the size the logs use.
-pub(crate) fn caption_command_line<'a>(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    command: &str,
-) -> Element<'a, Message> {
-    command_line(ui, theme, command, text_size::CAPTION)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,4 +184,29 @@ mod tests {
         assert_eq!(prose.revisions().collect::<Vec<_>>(), ["kmnopqrs"]);
         assert_eq!(prose.bookmarks().collect::<Vec<_>>(), ["push-sknyzssrnkun"]);
     }
+}
+
+/// Stub: the plan view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn wrapped_command_line(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    command: &str,
+    size: f32,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::panel("plan::wrapped_command_line")
+}
+
+/// Stub: the plan view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn caption_command_line(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    command: &str,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::panel("plan::caption_command_line")
 }

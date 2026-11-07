@@ -18,11 +18,10 @@
 //! arriving while one dialog is open queues behind it and is raised when that
 //! one resolves), every other kind replaces its own peer.
 
-use iced::keyboard;
-
 use crate::commands::Context;
 use crate::find::FindState;
 use crate::keymap::{Chord, ChordKey};
+use crate::keys as keyboard;
 use crate::menu::OverlayMenu;
 use crate::palette::PaletteState;
 use crate::{ConfirmDialog, DescriptionEditor, Diffui, DraftUi, OpenRepoDialog, TabState};
@@ -175,7 +174,7 @@ pub(crate) fn needs_unconsumed(context: Context, chord: &Chord) -> bool {
         Context::Base | Context::Lines => !chord.mods.any_command_like() || is_text_undo(chord),
         Context::Draft => {
             (!chord.mods.any_command_like()
-                && !matches!(chord.key, ChordKey::Named(keyboard::key::Named::Escape)))
+                && !matches!(chord.key, ChordKey::Named(keyboard::Named::Escape)))
                 || is_text_undo(chord)
         }
         _ => false,
@@ -183,7 +182,7 @@ pub(crate) fn needs_unconsumed(context: Context, chord: &Chord) -> bool {
 }
 
 /// ⌃A, ⌃E, ⌃K, …: on macOS a focused text field takes them as caret and
-/// delete keys ([`crate::ui::cocoa_text_key`]) and reports the key consumed,
+/// delete keys ([`crate::keys::cocoa_text_key`]) and reports the key consumed,
 /// so a command bound to one yields while a field has it, as in native apps.
 fn is_cocoa_text_chord(chord: &Chord) -> bool {
     let ChordKey::Char(key) = &chord.key else {
@@ -204,7 +203,7 @@ fn is_cocoa_text_chord(chord: &Chord) -> bool {
             modifiers |= modifier;
         }
     }
-    cfg!(target_os = "macos") && crate::ui::cocoa_text_key(latin, modifiers, true).is_some()
+    cfg!(target_os = "macos") && crate::keys::cocoa_text_key(latin, modifiers, true).is_some()
 }
 
 /// ⌘Z / ⌘⇧Z: a focused text field (the revset box) takes them as its own
@@ -546,8 +545,8 @@ mod stack_tests {
     #[test]
     fn a_per_tab_mode_only_owns_the_keyboard_while_its_tab_is_on_screen() {
         let mut ui = app();
-        let first = push_tab(&mut ui, "/tmp/first");
-        let _second = push_tab(&mut ui, "/tmp/second");
+        let first = push_tab(&mut ui, "/tmp/first", cx);
+        let _second = push_tab(&mut ui, "/tmp/second", cx);
         ui.active = 0;
         ui.tab_mut(first)
             .expect("the tab is open")
@@ -565,7 +564,7 @@ mod stack_tests {
     #[test]
     fn a_line_select_mode_that_no_longer_applies_holds_no_keys() {
         let mut ui = app();
-        let tab = push_tab(&mut ui, "/tmp/first");
+        let tab = push_tab(&mut ui, "/tmp/first", cx);
         ui.active = 0;
         // This tab has no diff to pick lines from.
         ui.tab_mut(tab)
@@ -580,21 +579,21 @@ mod stack_tests {
     #[test]
     fn switching_tabs_closes_the_description_editor() {
         let mut ui = app();
-        let first = push_tab(&mut ui, "/tmp/first");
-        let second = push_tab(&mut ui, "/tmp/second");
+        let first = push_tab(&mut ui, "/tmp/first", cx);
+        let second = push_tab(&mut ui, "/tmp/second", cx);
         ui.active = 0;
         ui.tab_mut(first)
             .expect("the tab is open")
             .push_mode(TabMode::Description(crate::DescriptionEditor {
                 target: diffui_core::RevisionSelection::WorkingCopy,
                 original: String::new(),
-                content: iced::widget::text_editor::Content::new(),
+                content: String::new(),
                 saving_activity: None,
                 switch_blocked: false,
                 commit: false,
             }));
 
-        let _ = ui.activate_tab(second);
+        let _ = ui.activate_tab(second, cx);
 
         assert_eq!(ui.active_tab_id(), Some(second));
         assert!(

@@ -3,26 +3,21 @@
 //! bookmarks, change ids, recent revsets), and jj's error once typing pauses,
 //! pointed at where the revset goes wrong.
 
+use crate::Cx;
+use crate::keys::{self as keyboard, Named};
+use gpui_kit::AnyElement;
+use gpui_kit::Window as GpuiWindow;
 use std::ops::Range;
 use std::time::Duration;
 
 use diffui_core::JobId;
 use diffui_core::completion::Completion;
 use diffui_core::revset::{RevsetError, RevsetMatch, RevsetQuery};
-use iced::advanced::text::Wrapping;
-use iced::keyboard::{self, key::Named};
-use iced::widget::text::Span;
-use iced::widget::{column, container, mouse_area, rich_text};
-use iced::{Element, Font, Length, Padding, Task};
 
-use crate::cmdline::{
-    CmdEvent, apply_completion, cursor_after_edit, cursor_after_key, place_caret,
-};
-use crate::icons;
-use crate::palette::{RESULTS_INSET, ROW_HEIGHT};
-use crate::theme::{self, ThemeSpec, text_size};
-use crate::typography::{self, Aligned};
-use crate::{Diffui, Message, TabId};
+use crate::cmdline::{apply_completion, cursor_after_edit, cursor_after_key, place_caret};
+use crate::palette::ROW_HEIGHT;
+use crate::theme::ThemeSpec;
+use crate::{Diffui, TabId};
 
 /// How long typing must pause before the revset is checked.
 const SETTLE: Duration = Duration::from_millis(300);
@@ -48,7 +43,7 @@ pub(crate) struct FieldAssist {
 
 impl Diffui {
     /// The field's text changed.
-    pub(crate) fn revset_field_edited(&mut self, value: String) -> Task<Message> {
+    pub(crate) fn revset_field_edited(&mut self, value: String, cx: &mut Cx) {
         let old = std::mem::replace(&mut self.active_mut().session.revset, value);
         let new = self.active().session.revset.clone();
         let cursor = cursor_after_edit(&old, &new, self.active().cmdline.field.cursor);
@@ -59,9 +54,9 @@ impl Diffui {
         field.checked = None;
         field.version = field.version.wrapping_add(1);
         let version = field.version;
-        Task::perform(tokio::time::sleep(SETTLE), move |()| {
-            Message::CommandLine(CmdEvent::FieldSettle(version))
-        })
+        Diffui::after(SETTLE, cx, move |this, cx| {
+            this.settle_revset_field(version, cx)
+        });
     }
 
     fn refresh_revset_field(&mut self, cursor: usize) {
@@ -81,18 +76,18 @@ impl Diffui {
     }
 
     /// Typing paused: ask jj whether the revset holds up.
-    pub(crate) fn settle_revset_field(&mut self, version: u64) -> Task<Message> {
+    pub(crate) fn settle_revset_field(&mut self, version: u64, cx: &mut Cx) {
         let Some(tab) = self.active_tab_id() else {
-            return Task::none();
+            return;
         };
         if self.active().cmdline.field.version != version
             || !self.active().session.capabilities.range_diff
         {
-            return Task::none();
+            return;
         }
         let value = self.active().session.revset.clone();
         let Some(state) = self.tab_mut(tab) else {
-            return Task::none();
+            return;
         };
         if let Some(old) = state.cmdline.field.job.take()
             && let Some(handle) = &state.handle
@@ -102,7 +97,7 @@ impl Diffui {
         let (job, effects) = state.session.resolve_revset(RevsetQuery::new(&value));
         state.cmdline.field.job = Some(job);
         state.jobs.revset_field = Some(job);
-        self.run_effects(tab, effects)
+        self.run_effects(tab, effects, cx)
     }
 
     pub(crate) fn revset_field_resolved(
@@ -110,18 +105,18 @@ impl Diffui {
         tab: TabId,
         revset: &str,
         result: Result<RevsetMatch, RevsetError>,
-    ) -> Task<Message> {
+        cx: &mut Cx,
+    ) {
         let Some(state) = self.tab_mut(tab) else {
-            return Task::none();
+            return;
         };
         state.jobs.revset_field = None;
         state.cmdline.field.job = None;
         if state.session.revset != revset {
-            return Task::none();
+            return;
         }
         state.cmdline.field.checked = Some(revset.to_owned());
         state.cmdline.field.error = result.err();
-        Task::none()
     }
 
     /// Keys while the dropdown is up: ↑/↓ move, Tab takes the candidate, Esc
@@ -132,13 +127,14 @@ impl Diffui {
         key: &keyboard::Key,
         modifiers: keyboard::Modifiers,
         consumed: bool,
-    ) -> Option<Task<Message>> {
+        cx: &mut Cx,
+    ) -> Option<()> {
         let field = &self.active().cmdline.field;
         if !field.open {
             return None;
         }
         // ⌃N/⌃P walk the list like ↓/↑, as in the palette.
-        let list_key = crate::ui::cocoa_list_key(key, modifiers);
+        let list_key = crate::keys::cocoa_list_key(key, modifiers);
         let key = list_key.as_ref().unwrap_or(key);
         // A plain key nobody typed means the field lost focus.
         if !consumed
@@ -158,24 +154,24 @@ impl Diffui {
             return None;
         }
         match key.as_ref() {
-            keyboard::Key::Named(Named::ArrowDown) => Some(self.move_revset_field(1)),
-            keyboard::Key::Named(Named::ArrowUp) => Some(self.move_revset_field(-1)),
+            keyboard::Key::Named(Named::ArrowDown) => Some(self.move_revset_field(1, cx)),
+            keyboard::Key::Named(Named::ArrowUp) => Some(self.move_revset_field(-1, cx)),
             keyboard::Key::Named(Named::Tab) => {
                 let index = self.active().cmdline.field.selected;
-                Some(self.accept_revset_field(index))
+                Some(self.accept_revset_field(index, cx))
             }
             keyboard::Key::Named(Named::Escape) => {
                 self.close_revset_field();
-                Some(Task::none())
+                Some(())
             }
             _ => None,
         }
     }
 
-    fn move_revset_field(&mut self, delta: i32) -> Task<Message> {
+    fn move_revset_field(&mut self, delta: i32, cx: &mut Cx) {
         let field = &mut self.active_mut().cmdline.field;
         if field.completions.is_empty() {
-            return Task::none();
+            return;
         }
         let len = field.completions.len() as i32;
         field.selected = (field.selected as i32 + delta).rem_euclid(len) as usize;
@@ -183,15 +179,11 @@ impl Diffui {
         let top = field.selected as f32 * ROW_HEIGHT;
         let viewport = VISIBLE_ROWS as f32 * ROW_HEIGHT;
         let y = (top + ROW_HEIGHT - viewport).max(0.0);
-        iced::widget::operation::scroll_to(
-            iced::widget::Id::new(DROPDOWN_ID),
-            iced::widget::scrollable::AbsoluteOffset { x: 0.0, y },
-        )
     }
 
-    pub(crate) fn accept_revset_field(&mut self, index: usize) -> Task<Message> {
+    pub(crate) fn accept_revset_field(&mut self, index: usize, cx: &mut Cx) {
         let Some(completion) = self.active().cmdline.field.completions.get(index).cloned() else {
-            return Task::none();
+            return;
         };
         let (value, cursor) = apply_completion(&self.active().session.revset, &completion);
         self.active_mut().session.revset = value.clone();
@@ -202,22 +194,22 @@ impl Diffui {
         field.checked = None;
         field.version = field.version.wrapping_add(1);
         let version = field.version;
-        Task::batch([
-            iced::widget::operation::focus(iced::widget::Id::new(crate::sidebar::REVSET_INPUT_ID)),
-            place_caret(crate::sidebar::REVSET_INPUT_ID, &value, cursor),
-            Task::perform(tokio::time::sleep(SETTLE), move |()| {
-                Message::CommandLine(CmdEvent::FieldSettle(version))
-            }),
-        ])
+        {
+            crate::input::focus(crate::sidebar::REVSET_INPUT_ID, cx);
+            place_caret(crate::sidebar::REVSET_INPUT_ID, &value, cursor, cx);
+            Diffui::after(SETTLE, cx, move |this, cx| {
+                this.settle_revset_field(version, cx)
+            });
+        }
     }
 
     /// Enter in the field: take the candidate the user went looking for,
     /// else run the revset.
-    pub(crate) fn submit_revset_field(&mut self) -> Task<Message> {
+    pub(crate) fn submit_revset_field(&mut self, cx: &mut Cx) {
         let field = &self.active().cmdline.field;
         if field.open && field.navigated {
             let index = field.selected;
-            return self.accept_revset_field(index);
+            return self.accept_revset_field(index, cx);
         }
         self.close_revset_field();
         let revset = self.active().session.revset.clone();
@@ -226,12 +218,13 @@ impl Diffui {
         // Check it now rather than after the typing pause, so a bad revset
         // is explained by the field, under it, as soon as it is run.
         let check = if self.active().cmdline.field.checked.as_deref() == Some(revset.as_str()) {
-            Task::none()
         } else {
             let version = self.active().cmdline.field.version;
-            self.settle_revset_field(version)
+            self.settle_revset_field(version, cx)
         };
-        Task::batch([self.evaluate_revset(), check])
+        {
+            self.evaluate_revset(cx);
+        }
     }
 
     pub(crate) fn close_revset_field(&mut self) {
@@ -249,47 +242,6 @@ impl Diffui {
 }
 
 const DROPDOWN_ID: &str = "revset-completions";
-
-/// The completion list, hung under the field over the graph.
-pub(crate) fn dropdown(ui: &Diffui, theme: ThemeSpec) -> Option<Element<'_, Message>> {
-    let field = &ui.active().cmdline.field;
-    if !field.open || field.completions.is_empty() {
-        return None;
-    }
-    let mut list = column![].spacing(0);
-    for (index, completion) in field.completions.iter().enumerate() {
-        list = list.push(
-            mouse_area(crate::palette::row_shell(
-                crate::cmdline_view::completion_row(ui, theme, completion),
-                index == field.selected,
-                theme,
-            ))
-            .on_press(Message::CommandLine(CmdEvent::FieldAccept(index)))
-            .on_enter(Message::CommandLine(CmdEvent::FieldSelect(index))),
-        );
-    }
-    let rows = field.completions.len().min(VISIBLE_ROWS);
-    let card = container(
-        crate::ui::scrollable(list.padding(RESULTS_INSET), theme)
-            .id(iced::widget::Id::new(DROPDOWN_ID))
-            .height(Length::Fixed(
-                rows as f32 * ROW_HEIGHT + 2.0 * RESULTS_INSET,
-            )),
-    )
-    .width(Length::Fill)
-    .style(move |_| theme::popover_style(theme));
-    Some(
-        container(card)
-            .width(Length::Fill)
-            .padding(Padding {
-                top: theme::space::XXS,
-                right: crate::field::PANEL_TOGGLE_INSET,
-                bottom: 0.0,
-                left: crate::field::PANEL_TOGGLE_INSET,
-            })
-            .into(),
-    )
-}
 
 /// jj's error for the revset in the field, when it is the one to show: the
 /// check is for what the field holds, and not about a word still being
@@ -318,121 +270,6 @@ pub(crate) fn explains_revset_error(ui: &Diffui) -> bool {
     shown_error(ui).is_some()
         || field.job.is_some()
             && field.checked.as_deref() != Some(ui.active().session.revset.as_str())
-}
-
-/// jj's error under the field: the message, the revset with the bad part
-/// underlined, and the way back to the default. The icon hangs in the
-/// field's icon column and the rest starts where the field's text does.
-pub(crate) fn error_strip(ui: &Diffui, theme: ThemeSpec) -> Option<Element<'_, Message>> {
-    use crate::field::{LEADING_ICON_INSET, LEADING_ICON_SIZE, LEADING_TEXT_X, PANEL_HEADER_LEAD};
-    let error = shown_error(ui)?;
-    let value = &ui.active().session.revset;
-    let font = ui.config.ui_font;
-    let mono = ui.config.mono_font;
-    let message = typography::baseline_row(
-        [
-            Aligned::glyph(
-                container(icons::icon(icons::ALERT_TRIANGLE, 12.0, theme.removed_text))
-                    .center_x(Length::Fixed(LEADING_ICON_SIZE)),
-                12.0,
-            ),
-            Aligned::gap(LEADING_TEXT_X - LEADING_ICON_INSET - LEADING_ICON_SIZE),
-            Aligned::text(
-                crate::prose::Prose::from_backticks(&crate::cmdline::sentence(
-                    &error.message,
-                    error.hint.as_deref(),
-                ))
-                .view(font, mono, theme.removed_text, theme)
-                .size(text_size::UI)
-                .width(Length::Fill),
-                font,
-                text_size::UI,
-            ),
-        ],
-        0.0,
-    );
-    let column_inset = Padding {
-        left: LEADING_TEXT_X - LEADING_ICON_INSET,
-        ..Padding::ZERO
-    };
-    let mut body = column![message].spacing(theme::space::SM);
-    if let Some(span) = error.span.clone() {
-        let room = ui.sidebar_width - PANEL_HEADER_LEAD - LEADING_TEXT_X - PANEL_HEADER_LEAD;
-        if let Some(echo) = echo(value, span, room, mono, theme) {
-            body = body.push(container(echo).padding(column_inset).clip(true));
-        }
-    }
-    // The way back, beside the only place the error is told.
-    if let Some(reset) = crate::empty_states::reset_button(ui, theme) {
-        body = body.push(container(reset).padding(column_inset));
-    }
-    Some(
-        container(body)
-            .width(Length::Fill)
-            .padding(Padding {
-                top: 0.0,
-                right: PANEL_HEADER_LEAD,
-                bottom: theme::space::SM,
-                left: PANEL_HEADER_LEAD + LEADING_ICON_INSET,
-            })
-            .into(),
-    )
-}
-
-/// The revset on one line, `span` underlined (or a caret where something is
-/// missing), cut to what fits in `room` around it.
-fn echo<'a>(
-    value: &str,
-    span: Range<usize>,
-    room: f32,
-    mono: Font,
-    theme: ThemeSpec,
-) -> Option<Element<'a, Message>> {
-    let start = span.start.min(value.len());
-    let end = span.end.min(value.len()).max(start);
-    if !value.is_char_boundary(start) || !value.is_char_boundary(end) {
-        return None;
-    }
-    // Nothing to underline: a caret marks where something is missing.
-    let (line, span) = if start == end {
-        const CARET: &str = "\u{2038}";
-        (
-            format!("{}{CARET}{}", &value[..start], &value[start..]),
-            start..start + CARET.len(),
-        )
-    } else {
-        (value.to_owned(), start..end)
-    };
-    let shown = window(&line, span.clone(), room, |text| {
-        crate::measure::line_width(text, text_size::UI, mono)
-    });
-    let bad = span.start.max(shown.range.start)..span.end.min(shown.range.end);
-    let mut spans: Vec<Span<'_, ()>> = Vec::new();
-    let plain = |text: &str, spans: &mut Vec<Span<'_, ()>>| {
-        if !text.is_empty() {
-            spans.push(Span::new(text.to_owned()).color(theme.muted_text));
-        }
-    };
-    if shown.lead {
-        plain(ELLIPSIS, &mut spans);
-    }
-    plain(&line[shown.range.start..bad.start], &mut spans);
-    spans.push(
-        Span::new(line[bad.clone()].to_owned())
-            .color(theme.removed_text)
-            .underline(end > start),
-    );
-    plain(&line[bad.end..shown.range.end], &mut spans);
-    if shown.trail {
-        plain(ELLIPSIS, &mut spans);
-    }
-    Some(
-        rich_text(spans)
-            .size(text_size::UI)
-            .font(mono)
-            .wrapping(Wrapping::None)
-            .into(),
-    )
 }
 
 const ELLIPSIS: &str = "\u{2026}";
@@ -617,4 +454,26 @@ mod tests {
         let line = shown(text, at..at + 'ζ'.len_utf8(), 8.0);
         assert!(line.contains('ζ'), "{line:?}");
     }
+}
+
+/// Stub: the revset_assist view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn dropdown(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut GpuiWindow,
+    cx: &mut Cx,
+) -> Option<AnyElement> {
+    None
+}
+
+/// Stub: the revset_assist view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn error_strip(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut GpuiWindow,
+    cx: &mut Cx,
+) -> Option<AnyElement> {
+    None
 }

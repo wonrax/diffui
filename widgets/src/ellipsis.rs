@@ -1,17 +1,16 @@
 //! One line of rich text cut to the width it gets, ending in an ellipsis.
 //!
-//! iced's rich text takes an `Ellipsis` but never applies it (only plain text
-//! hands it to the shaper), so a line of mixed fonts, a title with a mono
-//! bookmark in it or a highlighted command, ran on past its box. [`Line`]
-//! measures its spans with [`crate::measure`] and cuts them itself, and can
-//! say whether it had to, so a row offers the rest only when there is more.
+//! [`Line`] measures its spans with [`crate::measure`] and can say whether it
+//! has to cut, so a row offers the rest only when there is more. The cut itself
+//! is done here rather than by GPUI's `text_ellipsis` when a width is known, and
+//! by GPUI when it isn't ([`Line::view`]).
 
 use std::borrow::Cow;
 
-use iced::widget::text::{Rich, Span, Wrapping};
-use iced::widget::{responsive, text};
-use iced::{Color, Element, Font, Length};
+use gpui_kit::prelude::*;
+use gpui_kit::{Div, Hsla, SharedString, StyledText, TextRun, div, px};
 
+use crate::theme::{Color, Font};
 use crate::width_memo::WidthMemo;
 
 /// How far over its width a line may measure and still count as fitting:
@@ -27,9 +26,57 @@ thread_local! {
     static WIDTHS: WidthMemo = WidthMemo::default();
 }
 
+/// A run of a [`Line`] with its own font or colour.
+#[derive(Debug, Clone)]
+pub struct Span<'a> {
+    pub text: Cow<'a, str>,
+    pub font: Option<Font>,
+    pub color: Option<Color>,
+}
+
+impl<'a> Span<'a> {
+    pub fn new(text: impl Into<Cow<'a, str>>) -> Self {
+        Self {
+            text: text.into(),
+            font: None,
+            color: None,
+        }
+    }
+
+    pub fn font(mut self, font: Font) -> Self {
+        self.font = Some(font);
+        self
+    }
+
+    pub fn color(mut self, color: Color) -> Self {
+        self.color = Some(color);
+        self
+    }
+}
+
+/// `spans` as one styled text in a base font and colour. Size, wrapping and
+/// width are the container's.
+pub fn rich_text(spans: &[Span<'_>], font: Font, color: Color) -> StyledText {
+    let mut content = String::new();
+    let mut runs = Vec::with_capacity(spans.len());
+    for span in spans {
+        content.push_str(&span.text);
+        runs.push(TextRun {
+            len: span.text.len(),
+            font: span.font.unwrap_or(font).gpui(),
+            color: Hsla::from(span.color.unwrap_or(color)),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        });
+    }
+    runs.retain(|run| run.len > 0);
+    StyledText::new(SharedString::from(content)).with_runs(runs)
+}
+
 /// Spans in a base font, size and colour, drawn on one line cut to fit, or
 /// in full.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Line<'a> {
     spans: Vec<Span<'a>>,
     font: Font,
@@ -78,7 +125,7 @@ impl<'a> Line<'a> {
 
     /// One line, newlines read as spaces, cut with an ellipsis where it
     /// doesn't fit `width`.
-    pub fn cut<Message: 'a>(&self, width: f32) -> Rich<'a, (), Message> {
+    pub fn cut(&self, width: f32) -> Div {
         let mut spans = self.single();
         if let Some((index, keep)) = self.cut_point(width) {
             spans.truncate(index + 1);
@@ -89,28 +136,34 @@ impl<'a> Line<'a> {
             last.text = Cow::Owned(kept);
             spans.push(ellipsis);
         }
-        self.rich(spans).wrapping(Wrapping::None)
+        self.frame()
+            .whitespace_nowrap()
+            .child(rich_text(&spans, self.font, self.color))
     }
 
     /// The whole text, wrapping wherever it is laid out.
-    pub fn wrapped<Message: 'a>(&self) -> Rich<'a, (), Message> {
-        self.rich(self.spans.clone())
-            .wrapping(Wrapping::WordOrGlyph)
+    pub fn wrapped(&self) -> Div {
+        self.frame()
+            .child(rich_text(&self.spans, self.font, self.color))
     }
 
-    /// [`Line::cut`] at whatever width the line is given: it fills its
-    /// row's free space.
-    pub fn view<Message: 'a>(self) -> Element<'a, Message> {
-        responsive(move |size| self.cut::<Message>(size.width))
-            .height(Length::Shrink)
-            .into()
+    /// One line at whatever width it is given: it fills its row's free space
+    /// and GPUI cuts it, ellipsis included.
+    pub fn view(self) -> Div {
+        self.frame()
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .text_ellipsis()
+            .child(rich_text(&self.single(), self.font, self.color))
     }
 
-    fn rich<Message: 'a>(&self, spans: Vec<Span<'a>>) -> Rich<'a, (), Message> {
-        text::Rich::with_spans(spans)
-            .font(self.font)
-            .size(self.size)
-            .color(self.color)
+    fn frame(&self) -> Div {
+        div()
+            .font(self.font.gpui())
+            .text_size(px(self.size))
+            .text_color(self.color)
     }
 
     /// The spans with each newline (and the blank space around it) read as
@@ -129,9 +182,7 @@ impl<'a> Line<'a> {
     }
 
     fn measure(&self, span: &Span<'_>, content: &str) -> f32 {
-        let font = span.font.unwrap_or(self.font);
-        let size = span.size.map_or(self.size, |size| size.0);
-        text_width(content, size, font)
+        text_width(content, self.size, span.font.unwrap_or(self.font))
     }
 
     fn cut_point(&self, width: f32) -> Option<(usize, usize)> {

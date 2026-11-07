@@ -6,21 +6,22 @@
 //! seconds of CPU on a large photo, so it runs on a thread of its own, one
 //! side at a time, for the documents the active tab shows.
 
+use crate::Cx;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use diffui_core::{BlobChange, BlobKind, BlobSide, DiffDocument, DiffFile};
-use iced::Task;
-use iced::widget::image::Handle;
 
 use crate::diff_view::{Media, MediaImage, MediaSide};
-use crate::{Diffui, Message, UiEvent};
+use gpui_kit::RenderImage;
+
+use crate::Diffui;
 
 /// One side's decode, by blob id.
 #[derive(Debug, Clone)]
 enum Entry {
     Pending,
-    Ready(Handle),
+    Ready(Arc<RenderImage>),
     Failed,
 }
 
@@ -28,7 +29,7 @@ enum Entry {
 #[derive(Debug, Clone)]
 pub(crate) struct Decoded {
     id: String,
-    result: Result<Handle, String>,
+    result: Result<Arc<RenderImage>, String>,
 }
 
 #[derive(Debug, Default)]
@@ -132,7 +133,7 @@ impl Diffui {
     /// Start decoding what the active tab's diffs show and haven't decoded,
     /// and drop the decodes no open tab shows any more. Cheap when nothing
     /// changed: the active tab's document ids are compared first.
-    pub(crate) fn sync_media(&mut self) -> Task<Message> {
+    pub(crate) fn sync_media(&mut self, cx: &mut Cx) {
         let tab = self.active();
         let history = tab.history.diff_document();
         let key = (
@@ -141,7 +142,7 @@ impl Diffui {
             history.map(|(_, id)| id),
         );
         if self.media.scanned == Some(key) {
-            return Task::none();
+            return;
         }
         let mut jobs: Vec<(String, BlobKind, Arc<[u8]>)> = Vec::new();
         let shown = std::iter::once(&tab.session.document).chain(history.map(|(doc, _)| doc));
@@ -171,15 +172,15 @@ impl Diffui {
             .retain(|id, _| live.contains(id.as_str()));
 
         if jobs.is_empty() {
-            return Task::none();
+            return;
         }
         for (id, ..) in &jobs {
             self.media.entries.insert(id.clone(), Entry::Pending);
         }
-        decode(jobs)
+        decode(jobs, cx)
     }
 
-    pub(crate) fn on_media_decoded(&mut self, decoded: Decoded) -> Task<Message> {
+    pub(crate) fn on_media_decoded(&mut self, decoded: Decoded, cx: &mut Cx) {
         // Dropped meanwhile (a reload replaced the document): don't revive it.
         if let Some(entry) = self.media.entries.get_mut(&decoded.id) {
             *entry = match decoded.result {
@@ -190,20 +191,29 @@ impl Diffui {
                 }
             };
         }
-        Task::none()
     }
+}
+
+/// The decoded pixels as what GPUI paints. It takes BGRA.
+fn render_image(image: diffui_core::media::DecodedImage) -> Arc<RenderImage> {
+    let mut bytes = image.rgba;
+    for pixel in bytes.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    let buffer = image::RgbaImage::from_raw(image.width, image.height, bytes)
+        .expect("a decode's buffer matches its size");
+    Arc::new(RenderImage::new([image::Frame::new(buffer)]))
 }
 
 /// Decode `jobs` one after another on a thread of their own, reporting each
 /// as it lands so the first previews paint while the rest decode.
-fn decode(jobs: Vec<(String, BlobKind, Arc<[u8]>)>) -> Task<Message> {
-    let (sender, receiver) = futures::channel::mpsc::unbounded();
+fn decode(jobs: Vec<(String, BlobKind, Arc<[u8]>)>, cx: &mut Cx) {
+    let (sender, mut receiver) = futures::channel::mpsc::unbounded();
     std::thread::Builder::new()
         .name("diffui-media".to_owned())
         .spawn(move || {
             for (id, kind, bytes) in jobs {
-                let result = diffui_core::media::decode(kind, &bytes)
-                    .map(|image| Handle::from_rgba(image.width, image.height, image.rgba));
+                let result = diffui_core::media::decode(kind, &bytes).map(render_image);
                 if sender.unbounded_send(Decoded { id, result }).is_err() {
                     break;
                 }
@@ -212,12 +222,20 @@ fn decode(jobs: Vec<(String, BlobKind, Arc<[u8]>)>) -> Task<Message> {
         .map_or_else(
             |error| {
                 tracing::warn!(%error, "could not start the preview decoder");
-                Task::none()
             },
             |_| {
-                Task::run(receiver, |decoded| {
-                    Message::Ui(UiEvent::MediaDecoded(Box::new(decoded)))
+                cx.spawn(async move |this, cx| {
+                    use futures::StreamExt as _;
+                    while let Some(decoded) = receiver.next().await {
+                        let updated = this.update(cx, |this, cx| {
+                            this.act(cx, |this, cx| this.on_media_decoded(decoded, cx));
+                        });
+                        if updated.is_err() {
+                            return;
+                        }
+                    }
                 })
+                .detach();
             },
         )
 }

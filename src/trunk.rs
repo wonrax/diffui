@@ -4,8 +4,7 @@
 //! stopping for is a forecast conflict, so the rebase preview runs first and
 //! a confirmation names the changes that would end up conflicted.
 
-use iced::Task;
-
+use crate::Cx;
 use diffui_core::{
     Destination, DraftSimulation, JobId, PreviewRequest, RebaseSourceMode, RevisionSelection,
 };
@@ -14,7 +13,7 @@ use crate::commands::{self, CommandArg};
 use crate::modes::Mode;
 use crate::mutations::MutationOp;
 use crate::prose::Prose;
-use crate::{ConfirmDialog, Diffui, Message, PendingMutation, activity};
+use crate::{ConfirmDialog, Diffui, PendingMutation, activity};
 
 /// Why X's branch can't be rebased onto trunk, or `None` when it can.
 pub(crate) fn blocker(ui: &Diffui, arg: &CommandArg) -> Option<&'static str> {
@@ -65,16 +64,16 @@ fn rebase_op(sources: Vec<RevisionSelection>, trunk: String) -> MutationOp {
 
 impl Diffui {
     /// Preview the rebase, then run it (or ask first, if it would conflict).
-    pub(crate) fn rebase_onto_trunk(&mut self, sources: Vec<RevisionSelection>) -> Task<Message> {
+    pub(crate) fn rebase_onto_trunk(&mut self, sources: Vec<RevisionSelection>, cx: &mut Cx) {
         let Some(tab) = self.active_tab_id() else {
-            return Task::none();
+            return;
         };
         let Some(trunk) = self.active().session.bookmarks.trunk.clone() else {
-            return Task::none();
+            return;
         };
         let op = rebase_op(sources.clone(), trunk.clone());
         let Some(state) = self.tab_mut(tab) else {
-            return Task::none();
+            return;
         };
         let mut effects = Vec::new();
         if let Some((previous, _)) = state.jobs.trunk_rebase.take() {
@@ -89,7 +88,7 @@ impl Diffui {
         });
         state.jobs.trunk_rebase = Some((job, op));
         effects.extend(preview);
-        self.run_effects(tab, effects)
+        self.run_effects(tab, effects, cx)
     }
 
     /// The preview for a rebase onto trunk came back (`Err`: it failed, which
@@ -99,12 +98,13 @@ impl Diffui {
         tab: crate::TabId,
         job: JobId,
         simulation: Result<&DraftSimulation, String>,
-    ) -> Task<Message> {
+        cx: &mut Cx,
+    ) {
         let Some(state) = self.tab_mut(tab) else {
-            return Task::none();
+            return;
         };
         let Some((_, op)) = state.jobs.trunk_rebase.take_if(|(id, _)| *id == job) else {
-            return Task::none();
+            return;
         };
         let conflicts = match simulation {
             Ok(DraftSimulation::Rebase(preview)) => preview.new_conflicts.clone(),
@@ -115,10 +115,10 @@ impl Diffui {
             }
         };
         if conflicts.is_empty() || self.active_tab_id() != Some(tab) {
-            return self.start_mutation_op(op);
+            return self.start_mutation_op(op, cx);
         }
         let MutationOp::Rebase { sources, .. } = &op else {
-            return Task::none();
+            return;
         };
         let title = if let [source] = sources.as_slice() {
             Prose::from("Rebase ")
@@ -160,7 +160,6 @@ impl Diffui {
                 allow_immutable: false,
             },
         }));
-        Task::none()
     }
 }
 
@@ -195,7 +194,7 @@ mod tests {
     /// "o" is old immutable history.
     fn ui(trunk: Option<&str>) -> Diffui {
         let mut ui = app();
-        push_tab(&mut ui, "/tmp/trunk");
+        push_tab(&mut ui, "/tmp/trunk", cx);
         let tab = ui.active_mut();
         tab.session.capabilities.mutate = true;
         tab.session.bookmarks.trunk = trunk.map(|id| id.repeat(8));

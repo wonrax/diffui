@@ -8,18 +8,13 @@
 //! `diff_since` and `span`); this module draws the banner, the commit list
 //! that stands in for the commit info, and the empty states.
 
-use iced::widget::{Space, column, container, row, text};
-use iced::{Background, Color, Element, Length, Task, alignment};
-
+use crate::Cx;
 use diffui_core::{DiffBase, DiffRange, DiffSpan, RevisionSelection};
+use gpui_kit::{AnyElement, Window};
 
-use crate::action::Action;
+use crate::Diffui;
 use crate::diff_view::{HeaderAction, HeaderField, HeaderLine};
-use crate::message::Message;
-use crate::prose::Prose;
-use crate::theme::{ThemeSpec, emphasis_font, text_size};
-use crate::typography::Aligned;
-use crate::{Diffui, icons, ui};
+use crate::theme::ThemeSpec;
 
 /// The revset "diff since trunk" measures from.
 pub(crate) const TRUNK: &str = "trunk()";
@@ -113,37 +108,37 @@ fn display_revset(ui: &Diffui, mode: RangeMode<'_>) -> String {
 }
 
 impl Diffui {
-    pub(crate) fn perform_range(&mut self, action: RangeAction) -> Task<Message> {
+    pub(crate) fn perform_range(&mut self, action: RangeAction, cx: &mut Cx) {
         let Some(tab) = self.active_tab_id() else {
-            return Task::none();
+            return;
         };
         match action {
             RangeAction::SinceTrunk { target, symbol } => {
                 self.active_mut().revision_multi_selection.clear();
                 let effects = self.active_mut().session.diff_since(TRUNK, target, symbol);
-                self.run_effects(tab, effects)
+                self.run_effects(tab, effects, cx)
             }
             RangeAction::Edit => {
                 let Some(mode) = mode(self) else {
-                    return Task::none();
+                    return;
                 };
                 let command = diff_command(&display_revset(self, mode));
-                self.open_command_line(command)
+                self.open_command_line(command, cx)
             }
         }
     }
 
     /// The marked rows changed by a ⇧- or ⌘-click: a ⇧-click span shows
     /// them as one diff; a ⌘-click reshapes a span already on screen.
-    pub(crate) fn sync_span(&mut self, started_by_shift: bool) -> Task<Message> {
+    pub(crate) fn sync_span(&mut self, started_by_shift: bool, cx: &mut Cx) {
         let Some(tab) = self.active_tab_id() else {
-            return Task::none();
+            return;
         };
         let state = self.active();
         if !state.session.capabilities.range_diff
             || !(started_by_shift || state.session.span.is_some())
         {
-            return Task::none();
+            return;
         }
         let marked: Vec<RevisionSelection> = state
             .revision_multi_selection
@@ -152,7 +147,7 @@ impl Diffui {
             .map(|hex| state.session.canonical_selection(hex))
             .collect();
         let effects = self.active_mut().session.diff_span(&marked);
-        self.run_effects(tab, effects)
+        self.run_effects(tab, effects, cx)
     }
 }
 
@@ -161,120 +156,6 @@ fn diff_command(revset: &str) -> String {
     format!(
         "jj diff -r {}",
         diffui_core::cli::tokenize::shell_quote(revset)
-    )
-}
-
-/// The banner for a range: what it is, the revset,
-/// the jj command, and edit and exit. `None` when no range is on.
-pub(crate) fn banner<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Option<Element<'a, Message>> {
-    let mode = mode(ui)?;
-    let font = ui.config.ui_font;
-    let mono = ui.config.mono_font;
-    let medium = emphasis_font(font, iced::font::Weight::Medium);
-    let refused = refused_span(ui);
-    let (glyph, label) = match mode {
-        RangeMode::Since => (icons::GIT_BRANCH, "Since trunk"),
-        RangeMode::Span(span) if span.refused.is_some() || shown_range(ui).is_none() => {
-            (icons::FILE_DIFF, "Marked")
-        }
-        RangeMode::Span(_) | RangeMode::Fixed => (icons::FILE_DIFF, "Range"),
-    };
-    let revset = display_revset(ui, mode);
-
-    let headline: Element<'a, Message> = {
-        let mut line = vec![
-            Aligned::glyph(
-                icons::icon(glyph, ui::ICON_SIZE, theme.accent),
-                ui::ICON_SIZE,
-            ),
-            Aligned::text(
-                text(label)
-                    .size(text_size::UI)
-                    .font(medium)
-                    .color(theme.text)
-                    .wrapping(text::Wrapping::None),
-                medium,
-                text_size::UI,
-            ),
-        ];
-        match (mode, refused) {
-            (RangeMode::Span(span), Some(_)) => line.push(Aligned::text(
-                text(format!("{} revisions", span.count))
-                    .size(text_size::UI)
-                    .font(font)
-                    .color(theme.muted_text)
-                    .wrapping(text::Wrapping::None),
-                font,
-                text_size::UI,
-            )),
-            _ => line.push(Aligned::text(
-                crate::plan::revset_prose(&revset)
-                    .view(mono, mono, theme.text, theme)
-                    .size(text_size::UI)
-                    .wrapping(text::Wrapping::None)
-                    .ellipsis(text::Ellipsis::End),
-                mono,
-                text_size::UI,
-            )),
-        }
-        crate::typography::baseline_row(line, 8.0)
-    };
-
-    let subline: Element<'a, Message> = match refused {
-        Some(_) => text("Not a connected range. \u{2318}-click rows to fill the gap")
-            .size(text_size::CAPTION)
-            .font(font)
-            .color(theme.conflict_marker)
-            .wrapping(text::Wrapping::None)
-            .into(),
-        None => crate::plan::caption_command_line(ui, theme, &diff_command(&revset)),
-    };
-    let sides = column![headline, subline].spacing(3);
-
-    let action = |action: RangeAction| Message::Action(Action::Range(action));
-    let mut controls = row![].spacing(4).align_y(alignment::Vertical::Center);
-    if refused.is_none() {
-        controls = controls.push(ui::tooltip(
-            ui::icon_button(icons::PENCIL, theme.muted_text, ui::Size::Compact, theme)
-                .on_press(action(RangeAction::Edit)),
-            "Edit as a jj command",
-            iced::widget::tooltip::Position::Bottom,
-            font,
-            theme,
-        ));
-    }
-    controls = controls.push(ui::tooltip(
-        ui::close_button(theme.muted_text, theme).on_press(Message::Action(Action::Compare(
-            crate::compare::CompareAction::Exit,
-        ))),
-        match mode {
-            RangeMode::Since => "Stop diffing since trunk",
-            RangeMode::Span(_) => "Clear the marks",
-            RangeMode::Fixed => "Leave the range",
-        },
-        iced::widget::tooltip::Position::Left,
-        font,
-        theme,
-    ));
-
-    let strip = row![
-        container(sides).width(Length::Fill).clip(true),
-        Space::new().width(Length::Fixed(8.0)),
-        controls,
-    ]
-    .align_y(alignment::Vertical::Center);
-    Some(
-        container(strip)
-            .width(Length::Fill)
-            .padding([8.0, crate::theme::space::XL])
-            .style(move |_| container::Style {
-                background: Some(Background::Color(Color {
-                    a: 0.10,
-                    ..theme.accent
-                })),
-                ..Default::default()
-            })
-            .into(),
     )
 }
 
@@ -361,57 +242,25 @@ pub(crate) fn header_lines(ui: &Diffui, range: &DiffRange, theme: ThemeSpec) -> 
     lines
 }
 
-/// The pane when the marked rows can't be one diff: jj's reason, with the
-/// revision it names styled as one.
-pub(crate) fn refused_state<'a>(
-    ui: &'a Diffui,
+/// Stub: the range view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn banner(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> Option<AnyElement> {
+    None
+}
+
+/// Stub: the range view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn refused_state(
+    ui: &Diffui,
     theme: ThemeSpec,
     error: &diffui_core::RevsetError,
-) -> Element<'a, Message> {
-    let font = ui.config.ui_font;
-    let mono = ui.config.mono_font;
-    let mut detail = Prose::from("jj diff -r needs the marked revisions to have no gaps.");
-    if let Some(hint) = &error.hint {
-        detail = detail.text(" ");
-        for (index, word) in hint.split(' ').enumerate() {
-            if index > 0 {
-                detail = detail.text(" ");
-            }
-            detail = if word.len() == 12 && word.bytes().all(|b| b.is_ascii_hexdigit()) {
-                // jj names the missing commit by id; the graph by change.
-                let session = &ui.active().session;
-                let name = session
-                    .commits
-                    .iter()
-                    .find(|row| row.commit_id().starts_with(word))
-                    .map(|row| {
-                        session.revision_symbol(&session.canonical_selection(row.commit_id()))
-                    })
-                    .unwrap_or_else(|| word.to_owned());
-                detail.rev(name)
-            } else {
-                detail.text(word)
-            };
-        }
-    }
-    container(
-        column![
-            text("Not a connected range")
-                .size(text_size::TITLE)
-                .font(emphasis_font(font, iced::font::Weight::Medium))
-                .color(theme.text),
-            detail
-                .view(font, mono, theme.muted_text, theme)
-                .size(text_size::UI)
-                .align_x(alignment::Horizontal::Center),
-        ]
-        .spacing(crate::theme::space::SM)
-        .align_x(alignment::Horizontal::Center)
-        .width(Length::Fit.max(440)),
-    )
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .padding(crate::theme::space::XXL)
-    .center(Length::Fill)
-    .into()
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::panel("range::refused_state")
 }

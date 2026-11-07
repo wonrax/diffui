@@ -6,31 +6,40 @@
 //!
 //! Elsewhere this is a no-op: there is no global menu bar to fill.
 
-use iced::{Subscription, Task};
-
+use crate::Cx;
+use crate::Diffui;
 use crate::commands::{CommandArg, CommandId, REGISTRY};
-use crate::{Diffui, Message};
 
 impl Diffui {
     /// A menu-bar pick: `tag` is the command's position in the registry.
-    pub(crate) fn on_menu_bar_pick(&mut self, tag: u32) -> Task<Message> {
+    pub(crate) fn on_menu_bar_pick(&mut self, tag: u32, cx: &mut Cx) {
         match REGISTRY.get(tag as usize) {
-            Some(command) => self.run_command(command.id, CommandArg::None),
-            None => Task::none(),
+            Some(command) => self.run_command(command.id, CommandArg::None, cx),
+            None => {}
         }
     }
 }
 
-/// The menu bar's clicks, as messages.
-pub(crate) fn subscription() -> Subscription<Message> {
+/// Starts the loop that turns menu-bar clicks into commands.
+pub(crate) fn start(cx: &mut Cx) {
     #[cfg(target_os = "macos")]
     {
-        Subscription::run(crate::macos_native::menu_bar_picks).map(Message::MenuBar)
+        use futures::StreamExt as _;
+        let mut picks = crate::macos_native::menu_bar_picks();
+        cx.spawn(async move |this, cx| {
+            while let Some(tag) = picks.next().await {
+                let updated = this.update(cx, |this, cx| {
+                    this.act(cx, |this, cx| this.on_menu_bar_pick(tag, cx));
+                });
+                if updated.is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
     }
     #[cfg(not(target_os = "macos"))]
-    {
-        Subscription::none()
-    }
+    let _ = cx;
 }
 
 /// Install the menu bar. Called once the window is open, after winit has put
@@ -70,9 +79,9 @@ pub(crate) fn refresh_availability(ui: &Diffui) {
 /// Open `config.toml` in the user's text editor, creating it (with a pointer
 /// to what can go in it) when there isn't one yet. Behind Settings… in the
 /// app menu and "Open settings file" in the palette.
-pub(crate) fn open_config_file() -> Task<Message> {
+pub(crate) fn open_config_file(cx: &mut Cx) {
     let Some(path) = crate::config::config_path() else {
-        return Task::none();
+        return;
     };
     if !path.exists() {
         if let Some(parent) = path.parent() {
@@ -87,7 +96,6 @@ pub(crate) fn open_config_file() -> Task<Message> {
         .spawn();
     #[cfg(not(target_os = "macos"))]
     let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
-    Task::none()
 }
 
 const CONFIG_TEMPLATE: &str = "\
@@ -124,7 +132,6 @@ mod mac {
     use crate::commands::{self, CommandId, Context};
     use crate::keymap::{Chord, ChordKey};
     use crate::macos_native::{BarItem, BarMenu, BarRole, KeyEquivalent};
-    use iced::keyboard::key::Named;
 
     /// The chord the keymap binds `id` to in the base context, as an AppKit
     /// key equivalent, when AppKit can spell it.
@@ -137,14 +144,14 @@ mod mac {
         let key = match &chord.key {
             ChordKey::Char(c) => c.clone(),
             ChordKey::Named(named) => match named {
-                Named::Enter => "\r".to_owned(),
-                Named::Escape => "\u{1b}".to_owned(),
-                Named::Tab => "\t".to_owned(),
-                Named::Space => " ".to_owned(),
-                Named::ArrowUp => "\u{f700}".to_owned(),
-                Named::ArrowDown => "\u{f701}".to_owned(),
-                Named::ArrowLeft => "\u{f702}".to_owned(),
-                Named::ArrowRight => "\u{f703}".to_owned(),
+                crate::keys::Named::Enter => "\r".to_owned(),
+                crate::keys::Named::Escape => "\u{1b}".to_owned(),
+                crate::keys::Named::Tab => "\t".to_owned(),
+                crate::keys::Named::Space => " ".to_owned(),
+                crate::keys::Named::ArrowUp => "\u{f700}".to_owned(),
+                crate::keys::Named::ArrowDown => "\u{f701}".to_owned(),
+                crate::keys::Named::ArrowLeft => "\u{f702}".to_owned(),
+                crate::keys::Named::ArrowRight => "\u{f703}".to_owned(),
                 _ => return None,
             },
         };

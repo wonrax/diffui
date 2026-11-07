@@ -5,8 +5,9 @@ edition = "2024"
 
 [dependencies]
 diffui-core = { path = "../core" }
-iced = { workspace = true }
+gpui-kit = { workspace = true }
 raw-window-handle = "0.6"
+tracing = "0.1"
 
 # Build-time only: fetch + checksum the Lucide icon font (see build.rs). `ureq`
 # rides on rustls so the download needs no system TLS libs on any platform.

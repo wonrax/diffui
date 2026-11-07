@@ -6,11 +6,10 @@
 //! jj repository opened per launch checks `jj --version` once, off the UI
 //! thread, and says so if the CLI is behind.
 
+use crate::Cx;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use iced::Task;
-
-use crate::Message;
+use crate::Diffui;
 
 /// The jj-lib version Cargo.lock resolved (see `build.rs`).
 const EMBEDDED: &str = env!("DIFFUI_JJ_LIB_VERSION");
@@ -18,11 +17,13 @@ const EMBEDDED: &str = env!("DIFFUI_JJ_LIB_VERSION");
 static CHECKED: AtomicBool = AtomicBool::new(false);
 
 /// Start the check if it hasn't run this launch.
-pub(crate) fn check_once() -> Task<Message> {
+pub(crate) fn check_once(cx: &mut Cx) {
     if CHECKED.swap(true, Ordering::Relaxed) {
-        return Task::none();
+        return;
     }
-    Task::perform(cli_version(), Message::JjCliVersion)
+    Diffui::run_async(cli_version(), cx, |this, version, cx| {
+        this.on_jj_cli_version(version, cx);
+    });
 }
 
 /// `jj --version`'s version, or `None` when there is no `jj` on PATH (or it
@@ -69,10 +70,10 @@ fn parse(version: &str) -> Option<(u64, u64, u64)> {
 }
 
 impl crate::Diffui {
-    pub(crate) fn on_jj_cli_version(&mut self, version: Option<String>) -> Task<Message> {
+    pub(crate) fn on_jj_cli_version(&mut self, version: Option<String>, cx: &mut Cx) {
         let Some(version) = version else {
             tracing::info!("no jj CLI on PATH; jj-lib {EMBEDDED} embedded");
-            return Task::none();
+            return;
         };
         match skew_warning(&version) {
             Some(warning) => {
@@ -81,7 +82,6 @@ impl crate::Diffui {
             }
             None => tracing::info!("jj CLI {version}, jj-lib {EMBEDDED} embedded"),
         }
-        Task::none()
     }
 }
 
