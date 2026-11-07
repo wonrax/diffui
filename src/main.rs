@@ -51,6 +51,8 @@ mod range;
 mod revops;
 mod revset_assist;
 mod root;
+#[cfg(test)]
+mod panels_scenes;
 mod seam;
 mod shortcuts;
 mod sidebar;
