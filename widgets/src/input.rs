@@ -4,8 +4,9 @@
 //! is awkward for update code that has neither and thinks of a field as a
 //! `String` in app state. So the wrappers here keep that view: app state holds
 //! the text, a panel passes it in each render along with what to do on an edit,
-//! and if the two differ (update code set it: a restored revset, a picked
-//! preset, a chosen folder) the input is rewritten to match. The entity lives
+//! and when that value moves to something the input doesn't show (update code set
+//! it: a restored revset, a picked preset, a chosen folder) the input is rewritten
+//! to match. The entity lives
 //! in the window's element state under the field's id, so it exists exactly
 //! while the field is on screen, as the iced widget state did.
 //!
@@ -17,7 +18,7 @@ use std::rc::Rc;
 
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::prelude::*;
-use gpui_kit::{App, Context, Entity, Global, Subscription, Window};
+use gpui_kit::{App, Context, Entity, Global, Subscription, Window, px};
 
 use crate::theme::Font;
 
@@ -161,6 +162,10 @@ struct Callbacks {
     masked: bool,
     /// The text and caret last reported to `on_edit`.
     reported: (String, usize),
+    /// The value last passed in. The input is only rewritten when this moves:
+    /// an edit reaches app state a moment after the input has it, and a frame in
+    /// between would otherwise wipe the keystroke.
+    passed: Option<String>,
 }
 
 struct Controlled<S: 'static> {
@@ -270,9 +275,18 @@ pub fn single_line(spec: FieldSpec<'_>, font: Font, window: &mut Window, cx: &mu
         callbacks.masked = spec.masked;
         (replace.then(|| spec.placeholder.to_owned()), mask)
     };
-    let value = spec.value.to_owned();
+    let value = {
+        let mut callbacks = callbacks.borrow_mut();
+        let moved = callbacks.passed.as_deref() != Some(spec.value);
+        if moved {
+            callbacks.passed = Some(spec.value.to_owned());
+        }
+        moved.then(|| spec.value.to_owned())
+    };
     state.update(cx, |state, cx| {
-        if state.value().as_ref() != value {
+        if let Some(value) = value
+            && state.value().as_ref() != value
+        {
             state.set_value(value, window, cx);
         }
         if let Some(placeholder) = replace_placeholder {
@@ -295,7 +309,10 @@ pub fn single_line(spec: FieldSpec<'_>, font: Font, window: &mut Window, cx: &mu
             });
         });
     }
-    Input::new(&state).id(id).font(font.gpui())
+    Input::new(&state)
+        .id(id)
+        .font(font.gpui())
+        .text_size(px(crate::theme::text_size::UI))
 }
 
 /// A multi-line field that wraps its text. With no `on_input` it is read-only,
@@ -343,9 +360,18 @@ pub fn multi_line(spec: FieldSpec<'_>, font: Font, window: &mut Window, cx: &mut
         }
         replace.then(|| spec.placeholder.to_owned())
     };
-    let value = spec.value.to_owned();
+    let value = {
+        let mut callbacks = callbacks.borrow_mut();
+        let moved = callbacks.passed.as_deref() != Some(spec.value);
+        if moved {
+            callbacks.passed = Some(spec.value.to_owned());
+        }
+        moved.then(|| spec.value.to_owned())
+    };
     state.update(cx, |state, cx| {
-        if state.value().as_ref() != value {
+        if let Some(value) = value
+            && state.value().as_ref() != value
+        {
             state.set_value(value, window, cx);
         }
         if let Some(placeholder) = replace_placeholder {
@@ -365,7 +391,10 @@ pub fn multi_line(spec: FieldSpec<'_>, font: Font, window: &mut Window, cx: &mut
             });
         });
     }
-    Textarea::new(&state).readonly(readonly).font(font.gpui())
+    Textarea::new(&state)
+        .readonly(readonly)
+        .font(font.gpui())
+        .text_size(px(crate::theme::text_size::UI))
 }
 
 /// Inset of a [`multi_line`] editor's text from its border.

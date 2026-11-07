@@ -392,6 +392,28 @@ fn commit_description_color(commit: RowView, theme: ThemeSpec) -> Color {
     }
 }
 
+/// Stub: the sidebar view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn build_sidebar(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::panel("sidebar::build_sidebar")
+}
+
+/// Stub: the sidebar view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn build_collapsed_sidebar(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::panel("sidebar::build_collapsed_sidebar")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,26 +492,4 @@ mod tests {
         assert_eq!(commit_list_summary(&commits[..1]), "commit-0");
         assert_eq!(commit_list_summary(&commits), "commit-0 and 9 more");
     }
-}
-
-/// Stub: the sidebar view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn build_sidebar(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    crate::stub::panel("sidebar::build_sidebar")
-}
-
-/// Stub: the sidebar view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn build_collapsed_sidebar(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    crate::stub::panel("sidebar::build_collapsed_sidebar")
 }

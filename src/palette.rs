@@ -930,6 +930,43 @@ pub fn change_id_for_recents(item: &ResultRef, ui: &Diffui) -> Option<String> {
     }
 }
 
+/// Stub: the palette view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn build_overlay(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::overlay(
+        "palette::build_overlay",
+        ui.mode(ModeKind::Palette).is_some(),
+    )
+}
+
+/// Stub: the palette view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn row_shell(
+    body: impl gpui_kit::IntoElement,
+    selected: bool,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::panel("palette::row_shell")
+}
+
+/// Stub: the palette view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn glyph_icon(
+    glyph: &'static str,
+    color: Color,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> Aligned {
+    crate::stub::aligned("palette::glyph_icon")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1026,41 +1063,4 @@ mod tests {
         assert_eq!(revision_mode_needle(">cmd"), None);
         assert_eq!(revision_mode_needle("@file"), None);
     }
-}
-
-/// Stub: the palette view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn build_overlay(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    crate::stub::overlay(
-        "palette::build_overlay",
-        ui.mode(ModeKind::Palette).is_some(),
-    )
-}
-
-/// Stub: the palette view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn row_shell(
-    body: impl gpui_kit::IntoElement,
-    selected: bool,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    crate::stub::panel("palette::row_shell")
-}
-
-/// Stub: the palette view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn glyph_icon(
-    glyph: &'static str,
-    color: Color,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> Aligned {
-    crate::stub::aligned("palette::glyph_icon")
 }

@@ -172,6 +172,57 @@ fn tab_is_dirty(tab: &crate::Tab) -> bool {
         == Some(false)
 }
 
+/// Stub: the tab_bar view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn build_tab_bar(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::bar("tab_bar::build_tab_bar", 33.0)
+}
+
+/// Stub: the tab_bar view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn build_confirm_dialog(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::overlay(
+        "tab_bar::build_confirm_dialog",
+        ui.mode(ModeKind::Confirm).is_some(),
+    )
+}
+
+/// Stub: the tab_bar view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn build_open_repo_dialog(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::overlay(
+        "tab_bar::build_open_repo_dialog",
+        ui.mode(ModeKind::OpenRepo).is_some() && !ui.tabs.is_empty(),
+    )
+}
+
+/// Stub: the tab_bar view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn open_repo_card(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    dialog: &crate::OpenRepoDialog,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::panel("tab_bar::open_repo_card")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,55 +291,4 @@ mod tests {
         let widths = [40.0, 40.0, 200.0];
         assert_eq!(drop_index(&widths, 2, slot(&widths, 2), 0.0), 0);
     }
-}
-
-/// Stub: the tab_bar view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn build_tab_bar(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    crate::stub::bar("tab_bar::build_tab_bar", 33.0)
-}
-
-/// Stub: the tab_bar view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn build_confirm_dialog(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    crate::stub::overlay(
-        "tab_bar::build_confirm_dialog",
-        ui.mode(ModeKind::Confirm).is_some(),
-    )
-}
-
-/// Stub: the tab_bar view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn build_open_repo_dialog(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    crate::stub::overlay(
-        "tab_bar::build_open_repo_dialog",
-        ui.mode(ModeKind::OpenRepo).is_some() && !ui.tabs.is_empty(),
-    )
-}
-
-/// Stub: the tab_bar view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn open_repo_card(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    dialog: &crate::OpenRepoDialog,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    crate::stub::panel("tab_bar::open_repo_card")
 }

@@ -1,6 +1,8 @@
 // The port's lanes fill the views in; until they land, a lot of state and
 // plumbing here is written ahead of its reader. Remove these with the last stub.
 #![allow(dead_code, unused_variables)]
+// `Option<()>` means "handled", and most update code now returns `()`.
+#![allow(clippy::unit_arg)]
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
@@ -1257,55 +1259,6 @@ fn current_file_diff_text(ui: &Diffui) -> Option<String> {
     Some(out)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{expand_user_path, repo_label};
-    use std::path::{Path, PathBuf};
-
-    #[test]
-    fn repo_label_splits_owner_and_name() {
-        assert_eq!(
-            repo_label(Path::new("/Users/me/code/diffui")),
-            ("code".to_owned(), "diffui".to_owned())
-        );
-        // A root-level repo has no usable parent name → empty owner.
-        assert_eq!(
-            repo_label(Path::new("/diffui")),
-            (String::new(), "diffui".to_owned())
-        );
-        // A bare relative name likewise yields no owner.
-        assert_eq!(
-            repo_label(Path::new("repo")),
-            (String::new(), "repo".to_owned())
-        );
-    }
-
-    #[test]
-    fn expand_user_path_passes_through_non_tilde() {
-        assert_eq!(
-            expand_user_path("/abs/path/repo"),
-            PathBuf::from("/abs/path/repo")
-        );
-        assert_eq!(
-            expand_user_path("relative/repo"),
-            PathBuf::from("relative/repo")
-        );
-        // A tilde mid-path is not a home shortcut and must be left intact.
-        assert_eq!(expand_user_path("/etc/we~rd"), PathBuf::from("/etc/we~rd"));
-    }
-
-    #[test]
-    fn expand_user_path_expands_leading_tilde() {
-        // Only assert when HOME is available (it is in normal test runs);
-        // skip otherwise rather than mutate process-global env.
-        if let Some(home) = std::env::var_os("HOME") {
-            let home = PathBuf::from(home);
-            assert_eq!(expand_user_path("~"), home);
-            assert_eq!(expand_user_path("~/code/repo"), home.join("code/repo"));
-        }
-    }
-}
-
 /// Memory profile for a real jj load: retained store size vs the transient
 /// allocation peak. Lives app-side because it reads the app's tracking global
 /// allocator (`track_alloc::{CURRENT, PEAK}`); the load itself is core's.
@@ -1376,5 +1329,54 @@ mod mem_profile {
         eprintln!("=============================================\n");
 
         drop((store, graph));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{expand_user_path, repo_label};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn repo_label_splits_owner_and_name() {
+        assert_eq!(
+            repo_label(Path::new("/Users/me/code/diffui")),
+            ("code".to_owned(), "diffui".to_owned())
+        );
+        // A root-level repo has no usable parent name → empty owner.
+        assert_eq!(
+            repo_label(Path::new("/diffui")),
+            (String::new(), "diffui".to_owned())
+        );
+        // A bare relative name likewise yields no owner.
+        assert_eq!(
+            repo_label(Path::new("repo")),
+            (String::new(), "repo".to_owned())
+        );
+    }
+
+    #[test]
+    fn expand_user_path_passes_through_non_tilde() {
+        assert_eq!(
+            expand_user_path("/abs/path/repo"),
+            PathBuf::from("/abs/path/repo")
+        );
+        assert_eq!(
+            expand_user_path("relative/repo"),
+            PathBuf::from("relative/repo")
+        );
+        // A tilde mid-path is not a home shortcut and must be left intact.
+        assert_eq!(expand_user_path("/etc/we~rd"), PathBuf::from("/etc/we~rd"));
+    }
+
+    #[test]
+    fn expand_user_path_expands_leading_tilde() {
+        // Only assert when HOME is available (it is in normal test runs);
+        // skip otherwise rather than mutate process-global env.
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = PathBuf::from(home);
+            assert_eq!(expand_user_path("~"), home);
+            assert_eq!(expand_user_path("~/code/repo"), home.join("code/repo"));
+        }
     }
 }

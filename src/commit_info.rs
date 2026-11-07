@@ -345,6 +345,12 @@ fn signature_field(label: &str, signature: &SignatureInfo, theme: ThemeSpec) -> 
     field
 }
 
+/// Stub: the commit_info view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn view(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> AnyElement {
+    crate::stub::panel("commit_info::view")
+}
+
 #[cfg(test)]
 mod tests {
     use diffui_core::{ParentBrief, RevisionDetails, SignatureInfo};
@@ -468,10 +474,4 @@ mod tests {
             lines.len()
         );
     }
-}
-
-/// Stub: the commit_info view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn view(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> AnyElement {
-    crate::stub::panel("commit_info::view")
 }

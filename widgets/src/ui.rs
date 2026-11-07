@@ -103,8 +103,11 @@ fn frame(id: impl Into<ElementId>, style: theme::ButtonStyle, cx: &App) -> Butto
         .foreground(style.label.into())
         .hover(style.hover.into())
         .active(style.active.into());
+    // kit tints a custom variant's fill to 20%, for its own translucent style; ours
+    // is the fill itself. Instance styles win over the variant, hover over both.
     let mut button = Button::new(id)
         .custom(colors)
+        .bg(style.rest.unwrap_or(theme::TRANSPARENT))
         .rounded(px(theme::radius::BUTTON));
     if let Some(border) = style.border {
         button = button.border_1().border_color(border);
@@ -216,6 +219,7 @@ pub fn icon_button(
     let side = px(size.height());
     frame(id, theme::ghost_button_style(theme), cx)
         .size(side)
+        .p(px(0.0))
         .child(icons::icon(glyph, ICON_SIZE, color))
 }
 
@@ -225,6 +229,7 @@ pub fn icon_button(
 pub fn close_button(id: impl Into<ElementId>, color: Color, theme: ThemeSpec, cx: &App) -> Button {
     frame(id, theme::ghost_button_style(theme), cx)
         .size(px(CLOSE_SIDE))
+        .p(px(0.0))
         .child(icons::icon(icons::CLOSE, CLOSE_ICON_SIZE, color))
 }
 

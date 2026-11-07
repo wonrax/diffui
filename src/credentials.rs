@@ -199,6 +199,20 @@ fn title(request: &PromptRequest) -> Prose {
     }
 }
 
+/// Stub: the credentials view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn build_overlay(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::overlay(
+        "credentials::build_overlay",
+        ui.mode(ModeKind::Credential).is_some(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,18 +243,4 @@ mod tests {
             Prose::from("Trust host ").remote("h").text("?")
         );
     }
-}
-
-/// Stub: the credentials view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn build_overlay(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    crate::stub::overlay(
-        "credentials::build_overlay",
-        ui.mode(ModeKind::Credential).is_some(),
-    )
 }

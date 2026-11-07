@@ -84,7 +84,7 @@ pub(crate) fn build_toolbar(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    crate::stub::bar("toolbar::build_toolbar", 44.0)
+    crate::stub::bar("toolbar::build_toolbar", HEIGHT)
 }
 
 /// Stub: the toolbar view is the lane's to port (see the iced source).

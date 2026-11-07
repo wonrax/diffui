@@ -174,6 +174,43 @@ impl Diffui {
     }
 }
 
+/// Stub: the shortcuts view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn build_overlay(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::overlay(
+        "shortcuts::build_overlay",
+        ui.mode(ModeKind::Shortcuts).is_some(),
+    )
+}
+
+/// Stub: the shortcuts view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn keycap(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    key: String,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> Aligned {
+    crate::stub::aligned("shortcuts::keycap")
+}
+
+/// Stub: the shortcuts view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn welcome_hints(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::panel("shortcuts::welcome_hints")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,41 +266,4 @@ mod tests {
         assert_eq!(base_group("palette.toggle"), "General");
         assert_eq!(base_group("tab.select"), "General");
     }
-}
-
-/// Stub: the shortcuts view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn build_overlay(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    crate::stub::overlay(
-        "shortcuts::build_overlay",
-        ui.mode(ModeKind::Shortcuts).is_some(),
-    )
-}
-
-/// Stub: the shortcuts view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn keycap(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    key: String,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> Aligned {
-    crate::stub::aligned("shortcuts::keycap")
-}
-
-/// Stub: the shortcuts view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn welcome_hints(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    crate::stub::panel("shortcuts::welcome_hints")
 }

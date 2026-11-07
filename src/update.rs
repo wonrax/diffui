@@ -325,15 +325,15 @@ impl Diffui {
             return;
         };
         if let Some(task) = self.take_conflict_job(tab, &event, cx) {
-            return task;
+            return;
         }
         if let Some(task) = self.history_event(tab, &event, cx) {
-            return task;
+            return;
         }
         // A job can be both the frontend's and the projection's — a mutation
         // owns an activity row *and* a slot — so the two run in order rather
         // than one short-circuiting the other.
-        let own = self.take_own_job(tab, &event, cx).unwrap_or(());
+        self.take_own_job(tab, &event, cx);
         // Read the draft's destination off the store this event is about to
         // replace, so it can be re-found by commit id afterwards.
         let candidate = self.draft_candidate_commit(tab);
@@ -341,13 +341,13 @@ impl Diffui {
         // deferred "Edit description", so note it while the payload is here.
         let diff_landed = matches!(event.payload, Payload::DiffLoaded { .. });
         let Some(target) = self.tab_mut(tab) else {
-            return own;
+            return;
         };
         let effects = target.session.apply(event);
         let replaced = effects
             .iter()
             .any(|effect| matches!(effect, diffui_core::Effect::GraphReplaced));
-        let folded = self.run_effects(tab, effects, cx);
+        self.run_effects(tab, effects, cx);
         if replaced {
             self.rearm_draft_candidate(tab, candidate);
         }
@@ -381,7 +381,7 @@ impl Diffui {
         }
         self.active_mut().pending_description_edit = None;
         let commit = std::mem::take(&mut self.active_mut().pending_commit);
-        let task = self.open_description_editor(cx);
+        self.open_description_editor(cx);
         if commit && let Some(editor) = self.active_mut().description_editor_mut() {
             editor.commit = true;
         }
@@ -2026,7 +2026,7 @@ impl Diffui {
     /// move pushed it out.
     fn palette_move(&mut self, delta: i32, cx: &mut Cx) {
         if let Some(task) = self.command_line_move(delta, cx) {
-            return task;
+            return;
         }
         let Some(state) = self.palette_mut() else {
             return;
@@ -3696,7 +3696,7 @@ impl Diffui {
         origin: RefreshOrigin,
         cx: &mut Cx,
     ) {
-        let source_refresh = self.refresh_source_if_working_copy(tab, cx);
+        self.refresh_source_if_working_copy(tab, cx);
         let effects = match self.tab_mut(tab) {
             Some(target) => target.session.snapshot(origin),
             None => Vec::new(),

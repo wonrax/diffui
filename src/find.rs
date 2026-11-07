@@ -212,6 +212,17 @@ const CONTROL: crate::ui::Size = crate::ui::Size::Compact;
 const COUNT_WIDTH: f32 = 56.0;
 const CARD_MAX_WIDTH: f32 = 460.0;
 
+/// Stub: the find view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn build_overlay(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::panel("find::build_overlay")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,15 +284,4 @@ mod tests {
         assert_eq!(matches("alpha", false, &files), vec![(0, 5), (6, 11)]);
         assert_eq!(matches("a.pha", true, &files), vec![(0, 5), (6, 11)]);
     }
-}
-
-/// Stub: the find view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn build_overlay(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    crate::stub::panel("find::build_overlay")
 }

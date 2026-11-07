@@ -524,7 +524,7 @@ impl Diffui {
         // command line, typed at its end.
         let entering = column.command.is_none();
         let cursor = cursor_after_edit(old, &column.query, old.len());
-        let task = self.command_line_changed(column, cursor, cx)?;
+        self.command_line_changed(column, cursor, cx)?;
         Some(if entering {
             {
                 focus_command_input(cx);
@@ -726,9 +726,9 @@ impl Diffui {
 
     /// Open the palette with `line` typed and the caret at its end.
     pub(crate) fn open_command_line(&mut self, line: String, cx: &mut Cx) {
-        let open = self.perform(Action::OpenPalette, cx);
+        self.perform(Action::OpenPalette, cx);
         let Some(mut state) = self.take_palette() else {
-            return open;
+            return;
         };
         if let Some(column) = state.top_mut() {
             column.query = line.clone();
@@ -959,7 +959,7 @@ impl Diffui {
         };
         match view {
             ResolvedView::Diff(request) => {
-                let show = self.show_diff_view(cx);
+                self.show_diff_view(cx);
                 let state = self.active_mut();
                 state.pending_revision_reveal = true;
                 let effects = state.session.diff_revsets(request);
@@ -1007,7 +1007,7 @@ impl Diffui {
         if let Some((kind, placement)) = command.draft_kind()
             && let Some(task) = self.draft_from_op(kind, placement, &op, cx)
         {
-            return task;
+            return;
         }
         let allow_backwards = matches!(
             command,
@@ -1077,8 +1077,8 @@ impl Diffui {
         {
             return None;
         }
-        let task = self.start_draft_with(kind, sources, armed, cx);
-        self.active().op_draft().is_some().then_some(task)
+        self.start_draft_with(kind, sources, armed, cx);
+        self.active().op_draft().is_some().then_some(())
     }
 
     fn run_ui(&mut self, command: UiCommand, target: RevisionSelection, cx: &mut Cx) {
@@ -1093,14 +1093,14 @@ impl Diffui {
                 self.perform(Action::Revops(crate::revops::RevopsAction::BeginCommit), cx)
             }
             UiCommand::Split { .. } => {
-                let show = self.show_diff_view(cx);
+                self.show_diff_view(cx);
                 {
                     self.perform(Action::SelectRevision(target), cx);
                 }
             }
             UiCommand::Resolve { paths, .. } => {
-                let show = self.show_diff_view(cx);
-                let select = self.perform(Action::SelectRevision(target), cx);
+                self.show_diff_view(cx);
+                self.perform(Action::SelectRevision(target), cx);
                 let file = match paths.first() {
                     Some(path) => self.perform(Action::JumpToFile(path.value.clone()), cx),
                     None => {}

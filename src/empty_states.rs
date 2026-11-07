@@ -185,11 +185,15 @@ pub(crate) fn load_error(ui: &Diffui, theme: ThemeSpec, error: &str, cx: &mut Cx
                 .text_color(theme.text)
                 .child(detail.to_owned()),
         )
-        .children(if revset {
-            reset_button(ui, theme, cx)
-        } else {
-            None
-        });
+        .when_some(
+            if revset {
+                reset_button(ui, theme, cx)
+            } else {
+                None
+            },
+            // A column stretches its children; the button keeps its own width.
+            |card, reset| card.child(div().flex().child(reset)),
+        );
     div()
         .w_full()
         .px(px(8.0))

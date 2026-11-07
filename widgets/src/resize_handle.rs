@@ -60,13 +60,15 @@ impl Render for NoDragPreview {
 /// the parent must be `relative`, and its left edge is where widths are
 /// measured from. `on_resize` gets the width under the cursor, clamped so the
 /// pane keeps `min_width` and the pane to its right keeps `right_reserve`.
+type OnResize = Rc<dyn Fn(f32, &mut Window, &mut App)>;
+
 pub struct ResizeHandle {
     id: ElementId,
     handle_x: f32,
     min_width: f32,
     right_reserve: f32,
     hit_padding: f32,
-    on_resize: Rc<dyn Fn(f32, &mut Window, &mut App)>,
+    on_resize: OnResize,
 }
 
 impl ResizeHandle {

@@ -140,6 +140,17 @@ fn keys(ui: &Diffui, context: Context, commands: &[CommandId]) -> Vec<String> {
     keys
 }
 
+/// Stub: the mode_hints view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn strip(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> Option<AnyElement> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,15 +197,4 @@ mod tests {
         );
         assert!(keys(&ui, Context::Lines, &["lines.exit"]).is_empty());
     }
-}
-
-/// Stub: the mode_hints view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn strip(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> Option<AnyElement> {
-    None
 }

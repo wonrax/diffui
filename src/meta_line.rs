@@ -144,6 +144,30 @@ pub(crate) fn description(
     ellipsis::Line::new(spans, font, size, color)
 }
 
+/// Stub: the meta_line view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn view(
+    meta: Meta,
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::panel("meta_line::view")
+}
+
+/// Stub: the meta_line view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn badge(
+    label: &str,
+    color: Color,
+    ui: &Diffui,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> Aligned {
+    crate::stub::aligned("meta_line::badge")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,28 +198,4 @@ mod tests {
         );
         assert_eq!(shorten_ids("add deadbeef"), "add deadbeef");
     }
-}
-
-/// Stub: the meta_line view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn view(
-    meta: Meta,
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    crate::stub::panel("meta_line::view")
-}
-
-/// Stub: the meta_line view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn badge(
-    label: &str,
-    color: Color,
-    ui: &Diffui,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> Aligned {
-    crate::stub::aligned("meta_line::badge")
 }

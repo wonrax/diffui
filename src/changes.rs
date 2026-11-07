@@ -1032,7 +1032,7 @@ impl Diffui {
 
     /// Target mode for moving `selection` out of `revision`.
     fn move_into(&mut self, revision: RevisionSelection, selection: DiffSelection, cx: &mut Cx) {
-        let task = self.start_draft(diffui_core::DraftKind::Squash, revision, cx);
+        self.start_draft(diffui_core::DraftKind::Squash, revision, cx);
         if let Some(draft) = self.active_mut().op_draft_mut() {
             draft.draft.selection = Some(Box::new(selection));
         }
@@ -1121,6 +1121,28 @@ const SPLIT_CHROME_HEIGHT: f32 = 2.0 * ui::DIALOG_PADDING
     + crate::theme::control::STANDARD
     + 3.0 * ui::DIALOG_SPACING
     + crate::theme::space::XXL;
+
+/// Stub: the changes view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn selection_bar(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> Option<AnyElement> {
+    None
+}
+
+/// Stub: the changes view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn split_modal(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::overlay("changes::split_modal", crate::changes::split_shown(ui))
+}
 
 #[cfg(test)]
 mod tests {
@@ -1480,26 +1502,4 @@ mod tests {
         };
         assert_eq!(picked_prose(&whole), Prose::new().path("src/a.rs"));
     }
-}
-
-/// Stub: the changes view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn selection_bar(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> Option<AnyElement> {
-    None
-}
-
-/// Stub: the changes view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn split_modal(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    crate::stub::overlay("changes::split_modal", crate::changes::split_shown(ui))
 }

@@ -157,6 +157,31 @@ pub(crate) fn command_fits(
     !line.is_multiline() && line.fits(width - CHROME)
 }
 
+/// Stub: the plan view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn wrapped_command_line(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    command: &str,
+    size: f32,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::panel("plan::wrapped_command_line")
+}
+
+/// Stub: the plan view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn caption_command_line(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    command: &str,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::panel("plan::caption_command_line")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,29 +209,4 @@ mod tests {
         assert_eq!(prose.revisions().collect::<Vec<_>>(), ["kmnopqrs"]);
         assert_eq!(prose.bookmarks().collect::<Vec<_>>(), ["push-sknyzssrnkun"]);
     }
-}
-
-/// Stub: the plan view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn wrapped_command_line(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    command: &str,
-    size: f32,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    crate::stub::panel("plan::wrapped_command_line")
-}
-
-/// Stub: the plan view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn caption_command_line(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    command: &str,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    crate::stub::panel("plan::caption_command_line")
 }

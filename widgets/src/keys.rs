@@ -60,10 +60,11 @@ impl Key {
             "" => return Self::Unidentified,
             _ => {
                 let mods = &keystroke.modifiers;
-                if !mods.platform && !mods.control {
-                    if let Some(typed) = &keystroke.key_char {
-                        return Self::Character(typed.clone());
-                    }
+                if !mods.platform
+                    && !mods.control
+                    && let Some(typed) = &keystroke.key_char
+                {
+                    return Self::Character(typed.clone());
                 }
                 if mods.shift && key.len() == 1 {
                     return Self::Character(key.to_uppercase());

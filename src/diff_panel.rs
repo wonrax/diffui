@@ -188,33 +188,6 @@ fn description_editor_input_height(ui: &Diffui) -> f32 {
     )
 }
 
-#[cfg(test)]
-mod tests {
-
-    #[test]
-    fn description_height_counts_newlines_and_wrapping() {
-        let size = 12.0;
-        let line_height = size * crate::measure::LINE_HEIGHT_MULTIPLIER;
-        let count = |content: &str, width: f32| {
-            crate::measure::wrapped_line_count(
-                content,
-                size,
-                crate::theme::Font::MONOSPACE,
-                line_height,
-                width,
-            )
-        };
-        let wide = 10_000.0;
-        assert_eq!(count("", wide), 1);
-        assert_eq!(count("one\ntwo", wide), 2);
-        assert_eq!(count("short", wide), 1);
-        // A line well past the width must wrap into several visual lines.
-        let char_width =
-            crate::measure::line_width("M", size, crate::theme::Font::MONOSPACE).max(1.0);
-        assert!(count(&"word ".repeat(40), char_width * 12.0) > 2);
-    }
-}
-
 /// Stub: the diff_panel view is the lane's to port (see the iced source).
 #[allow(unused_variables)]
 pub(crate) fn build_file_navigator(
@@ -256,4 +229,31 @@ pub(crate) fn build_diff_panel(
     cx: &mut Cx,
 ) -> AnyElement {
     crate::stub::panel("diff_panel::build_diff_panel")
+}
+
+#[cfg(test)]
+mod tests {
+
+    #[test]
+    fn description_height_counts_newlines_and_wrapping() {
+        let size = 12.0;
+        let line_height = size * crate::measure::LINE_HEIGHT_MULTIPLIER;
+        let count = |content: &str, width: f32| {
+            crate::measure::wrapped_line_count(
+                content,
+                size,
+                crate::theme::Font::MONOSPACE,
+                line_height,
+                width,
+            )
+        };
+        let wide = 10_000.0;
+        assert_eq!(count("", wide), 1);
+        assert_eq!(count("one\ntwo", wide), 2);
+        assert_eq!(count("short", wide), 1);
+        // A line well past the width must wrap into several visual lines.
+        let char_width =
+            crate::measure::line_width("M", size, crate::theme::Font::MONOSPACE).max(1.0);
+        assert!(count(&"word ".repeat(40), char_width * 12.0) > 2);
+    }
 }

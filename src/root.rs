@@ -43,6 +43,9 @@ pub(crate) struct Background {
     loading: Option<Task<()>>,
     toasts: Option<Task<()>>,
     geometry: Option<Task<()>>,
+    /// What a harness scene shows in place of the app.
+    #[cfg(test)]
+    pub(crate) scene: Option<crate::harness::Scene>,
     /// The window observers. Non-empty once the view has a window: before that
     /// (and in tests of update code, which have none) nothing runs in the
     /// background.
@@ -168,10 +171,9 @@ impl Diffui {
         change: impl Fn(&mut Diffui, &E, &mut Window, &mut Cx) + 'static,
     ) -> impl Fn(&E, &mut Window, &mut App) + 'static {
         cx.listener(move |this: &mut Diffui, event: &E, window, cx| {
-            let out = change(this, event, window, cx);
+            change(this, event, window, cx);
             this.reconcile(cx);
             cx.notify();
-            out
         })
     }
 
@@ -292,6 +294,11 @@ impl Diffui {
         // The close is ours to perform: the pending window state has to be
         // flushed first, and ⌘Q and the close button raise no focus loss.
         let this = cx.weak_entity();
+        cx.on_app_quit(|this: &mut Diffui, _| {
+            this.on_window_close_requested();
+            async {}
+        })
+        .detach();
         window.on_window_should_close(cx, move |_, cx| {
             let _ = this.update(cx, |this, _| this.on_window_close_requested());
             cx.quit();
@@ -306,6 +313,10 @@ impl Diffui {
     /// Re-derives kit's theme from ours. Call when the preference or the OS
     /// appearance changes.
     pub(crate) fn apply_theme(&self, cx: &mut Cx) {
+        // Nothing to dress before there's a window; tests of update code have none.
+        if self.window.is_none() {
+            return;
+        }
         theme::apply_to_kit(self.resolved_theme(), cx);
     }
 }
@@ -379,6 +390,13 @@ impl Render for Diffui {
             window.request_animation_frame();
         }
 
+        #[cfg(test)]
+        if let Some(scene) = self.background.scene.clone() {
+            return self
+                .frame(theme, cx)
+                .child(scene(self, theme, window, cx))
+                .into_any_element();
+        }
         let body = if self.tabs.is_empty() {
             // No repositories open: the welcome screen owns the whole window, with
             // the open prompt inline rather than as a modal over it.
@@ -390,6 +408,13 @@ impl Render for Diffui {
         } else {
             self.shell(theme, window, cx)
         };
+        self.frame(theme, cx).child(body).into_any_element()
+    }
+}
+
+impl Diffui {
+    /// The root element: the window's ground, and the type everything inherits.
+    fn frame(&self, theme: ThemeSpec, cx: &mut Cx) -> gpui_kit::Stateful<Div> {
         div()
             .id("diffui-root")
             .relative()
@@ -399,7 +424,14 @@ impl Render for Diffui {
             .text_color(theme.text)
             .font(self.config.ui_font.gpui())
             .line_height(relative(crate::typography::DEFAULT_LINE_HEIGHT))
-            .child(body)
+            // Live modifier state, for pointer gestures to read at decision time
+            // (⌥-drop = rebase with descendants). Nothing on screen depends on it,
+            // so this skips `act`.
+            .on_modifiers_changed(cx.listener(
+                |this: &mut Diffui, event: &gpui_kit::ModifiersChangedEvent, _, _| {
+                    this.modifiers = event.modifiers.into();
+                },
+            ))
     }
 }
 

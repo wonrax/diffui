@@ -524,7 +524,7 @@ impl Diffui {
         }
         let job = state.session.next_job();
         state.changes.conflicts.text_job = Some((job, revision.clone(), path.clone()));
-        let select = self.select_file_path(&path, cx);
+        self.select_file_path(&path, cx);
         {
             self.send(
                 tab,
@@ -1014,6 +1014,17 @@ fn file_strip(
     (strip, buttons)
 }
 
+/// Stub: the conflicts view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn marker_editor(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> Option<AnyElement> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1057,15 +1068,4 @@ mod tests {
         assert_eq!(markers_left("<<<<<<< rysurqmy c676892a\nx\n", 7), 1);
         assert_eq!(markers_left("<<<<<<<x\n", 7), 0);
     }
-}
-
-/// Stub: the conflicts view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn marker_editor(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> Option<AnyElement> {
-    None
 }

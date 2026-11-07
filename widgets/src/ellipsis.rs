@@ -151,6 +151,7 @@ impl<'a> Line<'a> {
     /// and GPUI cuts it, ellipsis included.
     pub fn view(self) -> Div {
         self.frame()
+            .w_full()
             .flex_1()
             .min_w_0()
             .overflow_hidden()

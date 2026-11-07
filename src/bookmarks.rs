@@ -617,6 +617,20 @@ pub(crate) fn local_bookmark_label(label: &str) -> Option<&str> {
     )
 }
 
+/// Stub: the bookmarks view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn build_name_prompt(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::overlay(
+        "bookmarks::build_name_prompt",
+        ui.mode(ModeKind::NamePrompt).is_some(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -880,18 +894,4 @@ mod tests {
         assert_eq!(local_bookmark_label("main@origin"), None);
         assert_eq!(local_bookmark_label("ws@"), None);
     }
-}
-
-/// Stub: the bookmarks view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn build_name_prompt(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    crate::stub::overlay(
-        "bookmarks::build_name_prompt",
-        ui.mode(ModeKind::NamePrompt).is_some(),
-    )
 }

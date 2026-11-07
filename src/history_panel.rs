@@ -259,7 +259,7 @@ impl Diffui {
                 history.error = None;
                 let job = JobId::next();
                 history.evolog_job = Some(job);
-                let enter = self.enter_history_view(cx);
+                self.enter_history_view(cx);
                 let send = self.history_send(tab, job, HistoryRequest::Evolog { revision }, cx);
                 {}
             }
@@ -569,8 +569,8 @@ impl Diffui {
             previous,
         });
         target.history.filter_jumped = None;
-        let view = self.perform(Action::SetMainView(MainView::Diff), cx);
-        let load = self.perform(Action::SetRevset(revset), cx);
+        self.perform(Action::SetMainView(MainView::Diff), cx);
+        self.perform(Action::SetRevset(revset), cx);
         let target = self.active_mut();
         target.history.filter_loading = target.session.streaming();
         {}
@@ -1036,6 +1036,50 @@ fn op_rows<'a>(history: &'a HistoryState) -> Vec<OpRow<'a>> {
     rows
 }
 
+/// Stub: the history_panel view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn source_bar_actions(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::panel("history_panel::source_bar_actions")
+}
+
+/// Stub: the history_panel view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn file_filter_banner(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> Option<AnyElement> {
+    None
+}
+
+/// Stub: the history_panel view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn build_history_sidebar(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::panel("history_panel::build_history_sidebar")
+}
+
+/// Stub: the history_panel view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn build_history_panel(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::panel("history_panel::build_history_panel")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1272,48 +1316,4 @@ mod tests {
         history.expanded_runs.insert("b".to_owned());
         assert_eq!(shape(&history), ["a", "bx2[b,c]", "d", "e", "f"]);
     }
-}
-
-/// Stub: the history_panel view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn source_bar_actions(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    crate::stub::panel("history_panel::source_bar_actions")
-}
-
-/// Stub: the history_panel view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn file_filter_banner(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> Option<AnyElement> {
-    None
-}
-
-/// Stub: the history_panel view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn build_history_sidebar(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    crate::stub::panel("history_panel::build_history_sidebar")
-}
-
-/// Stub: the history_panel view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn build_history_panel(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    crate::stub::panel("history_panel::build_history_panel")
 }

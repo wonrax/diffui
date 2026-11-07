@@ -397,6 +397,53 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
+/// Stub: the activity view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn activity_indicator(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::panel("activity::activity_indicator")
+}
+
+/// Stub: the activity view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn activity_progress_line(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::panel("activity::activity_progress_line")
+}
+
+/// Stub: the activity view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn activity_popover(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::overlay(
+        "activity::activity_popover",
+        ui.mode(ModeKind::ActivityPopover).is_some(),
+    )
+}
+
+/// Stub: the activity view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn toast_layer(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::overlay("activity::toast_layer", !ui.toasts.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -535,51 +582,4 @@ mod tests {
             Some("queued".to_owned())
         );
     }
-}
-
-/// Stub: the activity view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn activity_indicator(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    crate::stub::panel("activity::activity_indicator")
-}
-
-/// Stub: the activity view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn activity_progress_line(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    crate::stub::panel("activity::activity_progress_line")
-}
-
-/// Stub: the activity view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn activity_popover(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    crate::stub::overlay(
-        "activity::activity_popover",
-        ui.mode(ModeKind::ActivityPopover).is_some(),
-    )
-}
-
-/// Stub: the activity view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn toast_layer(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    crate::stub::overlay("activity::toast_layer", !ui.toasts.is_empty())
 }

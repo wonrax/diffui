@@ -191,13 +191,13 @@ impl Diffui {
         }
         let target = RevisionSelection::WorkingCopy;
         if self.active().session.selected_revision == target {
-            let task = self.open_description_editor(cx);
+            self.open_description_editor(cx);
             if let Some(editor) = self.active_mut().description_editor_mut()
                 && editor.target == target
             {
                 editor.commit = true;
             }
-            return task;
+            return;
         }
         if let Some(editor) = self.active_mut().description_editor_mut()
             && (editor.is_dirty() || editor.saving_activity.is_some())

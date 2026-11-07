@@ -560,6 +560,17 @@ fn card_width(ui: &Diffui, entries: &[MenuEntry]) -> f32 {
 /// both the chevron's rendered size and the width the menu-width calc reserves.
 const CHEVRON_WIDTH: f32 = 13.0;
 
+/// Stub: the menu view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn build_overlay(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::overlay("menu::build_overlay", ui.mode(ModeKind::Menu).is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -663,15 +674,4 @@ mod tests {
         let mut menu = OverlayMenu::new(Vec::new(), AnchorSpec::At(Point::ORIGIN), None);
         assert!(!menu.opening_release(gpui_kit::MouseButton::Left));
     }
-}
-
-/// Stub: the menu view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn build_overlay(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    crate::stub::overlay("menu::build_overlay", ui.mode(ModeKind::Menu).is_some())
 }

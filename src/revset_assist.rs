@@ -371,6 +371,28 @@ fn window(text: &str, span: Range<usize>, room: f32, width: impl Fn(&str) -> f32
     shown(from, to)
 }
 
+/// Stub: the revset_assist view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn dropdown(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut GpuiWindow,
+    cx: &mut Cx,
+) -> Option<AnyElement> {
+    None
+}
+
+/// Stub: the revset_assist view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
+pub(crate) fn error_strip(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    window: &mut GpuiWindow,
+    cx: &mut Cx,
+) -> Option<AnyElement> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ELLIPSIS, Window, window};
@@ -454,26 +476,4 @@ mod tests {
         let line = shown(text, at..at + 'ζ'.len_utf8(), 8.0);
         assert!(line.contains('ζ'), "{line:?}");
     }
-}
-
-/// Stub: the revset_assist view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn dropdown(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut GpuiWindow,
-    cx: &mut Cx,
-) -> Option<AnyElement> {
-    None
-}
-
-/// Stub: the revset_assist view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
-pub(crate) fn error_strip(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut GpuiWindow,
-    cx: &mut Cx,
-) -> Option<AnyElement> {
-    None
 }

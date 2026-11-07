@@ -22,17 +22,22 @@
 //! debounces fire without touching the simulated clock.
 
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use gpui_kit::test::{TestEventExt as _, TestWindowExt as _};
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Entity, HeadlessAppContext, Pixels, Point, ScrollDelta,
-    Window, point, px, size,
+    AnyElement, AnyWindowHandle, App, AppContext as _, Entity, HeadlessAppContext, Pixels, Point,
+    ScrollDelta, Window, point, px, size,
 };
 
+use crate::theme::ThemeSpec;
 use crate::window_state::WindowState;
 use crate::{Action, Cli, Cx, Diffui};
+
+/// A view to show instead of the app: see [`Harness::show`].
+pub(crate) type Scene = Rc<dyn Fn(&Diffui, ThemeSpec, &mut Window, &mut Cx) -> AnyElement>;
 
 /// One window on one repository (or none: the welcome screen).
 pub(crate) struct Harness {
@@ -241,6 +246,15 @@ impl Harness {
         out
     }
 
+    /// Fills the window with `view` instead of the app, against the same state. For
+    /// shooting or driving one view before the views around it exist.
+    pub(crate) fn show(
+        &mut self,
+        view: impl Fn(&Diffui, ThemeSpec, &mut Window, &mut Cx) -> AnyElement + 'static,
+    ) {
+        self.act(|app, _| app.background.scene = Some(Rc::new(view)));
+    }
+
     /// Performs an action, as a button or a menu would.
     pub(crate) fn perform(&mut self, action: Action) {
         self.act(|app, cx| app.perform(action, cx));
@@ -327,7 +341,13 @@ pub(crate) fn at(x: f32, y: f32) -> Point<Pixels> {
 
 #[cfg(test)]
 mod scenes {
+    use gpui_kit::div;
+    use gpui_kit::prelude::*;
+
     use super::*;
+    use crate::prose::Prose;
+    use crate::theme::{self, ThemePreference};
+    use crate::{chip, ellipsis, empty_states, icons, input, typography, ui};
 
     /// With nothing to open the welcome screen owns the window, and its prompt
     /// exists before anything is typed.
@@ -352,7 +372,7 @@ mod scenes {
     }
 
     /// A key reaches the keymap from the root: ⌘K opens the palette, and Esc closes
-    /// it again even with its input focused.
+    /// it again.
     #[test]
     fn keys_reach_the_keymap() {
         let repo = fixture_repo();
@@ -365,5 +385,208 @@ mod scenes {
         );
         h.press("escape");
         assert!(h.read(|ui| ui.palette().is_none()), "esc closes it");
+    }
+
+    /// A text field works as a controlled component: typing lands in app state, a
+    /// plain key stays with the field instead of the keymap, update code can set the
+    /// value, and Esc still reaches the app first.
+    #[test]
+    fn a_field_is_controlled_and_esc_reaches_the_app_first() {
+        let repo = fixture_repo();
+        let mut h = Harness::open(Some(&repo));
+        h.wait_for_graph();
+        h.show(|ui, _, window, cx| {
+            let revset = ui.active().session.revset.clone();
+            let on_input = cx.listener(|this: &mut Diffui, text: &String, _, cx| {
+                this.act(cx, |this, _| {
+                    this.active_mut().session.revset = text.clone()
+                });
+            });
+            let spec = input::FieldSpec::new("scene-field", &revset)
+                .on_input(move |text, window, cx| on_input(&text, window, cx));
+            div()
+                .w(px(300.0))
+                .child(input::single_line(spec, ui.config.mono_font, window, cx))
+                .into_any_element()
+        });
+        h.act(|ui, cx| {
+            ui.active_mut().session.revset = String::new();
+            input::focus("scene-field", cx);
+        });
+        h.settle();
+        assert!(h.with_window(|window, _| input::input_has_focus(window)));
+
+        let selected = h.read(|ui| ui.active().selected_file);
+        h.type_text("jj");
+        h.press("j");
+        h.settle();
+        assert_eq!(h.read(|ui| ui.active().session.revset.clone()), "jjj");
+        assert_eq!(h.read(|ui| ui.active().selected_file), selected);
+
+        // Set from outside, as a picked preset does.
+        h.act(|ui, _| ui.active_mut().session.revset = "all()".to_owned());
+        h.settle();
+
+        h.act(|ui, cx| ui.perform(Action::OpenPalette, cx));
+        assert!(h.read(|ui| ui.palette().is_some()));
+        h.press("escape");
+        assert!(h.read(|ui| ui.palette().is_none()), "esc went to the app");
+    }
+
+    /// The shared primitives, drawn: every button variant through kit's button,
+    /// chips, an icon, a baseline row, the pattern panel. Also proves a click runs a
+    /// listener through `act`.
+    #[test]
+    fn primitives_and_the_pattern_panel() {
+        let repo = fixture_repo();
+        let mut h = Harness::open(Some(&repo));
+        h.wait_for_graph();
+        h.act(|ui, _| {
+            let state = ui.active_mut();
+            state.session.revset = "nope()".to_owned();
+            state.default_revset = "all()".to_owned();
+        });
+        h.perform(Action::SetTheme(ThemePreference::Dark));
+        h.show(|ui, theme, window, cx| {
+            let font = ui.config.ui_font;
+            let mono = ui.config.mono_font;
+            let spec = ui::Size::Compact;
+            let chip = chip::Chip {
+                label: "main".to_owned(),
+                font: mono,
+                background: theme::chip_background(theme.lane_base),
+                text_color: theme.lane_base,
+                border_color: None,
+                border_dashed: false,
+                icon: Some(icons::GIT_BRANCH),
+            };
+            let dashed = chip::Chip {
+                label: "empty".to_owned(),
+                background: theme::TRANSPARENT,
+                text_color: theme.subtle_text,
+                border_color: Some(theme.subtle_text),
+                border_dashed: true,
+                icon: None,
+                ..chip.clone()
+            };
+            let prose = Prose::from("Move ")
+                .bookmark("main")
+                .text(" to ")
+                .rev("zqxlrpwv")
+                .text(".");
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .gap(px(16.0))
+                .p(px(24.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(8.0))
+                        .items_center()
+                        .child(ui::text_button(
+                            "g",
+                            None,
+                            "Ghost",
+                            ui::Variant::Ghost,
+                            spec,
+                            font,
+                            theme,
+                            cx,
+                        ))
+                        .child(ui::text_button(
+                            "r",
+                            Some((icons::REFRESH, theme.muted_text)),
+                            "Raised",
+                            ui::Variant::Raised,
+                            spec,
+                            font,
+                            theme,
+                            cx,
+                        ))
+                        .child(ui::text_button(
+                            "p",
+                            None,
+                            "Primary",
+                            ui::Variant::Primary,
+                            spec,
+                            font,
+                            theme,
+                            cx,
+                        ))
+                        .child(ui::primary_button("o", "Off", false, spec, font, theme, cx))
+                        .child(ui::text_button(
+                            "d",
+                            None,
+                            "Destructive",
+                            ui::Variant::Destructive,
+                            ui::Size::Standard,
+                            font,
+                            theme,
+                            cx,
+                        ))
+                        .child(ui::icon_button(
+                            "i",
+                            icons::SEARCH,
+                            theme.muted_text,
+                            spec,
+                            theme,
+                            cx,
+                        ))
+                        .child(ui::close_button("c", theme.muted_text, theme, cx)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(8.0))
+                        .items_center()
+                        .child(chip::view(&chip))
+                        .child(chip::view(&dashed))
+                        .child(icons::icon(icons::HISTORY, 16.0, theme.accent)),
+                )
+                .child(typography::baseline_row(
+                    prose.runs(font, mono, theme.text, theme, theme::text_size::BODY),
+                    0.0,
+                ))
+                .child(
+                    div().w(px(80.0)).child(
+                        ellipsis::Line::new(
+                            vec![ellipsis::Span::new("A title that doesn't fit")],
+                            font,
+                            theme::text_size::UI,
+                            theme.text,
+                        )
+                        .view(),
+                    ),
+                )
+                .child(
+                    div()
+                        .w(px(420.0))
+                        .h(px(200.0))
+                        .children(empty_states::revision_list_placeholder(ui, theme, cx)),
+                )
+                .child(div().w(px(420.0)).child(empty_states::load_error(
+                    ui,
+                    theme,
+                    "failed to parse revset:  --> 1:4",
+                    cx,
+                )))
+                .child(input::single_line(
+                    input::FieldSpec::new("gallery-field", "a field").placeholder("Type here"),
+                    mono,
+                    window,
+                    cx,
+                ))
+                .into_any_element()
+        });
+        h.shot("foundation", "primitives");
+
+        // The reset button is real: clicking it goes through `act` and `perform`.
+        h.click("reset-revset");
+        h.settle();
+        assert_eq!(h.read(|ui| ui.active().session.revset.clone()), "all()");
     }
 }

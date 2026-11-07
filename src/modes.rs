@@ -399,94 +399,6 @@ impl TabState {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::keymap::Chord;
-
-    fn chord(raw: &str) -> Chord {
-        Chord::parse(raw).expect("a parsable chord")
-    }
-
-    /// Escape belongs to whatever is visually on top, and the find bar is a
-    /// strip over the sidebar. Opened before a draft starts, push order alone
-    /// buried it — Escape cancelled the draft and left the find bar open.
-    #[test]
-    fn a_find_bar_stays_above_a_draft_started_after_it() {
-        let mut tab = TabState::empty();
-        tab.push_mode(TabMode::Find(FindState::default()));
-        tab.push_mode(TabMode::Draft(DraftUi::new(diffui_core::OpDraft::squash(
-            diffui_core::DraftSource {
-                selection: diffui_core::RevisionSelection::WorkingCopy,
-                commit_id: "abc".to_owned(),
-                label: "abc".to_owned(),
-            },
-        ))));
-
-        assert_eq!(
-            tab.modes.last().map(TabMode::context),
-            Some(Context::Find),
-            "the find bar keeps the keyboard"
-        );
-        // …and closing it hands the keyboard back to the draft underneath.
-        tab.pop_mode(ModeKind::Find);
-        assert_eq!(tab.modes.last().map(TabMode::context), Some(Context::Draft));
-    }
-
-    #[test]
-    fn a_confirmation_passes_nothing_through() {
-        for raw in ["cmd+k", "esc", "j", "alt+z"] {
-            assert!(!passes_through(Context::Confirm, &chord(raw)));
-        }
-    }
-
-    #[test]
-    fn target_mode_passes_modifier_combos_but_keeps_the_plain_keys() {
-        assert!(passes_through(Context::Draft, &chord("cmd+w")));
-        assert!(passes_through(Context::Draft, &chord("alt+z")));
-        assert!(!passes_through(Context::Draft, &chord("j")));
-        assert!(!passes_through(Context::Draft, &chord("esc")));
-    }
-
-    #[test]
-    fn line_select_mode_claims_its_keys_and_passes_the_rest() {
-        assert!(passes_through(Context::Lines, &chord("X")));
-        assert!(passes_through(Context::Lines, &chord("cmd+k")));
-        // A focused input still keeps the plain keys it is typing.
-        assert!(needs_unconsumed(Context::Lines, &chord("j")));
-        assert!(!needs_unconsumed(Context::Lines, &chord("cmd+k")));
-    }
-
-    #[test]
-    fn a_focused_input_keeps_the_plain_keys_it_is_typing() {
-        // Plain keys belong to whatever has focus; combos never do.
-        assert!(needs_unconsumed(Context::Base, &chord("j")));
-        assert!(needs_unconsumed(Context::Base, &chord("esc")));
-        assert!(!needs_unconsumed(Context::Base, &chord("cmd+w")));
-        assert!(!needs_unconsumed(Context::Base, &chord("alt+z")));
-        // Leaving target mode has to work from inside the revset box.
-        assert!(needs_unconsumed(Context::Draft, &chord("j")));
-        assert!(!needs_unconsumed(Context::Draft, &chord("esc")));
-        // An overlay owns its keys outright; its own input is the focused one.
-        assert!(!needs_unconsumed(Context::Palette, &chord("esc")));
-        assert!(!needs_unconsumed(Context::Find, &chord("enter")));
-    }
-
-    /// A command bound to ⌃A must not take it from the field moving its caret.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_focused_input_keeps_its_cocoa_chords() {
-        for context in [Context::Base, Context::Palette, Context::Draft] {
-            for raw in ["ctrl+a", "ctrl+e", "ctrl+k", "ctrl+n", "ctrl+shift+a"] {
-                assert!(needs_unconsumed(context, &chord(raw)), "{raw}");
-            }
-            assert!(!needs_unconsumed(context, &chord("ctrl+x")));
-            assert!(!needs_unconsumed(context, &chord("cmd+a")));
-            assert!(!needs_unconsumed(context, &chord("ctrl+alt+a")));
-        }
-    }
-}
-
-#[cfg(test)]
 mod stack_tests {
     use super::*;
     use crate::tabs::tests::{app, push_tab};
@@ -608,5 +520,93 @@ mod stack_tests {
                     .is_none()
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keymap::Chord;
+
+    fn chord(raw: &str) -> Chord {
+        Chord::parse(raw).expect("a parsable chord")
+    }
+
+    /// Escape belongs to whatever is visually on top, and the find bar is a
+    /// strip over the sidebar. Opened before a draft starts, push order alone
+    /// buried it — Escape cancelled the draft and left the find bar open.
+    #[test]
+    fn a_find_bar_stays_above_a_draft_started_after_it() {
+        let mut tab = TabState::empty();
+        tab.push_mode(TabMode::Find(FindState::default()));
+        tab.push_mode(TabMode::Draft(DraftUi::new(diffui_core::OpDraft::squash(
+            diffui_core::DraftSource {
+                selection: diffui_core::RevisionSelection::WorkingCopy,
+                commit_id: "abc".to_owned(),
+                label: "abc".to_owned(),
+            },
+        ))));
+
+        assert_eq!(
+            tab.modes.last().map(TabMode::context),
+            Some(Context::Find),
+            "the find bar keeps the keyboard"
+        );
+        // …and closing it hands the keyboard back to the draft underneath.
+        tab.pop_mode(ModeKind::Find);
+        assert_eq!(tab.modes.last().map(TabMode::context), Some(Context::Draft));
+    }
+
+    #[test]
+    fn a_confirmation_passes_nothing_through() {
+        for raw in ["cmd+k", "esc", "j", "alt+z"] {
+            assert!(!passes_through(Context::Confirm, &chord(raw)));
+        }
+    }
+
+    #[test]
+    fn target_mode_passes_modifier_combos_but_keeps_the_plain_keys() {
+        assert!(passes_through(Context::Draft, &chord("cmd+w")));
+        assert!(passes_through(Context::Draft, &chord("alt+z")));
+        assert!(!passes_through(Context::Draft, &chord("j")));
+        assert!(!passes_through(Context::Draft, &chord("esc")));
+    }
+
+    #[test]
+    fn line_select_mode_claims_its_keys_and_passes_the_rest() {
+        assert!(passes_through(Context::Lines, &chord("X")));
+        assert!(passes_through(Context::Lines, &chord("cmd+k")));
+        // A focused input still keeps the plain keys it is typing.
+        assert!(needs_unconsumed(Context::Lines, &chord("j")));
+        assert!(!needs_unconsumed(Context::Lines, &chord("cmd+k")));
+    }
+
+    #[test]
+    fn a_focused_input_keeps_the_plain_keys_it_is_typing() {
+        // Plain keys belong to whatever has focus; combos never do.
+        assert!(needs_unconsumed(Context::Base, &chord("j")));
+        assert!(needs_unconsumed(Context::Base, &chord("esc")));
+        assert!(!needs_unconsumed(Context::Base, &chord("cmd+w")));
+        assert!(!needs_unconsumed(Context::Base, &chord("alt+z")));
+        // Leaving target mode has to work from inside the revset box.
+        assert!(needs_unconsumed(Context::Draft, &chord("j")));
+        assert!(!needs_unconsumed(Context::Draft, &chord("esc")));
+        // An overlay owns its keys outright; its own input is the focused one.
+        assert!(!needs_unconsumed(Context::Palette, &chord("esc")));
+        assert!(!needs_unconsumed(Context::Find, &chord("enter")));
+    }
+
+    /// A command bound to ⌃A must not take it from the field moving its caret.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_focused_input_keeps_its_cocoa_chords() {
+        for context in [Context::Base, Context::Palette, Context::Draft] {
+            for raw in ["ctrl+a", "ctrl+e", "ctrl+k", "ctrl+n", "ctrl+shift+a"] {
+                assert!(needs_unconsumed(context, &chord(raw)), "{raw}");
+            }
+            assert!(!needs_unconsumed(context, &chord("ctrl+x")));
+            assert!(!needs_unconsumed(context, &chord("cmd+a")));
+            assert!(!needs_unconsumed(context, &chord("ctrl+alt+a")));
+        }
     }
 }
