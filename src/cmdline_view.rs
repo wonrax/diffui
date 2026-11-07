@@ -400,7 +400,7 @@ pub(crate) fn results(
                 ),
         );
     }
-    let handle = palette::list_scroll("command-results-scroll", command.scroll_y, window, cx);
+    let handle = palette::list_scroll("command-results-scroll", command.scroll_y, 0, window, cx);
     ui::scrollable_with("command-results", &handle, list).into_any_element()
 }
 

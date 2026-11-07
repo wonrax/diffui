@@ -1234,15 +1234,20 @@ fn build_input(
 pub(crate) fn list_scroll(
     id: impl Into<ElementId>,
     target: f32,
+    epoch: u64,
     window: &mut Window,
     cx: &mut Cx,
 ) -> ScrollHandle {
-    struct Applied(ScrollHandle, f32);
-    let entry = window.use_keyed_state(id, cx, |_, _| Applied(ScrollHandle::default(), 0.0));
+    struct Applied(ScrollHandle, f32, u64);
+    let entry = window.use_keyed_state(id, cx, |_, _| Applied(ScrollHandle::default(), 0.0, 0));
     let handle = entry.read(cx).0.clone();
-    if (entry.read(cx).1 - target).abs() > f32::EPSILON {
+    let applied = entry.read(cx);
+    if (applied.1 - target).abs() > f32::EPSILON || applied.2 != epoch {
         handle.set_offset(point(px(0.0), px(-target)));
-        entry.update(cx, |entry, _| entry.1 = target);
+        entry.update(cx, |entry, _| {
+            entry.1 = target;
+            entry.2 = epoch;
+        });
     }
     handle
 }
@@ -1312,6 +1317,9 @@ fn build_results(
     let handle = list_scroll(
         ElementId::Name(format!("{id}-scroll").into()),
         column.scroll_y,
+        // The wheel moves the list without touching `scroll_y`, so a target of 0
+        // can be no change at all: every new query goes back to it regardless.
+        column.query_version,
         window,
         cx,
     );
