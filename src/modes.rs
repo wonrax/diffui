@@ -465,7 +465,7 @@ mod stack_tests {
 
     #[test]
     fn a_per_tab_mode_only_owns_the_keyboard_while_its_tab_is_on_screen() {
-        crate::tabs::tests::with_cx(|cx| {
+        crate::tabs::tests::with_cx(|_| {
             let mut ui = app();
             let first = push_tab(&mut ui, "/tmp/first");
             let _second = push_tab(&mut ui, "/tmp/second");
@@ -486,7 +486,7 @@ mod stack_tests {
 
     #[test]
     fn a_line_select_mode_that_no_longer_applies_holds_no_keys() {
-        crate::tabs::tests::with_cx(|cx| {
+        crate::tabs::tests::with_cx(|_| {
             let mut ui = app();
             let tab = push_tab(&mut ui, "/tmp/first");
             ui.active = 0;

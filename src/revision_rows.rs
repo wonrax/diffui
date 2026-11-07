@@ -107,10 +107,10 @@ pub(crate) fn build_revision_list(
         let hover = Diffui::listen(cx, |this, spot: &Option<DropSpot>, _, cx| {
             this.on_revision_drag_hover(*spot, cx);
         });
-        let drop = Diffui::listen(cx, |this, spot: &Option<DropSpot>, window, cx| {
+        let drop = Diffui::listen(cx, |this, spot: &Option<DropSpot>, window, _| {
             // ⌥ at the drop upgrades the move to "with descendants".
             this.modifiers = window.modifiers().into();
-            this.on_revision_drag_drop(*spot, cx);
+            this.on_revision_drag_drop(*spot);
         });
         props = props
             .on_drag(DragHooks {
@@ -1164,7 +1164,9 @@ pub(crate) mod scenes {
     /// A graph with the shape of a busy repository: a trunk, a merge every few
     /// rows and a long-lived side lane now and then, with bookmarks, long titles
     /// and conflicts sprinkled in.
-    fn large_graph(rows: usize) -> (diffui_core::CommitStore, crate::graph_layout::GraphLayout) {
+    pub(crate) fn large_graph(
+        rows: usize,
+    ) -> (diffui_core::CommitStore, crate::graph_layout::GraphLayout) {
         use jj_lib::graph::GraphEdge;
         let mut lanes = diffui_core::graph::LaneAssigner::<usize>::new();
         let mut layout = crate::graph_layout::GraphLayoutBuilder::new();

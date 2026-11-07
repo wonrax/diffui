@@ -354,14 +354,11 @@ impl Diffui {
                 } else {
                     self.close_marker_editor(&target, &path);
                 }
-                self.start_changes_op(
-                    MutationOp::ResolveConflict {
-                        target,
-                        path,
-                        resolution,
-                    },
-                    cx,
-                )
+                self.start_changes_op(MutationOp::ResolveConflict {
+                    target,
+                    path,
+                    resolution,
+                })
             }
             ConflictMsg::StepRegion(by) => match self.step_region(by) {
                 // The banner follows the region's file.
@@ -396,7 +393,7 @@ impl Diffui {
                     editor.content = text;
                 }
             }
-            ConflictMsg::EditorSave => self.save_marker_editor(cx),
+            ConflictMsg::EditorSave => self.save_marker_editor(),
             ConflictMsg::EditorCancel => {
                 let conflicts = &mut self.active_mut().changes.conflicts;
                 if conflicts
@@ -407,7 +404,7 @@ impl Diffui {
                     conflicts.editor = None;
                 }
             }
-            ConflictMsg::OpenMergeTool(path) => self.open_merge_tool(path, cx),
+            ConflictMsg::OpenMergeTool(path) => self.open_merge_tool(path),
             ConflictMsg::MergeToolDone {
                 tab,
                 activity,
@@ -431,7 +428,7 @@ impl Diffui {
                             path: invocation.path,
                             resolution,
                         };
-                        self.resolve_in(tab, op, label, cx)
+                        self.resolve_in(tab, op, label)
                     }
                     Err(error) => {
                         if let Some(log) = self.activity_log_for(tab) {
@@ -451,20 +448,17 @@ impl Diffui {
 
     /// Run `op` on `tab`, which may no longer be the active one (a merge
     /// tool finishing after a tab switch).
-    fn resolve_in(&mut self, tab: TabId, op: MutationOp, label: Prose, cx: &mut Cx) {
+    fn resolve_in(&mut self, tab: TabId, op: MutationOp, label: Prose) {
         if self.tab_mut(tab).is_none() {
             return;
         }
         let (activity_id, _) = self.begin_activity(tab, label, false);
-        self.run_mutation(
-            PendingMutation {
-                op,
-                tab_id: tab,
-                activity_id,
-                allow_immutable: false,
-            },
-            cx,
-        )
+        self.run_mutation(PendingMutation {
+            op,
+            tab_id: tab,
+            activity_id,
+            allow_immutable: false,
+        })
     }
 
     /// Move the keyboard's region `by` regions through the diff, starting
@@ -536,7 +530,6 @@ impl Diffui {
                     revision,
                     path,
                 },
-                cx,
             );
         }
     }
@@ -558,7 +551,7 @@ impl Diffui {
         }
     }
 
-    fn save_marker_editor(&mut self, cx: &mut Cx) {
+    fn save_marker_editor(&mut self) {
         let Some(tab) = self.active_tab_id() else {
             return;
         };
@@ -587,15 +580,12 @@ impl Diffui {
         if let Some(editor) = self.active_mut().changes.conflicts.editor.as_mut() {
             editor.saving = Some(activity_id);
         }
-        self.run_mutation(
-            PendingMutation {
-                op,
-                tab_id: tab,
-                activity_id,
-                allow_immutable: false,
-            },
-            cx,
-        )
+        self.run_mutation(PendingMutation {
+            op,
+            tab_id: tab,
+            activity_id,
+            allow_immutable: false,
+        })
     }
 
     /// A mutation finished (`saved`) or was dropped: the marker editor
@@ -633,7 +623,7 @@ impl Diffui {
         }
     }
 
-    fn open_merge_tool(&mut self, path: String, cx: &mut Cx) {
+    fn open_merge_tool(&mut self, path: String) {
         let Some(tab) = self.active_tab_id() else {
             return;
         };
@@ -652,13 +642,12 @@ impl Diffui {
                 revision,
                 path,
             },
-            cx,
         )
     }
 
     /// Ask for the conflicts of the active tab's revision when it has some
     /// and they aren't loaded yet. Cheap enough to call after every message.
-    pub(crate) fn sync_conflicts(&mut self, cx: &mut Cx) {
+    pub(crate) fn sync_conflicts(&mut self) {
         let Some(tab_id) = self.active_tab_id() else {
             return;
         };
@@ -704,11 +693,7 @@ impl Diffui {
         }
         let job = state.session.next_job();
         state.changes.conflicts.job = Some((job, revision.clone(), document_id));
-        self.send(
-            tab_id,
-            diffui_core::Command::ConflictInfo { job, revision },
-            cx,
-        )
+        self.send(tab_id, diffui_core::Command::ConflictInfo { job, revision })
     }
 
     /// Route a repository event answering one of our jobs. `None` when the
@@ -725,7 +710,7 @@ impl Diffui {
         if !conflicts.owns(job) {
             return None;
         }
-        Some(match &event.payload {
+        let _: () = match &event.payload {
             Payload::ConflictInfoLoaded { files, .. } => {
                 if let Some((_, revision, document_id)) = conflicts.job.take() {
                     if std::mem::take(&mut conflicts.reveal_on_load) {
@@ -812,7 +797,8 @@ impl Diffui {
                 conflicts.tool_job.take_if(|(id, _)| *id == job);
                 conflicts.text_job.take_if(|(id, ..)| *id == job);
             }
-        })
+        };
+        Some(())
     }
 }
 

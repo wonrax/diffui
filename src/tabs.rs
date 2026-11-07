@@ -101,7 +101,7 @@ impl Diffui {
         self.active = target;
         {
             self.on_active_tab_changed(cx);
-            self.ensure_active_loaded(cx);
+            self.ensure_active_loaded();
         }
     }
 
@@ -117,9 +117,8 @@ impl Diffui {
     fn on_active_tab_changed(&mut self, cx: &mut Cx) {
         self.scroll_restore_token = self.scroll_restore_token.wrapping_add(1);
         self.document_version = self.document_version.wrapping_add(1);
-        match self.active_tab_id() {
-            Some(tab) => self.open_pending_description_edit(tab, cx),
-            None => {}
+        if let Some(tab) = self.active_tab_id() {
+            self.open_pending_description_edit(tab, cx)
         }
     }
 
@@ -131,7 +130,7 @@ impl Diffui {
     /// but a `Focus` snapshot reconciles anything the projection coalesced
     /// while nothing was rendering. Its op-fingerprint dedup makes that a
     /// no-op when nothing changed.
-    pub(crate) fn ensure_active_loaded(&mut self, cx: &mut Cx) {
+    pub(crate) fn ensure_active_loaded(&mut self) {
         let Some(tab) = self.active_tab_id() else {
             return;
         };
@@ -141,7 +140,7 @@ impl Diffui {
             return;
         }
         self.active_mut().session.pending_refresh = None;
-        self.start_tab_load(tab, cx)
+        self.start_tab_load(tab)
     }
 
     /// Close the tab `id`. Closing an inactive tab just drops it — and with it
@@ -183,7 +182,7 @@ impl Diffui {
         }
         {
             self.on_active_tab_changed(cx);
-            self.ensure_active_loaded(cx);
+            self.ensure_active_loaded();
         }
     }
 
@@ -306,7 +305,7 @@ impl Diffui {
                     })
             },
             cx,
-            |this, listing, cx| this.on_open_repo_listed(listing, cx),
+            |this, listing, _| this.on_open_repo_listed(listing),
         );
     }
 
@@ -378,7 +377,7 @@ impl Diffui {
             self.active = 0;
             {
                 self.on_active_tab_changed(cx);
-                self.ensure_active_loaded(cx);
+                self.ensure_active_loaded();
             }
         } else {
             self.activate_tab(id, cx)
@@ -454,6 +453,9 @@ pub(crate) mod tests {
             next_toast_id: 0,
             window: None,
             background: Default::default(),
+            panes: None,
+            #[cfg(test)]
+            renders: 0,
             modifiers: crate::keys::Modifiers::default(),
         }
     }
@@ -680,7 +682,7 @@ pub(crate) mod tests {
 
     #[test]
     fn moving_a_tab_reorders_the_strip_without_changing_which_is_active() {
-        crate::tabs::tests::with_cx(|cx| {
+        crate::tabs::tests::with_cx(|_| {
             let mut ui = app();
             let first = push_tab(&mut ui, "/tmp/first");
             let second = push_tab(&mut ui, "/tmp/second");
@@ -715,7 +717,7 @@ pub(crate) mod tests {
 
     #[test]
     fn moving_a_tab_onto_its_own_slot_changes_nothing() {
-        crate::tabs::tests::with_cx(|cx| {
+        crate::tabs::tests::with_cx(|_| {
             let mut ui = app();
             let first = push_tab(&mut ui, "/tmp/first");
             let _second = push_tab(&mut ui, "/tmp/second");
@@ -768,20 +770,17 @@ pub(crate) mod tests {
             let mut ui = app();
             let tab = push_tab(&mut ui, "/tmp/only");
 
-            let describe = |ui: &mut Diffui, text: &str, cx: &mut crate::Cx| {
+            let describe = |ui: &mut Diffui, text: &str, _cx: &mut crate::Cx| {
                 let (activity_id, _) = ui.begin_activity(tab, "Describe", false);
-                ui.run_mutation(
-                    PendingMutation {
-                        op: mutations::MutationOp::Describe {
-                            target: RevisionSelection::WorkingCopy,
-                            description: text.to_owned(),
-                        },
-                        tab_id: tab,
-                        activity_id,
-                        allow_immutable: false,
+                ui.run_mutation(PendingMutation {
+                    op: mutations::MutationOp::Describe {
+                        target: RevisionSelection::WorkingCopy,
+                        description: text.to_owned(),
                     },
-                    cx,
-                )
+                    tab_id: tab,
+                    activity_id,
+                    allow_immutable: false,
+                })
             };
             describe(&mut ui, "first", cx);
             let first_job = ui.tab_mut(tab).unwrap().jobs.mutation.as_ref().unwrap().0;

@@ -52,8 +52,8 @@
 //! ```
 //!
 //! Kerning and OpenType feature toggles (ligatures, stylistic sets) aren't
-//! configurable: the text stack (iced/cosmic-text) exposes no per-run feature
-//! or letter-spacing control today.
+//! configurable: the text stack exposes no per-run feature or letter-spacing
+//! control today.
 
 use crate::theme::Font;
 use serde::Deserialize;
@@ -242,8 +242,7 @@ fn font_from_name(name: &str) -> Font {
 /// back to `fallback` when it isn't there. A named family that the font
 /// database can't resolve doesn't merely degrade: requesting a non-default
 /// weight (the tab bar's `Medium`, via `theme::emphasis_font`) on a missing
-/// family makes cosmic-text's fallback come up empty and the text renders
-/// as invisible `.notdef` glyphs. Validating up front means a config shared
+/// family can leave text rendering as invisible `.notdef` glyphs. Validating up front means a config shared
 /// across machines just falls back to the platform default where the font
 /// isn't installed.
 fn resolve_font(name: &str, fallback: Font) -> Font {

@@ -1,5 +1,5 @@
 //! Domain data model for diffui: the diff document, the compact commit store,
-//! and the per-revision metadata the loaders produce. Pure data — no `iced`.
+//! and the per-revision metadata the loaders produce. Pure data, no UI.
 
 use std::{
     cell::RefCell,

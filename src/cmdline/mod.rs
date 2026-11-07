@@ -150,11 +150,13 @@ impl LineEditor {
     }
 
     /// The caret's byte offset into the (one-line) text.
+    #[cfg(test)]
     pub(crate) fn cursor(&self) -> usize {
         self.cursor
     }
 
     /// One line, whatever was pasted.
+    #[cfg(test)]
     pub(crate) fn text(&self) -> String {
         self.line.clone()
     }
@@ -439,23 +441,16 @@ impl Diffui {
     pub(crate) fn on_command_line_action(&mut self, action: CmdAction, cx: &mut Cx) {
         match action {
             CmdAction::Open => self.open_command_line(PREFIX.to_owned(), cx),
-            CmdAction::FromDraft => match self.draft_command_line() {
-                Some(line) => self.open_command_line(line, cx),
-                None => {}
-            },
+            CmdAction::FromDraft => {
+                if let Some(line) = self.draft_command_line() {
+                    self.open_command_line(line, cx)
+                }
+            }
             CmdAction::Output(action) => self.on_output_action(action, cx),
         }
     }
 
-    pub(crate) fn cmd_on_settle(&mut self, version: u64, cx: &mut Cx) {
-        self.settle_command_line(version, cx);
-    }
-
-    pub(crate) fn cmd_on_field_settle(&mut self, version: u64, cx: &mut Cx) {
-        self.settle_revset_field(version, cx);
-    }
-
-    pub(crate) fn cmd_on_field_select(&mut self, index: usize, cx: &mut Cx) {
+    pub(crate) fn cmd_on_field_select(&mut self, index: usize) {
         self.revset_field_select(index);
     }
 
@@ -548,7 +543,8 @@ impl Diffui {
         command.navigated = false;
         command.settled = false;
         command.run_when_ready = false;
-        Some(self.schedule_settle(command, cx))
+        self.schedule_settle(command, cx);
+        Some(())
     }
 
     /// An edit or a caret move in the command line's editor.
@@ -582,9 +578,7 @@ impl Diffui {
                     let version = column.query_version;
                     crate::input::focus(palette::PALETTE_INPUT_ID, cx);
                     place_caret(palette::PALETTE_INPUT_ID, &line, cursor, cx);
-                    Self::later(cx, move |this, cx| {
-                        this.palette_on_recompute(0, version, cx)
-                    });
+                    Self::later(cx, move |this, _| this.palette_on_recompute(0, version));
                 }
             }
         }
@@ -594,13 +588,11 @@ impl Diffui {
     fn schedule_settle(&self, command: &mut CommandLine, cx: &mut Cx) {
         command.version = command.version.wrapping_add(1);
         let version = command.version;
-        Self::after(SETTLE, cx, move |this, cx| {
-            this.settle_command_line(version, cx)
-        });
+        Self::after(SETTLE, cx, move |this, _| this.settle_command_line(version));
     }
 
     /// Typing paused: show errors, and resolve the revsets nobody has yet.
-    pub(crate) fn settle_command_line(&mut self, version: u64, cx: &mut Cx) {
+    pub(crate) fn settle_command_line(&mut self, version: u64) {
         let Some(tab) = self.active_tab_id() else {
             return;
         };
@@ -649,7 +641,7 @@ impl Diffui {
             }
         }
         for effects in tasks {
-            self.run_effects(tab, effects, cx);
+            self.run_effects(tab, effects);
         }
         if let Some(command) = self.command_line_mut() {
             command.settled = true;
@@ -751,7 +743,10 @@ impl Diffui {
         let walking = command.history.is_some();
         let untouched = line == PREFIX && !command.navigated;
         if walking || (untouched && delta < 0) {
-            return Some(self.walk_history(delta, cx));
+            return {
+                self.walk_history(delta, cx);
+                Some(())
+            };
         }
         let command = self.command_line_mut()?;
         if command.completions.is_empty() {
@@ -819,7 +814,8 @@ impl Diffui {
     pub(crate) fn command_line_complete(&mut self, cx: &mut Cx) -> Option<()> {
         let command = self.command_line()?;
         let completion = command.completions.get(command.selected)?.clone();
-        Some(self.accept_completion(completion, cx))
+        self.accept_completion(completion, cx);
+        Some(())
     }
 
     /// Accept the candidate at `index` (a click).
@@ -904,7 +900,7 @@ impl Diffui {
                     command.run_when_ready = true;
                 }
                 if pending_settle {
-                    self.settle_command_line(version, cx);
+                    self.settle_command_line(version);
                 }
             }
             PlanState::Ready(run) => {
@@ -940,7 +936,7 @@ impl Diffui {
             Run::View(view) => self.run_view(view, cx),
             Run::Native { action, command } => self.run_native(action, command, cx),
             Run::Ui { command, target } => self.run_ui(command, target, cx),
-            Run::Cli { args } => self.start_cli_run(args, cx),
+            Run::Cli { args } => self.start_cli_run(args),
         }
     }
 
@@ -962,7 +958,7 @@ impl Diffui {
                 state.pending_revision_reveal = true;
                 let effects = state.session.diff_revsets(request);
                 {
-                    self.run_effects(tab, effects, cx);
+                    self.run_effects(tab, effects);
                 }
             }
             ResolvedView::Log(revset) => {
@@ -998,11 +994,11 @@ impl Diffui {
 
     fn run_native(&mut self, action: NativeAction, command: MutationCommand, cx: &mut Cx) {
         let op = match action {
-            NativeAction::Fetch(target) => return self.start_fetch(target, cx),
+            NativeAction::Fetch(target) => return self.start_fetch(target),
             NativeAction::Mutate(op) => op,
         };
         if let Some((kind, placement)) = command.draft_kind()
-            && let Some(task) = self.draft_from_op(kind, placement, &op, cx)
+            && self.draft_from_op(kind, placement, &op, cx).is_some()
         {
             return;
         }
@@ -1013,7 +1009,7 @@ impl Diffui {
                 ..
             }
         );
-        self.start_mutation(op, allow_backwards, cx)
+        self.start_mutation(op, allow_backwards)
     }
 
     /// Land a typed rebase / squash / placed new or duplicate / parallelize

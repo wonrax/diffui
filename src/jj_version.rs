@@ -21,8 +21,8 @@ pub(crate) fn check_once(cx: &mut Cx) {
     if CHECKED.swap(true, Ordering::Relaxed) {
         return;
     }
-    Diffui::run_async(cli_version(), cx, |this, version, cx| {
-        this.on_jj_cli_version(version, cx);
+    Diffui::run_async(cli_version(), cx, |this, version, _| {
+        this.on_jj_cli_version(version);
     });
 }
 
@@ -70,7 +70,7 @@ fn parse(version: &str) -> Option<(u64, u64, u64)> {
 }
 
 impl crate::Diffui {
-    pub(crate) fn on_jj_cli_version(&mut self, version: Option<String>, cx: &mut Cx) {
+    pub(crate) fn on_jj_cli_version(&mut self, version: Option<String>) {
         let Some(version) = version else {
             tracing::info!("no jj CLI on PATH; jj-lib {EMBEDDED} embedded");
             return;

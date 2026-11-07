@@ -894,7 +894,7 @@ fn columns_and_bytes_round_trip_on_multibyte_text() {
 /// wraps. They read one table, which this holds them to: a row reserves what the painter
 /// shapes, the shaped lines are the whole text in order, and none runs past the width
 /// unless the column can't hold a single glyph. Trailing blanks are in the corpus because GPUI doesn't
-/// hang them past the width the way cosmic did.
+/// hang them past the width.
 #[test]
 fn the_painter_shapes_the_lines_the_index_counted() {
     let corpus = [

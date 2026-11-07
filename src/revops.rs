@@ -113,8 +113,8 @@ impl Diffui {
             sources,
             selection: None,
         }));
-        Diffui::after(Duration::from_millis(250), cx, move |this, cx| {
-            this.on_draft_preview_kick(version, cx);
+        Diffui::after(Duration::from_millis(250), cx, move |this, _| {
+            this.on_draft_preview_kick(version);
         });
     }
 }
@@ -208,7 +208,7 @@ impl Diffui {
         let tab = self.active_mut();
         tab.pending_description_edit = Some(target.clone());
         tab.pending_commit = true;
-        self.select_revision(target, cx)
+        self.select_revision(target)
     }
 }
 
@@ -596,7 +596,7 @@ mod tests {
     }
 
     /// A jj-capable app over `@` = "w", then "a", "b", "c".
-    fn loaded(rows: Vec<CommitSummary>, cx: &mut crate::Cx) -> Diffui {
+    fn loaded(rows: Vec<CommitSummary>, _cx: &mut crate::Cx) -> Diffui {
         let mut ui = app();
         push_tab(&mut ui, "/tmp/revops");
         let tab = ui.active_mut();

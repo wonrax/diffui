@@ -4,7 +4,6 @@
 //! stopping for is a forecast conflict, so the rebase preview runs first and
 //! a confirmation names the changes that would end up conflicted.
 
-use crate::Cx;
 use diffui_core::{
     Destination, DraftSimulation, JobId, PreviewRequest, RebaseSourceMode, RevisionSelection,
 };
@@ -64,7 +63,7 @@ fn rebase_op(sources: Vec<RevisionSelection>, trunk: String) -> MutationOp {
 
 impl Diffui {
     /// Preview the rebase, then run it (or ask first, if it would conflict).
-    pub(crate) fn rebase_onto_trunk(&mut self, sources: Vec<RevisionSelection>, cx: &mut Cx) {
+    pub(crate) fn rebase_onto_trunk(&mut self, sources: Vec<RevisionSelection>) {
         let Some(tab) = self.active_tab_id() else {
             return;
         };
@@ -88,7 +87,7 @@ impl Diffui {
         });
         state.jobs.trunk_rebase = Some((job, op));
         effects.extend(preview);
-        self.run_effects(tab, effects, cx)
+        self.run_effects(tab, effects)
     }
 
     /// The preview for a rebase onto trunk came back (`Err`: it failed, which
@@ -98,7 +97,6 @@ impl Diffui {
         tab: crate::TabId,
         job: JobId,
         simulation: Result<&DraftSimulation, String>,
-        cx: &mut Cx,
     ) {
         let Some(state) = self.tab_mut(tab) else {
             return;
@@ -115,7 +113,7 @@ impl Diffui {
             }
         };
         if conflicts.is_empty() || self.active_tab_id() != Some(tab) {
-            return self.start_mutation_op(op, cx);
+            return self.start_mutation_op(op);
         }
         let MutationOp::Rebase { sources, .. } = &op else {
             return;
@@ -192,7 +190,7 @@ mod tests {
 
     /// "s" sits on trunk "t", "f" is a feature branch off older history,
     /// "o" is old immutable history.
-    fn ui(trunk: Option<&str>, cx: &mut crate::Cx) -> Diffui {
+    fn ui(trunk: Option<&str>, _cx: &mut crate::Cx) -> Diffui {
         let mut ui = app();
         push_tab(&mut ui, "/tmp/trunk");
         let tab = ui.active_mut();

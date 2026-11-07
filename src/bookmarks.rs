@@ -124,7 +124,7 @@ impl Diffui {
                     _ => return,
                 };
                 self.pop_mode(ModeKind::NamePrompt);
-                self.start_mutation_op(op, cx)
+                self.start_mutation_op(op)
             }
             BookmarkAction::Push { name, remote } => {
                 let remote = remote.or_else(|| {
@@ -135,9 +135,9 @@ impl Diffui {
                         .map(str::to_owned)
                 });
                 let Some(remote) = remote else {
-                    return self.no_push_remote(cx);
+                    return self.no_push_remote();
                 };
-                self.start_push(remote, vec![PushTarget::Bookmark(name)], cx)
+                self.start_push(remote, vec![PushTarget::Bookmark(name)])
             }
             BookmarkAction::PushChange { at, remote } => {
                 let remote = remote.or_else(|| {
@@ -148,12 +148,12 @@ impl Diffui {
                         .map(str::to_owned)
                 });
                 let Some(remote) = remote else {
-                    return self.no_push_remote(cx);
+                    return self.no_push_remote();
                 };
-                self.start_push(remote, vec![PushTarget::Change(at)], cx)
+                self.start_push(remote, vec![PushTarget::Change(at)])
             }
             BookmarkAction::DeleteEverywhere { name, remote } => {
-                self.start_push(remote, vec![PushTarget::DeleteBookmark(name)], cx)
+                self.start_push(remote, vec![PushTarget::DeleteBookmark(name)])
             }
             BookmarkAction::PushTracked => {
                 let Some(remote) = self
@@ -163,31 +163,28 @@ impl Diffui {
                     .default_push_remote()
                     .map(str::to_owned)
                 else {
-                    return self.no_push_remote(cx);
+                    return self.no_push_remote();
                 };
-                self.start_push(remote, vec![PushTarget::Tracked], cx)
+                self.start_push(remote, vec![PushTarget::Tracked])
             }
         }
     }
 
-    fn start_push(&mut self, remote: String, targets: Vec<PushTarget>, cx: &mut Cx) {
+    fn start_push(&mut self, remote: String, targets: Vec<PushTarget>) {
         // A plain push sends whatever tracked bookmarks moved, which nobody
         // picked one by one: confirm the plan first.
         let confirm = targets.contains(&PushTarget::Tracked);
-        self.start_mutation_op(
-            MutationOp::Push(PushRequest {
-                remote,
-                targets,
-                allow: PushAllow::default(),
-                confirm,
-            }),
-            cx,
-        )
+        self.start_mutation_op(MutationOp::Push(PushRequest {
+            remote,
+            targets,
+            allow: PushAllow::default(),
+            confirm,
+        }))
     }
 
     /// `jj git push` without `--remote` falls back to `origin`; with several
     /// remotes, none called that, and no `git.push`, there's nothing to guess.
-    fn no_push_remote(&mut self, cx: &mut Cx) {
+    fn no_push_remote(&mut self) {
         let remotes = &self.active().session.bookmarks.remotes;
         let body = if remotes.is_empty() {
             "This repository has no git remotes.".to_owned()
@@ -266,12 +263,7 @@ impl Diffui {
     /// `jj git push`'s commit checks refused `pending`. Where the CLI has an
     /// escape hatch for every reason, offer the push again with exactly those
     /// allowances; otherwise it's an error with the list.
-    pub(crate) fn push_rejected(
-        &mut self,
-        pending: PendingMutation,
-        rejection: PushRejection,
-        cx: &mut Cx,
-    ) {
+    pub(crate) fn push_rejected(&mut self, pending: PendingMutation, rejection: PushRejection) {
         if rejection.is_confirmation() {
             if let Some(log) = self.activity_log_for(pending.tab_id) {
                 log.set_status(pending.activity_id, activity::ActivityStatus::Queued);
@@ -295,7 +287,7 @@ impl Diffui {
                 "jj git push would refuse this, and has no override for it:\n{}",
                 lines.join("\n")
             );
-            return self.finish_mutation_error(pending, error, cx);
+            return self.finish_mutation_error(pending, error);
         };
         if let Some(log) = self.activity_log_for(pending.tab_id) {
             log.extend_output(pending.activity_id, lines);
@@ -360,7 +352,7 @@ impl Diffui {
         }));
     }
 
-    fn finish_mutation_error(&mut self, pending: PendingMutation, error: String, cx: &mut Cx) {
+    fn finish_mutation_error(&mut self, pending: PendingMutation, error: String) {
         let mut failure = None;
         if let Some(log) = self.activity_log_for(pending.tab_id) {
             let title = log
@@ -385,9 +377,9 @@ impl Diffui {
     /// push is snapshotted into it and the bookmark moves off what the remote
     /// has. The CLI doesn't refuse it outright, so this is a warning, not a
     /// guard (an undescribed `@` is refused by the push checks regardless).
-    pub(crate) fn run_mutation_checking_wc_push(&mut self, pending: PendingMutation, cx: &mut Cx) {
+    pub(crate) fn run_mutation_checking_wc_push(&mut self, pending: PendingMutation) {
         if !self.publishes_working_copy(&pending.op) {
-            return self.run_mutation(pending, cx);
+            return self.run_mutation(pending);
         }
         if let Some(log) = self.activity_log_for(pending.tab_id) {
             log.set_status(pending.activity_id, activity::ActivityStatus::Queued);
@@ -745,7 +737,7 @@ mod tests {
     const WC: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const MAIN: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
-    fn ui_with_bookmarks(cx: &mut crate::Cx) -> (Diffui, TabId) {
+    fn ui_with_bookmarks(_cx: &mut crate::Cx) -> (Diffui, TabId) {
         let mut ui = app();
         let tab = push_tab(&mut ui, "/tmp/repo");
         let session = &mut ui.tab_mut(tab).unwrap().session;
@@ -825,7 +817,7 @@ mod tests {
                     remote: "origin".to_owned(),
                 },
             );
-            ui.push_rejected(held, rejection(vec![PushCheck::EmptyDescription]), cx);
+            ui.push_rejected(held, rejection(vec![PushCheck::EmptyDescription]));
             let dialog = ui.confirm().expect("a confirmation is raised");
             let body = dialog.body.to_string();
             assert!(body.contains("has no description"), "{body}");
@@ -865,7 +857,6 @@ mod tests {
                     PushCheck::EmptyDescription,
                     PushCheck::MissingIdentity,
                 ]),
-                cx,
             );
             assert!(ui.confirm().is_none(), "no override for a missing author");
             assert!(!ui.active().activities.any_running());
@@ -899,7 +890,7 @@ mod tests {
             }));
 
             let held = pending(&mut ui, tab, wc_push);
-            ui.run_mutation_checking_wc_push(held, cx);
+            ui.run_mutation_checking_wc_push(held);
             assert!(ui.confirm().is_some());
             assert!(ui.tab_mut(tab).unwrap().jobs.mutation.is_none());
         });

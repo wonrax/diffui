@@ -104,7 +104,7 @@ pub(crate) struct OutputView {
 impl Diffui {
     /// Run `args` through the jj CLI in the active tab's workspace, and show
     /// the output as it comes.
-    pub(crate) fn start_cli_run(&mut self, args: Vec<String>, cx: &mut Cx) {
+    pub(crate) fn start_cli_run(&mut self, args: Vec<String>) {
         let Some(tab) = self.active_tab_id() else {
             return;
         };
@@ -211,7 +211,7 @@ impl Diffui {
     }
 
     /// The run ended: settle its row and its panel.
-    pub(crate) fn finish_cli_run(&mut self, tab: TabId, job: JobId, exit: Exit, cx: &mut Cx) {
+    pub(crate) fn finish_cli_run(&mut self, tab: TabId, job: JobId, exit: Exit) {
         let Some(state) = self.tab_mut(tab) else {
             return;
         };
@@ -254,8 +254,8 @@ impl Diffui {
         state.activities.finish(activity, status, summary);
     }
 
-    pub(crate) fn fail_cli_run(&mut self, tab: TabId, job: JobId, error: RepoError, cx: &mut Cx) {
-        self.finish_cli_run(tab, job, Exit::Failed(error.to_string()), cx)
+    pub(crate) fn fail_cli_run(&mut self, tab: TabId, job: JobId, error: RepoError) {
+        self.finish_cli_run(tab, job, Exit::Failed(error.to_string()))
     }
 
     pub(crate) fn on_output_action(&mut self, action: OutputAction, cx: &mut Cx) {
@@ -268,10 +268,11 @@ impl Diffui {
             OutputAction::Close => {
                 self.pop_mode(ModeKind::CliOutput);
             }
-            OutputAction::Copy => match self.shown_cli_run() {
-                Some(run) => crate::write_clipboard(run.transcript(), cx),
-                None => {}
-            },
+            OutputAction::Copy => {
+                if let Some(run) = self.shown_cli_run() {
+                    crate::write_clipboard(run.transcript(), cx)
+                }
+            }
             OutputAction::Stop => {
                 let Some(&Mode::CliOutput(view)) = self.mode(ModeKind::CliOutput) else {
                     return;

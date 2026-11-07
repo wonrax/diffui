@@ -60,8 +60,7 @@ impl Font {
     }
 }
 
-/// `base` at `weight`. Unlike iced's matcher, CoreText resolves weights of the
-/// system font too, so this no longer has to pass generic families through.
+/// `base` at `weight`. CoreText resolves weights of the system font too.
 pub fn emphasis_font(base: Font, weight: Weight) -> Font {
     Font { weight, ..base }
 }

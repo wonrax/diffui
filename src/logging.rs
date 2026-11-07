@@ -22,7 +22,7 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 /// the previous one), so the two together stay under twice this.
 const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Our own crates at `info`, everything else (iced, wgpu, jj-lib) at `warn`.
+/// Our own crates at `info`, everything else (GPUI, jj-lib) at `warn`.
 const DEFAULT_FILTER: &str = "warn,diffui=info,diffui_core=info";
 
 static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();

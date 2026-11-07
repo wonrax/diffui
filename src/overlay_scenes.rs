@@ -343,7 +343,7 @@ fn activity_popover_dark() {
 fn activity_popover_expanded() {
     let mut h = app();
     logged(&mut h);
-    h.act(|ui, cx| ui.on_activity_expand(ActivityId(103), cx));
+    h.act(|ui, _| ui.on_activity_expand(ActivityId(103)));
     h.perform(Action::ToggleActivityPopover);
     h.shot(LANE, "activity-popover-expanded");
 }
@@ -355,7 +355,7 @@ fn activity_popover_failed() {
     h.perform(Action::ToggleActivityPopover);
     h.shot(LANE, "activity-popover-failed");
     // A line cut short is what makes the row open, and open it's whole.
-    h.act(|ui, cx| ui.on_activity_expand(ActivityId(104), cx));
+    h.act(|ui, _| ui.on_activity_expand(ActivityId(104)));
     h.shot(LANE, "activity-popover-failed-open");
 }
 

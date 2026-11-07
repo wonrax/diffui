@@ -8,7 +8,7 @@
 //! it: a restored revset, a picked preset, a chosen folder) the input is rewritten
 //! to match. The entity lives
 //! in the window's element state under the field's id, so it exists exactly
-//! while the field is on screen, as the iced widget state did.
+//! while the field is on screen.
 //!
 //! Focus works the same way: update code asks with [`focus`] and no window, and
 //! the field applies it the next time it renders.
@@ -89,7 +89,7 @@ fn take_requests(id: &'static str, cx: &mut App) -> Vec<FocusRequest> {
     taken
 }
 
-/// Whether a kit text input has the keyboard. Replaces iced's `consumed` flag:
+/// Whether a kit text input has the keyboard:
 /// such an input takes the plain keys it types with, so the keymap leaves those
 /// alone. `context_stack` is the focused element's path; kit's inputs all put
 /// `Input` on it.

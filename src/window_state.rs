@@ -27,7 +27,7 @@ const MIN_RESTORE_DIMENSION: f32 = 100.0;
 /// Window geometry, sidebar split, and the open-repo session persisted between
 /// runs. Every field is optional / defaulted so a partial or older file still
 /// loads — a missing field just falls back to the in-app default. Geometry is
-/// logical pixels; the type is intentionally iced-free (plain `f32` / `String`)
+/// logical pixels; the type is intentionally UI-free (plain `f32` / `String`)
 /// so persistence stays decoupled from the UI layer.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WindowState {
@@ -172,7 +172,7 @@ const DEFAULT_MAX_SIZE: (f32, f32) = (1800.0, 1150.0);
 
 /// The window size for a launch with no saved geometry: most of the screen's
 /// usable area (`visible`, logical points, menu bar and Dock excluded), up to
-/// a cap. iced's fixed 1024-wide default leaves a three-pane split view too
+/// a cap. A fixed 1024-wide default would leave a three-pane split view too
 /// narrow to read. `None` without a screen to measure.
 pub fn default_window_size(visible: Option<(f32, f32)>) -> Option<(f32, f32)> {
     let (width, height) = visible.filter(|(w, h)| {

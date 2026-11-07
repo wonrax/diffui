@@ -388,7 +388,7 @@ pub(crate) fn results(
                             .command_line()
                             .is_some_and(|command| command.selected != index)
                         {
-                            this.act(cx, |this, cx| this.palette_on_select_index(0, index, cx));
+                            this.act(cx, |this, _| this.palette_on_select_index(0, index));
                         }
                     }),
                 )

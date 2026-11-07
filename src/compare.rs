@@ -34,7 +34,7 @@ pub(crate) enum CompareAction {
 }
 
 impl Diffui {
-    pub(crate) fn perform_compare(&mut self, action: CompareAction, cx: &mut Cx) {
+    pub(crate) fn perform_compare(&mut self, action: CompareAction) {
         let Some(tab) = self.active_tab_id() else {
             return;
         };
@@ -73,7 +73,7 @@ impl Diffui {
             CompareAction::SetInterdiff(on) => target.session.set_interdiff(on),
             CompareAction::Exit => target.session.exit_compare(),
         };
-        self.run_effects(tab, effects, cx)
+        self.run_effects(tab, effects)
     }
 }
 
@@ -138,7 +138,7 @@ fn revision_label(ui: &Diffui, revision: &RevisionSelection) -> (String, String)
 
 impl Diffui {
     /// Fetch the full diff of a file the backend collapsed for size.
-    pub(crate) fn expand_collapsed_file(&mut self, index: usize, cx: &mut Cx) {
+    pub(crate) fn expand_collapsed_file(&mut self, index: usize) {
         let Some(tab) = self.active_tab_id() else {
             return;
         };
@@ -153,7 +153,7 @@ impl Diffui {
             return;
         };
         let effects = target.session.expand_file(&path);
-        self.run_effects(tab, effects, cx)
+        self.run_effects(tab, effects)
     }
 }
 

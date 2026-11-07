@@ -209,7 +209,7 @@ mod tests {
 
     #[test]
     fn keys_follow_the_live_keymap() {
-        crate::tabs::tests::with_cx(|cx| {
+        crate::tabs::tests::with_cx(|_| {
             let mut ui = app();
             push_tab(&mut ui, "/tmp/hints");
             assert_eq!(

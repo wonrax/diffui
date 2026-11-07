@@ -3,7 +3,6 @@
 //! is up, the list's rows are its display rows, so every index the list
 //! reports goes through here on its way back to a loaded row.
 
-use crate::Cx;
 use std::rc::Rc;
 
 use diffui_core::{JobId, PreviewGraph};
@@ -108,7 +107,7 @@ impl Diffui {
     /// Run after every update: cancel a draft simulation nobody is waiting
     /// for any more (the draft ended, or its destination was dropped), so the
     /// repository stops spending time on it.
-    pub(crate) fn cancel_unwanted_preview(&mut self, cx: &mut Cx) {
+    pub(crate) fn cancel_unwanted_preview(&mut self) {
         let ids: Vec<TabId> = self.tabs.iter().map(|tab| tab.id).collect();
         for id in ids {
             let Some(tab) = self.tab_mut(id) else {
@@ -128,7 +127,6 @@ impl Diffui {
                 vec![diffui_core::Effect::Send(diffui_core::Command::Cancel {
                     job,
                 })],
-                cx,
             );
         }
     }

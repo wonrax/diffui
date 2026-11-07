@@ -48,7 +48,7 @@ impl Mods {
         .normalized()
     }
 
-    /// Off macOS, `cmd` *is* ctrl — iced's `Modifiers::COMMAND` is the ctrl
+    /// Off macOS, `cmd` *is* ctrl — `Modifiers::COMMAND` is the ctrl
     /// bit there, so a raw Ctrl press sets both flags and would never match a
     /// chord that set only one. Fold them into `command` so `cmd+k` and
     /// `ctrl+k` name one chord off macOS and stay two on it.

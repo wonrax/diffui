@@ -217,7 +217,7 @@ pub fn cocoa_text_key(
         'p' if multi_line => motion(Named::ArrowUp),
         'h' => Some((Named::Backspace, Modifiers::empty())),
         'd' => Some((Named::Delete, Modifiers::empty())),
-        // ⌘⌦ is iced's "delete to the end of the line".
+        // ⌘⌦ is "delete to the end of the line".
         'k' => Some((Named::Delete, Modifiers::LOGO)),
         _ => None,
     }

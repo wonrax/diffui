@@ -604,22 +604,18 @@ pub(crate) fn build_overlay(
         button: MouseButton,
         cx: &mut Cx,
     ) -> impl Fn(&MouseUpEvent, &mut Window, &mut gpui_kit::App) + 'static {
-        Diffui::listen(cx, move |this, _, _, cx| {
-            this.menu_on_scrim_release(button, cx)
-        })
+        Diffui::listen(cx, move |this, _, _, _| this.menu_on_scrim_release(button))
     }
     let mut layer = div()
         .id("menu-overlay")
         .absolute()
         .inset_0()
         .occlude()
-        .on_any_mouse_down(Diffui::listen(cx, |this, _, _, cx| {
-            this.menu_on_dismiss(cx)
-        }))
+        .on_any_mouse_down(Diffui::listen(cx, |this, _, _, _| this.menu_on_dismiss()))
         .on_mouse_up(MouseButton::Left, release(MouseButton::Left, cx))
         .on_mouse_up(MouseButton::Right, release(MouseButton::Right, cx))
-        .on_mouse_move(Diffui::listen(cx, |this, event: &MouseMoveEvent, _, cx| {
-            this.menu_on_mouse_moved(event.position.into(), cx)
+        .on_mouse_move(Diffui::listen(cx, |this, event: &MouseMoveEvent, _, _| {
+            this.menu_on_mouse_moved(event.position.into())
         }))
         .on_scroll(|_, _, cx| cx.stop_propagation());
 
@@ -748,8 +744,8 @@ fn build_card(
     let scrolled = handle.clone();
     // Out to the card's right edge, like every scroll view's bar; the card's right
     // inset moves inside the list.
-    card.on_scroll(Diffui::listen(cx, move |this, _: &ScrollEvent, _, cx| {
-        this.menu_on_card_scrolled(depth, -f32::from(scrolled.offset().y), cx)
+    card.on_scroll(Diffui::listen(cx, move |this, _: &ScrollEvent, _, _| {
+        this.menu_on_card_scrolled(depth, -f32::from(scrolled.offset().y))
     }))
     .child(
         div()
@@ -893,9 +889,9 @@ fn build_row(
         // looks identical across every list overlay.
         .when(active, |row| row.bg(theme.selected_file))
         .child(inner)
-        .on_hover(Diffui::listen(cx, move |this, entered: &bool, _, cx| {
+        .on_hover(Diffui::listen(cx, move |this, entered: &bool, _, _| {
             if *entered {
-                this.menu_on_hover(hover_path.clone(), cx);
+                this.menu_on_hover(hover_path.clone());
             }
         }))
         .on_mouse_up(MouseButton::Left, pick(path.clone(), MouseButton::Left, cx))

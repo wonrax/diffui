@@ -124,7 +124,7 @@ impl Diffui {
             RangeAction::SinceTrunk { target, symbol } => {
                 self.active_mut().revision_multi_selection.clear();
                 let effects = self.active_mut().session.diff_since(TRUNK, target, symbol);
-                self.run_effects(tab, effects, cx)
+                self.run_effects(tab, effects)
             }
             RangeAction::Edit => {
                 let Some(mode) = mode(self) else {
@@ -138,7 +138,7 @@ impl Diffui {
 
     /// The marked rows changed by a ⇧- or ⌘-click: a ⇧-click span shows
     /// them as one diff; a ⌘-click reshapes a span already on screen.
-    pub(crate) fn sync_span(&mut self, started_by_shift: bool, cx: &mut Cx) {
+    pub(crate) fn sync_span(&mut self, started_by_shift: bool) {
         let Some(tab) = self.active_tab_id() else {
             return;
         };
@@ -155,7 +155,7 @@ impl Diffui {
             .map(|hex| state.session.canonical_selection(hex))
             .collect();
         let effects = self.active_mut().session.diff_span(&marked);
-        self.run_effects(tab, effects, cx)
+        self.run_effects(tab, effects)
     }
 }
 

@@ -13,9 +13,8 @@ use crate::commands::{CommandArg, CommandId, REGISTRY};
 impl Diffui {
     /// A menu-bar pick: `tag` is the command's position in the registry.
     pub(crate) fn on_menu_bar_pick(&mut self, tag: u32, cx: &mut Cx) {
-        match REGISTRY.get(tag as usize) {
-            Some(command) => self.run_command(command.id, CommandArg::None, cx),
-            None => {}
+        if let Some(command) = REGISTRY.get(tag as usize) {
+            self.run_command(command.id, CommandArg::None, cx)
         }
     }
 }
@@ -58,6 +57,7 @@ pub(crate) fn install(ui: &Diffui) {
 /// Tell the menu bar which of its commands can't run in the state `ui` is in
 /// now, so their items are greyed when a menu opens. Cheap enough to run
 /// after every update: a predicate per bar command, no repository reads.
+#[cfg_attr(test, allow(unused_variables))]
 pub(crate) fn refresh_availability(ui: &Diffui) {
     #[cfg(all(target_os = "macos", not(test)))]
     {
@@ -79,7 +79,7 @@ pub(crate) fn refresh_availability(ui: &Diffui) {
 /// Open `config.toml` in the user's text editor, creating it (with a pointer
 /// to what can go in it) when there isn't one yet. Behind Settings… in the
 /// app menu and "Open settings file" in the palette.
-pub(crate) fn open_config_file(cx: &mut Cx) {
+pub(crate) fn open_config_file() {
     let Some(path) = crate::config::config_path() else {
         return;
     };
@@ -124,6 +124,8 @@ fn tag_of(id: CommandId) -> Option<u32> {
 }
 
 #[cfg(target_os = "macos")]
+// Tests never install the bar, so nothing there asks for its tags.
+#[cfg_attr(test, allow(dead_code))]
 mod mac {
     use objc2::sel;
 

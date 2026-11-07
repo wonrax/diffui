@@ -203,11 +203,7 @@ pub(crate) fn load_error(ui: &Diffui, theme: ThemeSpec, error: &str, cx: &mut Cx
 }
 
 /// A strip over the diff saying so, when [`selection_outside_view`].
-pub(crate) fn outside_view_banner(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    cx: &mut Cx,
-) -> Option<AnyElement> {
+pub(crate) fn outside_view_banner(ui: &Diffui, theme: ThemeSpec) -> Option<AnyElement> {
     if !selection_outside_view(ui) {
         return None;
     }

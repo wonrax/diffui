@@ -125,10 +125,8 @@ pub(crate) fn description(
     theme: ThemeSpec,
 ) -> ellipsis::Line<'static> {
     let mono = ui.config.mono_font;
-    let id_size = (size * typography::FontMetrics::of(font).cap_height
-        / typography::FontMetrics::of(mono).cap_height)
-        .min(size);
-    // One rich text, so the mono ids sit on the prose's baseline.
+    // One rich text, so the mono ids sit on the prose's baseline. GPUI sizes a line as
+    // a whole, so ids stay at the line's size rather than matching its cap height.
     let mut spans = Vec::new();
     for (index, part) in split_ids(description).into_iter().enumerate() {
         if index > 0 {

@@ -839,14 +839,11 @@ impl Diffui {
                 let Some((revision, selection)) = self.current_selection() else {
                     return;
                 };
-                self.start_changes_op(
-                    MutationOp::SquashChanges {
-                        from: revision,
-                        selection,
-                        into: SquashTarget::Parent,
-                    },
-                    cx,
-                )
+                self.start_changes_op(MutationOp::SquashChanges {
+                    from: revision,
+                    selection,
+                    into: SquashTarget::Parent,
+                })
             }
             ChangesMsg::MoveInto => {
                 let Some((revision, selection)) = self.current_selection() else {
@@ -858,7 +855,7 @@ impl Diffui {
                 let Some((revision, selection)) = self.current_selection() else {
                     return;
                 };
-                self.confirm_discard(revision, selection, cx)
+                self.confirm_discard(revision, selection)
             }
             ChangesMsg::OpenSplit => {
                 let Some((revision, selection)) = self.current_selection() else {
@@ -892,22 +889,19 @@ impl Diffui {
                 let first = stored_description(&prompt.first);
                 let first_description =
                     (first != stored_description(&prompt.original)).then_some(first);
-                self.start_changes_op(
-                    MutationOp::Split {
-                        target: prompt.revision,
-                        selection: prompt.selection,
-                        first_description,
-                        second_description: stored_description(&prompt.second),
-                    },
-                    cx,
-                )
+                self.start_changes_op(MutationOp::Split {
+                    target: prompt.revision,
+                    selection: prompt.selection,
+                    first_description,
+                    second_description: stored_description(&prompt.second),
+                })
             }
             ChangesMsg::RestoreFile(path) => {
                 if !editable(self.active()) {
                     return;
                 }
                 let revision = self.active().session.selected_revision.clone();
-                self.confirm_discard(revision, whole_file(&path), cx)
+                self.confirm_discard(revision, whole_file(&path))
             }
             ChangesMsg::MoveFile(path) => {
                 if !editable(self.active()) {
@@ -1139,12 +1133,7 @@ impl Diffui {
     }
 
     /// Discarding destroys changes: ask first, and say how to get them back.
-    fn confirm_discard(
-        &mut self,
-        revision: RevisionSelection,
-        selection: DiffSelection,
-        cx: &mut Cx,
-    ) {
+    fn confirm_discard(&mut self, revision: RevisionSelection, selection: DiffSelection) {
         let Some(tab_id) = self.active_tab_id() else {
             return;
         };
@@ -1178,11 +1167,11 @@ impl Diffui {
     }
 
     /// Run a partial-change op on the active tab, dropping the pick it used.
-    pub(crate) fn start_changes_op(&mut self, op: MutationOp, cx: &mut Cx) {
+    pub(crate) fn start_changes_op(&mut self, op: MutationOp) {
         let state = self.active_mut();
         state.changes.picks.clear();
         state.changes.split = None;
-        self.start_mutation_op(op, cx)
+        self.start_mutation_op(op)
     }
 }
 

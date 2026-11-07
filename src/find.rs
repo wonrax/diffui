@@ -269,8 +269,8 @@ pub(crate) fn build_overlay(
     )
     .on_click(Diffui::listen(
         cx,
-        |this, _: &gpui_kit::ClickEvent, _, cx| {
-            this.find_on_toggle_case(cx);
+        |this, _: &gpui_kit::ClickEvent, _, _| {
+            this.find_on_toggle_case();
         },
     ));
     let regex_button = toggle_button(
@@ -283,8 +283,8 @@ pub(crate) fn build_overlay(
     )
     .on_click(Diffui::listen(
         cx,
-        |this, _: &gpui_kit::ClickEvent, _, cx| {
-            this.find_on_toggle_regex(cx);
+        |this, _: &gpui_kit::ClickEvent, _, _| {
+            this.find_on_toggle_regex();
         },
     ));
 

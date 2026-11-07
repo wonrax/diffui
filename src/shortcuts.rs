@@ -163,7 +163,7 @@ fn label(id: CommandId) -> String {
 }
 
 impl Diffui {
-    pub(crate) fn toggle_shortcuts(&mut self, cx: &mut Cx) {
+    pub(crate) fn toggle_shortcuts(&mut self) {
         if self.pop_mode(ModeKind::Shortcuts).is_none() {
             // It replaces the transient overlays rather than stacking over
             // them: they share one keyboard.

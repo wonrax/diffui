@@ -7,8 +7,7 @@
 //! element then flushes the plan in paint with no document in sight.
 //!
 //! Order matters and it's simply call order: GPUI stacks primitives as they arrive,
-//! so what iced needed layers for (sticky header over text, scrollbar over that) is
-//! just drawing later.
+//! so a sticky header over text and a scrollbar over that is just drawing later.
 
 use std::cell::RefCell;
 use std::collections::HashMap;

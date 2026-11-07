@@ -61,9 +61,7 @@ impl Diffui {
         field.checked = None;
         field.version = field.version.wrapping_add(1);
         let version = field.version;
-        Diffui::after(SETTLE, cx, move |this, cx| {
-            this.settle_revset_field(version, cx)
-        });
+        Diffui::after(SETTLE, cx, move |this, _| this.settle_revset_field(version));
     }
 
     fn refresh_revset_field(&mut self, cursor: usize) {
@@ -83,7 +81,7 @@ impl Diffui {
     }
 
     /// Typing paused: ask jj whether the revset holds up.
-    pub(crate) fn settle_revset_field(&mut self, version: u64, cx: &mut Cx) {
+    pub(crate) fn settle_revset_field(&mut self, version: u64) {
         let Some(tab) = self.active_tab_id() else {
             return;
         };
@@ -104,7 +102,7 @@ impl Diffui {
         let (job, effects) = state.session.resolve_revset(RevsetQuery::new(&value));
         state.cmdline.field.job = Some(job);
         state.jobs.revset_field = Some(job);
-        self.run_effects(tab, effects, cx)
+        self.run_effects(tab, effects)
     }
 
     pub(crate) fn revset_field_resolved(
@@ -112,7 +110,6 @@ impl Diffui {
         tab: TabId,
         revset: &str,
         result: Result<RevsetMatch, RevsetError>,
-        cx: &mut Cx,
     ) {
         let Some(state) = self.tab_mut(tab) else {
             return;
@@ -161,11 +158,18 @@ impl Diffui {
             return None;
         }
         match key.as_ref() {
-            keyboard::Key::Named(Named::ArrowDown) => Some(self.move_revset_field(1, cx)),
-            keyboard::Key::Named(Named::ArrowUp) => Some(self.move_revset_field(-1, cx)),
+            keyboard::Key::Named(Named::ArrowDown) => {
+                self.move_revset_field(1);
+                Some(())
+            }
+            keyboard::Key::Named(Named::ArrowUp) => {
+                self.move_revset_field(-1);
+                Some(())
+            }
             keyboard::Key::Named(Named::Tab) => {
                 let index = self.active().cmdline.field.selected;
-                Some(self.accept_revset_field(index, cx))
+                self.accept_revset_field(index, cx);
+                Some(())
             }
             keyboard::Key::Named(Named::Escape) => {
                 self.close_revset_field();
@@ -175,7 +179,7 @@ impl Diffui {
         }
     }
 
-    fn move_revset_field(&mut self, delta: i32, cx: &mut Cx) {
+    fn move_revset_field(&mut self, delta: i32) {
         let field = &mut self.active_mut().cmdline.field;
         if field.completions.is_empty() {
             return;
@@ -201,9 +205,7 @@ impl Diffui {
         {
             crate::input::focus(crate::sidebar::REVSET_INPUT_ID, cx);
             place_caret(crate::sidebar::REVSET_INPUT_ID, &value, cursor, cx);
-            Diffui::after(SETTLE, cx, move |this, cx| {
-                this.settle_revset_field(version, cx)
-            });
+            Diffui::after(SETTLE, cx, move |this, _| this.settle_revset_field(version));
         }
     }
 
@@ -223,10 +225,10 @@ impl Diffui {
         // is explained by the field, under it, as soon as it is run.
         if self.active().cmdline.field.checked.as_deref() != Some(revset.as_str()) {
             let version = self.active().cmdline.field.version;
-            self.settle_revset_field(version, cx);
+            self.settle_revset_field(version);
         }
         {
-            self.evaluate_revset(cx);
+            self.evaluate_revset();
         }
     }
 
@@ -402,7 +404,7 @@ pub(crate) fn dropdown(
                 .on_mouse_move(
                     cx.listener(move |this: &mut Diffui, _: &MouseMoveEvent, _, cx| {
                         if this.active().cmdline.field.selected != index {
-                            this.act(cx, |this, cx| this.cmd_on_field_select(index, cx));
+                            this.act(cx, |this, _| this.cmd_on_field_select(index));
                         }
                     }),
                 )

@@ -1,9 +1,3 @@
-// The port's lanes fill the views in; until they land, a lot of state and
-// plumbing here is written ahead of its reader. Remove these with the last stub.
-#![allow(dead_code, unused_variables)]
-// `Option<()>` means "handled", and most update code now returns `()`.
-#![allow(clippy::unit_arg, clippy::single_match)]
-
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
@@ -38,7 +32,10 @@ mod jj_version;
 mod keymap;
 mod launch_env;
 mod logging;
+// Under test `menus::run_popup` stands in for the tracking loop and no bar goes up, so
+// the AppKit side has no callers.
 #[cfg(target_os = "macos")]
+#[cfg_attr(test, allow(dead_code))]
 mod macos_native;
 mod media;
 mod menu;
@@ -49,6 +46,10 @@ mod modes;
 #[cfg(test)]
 mod overlay_scenes;
 mod palette;
+#[cfg(test)]
+mod pane_scenes;
+#[cfg(test)]
+mod panels_scenes;
 mod path_browse;
 mod plan;
 mod range;
@@ -57,13 +58,11 @@ mod revops;
 mod revset_assist;
 mod root;
 #[cfg(test)]
-mod panels_scenes;
-mod seam;
+mod scene_suite;
 mod shortcuts;
 mod sidebar;
 mod source_panel;
 mod spawn;
-mod stub;
 mod tab_bar;
 mod tabs;
 mod toolbar;
@@ -295,9 +294,8 @@ pub(crate) struct Diffui {
     pub(crate) media: media::MediaCache,
     /// View-time memo for the file list's stat-column widths and flattened file
     /// tree, keyed on document identity. Without it, the sidebar re-shaped ~5·N
-    /// strings through `cosmic_text` on every diff-scroll file-boundary crossing
-    /// (each crossing publishes `SelectFile`, which forces a full `view()`
-    /// rebuild) and tanked the frame rate on large PRs. Interior-mutable because
+    /// strings on every diff-scroll file-boundary crossing
+    /// (each crossing publishes `SelectFile`, which forces a full rebuild) and tanked the frame rate on large PRs. Interior-mutable because
     /// `view()` only has `&self`; global rather than per-tab since every cache
     /// key carries `document_id`, which is unique across tabs — a switch is
     /// already a miss.
@@ -408,8 +406,13 @@ pub(crate) struct Diffui {
     /// The window this view lives in, once it has one. Update code holds no
     /// `Window`; see [`Diffui::with_window`].
     pub(crate) window: Option<gpui_kit::AnyWindowHandle>,
-    /// The loops that stand in for iced's subscriptions.
+    /// The loops that run while their condition holds.
     pub(crate) background: root::Background,
+    /// The window's regions as cached views, once it has a window.
+    pub(crate) panes: Option<root::Panes>,
+    /// How many times the root has rendered.
+    #[cfg(test)]
+    pub(crate) renders: usize,
 }
 
 /// Frontend wrapper around the core [`diffui_core::OpDraft`]: the draft
@@ -609,8 +612,8 @@ pub(crate) struct SourceState {
     pub(crate) reveal_pending: bool,
 }
 
-/// Which toolbar dropdown is open. Both render as iced overlays anchored near
-/// their trigger.
+/// Which toolbar dropdown is open. Off macOS both render as overlays anchored
+/// near their trigger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolbarMenu {
     /// The fetch split-button's caret: one row per known remote branch.
@@ -627,7 +630,6 @@ pub(crate) enum ToolbarMenu {
 pub(crate) enum HoverTarget {
     /// The Fetch split button's caret half (the main half uses `button`'s own
     /// hover state; only the `mouse_area` caret needs manual tracking).
-    FetchCaret,
     RevsetCaret,
     /// A title-bar tab, keyed by id — drives its inset hover fill. At most one is
     /// hovered at a time.
@@ -840,7 +842,7 @@ fn default_revset(repository: &Repository) -> String {
 /// Revset presets for the caret menu, as `(label, expression)`. jj uses
 /// revset functions and can be configured with `[[revset_presets]]` (see
 /// [`config`]); git uses `git log` revision-range shortcuts. Shared by the
-/// native macOS menu and the iced fallback so they stay in sync.
+/// native macOS menu and the overlay fallback so they stay in sync.
 pub(crate) fn revset_presets(vcs: Option<Vcs>) -> Vec<(String, String)> {
     let builtin: &[(&str, &str)] = match vcs {
         Some(Vcs::Git) => &[("All branches", "--all"), ("Current", "HEAD")],

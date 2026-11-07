@@ -2,7 +2,7 @@
 //!
 //! This crate owns the jj/git diffing, the commit graph, and — as the
 //! extraction proceeds — the diff data model and a `Session` orchestration
-//! engine. It has **no `iced` dependency**, so alternative frontends
+//! engine. It has **no UI dependency**, so alternative frontends
 //! (electron, swiftui, web, …) can build on it.
 
 pub mod askpass;

@@ -452,27 +452,21 @@ impl Diffui {
         if (command.enabled)(self, &arg).is_err() {
             return;
         }
-        match (command.build)(self, arg) {
-            Some(action) => self.perform(action, cx),
-            None => {}
+        if let Some(action) = (command.build)(self, arg) {
+            self.perform(action, cx)
         }
     }
 
     /// Wrap `op` in an activity and send it to the repository actor. Every
     /// mutation entry point — context menu, target-mode confirm, drag & drop —
     /// funnels through here so labels and guards can't drift apart.
-    pub(crate) fn start_mutation_op(&mut self, op: mutations::MutationOp, cx: &mut Cx) {
-        self.start_mutation(op, false, cx)
+    pub(crate) fn start_mutation_op(&mut self, op: mutations::MutationOp) {
+        self.start_mutation(op, false)
     }
 
     /// [`Self::start_mutation_op`], where `allow_backwards` is a typed
     /// `--allow-backwards`: a bookmark move then runs without asking first.
-    pub(crate) fn start_mutation(
-        &mut self,
-        op: mutations::MutationOp,
-        allow_backwards: bool,
-        cx: &mut Cx,
-    ) {
+    pub(crate) fn start_mutation(&mut self, op: mutations::MutationOp, allow_backwards: bool) {
         use mutations::MutationOp;
         let Some(tab_id) = self.active_tab_id() else {
             return;
@@ -599,19 +593,19 @@ impl Diffui {
             };
             let (job, effects) = state.session.bookmark_check(name, to);
             state.jobs.bookmark_check = Some((job, pending));
-            return self.run_effects(tab_id, effects, cx);
+            return self.run_effects(tab_id, effects);
         }
-        self.run_mutation_checking_wc_push(pending, cx)
+        self.run_mutation_checking_wc_push(pending)
     }
 
     /// Raise a confirmation for `op` and run it on accept. Only abandon asks
     /// today (reached from a single key or the palette); anything else runs
     /// straight away. The activity row is opened now and sits queued, so a
     /// cancel resolves it the same way the other confirmations do.
-    pub(crate) fn confirm_mutation_op(&mut self, op: mutations::MutationOp, cx: &mut Cx) {
+    pub(crate) fn confirm_mutation_op(&mut self, op: mutations::MutationOp) {
         use mutations::MutationOp;
         let MutationOp::Abandon { targets } = &op else {
-            return self.start_mutation_op(op, cx);
+            return self.start_mutation_op(op);
         };
         let Some(tab_id) = self.active_tab_id() else {
             return;

@@ -191,7 +191,7 @@ fn presets_caret(
         menu,
     } = caret;
     let on_hover = cx.listener(move |this: &mut Diffui, hovering: &bool, _, cx| {
-        this.on_set_hover(hovering.then_some(target), cx);
+        this.on_set_hover(hovering.then_some(target));
         cx.notify();
     });
     let on_press = Diffui::listen(cx, move |this, _: &gpui_kit::MouseDownEvent, _, cx| {
