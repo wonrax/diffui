@@ -422,6 +422,7 @@ pub(crate) mod tests {
             sidebar_min_width: 0.0,
             window_size: Size::new(1280.0, 800.0),
             window_position: None,
+            window_display: None,
             geometry_dirty_since: None,
             config: AppConfig {
                 ui_font: crate::theme::Font::DEFAULT,

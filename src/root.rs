@@ -64,6 +64,8 @@ impl std::fmt::Debug for Background {
 /// interception. Tests and the harness run this too.
 pub(crate) fn init(cx: &mut App) {
     gpui_kit::init(cx);
+    #[cfg(target_os = "macos")]
+    bind_cocoa_text_keys(cx);
     measure::install(cx.text_system().clone());
     icons::register(cx);
     init_keys(cx);
@@ -90,11 +92,14 @@ fn init_keys(cx: &mut App) {
         let keystroke = &event.keystroke;
         let key = keys::Key::from_keystroke(keystroke);
         let modifiers = keys::Modifiers::from(keystroke.modifiers);
-        let consumed = crate::input::field_takes_key(window, &key, modifiers, cx);
-        // Esc always lets go of a field, whoever else it means something to. Before
-        // the keymap, so a mode that hands focus on (a palette column) wins.
+        let mut consumed = crate::input::field_takes_key(window, &key, modifiers, cx);
+        // Esc always lets go of a field. Before the keymap, so a mode that hands
+        // focus on (a palette column) wins. That counts as using the key, so in the
+        // contexts `needs_unconsumed` holds back it clears nothing else; the overlays
+        // aren't among them, and close on the same press.
         if key == keys::Key::Named(keys::Named::Escape) && crate::input::input_has_focus(window) {
             window.blur(cx);
+            consumed = true;
         }
         let taken = app.update(cx, |app, cx| {
             app.modifiers = modifiers;
@@ -117,6 +122,42 @@ fn init_keys(cx: &mut App) {
     .detach();
 }
 
+/// What [`keys::cocoa_text_key`] names, on the actions kit's inputs run. Kit binds
+/// only ⌃A and ⌃E, and GPUI drops the selector AppKit answers the rest with.
+#[cfg(target_os = "macos")]
+fn bind_cocoa_text_keys(cx: &mut App) {
+    use gpui_kit::KeyBinding;
+    use gpui_kit::base::actions::{SelectDown, SelectLeft, SelectRight, SelectUp};
+    use gpui_kit::base::input::{
+        Backspace, Delete, DeleteToEndOfLine, MoveDown, MoveLeft, MoveRight, MoveUp,
+    };
+    const INPUT: Option<&str> = Some("Input");
+    cx.bind_keys([
+        KeyBinding::new("ctrl-b", MoveLeft, INPUT),
+        KeyBinding::new("ctrl-f", MoveRight, INPUT),
+        KeyBinding::new("ctrl-n", MoveDown, INPUT),
+        KeyBinding::new("ctrl-p", MoveUp, INPUT),
+        KeyBinding::new("ctrl-shift-b", SelectLeft, INPUT),
+        KeyBinding::new("ctrl-shift-f", SelectRight, INPUT),
+        KeyBinding::new("ctrl-shift-n", SelectDown, INPUT),
+        KeyBinding::new("ctrl-shift-p", SelectUp, INPUT),
+        KeyBinding::new("ctrl-h", Backspace, INPUT),
+        KeyBinding::new("ctrl-d", Delete, INPUT),
+        KeyBinding::new("ctrl-k", DeleteToEndOfLine, INPUT),
+    ]);
+}
+
+/// The display a window's position is relative to. On macOS `Window::bounds` is
+/// relative to the window's current screen and GPUI reports no screen origins, so
+/// the position only means something alongside this.
+fn window_display(window: &Window, cx: &App) -> Option<String> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let uuid = window.display(cx)?.uuid().ok()?;
+    Some(uuid.to_string())
+}
+
 /// Where the key interceptor finds the app.
 struct RootView(gpui_kit::WeakEntity<Diffui>);
 
@@ -131,7 +172,18 @@ pub(crate) fn open_window(cli: Cli, saved: WindowState, cx: &mut App) -> anyhow:
             crate::DEFAULT_WINDOW_SIZE.width,
             crate::DEFAULT_WINDOW_SIZE.height,
         ));
-    let bounds = match saved.position() {
+    let displays = cx.displays();
+    let display = saved.display.as_deref().and_then(|saved| {
+        displays
+            .iter()
+            .find(|display| display.uuid().is_ok_and(|uuid| uuid.to_string() == saved))
+    });
+    // A position on a display that has since been unplugged means nothing on the
+    // others: leave the window to open centered.
+    let position = saved
+        .position()
+        .filter(|_| saved.display.is_none() || display.is_some());
+    let bounds = match position {
         Some((x, y)) => Bounds::new(
             point(px(x), px(y)),
             size(px(window_size.0), px(window_size.1)),
@@ -140,6 +192,7 @@ pub(crate) fn open_window(cli: Cli, saved: WindowState, cx: &mut App) -> anyhow:
     };
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
+        display_id: display.map(|display| display.id()),
         titlebar: Some(chrome::titlebar_options()),
         // The strip draws the title bar and moves the window itself (see
         // `tab_bar`). Left to AppKit, a press-drag on a tab would move the window
@@ -297,15 +350,17 @@ impl Diffui {
     pub(crate) fn attach_window(&mut self, window: &mut Window, cx: &mut Cx) {
         self.window = Some(window.window_handle());
         let bounds = window.bounds();
+        self.window_display = window_display(window, cx);
         self.on_window_opened(Some(bounds.origin.into()), bounds.size.into());
         self.apply_theme(cx);
 
         let subscriptions = vec![
             cx.observe_window_bounds(window, |this, window, cx| {
                 let bounds = window.bounds();
+                let display = window_display(window, cx);
                 this.act(cx, |this, _| {
                     this.on_window_resized(bounds.size.into());
-                    this.on_window_moved(bounds.origin.into());
+                    this.on_window_moved(bounds.origin.into(), display);
                 });
             }),
             cx.observe_window_activation(window, |this, window, cx| {
@@ -449,6 +504,26 @@ impl Diffui {
             .text_color(theme.text)
             .font(self.config.ui_font.gpui())
             .line_height(relative(crate::typography::DEFAULT_LINE_HEIGHT))
+            // In the capture phase, so a surface that stops the press still counts,
+            // and a field pressed on next can take focus after this lets go.
+            .child(
+                gpui_kit::canvas(
+                    |_, _, _| {},
+                    |_, _, window, _| {
+                        window.on_mouse_event(
+                            |event: &gpui_kit::MouseDownEvent, phase, window, cx| {
+                                if phase == gpui_kit::DispatchPhase::Capture
+                                    && event.button == gpui_kit::MouseButton::Left
+                                {
+                                    crate::input::blur_on_press_outside(event.position, window, cx);
+                                }
+                            },
+                        );
+                    },
+                )
+                .absolute()
+                .size_0(),
+            )
             // Live modifier state, for pointer gestures to read at decision time
             // (⌥-drop = rebase with descendants). Nothing on screen depends on it,
             // so this skips `act`.

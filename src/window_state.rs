@@ -42,6 +42,11 @@ pub struct WindowState {
     pub x: Option<f32>,
     #[serde(default)]
     pub y: Option<f32>,
+    /// The display `x` and `y` are relative to, by UUID, on platforms that report
+    /// a window's position per display. `None` means the primary one, or global
+    /// coordinates where that's what the platform reports.
+    #[serde(default)]
+    pub display: Option<String>,
     #[serde(default)]
     pub sidebar_width: Option<f32>,
     /// Last expanded width of the changed-files tree.
@@ -289,6 +294,7 @@ mod tests {
             height: Some(800.0),
             x: Some(100.0),
             y: Some(50.0),
+            display: Some("37D8832A-2D66-02CA-B9F7-8F30A301B230".to_owned()),
             sidebar_width: Some(280.0),
             file_nav_width: Some(220.0),
             history_panel_collapsed: BTreeMap::from([
@@ -311,6 +317,7 @@ mod tests {
         let parsed: WindowState = toml::from_str(&raw).expect("deserialize");
         assert_eq!(parsed.size(), Some((1200.0, 800.0)));
         assert_eq!(parsed.position(), Some((100.0, 50.0)));
+        assert_eq!(parsed.display, state.display);
         assert_eq!(parsed.sidebar_width, Some(280.0));
         assert_eq!(parsed.file_nav_width, Some(220.0));
         assert_eq!(parsed.history_panel_collapsed.get("/a/repo"), Some(&true));

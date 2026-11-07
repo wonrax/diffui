@@ -52,6 +52,7 @@ impl Diffui {
             (window_size.width - sidebar_width - 2.0).max(diff_panel::MIN_FILE_NAV_WIDTH),
         );
         let window_position = saved.position().map(|(x, y)| Point::new(x, y));
+        let window_display = saved.display.clone();
 
         // Launch precedence: paths named on the command line (`diffui .`,
         // `--path`) win; else restore the last session, plus the current
@@ -230,6 +231,7 @@ impl Diffui {
             sidebar_min_width,
             window_size,
             window_position,
+            window_display,
             geometry_dirty_since: None,
             config,
             keymap,
@@ -1604,9 +1606,10 @@ impl Diffui {
         }
     }
 
-    pub(crate) fn on_window_moved(&mut self, position: Point) {
-        if self.window_position != Some(position) {
+    pub(crate) fn on_window_moved(&mut self, position: Point, display: Option<String>) {
+        if self.window_position != Some(position) || self.window_display != display {
             self.window_position = Some(position);
+            self.window_display = display;
             self.mark_geometry_dirty();
         }
     }
@@ -4406,6 +4409,7 @@ impl Diffui {
             height: Some(self.window_size.height),
             x: self.window_position.map(|p| p.x),
             y: self.window_position.map(|p| p.y),
+            display: self.window_display.clone(),
             sidebar_width: Some(self.sidebar_width),
             file_nav_width: Some(self.file_nav_width),
             diff_wrap: Some(self.diff_wrap),

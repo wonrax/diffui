@@ -34,6 +34,8 @@ mod launch_env;
 mod logging;
 // Under test `menus::run_popup` stands in for the tracking loop and no bar goes up, so
 // the AppKit side has no callers.
+#[cfg(test)]
+mod field_scenes;
 #[cfg(target_os = "macos")]
 #[cfg_attr(test, allow(dead_code))]
 mod macos_native;
@@ -43,8 +45,6 @@ mod menus;
 mod meta_line;
 mod mode_hints;
 mod modes;
-#[cfg(test)]
-mod field_scenes;
 #[cfg(test)]
 mod overlay_scenes;
 mod palette;
@@ -316,6 +316,9 @@ pub(crate) struct Diffui {
     /// doesn't report window positions).
     pub(crate) window_size: Size,
     pub(crate) window_position: Option<Point>,
+    /// The display `window_position` is relative to, where that's how the platform
+    /// reports it.
+    pub(crate) window_display: Option<String>,
     /// Set when the window geometry or sidebar width changes; cleared once the
     /// new value is persisted. While it's `Some`, the subscription runs a
     /// debounce timer whose tick flushes the geometry to disk after the

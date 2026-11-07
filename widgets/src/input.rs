@@ -23,7 +23,9 @@ use gpui_kit::component::input::{
     InputEvent, InputState, TextDecoration, TextDecorationCollection, Textarea, TextareaState,
 };
 use gpui_kit::prelude::*;
-use gpui_kit::{App, Context, Entity, Global, HighlightStyle, Subscription, Window, point, px};
+use gpui_kit::{
+    App, Context, Entity, Global, HighlightStyle, Pixels, Point, Subscription, Window, point, px,
+};
 
 use crate::keys::{Key, Modifiers, Named};
 use crate::theme::{Color, Font};
@@ -98,6 +100,21 @@ pub fn input_has_focus(window: &Window) -> bool {
         .context_stack()
         .iter()
         .any(|context| context.contains("Input"))
+}
+
+/// A left press outside the focused field takes the keyboard from it. GPUI leaves
+/// focus alone on a press elsewhere and kit's buttons deliberately keep it where
+/// it is, so without this the field goes on swallowing the keymap's plain keys.
+pub fn blur_on_press_outside(position: Point<Pixels>, window: &mut Window, cx: &mut App) {
+    let bounds = match window.focused_input(cx) {
+        Some(AnyInputState::Input(state)) => state.read(cx).input_bounds(),
+        Some(AnyInputState::Textarea(state)) => state.read(cx).input_bounds(),
+        Some(AnyInputState::Editor(state)) => state.read(cx).input_bounds(),
+        _ => return,
+    };
+    if !bounds.contains(&position) {
+        window.blur(cx);
+    }
 }
 
 /// Whether a focused text field keeps `key` for itself, which is what the
