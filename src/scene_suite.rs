@@ -541,7 +541,7 @@ fn all() -> Vec<Scene> {
     }).raw());
     t.add(s("toolbar-source-view", "Toolbar in the Source view: view switcher plus the browsed revision's id and description instead of the repo actions.", "Press the Source segment of the view switcher.", |c| { c.cmd("view.source"); }));
     t.add(s("toolbar-plain-git", "A plain git repository: no jj-only actions (no Undo, no Push), revset placeholder and git graph.", "Open a repository that has .git and no .jj.", |_c| {}).prepare(plain_git));
-    t.add(s("load-cold", "A cold load mid-flight: the list growing or 'Loading revisions…', progress line on the toolbar.", "Open a repository and look immediately.", |c| { c.pump_ms(30); }).cold());
+    t.add(s("load-cold", "A cold load mid-flight: the list growing or 'Loading revisions…', progress line on the toolbar.", "Open a repository and look immediately.", |_c| {}).cold());
 
     t.group("Revision list");
     t.add(s("graph-all", "Revset all(): branching graph, merges, the octopus merge, immutable diamonds, conflict marks, bookmarks, tags, remote bookmarks, divergent ids.", "Type all() in the revset field, Enter.", all_revs));
