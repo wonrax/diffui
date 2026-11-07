@@ -11,8 +11,8 @@
 //! Everything lands as an ordinary [`MutationOp`] through the same activity /
 //! immutable-guard pipeline every other mutation uses.
 
-use crate::Cx;
-use gpui_kit::{AnyElement, Window};
+use gpui_kit::prelude::*;
+use gpui_kit::{AnyElement, Window, div, px};
 use std::collections::{BTreeMap, BTreeSet};
 
 use diffui_core::{
@@ -21,12 +21,16 @@ use diffui_core::{
 };
 
 use crate::commands::CommandArg;
+use crate::commit_info::with_tooltip;
 use crate::diff_view::{CheckState, LineAt, LinePress};
 use crate::modes::{ModeKind, TabMode};
 use crate::palette::ResultRef;
 use crate::prose::Prose;
-use crate::theme::ThemeSpec;
-use crate::{ConfirmDialog, Diffui, MainView, PendingMutation, TabState, activity, ui};
+use crate::theme::{self, ThemeSpec, Weight, text_size};
+use crate::typography::{self, Aligned};
+use crate::{
+    Action, ConfirmDialog, Cx, Diffui, MainView, PendingMutation, TabState, activity, icons, ui,
+};
 
 /// A change-selection intent or event.
 #[derive(Debug, Clone)]
@@ -165,6 +169,14 @@ pub(crate) struct ChangesState {
     picks: BTreeMap<String, Pick>,
     split: Option<SplitPrompt>,
     pub(crate) conflicts: crate::conflicts::ConflictsState,
+}
+
+#[cfg(test)]
+impl ChangesState {
+    /// The first description as the split prompt holds it.
+    pub(crate) fn split_first(&self) -> Option<&str> {
+        self.split.as_ref().map(|prompt| prompt.first.as_str())
+    }
 }
 
 impl ChangesState {
@@ -1096,6 +1108,7 @@ fn picked_prose(selection: &DiffSelection) -> Prose {
 }
 
 pub(crate) const SPLIT_FIRST_EDITOR_ID: &str = "split-first-description";
+const SPLIT_SECOND_EDITOR_ID: &str = "split-second-description";
 const SPLIT_WIDTH: f32 = 560.0;
 
 /// Whether the split prompt is up, and so owns the keyboard and pointer.
@@ -1122,26 +1135,299 @@ const SPLIT_CHROME_HEIGHT: f32 = 2.0 * ui::DIALOG_PADDING
     + 3.0 * ui::DIALOG_SPACING
     + crate::theme::space::XXL;
 
-/// Stub: the changes view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+/// The strip docked under the diff while anything is picked or lines are
+/// being selected: what is picked, the actions on it, and the way out of
+/// line-select mode. It takes layout space, so it never covers code.
 pub(crate) fn selection_bar(
     ui: &Diffui,
     theme: ThemeSpec,
-    window: &mut Window,
+    _window: &mut Window,
     cx: &mut Cx,
 ) -> Option<AnyElement> {
-    None
+    let tab = ui.active();
+    if !editable(tab) || split_prompt_shown(ui).is_some() {
+        return None;
+    }
+    let selection = selection_of(tab);
+    let selecting = live_line_select(tab).is_some();
+    if selection.is_empty() && !selecting {
+        return None;
+    }
+    let font = ui.config.ui_font;
+    let mono = ui.config.mono_font;
+    let medium = theme::emphasis_font(font, Weight::MEDIUM);
+    let prose = |prose: Prose, color| {
+        Aligned::text(
+            div()
+                .whitespace_nowrap()
+                .text_size(px(text_size::UI))
+                .child(prose.view(font, mono, color, theme)),
+            font,
+            text_size::UI,
+        )
+    };
+
+    let picked = picked_prose(&selection);
+    // The icon centres on the caps and the runs share a baseline (see
+    // `crate::typography`).
+    let (lead_text, lead_icon): (Vec<Aligned>, _) = if selecting {
+        let status = if selection.is_empty() {
+            Prose::from("Nothing selected yet")
+        } else {
+            picked
+        };
+        (
+            vec![
+                Aligned::text(
+                    typography::line("Selecting lines", medium, text_size::UI, theme.text),
+                    medium,
+                    text_size::UI,
+                ),
+                Aligned::gap(theme::space::MD),
+                prose(status, theme.muted_text),
+            ],
+            icons::LIST_CHECKS,
+        )
+    } else {
+        (
+            vec![prose(picked.text(" selected"), theme.text)],
+            icons::CHECK,
+        )
+    };
+    let mut lead_items = vec![
+        Aligned::glyph(
+            icons::icon(lead_icon, ui::ICON_SIZE, theme.info),
+            ui::ICON_SIZE,
+        ),
+        Aligned::gap(theme::space::SM),
+    ];
+    lead_items.extend(lead_text);
+    let lead = typography::baseline_row(lead_items, 0.0);
+
+    let mut labels: Vec<(&'static str, &'static str, ChangesMsg, ui::Variant)> = Vec::new();
+    if !selection.is_empty() {
+        labels.extend([
+            (
+                "picks-clear",
+                "Clear",
+                ChangesMsg::Clear,
+                ui::Variant::Ghost,
+            ),
+            (
+                "picks-split",
+                "Split\u{2026}",
+                ChangesMsg::OpenSplit,
+                ui::Variant::Raised,
+            ),
+            (
+                "picks-squash",
+                "Squash into parent",
+                ChangesMsg::SquashIntoParent,
+                ui::Variant::Raised,
+            ),
+            (
+                "picks-move",
+                "Move into\u{2026}",
+                ChangesMsg::MoveInto,
+                ui::Variant::Raised,
+            ),
+            (
+                "picks-discard",
+                "Discard\u{2026}",
+                ChangesMsg::Discard,
+                ui::Variant::Raised,
+            ),
+        ]);
+    }
+    if selecting {
+        labels.push((
+            "lines-done",
+            "Done",
+            ChangesMsg::Lines(LineMsg::Exit),
+            ui::Variant::Primary,
+        ));
+    }
+    // Whether the summary and every button share one line in this pane.
+    let buttons_width: f32 = labels
+        .iter()
+        .map(|(_, label, _, _)| {
+            crate::measure::line_width(label, text_size::UI, font) + 2.0 * ui::Size::Compact.pad_x()
+        })
+        .sum::<f32>()
+        + ui::BUTTON_GAP * labels.len() as f32;
+    let lead_width = ui::ICON_SIZE
+        + theme::space::SM
+        + crate::measure::line_width(
+            &format!("Selecting lines  {} selected", selection.summary()),
+            text_size::UI,
+            font,
+        );
+    let one_line = lead_width + buttons_width + 2.0 * crate::diff_view::HEADER_HORIZONTAL_PADDING
+        <= crate::diff_panel::diff_pane_width(ui);
+    let buttons = labels
+        .iter()
+        .map(|(id, label, msg, variant)| {
+            ui::text_button(
+                *id,
+                None,
+                *label,
+                *variant,
+                ui::Size::Compact,
+                font,
+                theme,
+                cx,
+            )
+            .on_click(Diffui::on_action(Action::Changes(msg.clone()), cx))
+            .into_any_element()
+        })
+        .collect::<Vec<_>>();
+    // Line selection's keys are in the hint strip docked under this one
+    // (see `crate::mode_hints`).
+    let strip = div().flex().flex_col().gap(px(theme::space::SM)).w_full();
+    let strip = if one_line {
+        strip.child(ui::button_row(Some(lead.into_any_element()), buttons))
+    } else {
+        strip
+            .child(lead.overflow_hidden())
+            // A pane narrower than the buttons wraps them rather than cut one off.
+            .child(ui::button_row(None, buttons).flex_wrap())
+    };
+    Some(
+        div()
+            .w_full()
+            .flex_none()
+            .py(px(theme::space::MD))
+            .px(px(crate::diff_view::HEADER_HORIZONTAL_PADDING))
+            .bg(theme.file_header)
+            .border_1()
+            .border_color(theme.border)
+            .child(strip)
+            .into_any_element(),
+    )
 }
 
-/// Stub: the changes view is the lane's to port (see the iced source).
-#[allow(unused_variables)]
+/// The split prompt as a modal: what stays and what moves, the two
+/// descriptions in the app's editor, and the footer. Empty when closed. A
+/// stray click outside doesn't throw the typed descriptions away; Esc and
+/// Cancel do.
 pub(crate) fn split_modal(
     ui: &Diffui,
     theme: ThemeSpec,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    crate::stub::overlay("changes::split_modal", crate::changes::split_shown(ui))
+    let Some(prompt) = split_prompt_shown(ui) else {
+        return div().into_any_element();
+    };
+    let (font, mono) = (ui.config.ui_font, ui.config.mono_font);
+    let label = revision_label(ui.active(), &prompt.revision);
+    let size = ui.config.code_type.size;
+    let width = SPLIT_WIDTH - 2.0 * ui::DIALOG_PADDING;
+    // Two editors share what the window leaves under the card's fixed parts.
+    let max = ((ui.window_size.height - crate::toolbar::modal_top() - SPLIT_CHROME_HEIGHT) / 2.0)
+        .clamp(88.0, crate::input::editor_max_height(ui.window_size.height));
+    let field = |caption: Prose,
+                 content: &str,
+                 id: &'static str,
+                 placeholder: &'static str,
+                 on_edit: fn(String) -> ChangesMsg,
+                 window: &mut Window,
+                 cx: &mut Cx| {
+        let on_input = Diffui::listen(cx, move |this, text: &String, _, cx| {
+            this.on_changes(on_edit(text.clone()), cx);
+        });
+        let spec = crate::input::FieldSpec::new(id, content)
+            .placeholder(placeholder)
+            .on_input(move |text, window, cx| on_input(&text, window, cx));
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(theme::space::SM))
+            .child(div().text_size(px(text_size::UI)).child(caption.view(
+                font,
+                mono,
+                theme.muted_text,
+                theme,
+            )))
+            .child(
+                div()
+                    .w_full()
+                    .h(px(crate::input::fit_height(
+                        content, mono, size, width, 88.0, max,
+                    )))
+                    .bg(theme.panel_background)
+                    .border_1()
+                    .border_color(theme.border)
+                    .rounded(px(theme::radius::CONTROL))
+                    .child(
+                        crate::input::multi_line(spec, mono, window, cx)
+                            .appearance(false)
+                            .text_size(px(size))
+                            .h_full(),
+                    ),
+            )
+    };
+    let first = field(
+        Prose::from("Stays in ").rev(label.clone()),
+        &prompt.first,
+        SPLIT_FIRST_EDITOR_ID,
+        "Description of the changes that stay",
+        ChangesMsg::SplitFirstEdited,
+        window,
+        cx,
+    );
+    let second = field(
+        Prose::from("New change on top"),
+        &prompt.second,
+        SPLIT_SECOND_EDITOR_ID,
+        "Description of the new change (empty is fine)",
+        ChangesMsg::SplitSecondEdited,
+        window,
+        cx,
+    );
+    let cancel = ui::cancel_button("split-cancel", ui::Size::Standard, font, theme, cx).on_click(
+        Diffui::on_action(Action::Changes(ChangesMsg::SplitCancel), cx),
+    );
+    let split = ui::text_button(
+        "split-confirm",
+        None,
+        "Split",
+        ui::Variant::Primary,
+        ui::Size::Standard,
+        font,
+        theme,
+        cx,
+    )
+    .on_click(Diffui::on_action(
+        Action::Changes(ChangesMsg::SplitConfirm),
+        cx,
+    ));
+
+    let card = ui::dialog_card(SPLIT_WIDTH, theme)
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(theme::space::SM))
+                .child(ui::dialog_title(
+                    &Prose::from("Split ").rev(label),
+                    font,
+                    mono,
+                    theme,
+                ))
+                .child(ui::dialog_text(&prompt.summary, font, mono, theme)),
+        )
+        .child(first)
+        .child(second)
+        .child(ui::button_row(
+            None,
+            [
+                with_tooltip("split-cancel-tip", "Esc", font, theme, cancel),
+                with_tooltip("split-confirm-tip", "\u{2318}\u{21b5}", font, theme, split),
+            ],
+        ));
+    ui::modal("split-modal", card, crate::toolbar::modal_top(), |_, _| {}).into_any_element()
 }
 
 #[cfg(test)]
