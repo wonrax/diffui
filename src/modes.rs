@@ -177,8 +177,17 @@ pub(crate) fn needs_unconsumed(context: Context, chord: &Chord) -> bool {
                 && !matches!(chord.key, ChordKey::Named(keyboard::Named::Escape)))
                 || is_text_undo(chord)
         }
+        // ⌘C copies what's selected in the output; only with nothing selected
+        // does it mean the whole output.
+        Context::Output => is_copy(chord),
         _ => false,
     }
+}
+
+fn is_copy(chord: &Chord) -> bool {
+    chord.mods.command
+        && !chord.mods.alt
+        && matches!(&chord.key, ChordKey::Char(c) if c.eq_ignore_ascii_case("c"))
 }
 
 /// ⌃A, ⌃E, ⌃K, …: on macOS a focused text field takes them as caret and
@@ -598,6 +607,12 @@ mod tests {
 
     /// A command bound to ⌃A must not take it from the field moving its caret.
     #[cfg(target_os = "macos")]
+    #[test]
+    fn a_selection_in_the_output_keeps_its_copy() {
+        assert!(needs_unconsumed(Context::Output, &chord("cmd+c")));
+        assert!(!needs_unconsumed(Context::Output, &chord("esc")));
+    }
+
     #[test]
     fn a_focused_input_keeps_its_cocoa_chords() {
         for context in [Context::Base, Context::Palette, Context::Draft] {

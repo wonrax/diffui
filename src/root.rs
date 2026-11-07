@@ -75,10 +75,10 @@ pub(crate) fn init(cx: &mut App) {
 /// action bindings (a focused kit input's Esc, Enter, arrows) ahead of key
 /// listeners, in any phase, and we *must* see Esc even when an input is focused:
 /// the input would take it to clear focus, and the user would have to press Esc
-/// twice, once to unfocus and once to close. `consumed` is derived from whether an
-/// input has the keyboard; that's what keeps the revset box's typing out of the
-/// plain-key bindings. A key the keymap takes stops here; the rest carry on to the
-/// input as usual.
+/// twice, once to unfocus and once to close. `consumed` says the focused input keeps
+/// the key ([`crate::input::field_takes_key`]); that's what keeps the revset box's
+/// typing out of the plain-key bindings while its ↑/↓ still walk the list behind it.
+/// A key the keymap takes stops here; the rest carry on to the input as usual.
 fn init_keys(cx: &mut App) {
     cx.intercept_keystrokes(|event, window, cx| {
         let Some(app) = cx
@@ -90,14 +90,21 @@ fn init_keys(cx: &mut App) {
         let keystroke = &event.keystroke;
         let key = keys::Key::from_keystroke(keystroke);
         let modifiers = keys::Modifiers::from(keystroke.modifiers);
-        let consumed = crate::input::input_has_focus(window);
+        let consumed = crate::input::field_takes_key(window, &key, modifiers, cx);
+        // Esc always lets go of a field, whoever else it means something to. Before
+        // the keymap, so a mode that hands focus on (a palette column) wins.
+        if key == keys::Key::Named(keys::Named::Escape) && crate::input::input_has_focus(window) {
+            window.blur(cx);
+        }
         let taken = app.update(cx, |app, cx| {
             app.modifiers = modifiers;
             app.act(cx, |app, cx| {
                 app.on_key_pressed(&key, modifiers, consumed, cx)
             })
         });
-        if taken {
+        // Tab means nothing unless the keymap says so: no walking focus through
+        // the buttons, which never hold it here.
+        if taken || key == keys::Key::Named(keys::Named::Tab) {
             cx.stop_propagation();
         }
     })
