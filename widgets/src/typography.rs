@@ -252,6 +252,18 @@ pub fn centered(content: impl IntoElement, font: Font, size: f32) -> Div {
 pub struct Aligned {
     element: AnyElement,
     line: Line,
+    width: Width,
+}
+
+/// How a child of a line takes width from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Width {
+    /// Its own, always.
+    Natural,
+    /// Its own until the line runs out, then it gives way.
+    Shrink,
+    /// Whatever the line has left.
+    Fill,
 }
 
 /// The vertical facts [`baseline_row`] needs about a child.
@@ -281,7 +293,22 @@ impl Aligned {
                 height: padding.top + text.line_height() + padding.bottom,
                 glyph: false,
             },
+            width: Width::Natural,
         }
+    }
+
+    /// Takes whatever width the line has left. Give the text
+    /// `text_ellipsis`, so what doesn't fit is cut rather than overflowing.
+    pub fn fill(mut self) -> Self {
+        self.width = Width::Fill;
+        self
+    }
+
+    /// Keeps its natural width until the line runs out, then gives way. Give the
+    /// text `text_ellipsis`.
+    pub fn shrink(mut self) -> Self {
+        self.width = Width::Shrink;
+        self
     }
 
     /// A chip, badge or keycap: one line of text in a styled box, its padding
@@ -308,6 +335,7 @@ impl Aligned {
         Self {
             element: wrap(self.element),
             line: self.line,
+            width: self.width,
         }
     }
 
@@ -327,6 +355,7 @@ impl Aligned {
                 height,
                 glyph: true,
             },
+            width: Width::Natural,
         }
     }
 }
@@ -340,7 +369,12 @@ impl Aligned {
 pub fn baseline_row(items: impl IntoIterator<Item = Aligned>, spacing: f32) -> Div {
     let line = group(items, spacing);
     let shift = line.line.height / 2.0 - (line.line.baseline - line.line.cap_height / 2.0);
-    shift_padding(shift).apply(div()).child(line.element)
+    let row = shift_padding(shift).apply(div()).child(line.element);
+    match line.width {
+        Width::Natural => row,
+        Width::Shrink => row.flex().min_w_0(),
+        Width::Fill => row.flex().w_full().min_w_0(),
+    }
 }
 
 /// [`baseline_row`] without the centring, as one [`Aligned`] child of an outer
@@ -350,13 +384,33 @@ pub fn group(items: impl IntoIterator<Item = Aligned>, spacing: f32) -> Aligned 
     let items: Vec<Aligned> = items.into_iter().collect();
     let lines: Vec<Line> = items.iter().map(|item| item.line).collect();
     let layout = line_layout(&lines);
+    let width = items
+        .iter()
+        .map(|item| item.width)
+        .fold(Width::Natural, |line, item| match (line, item) {
+            (Width::Fill, _) | (_, Width::Fill) => Width::Fill,
+            (Width::Shrink, _) | (_, Width::Shrink) => Width::Shrink,
+            _ => Width::Natural,
+        });
     let mut row = div().flex().flex_row().items_start().gap(px(spacing));
+    match width {
+        Width::Natural => {}
+        Width::Shrink => row = row.min_w_0(),
+        Width::Fill => row = row.w_full().min_w_0(),
+    }
     for (item, top) in items.into_iter().zip(&layout.tops) {
-        row = row.child(div().flex_none().pt(px(*top)).child(item.element));
+        let cell = div().pt(px(*top));
+        let cell = match item.width {
+            Width::Natural => cell.flex_none(),
+            Width::Shrink => cell.flex_shrink(1.0).min_w_0(),
+            Width::Fill => cell.flex_1().min_w_0(),
+        };
+        row = row.child(cell.child(item.element));
     }
     Aligned {
         element: row.into_any_element(),
         line: layout.line,
+        width,
     }
 }
 
