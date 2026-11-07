@@ -846,6 +846,10 @@ impl Diffui {
             let (line, cursor) = apply_completion(&column.query, &completion);
             column.query = line.clone();
             self.refresh_command_line(column, cursor);
+            // The model's caret isn't the field's: it starts the new text at the
+            // end. A press on a candidate left the field, so bring it back too.
+            crate::input::focus(COMMAND_INPUT_ID, cx);
+            place_caret(COMMAND_INPUT_ID, &line, cursor, cx);
             if let Some(command) = column.command.as_mut() {
                 command.history = None;
                 command.navigated = false;
