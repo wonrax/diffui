@@ -217,11 +217,10 @@ impl Diffui {
         self.recents.save();
         // Check it now rather than after the typing pause, so a bad revset
         // is explained by the field, under it, as soon as it is run.
-        let check = if self.active().cmdline.field.checked.as_deref() == Some(revset.as_str()) {
-        } else {
+        if self.active().cmdline.field.checked.as_deref() != Some(revset.as_str()) {
             let version = self.active().cmdline.field.version;
-            self.settle_revset_field(version, cx)
-        };
+            self.settle_revset_field(version, cx);
+        }
         {
             self.evaluate_revset(cx);
         }

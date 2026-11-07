@@ -260,7 +260,7 @@ impl Diffui {
                 let job = JobId::next();
                 history.evolog_job = Some(job);
                 self.enter_history_view(cx);
-                let send = self.history_send(tab, job, HistoryRequest::Evolog { revision }, cx);
+                self.history_send(tab, job, HistoryRequest::Evolog { revision }, cx);
                 {}
             }
             HistoryAction::Reload => match self.active().history.kind.clone() {
@@ -317,7 +317,7 @@ impl Diffui {
                     return;
                 };
                 if self.active().session.revset == filter.revset {
-                    return self.perform(Action::SetRevset(filter.previous), cx);
+                    self.perform(Action::SetRevset(filter.previous), cx);
                 }
             }
             HistoryAction::ToggleAnnotate => {

@@ -125,7 +125,7 @@ impl Activity {
                 ));
             }
             text.push_str(&self.detail.join("\n"));
-            (&text).to_owned()
+            text
         });
     }
 

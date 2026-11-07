@@ -351,13 +351,10 @@ impl Diffui {
         if replaced {
             self.rearm_draft_candidate(tab, candidate);
         }
-        let description = if diff_landed {
-            self.open_pending_description_edit(tab, cx)
-        } else {
-        };
-        {
-            self.drain_queued_mutation(tab, cx);
+        if diff_landed {
+            self.open_pending_description_edit(tab, cx);
         }
+        self.drain_queued_mutation(tab, cx);
     }
 
     /// Open the editor a context-menu "Edit description" is still waiting on.
@@ -636,7 +633,7 @@ impl Diffui {
         if let Some((document_id, _)) = jobs.file_pairs.remove(&job) {
             target.session.highlight_in_flight =
                 target.session.highlight_in_flight.saturating_sub(1);
-            return self.spawn_highlights(document_id, cx);
+            self.spawn_highlights(document_id, cx);
         }
     }
 
@@ -743,7 +740,7 @@ impl Diffui {
                 self.active_mut().revision_multi_selection.clear();
                 // A span is the marks shown as one diff; it goes with them.
                 if self.active().session.span.is_some() {
-                    return self.perform_compare(crate::compare::CompareAction::Exit, cx);
+                    self.perform_compare(crate::compare::CompareAction::Exit, cx);
                 }
             }
             Action::Mutate(op) => self.start_mutation_op(op, cx),
@@ -883,7 +880,7 @@ impl Diffui {
                 let pushed = state.push_actions(self);
                 self.push_mode(Mode::Palette(state));
                 if pushed {
-                    return crate::input::focus(palette::PALETTE_INPUT_ID, cx);
+                    crate::input::focus(palette::PALETTE_INPUT_ID, cx);
                 }
             }
             Action::OpenFind => self.open_find(cx),
@@ -918,7 +915,7 @@ impl Diffui {
             Action::ChooseRepoFolder => {
                 #[cfg(target_os = "macos")]
                 if let Some(path) = crate::macos_native::choose_repository_folder() {
-                    return self.open_repository(&path, cx);
+                    self.open_repository(&path, cx);
                 }
             }
             Action::SubmitRepoDialog => {
@@ -1171,7 +1168,7 @@ impl Diffui {
     /// depends on state the widget can't see.
     pub(crate) fn on_select_row_key(&mut self, key: revision_list::RowSelectionKey, cx: &mut Cx) {
         self.close_revset_field();
-        return self.on_revision_row_click(key, cx);
+        self.on_revision_row_click(key, cx);
     }
 
     pub(crate) fn on_sidebar_file_row(&mut self, display_index: usize, cx: &mut Cx) {
@@ -1236,17 +1233,17 @@ impl Diffui {
 
     pub(crate) fn on_changed_files_trigger_exited(&mut self, cx: &mut Cx) {
         self.changed_files_trigger_hovered = false;
-        return Self::close_changed_files_peek_later(cx);
+        Self::close_changed_files_peek_later(cx);
     }
 
     pub(crate) fn on_changed_files_rail_exited(&mut self, cx: &mut Cx) {
         self.changed_files_rail_hovered = false;
-        return Self::close_changed_files_peek_later(cx);
+        Self::close_changed_files_peek_later(cx);
     }
 
     pub(crate) fn on_changed_files_popup_exited(&mut self, cx: &mut Cx) {
         self.changed_files_popup_hovered = false;
-        return Self::close_changed_files_peek_later(cx);
+        Self::close_changed_files_peek_later(cx);
     }
 
     pub(crate) fn on_close_changed_files_peek(&mut self, cx: &mut Cx) {
@@ -1276,7 +1273,7 @@ impl Diffui {
         cursor: Point,
         cx: &mut Cx,
     ) {
-        return self.open_revision_menu(key, row_rect, cursor, cx);
+        self.open_revision_menu(key, row_rect, cursor, cx);
     }
 
     pub(crate) fn on_sidebar_file_context_menu(
@@ -1286,7 +1283,7 @@ impl Diffui {
         cursor: Point,
         cx: &mut Cx,
     ) {
-        return self.open_file_context_menu(display_index, row_rect, cursor, cx);
+        self.open_file_context_menu(display_index, row_rect, cursor, cx);
     }
 
     pub(crate) fn on_open_toolbar_menu(
@@ -1296,7 +1293,7 @@ impl Diffui {
         cx: &mut Cx,
     ) {
         self.pop_mode(ModeKind::ActivityPopover);
-        return self.open_toolbar_menu(which, anchor, cx);
+        self.open_toolbar_menu(which, anchor, cx);
     }
 
     pub(crate) fn on_description_edited(&mut self, text: String, cx: &mut Cx) {
@@ -1313,7 +1310,7 @@ impl Diffui {
     }
 
     pub(crate) fn on_open_repo_path_changed(&mut self, path: String, cx: &mut Cx) {
-        return self.set_open_repo_path(path, cx);
+        self.set_open_repo_path(path, cx);
     }
 
     pub(crate) fn on_open_repo_listed(
@@ -1336,7 +1333,7 @@ impl Diffui {
     }
 
     pub(crate) fn on_revset_changed(&mut self, value: String, cx: &mut Cx) {
-        return self.revset_field_edited(value, cx);
+        self.revset_field_edited(value, cx);
     }
 
     pub(crate) fn on_sidebar_width_changed(&mut self, width: f32, cx: &mut Cx) {
@@ -1408,7 +1405,7 @@ impl Diffui {
             Some(diffui_core::SourceTreeRow::File { entry_index, .. }) => {
                 let path = entries.get(entry_index).map(|entry| entry.path.clone());
                 if let Some(path) = path {
-                    return self.select_source_file(path, cx);
+                    self.select_source_file(path, cx);
                 }
             }
             None => {}
@@ -1433,7 +1430,7 @@ impl Diffui {
         if let Some(diffui_core::SourceTreeRow::File { entry_index, .. }) = rows.first()
             && let Some(path) = entries.get(*entry_index).map(|entry| entry.path.clone())
         {
-            return self.select_source_file(path, cx);
+            self.select_source_file(path, cx);
         }
     }
 
@@ -1444,7 +1441,7 @@ impl Diffui {
         };
         let revision = target.session.selected_revision.clone();
         let path = file.path.clone();
-        return self.open_source_browser(revision, Some(path), cx);
+        self.open_source_browser(revision, Some(path), cx);
     }
 
     pub(crate) fn on_revision_drag_start(&mut self, row: usize, cx: &mut Cx) {
@@ -1452,7 +1449,7 @@ impl Diffui {
         let Some(index) = self.active().origin_row(row) else {
             return;
         };
-        return self.on_drag_start(index, cx);
+        self.on_drag_start(index, cx);
     }
 
     pub(crate) fn on_revision_drag_hover(
@@ -1481,7 +1478,7 @@ impl Diffui {
             Some(revision_list::DropSpot::OnRow(index)) => Some(index),
             _ => None,
         };
-        return self.kick_draft_preview(cx);
+        self.kick_draft_preview(cx);
     }
 
     pub(crate) fn on_revision_drag_drop(
@@ -1496,7 +1493,7 @@ impl Diffui {
                 .loaded_spot(spot)
                 .or_else(|| self.active().op_draft().and_then(|draft| draft.hover_spot))
         });
-        return self.on_drag_drop(spot, cx);
+        self.on_drag_drop(spot, cx);
     }
 
     pub(crate) fn on_draft_hover_candidate(&mut self, index: Option<usize>, cx: &mut Cx) {
@@ -1515,11 +1512,11 @@ impl Diffui {
             return;
         }
         draft.draft.candidate = Some(index);
-        return self.kick_draft_preview(cx);
+        self.kick_draft_preview(cx);
     }
 
     pub(crate) fn on_draft_preview_kick(&mut self, version: u64, cx: &mut Cx) {
-        return self.run_parked_preview(version, cx);
+        self.run_parked_preview(version, cx);
     }
 
     pub(crate) fn on_file_highlighted(
@@ -1556,7 +1553,7 @@ impl Diffui {
         if applied && self.is_active(tab) {
             self.document_version = self.document_version.wrapping_add(1);
         }
-        return self.spawn_highlights(document_id, cx);
+        self.spawn_highlights(document_id, cx);
     }
 
     /// Drop the changed-files peek along with every hover flag holding it
@@ -1864,14 +1861,14 @@ impl Diffui {
     pub(crate) fn find_on_toggle_case(&mut self, cx: &mut Cx) {
         if let Some(state) = self.active_mut().find_mut() {
             state.case_sensitive = !state.case_sensitive;
-            return self.refind_now(cx);
+            self.refind_now(cx);
         }
     }
 
     pub(crate) fn find_on_toggle_regex(&mut self, cx: &mut Cx) {
         if let Some(state) = self.active_mut().find_mut() {
             state.regex = !state.regex;
-            return self.refind_now(cx);
+            self.refind_now(cx);
         }
     }
 
@@ -1945,7 +1942,7 @@ impl Diffui {
         {
             let (command, arg) = (*command, arg.clone());
             self.pop_mode(ModeKind::Menu);
-            return self.run_command(command, arg, cx);
+            self.run_command(command, arg, cx);
         }
     }
 
@@ -2079,7 +2076,7 @@ impl Diffui {
             // Already loading this revision — let it land.
         } else if let Some(tab) = self.active_tab_id() {
             let effects = self.active_mut().session.browse(selection);
-            return self.run_effects(tab, effects, cx);
+            self.run_effects(tab, effects, cx);
         }
     }
 
@@ -2871,7 +2868,7 @@ impl Diffui {
                 .collect::<Vec<_>>()
         });
         let ok = result.is_ok();
-        let tasks = vec![self.finish_activity_row(tab, activity_id, result, summary, cx)];
+        self.finish_activity_row(tab, activity_id, result, summary, cx);
         if ok {
             let effects = match self.tab_mut(tab) {
                 Some(state) => state.session.snapshot(RefreshOrigin::Focus),
@@ -3358,7 +3355,7 @@ impl Diffui {
         // Previously-expanded ignored dirs re-list too, so an open `target/`
         // exploration tracks the disk like the rest of the tree.
         let dirs: Vec<String> = target.source.dir_children.keys().cloned().collect();
-        let tasks = vec![self.kick_source_tree_load(tab, cx)];
+        self.kick_source_tree_load(tab, cx);
         if reload_file {
             self.kick_source_file_load(tab, cx);
         }

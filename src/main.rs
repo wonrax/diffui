@@ -2,7 +2,7 @@
 // plumbing here is written ahead of its reader. Remove these with the last stub.
 #![allow(dead_code, unused_variables)]
 // `Option<()>` means "handled", and most update code now returns `()`.
-#![allow(clippy::unit_arg)]
+#![allow(clippy::unit_arg, clippy::single_match)]
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},

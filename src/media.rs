@@ -197,7 +197,7 @@ impl Diffui {
 /// The decoded pixels as what GPUI paints. It takes BGRA.
 fn render_image(image: diffui_core::media::DecodedImage) -> Arc<RenderImage> {
     let mut bytes = image.rgba;
-    for pixel in bytes.chunks_exact_mut(4) {
+    for pixel in bytes.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
     let buffer = image::RgbaImage::from_raw(image.width, image.height, bytes)

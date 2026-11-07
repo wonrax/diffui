@@ -220,10 +220,10 @@ impl Diffui {
         let specs: Vec<OpenSpec> = self.tabs.iter().map(|tab| tab.open_spec()).collect();
         self.background.repos.retain(|spec, _| specs.contains(spec));
         for spec in specs {
-            if !self.background.repos.contains_key(&spec) {
-                let task = repository_loop(spec.clone(), cx);
-                self.background.repos.insert(spec, task);
-            }
+            self.background
+                .repos
+                .entry(spec.clone())
+                .or_insert_with(|| repository_loop(spec, cx));
         }
 
         // While anything is in flight (a load, a diff switch, or any running

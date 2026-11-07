@@ -525,12 +525,10 @@ impl Diffui {
         let entering = column.command.is_none();
         let cursor = cursor_after_edit(old, &column.query, old.len());
         self.command_line_changed(column, cursor, cx)?;
-        Some(if entering {
-            {
-                focus_command_input(cx);
-            }
-        } else {
-        })
+        if entering {
+            focus_command_input(cx);
+        }
+        Some(())
     }
 
     /// The line is now `column.query`, with the caret at `cursor`: re-parse,
@@ -690,7 +688,7 @@ impl Diffui {
             .insert(revset.to_owned(), Resolution { result, set });
         if command.run_when_ready && command.in_flight.is_empty() {
             command.run_when_ready = false;
-            return self.run_command_line(cx);
+            self.run_command_line(cx);
         }
     }
 
@@ -905,8 +903,7 @@ impl Diffui {
                     command.run_when_ready = true;
                 }
                 if pending_settle {
-                    self.settle_command_line(version, cx)
-                } else {
+                    self.settle_command_line(version, cx);
                 }
             }
             PlanState::Ready(run) => {
@@ -980,20 +977,19 @@ impl Diffui {
                 cx,
             ),
             ResolvedView::Annotate { revision, path } => {
-                let browse = self.perform(
+                self.perform(
                     Action::BrowseSource {
                         revision,
                         path: Some(path),
                     },
                     cx,
                 );
-                let annotate = if self.active().history.annotating() {
-                } else {
+                if !self.active().history.annotating() {
                     self.perform(
                         Action::History(crate::history_panel::HistoryAction::ToggleAnnotate),
                         cx,
-                    )
-                };
+                    );
+                }
                 {}
             }
         }
@@ -1101,10 +1097,9 @@ impl Diffui {
             UiCommand::Resolve { paths, .. } => {
                 self.show_diff_view(cx);
                 self.perform(Action::SelectRevision(target), cx);
-                let file = match paths.first() {
-                    Some(path) => self.perform(Action::JumpToFile(path.value.clone()), cx),
-                    None => {}
-                };
+                if let Some(path) = paths.first() {
+                    self.perform(Action::JumpToFile(path.value.clone()), cx);
+                }
                 {}
             }
         }
