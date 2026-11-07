@@ -99,11 +99,11 @@ pub(crate) fn scratch_home() -> &'static Path {
     })
 }
 
-/// The jj the fixture needs: `$JJ`, or where the baseline keeps one.
+/// The jj the fixture needs: `$JJ`, which the dev shell sets.
 pub(crate) fn fixture_jj() -> PathBuf {
     std::env::var_os("JJ")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp/diffui-fix/uikit/jj"))
+        .expect("JJ names a jj matching the app's jj-lib; run the tests in `nix develop`")
 }
 
 /// The master copy of what `fixtures/make-fixture.sh` builds, made once per test run
@@ -116,7 +116,7 @@ fn master_fixture() -> &'static Path {
             return PathBuf::from(repo);
         }
         let home = scratch_home();
-        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/make-fixture.sh");
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/make-fixture.sh");
         let repo = home.join("fixture");
         let output = std::process::Command::new("bash")
             .arg(&script)
@@ -617,12 +617,11 @@ impl Harness {
     }
 }
 
-/// `DIFFUI_SHOTS_DIR`, else `/Users/wonrax/code/diffui-gpui-ws/shots` beside the
-/// workspaces.
+/// `DIFFUI_SHOTS_DIR`, else `target/shots`.
 fn shots_dir() -> PathBuf {
     std::env::var_os("DIFFUI_SHOTS_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../shots"))
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("target/shots"))
 }
 
 /// A point, for `click_point` and friends.

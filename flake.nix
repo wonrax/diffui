@@ -257,6 +257,10 @@
             buildInputs = lib.optionals pkgs.stdenv.hostPlatform.isDarwin darwinBuildInputs;
 
             RUST_BACKTRACE = "1";
+            # The jj the app's tests build their fixture repo with
+            # (`fixtures/make-fixture.sh`): it has to match the app's jj-lib.
+            # Only named here, not put on PATH, so the shell's `jj` stays yours.
+            JJ = "${pkgs.jujutsu}/bin/jj";
             WABT_DIR = pkgs.wabt;
             SIMDE_DIR = pkgs.simde;
 

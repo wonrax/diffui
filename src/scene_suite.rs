@@ -1,5 +1,6 @@
-//! Every scene of `shots/iced/scenes.md`, through the real root view, written to
-//! `shots/integrate/<scene-id>.png` for the parity sweep. The steps are the baseline
+//! Every scene of `fixtures/scenes.md`, through the real root view, written to
+//! `integrate/<scene-id>.png` under the shots directory (`DIFFUI_SHOTS_DIR`, else
+//! `target/shots`) for the parity sweep. The steps are the baseline
 //! capture's, so each scene reaches its state the way the iced one did.
 //!
 //! ```text
@@ -2296,12 +2297,11 @@ fn all() -> Vec<Scene> {
     t.scenes
 }
 
-/// The ids of `shots/iced/scenes.md`, in order.
+/// The ids of `fixtures/scenes.md`, in order.
 fn baseline_ids() -> Vec<String> {
-    let md = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../shots/iced/scenes.md"),
-    )
-    .expect("shots/iced/scenes.md");
+    let md =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/scenes.md"))
+            .expect("fixtures/scenes.md");
     md.lines()
         .filter_map(|line| line.strip_prefix("### `")?.strip_suffix('`'))
         .map(str::to_owned)
