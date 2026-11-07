@@ -2037,10 +2037,8 @@ impl Diffui {
         }
         let len = column.matches.len() as i32;
         column.selected = (column.selected as i32 + delta).rem_euclid(len) as usize;
-        if column.ensure_selected_visible() {
-            let y = column.scroll_y;
-            return;
-        }
+        // The view scrolls to `column.scroll_y`.
+        column.ensure_selected_visible();
     }
 
     /// Open the find bar, closing the overlays that share its keyboard.

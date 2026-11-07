@@ -159,6 +159,19 @@ pub(crate) fn command_fits(
 
 /// Stub: the plan view is the lane's to port (see the iced source).
 #[allow(unused_variables)]
+pub(crate) fn command_line(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    command: &str,
+    size: f32,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    crate::stub::panel("plan::command_line")
+}
+
+/// Stub: the plan view is the lane's to port (see the iced source).
+#[allow(unused_variables)]
 pub(crate) fn wrapped_command_line(
     ui: &Diffui,
     theme: ThemeSpec,
