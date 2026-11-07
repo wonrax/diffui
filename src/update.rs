@@ -247,6 +247,7 @@ impl Diffui {
             recent_repos,
             next_activity_id: 0,
             hovered: None,
+            tab_strip: Default::default(),
             changed_files_peek_open: false,
             changed_files_trigger_hovered: false,
             changed_files_rail_hovered: false,
@@ -912,12 +913,7 @@ impl Diffui {
                     self.pop_mode(ModeKind::OpenRepo);
                 }
             }
-            Action::ChooseRepoFolder => {
-                #[cfg(target_os = "macos")]
-                if let Some(path) = crate::macos_native::choose_repository_folder() {
-                    self.open_repository(&path, cx);
-                }
-            }
+            Action::ChooseRepoFolder => self.choose_repo_folder(cx),
             Action::SubmitRepoDialog => {
                 let Some(dialog) = self.open_repo_dialog() else {
                     return;
@@ -1692,6 +1688,9 @@ impl Diffui {
         consumed: bool,
         cx: &mut Cx,
     ) -> bool {
+        if matches!(key, keyboard::Key::Named(keyboard::Named::Escape)) {
+            self.cancel_tab_drag(cx);
+        }
         let Some(chord) = Chord::from_event(key, modifiers) else {
             return false;
         };

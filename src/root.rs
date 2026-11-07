@@ -50,6 +50,7 @@ pub(crate) struct Background {
     /// (and in tests of update code, which have none) nothing runs in the
     /// background.
     window: Vec<Subscription>,
+    menu: Option<Task<()>>,
 }
 
 impl std::fmt::Debug for Background {
@@ -128,6 +129,11 @@ pub(crate) fn open_window(cli: Cli, saved: WindowState, cx: &mut App) -> anyhow:
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(chrome::titlebar_options()),
+        // The strip draws the title bar and moves the window itself (see
+        // `tab_bar`). Left to AppKit, a press-drag on a tab would move the window
+        // before the tab heard it, and every press in the strip would wait to
+        // tell a click from a double-click.
+        app_owns_titlebar_drag: cfg!(target_os = "macos"),
         app_id: Some("diffui".to_owned()),
         ..Default::default()
     };
@@ -239,6 +245,16 @@ impl Diffui {
             Duration::from_millis(120),
             cx,
             |_, cx| cx.notify(),
+        );
+
+        // The overlay menu's fixed clock: the trajectory apex and the sweep stall.
+        let menu_open = self.menu().is_some();
+        sync_ticker(
+            &mut self.background.menu,
+            menu_open,
+            Duration::from_millis(16),
+            cx,
+            |this, cx| this.act(cx, |this, cx| this.menu_on_tick(cx)),
         );
 
         // Prunes expired error toasts; only while any are up.

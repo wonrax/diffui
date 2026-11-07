@@ -15,6 +15,8 @@ mod activity;
 mod app_menu;
 mod bookmarks;
 mod changes;
+#[cfg(test)]
+mod chrome_scenes;
 mod cli_output;
 mod cmdline;
 mod cmdline_view;
@@ -378,6 +380,8 @@ pub(crate) struct Diffui {
     /// The caret control the cursor is currently over, if any — drives the
     /// hover highlight that `mouse_area` (unlike `button`) doesn't provide.
     pub(crate) hovered: Option<HoverTarget>,
+    /// The tab strip's drag and slide state.
+    pub(crate) tab_strip: tab_bar::Strip,
     /// Whether the collapsed changed-files rail is exposing its temporary tree.
     /// Only the rail's icon opens it; the hover flags keep a delayed close from
     /// landing while the pointer is still on the icon, the rail or the tree, or
