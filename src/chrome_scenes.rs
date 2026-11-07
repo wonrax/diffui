@@ -9,7 +9,7 @@ use diffui_core::RevisionSelection;
 
 use crate::commands::CommandArg;
 use crate::geometry::{Point, Rectangle, Size};
-use crate::harness::{Harness, at, fixture_repo};
+use crate::harness::{Harness, at, fresh_repo_named};
 use crate::menu::{AnchorSpec, MenuEntry, OverlayMenu};
 use crate::modes::{Mode, ModeKind};
 use crate::theme::ThemePreference;
@@ -18,33 +18,17 @@ use crate::{Action, MainView, TabId, activity};
 const LANE: &str = "chrome";
 const BASELINE: (f32, f32) = (1440.0, 900.0);
 
-/// The scratch directory the repositories under `acme/` live in.
+/// A directory of its own, holding one repository, for a scene that lists it.
 fn acme() -> PathBuf {
-    fixture_repo()
+    render_toolkit()
         .parent()
-        .expect("the fixture has a parent")
-        .join("acme")
+        .expect("the copy has a parent")
+        .to_owned()
 }
 
-/// A copy of the fixture at `acme/<name>`, so the tab reads `acme/<name>`.
+/// A fresh copy of the fixture at `acme/<name>`, so the tab reads `acme/<name>`.
 fn repo_named(name: &str) -> PathBuf {
-    // Tests name their repositories before they take the harness's turn.
-    static COPYING: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _copying = COPYING
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let dest = acme().join(name);
-    if !dest.exists() {
-        std::fs::create_dir_all(acme()).expect("create acme");
-        let status = Command::new("cp")
-            .arg("-R")
-            .arg(fixture_repo())
-            .arg(&dest)
-            .status()
-            .expect("run cp");
-        assert!(status.success());
-    }
-    dest
+    fresh_repo_named(&format!("acme/{name}"))
 }
 
 fn render_toolkit() -> PathBuf {

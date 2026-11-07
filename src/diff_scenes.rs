@@ -605,7 +605,7 @@ fn split_selection_holds_its_column() {
     );
     h.shot(LANE, "split-columns-selection");
     // From the padded left side: the selection takes the populated column.
-    h.drag(at(1400.0, 300.0), at(1500.0, 420.0));
+    h.drag(at(1400.0, 345.0), at(1500.0, 365.0));
     h.frames();
     h.press("cmd-c");
     h.settle();

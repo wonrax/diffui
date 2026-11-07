@@ -499,3 +499,49 @@ fn a_row_drag_starts_a_draft() {
     assert!(h.read(|ui| ui.active().op_draft().is_some()), "no draft");
     h.pointer_up(at(IN_LIST.0, 330.0), gpui_kit::MouseButton::Left);
 }
+
+/// The changed files on the real list: a press on a row's box picks the file and leaves
+/// the selection, a press on its name selects, and a selection far down is revealed.
+#[test]
+fn the_file_tree_checks_selects_and_reveals() {
+    let (mut h, repo) = open();
+    select(&mut h, &repo, "kitchen-sink");
+    let selected = h.read(|ui| ui.active().selected_file);
+    h.click_point(at(416.0, 151.0));
+    h.settle();
+    assert!(h.read(crate::changes::has_selection), "the box picked it");
+    assert_eq!(h.read(|ui| ui.active().selected_file), selected);
+    h.click_point(at(460.0, 177.0));
+    h.settle();
+    assert_ne!(h.read(|ui| ui.active().selected_file), selected);
+
+    select(&mut h, &repo, "many-files");
+    assert_eq!(h.read(|ui| ui.active().file_tree_scroll_offset), 0.0);
+    h.perform(Action::SelectFile(200));
+    h.settle();
+    h.frames();
+    assert!(
+        h.read(|ui| ui.active().file_tree_scroll_offset) > 0.0,
+        "the row came into view"
+    );
+}
+
+/// The source tree on the real list, and the real code pane under it.
+#[test]
+fn the_source_view_is_the_real_one() {
+    let (mut h, _repo) = open();
+    let revision = h.read(|ui| ui.active().session.selected_revision.clone());
+    h.perform(Action::BrowseSource {
+        revision,
+        path: Some("src/generated/minified.js".to_owned()),
+    });
+    h.wait_until("the file", |ui| ui.active().source.file.is_some());
+    h.settle();
+    h.frames();
+    let before = diff_view::PAINTS.load(Ordering::Relaxed);
+    h.wheel(at(IN_DIFF.0, IN_DIFF.1), -60.0);
+    assert_eq!(diff_view::PAINTS.load(Ordering::Relaxed) - before, 1);
+    assert!(h.read(|ui| ui.active().source.scroll_offset) > 0.0);
+    h.wheel(at(IN_LIST.0, IN_LIST.1), -60.0);
+    assert_eq!(h.same_after_a_refresh(), Ok(()));
+}
