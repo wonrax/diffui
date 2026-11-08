@@ -106,8 +106,11 @@ pub enum MutationOp {
     /// Copy `target` onto its own parents (`jj duplicate`).
     Duplicate { target: RevisionSelection },
     /// Move `from`'s hunks into the mutable ancestors that last touched those
-    /// lines (`jj absorb --from`).
-    Absorb { from: RevisionSelection },
+    /// lines (`jj absorb --from`), only those of `paths` when it's not empty.
+    Absorb {
+        from: RevisionSelection,
+        paths: Vec<String>,
+    },
     /// Point local bookmark `name` at `to`, creating it if needed
     /// (`jj bookmark set -r <to> <name>`). With `push_remote`, the same
     /// transaction then pushes the bookmark there (`jj git push -b <name>`)

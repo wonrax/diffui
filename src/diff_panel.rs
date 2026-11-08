@@ -792,13 +792,11 @@ fn build_diff_panel_body(
         .overflow_hidden()
         .child(diff_view)
         .child(crate::find::build_overlay(ui, theme, window, cx));
-    // The selection strip docks below the diff rather than floating over it, so the last
-    // lines stay readable while something is picked; the active mode's key hints dock
-    // under it.
+    // The active mode's key hints dock under the diff; the picks' bar floats over it
+    // (see `crate::changes::action_bar`).
     panel
         .child(div().flex_none().w_full().child(summary))
         .child(layers)
-        .children(crate::changes::selection_bar(ui, theme, window, cx))
         .children(crate::mode_hints::strip(ui, theme, window, cx))
         .into_any_element()
 }

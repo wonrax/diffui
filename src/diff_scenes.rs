@@ -723,3 +723,116 @@ fn split_selection_holds_its_column() {
         "{text:?}"
     );
 }
+
+/// The redesign's states of the changed files, the diff and the picks' bar, light and
+/// dark, under the `redesign` lane:
+///   DIFFUI_SHOTS_DIR=… cargo test --bin diffui redesign_shots -- --ignored
+#[test]
+#[ignore = "shoots the redesign's review set: run on demand"]
+fn redesign_shots() {
+    const SHOTS: &str = "redesign";
+    for theme in ["light", "dark"] {
+        let start = |size: (f32, f32), name: &str| {
+            let (mut h, repo) = open_sized(size);
+            if theme == "dark" {
+                dark(&mut h);
+            }
+            select(&mut h, &repo, name);
+            h
+        };
+        let id = |scene: &str| format!("{scene}-{theme}");
+
+        let mut h = start(SIZE, "kitchen-sink");
+        h.frames();
+        h.shot(SHOTS, &id("diff-kitchen-sink"));
+        for (scene, file) in [
+            ("diff-mode-change", "scripts/run.sh"),
+            ("diff-empty-file", "docs/empty-file.txt"),
+            ("diff-binary", "vendor/blob.bin"),
+            ("diff-rename", "src/renderer/frame_loop.rs"),
+        ] {
+            select_file(&mut h, file);
+            h.shot(SHOTS, &id(scene));
+        }
+        let deep = h.read(|ui| {
+            let files = &ui.active().session.document.files;
+            let deep = files.iter().max_by_key(|file| file.path.len());
+            deep.map(|file| file.path.clone()).unwrap_or_default()
+        });
+        select_file(&mut h, &deep);
+        h.shot(SHOTS, &id("diff-deep-path"));
+        select_file(&mut h, "src/renderer/frame_loop.rs");
+        // The pointer on the rename's first hunk: its actions show.
+        h.hover_point(at(1100.0, 300.0));
+        h.frames();
+        h.shot(SHOTS, &id("diff-hunk-hover"));
+        wheel(&mut h, (1000.0, 500.0), -300.0);
+        h.frames();
+        h.shot(SHOTS, &id("diff-scrolled-sticky"));
+
+        // Picks: a file whole and a hunk of another, with the bar over the diff.
+        select_file(&mut h, "src/renderer/frame_loop.rs");
+        h.press("x");
+        h.press("j");
+        h.press("x");
+        let hunk_file = h.read(|ui| ui.active().selected_file);
+        h.perform(Action::Changes(crate::changes::ChangesMsg::ToggleFile(
+            hunk_file,
+        )));
+        h.perform(Action::Changes(crate::changes::ChangesMsg::ToggleHunk(
+            hunk_file + 1,
+            0,
+        )));
+        h.settle();
+        h.frames();
+        h.shot(SHOTS, &id("picks-files-hunks"));
+        h.press("v");
+        h.press("j");
+        h.press("space");
+        h.press("J");
+        h.press("J");
+        h.settle();
+        h.frames();
+        h.shot(SHOTS, &id("lines-picked"));
+        drop(h);
+
+        let mut h = start(SIZE, "kitchen-sink");
+        h.perform(Action::ToggleSplit);
+        h.frames();
+        h.shot(SHOTS, &id("split-kitchen-sink"));
+        drop(h);
+
+        let mut h = start(SIZE, "large-diff");
+        h.frames();
+        h.shot(SHOTS, &id("diff-large-collapsed"));
+        drop(h);
+
+        // Room for the bar's labels.
+        let mut h = start((1920.0, 900.0), "kitchen-sink");
+        h.press("x");
+        h.settle();
+        h.frames();
+        h.shot(SHOTS, &id("picks-bar-wide"));
+        drop(h);
+
+        // Too narrow for the bar's labels: icons alone.
+        let mut h = start((1180.0, 760.0), "kitchen-sink");
+        h.press("x");
+        h.settle();
+        h.frames();
+        h.shot(SHOTS, &id("picks-bar-narrow"));
+    }
+}
+
+/// Esc clears the picks before it backs out of anything else.
+#[test]
+fn escape_clears_the_picks() {
+    let (mut h, repo) = open_sized(SIZE);
+    select(&mut h, &repo, "kitchen-sink");
+    h.press("x");
+    h.settle();
+    assert!(h.read(crate::changes::has_selection));
+    h.press("escape");
+    h.settle();
+    assert!(!h.read(crate::changes::has_selection));
+}

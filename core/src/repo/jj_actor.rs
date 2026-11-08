@@ -1106,7 +1106,7 @@ pub fn rewritten_targets(
                 push(target);
             }
         }
-        MutationOp::Absorb { from } => push(from),
+        MutationOp::Absorb { from, .. } => push(from),
         MutationOp::Commit { .. } => push(&RevisionSelection::WorkingCopy),
         MutationOp::NewAt { destination } => match destination {
             // The insertion's far side gains the new commit as a parent.

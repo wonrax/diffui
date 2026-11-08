@@ -280,6 +280,7 @@ pub fn lower(
         },
         MutationCommand::Absorb { from } => MutationOp::Absorb {
             from: r.single(from)?,
+            paths: Vec::new(),
         },
         MutationCommand::Metaedit {
             targets,

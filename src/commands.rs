@@ -1086,8 +1086,12 @@ pub(crate) static REGISTRY: &[Command] = &[
         mac_chords: &[],
         enabled: can_mutate,
         build: |ui, arg| {
-            target_revision(ui, &arg)
-                .map(|from| Action::Mutate(mutations::MutationOp::Absorb { from }))
+            target_revision(ui, &arg).map(|from| {
+                Action::Mutate(mutations::MutationOp::Absorb {
+                    from,
+                    paths: Vec::new(),
+                })
+            })
         },
         palette: PaletteScope::RevisionVerb,
     },
@@ -1182,17 +1186,18 @@ pub(crate) static REGISTRY: &[Command] = &[
         chords: &["esc"],
         mac_chords: &[],
         enabled: always,
-        // Esc backs out of whatever is on: the marks first, then a
-        // comparison.
+        // Esc backs out of whatever is on: the picks first, then the
+        // marks, then a comparison.
         build: |ui, _arg| {
-            Some(
-                if ui.active().revision_multi_selection.is_empty() && crate::compare::comparing(ui)
-                {
-                    Action::Compare(CompareAction::Exit)
-                } else {
-                    Action::ClearMultiSelection
-                },
-            )
+            Some(if crate::changes::has_selection(ui) {
+                Action::Changes(crate::changes::ChangesMsg::Clear)
+            } else if ui.active().revision_multi_selection.is_empty()
+                && crate::compare::comparing(ui)
+            {
+                Action::Compare(CompareAction::Exit)
+            } else {
+                Action::ClearMultiSelection
+            })
         },
         palette: PaletteScope::Hidden,
     },

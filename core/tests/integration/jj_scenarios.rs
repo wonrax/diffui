@@ -1571,6 +1571,7 @@ fn absorb_moves_hunks_into_the_touching_ancestor() {
         &root,
         MutationOp::Absorb {
             from: RevisionSelection::WorkingCopy,
+            paths: Vec::new(),
         },
     );
 
@@ -1598,6 +1599,37 @@ fn absorb_moves_hunks_into_the_touching_ancestor() {
             .any(|line| line.starts_with("absorbed into")),
         "absorb reports its destinations: {:?}",
         outcome.output
+    );
+}
+
+/// `jj absorb` with paths: only the named files' hunks move; the rest stay in
+/// the working copy.
+#[test]
+fn absorb_with_paths_leaves_other_files_behind() {
+    let root = scratch_repo("absorb-paths");
+    write(&root, "a.txt", "a1\na2\n");
+    write(&root, "b.txt", "b1\nb2\n");
+    commit(&root, "base");
+    let base_change = change_id(&root, "description(exact:\"base\\n\")");
+    write(&root, "a.txt", "a1\na2 edited\n");
+    write(&root, "b.txt", "b1\nb2 edited\n");
+    snapshot(&root);
+
+    run(
+        &root,
+        MutationOp::Absorb {
+            from: RevisionSelection::WorkingCopy,
+            paths: vec!["a.txt".to_owned()],
+        },
+    );
+
+    let base = commit_id(&root, &base_change);
+    assert_eq!(harness::file_at(&root, &base, "a.txt"), "a1\na2 edited\n");
+    assert_eq!(harness::file_at(&root, &base, "b.txt"), "b1\nb2\n");
+    assert_eq!(
+        harness::file_at(&root, &commit_id(&root, "@"), "b.txt"),
+        "b1\nb2 edited\n",
+        "the unnamed file's edit stays in the working copy"
     );
 }
 

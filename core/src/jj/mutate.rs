@@ -935,7 +935,7 @@ async fn mutate_locked(
                 None => format!("Duplicated {short}"),
             }
         }
-        MutationOp::Absorb { from } => {
+        MutationOp::Absorb { from, paths } => {
             let source = resolve_mutation_target(tx.repo(), &context, from).await?;
             let short = short_change_id(&source);
             ensure_rewritable(
@@ -967,8 +967,18 @@ async fn mutate_locked(
                     .ancestors()
                     .intersection(&mutable)
             };
+            let matcher: Box<dyn jj_lib::matchers::Matcher> = if paths.is_empty() {
+                Box::new(EverythingMatcher)
+            } else {
+                let paths = paths
+                    .iter()
+                    .map(|path| jj_lib::repo_path::RepoPathBuf::from_internal_string(path.clone()))
+                    .collect::<Result<Vec<_>, _>>()
+                    .context("invalid path to absorb")?;
+                Box::new(jj_lib::matchers::FilesMatcher::new(paths))
+            };
             let selected =
-                split_hunks_to_trees(tx.repo(), &absorb_source, &destinations, &EverythingMatcher)
+                split_hunks_to_trees(tx.repo(), &absorb_source, &destinations, matcher.as_ref())
                     .await
                     .context("failed to plan absorb")?;
             for (path, reason) in &selected.skipped_paths {

@@ -28,7 +28,7 @@ use crate::diff_view::{
 use crate::modes::{ModeKind, TabMode};
 use crate::palette::ResultRef;
 use crate::prose::Prose;
-use crate::theme::{self, ThemeSpec, Weight, text_size};
+use crate::theme::{self, Color, ThemeSpec, Weight, text_size};
 use crate::typography::{self, Aligned};
 use crate::{
     Action, ConfirmDialog, Cx, Diffui, MainView, PendingMutation, TabState, activity, icons, ui,
@@ -45,6 +45,13 @@ pub(crate) enum ChangesMsg {
     RestoreHunk(usize, usize),
     /// Copy one hunk as a patch.
     CopyHunk(usize, usize),
+    /// Copy the pick as a patch.
+    CopyPatch,
+    /// Absorb the picked files into the ancestors that last touched their
+    /// lines (`jj absorb` takes paths, so whole files only).
+    Absorb,
+    /// The picks' "more" menu.
+    MoreMenu,
     /// Line-select mode — see [`LineMsg`].
     Lines(LineMsg),
     /// Toggle a changed-files tree row (display index); a directory toggles
@@ -1047,6 +1054,27 @@ impl Diffui {
                 let revision = tab.session.selected_revision.clone();
                 self.confirm_discard(revision, selection)
             }
+            ChangesMsg::CopyPatch => {
+                let tab = self.active();
+                let selection = selection_of(tab);
+                if !selection.is_empty() {
+                    let patch = selection_patch(&tab.session.document.files, &selection);
+                    self.perform(Action::Copy(patch), cx);
+                }
+            }
+            ChangesMsg::Absorb => {
+                let Some((revision, selection)) = self.current_selection() else {
+                    return;
+                };
+                if !whole_files_only(&selection) {
+                    return;
+                }
+                self.start_changes_op(MutationOp::Absorb {
+                    from: revision,
+                    paths: selection.files.into_iter().map(|file| file.path).collect(),
+                })
+            }
+            ChangesMsg::MoreMenu => self.open_picks_menu(cx),
             ChangesMsg::CopyHunk(file, hunk) => {
                 let files = &self.active().session.document.files;
                 if let Some(selection) = one_hunk(files, file, hunk) {
@@ -1396,21 +1424,35 @@ impl Diffui {
         }));
     }
 
+    /// The picks' "more" menu: what the bar has no room for.
+    fn open_picks_menu(&mut self, cx: &mut Cx) {
+        let tree = vec![
+            self.menu_item("lines.toggle", CommandArg::None),
+            self.menu_item("changes.clear", CommandArg::None),
+        ];
+        #[cfg(target_os = "macos")]
+        Self::popup_tree(&tree, None, cx);
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = cx;
+            let at = crate::geometry::Point::new(
+                self.window_size.width / 2.0,
+                self.window_size.height - BAR_BOTTOM - BAR_BUTTON_HEIGHT,
+            );
+            self.push_mode(crate::modes::Mode::Menu(crate::menu::OverlayMenu::new(
+                tree,
+                crate::menu::AnchorSpec::At(at),
+                None,
+            )));
+        }
+    }
+
     /// Run a partial-change op on the active tab, dropping the pick it used.
     pub(crate) fn start_changes_op(&mut self, op: MutationOp) {
         let state = self.active_mut();
         state.changes.picks.clear();
         state.changes.split = None;
         self.start_mutation_op(op)
-    }
-}
-
-/// "3 lines in `src/a.rs`" with the path styled as one.
-fn picked_prose(selection: &DiffSelection) -> Prose {
-    match (selection.picked_counts(), selection.files.as_slice()) {
-        (None, [only]) => Prose::new().path(&only.path),
-        (Some(picked), [only]) => Prose::from(format!("{picked} in ")).path(&only.path),
-        _ => Prose::from(selection.summary()),
     }
 }
 
@@ -1442,175 +1484,305 @@ const SPLIT_CHROME_HEIGHT: f32 = 2.0 * ui::DIALOG_PADDING
     + 3.0 * ui::DIALOG_SPACING
     + crate::theme::space::XXL;
 
-/// The strip docked under the diff while anything is picked or lines are
-/// being selected: what is picked, the actions on it, and the way out of
-/// line-select mode. It takes layout space, so it never covers code.
-pub(crate) fn selection_bar(
+/// Whether a picked file is whole: `jj absorb` takes paths, not hunks.
+fn whole_files_only(selection: &DiffSelection) -> bool {
+    selection
+        .files
+        .iter()
+        .all(|file| matches!(file.hunks, HunkPick::All))
+}
+
+/// "2 files · 1 hunk · 3 lines": what is picked whole, by hunk and by line.
+fn pick_detail(selection: &DiffSelection) -> String {
+    let count = |n: usize, noun: &str| match n {
+        1 => format!("1 {noun}"),
+        _ => format!("{n} {noun}s"),
+    };
+    let files = selection
+        .files
+        .iter()
+        .filter(|file| matches!(file.hunks, HunkPick::All))
+        .count();
+    let parts = [
+        (files, "file"),
+        (selection.hunk_count() - files, "hunk"),
+        (selection.line_count(), "line"),
+    ];
+    parts
+        .into_iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, noun)| count(n, noun))
+        .collect::<Vec<_>>()
+        .join(" \u{b7} ")
+}
+
+/// Below this pane width the bar's buttons drop their labels for their icons.
+const BAR_LABELS_MIN_WIDTH: f32 = 840.0;
+/// The bar's distance from the window's bottom edge.
+const BAR_BOTTOM: f32 = 40.0;
+const BAR_BUTTON_HEIGHT: f32 = 30.0;
+
+/// The picks' floating bar: what is picked and what can be done with it, over
+/// the diff, in inverted colours. Line-select mode shows it too, with its way
+/// out. Empty when nothing is picked. Mounted once for the window.
+pub(crate) fn action_bar(
     ui: &Diffui,
     theme: ThemeSpec,
     _window: &mut Window,
     cx: &mut Cx,
-) -> Option<AnyElement> {
+) -> AnyElement {
+    use gpui_kit::base::TestSupportExt as _;
     let tab = ui.active();
+    let empty = || div().into_any_element();
     if !editable(tab) || split_prompt_shown(ui).is_some() {
-        return None;
+        return empty();
     }
     let selection = selection_of(tab);
     let selecting = live_line_select(tab).is_some();
     if selection.is_empty() && !selecting {
-        return None;
+        return empty();
     }
     let font = ui.config.ui_font;
-    let mono = ui.config.mono_font;
-    let medium = theme::emphasis_font(font, Weight::MEDIUM);
-    let prose = |prose: Prose, color| {
-        Aligned::text(
-            div()
-                .whitespace_nowrap()
-                .text_size(px(text_size::UI))
-                .child(prose.view(font, mono, color, theme)),
-            font,
-            text_size::UI,
-        )
-    };
+    let bold = theme::emphasis_font(font, Weight::SEMIBOLD);
+    let ink = theme.panel_background;
+    let faded = Color { a: 0.7, ..ink };
+    let pane_width = crate::diff_panel::diff_pane_width(ui);
+    let pane_left = (ui.window_size.width - pane_width).max(0.0);
+    let labels = pane_width >= BAR_LABELS_MIN_WIDTH;
 
-    let picked = picked_prose(&selection);
-    // The icon centres on the caps and the runs share a baseline (see
-    // `crate::typography`).
-    let (lead_text, lead_icon): (Vec<Aligned>, _) = if selecting {
-        let status = if selection.is_empty() {
-            Prose::from("Nothing selected yet")
+    let (title, detail) = match (selecting, selection.is_empty()) {
+        (true, true) => ("Selecting lines", "Nothing picked yet".to_owned()),
+        (true, false) => ("Selecting lines", pick_detail(&selection)),
+        (false, _) => ("Picked", pick_detail(&selection)),
+    };
+    let label = typography::baseline_row(
+        vec![
+            Aligned::text(
+                typography::line(title, bold, text_size::UI, ink),
+                bold,
+                text_size::UI,
+            ),
+            Aligned::gap(theme::space::SM),
+            Aligned::text(
+                typography::line(detail, font, text_size::UI, faded),
+                font,
+                text_size::UI,
+            ),
+        ],
+        0.0,
+    );
+    let separator = || {
+        div()
+            .flex_none()
+            .w(px(1.0))
+            .h(px(18.0))
+            .mx(px(4.0))
+            .bg(Color { a: 0.18, ..ink })
+            .into_any_element()
+    };
+    let hover = Color {
+        r: 0.5,
+        g: 0.5,
+        b: 0.5,
+        a: 0.24,
+    };
+    let button = |id: &'static str,
+                  icon: Option<&'static str>,
+                  text: &'static str,
+                  tip: &'static str,
+                  enabled: bool,
+                  msg: ChangesMsg,
+                  cx: &mut Cx| {
+        let show_label = labels || icon.is_none();
+        let mut content = div().flex().flex_row().items_center().gap(px(6.0));
+        if let Some(icon) = icon {
+            content = content.child(icons::icon(icon, ui::ICON_SIZE, ink));
+        }
+        if show_label {
+            content = content.child(typography::centered(
+                typography::line(text, font, text_size::UI, ink),
+                font,
+                text_size::UI,
+            ));
+        }
+        let mut element = div()
+            .id(id)
+            .test_support()
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .h(px(BAR_BUTTON_HEIGHT))
+            .rounded(px(theme::radius::BUTTON))
+            .child(content)
+            .tooltip(ui::tooltip(tip, font, theme));
+        element = if show_label {
+            element.px(px(9.0))
         } else {
-            picked
+            element.w(px(BAR_BUTTON_HEIGHT))
         };
-        (
-            vec![
-                Aligned::text(
-                    typography::line("Selecting lines", medium, text_size::UI, theme.text),
-                    medium,
-                    text_size::UI,
-                ),
-                Aligned::gap(theme::space::MD),
-                prose(status, theme.muted_text),
-            ],
-            icons::LIST_CHECKS,
-        )
-    } else {
-        (
-            vec![prose(picked.text(" selected"), theme.text)],
-            icons::CHECK,
-        )
+        if enabled {
+            element = element
+                .cursor_pointer()
+                .hover(move |style| style.bg(hover))
+                .on_click(Diffui::on_action(Action::Changes(msg), cx));
+        } else {
+            element = element.opacity(0.4);
+        }
+        element.into_any_element()
     };
-    let mut lead_items = vec![
-        Aligned::glyph(
-            icons::icon(lead_icon, ui::ICON_SIZE, theme.info),
-            ui::ICON_SIZE,
-        ),
-        Aligned::gap(theme::space::SM),
-    ];
-    lead_items.extend(lead_text);
-    let lead = typography::baseline_row(lead_items, 0.0);
 
-    let mut labels: Vec<(&'static str, &'static str, ChangesMsg, ui::Variant)> = Vec::new();
+    let mut items = vec![
+        div()
+            .flex_none()
+            .pl(px(8.0))
+            .pr(px(10.0))
+            .child(label)
+            .into_any_element(),
+    ];
     if !selection.is_empty() {
-        labels.extend([
-            (
-                "picks-clear",
-                "Clear",
-                ChangesMsg::Clear,
-                ui::Variant::Ghost,
-            ),
-            (
-                "picks-split",
-                "Split\u{2026}",
-                ChangesMsg::OpenSplit,
-                ui::Variant::Raised,
-            ),
-            (
-                "picks-squash",
-                "Squash into parent",
-                ChangesMsg::SquashIntoParent,
-                ui::Variant::Raised,
-            ),
-            (
-                "picks-move",
-                "Move into\u{2026}",
-                ChangesMsg::MoveInto,
-                ui::Variant::Raised,
-            ),
-            (
-                "picks-discard",
-                "Discard\u{2026}",
-                ChangesMsg::Discard,
-                ui::Variant::Raised,
-            ),
-        ]);
-    }
-    if selecting {
-        labels.push((
-            "lines-done",
-            "Done",
-            ChangesMsg::Lines(LineMsg::Exit),
-            ui::Variant::Primary,
+        let absorb = whole_files_only(&selection);
+        items.push(separator());
+        items.push(button(
+            "picks-split",
+            Some(icons::SCISSORS),
+            "Split\u{2026}",
+            "jj split: move the picked changes into a new revision",
+            true,
+            ChangesMsg::OpenSplit,
+            cx,
+        ));
+        items.push(button(
+            "picks-squash",
+            Some(icons::ARROW_DOWN_TO_LINE),
+            "Squash",
+            "jj squash: fold the picked changes into the parent",
+            true,
+            ChangesMsg::SquashIntoParent,
+            cx,
+        ));
+        items.push(button(
+            "picks-move",
+            Some(icons::MOVE),
+            "Move to\u{2026}",
+            "jj squash --into: move the picked changes to another revision",
+            true,
+            ChangesMsg::MoveInto,
+            cx,
+        ));
+        items.push(button(
+            "picks-absorb",
+            Some(icons::COMBINE),
+            "Absorb",
+            if absorb {
+                "jj absorb: send each picked line to the revision that last touched it"
+            } else {
+                "jj absorb takes whole files: pick files, not hunks or lines"
+            },
+            absorb,
+            ChangesMsg::Absorb,
+            cx,
+        ));
+        items.push(button(
+            "picks-discard",
+            Some(icons::ROTATE_CCW),
+            "Restore",
+            "jj restore: undo the picked changes",
+            true,
+            ChangesMsg::Discard,
+            cx,
+        ));
+        items.push(separator());
+        items.push(button(
+            "picks-copy",
+            Some(icons::COPY),
+            "Copy patch",
+            "Copy the picked changes as a patch",
+            true,
+            ChangesMsg::CopyPatch,
+            cx,
+        ));
+        items.push(button(
+            "picks-more",
+            Some(icons::ELLIPSIS),
+            "",
+            "More actions for the picked changes",
+            true,
+            ChangesMsg::MoreMenu,
+            cx,
         ));
     }
-    // Whether the summary and every button share one line in this pane.
-    let buttons_width: f32 = labels
-        .iter()
-        .map(|(_, label, _, _)| {
-            crate::measure::line_width(label, text_size::UI, font) + 2.0 * ui::Size::Compact.pad_x()
-        })
-        .sum::<f32>()
-        + ui::BUTTON_GAP * labels.len() as f32;
-    let lead_width = ui::ICON_SIZE
-        + theme::space::SM
-        + crate::measure::line_width(
-            &format!("Selecting lines  {} selected", selection.summary()),
-            text_size::UI,
-            font,
-        );
-    let one_line = lead_width + buttons_width + 2.0 * crate::diff_view::HEADER_HORIZONTAL_PADDING
-        <= crate::diff_panel::diff_pane_width(ui);
-    let buttons = labels
-        .iter()
-        .map(|(id, label, msg, variant)| {
-            ui::text_button(
-                *id,
-                None,
-                *label,
-                *variant,
-                ui::Size::Compact,
-                font,
-                theme,
-                cx,
-            )
-            .on_click(Diffui::on_action(Action::Changes(msg.clone()), cx))
-            .into_any_element()
-        })
-        .collect::<Vec<_>>();
-    // Line selection's keys are in the hint strip docked under this one
-    // (see `crate::mode_hints`).
-    let strip = div().flex().flex_col().gap(px(theme::space::SM)).w_full();
-    let strip = if one_line {
-        strip.child(ui::button_row(Some(lead.into_any_element()), buttons))
-    } else {
-        strip
-            .child(lead.overflow_hidden())
-            // A pane narrower than the buttons wraps them rather than cut one off.
-            .child(ui::button_row(None, buttons).flex_wrap())
-    };
-    Some(
-        div()
-            .w_full()
+    items.push(separator());
+    if selecting {
+        items.push(button(
+            "lines-done",
+            None,
+            "Done",
+            "Stop selecting lines; the picked lines stay picked",
+            true,
+            ChangesMsg::Lines(LineMsg::Exit),
+            cx,
+        ));
+    }
+    if !selection.is_empty() {
+        let keycap = div()
             .flex_none()
-            .py(px(theme::space::MD))
-            .px(px(crate::diff_view::HEADER_HORIZONTAL_PADDING))
-            .bg(theme.file_header)
+            .px(px(5.0))
+            .rounded(px(theme::radius::XS))
             .border_1()
-            .border_color(theme.border)
-            .child(strip)
-            .into_any_element(),
-    )
+            .border_color(Color { a: 0.6, ..ink })
+            .child(typography::line("esc", font, text_size::CAPTION, faded));
+        let clear = div()
+            .id("picks-clear")
+            .test_support()
+            .flex()
+            .flex_none()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .h(px(BAR_BUTTON_HEIGHT))
+            .px(px(9.0))
+            .rounded(px(theme::radius::BUTTON))
+            .cursor_pointer()
+            .hover(move |style| style.bg(hover))
+            .tooltip(ui::tooltip("Clear picks", font, theme))
+            .on_click(Diffui::on_action(Action::Changes(ChangesMsg::Clear), cx))
+            .child(typography::centered(
+                typography::line("Clear", font, text_size::UI, ink),
+                font,
+                text_size::UI,
+            ))
+            .child(keycap);
+        items.push(clear.into_any_element());
+    }
+
+    let bar = div()
+        .id("picks-bar")
+        .occlude()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(2.0))
+        .p(px(5.0))
+        .max_w_full()
+        .overflow_hidden()
+        .rounded(px(theme::radius::LG))
+        .bg(theme.text)
+        .shadow(vec![
+            theme::floating_shadow(18.0, 40.0),
+            theme::floating_shadow(8.0, 16.0),
+        ])
+        .children(items);
+    div()
+        .absolute()
+        .left(px(pane_left))
+        .right(px(0.0))
+        .bottom(px(BAR_BOTTOM))
+        .px(px(16.0))
+        .flex()
+        .justify_center()
+        .child(bar)
+        .into_any_element()
 }
 
 /// The split prompt as a modal: what stays and what moves, the two
@@ -2074,27 +2246,62 @@ mod tests {
     }
 
     #[test]
-    fn the_strip_styles_a_single_file_path_as_a_path() {
-        let one = DiffSelection {
+    fn the_bar_counts_whole_files_hunks_and_lines_apart() {
+        let selection = DiffSelection {
+            files: vec![
+                FileSelection {
+                    path: "a.rs".to_owned(),
+                    hunks: HunkPick::All,
+                },
+                FileSelection {
+                    path: "b.rs".to_owned(),
+                    hunks: HunkPick::Hunks(vec![
+                        HunkRef {
+                            index: 0,
+                            header: String::new(),
+                            lines: None,
+                        },
+                        HunkRef {
+                            index: 1,
+                            header: String::new(),
+                            lines: Some(vec![LineRef::Added(0), LineRef::Added(1)]),
+                        },
+                    ]),
+                },
+            ],
+        };
+        assert_eq!(
+            pick_detail(&selection),
+            "1 file \u{b7} 1 hunk \u{b7} 2 lines"
+        );
+        assert!(!whole_files_only(&selection));
+        let files = DiffSelection {
+            files: selection.files[..1].to_vec(),
+        };
+        assert_eq!(pick_detail(&files), "1 file");
+        assert!(whole_files_only(&files));
+    }
+
+    /// A partly picked hunk copies as a patch of its picked lines: an unpicked
+    /// removal stays as context, an unpicked addition is left out.
+    #[test]
+    fn a_partial_hunk_copies_as_only_its_picked_lines() {
+        let file = rewrite("src/a.rs");
+        let picked = |row: usize| LineRef::of(&file.hunks[0].lines[row]).unwrap();
+        let selection = DiffSelection {
             files: vec![FileSelection {
-                path: "src/a.rs".to_owned(),
+                path: file.path.clone(),
                 hunks: HunkPick::Hunks(vec![HunkRef {
                     index: 0,
-                    header: String::new(),
-                    lines: Some(vec![LineRef::Added(0), LineRef::Added(1)]),
+                    header: file.hunks[0].header.clone(),
+                    lines: Some(vec![picked(1), picked(3)]),
                 }]),
             }],
         };
         assert_eq!(
-            picked_prose(&one),
-            Prose::from("2 lines in ").path("src/a.rs")
+            selection_patch(std::slice::from_ref(&file), &selection),
+            "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n\
+             @@ -1,4 +1,4 @@\n x\n-x\n x\n+x\n x\n"
         );
-        let whole = DiffSelection {
-            files: vec![FileSelection {
-                path: "src/a.rs".to_owned(),
-                hunks: HunkPick::All,
-            }],
-        };
-        assert_eq!(picked_prose(&whole), Prose::new().path("src/a.rs"));
     }
 }

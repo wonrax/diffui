@@ -758,6 +758,8 @@ fn floats_pane(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) 
     div()
         .relative()
         .size_full()
+        // Under every overlay: the picks' bar floats over the diff, not over them.
+        .child(crate::changes::action_bar(ui, theme, window, cx))
         .child(panel_peek(ui, theme, cx))
         .child(palette::build_overlay(ui, theme, window, cx))
         .child(activity::activity_popover(ui, theme, window, cx))

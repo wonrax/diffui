@@ -312,11 +312,12 @@ impl MutationOp {
                 args.extend(r.revs_or_default(std::slice::from_ref(target)));
                 CliEquivalent::one(args).approximate()
             }
-            Self::Absorb { from } => {
+            Self::Absorb { from, paths } => {
                 let mut args = strings(["absorb"]);
                 if *from != RevisionSelection::WorkingCopy {
                     args.extend(["--from".into(), r.rev(from)]);
                 }
+                args.extend(paths.iter().cloned());
                 CliEquivalent::one(args)
             }
             Self::MoveBookmark {
@@ -795,8 +796,14 @@ mod tests {
             MutationOp::Merge {
                 parents: vec![c('a'), c('b'), wc.clone()],
             },
-            MutationOp::Absorb { from: wc.clone() },
-            MutationOp::Absorb { from: c('b') },
+            MutationOp::Absorb {
+                from: wc.clone(),
+                paths: Vec::new(),
+            },
+            MutationOp::Absorb {
+                from: c('b'),
+                paths: Vec::new(),
+            },
             MutationOp::MoveBookmark {
                 name: "main".to_owned(),
                 to: c('a'),

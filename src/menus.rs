@@ -813,7 +813,11 @@ impl Diffui {
 
     /// macOS: pop `tree` natively and run the picked row's command.
     #[cfg(target_os = "macos")]
-    fn popup_tree(tree: &[menu::MenuEntry], glow: Option<macos_native::GlowRect>, cx: &mut Cx) {
+    pub(crate) fn popup_tree(
+        tree: &[menu::MenuEntry],
+        glow: Option<macos_native::GlowRect>,
+        cx: &mut Cx,
+    ) {
         let mut picks: Vec<(CommandId, CommandArg)> = Vec::new();
         let items = lower_menu_to_native(tree, &mut picks);
         Self::popup(items, glow, cx, move |this, chosen, cx| {
