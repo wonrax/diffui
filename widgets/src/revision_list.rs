@@ -18,6 +18,7 @@
 //! from the rest of the app's theming logic.
 
 use std::rc::Rc;
+use std::time::Instant;
 
 use diffui_core::graph::LaneFrame;
 use diffui_core::graph_layout::GraphEdgeType;
@@ -35,6 +36,7 @@ use crate::geometry::{Point, Rectangle};
 use crate::graph_view::{self, GraphFrame, LANE_WIDTH, RevisionGraphStyle, lane_strip_width};
 use crate::icons;
 use crate::measure::LINE_HEIGHT_MULTIPLIER;
+use crate::scroll_resample::{self, Resampler};
 use crate::scrollbar;
 use crate::theme::{Color, Font, chip_background};
 use crate::typography::{self, TextBox};
@@ -893,6 +895,8 @@ pub struct RevisionList {
     over_scrollbar: bool,
     /// What the bar over the list reads, and where a drag on it asks to go.
     bar: scrollbar::Shared,
+    /// Wheel motion still to be drawn, spread evenly over frames.
+    wheel: Resampler,
     /// Most recent `reveal_token` we acted on. `None` until first reveal.
     last_reveal_token: Option<u64>,
     /// Most recent `file_reveal_token` we acted on. `None` until first reveal.
@@ -963,6 +967,7 @@ impl RevisionList {
             cursor_position: None,
             over_scrollbar: false,
             bar: scrollbar::Shared::default(),
+            wheel: Resampler::default(),
             last_reveal_token: None,
             last_file_reveal_token: None,
             pending_reveal_row: None,
@@ -1237,9 +1242,14 @@ impl RevisionList {
             return;
         }
         // A positive delta moves the content down, towards the top of the list.
-        self.vertical_offset =
-            (self.vertical_offset - f64::from(delta_y)).clamp(0.0, self.max_offset());
-        self.recompute_hover(cx);
+        if scroll_resample::delay().is_zero() {
+            self.vertical_offset =
+                (self.vertical_offset - f64::from(delta_y)).clamp(0.0, self.max_offset());
+            self.recompute_hover(cx);
+        } else {
+            // Drawn over the next frames: see `scroll_resample`.
+            self.wheel.push(Instant::now(), -f64::from(delta_y));
+        }
         cx.notify();
     }
 
@@ -2780,9 +2790,30 @@ impl Element for ListElement {
         let (moved, on_scroll, tooltip, ghost) = self.list.update(cx, |list, cx| {
             list.bounds = bounds.into();
             let mut moved = list.settle_offset();
+            if moved.is_some() {
+                // A jump: the wheel's leftover motion would drag the list off it.
+                list.wheel.reset();
+            }
             if let Some(offset) = list.bar.take_requested() {
                 list.vertical_offset = f64::from(offset).clamp(0.0, list.max_offset());
+                list.wheel.reset();
                 moved = Some(list.vertical_offset);
+            }
+            let step = list.wheel.take(Instant::now());
+            if step != 0.0 {
+                crate::frame_log::value("sy", step);
+            }
+            if step != 0.0 {
+                let before = list.vertical_offset;
+                list.vertical_offset = (before + step).clamp(0.0, list.max_offset());
+                if list.vertical_offset != before {
+                    moved = Some(list.vertical_offset);
+                    // Rows slid under a still cursor: its hover moves with them.
+                    list.recompute_hover(cx);
+                }
+            }
+            if list.wheel.pending() {
+                window.request_animation_frame();
             }
             list.bar.publish(
                 list.bounds,
@@ -2875,6 +2906,7 @@ impl Element for ListElement {
                 return;
             }
             let delta_y = f32::from(event.delta.pixel_delta(window.line_height()).y);
+            crate::frame_log::value("wy", f64::from(delta_y));
             let effects = list.update(cx, |list, cx| {
                 list.with_scroll_report(|list, _, cx| list.on_wheel(delta_y, cx), cx)
             });

@@ -4,7 +4,8 @@
 //!
 //! Each frame writes one line: milliseconds since the log opened, since the
 //! previous frame began, and from the root's render to the last paint, then the
-//! timed spans inside that frame as `name=ms`. Wheel events count as `wheel` spans.
+//! timed spans inside that frame as `name=ms`. Wheel events count as `wheel` spans,
+//! with their vertical delta as `wy` and the distance a view drew that frame as `sy`.
 
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -16,7 +17,7 @@ struct Log {
     opened: Instant,
     began: Option<Instant>,
     last_began: Option<Instant>,
-    spans: Vec<(&'static str, Duration)>,
+    spans: Vec<(&'static str, f64)>,
 }
 
 static LOG: LazyLock<Option<Mutex<Log>>> = LazyLock::new(|| {
@@ -55,7 +56,12 @@ pub fn begin() {
 
 /// Something inside the frame took `took`.
 pub fn span(name: &'static str, took: Duration) {
-    with(|log| log.spans.push((name, took)));
+    value(name, took.as_secs_f64() * 1000.0);
+}
+
+/// A number from inside the frame, logged as `name=value`.
+pub fn value(name: &'static str, value: f64) {
+    with(|log| log.spans.push((name, value)));
 }
 
 /// Times `f` as span `name`.
@@ -87,9 +93,9 @@ pub fn end() {
             since_last,
             ms(now.saturating_duration_since(began)),
         );
-        for (name, took) in log.spans.drain(..) {
+        for (name, value) in log.spans.drain(..) {
             // A closure's type name (an `act` call site) holds spaces.
-            let _ = write!(line, " {}={:.2}", name.replace(' ', ""), ms(took));
+            let _ = write!(line, " {}={:.2}", name.replace(' ', ""), value);
         }
         line.push('\n');
         let _ = log.file.write_all(line.as_bytes());

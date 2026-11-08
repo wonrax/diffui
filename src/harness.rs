@@ -264,6 +264,8 @@ impl Harness {
                 cx,
             );
             crate::scrollbar::place_kit_bars(cx);
+            // Likewise a wheel event lands at once rather than over the next frames.
+            diffui_widgets::scroll_resample::turn_off();
         });
         let cli = Cli {
             paths: repo.map(Path::to_path_buf).into_iter().collect(),

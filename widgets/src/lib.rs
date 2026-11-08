@@ -18,6 +18,7 @@ pub mod measure;
 pub mod prose;
 pub mod resize_handle;
 pub mod revision_list;
+pub mod scroll_resample;
 pub mod scrollbar;
 pub mod theme;
 pub mod typography;

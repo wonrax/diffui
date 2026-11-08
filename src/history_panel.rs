@@ -17,7 +17,12 @@ use gpui_kit::component::Disableable as _;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, Div, ElementId, SharedString, Stateful, Window, div, px};
+use std::cell::RefCell;
 use std::collections::HashSet;
+use std::rc::Rc;
+use std::time::Instant;
+
+use diffui_widgets::scroll_resample::{self, Resampler};
 
 use diffui_core::history::{
     ChangedCommit, CommitBrief, CommitChangeKind, EvologEntry, FileAnnotation, HistoryDiffTarget,
@@ -1804,6 +1809,7 @@ fn op_log_list(ui: &Diffui, cx: &mut Cx) -> AnyElement {
     let state = list.state.clone();
     let app = cx.entity();
     let now = now_millis();
+    let wheel = op_log_wheel(&state, &list.wheel);
     let rows = gpui_kit::list(state.clone(), move |index, window, cx| {
         diffui_widgets::frame_log::time("oplog.row", || {
             app.update(cx, |ui, cx| {
@@ -1832,9 +1838,59 @@ fn op_log_list(ui: &Diffui, cx: &mut Cx) -> AnyElement {
     div()
         .relative()
         .size_full()
+        .child(wheel)
         .child(rows)
         .vertical_scrollbar(&state)
         .into_any_element()
+}
+
+/// Takes the op log's wheel events from the list and scrolls it evenly over the
+/// frames that follow, as the graph and the diff do (`scroll_resample`). It sits
+/// under the list: laid out first, so a frame's motion lands before the list's
+/// layout, and its capture-phase handler runs before the list's own.
+fn op_log_wheel(state: &gpui_kit::ListState, wheel: &Rc<RefCell<Resampler>>) -> AnyElement {
+    if scroll_resample::delay().is_zero() {
+        return div().into_any_element();
+    }
+    let (state, wheel) = (state.clone(), wheel.clone());
+    let events = wheel.clone();
+    gpui_kit::canvas(
+        move |bounds, window, _| {
+            let step = wheel.borrow_mut().take(Instant::now());
+            if step != 0.0 {
+                diffui_widgets::frame_log::value("sy", step);
+            }
+            if step != 0.0 {
+                let top = -f64::from(state.scroll_px_offset_for_scrollbar().y);
+                let max = f64::from(state.max_offset_for_scrollbar().y);
+                let top = (top + step).clamp(0.0, max) as f32;
+                state.set_offset_from_scrollbar(gpui_kit::point(px(0.0), px(-top)));
+            }
+            if wheel.borrow().pending() {
+                window.request_animation_frame();
+            }
+            window.insert_hitbox(bounds, gpui_kit::HitboxBehavior::Normal)
+        },
+        move |_, hitbox, window, _| {
+            let view = window.current_view();
+            let events = events.clone();
+            window.on_mouse_event(move |event: &gpui_kit::ScrollEvent, phase, window, cx| {
+                if phase != gpui_kit::DispatchPhase::Capture || !hitbox.should_handle_scroll(window)
+                {
+                    return;
+                }
+                // The list's own step for a wheel notch.
+                let delta = event.delta.pixel_delta(px(20.0)).y;
+                diffui_widgets::frame_log::value("wy", f64::from(delta));
+                events.borrow_mut().push(Instant::now(), -f64::from(delta));
+                cx.notify(view);
+                cx.stop_propagation();
+            });
+        },
+    )
+    .absolute()
+    .size_full()
+    .into_any_element()
 }
 
 /// How far past each edge of the op log rows are built. A row is built in the
@@ -1847,6 +1903,7 @@ const OP_LOG_OVERDRAW: f32 = 48.0;
 struct OpLogList {
     state: gpui_kit::ListState,
     keys: std::cell::RefCell<Vec<OpLogKey>>,
+    wheel: Rc<RefCell<Resampler>>,
 }
 
 impl Default for OpLogList {
@@ -1854,6 +1911,7 @@ impl Default for OpLogList {
         Self {
             state: gpui_kit::ListState::new(0, gpui_kit::ListAlignment::Top, px(OP_LOG_OVERDRAW)),
             keys: Default::default(),
+            wheel: Default::default(),
         }
     }
 }

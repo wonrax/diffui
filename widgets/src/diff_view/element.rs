@@ -22,6 +22,7 @@ use super::line::{GeometryMemo, body_geometry_key};
 use super::paint::{CodeCache, Plan};
 use super::{Callback, DiffProps, DiffView, HeaderAction, LineAt, LinePress};
 use crate::geometry::{Point, Rectangle};
+use crate::scroll_resample::{self, Resampler};
 use crate::scrollbar;
 use crate::theme::Color;
 
@@ -111,6 +112,8 @@ pub(super) struct State {
     last_auto_scroll: Option<Instant>,
     /// What the bar over the view reads, and where a drag on it asks to go.
     pub(super) bar: scrollbar::Shared,
+    /// Vertical wheel motion still to be drawn, spread evenly over frames.
+    wheel: Resampler,
     /// Most recent `restore_token` acted on; a change schedules a one-shot jump to the
     /// caller's `restore_offset`. Starts at 0 to match the caller's initial token.
     last_restore_token: u64,
@@ -192,6 +195,7 @@ impl Default for State {
             last_drag_cursor: None,
             last_auto_scroll: None,
             bar: scrollbar::Shared::default(),
+            wheel: Resampler::default(),
             last_restore_token: 0,
             pending_set_offset: None,
             last_content_version: 0,
@@ -615,6 +619,7 @@ impl State {
         let (max_vertical, max_horizontal) = self.limits(view, bounds);
         let prev_offset = self.vertical_offset;
         let delta = event.delta.pixel_delta(px(POINTS_PER_LINE));
+        crate::frame_log::value("wy", f64::from(delta.y));
         // Positive means the content moves down in GPUI; an offset grows going down.
         let mut movement = Point::new(-f32::from(delta.x), -f32::from(delta.y));
         // Shift+wheel pans sideways, matching editors. Only redirect when the event has no
@@ -654,9 +659,16 @@ impl State {
         }
 
         let prev_horizontal = self.horizontal_offset;
+        let mut owed = false;
         if movement.y != 0.0 {
-            self.vertical_offset = (self.vertical_offset + movement.y).clamp(0.0, max_vertical);
-            self.publish_file(view, out);
+            if scroll_resample::delay().is_zero() {
+                self.vertical_offset = (self.vertical_offset + movement.y).clamp(0.0, max_vertical);
+                self.publish_file(view, out);
+            } else {
+                // Drawn over the next frames: see `scroll_resample`.
+                self.wheel.push(Instant::now(), f64::from(movement.y));
+                owed = true;
+            }
         }
         // Sideways only lives in no-wrap mode, where content can actually overflow.
         if movement.x != 0.0 && max_horizontal > 0.0 {
@@ -670,7 +682,7 @@ impl State {
         if self.vertical_offset != prev_offset {
             send(out, &view.props.on_scroll, self.vertical_offset);
         }
-        self.vertical_offset != prev_offset || self.horizontal_offset != prev_horizontal
+        owed || self.vertical_offset != prev_offset || self.horizontal_offset != prev_horizontal
     }
 
     /// A left press at `point`, inside the view.
@@ -1029,12 +1041,31 @@ impl DiffView {
             }
             let prev_offset = state.vertical_offset;
             state.apply_pending(&view, bounds, &mut out);
+            if state.vertical_offset != prev_offset {
+                // A jump: the wheel's leftover motion would drag the view off it.
+                state.wheel.reset();
+            }
             if let Some(offset) = state.bar.take_requested() {
                 let (max_vertical, _) = state.limits(&view, bounds);
                 state.vertical_offset = offset.clamp(0.0, max_vertical);
+                state.wheel.reset();
                 state.publish_file(&view, &mut out);
             }
-            animating = state.step_auto_scroll(&view, bounds, &mut out);
+            let step = state.wheel.take(Instant::now()) as f32;
+            if step != 0.0 {
+                crate::frame_log::value("sy", f64::from(step));
+            }
+            if step != 0.0 {
+                let (max_vertical, _) = state.limits(&view, bounds);
+                let before = state.vertical_offset;
+                state.vertical_offset = (before + step).clamp(0.0, max_vertical);
+                if state.vertical_offset != before {
+                    state.publish_file(&view, &mut out);
+                    // Rows slid under a still cursor: its hover moves with them.
+                    state.refresh_hover(&view, bounds, bounds.contains(mouse).then_some(mouse));
+                }
+            }
+            animating = state.step_auto_scroll(&view, bounds, &mut out) || state.wheel.pending();
             if state.vertical_offset != prev_offset {
                 send(&mut out, &props.on_scroll, state.vertical_offset);
             }
