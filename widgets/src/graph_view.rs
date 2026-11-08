@@ -22,17 +22,33 @@ use gpui_kit::{BorderStyle, Bounds, PathBuilder, Pixels, Point, Window, point, p
 
 use crate::theme::Color;
 
-/// Horizontal width occupied by one lane in the gutter. `lane_x` centers
-/// the node disc in the middle of its lane, so adjacent lanes sit at
-/// `LANE_WIDTH` apart. Exposed because the revision list reserves
-/// `lanes * LANE_WIDTH` of horizontal space for the gutter, and sidebar
-/// layout math needs the same number to size the path column.
+/// Lane spacing of a strip with no list-wide gutter (a files-only list,
+/// whose rows carry no lanes): see [`LaneGeometry::strip`].
 pub const LANE_WIDTH: f32 = 10.0;
-const LINE_THICKNESS: f32 = 1.5;
+const LINE_THICKNESS: f32 = 1.75;
 const LINE_THICKNESS_EMPHASIZED: f32 = 2.75;
+/// A mutable revision's disc, and the ring of the pane's colour around it
+/// that keeps it apart from the strokes it sits on.
 const NODE_RADIUS: f32 = 4.0;
-/// The working copy's "you are here" halo around its disc.
-const HALO_RADIUS: f32 = NODE_RADIUS + 2.5;
+const NODE_RING: f32 = 2.0;
+/// An immutable revision: a small hollow ring.
+const IMMUTABLE_RADIUS: f32 = 4.4;
+const IMMUTABLE_RING: f32 = 1.75;
+/// A conflicted revision: a larger red disc carrying a `!`.
+const CONFLICT_RADIUS: f32 = 6.0;
+/// The working copy: an accent disc with a centre dot and a soft halo.
+const WORKING_COPY_RADIUS: f32 = 6.5;
+const WORKING_COPY_DOT: f32 = 2.4;
+pub const HALO_RADIUS: f32 = 10.0;
+const HALO_ALPHA: f32 = 0.18;
+/// A node on a folded lane: a grey dot in a faint ring.
+const FOLDED_RADIUS: f32 = 4.0;
+const FOLDED_RING_RADIUS: f32 = 7.5;
+/// How far the overflow column sits past the last real slot, so the bundle
+/// reads as apart from the lanes.
+pub const OVERFLOW_GAP: f32 = 6.0;
+/// What's left of an edge or node outside the lane a hover brought out.
+const DIMMED_ALPHA: f32 = 0.3;
 /// Indirect edges are dashed, so they stay distinguishable when they share a
 /// lane color with a direct edge.
 const DASH: [Pixels; 2] = [px(4.0), px(3.0)];
@@ -53,6 +69,76 @@ pub struct RevisionGraphStyle {
     /// Color used for the missing-parent stub. Doesn't participate in lane
     /// coloring because it isn't a real edge.
     pub missing_color: Color,
+    /// Folded lanes and immutable rings: ink that names no branch.
+    pub neutral: Color,
+    /// The pane under the graph: the rings that cut nodes out of strokes.
+    pub surface: Color,
+    /// The working copy's disc and halo.
+    pub accent: Color,
+    /// The working copy's centre dot.
+    pub accent_foreground: Color,
+    /// A conflicted revision's disc.
+    pub conflict: Color,
+}
+
+/// What a revision's node says about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeKind {
+    Mutable,
+    /// In `immutable()`.
+    Immutable,
+    /// Its tree holds a conflict.
+    Conflict,
+    /// The working copy: the most visible node in the graph.
+    WorkingCopy,
+    /// A previewed ghost: where a moved or abandoned commit used to be.
+    Ghost,
+}
+
+/// Where a list's lane columns sit: shared by every row so titles start at
+/// one x and lanes line up from row to row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LaneGeometry {
+    /// Column 0's centre, from the row's left edge.
+    pub first: f32,
+    /// Distance between neighbouring columns.
+    pub spacing: f32,
+    /// The column folded lanes share, when lanes fold. It sits
+    /// [`OVERFLOW_GAP`] further out than the spacing alone would put it.
+    pub overflow: Option<usize>,
+}
+
+impl LaneGeometry {
+    /// The fixed strip of a list without a list-wide gutter: lane centres
+    /// `LANE_WIDTH` apart past `left_padding`.
+    pub fn strip(left_padding: f32) -> Self {
+        Self {
+            first: left_padding + LANE_WIDTH / 2.0,
+            spacing: LANE_WIDTH,
+            overflow: None,
+        }
+    }
+
+    /// Centre of `column`, for a row whose left edge is at `origin`.
+    pub fn x(&self, origin: f32, column: usize) -> f32 {
+        let gap = if self.overflow == Some(column) {
+            OVERFLOW_GAP
+        } else {
+            0.0
+        };
+        origin + self.first + column as f32 * self.spacing + gap
+    }
+
+    /// The column under `local_x` (from the row's left edge), when it falls
+    /// within half a spacing of one. `columns` is how many there are.
+    pub fn column_at(&self, local_x: f32, columns: usize) -> Option<usize> {
+        (0..columns).find(|&column| (local_x - self.x(0.0, column)).abs() <= self.spacing / 2.0)
+    }
+
+    /// Whether `column` is the folded lanes' bundle.
+    pub fn is_overflow(&self, column: usize) -> bool {
+        self.overflow == Some(column)
+    }
 }
 
 impl RevisionGraphStyle {
@@ -60,6 +146,24 @@ impl RevisionGraphStyle {
     /// every four lanes, which keeps neighbours distinct without a rainbow.
     pub fn lane_color(&self, lane: usize) -> Color {
         self.lanes[lane % self.lanes.len()]
+    }
+}
+
+/// How one lane's edge reads at a row.
+#[derive(Debug, Clone, Copy, Default)]
+struct EdgeLook {
+    /// The lane under the cursor: drawn thicker.
+    emphasized: bool,
+    /// The lane sits in the overflow column: neutral ink.
+    folded: bool,
+    /// Another lane is brought out: this one recedes.
+    dimmed: bool,
+}
+
+fn dim(color: Color) -> Color {
+    Color {
+        a: color.a * DIMMED_ALPHA,
+        ..color
     }
 }
 
@@ -74,12 +178,19 @@ struct StrokeStyle {
 impl RevisionGraphStyle {
     /// Stroke for an edge of a given kind in a given lane. When `emphasized`
     /// it renders thicker: the lane under the cursor.
-    fn edge_stroke(&self, kind: GraphEdgeType, lane: usize, emphasized: bool) -> StrokeStyle {
+    fn edge_stroke(&self, kind: GraphEdgeType, lane: usize, look: EdgeLook) -> StrokeStyle {
+        let EdgeLook {
+            emphasized,
+            folded,
+            dimmed,
+        } = look;
+        let color = match kind {
+            GraphEdgeType::Missing => self.missing_color,
+            _ if folded => self.neutral,
+            _ => self.lane_color(lane),
+        };
         StrokeStyle {
-            color: match kind {
-                GraphEdgeType::Missing => self.missing_color,
-                _ => self.lane_color(lane),
-            },
+            color: if dimmed { dim(color) } else { color },
             width: if emphasized {
                 LINE_THICKNESS_EMPHASIZED
             } else {
@@ -106,6 +217,31 @@ struct Disc {
 pub struct GraphFrame {
     strokes: Vec<(StrokeStyle, PathBuilder)>,
     discs: Vec<Disc>,
+    /// Rounded bars painted over the discs.
+    marks: Vec<(Bounds<Pixels>, Color)>,
+}
+
+impl GraphFrame {
+    /// A rounded bar `width` wide from `top` to `bottom`, centred on `x`.
+    fn bar(&mut self, x: f32, top: f32, bottom: f32, width: f32, color: Color) {
+        self.marks.push((
+            Bounds::new(
+                point(px(x - width / 2.0), px(top)),
+                size(px(width), px(bottom - top)),
+            ),
+            color,
+        ));
+    }
+
+    fn disc(&mut self, x: f32, y: f32, radius: f32, fill: Color, border: Option<(Color, f32)>) {
+        self.discs.push(Disc {
+            x,
+            y,
+            radius,
+            fill,
+            border,
+        });
+    }
 }
 
 impl GraphFrame {
@@ -147,16 +283,25 @@ impl GraphFrame {
                 BorderStyle::Solid,
             ));
         }
+        // Marks drawn on the discs: a conflict's `!`.
+        for (bounds, color) in self.marks {
+            let radius = f32::from(bounds.size.width.min(bounds.size.height)) / 2.0;
+            window.paint_quad(quad(
+                bounds,
+                px(radius),
+                color,
+                px(0.0),
+                color,
+                BorderStyle::Solid,
+            ));
+        }
     }
 }
 
-/// Width in pixels needed to render a row with `lane_count` lanes.
+/// Width in pixels needed to render a row with `lane_count` lanes in a
+/// [`LaneGeometry::strip`].
 pub fn lane_strip_width(lane_count: usize) -> f32 {
     lane_count as f32 * LANE_WIDTH
-}
-
-fn lane_x(x_origin: f32, lane: usize) -> f32 {
-    x_origin + (lane as f32 + 0.5) * LANE_WIDTH
 }
 
 fn at(x: f32, y: f32) -> Point<Pixels> {
@@ -173,7 +318,7 @@ fn at(x: f32, y: f32) -> Point<Pixels> {
 /// so much that the gutter starts looking sketched.
 const NODE_TILT_DEG: f32 = 10.0;
 
-/// Corner radius as a fraction of `lane_width`. Bigger = softer, more
+/// Corner radius as a fraction of the lane spacing. Bigger = softer, more
 /// rounded turn; smaller = closer to a true square corner. Half the
 /// lane width is the practical ceiling: anything more starts to crowd
 /// the adjacent lane's vertical line. This value sits just under that
@@ -264,7 +409,14 @@ fn round_corner(
 /// Anything inside the disc area gets covered when the disc is painted
 /// on top, so the messy convergence of multiple edges at the centre is
 /// hidden by the disc rather than fanned out around it.
-fn outgoing(builder: &mut PathBuilder, x_node: f32, x_target: f32, y_mid: f32, y_bot: f32) {
+fn outgoing(
+    builder: &mut PathBuilder,
+    x_node: f32,
+    x_target: f32,
+    y_mid: f32,
+    y_bot: f32,
+    spacing: f32,
+) {
     builder.move_to(at(x_node, y_mid));
     if (x_target - x_node).abs() < 0.5 {
         builder.line_to(at(x_node, y_bot));
@@ -283,9 +435,9 @@ fn outgoing(builder: &mut PathBuilder, x_node: f32, x_target: f32, y_mid: f32, y
     // the row bottom and bleed into the next revision. Clamping flattens
     // the effective tilt so the line reads as a long diagonal into the
     // target column instead.
-    let max_corner_y = (y_bot - LANE_WIDTH * CORNER_RADIUS_FRAC * 0.5).max(y_mid);
+    let max_corner_y = (y_bot - spacing * CORNER_RADIUS_FRAC * 0.5).max(y_mid);
     let corner_y = natural_corner_y.min(max_corner_y);
-    let radius = (LANE_WIDTH * CORNER_RADIUS_FRAC)
+    let radius = (spacing * CORNER_RADIUS_FRAC)
         .min((y_bot - corner_y) * 0.5)
         .max(0.0);
 
@@ -322,7 +474,14 @@ fn lane_shift(builder: &mut PathBuilder, x_from: f32, x_to: f32, y_top: f32, y_m
 /// drop in the source column, rounded corner, tilted approach to the node
 /// centre. As with [`outgoing`], the path runs to the disc centre and the disc
 /// covers the convergence.
-fn incoming(builder: &mut PathBuilder, x_source: f32, x_node: f32, y_top: f32, y_mid: f32) {
+fn incoming(
+    builder: &mut PathBuilder,
+    x_source: f32,
+    x_node: f32,
+    y_top: f32,
+    y_mid: f32,
+    spacing: f32,
+) {
     if (x_node - x_source).abs() < 0.5 {
         builder.move_to(at(x_node, y_top));
         builder.line_to(at(x_node, y_mid));
@@ -333,9 +492,9 @@ fn incoming(builder: &mut PathBuilder, x_source: f32, x_node: f32, y_top: f32, y
     let natural_corner_y = y_mid - dx * NODE_TILT_DEG.to_radians().tan();
     // Mirror of `outgoing`: keep the corner inside the row with room for the
     // arc, so wide graphs don't push the path above `y_top`.
-    let min_corner_y = (y_top + LANE_WIDTH * CORNER_RADIUS_FRAC * 0.5).min(y_mid);
+    let min_corner_y = (y_top + spacing * CORNER_RADIUS_FRAC * 0.5).min(y_mid);
     let corner_y = natural_corner_y.max(min_corner_y);
-    let radius = (LANE_WIDTH * CORNER_RADIUS_FRAC)
+    let radius = (spacing * CORNER_RADIUS_FRAC)
         .min((corner_y - y_top) * 0.5)
         .max(0.0);
 
@@ -353,21 +512,15 @@ fn incoming(builder: &mut PathBuilder, x_source: f32, x_node: f32, y_top: f32, y
 /// How one revision row's gutter is drawn.
 pub struct RevisionRow<'a> {
     pub frame_data: &'a LaneFrame,
-    /// Warped lane -> display-column maps for this row and the previous one
-    /// (`LaneFrame::display_columns`). All x positions come from these; lane
-    /// *indices* (colors, dash kinds, emphasis) stay original. A lane whose
-    /// column differs between the rows slides over in the top half.
+    /// Lane -> display-column maps for this row and the previous one
+    /// (`LaneFrame::display_columns`, folded by the list). All x positions
+    /// come from these; lane *indices* (colors, dash kinds, emphasis) stay
+    /// original. A lane whose column differs between the rows slides over in
+    /// the top half.
     pub columns: &'a [Option<usize>],
     pub prev_columns: &'a [Option<usize>],
-    /// Forces the node disc to this color instead of the lane color. Used to
-    /// paint the working-copy node in the accent so the current
-    /// branching point is unmistakable in the graph, regardless of which lane
-    /// it happens to live in. Edges still wear their lane colors: only the
-    /// disc gets overridden.
-    pub node_color_override: Option<Color>,
-    /// A ghost row (a previewed commit's old place): the node is a hollow
-    /// ring filled with this background instead of a disc.
-    pub hollow_node: Option<Color>,
+    pub geometry: &'a LaneGeometry,
+    pub node: NodeKind,
     /// When `Some(lane)`, the incoming (top-half) strokes for that lane render
     /// thicker. Separate from `emphasized_lane_after` because a merge can reuse
     /// a lane index for an unrelated outgoing branch, and emphasizing both
@@ -377,10 +530,18 @@ pub struct RevisionRow<'a> {
     /// When `Some(lane)`, the outgoing (bottom-half) strokes for that lane
     /// render thicker. See `emphasized_lane_before`.
     pub emphasized_lane_after: Option<usize>,
+    /// A lane a hover brought out of the fold: every other lane but the
+    /// trunk (lane 0) recedes.
+    pub focus: Option<usize>,
 }
 
-/// Adds a revision row to `frame`. `x`, `top` and `height` place the row's lane
-/// strip, in window coordinates.
+/// Whether `lane` recedes behind the `focus` lane.
+fn dimmed(lane: usize, focus: Option<usize>) -> bool {
+    focus.is_some_and(|focus| lane != focus && lane != 0)
+}
+
+/// Adds a revision row to `frame`. `x`, `top` and `height` place the row, in
+/// window coordinates; `x` is its left edge.
 pub fn revision_row(
     frame: &mut GraphFrame,
     x: f32,
@@ -390,6 +551,8 @@ pub fn revision_row(
     style: &RevisionGraphStyle,
 ) {
     let frame_data = row.frame_data;
+    let geometry = row.geometry;
+    let spacing = geometry.spacing;
     let bot = top + height;
     let mid = top + height / 2.0;
     let col = |lane: usize| row.columns.get(lane).copied().flatten().unwrap_or(lane);
@@ -400,23 +563,29 @@ pub fn revision_row(
             .flatten()
             .unwrap_or_else(|| col(lane))
     };
-    let x_node = lane_x(x, col(frame_data.node_lane));
+    let lane_x = |column: usize| geometry.x(x, column);
+    let look = |lane: usize, emphasized: Option<usize>| EdgeLook {
+        emphasized: emphasized == Some(lane),
+        folded: geometry.is_overflow(col(lane)),
+        dimmed: dimmed(lane, row.focus),
+    };
+    let x_node = lane_x(col(frame_data.node_lane));
 
     // Incoming edges (top half). Each lane enters at the column it occupied
     // in the previous row and (when the warp shifts it) slides into this
     // row's column by mid-height.
     for (lane, kind) in frame_data.before.iter().enumerate() {
         let Some(kind) = *kind else { continue };
-        let x_top = lane_x(x, prev_col(lane));
-        let x_here = lane_x(x, col(lane));
-        let stroke = style.edge_stroke(kind, lane, row.emphasized_lane_before == Some(lane));
+        let x_top = lane_x(prev_col(lane));
+        let x_here = lane_x(col(lane));
+        let stroke = style.edge_stroke(kind, lane, look(lane, row.emphasized_lane_before));
         let path = frame.path(stroke);
 
         if frame_data.merging_lanes.contains(&lane) {
             // This lane terminates at the node: vertical from top, then
             // either continues straight (if it shares the node's column) or
             // curves into the node from the side.
-            incoming(path, x_top, x_node, top, mid);
+            incoming(path, x_top, x_node, top, mid, spacing);
         } else if frame_data.is_pass_through(lane) {
             // Pass-through: a single straight vertical when the column is
             // stable; an S-bend into the new column over the top half when
@@ -449,9 +618,19 @@ pub fn revision_row(
         // *opens* on lane 2 should already wear lane 2's color from the
         // moment it leaves the node, so the eye picks it up consistently
         // wherever the branch travels.
-        let stroke = style.edge_stroke(kind, lane, row.emphasized_lane_after == Some(lane));
-        outgoing(frame.path(stroke), x_node, lane_x(x, col(lane)), mid, bot);
+        let stroke = style.edge_stroke(kind, lane, look(lane, row.emphasized_lane_after));
+        outgoing(
+            frame.path(stroke),
+            x_node,
+            lane_x(col(lane)),
+            mid,
+            bot,
+            spacing,
+        );
     }
+
+    let node_dimmed = dimmed(frame_data.node_lane, row.focus);
+    let ink = |color: Color| if node_dimmed { dim(color) } else { color };
 
     // Elided-ancestry marker: jj log's `~`. Centered under the node when its
     // lane ends here (the common trailing-boundary read); nudged right when
@@ -472,7 +651,7 @@ pub fn revision_row(
         let half = ELIDED_SQUIGGLE_HALF_WIDTH;
         let amplitude = ELIDED_SQUIGGLE_AMPLITUDE;
         let path = frame.path(StrokeStyle {
-            color: style.missing_color,
+            color: ink(style.missing_color),
             width: LINE_THICKNESS,
             dashed: false,
         });
@@ -489,49 +668,90 @@ pub fn revision_row(
     // (multiple parents) the lane-assignment first-parent rule means
     // `node_lane` is also the first parent's lane, so this picks the closest
     // possible match in hue.
-    let disc_color = row
-        .node_color_override
-        .unwrap_or_else(|| style.lane_color(frame_data.node_lane));
-    // The working copy (the only override caller) gets a soft halo behind
-    // its disc so "you are here" reads even at a glance across the gutter.
-    if row.node_color_override.is_some() {
-        frame.discs.push(Disc {
-            x: x_node,
-            y: mid,
-            radius: HALO_RADIUS,
-            fill: Color {
-                a: 0.30,
-                ..disc_color
-            },
-            border: None,
-        });
-    }
-    frame.discs.push(match row.hollow_node {
-        Some(background) => Disc {
-            x: x_node,
-            y: mid,
-            radius: NODE_RADIUS,
-            fill: background,
-            border: Some((
-                Color {
+    let lane_color = style.lane_color(frame_data.node_lane);
+    let surface = ink(style.surface);
+    let folded = geometry.is_overflow(col(frame_data.node_lane));
+    match row.node {
+        NodeKind::WorkingCopy => {
+            frame.disc(
+                x_node,
+                mid,
+                HALO_RADIUS,
+                ink(Color {
+                    a: style.accent.a * HALO_ALPHA,
+                    ..style.accent
+                }),
+                None,
+            );
+            frame.disc(x_node, mid, WORKING_COPY_RADIUS, ink(style.accent), None);
+            frame.disc(
+                x_node,
+                mid,
+                WORKING_COPY_DOT,
+                ink(style.accent_foreground),
+                None,
+            );
+        }
+        NodeKind::Ghost => frame.disc(
+            x_node,
+            mid,
+            NODE_RADIUS,
+            surface,
+            Some((
+                ink(Color {
                     a: 0.7,
-                    ..disc_color
-                },
+                    ..lane_color
+                }),
                 1.25,
             )),
-        },
-        None => Disc {
-            x: x_node,
-            y: mid,
-            radius: NODE_RADIUS,
-            fill: disc_color,
-            border: None,
-        },
-    });
+        ),
+        _ if folded => {
+            frame.disc(
+                x_node,
+                mid,
+                FOLDED_RING_RADIUS,
+                surface,
+                Some((
+                    ink(Color {
+                        a: style.neutral.a * 0.8,
+                        ..style.neutral
+                    }),
+                    1.0,
+                )),
+            );
+            frame.disc(x_node, mid, FOLDED_RADIUS, ink(style.neutral), None);
+        }
+        NodeKind::Conflict => {
+            frame.disc(
+                x_node,
+                mid,
+                CONFLICT_RADIUS + NODE_RING,
+                ink(style.conflict),
+                Some((surface, NODE_RING)),
+            );
+            // A `!`: a short bar over a dot, in the pane's colour.
+            frame.bar(x_node, mid - 4.2, mid + 1.2, 2.0, surface);
+            frame.bar(x_node, mid + 1.8, mid + 3.8, 2.0, surface);
+        }
+        NodeKind::Immutable => frame.disc(
+            x_node,
+            mid,
+            IMMUTABLE_RADIUS,
+            surface,
+            Some((ink(style.neutral), IMMUTABLE_RING)),
+        ),
+        NodeKind::Mutable => frame.disc(
+            x_node,
+            mid,
+            NODE_RADIUS + NODE_RING,
+            ink(lane_color),
+            Some((surface, NODE_RING)),
+        ),
+    }
 }
 
-/// Adds a row of straight lanes to `frame`. `columns` are the warped display
-/// columns of the parent revision row (the file rows sit inside its `after`
+/// Adds a row of straight lanes to `frame`. `columns` are the display columns
+/// of the parent revision row (the file rows sit inside its `after`
 /// snapshot, so they inherit its packing as-is).
 #[allow(clippy::too_many_arguments)]
 pub fn continuation_row(
@@ -541,14 +761,21 @@ pub fn continuation_row(
     height: f32,
     lanes: &[Option<GraphEdgeType>],
     columns: &[Option<usize>],
+    geometry: &LaneGeometry,
     style: &RevisionGraphStyle,
     emphasized_lane: Option<usize>,
+    focus: Option<usize>,
 ) {
     for (lane, kind) in lanes.iter().enumerate() {
         let Some(kind) = *kind else { continue };
         let column = columns.get(lane).copied().flatten().unwrap_or(lane);
-        let lane_center = lane_x(x, column);
-        let path = frame.path(style.edge_stroke(kind, lane, emphasized_lane == Some(lane)));
+        let lane_center = geometry.x(x, column);
+        let look = EdgeLook {
+            emphasized: emphasized_lane == Some(lane),
+            folded: geometry.is_overflow(column),
+            dimmed: dimmed(lane, focus),
+        };
+        let path = frame.path(style.edge_stroke(kind, lane, look));
         path.move_to(at(lane_center, top));
         path.line_to(at(lane_center, top + height));
     }
@@ -578,6 +805,27 @@ mod tests {
     }
 
     #[test]
+    fn a_strip_puts_lanes_where_the_fixed_width_did() {
+        let strip = LaneGeometry::strip(8.0);
+        assert_eq!(strip.x(100.0, 0), 113.0);
+        assert_eq!(strip.x(100.0, 2), 133.0);
+    }
+
+    #[test]
+    fn the_overflow_column_sits_apart_and_hit_tests_by_its_centre() {
+        let geometry = LaneGeometry {
+            first: 16.0,
+            spacing: 9.0,
+            overflow: Some(3),
+        };
+        assert_eq!(geometry.x(0.0, 2), 34.0);
+        assert_eq!(geometry.x(0.0, 3), 43.0 + OVERFLOW_GAP);
+        assert_eq!(geometry.column_at(35.0, 4), Some(2));
+        assert_eq!(geometry.column_at(49.0, 4), Some(3));
+        assert_eq!(geometry.column_at(3.0, 4), None);
+    }
+
+    #[test]
     fn lane_colors_cycle_through_the_palette() {
         let color = |r: f32| Color {
             r,
@@ -585,9 +833,15 @@ mod tests {
             b: 0.8,
             a: 1.0,
         };
+        let black = crate::theme::BLACK;
         let style = RevisionGraphStyle {
             lanes: [color(0.1), color(0.2), color(0.3), color(0.4)],
-            missing_color: crate::theme::BLACK,
+            missing_color: black,
+            neutral: black,
+            surface: black,
+            accent: black,
+            accent_foreground: black,
+            conflict: black,
         };
         assert_eq!(style.lane_color(0), color(0.1));
         assert_eq!(style.lane_color(5), style.lane_color(1));

@@ -1,7 +1,7 @@
 use crate::chip::{self, Chip};
 use crate::config::AppConfig;
 use crate::field;
-use crate::graph_view::{self, RevisionGraphStyle};
+use crate::graph_view::RevisionGraphStyle;
 use crate::measure;
 use crate::repository::Vcs;
 use crate::revision_list::{self, DropSpot, RevisionListStyle};
@@ -25,33 +25,27 @@ use std::rc::Rc;
 pub const DEFAULT_WIDTH: f32 = 340.0;
 pub const RESIZE_HIT_PADDING: f32 = 2.0;
 
-/// Minimum sidebar width for the current font config. Picked so the top
-/// row of a revision can always fit its load-bearing columns at this font:
-/// change-id (12 chars) + commit-id (12 chars) + an abbreviated author +
-/// the `+N` bookmark-overflow chip + the loudest status chip
-/// (`divergent`, 9 chars). Below this width the chip rail starts dropping
-/// rails, so the user loses the conflict/divergence signal.
+/// Minimum sidebar width for the current font config. Picked so a revision's
+/// id line can always fit its load-bearing columns at this font beside a
+/// one-lane gutter: the change id (8 chars), commit id (8 chars), an
+/// abbreviated author, the `+N` bookmark-overflow chip and the loudest
+/// status chip (`divergent`); on the working copy's row, the "Working copy"
+/// label, the change id and that status chip. Below this width the chip rail
+/// starts dropping rails, so the user loses the conflict/divergence signal.
 pub fn min_width(config: AppConfig) -> f32 {
     let id_width =
         |content: &str| measure::line_width(content, CAPTION_TEXT_SIZE, config.mono_font);
 
     let change_id_w = id_width(&"a".repeat(REVISION_ID_CHARS));
     let commit_id_w = id_width(&"a".repeat(COMMIT_ID_CHARS));
-    let at_w = id_width("@");
     let author_w = measure::line_width("Author Name", CAPTION_TEXT_SIZE, config.ui_font);
     let plus_n_w = chip::width("+9", None, config.ui_font);
     let conflict_w = chip::width("divergent", None, config.mono_font);
+    let label_w = revision_list::working_copy_label_width(config.ui_font);
 
-    let at_gap = 4.0;
     let id_gap = 8.0;
     let chip_gap = 6.0;
-    // Gutter for a typical 1-lane row: `lane_strip_width(1) = LANE_WIDTH`.
-    let gutter =
-        revision_list::GUTTER_LEFT_PADDING + graph_view::LANE_WIDTH + revision_list::GUTTER_PADDING;
-
-    let row_content = at_w
-        + at_gap
-        + change_id_w
+    let row = change_id_w
         + id_gap
         + commit_id_w
         + id_gap
@@ -60,7 +54,10 @@ pub fn min_width(config: AppConfig) -> f32 {
         + plus_n_w
         + chip_gap
         + conflict_w;
-    gutter + row_content + REVISION_CONTENT_RIGHT_PAD
+    let working_copy_row = label_w + id_gap + change_id_w + chip_gap + conflict_w;
+    revision_list::gutter_width(1, revision_list::DEFAULT_LANE_CAP)
+        + row.max(working_copy_row)
+        + REVISION_CONTENT_RIGHT_PAD
 }
 
 /// Mirrors `revision_list::CONTENT_PADDING` — the right-edge padding
@@ -120,6 +117,11 @@ pub(crate) fn revision_graph_style(theme: ThemeSpec) -> RevisionGraphStyle {
     RevisionGraphStyle {
         lanes: theme.lanes,
         missing_color: theme.subtle_text,
+        neutral: theme.subtle_text,
+        surface: theme.panel_background,
+        accent: theme.accent,
+        accent_foreground: theme.panel_background,
+        conflict: theme.conflict_marker,
     }
 }
 

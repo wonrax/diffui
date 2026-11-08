@@ -33,7 +33,9 @@ use gpui_kit::{
 use crate::chip::{self, Chip};
 use crate::ellipsis;
 use crate::geometry::{Point, Rectangle};
-use crate::graph_view::{self, GraphFrame, LANE_WIDTH, RevisionGraphStyle, lane_strip_width};
+use crate::graph_view::{
+    self, GraphFrame, LaneGeometry, NodeKind, RevisionGraphStyle, lane_strip_width,
+};
 use crate::icons;
 use crate::measure::LINE_HEIGHT_MULTIPLIER;
 use crate::scroll_resample::{self, Resampler};
@@ -106,6 +108,36 @@ const DRAG_THRESHOLD: f32 = 6.0;
 /// How close to a boundary between two revision rows a drag reads as the gap
 /// between them.
 const GAP_ZONE: f64 = 7.0;
+
+/// The first lane's centre, from the list's left edge: far enough in for the
+/// working copy's halo to clear the row card's edge.
+const FIRST_LANE_X: f32 = 16.0;
+/// From the last lane's centre to where row text starts.
+const GUTTER_TRAIL: f32 = 14.0;
+/// Lanes squeeze from this spacing for a narrow graph...
+const LANE_SPACING_MAX: f32 = 13.0;
+/// ...down to this one for a wide graph...
+const LANE_SPACING_MIN: f32 = 9.0;
+/// ...aiming to fit the graph's lanes in about this much width.
+const LANE_SQUEEZE_SPAN: f32 = 80.0;
+/// Lane slots shown before the outer lanes fold into one column, by default.
+pub const DEFAULT_LANE_CAP: usize = 9;
+/// The fewest slots dragging the gutter's edge can leave.
+pub const MIN_LANE_CAP: usize = 4;
+/// Width of the gutter edge's drag zone.
+const GRIP_WIDTH: f32 = 10.0;
+/// The `+N` badge over the folded lanes' column.
+const FOLD_BADGE_HEIGHT: f32 = 18.0;
+const FOLD_BADGE_TEXT_SIZE: f32 = 10.5;
+const FOLD_BADGE_PAD_X: f32 = 6.0;
+/// The working-copy pin shown while its row is scrolled away.
+const PIN_HEIGHT: f32 = 28.0;
+const PIN_TEXT_SIZE: f32 = crate::theme::text_size::UI;
+const PIN_PAD_LEFT: f32 = 12.0;
+const PIN_PAD_RIGHT: f32 = 10.0;
+const PIN_GAP: f32 = 8.0;
+const PIN_ICON_SIZE: f32 = 12.0;
+const PIN_MARGIN: f32 = 10.0;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RevisionListStyle {
@@ -243,6 +275,121 @@ pub struct RevisionRowView {
     /// A previewed ghost: where a moved or abandoned commit used to be,
     /// drawn faded with a hollow node.
     pub ghost: bool,
+    /// What the row's node says: working copy, conflict, immutable, ...
+    pub node: NodeKind,
+}
+
+/// The revision graph's gutter, list-wide: every row's titles start at one
+/// x, from the widest the revset's graph gets, and past `cap` slots the outer
+/// lanes fold into one column.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GraphGutter {
+    /// The most lanes any row draws (see `GraphLayout::max_lanes`).
+    pub lanes: usize,
+    /// Slots shown before lanes fold; the gutter's edge drags it.
+    pub cap: usize,
+    /// Lanes that always keep a real slot: the working copy's and the selected
+    /// revision's.
+    pub pinned: Vec<usize>,
+}
+
+/// Where a [`GraphGutter`]'s lanes sit, and how wide it is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GutterLayout {
+    geometry: LaneGeometry,
+    /// From the list's left edge to where row text starts.
+    width: f32,
+    lanes: usize,
+    /// Columns drawn: the real slots, plus the overflow column when folding.
+    slots: usize,
+    /// How many lanes the overflow column holds.
+    folded: usize,
+}
+
+impl GutterLayout {
+    fn new(lanes: usize, cap: usize) -> Self {
+        let lanes = lanes.max(1);
+        let cap = cap.max(MIN_LANE_CAP);
+        let spacing = if lanes > 1 {
+            (LANE_SQUEEZE_SPAN / (lanes - 1) as f32).clamp(LANE_SPACING_MIN, LANE_SPACING_MAX)
+        } else {
+            LANE_SPACING_MAX
+        };
+        let fold = lanes > cap;
+        let slots = if fold { cap } else { lanes };
+        let geometry = LaneGeometry {
+            first: FIRST_LANE_X,
+            spacing,
+            overflow: fold.then_some(cap - 1),
+        };
+        Self {
+            geometry,
+            width: geometry.x(0.0, slots - 1) + GUTTER_TRAIL,
+            lanes,
+            slots,
+            folded: if fold { lanes - (cap - 1) } else { 0 },
+        }
+    }
+
+    /// A row's display columns with the outer lanes folded: when the row has
+    /// more live lanes than real slots, the `pinned` ones and then the
+    /// leftmost keep a slot (in lane order, so edges never cross), and the
+    /// rest share the overflow column.
+    fn fold(
+        &self,
+        columns: &[Option<usize>],
+        pinned: impl Fn(usize) -> bool,
+    ) -> Vec<Option<usize>> {
+        let Some(overflow) = self.geometry.overflow else {
+            return columns.to_vec();
+        };
+        let mut live: Vec<(usize, usize)> = columns
+            .iter()
+            .enumerate()
+            .filter_map(|(lane, column)| column.map(|column| (column, lane)))
+            .collect();
+        if live.len() <= overflow {
+            return columns.to_vec();
+        }
+        live.sort_unstable();
+        let mut keep = vec![false; columns.len()];
+        let mut kept = 0;
+        for &(_, lane) in &live {
+            if kept < overflow && pinned(lane) {
+                keep[lane] = true;
+                kept += 1;
+            }
+        }
+        for &(_, lane) in &live {
+            if kept == overflow {
+                break;
+            }
+            if !keep[lane] {
+                keep[lane] = true;
+                kept += 1;
+            }
+        }
+        let mut folded = vec![None; columns.len()];
+        let mut slot = 0;
+        for &(_, lane) in &live {
+            folded[lane] = Some(if keep[lane] {
+                slot += 1;
+                slot - 1
+            } else {
+                overflow
+            });
+        }
+        folded
+    }
+
+    /// The cap that puts the gutter's edge nearest `local_x`.
+    fn cap_at(&self, local_x: f32) -> usize {
+        let slots = ((local_x - FIRST_LANE_X - GUTTER_TRAIL - graph_view::OVERFLOW_GAP)
+            / self.geometry.spacing)
+            .round()
+            + 1.0;
+        (slots.max(0.0) as usize).clamp(MIN_LANE_CAP, self.lanes.max(MIN_LANE_CAP))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -411,6 +558,13 @@ pub struct RevisionListProps {
     /// count when a drag starts on one of them: see
     /// [`RevisionListProps::multi_selection_count`].
     multi_selection_count: usize,
+    /// The list-wide graph gutter: see [`RevisionListProps::graph_gutter`].
+    gutter: Option<GraphGutter>,
+    /// The gutter's edge was dragged to a new cap.
+    on_lane_cap: Option<Callback<usize>>,
+    /// Flat row of the working copy, for the pin shown while it's scrolled
+    /// away.
+    working_copy_flat: Option<usize>,
 }
 
 impl RevisionListProps {
@@ -445,7 +599,31 @@ impl RevisionListProps {
             leading_edge: 0.0,
             drop_indicator: None,
             multi_selection_count: 0,
+            gutter: None,
+            on_lane_cap: None,
+            working_copy_flat: None,
         }
+    }
+
+    /// Give the revision rows one gutter: titles start at one x, lanes
+    /// squeeze and fold past `gutter.cap`, and the gutter's edge drags to
+    /// change the cap, which `on_cap` hears. Without it each row sizes its own
+    /// strip (a files-only list).
+    pub fn graph_gutter(
+        mut self,
+        gutter: GraphGutter,
+        on_cap: impl Fn(&usize, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.gutter = Some(gutter);
+        self.on_lane_cap = Some(Rc::new(on_cap));
+        self
+    }
+
+    /// Where the working copy's row is, so a pin can bring it back when it's
+    /// scrolled out of view.
+    pub fn working_copy(mut self, flat: Option<usize>) -> Self {
+        self.working_copy_flat = flat;
+        self
     }
 
     /// The revision rows: how to build one, which is selected, and where a
@@ -940,6 +1118,13 @@ pub struct RevisionList {
     /// strings to lay itself out, and they are the same strings every frame:
     /// see [`WidthMemo`].
     widths: WidthMemo,
+    /// A folded lane a hover brought out: pinned to a real slot while its
+    /// row is hovered, every other lane receding.
+    fold_hover: Option<usize>,
+    /// The gutter's edge under the cursor: its accent line shows.
+    over_grip: bool,
+    /// The cap a gutter-edge drag is at, while one is in progress.
+    cap_drag: Option<usize>,
     _escape: Subscription,
 }
 
@@ -992,6 +1177,9 @@ impl RevisionList {
             pending_click: None,
             target_hover: None,
             widths: WidthMemo::default(),
+            fold_hover: None,
+            over_grip: false,
+            cap_drag: None,
             _escape: escape,
         }
     }
@@ -1023,6 +1211,144 @@ impl RevisionList {
         // notify during a draw would dirty the view, and every view above it, for the
         // next frame too.
         self.props = Rc::new(props);
+    }
+
+    /// The gutter this frame, a drag's cap winning over the props'.
+    fn gutter_layout(&self) -> Option<GutterLayout> {
+        let gutter = self.props.gutter.as_ref()?;
+        Some(GutterLayout::new(
+            gutter.lanes,
+            self.cap_drag.unwrap_or(gutter.cap),
+        ))
+    }
+
+    /// Where lane columns sit: the list's gutter, or the per-row strip.
+    fn lane_geometry(&self) -> LaneGeometry {
+        self.gutter_layout()
+            .map_or(LaneGeometry::strip(GUTTER_LEFT_PADDING), |layout| {
+                layout.geometry
+            })
+    }
+
+    /// Where row text starts, from the list's left edge.
+    fn gutter_width(&self, item: &Item) -> f32 {
+        self.gutter_layout()
+            .map_or_else(|| item_gutter_width(item), |layout| layout.width)
+    }
+
+    /// Whether `lane` keeps a real slot when lanes fold.
+    fn lane_pinned(&self, lane: usize) -> bool {
+        self.fold_hover == Some(lane)
+            || self
+                .props
+                .gutter
+                .as_ref()
+                .is_some_and(|gutter| gutter.pinned.contains(&lane))
+    }
+
+    /// Row `flat` as drawn: [`RevisionListProps::item_at`] with its lanes
+    /// folded into the gutter.
+    fn item(&self, flat: usize, cx: &App) -> Option<Item> {
+        let mut item = self.props.item_at(flat, cx)?;
+        let Some(layout) = self.gutter_layout().filter(|layout| layout.folded > 0) else {
+            return Some(item);
+        };
+        let pinned = |lane| self.lane_pinned(lane);
+        match &mut item {
+            Item::Revision(row) => {
+                row.columns = layout.fold(&row.columns, pinned);
+                row.prev_columns = layout.fold(&row.prev_columns, pinned);
+            }
+            Item::File(row) => row.columns = layout.fold(&row.columns, pinned).into(),
+        }
+        Some(item)
+    }
+
+    /// The lane a hover over row `flat` brings out of the fold: the row's own
+    /// lane when it's folded, or kept while it's the one already out.
+    fn fold_hover_at(&self, flat: usize, cx: &App) -> Option<usize> {
+        let layout = self.gutter_layout().filter(|layout| layout.folded > 0)?;
+        let Some(Item::Revision(row)) = self.props.item_at(flat, cx) else {
+            return None;
+        };
+        let lane = row.frame.node_lane;
+        if self.fold_hover == Some(lane) {
+            return Some(lane);
+        }
+        let pinned = |lane| {
+            self.props
+                .gutter
+                .as_ref()
+                .is_some_and(|gutter| gutter.pinned.contains(&lane))
+        };
+        let columns = layout.fold(&row.columns, pinned);
+        let column = columns.get(lane).copied().flatten()?;
+        layout.geometry.is_overflow(column).then_some(lane)
+    }
+
+    /// Whether `cursor` is on the gutter's draggable edge.
+    fn on_grip(&self, cursor: Point) -> bool {
+        self.gutter_layout().is_some_and(|layout| {
+            layout.lanes > MIN_LANE_CAP
+                && self.bounds.contains(cursor)
+                && (cursor.x - self.bounds.x - layout.width).abs() <= GRIP_WIDTH / 2.0
+        })
+    }
+
+    /// The working-copy pin, when its row is out of view: its box, whether
+    /// the row is above the view, and the change id it names.
+    fn working_copy_pin(&self, cx: &App) -> Option<(Rectangle, bool, String)> {
+        // A drag owns the list: a pin would sit over the rows it aims at.
+        if self.drag.is_some_and(|drag| drag.active) {
+            return None;
+        }
+        let flat = self.props.working_copy_flat?;
+        if flat >= self.props.row_count() {
+            return None;
+        }
+        let top = self.props.row_top(flat) - self.vertical_offset;
+        let bottom = top + f64::from(row_height_of(self.props.row_kind(flat)));
+        let height = f64::from(self.bounds.height);
+        let above = bottom < 8.0;
+        if !above && top <= height - 8.0 {
+            return None;
+        }
+        let Some(Item::Revision(row)) = self.props.item_at(flat, cx) else {
+            return None;
+        };
+        let id = format!("{}{}", row.change_id_prefix, row.change_id_suffix);
+        let style = &self.props.style;
+        let label_font = emphasis_font(style.primary_font, Weight::SEMIBOLD);
+        let mut width = PIN_PAD_LEFT
+            + self
+                .widths
+                .width(WORKING_COPY_LABEL, PIN_TEXT_SIZE, label_font)
+            + PIN_GAP
+            + PIN_ICON_SIZE
+            + PIN_PAD_RIGHT;
+        if !id.is_empty() {
+            width += self.widths.width(&id, CAPTION_TEXT_SIZE, style.mono_font) + PIN_GAP;
+        }
+        let y = if above {
+            // Clear of the folded lanes' badge, which is pinned to the top too.
+            let badge = self
+                .gutter_layout()
+                .filter(|layout| layout.folded > 0)
+                .map_or(0.0, |_| FOLD_BADGE_HEIGHT + 4.0);
+            self.bounds.y + PIN_MARGIN + badge
+        } else {
+            self.bounds.y + self.bounds.height - PIN_MARGIN - PIN_HEIGHT
+        };
+        Some((
+            Rectangle {
+                x: self.bounds.x + ((self.bounds.width - width) / 2.0).max(0.0),
+                y,
+                width,
+                height: PIN_HEIGHT,
+            },
+            above,
+            id,
+        ))
     }
 
     fn max_offset(&self) -> f64 {
@@ -1072,12 +1398,15 @@ impl RevisionList {
         self.hovered_file_item.take().is_some()
             | self.hovered_revision_item.take().is_some()
             | self.hovered_lane.take().is_some()
+            | self.fold_hover.take().is_some()
+            | std::mem::take(&mut self.over_grip)
     }
 
     fn recompute_hover(&mut self, cx: &App) {
         self.hovered_file_item = None;
         self.hovered_revision_item = None;
         self.hovered_lane = None;
+        self.fold_hover = None;
         let Some(pos) = self.cursor_position else {
             return;
         };
@@ -1090,15 +1419,22 @@ impl RevisionList {
         let Some(row_idx) = props.row_at_offset(local_y) else {
             return;
         };
-        let Some(item) = props.item_at(row_idx, cx) else {
+        self.fold_hover = self.fold_hover_at(row_idx, cx);
+        let Some(item) = self.item(row_idx, cx) else {
             return;
         };
-        let gutter_total = item_gutter_width(&item);
+        let gutter_total = self.gutter_width(&item);
+        let geometry = self.lane_geometry();
+        let columns = match self.gutter_layout() {
+            Some(layout) => layout.slots,
+            None => {
+                ((gutter_total - GUTTER_LEFT_PADDING - GUTTER_PADDING) / graph_view::LANE_WIDTH)
+                    .round() as usize
+            }
+        };
         // Lane hit-test first: a cursor in the lane strip with a
         // labeled lane wins over the content-area file tooltip.
-        if local_x >= GUTTER_LEFT_PADDING && local_x < gutter_total - GUTTER_PADDING {
-            let strip_x = local_x - GUTTER_LEFT_PADDING;
-            let display = (strip_x / LANE_WIDTH).floor() as usize;
+        if let Some(display) = geometry.column_at(local_x, columns) {
             // Pick the half from the cursor's vertical position within the
             // row, so a click on the incoming stub of a split lane resolves to
             // that branch's segment (not the unrelated new branch starting
@@ -1152,6 +1488,20 @@ impl RevisionList {
     ) {
         let props = self.props.clone();
         let bounds = self.bounds;
+        // Dragging the gutter's edge: more or fewer lane slots.
+        if let Some(cap) = self.cap_drag {
+            if let Some(layout) = self.gutter_layout() {
+                let next = layout.cap_at(position.x - bounds.x);
+                if next != cap {
+                    self.cap_drag = Some(next);
+                    if let Some(on_cap) = &props.on_lane_cap {
+                        effects.push(call(on_cap, next));
+                    }
+                    cx.notify();
+                }
+            }
+            return;
+        }
         // Drag-to-rebase tracking: past a small threshold the press becomes a
         // drag; from then on the list owns the cursor (no hover washes) and
         // mirrors spot changes to the app.
@@ -1222,7 +1572,10 @@ impl RevisionList {
             self.hovered_file_item,
             self.hovered_revision_item,
             self.hovered_lane,
+            self.fold_hover,
+            self.over_grip,
         );
+        self.over_grip = inside && self.on_grip(position);
         self.recompute_hover(cx);
         // The cursor shape is set at paint, so crossing onto the bar repaints.
         let over_scrollbar =
@@ -1232,6 +1585,8 @@ impl RevisionList {
                 self.hovered_file_item,
                 self.hovered_revision_item,
                 self.hovered_lane,
+                self.fold_hover,
+                self.over_grip,
             )
             || over_scrollbar != self.over_scrollbar
         {
@@ -1277,6 +1632,20 @@ impl RevisionList {
     ) -> bool {
         let props = self.props.clone();
         let bounds = self.bounds;
+        if let Some((pin, ..)) = self.working_copy_pin(cx)
+            && pin.contains(cursor)
+        {
+            self.pending_reveal_row = props.working_copy_flat;
+            cx.notify();
+            return true;
+        }
+        if self.on_grip(cursor)
+            && let Some(gutter) = &props.gutter
+        {
+            self.cap_drag = Some(gutter.cap);
+            cx.notify();
+            return true;
+        }
         let local_y = f64::from(cursor.y - bounds.y) + self.vertical_offset;
         let Some(row_idx) = props.row_at_offset(local_y) else {
             return false;
@@ -1315,7 +1684,7 @@ impl RevisionList {
                     let Some(item) = props.item_at(row_idx, cx) else {
                         return false;
                     };
-                    let gutter_total = item_gutter_width(&item);
+                    let gutter_total = self.gutter_width(&item);
                     let Item::File(file) = item else {
                         return false;
                     };
@@ -1336,6 +1705,11 @@ impl RevisionList {
 
     fn on_left_release(&mut self, cursor: Point, effects: &mut Effects, cx: &mut Context<Self>) {
         let props = self.props.clone();
+        if self.cap_drag.take().is_some() {
+            self.over_grip = self.on_grip(cursor);
+            cx.notify();
+            return;
+        }
         let pending_click = self.pending_click.take();
         if let Some(drag) = self.drag.take()
             && drag.active
@@ -1422,7 +1796,7 @@ impl RevisionList {
                 if item_idx >= props.row_count() {
                     return None;
                 }
-                let item = props.item_at(item_idx, cx)?;
+                let item = self.item(item_idx, cx)?;
                 let labels = item_lane_labels(&item, lane);
                 if labels.is_empty() {
                     return None;
@@ -1431,7 +1805,7 @@ impl RevisionList {
                     labels.join(", "),
                     // Anchor just past the gutter so the tip sits next to the
                     // stroke rather than at the far right edge.
-                    bounds.x + item_gutter_width(&item),
+                    bounds.x + self.gutter_width(&item),
                     self.row_screen_y(item_idx),
                     row_height_of(props.row_kind(item_idx)),
                 )
@@ -1441,7 +1815,7 @@ impl RevisionList {
                     return None;
                 }
                 let item = props.item_at(item_idx, cx)?;
-                let gutter_total = item_gutter_width(&item);
+                let gutter_total = self.gutter_width(&item);
                 let Item::File(file) = item else {
                     return None;
                 };
@@ -1565,7 +1939,7 @@ impl RevisionList {
             if row >= props.row_count() {
                 return None;
             }
-            let item = props.item_at(row, cx)?;
+            let item = self.item(row, cx)?;
             item_lane_segment(&item, lane, half).map(|segment| (segment, lane))
         });
 
@@ -1631,8 +2005,8 @@ impl RevisionList {
                     width: bounds.width,
                     height: row_h,
                 };
-                if let Some(item) = props.item_at(flat, cx) {
-                    let gutter_total = item_gutter_width(&item);
+                if let Some(item) = self.item(flat, cx) {
+                    let gutter_total = self.gutter_width(&item);
                     let emphasized = |half| {
                         emphasized_segment.and_then(|(segment, lane)| {
                             let here = item_lane_segment(&item, lane, half)?;
@@ -1685,6 +2059,7 @@ impl RevisionList {
 
             // The graph sits on top of any row chrome.
             graph.paint(window);
+            self.paint_gutter_chrome(window, cx);
 
             // Target-mode destination decorations, on top of everything: the
             // ring (lands as a child of this row) or the insertion line
@@ -1740,7 +2115,7 @@ impl RevisionList {
                         {
                             paint_insertion_line(
                                 rect,
-                                item_gutter_width(&item),
+                                self.gutter_width(&item),
                                 true,
                                 style.accent,
                                 window,
@@ -1750,7 +2125,126 @@ impl RevisionList {
                     None => {}
                 }
             }
+            self.paint_working_copy_pin(window, cx);
         });
+    }
+
+    /// Over the graph: the `+N` badge naming the folded lanes, pinned to the
+    /// top of their column, and the gutter edge's line while it's hovered or
+    /// dragged.
+    fn paint_gutter_chrome(&self, window: &mut Window, cx: &mut App) {
+        let Some(layout) = self.gutter_layout() else {
+            return;
+        };
+        let style = &self.props.style;
+        let bounds = self.bounds;
+        if self.over_grip || self.cap_drag.is_some() {
+            fill_rounded(
+                Rectangle {
+                    x: bounds.x + layout.width - 1.0,
+                    y: bounds.y,
+                    width: 2.0,
+                    height: bounds.height,
+                },
+                Color {
+                    a: 0.55,
+                    ..style.accent
+                },
+                1.0,
+                window,
+            );
+        }
+        let Some(overflow) = layout.geometry.overflow else {
+            return;
+        };
+        let label = format!("+{}", layout.folded);
+        let font = emphasis_font(style.primary_font, Weight::SEMIBOLD);
+        let width = self.widths.width(&label, FOLD_BADGE_TEXT_SIZE, font) + 2.0 * FOLD_BADGE_PAD_X;
+        let center_x = layout.geometry.x(bounds.x, overflow);
+        let badge = Rectangle {
+            x: (center_x - width / 2.0).max(bounds.x + 1.0),
+            y: bounds.y + 4.0,
+            width,
+            height: FOLD_BADGE_HEIGHT,
+        };
+        window.paint_quad(quad(
+            badge.bounds(),
+            px(FOLD_BADGE_HEIGHT / 2.0),
+            style.background,
+            px(1.0),
+            style.border,
+            BorderStyle::Solid,
+        ));
+        paint_centered(
+            &label,
+            badge.x + FOLD_BADGE_PAD_X,
+            badge.y + FOLD_BADGE_HEIGHT / 2.0,
+            FOLD_BADGE_TEXT_SIZE,
+            font,
+            style.subtle_text,
+            window,
+            cx,
+        );
+    }
+
+    /// The pill that brings the working copy back when its row is out of
+    /// view: accent, "Working copy", its change id and an arrow its way.
+    fn paint_working_copy_pin(&self, window: &mut Window, cx: &mut App) {
+        let Some((pin, above, id)) = self.working_copy_pin(cx) else {
+            return;
+        };
+        let style = &self.props.style;
+        fill_rounded(pin, style.accent, PIN_HEIGHT / 2.0, window);
+        let mid = pin.y + PIN_HEIGHT / 2.0;
+        let label_font = emphasis_font(style.primary_font, Weight::SEMIBOLD);
+        let mut x = pin.x + PIN_PAD_LEFT;
+        paint_centered(
+            WORKING_COPY_LABEL,
+            x,
+            mid,
+            PIN_TEXT_SIZE,
+            label_font,
+            style.accent_foreground,
+            window,
+            cx,
+        );
+        x += self
+            .widths
+            .width(WORKING_COPY_LABEL, PIN_TEXT_SIZE, label_font)
+            + PIN_GAP;
+        if !id.is_empty() {
+            // On the label's baseline.
+            let baseline =
+                TextBox::new(label_font, PIN_TEXT_SIZE, PIN_TEXT_SIZE).baseline_for_center(mid);
+            paint_centered(
+                &id,
+                x,
+                TextBox::new(style.mono_font, CAPTION_TEXT_SIZE, CAPTION_TEXT_SIZE)
+                    .center_for_baseline(baseline),
+                CAPTION_TEXT_SIZE,
+                style.mono_font,
+                Color {
+                    a: 0.8,
+                    ..style.accent_foreground
+                },
+                window,
+                cx,
+            );
+            x += self.widths.width(&id, CAPTION_TEXT_SIZE, style.mono_font) + PIN_GAP;
+        }
+        paint_glyph(
+            if above {
+                icons::ARROW_UP
+            } else {
+                icons::ARROW_DOWN
+            },
+            x + PIN_ICON_SIZE / 2.0,
+            mid,
+            PIN_ICON_SIZE,
+            style.accent_foreground,
+            window,
+            cx,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1864,7 +2358,7 @@ impl RevisionList {
         let chip_gap = 6.0;
         let label_font = emphasis_font(primary, Weight::SEMIBOLD);
         let label_w = if is_working_copy {
-            working_copy_label_width(widths, label_font)
+            label_width(widths, label_font)
         } else {
             0.0
         };
@@ -2129,21 +2623,20 @@ impl RevisionList {
             );
         }
 
-        // Working-copy node sits on the gradient's faded right side, so the
-        // saturated accent reads cleanly without a contrast swap.
         graph_view::revision_row(
             graph,
-            row.x + GUTTER_LEFT_PADDING,
+            row.x,
             row.y,
             row.height,
             &graph_view::RevisionRow {
                 frame_data: &rev.frame,
                 columns: &rev.columns,
                 prev_columns: &rev.prev_columns,
-                node_color_override: is_working_copy.then_some(style.accent),
-                hollow_node: rev.ghost.then_some(style.background),
+                geometry: &self.lane_geometry(),
+                node: rev.node,
                 emphasized_lane_before,
                 emphasized_lane_after,
+                focus: self.fold_hover,
             },
             &style.graph,
         );
@@ -2362,13 +2855,15 @@ impl RevisionList {
 
         graph_view::continuation_row(
             graph,
-            row.x + GUTTER_LEFT_PADDING,
+            row.x,
             row.y,
             row.height,
             &file.continuation,
             &file.columns,
+            &self.lane_geometry(),
             &style.graph,
             emphasized_lane,
+            self.fold_hover,
         );
     }
 }
@@ -2381,6 +2876,11 @@ fn placeholder_style() -> RevisionListStyle {
         graph: RevisionGraphStyle {
             lanes: [color; 4],
             missing_color: color,
+            neutral: color,
+            surface: color,
+            accent: color,
+            accent_foreground: color,
+            conflict: color,
         },
         background: color,
         selected_background: color,
@@ -2404,7 +2904,7 @@ fn placeholder_style() -> RevisionListStyle {
 /// The widths a revision row's meta line divides up.
 struct RailInput {
     total_width: f32,
-    /// `@`, its gap and the change id.
+    /// The working-copy label, its gap and the change id.
     mandatory_left: f32,
     status_total: f32,
     has_status: bool,
@@ -2626,8 +3126,19 @@ fn item_lane_segment(item: &Item, lane: usize, half: LaneHalf) -> Option<usize> 
     slot.copied().flatten()
 }
 
+/// The gutter's width (to where row text starts) for a graph of `lanes`
+/// lanes folding past `cap`.
+pub fn gutter_width(lanes: usize, cap: usize) -> f32 {
+    GutterLayout::new(lanes, cap).width
+}
+
+/// Width of the working copy's "Working copy" label in `font`.
+pub fn working_copy_label_width(font: Font) -> f32 {
+    label_width(&WidthMemo::default(), emphasis_font(font, Weight::SEMIBOLD))
+}
+
 /// Width of the working-copy label: dot, gap, text and padding.
-fn working_copy_label_width(widths: &WidthMemo, font: Font) -> f32 {
+fn label_width(widths: &WidthMemo, font: Font) -> f32 {
     WORKING_COPY_PAD_LEFT
         + WORKING_COPY_DOT
         + WORKING_COPY_DOT_GAP
@@ -2653,7 +3164,7 @@ fn paint_working_copy_label(
         Rectangle {
             x,
             y: top,
-            width: working_copy_label_width(widths, font),
+            width: label_width(widths, font),
             height,
         },
         style.accent,
@@ -2971,6 +3482,8 @@ impl Element for ListElement {
             crate::frame_log::time("list.paint", || list.paint(window, cx));
             if list.drag.is_some_and(|drag| drag.active) {
                 CursorStyle::ClosedHand
+            } else if list.over_grip || list.cap_drag.is_some() {
+                CursorStyle::ResizeLeftRight
             } else if scrollbar::hits_container(
                 list.bounds,
                 window.mouse_position().into(),
@@ -3093,6 +3606,53 @@ mod tests {
     // so the file block starts at flat 2.
     // Flat layout: [rev0, rev1, file0, file1, rev2].
     const EXP: Option<(usize, usize)> = Some((2, 2));
+
+    #[test]
+    fn lanes_squeeze_from_thirteen_to_nine_px() {
+        assert_eq!(GutterLayout::new(1, 9).geometry.spacing, 13.0);
+        assert_eq!(GutterLayout::new(5, 9).geometry.spacing, 13.0);
+        assert_eq!(GutterLayout::new(8, 9).geometry.spacing, 80.0 / 7.0);
+        assert_eq!(GutterLayout::new(14, 9).geometry.spacing, 9.0);
+    }
+
+    #[test]
+    fn every_row_shares_one_gutter_width() {
+        let narrow = GutterLayout::new(3, 9);
+        assert_eq!(narrow.width, FIRST_LANE_X + 2.0 * 13.0 + GUTTER_TRAIL);
+        assert_eq!(narrow.folded, 0);
+        // Past the cap: eight real slots and the overflow column a gap beyond.
+        let wide = GutterLayout::new(14, 9);
+        assert_eq!(wide.slots, 9);
+        assert_eq!(wide.folded, 6);
+        assert_eq!(
+            wide.width,
+            FIRST_LANE_X + 8.0 * 9.0 + graph_view::OVERFLOW_GAP + GUTTER_TRAIL
+        );
+    }
+
+    #[test]
+    fn folding_keeps_pinned_and_leftmost_lanes_and_bundles_the_rest() {
+        let layout = GutterLayout::new(6, 4);
+        // Six live lanes; lane 4 is pinned (the working copy's, say).
+        let columns: Vec<Option<usize>> = (0..6).map(Some).collect();
+        let folded = layout.fold(&columns, |lane| lane == 4);
+        assert_eq!(
+            folded,
+            [Some(0), Some(1), Some(3), Some(3), Some(2), Some(3)]
+        );
+        // A row with no more live lanes than real slots is left alone.
+        let sparse = [Some(0), None, Some(1), None, None, Some(2)];
+        assert_eq!(layout.fold(&sparse, |_| false), sparse);
+    }
+
+    #[test]
+    fn dragging_the_edge_picks_the_nearest_cap_within_bounds() {
+        let layout = GutterLayout::new(14, 9);
+        assert_eq!(layout.cap_at(layout.width), 9);
+        assert_eq!(layout.cap_at(layout.width + 9.0), 10);
+        assert_eq!(layout.cap_at(0.0), MIN_LANE_CAP);
+        assert_eq!(layout.cap_at(10_000.0), 14);
+    }
 
     #[test]
     fn row_count_includes_expanded_files() {

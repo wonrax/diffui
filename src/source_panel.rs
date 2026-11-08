@@ -198,6 +198,7 @@ pub(crate) fn empty_revision_row(theme: ThemeSpec) -> RevisionRowView {
         draft_marker: None,
         inert: false,
         ghost: false,
+        node: crate::graph_view::NodeKind::Mutable,
     }
 }
 

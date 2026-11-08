@@ -169,6 +169,7 @@ impl Diffui {
                         .get(&key)
                         .copied()
                         .unwrap_or(false);
+                    state.lane_cap = saved.lane_caps.get(&key).copied();
                     (owner, name, source, state)
                 }
                 BootTarget::Pr(spec) => (
@@ -4381,6 +4382,16 @@ impl Diffui {
                 .collect_panel_collapse_state(|state| state.history_panel_collapsed),
             files_panel_collapsed: self
                 .collect_panel_collapse_state(|state| state.files_panel_collapsed),
+            lane_caps: self
+                .tabs
+                .iter()
+                .filter_map(|tab| {
+                    Some((
+                        tab.root()?.to_string_lossy().into_owned(),
+                        tab.state.lane_cap?,
+                    ))
+                })
+                .collect(),
             recent_repos: self.recent_repos.clone(),
         }
     }

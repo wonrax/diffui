@@ -203,9 +203,18 @@ pub struct GraphLayout {
     seg_before: Vec<RunList<Option<u32>>>,
     seg_after: Vec<RunList<Option<u32>>>,
     labels: Vec<RunList<Vec<String>>>,
+    /// The most lanes live in any one row so far: see [`GraphLayout::max_lanes`].
+    max_lanes: usize,
 }
 
 impl GraphLayout {
+    /// The most lanes any row draws: live lanes (an edge in either half, or
+    /// the node), as `LaneFrame::display_columns` packs them. The sidebar
+    /// sizes one gutter for every row from it.
+    pub fn max_lanes(&self) -> usize {
+        self.max_lanes
+    }
+
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.row_count
@@ -314,6 +323,8 @@ impl GraphLayout {
         let row = self.row_count as u32;
         let data = fold.advance(frame, bookmarks);
         self.ensure_columns(frame.lane_count());
+        let live = frame.display_columns().iter().flatten().count();
+        self.max_lanes = self.max_lanes.max(live);
 
         // Push every existing column (including ones that just went dead, so
         // their run closes with a `None`). `RunList::push` no-ops on no change,
@@ -408,6 +419,21 @@ fn seg_id(id: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn max_lanes_counts_the_widest_row_live_lanes() {
+        // a and b are heads on two lanes that meet at c.
+        let frames = assign_lanes([
+            ('a', vec![direct('c')]),
+            ('b', vec![direct('c')]),
+            ('c', vec![]),
+        ]);
+        let mut layout = GraphLayoutBuilder::new();
+        for frame in &frames {
+            layout.push(frame, &[]);
+        }
+        assert_eq!(layout.finish().max_lanes(), 2);
+    }
     use crate::graph::assign_lanes;
     use jj_lib::graph::GraphEdge;
 

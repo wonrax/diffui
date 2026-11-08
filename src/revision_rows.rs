@@ -12,10 +12,12 @@ use crate::chip::Chip;
 use crate::config::AppConfig;
 use crate::geometry::{Point, Rectangle};
 use crate::graph_layout::GraphLayout;
+use crate::graph_view::NodeKind;
 use crate::graph_view::RevisionGraphStyle;
 use crate::icons;
 use crate::revision_list::{
-    self, DragHooks, DropSpot, RevisionListProps, RevisionRowView, RowSelectionKey,
+    self, DEFAULT_LANE_CAP, DragHooks, DropSpot, GraphGutter, RevisionListProps, RevisionRowView,
+    RowSelectionKey,
 };
 use crate::sidebar::{
     COMMIT_ID_CHARS, REVISION_ID_CHARS, bookmark_chips_for, commit_description_color,
@@ -51,6 +53,8 @@ pub(crate) fn build_revision_list(
     let mut list_style = revision_list_style(theme, ui.config, 0.0);
     if tab.op_draft().is_some() {
         list_style.background = draft_panel_background(theme);
+        // The rings that cut nodes out of their strokes are the pane's colour.
+        list_style.graph.surface = list_style.background;
     }
 
     // The per-row lane fold + prefix lengths are precomputed once and held in
@@ -62,13 +66,37 @@ pub(crate) fn build_revision_list(
         Rc::new(move |row: usize, cx: &App| revision_row_at(this.read(cx), theme, row))
     };
 
+    // One gutter for every row, from the widest the drawn graph gets. The
+    // working copy's and the selected revision's lanes never fold away.
+    let layout = tab
+        .shown_preview()
+        .map_or(&tab.session.graph, |preview| &preview.layout);
+    let working_copy_row = tab
+        .session
+        .commits
+        .working_copy_index()
+        .and_then(|index| tab.list_row(index));
+    let selected_list_row = tab
+        .session
+        .selected_commit_index
+        .and_then(|index| tab.list_row(index));
+    let pinned = [working_copy_row, selected_list_row]
+        .into_iter()
+        .flatten()
+        .filter(|&row| row < layout.len())
+        .map(|row| layout.frame(row, usize::MAX).node_lane)
+        .collect();
+    let gutter = GraphGutter {
+        lanes: layout.max_lanes(),
+        cap: tab.lane_cap.unwrap_or(DEFAULT_LANE_CAP),
+        pinned,
+    };
+
     let mut props = RevisionListProps::new(row_count, None, list_style)
         .revisions(
             build,
             selected_row,
-            tab.session
-                .selected_commit_index
-                .and_then(|index| tab.list_row(index)),
+            selected_list_row,
             Diffui::listen(cx, |this, key: &RowSelectionKey, window, cx| {
                 // Whatever the modifier events did or didn't reach: the click
                 // knows what's held.
@@ -77,6 +105,14 @@ pub(crate) fn build_revision_list(
             }),
         )
         .at_window_edge()
+        .graph_gutter(
+            gutter,
+            Diffui::listen(cx, |this, cap: &usize, _, _| {
+                this.active_mut().lane_cap = Some(*cap);
+                this.mark_geometry_dirty();
+            }),
+        )
+        .working_copy(working_copy_row)
         .multi_selection_count(tab.revision_multi_selection.len())
         .reveal_selected(tab.revision_reveal_token)
         .reveal_file(ui.sidebar_file_reveal_token, reveal_target)
@@ -302,7 +338,7 @@ fn build_revision_row(
     }
     // Git has no change ids: its rows carry the commit hash in both slots, and
     // its synthesized working copy a placeholder in both. Show the hash once,
-    // and nothing but the `@` marker on the working copy.
+    // and nothing but the "Working copy" label on the working copy.
     let single_id = created
         || commit.commit_id().starts_with(change_id)
         || change_id.starts_with(commit.commit_id());
@@ -530,6 +566,17 @@ fn build_revision_row(
         draft_marker,
         inert: role.is_some_and(|role| !role.is_target()),
         ghost,
+        node: if ghost {
+            NodeKind::Ghost
+        } else if commit.is_working_copy() {
+            NodeKind::WorkingCopy
+        } else if commit.has_conflict() {
+            NodeKind::Conflict
+        } else if commit.is_immutable() {
+            NodeKind::Immutable
+        } else {
+            NodeKind::Mutable
+        },
     }
 }
 
@@ -1112,6 +1159,44 @@ pub(crate) mod scenes {
             Some(10),
             "the row on top is the tenth"
         );
+    }
+
+    /// Dragging the gutter's edge out shows more lane slots, and the tab
+    /// remembers how many.
+    #[test]
+    fn dragging_the_gutter_edge_widens_the_graph() {
+        let mut h = open("all()");
+        let lanes = h.read(|ui| ui.active().session.graph.max_lanes());
+        assert!(lanes > revision_list::DEFAULT_LANE_CAP, "all() folds");
+        let edge = revision_list::gutter_width(lanes, revision_list::DEFAULT_LANE_CAP);
+        let y = row_at(3).y;
+        h.drag(point(px(edge), y), point(px(edge + 30.0), y));
+        h.settle();
+        let cap = h.read(|ui| ui.active().lane_cap).expect("a dragged cap");
+        assert!(cap > revision_list::DEFAULT_LANE_CAP, "widened to {cap}");
+        // Nothing was selected or dragged on the way.
+        assert_eq!(
+            h.read(|ui| ui.active().session.selected_commit_index),
+            Some(0)
+        );
+    }
+
+    /// With the working copy scrolled away, its pin at the top of the list
+    /// brings it back.
+    #[test]
+    fn the_working_copy_pin_scrolls_its_row_back() {
+        let mut h = open("all()");
+        let row_h = f64::from(revision_list::REVISION_ROW_HEIGHT);
+        h.act(|ui, _| {
+            ui.active_mut().sidebar_scroll_offset = 10.0 * row_h;
+            ui.scroll_restore_token = ui.scroll_restore_token.wrapping_add(1);
+        });
+        h.settle();
+        let width = h.read(|ui| ui.sidebar_width);
+        // Under the folded lanes' badge, which all() shows too.
+        h.click_point(point(px(width / 2.0), px(LIST_TOP + 46.0)));
+        h.settle();
+        assert_eq!(h.read(|ui| ui.active().sidebar_scroll_offset), 0.0);
     }
 
     /// A marked stack dragged onto the newest commit at the base lands on it, in

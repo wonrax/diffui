@@ -689,6 +689,9 @@ pub(crate) struct TabState {
     /// via `scroll_restore_token`.
     pub(crate) sidebar_scroll_offset: f64,
     pub(crate) file_tree_scroll_offset: f64,
+    /// How many lane slots the graph gutter shows before folding, once the
+    /// gutter's edge has been dragged; `None` is the default.
+    pub(crate) lane_cap: Option<usize>,
     pub(crate) diff_scroll_offset: f32,
     /// This tab's activity log (long-running ops: load, refresh, revset eval,
     /// fetch, undo, push).
@@ -762,6 +765,7 @@ impl TabState {
             pending_revision_reveal: false,
             sidebar_scroll_offset: 0.0,
             file_tree_scroll_offset: 0.0,
+            lane_cap: None,
             diff_scroll_offset: 0.0,
             activities: activity::ActivityLog::default(),
             pending_load_activity: None,

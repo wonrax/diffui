@@ -59,6 +59,10 @@ pub struct WindowState {
     pub history_panel_collapsed: BTreeMap<String, bool>,
     #[serde(default)]
     pub files_panel_collapsed: BTreeMap<String, bool>,
+    /// Per-repository lane slots of the graph gutter, where its edge was
+    /// dragged.
+    #[serde(default)]
+    pub lane_caps: BTreeMap<String, usize>,
     /// Whether the diff pane wraps long lines. `None` (older state files)
     /// falls back to wrapping on.
     #[serde(default)]
@@ -302,6 +306,7 @@ mod tests {
                 ("/b/repo".to_owned(), false),
             ]),
             files_panel_collapsed: BTreeMap::from([("/b/repo".to_owned(), true)]),
+            lane_caps: BTreeMap::from([("/a/repo".to_owned(), 5)]),
             diff_wrap: Some(false),
             diff_split: Some(true),
             commit_details_collapsed: Some(true),
@@ -322,6 +327,7 @@ mod tests {
         assert_eq!(parsed.file_nav_width, Some(220.0));
         assert_eq!(parsed.history_panel_collapsed.get("/a/repo"), Some(&true));
         assert_eq!(parsed.files_panel_collapsed.get("/b/repo"), Some(&true));
+        assert_eq!(parsed.lane_caps.get("/a/repo"), Some(&5));
         assert_eq!(parsed.diff_wrap, Some(false));
         assert_eq!(parsed.diff_split, Some(true));
         assert_eq!(
