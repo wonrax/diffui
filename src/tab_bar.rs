@@ -887,7 +887,7 @@ fn badge_chip(label: &'static str, color: Color, mono: Font) -> Aligned {
         mono,
         text_size::BADGE,
         [1.0, 4.0].into(),
-        move |chip| chip.bg(chip_background(color)).rounded(px(4.0)),
+        move |chip| chip.bg(chip_background(color)).rounded(px(radius::XS)),
     )
 }
 
@@ -933,7 +933,7 @@ fn palette_hint(theme: ThemeSpec, mono: Font, cx: &mut Cx) -> impl IntoElement {
             div()
                 .px(px(5.0))
                 .py(px(1.0))
-                .rounded(px(4.0))
+                .rounded(px(radius::XS))
                 .border_1()
                 .border_color(theme.border)
                 .bg(chip_background(theme.muted_text))

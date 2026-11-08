@@ -159,82 +159,86 @@ pub enum ResolvedTheme {
 impl ResolvedTheme {
     pub fn spec(self) -> ThemeSpec {
         match self {
-            // Dark-first warm ink with a coral accent. Tokens mirror the
-            // Diffui v2 design system: `bg-canvas`, `bg-pane`, `bg-elev`,
-            // `bg-active`, `ink-100..300`, and a vivid coral accent. The trunk lane
-            // is intentionally decoupled from the accent — the accent is
-            // reserved for the working copy, selection, and focus, while
-            // the graph rides on a violet base so coral doesn't fight the
-            // green/red diff signals.
+            // Cool, slightly blue-biased neutrals with a cobalt accent. The
+            // accent marks selection, focus, the working copy and primary
+            // actions; everything else that carries colour means something
+            // (add/delete/modify/rename, a graph lane). Panes and the code
+            // surface sit a step above the chrome so hairlines, not fills,
+            // separate them.
             Self::Dark => ThemeSpec {
-                background: rgb(0.043, 0.051, 0.071),
-                panel_background: rgb(0.067, 0.078, 0.106),
-                panel_background_elevated: rgb(0.094, 0.110, 0.145),
-                selected_file: rgb(0.160, 0.178, 0.255),
-                text: rgb(0.902, 0.910, 0.933),
-                muted_text: rgb(0.690, 0.710, 0.761),
-                subtle_text: rgb(0.563, 0.584, 0.643),
-                accent: rgb(1.000, 0.400, 0.245),
-                added_line: rgba(0.263, 0.843, 0.463, 0.11),
-                removed_line: rgba(1.000, 0.408, 0.349, 0.10),
-                added_text: rgb(0.263, 0.843, 0.463),
-                removed_text: rgb(1.000, 0.408, 0.349),
-                modified_token: rgb(1.000, 0.706, 0.220),
-                info: rgb(0.310, 0.655, 1.000),
-                // A step *lighter* than the elevated code surface so the
-                // strip reads as a raised header rather than a hole cut
-                // into the scroll body.
-                file_header: rgb(0.122, 0.141, 0.184),
-                hunk_header: rgba(0.310, 0.655, 1.000, 0.12),
-                conflict_marker: rgb(1.000, 0.408, 0.443),
-                border: rgb(0.137, 0.153, 0.196),
-                note_background: rgba(1.000, 0.706, 0.220, 0.17),
-                note_text: rgb(1.000, 0.706, 0.220),
-                lane_base: rgb(0.690, 0.510, 1.000),
+                background: rgb(0.086, 0.094, 0.114),
+                panel_background: rgb(0.067, 0.075, 0.090),
+                panel_background_elevated: rgb(0.090, 0.102, 0.122),
+                selected_file: rgb(0.137, 0.165, 0.243),
+                text: rgb(0.910, 0.918, 0.933),
+                muted_text: rgb(0.714, 0.737, 0.776),
+                subtle_text: rgb(0.561, 0.588, 0.635),
+                accent: rgb(0.525, 0.627, 0.980),
+                added_line: rgba(0.365, 0.769, 0.545, 0.10),
+                removed_line: rgba(0.957, 0.494, 0.514, 0.10),
+                added_text: rgb(0.365, 0.769, 0.545),
+                removed_text: rgb(0.957, 0.494, 0.514),
+                modified_token: rgb(0.902, 0.659, 0.322),
+                renamed: rgb(0.710, 0.592, 0.949),
+                info: rgb(0.525, 0.627, 0.980),
+                // One step above the code surface: the sticky file header
+                // reads as a raised strip as the body scrolls under it.
+                file_header: rgb(0.106, 0.118, 0.141),
+                hunk_header: rgba(0.525, 0.627, 0.980, 0.12),
+                conflict_marker: rgb(0.957, 0.494, 0.514),
+                border: rgb(0.137, 0.149, 0.176),
+                note_background: rgba(0.902, 0.659, 0.322, 0.13),
+                note_text: rgb(0.902, 0.659, 0.322),
+                change_id: rgb(0.949, 0.490, 0.733),
+                lane_base: rgb(0.494, 0.608, 0.965),
+                lanes: [
+                    rgb(0.494, 0.608, 0.965),
+                    rgb(0.310, 0.753, 0.682),
+                    rgb(0.890, 0.635, 0.298),
+                    rgb(0.878, 0.486, 0.725),
+                ],
                 syntax_keyword: rgb(0.760, 0.610, 1.000),
                 syntax_type: rgb(0.260, 0.840, 0.755),
                 syntax_function: rgb(0.480, 0.725, 1.000),
                 syntax_literal: rgb(1.000, 0.706, 0.220),
                 syntax_property: rgb(0.460, 0.820, 0.930),
             },
-            // Neutral whites — panes are pure white, canvas is a faint
-            // gray so the panes still read as elevated. Coral accent stays
-            // for selection / working-copy signalling.
-            //
             // Every ink here is derived for a white ground rather than
             // mirrored from the dark spec: a colour that reads well against
-            // near-black is nowhere near AA against near-white, and mirroring
-            // is what left the captions, the diff inks and the chips between
-            // 2.6:1 and 3.9:1. Hues are the dark theme's; only lightness
-            // moved, down to whatever clears 4.5:1 against the *darkest*
-            // surface each ink lands on — usually the selected row, not the
-            // white pane. `every_pairing_meets_wcag_aa` holds the line.
+            // near-black is nowhere near AA against near-white. Lightness is
+            // set to clear 4.5:1 against the *darkest* surface each ink lands
+            // on, usually the selected row or the accent wash, not the white
+            // pane. `every_pairing_meets_wcag_aa` holds the line.
             Self::Light => ThemeSpec {
-                background: rgb(0.957, 0.957, 0.961),
+                background: rgb(0.953, 0.957, 0.965),
                 panel_background: rgb(1.000, 1.000, 1.000),
-                panel_background_elevated: rgb(0.976, 0.976, 0.980),
-                selected_file: rgb(0.923, 0.910, 0.957),
-                text: rgb(0.106, 0.114, 0.133),
-                muted_text: rgb(0.314, 0.337, 0.380),
-                subtle_text: rgb(0.392, 0.410, 0.451),
-                accent: rgb(0.690, 0.160, 0.055),
-                added_line: rgba(0.020, 0.410, 0.190, 0.10),
-                removed_line: rgba(0.670, 0.130, 0.105, 0.09),
-                added_text: rgb(0.020, 0.410, 0.190),
-                removed_text: rgb(0.670, 0.130, 0.105),
-                modified_token: rgb(0.490, 0.290, 0.000),
-                info: rgb(0.050, 0.310, 0.700),
-                // Same role as in the dark theme: distinct from the white
-                // code surface so file headers stand out as the scroll
-                // body slides past, but not so dark that it overpowers
-                // the body content.
-                file_header: rgb(0.949, 0.953, 0.961),
-                hunk_header: rgba(0.050, 0.310, 0.700, 0.09),
-                conflict_marker: rgb(0.690, 0.115, 0.150),
-                border: rgb(0.882, 0.886, 0.898),
-                note_background: rgba(0.490, 0.290, 0.000, 0.17),
-                note_text: rgb(0.490, 0.290, 0.000),
-                lane_base: rgb(0.430, 0.235, 0.890),
+                panel_background_elevated: rgb(1.000, 1.000, 1.000),
+                selected_file: rgb(0.914, 0.933, 0.988),
+                text: rgb(0.082, 0.090, 0.110),
+                muted_text: rgb(0.267, 0.290, 0.337),
+                subtle_text: rgb(0.388, 0.416, 0.467),
+                accent: rgb(0.184, 0.310, 0.769),
+                added_line: rgba(0.094, 0.478, 0.235, 0.08),
+                removed_line: rgba(0.749, 0.161, 0.188, 0.07),
+                added_text: rgb(0.075, 0.420, 0.200),
+                removed_text: rgb(0.700, 0.140, 0.170),
+                modified_token: rgb(0.560, 0.320, 0.000),
+                renamed: rgb(0.439, 0.255, 0.761),
+                info: rgb(0.184, 0.310, 0.769),
+                file_header: rgb(0.969, 0.973, 0.980),
+                hunk_header: rgba(0.184, 0.310, 0.769, 0.07),
+                conflict_marker: rgb(0.700, 0.140, 0.170),
+                border: rgb(0.894, 0.902, 0.922),
+                note_background: rgba(0.560, 0.320, 0.000, 0.12),
+                note_text: rgb(0.560, 0.320, 0.000),
+                change_id: rgb(0.690, 0.141, 0.424),
+                lane_base: rgb(0.290, 0.424, 0.831),
+                lanes: [
+                    rgb(0.290, 0.424, 0.831),
+                    rgb(0.137, 0.537, 0.486),
+                    rgb(0.737, 0.455, 0.078),
+                    rgb(0.682, 0.290, 0.545),
+                ],
                 syntax_keyword: rgb(0.420, 0.145, 0.850),
                 syntax_type: rgb(0.000, 0.405, 0.350),
                 syntax_function: rgb(0.070, 0.315, 0.690),
@@ -245,24 +249,32 @@ impl ResolvedTheme {
                 background: BLACK,
                 panel_background: rgb(0.030, 0.030, 0.030),
                 panel_background_elevated: rgb(0.070, 0.070, 0.070),
-                selected_file: rgb(0.000, 0.180, 0.240),
+                selected_file: rgb(0.050, 0.110, 0.300),
                 text: WHITE,
                 muted_text: rgb(0.780, 0.820, 0.840),
                 subtle_text: rgb(0.620, 0.660, 0.690),
-                accent: rgb(1.000, 0.478, 0.349),
+                accent: rgb(0.580, 0.700, 1.000),
                 added_line: rgb(0.000, 0.235, 0.080),
                 removed_line: rgb(0.300, 0.000, 0.045),
                 added_text: rgb(0.500, 1.000, 0.600),
                 removed_text: rgb(1.000, 0.520, 0.560),
                 modified_token: rgb(1.000, 0.920, 0.000),
-                info: rgb(0.380, 0.770, 1.000),
+                renamed: rgb(0.830, 0.730, 1.000),
+                info: rgb(0.580, 0.700, 1.000),
                 file_header: rgb(0.120, 0.120, 0.120),
-                hunk_header: rgb(0.000, 0.220, 0.310),
+                hunk_header: rgb(0.000, 0.150, 0.330),
                 conflict_marker: rgb(1.000, 0.445, 0.445),
                 border: rgb(0.570, 0.620, 0.660),
                 note_background: rgb(0.260, 0.210, 0.000),
                 note_text: rgb(1.000, 0.940, 0.500),
-                lane_base: rgb(0.760, 0.620, 1.000),
+                change_id: rgb(1.000, 0.560, 0.820),
+                lane_base: rgb(0.580, 0.700, 1.000),
+                lanes: [
+                    rgb(0.580, 0.700, 1.000),
+                    rgb(0.400, 0.950, 0.850),
+                    rgb(1.000, 0.800, 0.400),
+                    rgb(1.000, 0.600, 0.850),
+                ],
                 syntax_keyword: rgb(0.870, 0.740, 1.000),
                 syntax_type: rgb(0.400, 1.000, 0.920),
                 syntax_function: rgb(0.600, 0.840, 1.000),
@@ -295,10 +307,11 @@ pub struct ThemeSpec {
     pub added_text: Color,
     pub removed_text: Color,
     pub modified_token: Color,
-    /// Informational blue. Used for the `M` (Modified) file-status chip
-    /// and the diff-view hunk header — wherever the design system uses
-    /// `--info`. Separate from `accent` so the accent (coral) stays
-    /// reserved for selection, working copy, and primary actions.
+    /// A renamed or copied file's status letter.
+    pub renamed: Color,
+    /// Informational ink: primary buttons, the hunk header's tint, file and
+    /// command icons. The accent's hue, kept as its own token so a theme can
+    /// split them.
     pub info: Color,
     pub file_header: Color,
     pub hunk_header: Color,
@@ -306,12 +319,16 @@ pub struct ThemeSpec {
     pub border: Color,
     pub note_background: Color,
     pub note_text: Color,
-    /// Base color for lane 0 of the revision graph. Subsequent lanes
-    /// derive their hue from this via `RevisionGraphStyle::lane_color`'s
-    /// HSL rotation. Decoupled from `accent` so the trunk (violet in the
-    /// design) doesn't fight diff add/del greens and reds, and so the
-    /// coral accent stays reserved for the working copy and selection.
+    /// The highlighted shortest-unique prefix of a change id (jj prints it
+    /// in magenta, so jj users already read it as "the id part").
+    pub change_id: Color,
+    /// Lane 0 of the revision graph, and the colour bookmark names take in
+    /// prose. Always `lanes[0]`.
     pub lane_base: Color,
+    /// The revision graph's lane colours, cycled by lane index. Four muted
+    /// hues of like lightness: enough to tell adjacent branches apart
+    /// without turning the gutter into a rainbow.
+    pub lanes: [Color; 4],
     /// Dedicated syntax ramp. Deliberately decoupled from the diff
     /// semantics (`added_text`, `removed_text`, `conflict_marker`) so
     /// code coloring never echoes add/del/conflict signals — a keyword
@@ -387,17 +404,16 @@ pub fn chip_background(color: Color) -> Color {
     Color { a: 0.18, ..color }
 }
 
-/// Saturated color for a file's status letter chip. Mapping follows the
-/// design system: A→green (added_text), M→blue (info), D→red (removed_text),
-/// R→amber (modified_token). The chip's background is derived from this
-/// color via `chip_background` so the glyph and the tint share a hue.
+/// Ink for a file's status letter: A green, M amber, D red, R violet. The
+/// badge's tint is derived from it via `chip_background`, so the letter and
+/// its fill share a hue.
 pub fn file_status_color(status: diffui_core::DiffFileStatus, theme: ThemeSpec) -> Color {
     use diffui_core::DiffFileStatus;
     match status {
         DiffFileStatus::Added => theme.added_text,
         DiffFileStatus::Deleted => theme.removed_text,
-        DiffFileStatus::Modified => theme.info,
-        DiffFileStatus::Renamed => theme.modified_token,
+        DiffFileStatus::Modified => theme.modified_token,
+        DiffFileStatus::Renamed => theme.renamed,
         DiffFileStatus::Conflicted => theme.conflict_marker,
     }
 }
@@ -442,19 +458,30 @@ pub mod control {
     pub const STANDARD: f32 = 32.0;
 }
 
-/// Corner radii shared across the chrome. Chips keep their own tighter
-/// rounding ([`crate::chip::RADIUS`]).
+/// Corner radii. One scale for the whole app: pick the step by the size of
+/// the thing being rounded, so a 20px chip and a 400px card read as the same
+/// family. The named roles below are the steps the chrome reaches for.
 pub mod radius {
+    /// Chips, badges, keycaps, small icon buttons.
+    pub const XS: f32 = 6.0;
+    /// Buttons, inputs, tree and menu rows.
+    pub const SM: f32 = 10.0;
+    /// Revision rows, inner cards and wells.
+    pub const MD: f32 = 12.0;
+    /// Popovers.
+    pub const LG: f32 = 16.0;
+    /// Modals: dialogs, the palette.
+    pub const XL: f32 = 20.0;
+
     /// Inputs, hover washes, list/menu rows.
-    pub const CONTROL: f32 = 7.0;
+    pub const CONTROL: f32 = SM;
     /// Every button-shaped control (ghost, raised, primary, dialog) and
-    /// the toolbar's segmented well — one rounding for everything that
-    /// reads as a button.
-    pub const BUTTON: f32 = 7.0;
+    /// the toolbar's segmented well.
+    pub const BUTTON: f32 = SM;
     /// Inset row cards (revision/file selection).
-    pub const PUSH: f32 = 8.0;
-    /// Floating cards: popovers, modals, and tooltips.
-    pub const SURFACE: f32 = 12.0;
+    pub const PUSH: f32 = MD;
+    /// Floating cards anchored to a trigger: popovers, menus.
+    pub const SURFACE: f32 = LG;
 }
 
 /// Blend `a` toward `b` by `t` (0..=1), ignoring alpha. Used to derive the
@@ -520,9 +547,8 @@ pub fn raised_button_style(theme: ThemeSpec) -> ButtonStyle {
     }
 }
 
-/// Primary call-to-action: informational blue fill with an inverted label.
-/// Keeping actions blue leaves coral for selection and working-copy state,
-/// away from destructive red.
+/// Primary call-to-action: an `info` fill with an inverted label, well away
+/// from the destructive red.
 pub fn primary_button_style(theme: ThemeSpec) -> ButtonStyle {
     ButtonStyle {
         rest: Some(theme.info),
@@ -591,7 +617,7 @@ pub fn modal_card<E: Styled>(element: E, theme: ThemeSpec) -> E {
         .bg(theme.panel_background_elevated)
         .border_1()
         .border_color(theme.border)
-        .rounded(px(radius::SURFACE))
+        .rounded(px(radius::XL))
         .shadow(vec![floating_shadow(4.0, 12.0)])
 }
 
@@ -615,7 +641,7 @@ pub fn tooltip_card<E: Styled>(element: E, theme: ThemeSpec) -> E {
         .text_color(theme.text)
         .border_1()
         .border_color(theme.border)
-        .rounded(px(radius::SURFACE))
+        .rounded(px(radius::SM))
 }
 
 /// Makes kit's theme speak diffui's palette, so a stock kit component (a
@@ -774,8 +800,8 @@ mod tests {
         for (label, color) in [
             ("added chip", spec.added_text),
             ("removed chip", spec.removed_text),
-            ("modified chip", spec.info),
-            ("renamed chip", spec.modified_token),
+            ("modified chip", spec.modified_token),
+            ("renamed chip", spec.renamed),
             ("conflicted chip", spec.conflict_marker),
             ("accent chip", spec.accent),
         ] {
@@ -808,8 +834,13 @@ mod tests {
             }
         }
         // The graph's lanes are strokes, not glyphs to read.
-        for base in [spec.panel_background, spec.selected_file] {
-            pairs.push(("lane", spec.lane_base, base, GLYPH));
+        for lane in spec.lanes {
+            for base in [spec.panel_background, spec.selected_file] {
+                pairs.push(("lane", lane, base, GLYPH));
+            }
+        }
+        for background in [spec.panel_background, spec.selected_file] {
+            pairs.push(("change id prefix", spec.change_id, background, TEXT));
         }
         pairs
     }

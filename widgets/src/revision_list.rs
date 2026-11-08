@@ -2020,6 +2020,7 @@ impl RevisionList {
                 border_color: None,
                 border_dashed: false,
                 icon: None,
+                icon_color: None,
             };
             let center = chip::center_for_baseline(&overflow_chip, meta_baseline);
             chip::paint(&overflow_chip, widths, chip_x, center, window, cx);
@@ -2252,6 +2253,7 @@ impl RevisionList {
                 border_color: None,
                 border_dashed: false,
                 icon: None,
+                icon_color: None,
             };
             let chip_w = chip::width_memoized(widths, &file.status_label, None, style.mono_font);
             chip::paint(
@@ -2321,7 +2323,7 @@ fn placeholder_style() -> RevisionListStyle {
     let color = crate::theme::BLACK;
     RevisionListStyle {
         graph: RevisionGraphStyle {
-            lane_base_color: color,
+            lanes: [color; 4],
             missing_color: color,
         },
         background: color,

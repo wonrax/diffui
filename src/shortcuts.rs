@@ -415,7 +415,7 @@ pub(crate) fn keycap(
             chip.bg(theme::chip_background(theme.muted_text))
                 .border_1()
                 .border_color(theme.border)
-                .rounded(px(4.0))
+                .rounded(px(theme::radius::XS))
         },
     )
 }

@@ -13,20 +13,19 @@ use crate::typography::TextBox;
 use crate::width_memo::WidthMemo;
 
 pub const TEXT_SIZE: f32 = crate::theme::text_size::BODY;
-pub const PAD_X: f32 = 6.0;
-/// Soft rounding just under half of [`height`] — rounder than a plain tag,
-/// deliberately short of a full pill.
-pub const RADIUS: f32 = 6.0;
+pub const PAD_X: f32 = 7.0;
+/// The app's smallest radius step, shared with keycaps and badges.
+pub const RADIUS: f32 = crate::theme::radius::XS;
 /// Chip icon glyph size — a step under the label size so the glyph's optical
 /// weight matches the text next to it.
 pub const ICON_SIZE: f32 = 11.0;
 /// Gap between a chip's icon and its label.
 pub const ICON_GAP: f32 = 3.0;
 
-/// Tight box: just enough vertical room for the cap-height plus a hair of
-/// breathing room. Anything more makes the chip dwarf the text around it.
+/// Enough room around the label that the chip reads as a box of its own,
+/// short of dwarfing the text it sits beside.
 pub fn height() -> f32 {
-    (TEXT_SIZE + 3.0).round()
+    (TEXT_SIZE + 5.0).round()
 }
 
 #[derive(Debug, Clone)]
@@ -44,11 +43,13 @@ pub struct Chip {
     /// bookmark chips — outlined, lane-colored).
     pub border_color: Option<Color>,
     pub border_dashed: bool,
-    /// Optional Lucide glyph drawn ahead of the label, tinted like it.
-    /// Workspace chips carry one so a `name@` working-copy marker reads as
-    /// a different kind of thing than the bookmark pills around it —
-    /// color alone doesn't separate two chips in the same rail.
+    /// Optional Lucide glyph drawn ahead of the label. Workspace chips
+    /// carry one so a `name@` working-copy marker reads as a different kind
+    /// of thing than the bookmark pills around it.
     pub icon: Option<&'static str>,
+    /// The glyph's own tint, when it differs from the label's: a neutral
+    /// bookmark chip shows its graph lane through the icon alone.
+    pub icon_color: Option<Color>,
 }
 
 /// Full chip width (icon + label + horizontal padding) for the given label,
@@ -124,7 +125,7 @@ pub fn paint(
             ICON_SIZE,
             ICON_SIZE,
             icons::ICON_FONT,
-            chip.text_color,
+            chip.icon_color.unwrap_or(chip.text_color),
             TextAlign::Left,
             window,
             cx,
@@ -177,7 +178,11 @@ pub fn view(chip: &Chip) -> Div {
         }
     }
     if let Some(glyph) = chip.icon {
-        element = element.child(icons::icon(glyph, ICON_SIZE, chip.text_color));
+        element = element.child(icons::icon(
+            glyph,
+            ICON_SIZE,
+            chip.icon_color.unwrap_or(chip.text_color),
+        ));
     }
     element.child(
         div()

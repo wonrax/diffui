@@ -225,6 +225,7 @@ fn revision_row_at(ui: &Diffui, theme: ThemeSpec, row: usize) -> RevisionRowView
                     border_color: Some(theme.accent),
                     border_dashed: true,
                     icon: None,
+                    icon_color: None,
                 },
             );
         }
@@ -411,6 +412,7 @@ fn build_revision_row(
                     border_color: Some(theme.accent),
                     border_dashed: true,
                     icon: Some(icons::ARROW_UP),
+                    icon_color: None,
                 },
             );
         } else {
@@ -465,6 +467,7 @@ fn build_revision_row(
                         border_color: None,
                         border_dashed: false,
                         icon: Some(icons::ARROW_DOWN),
+                        icon_color: None,
                     },
                 );
             }
@@ -489,6 +492,7 @@ fn build_revision_row(
                 border_color: Some(theme.accent),
                 border_dashed: true,
                 icon: None,
+                icon_color: None,
             },
         );
     }

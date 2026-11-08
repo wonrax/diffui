@@ -147,7 +147,7 @@ fn thousands(n: usize) -> String {
 /// The graph's lane colours for `theme`.
 pub(crate) fn revision_graph_style(theme: ThemeSpec) -> RevisionGraphStyle {
     RevisionGraphStyle {
-        lane_base_color: theme.lane_base,
+        lanes: theme.lanes,
         missing_color: theme.subtle_text,
     }
 }
@@ -201,6 +201,7 @@ pub(crate) fn bookmark_chips_for(
             border_color: is_remote.then_some(lane_color),
             border_dashed: false,
             icon: is_workspace.then_some(icons::FOLDER),
+            icon_color: None,
         });
     }
     chips
@@ -220,6 +221,7 @@ pub(crate) fn tag_chips_for(tags: &[String], theme: ThemeSpec, config: AppConfig
             border_color: tag.contains('@').then_some(theme.subtle_text),
             border_dashed: false,
             icon: Some(icons::TAG),
+            icon_color: None,
         })
         .collect()
 }
@@ -237,6 +239,7 @@ pub(crate) fn status_chips_for(commit: RowView, theme: ThemeSpec, config: AppCon
             border_color: Some(theme.subtle_text),
             border_dashed: true,
             icon: None,
+            icon_color: None,
         });
     }
     if commit.has_conflict() {
@@ -248,6 +251,7 @@ pub(crate) fn status_chips_for(commit: RowView, theme: ThemeSpec, config: AppCon
             border_color: None,
             border_dashed: false,
             icon: None,
+            icon_color: None,
         });
     }
     if commit.is_hidden() {
@@ -262,6 +266,7 @@ pub(crate) fn status_chips_for(commit: RowView, theme: ThemeSpec, config: AppCon
             border_color: Some(theme.subtle_text),
             border_dashed: false,
             icon: None,
+            icon_color: None,
         });
     } else if commit.is_divergent() {
         // jj log flags these with a change-offset suffix: the change id maps
@@ -275,6 +280,7 @@ pub(crate) fn status_chips_for(commit: RowView, theme: ThemeSpec, config: AppCon
             border_color: None,
             border_dashed: false,
             icon: None,
+            icon_color: None,
         });
     }
     status_chips
@@ -330,16 +336,7 @@ pub(crate) fn revision_list_style(
     file_badge_width: f32,
 ) -> RevisionListStyle {
     RevisionListStyle {
-        graph: RevisionGraphStyle {
-            // Lane 0 (the trunk) wears `theme.lane_base` — violet by
-            // design — and subsequent lanes derive from it via HSL
-            // rotation in `RevisionGraphStyle::lane_color`. Kept
-            // separate from `theme.accent` so the coral accent stays
-            // reserved for working-copy / selection signalling and
-            // doesn't compete with the diff add/del greens and reds.
-            lane_base_color: theme.lane_base,
-            missing_color: theme.subtle_text,
-        },
+        graph: revision_graph_style(theme),
         background: theme.panel_background,
         selected_background: theme.selected_file,
         accent: theme.accent,
@@ -561,7 +558,7 @@ fn op_target_row(
             mono_font,
             text_size::CAPTION,
             Padding::from([0.0, 5.0]),
-            move |chip| chip.bg(key_bg).rounded(px(4.0)),
+            move |chip| chip.bg(key_bg).rounded(px(crate::theme::radius::XS)),
         ));
     }
     if let Some(description) = description {

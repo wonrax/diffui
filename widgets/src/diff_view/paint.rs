@@ -1788,6 +1788,7 @@ impl View<'_> {
             border_color: None,
             border_dashed: false,
             icon: None,
+            icon_color: None,
         };
         let chip_w = plan.chip(
             &status_chip,
