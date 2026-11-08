@@ -1113,6 +1113,17 @@ pub struct BookmarksInfo {
     /// `trunk()`'s commit id (hex), unless it falls back to the root commit
     /// because no trunk bookmark exists. jj only.
     pub trunk: Option<String>,
+    /// What a plain `jj git push` to [`Self::default_push_remote`] would send,
+    /// by name. jj only; empty when nothing would go.
+    pub tracked_push: Vec<PushCandidate>,
+}
+
+/// A bookmark a plain push would send, and how many commits its local
+/// target is ahead of the remote's copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushCandidate {
+    pub name: String,
+    pub ahead: usize,
 }
 
 impl BookmarksInfo {

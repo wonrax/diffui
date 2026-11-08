@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 
 use diffui_core::repo::{Command, Payload, RepoError};
 use diffui_core::{
-    BookmarksInfo, MutationOp, PushAllow, PushCheck, PushRequest, PushTarget, RevisionSelection,
+    BookmarksInfo, MutationOp, PushAllow, PushCandidate, PushCheck, PushRequest, PushTarget,
+    RevisionSelection,
 };
 use harness::{TestRepo, scratch_repo, write};
 
@@ -586,12 +587,22 @@ fn tracked_push_sends_tracked_bookmarks_that_moved() {
     })
     .expect("create bookmark");
 
+    // What the toolbar's Push says it sends, before it does.
+    assert_eq!(
+        bookmarks(&mut repo).tracked_push,
+        vec![PushCandidate {
+            name: "main".to_owned(),
+            ahead: 1,
+        }]
+    );
+
     let outcome = repo
         .mutate(push("origin", vec![PushTarget::Tracked]))
         .expect("plain push");
     assert_eq!(outcome.message, "Pushed main to origin");
     assert_eq!(remote_ref(&remote, "main"), Some(second));
     assert_eq!(remote_ref(&remote, "local-only"), None);
+    assert!(bookmarks(&mut repo).tracked_push.is_empty());
 }
 
 #[test]

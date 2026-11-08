@@ -766,6 +766,7 @@ mod tests {
             git_push: None,
             tags: Default::default(),
             trunk: None,
+            tracked_push: Vec::new(),
         };
         (ui, tab)
     }
