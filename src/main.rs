@@ -1025,9 +1025,13 @@ pub(crate) struct OpenRepoDialog {
     /// The folder a read is in flight for, so typing within it doesn't
     /// queue another.
     pub(crate) listing_pending: Option<PathBuf>,
-    /// The highlighted suggestion; `None` until the arrows pick one, so a
-    /// plain Enter still opens what was typed.
+    /// The highlighted suggestion (or recent, while the recents show);
+    /// `None` until the arrows pick one, so a plain Enter still opens what
+    /// was typed.
     pub(crate) selected: Option<usize>,
+    /// What the typed path was found to be, for the status line. May lag the
+    /// path for a beat; see [`path_browse::Probe`].
+    pub(crate) probe: Option<path_browse::Probe>,
 }
 
 impl OpenRepoDialog {

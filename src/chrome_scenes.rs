@@ -158,7 +158,7 @@ fn welcome_scenes() {
 
     let typed = format!("{}/", acme().display());
     render_toolkit();
-    h.act(|ui, cx| ui.on_open_repo_path_changed(typed, cx));
+    h.act(|ui, cx| ui.open_repo_typed(typed, cx));
     h.wait_until("the folder listing", |ui| {
         ui.open_repo_dialog()
             .and_then(|dialog| dialog.suggestions())
@@ -166,7 +166,7 @@ fn welcome_scenes() {
     });
     h.shot(LANE, "welcome-typed-path");
 
-    h.act(|ui, cx| ui.on_open_repo_path_changed("/nonexistent/place".to_owned(), cx));
+    h.act(|ui, cx| ui.open_repo_typed("/nonexistent/place".to_owned(), cx));
     h.perform(Action::SubmitRepoDialog);
     h.wait_until("the open error", |ui| {
         ui.open_repo_dialog()
@@ -476,7 +476,7 @@ fn open_repo_scenes() {
     h.shot(LANE, "open-repo-dialog");
 
     let typed = format!("{}/", acme().display());
-    h.act(|ui, cx| ui.on_open_repo_path_changed(typed, cx));
+    h.act(|ui, cx| ui.open_repo_typed(typed, cx));
     h.wait_until("the folder listing", |ui| {
         ui.open_repo_dialog()
             .and_then(|dialog| dialog.suggestions())
@@ -485,7 +485,7 @@ fn open_repo_scenes() {
     h.perform(Action::OpenRepoMove(1));
     h.shot(LANE, "open-repo-typed");
 
-    h.act(|ui, cx| ui.on_open_repo_path_changed("/tmp".to_owned(), cx));
+    h.act(|ui, cx| ui.open_repo_typed("/tmp".to_owned(), cx));
     h.perform(Action::SubmitRepoDialog);
     h.wait_until("the open error", |ui| {
         ui.open_repo_dialog()

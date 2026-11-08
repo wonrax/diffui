@@ -2088,6 +2088,17 @@ pub(crate) static REGISTRY: &[Command] = &[
         palette: PaletteScope::Hidden,
     },
     Command {
+        id: "repo.remove-recent",
+        label: "Remove from recents",
+        hint: "Forget the highlighted recent repository",
+        contexts: &[Context::OpenRepo],
+        chords: &["ctrl+backspace"],
+        mac_chords: &["cmd+backspace"],
+        enabled: always,
+        build: |ui, _arg| ui.open_repo_selected_recent().map(Action::RemoveRecentRepo),
+        palette: PaletteScope::Hidden,
+    },
+    Command {
         id: "repo.complete-folder",
         label: "Complete folder",
         hint: "Complete the path into the highlighted folder",

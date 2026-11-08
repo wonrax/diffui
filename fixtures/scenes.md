@@ -863,8 +863,32 @@ have no scene; see src/toolbar.rs and core/src/github.rs for what differs.
 ### `open-repo-not-repo`
 
 - Window: 1440x900, light
-- State: Dialog after submitting a path that isn't a repository.
-- Steps: cmd+O, type /tmp, Enter.
+- State: Dialog after submitting a path that isn't a repository: the open's own error in the status line.
+- Steps: cmd+O, type /usr/bin, Enter.
+
+### `open-repo-repository`
+
+- Window: 1440x900, light
+- State: A typed path that is a repository: the status line says so and what Enter does.
+- Steps: cmd+O, type the fixture repository's path.
+
+### `open-repo-no-match`
+
+- Window: 1440x900, light
+- State: A typed name no folder starts with: the warning status line.
+- Steps: cmd+O, type a folder and a name nothing matches.
+
+### `open-repo-pull-request`
+
+- Window: 1440x900, light
+- State: A pull request reference: its status line and the card saying how it opens.
+- Steps: cmd+O, type acme/render-toolkit#42.
+
+### `open-repo-typed-dark`
+
+- Window: 1440x900, dark
+- State: open-repo-typed in dark.
+- Steps: As open-repo-typed, theme Dark.
 
 ### `shortcuts-sheet`
 

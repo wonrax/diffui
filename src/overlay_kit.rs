@@ -11,6 +11,8 @@ use crate::typography;
 /// Lucide glyphs the overlays use that the shared catalog doesn't carry, from
 /// the same pinned font (see `widgets/build.rs`).
 pub(crate) mod glyph {
+    pub(crate) const CHECK_CIRCLE: &str = "\u{e07c}"; // check-circle
+    pub(crate) const PULL_REQUEST: &str = "\u{e0e5}"; // git-pull-request
     pub(crate) const BOOKMARK: &str = "\u{e060}"; // bookmark
     pub(crate) const SUN: &str = "\u{e178}"; // sun
     pub(crate) const MOON: &str = "\u{e11e}"; // moon

@@ -27,7 +27,8 @@ use crate::input;
 use crate::measure;
 use crate::repository::Vcs;
 use crate::theme::{
-    self, Font, ThemeSpec, Weight, chip_background, emphasis_font, radius, text_size, well_fill,
+    self, Color, Font, ThemeSpec, Weight, chip_background, emphasis_font, radius, text_size,
+    well_fill,
 };
 use crate::typography::{self, Aligned};
 use crate::{Action, Cx, Diffui, HoverTarget, TabId, icons, ui};
@@ -76,25 +77,31 @@ const SWAP_HYSTERESIS: f32 = 4.0;
 /// slide is visually done in about three of them.
 const SLIDE_TAU: f32 = 0.05;
 
-/// The open-repo card, sized and inset like a palette column.
-const OPEN_DIALOG_WIDTH: f32 = 520.0;
+/// The open-repo card, sized like a palette column.
+const OPEN_DIALOG_WIDTH: f32 = crate::palette::COLUMN_WIDTH;
 /// Height of the card's input band.
-const OPEN_INPUT_BAND: f32 = 52.0;
-/// Shared left edge of the input text, the section label and row glyphs.
+const OPEN_INPUT_BAND: f32 = crate::palette::INPUT_BAND;
+/// The input band's inset: the kind square sits as far in as the rows' leads.
+const OPEN_BAND_X: f32 = OPEN_LIST_INSET + OPEN_ROW_PAD_X - (OPEN_KIND_SIDE - OPEN_LEAD_BOX) / 2.0;
+/// The status line's text edge.
 const OPEN_CONTENT_X: f32 = theme::space::XL;
-/// Inset of the recent list's hover washes inside the card.
-const OPEN_LIST_INSET: f32 = theme::space::XS;
-const OPEN_SECTION_HEIGHT: f32 = 28.0;
+/// Inset of the list's hover washes inside the card.
+const OPEN_LIST_INSET: f32 = theme::space::SM;
+/// A row's inset from its wash to its lead.
+const OPEN_ROW_PAD_X: f32 = 10.0;
+const OPEN_KIND_SIDE: f32 = 30.0;
+const OPEN_STATUS_HEIGHT: f32 = 40.0;
 const OPEN_SECTION_PILL: f32 = 22.0;
 const OPEN_SECTION_PILL_PAD_X: f32 = theme::space::SM;
-const OPEN_ROW_HEIGHT: f32 = 34.0;
+const OPEN_ROW_HEIGHT: f32 = 36.0;
 /// Rows the card's list shows before it scrolls: as many as the folder
 /// suggestions can be, so typing a path and clearing it again keeps the card
 /// the same size once the recents fill it.
 const OPEN_LIST_ROWS: usize = crate::path_browse::MAX_SUGGESTIONS;
-const OPEN_GLYPH_BOX: f32 = 16.0;
+/// The column a row's badge or folder glyph is centred in.
+const OPEN_LEAD_BOX: f32 = 22.0;
 const OPEN_GLYPH_GAP: f32 = 10.0;
-const OPEN_REMOVE_SIDE: f32 = 24.0;
+const OPEN_REMOVE_SIDE: f32 = 22.0;
 
 /// The strip's height: the title-bar height where it stands in for one,
 /// otherwise its top padding plus the tabs.
@@ -894,24 +901,6 @@ fn tab_badge(source: &crate::TabSource, active: bool, theme: ThemeSpec, mono: Fo
         .child(typography::line(label, font, text_size::BADGE, text))
 }
 
-/// `jj` / `git` badge: a soft colored chip carrying the VCS kind, so a mixed set
-/// of repos reads at a glance.
-fn vcs_badge(vcs: Vcs, theme: ThemeSpec, mono: Font) -> Aligned {
-    let (label, color) = match vcs {
-        // Violet for jj (the trunk/lane hue), warm amber for git: distinct from
-        // the diff add/del greens and reds.
-        Vcs::Jj => ("jj", theme.lane_base),
-        Vcs::Git => ("git", theme.modified_token),
-    };
-    Aligned::chip(
-        typography::line(label, mono, text_size::BADGE, color),
-        mono,
-        text_size::BADGE,
-        [1.0, 4.0].into(),
-        move |chip| chip.bg(chip_background(color)).rounded(px(radius::XS)),
-    )
-}
-
 /// Small ring signalling the working copy (`@`) has changes. A ring in the
 /// "modified" colour rather than a filled accent dot: in an editor a filled dot
 /// means unsaved work, and jj has none; it snapshots `@` on its own.
@@ -1043,8 +1032,9 @@ pub(crate) fn build_open_repo_dialog(
 }
 
 /// The open prompt itself, shared by the modal and the welcome screen: a
-/// palette-family card with one input band (path, folder picker, Open), an error
-/// line when the last open failed, then the recent repositories.
+/// palette-family card with one input band (what kind of thing is typed, the
+/// path, a folder picker), a status line saying what Enter will do with it,
+/// then the recents, the folders under the path, or the pull request it names.
 pub(crate) fn open_repo_card(
     ui: &Diffui,
     theme: ThemeSpec,
@@ -1052,10 +1042,9 @@ pub(crate) fn open_repo_card(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let (font, mono) = (ui.config.ui_font, ui.config.mono_font);
     let on_input = cx.listener(|this: &mut Diffui, path: &String, _, cx| {
-        this.act(cx, |this, cx| {
-            this.on_open_repo_path_changed(path.clone(), cx)
-        });
+        this.act(cx, |this, cx| this.open_repo_typed(path.clone(), cx));
     });
     let submit = Diffui::on_action::<()>(Action::SubmitRepoDialog, cx);
     let spec = input::FieldSpec::new(OPEN_REPO_INPUT_ID, &dialog.path)
@@ -1063,30 +1052,38 @@ pub(crate) fn open_repo_card(
         .on_input(move |path, window, cx| on_input(&path, window, cx))
         .on_submit(move |window, cx| submit(&(), window, cx));
     // Bare: the card is the field.
-    let field = input::single_line(spec, ui.config.mono_font, window, cx)
+    let field = input::single_line(spec, mono, window, cx)
         .appearance(false)
-        // On the card's content edge, not inset from it.
+        // On the band's text edge, not inset from it.
         .px(px(0.0))
         .text_size(px(text_size::BODY_LG));
+    let status = ui.open_repo_status();
 
-    let mut trailing = div()
+    let mut band = div()
         .flex()
         .flex_row()
-        .flex_none()
         .items_center()
-        .gap(px(theme::space::XS));
+        .w_full()
+        .h(px(OPEN_INPUT_BAND))
+        .px(px(OPEN_BAND_X))
+        .gap(px(OPEN_GLYPH_GAP))
+        .text_size(px(text_size::BODY_LG))
+        .child(kind_box(status.as_ref(), theme))
+        .child(div().flex_1().min_w_0().child(field));
     #[cfg(target_os = "macos")]
     {
-        trailing = trailing.child(
+        band = band.child(
             div()
                 .id("open-repo-folder-tip")
-                .tooltip(ui::tooltip("Choose folder…", ui.config.ui_font, theme))
+                .tooltip(ui::tooltip("Choose a folder in Finder", font, theme))
                 .child(
-                    ui::icon_button(
+                    ui::text_button(
                         "open-repo-folder",
-                        icons::FOLDER_OPEN,
-                        theme.muted_text,
+                        None,
+                        "Browse\u{2026}",
+                        ui::Variant::Raised,
                         ui::Size::Compact,
+                        font,
                         theme,
                         cx,
                     )
@@ -1094,144 +1091,473 @@ pub(crate) fn open_repo_card(
                 ),
         );
     }
-    let enabled = !dialog.path.trim().is_empty();
-    let mut open = ui::primary_button(
-        "open-repo-submit",
-        "Open",
-        enabled,
-        ui::Size::Compact,
-        ui.config.ui_font,
-        theme,
-        cx,
-    );
-    if enabled {
-        open = open.on_click(Diffui::on_action(Action::SubmitRepoDialog, cx));
-    }
-    let trailing = trailing.child(open);
-
-    // The trailing controls sit as far in from the right edge as from the band's
-    // top and bottom.
-    let band_inset = (OPEN_INPUT_BAND - ui::Size::Compact.height()) / 2.0;
-    let band = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .w_full()
-        .h(px(OPEN_INPUT_BAND))
-        .pl(px(OPEN_CONTENT_X))
-        .pr(px(band_inset))
-        .gap(px(theme::space::MD))
-        .text_size(px(text_size::BODY_LG))
-        .child(div().flex_1().min_w_0().child(field))
-        .child(trailing);
 
     let mut body = theme::modal_card(div(), theme)
         .w(px(OPEN_DIALOG_WIDTH))
         .flex()
         .flex_col()
         .overflow_hidden()
-        .child(band);
-
-    if let Some(error) = &dialog.error {
-        // The glyph centres on the first line's caps.
-        let line = typography::TextBox::default_line(ui.config.ui_font, text_size::UI);
-        body = body.child(
-            div()
-                .w_full()
-                .flex()
-                .flex_row()
-                .items_start()
-                .gap(px(theme::space::MD))
-                .pl(px(OPEN_CONTENT_X))
-                .pr(px(OPEN_CONTENT_X))
-                .pb(px(theme::space::LG))
-                .child(
-                    div()
-                        .flex_none()
-                        .pt(px(((line.cap_top() + line.baseline()) / 2.0
-                            - ui::ICON_SIZE / 2.0)
-                            .max(0.0)))
-                        .child(icons::icon(
-                            icons::ALERT_TRIANGLE,
-                            ui::ICON_SIZE,
-                            theme.removed_text,
-                        )),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .font(ui.config.ui_font.gpui())
-                        .text_size(px(text_size::UI))
-                        .text_color(theme.removed_text)
-                        .child(error.clone()),
-                ),
-        );
+        .child(band)
+        .child(crate::root::horizontal_divider(theme));
+    if let Some(status) = &status {
+        body = body
+            .child(status_line(ui, theme, status))
+            .child(crate::root::horizontal_divider(theme));
     }
 
-    // A path being typed lists the folders it can continue into; anything else
-    // shows the recents.
-    let section = match dialog.suggestions() {
-        Some((query, rows)) => folder_section(ui, theme, dialog, query, rows, cx),
-        None => recents_section(ui, theme, cx),
+    let path = dialog.path.trim();
+    let list: Option<AnyElement> = match (&status, dialog.suggestions()) {
+        (Some(crate::path_browse::Status::PullRequest(spec)), _) => {
+            Some(pull_request_card(ui, theme, spec).into_any_element())
+        }
+        (_, Some((query, rows))) => Some(folder_section(ui, theme, dialog, query, rows, cx)),
+        _ if path.is_empty() => recents_section(ui, theme, dialog, cx),
+        _ => None,
     };
-    if let Some((header, list, rows)) = section {
-        let list = if rows > OPEN_LIST_ROWS {
-            // Past the fixed height the list scrolls, its bar at the card's edge
-            // and the rows clear of it.
-            div()
-                .w_full()
-                .pl(px(OPEN_LIST_INSET))
-                .pb(px(OPEN_LIST_INSET))
-                .child(
-                    div()
-                        .w_full()
-                        .h(px(OPEN_LIST_ROWS as f32 * OPEN_ROW_HEIGHT))
-                        .child(ui::scrollable("open-repo-list", ui::gutter().child(list))),
-                )
-        } else {
+    if let Some(list) = list {
+        body = body.child(
             div()
                 .w_full()
                 .px(px(OPEN_LIST_INSET))
                 .pb(px(OPEN_LIST_INSET))
-                .child(list)
-        };
-        body = body
-            .child(crate::root::horizontal_divider(theme))
-            .child(
-                div()
-                    .w_full()
-                    .h(px(OPEN_SECTION_HEIGHT))
-                    .flex()
-                    .items_center()
-                    .child(header),
-            )
-            .child(list);
+                .child(list),
+        );
     }
-    body.into_any_element()
+    body.child(open_repo_footer(ui, theme, dialog, status.as_ref()))
+        .into_any_element()
 }
 
-/// The open prompt's recent list: anything in the MRU that isn't already open; one
-/// click reopens it. `None` when there is nothing to list.
+/// How a status line is tinted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tone {
+    Ok,
+    Info,
+    Muted,
+    Warn,
+    Danger,
+}
+
+/// A stretch of a status line.
+enum Run {
+    Plain(String),
+    /// A name: semibold, full ink.
+    Strong(String),
+    /// A path or a spelling to type: mono.
+    Code(String),
+}
+
+fn plain(text: impl Into<String>) -> Run {
+    Run::Plain(text.into())
+}
+
+fn strong(text: impl Into<String>) -> Run {
+    Run::Strong(text.into())
+}
+
+fn code(text: impl Into<String>) -> Run {
+    Run::Code(text.into())
+}
+
+/// The tone, glyph, words and Enter hint of a status.
+fn status_parts(
+    status: &crate::path_browse::Status,
+) -> (Tone, &'static str, Vec<Run>, Option<&'static str>) {
+    use crate::overlay_kit::glyph;
+    use crate::path_browse::Status;
+    let vcs_name = |vcs: Vcs| match vcs {
+        Vcs::Jj => "jj",
+        Vcs::Git => "git",
+    };
+    match status {
+        Status::PullRequest(spec) => {
+            let mut runs = vec![
+                plain("Pull request "),
+                strong(format!("#{}", spec.number)),
+                plain(" in "),
+                strong(format!("{}/{}", spec.owner, spec.repo)),
+            ];
+            if let Some(host) = &spec.host {
+                runs.extend([plain(" on "), code(host.clone())]);
+            }
+            (
+                Tone::Info,
+                glyph::PULL_REQUEST,
+                runs,
+                Some("Open in a new tab"),
+            )
+        }
+        Status::Relative => (
+            Tone::Warn,
+            icons::ALERT_TRIANGLE,
+            vec![
+                plain("Start with "),
+                code("/"),
+                plain(" or "),
+                code("~/"),
+                plain(" for a folder, or type "),
+                code("owner/repo#123"),
+                plain(" for a pull request."),
+            ],
+            None,
+        ),
+        Status::Repository {
+            name, open: true, ..
+        } => (
+            Tone::Info,
+            glyph::CHECK_CIRCLE,
+            vec![strong(name.clone()), plain(" is already open.")],
+            Some("Switch to its tab"),
+        ),
+        Status::Repository {
+            name,
+            vcs,
+            at_root: true,
+            ..
+        } => (
+            Tone::Ok,
+            glyph::CHECK_CIRCLE,
+            vec![
+                strong(name.clone()),
+                plain(format!(" is a {} repository.", vcs_name(*vcs))),
+            ],
+            Some("Open"),
+        ),
+        Status::Repository { name, vcs, .. } => (
+            Tone::Ok,
+            glyph::CHECK_CIRCLE,
+            vec![
+                plain("Inside "),
+                strong(name.clone()),
+                plain(format!(" ({}). Opens the repository root.", vcs_name(*vcs))),
+            ],
+            Some("Open"),
+        ),
+        Status::NotRepository { folder } => (
+            Tone::Muted,
+            icons::FOLDER,
+            vec![
+                code(folder.clone()),
+                plain(" isn't a repository. Pick a folder marked "),
+                strong("jj"),
+                plain(" or "),
+                strong("git"),
+                plain("."),
+            ],
+            None,
+        ),
+        Status::NoMatch { folder, partial } => (
+            Tone::Warn,
+            icons::ALERT_TRIANGLE,
+            vec![
+                plain("No folder in "),
+                code(folder.clone()),
+                plain(format!(" starts with \u{201c}{partial}\u{201d}.")),
+            ],
+            None,
+        ),
+        Status::Missing { folder } => (
+            Tone::Warn,
+            icons::ALERT_TRIANGLE,
+            vec![code(folder.clone()), plain(" doesn't exist.")],
+            None,
+        ),
+        Status::Failed(error) => (
+            Tone::Danger,
+            icons::ALERT_TRIANGLE,
+            vec![plain(error.clone())],
+            None,
+        ),
+    }
+}
+
+fn tone_ink(tone: Tone, theme: ThemeSpec) -> Color {
+    match tone {
+        Tone::Ok => theme.added_text,
+        Tone::Info => theme.accent,
+        Tone::Muted => theme.subtle_text,
+        Tone::Warn => theme.note_text,
+        Tone::Danger => theme.removed_text,
+    }
+}
+
+/// The square at the band's start: what kind of thing the input names. Green
+/// once the path resolves to a repository, the accent for a pull request.
+fn kind_box(status: Option<&crate::path_browse::Status>, theme: ThemeSpec) -> impl IntoElement {
+    use crate::path_browse::Status;
+    let (glyph, fill, ink) = match status {
+        Some(Status::PullRequest(_)) => (
+            crate::overlay_kit::glyph::PULL_REQUEST,
+            chip_background(theme.accent),
+            theme.accent,
+        ),
+        Some(Status::Repository { .. }) => (
+            icons::FOLDER,
+            chip_background(theme.added_text),
+            theme.added_text,
+        ),
+        _ => (
+            icons::FOLDER,
+            crate::palette::active_wash(theme),
+            theme.muted_text,
+        ),
+    };
+    div()
+        .flex_none()
+        .size(px(OPEN_KIND_SIDE))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(radius::SM))
+        .bg(fill)
+        .child(icons::icon(glyph, ui::ICON_SIZE, ink))
+}
+
+/// The line under the input saying what Enter will do with it, updated as it's
+/// typed. An open that failed for a reason only the open found says why here.
+fn status_line(ui: &Diffui, theme: ThemeSpec, status: &crate::path_browse::Status) -> Div {
+    let (font, mono) = (ui.config.ui_font, ui.config.mono_font);
+    let (tone, glyph, runs, enter) = status_parts(status);
+    let ink = tone_ink(tone, theme);
+    let line = div()
+        .w_full()
+        .min_h(px(OPEN_STATUS_HEIGHT))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(theme::space::MD))
+        .px(px(OPEN_CONTENT_X))
+        .py(px(theme::space::SM))
+        .when(tone == Tone::Warn, |line| line.bg(theme.note_background))
+        .when(tone == Tone::Danger, |line| {
+            line.bg(chip_background(theme.removed_text))
+        });
+    if let crate::path_browse::Status::Failed(error) = status {
+        // jj's and the OS's reasons run long: wrap them.
+        return line
+            .items_start()
+            .child(icons::icon(glyph, ui::ICON_SIZE, ink))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .font(font.gpui())
+                    .text_size(px(text_size::UI))
+                    .text_color(theme.removed_text)
+                    .child(error.clone()),
+            );
+    }
+    let strong_font = emphasis_font(font, Weight::SEMIBOLD);
+    let mut words: Vec<Aligned> = vec![
+        Aligned::glyph(icons::icon(glyph, ui::ICON_SIZE, ink), ui::ICON_SIZE),
+        Aligned::gap(theme::space::MD),
+    ];
+    for run in runs {
+        let code = matches!(run, Run::Code(_));
+        let (text, run_font, size, color) = match run {
+            Run::Plain(text) => (text, font, text_size::UI, theme.muted_text),
+            Run::Strong(text) => (text, strong_font, text_size::UI, theme.text),
+            Run::Code(text) => (text, mono, text_size::CAPTION, theme.text),
+        };
+        let item = Aligned::text(
+            typography::line(text, run_font, size, color)
+                .overflow_hidden()
+                .text_ellipsis(),
+            run_font,
+            size,
+        );
+        // A long path gives way when the card runs out of room; the words
+        // around it stay whole.
+        words.push(if code { item.shrink() } else { item });
+    }
+    let mut line = line.child(typography::baseline_row(words, 0.0).flex_1().min_w_0());
+    if let Some(enter) = enter {
+        line = line.child(crate::overlay_kit::key_hint(
+            &["\u{21b5}"],
+            enter,
+            font,
+            theme,
+        ));
+    }
+    line
+}
+
+/// The pull request a reference names, and what opening it does.
+fn pull_request_card(ui: &Diffui, theme: ThemeSpec, spec: &diffui_core::github::PrSpec) -> Div {
+    let (font, mono) = (ui.config.ui_font, ui.config.mono_font);
+    let title_font = emphasis_font(font, Weight::SEMIBOLD);
+    let mut words = crate::prose::Prose::from(
+        "Opens as its own tab, diffing the pull request's head against its base.",
+    );
+    if spec.host.is_none() {
+        words = words
+            .text(" A bare ")
+            .code("owner/repo#123")
+            .text(" takes its host from the current tab's remote, so GitHub Enterprise works too.");
+    }
+    let title = typography::baseline_row(
+        [
+            Aligned::text(
+                typography::line(
+                    format!("{}/{}", spec.owner, spec.repo),
+                    title_font,
+                    text_size::BODY_LG,
+                    theme.text,
+                ),
+                title_font,
+                text_size::BODY_LG,
+            ),
+            Aligned::gap(theme::space::SM),
+            Aligned::text(
+                typography::line(
+                    format!("#{}", spec.number),
+                    emphasis_font(font, Weight::MEDIUM),
+                    text_size::BODY_LG,
+                    theme.subtle_text,
+                ),
+                emphasis_font(font, Weight::MEDIUM),
+                text_size::BODY_LG,
+            ),
+        ],
+        0.0,
+    );
+    div()
+        .mt(px(OPEN_LIST_INSET))
+        .w_full()
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap(px(theme::space::LG))
+        .px(px(theme::space::XL))
+        .py(px(14.0))
+        .rounded(px(radius::MD))
+        .bg(Color {
+            a: 0.07,
+            ..theme.accent
+        })
+        .border_1()
+        .border_color(Color {
+            a: 0.3,
+            ..theme.accent
+        })
+        .child(div().pt(px(1.0)).child(icons::icon(
+            crate::overlay_kit::glyph::PULL_REQUEST,
+            18.0,
+            theme.accent,
+        )))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(theme::space::XS))
+                .child(title)
+                .child(
+                    div()
+                        .w_full()
+                        .text_size(px(text_size::UI))
+                        .line_height(px(text_size::UI * 1.5))
+                        .child(words.view(font, mono, theme.muted_text, theme)),
+                ),
+        )
+}
+
+/// The prompt's footer: the keys that work in the state it's in.
+fn open_repo_footer(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    dialog: &crate::OpenRepoDialog,
+    status: Option<&crate::path_browse::Status>,
+) -> Div {
+    use crate::overlay_kit::{footer_note, footer_strip, key_hint, keycap};
+    let font = ui.config.ui_font;
+    let mono = ui.config.mono_font;
+    let path = dialog.path.trim();
+    let end = || {
+        div()
+            .ml_auto()
+            .flex()
+            .flex_row()
+            .flex_none()
+            .items_center()
+            .gap(px(theme::space::SM))
+    };
+    let strip = footer_strip(theme);
+    if path.is_empty() {
+        let remove = ui
+            .keymap
+            .chord_for(crate::commands::Context::OpenRepo, "repo.remove-recent")
+            .map(|chord| crate::overlay_kit::chord_keys(&chord.display()))
+            .unwrap_or_default();
+        let remove: Vec<&str> = remove.iter().map(String::as_str).collect();
+        return strip
+            .child(key_hint(&["\u{2191}", "\u{2193}"], "Select", font, theme))
+            .child(key_hint(&["\u{21b5}"], "Open", font, theme))
+            .when(!remove.is_empty(), |strip| {
+                strip.child(key_hint(&remove, "Remove", font, theme))
+            })
+            .child(
+                end()
+                    .child(footer_note("Type", font, theme))
+                    .child(keycap("/", font, theme))
+                    .child(footer_note("or", font, theme))
+                    .child(keycap("~", font, theme))
+                    .child(footer_note("to browse, or", font, theme))
+                    .child(footer_note("owner/repo#123", mono, theme)),
+            );
+    }
+    let browsing = crate::path_browse::Query::parse(path).is_some()
+        && !matches!(status, Some(crate::path_browse::Status::PullRequest(_)));
+    if browsing {
+        return strip
+            .child(key_hint(&["\u{2191}", "\u{2193}"], "Select", font, theme))
+            .child(key_hint(&["\u{21e5}"], "Complete", font, theme))
+            .child(key_hint(&["\u{21b5}"], "Open", font, theme))
+            .child(key_hint(&["\u{232b}"], "Up a folder", font, theme))
+            .child(
+                end()
+                    .child(footer_note("Hidden folders: type", font, theme))
+                    .child(keycap(".", font, theme)),
+            );
+    }
+    strip
+        .child(key_hint(&["\u{21b5}"], "Open", font, theme))
+        .child(end().child(key_hint(&["esc"], "Close", font, theme)))
+}
+
+/// A list's group heading with an action at its far end, both on the rows'
+/// text edges.
+fn section_head(label: &'static str, font: Font, theme: ThemeSpec) -> Div {
+    crate::overlay_kit::group_heading(label, font, theme).px(px(OPEN_ROW_PAD_X))
+}
+
+/// The open prompt's recent list: the repositories opened before, the open
+/// ones marked (a pick switches to their tab). `None` when there is nothing to
+/// list.
 fn recents_section(
     ui: &Diffui,
     theme: ThemeSpec,
+    dialog: &crate::OpenRepoDialog,
     cx: &mut Cx,
-) -> Option<(AnyElement, AnyElement, usize)> {
-    let open_roots: Vec<&str> = ui
-        .tabs
-        .iter()
-        .filter_map(|tab| tab.root()?.to_str())
-        .collect();
-    let recents: Vec<&String> = ui
-        .recent_repos
-        .iter()
-        .filter(|root| !open_roots.contains(&root.as_str()))
-        .collect();
-    if recents.is_empty() {
-        return None;
-    }
+) -> Option<AnyElement> {
+    let recents = ui.open_repo_recents();
     let font = ui.config.ui_font;
+    if recents.is_empty() {
+        return Some(
+            div()
+                .w_full()
+                .pl(px(OPEN_ROW_PAD_X + OPEN_LEAD_BOX + OPEN_GLYPH_GAP))
+                .pr(px(OPEN_ROW_PAD_X))
+                .py(px(theme::space::XL))
+                .child(typography::line(
+                    "Nothing opened yet. Type a path to browse folders.",
+                    font,
+                    text_size::UI,
+                    theme.subtle_text,
+                ))
+                .into_any_element(),
+        );
+    }
     let clear = ui::button(
         "open-repo-clear",
         ui::Variant::Ghost,
@@ -1247,33 +1573,59 @@ fn recents_section(
         text_size::CAPTION,
     ))
     .on_click(Diffui::on_action(Action::ClearRecentRepos, cx));
-    let title_font = emphasis_font(font, Weight::MEDIUM);
     let header = div()
+        .w_full()
         .flex()
         .flex_row()
-        .items_center()
-        .w_full()
-        .pl(px(OPEN_CONTENT_X))
-        // "Clear"'s label, not its wash, ends on the content edge.
-        .pr(px(OPEN_CONTENT_X - OPEN_SECTION_PILL_PAD_X))
-        .child(typography::centered(
-            typography::line("Recent", title_font, text_size::CAPTION, theme.subtle_text),
-            title_font,
-            text_size::CAPTION,
-        ))
-        .child(div().flex_1())
-        .child(clear);
+        .items_end()
+        .child(section_head("Recent", font, theme).flex_1())
+        // "Clear"'s label, not its wash, ends on the rows' end.
+        .child(
+            div()
+                .pb(px(theme::space::XXS))
+                .pr(px(OPEN_ROW_PAD_X - OPEN_SECTION_PILL_PAD_X))
+                .child(clear),
+        );
 
     let rows = recents.len();
     let mut list = div().flex().flex_col().w_full();
-    for (index, root) in recents.into_iter().enumerate() {
-        list = list.child(recent_repo_row(ui, theme, root, index, rows, cx));
+    for (index, recent) in recents.iter().enumerate() {
+        list = list.child(recent_repo_row(
+            ui,
+            theme,
+            recent,
+            index,
+            dialog.selected == Some(index),
+            rows,
+            cx,
+        ));
     }
-    Some((header.into_any_element(), list.into_any_element(), rows))
+    Some(
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(scrolling(list, rows, "open-repo-list"))
+            .into_any_element(),
+    )
 }
 
-/// The folders under the typed path, headed by the folder being browsed. `None`
-/// when nothing matches (or the folder is still being read).
+/// `list`, scrolling past [`OPEN_LIST_ROWS`] rows so the card keeps its size.
+fn scrolling(list: Div, rows: usize, id: &'static str) -> AnyElement {
+    if rows > OPEN_LIST_ROWS {
+        div()
+            .w_full()
+            .h(px(OPEN_LIST_ROWS as f32 * OPEN_ROW_HEIGHT))
+            .child(ui::scrollable(id, list))
+            .into_any_element()
+    } else {
+        list.into_any_element()
+    }
+}
+
+/// The folders under the typed path: the folder as breadcrumbs (a segment
+/// lists it), how many folders and repositories match, then the matches.
 fn folder_section(
     ui: &Diffui,
     theme: ThemeSpec,
@@ -1281,57 +1633,144 @@ fn folder_section(
     query: crate::path_browse::Query,
     rows: Vec<&crate::path_browse::Entry>,
     cx: &mut Cx,
-) -> Option<(AnyElement, AnyElement, usize)> {
-    if rows.is_empty() {
-        return None;
-    }
-    let mono = ui.config.mono_font;
-    let width = OPEN_DIALOG_WIDTH - 2.0 * OPEN_CONTENT_X;
-    let header = div()
-        .w_full()
-        .px(px(OPEN_CONTENT_X))
-        .child(typography::centered(
-            typography::line(
-                middle_cut(&query.typed_dir, width, text_size::CAPTION, mono),
+) -> AnyElement {
+    let (font, mono) = (ui.config.ui_font, ui.config.mono_font);
+    let listing = dialog.listing.as_ref();
+    let (folders, repos) = listing.map_or((0, 0), |listing| query.count(listing));
+
+    let mut crumbs = div().flex().flex_row().items_center().min_w_0();
+    for (index, (segment, target)) in query.crumbs().into_iter().enumerate() {
+        let root = segment == "/";
+        crumbs = crumbs.child(
+            div()
+                .id(("open-repo-crumb", index))
+                .flex_none()
+                .px(px(3.0))
+                .rounded(px(radius::XS))
+                .cursor_pointer()
+                .hover(|crumb| crumb.bg(crate::palette::active_wash(theme)))
+                .child(typography::line(
+                    segment,
+                    mono,
+                    text_size::CAPTION,
+                    theme.muted_text,
+                ))
+                .on_click(Diffui::listen(cx, move |this, _, _, cx| {
+                    this.browse_open_repo_path(target.clone(), cx);
+                })),
+        );
+        if !root {
+            crumbs = crumbs.child(typography::line(
+                "/",
                 mono,
                 text_size::CAPTION,
                 theme.subtle_text,
-            ),
-            mono,
+            ));
+        }
+    }
+    let plural =
+        |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let mut count = plural(folders, "folder", "folders");
+    if repos > 0 {
+        count.push_str(" \u{b7} ");
+        count.push_str(&plural(repos, "repo", "repos"));
+    }
+    let header = div()
+        .w_full()
+        .h(px(crate::overlay_kit::GROUP_HEIGHT))
+        .flex()
+        .flex_row()
+        .items_end()
+        .pb(px(theme::space::XS))
+        .pl(px(OPEN_ROW_PAD_X - 3.0))
+        .pr(px(OPEN_ROW_PAD_X))
+        .gap(px(theme::space::MD))
+        .child(crumbs.flex_1())
+        .child(typography::line(
+            count,
+            font,
             text_size::CAPTION,
+            theme.subtle_text,
         ));
 
-    let count = rows.len();
+    let shown = rows.len();
     let mut list = div().flex().flex_col().w_full();
     for (index, entry) in rows.into_iter().enumerate() {
         list = list.child(folder_row(
             ui,
             theme,
+            &query,
             entry,
             index,
             dialog.selected == Some(index),
             cx,
         ));
     }
-    Some((header.into_any_element(), list.into_any_element(), count))
+    let note = |text: String| {
+        div()
+            .w_full()
+            .pl(px(OPEN_ROW_PAD_X + OPEN_LEAD_BOX + OPEN_GLYPH_GAP))
+            .pr(px(OPEN_ROW_PAD_X))
+            .py(px(theme::space::SM))
+            .child(typography::line(
+                text,
+                font,
+                text_size::UI,
+                theme.subtle_text,
+            ))
+    };
+    let mut section = div().w_full().flex().flex_col().child(header).child(list);
+    if folders > shown {
+        section = section.child(note(format!(
+            "{} more. Keep typing to narrow.",
+            folders - shown
+        )));
+    } else if listing.is_some_and(|listing| listing.entries.is_empty()) {
+        section = section.child(note("This folder has no subfolders.".to_owned()));
+    }
+    section.into_any_element()
 }
 
-/// The folder glyph that leads a row of the open prompt's list.
-fn row_glyph(theme: ThemeSpec) -> Aligned {
-    Aligned::glyph(
-        div()
-            .w(px(OPEN_GLYPH_BOX))
-            .flex()
-            .justify_center()
-            .child(icons::icon(icons::FOLDER, ui::ICON_SIZE, theme.subtle_text)),
-        ui::ICON_SIZE,
-    )
+/// A row's lead: the jj/git badge of a repository, or a folder.
+fn row_lead(vcs: Option<Vcs>, theme: ThemeSpec, mono: Font) -> Aligned {
+    match vcs {
+        Some(vcs) => {
+            let (label, fill, ink) = match vcs {
+                Vcs::Jj => ("jj", chip_background(theme.accent), theme.accent),
+                Vcs::Git => ("git", crate::palette::active_wash(theme), theme.subtle_text),
+            };
+            let font = emphasis_font(mono, Weight::SEMIBOLD);
+            Aligned::chip(
+                typography::line(label, font, text_size::BADGE, ink),
+                font,
+                text_size::BADGE,
+                [2.0, 4.0].into(),
+                move |chip| chip.bg(fill).rounded(px(radius::XS)),
+            )
+            .map(|badge| {
+                div()
+                    .w(px(OPEN_LEAD_BOX))
+                    .flex()
+                    .justify_center()
+                    .child(badge)
+                    .into_any_element()
+            })
+        }
+        None => Aligned::glyph(
+            div()
+                .w(px(OPEN_LEAD_BOX))
+                .flex()
+                .justify_center()
+                .child(icons::icon(icons::FOLDER, ui::ICON_SIZE, theme.subtle_text)),
+            ui::ICON_SIZE,
+        ),
+    }
 }
 
 /// A row of the open prompt's list: full width, its wash on hover or `selected`.
 fn list_row(
     id: gpui_kit::ElementId,
-    content: gpui_kit::Div,
+    content: impl IntoElement,
     selected: bool,
     theme: ThemeSpec,
 ) -> gpui_kit::Stateful<gpui_kit::Div> {
@@ -1342,110 +1781,188 @@ fn list_row(
         .items_center()
         .w_full()
         .h(px(OPEN_ROW_HEIGHT))
-        .px(px(OPEN_CONTENT_X - OPEN_LIST_INSET))
+        .px(px(OPEN_ROW_PAD_X))
+        .gap(px(theme::space::MD))
         .rounded(px(radius::CONTROL))
         .cursor_pointer()
         .when(selected, |row| row.bg(theme.selected_file))
-        .hover(|row| row.bg(theme.selected_file))
+        .when(!selected, |row| {
+            row.hover(|row| row.bg(crate::palette::active_wash(theme)))
+        })
         .child(content)
 }
 
-/// One folder suggestion: glyph, name, and a jj/git chip when the folder is a
-/// repository (which a click opens rather than browses into).
+/// The "Open" chip of a repository a tab has open.
+fn open_chip(font: Font, theme: ThemeSpec) -> impl IntoElement {
+    let font = emphasis_font(font, Weight::MEDIUM);
+    div()
+        .flex_none()
+        .h(px(18.0))
+        .px(px(6.0))
+        .flex()
+        .items_center()
+        .rounded(px(radius::XS))
+        .bg(chip_background(theme.accent))
+        .child(typography::centered(
+            typography::line("Open", font, text_size::CAPTION, theme.accent),
+            font,
+            text_size::CAPTION,
+        ))
+}
+
+/// What a row's pick does, said on the highlighted row.
+fn row_hint(hint: &'static str, font: Font, theme: ThemeSpec) -> impl IntoElement {
+    crate::overlay_kit::footer_note(hint, font, theme)
+}
+
+/// One folder suggestion: badge or folder glyph, the name with what's typed
+/// of it picked out, and on the highlighted row what a pick does (a
+/// repository opens, a folder is browsed into).
 fn folder_row(
     ui: &Diffui,
     theme: ThemeSpec,
+    query: &crate::path_browse::Query,
     entry: &crate::path_browse::Entry,
     index: usize,
     selected: bool,
     cx: &mut Cx,
 ) -> impl IntoElement {
-    let font = ui.config.ui_font;
-    let mut content = vec![
-        row_glyph(theme),
-        Aligned::gap(OPEN_GLYPH_GAP),
-        Aligned::text(
-            typography::line(entry.name.clone(), font, text_size::BODY, theme.text).text_ellipsis(),
-            font,
-            text_size::BODY,
-        )
-        .fill(),
+    let (font, mono) = (ui.config.ui_font, ui.config.mono_font);
+    let repo = entry.vcs.is_some();
+    let open = entry
+        .canonical
+        .as_deref()
+        .is_some_and(|path| ui.tabs.iter().any(|tab| tab.root() == Some(path)));
+    let (name_font, ink) = if repo {
+        (emphasis_font(font, Weight::MEDIUM), theme.text)
+    } else {
+        (font, theme.muted_text)
+    };
+    // What's typed of the name is a prefix of it.
+    let typed = query
+        .partial
+        .chars()
+        .count()
+        .min(entry.name.chars().count());
+    let split = entry
+        .name
+        .char_indices()
+        .nth(typed)
+        .map_or(entry.name.len(), |(at, _)| at);
+    let (head, tail) = entry.name.split_at(split);
+    let spans = [
+        crate::ellipsis::Span::new(head)
+            .font(emphasis_font(font, Weight::SEMIBOLD))
+            .color(theme.accent),
+        crate::ellipsis::Span::new(tail),
     ];
-    if let Some(vcs) = entry.vcs {
-        content.push(vcs_badge(vcs, theme, ui.config.mono_font));
-    }
+    let name = Aligned::text(
+        crate::overlay_kit::rich_line(name_font, text_size::BODY, ink)
+            .overflow_hidden()
+            .text_ellipsis()
+            .child(crate::ellipsis::rich_text(&spans, name_font, ink)),
+        name_font,
+        text_size::BODY,
+    )
+    .fill();
+    let text = typography::baseline_row(
+        [
+            row_lead(entry.vcs, theme, mono),
+            Aligned::gap(OPEN_GLYPH_GAP),
+            name,
+        ],
+        0.0,
+    )
+    .flex_1()
+    .min_w_0();
+    let (hint, key) = match (repo, open) {
+        (true, true) => ("switch to tab", "\u{21b5}"),
+        (true, false) => ("open", "\u{21b5}"),
+        (false, _) => ("go in", "\u{21e5}"),
+    };
+    let end = div()
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_center()
+        .gap(px(theme::space::MD))
+        .when(open, |end| end.child(open_chip(font, theme)))
+        .when(selected, |end| {
+            end.child(row_hint(hint, font, theme))
+                .child(crate::overlay_kit::keycap(key, font, theme))
+        });
     list_row(
         ("open-repo-folder-row", index).into(),
-        typography::baseline_row(content, 0.0).w_full(),
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .w_full()
+            .gap(px(theme::space::MD))
+            .child(text)
+            .child(end),
         selected,
         theme,
     )
     .on_click(Diffui::on_action(Action::OpenRepoPick(index), cx))
 }
 
-/// One line of the open prompt's recent list, laid out like a palette row: glyph,
-/// `owner/name`, the home-contracted path, with a remove `×` that floats over the
-/// row's right end.
+/// One line of the open prompt's recent list: badge, name, the folder it's in,
+/// whether a tab has it open, and a remove ✕ on the hovered or highlighted row.
 fn recent_repo_row(
     ui: &Diffui,
     theme: ThemeSpec,
-    root: &str,
+    recent: &crate::path_browse::Recent,
     index: usize,
+    selected: bool,
     rows: usize,
     cx: &mut Cx,
 ) -> impl IntoElement {
     let (font, mono) = (ui.config.ui_font, ui.config.mono_font);
-    let (owner, name) = crate::repo_label(std::path::Path::new(root));
-    // The name (sans) and the path (smaller mono) share a baseline; the glyph
-    // centres on the caps.
+    let root = std::path::Path::new(&recent.root);
+    let name = root.file_name().map_or_else(
+        || recent.root.clone(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let parent = root
+        .parent()
+        .map(|parent| crate::contract_user_path(&parent.to_string_lossy()))
+        .unwrap_or_default();
     let name_font = emphasis_font(font, Weight::MEDIUM);
-    let mut label = Vec::new();
-    let mut label_width = measure::line_width(&name, text_size::BODY, name_font);
-    if !owner.is_empty() {
-        let owner = format!("{owner}/");
-        label_width += measure::line_width(&owner, text_size::BODY, font);
-        label.push(Aligned::text(
-            typography::line(owner, font, text_size::BODY, theme.subtle_text),
-            font,
-            text_size::BODY,
-        ));
-    }
-    label.push(Aligned::text(
-        typography::line(name, name_font, text_size::BODY, theme.text),
-        name_font,
-        text_size::BODY,
-    ));
+    let name_width = measure::line_width(&name, text_size::BODY, name_font);
     let gutter = if rows > OPEN_LIST_ROWS {
         crate::scrollbar::GUTTER
     } else {
-        OPEN_LIST_INSET
+        0.0
     };
-    let path_width = (OPEN_DIALOG_WIDTH
-        - OPEN_LIST_INSET
+    let end_width = if recent.open { 44.0 } else { 0.0 }
+        + if selected { 100.0 } else { 0.0 }
+        + OPEN_REMOVE_SIDE;
+    let where_width = (OPEN_DIALOG_WIDTH
+        - 2.0 * OPEN_LIST_INSET
         - gutter
-        - 2.0 * (OPEN_CONTENT_X - OPEN_LIST_INSET)
-        - OPEN_GLYPH_BOX
+        - 2.0 * OPEN_ROW_PAD_X
+        - OPEN_LEAD_BOX
         - OPEN_GLYPH_GAP
-        - label_width
+        - name_width
         - theme::space::MD
-        - OPEN_REMOVE_SIDE)
+        - end_width)
         .max(0.0);
-    let content = typography::baseline_row(
+    let text = typography::baseline_row(
         [
-            row_glyph(theme),
+            row_lead(recent.vcs, theme, mono),
             Aligned::gap(OPEN_GLYPH_GAP),
-            typography::group(label, 0.0),
+            Aligned::text(
+                typography::line(name, name_font, text_size::BODY, theme.text),
+                name_font,
+                text_size::BODY,
+            ),
             Aligned::gap(theme::space::MD),
             // Middle-ellipsized: a path's ends (where it lives, what it's called)
             // say more than its middle.
             Aligned::text(
                 typography::line(
-                    middle_cut(
-                        &crate::contract_user_path(root),
-                        path_width,
-                        text_size::CAPTION,
-                        mono,
-                    ),
+                    middle_cut(&parent, where_width, text_size::CAPTION, mono),
                     mono,
                     text_size::CAPTION,
                     theme.subtle_text,
@@ -1454,17 +1971,12 @@ fn recent_repo_row(
                 text_size::CAPTION,
             )
             .fill(),
-            // Keeps the path clear of the floating `×`.
-            Aligned::gap(OPEN_REMOVE_SIDE),
         ],
         0.0,
     )
-    .w_full();
-
-    let row = list_row(("open-repo-recent", index).into(), content, false, theme)
-        .on_click(Diffui::on_action(Action::OpenRepo(root.to_owned()), cx));
-    // Inset from the row's end as far as from its top and bottom.
-    let remove_inset = (OPEN_ROW_HEIGHT - OPEN_REMOVE_SIDE) / 2.0;
+    .flex_1()
+    .min_w_0();
+    let group: gpui_kit::SharedString = format!("open-repo-recent-{index}").into();
     let remove = ui::button(
         ("open-repo-remove", index),
         ui::Variant::Ghost,
@@ -1474,19 +1986,49 @@ fn recent_repo_row(
     )
     .size(px(OPEN_REMOVE_SIDE))
     .p(px(0.0))
-    .rounded(px(radius::CONTROL))
-    .child(icons::icon(icons::CLOSE, 13.0, theme.subtle_text))
+    .rounded(px(radius::XS))
+    .child(icons::icon(icons::CLOSE, 12.0, theme.subtle_text))
     .on_click(Diffui::on_action(
-        Action::RemoveRecentRepo(root.to_owned()),
+        Action::RemoveRecentRepo(recent.root.clone()),
         cx,
     ));
-    div().relative().w_full().child(row).child(
+    let end = div()
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_center()
+        .gap(px(theme::space::MD))
+        .when(recent.open, |end| end.child(open_chip(font, theme)))
+        .when(selected, |end| {
+            end.child(row_hint(
+                if recent.open { "switch to tab" } else { "open" },
+                font,
+                theme,
+            ))
+        })
+        .child(
+            div()
+                .when(!selected, |slot| {
+                    slot.opacity(0.0)
+                        .group_hover(group.clone(), |slot| slot.opacity(1.0))
+                })
+                .child(remove),
+        );
+    list_row(
+        ("open-repo-recent", index).into(),
         div()
-            .absolute()
-            .top(px(remove_inset))
-            .right(px(remove_inset))
-            .child(remove),
+            .flex()
+            .flex_row()
+            .items_center()
+            .w_full()
+            .gap(px(theme::space::MD))
+            .child(text)
+            .child(end),
+        selected,
+        theme,
     )
+    .group(group)
+    .on_click(Diffui::on_action(Action::OpenRepo(recent.root.clone()), cx))
 }
 
 /// `text` cut out of its middle to fit `width` on one line. GPUI can end a line

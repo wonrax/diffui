@@ -1602,14 +1602,59 @@ fn all() -> Vec<Scene> {
     ));
     t.add(s(
         "open-repo-not-repo",
-        "Dialog after submitting a path that isn't a repository.",
-        "cmd+O, type /tmp, Enter.",
+        "Dialog after submitting a path that isn't a repository: the open's own error in the status line.",
+        "cmd+O, type /usr/bin, Enter.",
         |c| {
             c.key("cmd+o");
             c.typed("/usr/bin");
             c.key("enter");
         },
     ));
+    t.add(s(
+        "open-repo-repository",
+        "A typed path that is a repository: the status line says so and what Enter does.",
+        "cmd+O, type the fixture repository's path.",
+        |c| {
+            c.key("cmd+o");
+            let path = c.repo.to_string_lossy().into_owned();
+            c.typed(&path);
+            c.pump_ms(300);
+        },
+    ));
+    t.add(s(
+        "open-repo-no-match",
+        "A typed name no folder starts with: the warning status line.",
+        "cmd+O, type a folder and a name nothing matches.",
+        |c| {
+            c.key("cmd+o");
+            let dir = c.repo.parent().unwrap().to_string_lossy().into_owned();
+            c.typed(&format!("{dir}/zzq"));
+            c.pump_ms(300);
+        },
+    ));
+    t.add(s(
+        "open-repo-pull-request",
+        "A pull request reference: its status line and the card saying how it opens.",
+        "cmd+O, type acme/render-toolkit#42.",
+        |c| {
+            c.key("cmd+o");
+            c.typed("acme/render-toolkit#42");
+        },
+    ));
+    t.add(
+        s(
+            "open-repo-typed-dark",
+            "open-repo-typed in dark.",
+            "As open-repo-typed, theme Dark.",
+            |c| {
+                c.key("cmd+o");
+                let dir = c.repo.parent().unwrap().to_string_lossy().into_owned();
+                c.typed(&format!("{dir}/"));
+                c.key("down");
+            },
+        )
+        .dark(),
+    );
     t.add(s(
         "shortcuts-sheet",
         "The keyboard-shortcut cheat sheet over the window.",

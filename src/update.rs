@@ -902,7 +902,7 @@ impl Diffui {
                     return;
                 };
                 match dialog.selected {
-                    Some(row) => self.pick_open_repo_suggestion(row, cx),
+                    Some(row) => self.open_repo_pick_row(row, cx),
                     None => {
                         let path = dialog.path.clone();
                         self.open_repository(&path, cx)
@@ -910,8 +910,8 @@ impl Diffui {
                 }
             }
             Action::OpenRepoMove(delta) => {
+                let len = self.open_repo_row_count();
                 if let Some(dialog) = self.open_repo_dialog_mut() {
-                    let len = dialog.suggestions().map_or(0, |(_, rows)| rows.len());
                     dialog.selected = (len > 0).then(|| match dialog.selected {
                         Some(row) => (row as i32 + delta).rem_euclid(len as i32) as usize,
                         None if delta < 0 => len - 1,
@@ -919,16 +919,7 @@ impl Diffui {
                     });
                 }
             }
-            Action::OpenRepoComplete => {
-                let completed = self.open_repo_dialog().and_then(|dialog| {
-                    let (query, rows) = dialog.suggestions()?;
-                    let entry = rows.get(dialog.selected.unwrap_or(0))?;
-                    Some(query.complete(entry))
-                });
-                if let Some(path) = completed {
-                    self.browse_open_repo_path(path, cx)
-                }
-            }
+            Action::OpenRepoComplete => self.open_repo_complete(cx),
             Action::OpenRepoPick(row) => self.pick_open_repo_suggestion(row, cx),
             Action::OpenRepo(path) => self.open_repository(&path, cx),
             Action::RemoveRecentRepo(path) => {
@@ -1239,10 +1230,6 @@ impl Diffui {
 
     pub(crate) fn on_activity_expand(&mut self, id: activity::ActivityId) {
         self.active_mut().activities.toggle_expand(id);
-    }
-
-    pub(crate) fn on_open_repo_path_changed(&mut self, path: String, cx: &mut Cx) {
-        self.set_open_repo_path(path, cx);
     }
 
     pub(crate) fn on_open_repo_listed(&mut self, listing: crate::path_browse::Listing) {

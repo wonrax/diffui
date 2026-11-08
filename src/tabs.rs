@@ -279,6 +279,10 @@ impl Diffui {
         let Some(query) = path_browse::Query::parse(&dialog.path) else {
             return;
         };
+        self.probe_open_repo_path(cx);
+        let Some(dialog) = self.open_repo_dialog_mut() else {
+            return;
+        };
         if dialog
             .listing
             .as_ref()
