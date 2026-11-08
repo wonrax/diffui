@@ -70,8 +70,8 @@ pub fn cmd_label(key: &str) -> String {
 /// top bar with no controls to match).
 pub fn title_bar_height() -> Option<f32> {
     if cfg!(target_os = "macos") {
-        // ~4px of breathing room above/below the ~25px-tall tabs.
-        Some(33.0)
+        // 5px of room above and below the 28px tabs.
+        Some(38.0)
     } else {
         None
     }

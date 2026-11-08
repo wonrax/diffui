@@ -38,19 +38,21 @@ pub const OPEN_REPO_INPUT_ID: &str = "open-repo-input";
 
 const TAB_TEXT_SIZE: f32 = text_size::UI;
 
-/// Fixed tab height: tall enough for the label row plus the hover wash's
-/// breathing room, and the unit the strip's other controls center against.
-/// Tabs run flush to the strip's bottom edge (browser-style), so this — plus
-/// the strip's top padding — decides the whole strip's height.
-const TAB_HEIGHT: f32 = 29.0;
+/// A tab's height: a floating rounded tab, centred in the strip like the
+/// strip's other controls.
+const TAB_HEIGHT: f32 = 28.0;
 
-/// Gap between the inactive hover wash's bottom edge and the strip floor —
-/// what keeps the wash reading as floating rather than connected like the
-/// active tab.
-const WASH_BOTTOM_GAP: f32 = 3.0;
+/// Room around the tabs' row inside its clip, so the active tab's ring and
+/// shadow aren't cut off.
+const TAB_RING_ROOM: f32 = 2.0;
 
 /// Gap between neighboring tabs, and between the final tab and the add button.
-const TAB_GAP: f32 = 3.0;
+const TAB_GAP: f32 = 2.0;
+
+/// The search field's width when the strip has room for it.
+const OMNI_WIDTH: f32 = 320.0;
+/// Narrowest the search field gets before the tabs give way instead.
+const OMNI_MIN_WIDTH: f32 = 160.0;
 
 /// Label padding inside a tab's fill / hover wash.
 const LABEL_PAD_X: f32 = 8.0;
@@ -104,13 +106,13 @@ const OPEN_GLYPH_GAP: f32 = 10.0;
 const OPEN_REMOVE_SIDE: f32 = 22.0;
 
 /// The strip's height: the title-bar height where it stands in for one,
-/// otherwise its top padding plus the tabs.
+/// otherwise the same height on its own.
 pub fn height() -> f32 {
-    chrome::title_bar_height().unwrap_or(STRIP_TOP_PAD + TAB_HEIGHT)
+    chrome::title_bar_height().unwrap_or(STRIP_HEIGHT)
 }
 
-/// Top padding of the strip where it sizes to its own content.
-const STRIP_TOP_PAD: f32 = 6.0;
+/// The strip's height where it sizes itself (no title bar to stand in for).
+const STRIP_HEIGHT: f32 = 38.0;
 
 /// The slot a dragged tab belongs in, given `widths` in strip order, the
 /// dragged tab's current `index` with its slot starting at `slot`, and the
@@ -505,12 +507,11 @@ pub(crate) fn build_tab_bar(
     let mut tabs = div()
         .flex()
         .flex_row()
-        .items_start()
+        .items_center()
         .gap(px(TAB_GAP))
-        // Clears the active tab's left join, which the clip would cut.
-        .ml(px(-radius::BUTTON))
-        .pl(px(radius::BUTTON))
-        .h(px(TAB_HEIGHT))
+        // Room for the active tab's ring and shadow, which the clip would cut.
+        .p(px(TAB_RING_ROOM))
+        .m(px(-TAB_RING_ROOM))
         .min_w_0()
         .flex_shrink(1.0)
         .overflow_hidden();
@@ -593,27 +594,25 @@ pub(crate) fn build_tab_bar(
     .absolute()
     .size_0();
 
-    // Top padding only: the tabs run flush to the strip's bottom edge so the
-    // active one connects to the toolbar band below. When the strip stands in for
-    // the title bar (macOS) it's pinned to a fixed height with the content
-    // bottom-aligned instead; the traffic lights stay centered on the full strip
-    // (see `chrome::titlebar_options`), like a native browser window.
+    // Everything centres on the strip, and so do the traffic lights where the
+    // strip stands in for the title bar (see `chrome::titlebar_options`).
     let inset = chrome::leading_inset();
     let row = div()
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(6.0))
+        .gap(px(theme::space::MD))
         .px(px(8.0))
-        .h(px(TAB_HEIGHT))
+        .h_full()
         .w_full()
         .when(inset > 0.0, |row| row.child(div().w(px(inset)).flex_none()))
-        // `+` and the palette control stay pinned: only the tabs give way.
+        // `+` stays with the tabs; the search field gives way to its floor, then
+        // the tabs squeeze.
         .child(
             div()
                 .flex()
                 .flex_row()
-                .items_start()
+                .items_center()
                 .gap(px(TAB_GAP))
                 .flex_shrink(1.0)
                 .min_w_0()
@@ -621,18 +620,15 @@ pub(crate) fn build_tab_bar(
                 .child(add_button(theme, cx)),
         )
         .child(div().flex_1().min_w_0())
-        .child(palette_hint(theme, ui.config.mono_font, cx));
+        .child(palette_hint(ui, theme, cx));
 
-    // Recessed, darker than the toolbar below it, so the active tab, filled with
-    // the toolbar's color, reads as a connected block against it (browser-style).
-    // No border: the seam between the active tab and the toolbar must stay
-    // invisible.
+    // The window's chrome: recessed, with tabs floating on it.
     let bar = div()
         .id("tab-bar")
         .relative()
         .flex()
         .flex_col()
-        .justify_end()
+        .justify_center()
         .w_full()
         .h(px(height()))
         .flex_none()
@@ -776,9 +772,8 @@ fn tab_widget(
         .into_any_element()
     };
 
-    // Inactive tabs stay quiet; hovering one paints a floating wash over the same
-    // box minus `WASH_BOTTOM_GAP`. The label centers in the same top-anchored box
-    // in every state, so nothing shifts on hover or selection.
+    // Inactive tabs stay quiet; hovering one washes it. The label sits in the
+    // same box in every state, so nothing shifts on hover or selection.
     let wash_fill = (!active && (hovered || lifted)).then(|| chip_background(theme.muted_text));
     let wash = div()
         .flex()
@@ -786,8 +781,9 @@ fn tab_widget(
         .items_center()
         .gap(px(theme::space::XS))
         .w_full()
-        .h(px(TAB_HEIGHT - WASH_BOTTOM_GAP))
-        .px(px(LABEL_PAD_X))
+        .h_full()
+        .pl(px(LABEL_PAD_X))
+        .pr(px(LABEL_PAD_X - 3.0))
         .rounded(px(radius::BUTTON))
         .when_some(wash_fill, |wash, fill| wash.bg(fill))
         .child(label)
@@ -808,34 +804,25 @@ fn tab_widget(
         cx.stop_propagation();
     });
 
-    // Browser-style tab: the active tab is a top-rounded block filled with the
-    // toolbar band's own color and running flush to the strip's bottom edge. Its
-    // concave joins share the top corners' radius.
+    // A floating rounded tab. The active one is raised: the panes' surface,
+    // a hairline ring and a soft shadow.
     let body = div()
         .id(("tab", element))
         .relative()
         .left(px(offset))
         .w_full()
         .h(px(TAB_HEIGHT))
+        .rounded(px(radius::BUTTON))
         .when(active, |body| {
             body.bg(theme.panel_background_elevated)
-                .rounded_t(px(radius::BUTTON))
-                .child(join(theme, true))
-                .child(join(theme, false))
+                .border_1()
+                .border_color(theme.border)
+                .shadow(vec![theme::floating_shadow(1.0, 2.0)])
         })
         // Only the active tab has a fill to hide what it passes over; a background
         // one in the air (its activation was refused) gets a stand-in.
-        .when(lifted && !active, |body| {
-            body.child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .bottom(px(WASH_BOTTOM_GAP))
-                    .rounded(px(radius::BUTTON))
-                    .bg(well_fill(theme)),
-            )
-        })
-        .child(div().relative().w_full().child(wash))
+        .when(lifted && !active, |body| body.bg(well_fill(theme)))
+        .child(div().relative().size_full().child(wash))
         .cursor_pointer()
         .on_hover(on_hover)
         .on_mouse_down(MouseButton::Left, on_press);
@@ -856,26 +843,6 @@ fn tab_natural_width(ui: &Diffui, tab: &crate::Tab) -> f32 {
         + 2.0 * LABEL_PAD_X
         + theme::space::XS
         + CLOSE_SIDE
-}
-
-/// The concave join between one of the active tab's bottom corners and the
-/// toolbar band: the tab's fill in the square outside the corner, with the strip's
-/// color over it rounded off.
-fn join(theme: ThemeSpec, left: bool) -> impl IntoElement {
-    let side = px(radius::BUTTON);
-    let square = div().absolute().bottom_0().size(side);
-    let square = if left {
-        square.left(-side)
-    } else {
-        square.right(-side)
-    };
-    let cover = div().size_full().bg(well_fill(theme));
-    let cover = if left {
-        cover.rounded_br(side)
-    } else {
-        cover.rounded_bl(side)
-    };
-    square.bg(theme.panel_background_elevated).child(cover)
 }
 
 /// A tab's `jj` / `git` / `pr` badge: says what the tab holds. Neutral, and
@@ -912,12 +879,10 @@ fn dirty_dot(theme: ThemeSpec) -> impl IntoElement {
         .border_color(theme.modified_token)
 }
 
-/// `+` button: opens the path dialog to add another repository. A square sized
-/// and anchored exactly like an inactive tab's hover wash (same height, same top
-/// edge, same clearance from the strip floor), so the strip's controls sit on one
-/// visual grid.
+/// `+` button: opens the path dialog to add another repository. A square as
+/// tall as a tab, so the strip's controls sit on one line.
 fn add_button(theme: ThemeSpec, cx: &mut Cx) -> impl IntoElement {
-    let side = TAB_HEIGHT - WASH_BOTTOM_GAP;
+    let side = TAB_HEIGHT;
     ui::button("tab-add", ui::Variant::Ghost, ui::Size::Compact, theme, cx)
         .size(px(side))
         .p(px(0.0))
@@ -926,34 +891,50 @@ fn add_button(theme: ThemeSpec, cx: &mut Cx) -> impl IntoElement {
         .on_click(Diffui::on_action(Action::OpenRepoDialog, cx))
 }
 
-/// The right-hand `⌘K` control. The design put a repo-search `⌘P` here; per the
-/// spec it instead opens our existing command palette. Styled as a keycap
-/// (hairline border, mono glyphs) so it reads as "press this key", not as another
-/// action button.
-fn palette_hint(theme: ThemeSpec, mono: Font, cx: &mut Cx) -> impl IntoElement {
+/// The right-hand search field: opens the command palette, and says what it
+/// searches and its key.
+fn palette_hint(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> impl IntoElement {
     use gpui_kit::base::TestSupportExt as _;
+    let font = ui.config.ui_font;
+    let placeholder = div()
+        .flex_1()
+        .min_w_0()
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_ellipsis()
+        .child(typography::line(
+            "Search revisions, files, commands",
+            font,
+            text_size::UI,
+            theme.subtle_text,
+        ));
+    let keys = crate::overlay_kit::keycaps(
+        crate::overlay_kit::chord_keys(&chrome::cmd_label("K")),
+        ui.config.mono_font,
+        theme,
+    );
     div()
         .id("palette-hint")
         .test_support()
-        .flex_none()
-        .px(px(4.0))
-        .py(px(2.0))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(theme::space::SM))
+        .flex_shrink(1.0)
+        .w(px(OMNI_WIDTH))
+        .min_w(px(OMNI_MIN_WIDTH))
+        .h(px(TAB_HEIGHT))
+        .pl(px(10.0))
+        .pr(px(5.0))
+        .rounded(px(radius::BUTTON))
+        .bg(theme.panel_background_elevated)
+        .border_1()
+        .border_color(theme.border)
         .cursor_pointer()
-        .child(
-            div()
-                .px(px(5.0))
-                .py(px(1.0))
-                .rounded(px(radius::XS))
-                .border_1()
-                .border_color(theme.border)
-                .bg(chip_background(theme.muted_text))
-                .child(typography::line(
-                    chrome::cmd_label("K"),
-                    mono,
-                    text_size::CAPTION,
-                    theme.muted_text,
-                )),
-        )
+        .hover(|field| field.border_color(crate::overlay_kit::firm_border(theme)))
+        .child(icons::icon(icons::SEARCH, 14.0, theme.subtle_text))
+        .child(placeholder)
+        .child(keys)
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(Diffui::on_action(Action::OpenPalette, cx))
 }
@@ -2268,9 +2249,9 @@ mod tests {
     #[test]
     fn a_tab_swaps_once_its_leading_edge_clears_the_neighbors_center() {
         let widths = [100.0, 60.0, 80.0];
-        // The neighbor spans 103..163, so its center is 133; the dragged tab's
-        // right edge is `x + 100`.
-        let swap_at = 133.0 + SWAP_HYSTERESIS - 100.0;
+        // The neighbor starts a gap after the dragged tab, so its center is
+        // `100 + TAB_GAP + 30`; the dragged tab's right edge is `x + 100`.
+        let swap_at = 100.0 + TAB_GAP + 30.0 + SWAP_HYSTERESIS - 100.0;
         assert_eq!(drop_index(&widths, 0, 0.0, swap_at), 0);
         assert_eq!(drop_index(&widths, 0, 0.0, swap_at + 1.0), 1);
     }
@@ -2283,7 +2264,7 @@ mod tests {
         // The strip after the swap above, the dragged tab now second.
         let widths = [60.0, 100.0, 80.0];
         let dragged_slot = slot(&widths, 1);
-        let swapped_at = 133.0 + SWAP_HYSTERESIS - 100.0 + 1.0;
+        let swapped_at = 100.0 + TAB_GAP + 30.0 + SWAP_HYSTERESIS - 100.0 + 1.0;
         assert_eq!(drop_index(&widths, 1, dragged_slot, swapped_at), 1);
 
         // The neighbor now spans 0..60: back across its center, less the margin.
