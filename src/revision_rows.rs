@@ -1091,6 +1091,8 @@ pub(crate) mod scenes {
                     1 => crate::diff_view::CheckState::Off,
                     _ => crate::diff_view::CheckState::Partial,
                 }),
+                tag: None,
+                struck: false,
             });
             let (selected, checked, menus) = (seen.clone(), seen.clone(), seen.clone());
             let props = RevisionListProps::new(0, Some((0, 8)), style)

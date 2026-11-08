@@ -1003,7 +1003,7 @@ fn row_glow(rect: Rectangle) -> macos_native::GlowRect {
         y: rect.y,
         width: rect.width,
         height: rect.height,
-        radius: crate::revision_list::ROW_CARD_RADIUS,
+        radius: crate::revision_list::row_card_radius(rect.height),
     }
 }
 

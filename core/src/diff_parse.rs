@@ -66,6 +66,7 @@ impl DiffStreamParser {
                 deletions: 0,
                 collapsed: None,
                 blob: None,
+                mode_change: None,
             });
             return finished;
         }
@@ -157,6 +158,10 @@ fn update_file_metadata(file: &mut DiffFile, line: &str) {
     } else if let Some(path) = line.strip_prefix("rename to ") {
         file.path = unquote_git_path(path);
         file.status = DiffFileStatus::Renamed;
+    } else if let Some(mode) = line.strip_prefix("old mode ").and_then(parse_mode) {
+        file.mode_change = Some((mode, file.mode_change.map_or(mode, |(_, new)| new)));
+    } else if let Some(mode) = line.strip_prefix("new mode ").and_then(parse_mode) {
+        file.mode_change = Some((file.mode_change.map_or(mode, |(old, _)| old), mode));
     } else if line.starts_with("new file mode ") || line == "--- /dev/null" {
         file.status = DiffFileStatus::Added;
     } else if line.starts_with("deleted file mode ") || line == "+++ /dev/null" {
@@ -178,6 +183,11 @@ fn update_file_metadata(file: &mut DiffFile, line: &str) {
         // the PR path show the same row.
         file.hunks.push(binary_hunk());
     }
+}
+
+/// A git file mode as its octal digits print it (`100755`).
+pub fn parse_mode(digits: &str) -> Option<u32> {
+    u32::from_str_radix(digits.trim(), 8).ok()
 }
 
 /// One header-only hunk standing in for content the diff can't show.
@@ -696,6 +706,7 @@ mod tests {
         let file = &document.files[0];
         assert_eq!(file.path, "mode only.sh");
         assert_eq!(file.old_path.as_deref(), Some("mode only.sh"));
+        assert_eq!(file.mode_change, Some((0o100644, 0o100755)));
         assert_eq!(file.status, DiffFileStatus::Modified);
     }
 

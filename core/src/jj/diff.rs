@@ -260,6 +260,12 @@ pub(crate) async fn diff_trees(
             deletions: 0,
             collapsed: None,
             blob: None,
+            mode_change: match (before.mode, after.mode) {
+                (Some(old), Some(new)) if old != new => {
+                    crate::diff_parse::parse_mode(old).zip(crate::diff_parse::parse_mode(new))
+                }
+                _ => None,
+            },
         };
 
         let binary = before.content.is_binary || after.content.is_binary;
@@ -444,6 +450,7 @@ pub(crate) async fn diff_trees(
                 deletions: 0,
                 collapsed: None,
                 blob: None,
+                mode_change: None,
             };
             if part.content.is_binary {
                 file.hunks.push(DiffHunkView {

@@ -1519,6 +1519,7 @@ mod tests {
             status: DiffFileStatus::Modified,
             collapsed: None,
             blob: None,
+            mode_change: None,
             hunks: headers
                 .iter()
                 .map(|header| DiffHunkView {
@@ -1678,6 +1679,7 @@ mod tests {
             status: DiffFileStatus::Modified,
             collapsed: None,
             blob: None,
+            mode_change: None,
             hunks: vec![
                 DiffHunkView {
                     header: "@@ -1,4 +1,4 @@".to_owned(),

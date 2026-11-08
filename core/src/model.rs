@@ -235,6 +235,9 @@ pub struct DiffFile {
     /// preview caps, its bytes (see [`crate::media`]). Boxed: text files are
     /// the common case and carry none of it.
     pub blob: Option<Box<BlobChange>>,
+    /// The file's git mode before and after (`0o100644` to `0o100755`), when
+    /// it changed and the file exists on both sides.
+    pub mode_change: Option<(u32, u32)>,
 }
 
 /// The two sides of a file whose diff isn't (only) text.
@@ -1317,6 +1320,7 @@ mod tests {
             deletions: 0,
             collapsed: None,
             blob: None,
+            mode_change: None,
         }
     }
 

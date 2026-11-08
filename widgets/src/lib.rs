@@ -20,6 +20,7 @@ pub mod resize_handle;
 pub mod revision_list;
 pub mod scroll_resample;
 pub mod scrollbar;
+pub mod status_badge;
 pub mod theme;
 pub mod typography;
 pub mod ui;

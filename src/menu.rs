@@ -921,7 +921,7 @@ fn glow_card(theme: ThemeSpec, rect: Rectangle, opened_at: Instant) -> impl Into
             ..accent
         })
         // Traces the row card it sits on.
-        .rounded(px(crate::revision_list::ROW_CARD_RADIUS))
+        .rounded(px(crate::revision_list::row_card_radius(rect.height)))
         // A soft accent halo: the "glow" half of the effect, pulsing with the
         // border.
         .shadow(vec![BoxShadow {

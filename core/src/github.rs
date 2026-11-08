@@ -766,6 +766,7 @@ fn api_file_to_diff_file(file: ApiPrFile) -> DiffFile {
         deletions: 0,
         collapsed: None,
         blob: None,
+        mode_change: None,
     });
     match &file.patch {
         Some(patch) => {

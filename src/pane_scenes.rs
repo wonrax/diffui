@@ -557,7 +557,9 @@ fn the_file_tree_checks_selects_and_reveals() {
     let (mut h, repo) = open();
     select(&mut h, &repo, "kitchen-sink");
     let selected = h.read(|ui| ui.active().selected_file);
-    h.click_point(at(416.0, 151.0));
+    // The box rides the row's right edge, clear of the scrollbar's gutter.
+    let check_x = h.read(|ui| ui.sidebar_width + 1.0 + ui.file_nav_width) - 12.0 - 7.0;
+    h.click_point(at(check_x, 151.0));
     h.settle();
     assert!(h.read(crate::changes::has_selection), "the box picked it");
     assert_eq!(h.read(|ui| ui.active().selected_file), selected);

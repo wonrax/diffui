@@ -4581,6 +4581,7 @@ mod tests {
                     }],
                     collapsed: None,
                     blob: None,
+                    mode_change: None,
                 }],
                 total_additions: 0,
                 total_deletions: 0,

@@ -53,6 +53,7 @@ fn changed_file_row(
     deletions_width: f32,
     lanes: &EmptyFileTreeLanes,
 ) -> FileRowView {
+    let indent_step = crate::revision_list::CHANGES_TREE_INDENT;
     let (
         primary,
         raw_path,
@@ -72,7 +73,7 @@ fn changed_file_row(
         } => (
             label.clone(),
             path.clone(),
-            *depth as f32 * crate::revision_list::FILE_TREE_INDENT,
+            *depth as f32 * indent_step,
             Some(*collapsed),
             usize::MAX,
             String::new(),
@@ -91,7 +92,7 @@ fn changed_file_row(
             (
                 label.clone(),
                 file.map_or_else(String::new, |file| file.path.clone()),
-                *depth as f32 * crate::revision_list::FILE_TREE_INDENT,
+                *depth as f32 * indent_step,
                 None,
                 *file_index,
                 file.map_or("", |file| file.status.short_label()).to_owned(),
@@ -103,6 +104,11 @@ fn changed_file_row(
             )
         }
     };
+    let file = match row {
+        FileTreeRow::File { file_index, .. } => files.get(*file_index),
+        FileTreeRow::Dir { .. } => None,
+    };
+    let struck = file.is_some_and(|file| file.status == diffui_core::DiffFileStatus::Deleted);
     FileRowView {
         primary,
         raw_path,
@@ -117,7 +123,14 @@ fn changed_file_row(
         columns: Rc::clone(&lanes.columns),
         additions_width,
         deletions_width,
-        primary_color: theme.text,
+        // A directory recedes behind its files; a deleted file is gone.
+        primary_color: if chevron.is_some() {
+            theme.muted_text
+        } else if struck {
+            theme.subtle_text
+        } else {
+            theme.text
+        },
         icon_color: status_color,
         indent,
         chevron,
@@ -125,7 +138,33 @@ fn changed_file_row(
         lane_labels: Rc::clone(&lanes.labels),
         lane_segments: Rc::clone(&lanes.segments),
         check: None,
+        tag: file.and_then(count_tag).map(str::to_owned),
+        struck,
     }
+}
+
+/// What a changed file with no line counts says in their place.
+fn count_tag(file: &diffui_core::DiffFile) -> Option<&'static str> {
+    use diffui_core::{BlobKind, DiffFileStatus};
+    if file.additions + file.deletions > 0 {
+        return None;
+    }
+    if let Some(blob) = &file.blob {
+        return Some(match blob.kind {
+            BlobKind::Image | BlobKind::Svg => "image",
+            BlobKind::Binary => "binary",
+        });
+    }
+    if file.mode_change.is_some() {
+        return Some("mode");
+    }
+    let placeholder = file.hunks.iter().find(|hunk| hunk.lines.is_empty());
+    if placeholder.is_some_and(|hunk| hunk.header.to_ascii_lowercase().contains("binary")) {
+        return Some("binary");
+    }
+    let no_lines = file.hunks.iter().all(|hunk| hunk.lines.is_empty());
+    (no_lines && matches!(file.status, DiffFileStatus::Added | DiffFileStatus::Deleted))
+        .then_some("empty")
 }
 
 /// Code columns a side-by-side half has to hold before the split is worth
@@ -268,7 +307,7 @@ fn file_tree(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) ->
     let max_deletions = files.iter().map(|file| file.deletions).max().unwrap_or(0);
     let additions_width = changed_file_stat_width('+', max_additions, ui.config.ui_font);
     let deletions_width = changed_file_stat_width('\u{2212}', max_deletions, ui.config.ui_font);
-    let badge_width = crate::chip::width("M", None, ui.config.mono_font);
+    let badge_width = diffui_widgets::status_badge::SIZE;
     let lanes = EmptyFileTreeLanes::default();
     let this = cx.entity();
     let build_file = Rc::new(move |display: usize, cx: &gpui_kit::App| {
@@ -299,6 +338,9 @@ fn file_tree(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) ->
         Some((0, row_count)),
         crate::sidebar::revision_list_style(theme, ui.config, badge_width),
     )
+    .file_layout(revision_list::FileRowLayout::Changes {
+        picking: crate::changes::has_selection(ui),
+    })
     .files(
         build_file,
         Some(tab.selected_file),

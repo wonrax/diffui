@@ -311,6 +311,8 @@ fn source_file_row(
         lane_labels,
         lane_segments,
         check: None,
+        tag: None,
+        struck: false,
     }
 }
 
