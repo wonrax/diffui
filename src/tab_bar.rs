@@ -18,8 +18,8 @@ use std::time::Instant;
 
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    AnyElement, App, Bounds, MouseButton, MouseMoveEvent, MouseUpEvent, Pixels, Window, canvas,
-    deferred, div, px,
+    AnyElement, App, Bounds, Div, MouseButton, MouseMoveEvent, MouseUpEvent, Pixels, Window,
+    canvas, deferred, div, px,
 };
 
 use crate::chrome;
@@ -27,8 +27,7 @@ use crate::input;
 use crate::measure;
 use crate::repository::Vcs;
 use crate::theme::{
-    self, Color, Font, ThemeSpec, Weight, chip_background, emphasis_font, radius, text_size,
-    well_fill,
+    self, Font, ThemeSpec, Weight, chip_background, emphasis_font, radius, text_size, well_fill,
 };
 use crate::typography::{self, Aligned};
 use crate::{Action, Cx, Diffui, HoverTarget, TabId, icons, ui};
@@ -698,10 +697,7 @@ fn tab_widget(
     let mono = ui.config.mono_font;
     let hovered = !dragging && ui.hovered == Some(HoverTarget::Tab(id));
 
-    let badge = match &tab.source {
-        crate::TabSource::Repo { vcs, .. } => vcs_badge(*vcs, theme, mono),
-        crate::TabSource::GitHubPr(_) => badge_chip("pr", theme.accent, mono),
-    };
+    let badge = tab_badge(&tab.source, active, theme, mono);
 
     let name_color = if active { theme.text } else { theme.muted_text };
     // owner + name as a tight unit (no gap), matching the design's RepoLabel:
@@ -722,13 +718,19 @@ fn tab_widget(
         .whitespace_nowrap()
         .text_ellipsis()
         .child(crate::ellipsis::rich_text(&spans, name_font, name_color));
-    let label = typography::baseline_row(
-        [
-            badge,
-            Aligned::text(name, name_font, TAB_TEXT_SIZE).shrink(),
-        ],
-        6.0,
-    );
+    // The badge's text is two steps under the name's, so its box centres on the
+    // tab rather than sitting on the name's baseline.
+    let label = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.0))
+        .min_w_0()
+        .child(badge)
+        .child(typography::baseline_row(
+            [Aligned::text(name, name_font, TAB_TEXT_SIZE).shrink()],
+            0.0,
+        ));
     // The dot gives way to the `×` under the cursor, so it can't carry its own
     // tooltip; the label says what the tab is and what the dot means.
     let label = div()
@@ -869,6 +871,29 @@ fn join(theme: ThemeSpec, left: bool) -> impl IntoElement {
     square.bg(theme.panel_background_elevated).child(cover)
 }
 
+/// A tab's `jj` / `git` / `pr` badge: says what the tab holds. Neutral, and
+/// in the accent on the active tab, so colour never competes with the state
+/// the panes below show.
+fn tab_badge(source: &crate::TabSource, active: bool, theme: ThemeSpec, mono: Font) -> Div {
+    let label = match source {
+        crate::TabSource::Repo { vcs: Vcs::Jj, .. } => "jj",
+        crate::TabSource::Repo { vcs: Vcs::Git, .. } => "git",
+        crate::TabSource::GitHubPr(_) => "pr",
+    };
+    let (text, fill) = if active {
+        (theme.accent, chip_background(theme.accent))
+    } else {
+        (theme.muted_text, chip_background(theme.muted_text))
+    };
+    let font = emphasis_font(mono, Weight::SEMIBOLD);
+    typography::trimmed_padding([1.0, 5.0].into(), font, text_size::BADGE)
+        .apply(div())
+        .flex_none()
+        .bg(fill)
+        .rounded(px(radius::XS))
+        .child(typography::line(label, font, text_size::BADGE, text))
+}
+
 /// `jj` / `git` badge: a soft colored chip carrying the VCS kind, so a mixed set
 /// of repos reads at a glance.
 fn vcs_badge(vcs: Vcs, theme: ThemeSpec, mono: Font) -> Aligned {
@@ -878,10 +903,6 @@ fn vcs_badge(vcs: Vcs, theme: ThemeSpec, mono: Font) -> Aligned {
         Vcs::Jj => ("jj", theme.lane_base),
         Vcs::Git => ("git", theme.modified_token),
     };
-    badge_chip(label, color, mono)
-}
-
-fn badge_chip(label: &'static str, color: Color, mono: Font) -> Aligned {
     Aligned::chip(
         typography::line(label, mono, text_size::BADGE, color),
         mono,
