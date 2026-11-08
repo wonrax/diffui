@@ -115,24 +115,6 @@ fn conflict_verdict(
 /// Focus target id for the revset input.
 pub const REVSET_INPUT_ID: &str = "revset-input";
 
-const FOOTER_TEXT_SIZE: f32 = theme::text_size::UI;
-/// One control step, so the footer is as tall as the header above the list.
-const FOOTER_HEIGHT: f32 = theme::control::COMPACT;
-
-/// Group an integer with `,` thousands separators, e.g. 1410 -> "1,410".
-fn thousands(n: usize) -> String {
-    let digits = n.to_string();
-    let len = digits.len();
-    let mut out = String::with_capacity(len + len / 3);
-    for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (len - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    out
-}
-
 /// Bookmark chips for a revision row, wearing `lane_color`. Shared with the
 /// source browser's revision-header row so both rails style identically.
 ///
@@ -456,12 +438,12 @@ pub(crate) fn build_sidebar(
                     .map(|dropdown| div().absolute().top_0().left_0().right_0().child(dropdown)),
             ),
     );
-    // Target mode: the op bar floats between the list and the footer while a
-    // rebase/squash draft is picking its destination.
+    // Target mode: the op bar floats under the list while a rebase/squash
+    // draft is picking its destination.
     if draft_active {
         body = body.child(build_op_bar(ui, theme, window, cx));
     }
-    body.child(build_footer(ui, theme)).into_any_element()
+    body.into_any_element()
 }
 
 pub(crate) fn build_collapsed_sidebar(
@@ -1225,117 +1207,6 @@ fn build_revset_filter(
 /// right. Monospace, dim, with a hairline top border. The "uncommitted files"
 /// count common to git tools is deliberately omitted — jj's `@` is always a
 /// commit, so it would be semantically wrong here.
-fn build_footer(ui: &Diffui, theme: ThemeSpec) -> AnyElement {
-    let font = ui.config.mono_font;
-    let dim = theme.subtle_text;
-    // Every run sits on one baseline and the arrows centre on the digits'
-    // caps (see `crate::typography`).
-    let label = |value: String, color: Color| {
-        Aligned::text(
-            typography::line(value, font, FOOTER_TEXT_SIZE, color),
-            font,
-            FOOTER_TEXT_SIZE,
-        )
-    };
-    let glyph = |glyph: &'static str, color: Color| {
-        Aligned::glyph(
-            icons::icon(glyph, FOOTER_TEXT_SIZE, color),
-            FOOTER_TEXT_SIZE,
-        )
-    };
-
-    let mut left: Vec<Aligned> = Vec::new();
-    if let Some(status) = &ui.active().session.branch_status {
-        // Branch glyph + name; the tracked upstream rides along as a tooltip.
-        let name = typography::group(
-            [
-                glyph(icons::GIT_BRANCH, dim),
-                label(status.branch.clone(), dim),
-            ],
-            5.0,
-        );
-        left.push(match &status.upstream {
-            Some(upstream) => {
-                let upstream = upstream.clone();
-                name.map(move |name| {
-                    div()
-                        .id("footer-branch")
-                        .tooltip(ui::tooltip(upstream, font, theme))
-                        .child(name)
-                        .into_any_element()
-                })
-            }
-            None => name,
-        });
-        // Ahead/behind only mean something against a tracked upstream.
-        if status.upstream.is_some() {
-            if status.ahead == 0 && status.behind == 0 {
-                left.push(label("in sync".to_owned(), dim));
-            } else {
-                if status.ahead > 0 {
-                    left.push(typography::group(
-                        [
-                            glyph(icons::ARROW_UP, theme.added_text),
-                            label(status.ahead.to_string(), theme.added_text),
-                        ],
-                        1.0,
-                    ));
-                }
-                if status.behind > 0 {
-                    left.push(typography::group(
-                        [
-                            glyph(icons::ARROW_DOWN, theme.removed_text),
-                            label(status.behind.to_string(), theme.removed_text),
-                        ],
-                        1.0,
-                    ));
-                }
-            }
-        }
-    }
-
-    // jj counts changes; git has only commits.
-    let noun = match ui.active().repository.as_ref().map(|r| r.vcs) {
-        Some(Vcs::Git) => "commits",
-        _ => "changes",
-    };
-    let right = label(
-        format!("{} {noun}", thousands(ui.active().session.commits.len())),
-        dim,
-    );
-
-    div()
-        .flex_none()
-        .w_full()
-        .flex()
-        .flex_col()
-        .child(crate::root::horizontal_divider(theme))
-        .child(
-            div()
-                .w_full()
-                .h(px(FOOTER_HEIGHT))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(8.0))
-                .px(px(theme::space::LG))
-                .bg(theme.panel_background)
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .child(typography::baseline_row(left, 8.0)),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .child(typography::baseline_row([right], 0.0)),
-                ),
-        )
-        .into_any_element()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

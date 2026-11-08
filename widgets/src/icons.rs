@@ -107,3 +107,6 @@ pub const USER: &str = "\u{e19f}"; // user
 pub const CLOCK: &str = "\u{e087}"; // clock
 pub const TERMINAL: &str = "\u{e181}"; // terminal
 pub const LIST_CHECKS: &str = "\u{e1d0}"; // list-checks
+pub const BOOKMARK: &str = "\u{e060}"; // bookmark
+pub const PANEL_LEFT: &str = "\u{e12a}"; // panel-left
+pub const ELLIPSIS: &str = "\u{e0b6}"; // ellipsis

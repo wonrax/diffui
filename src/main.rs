@@ -65,6 +65,7 @@ mod shortcuts;
 mod sidebar;
 mod source_panel;
 mod spawn;
+mod status_bar;
 mod tab_bar;
 mod tabs;
 mod toolbar;

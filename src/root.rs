@@ -693,6 +693,7 @@ pub(crate) struct Panes {
     pub(crate) left: Entity<Pane>,
     pub(crate) files: Entity<Pane>,
     pub(crate) main: Entity<Pane>,
+    pub(crate) status: Entity<Pane>,
     pub(crate) floats: Entity<Pane>,
 }
 
@@ -710,6 +711,12 @@ impl Panes {
             left: Pane::new(app.clone(), "left", left_pane, cx),
             files: Pane::new(app.clone(), "files", files_pane, cx),
             main: Pane::new(app.clone(), "main", main_pane, cx),
+            status: Pane::new(
+                app.clone(),
+                "status",
+                crate::status_bar::build_status_bar,
+                cx,
+            ),
             floats: Pane::new(app, "floats", floats_pane, cx),
         }
     }
@@ -814,7 +821,14 @@ impl Diffui {
                     .child(embed(&panes.toolbar)),
             )
             .child(horizontal_divider(theme))
-            .child(self.panes(panes, theme, window, cx));
+            .child(self.panes(panes, theme, window, cx))
+            .child(
+                div()
+                    .w_full()
+                    .flex_none()
+                    .h(px(crate::status_bar::TOTAL_HEIGHT))
+                    .child(embed(&panes.status)),
+            );
         // While something floats above, nothing below it hovers or takes presses.
         if modal_open {
             shell = shell.child(div().absolute().inset_0().occlude());
