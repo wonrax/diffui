@@ -784,6 +784,7 @@ mod scenes {
                 border_dashed: false,
                 icon: Some(icons::GIT_BRANCH),
                 icon_color: None,
+                suffix: None,
             };
             let dashed = chip::Chip {
                 label: "empty".to_owned(),
@@ -793,6 +794,7 @@ mod scenes {
                 border_dashed: true,
                 icon: None,
                 icon_color: None,
+                suffix: None,
                 ..chip.clone()
             };
             let prose = Prose::from("Move ")

@@ -299,6 +299,10 @@ pub struct CommitSummary {
     pub shortest_change_id_len: Option<usize>,
     pub description: String,
     pub author: String,
+    /// When the author made the commit, in milliseconds since the epoch.
+    /// `None` when the backend doesn't say (git's synthesized working copy,
+    /// the PR "All changes" row).
+    pub author_timestamp: Option<i64>,
     pub has_description: bool,
     pub is_empty: Option<bool>,
     /// Whether the commit's tree is in a conflicted state (jj only — git
@@ -382,6 +386,8 @@ pub struct CommitStore {
     spans: Vec<CommitSpans>,
     authors: Vec<Arc<str>>,
     author_idx: Vec<u32>,
+    /// Author timestamps in epoch millis; [`NO_TIMESTAMP`] when unknown.
+    author_millis: Vec<i64>,
     shortest_change_id_len: Vec<u32>,
     flags: Vec<u16>,
     bookmarks: HashMap<usize, Vec<String>>,
@@ -412,6 +418,10 @@ pub struct CommitStore {
 /// re-sort the whole store mid-load; a longer one leaves the first lookups
 /// after a load scanning.
 const INDEX_IDLE: Duration = Duration::from_millis(250);
+
+/// [`CommitStore::author_millis`]'s "no timestamp", so the column stays a
+/// plain `i64` per row rather than an `Option` twice the size.
+const NO_TIMESTAMP: i64 = i64::MIN;
 
 /// Row indices sorted by the id they carry, so `find_by_change_id` /
 /// `find_by_commit_id` binary-search rather than scan the whole store — the
@@ -661,6 +671,8 @@ impl CommitStore {
 
         let author = intern_author(&mut self.authors, author_interner, &commit.author);
         self.author_idx.push(author);
+        self.author_millis
+            .push(commit.author_timestamp.unwrap_or(NO_TIMESTAMP));
 
         self.shortest_change_id_len
             .push(commit.shortest_change_id_len.unwrap_or(0) as u32);
@@ -745,6 +757,7 @@ impl CommitStore {
         total += self.authors.capacity() * size_of::<Arc<str>>();
         total += self.authors.iter().map(|name| name.len()).sum::<usize>();
         total += self.author_idx.capacity() * size_of::<u32>();
+        total += self.author_millis.capacity() * size_of::<i64>();
         total += self.shortest_change_id_len.capacity() * size_of::<u32>();
         total += self.flags.capacity() * size_of::<u16>();
         for names in self.bookmarks.values() {
@@ -787,6 +800,15 @@ impl<'a> RowView<'a> {
 
     pub fn author(&self) -> &'a str {
         &self.store.authors[self.store.author_idx[self.index] as usize]
+    }
+
+    /// When the author made the commit, in epoch millis (see
+    /// [`CommitSummary::author_timestamp`]).
+    pub fn author_timestamp(&self) -> Option<i64> {
+        match self.store.author_millis[self.index] {
+            NO_TIMESTAMP => None,
+            millis => Some(millis),
+        }
     }
 
     pub fn shortest_change_id_len(&self) -> Option<usize> {
@@ -875,6 +897,7 @@ impl CommitStoreBuilder {
         let mut store = CommitStore::default();
         store.spans.reserve(commits);
         store.author_idx.reserve(commits);
+        store.author_millis.reserve(commits);
         store.shortest_change_id_len.reserve(commits);
         store.flags.reserve(commits);
         Self {
@@ -1305,6 +1328,7 @@ mod tests {
             shortest_change_id_len: None,
             description: String::new(),
             author: String::new(),
+            author_timestamp: None,
             has_description: false,
             is_empty: None,
             has_conflict: false,
@@ -1349,6 +1373,7 @@ mod tests {
             shortest_change_id_len: None,
             description: String::new(),
             author: String::new(),
+            author_timestamp: None,
             has_description: false,
             is_empty: None,
             has_conflict: false,

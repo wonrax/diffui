@@ -38,7 +38,7 @@ use crate::icons;
 use crate::measure::LINE_HEIGHT_MULTIPLIER;
 use crate::scroll_resample::{self, Resampler};
 use crate::scrollbar;
-use crate::theme::{Color, Font, chip_background};
+use crate::theme::{Color, Font, Weight, chip_background, emphasis_font};
 use crate::typography::{self, TextBox};
 use crate::width_memo::WidthMemo;
 use gpui_kit::component::scroll::ScrollableElement as _;
@@ -76,6 +76,15 @@ pub const SMALL_TEXT_SIZE: f32 = crate::theme::text_size::BODY_LG;
 pub const CAPTION_TEXT_SIZE: f32 = crate::theme::text_size::CAPTION;
 /// Gap between a revision row's description and its id line.
 pub const ROW_LINE_GAP: f32 = 4.0;
+/// The commit's age, right-aligned on a revision row's title line.
+const AGE_TEXT_SIZE: f32 = 11.5;
+/// The working-copy label on its row's id line: the list's one solid chip.
+const WORKING_COPY_LABEL: &str = "Working copy";
+const WORKING_COPY_TEXT_SIZE: f32 = crate::theme::text_size::CAPTION;
+const WORKING_COPY_DOT: f32 = 6.0;
+const WORKING_COPY_PAD_LEFT: f32 = 5.0;
+const WORKING_COPY_PAD_RIGHT: f32 = 7.0;
+const WORKING_COPY_DOT_GAP: f32 = 4.0;
 /// Text size for the collapse/expand chevron on the selected revision row. The
 /// Lucide glyph fills its box, so a near-text size reads clearly as a chevron
 /// without dominating the row.
@@ -114,6 +123,10 @@ pub struct RevisionListStyle {
     pub muted_text: Color,
     pub subtle_text: Color,
     pub accent_text: Color,
+    /// A change id's shortest unique prefix, as jj prints it.
+    pub change_id: Color,
+    /// Text on an accent fill: the working-copy label.
+    pub accent_foreground: Color,
     pub primary_font: Font,
     pub mono_font: Font,
     pub file_badge_width: f32,
@@ -170,17 +183,19 @@ pub struct RevisionRowView {
     pub change_id_suffix: String,
     pub commit_id_short: String,
     pub author: String,
+    /// How long ago the author made the commit (`3h`, `2d`), or empty when
+    /// the backend doesn't say.
+    pub age: String,
     pub description: String,
     pub description_color: Color,
     /// Bookmark chips, in display order. May be partially hidden behind
     /// a synthetic `+N` overflow chip when there's not enough horizontal
-    /// room — see the layout logic in `draw_revision`. The lane color
-    /// these chips wear is also the color of the overflow chip.
+    /// room: see [`rail_layout`].
     pub bookmark_chips: Vec<Chip>,
     /// Status chips (e.g. `empty`, `conflict`). Always shown — they're
     /// load-bearing semantics and shouldn't compress.
     pub status_chips: Vec<Chip>,
-    /// Color for the `+N` overflow chip (= the row's lane color).
+    /// The colour of the row's own lane: its bookmark chips' glyphs.
     pub lane_color: Color,
     pub frame: LaneFrame,
     /// Warped lane → display-column maps for this row and the previous one
@@ -1847,10 +1862,15 @@ impl RevisionList {
         // === Measurements ===
         let id_gap = 8.0;
         let chip_gap = 6.0;
-        let at_marker = is_working_copy;
-        let at_gap = 4.0;
-        let at_w = if at_marker {
-            widths.width("@", id_size, mono)
+        let label_font = emphasis_font(primary, Weight::SEMIBOLD);
+        let label_w = if is_working_copy {
+            working_copy_label_width(widths, label_font)
+        } else {
+            0.0
+        };
+        let has_change_id = prefix_w + suffix_w > 0.0;
+        let label_gap = if is_working_copy && has_change_id {
+            id_gap
         } else {
             0.0
         };
@@ -1860,12 +1880,12 @@ impl RevisionList {
         let bm_widths: Vec<f32> = rev
             .bookmark_chips
             .iter()
-            .map(|c| chip::width_memoized(widths, &c.label, c.icon, c.font))
+            .map(|c| chip::chip_width(widths, c))
             .collect();
         let status_widths: Vec<f32> = rev
             .status_chips
             .iter()
-            .map(|c| chip::width_memoized(widths, &c.label, c.icon, c.font))
+            .map(|c| chip::chip_width(widths, c))
             .collect();
         let status_total: f32 = status_widths.iter().sum::<f32>()
             + chip_gap * status_widths.len().saturating_sub(1) as f32;
@@ -1876,7 +1896,7 @@ impl RevisionList {
         let layout = rail_layout(
             RailInput {
                 total_width,
-                mandatory_left: at_w + (if at_marker { at_gap } else { 0.0 }) + prefix_w + suffix_w,
+                mandatory_left: label_w + label_gap + prefix_w + suffix_w,
                 status_total,
                 has_status: !status_widths.is_empty(),
                 commit_w,
@@ -1916,18 +1936,17 @@ impl RevisionList {
                 .center_for_baseline(meta_baseline)
         };
         let mut x_cursor = content_left;
-        if at_marker {
-            paint_centered(
-                "@",
+        if is_working_copy {
+            paint_working_copy_label(
                 x_cursor,
-                title_mid_y,
-                id_size,
-                mono,
-                fade(style.accent),
+                meta_baseline,
+                label_font,
+                style,
+                widths,
                 window,
                 cx,
             );
-            x_cursor += at_w + at_gap;
+            x_cursor += label_w + label_gap;
         }
         paint_centered(
             &rev.change_id_prefix,
@@ -1935,7 +1954,7 @@ impl RevisionList {
             title_mid_y,
             id_size,
             mono,
-            fade(style.accent_text),
+            fade(style.change_id),
             window,
             cx,
         );
@@ -1960,7 +1979,7 @@ impl RevisionList {
                 title_mid_y,
                 id_size,
                 mono,
-                fade(style.muted_text),
+                fade(style.subtle_text),
                 window,
                 cx,
             );
@@ -2015,12 +2034,13 @@ impl RevisionList {
             let overflow_chip = Chip {
                 label: format!("+{}", layout.overflow_count),
                 font: primary,
-                background: chip_background(rev.lane_color),
-                text_color: rev.lane_color,
+                background: chip_background(style.muted_text),
+                text_color: style.subtle_text,
                 border_color: None,
                 border_dashed: false,
                 icon: None,
                 icon_color: None,
+                suffix: None,
             };
             let center = chip::center_for_baseline(&overflow_chip, meta_baseline);
             chip::paint(&overflow_chip, widths, chip_x, center, window, cx);
@@ -2046,20 +2066,55 @@ impl RevisionList {
             widths.width(glyph, CHEVRON_TEXT_SIZE, icons::ICON_FONT)
         });
         let chevron_gap = if chevron_glyph.is_some() { 6.0 } else { 0.0 };
-        let description_width = (content_width - chevron_width - chevron_gap).max(1.0);
+        let age_w = if rev.age.is_empty() {
+            0.0
+        } else {
+            widths.width(&rev.age, AGE_TEXT_SIZE, primary)
+        };
+        let age_gap = if age_w > 0.0 { id_gap } else { 0.0 };
+        let description_width =
+            (content_width - chevron_width - chevron_gap - age_w - age_gap).max(1.0);
 
+        // The working copy is the row to find at a glance: its title carries
+        // a little more weight.
+        let title_font = if is_working_copy {
+            emphasis_font(primary, Weight::MEDIUM)
+        } else {
+            primary
+        };
         let description =
-            ellipsis::cut_end(&rev.description, description_width, desc_size, primary);
+            ellipsis::cut_end(&rev.description, description_width, desc_size, title_font);
         paint_centered(
             &description,
             content_left,
             desc_mid_y,
             desc_size,
-            primary,
+            title_font,
             fade(rev.description_color),
             window,
             cx,
         );
+        if age_w > 0.0 {
+            // On the title's baseline, not centred on its own smaller box.
+            let title_baseline =
+                TextBox::new(title_font, desc_size, desc_size * LINE_HEIGHT_MULTIPLIER)
+                    .baseline_for_center(desc_mid_y);
+            paint_centered(
+                &rev.age,
+                content_right - chevron_width - chevron_gap - age_w,
+                TextBox::new(
+                    primary,
+                    AGE_TEXT_SIZE,
+                    AGE_TEXT_SIZE * LINE_HEIGHT_MULTIPLIER,
+                )
+                .center_for_baseline(title_baseline),
+                AGE_TEXT_SIZE,
+                primary,
+                fade(style.subtle_text),
+                window,
+                cx,
+            );
+        }
 
         if let Some(glyph) = chevron_glyph {
             paint_centered(
@@ -2254,6 +2309,7 @@ impl RevisionList {
                 border_dashed: false,
                 icon: None,
                 icon_color: None,
+                suffix: None,
             };
             let chip_w = chip::width_memoized(widths, &file.status_label, None, style.mono_font);
             chip::paint(
@@ -2334,6 +2390,8 @@ fn placeholder_style() -> RevisionListStyle {
         muted_text: color,
         subtle_text: color,
         accent_text: color,
+        change_id: color,
+        accent_foreground: color,
         primary_font: Font::DEFAULT,
         mono_font: Font::MONOSPACE,
         file_badge_width: 0.0,
@@ -2566,6 +2624,64 @@ fn item_lane_segment(item: &Item, lane: usize, half: LaneHalf) -> Option<usize> 
         Item::File(row) => row.lane_segments.get(lane),
     };
     slot.copied().flatten()
+}
+
+/// Width of the working-copy label: dot, gap, text and padding.
+fn working_copy_label_width(widths: &WidthMemo, font: Font) -> f32 {
+    WORKING_COPY_PAD_LEFT
+        + WORKING_COPY_DOT
+        + WORKING_COPY_DOT_GAP
+        + widths.width(WORKING_COPY_LABEL, WORKING_COPY_TEXT_SIZE, font)
+        + WORKING_COPY_PAD_RIGHT
+}
+
+/// The working copy's "Working copy" label at `x`, its text on `baseline`: an
+/// accent box, chip-high, with a dot ahead of the text.
+fn paint_working_copy_label(
+    x: f32,
+    baseline: f32,
+    font: Font,
+    style: &RevisionListStyle,
+    widths: &WidthMemo,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let height = chip::height();
+    let center = TextBox::new(font, WORKING_COPY_TEXT_SIZE, height).center_for_baseline(baseline);
+    let top = (center - height / 2.0).round();
+    fill_rounded(
+        Rectangle {
+            x,
+            y: top,
+            width: working_copy_label_width(widths, font),
+            height,
+        },
+        style.accent,
+        crate::theme::radius::XS,
+        window,
+    );
+    let dot_x = x + WORKING_COPY_PAD_LEFT;
+    fill_rounded(
+        Rectangle {
+            x: dot_x,
+            y: top + (height - WORKING_COPY_DOT) / 2.0,
+            width: WORKING_COPY_DOT,
+            height: WORKING_COPY_DOT,
+        },
+        style.accent_foreground,
+        WORKING_COPY_DOT / 2.0,
+        window,
+    );
+    paint_centered(
+        WORKING_COPY_LABEL,
+        dot_x + WORKING_COPY_DOT + WORKING_COPY_DOT_GAP,
+        center,
+        WORKING_COPY_TEXT_SIZE,
+        font,
+        style.accent_foreground,
+        window,
+        cx,
+    );
 }
 
 fn fill_rounded(rect: Rectangle, color: Color, radius: f32, window: &mut Window) {

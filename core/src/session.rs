@@ -1586,6 +1586,7 @@ mod tests {
                 shortest_change_id_len: Some(8),
                 description: format!("row {index}"),
                 author: "someone".to_owned(),
+                author_timestamp: None,
                 has_description: true,
                 is_empty: None,
                 has_conflict: false,

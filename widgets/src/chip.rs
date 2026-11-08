@@ -50,12 +50,30 @@ pub struct Chip {
     /// The glyph's own tint, when it differs from the label's: a neutral
     /// bookmark chip shows its graph lane through the icon alone.
     pub icon_color: Option<Color>,
+    /// A trailing run in its own colour, right after the label: a remote
+    /// bookmark's `@origin`, or the `*` of a bookmark that differs from its
+    /// remote.
+    pub suffix: Option<(String, Color)>,
 }
 
 /// Full chip width (icon + label + horizontal padding) for the given label,
 /// rendered with `font` at [`TEXT_SIZE`].
 pub fn width(label: &str, icon: Option<&str>, font: Font) -> f32 {
     width_memoized(&WidthMemo::default(), label, icon, font)
+}
+
+/// Full width of `chip`, its suffix included.
+pub fn full_width(chip: &Chip) -> f32 {
+    chip_width(&WidthMemo::default(), chip)
+}
+
+/// [`full_width`], shaping through `memo`.
+pub fn chip_width(memo: &WidthMemo, chip: &Chip) -> f32 {
+    width_memoized(memo, &chip.label, chip.icon, chip.font)
+        + chip
+            .suffix
+            .as_ref()
+            .map_or(0.0, |(suffix, _)| memo.width(suffix, TEXT_SIZE, chip.font))
 }
 
 /// [`width`], shaping through `memo`.
@@ -90,7 +108,7 @@ pub fn paint(
     cx: &mut App,
 ) {
     let chip_h = height();
-    let width = width_memoized(memo, &chip.label, chip.icon, chip.font);
+    let width = chip_width(memo, chip);
     let top = (center_y - chip_h / 2.0).round();
     let bounds = Bounds::new(point(px(x), px(top)), size(px(width), px(chip_h)));
     let background = if chip.background.a > f32::EPSILON {
@@ -147,6 +165,20 @@ pub fn paint(
         window,
         cx,
     );
+    if let Some((suffix, color)) = &chip.suffix {
+        crate::typography::paint_line(
+            suffix,
+            text_x + memo.width(&chip.label, TEXT_SIZE, chip.font),
+            top + shift,
+            TEXT_SIZE,
+            chip_h,
+            chip.font,
+            *color,
+            TextAlign::Left,
+            window,
+            cx,
+        );
+    }
 }
 
 /// `chip` as an element, [`height`] tall. A painter placing chips by hand (a
@@ -184,15 +216,21 @@ pub fn view(chip: &Chip) -> Div {
             chip.icon_color.unwrap_or(chip.text_color),
         ));
     }
-    element.child(
+    let text = |value: String, color: Color| {
         div()
             .relative()
             .top(px(shift))
             .font(chip.font.gpui())
             .text_size(px(TEXT_SIZE))
             .line_height(px(chip_h))
-            .text_color(chip.text_color)
+            .text_color(color)
             .whitespace_nowrap()
-            .child(chip.label.clone()),
-    )
+            .child(value)
+    };
+    element = element.child(text(chip.label.clone(), chip.text_color));
+    if let Some((suffix, color)) = &chip.suffix {
+        // Flush against the label: the row's gap is for the icon.
+        element = element.child(text(suffix.clone(), *color).ml(px(-ICON_GAP)));
+    }
+    element
 }

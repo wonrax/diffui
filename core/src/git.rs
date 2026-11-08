@@ -62,7 +62,7 @@ pub async fn load_git_commits(
     // worktree tips, including detached HEADs outside the current ancestry.
     let mut args = git_args(&["log", "--topo-order", "--no-color"]);
     args.push(OsString::from(
-        "--pretty=format:%h%x09%H%x09%P%x09%an%x09%x09%s",
+        "--pretty=format:%h%x09%H%x09%P%x09%at%x09%an%x09%x09%s",
     ));
     // `None` on an unborn branch (a repository with no commits yet), where
     // `git log HEAD` fails outright.
@@ -105,6 +105,7 @@ pub async fn load_git_commits(
                 commit_id: GIT_WORKING_COPY_ID.to_owned(),
                 parents: head.into_iter().collect(),
                 author: String::new(),
+                author_timestamp: None,
                 is_empty: None,
                 description: "Working copy".to_owned(),
                 has_description: true,
@@ -830,6 +831,7 @@ struct ParsedCommitRow {
     commit_id: String,
     parents: Vec<String>,
     author: String,
+    author_timestamp: Option<i64>,
     is_empty: Option<bool>,
     description: String,
     has_description: bool,
@@ -840,10 +842,17 @@ fn parse_commit_log_rows(output: &str) -> Vec<ParsedCommitRow> {
     output
         .lines()
         .filter_map(|line| {
-            let mut parts = line.splitn(5, '\t');
+            let mut parts = line.splitn(6, '\t');
             let change_id = parts.next()?.trim();
             let commit_id = parts.next()?.trim();
             let parents_field = parts.next().unwrap_or("");
+            // `%at`: Unix seconds.
+            let author_timestamp = parts
+                .next()?
+                .trim()
+                .parse::<i64>()
+                .ok()
+                .map(|seconds| seconds * 1000);
             let author = parts.next()?.trim();
             let remainder = parts.next().unwrap_or("");
             let (empty, description) =
@@ -867,6 +876,7 @@ fn parse_commit_log_rows(output: &str) -> Vec<ParsedCommitRow> {
                 commit_id: commit_id.to_owned(),
                 parents,
                 author: author.to_owned(),
+                author_timestamp,
                 is_empty: empty,
                 description: if description.is_empty() {
                     "(no description set)".to_owned()
@@ -912,6 +922,7 @@ fn build_commit_summaries(rows: Vec<ParsedCommitRow>) -> Vec<StreamRow> {
                 shortest_change_id_len: None,
                 description: row.description,
                 author: row.author,
+                author_timestamp: row.author_timestamp,
                 has_description: row.has_description,
                 is_empty: row.is_empty,
                 has_conflict: false,
@@ -1074,12 +1085,14 @@ mod tests {
 
     #[test]
     fn parses_commit_log_rows_basic() {
-        let commits = parse_commit_log("abc\tdef\t\tme@example.com\tfalse\tadd commit sidebar\n");
+        let commits =
+            parse_commit_log("abc\tdef\t\t1700000000\tme@example.com\tfalse\tadd commit sidebar\n");
 
         assert_eq!(commits.len(), 1);
         assert_eq!(commits[0].change_id, "abc");
         assert_eq!(commits[0].commit_id, "def");
         assert_eq!(commits[0].author, "me@example.com");
+        assert_eq!(commits[0].author_timestamp, Some(1_700_000_000_000));
         assert_eq!(commits[0].description, "add commit sidebar");
         assert!(commits[0].has_description);
         assert_eq!(commits[0].is_empty, Some(false));
@@ -1087,7 +1100,7 @@ mod tests {
 
     #[test]
     fn parses_commit_log_rows_without_description() {
-        let commits = parse_commit_log("abc\tdef\t\tme@example.com\ttrue\t\n");
+        let commits = parse_commit_log("abc\tdef\t\t1700000000\tme@example.com\ttrue\t\n");
 
         assert_eq!(commits.len(), 1);
         assert_eq!(commits[0].description, "(no description set)");
@@ -1098,7 +1111,7 @@ mod tests {
     #[test]
     fn commit_log_rows_select_full_revision_id() {
         let commits = parse_commit_log(
-            "abc\tdef123456789abcdef\t\tme@example.com\tfalse\tadd commit sidebar\n",
+            "abc\tdef123456789abcdef\t\t1700000000\tme@example.com\tfalse\tadd commit sidebar\n",
         );
 
         assert_eq!(commits[0].change_id, "abc");
@@ -1113,10 +1126,10 @@ mod tests {
         //   W - parent: A
         //   A - root, no parents
         let graph = parse_commit_log_graph(
-            "M\tM\tT W\tme@example.com\tfalse\tmerge\n\
-             T\tT\tA\tme@example.com\tfalse\ttrunk\n\
-             W\tW\tA\tme@example.com\tfalse\tside\n\
-             A\tA\t\tme@example.com\tfalse\troot\n",
+            "M\tM\tT W\t1700000000\tme@example.com\tfalse\tmerge\n\
+             T\tT\tA\t1700000000\tme@example.com\tfalse\ttrunk\n\
+             W\tW\tA\t1700000000\tme@example.com\tfalse\tside\n\
+             A\tA\t\t1700000000\tme@example.com\tfalse\troot\n",
         );
 
         assert_eq!(graph.len(), 4);
@@ -1132,7 +1145,8 @@ mod tests {
     #[test]
     fn git_log_marks_unknown_parents_as_missing() {
         // Single commit whose parent isn't in the listing — e.g. a shallow clone.
-        let graph = parse_commit_log_graph("abc\tabc\tdeadbeef\tme@example.com\tfalse\thead\n");
+        let graph =
+            parse_commit_log_graph("abc\tabc\tdeadbeef\t1700000000\tme@example.com\tfalse\thead\n");
 
         assert_eq!(graph.len(), 1);
         assert_eq!(graph.frame(0, usize::MAX).missing_parents, 1);

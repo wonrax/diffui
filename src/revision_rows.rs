@@ -4,6 +4,7 @@
 
 use std::rc::Rc;
 
+use diffui_core::history::{now_millis, relative_age};
 use diffui_core::{RevisionSelection, RowView};
 use gpui_kit::{AnyElement, App, Window};
 
@@ -226,6 +227,7 @@ fn revision_row_at(ui: &Diffui, theme: ThemeSpec, row: usize) -> RevisionRowView
                     border_dashed: true,
                     icon: None,
                     icon_color: None,
+                    suffix: None,
                 },
             );
         }
@@ -413,6 +415,7 @@ fn build_revision_row(
                     border_dashed: true,
                     icon: Some(icons::ARROW_UP),
                     icon_color: None,
+                    suffix: None,
                 },
             );
         } else {
@@ -468,6 +471,7 @@ fn build_revision_row(
                         border_dashed: false,
                         icon: Some(icons::ARROW_DOWN),
                         icon_color: None,
+                        suffix: None,
                     },
                 );
             }
@@ -493,6 +497,7 @@ fn build_revision_row(
                 border_dashed: true,
                 icon: None,
                 icon_color: None,
+                suffix: None,
             },
         );
     }
@@ -504,6 +509,10 @@ fn build_revision_row(
         change_id_suffix: id_suffix,
         commit_id_short,
         author: commit.author().to_owned(),
+        age: commit
+            .author_timestamp()
+            .map(|then| relative_age(then, now_millis()))
+            .unwrap_or_default(),
         description: commit.description().to_owned(),
         description_color: commit_description_color(commit, theme),
         bookmark_chips,
@@ -1204,6 +1213,7 @@ pub(crate) mod scenes {
                     row % 17
                 ),
                 author: "Ada Lovelace".to_owned(),
+                author_timestamp: None,
                 has_description: true,
                 is_empty: Some(row % 19 == 0),
                 has_conflict: row % 23 == 0,

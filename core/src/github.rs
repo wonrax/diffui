@@ -415,13 +415,14 @@ pub struct PrCommit {
     pub oid: String,
     pub author: String,
     pub headline: String,
+    /// `authoredDate`, in epoch millis, when it parses.
+    pub authored_millis: Option<i64>,
 }
 
 /// Fetch the PR's commits, oldest first (GitHub's order). Same `\u{1f}` field
 /// framing as [`fetch_pr_info`]; headlines are single-line by construction.
 pub async fn fetch_pr_commits(spec: &PrSpec) -> Result<Vec<PrCommit>> {
-    const JQ: &str =
-        r#".commits[] | [.oid, (.authors[0].login // ""), .messageHeadline] | join("\u001f")"#;
+    const JQ: &str = r#".commits[] | [.oid, (.authors[0].login // ""), .messageHeadline, (.authoredDate // "")] | join("\u001f")"#;
     let stdout = run_gh(
         spec,
         &[
@@ -450,6 +451,7 @@ pub async fn fetch_pr_commits(spec: &PrSpec) -> Result<Vec<PrCommit>> {
                 oid: next(),
                 author: next(),
                 headline: next(),
+                authored_millis: crate::history::parse_timestamp_millis(&next()),
             }
         })
         .collect())
@@ -469,6 +471,7 @@ pub fn pr_commit_rows(commits: &[PrCommit]) -> Vec<StreamRow> {
         shortest_change_id_len: None,
         description: "All changes".to_owned(),
         author: String::new(),
+        author_timestamp: None,
         has_description: true,
         is_empty: Some(false),
         has_conflict: false,
@@ -492,6 +495,7 @@ pub fn pr_commit_rows(commits: &[PrCommit]) -> Vec<StreamRow> {
                 commit.headline.clone()
             },
             author: commit.author.clone(),
+            author_timestamp: commit.authored_millis,
             has_description: !commit.headline.is_empty(),
             is_empty: Some(false),
             has_conflict: false,

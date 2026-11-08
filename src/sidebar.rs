@@ -115,17 +115,6 @@ fn conflict_verdict(
 /// Focus target id for the revset input.
 pub const REVSET_INPUT_ID: &str = "revset-input";
 
-/// Bookmark chips for a revision row, wearing `lane_color`. Shared with the
-/// source browser's revision-header row so both rails style identically.
-///
-/// Core authors the label shapes and jj forbids `@` inside bookmark and
-/// remote names, so a trailing `@` can only be another workspace's working
-/// copy (`name@`) and an interior `@` a remote bookmark (`main@origin`).
-/// Workspace chips get a folder glyph (another working-copy *directory*) and
-/// the working-copy accent — the lane palette is deliberately decoupled from
-/// it — so they read as a different kind of thing than the bookmark pills
-/// sharing the rail. Remotes render outlined (transparent fill + 1px
-/// lane-color border) so they read as "tracking" rather than "live".
 /// The graph's lane colours for `theme`.
 pub(crate) fn revision_graph_style(theme: ThemeSpec) -> RevisionGraphStyle {
     RevisionGraphStyle {
@@ -156,37 +145,72 @@ pub(crate) fn graph_ref_chips(
     chips
 }
 
+/// Bookmark chips for a revision row. Shared with the source browser's
+/// revision-header row and the commit header, so every rail styles them alike.
+///
+/// One neutral chip for every ref, so the rail stays quiet next to the status
+/// chips; the bookmark glyph wears `lane_color`, tying the name to its branch
+/// in the graph. Core authors the label shapes and jj forbids `@` inside
+/// bookmark and remote names, so a trailing `@` can only be another
+/// workspace's working copy (`name@`, a folder glyph) and an interior `@` a
+/// remote bookmark (`main@origin`): outlined, with the remote in subtle text.
+/// A local bookmark that differs from its remote keeps its `*` in the modified
+/// colour, and a conflicted one its `??` in the conflict colour.
 pub(crate) fn bookmark_chips_for(
     bookmarks: &[String],
     lane_color: Color,
     theme: ThemeSpec,
     config: AppConfig,
 ) -> Vec<Chip> {
-    let mut chips = Vec::with_capacity(bookmarks.len());
-    for bookmark in bookmarks {
-        let is_workspace = bookmark.ends_with('@');
-        let is_remote = !is_workspace && bookmark.contains('@');
-        let chip_color = if is_workspace {
-            theme.accent
-        } else {
-            lane_color
-        };
-        chips.push(Chip {
-            label: bookmark.clone(),
-            font: config.ui_font,
-            background: if is_remote {
-                crate::theme::TRANSPARENT
+    bookmarks
+        .iter()
+        .map(|bookmark| {
+            let is_workspace = bookmark.ends_with('@');
+            let remote_at = (!is_workspace).then(|| bookmark.find('@')).flatten();
+            let (label, suffix) = if let Some(at) = remote_at {
+                (
+                    bookmark[..at].to_owned(),
+                    Some((bookmark[at..].to_owned(), theme.subtle_text)),
+                )
+            } else if let Some(name) = bookmark.strip_suffix("??") {
+                (
+                    name.to_owned(),
+                    Some(("??".to_owned(), theme.conflict_marker)),
+                )
+            } else if let Some(name) = bookmark.strip_suffix('*') {
+                (
+                    name.to_owned(),
+                    Some(("*".to_owned(), theme.modified_token)),
+                )
             } else {
-                chip_background(chip_color)
-            },
-            text_color: chip_color,
-            border_color: is_remote.then_some(lane_color),
-            border_dashed: false,
-            icon: is_workspace.then_some(icons::FOLDER),
-            icon_color: None,
-        });
-    }
-    chips
+                (bookmark.clone(), None)
+            };
+            Chip {
+                label,
+                font: config.ui_font,
+                background: if remote_at.is_some() {
+                    crate::theme::TRANSPARENT
+                } else {
+                    neutral_chip_background(theme)
+                },
+                text_color: theme.muted_text,
+                border_color: remote_at.is_some().then_some(theme.border),
+                border_dashed: false,
+                icon: Some(if is_workspace {
+                    icons::FOLDER
+                } else {
+                    icons::BOOKMARK
+                }),
+                icon_color: Some(lane_color),
+                suffix,
+            }
+        })
+        .collect()
+}
+
+/// The fill every neutral chip shares: bookmarks, tags and the `+N` overflow.
+pub(crate) fn neutral_chip_background(theme: ThemeSpec) -> Color {
+    chip_background(theme.muted_text)
 }
 
 /// Read-only tag chips for a revision row: neutral rather than lane-colored,
@@ -198,12 +222,13 @@ pub(crate) fn tag_chips_for(tags: &[String], theme: ThemeSpec, config: AppConfig
         .map(|tag| Chip {
             label: tag.clone(),
             font: config.ui_font,
-            background: chip_background(theme.muted_text),
+            background: neutral_chip_background(theme),
             text_color: theme.muted_text,
-            border_color: tag.contains('@').then_some(theme.subtle_text),
+            border_color: tag.contains('@').then_some(theme.border),
             border_dashed: false,
             icon: Some(icons::TAG),
             icon_color: None,
+            suffix: None,
         })
         .collect()
 }
@@ -222,6 +247,7 @@ pub(crate) fn status_chips_for(commit: RowView, theme: ThemeSpec, config: AppCon
             border_dashed: true,
             icon: None,
             icon_color: None,
+            suffix: None,
         });
     }
     if commit.has_conflict() {
@@ -234,6 +260,7 @@ pub(crate) fn status_chips_for(commit: RowView, theme: ThemeSpec, config: AppCon
             border_dashed: false,
             icon: None,
             icon_color: None,
+            suffix: None,
         });
     }
     if commit.is_hidden() {
@@ -249,6 +276,7 @@ pub(crate) fn status_chips_for(commit: RowView, theme: ThemeSpec, config: AppCon
             border_dashed: false,
             icon: None,
             icon_color: None,
+            suffix: None,
         });
     } else if commit.is_divergent() {
         // jj log flags these with a change-offset suffix: the change id maps
@@ -263,6 +291,7 @@ pub(crate) fn status_chips_for(commit: RowView, theme: ThemeSpec, config: AppCon
             border_dashed: false,
             icon: None,
             icon_color: None,
+            suffix: None,
         });
     }
     status_chips
@@ -327,6 +356,8 @@ pub(crate) fn revision_list_style(
         muted_text: theme.muted_text,
         subtle_text: theme.subtle_text,
         accent_text: theme.accent,
+        change_id: theme.change_id,
+        accent_foreground: theme.panel_background,
         primary_font: config.ui_font,
         mono_font: config.mono_font,
         file_badge_width,
@@ -1182,6 +1213,7 @@ mod tests {
             shortest_change_id_len: None,
             description: String::new(),
             author: String::new(),
+            author_timestamp: None,
             has_description: false,
             is_empty: None,
             has_conflict: false,

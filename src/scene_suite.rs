@@ -2341,8 +2341,10 @@ fn run(scene: &Scene) -> Result<(), String> {
     } else {
         scene.open_repo.then(|| repo.clone())
     };
-    // `DIFFUI_SCENE_THEME=Dark` shoots a light scene dark, and the other way.
-    let theme = std::env::var("DIFFUI_SCENE_THEME").unwrap_or_else(|_| scene.theme.to_owned());
+    // `DIFFUI_SCENE_THEME=Dark` reshoots light scenes in another theme, as
+    // `<id>-dark.png`.
+    let theme_override = std::env::var("DIFFUI_SCENE_THEME").ok();
+    let theme = theme_override.as_deref().unwrap_or(scene.theme);
     let config = format!("theme = \"{theme}\"\n{}", scene.config);
     let h = Harness::open_fresh(open.as_deref(), scene.size, &config);
     let mut c = Ctx {
@@ -2358,7 +2360,12 @@ fn run(scene: &Scene) -> Result<(), String> {
     if !scene.raw {
         c.settle();
     }
-    c.h.shot_now(LANE, scene.id);
+    match &theme_override {
+        Some(theme) => {
+            c.h.shot_now(LANE, &format!("{}-{}", scene.id, theme.to_lowercase()))
+        }
+        None => c.h.shot_now(LANE, scene.id),
+    };
     if scene.raw || scene.animated {
         return Ok(());
     }

@@ -841,6 +841,19 @@ mod tests {
         for background in [spec.panel_background, spec.selected_file] {
             pairs.push(("change id prefix", spec.change_id, background, TEXT));
         }
+        // The revision rows' neutral ref chips, their `+N`, and the working
+        // copy's label: pane-coloured text on the accent.
+        for base in [spec.panel_background, spec.selected_file] {
+            let fill = over(chip_background(spec.muted_text), base);
+            pairs.push(("ref chip", spec.muted_text, fill, TEXT));
+            pairs.push(("overflow chip", spec.subtle_text, fill, GLYPH));
+        }
+        pairs.push((
+            "working copy label",
+            spec.panel_background,
+            spec.accent,
+            TEXT,
+        ));
         pairs
     }
 

@@ -1072,7 +1072,7 @@ impl<'a> View<'a> {
         }
         let mut x = value_x + geometry.width_columns * cw;
         for chip in &field.chips {
-            x += HEADER_CHIP_GAP + chip::width(&chip.label, chip.icon, chip.font);
+            x += HEADER_CHIP_GAP + chip::full_width(chip);
         }
         let side = HEADER_BUTTON_SIZE.min(self.metrics.row_height);
         for (slot, (_, action)) in field.buttons.iter().enumerate() {

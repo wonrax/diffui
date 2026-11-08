@@ -1203,6 +1203,7 @@ mod tests {
             shortest_change_id_len: Some(2),
             description: title.to_owned(),
             author: "a".to_owned(),
+            author_timestamp: None,
             has_description: true,
             is_empty: None,
             has_conflict: false,

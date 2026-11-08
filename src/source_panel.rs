@@ -180,6 +180,7 @@ pub(crate) fn empty_revision_row(theme: ThemeSpec) -> RevisionRowView {
         change_id_suffix: String::new(),
         commit_id_short: String::new(),
         author: String::new(),
+        age: String::new(),
         description: String::new(),
         description_color: theme.text,
         bookmark_chips: Vec::new(),

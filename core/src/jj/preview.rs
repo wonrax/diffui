@@ -780,6 +780,7 @@ async fn summary_of(
             description.to_owned()
         },
         author: commit.author().name.clone(),
+        author_timestamp: Some(commit.author().timestamp.timestamp.0),
         has_description: !description.is_empty(),
         is_empty,
         has_conflict: commit.has_conflict(),

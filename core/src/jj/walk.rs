@@ -406,6 +406,7 @@ pub async fn walk_jj_with_repo(
                     description.to_owned()
                 },
                 author: commit.author().name.clone(),
+                author_timestamp: Some(commit.author().timestamp.timestamp.0),
                 has_description: !description.is_empty(),
                 is_empty: None,
                 has_conflict: commit.has_conflict(),

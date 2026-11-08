@@ -231,7 +231,7 @@ impl Plan {
     /// A chip painted by hand, its left edge at `x`, centred on `center_y`. Returns
     /// its width. The same geometry as [`chip::view`].
     fn chip(&mut self, chip: &Chip, x: f32, center_y: f32, clip: Rectangle) -> f32 {
-        let width = chip::width(&chip.label, chip.icon, chip.font);
+        let width = chip::full_width(chip);
         let height = chip::height();
         let rect = Rectangle {
             x,
@@ -267,7 +267,7 @@ impl Plan {
                     width: glyph_width,
                     ..rect
                 },
-                chip.text_color,
+                chip.icon_color.unwrap_or(chip.text_color),
                 clip,
             );
             text_x += glyph_width + chip::ICON_GAP;
@@ -283,6 +283,18 @@ impl Plan {
             chip.text_color,
             clip,
         );
+        if let Some((suffix, color)) = &chip.suffix {
+            self.line(
+                suffix,
+                chip.font,
+                chip::TEXT_SIZE,
+                text_x + measure::line_width(&chip.label, chip::TEXT_SIZE, chip.font),
+                rect.y + shift,
+                height,
+                *color,
+                clip,
+            );
+        }
         width
     }
 
@@ -1264,7 +1276,7 @@ impl View<'_> {
         for chip in &field.chips {
             x += HEADER_CHIP_GAP;
             plan.chip(chip, x, chip::center_for_baseline(chip, baseline), clip);
-            x += chip::width(&chip.label, chip.icon, chip.font);
+            x += chip::full_width(chip);
         }
         for (slot, rect, _) in self.rich_targets(line_index, field, bounds, visible_top) {
             let hot = hovered == Some(slot);
@@ -1376,7 +1388,7 @@ impl View<'_> {
                     let baseline = self.code_baseline(text_top);
                     let mut chip_x = value_x;
                     for chip in chips {
-                        let chip_w = chip::width(&chip.label, chip.icon, chip.font);
+                        let chip_w = chip::full_width(chip);
                         // Drop chips that would overflow the panel rather than clip them
                         // mid-glyph.
                         if chip_x + chip_w > right_edge {
@@ -1789,6 +1801,7 @@ impl View<'_> {
             border_dashed: false,
             icon: None,
             icon_color: None,
+            suffix: None,
         };
         let chip_w = plan.chip(
             &status_chip,
