@@ -1941,6 +1941,24 @@ pub(crate) static REGISTRY: &[Command] = &[
         palette: PaletteScope::Hidden,
     },
     Command {
+        id: "palette.leave-command-line",
+        label: "Back to commands",
+        hint: "Leave the empty command line for the palette's search",
+        contexts: &[Context::Palette],
+        chords: &["backspace"],
+        mac_chords: &[],
+        enabled: always,
+        // Only an empty line: Backspace anywhere else edits it.
+        build: |ui, _arg| {
+            let empty = ui
+                .palette()
+                .and_then(|state| state.top())
+                .is_some_and(|column| column.query == crate::cmdline::PREFIX);
+            (ui.command_line().is_some() && empty).then_some(Action::CommandLine(CmdAction::Leave))
+        },
+        palette: PaletteScope::Hidden,
+    },
+    Command {
         id: "palette.back",
         label: "Back",
         hint: "Pop the rightmost palette column",

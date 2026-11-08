@@ -45,6 +45,7 @@ mod menus;
 mod meta_line;
 mod mode_hints;
 mod modes;
+mod overlay_kit;
 #[cfg(test)]
 mod overlay_scenes;
 mod palette;

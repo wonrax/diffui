@@ -669,7 +669,7 @@ fn hovering_a_row_highlights_it() {
     let mut h = app();
     h.press("cmd-k");
     h.settle();
-    let top = crate::toolbar::modal_top() + crate::palette::INPUT_HEIGHT + 20.0;
+    let top = crate::toolbar::modal_top() + crate::palette::list_top() + 20.0;
     let x = 1440.0 / 2.0;
     h.hover_point(at(x, top + 3.0 * crate::palette::ROW_HEIGHT));
     h.settle();
@@ -697,8 +697,14 @@ fn command_line_keys() {
     h.type_text("x");
     h.settle();
     assert!(line(&mut h).ends_with('x'), "{}", line(&mut h));
-    // Emptied to a search again, the search input takes over, caret and all.
+    // Emptied, the line is still a command line: the `jj` chip stays.
     h.press("cmd-backspace");
+    h.settle();
+    assert_eq!(line(&mut h), "jj ");
+    assert!(h.read(|ui| ui.command_line().is_some()));
+    // Backspace on the empty line goes back to the search, whose input takes
+    // over, caret and all.
+    h.press("backspace");
     h.settle();
     assert!(h.read(|ui| ui.command_line().is_none()));
     h.type_text("abc");

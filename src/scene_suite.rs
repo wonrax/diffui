@@ -1090,6 +1090,18 @@ fn all() -> Vec<Scene> {
         },
     ));
     t.add(s("cmdline-typed-rebase", "A typed rebase: words coloured in place, revset arguments with live counts, footer saying what Enter does.", "':' then 'rebase -s @ -d main'.", |c| { c.key(":"); c.typed("rebase -s @ -d main"); }));
+    t.add(
+        s(
+            "cmdline-typed-rebase-dark",
+            "cmdline-typed-rebase in dark.",
+            "As cmdline-typed-rebase, theme Dark.",
+            |c| {
+                c.key(":");
+                c.typed("rebase -s @ -d main");
+            },
+        )
+        .dark(),
+    );
     t.add(s(
         "cmdline-revset-error",
         "A typed command with a broken revset argument: the error pointed at.",

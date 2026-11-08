@@ -1616,6 +1616,14 @@ impl Diffui {
         let Some(id) = self.resolve_chord(context, &chord, consumed) else {
             return false;
         };
+        // A key a focused field also edits with (Backspace) stays the field's
+        // when the command bound to it has nothing to do right now.
+        if consumed
+            && commands::command(id)
+                .is_some_and(|command| (command.build)(self, CommandArg::None).is_none())
+        {
+            return false;
+        }
         self.run_command(id, CommandArg::None, cx);
         true
     }

@@ -560,6 +560,12 @@ have no scene; see src/toolbar.rs and core/src/github.rs for what differs.
 - State: A typed rebase: words coloured in place, revset arguments with live counts, footer saying what Enter does.
 - Steps: ':' then 'rebase -s @ -d main'.
 
+### `cmdline-typed-rebase-dark`
+
+- Window: 1440x900, dark
+- State: cmdline-typed-rebase in dark.
+- Steps: As cmdline-typed-rebase, theme Dark.
+
 ### `cmdline-revset-error`
 
 - Window: 1440x900, light

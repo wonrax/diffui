@@ -110,6 +110,8 @@ pub(crate) enum CmdAction {
     FromDraft,
     /// The CLI output panel.
     Output(crate::cli_output::OutputAction),
+    /// Back from the command line to the palette's search, the line empty.
+    Leave,
 }
 
 /// How a revset argument resolved, kept by its text so it survives edits
@@ -415,6 +417,34 @@ pub(crate) fn place_caret(id: &'static str, line: &str, at: usize, cx: &mut Cx) 
     crate::input::set_caret(id, floor_boundary(line, at), cx);
 }
 
+/// Puts the command line's caret at byte `at` of `line`. The field holds the
+/// line after its `jj `, which the input shows as a chip.
+fn place_command_caret(line: &str, at: usize, cx: &mut Cx) {
+    let shown = line.strip_prefix(PREFIX).unwrap_or(line);
+    let offset = line.len() - shown.len();
+    place_caret(COMMAND_INPUT_ID, shown, at.saturating_sub(offset), cx);
+}
+
+/// The candidates of each kind together, the kinds in the order their best
+/// candidate ranked, the history last: what completes the word comes first,
+/// whole lines from before after it.
+fn group_completions(completions: &mut [Completion]) {
+    let mut order: Vec<&'static str> = Vec::new();
+    for completion in completions.iter() {
+        let group = crate::cmdline_view::completion_group(completion.kind);
+        if completion.kind != CompletionKind::History && !order.contains(&group) {
+            order.push(group);
+        }
+    }
+    completions.sort_by_key(|completion| {
+        let group = crate::cmdline_view::completion_group(completion.kind);
+        order
+            .iter()
+            .position(|seen| *seen == group)
+            .unwrap_or(order.len())
+    });
+}
+
 // ── refresh ─────────────────────────────────────────────────────────────
 
 /// History entries that extend what is typed, as candidates for the whole
@@ -447,6 +477,12 @@ impl Diffui {
                 }
             }
             CmdAction::Output(action) => self.on_output_action(action, cx),
+            CmdAction::Leave => {
+                if self.command_line().is_some() {
+                    self.palette_on_query_changed(String::new(), cx);
+                    crate::input::focus(palette::PALETTE_INPUT_ID, cx);
+                }
+            }
         }
     }
 
@@ -496,6 +532,7 @@ impl Diffui {
             &self.recents.cli.iter().cloned().collect::<Vec<_>>(),
         );
         completions.extend(cli.complete(&line, command.cursor, &completer));
+        group_completions(&mut completions);
         command.completions = completions;
         command.selected = 0;
         command.scroll_y = 0.0;
@@ -755,8 +792,13 @@ impl Diffui {
         let len = command.completions.len() as i32;
         command.selected = (command.selected as i32 + delta).rem_euclid(len) as usize;
         command.navigated = true;
-        let top = command.selected as f32 * palette::ROW_HEIGHT;
-        let bottom = top + palette::ROW_HEIGHT;
+        let (top, bottom) = palette::row_span(
+            command
+                .completions
+                .iter()
+                .map(|completion| crate::cmdline_view::completion_group(completion.kind)),
+            command.selected,
+        );
         let viewport = palette::command_results_viewport();
         let y = if top < command.scroll_y {
             top
@@ -849,7 +891,7 @@ impl Diffui {
             // The model's caret isn't the field's: it starts the new text at the
             // end. A press on a candidate left the field, so bring it back too.
             crate::input::focus(COMMAND_INPUT_ID, cx);
-            place_caret(COMMAND_INPUT_ID, &line, cursor, cx);
+            place_command_caret(&line, cursor, cx);
             if let Some(command) = column.command.as_mut() {
                 command.history = None;
                 command.navigated = false;
