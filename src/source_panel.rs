@@ -576,6 +576,8 @@ fn source_code(
         status_fill: chip_background(theme.info),
         additions: 0,
         deletions: 0,
+        tag: None,
+        note: None,
     }];
     let revision_key = format!(
         "source:{}:{}",

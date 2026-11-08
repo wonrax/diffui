@@ -28,15 +28,29 @@ use crate::typography::{CodeTypography, TextBox};
 pub(super) const FILE_HEADER_VPAD: f32 = 8.0;
 // Padding above and below the centered title row inside the hunk-header strip.
 pub(super) const HUNK_HEADER_VPAD: f32 = 3.0;
+/// Padding above and below a file note's line.
+const NOTE_VPAD: f32 = 12.0;
+/// A file note's inset from the pane's left edge, and its button's size.
+pub(super) const NOTE_INSET: f32 = 20.0;
+pub(super) const NOTE_BUTTON_HEIGHT: f32 = 24.0;
+pub(super) const NOTE_BUTTON_PAD_X: f32 = 10.0;
+/// The size of a note's prose.
+pub(super) const NOTE_TEXT_SIZE: f32 = 12.0;
 pub(super) const PREFIX_WIDTH: f32 = 24.0;
 pub(super) const TEXT_X_PADDING: f32 = 8.0;
 /// A plain document's inset of its code from the gutter's edge and from the
 /// top, to the glyphs: it has no prefix column to clear.
 pub(super) const PLAIN_INSET: f32 = 12.0;
-// Floor for the gutter so two single-digit columns still look intentional.
-pub(super) const GUTTER_MIN_WIDTH: f32 = 56.0;
+// Floor for a plain document's gutter so a single-digit column still looks
+// intentional.
+const GUTTER_MIN_WIDTH: f32 = 28.0;
 // Padding flanking the gutter text on both sides.
 pub(super) const GUTTER_HORIZONTAL_PADDING: f32 = 8.0;
+/// A diff's line-number column: never narrower than this, and the space right
+/// of its right-aligned numbers and left of the widest one.
+pub(super) const NUMBER_COLUMN_MIN: f32 = 44.0;
+pub(super) const NUMBER_PAD_RIGHT: f32 = 10.0;
+const NUMBER_PAD_LEFT: f32 = 6.0;
 // Space drawn between the label column and the value column.
 pub(super) const HEADER_LABEL_GAP: f32 = 8.0;
 /// Gap between a rich field's value, its badges and its buttons.
@@ -47,11 +61,56 @@ pub(super) const HEADER_BUTTON_SIZE: f32 = 20.0;
 const HEADER_DESCRIPTION_INDENT: f32 = 0.0;
 pub(super) const HEADER_EDIT_WIDTH: f32 = 66.0;
 pub(super) const HEADER_EDIT_HEIGHT: f32 = 26.0;
-// Square hit target of the per-file "browse source" button in file headers.
-pub(super) const BROWSE_BUTTON_SIZE: f32 = 22.0;
-/// Side of a change-selection checkbox, and the gap after it.
+/// Side of a change-selection checkbox.
 pub(super) const CHECK_SIZE: f32 = 14.0;
-pub(super) const CHECK_GAP: f32 = 8.0;
+/// A file header: never shorter than this, its insets, the gap between its
+/// pieces, the side of its icon buttons, and the gaps around its counts.
+pub(super) const FILE_HEADER_MIN_HEIGHT: f32 = 38.0;
+const FILE_HEADER_PAD_LEFT: f32 = 8.0;
+const FILE_HEADER_PAD_RIGHT: f32 = 14.0;
+const FILE_HEADER_GAP: f32 = 8.0;
+const FILE_CONTROL_SIZE: f32 = 22.0;
+const FILE_HEADER_META_GAP: f32 = 10.0;
+const FILE_HEADER_STAT_GAP: f32 = 6.0;
+
+/// A file header's controls (see [`View::file_header_layout`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FileControl {
+    Fold,
+    Check,
+    Browse,
+    More,
+}
+
+/// What a file header count is, for its colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StatKind {
+    Added,
+    Deleted,
+    /// The label standing in for counts ("binary").
+    Tag,
+}
+
+/// A file header laid out: see [`View::file_header_layout`].
+#[derive(Debug, Clone)]
+pub(super) struct FileHeaderLayout {
+    pub(super) fold: Rectangle,
+    pub(super) check: Option<Rectangle>,
+    pub(super) badge: Rectangle,
+    /// The path runs from here to `title_right`, ellipsised to fit.
+    pub(super) title_x: f32,
+    pub(super) title_right: f32,
+    /// Top of the path's line box (a code row's), and its baseline, which every
+    /// text piece of the header sits on.
+    pub(super) line_top: f32,
+    pub(super) baseline: f32,
+    /// "3 hunks" and its left edge.
+    pub(super) hunks: Option<(String, f32)>,
+    /// The counts (or the tag) and their left edges.
+    pub(super) stats: Vec<(String, f32, StatKind)>,
+    pub(super) browse: Option<Rectangle>,
+    pub(super) more: Option<Rectangle>,
+}
 
 /// Sizes derived from the caller's typography, so the diff view stays visually
 /// proportional under a non-default code font size.
@@ -64,12 +123,17 @@ pub(super) struct LayoutMetrics {
     pub(super) text_y_pad: f32,
     pub(super) file_header_height: f32,
     pub(super) hunk_header_height: f32,
+    /// A file note's band (see [`super::FileNote`]).
+    pub(super) note_height: f32,
     /// The `+`/`-` column between the gutter and the code; narrower in a plain
     /// document, which has none to draw.
     pub(super) prefix_width: f32,
     /// Space above the first row: a plain document's top inset.
     pub(super) top_inset: f32,
     pub(super) gutter_width: f32,
+    /// One line-number column of a diff: the gutter holds two (old, new) in
+    /// unified, one per side in split.
+    pub(super) number_column: f32,
     pub(super) gutter_digit_count: usize,
     /// Real monospace advance for the diff font + size. Wrap math and selection
     /// geometry both rely on it.
@@ -97,26 +161,23 @@ impl LayoutMetrics {
             (0.0, 0.0)
         } else {
             (
-                row_height + 2.0 * FILE_HEADER_VPAD,
+                (row_height + 2.0 * FILE_HEADER_VPAD).max(FILE_HEADER_MIN_HEIGHT),
                 row_height + 2.0 * HUNK_HEADER_VPAD,
             )
         };
         let char_width = char_advance(font, text_size).max(1.0);
-        // Two line-number columns + a separating space; plain documents have
-        // no old side, so a single column suffices.
-        let gutter_text_chars = if plain {
-            gutter_digit_count
+        // Two line-number columns, old and new; plain documents have no old
+        // side, so a single column suffices.
+        let number_column =
+            (gutter_digit_count as f32 * char_width + NUMBER_PAD_LEFT + NUMBER_PAD_RIGHT)
+                .max(NUMBER_COLUMN_MIN)
+                .round();
+        let gutter_width = if plain {
+            (gutter_digit_count as f32 * char_width + GUTTER_HORIZONTAL_PADDING * 2.0)
+                .max(GUTTER_MIN_WIDTH)
         } else {
-            gutter_digit_count * 2 + 1
+            2.0 * number_column
         };
-        let gutter_min = if plain {
-            GUTTER_MIN_WIDTH / 2.0
-        } else {
-            GUTTER_MIN_WIDTH
-        };
-        let gutter_width = (gutter_text_chars as f32 * char_width
-            + GUTTER_HORIZONTAL_PADDING * 2.0)
-            .max(gutter_min);
         // Inset to the caps: the row already holds half its leading above them.
         let (prefix_width, top_inset) = if plain {
             let caps = TextBox::new(font, text_size, row_height).cap_height();
@@ -132,9 +193,11 @@ impl LayoutMetrics {
             text_y_pad,
             file_header_height,
             hunk_header_height,
+            note_height: row_height + 2.0 * NOTE_VPAD,
             prefix_width,
             top_inset,
             gutter_width,
+            number_column,
             gutter_digit_count,
             char_width,
         }
@@ -224,6 +287,8 @@ pub(super) struct HeightIndex {
     pub(super) media_bands: Vec<(usize, f32, f32)>,
     /// `(file, top)` of each file strip, in document order.
     pub(super) file_strips: Vec<(usize, f32)>,
+    /// `(file, top)` of each file note, in document order.
+    pub(super) note_bands: Vec<(usize, f32)>,
 }
 
 impl HeightIndex {
@@ -393,7 +458,6 @@ pub(super) enum ActionHit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CheckHit {
     File(usize),
-    Hunk(usize, usize),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -730,7 +794,8 @@ impl<'a> View<'a> {
         }
     }
 
-    /// Names which files have a strip, for [`HeightIndex::key`].
+    /// Names which files have a strip or a note and which are folded, for
+    /// [`HeightIndex::key`].
     fn file_strips_key(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -738,6 +803,10 @@ impl<'a> View<'a> {
             for strip in &actions.files {
                 strip.file.hash(&mut hasher);
             }
+        }
+        self.props.folded.hash(&mut hasher);
+        for file in &self.props.files {
+            file.note.is_some().hash(&mut hasher);
         }
         hasher.finish()
     }
@@ -865,6 +934,86 @@ impl<'a> View<'a> {
             .iter()
             .position(|button| button.rect.contains(point))
             .map(|button| ActionHit::Hunk(row, button))
+    }
+
+    /// The button of `file`'s note drawn with its band's top at screen-y `top`: a
+    /// held-back file's "show" button, when the view can expand it.
+    pub(super) fn note_button_rect(
+        &self,
+        file: usize,
+        top: f32,
+        bounds: Rectangle,
+    ) -> Option<Rectangle> {
+        self.props.on_expand_file.as_ref()?;
+        if !self.is_collapsed(file) {
+            return None;
+        }
+        let label = self.file(file)?.note.as_ref()?.action.as_deref()?;
+        let width = measure::line_width(label, NOTE_TEXT_SIZE, self.props.ui_font)
+            + 2.0 * NOTE_BUTTON_PAD_X;
+        Some(Rectangle {
+            x: (bounds.x + bounds.width - HEADER_HORIZONTAL_PADDING - width).round(),
+            y: (top + (self.metrics.note_height - NOTE_BUTTON_HEIGHT) / 2.0).round(),
+            width: width.round(),
+            height: NOTE_BUTTON_HEIGHT,
+        })
+    }
+
+    /// The file whose note button is under `point`.
+    pub(super) fn note_button_at(
+        &self,
+        index: &HeightIndex,
+        vertical_offset: f32,
+        bounds: Rectangle,
+        point: Point,
+    ) -> Option<usize> {
+        if self
+            .file_header_at(index, vertical_offset, bounds, point)
+            .is_some()
+        {
+            return None;
+        }
+        let content_y = point.y - bounds.y + vertical_offset;
+        let slot = index
+            .note_bands
+            .partition_point(|&(_, top)| top <= content_y)
+            .checked_sub(1)?;
+        let (file, top) = index.note_bands[slot];
+        if content_y >= top + self.metrics.note_height {
+            return None;
+        }
+        let rect = self.note_button_rect(file, bounds.y + (top - vertical_offset), bounds)?;
+        rect.contains(point).then_some(file)
+    }
+
+    /// The hunk under `point`: its header or one of its rows.
+    pub(super) fn hunk_at(
+        &self,
+        index: &HeightIndex,
+        vertical_offset: f32,
+        bounds: Rectangle,
+        point: Point,
+    ) -> Option<(usize, usize)> {
+        if !bounds.contains(point) || self.props.plain {
+            return None;
+        }
+        if self
+            .file_header_at(index, vertical_offset, bounds, point)
+            .is_some()
+        {
+            return None;
+        }
+        let content_y = point.y - bounds.y + vertical_offset;
+        let slot = index
+            .hunk_tops
+            .partition_point(|&top| top <= content_y)
+            .checked_sub(1)?;
+        let (file, hunk) = index.hunk_ids[slot];
+        let end = match index.hunk_ids.get(slot + 1) {
+            Some(&(next_file, _)) if next_file == file => index.hunk_tops[slot + 1],
+            _ => *index.file_tops.get(file as usize + 1)?,
+        };
+        (content_y < end).then_some((file as usize, hunk as usize))
     }
 
     pub(super) fn is_collapsed(&self, file_index: usize) -> bool {
@@ -1221,6 +1370,7 @@ impl<'a> View<'a> {
         }
         index.media_bands.clear();
         index.file_strips.clear();
+        index.note_bands.clear();
         index.max_columns = 0.0;
         index.full_width_files = if props.side_by_side {
             self.hunks
@@ -1240,6 +1390,10 @@ impl<'a> View<'a> {
         for (file_index, hunks) in self.hunks.iter().enumerate() {
             index.file_tops.push(y);
             y += self.metrics.file_header_height;
+            if self.is_folded(file_index) {
+                base += hunks.iter().map(|hunk| hunk.lines.len()).sum::<usize>();
+                continue;
+            }
             let strip = self.file_strip_height(file_index);
             if strip > 0.0 {
                 index.file_strips.push((file_index, y));
@@ -1250,6 +1404,16 @@ impl<'a> View<'a> {
                 let height = media::layout(media, width, self.metrics.row_height).height;
                 index.media_bands.push((file_index, y, height));
                 y += height;
+                base += hunks.iter().map(|hunk| hunk.lines.len()).sum::<usize>();
+                continue;
+            }
+            if self
+                .file(file_index)
+                .is_some_and(|file| file.note.is_some())
+            {
+                // The note stands in for the file's rows (placeholders, if any).
+                index.note_bands.push((file_index, y));
+                y += self.metrics.note_height;
                 base += hunks.iter().map(|hunk| hunk.lines.len()).sum::<usize>();
                 continue;
             }
@@ -1445,9 +1609,7 @@ impl<'a> View<'a> {
     /// differ. Each side gets a single-number gutter (old line numbers left, new
     /// right).
     pub(super) fn split_layout(&self, viewport_width: f32) -> SplitLayout {
-        let gutter_width = (self.metrics.gutter_digit_count as f32 * self.metrics.char_width
-            + GUTTER_HORIZONTAL_PADDING * 2.0)
-            .max(GUTTER_MIN_WIDTH * 0.5);
+        let gutter_width = self.metrics.number_column;
         let column_width = ((viewport_width - 1.0) / 2.0).max(1.0);
         // Both columns keep the scrollbar's gutter, so the right one's text stays
         // clear of the bar and the two still wrap alike.
@@ -1934,70 +2096,146 @@ impl<'a> View<'a> {
         (content.chars().count() as f32 * self.metrics.char_width + 16.0).max(1.0)
     }
 
-    /// The right-aligned `+N -N  K Hunks` summary of a file header, and its clamped
-    /// width: shared by the header draw and the browse-button hit test so the two
-    /// agree on geometry.
-    pub(super) fn file_header_summary(
+    /// Where file `file`'s header puts its pieces when drawn with its top at `y`:
+    /// `[fold] [pick] [badge] dir/name … [N hunks] [+a −d] [source] [more]`. Shared
+    /// by the painter and every hit test, so they can't disagree. The counts and
+    /// then the hunk count give way before the path does.
+    pub(super) fn file_header_layout(
         &self,
         file: usize,
+        y: f32,
         bounds: Rectangle,
-    ) -> (String, String, String, f32) {
-        let hunks = self.hunks.get(file).map_or(0, |hunks| hunks.len());
-        let hunk_label = if hunks == 1 {
-            "1 hunk".to_owned()
-        } else {
-            format!("{hunks} hunks")
-        };
-        let (added, deleted) = self
-            .file(file)
-            .map_or((0, 0), |file| (file.additions, file.deletions));
-        let additions = format!("+{added}");
-        let deletions = format!("\u{2212}{deleted}");
-        let mono_width = |content: &str| content.chars().count() as f32 * self.metrics.char_width;
-        let gap = self.metrics.char_width;
-        let summary_width = (mono_width(&additions)
-            + gap
-            + mono_width(&deletions)
-            + 2.0 * gap
-            + mono_width(&hunk_label))
-        .min((bounds.width - 2.0 * HEADER_HORIZONTAL_PADDING).max(1.0));
-        (additions, deletions, hunk_label, summary_width)
-    }
-
-    /// Left edge of a file header's right-aligned summary. Inset like the header's
-    /// leading chip, which also keeps the summary clear of the overlay scrollbar
-    /// riding the pane's right edge.
-    pub(super) fn file_header_summary_x(summary_width: f32, bounds: Rectangle) -> f32 {
-        (bounds.x + bounds.width - HEADER_HORIZONTAL_PADDING - summary_width)
-            .max(bounds.x + HEADER_HORIZONTAL_PADDING)
-    }
-
-    /// Screen rect of a file header's browse button when the header is drawn at
-    /// `header_y`, or `None` when the affordance is off or there's no room.
-    pub(super) fn browse_button_rect(
-        &self,
-        file_index: usize,
-        header_y: f32,
-        bounds: Rectangle,
-    ) -> Option<Rectangle> {
-        self.props.on_browse_file.as_ref()?;
-        if self.props.plain {
-            return None;
-        }
-        self.file(file_index)?;
-        let (_, _, _, summary_width) = self.file_header_summary(file_index, bounds);
-        let summary_x = Self::file_header_summary_x(summary_width, bounds);
-        let size = BROWSE_BUTTON_SIZE;
-        let x = summary_x - 10.0 - size;
-        let y = header_y + (self.metrics.file_header_height - size) / 2.0;
-        // Vanishes rather than colliding with the title when the pane is squeezed
-        // to nothing.
-        (x > bounds.x + 48.0).then_some(Rectangle {
+    ) -> Option<FileHeaderLayout> {
+        let view = self.file(file)?;
+        let height = self.metrics.file_header_height;
+        let control = |x: f32, side: f32| Rectangle {
             x,
-            y,
-            width: size,
-            height: size,
+            y: (y + (height - side) / 2.0).round(),
+            width: side,
+            height: side,
+        };
+        let line_top = y + (height - self.metrics.row_height) / 2.0 + self.metrics.text_y_pad;
+        let baseline = line_top
+            + TextBox::new(
+                self.props.font,
+                self.props.typography.size,
+                self.metrics.row_height,
+            )
+            .baseline();
+
+        let mut x = bounds.x + FILE_HEADER_PAD_LEFT;
+        let fold = control(x, FILE_CONTROL_SIZE);
+        x += FILE_CONTROL_SIZE + FILE_HEADER_GAP;
+        let check = self
+            .props
+            .marks
+            .as_ref()
+            .filter(|marks| marks.files.get(file).is_some())
+            .map(|_| {
+                let rect = control(x, CHECK_SIZE);
+                x += CHECK_SIZE + FILE_HEADER_GAP;
+                rect
+            });
+        let badge = crate::status_badge::rect(
+            x,
+            crate::status_badge::center_for_baseline(self.props.font, baseline),
+        );
+        x += badge.width + FILE_HEADER_GAP;
+        let title_x = x;
+
+        let mut right = bounds.x + bounds.width - FILE_HEADER_PAD_RIGHT;
+        let more = self.props.on_file_menu.as_ref().map(|_| {
+            right -= FILE_CONTROL_SIZE;
+            control(right, FILE_CONTROL_SIZE)
+        });
+        let browse = self.props.on_browse_file.as_ref().map(|_| {
+            right -= FILE_CONTROL_SIZE + if more.is_some() { 2.0 } else { 0.0 };
+            control(right, FILE_CONTROL_SIZE)
+        });
+        if browse.is_some() || more.is_some() {
+            right -= FILE_HEADER_META_GAP;
+        }
+        let meta = |text: &str| measure::line_width(text, self.meta_size(), self.props.font);
+        let mut stats: Vec<(String, StatKind)> = Vec::new();
+        if view.additions > 0 {
+            stats.push((format!("+{}", view.additions), StatKind::Added));
+        }
+        if view.deletions > 0 {
+            stats.push((format!("\u{2212}{}", view.deletions), StatKind::Deleted));
+        }
+        if stats.is_empty()
+            && let Some(tag) = &view.tag
+        {
+            stats.push((tag.clone(), StatKind::Tag));
+        }
+        let stats_width = stats.iter().map(|(text, _)| meta(text)).sum::<f32>()
+            + FILE_HEADER_STAT_GAP * stats.len().saturating_sub(1) as f32;
+        let hunk_count = self.real_hunk_count(file);
+        let hunks = (hunk_count > 0).then(|| {
+            if hunk_count == 1 {
+                "1 hunk".to_owned()
+            } else {
+                format!("{hunk_count} hunks")
+            }
+        });
+        let hunks_width = hunks.as_deref().map_or(0.0, meta);
+        // The path keeps at least this much before the meta gives way.
+        let min_title = 12.0 * self.metrics.char_width;
+        let fits = |used: f32| right - used - FILE_HEADER_GAP - title_x >= min_title;
+        let with_stats = stats_width > 0.0 && fits(stats_width);
+        let used_stats = if with_stats {
+            stats_width + FILE_HEADER_META_GAP
+        } else {
+            0.0
+        };
+        let with_hunks = hunks_width > 0.0 && fits(used_stats + hunks_width);
+        let mut placed_stats = Vec::new();
+        if with_stats {
+            let mut at = right - stats_width;
+            for (text, kind) in stats {
+                let width = meta(&text);
+                placed_stats.push((text, at, kind));
+                at += width + FILE_HEADER_STAT_GAP;
+            }
+            right -= used_stats;
+        }
+        let hunks = hunks.filter(|_| with_hunks).map(|text| {
+            right -= hunks_width;
+            let at = right;
+            right -= FILE_HEADER_META_GAP;
+            (text, at)
+        });
+        Some(FileHeaderLayout {
+            fold,
+            check,
+            badge,
+            title_x,
+            title_right: (right - FILE_HEADER_GAP).max(title_x + 1.0),
+            line_top,
+            baseline,
+            hunks,
+            stats: placed_stats,
+            browse,
+            more,
         })
+    }
+
+    /// The size of a file header's counts and hunk count: a step under the code.
+    pub(super) fn meta_size(&self) -> f32 {
+        (self.props.typography.size - 1.0).max(9.0)
+    }
+
+    /// How many of `file`'s hunks are real ones, with rows: placeholders stand in
+    /// for a binary or a held-back file.
+    pub(super) fn real_hunk_count(&self, file: usize) -> usize {
+        self.hunks.get(file).map_or(0, |hunks| {
+            hunks.iter().filter(|hunk| !hunk.lines.is_empty()).count()
+        })
+    }
+
+    /// Whether `file`'s body is folded away under its header.
+    pub(super) fn is_folded(&self, file: usize) -> bool {
+        self.props.folded.get(file).copied().unwrap_or(false)
     }
 
     /// `(file index, header screen y)` for every file header currently visible, with
@@ -2043,53 +2281,28 @@ impl<'a> View<'a> {
         out
     }
 
-    /// The browse button under `point`, if any.
-    pub(super) fn browse_button_at(
+    /// The file header under `point`, and the control in it the point is on.
+    pub(super) fn file_header_at(
         &self,
         index: &HeightIndex,
         vertical_offset: f32,
         bounds: Rectangle,
         point: Point,
-    ) -> Option<usize> {
-        self.props.on_browse_file.as_ref()?;
-        self.visible_file_header_positions(index, bounds, vertical_offset)
+    ) -> Option<(usize, Option<FileControl>)> {
+        let (file, y) = self
+            .visible_file_header_positions(index, bounds, vertical_offset)
             .into_iter()
-            .find_map(|(file_index, y)| {
-                self.browse_button_rect(file_index, y, bounds)
-                    .filter(|rect| rect.contains(point))
-                    .map(|_| file_index)
-            })
-    }
-
-    /// Screen rect of a file header's checkbox when the header is drawn at
-    /// `header_y`, or `None` when the checkboxes are off.
-    pub(super) fn file_check_rect(
-        &self,
-        file_index: usize,
-        header_y: f32,
-        bounds: Rectangle,
-    ) -> Option<Rectangle> {
-        let marks = self.props.marks.as_ref()?;
-        if self.props.plain || marks.files.get(file_index).is_none() {
-            return None;
-        }
-        Some(Rectangle {
-            x: bounds.x + HEADER_HORIZONTAL_PADDING,
-            y: header_y + (self.metrics.file_header_height - CHECK_SIZE) / 2.0,
-            width: CHECK_SIZE,
-            height: CHECK_SIZE,
-        })
-    }
-
-    /// Screen rect of a hunk header's checkbox (in the gutter band), on the same
-    /// vertical axis as the file header's.
-    pub(super) fn hunk_check_rect(&self, header_y: f32, bounds: Rectangle) -> Rectangle {
-        Rectangle {
-            x: bounds.x + HEADER_HORIZONTAL_PADDING,
-            y: header_y + (self.metrics.hunk_header_height - CHECK_SIZE) / 2.0,
-            width: CHECK_SIZE,
-            height: CHECK_SIZE,
-        }
+            .find(|&(_, y)| point.y >= y && point.y < y + self.metrics.file_header_height)?;
+        let layout = self.file_header_layout(file, y, bounds)?;
+        let control = [
+            (Some(layout.fold), FileControl::Fold),
+            (layout.check.map(|rect| grow(rect, 3.0)), FileControl::Check),
+            (layout.browse, FileControl::Browse),
+            (layout.more, FileControl::More),
+        ]
+        .into_iter()
+        .find_map(|(rect, control)| rect.filter(|rect| rect.contains(point)).map(|_| control));
+        Some((file, control))
     }
 
     /// How much of hunk `(file, hunk)` is picked, or `None` when it has no checkbox.
@@ -2190,8 +2403,8 @@ impl<'a> View<'a> {
         self.line_mark(at).map(|_| (at, lane))
     }
 
-    /// The checkbox under `point`, if any. File headers (the pinned sticky one
-    /// included) win over the hunk headers scrolling beneath them.
+    /// The file header checkbox under `point`, if any (the pinned sticky header
+    /// included).
     pub(super) fn check_at(
         &self,
         index: &HeightIndex,
@@ -2203,38 +2416,8 @@ impl<'a> View<'a> {
         if self.props.plain {
             return None;
         }
-        let headers = self.visible_file_header_positions(index, bounds, vertical_offset);
-        let mut over_file_header = false;
-        for (file_index, y) in headers {
-            if point.y >= y && point.y < y + self.metrics.file_header_height {
-                over_file_header = true;
-                if self
-                    .file_check_rect(file_index, y, bounds)
-                    .is_some_and(|rect| grow(rect, 3.0).contains(point))
-                {
-                    return Some(CheckHit::File(file_index));
-                }
-            }
-        }
-        if over_file_header {
-            return None;
-        }
-        let content_y = point.y - bounds.y + vertical_offset;
-        let slot = index
-            .hunk_tops
-            .partition_point(|&top| top <= content_y)
-            .checked_sub(1)?;
-        let top = index.hunk_tops[slot];
-        if content_y >= top + self.metrics.hunk_header_height {
-            return None;
-        }
-        let (file, hunk) = index.hunk_ids[slot];
-        let (file, hunk) = (file as usize, hunk as usize);
-        self.hunk_mark(file, hunk)?;
-        let y = bounds.y + (top - vertical_offset);
-        grow(self.hunk_check_rect(y, bounds), 3.0)
-            .contains(point)
-            .then_some(CheckHit::Hunk(file, hunk))
+        let (file, control) = self.file_header_at(index, vertical_offset, bounds, point)?;
+        (control == Some(FileControl::Check)).then_some(CheckHit::File(file))
     }
 }
 

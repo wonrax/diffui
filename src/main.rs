@@ -669,6 +669,9 @@ pub(crate) struct TabState {
     pub(crate) files_panel_collapsed: bool,
     /// Collapsed directories of the sidebar file tree, by full path prefix.
     pub(crate) collapsed_dirs: HashSet<String>,
+    /// Files folded to their headers in the diff, by path, and the diff they
+    /// were folded in (see `diff_panel::folded_files`).
+    pub(crate) folded_files: (String, HashSet<String>),
     pub(crate) selected_file: usize,
     /// Bumped whenever the user picks a revision through a path that doesn't go
     /// through the revision list (currently: the palette). The sidebar's
@@ -760,6 +763,7 @@ impl TabState {
             history_panel_collapsed: false,
             files_panel_collapsed: false,
             collapsed_dirs: HashSet::new(),
+            folded_files: (String::new(), HashSet::new()),
             selected_file: 0,
             revision_reveal_token: 0,
             pending_revision_reveal: false,

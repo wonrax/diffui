@@ -980,6 +980,7 @@ fn file_strip(
         for pick in picks(conflict) {
             takes.push(Button {
                 runs: term_runs(conflict, pick, font, mono, theme),
+                tone: crate::hunk_actions::Tone::Raised,
             });
             buttons.push(FileButton::Take(pick));
         }
@@ -998,6 +999,7 @@ fn file_strip(
                 color: theme.muted_text,
             }),
             buttons: takes,
+            hover: false,
         },
     };
     (strip, buttons)
@@ -1041,6 +1043,7 @@ pub(crate) fn hunk_actions(
             .into_iter()
             .map(|pick| Button {
                 runs: term_runs(conflict, pick, font, mono, theme),
+                tone: crate::hunk_actions::Tone::Raised,
             })
             .collect();
         rows.push(Row {
@@ -1053,6 +1056,7 @@ pub(crate) fn hunk_actions(
                 color: theme.muted_text,
             }),
             buttons,
+            hover: false,
         });
         targets.push((path.to_owned(), at.region, at.regions, picks(conflict)));
     }
@@ -1066,6 +1070,7 @@ pub(crate) fn hunk_actions(
             ghost_hover_fill: crate::theme::ghost_button_style(theme).hover,
             border: theme.border,
             focus: theme.accent,
+            on_fill: theme.accent,
             radius: crate::theme::radius::BUTTON,
         },
         on_press: std::rc::Rc::new(Diffui::listen(

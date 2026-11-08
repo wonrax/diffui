@@ -21,10 +21,11 @@ use gpui_kit::{
 };
 
 use super::element::State;
+use super::layout;
 use super::layout::{
-    ActionHit, BROWSE_BUTTON_SIZE, CHECK_GAP, CHECK_SIZE, GUTTER_HORIZONTAL_PADDING,
-    HEADER_CHIP_GAP, HEADER_EDIT_WIDTH, HEADER_LABEL_GAP, HeightIndex, NO_LINE, PREFIX_WIDTH,
-    SplitLayout, SplitSide, TEXT_X_PADDING, TextPosition, View, VisibleRow, body_position,
+    ActionHit, FileControl, FileHeaderLayout, GUTTER_HORIZONTAL_PADDING, HEADER_CHIP_GAP,
+    HEADER_EDIT_WIDTH, HEADER_LABEL_GAP, HeightIndex, NO_LINE, PREFIX_WIDTH, SplitLayout,
+    SplitSide, StatKind, TEXT_X_PADDING, TextPosition, View, VisibleRow, body_position,
     header_position, matches_between, matches_on_line, ordered,
 };
 use super::line::{GeometryMemo, LineGeometry, body_geometry_key};
@@ -38,6 +39,7 @@ use crate::geometry::{Point, Rectangle};
 use crate::hunk_actions::{self, FilePlaced, Placed, Run};
 use crate::icons;
 use crate::measure;
+use crate::status_badge;
 use crate::theme::{self, Color, Font};
 use crate::typography::TextBox;
 
@@ -298,6 +300,29 @@ impl Plan {
         width
     }
 
+    /// A file's status badge in `rect` (see [`status_badge`]).
+    fn status_badge(
+        &mut self,
+        badge: &status_badge::StatusBadge,
+        mono: Font,
+        rect: Rectangle,
+        clip: Rectangle,
+    ) {
+        self.rounded(rect, status_badge::RADIUS, status_badge::fill_color(badge));
+        let font = status_badge::font(mono);
+        let width = measure::line_width(badge.letter, status_badge::TEXT_SIZE, font);
+        self.line(
+            badge.letter,
+            font,
+            status_badge::TEXT_SIZE,
+            rect.center_x() - width / 2.0,
+            status_badge::letter_top(mono, rect),
+            rect.height,
+            badge.ink,
+            clip,
+        );
+    }
+
     /// Paints a change-selection checkbox; see [`paint_checkbox`].
     #[allow(clippy::too_many_arguments)]
     fn checkbox(
@@ -374,24 +399,6 @@ fn text_run(len: usize, font: Font, color: Color) -> TextRun {
         underline: None,
         strikethrough: None,
     }
-}
-
-fn format_gutter(old_line: Option<usize>, new_line: Option<usize>, digit_count: usize) -> String {
-    use core::fmt::Write as _;
-    // Two right-aligned, space-padded columns in one buffer.
-    let mut out = String::with_capacity(digit_count * 2 + 1);
-    if let Some(line) = old_line {
-        let _ = write!(out, "{line:>digit_count$}");
-    } else {
-        out.extend(std::iter::repeat_n(' ', digit_count));
-    }
-    out.push(' ');
-    if let Some(line) = new_line {
-        let _ = write!(out, "{line:>digit_count$}");
-    } else {
-        out.extend(std::iter::repeat_n(' ', digit_count));
-    }
-    out
 }
 
 /// Single right-aligned line-number column for plain source documents.
@@ -507,6 +514,39 @@ impl View<'_> {
             color,
             clip,
         )
+    }
+
+    /// A line number right-aligned in its column, which ends at `column_right`.
+    fn line_number(
+        &self,
+        plan: &mut Plan,
+        number: usize,
+        column_right: f32,
+        top: f32,
+        color: Color,
+        clip: Rectangle,
+    ) {
+        let text = number.to_string();
+        let width = text.len() as f32 * self.metrics.char_width;
+        self.code_line(
+            plan,
+            &text,
+            column_right - layout::NUMBER_PAD_RIGHT - width,
+            top,
+            color,
+            clip,
+        );
+    }
+
+    /// A line number's colour: the change's own on a changed line, receding
+    /// elsewhere.
+    fn number_color(&self, kind: DiffLineKind) -> Color {
+        let palette = &self.props.palette;
+        match kind {
+            DiffLineKind::Addition => palette.addition_text,
+            DiffLineKind::Deletion => palette.deletion_text,
+            _ => palette.text_muted,
+        }
     }
 
     /// Where the baseline of code text drawn with its line box's top at `line_top`
@@ -914,7 +954,8 @@ impl View<'_> {
                 ),
             ];
             for (member, x, width) in halves {
-                let color = if member == NO_LINE {
+                let changed = member != NO_LINE;
+                let color = if !changed {
                     padded.push(Rectangle {
                         x,
                         y: row.y,
@@ -931,6 +972,9 @@ impl View<'_> {
                 };
                 if let Some(color) = color {
                     plan.rect(x, row.y, width, row.height, color);
+                    if changed {
+                        plan.rect(x, row.y, split.gutter_width, row.height, color);
+                    }
                 }
             }
         }
@@ -996,13 +1040,6 @@ impl View<'_> {
     ) {
         let metrics = &self.metrics;
         let text_color = self.line_text_color(line.kind);
-        // Plain source documents have one side, so a single right-aligned line-number
-        // column (the metrics sized the gutter to match).
-        let gutter = if self.props.plain {
-            format_gutter_plain(line.new_line, metrics.gutter_digit_count)
-        } else {
-            format_gutter(line.old_line, line.new_line, metrics.gutter_digit_count)
-        };
         let annotation_width = self.annotation_width();
         if annotation_width > 0.0
             && let Some(gutter) = &self.props.annotations
@@ -1014,14 +1051,27 @@ impl View<'_> {
             self.draw_annotation(plan, gutter, label, bounds, row.y);
         }
         let text_top = row.y + metrics.text_y_pad;
-        self.code_line(
-            plan,
-            &gutter,
-            bounds.x + annotation_width + GUTTER_HORIZONTAL_PADDING,
-            text_top,
-            self.props.palette.text_muted,
-            bounds,
-        );
+        if self.props.plain {
+            // Plain source documents have one side, so a single right-aligned
+            // line-number column (the metrics sized the gutter to match).
+            let gutter = format_gutter_plain(line.new_line, metrics.gutter_digit_count);
+            self.code_line(
+                plan,
+                &gutter,
+                bounds.x + annotation_width + GUTTER_HORIZONTAL_PADDING,
+                text_top,
+                self.props.palette.text_muted,
+                bounds,
+            );
+        } else {
+            let color = self.number_color(line.kind);
+            for (column, number) in [line.old_line, line.new_line].into_iter().enumerate() {
+                if let Some(number) = number {
+                    let right = bounds.x + (column + 1) as f32 * metrics.number_column;
+                    self.line_number(plan, number, right, text_top, color, bounds);
+                }
+            }
+        }
         if !self.props.plain {
             self.code_line(
                 plan,
@@ -1120,15 +1170,9 @@ impl View<'_> {
             let text_color = self.line_text_color(line.kind);
             let text_top = row.y + metrics.text_y_pad;
             if let Some(number) = number {
-                let digits = metrics.gutter_digit_count;
-                self.code_line(
-                    plan,
-                    &format!("{number:>digits$}"),
-                    bounds.x + gutter_x + GUTTER_HORIZONTAL_PADDING,
-                    text_top,
-                    self.props.palette.text_muted,
-                    bounds,
-                );
+                let right = bounds.x + gutter_x + split.gutter_width;
+                let color = self.number_color(line.kind);
+                self.line_number(plan, number, right, text_top, color, bounds);
             }
             self.code_line(
                 plan,
@@ -1737,30 +1781,27 @@ impl View<'_> {
         }
     }
 
-    /// One file's header strip (background + bottom border + title + stats) at screen-y
-    /// `y`. Shared by the normal scrolling draw and the pinned sticky draw.
+    /// One file's header strip at screen-y `y`: `[fold] [pick] [badge] dir/name …
+    /// [N hunks] [+a −d] [source] [more]` (see [`View::file_header_layout`]). Shared
+    /// by the normal scrolling draw and the pinned sticky draw. `hovered` is set when
+    /// the cursor is on this header, with the control it is on.
     fn draw_file_header(
         &self,
         plan: &mut Plan,
         file_index: usize,
         y: f32,
         bounds: Rectangle,
-        browse_hovered: bool,
+        hovered: Option<Option<FileControl>>,
     ) {
         let Some(file) = self.file(file_index) else {
             return;
         };
+        let Some(layout) = self.file_header_layout(file_index, y, bounds) else {
+            return;
+        };
         let palette = &self.props.palette;
         let metrics = &self.metrics;
-        let (additions, deletions, hunk_label, summary_width) =
-            self.file_header_summary(file_index, bounds);
-        // Tight monospace widths (like the bookmark chips): `text_width` adds breathing
-        // room meant for wrapped text.
-        let mono_width = |content: &str| content.chars().count() as f32 * metrics.char_width;
-        let gap = metrics.char_width;
-        let additions_width = mono_width(&additions);
-        let deletions_width = mono_width(&deletions);
-        let hunk_width = mono_width(&hunk_label);
+        let folded = self.is_folded(file_index);
 
         plan.rect(
             bounds.x,
@@ -1777,101 +1818,12 @@ impl View<'_> {
             palette.border,
         );
 
-        let text_y =
-            centered_text_y(y, metrics.file_header_height, metrics.row_height) + metrics.text_y_pad;
-        let check_reserve = if let Some(rect) = self.file_check_rect(file_index, y, bounds) {
-            let state = self
-                .props
-                .marks
-                .as_ref()
-                .and_then(|marks| marks.files.get(file_index))
-                .map(|mark| mark.state)
-                .unwrap_or_default();
-            self.draw_check(plan, rect, state, bounds);
-            CHECK_SIZE + CHECK_GAP
-        } else {
-            0.0
-        };
-        let status_chip = Chip {
-            label: file.status.short_label().to_owned(),
-            font: self.props.font,
-            background: file.status_fill,
-            text_color: file.status_color,
-            border_color: None,
-            border_dashed: false,
-            icon: None,
-            icon_color: None,
-            suffix: None,
-        };
-        let chip_w = plan.chip(
-            &status_chip,
-            bounds.x + HEADER_HORIZONTAL_PADDING + check_reserve,
-            chip::center_for_baseline(&status_chip, self.code_baseline(text_y)),
-            bounds,
-        );
-
-        let browse_rect = self.browse_button_rect(file_index, y, bounds);
-        let browse_reserve = if browse_rect.is_some() {
-            BROWSE_BUTTON_SIZE + 10.0
-        } else {
-            0.0
-        };
-        let title_x = bounds.x + HEADER_HORIZONTAL_PADDING + check_reserve + chip_w + 8.0;
-        let title_width = (bounds.x + bounds.width
-            - HEADER_HORIZONTAL_PADDING
-            - summary_width
-            - 16.0
-            - browse_reserve
-            - title_x)
-            .max(1.0);
-        let title_clip = Rectangle {
-            x: title_x,
-            width: title_width,
-            ..bounds
-        };
-        // Dim the directory prefix so the basename carries the header: the path tail is
-        // what distinguishes files at a glance. Renames ("old -> new") and squeezed
-        // headers fall back to one plain run.
-        let split_at = (!file.title.contains(" -> "))
-            .then(|| file.title.rfind('/').map(|i| i + 1))
-            .flatten()
-            .filter(|&i| mono_width(&file.title) <= title_width && i < file.title.len());
-        if let Some(split) = split_at {
-            let (dir, base) = file.title.split_at(split);
-            self.code_line(plan, dir, title_x, text_y, palette.text_muted, title_clip);
-            self.code_line(
-                plan,
-                base,
-                title_x + mono_width(dir),
-                text_y,
-                palette.text,
-                title_clip,
-            );
-        } else {
-            // Long one-line text ellipsises; it never runs into the next column.
-            let fits = (title_width / metrics.char_width).floor() as usize;
-            let cut;
-            let title = if file.title.chars().count() > fits {
-                cut = file
-                    .title
-                    .chars()
-                    .take(fits.saturating_sub(1))
-                    .chain(std::iter::once('\u{2026}'))
-                    .collect::<String>();
-                cut.as_str()
-            } else {
-                file.title.as_str()
-            };
-            self.code_line(plan, title, title_x, text_y, palette.text, title_clip);
-        }
-
-        if let Some(rect) = browse_rect {
-            // Hover wash mirrors the app's ghost buttons: a translucent muted-text tint
-            // behind the glyph.
-            if browse_hovered {
+        let control_hovered = |control: FileControl| hovered == Some(Some(control));
+        let icon_button = |plan: &mut Plan, rect: Rectangle, glyph: &str, hover: bool| {
+            if hover {
                 plan.rounded(
                     rect,
-                    theme::radius::CONTROL,
+                    theme::radius::XS,
                     Color {
                         a: 0.14,
                         ..palette.text_muted
@@ -1879,45 +1831,318 @@ impl View<'_> {
                 );
             }
             plan.icon(
-                icons::CODE,
+                glyph,
                 BROWSE_ICON_SIZE,
                 rect,
-                if browse_hovered {
+                if hover {
                     palette.text
                 } else {
                     palette.text_muted
                 },
                 bounds,
             );
+        };
+        icon_button(
+            plan,
+            layout.fold,
+            if folded {
+                icons::CHEVRON_RIGHT
+            } else {
+                icons::CHEVRON_DOWN
+            },
+            control_hovered(FileControl::Fold),
+        );
+        if let Some(rect) = layout.check {
+            let state = self
+                .props
+                .marks
+                .as_ref()
+                .and_then(|marks| marks.files.get(file_index))
+                .map(|mark| mark.state)
+                .unwrap_or_default();
+            let picking = self.props.marks.as_ref().is_some_and(|marks| marks.picking);
+            // Out of the way until it's wanted: on hover, or while anything is picked.
+            if hovered.is_some() || picking || state != CheckState::Off {
+                self.draw_check(plan, rect, state, bounds);
+            }
         }
+        plan.status_badge(
+            &status_badge::StatusBadge {
+                letter: file.status.short_label(),
+                ink: file.status_color,
+            },
+            self.props.font,
+            layout.badge,
+            bounds,
+        );
 
-        let summary_x = View::file_header_summary_x(summary_width, bounds);
-        let segments = [
-            // Zero counts go quiet, like the changed-files list's.
+        self.draw_file_path(plan, file, &layout, bounds);
+
+        let meta_size = self.meta_size();
+        let meta_line = TextBox::new(self.props.font, meta_size, metrics.row_height);
+        let meta_top = layout.baseline - meta_line.baseline();
+        if let Some((text, x)) = &layout.hunks {
+            plan.line(
+                text,
+                self.props.font,
+                meta_size,
+                *x,
+                meta_top,
+                metrics.row_height,
+                palette.text_muted,
+                bounds,
+            );
+        }
+        for (text, x, kind) in &layout.stats {
+            let color = match kind {
+                StatKind::Added => palette.addition_text,
+                StatKind::Deleted => palette.deletion_text,
+                StatKind::Tag => palette.text_muted,
+            };
+            plan.line(
+                text,
+                self.props.font,
+                meta_size,
+                *x,
+                meta_top,
+                metrics.row_height,
+                color,
+                bounds,
+            );
+        }
+        if let Some(rect) = layout.browse {
+            icon_button(
+                plan,
+                rect,
+                icons::CODE,
+                control_hovered(FileControl::Browse),
+            );
+        }
+        if let Some(rect) = layout.more {
+            icon_button(
+                plan,
+                rect,
+                icons::ELLIPSIS,
+                control_hovered(FileControl::More),
+            );
+        }
+    }
+
+    /// A file header's path: the directory in the muted colour, the name in the text
+    /// colour at semibold, ellipsised from the front of the directory so the name
+    /// stays. A rename shows `old -> new` in one muted run with the new name bold.
+    fn draw_file_path(
+        &self,
+        plan: &mut Plan,
+        file: &super::DiffFileView,
+        layout: &FileHeaderLayout,
+        bounds: Rectangle,
+    ) {
+        let palette = &self.props.palette;
+        let size = self.props.typography.size;
+        let regular = self.props.font;
+        let bold = theme::emphasis_font(regular, theme::Weight::SEMIBOLD);
+        let available = (layout.title_right - layout.title_x).max(1.0);
+        let clip = Rectangle {
+            x: layout.title_x,
+            width: available,
+            ..bounds
+        };
+        let split = file.title.rfind('/').map_or(0, |at| at + 1);
+        let (dir, name) = file.title.split_at(split);
+        let name_width = measure::line_width(name, size, bold);
+        let gone = file.status == super::DiffFileStatus::Deleted;
+        let name_color = if gone {
+            palette.text_muted
+        } else {
+            palette.text
+        };
+        let (dir, name) = if name_width >= available {
+            (String::new(), truncate_end(name, size, bold, available))
+        } else {
             (
-                additions.as_str(),
-                additions_width,
-                if file.additions == 0 {
-                    palette.text_muted
+                truncate_start(dir, size, regular, available - name_width),
+                name.to_owned(),
+            )
+        };
+        let dir_width = plan.line(
+            &dir,
+            regular,
+            size,
+            layout.title_x,
+            layout.line_top,
+            self.metrics.row_height,
+            palette.text_muted,
+            clip,
+        );
+        let name_x = layout.title_x + dir_width;
+        let drawn = plan.line(
+            &name,
+            bold,
+            size,
+            name_x,
+            layout.line_top,
+            self.metrics.row_height,
+            name_color,
+            clip,
+        );
+        if gone {
+            let x_height = 0.52 * size;
+            plan.rect(
+                name_x,
+                (layout.baseline - x_height / 2.0).round(),
+                drawn.min(available - dir_width),
+                1.0,
+                palette.text_muted,
+            );
+        }
+    }
+
+    /// A hunk header's text: `@@` centred in the gutter in the accent, the ranges
+    /// after it, then the enclosing function. A header that isn't a range (a
+    /// placeholder, a conflict region's) is drawn whole, as it comes.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_hunk_title(
+        &self,
+        plan: &mut Plan,
+        header: &str,
+        y: f32,
+        gutter: f32,
+        text_x: f32,
+        emphasized: bool,
+        clip: Rectangle,
+        bounds: Rectangle,
+    ) {
+        let palette = &self.props.palette;
+        let metrics = &self.metrics;
+        let font = self.props.font;
+        let size = self.meta_size();
+        let height = metrics.hunk_header_height;
+        let top = y + TextBox::new(font, size, height).trim_shift();
+        let Some((ranges, context)) = split_hunk_header(header) else {
+            self.code_line(
+                plan,
+                header,
+                text_x,
+                centered_text_y(y, height, metrics.row_height) + metrics.text_y_pad,
+                if emphasized {
+                    palette.text
                 } else {
-                    palette.addition_text
-                },
-            ),
-            (
-                deletions.as_str(),
-                deletions_width,
-                if file.deletions == 0 {
                     palette.text_muted
-                } else {
-                    palette.deletion_text
                 },
-            ),
-            (hunk_label.as_str(), hunk_width, palette.text_muted),
-        ];
-        let mut segment_x = summary_x;
-        for (index, (content, width, color)) in segments.into_iter().enumerate() {
-            self.code_line(plan, content, segment_x, text_y, color, bounds);
-            segment_x += width + if index == 0 { gap } else { 2.0 * gap };
+                clip,
+            );
+            return;
+        };
+        let marker_width = measure::line_width("@@", size, font);
+        plan.line(
+            "@@",
+            font,
+            size,
+            bounds.x + (gutter - marker_width) / 2.0,
+            top,
+            height,
+            palette.accent,
+            bounds,
+        );
+        let ranges_width = plan.line(
+            ranges,
+            font,
+            size,
+            text_x,
+            top,
+            height,
+            palette.text_muted,
+            clip,
+        );
+        if !context.is_empty() {
+            plan.line(
+                context,
+                font,
+                size,
+                text_x + ranges_width + 2.0 * metrics.char_width,
+                top,
+                height,
+                palette.text,
+                clip,
+            );
+        }
+    }
+
+    /// A file note at screen-y `top`: its icon, its runs, and its button.
+    fn draw_note(
+        &self,
+        plan: &mut Plan,
+        file: usize,
+        top: f32,
+        bounds: Rectangle,
+        button_hovered: bool,
+    ) {
+        let Some(note) = self.file(file).and_then(|file| file.note.as_ref()) else {
+            return;
+        };
+        let palette = &self.props.palette;
+        let height = self.metrics.note_height;
+        let ui = self.props.ui_font;
+        let mono = self.props.font;
+        // Over the gutter's band and edge: a note has no line numbers.
+        plan.rect(bounds.x, top, bounds.width, height, palette.panel);
+        let center_y = top + height / 2.0;
+        let line = TextBox::new(ui, layout::NOTE_TEXT_SIZE, height);
+        let baseline = line.baseline_for_center(center_y);
+        let icon_size = 14.0;
+        let mut x = bounds.x + layout::NOTE_INSET;
+        plan.icon(
+            note.icon,
+            icon_size,
+            Rectangle {
+                x,
+                y: center_y - icon_size / 2.0,
+                width: icon_size,
+                height: icon_size,
+            },
+            palette.text_muted,
+            bounds,
+        );
+        x += icon_size + 10.0;
+        let button = self.note_button_rect(file, top, bounds);
+        let clip = Rectangle {
+            x,
+            width: (button.map_or(bounds.x + bounds.width, |rect| rect.x - 8.0) - x).max(1.0),
+            ..bounds
+        };
+        for (text, code) in &note.runs {
+            let (font, size, color) = if *code {
+                (mono, self.meta_size(), palette.text)
+            } else {
+                (ui, layout::NOTE_TEXT_SIZE, palette.text_muted)
+            };
+            let line_top = baseline - TextBox::new(font, size, height).baseline();
+            x += plan.line(text, font, size, x, line_top, height, color, clip);
+        }
+        if let (Some(rect), Some(label)) = (button, note.action.as_deref()) {
+            plan.boxed(
+                rect,
+                theme::radius::BUTTON,
+                if button_hovered {
+                    palette.hunk_header
+                } else {
+                    palette.file_header
+                },
+                palette.border,
+                BorderStyle::Solid,
+            );
+            let label_line = TextBox::new(ui, layout::NOTE_TEXT_SIZE, rect.height);
+            plan.line(
+                label,
+                ui,
+                layout::NOTE_TEXT_SIZE,
+                rect.x + layout::NOTE_BUTTON_PAD_X,
+                label_line.baseline_for_center(rect.center_y()) - label_line.baseline(),
+                rect.height,
+                palette.text,
+                bounds,
+            );
         }
     }
 
@@ -2246,6 +2471,11 @@ impl View<'_> {
         for &(kind, y, height) in &bands {
             if let Some(background) = self.changed_line_background_color(kind) {
                 plan.rect(bounds.x, y, bounds.width, height, background);
+                // The number cells a step stronger, so a change reads down the
+                // gutter too.
+                if !props.plain {
+                    plan.rect(bounds.x, y, metrics.gutter_width, height, background);
+                }
             }
         }
         if let Some(split) = &split {
@@ -2265,6 +2495,21 @@ impl View<'_> {
                 if let Some(preview) = props.media_of(file_index) {
                     media::draw(self, plan, preview, bounds.y + (top - visible_top), bounds);
                 }
+            }
+            let first = height_index
+                .note_bands
+                .partition_point(|&(_, top)| top + metrics.note_height < visible_top);
+            for &(file_index, top) in &height_index.note_bands[first..] {
+                if top > visible_bottom {
+                    break;
+                }
+                self.draw_note(
+                    plan,
+                    file_index,
+                    bounds.y + (top - visible_top),
+                    bounds,
+                    state.hovered_note_button == Some(file_index),
+                );
             }
         }
 
@@ -2313,7 +2558,7 @@ impl View<'_> {
                     file_index,
                     bounds.y + (top - visible_top),
                     bounds,
-                    state.hovered_browse == Some(file_index),
+                    state.header_hover(file_index),
                 );
             }
 
@@ -2339,30 +2584,43 @@ impl View<'_> {
                     metrics.hunk_header_height,
                     palette.hunk_header,
                 );
+                let picked = self
+                    .hunk_mark(file_index, hunk_index)
+                    .is_some_and(|mark| mark != CheckState::Off);
+                if picked {
+                    plan.rect(
+                        bounds.x,
+                        y,
+                        bounds.width,
+                        metrics.hunk_header_height,
+                        Color {
+                            a: 0.14,
+                            ..palette.accent
+                        },
+                    );
+                }
                 let (header_x, header_clip) = if height_index.is_full_width(file_index) {
                     (unified_region_x, unified_clip)
                 } else {
                     (text_region_x, content_clip)
                 };
-                self.code_line(
+                let gutter = header_x - metrics.prefix_width;
+                self.draw_hunk_title(
                     plan,
                     &hunk.header,
+                    y,
+                    gutter,
                     bounds.x + header_x + TEXT_X_PADDING,
-                    centered_text_y(y, metrics.hunk_header_height, metrics.row_height)
-                        + metrics.text_y_pad,
-                    if self.is_collapsed(file_index) {
-                        palette.text
-                    } else {
-                        palette.text_muted
-                    },
+                    self.is_collapsed(file_index),
                     header_clip,
+                    bounds,
                 );
-                if let Some(mark) = self.hunk_mark(file_index, hunk_index) {
-                    self.draw_check(plan, self.hunk_check_rect(y, bounds), mark, bounds);
-                }
                 if let Some(actions) = &props.hunk_actions
                     && let Some((row, placed)) =
                         self.hunk_action_layout(file_index, hunk_index, y, bounds)
+                    && (!actions.rows[row].hover
+                        || picked
+                        || state.hovered_hunk == Some((file_index, hunk_index)))
                 {
                     let row_spec = &actions.rows[row];
                     let strip = Rectangle {
@@ -2515,15 +2773,35 @@ impl View<'_> {
 
         // Pinned sticky file header, over the code scrolling under it.
         if let (Some(file_index), Some(y)) = (sticky_file, sticky_pin_y) {
-            self.draw_file_header(
-                plan,
-                file_index,
-                y,
-                bounds,
-                state.hovered_browse == Some(file_index),
-            );
+            self.draw_file_header(plan, file_index, y, bounds, state.header_hover(file_index));
         }
     }
+}
+
+/// A hunk header `@@ -a,b +c,d @@ context` as its ranges and its context, or
+/// `None` when it isn't one.
+fn split_hunk_header(header: &str) -> Option<(&str, &str)> {
+    let rest = header.strip_prefix("@@")?;
+    let end = rest.find("@@")?;
+    Some((rest[..end].trim(), rest[end + 2..].trim()))
+}
+
+/// `text` with its start cut to an ellipsis to fit `max_width`: a path keeps the
+/// directories nearest its file.
+fn truncate_start(text: &str, size: f32, font: Font, max_width: f32) -> String {
+    if measure::line_width(text, size, font) <= max_width {
+        return text.to_owned();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    for start in 1..chars.len() {
+        let candidate: String = std::iter::once('\u{2026}')
+            .chain(chars[start..].iter().copied())
+            .collect();
+        if measure::line_width(&candidate, size, font) <= max_width {
+            return candidate;
+        }
+    }
+    String::new()
 }
 
 /// `text` cut with an ellipsis to fit `max_width`.
@@ -2562,17 +2840,24 @@ fn draw_button(
     hovered: bool,
     clip: Rectangle,
 ) {
-    plan.boxed(
-        placed.rect,
-        style.radius,
-        if hovered {
-            style.hover_fill
-        } else {
-            style.fill
-        },
-        style.border,
-        BorderStyle::Solid,
-    );
+    match button.tone {
+        hunk_actions::Tone::Raised => plan.boxed(
+            placed.rect,
+            style.radius,
+            if hovered {
+                style.hover_fill
+            } else {
+                style.fill
+            },
+            style.border,
+            BorderStyle::Solid,
+        ),
+        hunk_actions::Tone::Ghost if hovered => {
+            plan.rounded(placed.rect, style.radius, style.ghost_hover_fill)
+        }
+        hunk_actions::Tone::Ghost => {}
+        hunk_actions::Tone::On => plan.rounded(placed.rect, style.radius, style.on_fill),
+    }
     draw_runs(
         plan,
         &button.runs,

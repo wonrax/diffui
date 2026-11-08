@@ -77,6 +77,7 @@ fn test_palette() -> Palette {
         gutter_background: c,
         border: c,
         selection: c,
+        accent: c,
     }
 }
 
@@ -130,6 +131,8 @@ fn test_props(files: usize) -> DiffProps {
                 status_fill: TRANSPARENT,
                 additions: 1,
                 deletions: 1,
+                tag: None,
+                note: None,
             })
             .collect(),
         DocSource::empty(),
@@ -252,6 +255,7 @@ fn conflict_strip(file: usize) -> HunkActions {
             ghost_hover_fill: WHITE,
             border: BLACK,
             focus: BLACK,
+            on_fill: BLACK,
             radius: 4.0,
         },
         on_press: Rc::new(|_, _, _| ()),
@@ -270,11 +274,14 @@ fn conflict_strip(file: usize) -> HunkActions {
                 buttons: vec![
                     Button {
                         runs: vec![run("one")],
+                        tone: crate::hunk_actions::Tone::Raised,
                     },
                     Button {
                         runs: vec![run("two")],
+                        tone: crate::hunk_actions::Tone::Raised,
                     },
                 ],
+                hover: false,
             },
         }],
         on_file_press: Rc::new(|_, _, _| ()),
@@ -748,10 +755,13 @@ fn a_tab_indented_wrapped_row_reserves_its_full_height() {
     let props = test_props(1);
     let view = view_of(&props, &hunks);
     let cells = TestCaches::default();
-    view.ensure_height_index(&cells.index, &cells.geometry, 420.0);
+    // About seventy columns of text: the line wraps with its tabs at eight
+    // columns and fits with them at one.
+    let width = view.metrics.gutter_width + 32.0 + 70.0 * view.metrics.char_width + 12.0;
+    view.ensure_height_index(&cells.index, &cells.geometry, width);
 
     let cw = view.metrics.char_width;
-    let wrap_width = view.content_width(420.0);
+    let wrap_width = view.content_width(width);
     let rows = |line_index: usize, content: &str| {
         let key = body_geometry_key(0, 0, line_index, wrap_width, cw);
         view.geometry(&cells.geometry, key, content, wrap_width)
@@ -1060,6 +1070,7 @@ fn line_select_hits_changed_lines_in_the_clicked_column() {
             on_press: Rc::new(|_, _, _| ()),
             on_paint: Rc::new(|_, _, _| ()),
         }),
+        picking: false,
     };
     let bounds = Rectangle {
         x: 0.0,

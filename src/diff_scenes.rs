@@ -455,8 +455,9 @@ fn the_browse_button_opens_the_source_view() {
     select(&mut h, &repo, "kitchen-sink");
     select_file(&mut h, "src/renderer/frame_loop.rs");
     h.frames();
-    // Left of the summary, on the header parked under the commit title: the `<>` icon.
-    h.click_point(at(1295.0, 139.0));
+    // The `<>` icon left of the header's "more" button, on the header parked under the
+    // commit title.
+    h.click_point(at(SIZE.0 - 14.0 - 22.0 - 2.0 - 11.0, 139.0));
     h.settle();
     assert_eq!(h.read(|ui| ui.active().main_view), crate::MainView::Source);
 }
@@ -546,6 +547,8 @@ fn plain_document_with_blame() {
                 status_fill: theme.text,
                 additions: 0,
                 deletions: 0,
+                tag: None,
+                note: None,
             }],
             DocSource::new(cx.entity(), first_file),
             0,

@@ -15,8 +15,8 @@ use gpui_kit::{
 };
 
 use super::layout::{
-    ActionHit, CheckHit, HeightIndex, PREFIX_WIDTH, SelectionUnit, SplitSide, TextPosition, View,
-    ordered,
+    ActionHit, CheckHit, FileControl, HeightIndex, PREFIX_WIDTH, SelectionUnit, SplitSide,
+    TextPosition, View, ordered,
 };
 use super::line::{GeometryMemo, body_geometry_key};
 use super::paint::{CodeCache, Plan};
@@ -126,8 +126,12 @@ pub(super) struct State {
     /// Palette identity last seen. Cached text bakes the syntax colours in, so a theme
     /// switch must drop it. `text` alone distinguishes every built-in theme.
     last_palette_text: Option<Color>,
-    /// File whose header's browse button the cursor is over.
-    pub(super) hovered_browse: Option<usize>,
+    /// The file header under the cursor, and the control in it the cursor is on.
+    pub(super) hovered_file_header: Option<(usize, Option<FileControl>)>,
+    /// The hunk under the cursor: its hover-only strip buttons show.
+    pub(super) hovered_hunk: Option<(usize, usize)>,
+    /// The file whose note button is under the cursor.
+    pub(super) hovered_note_button: Option<usize>,
     /// The blame run under the cursor: `start..end` lines.
     pub(super) hovered_annotation: Option<(usize, usize)>,
     /// Whether the cursor is over the description block. Reveals the edit affordance at
@@ -197,7 +201,9 @@ impl Default for State {
             last_content_version: 0,
             last_header_height_bits: 0,
             last_palette_text: None,
-            hovered_browse: None,
+            hovered_file_header: None,
+            hovered_hunk: None,
+            hovered_note_button: None,
             hovered_annotation: None,
             hovered_description: false,
             hovered_header_action: None,
@@ -233,6 +239,13 @@ fn run(out: Outbox, window: &mut Window, cx: &mut App) {
 }
 
 impl State {
+    /// Whether the cursor is on `file`'s header, and on which control.
+    pub(super) fn header_hover(&self, file: usize) -> Option<Option<FileControl>> {
+        self.hovered_file_header
+            .filter(|(hovered, _)| *hovered == file)
+            .map(|(_, control)| control)
+    }
+
     fn clear_selection(&mut self) {
         self.selection_anchor = None;
         self.selection_focus = None;
@@ -518,12 +531,22 @@ impl State {
     /// Everything hover-driven at `point`. Returns whether any of it changed.
     fn refresh_hover(&mut self, view: &View<'_>, bounds: Rectangle, point: Option<Point>) -> bool {
         let offset = self.vertical_offset;
-        let (browse, annotation, action, description, header, line) = {
+        let (hunk, note_button) = {
+            let index = self.height_index.borrow();
+            (
+                point.and_then(|p| view.hunk_at(&index, offset, bounds, p)),
+                point.and_then(|p| view.note_button_at(&index, offset, bounds, p)),
+            )
+        };
+        let hunk_changed = hunk != self.hovered_hunk || note_button != self.hovered_note_button;
+        self.hovered_hunk = hunk;
+        self.hovered_note_button = note_button;
+        let (file_header, annotation, action, description, header, line) = {
             let index = self.height_index.borrow();
             let index = &*index;
             let at = |f: &dyn Fn(Point) -> bool| point.is_some_and(f);
             (
-                point.and_then(|p| view.browse_button_at(index, offset, bounds, p)),
+                point.and_then(|p| view.file_header_at(index, offset, bounds, p)),
                 point.and_then(|p| view.annotation_run_at(index, bounds, offset, p)),
                 point.and_then(|p| view.strip_action_at(index, bounds, offset, p)),
                 at(&|p| view.description_row_contains(bounds, offset, p)),
@@ -535,13 +558,14 @@ impl State {
                     .map(|(line, _)| line),
             )
         };
-        let changed = browse != self.hovered_browse
+        let changed = hunk_changed
+            || file_header != self.hovered_file_header
             || annotation != self.hovered_annotation
             || action != self.hovered_hunk_action
             || description != self.hovered_description
             || header != self.hovered_header_action
             || line != self.hovered_line;
-        self.hovered_browse = browse;
+        self.hovered_file_header = file_header;
         self.hovered_annotation = annotation;
         self.hovered_hunk_action = action;
         self.hovered_description = description;
@@ -704,15 +728,19 @@ impl State {
             send(out, &props.on_edit_description, ());
             return;
         }
-        let (hit, check, browse, annotation, expand, pickable) = {
+        let (hit, check, file_control, annotation, expand, pickable) = {
             let index = self.height_index.borrow();
             let index = &*index;
+            let expand = view
+                .note_button_at(index, offset, bounds, point)
+                .or_else(|| view.expand_header_at(index, offset, bounds, point));
             (
                 view.strip_action_at(index, bounds, offset, point),
                 view.check_at(index, offset, bounds, point),
-                view.browse_button_at(index, offset, bounds, point),
+                view.file_header_at(index, offset, bounds, point)
+                    .and_then(|(file, control)| Some((file, control?))),
                 view.annotation_line_at(index, bounds, offset, point),
-                view.expand_header_at(index, offset, bounds, point),
+                expand,
                 view.pickable_line_at(index, offset, bounds, point, None),
             )
         };
@@ -729,16 +757,30 @@ impl State {
         if let Some(hit) = check
             && let Some(marks) = &props.marks
         {
-            match hit {
-                CheckHit::File(file) => send(out, &Some(marks.on_toggle_file.clone()), file),
-                CheckHit::Hunk(file, hunk) => {
-                    send(out, &Some(marks.on_toggle_hunk.clone()), (file, hunk))
-                }
-            }
+            let CheckHit::File(file) = hit;
+            send(out, &Some(marks.on_toggle_file.clone()), file);
             return;
         }
-        if let Some(file_index) = browse {
-            send(out, &props.on_browse_file, file_index);
+        if let Some((file_index, control)) = file_control {
+            match control {
+                FileControl::Fold => send(out, &props.on_toggle_fold, file_index),
+                FileControl::Browse => send(out, &props.on_browse_file, file_index),
+                FileControl::More => {
+                    let rect = {
+                        let index = self.height_index.borrow();
+                        view.visible_file_header_positions(&index, bounds, offset)
+                            .into_iter()
+                            .find(|&(file, _)| file == file_index)
+                            .and_then(|(_, y)| view.file_header_layout(file_index, y, bounds))
+                            .and_then(|layout| layout.more)
+                    };
+                    if let Some(rect) = rect {
+                        send(out, &props.on_file_menu, (file_index, rect));
+                    }
+                }
+                // Handled with the hunk boxes above.
+                FileControl::Check => {}
+            }
             return;
         }
         if let (Some(gutter), Some(line)) = (&props.annotations, annotation) {
@@ -904,12 +946,13 @@ impl State {
             return CursorStyle::Arrow;
         }
         if view
-            .browse_button_at(index, offset, bounds, point)
-            .is_some()
+            .file_header_at(index, offset, bounds, point)
+            .is_some_and(|(_, control)| control.is_some())
             || view.check_at(index, offset, bounds, point).is_some()
             || view
                 .expand_header_at(index, offset, bounds, point)
                 .is_some()
+            || view.note_button_at(index, offset, bounds, point).is_some()
             || view
                 .pickable_line_at(index, offset, bounds, point, None)
                 .is_some()

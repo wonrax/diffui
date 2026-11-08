@@ -38,6 +38,19 @@ pub struct Run {
 #[derive(Debug, Clone)]
 pub struct Button {
     pub runs: Vec<Run>,
+    pub tone: Tone,
+}
+
+/// How a button is drawn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Tone {
+    /// Filled and outlined: a conflict region's take-a-side buttons.
+    #[default]
+    Raised,
+    /// Nothing at rest, a wash on hover: a hunk's pick actions.
+    Ghost,
+    /// Switched on: the accent fill (a picked hunk's "Picked").
+    On,
 }
 
 /// The buttons of one hunk header.
@@ -50,6 +63,8 @@ pub struct Row {
     /// A word before the buttons ("Take").
     pub lead: Option<Run>,
     pub buttons: Vec<Button>,
+    /// Shown only while the cursor is on the hunk, or while it's picked.
+    pub hover: bool,
 }
 
 /// A ghost button (no fill or border at rest) following a file strip's
@@ -83,6 +98,8 @@ pub struct Style {
     pub ghost_hover_fill: Color,
     pub border: Color,
     pub focus: Color,
+    /// An [`Tone::On`] button's fill.
+    pub on_fill: Color,
     pub radius: f32,
 }
 
@@ -118,6 +135,51 @@ impl HunkActions {
         self.files
             .binary_search_by(|strip| strip.file.cmp(&file))
             .ok()
+    }
+
+    /// One set of strips holding both `self`'s and `other`'s, each press still
+    /// reaching the producer that made its row. Two producers never put a row on
+    /// the same hunk or a strip under the same file. `self`'s style wins.
+    pub fn merge(self, other: HunkActions) -> HunkActions {
+        fn interleave<T>(
+            a: Vec<T>,
+            b: Vec<T>,
+            key: impl Fn(&T) -> (usize, usize),
+        ) -> (Vec<T>, Vec<(bool, usize)>) {
+            let mut tagged: Vec<(T, bool, usize)> = a
+                .into_iter()
+                .enumerate()
+                .map(|(index, item)| (item, false, index))
+                .chain(
+                    b.into_iter()
+                        .enumerate()
+                        .map(|(index, item)| (item, true, index)),
+                )
+                .collect();
+            tagged.sort_by_key(|(item, ..)| key(item));
+            tagged
+                .into_iter()
+                .map(|(item, second, index)| (item, (second, index)))
+                .unzip()
+        }
+        fn route(first: OnPress, second: OnPress, map: Vec<(bool, usize)>) -> OnPress {
+            Rc::new(move |&(at, button), window, cx| {
+                if let Some(&(other, index)) = map.get(at) {
+                    let press = if other { &second } else { &first };
+                    press(&(index, button), window, cx);
+                }
+            })
+        }
+        let (rows, row_map) = interleave(self.rows, other.rows, |row| (row.file, row.hunk));
+        let (files, file_map) = interleave(self.files, other.files, |strip| (strip.file, 0));
+        HunkActions {
+            rows,
+            style: self.style,
+            on_press: route(self.on_press, other.on_press, row_map),
+            files,
+            on_file_press: route(self.on_file_press, other.on_file_press, file_map),
+            reveal: self.reveal.or(other.reveal),
+        }
     }
 }
 
@@ -341,8 +403,10 @@ mod tests {
                             color: crate::theme::WHITE,
                         })
                         .collect(),
+                    tone: Tone::Raised,
                 })
                 .collect(),
+            hover: false,
         }
     }
 
@@ -355,6 +419,7 @@ mod tests {
             ghost_hover_fill: white,
             border: white,
             focus: white,
+            on_fill: white,
             radius: 7.0,
         }
     }

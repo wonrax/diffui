@@ -143,6 +143,106 @@ fn changed_file_row(
     }
 }
 
+/// The line the diff shows in place of a file's rows when it has none to show:
+/// a mode-only change, an empty file, a binary, a file held back for size.
+fn file_note(file: &diffui_core::DiffFile) -> Option<diff_view::FileNote> {
+    use diffui_core::{BlobKind, DiffCollapse, DiffFileStatus};
+    let note = |icon, runs: Vec<(String, bool)>, action: Option<&str>| {
+        Some(diff_view::FileNote {
+            icon,
+            runs,
+            action: action.map(str::to_owned),
+        })
+    };
+    let text = |text: &str| (text.to_owned(), false);
+    let code = |text: String| (text, true);
+    if !file.hunks.iter().all(|hunk| hunk.lines.is_empty()) {
+        return None;
+    }
+    let sizes = file.blob.as_ref().map(|blob| {
+        diffui_core::media::size_span(
+            blob.before.as_ref().map(|side| side.size),
+            blob.after.as_ref().map(|side| side.size),
+        )
+    });
+    if let Some(reason) = file.collapsed {
+        let why = match reason {
+            DiffCollapse::LargeFile => " Collapsed because it is large.",
+            DiffCollapse::OverBudget => " Held back because this revision is large.",
+        };
+        if file
+            .blob
+            .as_ref()
+            .is_some_and(|blob| blob.kind == BlobKind::Image)
+        {
+            let mut runs = vec![text("Image ")];
+            runs.extend(sizes.map(code));
+            runs.push(text(&format!(".{why}")));
+            return note(icons::IMAGE, runs, Some("Show image"));
+        }
+        let lines = file.additions + file.deletions;
+        let lead = match file.status {
+            DiffFileStatus::Added => format!("New file, {lines} lines."),
+            DiffFileStatus::Deleted => format!("Deleted file, {lines} lines."),
+            _ => format!("{lines} changed lines."),
+        };
+        return note(
+            icons::FOLD_VERTICAL,
+            vec![text(&lead), text(why)],
+            Some("Show diff"),
+        );
+    }
+    if let Some(blob) = &file.blob {
+        let label = match blob.kind {
+            BlobKind::Image | BlobKind::Svg => "Image",
+            BlobKind::Binary => "Binary file",
+        };
+        let mut runs = vec![text(label)];
+        if let Some(sizes) = sizes.filter(|sizes| !sizes.is_empty()) {
+            runs.push(text(" "));
+            runs.push(code(sizes));
+        }
+        return note(icons::BINARY, runs, None);
+    }
+    if let Some((old, new)) = file.mode_change {
+        return note(
+            icons::TERMINAL,
+            vec![
+                text("File mode changed "),
+                code(format!("{old:o} \u{2192} {new:o}")),
+                text(". The contents are unchanged."),
+            ],
+            None,
+        );
+    }
+    match file.hunks.first() {
+        Some(placeholder) => note(
+            icons::BINARY,
+            vec![text(&sentence(&placeholder.header))],
+            None,
+        ),
+        None => match file.status {
+            DiffFileStatus::Added | DiffFileStatus::Deleted => {
+                note(icons::FILE, vec![text("Empty file")], None)
+            }
+            DiffFileStatus::Renamed => note(
+                icons::FILE,
+                vec![text("Renamed. The contents are unchanged.")],
+                None,
+            ),
+            _ => None,
+        },
+    }
+}
+
+/// `text` with its first letter capitalised.
+fn sentence(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
+}
+
 /// What a changed file with no line counts says in their place.
 fn count_tag(file: &diffui_core::DiffFile) -> Option<&'static str> {
     use diffui_core::{BlobKind, DiffFileStatus};
@@ -186,7 +286,7 @@ pub(crate) fn split_fits(ui: &Diffui) -> bool {
     let char_width = crate::measure::line_width("0000000000", size, ui.config.mono_font) / 10.0;
     // Per half: a line-number gutter (one number, ~4 digits + padding) plus
     // the code columns.
-    let half = 4.0 * char_width + 16.0 + MIN_SPLIT_COLUMN_CHARS * char_width;
+    let half = (4.0 * char_width + 16.0).max(44.0) + MIN_SPLIT_COLUMN_CHARS * char_width;
     diff_pane_width(ui) >= 2.0 * half
 }
 
@@ -403,6 +503,8 @@ pub(crate) fn file_views(files: &[diffui_core::DiffFile], theme: ThemeSpec) -> V
                 status_fill: chip_background(status_color),
                 additions: file.additions,
                 deletions: file.deletions,
+                tag: count_tag(file).map(str::to_owned),
+                note: file_note(file),
             }
         })
         .collect()
@@ -701,6 +803,63 @@ fn build_diff_panel_body(
         .into_any_element()
 }
 
+/// What the diff shows, as fold state is keyed: a fold holds while the same diff
+/// stays up, and a different revision opens unfolded.
+fn diff_key(tab: &crate::TabState) -> String {
+    tab.session.selected_revision.view_key() + &tab.session.document_base.view_key()
+}
+
+/// Per file of the active diff: whether it's folded to its header.
+fn folded_files(tab: &crate::TabState) -> Vec<bool> {
+    let (key, folded) = &tab.folded_files;
+    let live = *key == diff_key(tab);
+    tab.session
+        .document
+        .files
+        .iter()
+        .map(|file| live && folded.contains(&file.path))
+        .collect()
+}
+
+impl Diffui {
+    /// Folds file `index` of the active diff to its header, or unfolds it.
+    pub(crate) fn toggle_file_fold(&mut self, index: usize) {
+        let tab = self.active_mut();
+        let key = diff_key(tab);
+        let Some(path) = tab
+            .session
+            .document
+            .files
+            .get(index)
+            .map(|file| file.path.clone())
+        else {
+            return;
+        };
+        let (folded_key, folded) = &mut tab.folded_files;
+        if *folded_key != key {
+            *folded_key = key;
+            folded.clear();
+        }
+        if !folded.remove(&path) {
+            folded.insert(path);
+        }
+    }
+
+    /// The file context menu for document file `index`, from a diff header's
+    /// "more" button.
+    fn open_diff_file_menu(&mut self, index: usize, anchor: Rectangle, cx: &mut Cx) {
+        let tab = self.active();
+        let rows = diffui_core::file_tree_rows(&tab.session.document.files, &tab.collapsed_dirs);
+        let display = rows.iter().position(
+            |row| matches!(row, FileTreeRow::File { file_index, .. } if *file_index == index),
+        );
+        if let Some(display) = display {
+            let cursor = Point::new(anchor.x, anchor.y + anchor.height);
+            self.open_file_context_menu(display, anchor, cursor, cx);
+        }
+    }
+}
+
 fn diff_props(
     ui: &Diffui,
     theme: ThemeSpec,
@@ -713,7 +872,7 @@ fn diff_props(
         file_views(&session.document.files, theme),
         DocSource::new(cx.entity(), document_hunks),
         tab.selected_file,
-        session.selected_revision.view_key() + &session.document_base.view_key(),
+        diff_key(tab),
         diff_palette(theme),
         ui.config.mono_font,
         ui.config.code_type,
@@ -732,7 +891,20 @@ fn diff_props(
     .layout_version(session.document_id)
     .wrap(ui.diff_wrap)
     .side_by_side(split_in_effect(ui))
-    .on_header_action(on_header_action(cx));
+    .ui_font(ui.config.ui_font)
+    .on_header_action(on_header_action(cx))
+    .folds(
+        folded_files(tab),
+        Diffui::listen(cx, |this, index: &usize, _, _| {
+            this.toggle_file_fold(*index);
+        }),
+    )
+    .on_file_menu(Diffui::listen(
+        cx,
+        |this, (index, anchor): &(usize, Rectangle), _, cx| {
+            this.open_diff_file_menu(*index, *anchor, cx);
+        },
+    ));
     if let Some(range) = range {
         props = props.with_header(crate::range::header_lines(ui, range, theme));
     } else if let Some(details) = session.revision_details.as_ref() {
@@ -774,7 +946,14 @@ fn diff_props(
     if let Some(marks) = crate::changes::diff_marks(ui, theme, cx) {
         props = props.change_marks(marks);
     }
-    if let Some(actions) = crate::conflicts::hunk_actions(ui, theme, cx) {
+    let actions = match (
+        crate::conflicts::hunk_actions(ui, theme, cx),
+        crate::changes::hunk_actions(ui, theme, cx),
+    ) {
+        (Some(conflicts), Some(picks)) => Some(conflicts.merge(picks)),
+        (conflicts, picks) => conflicts.or(picks),
+    };
+    if let Some(actions) = actions {
         props = props.hunk_actions(actions);
     }
     if let Some(find) = find_overlay(ui, theme, cx) {

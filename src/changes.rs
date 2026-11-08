@@ -16,8 +16,8 @@ use gpui_kit::{AnyElement, Window, div, px};
 use std::collections::{BTreeMap, BTreeSet};
 
 use diffui_core::{
-    DiffFile, DiffFileStatus, DiffHunkView, DiffSelection, FileSelection, HunkPick, HunkRef,
-    LineRef, MutationOp, RevisionSelection, SquashTarget,
+    DiffFile, DiffFileStatus, DiffHunkView, DiffLineKind, DiffSelection, FileSelection, HunkPick,
+    HunkRef, LineRef, MutationOp, RevisionSelection, SquashTarget,
 };
 
 use crate::commands::CommandArg;
@@ -41,6 +41,10 @@ pub(crate) enum ChangesMsg {
     ToggleFile(usize),
     /// Toggle one hunk: `(file, hunk)` document indices.
     ToggleHunk(usize, usize),
+    /// Discard one hunk (asks first).
+    RestoreHunk(usize, usize),
+    /// Copy one hunk as a patch.
+    CopyHunk(usize, usize),
     /// Line-select mode — see [`LineMsg`].
     Lines(LineMsg),
     /// Toggle a changed-files tree row (display index); a directory toggles
@@ -756,6 +760,7 @@ pub(crate) fn diff_marks(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> Option<C
             },
         )),
         lines,
+        picking: !selection_of(tab).is_empty(),
     })
 }
 
@@ -769,6 +774,213 @@ pub(crate) fn live_line_select(tab: &TabState) -> Option<&LineSelect> {
 /// Whether line-select mode can be entered on the active tab.
 pub(crate) fn can_select_lines(ui: &Diffui) -> bool {
     editable(ui.active())
+}
+
+/// Hunk `hunk` of file `file`, whole, as a selection.
+fn one_hunk(files: &[DiffFile], file: usize, hunk: usize) -> Option<DiffSelection> {
+    let file = files.get(file)?;
+    let view = file.hunks.get(hunk)?;
+    Some(DiffSelection {
+        files: vec![FileSelection {
+            path: file.path.clone(),
+            hunks: HunkPick::Hunks(vec![HunkRef {
+                index: hunk,
+                header: view.header.clone(),
+                lines: None,
+            }]),
+        }],
+    })
+}
+
+/// `selection` of `files` as a unified patch, the way `git apply` takes one.
+/// A partly picked hunk keeps its unpicked removals as context and leaves its
+/// unpicked additions out, so the patch carries exactly the picked lines.
+pub(crate) fn selection_patch(files: &[DiffFile], selection: &DiffSelection) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for picked in &selection.files {
+        let Some(file) = files.iter().find(|file| file.path == picked.path) else {
+            continue;
+        };
+        let old = file.old_path.as_deref().unwrap_or(&file.path);
+        let _ = writeln!(out, "diff --git a/{old} b/{}", file.path);
+        if let Some((from, to)) = file.mode_change {
+            let _ = writeln!(out, "old mode {from:o}\nnew mode {to:o}");
+        }
+        let hunks: Vec<(&DiffHunkView, Option<&[LineRef]>)> = match &picked.hunks {
+            HunkPick::All => file.hunks.iter().map(|hunk| (hunk, None)).collect(),
+            HunkPick::Hunks(refs) => refs
+                .iter()
+                .filter_map(|at| Some((file.hunks.get(at.index)?, at.lines.as_deref())))
+                .collect(),
+        };
+        if hunks.iter().all(|(hunk, _)| hunk.lines.is_empty()) {
+            continue;
+        }
+        let side = |prefix: &str, path: &str, absent: bool| {
+            if absent {
+                "/dev/null".to_owned()
+            } else {
+                format!("{prefix}/{path}")
+            }
+        };
+        let _ = writeln!(
+            out,
+            "--- {}\n+++ {}",
+            side("a", old, file.status == DiffFileStatus::Added),
+            side("b", &file.path, file.status == DiffFileStatus::Deleted),
+        );
+        for (hunk, lines) in hunks {
+            write_hunk(&mut out, hunk, lines);
+        }
+    }
+    out
+}
+
+/// One hunk of [`selection_patch`]: all of it, or only the `picked` lines.
+fn write_hunk(out: &mut String, hunk: &DiffHunkView, picked: Option<&[LineRef]>) {
+    use std::fmt::Write as _;
+    if hunk.lines.is_empty() {
+        return;
+    }
+    let mut body = String::new();
+    let (mut old_count, mut new_count) = (0usize, 0usize);
+    for line in &hunk.lines {
+        let take =
+            picked.is_none_or(|picked| LineRef::of(line).is_some_and(|at| picked.contains(&at)));
+        let prefix = match (line.kind, take) {
+            (DiffLineKind::Addition, true) => {
+                new_count += 1;
+                '+'
+            }
+            (DiffLineKind::Addition, false) => continue,
+            (DiffLineKind::Deletion, true) => {
+                old_count += 1;
+                '-'
+            }
+            (DiffLineKind::Note, _) => {
+                let _ = writeln!(body, "{}", line.content.trim_end_matches('\n'));
+                continue;
+            }
+            _ => {
+                old_count += 1;
+                new_count += 1;
+                ' '
+            }
+        };
+        let _ = writeln!(body, "{prefix}{}", line.content.trim_end_matches('\n'));
+    }
+    let old_start = hunk
+        .lines
+        .iter()
+        .find_map(|line| line.old_line)
+        .unwrap_or(0);
+    let new_start = hunk
+        .lines
+        .iter()
+        .find_map(|line| line.new_line)
+        .unwrap_or(0);
+    let context = hunk
+        .header
+        .strip_prefix("@@")
+        .and_then(|rest| rest.find("@@").map(|end| rest[end + 2..].trim()))
+        .unwrap_or("");
+    let _ = write!(
+        out,
+        "@@ -{old_start},{old_count} +{new_start},{new_count} @@"
+    );
+    if !context.is_empty() {
+        let _ = write!(out, " {context}");
+    }
+    out.push('\n');
+    out.push_str(&body);
+}
+
+/// The pick actions riding each pickable hunk's header, shown while the
+/// cursor is on the hunk or while it's picked: pick it, restore it, copy it.
+pub(crate) fn hunk_actions(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    cx: &mut Cx,
+) -> Option<crate::hunk_actions::HunkActions> {
+    use crate::hunk_actions::{Button, HunkActions, Row, Run, Style, Tone};
+    let tab = ui.active();
+    if !editable(tab) {
+        return None;
+    }
+    let revision = &tab.session.selected_revision;
+    let font = ui.config.ui_font;
+    let mut rows = Vec::new();
+    for (index, file) in tab.session.document.files.iter().enumerate() {
+        if !hunk_pickable(file, crate::conflicts::is_conflicted(tab, &file.path)) {
+            continue;
+        }
+        for hunk in 0..file.hunks.len() {
+            let state = tab.changes.hunk_state(revision, file, hunk);
+            let button = |text: &str, tone: Tone| Button {
+                runs: vec![Run {
+                    text: text.to_owned(),
+                    font,
+                    color: match tone {
+                        Tone::On => theme.panel_background,
+                        _ => theme.muted_text,
+                    },
+                }],
+                tone,
+            };
+            let pick = match state {
+                CheckState::Off => button("Pick hunk", Tone::Ghost),
+                CheckState::On => button("Picked", Tone::On),
+                CheckState::Partial => button("Picked lines", Tone::On),
+            };
+            rows.push(Row {
+                file: index,
+                hunk,
+                focused: false,
+                lead: None,
+                buttons: vec![
+                    pick,
+                    button("Restore hunk", Tone::Ghost),
+                    button("Copy", Tone::Ghost),
+                ],
+                hover: true,
+            });
+        }
+    }
+    if rows.is_empty() {
+        return None;
+    }
+    let targets: Vec<(usize, usize)> = rows.iter().map(|row| (row.file, row.hunk)).collect();
+    Some(HunkActions {
+        rows,
+        style: Style {
+            size: text_size::CAPTION,
+            fill: theme.panel_background,
+            hover_fill: theme::ghost_button_style(theme).hover,
+            ghost_hover_fill: theme::ghost_button_style(theme).hover,
+            border: theme.border,
+            focus: theme.accent,
+            on_fill: theme.accent,
+            radius: theme::radius::XS,
+        },
+        on_press: std::rc::Rc::new(Diffui::listen(
+            cx,
+            move |this, &(row, button): &(usize, usize), _, cx| {
+                let Some(&(file, hunk)) = targets.get(row) else {
+                    return;
+                };
+                let msg = match button {
+                    0 => ChangesMsg::ToggleHunk(file, hunk),
+                    1 => ChangesMsg::RestoreHunk(file, hunk),
+                    _ => ChangesMsg::CopyHunk(file, hunk),
+                };
+                this.perform(Action::Changes(msg), cx);
+            },
+        )),
+        files: Vec::new(),
+        on_file_press: std::rc::Rc::new(|_, _, _| {}),
+        reveal: None,
+    })
 }
 
 /// The changed-files tree checkbox for a row: a file's own state, or for a
@@ -823,6 +1035,24 @@ impl Diffui {
             }
             ChangesMsg::ToggleHunk(file, hunk) => {
                 self.toggle_hunk(file, hunk);
+            }
+            ChangesMsg::RestoreHunk(file, hunk) => {
+                let tab = self.active();
+                if !editable(tab) {
+                    return;
+                }
+                let Some(selection) = one_hunk(&tab.session.document.files, file, hunk) else {
+                    return;
+                };
+                let revision = tab.session.selected_revision.clone();
+                self.confirm_discard(revision, selection)
+            }
+            ChangesMsg::CopyHunk(file, hunk) => {
+                let files = &self.active().session.document.files;
+                if let Some(selection) = one_hunk(files, file, hunk) {
+                    let patch = selection_patch(files, &selection);
+                    self.perform(Action::Copy(patch), cx);
+                }
             }
             ChangesMsg::ToggleTreeRow(display) => {
                 self.toggle_tree_row(display);

@@ -46,6 +46,8 @@ impl Render for Stage {
                 status_fill: diffui_widgets::theme::chip_background(self.theme.added_text),
                 additions: 3,
                 deletions: 2,
+                tag: None,
+                note: None,
             })
             .collect();
         let props = DiffProps::new(

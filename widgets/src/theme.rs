@@ -382,6 +382,7 @@ pub fn diff_palette(theme: ThemeSpec) -> Palette {
             a: 0.20,
             ..theme.accent
         },
+        accent: theme.accent,
     }
 }
 

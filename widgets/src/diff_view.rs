@@ -119,6 +119,21 @@ pub struct DiffFileView {
     pub status_fill: Color,
     pub additions: usize,
     pub deletions: usize,
+    /// What the header says in place of counts when there are none ("binary").
+    pub tag: Option<String>,
+    /// One line standing in for the file's rows (a mode-only change, an empty
+    /// file, a binary, a file held back for size).
+    pub note: Option<FileNote>,
+}
+
+/// One muted line in place of a file's rows: an icon, the text in runs (a run
+/// flagged `true` is in the code font, for a mode or a size), and, for a file the
+/// backend held back, a button that fires [`DiffProps::on_expand_file`].
+#[derive(Debug, Clone)]
+pub struct FileNote {
+    pub icon: &'static str,
+    pub runs: Vec<(String, bool)>,
+    pub action: Option<String>,
 }
 
 /// Tri-state of a change-selection checkbox.
@@ -389,6 +404,9 @@ pub struct ChangeMarks {
     pub on_toggle_hunk: Callback<(usize, usize)>,
     /// Line-select mode, when it is on.
     pub lines: Option<LineMode>,
+    /// Anything is picked: every file header shows its box, not only the
+    /// hovered one.
+    pub picking: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -419,6 +437,8 @@ pub struct Palette {
     pub border: Color,
     /// Background tint drawn under selected text.
     pub selection: Color,
+    /// A hunk header's `@@`, and the wash of a picked hunk's header.
+    pub accent: Color,
 }
 
 /// Everything the app decides about a [`DiffView`], set from a render.
@@ -487,6 +507,13 @@ pub struct DiffProps {
     media_key: Option<u64>,
     /// Buttons on hunk header strips.
     hunk_actions: Option<HunkActions>,
+    /// Per file: its body is folded away under its header.
+    folded: Vec<bool>,
+    /// The UI's font, for the prose in notes.
+    ui_font: Font,
+    on_toggle_fold: Option<Callback<usize>>,
+    /// The "more" button of a file header: the file and the button's rect.
+    on_file_menu: Option<Callback<(usize, crate::geometry::Rectangle)>>,
     /// The gutter's digit count, worked out once per set of props.
     digits: Cell<Option<usize>>,
 }
@@ -534,6 +561,10 @@ impl DiffProps {
             media: Vec::new(),
             media_key: None,
             hunk_actions: None,
+            folded: Vec::new(),
+            ui_font: font,
+            on_toggle_fold: None,
+            on_file_menu: None,
             digits: Cell::new(None),
         }
     }
@@ -618,6 +649,34 @@ impl DiffProps {
     /// headers (a conflicted file's). Ignored for plain documents.
     pub fn hunk_actions(mut self, actions: HunkActions) -> Self {
         self.hunk_actions = Some(actions);
+        self
+    }
+
+    /// Set the prose in notes in `font` (the code font by default).
+    pub fn ui_font(mut self, font: Font) -> Self {
+        self.ui_font = font;
+        self
+    }
+
+    /// Fold the files flagged in `folded` to their headers; a press on a header's
+    /// chevron fires `f` with the file index.
+    pub fn folds(
+        mut self,
+        folded: Vec<bool>,
+        f: impl Fn(&usize, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.folded = folded;
+        self.on_toggle_fold = Some(callback(f));
+        self
+    }
+
+    /// Draw a "more" button in every file header, firing with the file index and
+    /// the button's rect.
+    pub fn on_file_menu(
+        mut self,
+        f: impl Fn(&(usize, crate::geometry::Rectangle), &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_file_menu = Some(callback(f));
         self
     }
 
