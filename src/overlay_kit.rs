@@ -12,7 +12,10 @@ use crate::typography;
 /// the same pinned font (see `widgets/build.rs`).
 pub(crate) mod glyph {
     pub(crate) const CHECK_CIRCLE: &str = "\u{e07c}"; // check-circle
+    pub(crate) const X_CIRCLE: &str = "\u{e084}"; // circle-x
+    pub(crate) const SLASH_CIRCLE: &str = "\u{e402}"; // circle-slash
     pub(crate) const PULL_REQUEST: &str = "\u{e0e5}"; // git-pull-request
+    pub(crate) const EXTERNAL_LINK: &str = "\u{e0b9}"; // external-link
     pub(crate) const BOOKMARK: &str = "\u{e060}"; // bookmark
     pub(crate) const SUN: &str = "\u{e178}"; // sun
     pub(crate) const MOON: &str = "\u{e11e}"; // moon
@@ -194,6 +197,51 @@ pub(crate) fn group_heading(label: impl Into<SharedString>, font: Font, theme: T
             text_size::UI,
             theme.muted_text,
         ))
+}
+
+/// How a [`count_chip`] is tinted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tone {
+    Accent,
+    Neutral,
+    Danger,
+}
+
+/// A small tinted chip with a count or a state in it ("1 running"), placed on
+/// its text's baseline.
+pub(crate) fn count_chip(
+    label: impl Into<SharedString>,
+    tone: Tone,
+    font: Font,
+    theme: ThemeSpec,
+) -> typography::Aligned {
+    let font = theme::emphasis_font(font, Weight::MEDIUM);
+    let (fill, ink, outline) = match tone {
+        Tone::Accent => (theme::chip_background(theme.accent), theme.accent, None),
+        Tone::Danger => (
+            theme::chip_background(theme.removed_text),
+            theme.removed_text,
+            None,
+        ),
+        Tone::Neutral => (
+            theme::TRANSPARENT,
+            theme.subtle_text,
+            Some(firm_border(theme)),
+        ),
+    };
+    typography::Aligned::chip(
+        typography::line(label, font, text_size::CAPTION, ink),
+        font,
+        text_size::CAPTION,
+        [3.0, 7.0].into(),
+        move |chip| {
+            let chip = chip.bg(fill).rounded(px(radius::XS));
+            match outline {
+                Some(color) => chip.border_1().border_color(color),
+                None => chip,
+            }
+        },
+    )
 }
 
 #[cfg(test)]
