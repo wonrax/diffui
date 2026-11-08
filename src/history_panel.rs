@@ -1006,6 +1006,12 @@ enum OpRow<'a> {
 
 /// Width of the chevron column in a snapshot run's row.
 const RUN_CHEVRON: f32 = 12.0;
+/// An operation's age on its row's title line.
+const AGE_TEXT_SIZE: f32 = 11.5;
+/// The op detail's title.
+const DETAIL_TITLE_SIZE: f32 = 18.0;
+/// A section label: "Changed revisions 1".
+const SECTION_LABEL_SIZE: f32 = 12.5;
 
 fn ref_side_label(side: &[CommitBrief]) -> String {
     match side {
@@ -1375,7 +1381,7 @@ fn op_row(
     let id_color = if op.is_current {
         theme.accent
     } else {
-        theme.muted_text
+        theme.subtle_text
     };
     let mut meta = vec![mono_on_line(op.short_id().to_owned(), id_color, ui)];
     if op.is_current {
@@ -1385,7 +1391,7 @@ fn op_row(
     // or diffui's equivalent), says more than who ran it; the header below
     // the list still names the user.
     // One line whatever the command holds (a message's line breaks read as
-    // spaces), cut short before the age.
+    // spaces), cut short at the row's edge.
     match &op.args {
         Some(args) => meta.push(fill_on_line(
             crate::plan::command_prose(args)
@@ -1406,17 +1412,21 @@ fn op_row(
             text_size::CAPTION,
         )),
     }
-    meta.push(caption_on_line(caption(age, theme.subtle_text, ui), ui));
     let meta = typography::baseline_row(meta, space::SM);
-    let title = meta_line::description(
-        op.summary(),
-        SMALL_TEXT_SIZE,
-        ui.config.ui_font,
-        theme.text,
+    let title = title_with_age(
+        meta_line::description(
+            op.summary(),
+            SMALL_TEXT_SIZE,
+            ui.config.ui_font,
+            theme.text,
+            ui,
+            theme,
+        )
+        .view(),
+        age,
         ui,
         theme,
-    )
-    .view();
+    );
     list_row(
         SharedString::from(format!("op-{}", op.id)),
         REVISION_ROW_HEIGHT,
@@ -1439,23 +1449,28 @@ fn snapshot_row(
     cx: &mut Cx,
 ) -> AnyElement {
     let selected = ui.active().history.selected_op.as_deref() == Some(op.id.as_str());
-    let mut line = vec![mono_on_line(
-        op.short_id().to_owned(),
-        if op.is_current {
-            theme.accent
-        } else {
-            theme.subtle_text
-        },
-        ui,
-    )];
+    let mut line = vec![
+        Aligned::glyph(snapshot_dot(theme), RUN_CHEVRON),
+        Aligned::text(
+            caption_fill(op.summary().to_owned(), theme.subtle_text, ui),
+            ui.config.ui_font,
+            text_size::CAPTION,
+        )
+        .shrink(),
+        mono_on_line(
+            op.short_id().to_owned(),
+            if op.is_current {
+                theme.accent
+            } else {
+                theme.subtle_text
+            },
+            ui,
+        ),
+    ];
     if op.is_current {
         line.push(meta_line::badge("current", theme.accent, ui, window, cx));
     }
-    line.push(fill_on_line(
-        caption_fill(op.summary().to_owned(), theme.subtle_text, ui),
-        ui.config.ui_font,
-        text_size::CAPTION,
-    ));
+    line.push(fill_on_line(div(), ui.config.ui_font, text_size::CAPTION));
     line.push(caption_on_line(
         caption(relative_age(op.time_millis, now), theme.subtle_text, ui),
         ui,
@@ -1470,6 +1485,41 @@ fn snapshot_row(
     )
     .child(typography::baseline_row(line, space::SM).flex_1().min_w_0())
     .into_any_element()
+}
+
+/// A snapshot's marker: a small quiet dot in the chevron column, so a lone
+/// snapshot lines up with a folded run's label.
+fn snapshot_dot(theme: ThemeSpec) -> Div {
+    const DOT: f32 = 5.0;
+    div()
+        .flex_none()
+        .size(px(RUN_CHEVRON))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .size(px(DOT))
+                .rounded(px(DOT / 2.0))
+                .bg(crate::theme::mix(theme.border, theme.subtle_text, 0.35)),
+        )
+}
+
+/// A two-line row's title: the text cut to fit, and the age right-aligned on
+/// its baseline.
+fn title_with_age(title: impl IntoElement, age: String, ui: &Diffui, theme: ThemeSpec) -> Div {
+    let font = ui.config.ui_font;
+    typography::baseline_row(
+        [
+            fill_on_line(title, font, SMALL_TEXT_SIZE),
+            Aligned::text(
+                typography::line(age, font, AGE_TEXT_SIZE, theme.subtle_text),
+                font,
+                AGE_TEXT_SIZE,
+            ),
+        ],
+        space::MD,
+    )
 }
 
 /// A folded run of snapshots, and its operations under it when unfolded:
@@ -2031,7 +2081,7 @@ fn commit_line(
     cx: &mut Cx,
 ) -> Vec<Aligned> {
     let mut line = vec![
-        mono_on_line(commit.short_change_id().to_owned(), theme.accent, ui),
+        mono_on_line(commit.short_change_id().to_owned(), theme.change_id, ui),
         mono_on_line(commit.short_commit_id().to_owned(), theme.subtle_text, ui),
     ];
     if !commit.visible {
@@ -2054,11 +2104,15 @@ fn commit_line(
     line
 }
 
+/// One changed revision, a row of its table. `(first, last)`: where it sits
+/// in the table, whose rounded corners its selection wash follows.
+#[allow(clippy::too_many_arguments)]
 fn change_row(
     ui: &Diffui,
     theme: ThemeSpec,
     index: usize,
     change: &ChangedCommit,
+    (first, last): (bool, bool),
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
@@ -2115,7 +2169,8 @@ fn change_row(
     })];
     line.extend(commit_line(ui, theme, &change.commit, window, cx));
     line.push(caption_on_line(caption(verb, theme.subtle_text, ui), ui));
-    row_card(
+    let inner = px(radius::MD - 1.0);
+    let mut card = row_card(
         SharedString::from(format!("change-{index}")),
         CHANGE_ROW_HEIGHT,
         selected,
@@ -2123,11 +2178,18 @@ fn change_row(
         theme,
         cx,
     )
-    .px(px(space::SM))
-    .gap(px(space::SM))
-    .child(typography::baseline_row(line, space::SM).flex_1().min_w_0())
-    .child(open)
-    .into_any_element()
+    .rounded(px(0.0));
+    if first {
+        card = card.rounded_t(inner);
+    }
+    if last {
+        card = card.rounded_b(inner);
+    }
+    card.px(px(space::LG))
+        .gap(px(space::SM))
+        .child(typography::baseline_row(line, space::SM).flex_1().min_w_0())
+        .child(open)
+        .into_any_element()
 }
 
 /// A moved ref, laid out like a changed commit's row: a kind marker in the
@@ -2159,7 +2221,7 @@ fn ref_row(ui: &Diffui, theme: ThemeSpec, change: &RefChange) -> AnyElement {
         .flex_row()
         .items_center()
         .gap(px(space::SM))
-        .px(px(space::SM))
+        .px(px(space::LG))
         .child(typography::baseline_row(
             [
                 marker.map(|marker| {
@@ -2185,19 +2247,50 @@ fn ref_row(ui: &Diffui, theme: ThemeSpec, change: &RefChange) -> AnyElement {
         .into_any_element()
 }
 
-fn section_title(label: String, ui: &Diffui, theme: ThemeSpec) -> Div {
+/// A section's label, sentence case and semibold, with its count in subtle
+/// text after it: "Changed revisions 1".
+fn section_title(label: &str, count: String, ui: &Diffui, theme: ThemeSpec) -> Div {
+    let font = emphasis_font(ui.config.ui_font, Weight::SEMIBOLD);
+    let plain = ui.config.ui_font;
     div()
         .flex_none()
-        .pt(px(space::SM))
-        .pr(px(space::SM))
-        .pb(px(space::XXS))
-        .pl(px(space::SM))
-        .child(typography::line(
-            label,
-            emphasis_font(ui.config.ui_font, Weight::MEDIUM),
-            text_size::CAPTION,
-            theme.muted_text,
+        .pt(px(space::LG))
+        .pb(px(space::MD))
+        .child(typography::baseline_row(
+            [
+                Aligned::text(
+                    typography::line(label.to_owned(), font, SECTION_LABEL_SIZE, theme.text),
+                    font,
+                    SECTION_LABEL_SIZE,
+                ),
+                Aligned::text(
+                    typography::line(count, plain, SECTION_LABEL_SIZE, theme.subtle_text),
+                    plain,
+                    SECTION_LABEL_SIZE,
+                ),
+            ],
+            space::SM,
         ))
+}
+
+/// Rows in a rounded box, hairlines between them.
+fn table(rows: Vec<AnyElement>, theme: ThemeSpec) -> Div {
+    let mut table = div()
+        .w_full()
+        .flex_none()
+        .flex()
+        .flex_col()
+        .rounded(px(radius::MD))
+        .border_1()
+        .border_color(theme.border)
+        .overflow_hidden();
+    for (index, row) in rows.into_iter().enumerate() {
+        if index > 0 {
+            table = table.child(div().w_full().h(px(1.0)).flex_none().bg(theme.border));
+        }
+        table = table.child(row);
+    }
+    table
 }
 
 /// The operation's header: description, metadata, and the two actions.
@@ -2284,15 +2377,16 @@ fn operation_header(
         cx,
     );
 
-    let title_font = emphasis_font(ui.config.ui_font, Weight::MEDIUM);
+    let title_font = emphasis_font(ui.config.ui_font, Weight::SEMIBOLD);
     let mut block = div()
         .w_full()
         .flex_none()
         .flex()
         .flex_col()
-        .gap(px(space::XS))
-        .px(px(space::LG))
-        .py(px(space::MD))
+        .gap(px(space::MD))
+        .px(px(space::XXL))
+        .pt(px(space::XL))
+        .pb(px(space::XS))
         .child(
             div()
                 .w_full()
@@ -2304,7 +2398,7 @@ fn operation_header(
                 .child(div().flex_1().min_w_0().child(typography::centered(
                     meta_line::description(
                         op.summary(),
-                        text_size::BODY_LG,
+                        DETAIL_TITLE_SIZE,
                         title_font,
                         theme.text,
                         ui,
@@ -2312,7 +2406,7 @@ fn operation_header(
                     )
                     .wrapped(),
                     title_font,
-                    text_size::BODY_LG,
+                    DETAIL_TITLE_SIZE,
                 )))
                 .child(with_tooltip(
                     "op-restore-tip",
@@ -2331,14 +2425,29 @@ fn operation_header(
         )
         .child(meta);
     if let Some(args) = &op.args {
-        block = block.child(crate::plan::wrapped_command_line(
-            ui,
-            theme,
-            args,
-            text_size::CAPTION,
-            window,
-            cx,
-        ));
+        // The command in a well of its own, copyable.
+        block = block.child(
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .min_h(px(34.0))
+                .py(px(space::XS))
+                .pl(px(space::LG))
+                .pr(px(space::SM))
+                .rounded(px(radius::MD))
+                .bg(theme.background)
+                .border_1()
+                .border_color(theme.border)
+                .child(crate::plan::wrapped_command_line(
+                    ui,
+                    theme,
+                    args,
+                    text_size::UI,
+                    window,
+                    cx,
+                )),
+        );
     }
     block
 }
@@ -2354,9 +2463,8 @@ fn operation_changes(
         .w_full()
         .flex()
         .flex_col()
-        .gap(px(1.0))
-        .px(px(space::SM))
-        .pb(px(space::SM));
+        .px(px(space::XXL))
+        .pb(px(space::LG));
     if changes.is_merge {
         list = list.child(note(
             "A merge of concurrent operations. Like the jj CLI, it lists no changes.",
@@ -2365,24 +2473,43 @@ fn operation_changes(
         ));
     }
     if !changes.commits.is_empty() {
-        let mut title = format!("Changed commits ({})", changes.commits.len());
+        let mut count = changes.commits.len().to_string();
         if changes.commits_truncated {
-            title.push_str(", more not listed");
+            count.push_str(", more not listed");
         }
-        list = list.child(section_title(title, ui, theme));
-        for (index, change) in changes.commits.iter().enumerate() {
-            list = list.child(change_row(ui, theme, index, change, window, cx));
-        }
+        list = list.child(section_title("Changed revisions", count, ui, theme));
+        let last = changes.commits.len() - 1;
+        let rows = changes
+            .commits
+            .iter()
+            .enumerate()
+            .map(|(index, change)| {
+                change_row(
+                    ui,
+                    theme,
+                    index,
+                    change,
+                    (index == 0, index == last),
+                    window,
+                    cx,
+                )
+            })
+            .collect();
+        list = list.child(table(rows, theme));
     }
     if !changes.refs.is_empty() {
         list = list.child(section_title(
-            format!("Moved refs ({})", changes.refs.len()),
+            "Moved refs",
+            changes.refs.len().to_string(),
             ui,
             theme,
         ));
-        for change in &changes.refs {
-            list = list.child(ref_row(ui, theme, change));
-        }
+        let rows = changes
+            .refs
+            .iter()
+            .map(|change| ref_row(ui, theme, change))
+            .collect();
+        list = list.child(table(rows, theme));
     }
     if changes.commits.is_empty() && changes.refs.is_empty() && !changes.is_merge {
         list = list.child(note(
