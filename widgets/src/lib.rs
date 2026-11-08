@@ -23,4 +23,5 @@ pub mod scrollbar;
 pub mod theme;
 pub mod typography;
 pub mod ui;
+pub mod wheel;
 pub mod width_memo;

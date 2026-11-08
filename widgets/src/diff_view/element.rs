@@ -11,7 +11,7 @@ use std::time::Instant;
 use gpui_kit::{
     App, Bounds, Context, CursorStyle, DispatchPhase, Element, ElementId, Entity, GlobalElementId,
     Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId, Modifiers, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollEvent, Style, Window, px, relative,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollEvent, Style, Window, relative,
 };
 
 use super::layout::{
@@ -40,10 +40,6 @@ const AUTO_SCROLL_MAX_SPEED: f32 = 1200.0;
 // ramps up. The cursor sitting just past the edge scrolls slowly; a cursor far
 // outside the viewport scrolls at full speed.
 const AUTO_SCROLL_RAMP_PX: f32 = 80.0;
-/// Points one wheel line scrolls. macOS reports a slow notch as one line and
-/// accelerates faster spins into several, so this is the slow-notch step: WebKit's
-/// and Chromium's per-line distance on macOS, about two diff rows.
-const POINTS_PER_LINE: f32 = 40.0;
 
 /// Which axis a scroll gesture is locked to (see `State::scroll_axis`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -618,7 +614,7 @@ impl State {
     ) -> bool {
         let (max_vertical, max_horizontal) = self.limits(view, bounds);
         let prev_offset = self.vertical_offset;
-        let delta = event.delta.pixel_delta(px(POINTS_PER_LINE));
+        let delta = crate::wheel::points(event.delta);
         crate::frame_log::value("wy", f64::from(delta.y));
         // Positive means the content moves down in GPUI; an offset grows going down.
         let mut movement = Point::new(-f32::from(delta.x), -f32::from(delta.y));

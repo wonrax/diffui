@@ -2905,7 +2905,7 @@ impl Element for ListElement {
             if phase != DispatchPhase::Bubble || !hit.should_handle_scroll(window) {
                 return;
             }
-            let delta_y = f32::from(event.delta.pixel_delta(window.line_height()).y);
+            let delta_y = f32::from(crate::wheel::points(event.delta).y);
             crate::frame_log::value("wy", f64::from(delta_y));
             let effects = list.update(cx, |list, cx| {
                 list.with_scroll_report(|list, _, cx| list.on_wheel(delta_y, cx), cx)

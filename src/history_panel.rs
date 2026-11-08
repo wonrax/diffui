@@ -1879,8 +1879,7 @@ fn op_log_wheel(state: &gpui_kit::ListState, wheel: &Rc<RefCell<Resampler>>) -> 
                 {
                     return;
                 }
-                // The list's own step for a wheel notch.
-                let delta = event.delta.pixel_delta(px(20.0)).y;
+                let delta = diffui_widgets::wheel::points(event.delta).y;
                 diffui_widgets::frame_log::value("wy", f64::from(delta));
                 events.borrow_mut().push(Instant::now(), -f64::from(delta));
                 cx.notify(view);
