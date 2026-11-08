@@ -782,6 +782,12 @@ have no scene; see src/toolbar.rs and core/src/github.rs for what differs.
 - State: Push confirm listing what goes out.
 - Steps: Press P.
 
+### `confirm-push-tracked-dark`
+
+- Window: 1440x900, dark
+- State: confirm-push-tracked in dark.
+- Steps: As confirm-push-tracked, theme Dark.
+
 ### `confirm-push-working-copy`
 
 - Window: 1440x900, light

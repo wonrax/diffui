@@ -1448,6 +1448,17 @@ fn all() -> Vec<Scene> {
             c.key("P");
         },
     ));
+    t.add(
+        s(
+            "confirm-push-tracked-dark",
+            "confirm-push-tracked in dark.",
+            "As confirm-push-tracked, theme Dark.",
+            |c| {
+                c.key("P");
+            },
+        )
+        .dark(),
+    );
     t.add(s(
         "confirm-push-working-copy",
         "The warning for pushing the working-copy commit.",

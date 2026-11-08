@@ -538,7 +538,24 @@ pub(crate) struct ConfirmDialog {
     pub(crate) title: prose::Prose,
     pub(crate) body: prose::Prose,
     pub(crate) confirm_label: String,
+    /// What the dialog shows beyond its words, and how its confirm looks.
+    pub(crate) look: ConfirmLook,
     pub(crate) pending: PendingMutation,
+}
+
+/// The parts of a [`ConfirmDialog`] only some confirms have. The default is
+/// the plain guard: words and a destructive confirm.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ConfirmLook {
+    /// The confirm goes ahead with something ordinary (a push the user
+    /// started), rather than destroying or overriding something: the
+    /// primary button, not the red one.
+    pub(crate) routine: bool,
+    /// The bookmarks a push moves, a row each.
+    pub(crate) moves: Vec<diffui_core::BookmarkMove>,
+    /// Things to know before confirming that don't stop it, as warning
+    /// callouts: what's wrong, then what it means.
+    pub(crate) callouts: Vec<(prose::Prose, Option<prose::Prose>)>,
 }
 
 /// Which main view the active tab shows: the diff (default) or the source

@@ -72,7 +72,10 @@ use super::settings::cli_error;
 use super::walk::{parse_user_revset, with_revset_parse_context};
 use super::workspace::TargetContext;
 use crate::model::LoadProgress;
-use crate::push::{PushAllow, PushCheck, PushRejection, PushRequest, PushTarget, RejectedCommit};
+use crate::push::{
+    BookmarkMove, MoveKind, PushAllow, PushCheck, PushRejection, PushRequest, PushTarget,
+    RejectedCommit,
+};
 
 /// How many offending commits a rejection lists before it says "and more".
 const MAX_REJECTED: usize = 20;
@@ -269,11 +272,12 @@ pub(super) async fn plan_push(
         .collect();
     let (commits, truncated, private_revset) =
         check_commits(context, repo, remote, &new_heads, request.allow).await?;
-    let plan = describe_updates(repo, &updates).await;
+    let moves = describe_updates(repo, remote, &updates).await?;
+    let plan = moves.iter().map(BookmarkMove::line).collect();
     if !commits.is_empty() || request.confirm {
         return Err(anyhow!(PushRejection {
             remote: request.remote.clone(),
-            plan,
+            moves,
             commits,
             truncated,
             private_commits: private_revset,
@@ -772,34 +776,70 @@ async fn default_push_range(
         .await
 }
 
-/// `  bookmark: main [move forward from abc to def]`, as the CLI prints the
-/// plan before pushing.
+/// What each update does to the remote: the CLI's "Changes to push" plan
+/// (`print_commits_ready_to_push`), with the revisions each move publishes,
+/// the ones not yet reachable from any of the remote's bookmarks.
 async fn describe_updates(
     repo: &MutableRepo,
+    remote: &RemoteName,
     updates: &[(RefNameBuf, Diff<Option<CommitId>>)],
-) -> Vec<String> {
+) -> Result<Vec<BookmarkMove>> {
     let short = short_commit_hash;
-    let mut lines = Vec::new();
+    let known_heads: Vec<CommitId> = repo
+        .view()
+        .remote_bookmarks(remote)
+        .flat_map(|(_, remote_ref)| remote_ref.target.added_ids())
+        .cloned()
+        .collect();
+    let mut moves = Vec::new();
     for (name, update) in updates {
-        let what = match (&update.before, &update.after) {
+        let kind = match (&update.before, &update.after) {
             (Some(old), Some(new)) => {
                 let index = repo.index();
-                let direction = if index.is_ancestor(old, new).await.unwrap_or(false) {
-                    "forward"
+                if index.is_ancestor(old, new).await.unwrap_or(false) {
+                    MoveKind::Forward
                 } else if index.is_ancestor(new, old).await.unwrap_or(false) {
-                    "backward"
+                    MoveKind::Backward
                 } else {
-                    "sideways"
-                };
-                format!("move {direction} from {} to {}", short(old), short(new))
+                    MoveKind::Sideways
+                }
             }
-            (Some(old), None) => format!("delete from {}", short(old)),
-            (None, Some(new)) => format!("add to {}", short(new)),
+            (Some(_), None) => MoveKind::Delete,
+            (None, Some(_)) => MoveKind::Add,
             (None, None) => continue,
         };
-        lines.push(format!("bookmark: {} [{what}]", name.as_str()));
+        let (mut revisions, mut revision_count) = (Vec::new(), 0);
+        if let Some(new) = &update.after {
+            let published: Arc<ResolvedRevsetExpression> =
+                RevsetExpression::commits(known_heads.clone())
+                    .range(&RevsetExpression::commits(vec![new.clone()]));
+            let mut stream = published
+                .evaluate(repo)
+                .context("failed to evaluate the revisions a push publishes")?
+                .stream();
+            while let Some(id) = stream.next().await {
+                let id = id.context("failed to walk the revisions a push publishes")?;
+                revision_count += 1;
+                if revisions.len() < BookmarkMove::LISTED {
+                    let commit = repo
+                        .store()
+                        .get_commit_async(&id)
+                        .await
+                        .with_context(|| format!("failed to load jj commit {}", id.hex()))?;
+                    revisions.push(short_change_id(&commit));
+                }
+            }
+        }
+        moves.push(BookmarkMove {
+            bookmark: name.as_str().to_owned(),
+            from: update.before.as_ref().map(short),
+            to: update.after.as_ref().map(short),
+            kind,
+            revisions,
+            revision_count,
+        });
     }
-    lines
+    Ok(moves)
 }
 
 /// The CLI's `ensure_new_bookmark_name` for `--change`.

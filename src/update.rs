@@ -2942,6 +2942,7 @@ impl Diffui {
             title,
             body,
             confirm_label,
+            look: Default::default(),
             pending,
         }));
     }
@@ -4194,6 +4195,7 @@ impl Diffui {
             title: format!("{verb} immutable {noun}?").into(),
             body,
             confirm_label: confirm_label.to_owned(),
+            look: Default::default(),
             pending,
         }));
     }
@@ -4705,6 +4707,7 @@ mod tests {
             title: "Rewrite?".into(),
             body: Prose::new(),
             confirm_label: "Rewrite anyway".to_owned(),
+            look: Default::default(),
             pending: PendingMutation {
                 op: mutations::MutationOp::Undo { operation_id: None },
                 tab_id: TabId(0),

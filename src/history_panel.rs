@@ -546,6 +546,7 @@ impl Diffui {
             title,
             body,
             confirm_label: confirm_label.to_owned(),
+            look: Default::default(),
             pending: PendingMutation {
                 op,
                 tab_id: tab,

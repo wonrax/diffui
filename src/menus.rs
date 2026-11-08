@@ -638,6 +638,7 @@ impl Diffui {
             title,
             body,
             confirm_label: "Abandon".to_owned(),
+            look: Default::default(),
             pending: PendingMutation {
                 op,
                 tab_id,

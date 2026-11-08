@@ -5,6 +5,8 @@
 use gpui_kit::prelude::*;
 use gpui_kit::{Div, SharedString, div, px};
 
+use crate::icons;
+use crate::prose::Prose;
 use crate::theme::{self, Color, Font, ThemeSpec, Weight, radius, text_size};
 use crate::typography;
 
@@ -243,6 +245,49 @@ pub(crate) fn count_chip(
         },
     )
 }
+
+/// A warning-tinted box with an alert glyph: something the reader should know
+/// before they confirm, that doesn't stop them. `lead` takes the warning's
+/// ink, `detail` (the consequence, in plain words) the body's.
+pub(crate) fn callout(
+    lead: &Prose,
+    detail: Option<&Prose>,
+    font: Font,
+    mono: Font,
+    theme: ThemeSpec,
+) -> Div {
+    let line = typography::TextBox::default_line(font, text_size::UI);
+    // The glyph centres on the first line's caps.
+    let glyph_top = ((line.cap_top() + line.baseline()) / 2.0 - CALLOUT_ICON / 2.0).max(0.0);
+    let mut text = div()
+        .flex_1()
+        .min_w_0()
+        .font(font.gpui())
+        .text_size(px(text_size::UI))
+        .line_height(px(text_size::UI * typography::DEFAULT_LINE_HEIGHT))
+        .child(lead.view(font, mono, theme.note_text, theme));
+    if let Some(detail) = detail {
+        text = text.child(detail.view(font, mono, theme.muted_text, theme));
+    }
+    div()
+        .w_full()
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap(px(10.0))
+        .px(px(theme::space::LG))
+        .py(px(10.0))
+        .rounded(px(radius::MD))
+        .bg(theme.note_background)
+        .child(div().flex_none().pt(px(glyph_top)).child(icons::icon(
+            icons::ALERT_TRIANGLE,
+            CALLOUT_ICON,
+            theme.note_text,
+        )))
+        .child(text)
+}
+
+const CALLOUT_ICON: f32 = 14.0;
 
 #[cfg(test)]
 mod tests {

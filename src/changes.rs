@@ -1412,6 +1412,7 @@ impl Diffui {
                 .rev(label)
                 .text(". Undo brings them back."),
             confirm_label: "Discard".to_owned(),
+            look: Default::default(),
             pending: PendingMutation {
                 op: MutationOp::RestoreChanges {
                     target: revision,

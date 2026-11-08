@@ -44,7 +44,10 @@ pub use mutations::{
 };
 pub use partial::{DiffSelection, FileSelection, HunkPick, HunkRef, LineRef};
 pub use preview_graph::{PostOpGraph, PreviewGraph, PreviewRole, PreviewRow, RowSource};
-pub use push::{PushAllow, PushCheck, PushRejection, PushRequest, PushTarget, RejectedCommit};
+pub use push::{
+    BookmarkMove, MoveKind, PushAllow, PushCheck, PushRejection, PushRequest, PushTarget,
+    RejectedCommit,
+};
 pub use repo::{
     Capabilities, Command, Event, JobId, OpenSpec, Payload, PreviewRequest, RepoError, RepoHandle,
     RepoId, canonical_selection, rewritten_targets,

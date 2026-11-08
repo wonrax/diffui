@@ -961,6 +961,9 @@ fn palette_hint(theme: ThemeSpec, mono: Font, cx: &mut Cx) -> impl IntoElement {
 /// Modal confirmation for a guarded mutation (see [`crate::ConfirmDialog`]). Empty
 /// when closed. Lives here because it mirrors the open-repository modal's scrim +
 /// card construction exactly.
+///
+/// The title and a line of plain words up top; then, for a push, a row per
+/// bookmark it moves and any callouts; the buttons in a footer strip.
 pub(crate) fn build_confirm_dialog(
     ui: &Diffui,
     theme: ThemeSpec,
@@ -971,12 +974,22 @@ pub(crate) fn build_confirm_dialog(
         return div().into_any_element();
     };
     let (font, mono) = (ui.config.ui_font, ui.config.mono_font);
-    // Red fill: the confirm runs a mutation the jj CLI refuses by default.
+    // Red when the confirm destroys or overrides something (a mutation the jj
+    // CLI refuses by default); the plain call to action for a routine one.
+    let (variant, glyph) = if dialog.look.routine {
+        (
+            ui::Variant::Primary,
+            Some((icons::UPLOAD, theme.background)),
+        )
+    } else {
+        (ui::Variant::Destructive, None)
+    };
+    let glyph = glyph.filter(|_| !dialog.look.moves.is_empty());
     let accept = ui::text_button(
         "confirm-accept",
-        None,
+        glyph,
         dialog.confirm_label.clone(),
-        ui::Variant::Destructive,
+        variant,
         ui::Size::Standard,
         font,
         theme,
@@ -986,19 +999,83 @@ pub(crate) fn build_confirm_dialog(
     let cancel = ui::cancel_button("confirm-cancel", ui::Size::Standard, font, theme, cx)
         .on_click(Diffui::on_action(Action::ConfirmCancel, cx));
 
-    let mut card = ui::dialog_card(ui::DIALOG_WIDTH, theme).child(ui::dialog_title(
-        &dialog.title,
-        font,
-        mono,
-        theme,
-    ));
+    let title_font = emphasis_font(font, Weight::SEMIBOLD);
+    let mut head = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(theme::space::SM))
+        .pt(px(CONFIRM_PAD))
+        .px(px(CONFIRM_PAD))
+        .child(
+            div()
+                .text_size(px(text_size::TITLE))
+                .child(dialog.title.view(title_font, mono, theme.text, theme)),
+        );
     if !dialog.body.is_empty() {
-        card = card.child(ui::dialog_text(&dialog.body, font, mono, theme));
+        head = head.child(
+            div()
+                .w_full()
+                .text_size(px(text_size::BODY))
+                .line_height(px(text_size::BODY * 1.5))
+                .child(dialog.body.view(font, mono, theme.muted_text, theme)),
+        );
     }
-    let card = card.child(ui::button_row(
-        None,
-        [cancel.into_any_element(), accept.into_any_element()],
-    ));
+    let mut details = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(10.0))
+        .px(px(CONFIRM_PAD));
+    for (index, bookmark) in dialog.look.moves.iter().enumerate() {
+        details = details.child(push_row(ui, theme, index, bookmark));
+    }
+    for (lead, detail) in &dialog.look.callouts {
+        details = details.child(crate::overlay_kit::callout(
+            lead,
+            detail.as_ref(),
+            font,
+            mono,
+            theme,
+        ));
+    }
+    let footer = div()
+        .w_full()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(ui::BUTTON_GAP))
+        .px(px(theme::space::XL))
+        .py(px(theme::space::LG))
+        .bg(crate::overlay_kit::inset_fill(theme))
+        .rounded_b(px(radius::XL - 1.0))
+        .child(crate::overlay_kit::key_hint(
+            &["esc"],
+            "Cancel",
+            font,
+            theme,
+        ))
+        .child(div().flex_1())
+        .child(cancel)
+        .child(accept);
+    let card = theme::modal_card(div(), theme)
+        .w(px(CONFIRM_WIDTH))
+        .flex()
+        .flex_col()
+        .gap(px(theme::space::XL))
+        .child(head)
+        .when(
+            !dialog.look.moves.is_empty() || !dialog.look.callouts.is_empty(),
+            |card| card.child(details),
+        )
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .child(crate::root::horizontal_divider(theme))
+                .child(footer),
+        );
     let dismiss = Diffui::on_action::<()>(Action::ConfirmCancel, cx);
     ui::modal(
         "confirm-dialog",
@@ -1007,6 +1084,117 @@ pub(crate) fn build_confirm_dialog(
         move |window, cx| dismiss(&(), window, cx),
     )
     .into_any_element()
+}
+
+const CONFIRM_WIDTH: f32 = 480.0;
+/// The confirm card's inset around its words and rows.
+const CONFIRM_PAD: f32 = 20.0;
+
+/// One bookmark a push moves: its name, where the remote has it and where it
+/// goes, and whether that's a fast-forward and which revisions it publishes.
+fn push_row(
+    ui: &Diffui,
+    theme: ThemeSpec,
+    index: usize,
+    bookmark: &diffui_core::BookmarkMove,
+) -> impl IntoElement {
+    use diffui_core::MoveKind;
+    let (font, mono) = (ui.config.ui_font, ui.config.mono_font);
+    let name_font = emphasis_font(font, Weight::SEMIBOLD);
+    let hash = |text: &str, color: Color| {
+        Aligned::text(
+            typography::line(text.to_owned(), mono, text_size::UI, color),
+            mono,
+            text_size::UI,
+        )
+    };
+    let none = "\u{2014}";
+    let route = typography::baseline_row(
+        [
+            hash(bookmark.from.as_deref().unwrap_or(none), theme.subtle_text),
+            Aligned::gap(theme::space::MD),
+            Aligned::text(
+                typography::line("\u{2192}", font, text_size::UI, theme.subtle_text),
+                font,
+                text_size::UI,
+            ),
+            Aligned::gap(theme::space::MD),
+            hash(bookmark.to.as_deref().unwrap_or(none), theme.text),
+        ],
+        0.0,
+    );
+    let kind = match bookmark.kind {
+        MoveKind::Add => "New on the remote",
+        MoveKind::Forward => "Fast-forward",
+        MoveKind::Backward => "Moves backward",
+        MoveKind::Sideways => "Not a fast-forward",
+        MoveKind::Delete => "Deleted on the remote",
+    };
+    let mut why = crate::prose::Prose::from(kind);
+    if bookmark.revision_count > 0 {
+        why = why.text(match bookmark.revision_count {
+            1 => " \u{b7} 1 revision: ".to_owned(),
+            n => format!(" \u{b7} {n} revisions: "),
+        });
+        for (at, id) in bookmark.revisions.iter().enumerate() {
+            if at > 0 {
+                why = why.text(", ");
+            }
+            why = why.rev(id.clone());
+        }
+        let more = bookmark
+            .revision_count
+            .saturating_sub(bookmark.revisions.len());
+        if more > 0 {
+            why = why.text(format!(" and {more} more"));
+        }
+    }
+    let ink = if bookmark.kind.is_fast_forward() {
+        theme.subtle_text
+    } else {
+        theme.note_text
+    };
+    div()
+        .id(("confirm-push-row", index))
+        .w_full()
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap(px(theme::space::LG))
+        .p(px(theme::space::LG))
+        .rounded(px(radius::MD))
+        .border_1()
+        .border_color(theme.border)
+        .child(div().pt(px(1.0)).child(icons::icon(
+            crate::overlay_kit::glyph::BOOKMARK,
+            ui::ICON_SIZE,
+            theme.lane_base,
+        )))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(theme::space::XS))
+                .child(
+                    typography::line(
+                        bookmark.bookmark.clone(),
+                        name_font,
+                        text_size::BODY,
+                        theme.text,
+                    )
+                    .overflow_hidden()
+                    .text_ellipsis(),
+                )
+                .child(route)
+                .child(
+                    div()
+                        .w_full()
+                        .text_size(px(text_size::UI))
+                        .child(why.view(font, mono, ink, theme)),
+                ),
+        )
 }
 
 /// Modal overlay for opening a repository from a path. Empty when the dialog is

@@ -151,6 +151,7 @@ impl Diffui {
             title,
             body,
             confirm_label: "Rebase".to_owned(),
+            look: Default::default(),
             pending: PendingMutation {
                 op,
                 tab_id: tab,

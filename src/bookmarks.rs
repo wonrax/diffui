@@ -271,9 +271,14 @@ impl Diffui {
             let mut request = rejection.request;
             request.confirm = false;
             self.push_mode(Mode::Confirm(ConfirmDialog {
-                title: Prose::from("Push to ").remote(&request.remote).text("?"),
-                body: rejection.plan.join("\n").into(),
+                title: push_title(&rejection.moves, &request.remote),
+                body: push_explanation(&rejection.moves, &request.remote),
                 confirm_label: "Push".to_owned(),
+                look: crate::ConfirmLook {
+                    routine: true,
+                    moves: rejection.moves,
+                    callouts: Vec::new(),
+                },
                 pending: PendingMutation {
                     op: MutationOp::Push(request),
                     ..pending
@@ -326,15 +331,14 @@ impl Diffui {
                 .code(revset)
                 .text(" (git.private-commits).");
         }
-        body = body.text(format!(
-            "\n\nChanges to push:\n{}",
-            rejection.plan.join("\n")
-        ));
+        let mut callouts = Vec::new();
         if rejection.commits.iter().any(|commit| commit.working_copy) {
-            body = body
-                .text("\n\nOne of them is ")
-                .rev("@")
-                .text(", still being edited.");
+            callouts.push((
+                Prose::from("One of them is ")
+                    .rev("@")
+                    .text(", still being edited."),
+                Some(working_copy_push_warning()),
+            ));
         }
         let mut request = rejection.request;
         request.allow = allow;
@@ -345,6 +349,11 @@ impl Diffui {
                 .text(" anyway?"),
             body,
             confirm_label: "Push anyway".to_owned(),
+            look: crate::ConfirmLook {
+                routine: false,
+                moves: rejection.moves,
+                callouts,
+            },
             pending: PendingMutation {
                 op: MutationOp::Push(request),
                 ..pending
@@ -386,8 +395,18 @@ impl Diffui {
         }
         self.push_mode(Mode::Confirm(ConfirmDialog {
             title: Prose::from("Push the working-copy commit?"),
-            body: working_copy_push_warning(),
+            body: Prose::from("This puts ")
+                .rev("@")
+                .text(" on the remote as it stands now."),
             confirm_label: "Push anyway".to_owned(),
+            look: crate::ConfirmLook {
+                routine: true,
+                moves: Vec::new(),
+                callouts: vec![(
+                    Prose::from("The working copy is part of this push."),
+                    Some(working_copy_push_warning()),
+                )],
+            },
             pending,
         }));
     }
@@ -575,6 +594,52 @@ pub(crate) fn working_copy_push_warning() -> Prose {
         .text(" is still being edited, so later saves drift from what the remote has. Usually you push ")
         .rev("@-")
         .text(" instead.")
+}
+
+/// A push confirmation's title: how many bookmarks go to which remote.
+pub(crate) fn push_title(moves: &[diffui_core::BookmarkMove], remote: &str) -> Prose {
+    let count = match moves.len() {
+        1 => "1 bookmark".to_owned(),
+        n => format!("{n} bookmarks"),
+    };
+    Prose::from(format!("Push {count} to "))
+        .remote(remote)
+        .text("?")
+}
+
+/// One plain line on what a push does to the remote: whether anything there
+/// is lost.
+pub(crate) fn push_explanation(moves: &[diffui_core::BookmarkMove], remote: &str) -> Prose {
+    use diffui_core::MoveKind;
+    let several = moves.len() > 1;
+    if moves
+        .iter()
+        .any(|m| matches!(m.kind, MoveKind::Backward | MoveKind::Sideways))
+    {
+        return Prose::from("Not a fast-forward: revisions only ")
+            .remote(remote)
+            .text(" has are dropped from its bookmark.");
+    }
+    if moves.iter().any(|m| m.kind == MoveKind::Delete) {
+        return Prose::from("Deletes the bookmark on ")
+            .remote(remote)
+            .text(". The revisions stay here.");
+    }
+    if moves.iter().all(|m| m.kind == MoveKind::Add) {
+        return Prose::from(if several {
+            "The bookmarks are new on "
+        } else {
+            "The bookmark is new on "
+        })
+        .remote(remote)
+        .text(", and tracked from here on.");
+    }
+    Prose::from(if several {
+        "This moves the remote bookmarks forward. "
+    } else {
+        "This moves the remote bookmark forward. "
+    })
+    .text("Nobody else's work is overwritten.")
 }
 
 /// Activity label for a push.
@@ -802,7 +867,14 @@ mod tests {
                 allow: PushAllow::default(),
                 confirm: false,
             },
-            plan: vec!["bookmark: main [add to aaaaaaaaaaaa]".to_owned()],
+            moves: vec![diffui_core::BookmarkMove {
+                bookmark: "main".to_owned(),
+                from: None,
+                to: Some("aaaaaaaaaaaa".to_owned()),
+                kind: diffui_core::MoveKind::Add,
+                revisions: vec!["zzzzzzzz".to_owned()],
+                revision_count: 1,
+            }],
         }
     }
 

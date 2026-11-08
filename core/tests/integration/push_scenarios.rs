@@ -665,13 +665,23 @@ fn a_confirmed_push_reports_its_plan_before_pushing() {
     };
     assert!(plan.is_confirmation());
     assert_eq!(
-        plan.plan,
+        plan.plan(),
         vec![format!(
             "bookmark: main [move forward from {} to {}]",
             &first[..12],
             &second[..12]
         )]
     );
+    let [moved] = plan.moves.as_slice() else {
+        panic!("one bookmark moves: {:?}", plan.moves);
+    };
+    assert_eq!(moved.kind, diffui_core::MoveKind::Forward);
+    assert!(moved.kind.is_fast_forward());
+    assert_eq!(
+        moved.revision_count, 1,
+        "only `second` is new to the remote"
+    );
+    assert_eq!(moved.revisions.len(), 1);
     assert_eq!(
         remote_ref(&remote, "main"),
         Some(first),

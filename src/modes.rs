@@ -418,6 +418,7 @@ mod stack_tests {
             title: title.into(),
             body: crate::prose::Prose::new(),
             confirm_label: "Do it".to_owned(),
+            look: Default::default(),
             pending: PendingMutation {
                 op: mutations::MutationOp::Undo { operation_id: None },
                 tab_id: TabId(0),
