@@ -11,14 +11,12 @@ use gpui_kit::{AnyElement, Bounds, MouseButton, Pixels, Window, canvas, div, px}
 
 use crate::theme::{self, ThemeSpec};
 use crate::theme::{Font, Padding, chip_background};
-use crate::{Action, HoverTarget, ToolbarMenu};
-use crate::{Cx, Diffui, icons, input, ui};
+use crate::{Cx, Diffui, icons, input};
+use crate::{HoverTarget, ToolbarMenu};
 
 /// Fixed height of the field well; the caret square derives from it.
 pub const FIELD_HEIGHT: f32 = theme::control::COMPACT;
-/// Equal breathing room around panel collapse buttons. Panel headers use this
-/// on all four sides so the square hover wash sits optically centered between
-/// the surrounding content and panel edges.
+/// Equal breathing room around a panel header's controls, on all four sides.
 pub const PANEL_TOGGLE_INSET: f32 = theme::space::XS;
 
 /// Inset of a panel header's leading content (a filter field's left edge) —
@@ -26,8 +24,8 @@ pub const PANEL_TOGGLE_INSET: f32 = theme::space::XS;
 /// toolbar's first control.
 pub const PANEL_HEADER_LEAD: f32 = theme::space::MD;
 
-/// Padding of a panel header whose trailing element is a collapse toggle:
-/// the toggle's square inset on top/right/bottom, the lead on the left.
+/// Padding of a panel header: the controls' square inset on top/right/bottom,
+/// the lead on the left.
 pub const PANEL_HEADER_PADDING: Padding = Padding {
     top: PANEL_TOGGLE_INSET,
     right: PANEL_TOGGLE_INSET,
@@ -40,9 +38,6 @@ pub const PANEL_HEADER_PADDING: Padding = Padding {
 /// browser's info bar) take the same height so their text shares a line.
 pub const PANEL_HEADER_HEIGHT: f32 = theme::control::COMPACT + 2.0 * PANEL_TOGGLE_INSET;
 
-/// Padding of a collapsed panel's rail, which holds only its toggle: the
-/// toggle sits exactly where the expanded header's toggle row does.
-pub const COLLAPSED_RAIL_PADDING: f32 = PANEL_TOGGLE_INSET;
 /// Gap between the caret square and the field's top/right/bottom edges —
 /// equal on all three sides so the caret reads as a centered inset button.
 const CARET_MARGIN: f32 = 3.0;
@@ -75,38 +70,6 @@ pub(crate) struct FilterField<'a> {
     /// Enter / Shift+Enter).
     pub on_submit: Option<fn(&mut Diffui, &mut Cx)>,
     pub caret: Option<FilterCaret>,
-}
-
-pub(crate) fn panel_toggle_button(
-    font: Font,
-    theme: ThemeSpec,
-    glyph: &'static str,
-    label: &'static str,
-    action: Action,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    div()
-        .id(label)
-        .flex_none()
-        .tooltip(ui::tooltip(label, font, theme))
-        .child(panel_toggle_button_bare(theme, glyph, action, window, cx))
-        .into_any_element()
-}
-
-/// The same collapse control without a tooltip. Used when hovering the control
-/// opens a self-labeling preview, where a second floating label would overlap
-/// the preview and add noise.
-pub(crate) fn panel_toggle_button_bare(
-    theme: ThemeSpec,
-    glyph: &'static str,
-    action: Action,
-    _window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    ui::icon_button(glyph, glyph, theme.muted_text, ui::Size::Compact, theme, cx)
-        .on_click(Diffui::on_action(action, cx))
-        .into_any_element()
 }
 
 /// The field chrome (well + hairline border) lives on a wrapping element rather

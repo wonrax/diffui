@@ -11,6 +11,7 @@ use crate::diff_view::HeaderLine;
 use crate::harness::{Harness, at, fixture_repo};
 use crate::range::RangeAction;
 use crate::revision_list::RowSelectionKey;
+use crate::root::Panel;
 use crate::theme::ThemePreference;
 use crate::{Action, MainView};
 
@@ -82,9 +83,40 @@ fn panels_collapse_and_peek() {
     shot(&mut h, "panel-both-collapsed");
     h.perform(Action::ToggleHistoryPanel);
     shot(&mut h, "panel-files-collapsed");
-    h.act(|ui, _| ui.on_changed_files_trigger_entered());
-    assert!(h.read(|ui| ui.changed_files_peek_open));
+
+    // The header's file count floats the hidden tree; Esc puts it away.
+    h.click("commit-files-trigger");
+    assert_eq!(
+        h.read(|ui| ui.panel_peek.map(|peek| peek.panel)),
+        Some(Panel::Files)
+    );
     shot(&mut h, "panel-files-peek");
+    h.press("escape");
+    h.settle();
+    assert!(h.read(|ui| ui.panel_peek.is_none()));
+
+    // The ids float the hidden revisions; picking one puts them away.
+    h.perform(Action::ToggleHistoryPanel);
+    h.click("commit-revisions-trigger");
+    assert_eq!(
+        h.read(|ui| ui.panel_peek.map(|peek| peek.panel)),
+        Some(Panel::Revisions)
+    );
+    shot(&mut h, "panel-revisions-peek");
+    select(&mut h, REWORK);
+    assert!(h.read(|ui| ui.panel_peek.is_none()));
+
+    // A press outside closes it too.
+    h.click("commit-files-trigger");
+    assert!(h.read(|ui| ui.panel_peek.is_some()));
+    h.click("commit-fold");
+    assert!(h.read(|ui| ui.panel_peek.is_none()));
+    h.click("commit-fold");
+
+    // Showing the panel again ends its peek.
+    h.click("commit-files-trigger");
+    h.perform(Action::ToggleFilesPanel);
+    assert!(h.read(|ui| ui.panel_peek.is_none()));
 }
 
 #[test]

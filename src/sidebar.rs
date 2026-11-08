@@ -384,6 +384,7 @@ pub(crate) fn build_sidebar(
         .child(
             field::PANEL_HEADER_PADDING
                 .apply(div())
+                .pr(px(field::PANEL_HEADER_LEAD))
                 .w_full()
                 .flex_none()
                 .flex()
@@ -396,18 +397,7 @@ pub(crate) fn build_sidebar(
                         .min_w_0()
                         .h(px(field::FIELD_HEIGHT))
                         .child(build_revset_filter(ui, theme, window, cx)),
-                )
-                .child(div().flex_none().size(px(theme::control::COMPACT)).child(
-                    field::panel_toggle_button(
-                        ui.config.ui_font,
-                        theme,
-                        icons::MINUS,
-                        "Hide revision history",
-                        Action::ToggleHistoryPanel,
-                        window,
-                        cx,
-                    ),
-                )),
+                ),
         )
         .children(crate::revset_assist::error_strip(ui, theme, window, cx))
         .children(crate::history_panel::file_filter_banner(
@@ -444,33 +434,6 @@ pub(crate) fn build_sidebar(
         body = body.child(build_op_bar(ui, theme, window, cx));
     }
     body.into_any_element()
-}
-
-pub(crate) fn build_collapsed_sidebar(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    div()
-        .w(px(theme::COLLAPSED_PANEL_WIDTH))
-        .h_full()
-        .p(px(field::COLLAPSED_RAIL_PADDING))
-        .bg(theme.panel_background)
-        .child(
-            div()
-                .size(px(theme::control::COMPACT))
-                .child(field::panel_toggle_button(
-                    ui.config.ui_font,
-                    theme,
-                    icons::GIT_BRANCH,
-                    "Show revision history",
-                    Action::ToggleHistoryPanel,
-                    window,
-                    cx,
-                )),
-        )
-        .into_any_element()
 }
 
 /// How a target row of the op bar reads.

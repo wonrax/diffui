@@ -390,16 +390,10 @@ pub(crate) struct Diffui {
     /// The caret control the cursor is currently over, if any — drives the
     /// hover highlight that `mouse_area` (unlike `button`) doesn't provide.
     pub(crate) hovered: Option<HoverTarget>,
+    /// A hidden panel shown over the diff for a moment (see `root::Panel`).
+    pub(crate) panel_peek: Option<root::PanelPeek>,
     /// The tab strip's drag and slide state.
     pub(crate) tab_strip: tab_bar::Strip,
-    /// Whether the collapsed changed-files rail is exposing its temporary tree.
-    /// Only the rail's icon opens it; the hover flags keep a delayed close from
-    /// landing while the pointer is still on the icon, the rail or the tree, or
-    /// crossing between them.
-    pub(crate) changed_files_peek_open: bool,
-    pub(crate) changed_files_trigger_hovered: bool,
-    pub(crate) changed_files_rail_hovered: bool,
-    pub(crate) changed_files_popup_hovered: bool,
     /// Transient error toasts (failed mutation/fetch/undo), newest last.
     /// The activity log keeps the durable record; these only make a failure
     /// impossible to miss. Auto-pruned after a few seconds, click to dismiss.

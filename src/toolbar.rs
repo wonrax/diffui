@@ -8,11 +8,15 @@
 
 use diffui_core::RevisionSelection;
 use gpui_kit::base::TestSupportExt as _;
+use gpui_kit::component::Disableable as _;
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, ElementId, MouseButton, MouseDownEvent, SharedString, Window, div, px};
 
 use crate::repository::Vcs;
-use crate::theme::{self, Color, Font, ThemeSpec, chip_background, radius, text_size, well_fill};
+use crate::theme::{
+    self, Color, Font, ThemeSpec, Weight, chip_background, emphasis_font, radius, text_size,
+    well_fill,
+};
 use crate::typography::{self, Aligned};
 use crate::{Action, Cx, Diffui, FetchTarget, MainView, ToolbarMenu, activity, icons, sidebar, ui};
 
@@ -40,6 +44,19 @@ pub fn modal_top() -> f32 {
 /// Size of the dropdown carets (fetch split button, revset presets). A touch
 /// smaller than the action icons so the caret reads as a subordinate affordance.
 const CARET_ICON_SIZE: f32 = 12.0;
+
+/// Between the controls of one group; separators part the groups.
+const GROUP_GAP: f32 = theme::space::XXS;
+
+/// The push target chip: between its glyph, name and count, and before it.
+const PUSH_CHIP_GAP: f32 = 4.0;
+/// Between Push's glyph and its label, as in every labelled button.
+const PUSH_ICON_GAP: f32 = 6.0;
+/// The widest a bookmark name in the push chip gets before it ellipsises.
+const PUSH_TARGET_MAX_WIDTH: f32 = 200.0;
+
+/// A group separator's height.
+const SEPARATOR_HEIGHT: f32 = 18.0;
 
 /// Width of the fetch split button's caret half.
 const CARET_WIDTH: f32 = 24.0;
@@ -119,14 +136,18 @@ pub(crate) fn build_toolbar(
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(theme::space::SM))
-        .flex_none();
-    // Diff ↔ Source view switcher, leftmost so the "what am I looking at" control
-    // leads the bar. Repo tabs only: a PR has no tree to browse.
+        .gap(px(GROUP_GAP))
+        .flex_none()
+        .child(panel_toggles(ui, theme, font, cx))
+        .child(separator(theme));
+    // Diff ↔ Source view switcher, so the "what am I looking at" control leads
+    // the bar after the panels. Repo tabs only: a PR has no tree to browse.
     let is_repo = ui.active().repository.is_some();
     let in_source = is_repo && ui.active().main_view == MainView::Source;
     if is_repo {
-        actions = actions.child(view_switcher(ui, theme, font, window, cx));
+        actions = actions
+            .child(view_switcher(ui, theme, font, window, cx))
+            .child(separator(theme));
     }
     if in_source {
         // The repo-mutating actions don't apply to browsing a snapshot; instead
@@ -150,33 +171,28 @@ pub(crate) fn build_toolbar(
             && ui.active().session.capabilities.mutate
             && !ui.active().session.bookmarks.remotes.is_empty()
         {
-            actions = actions.child(toolbar_button(
-                "toolbar-push",
-                icons::UPLOAD,
-                "Push",
-                Action::Bookmark(crate::bookmarks::BookmarkAction::PushTracked),
-                theme,
-                font,
-                cx,
-            ));
+            actions = actions.child(push_button(ui, theme, font, cx));
         }
         // jj-only: git has no operation log to undo.
         if is_jj {
             actions = actions
-                .child(toolbar_button(
+                .child(separator(theme))
+                .child(toggle_button(
                     "toolbar-undo",
                     icons::UNDO,
-                    "Undo",
-                    Action::Undo,
+                    with_shortcut(ui, "Undo the last operation", "repo.undo"),
+                    false,
+                    Some(Action::Undo),
                     theme,
                     font,
                     cx,
                 ))
-                .child(toolbar_button(
+                .child(toggle_button(
                     "toolbar-redo",
                     icons::REDO,
-                    "Redo",
-                    Action::Redo,
+                    with_shortcut(ui, "Redo the last undone operation", "repo.redo"),
+                    false,
+                    Some(Action::Redo),
                     theme,
                     font,
                     cx,
@@ -191,12 +207,12 @@ pub(crate) fn build_toolbar(
         .flex_row()
         .flex_none()
         .items_center()
-        .gap(px(theme::space::SM));
+        .gap(px(GROUP_GAP));
     if crate::changes::can_select_lines(ui) {
         toggles = toggles.child(toolbar_toggle_button(
             "toolbar-lines",
             icons::LIST_CHECKS,
-            "Select lines (v)",
+            "Select lines (v)".into(),
             crate::changes::live_line_select(ui.active()).is_some(),
             Action::Changes(crate::changes::ChangesMsg::Lines(
                 crate::changes::LineMsg::Toggle,
@@ -212,7 +228,7 @@ pub(crate) fn build_toolbar(
     toggles = toggles.child(toolbar_toggle_button(
         "toolbar-wrap",
         icons::WRAP,
-        "Wrap lines",
+        "Wrap lines".into(),
         ui.diff_wrap,
         Action::ToggleWrap,
         theme,
@@ -232,7 +248,7 @@ pub(crate) fn build_toolbar(
         toggles = toggles.child(toolbar_toggle_button(
             "toolbar-split",
             icons::SPLIT,
-            split_label,
+            split_label.into(),
             ui.diff_split,
             Action::ToggleSplit,
             theme,
@@ -437,33 +453,236 @@ fn toolbar_button(
 /// A toolbar toggle: an icon-only button with a persistent accent tint while
 /// active so the on state reads at a glance. The label lives in a hover tooltip
 /// instead of beside the glyph: these are view options, not actions, so they stay
-/// compact at the bar's right edge.
+/// compact.
 #[allow(clippy::too_many_arguments)]
 fn toolbar_toggle_button(
     id: &'static str,
     icon: &'static str,
-    label: &'static str,
+    label: SharedString,
     active: bool,
     action: Action,
     theme: ThemeSpec,
     font: Font,
     cx: &mut Cx,
 ) -> impl IntoElement {
-    let icon_color = if active {
-        theme.accent
-    } else {
-        theme.muted_text
+    toggle_button(id, icon, label, active, Some(action), theme, font, cx)
+}
+
+/// [`toolbar_toggle_button`], inert (greyed, no press) without an action.
+#[allow(clippy::too_many_arguments)]
+fn toggle_button(
+    id: &'static str,
+    icon: &'static str,
+    label: SharedString,
+    active: bool,
+    action: Option<Action>,
+    theme: ThemeSpec,
+    font: Font,
+    cx: &mut Cx,
+) -> AnyElement {
+    let icon_color = match (&action, active) {
+        (None, _) => theme.subtle_text,
+        (Some(_), true) => theme.accent,
+        (Some(_), false) => theme.muted_text,
     };
-    let mut button = ui::icon_button(id, icon, icon_color, CONTROL, theme, cx)
-        .on_click(Diffui::on_action(action, cx));
+    let mut button = ui::icon_button(id, icon, icon_color, CONTROL, theme, cx);
     if active {
         button = button.bg(chip_background(theme.accent));
     }
+    button = match action {
+        Some(action) => button.on_click(Diffui::on_action(action, cx)),
+        None => button.disabled(true),
+    };
     div()
         .id(ElementId::Name(SharedString::from(format!("{id}-tip"))))
         .flex_none()
         .tooltip(ui::tooltip(label, font, theme))
         .child(button)
+        .into_any_element()
+}
+
+/// `label`, with the first key bound to `command` in parentheses.
+pub(crate) fn with_shortcut(ui: &Diffui, label: &str, command: &'static str) -> SharedString {
+    match ui.keymap.chord_for(crate::commands::Context::Base, command) {
+        Some(chord) => format!("{label} ({})", chord.display()).into(),
+        None => SharedString::from(label.to_owned()),
+    }
+}
+
+/// The two panel toggles that lead the bar: the revision list and the changed
+/// files beside the diff. Only the Diff view hides its panels; the others keep
+/// theirs, so there the toggles sit inert.
+fn panel_toggles(ui: &Diffui, theme: ThemeSpec, font: Font, cx: &mut Cx) -> impl IntoElement {
+    let tab = ui.active();
+    let in_diff = tab.main_view == MainView::Diff;
+    let toggle = |id: &'static str,
+                  icon: &'static str,
+                  shown: bool,
+                  what: &'static str,
+                  command: &'static str,
+                  action: Action,
+                  cx: &mut Cx| {
+        let label = if !in_diff {
+            SharedString::from(format!("Only the Diff view hides its {what}"))
+        } else {
+            with_shortcut(
+                ui,
+                &format!("{} {what}", if shown { "Hide" } else { "Show" }),
+                command,
+            )
+        };
+        toggle_button(
+            id,
+            icon,
+            label,
+            shown && in_diff,
+            in_diff.then_some(action),
+            theme,
+            font,
+            cx,
+        )
+    };
+    div()
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_center()
+        .gap(px(GROUP_GAP))
+        .child(toggle(
+            "toolbar-revisions",
+            icons::PANEL_LEFT,
+            !tab.history_panel_collapsed,
+            "revisions",
+            "view.toggle-revisions",
+            Action::ToggleHistoryPanel,
+            cx,
+        ))
+        .child(toggle(
+            "toolbar-changed-files",
+            icons::COLUMNS_3,
+            !tab.files_panel_collapsed,
+            "changed files",
+            "view.toggle-changed-files",
+            Action::ToggleFilesPanel,
+            cx,
+        ))
+}
+
+/// Push, saying what it pushes: the bookmark a plain `jj git push` would send
+/// and how far it is ahead of the remote, or how many bookmarks go. Plain
+/// "Push" when nothing would.
+fn push_button(ui: &Diffui, theme: ThemeSpec, font: Font, cx: &mut Cx) -> AnyElement {
+    let session = &ui.active().session;
+    let bookmarks = &session.bookmarks;
+    let remote = bookmarks.default_push_remote();
+    let candidates = &bookmarks.tracked_push;
+
+    let tip = match (remote, candidates.as_slice()) {
+        (None, _) => "Push needs a remote: several are set up, and no git.push".to_owned(),
+        (Some(remote), []) => format!("Nothing to push to {remote}"),
+        (Some(remote), [one]) => format!(
+            "Push {} to {remote}: {} {} ahead",
+            one.name,
+            one.ahead,
+            if one.ahead == 1 {
+                "revision"
+            } else {
+                "revisions"
+            }
+        ),
+        (Some(remote), many) => format!(
+            "Push {} bookmarks to {remote}: {}",
+            many.len(),
+            many.iter()
+                .map(|candidate| candidate.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+
+    let size = CONTROL.text_size();
+    let mut line = vec![
+        Aligned::glyph(
+            icons::icon(icons::UPLOAD, ui::ICON_SIZE, theme.muted_text),
+            size,
+        ),
+        Aligned::gap(PUSH_ICON_GAP),
+        Aligned::text(typography::line("Push", font, size, theme.text), font, size),
+    ];
+    let target = match candidates.as_slice() {
+        [] => None,
+        [one] => {
+            let lane = session
+                .commits
+                .find_by_bookmark(&one.name)
+                .map(|row| {
+                    let lane = session.graph.frame(row.index(), usize::MAX).node_lane;
+                    sidebar::revision_graph_style(theme).lane_color(lane)
+                })
+                .unwrap_or(theme.lanes[0]);
+            Some((one.name.clone(), Some(one.ahead), lane))
+        }
+        many => Some((format!("{} bookmarks", many.len()), None, theme.lanes[0])),
+    };
+    if let Some((name, ahead, lane)) = target {
+        let counts = emphasis_font(font, Weight::SEMIBOLD);
+        let content = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(PUSH_CHIP_GAP))
+            .child(icons::icon(icons::BOOKMARK, crate::chip::ICON_SIZE, lane))
+            .child(
+                div()
+                    .max_w(px(PUSH_TARGET_MAX_WIDTH))
+                    .overflow_hidden()
+                    .child(typography::line(name, font, size, theme.muted_text).text_ellipsis()),
+            )
+            .children(
+                ahead
+                    .filter(|ahead| *ahead > 0)
+                    .map(|ahead| typography::line(format!("↑{ahead}"), counts, size, theme.accent)),
+            );
+        line.push(Aligned::gap(PUSH_CHIP_GAP));
+        line.push(Aligned::chip(
+            content,
+            font,
+            size,
+            [2.0, 6.0].into(),
+            move |chip| {
+                chip.bg(chip_background(theme.muted_text))
+                    .rounded(px(crate::chip::RADIUS))
+            },
+        ));
+    }
+
+    let button = ui::button("toolbar-push", ui::Variant::Ghost, CONTROL, theme, cx)
+        .flex_none()
+        .child(typography::baseline_row(line, 0.0))
+        .on_click(Diffui::on_action(
+            Action::Bookmark(crate::bookmarks::BookmarkAction::PushTracked),
+            cx,
+        ));
+    div()
+        .id("toolbar-push-tip")
+        .flex_none()
+        .tooltip(ui::tooltip(
+            with_shortcut(ui, &tip, "repo.push"),
+            font,
+            theme,
+        ))
+        .child(button)
+        .into_any_element()
+}
+
+/// The hairline between two groups of the bar.
+fn separator(theme: ThemeSpec) -> impl IntoElement {
+    div()
+        .w(px(1.0))
+        .h(px(SEPARATOR_HEIGHT))
+        .mx(px(theme::space::XS))
+        .flex_none()
+        .bg(theme.border)
 }
 
 /// What the source browser is looking at, in the toolbar slot the diff view's

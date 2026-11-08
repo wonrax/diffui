@@ -109,7 +109,6 @@ impl From<[f32; 2]> for Padding {
 /// footprint, 2px clear of every edge → an 8px pill).
 pub const SCROLLBAR_WIDTH: f32 = 8.0;
 pub const SCROLLBAR_MARGIN: f32 = 2.0;
-pub const COLLAPSED_PANEL_WIDTH: f32 = 36.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThemePreference {

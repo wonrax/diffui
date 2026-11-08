@@ -22,7 +22,7 @@ const DESCRIPTION_EDITOR_GAP: f32 = 8.0;
 // iced's shaper did, and the stat columns measure wider with it.
 pub const DEFAULT_FILE_NAV_WIDTH: f32 = 248.0;
 pub const MIN_FILE_NAV_WIDTH: f32 = 168.0;
-pub const FILE_NAV_PEEK_WIDTH: f32 = 284.0;
+pub const FILE_NAV_PEEK_WIDTH: f32 = 300.0;
 
 /// A `+N` / `−N` count wears its add/del color only when it counts
 /// something: a `+0` beside a `−5` reads as noise, not as a signal.
@@ -136,19 +136,7 @@ const MIN_SPLIT_COLUMN_CHARS: f32 = 56.0;
 /// The diff pane's width: the window minus the history and file panes and
 /// their dividers.
 pub(crate) fn diff_pane_width(ui: &Diffui) -> f32 {
-    let history_width = if ui.active().history_panel_collapsed {
-        crate::theme::COLLAPSED_PANEL_WIDTH
-    } else {
-        ui.sidebar_width
-    };
-    let files_width = if ui.active().session.document.files.is_empty() {
-        0.0
-    } else if ui.active().files_panel_collapsed {
-        crate::theme::COLLAPSED_PANEL_WIDTH + 1.0
-    } else {
-        ui.file_nav_width + 1.0
-    };
-    (ui.window_size.width - history_width - files_width - 1.0).max(0.0)
+    (ui.window_size.width - ui.side_panes_width()).max(0.0)
 }
 
 /// Whether a side-by-side diff has room for both halves. The toggle is the
@@ -172,24 +160,7 @@ fn description_editor_input_height(ui: &Diffui) -> f32 {
     let Some(editor) = ui.active().description_editor() else {
         return 0.0;
     };
-    let history_width = if ui.active().history_panel_collapsed {
-        crate::theme::COLLAPSED_PANEL_WIDTH
-    } else {
-        ui.sidebar_width
-    };
-    let files_width = if ui.active().session.document.files.is_empty() {
-        0.0
-    } else if ui.active().files_panel_collapsed {
-        crate::theme::COLLAPSED_PANEL_WIDTH + 1.0
-    } else {
-        ui.file_nav_width + 1.0
-    };
-    let width = (ui.window_size.width
-        - history_width
-        - files_width
-        - 1.0
-        - diff_view::HEADER_HORIZONTAL_PADDING * 2.0)
-        .max(1.0);
+    let width = (diff_pane_width(ui) - diff_view::HEADER_HORIZONTAL_PADDING * 2.0).max(1.0);
     crate::input::fit_height(
         &editor.text(),
         ui.config.mono_font,
@@ -208,41 +179,24 @@ pub(crate) fn build_file_navigator(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    build_file_navigator_surface(ui, theme, ui.file_nav_width, true, window, cx)
+    build_file_navigator_surface(ui, theme, ui.file_nav_width, window, cx)
 }
 
-/// The same navigator used by the permanent panel, sized as a floating quick
-/// picker when the panel is collapsed. Keeping one tree builder preserves file
-/// selection, directory folding, scrolling, and the file context menu.
+/// The navigator at the width it floats at over the diff while its panel is
+/// hidden (see `root::Panel`).
 pub(crate) fn build_file_navigator_peek(
     ui: &Diffui,
     theme: ThemeSpec,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let tree = build_file_navigator_surface(ui, theme, FILE_NAV_PEEK_WIDTH, false, window, cx);
-    let hover = Diffui::listen(cx, |this, entered: &bool, _, cx| {
-        if *entered {
-            this.on_changed_files_popup_entered();
-        } else {
-            this.on_changed_files_popup_exited(cx);
-        }
-    });
-    crate::theme::popover(div().id("file-navigator-peek"), theme)
-        .w(px(FILE_NAV_PEEK_WIDTH))
-        .h_full()
-        .overflow_hidden()
-        .occlude()
-        .on_hover(hover)
-        .child(tree)
-        .into_any_element()
+    build_file_navigator_surface(ui, theme, FILE_NAV_PEEK_WIDTH, window, cx)
 }
 
 fn build_file_navigator_surface(
     ui: &Diffui,
     theme: ThemeSpec,
     width: f32,
-    show_collapse: bool,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
@@ -262,32 +216,15 @@ fn build_file_navigator_surface(
         title_font,
         text_size::UI,
     );
-    let mut header = div()
+    // One control step tall, so the label sits on the same line as the other
+    // panels' headers. The toolbar's toggle hides the panel.
+    let header = div()
         .flex()
         .flex_row()
         .items_center()
-        // Toggle-row height even without the toggle (the peek), so the label sits on
-        // the same line as the other panels' headers.
         .h(px(crate::theme::control::COMPACT))
         .child(title)
         .child(div().flex_1());
-    if show_collapse {
-        header = header.child(
-            div()
-                .flex_none()
-                .size(px(crate::theme::control::COMPACT))
-                .overflow_hidden()
-                .child(crate::field::panel_toggle_button(
-                    ui.config.ui_font,
-                    theme,
-                    icons::MINUS,
-                    "Hide changed files",
-                    Action::ToggleFilesPanel,
-                    window,
-                    cx,
-                )),
-        );
-    }
     div()
         .flex()
         .flex_col()
@@ -300,13 +237,7 @@ fn build_file_navigator_surface(
                 .pt(px(crate::field::PANEL_TOGGLE_INSET))
                 .pb(px(crate::field::PANEL_TOGGLE_INSET))
                 .pl(px(crate::theme::space::LG))
-                // The toggle keeps its square inset; a bare count (the peek) mirrors
-                // the label's inset instead.
-                .pr(px(if show_collapse {
-                    crate::field::PANEL_TOGGLE_INSET
-                } else {
-                    crate::theme::space::LG
-                }))
+                .pr(px(crate::theme::space::LG))
                 .child(header),
         )
         .child(
@@ -391,54 +322,6 @@ fn file_tree(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) ->
         this.perform(Action::Changes(ChangesMsg::ToggleTreeRow(*row)), cx);
     }));
     revision_list::view("file-navigator", props, window, cx)
-}
-
-pub(crate) fn build_collapsed_file_navigator(
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    // Only the icon opens the peek: the rail runs the full height of the window, so
-    // as a trigger it would fire on every pass between the history and the diff. It
-    // still holds a peek that is already open, because a diagonal move from the icon
-    // to a file far down the tree spends longer crossing the rail than the close
-    // delay allows.
-    let toggle = crate::field::panel_toggle_button_bare(
-        theme,
-        icons::FILE_DIFF,
-        Action::ToggleFilesPanel,
-        window,
-        cx,
-    );
-    let trigger_hover = Diffui::listen(cx, |this, entered: &bool, _, cx| {
-        if *entered {
-            this.on_changed_files_trigger_entered();
-        } else {
-            this.on_changed_files_trigger_exited(cx);
-        }
-    });
-    let rail_hover = Diffui::listen(cx, |this, entered: &bool, _, cx| {
-        if *entered {
-            this.on_changed_files_rail_entered();
-        } else {
-            this.on_changed_files_rail_exited(cx);
-        }
-    });
-    div()
-        .id("collapsed-file-navigator")
-        .w(px(crate::theme::COLLAPSED_PANEL_WIDTH))
-        .h_full()
-        .p(px(crate::field::COLLAPSED_RAIL_PADDING))
-        .bg(theme.panel_background)
-        .on_hover(rail_hover)
-        .child(
-            div()
-                .id("collapsed-file-navigator-trigger")
-                .size(px(crate::theme::control::COMPACT))
-                .on_hover(trigger_hover)
-                .child(toggle),
-        )
-        .into_any_element()
 }
 
 pub(crate) fn build_diff_panel(

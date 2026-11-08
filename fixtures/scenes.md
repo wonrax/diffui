@@ -86,7 +86,7 @@ have no scene; see src/toolbar.rs and core/src/github.rs for what differs.
 ### `base-working-copy`
 
 - Window: 1440x900, light
-- State: The default layout: tab strip, toolbar, revision list with revset filter and footer, changed-files pane, diff of @ (unified, wrap on). Working copy selected, activity indicator idle.
+- State: The default layout: tab strip, toolbar, revision list with revset filter, changed-files pane, diff of @ (unified, wrap on). Working copy selected, activity indicator idle, status bar along the bottom.
 - Steps: Open the fixture repo.
 
 ### `base-dark`
@@ -197,26 +197,32 @@ have no scene; see src/toolbar.rs and core/src/github.rs for what differs.
 ### `panel-history-collapsed`
 
 - Window: 1440x900, light
-- State: Revision list collapsed to its rail, changed files and diff widen.
-- Steps: Click the history pane's collapse toggle.
+- State: Revision list hidden: it takes no width, changed files and diff widen, its toolbar toggle is off and the ids in the diff header carry a chevron.
+- Steps: Click the toolbar's revisions toggle.
 
 ### `panel-files-collapsed`
 
 - Window: 1440x900, light
-- State: Changed-files pane collapsed to its rail.
-- Steps: Click the files pane's collapse toggle.
+- State: Changed files hidden: no width, the diff widens, the file count in the diff header carries a chevron.
+- Steps: Click the toolbar's changed-files toggle.
 
 ### `panel-both-collapsed`
 
 - Window: 1440x900, light
-- State: Both panes collapsed: the diff has the window.
-- Steps: Collapse both.
+- State: Both panels hidden: the diff has the window.
+- Steps: Hide both.
 
 ### `panel-files-peek`
 
 - Window: 1440x900, light
-- State: Files pane collapsed, its rail icon hovered: the file tree floats over the diff.
-- Steps: Collapse the files pane, hover its rail icon.
+- State: Changed files hidden, the header's file count pressed: the file tree floats under it, over the diff.
+- Steps: Hide the changed files, click 'N files' in the diff header.
+
+### `panel-revisions-peek`
+
+- Window: 1440x900, light
+- State: Revisions hidden, the header's ids pressed: the revision list floats down the window's left edge, over the panes.
+- Steps: Hide the revisions, click the ids in the diff header.
 
 
 ## Diff: file kinds

@@ -2234,6 +2234,40 @@ pub(crate) static REGISTRY: &[Command] = &[
         palette: PaletteScope::Root,
     },
     Command {
+        id: "view.toggle-revisions",
+        label: "Toggle the revisions sidebar",
+        hint: "Show or hide the revision list beside the diff",
+        contexts: &[Context::Base],
+        chords: &["alt+cmd+1"],
+        // ⌥ composes 1 into `¡` on a US layout, and the key event can carry that.
+        mac_chords: &["alt+cmd+1", "alt+cmd+\u{a1}"],
+        enabled: |ui, _arg| {
+            require(
+                ui.active().main_view == MainView::Diff,
+                "Only the Diff view hides its panels",
+            )
+        },
+        build: |_ui, _arg| Some(Action::ToggleHistoryPanel),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "view.toggle-changed-files",
+        label: "Toggle the changed files",
+        hint: "Show or hide the changed-file tree beside the diff",
+        contexts: &[Context::Base],
+        chords: &["alt+cmd+2"],
+        // ⌥2 composes into `™` on a US layout.
+        mac_chords: &["alt+cmd+2", "alt+cmd+\u{2122}"],
+        enabled: |ui, _arg| {
+            require(
+                ui.active().main_view == MainView::Diff,
+                "Only the Diff view hides its panels",
+            )
+        },
+        build: |_ui, _arg| Some(Action::ToggleFilesPanel),
+        palette: PaletteScope::Root,
+    },
+    Command {
         id: "view.diff",
         label: "Show the diff",
         hint: "Switch the main pane back to the diff",

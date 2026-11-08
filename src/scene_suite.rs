@@ -509,7 +509,7 @@ fn all() -> Vec<Scene> {
     );
 
     t.group("Shell: tabs and toolbar");
-    t.add(s("base-working-copy", "The default layout: tab strip, toolbar, revision list with revset filter and footer, changed-files pane, diff of @ (unified, wrap on). Working copy selected, activity indicator idle.", "Open the fixture repo.", |_c| {}));
+    t.add(s("base-working-copy", "The default layout: tab strip, toolbar, revision list with revset filter, changed-files pane, diff of @ (unified, wrap on). Working copy selected, activity indicator idle, status bar along the bottom.", "Open the fixture repo.", |_c| {}));
     t.add(
         s(
             "base-dark",
@@ -589,24 +589,24 @@ fn all() -> Vec<Scene> {
     t.add(s("selection-outside-revset", "The diff pane keeps showing a revision the revset no longer lists, with the note saying so.", "Select a revision, then change the revset so it drops out.", |c| { c.select("kitchen-sink"); c.act(Action::SetRevset("main".to_owned())); }));
     t.add(s(
         "panel-history-collapsed",
-        "Revision list collapsed to its rail, changed files and diff widen.",
-        "Click the history pane's collapse toggle.",
+        "Revision list hidden: it takes no width, changed files and diff widen, its toolbar toggle is off and the ids in the diff header carry a chevron.",
+        "Click the toolbar's revisions toggle.",
         |c| {
             c.cmd_action(Action::ToggleHistoryPanel);
         },
     ));
     t.add(s(
         "panel-files-collapsed",
-        "Changed-files pane collapsed to its rail.",
-        "Click the files pane's collapse toggle.",
+        "Changed files hidden: no width, the diff widens, the file count in the diff header carries a chevron.",
+        "Click the toolbar's changed-files toggle.",
         |c| {
             c.cmd_action(Action::ToggleFilesPanel);
         },
     ));
     t.add(s(
         "panel-both-collapsed",
-        "Both panes collapsed: the diff has the window.",
-        "Collapse both.",
+        "Both panels hidden: the diff has the window.",
+        "Hide both.",
         |c| {
             c.cmd_action(Action::ToggleHistoryPanel);
             c.cmd_action(Action::ToggleFilesPanel);
@@ -614,12 +614,22 @@ fn all() -> Vec<Scene> {
     ));
     t.add(s(
         "panel-files-peek",
-        "Files pane collapsed, its rail icon hovered: the file tree floats over the diff.",
-        "Collapse the files pane, hover its rail icon.",
+        "Changed files hidden, the header's file count pressed: the file tree floats under it, over the diff.",
+        "Hide the changed files, click 'N files' in the diff header.",
         |c| {
             c.select("kitchen-sink");
             c.cmd_action(Action::ToggleFilesPanel);
-            c.h.act(|ui, _| ui.on_changed_files_trigger_entered());
+            c.h.click("commit-files-trigger");
+            c.settle();
+        },
+    ));
+    t.add(s(
+        "panel-revisions-peek",
+        "Revisions hidden, the header's ids pressed: the revision list floats down the window's left edge, over the panes.",
+        "Hide the revisions, click the ids in the diff header.",
+        |c| {
+            c.cmd_action(Action::ToggleHistoryPanel);
+            c.h.click("commit-revisions-trigger");
             c.settle();
         },
     ));
@@ -2331,7 +2341,9 @@ fn run(scene: &Scene) -> Result<(), String> {
     } else {
         scene.open_repo.then(|| repo.clone())
     };
-    let config = format!("theme = \"{}\"\n{}", scene.theme, scene.config);
+    // `DIFFUI_SCENE_THEME=Dark` shoots a light scene dark, and the other way.
+    let theme = std::env::var("DIFFUI_SCENE_THEME").unwrap_or_else(|_| scene.theme.to_owned());
+    let config = format!("theme = \"{theme}\"\n{}", scene.config);
     let h = Harness::open_fresh(open.as_deref(), scene.size, &config);
     let mut c = Ctx {
         h,

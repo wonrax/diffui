@@ -249,11 +249,8 @@ impl Diffui {
             recent_repos,
             next_activity_id: 0,
             hovered: None,
+            panel_peek: None,
             tab_strip: Default::default(),
-            changed_files_peek_open: false,
-            changed_files_trigger_hovered: false,
-            changed_files_rail_hovered: false,
-            changed_files_popup_hovered: false,
             modifiers: keyboard::Modifiers::default(),
             toasts: Vec::new(),
             next_toast_id: 0,
@@ -1060,7 +1057,6 @@ impl Diffui {
             Action::ToggleFilesPanel => {
                 let target = self.active_mut();
                 target.files_panel_collapsed = !target.files_panel_collapsed;
-                self.close_changed_files_peek();
                 self.mark_geometry_dirty();
             }
             Action::SetTheme(theme) => {
@@ -1140,6 +1136,7 @@ impl Diffui {
     /// depends on state the widget can't see.
     pub(crate) fn on_select_row_key(&mut self, key: revision_list::RowSelectionKey, cx: &mut Cx) {
         self.close_revset_field();
+        self.close_panel_peek();
         self.on_revision_row_click(key, cx);
     }
 
@@ -1162,7 +1159,13 @@ impl Diffui {
             }
             None => {}
         }
-        self.close_changed_files_peek();
+        // A pick closes a peeked tree; folding a folder keeps it.
+        if matches!(
+            rows.get(display_index),
+            Some(diffui_core::FileTreeRow::File { .. })
+        ) {
+            self.close_panel_peek();
+        }
     }
 
     pub(crate) fn on_changed_files_scrolled(&mut self, offset: f64) {
@@ -1183,44 +1186,6 @@ impl Diffui {
 
     pub(crate) fn on_set_hover(&mut self, target: Option<HoverTarget>) {
         self.hovered = target;
-    }
-
-    pub(crate) fn on_changed_files_trigger_entered(&mut self) {
-        self.changed_files_trigger_hovered = true;
-        self.changed_files_peek_open = true;
-    }
-
-    pub(crate) fn on_changed_files_popup_entered(&mut self) {
-        self.changed_files_popup_hovered = true;
-        self.changed_files_peek_open = true;
-    }
-
-    pub(crate) fn on_changed_files_rail_entered(&mut self) {
-        self.changed_files_rail_hovered = true;
-    }
-
-    pub(crate) fn on_changed_files_trigger_exited(&mut self, cx: &mut Cx) {
-        self.changed_files_trigger_hovered = false;
-        Self::close_changed_files_peek_later(cx);
-    }
-
-    pub(crate) fn on_changed_files_rail_exited(&mut self, cx: &mut Cx) {
-        self.changed_files_rail_hovered = false;
-        Self::close_changed_files_peek_later(cx);
-    }
-
-    pub(crate) fn on_changed_files_popup_exited(&mut self, cx: &mut Cx) {
-        self.changed_files_popup_hovered = false;
-        Self::close_changed_files_peek_later(cx);
-    }
-
-    pub(crate) fn on_close_changed_files_peek(&mut self) {
-        if !self.changed_files_trigger_hovered
-            && !self.changed_files_rail_hovered
-            && !self.changed_files_popup_hovered
-        {
-            self.changed_files_peek_open = false;
-        }
     }
 
     pub(crate) fn on_toast_dismiss(&mut self, id: u64) {
@@ -1304,19 +1269,17 @@ impl Diffui {
             self.mark_geometry_dirty();
             return;
         }
-        let files_width = if self.active().session.document.files.is_empty() {
-            0.0
-        } else if self.active().files_panel_collapsed {
-            crate::theme::COLLAPSED_PANEL_WIDTH
+        let files_width = self.files_pane_width();
+        let files = if files_width > 0.0 {
+            files_width + 1.0
         } else {
-            self.file_nav_width
+            0.0
         };
-        let dividers = if files_width == 0.0 { 1.0 } else { 2.0 };
         let clamped = resize_handle::clamp_width_with_reserve(
             width,
             self.sidebar_min_width,
             self.window_size.width,
-            files_width + dividers + resize_handle::MIN_DIFF_PANE_WIDTH,
+            files + 1.0 + resize_handle::MIN_DIFF_PANE_WIDTH,
         );
         if clamped != self.sidebar_width {
             self.sidebar_width = clamped;
@@ -1325,19 +1288,19 @@ impl Diffui {
     }
 
     pub(crate) fn on_changed_files_width_changed(&mut self, handle_x: f32) {
-        let history_width = if self.active().history_panel_collapsed {
-            crate::theme::COLLAPSED_PANEL_WIDTH
+        let history_width = self.left_pane_width();
+        let lead = if history_width > 0.0 {
+            history_width + 1.0
         } else {
-            self.sidebar_width
+            0.0
         };
-        let width = handle_x - history_width - 1.0;
+        let width = handle_x - lead;
         if width <= diff_panel::MIN_FILE_NAV_WIDTH + f32::EPSILON {
             self.active_mut().files_panel_collapsed = true;
             self.mark_geometry_dirty();
             return;
         }
-        let available =
-            (self.window_size.width - history_width - 2.0).max(diff_panel::MIN_FILE_NAV_WIDTH);
+        let available = (self.window_size.width - lead - 1.0).max(diff_panel::MIN_FILE_NAV_WIDTH);
         let clamped = resize_handle::clamp_width(width, diff_panel::MIN_FILE_NAV_WIDTH, available);
         if clamped != self.file_nav_width {
             self.file_nav_width = clamped;
@@ -1511,25 +1474,6 @@ impl Diffui {
         self.spawn_highlights(document_id);
     }
 
-    /// Drop the changed-files peek along with every hover flag holding it
-    /// open. The widgets reporting those hovers may be gone by the next frame
-    /// (the rail, once the panel expands), and a widget that is gone never
-    /// reports its exit.
-    fn close_changed_files_peek(&mut self) {
-        self.changed_files_peek_open = false;
-        self.changed_files_trigger_hovered = false;
-        self.changed_files_rail_hovered = false;
-        self.changed_files_popup_hovered = false;
-    }
-
-    /// Re-check the peek once the pointer has had time to reach whichever of
-    /// the icon, the rail or the tree it was heading for.
-    fn close_changed_files_peek_later(cx: &mut Cx) {
-        Self::after(Duration::from_millis(140), cx, |this, _| {
-            this.on_close_changed_files_peek();
-        });
-    }
-
     /// The platform half: window geometry and lifecycle, modifiers, the OS
     /// appearance, and the raw key presses the keymap resolves.
     pub(crate) fn on_window_focus_changed(&mut self, focused: bool) {
@@ -1557,30 +1501,28 @@ impl Diffui {
     /// opens below its minimum.
     pub(crate) fn clamp_panes_to_window(&mut self) {
         let width = self.window_size.width;
-        let files_width = if self.active().session.document.files.is_empty() {
-            0.0
-        } else if self.active().files_panel_collapsed {
-            crate::theme::COLLAPSED_PANEL_WIDTH
-        } else {
-            self.file_nav_width
-        };
+        let files_width = self.files_pane_width();
         self.sidebar_width = resize_handle::clamp_width_with_reserve(
             self.sidebar_width,
             self.sidebar_min_width,
             width,
-            files_width
-                + if files_width == 0.0 { 1.0 } else { 2.0 }
+            if files_width > 0.0 {
+                files_width + 1.0
+            } else {
+                0.0
+            } + 1.0
                 + resize_handle::MIN_DIFF_PANE_WIDTH,
         );
-        let history_width = if self.active().history_panel_collapsed {
-            crate::theme::COLLAPSED_PANEL_WIDTH
+        let history_width = self.left_pane_width();
+        let lead = if history_width > 0.0 {
+            history_width + 1.0
         } else {
-            self.sidebar_width
+            0.0
         };
         self.file_nav_width = resize_handle::clamp_width(
             self.file_nav_width,
             diff_panel::MIN_FILE_NAV_WIDTH,
-            (width - history_width - 2.0).max(diff_panel::MIN_FILE_NAV_WIDTH),
+            (width - lead - 1.0).max(diff_panel::MIN_FILE_NAV_WIDTH),
         );
     }
 
@@ -1655,6 +1597,14 @@ impl Diffui {
             return false;
         };
         let context = self.key_context();
+        // A peeked panel is the topmost thing on screen until a mode opens over it.
+        if context == Context::Base
+            && self.panel_peek.is_some()
+            && matches!(key, keyboard::Key::Named(keyboard::Named::Escape))
+        {
+            self.close_panel_peek();
+            return true;
+        }
         if context == Context::Base
             && self
                 .revset_field_key(key, modifiers, consumed, cx)
@@ -4513,50 +4463,6 @@ mod tests {
             });
             assert!(ui.active().files_panel_collapsed);
             assert_eq!(ui.file_nav_width, 280.0);
-        });
-    }
-
-    #[test]
-    fn changed_files_peek_survives_trigger_exit_after_popup_entry() {
-        crate::tabs::tests::with_cx(|_| {
-            let mut ui = app();
-
-            ui.on_changed_files_trigger_entered();
-            ui.on_changed_files_popup_entered();
-            // The rail exit can arrive after the popup enter at their shared seam.
-            ui.changed_files_trigger_hovered = false;
-            ui.on_close_changed_files_peek();
-            assert!(ui.changed_files_peek_open);
-
-            ui.changed_files_popup_hovered = false;
-            ui.on_close_changed_files_peek();
-            assert!(!ui.changed_files_peek_open);
-        });
-    }
-
-    /// The rail is a corridor, not a trigger: crossing it on the way somewhere
-    /// else opens nothing, but it holds a peek the icon already opened.
-    #[test]
-    fn the_changed_files_rail_holds_a_peek_but_never_opens_one() {
-        crate::tabs::tests::with_cx(|_| {
-            let mut ui = app();
-
-            ui.on_changed_files_rail_entered();
-            ui.on_close_changed_files_peek();
-            assert!(!ui.changed_files_peek_open);
-
-            ui.on_changed_files_trigger_entered();
-            assert!(ui.changed_files_peek_open);
-            // Off the icon but still on the rail, heading for a file far down the
-            // tree. (The exit events themselves arm a tokio timer, which needs a
-            // runtime this test doesn't have.)
-            ui.changed_files_trigger_hovered = false;
-            ui.on_close_changed_files_peek();
-            assert!(ui.changed_files_peek_open);
-
-            ui.changed_files_rail_hovered = false;
-            ui.on_close_changed_files_peek();
-            assert!(!ui.changed_files_peek_open);
         });
     }
 

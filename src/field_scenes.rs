@@ -239,8 +239,7 @@ fn source_and_history_keep_their_width_with_the_panel_collapsed() {
     let mut h = app();
     h.act(|ui, _| ui.active_mut().history_panel_collapsed = true);
     h.settle();
-    let collapsed = crate::theme::COLLAPSED_PANEL_WIDTH;
-    assert_eq!(h.read(|ui| ui.left_pane_width()), collapsed, "the diff's");
+    assert_eq!(h.read(|ui| ui.left_pane_width()), 0.0, "the diff's");
     for view in [MainView::Source, MainView::History] {
         h.act(|ui, _| ui.active_mut().main_view = view);
         h.settle();

@@ -296,6 +296,7 @@ impl Diffui {
     pub(crate) fn reconcile(&mut self, cx: &mut Cx) {
         // A mode that isn't on screen must not keep the keyboard.
         self.prune_stale_modes();
+        self.prune_panel_peek();
         crate::app_menu::refresh_availability(self);
         self.keep_graph_anchor();
         self.cancel_unwanted_preview();
@@ -725,19 +726,17 @@ impl Panes {
 /// The revision list, or what the view shows in its place.
 fn left_pane(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> AnyElement {
     match ui.active().main_view {
-        MainView::Diff if ui.active().history_panel_collapsed => {
-            sidebar::build_collapsed_sidebar(ui, theme, window, cx)
-        }
         MainView::Diff => sidebar::build_sidebar(ui, theme, window, cx),
         MainView::Source => source_panel::build_source_sidebar(ui, theme, window, cx),
         MainView::History => history_panel::build_history_sidebar(ui, theme, window, cx),
     }
 }
 
-/// The changed files, in the Diff view.
+/// The changed files, in the Diff view: the panel, or the narrower tree that
+/// floats over the diff while the panel is hidden.
 fn files_pane(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> AnyElement {
     if ui.active().files_panel_collapsed {
-        diff_panel::build_collapsed_file_navigator(theme, window, cx)
+        diff_panel::build_file_navigator_peek(ui, theme, window, cx)
     } else {
         diff_panel::build_file_navigator(ui, theme, window, cx)
     }
@@ -759,6 +758,7 @@ fn floats_pane(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) 
     div()
         .relative()
         .size_full()
+        .child(panel_peek(ui, theme, cx))
         .child(palette::build_overlay(ui, theme, window, cx))
         .child(activity::activity_popover(ui, theme, window, cx))
         .child(menu::build_overlay(ui, theme, window, cx))
@@ -770,6 +770,149 @@ fn floats_pane(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) 
         .child(crate::credentials::build_overlay(ui, theme, window, cx))
         .child(crate::shortcuts::build_overlay(ui, theme, window, cx))
         .child(activity::toast_layer(ui, theme, window, cx))
+        .into_any_element()
+}
+
+/// A panel the toolbar can hide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Panel {
+    /// The revision list beside the diff.
+    Revisions,
+    /// The changed files.
+    Files,
+}
+
+/// A hidden panel shown over the diff for a moment, opened from the diff's
+/// header bar. It closes on Esc, on a press anywhere else, and once something
+/// in it is picked; it's the panel's own pane, not a copy.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PanelPeek {
+    pub(crate) panel: Panel,
+    /// The control that opened it, in window coordinates: the file tree hangs
+    /// from it, and a press on it toggles rather than closing and reopening.
+    pub(crate) anchor: crate::geometry::Rectangle,
+}
+
+/// The file tree's peek: this wide, at most this tall.
+const FILES_PEEK_WIDTH: f32 = diff_panel::FILE_NAV_PEEK_WIDTH;
+const FILES_PEEK_MAX_HEIGHT: f32 = 560.0;
+/// The file tree's peek: how far it sits under its trigger, how far its left
+/// edge sits left of the trigger's, and the least room it keeps to the window.
+const FILES_PEEK_DROP: f32 = 6.0;
+const FILES_PEEK_LEAD: f32 = 10.0;
+const FILES_PEEK_MARGIN: f32 = 8.0;
+
+impl Diffui {
+    /// Opens `panel` over the diff, or closes it if it's the one open. Only a
+    /// hidden panel opens.
+    pub(crate) fn toggle_panel_peek(&mut self, panel: Panel, anchor: crate::geometry::Rectangle) {
+        if self.panel_peek.is_some_and(|peek| peek.panel == panel) {
+            self.panel_peek = None;
+        } else if self.panel_hidden(panel) {
+            self.panel_peek = Some(PanelPeek { panel, anchor });
+        }
+    }
+
+    pub(crate) fn close_panel_peek(&mut self) {
+        self.panel_peek = None;
+    }
+
+    /// Whether `panel` is hidden in the Diff view, where only it can be.
+    fn panel_hidden(&self, panel: Panel) -> bool {
+        let tab = self.active();
+        tab.main_view == MainView::Diff
+            && match panel {
+                Panel::Revisions => tab.history_panel_collapsed,
+                Panel::Files => tab.files_panel_collapsed && !tab.session.document.files.is_empty(),
+            }
+    }
+
+    /// A peek outlives nothing it stands in for: the panel coming back, a view
+    /// or tab switch, the files going away.
+    fn prune_panel_peek(&mut self) {
+        if let Some(peek) = self.panel_peek
+            && !self.panel_hidden(peek.panel)
+        {
+            self.panel_peek = None;
+        }
+    }
+}
+
+/// The peeked panel, over the panes: the revisions down the window's left edge
+/// at the sidebar's width, the file tree under the control that opened it.
+fn panel_peek(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> AnyElement {
+    let (Some(peek), Some(panes)) = (ui.panel_peek, ui.panes.as_ref()) else {
+        return div().into_any_element();
+    };
+    let top = toolbar::chrome_bottom();
+    let bottom = crate::status_bar::TOTAL_HEIGHT;
+    let shadow = theme::floating_shadow(8.0, 16.0);
+    let (surface, pane) = match peek.panel {
+        Panel::Revisions => (
+            div()
+                .absolute()
+                .left_0()
+                .top(px(top))
+                .bottom(px(bottom))
+                .w(px(ui.sidebar_width))
+                .rounded_r(px(theme::radius::LG))
+                .border_r_1(),
+            &panes.left,
+        ),
+        Panel::Files => {
+            let window = ui.window_size;
+            let left = (peek.anchor.x - FILES_PEEK_LEAD)
+                .min(window.width - FILES_PEEK_WIDTH - FILES_PEEK_MARGIN)
+                .max(FILES_PEEK_MARGIN);
+            let top = peek.anchor.y + peek.anchor.height + FILES_PEEK_DROP;
+            let height = (window.height - bottom - FILES_PEEK_MARGIN - top)
+                .clamp(0.0, FILES_PEEK_MAX_HEIGHT);
+            (
+                div()
+                    .absolute()
+                    .left(px(left))
+                    .top(px(top))
+                    .w(px(FILES_PEEK_WIDTH))
+                    .h(px(height))
+                    .rounded(px(theme::radius::LG))
+                    .border_1(),
+                &panes.files,
+            )
+        }
+    };
+    // A press anywhere but the peek and its trigger closes it, and still does
+    // what it would have; one on the trigger leaves the toggle to the trigger.
+    let bounds = std::rc::Rc::new(std::cell::Cell::new(crate::geometry::Rectangle::default()));
+    let recorded = bounds.clone();
+    let close = Diffui::listen(cx, |this, _: &gpui_kit::MouseDownEvent, _, _| {
+        this.close_panel_peek();
+    });
+    let anchor = peek.anchor;
+    let watcher = gpui_kit::canvas(
+        move |rect, _, _| recorded.set(rect.into()),
+        move |_, _, window, _| {
+            window.on_mouse_event(move |event: &gpui_kit::MouseDownEvent, phase, window, cx| {
+                let at = crate::geometry::Point::from(event.position);
+                if phase == gpui_kit::DispatchPhase::Capture
+                    && !bounds.get().contains(at)
+                    && !anchor.contains(at)
+                {
+                    close(event, window, cx);
+                }
+            });
+        },
+    )
+    .absolute()
+    .size_full();
+    surface
+        .id("panel-peek")
+        .overflow_hidden()
+        .bg(theme.panel_background)
+        .border_color(theme.border)
+        .shadow(vec![shadow])
+        .occlude()
+        .child(watcher)
+        .child(embed(pane))
         .into_any_element()
 }
 
@@ -848,31 +991,43 @@ impl Diffui {
     /// no diff-pane spinner. On a cold load the sidebar simply grows from empty as
     /// batches arrive, and a revision switch keeps the prior diff until the new one
     /// replaces it.
-    /// Collapsing folds the Diff view's sidebar. Source and History have no toggle
-    /// of their own, so they keep their width whatever the flag says.
+    /// Collapsing hides the Diff view's sidebar entirely. Source and History have
+    /// no toggle of their own, so they keep their width whatever the flag says.
     pub(crate) fn left_pane_width(&self) -> f32 {
         if self.active().main_view == MainView::Diff && self.active().history_panel_collapsed {
-            theme::COLLAPSED_PANEL_WIDTH
+            0.0
         } else {
             self.sidebar_width
         }
     }
 
-    fn panes(&self, panes: &Panes, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> Div {
-        let has_files = !self.active().session.document.files.is_empty();
-        let history_collapsed = self.active().history_panel_collapsed;
-        let files_collapsed = self.active().files_panel_collapsed;
-        let main_view = self.active().main_view;
-        let collapsed = theme::COLLAPSED_PANEL_WIDTH;
-
-        let history_width = self.left_pane_width();
-        let files_width = if !has_files {
+    /// The changed files' width: none outside the Diff view, with no files, or
+    /// collapsed.
+    pub(crate) fn files_pane_width(&self) -> f32 {
+        let tab = self.active();
+        if tab.main_view != MainView::Diff
+            || tab.files_panel_collapsed
+            || tab.session.document.files.is_empty()
+        {
             0.0
-        } else if files_collapsed {
-            collapsed
         } else {
             self.file_nav_width
-        };
+        }
+    }
+
+    /// What the side panes take from the window, their dividers included: a
+    /// hidden pane takes nothing, not even its divider.
+    pub(crate) fn side_panes_width(&self) -> f32 {
+        [self.left_pane_width(), self.files_pane_width()]
+            .into_iter()
+            .filter(|width| *width > 0.0)
+            .map(|width| width + 1.0)
+            .sum()
+    }
+
+    fn panes(&self, panes: &Panes, theme: ThemeSpec, _window: &mut Window, cx: &mut Cx) -> Div {
+        let history_width = self.left_pane_width();
+        let files_width = self.files_pane_width();
 
         let fixed = |width: f32, pane: &Entity<Pane>| {
             div()
@@ -884,11 +1039,15 @@ impl Diffui {
         };
         let divider = || vertical_divider(theme);
 
+        // A hidden pane isn't drawn here at all: its entity may be on screen as a
+        // peek instead (see `floats_pane`).
         let mut row = div().flex().flex_row().size_full();
-        row = row
-            .child(fixed(history_width, &panes.left))
-            .child(divider());
-        if main_view == MainView::Diff && has_files {
+        if history_width > 0.0 {
+            row = row
+                .child(fixed(history_width, &panes.left))
+                .child(divider());
+        }
+        if files_width > 0.0 {
             row = row.child(fixed(files_width, &panes.files)).child(divider());
         }
         row = row.child(
@@ -903,9 +1062,12 @@ impl Diffui {
         let mut body = div().relative().flex_1().min_h_0().w_full().child(row);
 
         // The history pane's seam.
-        if !history_collapsed {
-            let reserve = files_width
-                + if files_width == 0.0 { 1.0 } else { 2.0 }
+        if history_width > 0.0 {
+            let reserve = if files_width > 0.0 {
+                files_width + 1.0
+            } else {
+                0.0
+            } + 1.0
                 + resize_handle::MIN_DIFF_PANE_WIDTH;
             let on_resize = cx.listener(|this: &mut Diffui, width: &f32, _, cx| {
                 this.act(cx, |this, _| this.on_sidebar_width_changed(*width));
@@ -913,7 +1075,7 @@ impl Diffui {
             body = body.child(
                 resize_handle::ResizeHandle::new(
                     "history-seam",
-                    self.sidebar_width,
+                    history_width,
                     self.sidebar_min_width,
                     sidebar::RESIZE_HIT_PADDING,
                     move |width, window, cx| on_resize(&width, window, cx),
@@ -923,38 +1085,25 @@ impl Diffui {
             );
         }
         // The changed files' seam.
-        if main_view == MainView::Diff && has_files && !files_collapsed {
-            let handle_x = history_width + 1.0 + self.file_nav_width;
+        if files_width > 0.0 {
+            let lead = if history_width > 0.0 {
+                history_width + 1.0
+            } else {
+                0.0
+            };
             let on_resize = cx.listener(|this: &mut Diffui, position: &f32, _, cx| {
                 this.act(cx, |this, _| this.on_changed_files_width_changed(*position));
             });
             body = body.child(
                 resize_handle::ResizeHandle::new(
                     "files-seam",
-                    handle_x,
-                    history_width + 1.0 + diff_panel::MIN_FILE_NAV_WIDTH,
+                    lead + files_width,
+                    lead + diff_panel::MIN_FILE_NAV_WIDTH,
                     sidebar::RESIZE_HIT_PADDING,
                     move |position, window, cx| on_resize(&position, window, cx),
                 )
                 .right_reserve(1.0 + resize_handle::MIN_DIFF_PANE_WIDTH)
                 .view(),
-            );
-        }
-        // The collapsed file rail's temporary tree.
-        if main_view == MainView::Diff
-            && files_collapsed
-            && self.changed_files_peek_open
-            && has_files
-        {
-            body = body.child(
-                div()
-                    .absolute()
-                    .top(px(crate::field::PANEL_TOGGLE_INSET))
-                    .bottom(px(crate::field::PANEL_TOGGLE_INSET))
-                    .left(px(history_width + 2.0 + collapsed))
-                    .child(diff_panel::build_file_navigator_peek(
-                        self, theme, window, cx,
-                    )),
             );
         }
         body
