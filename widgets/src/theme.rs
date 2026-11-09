@@ -533,8 +533,10 @@ pub struct ButtonStyle {
     pub hover: Color,
     pub active: Color,
     pub label: Color,
-    pub border: Option<Color>,
-    /// Drawn on the button, under its fill: its edge and lift.
+    /// Drawn on the button, under its fill: its edge and lift. Every edge is a
+    /// ring inside the box, never a border, so a button keeps its size when
+    /// it changes style (a Save that turns primary once there's something to
+    /// save).
     pub shadow: Option<fn(ThemeSpec) -> Vec<BoxShadow>>,
 }
 
@@ -548,7 +550,6 @@ pub fn ghost_button_style(theme: ThemeSpec) -> ButtonStyle {
         hover: hover_wash(theme),
         active: press_wash(theme),
         label: theme.muted_text,
-        border: None,
         shadow: None,
     }
 }
@@ -561,7 +562,6 @@ pub fn raised_button_style(theme: ThemeSpec) -> ButtonStyle {
         hover: mix(theme.panel_background_elevated, theme.text, 0.035),
         active: mix(theme.panel_background_elevated, theme.text, 0.07),
         label: theme.text,
-        border: None,
         shadow: Some(raised_button_shadow),
     }
 }
@@ -600,7 +600,6 @@ pub fn primary_button_style(theme: ThemeSpec) -> ButtonStyle {
         hover: mix(theme.accent, theme.text, 0.10),
         active: mix(theme.accent, theme.text, 0.18),
         label: theme.background,
-        border: None,
         shadow: Some(primary_shadow),
     }
 }
@@ -634,8 +633,24 @@ pub fn disabled_button_style(theme: ThemeSpec) -> ButtonStyle {
         hover: fill,
         active: fill,
         label: theme.subtle_text,
-        border: Some(theme.border),
-        shadow: None,
+        shadow: Some(disabled_ring),
+    }
+}
+
+/// A disabled button's edge: the panes' hairline, inside its box.
+fn disabled_ring(theme: ThemeSpec) -> Vec<BoxShadow> {
+    vec![inset_ring(theme.border)]
+}
+
+/// A 1px edge drawn inside a box. Unlike a border it takes no room, so a
+/// control that gains or loses its edge with its state keeps its size.
+pub fn inset_ring(color: Color) -> BoxShadow {
+    BoxShadow {
+        color: Hsla::from(color),
+        offset: point(px(0.0), px(0.0)),
+        blur_radius: px(0.0),
+        spread_radius: px(1.0),
+        inset: true,
     }
 }
 
@@ -647,7 +662,6 @@ pub fn destructive_button_style(theme: ThemeSpec) -> ButtonStyle {
         hover: theme.removed_text,
         active: theme.removed_text,
         label: theme.background,
-        border: None,
         shadow: Some(primary_shadow),
     }
 }

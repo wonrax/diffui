@@ -239,7 +239,7 @@ pub(crate) fn count_chip(
         move |chip| {
             let chip = chip.bg(fill).rounded(px(radius::XS));
             match outline {
-                Some(color) => chip.border_1().border_color(color),
+                Some(color) => chip.shadow(vec![theme::inset_ring(color)]),
                 None => chip,
             }
         },

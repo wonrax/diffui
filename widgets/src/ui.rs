@@ -116,9 +116,6 @@ fn frame(
         .custom(colors)
         .bg(style.rest.unwrap_or(theme::TRANSPARENT))
         .rounded(px(theme::radius::BUTTON));
-    if let Some(border) = style.border {
-        button = button.border_1().border_color(border);
-    }
     if let Some(shadow) = style.shadow {
         button = button.shadow(shadow(theme));
     }

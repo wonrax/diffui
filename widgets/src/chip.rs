@@ -211,7 +211,9 @@ pub fn view(chip: &Chip) -> Div {
         element = element.bg(chip.background);
     }
     if let Some(color) = chip.border_color {
-        element = element.border_1().border_color(color);
+        // The outline comes out of the padding, as `paint` draws it, so an
+        // outlined chip is as wide as `width` says and as its filled twin.
+        element = element.px(px(PAD_X - 1.0)).border_1().border_color(color);
         if chip.border_dashed {
             element = element.border_dashed();
         }

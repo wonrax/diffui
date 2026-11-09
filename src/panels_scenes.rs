@@ -139,6 +139,15 @@ fn the_commit_block() {
     h.settle();
     assert!(h.read(|ui| ui.active().description_editor().is_some()));
     shot(&mut h, "description-editor");
+    // An edit turns Save primary.
+    h.type_text("!");
+    h.settle();
+    assert!(h.read(|ui| {
+        ui.active()
+            .description_editor()
+            .is_some_and(|e| e.is_dirty())
+    }));
+    shot(&mut h, "description-editor-dirty");
 }
 
 #[test]
