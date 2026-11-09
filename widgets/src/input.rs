@@ -320,6 +320,17 @@ where
 /// caller's: `.appearance(false)` on the result leaves a bare input to set in a
 /// well, as [`field`](crate) does in the app's filter fields.
 pub fn single_line(spec: FieldSpec<'_>, font: Font, window: &mut Window, cx: &mut App) -> Input {
+    single_line_with_focus(spec, font, window, cx).0
+}
+
+/// [`single_line`], and whether it has the keyboard: for a well drawn around
+/// it to ring itself while it does.
+pub fn single_line_with_focus(
+    spec: FieldSpec<'_>,
+    font: Font,
+    window: &mut Window,
+    cx: &mut App,
+) -> (Input, bool) {
     let id = spec.id;
     let controlled = window.use_keyed_state(id, cx, |window, cx| {
         let state = cx.new(|cx| InputState::new(window, cx));
@@ -396,16 +407,28 @@ pub fn single_line(spec: FieldSpec<'_>, font: Font, window: &mut Window, cx: &mu
             });
         });
     }
-    Input::new(&state)
+    let focused = gpui_kit::Focusable::focus_handle(state.read(cx), cx).is_focused(window);
+    let input = Input::new(&state)
         .id(id)
         .font(font.gpui())
-        .text_size(px(crate::theme::text_size::UI))
+        .text_size(px(crate::theme::text_size::UI));
+    (input, focused)
 }
 
 /// A multi-line field that wraps its text. With no `on_input` it is read-only,
 /// which is how the description editor behaves while it saves and how captured
 /// output stays selectable.
 pub fn multi_line(spec: FieldSpec<'_>, font: Font, window: &mut Window, cx: &mut App) -> Textarea {
+    multi_line_with_focus(spec, font, window, cx).0
+}
+
+/// [`multi_line`], and whether it has the keyboard.
+pub fn multi_line_with_focus(
+    spec: FieldSpec<'_>,
+    font: Font,
+    window: &mut Window,
+    cx: &mut App,
+) -> (Textarea, bool) {
     let id = spec.id;
     let controlled = window.use_keyed_state(id, cx, |window, cx| {
         let state = cx.new(|cx| TextareaState::new(window, cx));
@@ -478,10 +501,12 @@ pub fn multi_line(spec: FieldSpec<'_>, font: Font, window: &mut Window, cx: &mut
             });
         });
     }
-    Textarea::new(&state)
+    let focused = gpui_kit::Focusable::focus_handle(state.read(cx), cx).is_focused(window);
+    let textarea = Textarea::new(&state)
         .readonly(readonly)
         .font(font.gpui())
-        .text_size(px(crate::theme::text_size::UI))
+        .text_size(px(crate::theme::text_size::UI));
+    (textarea, focused)
 }
 
 /// Coloured byte ranges of a text.

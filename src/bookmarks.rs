@@ -738,11 +738,7 @@ pub(crate) fn build_name_prompt(
         .placeholder("bookmark name")
         .on_input(move |value, window, cx| on_input(&value, window, cx))
         .on_submit(move |window, cx| on_submit(&(), window, cx));
-    let mut field = div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap(px(theme::space::SM))
+    let mut card = crate::overlay_kit::Dialog::new(&title, font, mono, theme)
         .child(crate::field::dialog_input(spec, mono, theme, window, cx));
     if !note.is_empty() {
         let color = if error {
@@ -750,7 +746,7 @@ pub(crate) fn build_name_prompt(
         } else {
             theme.muted_text
         };
-        field = field.child(
+        card = card.child(
             div()
                 .w_full()
                 .text_size(px(theme::text_size::UI))
@@ -775,13 +771,11 @@ pub(crate) fn build_name_prompt(
         ui::cancel_button("name-prompt-cancel", ui::Size::Standard, font, theme, cx)
             .on_click(Diffui::on_action(cancel.clone(), cx));
 
-    let card = ui::dialog_card(ui::DIALOG_WIDTH, theme)
-        .child(ui::dialog_title(&title, font, mono, theme))
-        .child(field)
-        .child(ui::button_row(
-            None,
-            [cancel_button.into_any_element(), accept.into_any_element()],
-        ));
+    let card = card
+        .hint(&["\u{21b5}"], verb)
+        .hint(&["esc"], "Cancel")
+        .buttons([cancel_button.into_any_element(), accept.into_any_element()])
+        .build();
     let dismiss = Diffui::on_action(cancel, cx);
     ui::modal(
         "name-prompt-modal",

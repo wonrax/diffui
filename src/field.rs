@@ -255,7 +255,20 @@ pub(crate) fn sidebar_filter_field(
         .into_any_element()
 }
 
-const DIALOG_FIELD_HEIGHT: f32 = 28.0;
+/// A dialog field's height: the dialog's buttons' control height.
+const DIALOG_FIELD_HEIGHT: f32 = theme::control::STANDARD;
+
+/// The well a dialog's field sits in, its border taking the accent while the
+/// field has the keyboard. Only the colour changes, so focus never moves the
+/// text.
+pub(crate) fn field_well(focused: bool, theme: ThemeSpec) -> Div {
+    div()
+        .w_full()
+        .bg(theme.panel_background)
+        .border_1()
+        .border_color(if focused { theme.accent } else { theme.border })
+        .rounded(px(theme::radius::CONTROL))
+}
 
 /// A dialog's one-line field: the shared well, at the dialog's control height.
 pub(crate) fn dialog_input(
@@ -266,20 +279,16 @@ pub(crate) fn dialog_input(
     cx: &mut Cx,
 ) -> AnyElement {
     // The well is drawn here, around the input's own row: see [`INPUT_ROW`].
-    let input = input::single_line(spec, font, window, cx)
+    let (input, focused) = input::single_line_with_focus(spec, font, window, cx);
+    let input = input
         .appearance(false)
         .text_size(px(theme::text_size::BODY))
         .py(px(0.0))
         .h_full();
-    div()
-        .w_full()
+    field_well(focused, theme)
         .h(px(DIALOG_FIELD_HEIGHT))
         .flex()
         .items_center()
-        .bg(theme.panel_background)
-        .border_1()
-        .border_color(theme.border)
-        .rounded(px(theme::radius::CONTROL))
         .child(div().w_full().h(px(INPUT_ROW)).child(input))
         .into_any_element()
 }

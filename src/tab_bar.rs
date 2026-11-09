@@ -980,39 +980,13 @@ pub(crate) fn build_confirm_dialog(
     let cancel = ui::cancel_button("confirm-cancel", ui::Size::Standard, font, theme, cx)
         .on_click(Diffui::on_action(Action::ConfirmCancel, cx));
 
-    let title_font = emphasis_font(font, Weight::SEMIBOLD);
-    let mut head = div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap(px(theme::space::SM))
-        .pt(px(CONFIRM_PAD))
-        .px(px(CONFIRM_PAD))
-        .child(
-            div()
-                .text_size(px(text_size::TITLE))
-                .child(dialog.title.view(title_font, mono, theme.text, theme)),
-        );
-    if !dialog.body.is_empty() {
-        head = head.child(
-            div()
-                .w_full()
-                .text_size(px(text_size::BODY))
-                .line_height(px(text_size::BODY * 1.5))
-                .child(dialog.body.view(font, mono, theme.muted_text, theme)),
-        );
-    }
-    let mut details = div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap(px(10.0))
-        .px(px(CONFIRM_PAD));
+    let mut card =
+        crate::overlay_kit::Dialog::new(&dialog.title, font, mono, theme).lede(&dialog.body, mono);
     for (index, bookmark) in dialog.look.moves.iter().enumerate() {
-        details = details.child(push_row(ui, theme, index, bookmark));
+        card = card.child(push_row(ui, theme, index, bookmark));
     }
     for (lead, detail) in &dialog.look.callouts {
-        details = details.child(crate::overlay_kit::callout(
+        card = card.child(crate::overlay_kit::callout(
             lead,
             detail.as_ref(),
             font,
@@ -1020,43 +994,10 @@ pub(crate) fn build_confirm_dialog(
             theme,
         ));
     }
-    let footer = div()
-        .w_full()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(ui::BUTTON_GAP))
-        .px(px(theme::space::XL))
-        .py(px(theme::space::LG))
-        .bg(crate::overlay_kit::inset_fill(theme))
-        .rounded_b(px(radius::XL - 1.0))
-        .child(crate::overlay_kit::key_hint(
-            &["esc"],
-            "Cancel",
-            font,
-            theme,
-        ))
-        .child(div().flex_1())
-        .child(cancel)
-        .child(accept);
-    let card = theme::modal_card(div(), theme)
-        .w(px(CONFIRM_WIDTH))
-        .flex()
-        .flex_col()
-        .gap(px(theme::space::XL))
-        .child(head)
-        .when(
-            !dialog.look.moves.is_empty() || !dialog.look.callouts.is_empty(),
-            |card| card.child(details),
-        )
-        .child(
-            div()
-                .w_full()
-                .flex()
-                .flex_col()
-                .child(crate::root::horizontal_divider(theme))
-                .child(footer),
-        );
+    let card = card
+        .hint(&["esc"], "Cancel")
+        .buttons([cancel.into_any_element(), accept.into_any_element()])
+        .build();
     let dismiss = Diffui::on_action::<()>(Action::ConfirmCancel, cx);
     ui::modal(
         "confirm-dialog",
@@ -1066,10 +1007,6 @@ pub(crate) fn build_confirm_dialog(
     )
     .into_any_element()
 }
-
-const CONFIRM_WIDTH: f32 = 480.0;
-/// The confirm card's inset around its words and rows.
-const CONFIRM_PAD: f32 = 20.0;
 
 /// One bookmark a push moves: its name, where the remote has it and where it
 /// goes, and whether that's a fast-forward and which revisions it publishes.

@@ -836,3 +836,60 @@ fn escape_clears_the_picks() {
     h.settle();
     assert!(!h.read(crate::changes::has_selection));
 }
+
+/// Sideways scroll in no-wrap mode: a trackpad swipe over the body pans long lines in
+/// unified, and in split from over either column, both columns together.
+#[test]
+fn a_sideways_swipe_pans_long_lines_without_wrap() {
+    let (mut h, repo) = open_sized((2400.0, 1000.0));
+    select(&mut h, &repo, "kitchen-sink");
+    h.perform(Action::ToggleWrap);
+    select_file(&mut h, "src/generated/minified.js");
+    let swipe = |h: &mut Harness, x: f32, dx: f32| {
+        // The cursor is over the pane first, as it is for a real swipe.
+        h.pointer_move(at(x, 400.0), None);
+        h.frames();
+        // As macOS sends it: a still "began" event, then the pan.
+        for (phase, dx) in [
+            (gpui_kit::TouchPhase::Started, 0.0),
+            (gpui_kit::TouchPhase::Moved, dx / 2.0),
+            (gpui_kit::TouchPhase::Moved, dx / 2.0),
+        ] {
+            h.with_window(|window, cx| {
+                window.dispatch_event(
+                    gpui_kit::PlatformInput::Scroll(ScrollEvent {
+                        position: at(x, 400.0),
+                        delta: ScrollDelta::Pixels(gpui_kit::point(px(dx), px(0.0))),
+                        touch_phase: phase,
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+            });
+        }
+        h.frames();
+    };
+    let before = h.shot(LANE, "pan-unified-before");
+    swipe(&mut h, 1800.0, -400.0);
+    let after = h.shot(LANE, "pan-unified-after");
+    assert_ne!(
+        std::fs::read(&before).unwrap(),
+        std::fs::read(&after).unwrap()
+    );
+    swipe(&mut h, 1800.0, 4000.0);
+
+    h.perform(Action::ToggleSplit);
+    assert!(h.read(crate::diff_panel::split_in_effect));
+    select_file(&mut h, "Makefile");
+    select_file(&mut h, "src/generated/minified.js");
+    for (side, x) in [("right", 2000.0), ("left", 1000.0)] {
+        let before = h.shot(LANE, &format!("pan-split-{side}-before"));
+        swipe(&mut h, x, -400.0);
+        let after = h.shot(LANE, &format!("pan-split-{side}-after"));
+        assert_ne!(
+            std::fs::read(&before).unwrap(),
+            std::fs::read(&after).unwrap(),
+            "a swipe over the {side} column didn't pan"
+        );
+    }
+}

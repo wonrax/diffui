@@ -310,26 +310,6 @@ pub(crate) fn build_overlay(
     let font = ui.config.ui_font;
     let mono = ui.config.mono_font;
 
-    let title = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(theme::space::SM))
-        .child(div().flex_1().min_w_0().child(ui::dialog_title(
-            &Prose::new().code(run.command()),
-            font,
-            mono,
-            theme,
-        )))
-        .child(
-            ui::close_button("cli-output-close", theme.muted_text, theme, cx).on_click(send::<
-                ClickEvent,
-            >(
-                OutputAction::Close,
-                cx,
-            )),
-        );
-
     let content = if run.lines.is_empty() && run.dropped == 0 {
         div()
             .p(px(theme::space::SM))
@@ -347,12 +327,7 @@ pub(crate) fn build_overlay(
     } else {
         output_text(run, theme, mono, window, cx)
     };
-    let output = div()
-        .w_full()
-        .bg(theme.panel_background)
-        .border_1()
-        .border_color(theme.border)
-        .rounded(px(theme::radius::CONTROL))
+    let output = crate::field::field_well(false, theme)
         .overflow_hidden()
         .child(content);
 
@@ -367,7 +342,11 @@ pub(crate) fn build_overlay(
         Some(Exit::Cancelled) => ("Cancelled".to_owned(), theme.muted_text),
         Some(Exit::Failed(error)) => (format!("Didn't run: {error}"), theme.removed_text),
     };
-    let leading = typography::line(status, font, text_size::UI, status_color).into_any_element();
+    let status = typography::centered(
+        typography::line(status, font, text_size::CAPTION, status_color),
+        font,
+        text_size::CAPTION,
+    );
     let mut buttons: Vec<AnyElement> = vec![
         ui::text_button(
             "cli-output-copy",
@@ -413,10 +392,15 @@ pub(crate) fn build_overlay(
             .into_any_element(),
         );
     }
-    let card = ui::dialog_card(OUTPUT_WIDTH, theme)
-        .child(title)
-        .child(output)
-        .child(ui::button_row(Some(leading), buttons));
+    let card =
+        crate::overlay_kit::Dialog::new(&Prose::new().code(run.command()), font, mono, theme)
+            .width(OUTPUT_WIDTH)
+            .child(output)
+            .hint(&["\u{2318}", "C"], "Copy")
+            .hint(&["esc"], "Close")
+            .note(status)
+            .buttons(buttons)
+            .build();
     let dismiss = send::<()>(OutputAction::Close, cx);
     ui::modal(
         "cli-output-modal",
@@ -467,7 +451,8 @@ fn output_text(
             }
         }
     }
-    let inner = OUTPUT_WIDTH - 2.0 * ui::DIALOG_PADDING - 2.0 - OUTPUT_INSET * 2.0 - RULE_ROOM;
+    let inner =
+        OUTPUT_WIDTH - 2.0 * crate::overlay_kit::DIALOG_PAD - 2.0 - OUTPUT_INSET * 2.0 - RULE_ROOM;
     let line_height = (text_size::UI * typography::DEFAULT_LINE_HEIGHT).ceil();
     let lines = crate::measure::wrapped_line_count(&text, text_size::UI, mono, line_height, inner);
     let height = (lines as f32 * line_height + 2.0 * OUTPUT_INSET).min(OUTPUT_MAX_HEIGHT);

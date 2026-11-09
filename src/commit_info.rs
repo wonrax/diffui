@@ -422,7 +422,7 @@ pub(crate) fn view(ui: &Diffui, theme: ThemeSpec, _window: &mut Window, cx: &mut
                 "commit-edit",
                 Some((icons::PENCIL, theme.muted_text)),
                 "Describe",
-                ui::Variant::Ghost,
+                ui::Variant::Raised,
                 ui::Size::Compact,
                 font,
                 theme,

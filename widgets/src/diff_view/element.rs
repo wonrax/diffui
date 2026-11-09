@@ -11,7 +11,8 @@ use std::time::Instant;
 use gpui_kit::{
     App, Bounds, Context, CursorStyle, DispatchPhase, Element, ElementId, Entity, GlobalElementId,
     Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId, Modifiers, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollEvent, Style, Window, relative,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollEvent, Style, TouchPhase, Window,
+    relative,
 };
 
 use super::layout::{
@@ -659,19 +660,24 @@ impl State {
                 now.saturating_duration_since(at).as_millis() as u64 >= SCROLL_GESTURE_GAP_MS
             });
             self.last_scroll_at = Some(now);
-            if gesture_ended {
+            if gesture_ended || event.touch_phase == TouchPhase::Started {
                 self.scroll_axis = None;
             }
-            let axis = *self
-                .scroll_axis
-                .get_or_insert(if movement.x.abs() > movement.y.abs() {
-                    ScrollAxis::Horizontal
-                } else {
-                    ScrollAxis::Vertical
-                });
-            match axis {
-                ScrollAxis::Horizontal => movement.y = 0.0,
-                ScrollAxis::Vertical => movement.x = 0.0,
+            // A trackpad opens its gesture with a still event: it says nothing about the
+            // axis, so the first one that moves picks it.
+            if movement.x != 0.0 || movement.y != 0.0 {
+                let axis =
+                    *self
+                        .scroll_axis
+                        .get_or_insert(if movement.x.abs() > movement.y.abs() {
+                            ScrollAxis::Horizontal
+                        } else {
+                            ScrollAxis::Vertical
+                        });
+                match axis {
+                    ScrollAxis::Horizontal => movement.y = 0.0,
+                    ScrollAxis::Vertical => movement.x = 0.0,
+                }
             }
         } else {
             self.scroll_axis = None;

@@ -11,7 +11,6 @@
 
 use crate::Cx;
 use crate::theme::Font;
-use crate::ui::Tip as _;
 use diffui_core::{
     ConflictFile, ConflictPick, ConflictResolution, DiffFileStatus, JobId, MergeToolInvocation,
     MutationOp, RevisionSelection, hunk_conflict_region,
@@ -1161,19 +1160,13 @@ pub(crate) fn marker_editor(
         });
         spec = spec.on_input(move |text, window, cx| on_input(&text, window, cx));
     }
-    // The well is ours: kit's own would draw a focus ring the app's inputs don't have.
+    // The well is ours: kit's own focus ring isn't the app's.
+    let (field, focused) = input::multi_line_with_focus(spec, mono, window, cx);
     let field = div()
-        .size_full()
-        .bg(theme.panel_background)
-        .border_1()
-        .border_color(theme.border)
-        .rounded(px(theme::radius::CONTROL))
-        .child(
-            input::multi_line(spec, mono, window, cx)
-                .appearance(false)
-                .text_size(px(size))
-                .h_full(),
-        );
+        .flex_1()
+        .min_h_0()
+        .w_full()
+        .child(field.appearance(false).text_size(px(size)).h_full());
     Some(
         div()
             .size_full()
@@ -1184,8 +1177,15 @@ pub(crate) fn marker_editor(
             .px(px(theme::space::XL))
             .bg(theme.panel_background)
             .child(title)
-            .child(div().flex_1().min_h_0().w_full().child(field))
-            .child(editor_footer(ui, theme, editor, cx))
+            .child(
+                crate::field::field_well(focused, theme)
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .child(field)
+                    .child(editor_footer(ui, theme, editor, cx)),
+            )
             .into_any_element(),
     )
 }
@@ -1198,18 +1198,6 @@ fn editor_footer(ui: &Diffui, theme: ThemeSpec, editor: &MarkerEditor, cx: &mut 
         0 => "No conflict markers left: saving resolves the file".to_owned(),
         1 => "1 conflict left: saving keeps it conflicted".to_owned(),
         n => format!("{n} conflicts left: saving keeps them conflicted"),
-    };
-    let hint = typography::centered(
-        typography::line(hint, font, text_size::UI, theme.subtle_text),
-        font,
-        text_size::UI,
-    );
-    let keyed = |id: &'static str, button: AnyElement, key: &'static str| {
-        div()
-            .id(id)
-            .tip(key, font, theme)
-            .child(button)
-            .into_any_element()
     };
     let mut cancel = ui::cancel_button("marker-cancel", ui::Size::Compact, font, theme, cx);
     if !saving {
@@ -1232,18 +1220,16 @@ fn editor_footer(ui: &Diffui, theme: ThemeSpec, editor: &MarkerEditor, cx: &mut 
             this.on_conflict(ConflictMsg::EditorSave, cx);
         }));
     }
-    ui::button_row(
-        Some(hint.into_any_element()),
-        [
-            keyed("marker-cancel-tip", cancel.into_any_element(), "Esc"),
-            keyed(
-                "marker-save-tip",
-                save.into_any_element(),
-                "\u{2318}\u{21b5}",
-            ),
+    crate::overlay_kit::well_footer(
+        vec![
+            crate::overlay_kit::key_hint(&["\u{2318}", "\u{21b5}"], "Save", font, theme)
+                .into_any_element(),
+            crate::overlay_kit::key_hint(&["esc"], "Cancel", font, theme).into_any_element(),
+            crate::overlay_kit::hint_note(hint, theme.subtle_text, font),
         ],
+        [cancel.into_any_element(), save.into_any_element()],
+        theme,
     )
-    .flex_none()
     .into_any_element()
 }
 

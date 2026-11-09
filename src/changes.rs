@@ -21,7 +21,6 @@ use diffui_core::{
 };
 
 use crate::commands::CommandArg;
-use crate::commit_info::with_tooltip;
 use crate::diff_view::{
     ChangeMarks, CheckState, FileMark, HunkMark, HunkMarks, LineAt, LineMode, LinePress,
 };
@@ -1477,14 +1476,10 @@ fn split_prompt_shown(ui: &Diffui) -> Option<&SplitPrompt> {
         .filter(|prompt| editable(tab) && prompt.revision == tab.session.selected_revision)
 }
 
-/// The split card's height without its two editors: insets, title and
-/// summary, the two captions, the footer and the gaps between them.
-const SPLIT_CHROME_HEIGHT: f32 = 2.0 * ui::DIALOG_PADDING
-    + 44.0
-    + 2.0 * 22.0
-    + crate::theme::control::STANDARD
-    + 3.0 * ui::DIALOG_SPACING
-    + crate::theme::space::XXL;
+/// The split card's height without its two editors: the head (title and summary),
+/// the body's insets and the gap between the fields, the fields' captions and the
+/// footer strip.
+const SPLIT_CHROME_HEIGHT: f32 = 68.0 + (16.0 + 20.0 + 10.0) + 2.0 * 24.0 + 57.0;
 
 /// Whether a picked file is whole: `jj absorb` takes paths, not hunks.
 fn whole_files_only(selection: &DiffSelection) -> bool {
@@ -1849,7 +1844,7 @@ pub(crate) fn split_modal(
     let (font, mono) = (ui.config.ui_font, ui.config.mono_font);
     let label = revision_label(ui.active(), &prompt.revision);
     let size = ui.config.code_type.size;
-    let width = SPLIT_WIDTH - 2.0 * ui::DIALOG_PADDING;
+    let width = SPLIT_WIDTH - 2.0 * crate::overlay_kit::DIALOG_PAD;
     // Two editors share what the window leaves under the card's fixed parts.
     let max = ((ui.window_size.height - crate::toolbar::modal_top() - SPLIT_CHROME_HEIGHT) / 2.0)
         .clamp(88.0, crate::input::editor_max_height(ui.window_size.height));
@@ -1877,23 +1872,14 @@ pub(crate) fn split_modal(
                 theme.muted_text,
                 theme,
             )))
-            .child(
-                div()
-                    .w_full()
+            .child({
+                let (editor, focused) = crate::input::multi_line_with_focus(spec, mono, window, cx);
+                crate::field::field_well(focused, theme)
                     .h(px(crate::input::fit_height(
                         content, mono, size, width, 88.0, max,
                     )))
-                    .bg(theme.panel_background)
-                    .border_1()
-                    .border_color(theme.border)
-                    .rounded(px(theme::radius::CONTROL))
-                    .child(
-                        crate::input::multi_line(spec, mono, window, cx)
-                            .appearance(false)
-                            .text_size(px(size))
-                            .h_full(),
-                    ),
-            )
+                    .child(editor.appearance(false).text_size(px(size)).h_full())
+            })
     };
     let first = field(
         Prose::from("Stays in ").rev(label.clone()),
@@ -1931,29 +1917,16 @@ pub(crate) fn split_modal(
         cx,
     ));
 
-    let card = ui::dialog_card(SPLIT_WIDTH, theme)
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(theme::space::SM))
-                .child(ui::dialog_title(
-                    &Prose::from("Split ").rev(label),
-                    font,
-                    mono,
-                    theme,
-                ))
-                .child(ui::dialog_text(&prompt.summary, font, mono, theme)),
-        )
-        .child(first)
-        .child(second)
-        .child(ui::button_row(
-            None,
-            [
-                with_tooltip("split-cancel-tip", "Esc", font, theme, cancel),
-                with_tooltip("split-confirm-tip", "\u{2318}\u{21b5}", font, theme, split),
-            ],
-        ));
+    let card =
+        crate::overlay_kit::Dialog::new(&Prose::from("Split ").rev(label), font, mono, theme)
+            .width(SPLIT_WIDTH)
+            .lede(&prompt.summary, mono)
+            .child(first)
+            .child(second)
+            .hint(&["\u{2318}", "\u{21b5}"], "Split")
+            .hint(&["esc"], "Cancel")
+            .buttons([cancel.into_any_element(), split.into_any_element()])
+            .build();
     ui::modal("split-modal", card, crate::toolbar::modal_top(), |_, _| {}).into_any_element()
 }
 

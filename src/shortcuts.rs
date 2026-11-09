@@ -259,37 +259,6 @@ pub(crate) fn build_overlay(
     let left = left.child(section(ui, theme, "Mouse", gestures));
 
     let font = ui.config.ui_font;
-    let title_font = emphasis_font(font, Weight::MEDIUM);
-    let header = div()
-        .flex_none()
-        .pr(px(ui::DIALOG_PADDING))
-        .child(typography::baseline_row(
-            [
-                Aligned::text(
-                    typography::line(
-                        "Keyboard shortcuts",
-                        title_font,
-                        text_size::TITLE,
-                        theme.text,
-                    ),
-                    title_font,
-                    text_size::TITLE,
-                )
-                .fill(),
-                Aligned::text(
-                    typography::line(
-                        "Rebind in config.toml [keys]   \u{b7}   esc to close",
-                        font,
-                        text_size::CAPTION,
-                        theme.subtle_text,
-                    ),
-                    font,
-                    text_size::CAPTION,
-                ),
-            ],
-            0.0,
-        ));
-
     let columns = div()
         .flex()
         .flex_row()
@@ -297,23 +266,35 @@ pub(crate) fn build_overlay(
         .gap(px(theme::space::XXL * 1.5))
         // The list scrolls out to the card's right edge, so the bar sits where
         // every other scroll view's does; the inset moves inside.
-        .pr(px(ui::DIALOG_PADDING))
+        .pr(px(crate::overlay_kit::DIALOG_PAD))
         .child(left)
         .child(right);
 
     let height = (ui.window_size.height - crate::toolbar::modal_top() - theme::space::XXL)
         .clamp(240.0, CARD_MAX_HEIGHT);
-    let card = ui::dialog_card(CARD_WIDTH, theme)
-        .h(px(height))
-        .pr(px(0.0))
-        .gap(px(theme::space::XL))
-        .child(header)
-        .child(
-            div()
-                .flex_1()
-                .min_h_0()
-                .child(ui::scrollable("shortcuts-list", columns)),
-        );
+    let card = crate::overlay_kit::Dialog::new(
+        &crate::prose::Prose::from("Keyboard shortcuts"),
+        font,
+        ui.config.mono_font,
+        theme,
+    )
+    .width(CARD_WIDTH)
+    .height(height)
+    .lede(
+        &crate::prose::Prose::from("Rebind any of them under ")
+            .code("[keys]")
+            .text(" in ")
+            .path("config.toml")
+            .text("."),
+        ui.config.mono_font,
+    )
+    .child(
+        div()
+            .size_full()
+            .child(ui::scrollable("shortcuts-list", columns)),
+    )
+    .hint(&["esc"], "Close")
+    .build();
     let dismiss = Diffui::on_action::<()>(Action::CloseShortcuts, cx);
     ui::modal(
         "shortcuts-sheet",
@@ -380,13 +361,24 @@ fn binding_row(
             .fill(),
         ],
     };
-    for (index, key) in keys.into_iter().enumerate() {
+    for (index, chord) in keys.into_iter().enumerate() {
         line.push(Aligned::gap(if index == 0 {
             theme::space::MD
         } else {
-            theme::space::XS
+            theme::space::SM
         }));
-        line.push(keycap(ui, theme, key, window, cx));
+        // A range (`⌘1–⌘9`) reads as one thing; split, its keys would mispair.
+        let caps = if chord.contains('\u{2013}') {
+            vec![chord]
+        } else {
+            crate::overlay_kit::chord_keys(&chord)
+        };
+        for (at, key) in caps.into_iter().enumerate() {
+            if at > 0 {
+                line.push(Aligned::gap(3.0));
+            }
+            line.push(keycap(ui, theme, key, window, cx));
+        }
     }
     div()
         .flex()
@@ -397,7 +389,8 @@ fn binding_row(
         .into_any_element()
 }
 
-/// A key rendered like the tab strip's `⌘K` control: hairline border, mono.
+/// One key in its own cap, the overlays' [`crate::overlay_kit::keycap`] on a
+/// baseline: a step raised off the card, a firm hairline.
 pub(crate) fn keycap(
     ui: &Diffui,
     theme: ThemeSpec,
@@ -405,17 +398,19 @@ pub(crate) fn keycap(
     _window: &mut Window,
     _cx: &mut Cx,
 ) -> Aligned {
-    let mono = ui.config.mono_font;
-    let size = typography::optical_size(mono, text_size::CAPTION);
+    let font = emphasis_font(ui.config.ui_font, Weight::MEDIUM);
+    let size = text_size::BADGE;
     Aligned::chip(
-        typography::line(key, mono, size, theme.muted_text),
-        mono,
+        typography::line(key, font, size, theme.subtle_text),
+        font,
         size,
-        [1.0, 5.0].into(),
+        [3.0, 5.0].into(),
         move |chip| {
-            chip.bg(theme::chip_background(theme.muted_text))
+            chip.min_w(px(crate::overlay_kit::KEYCAP))
+                .justify_center()
+                .bg(theme.panel_background_elevated)
                 .border_1()
-                .border_color(theme.border)
+                .border_color(crate::overlay_kit::firm_border(theme))
                 .rounded(px(theme::radius::XS))
         },
     )

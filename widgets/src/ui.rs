@@ -15,12 +15,11 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use gpui_kit::{
-    AnyElement, App, Bounds, Context, Div, ElementId, Entity, MouseButton, Pixels, ScrollHandle,
-    SharedString, Stateful, Window, anchored, canvas, div, point, px,
+    App, Bounds, Context, Div, ElementId, Entity, MouseButton, Pixels, ScrollHandle, SharedString,
+    Stateful, Window, anchored, canvas, div, point, px,
 };
 
 use crate::icons;
-use crate::prose::Prose;
 use crate::theme::{self, Color, Font, ThemeSpec, Weight, text_size};
 use crate::typography;
 
@@ -192,22 +191,6 @@ pub fn primary_button(
 /// Gap between buttons sitting side by side, in dialogs, editors and bars.
 pub const BUTTON_GAP: f32 = theme::space::SM;
 
-/// A row of buttons ending at the right edge, `leading` (a hint, a status) at
-/// the left. Every dialog and editor footer is one of these.
-pub fn button_row(
-    leading: Option<AnyElement>,
-    buttons: impl IntoIterator<Item = AnyElement>,
-) -> Div {
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(BUTTON_GAP))
-        .children(leading)
-        .child(div().flex_1())
-        .children(buttons)
-}
-
 /// The Cancel of a dialog or editor footer: always the raised secondary
 /// button, beside the footer's one filled call-to-action.
 pub fn cancel_button(
@@ -255,13 +238,6 @@ const CLOSE_ICON_SIZE: f32 = 12.0;
 
 // ── Modals ──────────────────────────────────────────────────────────────
 
-/// Inset between a dialog card's edge and its content.
-pub const DIALOG_PADDING: f32 = theme::space::XL + theme::space::XS;
-/// Gap between a dialog's title, body, fields and footer.
-pub const DIALOG_SPACING: f32 = theme::space::LG;
-/// Width of a dialog that asks one question.
-pub const DIALOG_WIDTH: f32 = 460.0;
-
 /// A card over the scrim, hung `top` px below the window's top edge. A press
 /// on the scrim runs `dismiss`; one on the card stays on the card. The layer
 /// is occluding so wheel events and the cursor don't bleed through to the
@@ -290,36 +266,6 @@ pub fn modal(
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .child(card),
         )
-}
-
-/// The dialog card: the modal surface with the shared inset.
-pub fn dialog_card(width: f32, theme: ThemeSpec) -> Div {
-    theme::modal_card(div(), theme)
-        .w(px(width))
-        .p(px(DIALOG_PADDING))
-        .flex()
-        .flex_col()
-        .gap(px(DIALOG_SPACING))
-}
-
-/// A dialog's title line.
-pub fn dialog_title(title: &Prose, font: Font, mono: Font, theme: ThemeSpec) -> Div {
-    div().text_size(px(text_size::TITLE)).child(title.view(
-        theme::emphasis_font(font, Weight::MEDIUM),
-        mono,
-        theme.text,
-        theme,
-    ))
-}
-
-/// A dialog's explanatory text.
-pub fn dialog_text(body: &Prose, font: Font, mono: Font, theme: ThemeSpec) -> Div {
-    div().w_full().text_size(px(text_size::UI)).child(body.view(
-        font,
-        mono,
-        theme.muted_text,
-        theme,
-    ))
 }
 
 /// Every plain scroll view in the app: `content` scrolling vertically under

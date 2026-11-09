@@ -7,7 +7,6 @@ use crate::revision_list::{self, FileRowView, RevisionListProps};
 use crate::theme::{
     Color, Font, ThemeSpec, Weight, chip_background, diff_palette, file_status_color, text_size,
 };
-use crate::ui::Tip as _;
 use crate::{Action, Cx, Diffui, LoadStatus, icons, ui};
 use diffui_core::FileTreeRow;
 use gpui_kit::component::Disableable as _;
@@ -18,7 +17,6 @@ use std::rc::Rc;
 
 const EMPTY_STATE_TEXT_SIZE: f32 = text_size::BODY_LG;
 pub(crate) const DESCRIPTION_EDITOR_ID: &str = "revision-description-editor";
-const DESCRIPTION_EDITOR_GAP: f32 = 8.0;
 // 12 over iced's 236: CoreText sets 13pt SF as AppKit does, about 12% wider than
 // iced's shaper did, and the stat columns measure wider with it.
 pub const DEFAULT_FILE_NAV_WIDTH: f32 = 248.0;
@@ -996,13 +994,18 @@ fn build_description_editor(
         });
         spec = spec.on_input(move |text, window, cx| on_edit(&text, window, cx));
     }
+    let (field, focused) =
+        crate::input::multi_line_with_focus(spec, ui.config.mono_font, window, cx);
     let input = div()
+        .w_full()
         .h(px(description_editor_input_height(ui)))
         .font(ui.config.mono_font.gpui())
         .text_size(px(ui.config.code_type.size))
         .child(
-            crate::input::multi_line(spec, ui.config.mono_font, window, cx)
-                .h(px(description_editor_input_height(ui))),
+            field
+                .appearance(false)
+                .text_size(px(ui.config.code_type.size))
+                .h_full(),
         );
 
     let cancel = ui::cancel_button(
@@ -1034,55 +1037,42 @@ fn build_description_editor(
     )
     .on_click(Diffui::on_action(Action::SaveDescription, cx));
 
-    // The keys live in the buttons' tooltips; the strip only speaks up when the editor is
-    // holding a revision switch back.
-    let hint_text = |value: &'static str, color: Color| {
-        crate::typography::centered(
-            crate::typography::line(value, ui.config.ui_font, text_size::UI, color),
-            ui.config.ui_font,
-            text_size::UI,
-        )
-        .into_any_element()
-    };
-    let hint = if editor.switch_blocked {
-        Some(hint_text(
-            "Save or cancel before switching revisions",
-            theme.note_text,
-        ))
+    let font = ui.config.ui_font;
+    let mut hints = vec![
+        crate::overlay_kit::key_hint(&["\u{2318}", "\u{21b5}"], save_label, font, theme)
+            .into_any_element(),
+        crate::overlay_kit::key_hint(&["esc"], "Cancel", font, theme).into_any_element(),
+    ];
+    // Speaks up when the editor is holding a revision switch back, or what a commit does
+    // after.
+    let note = if editor.switch_blocked {
+        Some(("Save or cancel before switching revisions", theme.note_text))
     } else if editor.commit {
-        Some(hint_text(
-            "Then starts a new change on top",
-            theme.subtle_text,
-        ))
+        Some(("Then starts a new change on top", theme.subtle_text))
     } else {
         None
     };
-    let keyed =
-        |id: &'static str, button: gpui_kit::component::button::Button, key: &'static str| {
-            div()
-                .id(id)
-                .child(button)
-                .tip(key, ui.config.ui_font, theme)
-                .into_any_element()
-        };
-    let actions = ui::button_row(
-        hint,
-        [
-            keyed("description-cancel-tip", cancel, "Esc"),
-            keyed("description-save-tip", save, "\u{2318}\u{21b5}"),
-        ],
+    if let Some((text, color)) = note {
+        hints.push(crate::overlay_kit::hint_note(text, color, font));
+    }
+    let footer = crate::overlay_kit::well_footer(
+        hints,
+        [cancel.into_any_element(), save.into_any_element()],
+        theme,
     );
     div()
         .flex_none()
-        .flex()
-        .flex_col()
-        .gap(px(DESCRIPTION_EDITOR_GAP))
         .w_full()
         .py(px(10.0))
         .px(px(crate::theme::space::XL))
         .bg(theme.panel_background)
-        .child(input)
-        .child(actions)
+        .child(
+            crate::field::field_well(focused, theme)
+                .flex()
+                .flex_col()
+                .child(input)
+                .child(footer),
+        )
         .into_any_element()
 }
 

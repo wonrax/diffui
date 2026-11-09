@@ -138,6 +138,7 @@ fn the_commit_block() {
     h.click("commit-edit");
     h.settle();
     assert!(h.read(|ui| ui.active().description_editor().is_some()));
+    shot(&mut h, "description-editor");
 }
 
 #[test]

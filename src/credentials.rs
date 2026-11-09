@@ -7,10 +7,11 @@
 //! asker went away (git gave up, the op finished) is withdrawn without the
 //! user doing anything.
 
-use crate::theme::text_size;
-use crate::{Action, Cx, input, typography, ui};
+use crate::overlay_kit::Dialog;
+use crate::theme::{self, Font, text_size};
+use crate::{Action, Cx, input, ui};
 use gpui_kit::prelude::*;
-use gpui_kit::{AnyElement, Window, div};
+use gpui_kit::{AnyElement, Window, div, px};
 use std::collections::VecDeque;
 
 use diffui_core::askpass::{self, AskpassEvent, PromptKind, PromptRequest};
@@ -221,12 +222,7 @@ pub(crate) fn build_overlay(
     let (font, mono) = (ui.config.ui_font, ui.config.mono_font);
     let prompt = &dialog.current.prompt;
 
-    let mut card = ui::dialog_card(ui::DIALOG_WIDTH, theme).child(ui::dialog_title(
-        &title(&dialog.current),
-        font,
-        mono,
-        theme,
-    ));
+    let mut card = Dialog::new(&title(&dialog.current), font, mono, theme);
     let accept_label = match prompt.kind {
         PromptKind::Secret | PromptKind::Text => {
             // The title already says what goes here.
@@ -246,43 +242,28 @@ pub(crate) fn build_overlay(
             Some("Continue")
         }
         PromptKind::YesNo => {
-            let mut text = Prose::from("First connection to this host. Check the fingerprint.");
+            card = card.lede(
+                &Prose::from("First connection to this host. Check its fingerprint."),
+                mono,
+            );
             if let Some(detail) = &prompt.detail {
-                text = text.text("\n").code(detail.clone());
+                card = card.child(fingerprint(detail, mono, theme));
             }
-            card = card.child(ui::dialog_text(&text, font, mono, theme));
             Some("Yes")
         }
         PromptKind::Confirm => {
-            card = card.child(ui::dialog_text(
-                &Prose::from(prompt.text.clone()),
-                font,
-                mono,
-                theme,
-            ));
+            card = card.lede(&Prose::from(prompt.text.clone()), mono);
             Some("Yes")
         }
         PromptKind::Notice => {
-            card = card.child(ui::dialog_text(
-                &Prose::from(prompt.text.clone()),
-                font,
-                mono,
-                theme,
-            ));
+            card = card.lede(&Prose::from(prompt.text.clone()), mono);
             None
         }
     };
 
-    let queued = dialog.queue.len();
-    let leading = (queued > 0).then(|| {
-        typography::line(
-            format!("{queued} more waiting"),
-            font,
-            text_size::UI,
-            theme.muted_text,
-        )
-        .into_any_element()
-    });
+    if let Some(label) = accept_label {
+        card = card.hint(&["\u{21b5}"], label);
+    }
     let raised = |label: &'static str, cx: &mut Cx| {
         ui::text_button(
             "credential-decline",
@@ -295,14 +276,24 @@ pub(crate) fn build_overlay(
             cx,
         )
     };
-    let decline = match prompt.kind {
-        PromptKind::YesNo | PromptKind::Confirm => raised("No", cx),
-        PromptKind::Notice => raised("Dismiss", cx),
-        PromptKind::Secret | PromptKind::Text => {
-            ui::cancel_button("credential-decline", ui::Size::Standard, font, theme, cx)
-        }
+    let (decline, decline_label) = match prompt.kind {
+        PromptKind::YesNo | PromptKind::Confirm => (raised("No", cx), "No"),
+        PromptKind::Notice => (raised("Dismiss", cx), "Dismiss"),
+        PromptKind::Secret | PromptKind::Text => (
+            ui::cancel_button("credential-decline", ui::Size::Standard, font, theme, cx),
+            "Cancel",
+        ),
+    };
+    card = card.hint(&["esc"], decline_label);
+    let queued = dialog.queue.len();
+    if queued > 0 {
+        card = card.note(crate::overlay_kit::footer_note(
+            format!("{queued} more waiting"),
+            font,
+            theme,
+        ));
     }
-    .on_click(Diffui::on_action(
+    let decline = decline.on_click(Diffui::on_action(
         Action::Credential(CredentialAction::Cancel),
         cx,
     ));
@@ -326,7 +317,7 @@ pub(crate) fn build_overlay(
             .into_any_element(),
         );
     }
-    let card = card.child(ui::button_row(leading, buttons));
+    let card = card.buttons(buttons).build();
     // A stray click on the scrim must not cancel a push.
     ui::modal(
         "credential-modal",
@@ -335,6 +326,22 @@ pub(crate) fn build_overlay(
         |_, _| {},
     )
     .into_any_element()
+}
+
+/// A host key's fingerprint in a quiet well, wrapping at any character so the
+/// long hash never runs off the card.
+fn fingerprint(detail: &str, mono: Font, theme: ThemeSpec) -> gpui_kit::Div {
+    div()
+        .w_full()
+        .px(px(theme::space::LG))
+        .py(px(theme::space::MD))
+        .rounded(px(theme::radius::SM))
+        .bg(crate::overlay_kit::inset_fill(theme))
+        .font(mono.gpui())
+        .text_size(px(text_size::UI))
+        .line_height(px(text_size::UI * 1.5))
+        .text_color(theme.text)
+        .child(detail.to_owned())
 }
 
 #[cfg(test)]

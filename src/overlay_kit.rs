@@ -289,6 +289,218 @@ pub(crate) fn callout(
 
 const CALLOUT_ICON: f32 = 14.0;
 
+/// Width of a dialog that asks one question.
+pub(crate) const DIALOG_WIDTH: f32 = 480.0;
+/// A dialog's inset around its words, fields and rows.
+pub(crate) const DIALOG_PAD: f32 = 20.0;
+/// Gap between a dialog's title and the line under it.
+const DIALOG_HEAD_GAP: f32 = 6.0;
+/// Gap between the things in a dialog's body.
+const DIALOG_BODY_GAP: f32 = 10.0;
+
+/// Every modal dialog's anatomy: the title with a line of plain words under
+/// it, a body of fields and rows, and a footer strip a step off the card with
+/// the key hints on the left and the buttons on the right.
+pub(crate) struct Dialog {
+    width: f32,
+    /// A fixed height, the body taking what the head and footer leave and
+    /// scrolling out to the card's right edge.
+    height: Option<f32>,
+    head: Div,
+    body: Vec<gpui_kit::AnyElement>,
+    hints: Vec<gpui_kit::AnyElement>,
+    buttons: Vec<gpui_kit::AnyElement>,
+    font: Font,
+    theme: ThemeSpec,
+}
+
+impl Dialog {
+    pub(crate) fn new(title: &Prose, font: Font, mono: Font, theme: ThemeSpec) -> Self {
+        let title_font = theme::emphasis_font(font, Weight::SEMIBOLD);
+        Self {
+            width: DIALOG_WIDTH,
+            height: None,
+            head: div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(DIALOG_HEAD_GAP))
+                .child(
+                    div()
+                        .w_full()
+                        .text_size(px(text_size::TITLE))
+                        .child(title.view(title_font, mono, theme.text, theme)),
+                ),
+            body: Vec::new(),
+            hints: Vec::new(),
+            buttons: Vec::new(),
+            font,
+            theme,
+        }
+    }
+
+    pub(crate) fn width(mut self, width: f32) -> Self {
+        self.width = width;
+        self
+    }
+
+    /// Fixes the card's height: the body fills the rest and is expected to
+    /// scroll, so its right inset moves inside the scroll view, where the bar
+    /// sits at the card's edge.
+    pub(crate) fn height(mut self, height: f32) -> Self {
+        self.height = Some(height);
+        self
+    }
+
+    /// The plain words under the title: what happens, in a sentence.
+    pub(crate) fn lede(mut self, text: &Prose, mono: Font) -> Self {
+        if !text.is_empty() {
+            self.head = self.head.child(
+                div()
+                    .w_full()
+                    .text_size(px(text_size::BODY))
+                    .line_height(px(text_size::BODY * 1.5))
+                    .child(text.view(self.font, mono, self.theme.muted_text, self.theme)),
+            );
+        }
+        self
+    }
+
+    /// Something in the body: a field, a row, a callout.
+    pub(crate) fn child(mut self, child: impl IntoElement) -> Self {
+        self.body.push(child.into_any_element());
+        self
+    }
+
+    /// A key hint in the footer's left end.
+    pub(crate) fn hint(mut self, keys: &[&str], label: impl Into<SharedString>) -> Self {
+        self.hints
+            .push(key_hint(keys, label, self.font, self.theme).into_any_element());
+        self
+    }
+
+    /// Quiet words in the footer's left end, after the hints.
+    pub(crate) fn note(mut self, note: impl IntoElement) -> Self {
+        self.hints.push(note.into_any_element());
+        self
+    }
+
+    /// The footer's buttons, Cancel first and the call to action last.
+    pub(crate) fn buttons(
+        mut self,
+        buttons: impl IntoIterator<Item = gpui_kit::AnyElement>,
+    ) -> Self {
+        self.buttons.extend(buttons);
+        self
+    }
+
+    pub(crate) fn build(self) -> Div {
+        let theme = self.theme;
+        let has_body = !self.body.is_empty();
+        let head = self
+            .head
+            .pt(px(DIALOG_PAD))
+            .px(px(DIALOG_PAD))
+            .when(!has_body, |head| head.pb(px(DIALOG_PAD)));
+        let fixed = self.height.is_some();
+        let body = has_body.then(|| {
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(DIALOG_BODY_GAP))
+                .pl(px(DIALOG_PAD))
+                .when(!fixed, |body| body.pr(px(DIALOG_PAD)))
+                .when(fixed, |body| body.flex_1().min_h_0())
+                .pt(px(theme::space::XL))
+                .pb(px(DIALOG_PAD))
+                .children(self.body)
+        });
+        let footer = div()
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(crate::ui::BUTTON_GAP))
+            .px(px(theme::space::XL))
+            .py(px(theme::space::LG))
+            .border_t_1()
+            .border_color(theme.border)
+            .bg(inset_fill(theme))
+            .rounded_b(px(radius::XL - 1.0))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(theme::space::LG))
+                    .overflow_hidden()
+                    .children(self.hints),
+            )
+            .children(self.buttons)
+            .flex_none();
+        theme::modal_card(div(), theme)
+            .w(px(self.width))
+            .when_some(self.height, |card, height| card.h(px(height)))
+            .flex()
+            .flex_col()
+            .child(head.flex_none())
+            .children(body)
+            .child(footer)
+    }
+}
+
+/// The footer strip inside an editor's well: key hints and notes on the left,
+/// the buttons on the right, a step off the field above it.
+pub(crate) fn well_footer(
+    hints: Vec<gpui_kit::AnyElement>,
+    buttons: impl IntoIterator<Item = gpui_kit::AnyElement>,
+    theme: ThemeSpec,
+) -> Div {
+    div()
+        .w_full()
+        .flex_none()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(crate::ui::BUTTON_GAP))
+        .pl(px(theme::space::LG))
+        .pr(px(theme::space::MD))
+        .py(px(theme::space::SM))
+        .border_t_1()
+        .border_color(theme.border)
+        .bg(inset_fill(theme))
+        .rounded_b(px(radius::CONTROL - 1.0))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(theme::space::LG))
+                .overflow_hidden()
+                .children(hints),
+        )
+        .children(buttons)
+}
+
+/// A quiet note among a footer's hints, in `color`.
+pub(crate) fn hint_note(
+    text: impl Into<SharedString>,
+    color: Color,
+    font: Font,
+) -> gpui_kit::AnyElement {
+    typography::centered(
+        typography::line(text, font, text_size::CAPTION, color),
+        font,
+        text_size::CAPTION,
+    )
+    .into_any_element()
+}
+
 #[cfg(test)]
 mod tests {
     use super::chord_keys;
