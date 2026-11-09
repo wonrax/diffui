@@ -35,7 +35,7 @@ pub(super) const NOTE_INSET: f32 = 20.0;
 pub(super) const NOTE_BUTTON_HEIGHT: f32 = 24.0;
 pub(super) const NOTE_BUTTON_PAD_X: f32 = 10.0;
 /// The size of a note's prose.
-pub(super) const NOTE_TEXT_SIZE: f32 = 12.0;
+pub(super) const NOTE_TEXT_SIZE: f32 = crate::theme::text_size::UI;
 pub(super) const PREFIX_WIDTH: f32 = 24.0;
 pub(super) const TEXT_X_PADDING: f32 = 8.0;
 /// A plain document's inset of its code from the gutter's edge and from the

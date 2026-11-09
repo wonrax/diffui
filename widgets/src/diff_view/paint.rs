@@ -52,7 +52,7 @@ const PICK_BAR_WIDTH: f32 = 3.0;
 const BROWSE_ICON_SIZE: f32 = 13.0;
 const HEADER_BUTTON_ICON_SIZE: f32 = 12.0;
 const HEADER_EDIT_ICON_SIZE: f32 = 13.0;
-const HEADER_EDIT_LABEL_SIZE: f32 = 12.0;
+const HEADER_EDIT_LABEL_SIZE: f32 = crate::theme::text_size::UI;
 const HEADER_EDIT_CONTENT_GAP: f32 = 5.0;
 /// Spacing of the hatch on a padded split column.
 const HATCH_STEP: f32 = 6.0;

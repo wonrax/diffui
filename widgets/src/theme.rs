@@ -428,7 +428,8 @@ pub mod text_size {
     /// result summaries.
     pub const CAPTION: f32 = 11.0;
     /// Chrome controls: buttons, tabs, menu rows, footer, dialog body.
-    pub const UI: f32 = 12.0;
+    /// macOS's regular control size (`NSFont.systemFontSize`).
+    pub const UI: f32 = 13.0;
     /// Primary content runs: ids, chips, list rows, inputs.
     pub const BODY: f32 = 13.0;
     /// Emphasized content: revision descriptions, empty states.
