@@ -38,9 +38,31 @@ pub(crate) struct MediaCache {
     /// The active tab's documents as of the last scan: a new id there is
     /// what starts decodes.
     scanned: Option<(Option<crate::TabId>, u64, Option<u64>)>,
+    /// Pixels nothing shows any more. They stay in the window's sprite atlas
+    /// until [`MediaCache::release`] gives them back, which needs the window.
+    retired: Vec<Arc<RenderImage>>,
 }
 
 impl MediaCache {
+    /// Decoded previews held, and dropped ones still waiting for the window.
+    #[cfg(test)]
+    pub(crate) fn counts(&self) -> (usize, usize) {
+        let ready = self
+            .entries
+            .values()
+            .filter(|entry| matches!(entry, Entry::Ready(_)))
+            .count();
+        (ready, self.retired.len())
+    }
+
+    /// Takes the dropped previews out of the window's sprite atlas: it only
+    /// grows otherwise, so every image ever shown would keep its GPU memory.
+    pub(crate) fn release(&mut self, window: &mut gpui_kit::Window) {
+        for image in self.retired.drain(..) {
+            let _ = window.drop_image(image);
+        }
+    }
+
     fn image(&self, side: &BlobSide) -> MediaImage {
         if side.bytes.is_none() {
             return MediaImage::Unavailable;
@@ -167,9 +189,14 @@ impl Diffui {
             .flat_map(previewable_sides)
             .map(|(_, side)| side.id.as_str())
             .collect();
-        self.media
-            .entries
-            .retain(|id, _| live.contains(id.as_str()));
+        let retired = &mut self.media.retired;
+        self.media.entries.retain(|id, entry| {
+            let keep = live.contains(id.as_str());
+            if let (false, Entry::Ready(image)) = (keep, entry) {
+                retired.push(image.clone());
+            }
+            keep
+        });
 
         if jobs.is_empty() {
             return;

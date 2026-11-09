@@ -139,6 +139,22 @@ fn kitchen_sink_file_kinds() {
 }
 
 #[test]
+fn previews_leave_the_atlas_when_nothing_shows_them() {
+    let (mut h, repo) = open_sized(SIZE);
+    select(&mut h, &repo, "kitchen-sink");
+    select_file(&mut h, "assets/logo.png");
+    h.wait_until("previews decode", |ui| ui.media.counts().0 > 0);
+
+    select(&mut h, &repo, "many-files");
+    h.frames();
+    assert_eq!(
+        h.read(|ui| ui.media.counts()),
+        (0, 0),
+        "the kitchen sink's previews were dropped, and the next frame gave their pixels back"
+    );
+}
+
+#[test]
 fn split_modes() {
     let (mut h, repo) = open_sized(SIZE);
     select(&mut h, &repo, "kitchen-sink");

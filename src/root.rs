@@ -517,6 +517,7 @@ impl Render for Diffui {
             self.renders += 1;
         }
         frame_log::begin();
+        self.media.release(window);
         let theme = self.resolved_theme().spec();
 
         #[cfg(test)]
