@@ -855,7 +855,9 @@ fn panel_peek(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> AnyElement {
     let top = toolbar::chrome_bottom();
     let bottom = crate::status_bar::TOTAL_HEIGHT;
     let shadow = theme::floating_shadow(8.0, 16.0);
-    let (surface, pane) = match peek.panel {
+    // The floating files peek is a squircle; the revisions peek, flush with the
+    // window's left edge and edged on its right only, keeps its plain corners.
+    let (surface, pane, squircle) = match peek.panel {
         Panel::Revisions => (
             div()
                 .absolute()
@@ -868,6 +870,7 @@ fn panel_peek(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> AnyElement {
                 .py(px(PEEK_CORNER_INSET))
                 .pr(px(PEEK_CORNER_INSET)),
             &panes.left,
+            false,
         ),
         Panel::Files => {
             let window = ui.window_size;
@@ -888,6 +891,7 @@ fn panel_peek(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> AnyElement {
                     .border_1()
                     .p(px(PEEK_CORNER_INSET)),
                 &panes.files,
+                true,
             )
         }
     };
@@ -918,8 +922,24 @@ fn panel_peek(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> AnyElement {
     surface
         .id("panel-peek")
         .overflow_hidden()
-        .bg(theme.panel_background)
-        .border_color(theme.border)
+        .map(|surface| {
+            if squircle {
+                surface
+                    .border_color(theme::TRANSPARENT)
+                    .child(crate::squircle::background(
+                        crate::squircle::Fill::new(crate::squircle::Corners::all(
+                            theme::radius::LG,
+                        ))
+                        .background(theme.panel_background)
+                        .border(1.0, theme.border),
+                        1.0,
+                    ))
+            } else {
+                surface
+                    .bg(theme.panel_background)
+                    .border_color(theme.border)
+            }
+        })
         .shadow(vec![shadow])
         .occlude()
         .child(watcher)

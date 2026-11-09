@@ -429,8 +429,7 @@ pub(crate) fn dropdown(
     // The keys the field answers while the list is open, as the palette's
     // footer tells its own.
     let font = ui.config.ui_font;
-    let footer = crate::overlay_kit::footer_strip(theme)
-        .rounded_b(px(CARD_RADIUS - 1.0))
+    let footer = crate::overlay_kit::footer_strip_rounded(theme, CARD_RADIUS - 1.0)
         .child(crate::overlay_kit::key_hint(
             &["\u{21e5}"],
             "Complete",
@@ -451,33 +450,36 @@ pub(crate) fn dropdown(
             .pl(px(crate::field::list_field_insets().0))
             .pr(px(crate::field::list_field_insets().1))
             .child(
-                theme::popover(div(), theme)
-                    // Firmer than a popover's edge: it hangs over a busy list.
-                    .border_color(crate::overlay_kit::firm_border(theme))
-                    .shadow(vec![
+                // Firmer than a popover's edge: it hangs over a busy list.
+                theme::floating_card(
+                    div(),
+                    theme,
+                    CARD_RADIUS,
+                    crate::overlay_kit::firm_border(theme),
+                    vec![
                         theme::floating_shadow(10.0, 28.0),
                         theme::floating_shadow(10.0, 28.0),
                         theme::floating_shadow(2.0, 6.0),
-                    ])
-                    .rounded(px(CARD_RADIUS))
-                    .id("revset-dropdown-card")
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .overflow_hidden()
-                    .occlude()
-                    .child(if field.completions.len() > VISIBLE_ROWS {
-                        div().w_full().h(px(height)).child(ui::scrollable_inset(
-                            DROPDOWN_ID,
-                            &handle,
-                            list,
-                            BAR_INSET,
-                        ))
-                    } else {
-                        // All of it fits: nothing to scroll, and no bar.
-                        list
-                    })
-                    .child(footer),
+                    ],
+                )
+                .id("revset-dropdown-card")
+                .w_full()
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .occlude()
+                .child(if field.completions.len() > VISIBLE_ROWS {
+                    div().w_full().h(px(height)).child(ui::scrollable_inset(
+                        DROPDOWN_ID,
+                        &handle,
+                        list,
+                        BAR_INSET,
+                    ))
+                } else {
+                    // All of it fits: nothing to scroll, and no bar.
+                    list
+                })
+                .child(footer),
             )
             .into_any_element(),
     )
@@ -492,8 +494,14 @@ fn row_shell(body: AnyElement, selected: bool, theme: ThemeSpec) -> gpui_kit::Di
         .items_center()
         .px(px(ROW_PAD_X))
         // Concentric with the card around it.
-        .rounded(px(CARD_RADIUS - RESULTS_INSET))
-        .when(selected, |row| row.bg(theme.selected_file))
+        .when(selected, |row| {
+            theme::squircle(
+                row,
+                CARD_RADIUS - RESULTS_INSET,
+                Some(theme.selected_file),
+                None,
+            )
+        })
         .child(body)
 }
 

@@ -1156,15 +1156,19 @@ fn build_column(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let card = theme::modal_card(div(), theme)
+    let edge = if outline_focus {
+        theme.accent
+    } else {
+        theme.border
+    };
+    let card = theme::modal_card_outlined(div(), theme, edge)
         .id(("palette-column", depth))
         .w(px(COLUMN_WIDTH))
         .h(px(COLUMN_HEIGHT))
         .flex()
         .flex_col()
         .overflow_hidden()
-        .occlude()
-        .when(outline_focus, |card| card.border_color(theme.accent));
+        .occlude();
     let body = |slot: AnyElement| div().flex_1().min_h_0().w_full().child(slot);
     let rule = || crate::root::horizontal_divider(theme);
     if let Some(command) = column.command.as_deref() {
@@ -1297,8 +1301,7 @@ fn segment_well(theme: ThemeSpec) -> Div {
         .flex_none()
         .p(px(SEGMENT_WELL_PAD))
         .gap(px(SEGMENT_WELL_PAD))
-        .rounded(px(theme::radius::MD))
-        .bg(active_wash(theme))
+        .map(|well| theme::squircle(well, theme::radius::MD, Some(active_wash(theme)), None))
 }
 
 /// One segmented tab: an optional glyph, its label and an optional count,
@@ -1314,7 +1317,7 @@ fn segment(
     font: Font,
     theme: ThemeSpec,
     cx: &mut Cx,
-) -> gpui_kit::component::button::Button {
+) -> ui::Button {
     let label_font = theme::emphasis_font(font, Weight::MEDIUM);
     let ink = if pressed {
         theme.text
@@ -1352,12 +1355,7 @@ fn segment(
     ui::button(id, ui::Variant::Ghost, ui::Size::Compact, theme, cx)
         .h(px(SEGMENT_HEIGHT))
         .px(px(pad_x))
-        .rounded(px(theme::radius::SM))
-        .when(pressed, |segment| {
-            segment
-                .bg(theme.panel_background_elevated)
-                .shadow(theme::raised_shadow(theme))
-        })
+        .when(pressed, |segment| segment.raised(theme))
         .child(typography::baseline_row(line, 0.0))
 }
 
@@ -1658,8 +1656,9 @@ pub(crate) fn row_shell(
         .flex()
         .items_center()
         .px(px(ROW_PAD_X))
-        .rounded(px(theme::radius::CONTROL))
-        .when(selected, |row| row.bg(theme.selected_file))
+        .when(selected, |row| {
+            theme::squircle(row, theme::radius::CONTROL, Some(theme.selected_file), None)
+        })
         .child(body)
         .into_any_element()
 }

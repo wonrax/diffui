@@ -8,7 +8,7 @@
 //! neighbouring controls disagree by a pixel and snap unevenly.
 
 use gpui_kit::component::Disableable as _;
-use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
+use gpui_kit::component::button::{Button as KitButton, ButtonCustomVariant, ButtonVariants as _};
 use gpui_kit::component::scroll::{Scrollable, ScrollableElement as _};
 use gpui_kit::prelude::*;
 use std::cell::Cell;
@@ -20,6 +20,7 @@ use gpui_kit::{
 };
 
 use crate::icons;
+use crate::squircle;
 use crate::theme::{self, Color, Font, ThemeSpec, Weight, text_size};
 use crate::typography;
 
@@ -94,32 +95,164 @@ pub fn button(
     theme: ThemeSpec,
     cx: &App,
 ) -> Button {
-    frame(id, style(variant, theme), theme, cx)
+    frame(id, style(variant, theme), cx)
         .h(px(size.height()))
         .px(px(size.pad_x()))
 }
 
-fn frame(
-    id: impl Into<ElementId>,
-    style: theme::ButtonStyle,
-    theme: ThemeSpec,
-    cx: &App,
-) -> Button {
+fn frame(id: impl Into<ElementId>, style: theme::ButtonStyle, cx: &App) -> Button {
+    let id = id.into();
+    // kit paints nothing of its own: its fill would be a circular quad. The
+    // squircle behind the label paints each state instead.
+    let clear = gpui_kit::Hsla::from(theme::TRANSPARENT);
     let colors = ButtonCustomVariant::new(cx)
-        .color(style.rest.unwrap_or(theme::TRANSPARENT).into())
+        .color(clear)
         .foreground(style.label.into())
-        .hover(style.hover.into())
-        .active(style.active.into());
-    // kit tints a custom variant's fill to 20%, for its own translucent style; ours
-    // is the fill itself. Instance styles win over the variant, hover over both.
-    let mut button = Button::new(id)
+        .hover(clear)
+        .active(clear);
+    let mut inner = KitButton::new(id.clone())
         .custom(colors)
-        .bg(style.rest.unwrap_or(theme::TRANSPARENT))
+        .bg(theme::TRANSPARENT)
+        // The lift's shape: a shadow's blur hides its circular corner.
         .rounded(px(theme::radius::BUTTON));
-    if let Some(shadow) = style.shadow {
-        button = button.shadow(shadow(theme));
+    if let Some(lift) = style.lift {
+        inner = inner.shadow(vec![lift]);
     }
-    button
+    let fill = |color: Option<Color>| {
+        let mut fill = squircle::Fill::new(squircle::Corners::all(theme::radius::BUTTON));
+        if let Some(color) = color {
+            fill = fill.background(color);
+        }
+        if let Some(ring) = style.ring {
+            fill = fill.border(1.0, ring);
+        }
+        fill
+    };
+    Button {
+        inner,
+        id,
+        states: squircle::States {
+            rest: fill(style.rest),
+            hover: fill(Some(style.hover)),
+            active: fill(Some(style.active)),
+        },
+        disabled: false,
+        children: Vec::new(),
+    }
+}
+
+/// A diffui button: kit's button for what it does (clicks, focus, tooltips,
+/// accessibility), drawn as a squircle. kit lays its children out inside its
+/// padding and clips them there, so the button's padding moves onto a row of
+/// its own when it renders, and the squircle, its first child, covers the
+/// whole box.
+#[derive(IntoElement)]
+pub struct Button {
+    inner: KitButton,
+    id: ElementId,
+    states: squircle::States,
+    disabled: bool,
+    children: Vec<gpui_kit::AnyElement>,
+}
+
+impl Button {
+    pub fn on_click(
+        mut self,
+        handler: impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.inner = self.inner.on_click(handler);
+        self
+    }
+
+    pub fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self.inner = self.inner.disabled(disabled);
+        self
+    }
+
+    pub fn tooltip(mut self, tooltip: impl Into<SharedString>) -> Self {
+        self.inner = self.inner.tooltip(tooltip);
+        self
+    }
+
+    /// The fill and edge at rest, in place of the variant's: a toggle while
+    /// it's on. Hover and press keep the variant's.
+    pub fn resting(mut self, fill: Color, ring: Option<Color>) -> Self {
+        let mut rest = squircle::Fill::new(self.states.rest.corners).background(fill);
+        if let Some(ring) = ring {
+            rest = rest.border(1.0, ring);
+        }
+        self.states.rest = rest;
+        self
+    }
+
+    /// Rounds the button by `radius` in place of [`theme::radius::BUTTON`]: a
+    /// smaller control.
+    pub fn corner_radius(mut self, radius: f32) -> Self {
+        let corners = squircle::Corners::all(radius);
+        self.states.rest.corners = corners;
+        self.states.hover.corners = corners;
+        self.states.active.corners = corners;
+        self.inner = self.inner.rounded(px(radius));
+        self
+    }
+
+    /// [`Button::resting`] raised out of its track, as the active segment of a
+    /// segmented control is.
+    pub fn raised(self, theme: ThemeSpec) -> Self {
+        self.resting(
+            theme.panel_background_elevated,
+            Some(theme::firm_ring(theme)),
+        )
+        .shadow(vec![theme::raised_lift()])
+    }
+}
+
+impl Styled for Button {
+    fn style(&mut self) -> &mut gpui_kit::StyleRefinement {
+        self.inner.style()
+    }
+}
+
+impl ParentElement for Button {
+    fn extend(&mut self, elements: impl IntoIterator<Item = gpui_kit::AnyElement>) {
+        self.children.extend(elements);
+    }
+}
+
+impl RenderOnce for Button {
+    fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        let mut inner = self.inner;
+        let padding = std::mem::take(&mut inner.style().padding);
+        // An explicit zero: left unset, kit pads the button for its size.
+        let inner = inner.p(px(0.0));
+        let mut row = div()
+            .h_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .children(self.children);
+        row.style().padding = padding;
+        // A disabled button doesn't answer the pointer.
+        let states = if self.disabled {
+            squircle::States {
+                hover: self.states.rest,
+                active: self.states.rest,
+                ..self.states
+            }
+        } else {
+            self.states
+        };
+        inner
+            .child(squircle::interactive_background(
+                ElementId::NamedChild(std::sync::Arc::new(self.id), "squircle".into()),
+                states,
+                0.0,
+            ))
+            .child(row)
+    }
 }
 
 /// An optional leading icon and a label, sized for `size`. The building block
@@ -178,7 +311,7 @@ pub fn primary_button(
     } else {
         theme::disabled_button_style(theme)
     };
-    frame(id, colors, theme, cx)
+    frame(id, colors, cx)
         .h(px(size.height()))
         .px(px(size.pad_x()))
         .disabled(!enabled)
@@ -210,7 +343,7 @@ pub fn icon_button(
     cx: &App,
 ) -> Button {
     let side = px(size.height());
-    frame(id, theme::ghost_button_style(theme), theme, cx)
+    frame(id, theme::ghost_button_style(theme), cx)
         .size(side)
         .p(px(0.0))
         .child(icons::icon(glyph, ICON_SIZE, color))
@@ -220,7 +353,7 @@ pub fn icon_button(
 /// wash, so it sits inside the banner with even insets instead of filling
 /// its height.
 pub fn close_button(id: impl Into<ElementId>, color: Color, theme: ThemeSpec, cx: &App) -> Button {
-    frame(id, theme::ghost_button_style(theme), theme, cx)
+    frame(id, theme::ghost_button_style(theme), cx)
         .size(px(CLOSE_SIDE))
         .p(px(0.0))
         .child(icons::icon(icons::CLOSE, CLOSE_ICON_SIZE, color))

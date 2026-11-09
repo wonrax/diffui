@@ -8,7 +8,6 @@
 
 use diffui_core::RevisionSelection;
 use gpui_kit::base::TestSupportExt as _;
-use gpui_kit::component::Disableable as _;
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, ElementId, MouseButton, MouseDownEvent, SharedString, Window, div, px};
 
@@ -106,14 +105,12 @@ pub(crate) fn caret_glyph(
 /// Hover fill of a dropdown caret (fetch / revset), so both highlight identically.
 /// `radius` follows the caret's context: BUTTON beside toolbar buttons, CONTROL
 /// inside a filter field.
-pub(crate) fn caret_hover<E: StatefulInteractiveElement + Styled>(
-    caret: E,
-    theme: ThemeSpec,
-    radius: f32,
-) -> E {
-    caret
-        .rounded(px(radius))
-        .hover(move |caret| caret.bg(theme::hover_wash(theme)))
+pub(crate) fn caret_hover<E: Styled + ParentElement>(caret: E, theme: ThemeSpec, radius: f32) -> E {
+    caret.child(crate::squircle::hover_background(
+        crate::squircle::Fill::new(crate::squircle::Corners::all(radius))
+            .background(theme::hover_wash(theme)),
+        0.0,
+    ))
 }
 
 /// Build the actions toolbar. Empty when no repo is open (the welcome screen owns
@@ -373,12 +370,16 @@ pub(crate) fn segmented(
         .items_center()
         .gap(px(theme::space::XXS))
         .p(px(INSET))
-        .rounded(px(radius::BUTTON))
         // A step into the chrome it sits on.
-        .bg(Color {
-            a: 0.07,
-            ..theme.text
-        });
+        .child(crate::squircle::background(
+            crate::squircle::Fill::new(crate::squircle::Corners::all(radius::BUTTON)).background(
+                Color {
+                    a: 0.07,
+                    ..theme.text
+                },
+            ),
+            0.0,
+        ));
     for segment in segments {
         let Segment {
             icon,
@@ -412,10 +413,8 @@ pub(crate) fn segmented(
             .gap(px(6.0))
             .h(px(SEGMENT_HEIGHT))
             .px(px(10.0 - INSET))
-            .rounded(px(radius::BUTTON - INSET))
             .when(active, |tab| {
-                tab.bg(theme.panel_background_elevated)
-                    .shadow(theme::raised_shadow(theme))
+                theme::raised(tab, radius::BUTTON - INSET, theme)
             })
             .children(icon.map(|icon| icons::icon(icon, ui::ICON_SIZE, icon_color)))
             .child(typography::centered(
@@ -493,7 +492,7 @@ fn toggle_button(
     };
     let mut button = ui::icon_button(id, icon, icon_color, CONTROL, theme, cx);
     if active {
-        button = button.bg(chip_background(theme.accent));
+        button = button.resting(chip_background(theme.accent), None);
     }
     button = match action {
         Some(action) => button.on_click(Diffui::on_action(action, cx)),

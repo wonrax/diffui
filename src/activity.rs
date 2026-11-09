@@ -543,7 +543,7 @@ pub(crate) fn activity_indicator(
         cx,
     )
     .when(ui.activity_popover_open(), |button| {
-        button.bg(crate::palette::active_wash(theme))
+        button.resting(crate::palette::active_wash(theme), None)
     })
     .child(body)
     .on_click(Diffui::on_action(Action::ToggleActivityPopover, cx))
@@ -862,7 +862,7 @@ fn row_button(
         ui::button((id.0, id.1 as usize), variant, ui::Size::Compact, theme, cx)
             .h(px(SMALL_BUTTON))
             .px(px(7.0))
-            .rounded(px(theme::radius::XS + 2.0))
+            .corner_radius(theme::radius::XS + 2.0)
             .child(typography::baseline_row(line, 0.0))
             .on_click(Diffui::on_action(on_press, cx)),
     )
@@ -931,20 +931,26 @@ fn activity_row(
         .w_full()
         .flex()
         .flex_col()
-        .rounded(px(theme::radius::MD))
         .when(error, |row| {
-            row.bg(Color {
-                a: 0.07,
-                ..theme.removed_text
-            })
+            theme::squircle(
+                row,
+                theme::radius::MD,
+                Some(Color {
+                    a: 0.07,
+                    ..theme.removed_text
+                }),
+                None,
+            )
         })
         .when(!error, |row| {
-            row.hover(|row| {
-                row.bg(Color {
-                    a: 0.045,
-                    ..theme.text
-                })
-            })
+            row.child(crate::squircle::hover_background(
+                crate::squircle::Fill::new(crate::squircle::Corners::all(theme::radius::MD))
+                    .background(Color {
+                        a: 0.045,
+                        ..theme.text
+                    }),
+                0.0,
+            ))
         })
         .child(header);
 
@@ -982,10 +988,14 @@ fn activity_row(
         .py(px(theme::space::MD))
         .px(px(WELL_PAD_X))
         .overflow_hidden()
-        .bg(crate::overlay_kit::inset_fill(theme))
-        .border_1()
-        .border_color(theme.border)
-        .rounded(px(theme::radius::SM))
+        .map(|well| {
+            theme::squircle(
+                well,
+                theme::radius::SM,
+                Some(crate::overlay_kit::inset_fill(theme)),
+                Some(theme.border),
+            )
+        })
         .child(field);
     let mut actions = div().flex().flex_row().flex_wrap().gap(px(6.0));
     for (index, url) in activity.urls.iter().enumerate() {

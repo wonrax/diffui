@@ -155,8 +155,14 @@ pub(crate) fn load_error(ui: &Diffui, theme: ThemeSpec, error: &str, cx: &mut Cx
         .gap(px(theme::space::SM))
         .px(px(theme::space::LG))
         .py(px(theme::space::MD))
-        .rounded(px(theme::radius::CONTROL))
-        .bg(chip_background(theme.removed_text))
+        .map(|card| {
+            theme::squircle(
+                card,
+                theme::radius::CONTROL,
+                Some(chip_background(theme.removed_text)),
+                None,
+            )
+        })
         .child(typography::baseline_row(
             [
                 Aligned::glyph(

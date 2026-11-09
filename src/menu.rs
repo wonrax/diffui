@@ -883,11 +883,12 @@ fn build_row(
         .w_full()
         .h(px(MENU_ROW_HEIGHT))
         .px(px(MENU_ITEM_PAD_X))
-        .rounded(px(MENU_ROW_RADIUS))
         .cursor_pointer()
         // Same solid selection fill the palette's rows use, so "the row you're on"
         // looks identical across every list overlay.
-        .when(active, |row| row.bg(theme.selected_file))
+        .when(active, |row| {
+            theme::squircle(row, MENU_ROW_RADIUS, Some(theme.selected_file), None)
+        })
         .child(inner)
         .on_hover(Diffui::listen(cx, move |this, entered: &bool, _, _| {
             if *entered {
@@ -905,23 +906,30 @@ fn glow_card(theme: ThemeSpec, rect: Rectangle, opened_at: Instant) -> impl Into
         .as_secs_f32();
     let pulse = 0.5 + 0.5 * (elapsed * GLOW_PULSE_SPEED).sin();
     let accent = theme.accent;
+    let radius = crate::revision_list::row_card_radius(rect.height);
     div()
         .absolute()
         .left(px(rect.x))
         .top(px(rect.y))
         .w(px(rect.width))
         .h(px(rect.height))
-        .bg(Color {
-            a: 0.10 + 0.14 * pulse,
-            ..accent
-        })
-        .border(px(1.5))
-        .border_color(Color {
-            a: 0.55 + 0.45 * pulse,
-            ..accent
-        })
         // Traces the row card it sits on.
-        .rounded(px(crate::revision_list::row_card_radius(rect.height)))
+        .rounded(px(radius))
+        .child(crate::squircle::background(
+            crate::squircle::Fill::new(crate::squircle::Corners::all(radius))
+                .background(Color {
+                    a: 0.10 + 0.14 * pulse,
+                    ..accent
+                })
+                .border(
+                    1.5,
+                    Color {
+                        a: 0.55 + 0.45 * pulse,
+                        ..accent
+                    },
+                ),
+            0.0,
+        ))
         // A soft accent halo: the "glow" half of the effect, pulsing with the
         // border.
         .shadow(vec![BoxShadow {

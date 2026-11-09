@@ -167,6 +167,11 @@ pub(crate) fn footer_note(text: impl Into<SharedString>, font: Font, theme: Them
 /// rounded into its corners. Put the hints in with `.child`; a child with
 /// `ml_auto` sits at the far end.
 pub(crate) fn footer_strip(theme: ThemeSpec) -> Div {
+    footer_strip_rounded(theme, radius::XL - 1.0)
+}
+
+/// [`footer_strip`] for a card rounded by `radius + 1`.
+pub(crate) fn footer_strip_rounded(theme: ThemeSpec, radius: f32) -> Div {
     div()
         .w_full()
         .h(px(FOOTER_HEIGHT))
@@ -177,8 +182,17 @@ pub(crate) fn footer_strip(theme: ThemeSpec) -> Div {
         .gap(px(theme::space::XL))
         .px(px(14.0))
         .overflow_hidden()
-        .bg(inset_fill(theme))
-        .rounded_b(px(radius::XL - 1.0))
+        .child(card_foot(theme, radius))
+}
+
+/// The inset fill of a modal card's footer, its bottom corners following the
+/// card's squircle inside its 1px edge. The footer's first child.
+fn card_foot(theme: ThemeSpec, radius: f32) -> impl IntoElement {
+    crate::squircle::background(
+        crate::squircle::Fill::new(crate::squircle::Corners::bottom(radius))
+            .background(inset_fill(theme)),
+        0.0,
+    )
 }
 
 /// A list's group heading: sentence case, semibold, on the bottom of its
@@ -277,8 +291,7 @@ pub(crate) fn callout(
         .gap(px(10.0))
         .px(px(theme::space::LG))
         .py(px(10.0))
-        .rounded(px(radius::MD))
-        .bg(theme.note_background)
+        .map(|callout| theme::squircle(callout, radius::MD, Some(theme.note_background), None))
         .child(div().flex_none().pt(px(glyph_top)).child(icons::icon(
             icons::ALERT_TRIANGLE,
             CALLOUT_ICON,
@@ -426,8 +439,7 @@ impl Dialog {
             .py(px(theme::space::LG))
             .border_t_1()
             .border_color(theme.border)
-            .bg(inset_fill(theme))
-            .rounded_b(px(radius::XL - 1.0))
+            .child(card_foot(theme, radius::XL - 1.0))
             .child(
                 div()
                     .flex_1()
@@ -471,8 +483,11 @@ pub(crate) fn well_footer(
         .py(px(theme::space::SM))
         .border_t_1()
         .border_color(theme.border)
-        .bg(inset_fill(theme))
-        .rounded_b(px(radius::CONTROL - 1.0))
+        .child(crate::squircle::background(
+            crate::squircle::Fill::new(crate::squircle::Corners::bottom(radius::CONTROL - 1.0))
+                .background(inset_fill(theme)),
+            0.0,
+        ))
         .child(
             div()
                 .flex_1()

@@ -386,14 +386,14 @@ fn toggle_button(
     theme: ThemeSpec,
     font: Font,
     cx: &mut Cx,
-) -> gpui_kit::component::button::Button {
+) -> crate::ui::Button {
     let side = px(CONTROL.height());
     let font = theme::emphasis_font(font, Weight::MEDIUM);
     let mut button = crate::ui::button(id, crate::ui::Variant::Ghost, CONTROL, theme, cx)
         .size(side)
         .p(px(0.0));
     if on {
-        button = button.bg(theme::chip_background(theme.accent));
+        button = button.resting(theme::chip_background(theme.accent), None);
     }
     button.child(crate::typography::line(
         label,

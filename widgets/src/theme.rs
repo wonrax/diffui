@@ -527,17 +527,18 @@ pub fn press_wash(theme: ThemeSpec) -> Color {
 }
 
 /// Colours of a button in each state. Geometry lives in [`crate::ui`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ButtonStyle {
     pub rest: Option<Color>,
     pub hover: Color,
     pub active: Color,
     pub label: Color,
-    /// Drawn on the button, under its fill: its edge and lift. Every edge is a
-    /// ring inside the box, never a border, so a button keeps its size when
-    /// it changes style (a Save that turns primary once there's something to
-    /// save).
-    pub shadow: Option<fn(ThemeSpec) -> Vec<BoxShadow>>,
+    /// The button's 1px edge, inside its box and following its squircle. An
+    /// edge never takes room, so a button keeps its size when it changes
+    /// style (a Save that turns primary once there's something to save).
+    pub ring: Option<Color>,
+    /// The soft drop under a button that stands off its surface.
+    pub lift: Option<BoxShadow>,
 }
 
 /// Ghost button: invisible at rest, [`hover_wash`] on hover and
@@ -550,7 +551,8 @@ pub fn ghost_button_style(theme: ThemeSpec) -> ButtonStyle {
         hover: hover_wash(theme),
         active: press_wash(theme),
         label: theme.muted_text,
-        shadow: None,
+        ring: None,
+        lift: None,
     }
 }
 
@@ -562,33 +564,24 @@ pub fn raised_button_style(theme: ThemeSpec) -> ButtonStyle {
         hover: mix(theme.panel_background_elevated, theme.text, 0.035),
         active: mix(theme.panel_background_elevated, theme.text, 0.07),
         label: theme.text,
-        shadow: Some(raised_button_shadow),
+        ring: Some(firm_ring(theme)),
+        lift: Some(lift(0.05, 1.0)),
     }
 }
 
-/// A raised button's edge: its ring drawn *inside* its box, as every button's
-/// edge is, so buttons of one size step stand the same height side by side.
-fn raised_button_shadow(theme: ThemeSpec) -> Vec<BoxShadow> {
-    vec![
-        BoxShadow {
-            color: Hsla::from(firm_ring(theme)),
-            offset: point(px(0.0), px(0.0)),
-            blur_radius: px(0.0),
-            spread_radius: px(1.0),
-            inset: true,
-        },
-        BoxShadow {
-            color: Hsla::from(Color { a: 0.05, ..BLACK }),
-            offset: point(px(0.0), px(1.0)),
-            blur_radius: px(1.0),
-            spread_radius: px(0.0),
-            inset: false,
-        },
-    ]
+/// A faint drop one pixel under a control.
+fn lift(alpha: f32, blur: f32) -> BoxShadow {
+    BoxShadow {
+        color: Hsla::from(Color { a: alpha, ..BLACK }),
+        offset: point(px(0.0), px(1.0)),
+        blur_radius: px(blur),
+        spread_radius: px(0.0),
+        inset: false,
+    }
 }
 
 /// The hairline of a raised control, a step firmer than the panes' borders.
-fn firm_ring(theme: ThemeSpec) -> Color {
+pub fn firm_ring(theme: ThemeSpec) -> Color {
     mix(theme.border, theme.subtle_text, 0.25)
 }
 
@@ -600,29 +593,9 @@ pub fn primary_button_style(theme: ThemeSpec) -> ButtonStyle {
         hover: mix(theme.accent, theme.text, 0.10),
         active: mix(theme.accent, theme.text, 0.18),
         label: theme.background,
-        shadow: Some(primary_shadow),
+        ring: Some(Color { a: 0.10, ..BLACK }),
+        lift: Some(lift(0.08, 1.0)),
     }
-}
-
-/// A primary button's edge: an inner ring a shade darker than its fill and a
-/// faint drop.
-fn primary_shadow(_theme: ThemeSpec) -> Vec<BoxShadow> {
-    vec![
-        BoxShadow {
-            color: Hsla::from(Color { a: 0.10, ..BLACK }),
-            offset: point(px(0.0), px(0.0)),
-            blur_radius: px(0.0),
-            spread_radius: px(1.0),
-            inset: true,
-        },
-        BoxShadow {
-            color: Hsla::from(Color { a: 0.08, ..BLACK }),
-            offset: point(px(0.0), px(1.0)),
-            blur_radius: px(1.0),
-            spread_radius: px(0.0),
-            inset: false,
-        },
-    ]
 }
 
 /// The primary button while it can't be pressed.
@@ -633,13 +606,9 @@ pub fn disabled_button_style(theme: ThemeSpec) -> ButtonStyle {
         hover: fill,
         active: fill,
         label: theme.subtle_text,
-        shadow: Some(disabled_ring),
+        ring: Some(theme.border),
+        lift: None,
     }
-}
-
-/// A disabled button's edge: the panes' hairline, inside its box.
-fn disabled_ring(theme: ThemeSpec) -> Vec<BoxShadow> {
-    vec![inset_ring(theme.border)]
 }
 
 /// A 1px edge drawn inside a box. Unlike a border it takes no room, so a
@@ -662,7 +631,8 @@ pub fn destructive_button_style(theme: ThemeSpec) -> ButtonStyle {
         hover: theme.removed_text,
         active: theme.removed_text,
         label: theme.background,
-        shadow: Some(primary_shadow),
+        ring: Some(Color { a: 0.10, ..BLACK }),
+        lift: Some(lift(0.08, 1.0)),
     }
 }
 
@@ -679,53 +649,126 @@ pub fn floating_shadow(offset_y: f32, blur_radius: f32) -> BoxShadow {
     }
 }
 
-/// The edge of a control raised out of its track (the active tab, the active
-/// segment): a hairline ring a step firmer than the panes' borders and a soft
-/// drop under it. Shadows, not a border, so raising a control never moves its
-/// content; the ring is inset because GPUI grows a spread shadow's box but not
-/// its corner radius, which thickens an outer ring at the corners.
-pub fn raised_shadow(theme: ThemeSpec) -> Vec<BoxShadow> {
-    vec![
-        BoxShadow {
-            color: Hsla::from(firm_ring(theme)),
-            offset: point(px(0.0), px(0.0)),
-            blur_radius: px(0.0),
-            spread_radius: px(1.0),
-            inset: true,
-        },
-        BoxShadow {
-            color: Hsla::from(Color { a: 0.10, ..BLACK }),
-            offset: point(px(0.0), px(1.0)),
-            blur_radius: px(2.0),
-            spread_radius: px(0.0),
-            inset: false,
-        },
-    ]
+/// The soft drop under a control raised out of its track (the active tab, the
+/// active segment). Its edge is the squircle's ring, in [`firm_ring`].
+pub fn raised_lift() -> BoxShadow {
+    lift(0.10, 2.0)
+}
+
+/// Gives `element` a squircle of `radius`: filled with `fill`, and edged in
+/// `border` 1px inside its box where a border would be (the element keeps a
+/// transparent border for its layout). Call it before adding children: the
+/// squircle is the first.
+pub fn squircle<E: Styled + gpui_kit::ParentElement>(
+    element: E,
+    radius: f32,
+    fill: Option<Color>,
+    border: Option<Color>,
+) -> E {
+    use crate::squircle::{Corners, Fill, background};
+    let mut shape = Fill::new(Corners::all(radius));
+    if let Some(fill) = fill {
+        shape = shape.background(fill);
+    }
+    let element = element.rounded(px(radius));
+    match border {
+        Some(border) => element
+            .border_1()
+            .border_color(TRANSPARENT)
+            .child(background(shape.border(1.0, border), 1.0)),
+        None => element.child(background(shape, 0.0)),
+    }
+}
+
+/// Raises `element` out of its track (the active tab, the active segment): the
+/// panes' surface in a squircle of `radius` with a [`firm_ring`] edge, and a
+/// soft drop. Call it before adding children: the squircle is the first.
+pub fn raised<E: Styled + gpui_kit::ParentElement>(element: E, radius: f32, theme: ThemeSpec) -> E {
+    use crate::squircle::{Corners, Fill, background};
+    element
+        .rounded(px(radius))
+        .shadow(vec![raised_lift()])
+        .child(background(
+            Fill::new(Corners::all(radius))
+                .background(theme.panel_background_elevated)
+                .border(1.0, firm_ring(theme)),
+            0.0,
+        ))
 }
 
 /// Floating card anchored to a trigger with nothing dimming the content behind
 /// it (dropdown menus, the activity popover). The heavy drop shadow is what
-/// separates it from the busy panel underneath.
-pub fn popover<E: Styled>(element: E, theme: ThemeSpec) -> E {
-    element
-        .bg(theme.panel_background_elevated)
-        .border_1()
-        .border_color(theme.border)
-        .rounded(px(radius::SURFACE))
-        .shadow(vec![floating_shadow(8.0, 16.0)])
+/// separates it from the busy panel underneath. Add its content after this:
+/// its squircle is the card's first child.
+pub fn popover<E: Styled + gpui_kit::ParentElement>(element: E, theme: ThemeSpec) -> E {
+    floating(
+        element,
+        theme,
+        radius::SURFACE,
+        theme.border,
+        floating_shadow(8.0, 16.0),
+    )
 }
 
 /// Centered card over a scrim (confirm dialog, open-repo dialog, command
 /// palette). The scrim already darkens what's behind the modal, so a heavy
 /// shadow would just look like double dimming: soft, just enough to suggest
 /// the card is lifted.
-pub fn modal_card<E: Styled>(element: E, theme: ThemeSpec) -> E {
+pub fn modal_card<E: Styled + gpui_kit::ParentElement>(element: E, theme: ThemeSpec) -> E {
+    modal_card_outlined(element, theme, theme.border)
+}
+
+/// [`modal_card`] with its edge in `border`: the palette rings the column
+/// that has the keyboard.
+pub fn modal_card_outlined<E: Styled + gpui_kit::ParentElement>(
+    element: E,
+    theme: ThemeSpec,
+    border: Color,
+) -> E {
+    floating(
+        element,
+        theme,
+        radius::XL,
+        border,
+        floating_shadow(4.0, 12.0),
+    )
+}
+
+/// A floating card: its fill and edge are a squircle, and its drop shadow
+/// keeps the circular corner GPUI shadows have, which the blur hides.
+fn floating<E: Styled + gpui_kit::ParentElement>(
+    element: E,
+    theme: ThemeSpec,
+    radius: f32,
+    border: Color,
+    shadow: BoxShadow,
+) -> E {
+    floating_card(element, theme, radius, border, vec![shadow])
+}
+
+/// [`popover`] with its own corner, edge and shadows: a card that needs to
+/// stand further off what it hangs over.
+pub fn floating_card<E: Styled + gpui_kit::ParentElement>(
+    element: E,
+    theme: ThemeSpec,
+    radius: f32,
+    border: Color,
+    shadows: Vec<BoxShadow>,
+) -> E {
+    use crate::squircle::{Corners, Fill, background};
+    // The transparent border keeps the card's layout and lets an
+    // overflow-hidden card clip to its whole box, edge included.
     element
-        .bg(theme.panel_background_elevated)
         .border_1()
-        .border_color(theme.border)
-        .rounded(px(radius::XL))
-        .shadow(vec![floating_shadow(4.0, 12.0)])
+        .border_color(TRANSPARENT)
+        .rounded(px(radius))
+        .shadow(shadows)
+        .child(background(
+            Fill::new(Corners::all(radius))
+                .background(theme.panel_background_elevated)
+                .border(1.0, border),
+            1.0,
+        ))
 }
 
 /// Dimming layer behind modal surfaces. One alpha everywhere so stacked

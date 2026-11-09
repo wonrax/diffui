@@ -546,10 +546,14 @@ fn preview(ui: &Diffui, theme: ThemeSpec, line: &str, command: &CommandLine) -> 
         .gap(px(theme::space::XS))
         .px(px(theme::space::LG))
         .py(px(10.0))
-        .rounded(px(theme::radius::MD))
-        .bg(crate::overlay_kit::inset_fill(theme))
-        .border_1()
-        .border_color(theme.border)
+        .map(|card| {
+            theme::squircle(
+                card,
+                theme::radius::MD,
+                Some(crate::overlay_kit::inset_fill(theme)),
+                Some(theme.border),
+            )
+        })
         .child(typography::baseline_row(head, 0.0));
     if !ghosted && !plan.words.is_empty() {
         card = card.child(typography::baseline_row(

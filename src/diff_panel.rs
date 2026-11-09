@@ -9,7 +9,6 @@ use crate::theme::{
 };
 use crate::{Action, Cx, Diffui, LoadStatus, icons, ui};
 use diffui_core::FileTreeRow;
-use gpui_kit::component::Disableable as _;
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, Window, div, px};
 use jj_lib::graph::GraphEdgeType;
@@ -750,8 +749,14 @@ fn build_diff_panel_body(
                         .flex()
                         .items_center()
                         .justify_center()
-                        .rounded(px(crate::theme::radius::SURFACE))
-                        .bg(chip_background(theme.added_text))
+                        .map(|badge| {
+                            crate::theme::squircle(
+                                badge,
+                                crate::theme::radius::SURFACE,
+                                Some(chip_background(theme.added_text)),
+                                None,
+                            )
+                        })
                         .child(icons::icon(icons::CHECK, 22.0, theme.added_text)),
                 )
                 .child(crate::typography::line(

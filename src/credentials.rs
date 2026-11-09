@@ -335,8 +335,14 @@ fn fingerprint(detail: &str, mono: Font, theme: ThemeSpec) -> gpui_kit::Div {
         .w_full()
         .px(px(theme::space::LG))
         .py(px(theme::space::MD))
-        .rounded(px(theme::radius::SM))
-        .bg(crate::overlay_kit::inset_fill(theme))
+        .map(|well| {
+            theme::squircle(
+                well,
+                theme::radius::SM,
+                Some(crate::overlay_kit::inset_fill(theme)),
+                None,
+            )
+        })
         .font(mono.gpui())
         .text_size(px(text_size::UI))
         .line_height(px(text_size::UI * 1.5))

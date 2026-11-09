@@ -145,6 +145,13 @@ impl Plan {
     }
 
     fn rounded(&mut self, rect: Rectangle, radius: f32, color: Color) {
+        if radius >= crate::squircle::MIN_RADIUS
+            && let Some(path) =
+                crate::squircle::fill_path(rect.bounds(), crate::squircle::Corners::all(radius))
+        {
+            self.ops.push(Op::Path(path, color.into()));
+            return;
+        }
         self.ops.push(Op::Quad(
             fill(rect.bounds(), color).corner_radii(px(radius)),
         ));
@@ -158,6 +165,19 @@ impl Plan {
         border: Color,
         style: BorderStyle,
     ) {
+        // A dashed edge stays a quad: a path can't dash.
+        if radius >= crate::squircle::MIN_RADIUS && matches!(style, BorderStyle::Solid) {
+            let corners = crate::squircle::Corners::all(radius);
+            if background.a > 0.0
+                && let Some(path) = crate::squircle::fill_path(rect.bounds(), corners)
+            {
+                self.ops.push(Op::Path(path, background.into()));
+            }
+            if let Some(path) = crate::squircle::stroke_path(rect.bounds(), corners, 1.0) {
+                self.ops.push(Op::Path(path, border.into()));
+            }
+            return;
+        }
         self.ops.push(Op::Quad(PaintQuad {
             bounds: rect.bounds(),
             corner_radii: Corners::all(px(radius)),

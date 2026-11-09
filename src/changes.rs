@@ -1656,7 +1656,16 @@ pub(crate) fn action_bar(
             .items_center()
             .justify_center()
             .h(px(BAR_BUTTON_HEIGHT))
-            .rounded(px(theme::radius::BUTTON))
+            // The hover wash comes before the content it sits under.
+            .when(enabled, |element| {
+                element.child(crate::squircle::hover_background(
+                    crate::squircle::Fill::new(crate::squircle::Corners::all(
+                        theme::radius::BUTTON,
+                    ))
+                    .background(hover),
+                    0.0,
+                ))
+            })
             .child(content)
             .tip(tip, font, theme);
         element = if show_label {
@@ -1667,7 +1676,6 @@ pub(crate) fn action_bar(
         if enabled {
             element = element
                 .cursor_pointer()
-                .hover(move |style| style.bg(hover))
                 .on_click(Diffui::on_action(Action::Changes(msg), cx));
         } else {
             element = element.opacity(0.4);
@@ -1785,9 +1793,12 @@ pub(crate) fn action_bar(
             .gap(px(6.0))
             .h(px(BAR_BUTTON_HEIGHT))
             .px(px(9.0))
-            .rounded(px(theme::radius::BUTTON))
+            .child(crate::squircle::hover_background(
+                crate::squircle::Fill::new(crate::squircle::Corners::all(theme::radius::BUTTON))
+                    .background(hover),
+                0.0,
+            ))
             .cursor_pointer()
-            .hover(move |style| style.bg(hover))
             .tip("Clear picks", font, theme)
             .on_click(Diffui::on_action(Action::Changes(ChangesMsg::Clear), cx))
             .child(typography::centered(
@@ -1809,8 +1820,7 @@ pub(crate) fn action_bar(
         .p(px(5.0))
         .max_w_full()
         .overflow_hidden()
-        .rounded(px(theme::radius::LG))
-        .bg(theme.text)
+        .map(|bar| theme::squircle(bar, theme::radius::LG, Some(theme.text), None))
         .shadow(vec![
             theme::floating_shadow(18.0, 40.0),
             theme::floating_shadow(8.0, 16.0),

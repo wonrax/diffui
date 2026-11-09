@@ -14,7 +14,6 @@
 
 use crate::Cx;
 use crate::ui::Tip as _;
-use gpui_kit::component::Disableable as _;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, Div, ElementId, SharedString, Stateful, Window, div, px};
@@ -1231,8 +1230,14 @@ pub(crate) fn file_filter_banner(
                     .gap(px(space::SM))
                     .pl(px(space::MD))
                     .pr(px(ui::BANNER_INSET))
-                    .bg(chip_background(theme.accent))
-                    .rounded(px(radius::CONTROL))
+                    .map(|banner| {
+                        crate::theme::squircle(
+                            banner,
+                            radius::CONTROL,
+                            Some(chip_background(theme.accent)),
+                            None,
+                        )
+                    })
                     .child(div().flex_1().min_w_0().child(line))
                     .child(with_tooltip(
                         "file-filter-close-tip",
@@ -1279,15 +1284,17 @@ fn row_card(
         .flex()
         .flex_row()
         .items_center()
-        .rounded(px(ROW_CARD_RADIUS))
         .cursor_pointer()
         .text_color(theme.text)
         .on_click(Diffui::on_action(action, cx));
     if selected {
-        card = card.bg(theme.selected_file);
+        card = crate::theme::squircle(card, ROW_CARD_RADIUS, Some(theme.selected_file), None);
     } else {
-        let wash = chip_background(theme.muted_text);
-        card = card.hover(move |style| style.bg(wash));
+        card = card.child(crate::squircle::hover_background(
+            crate::squircle::Fill::new(crate::squircle::Corners::all(ROW_CARD_RADIUS))
+                .background(chip_background(theme.muted_text)),
+            0.0,
+        ));
     }
     card
 }
@@ -2330,9 +2337,7 @@ fn table(rows: Vec<AnyElement>, theme: ThemeSpec) -> Div {
         .flex_none()
         .flex()
         .flex_col()
-        .rounded(px(radius::MD))
-        .border_1()
-        .border_color(theme.border)
+        .map(|table| crate::theme::squircle(table, radius::MD, None, Some(theme.border)))
         .overflow_hidden();
     for (index, row) in rows.into_iter().enumerate() {
         if index > 0 {
@@ -2485,10 +2490,14 @@ fn operation_header(
                 .py(px(space::XS))
                 .pl(px(space::LG))
                 .pr(px(space::SM))
-                .rounded(px(radius::MD))
-                .bg(theme.background)
-                .border_1()
-                .border_color(theme.border)
+                .map(|well| {
+                    crate::theme::squircle(
+                        well,
+                        radius::MD,
+                        Some(theme.background),
+                        Some(theme.border),
+                    )
+                })
                 .child(crate::plan::wrapped_command_line(
                     ui,
                     theme,

@@ -113,10 +113,14 @@ pub(crate) fn filter_field(
         .items_center()
         .w_full()
         .h(px(FIELD_HEIGHT))
-        .bg(theme.panel_background)
-        .border_1()
-        .border_color(theme.border)
-        .rounded(px(theme::radius::PUSH))
+        .map(|bar| {
+            theme::squircle(
+                bar,
+                theme::radius::PUSH,
+                Some(theme.panel_background),
+                Some(theme.border),
+            )
+        })
         .font(font.gpui());
     if spec.caret.is_some() {
         let bounds = bounds.clone();
@@ -172,9 +176,15 @@ fn presets_caret(
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(theme::radius::CONTROL))
         .cursor_pointer()
-        .when(hovered, |this| this.bg(theme::hover_wash(theme)))
+        .when(hovered, |this| {
+            theme::squircle(
+                this,
+                theme::radius::CONTROL,
+                Some(theme::hover_wash(theme)),
+                None,
+            )
+        })
         .on_hover(on_hover)
         .on_mouse_down(MouseButton::Left, on_press)
         .child(crate::toolbar::caret_glyph(
@@ -262,12 +272,12 @@ const DIALOG_FIELD_HEIGHT: f32 = theme::control::STANDARD;
 /// field has the keyboard. Only the colour changes, so focus never moves the
 /// text.
 pub(crate) fn field_well(focused: bool, theme: ThemeSpec) -> Div {
-    div()
-        .w_full()
-        .bg(theme.panel_background)
-        .border_1()
-        .border_color(if focused { theme.accent } else { theme.border })
-        .rounded(px(theme::radius::CONTROL))
+    theme::squircle(
+        div().w_full(),
+        theme::radius::CONTROL,
+        Some(theme.panel_background),
+        Some(if focused { theme.accent } else { theme.border }),
+    )
 }
 
 /// A dialog's one-line field: the shared well, at the dialog's control height.

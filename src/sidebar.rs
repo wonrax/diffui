@@ -567,12 +567,20 @@ fn op_target_row(
         .overflow_hidden()
         .py(px(6.0))
         .px(px(10.0))
-        .rounded(px(theme::radius::CONTROL))
         .when(tone == RowTone::Armed, |row| {
-            row.bg(chip_background(theme.accent))
+            theme::squircle(
+                row,
+                theme::radius::CONTROL,
+                Some(chip_background(theme.accent)),
+                None,
+            )
         })
         .when(tone != RowTone::Armed, |row| {
-            row.hover(move |row| row.bg(hover))
+            row.child(crate::squircle::hover_background(
+                crate::squircle::Fill::new(crate::squircle::Corners::all(theme::radius::CONTROL))
+                    .background(hover),
+                0.0,
+            ))
         })
         .test_support()
         .child(typography::baseline_row(content, 8.0));

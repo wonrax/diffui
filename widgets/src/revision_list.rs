@@ -1805,13 +1805,17 @@ impl RevisionList {
             div()
                 .px(px(8.0))
                 .py(px(4.0))
-                .bg(style.tooltip_background)
-                .border_1()
-                .border_color(Color {
-                    a: 0.6,
-                    ..style.accent
+                .map(|label| {
+                    crate::theme::squircle(
+                        label,
+                        crate::theme::radius::CONTROL,
+                        Some(style.tooltip_background),
+                        Some(Color {
+                            a: 0.6,
+                            ..style.accent
+                        }),
+                    )
                 })
-                .rounded(px(crate::theme::radius::CONTROL))
                 .shadow(vec![crate::theme::floating_shadow(3.0, 10.0)])
                 .font(style.mono_font.gpui())
                 .text_size(px(CAPTION_TEXT_SIZE))
@@ -2138,16 +2142,15 @@ impl RevisionList {
                 style.background
             };
             let left = crate::theme::mix(style.background, style.accent, 0.20);
-            window.paint_quad(
-                fill(
-                    card.bounds(),
-                    linear_gradient(
-                        90.0,
-                        linear_color_stop(left, 0.0),
-                        linear_color_stop(right, 1.0),
-                    ),
-                )
-                .corner_radii(px(ROW_CARD_RADIUS)),
+            fill_rounded(
+                card,
+                linear_gradient(
+                    90.0,
+                    linear_color_stop(left, 0.0),
+                    linear_color_stop(right, 1.0),
+                ),
+                ROW_CARD_RADIUS,
+                window,
             );
         } else if selected {
             fill_rounded(card, style.selected_background, ROW_CARD_RADIUS, window);
@@ -3186,12 +3189,34 @@ fn paint_working_copy_label(
     );
 }
 
-fn fill_rounded(rect: Rectangle, color: Color, radius: f32, window: &mut Window) {
+fn fill_rounded(
+    rect: Rectangle,
+    color: impl Into<gpui_kit::Background>,
+    radius: f32,
+    window: &mut Window,
+) {
+    if radius >= crate::squircle::MIN_RADIUS
+        && let Some(path) =
+            crate::squircle::fill_path(rect.bounds(), crate::squircle::Corners::all(radius))
+    {
+        window.paint_path(path, color);
+        return;
+    }
     window.paint_quad(fill(rect.bounds(), color).corner_radii(px(radius)));
 }
 
 /// Border-only rounded rect: the target ring for draft/drag destinations.
 fn stroke_rounded(rect: Rectangle, color: Color, width: f32, radius: f32, window: &mut Window) {
+    if radius >= crate::squircle::MIN_RADIUS
+        && let Some(path) = crate::squircle::stroke_path(
+            rect.bounds(),
+            crate::squircle::Corners::all(radius),
+            width,
+        )
+    {
+        window.paint_path(path, color);
+        return;
+    }
     window.paint_quad(quad(
         rect.bounds(),
         px(radius),

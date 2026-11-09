@@ -785,8 +785,13 @@ fn tab_widget(
         .h_full()
         .pl(px(LABEL_PAD_X))
         .pr(px(LABEL_PAD_X - 3.0))
-        .rounded(px(radius::BUTTON))
-        .when_some(wash_fill, |wash, fill| wash.bg(fill))
+        .when_some(wash_fill, |wash, fill| {
+            wash.child(crate::squircle::background(
+                crate::squircle::Fill::new(crate::squircle::Corners::all(radius::BUTTON))
+                    .background(fill),
+                0.0,
+            ))
+        })
         .child(label)
         .child(div().ml_auto().flex_none().child(trailing));
 
@@ -813,14 +818,16 @@ fn tab_widget(
         .left(px(offset))
         .w_full()
         .h(px(TAB_HEIGHT))
-        .rounded(px(radius::BUTTON))
-        .when(active, |body| {
-            body.bg(theme.panel_background_elevated)
-                .shadow(theme::raised_shadow(theme))
-        })
+        .when(active, |body| theme::raised(body, radius::BUTTON, theme))
         // Only the active tab has a fill to hide what it passes over; a background
         // one in the air (its activation was refused) gets a stand-in.
-        .when(lifted && !active, |body| body.bg(well_fill(theme)))
+        .when(lifted && !active, |body| {
+            body.child(crate::squircle::background(
+                crate::squircle::Fill::new(crate::squircle::Corners::all(radius::BUTTON))
+                    .background(well_fill(theme)),
+                0.0,
+            ))
+        })
         .child(div().relative().size_full().child(wash))
         .cursor_pointer()
         .on_hover(on_hover)
@@ -926,12 +933,21 @@ fn palette_hint(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> impl IntoElement 
         .h(px(TAB_HEIGHT))
         .pl(px(10.0))
         .pr(px(5.0))
-        .rounded(px(radius::BUTTON))
-        .bg(theme.panel_background_elevated)
-        .border_1()
-        .border_color(theme.border)
+        .map(|field| {
+            theme::squircle(
+                field,
+                radius::BUTTON,
+                Some(theme.panel_background_elevated),
+                Some(theme.border),
+            )
+        })
+        // Its edge firms up under the pointer.
+        .child(crate::squircle::hover_background(
+            crate::squircle::Fill::new(crate::squircle::Corners::all(radius::BUTTON))
+                .border(1.0, crate::overlay_kit::firm_border(theme)),
+            1.0,
+        ))
         .cursor_pointer()
-        .hover(|field| field.border_color(crate::overlay_kit::firm_border(theme)))
         .child(icons::icon(icons::SEARCH, 14.0, theme.subtle_text))
         .child(placeholder)
         .child(keys)
@@ -1080,9 +1096,7 @@ fn push_row(
         .items_start()
         .gap(px(theme::space::LG))
         .p(px(theme::space::LG))
-        .rounded(px(radius::MD))
-        .border_1()
-        .border_color(theme.border)
+        .map(|row| theme::squircle(row, radius::MD, None, Some(theme.border)))
         .child(div().pt(px(1.0)).child(icons::icon(
             crate::overlay_kit::glyph::BOOKMARK,
             ui::ICON_SIZE,
@@ -1420,8 +1434,7 @@ fn kind_box(status: Option<&crate::path_browse::Status>, theme: ThemeSpec) -> im
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(radius::SM))
-        .bg(fill)
+        .map(|badge| theme::squircle(badge, radius::SM, Some(fill), None))
         .child(icons::icon(glyph, ui::ICON_SIZE, ink))
 }
 
@@ -1542,15 +1555,19 @@ fn pull_request_card(ui: &Diffui, theme: ThemeSpec, spec: &diffui_core::github::
         .gap(px(theme::space::LG))
         .px(px(theme::space::XL))
         .py(px(14.0))
-        .rounded(px(radius::MD))
-        .bg(Color {
-            a: 0.07,
-            ..theme.accent
-        })
-        .border_1()
-        .border_color(Color {
-            a: 0.3,
-            ..theme.accent
+        .map(|card| {
+            theme::squircle(
+                card,
+                radius::MD,
+                Some(Color {
+                    a: 0.07,
+                    ..theme.accent
+                }),
+                Some(Color {
+                    a: 0.3,
+                    ..theme.accent
+                }),
+            )
         })
         .child(div().pt(px(1.0)).child(icons::icon(
             crate::overlay_kit::glyph::PULL_REQUEST,
@@ -1935,11 +1952,16 @@ fn list_row(
         .h(px(OPEN_ROW_HEIGHT))
         .px(px(OPEN_ROW_PAD_X))
         .gap(px(theme::space::MD))
-        .rounded(px(radius::CONTROL))
         .cursor_pointer()
-        .when(selected, |row| row.bg(theme.selected_file))
+        .when(selected, |row| {
+            theme::squircle(row, radius::CONTROL, Some(theme.selected_file), None)
+        })
         .when(!selected, |row| {
-            row.hover(|row| row.bg(crate::palette::active_wash(theme)))
+            row.child(crate::squircle::hover_background(
+                crate::squircle::Fill::new(crate::squircle::Corners::all(radius::CONTROL))
+                    .background(crate::palette::active_wash(theme)),
+                0.0,
+            ))
         })
         .child(content)
 }
@@ -2138,7 +2160,7 @@ fn recent_repo_row(
     )
     .size(px(OPEN_REMOVE_SIDE))
     .p(px(0.0))
-    .rounded(px(radius::XS))
+    .corner_radius(radius::XS)
     .child(icons::icon(icons::CLOSE, 12.0, theme.subtle_text))
     .on_click(Diffui::on_action(
         Action::RemoveRecentRepo(recent.root.clone()),
