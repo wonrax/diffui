@@ -15,6 +15,7 @@ use crate::prose::Prose;
 impl Diffui {
     pub(crate) fn new(cli: Cli, saved: WindowState, cx: &mut Cx) -> Self {
         let (config, raw_keys, config_error) = AppConfig::load();
+        crate::typography::set_ui_font(config.ui_font);
         // A keymap problem is never fatal: a config written against another
         // build still opens the app, having said once what it had to skip.
         let (keymap, problems) = Keymap::build(&raw_keys);

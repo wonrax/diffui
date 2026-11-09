@@ -95,6 +95,7 @@ pub(crate) fn build_revision_list(
         .on_scroll(cx.listener(|this: &mut Diffui, offset: &f64, _, _| {
             this.active_mut().sidebar_scroll_offset = *offset;
         }))
+        .top_fade(list_style.background)
         .restore_scroll(tab.sidebar_scroll_offset, ui.scroll_restore_token)
         .on_context_menu(Diffui::listen(
             cx,

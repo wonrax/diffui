@@ -1231,8 +1231,9 @@ fn scope_tabs(ui: &Diffui, theme: ThemeSpec, column: &PaletteColumn, cx: &mut Cx
     let mut well = segment_well(theme);
     for (index, (label, prefix, scope, count)) in scopes.into_iter().enumerate() {
         let query = format!("{prefix}{needle}");
-        // The counts are the search's: a command line has none to give.
-        let count = count.filter(|_| !command);
+        // The counts are the search's: a command line has none to give. They
+        // keep their room while hidden, so the tabs don't move.
+        let count = count.map(|count| (count, !command));
         well = well.child(
             segment(
                 ("palette-scope", index),
@@ -1300,14 +1301,15 @@ fn segment_well(theme: ThemeSpec) -> Div {
         .bg(active_wash(theme))
 }
 
-/// One segmented tab: an optional glyph, its label and an optional count. A
-/// pressed one stands out of the well as a raised face.
+/// One segmented tab: an optional glyph, its label and an optional count,
+/// drawn or only keeping its room (the label centred in it). A pressed one stands out of the well as a
+/// raised face, ringed with shadows so pressing it moves nothing.
 #[allow(clippy::too_many_arguments)]
 fn segment(
     id: impl Into<ElementId>,
     glyph: Option<&'static str>,
     label: &'static str,
-    count: Option<usize>,
+    count: Option<(usize, bool)>,
     pressed: bool,
     font: Font,
     theme: ThemeSpec,
@@ -1329,29 +1331,32 @@ fn segment(
         label_font,
         text_size::CAPTION,
     ));
-    if let Some(count) = count {
-        line.push(Aligned::gap(theme::space::SM));
-        line.push(Aligned::text(
-            typography::line(
-                count.to_string(),
+    // A hidden count's room goes half to each side, so the tab keeps its width
+    // and its label sits centred in it.
+    let mut pad_x = SEGMENT_PAD_X;
+    if let Some((count, shown)) = count {
+        let count = count.to_string();
+        if shown {
+            line.push(Aligned::gap(theme::space::SM));
+            line.push(Aligned::text(
+                typography::line(count, font, text_size::CAPTION, theme.subtle_text),
                 font,
                 text_size::CAPTION,
-                theme.subtle_text,
-            ),
-            font,
-            text_size::CAPTION,
-        ));
+            ));
+        } else {
+            let room =
+                theme::space::SM + crate::measure::line_width(&count, text_size::CAPTION, font);
+            pad_x += room / 2.0;
+        }
     }
     ui::button(id, ui::Variant::Ghost, ui::Size::Compact, theme, cx)
         .h(px(SEGMENT_HEIGHT))
-        .px(px(SEGMENT_PAD_X))
+        .px(px(pad_x))
         .rounded(px(theme::radius::SM))
         .when(pressed, |segment| {
             segment
                 .bg(theme.panel_background_elevated)
-                .border_1()
-                .border_color(theme.border)
-                .shadow(vec![theme::floating_shadow(1.0, 2.0)])
+                .shadow(theme::raised_shadow(theme))
         })
         .child(typography::baseline_row(line, 0.0))
 }

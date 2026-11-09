@@ -345,6 +345,18 @@ pub fn scrollable_with(
     handle: &ScrollHandle,
     content: impl IntoElement,
 ) -> Stateful<Div> {
+    scrollable_inset(id, handle, content, 0.0)
+}
+
+/// [`scrollable_with`] whose bar's track stops `bar_inset` short of the top
+/// and bottom: for a list filling a rounded card, so the bar keeps clear of
+/// the corners. The list scrolls over the whole height all the same.
+pub fn scrollable_inset(
+    id: impl Into<ElementId>,
+    handle: &ScrollHandle,
+    content: impl IntoElement,
+    bar_inset: f32,
+) -> Stateful<Div> {
     let id = id.into();
     div()
         .id(id.clone())
@@ -363,7 +375,16 @@ pub fn scrollable_with(
                 .overflow_y_scroll()
                 .child(div().w_full().flex_none().child(content)),
         )
-        .vertical_scrollbar(handle)
+        // The bar fills the box it's mounted on: one inset from the ends.
+        .child(
+            div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .top(px(bar_inset))
+                .bottom(px(bar_inset))
+                .vertical_scrollbar(handle),
+        )
 }
 
 /// The scroll handle of list `id`, kept while the list is on screen.

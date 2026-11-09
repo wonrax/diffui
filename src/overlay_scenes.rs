@@ -689,6 +689,8 @@ fn command_line_keys() {
     });
     let line = |h: &mut Harness| h.read(|ui| ui.palette().unwrap().top().unwrap().query.clone());
     assert_eq!(line(&mut h), "jj git pu");
+    // The scope tabs keep their widths with their counts hidden.
+    h.shot(LANE, "palette-jj-command");
     // Tab takes the candidate, into the text and its caret.
     h.press("tab");
     h.settle();

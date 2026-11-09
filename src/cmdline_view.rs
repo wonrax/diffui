@@ -381,6 +381,7 @@ fn count_chip(
     size: f32,
     color: Color,
 ) -> Aligned {
+    let size = typography::optical_size(font, size);
     Aligned::chip(
         typography::line(label, font, size, color),
         font,
@@ -572,10 +573,11 @@ pub(crate) fn completion_row(
     ui: &Diffui,
     theme: ThemeSpec,
     completion: &Completion,
+    selected: bool,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    candidate_row(ui, theme, completion, false, window, cx)
+    candidate_row(ui, theme, completion, selected, window, cx)
 }
 
 /// [`completion_row`], the highlighted one showing the key that takes it.

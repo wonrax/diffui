@@ -28,7 +28,7 @@ use crate::diff_view::{
 use crate::modes::{ModeKind, TabMode};
 use crate::palette::ResultRef;
 use crate::prose::Prose;
-use crate::theme::{self, Color, ThemeSpec, Weight, text_size};
+use crate::theme::{self, Color, Font, ThemeSpec, Weight, text_size};
 use crate::typography::{self, Aligned};
 use crate::ui::Tip as _;
 use crate::{
@@ -1518,11 +1518,51 @@ fn pick_detail(selection: &DiffSelection) -> String {
         .join(" \u{b7} ")
 }
 
-/// Below this pane width the bar's buttons drop their labels for their icons.
-const BAR_LABELS_MIN_WIDTH: f32 = 840.0;
+/// The labels the bar's buttons carry when it has room: see [`bar_fits_labels`].
+const BAR_LABELS: [&str; 6] = [
+    "Split\u{2026}",
+    "Squash",
+    "Move to\u{2026}",
+    "Absorb",
+    "Restore",
+    "Copy patch",
+];
 /// The bar's distance from the window's bottom edge.
 const BAR_BOTTOM: f32 = 40.0;
 const BAR_BUTTON_HEIGHT: f32 = 30.0;
+
+/// Whether the bar, its buttons labelled, fits over a diff pane `pane_width`
+/// wide; if not, they drop their labels for their icons. Measured from the
+/// labels themselves, so a longer summary or the Done of line-select mode
+/// can't push the bar's last buttons off the window.
+fn bar_fits_labels(
+    pane_width: f32,
+    (title, detail): (&str, &str),
+    actions: bool,
+    selecting: bool,
+    font: Font,
+) -> bool {
+    let width = |text: &str, font: Font| crate::measure::line_width(text, text_size::UI, font);
+    // The bar's padding, the summary's own and the side margins around the bar.
+    let mut needed = 2.0 * 5.0 + 8.0 + 10.0 + 2.0 * 16.0;
+    needed += width(title, theme::emphasis_font(font, Weight::SEMIBOLD))
+        + theme::space::SM
+        + width(detail, font);
+    // A labelled button: icon, gap, label, padding, and the bar's gap.
+    let button = |label: &str| ui::ICON_SIZE + 6.0 + width(label, font) + 2.0 * 9.0 + 2.0;
+    let separator = 1.0 + 2.0 * 4.0 + 2.0;
+    if actions {
+        needed += BAR_LABELS.iter().map(|label| button(label)).sum::<f32>()
+            + BAR_BUTTON_HEIGHT
+            + 2.0 * separator;
+        // Clear and its `esc` keycap.
+        needed += width("Clear", font) + 6.0 + 30.0 + 2.0 * 9.0;
+    }
+    if selecting {
+        needed += separator + width("Done", font) + 2.0 * 9.0;
+    }
+    pane_width >= needed
+}
 
 /// The picks' floating bar: what is picked and what can be done with it, over
 /// the diff, in inverted colours. Line-select mode shows it too, with its way
@@ -1550,13 +1590,19 @@ pub(crate) fn action_bar(
     let faded = Color { a: 0.7, ..ink };
     let pane_width = crate::diff_panel::diff_pane_width(ui);
     let pane_left = (ui.window_size.width - pane_width).max(0.0);
-    let labels = pane_width >= BAR_LABELS_MIN_WIDTH;
 
     let (title, detail) = match (selecting, selection.is_empty()) {
         (true, true) => ("Selecting lines", "Nothing picked yet".to_owned()),
         (true, false) => ("Selecting lines", pick_detail(&selection)),
         (false, _) => ("Picked", pick_detail(&selection)),
     };
+    let labels = bar_fits_labels(
+        pane_width,
+        (title, &detail),
+        !selection.is_empty(),
+        selecting,
+        font,
+    );
     let label = typography::baseline_row(
         vec![
             Aligned::text(

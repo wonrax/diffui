@@ -13,6 +13,13 @@ use crate::typography::TextBox;
 use crate::width_memo::WidthMemo;
 
 pub const TEXT_SIZE: f32 = crate::theme::text_size::BODY;
+
+/// The label size of a chip set in `font`: [`TEXT_SIZE`], matched to the UI
+/// font's x-height so a mono chip (`conflict`, `divergent`) reads the same
+/// size as a sans one beside it.
+pub fn text_size(font: Font) -> f32 {
+    crate::typography::optical_size(font, TEXT_SIZE)
+}
 pub const PAD_X: f32 = 7.0;
 /// The app's smallest radius step, shared with keycaps and badges.
 pub const RADIUS: f32 = crate::theme::radius::XS;
@@ -57,7 +64,7 @@ pub struct Chip {
 }
 
 /// Full chip width (icon + label + horizontal padding) for the given label,
-/// rendered with `font` at [`TEXT_SIZE`].
+/// rendered with `font` at its [`text_size`].
 pub fn width(label: &str, icon: Option<&str>, font: Font) -> f32 {
     width_memoized(&WidthMemo::default(), label, icon, font)
 }
@@ -70,10 +77,9 @@ pub fn full_width(chip: &Chip) -> f32 {
 /// [`full_width`], shaping through `memo`.
 pub fn chip_width(memo: &WidthMemo, chip: &Chip) -> f32 {
     width_memoized(memo, &chip.label, chip.icon, chip.font)
-        + chip
-            .suffix
-            .as_ref()
-            .map_or(0.0, |(suffix, _)| memo.width(suffix, TEXT_SIZE, chip.font))
+        + chip.suffix.as_ref().map_or(0.0, |(suffix, _)| {
+            memo.width(suffix, text_size(chip.font), chip.font)
+        })
 }
 
 /// [`width`], shaping through `memo`.
@@ -84,7 +90,7 @@ pub fn chip_width(memo: &WidthMemo, chip: &Chip) -> f32 {
 /// in; the rest go through [`width`], which is the same call against an empty
 /// one.
 pub fn width_memoized(memo: &WidthMemo, label: &str, icon: Option<&str>, font: Font) -> f32 {
-    let label_w = memo.width(label, TEXT_SIZE, font);
+    let label_w = memo.width(label, text_size(font), font);
     let icon_w = icon.map_or(0.0, |glyph| {
         memo.width(glyph, ICON_SIZE, icons::ICON_FONT) + ICON_GAP
     });
@@ -94,7 +100,7 @@ pub fn width_memoized(memo: &WidthMemo, label: &str, icon: Option<&str>, font: F
 /// The `center_y` to draw `chip` at so its label's baseline lands on
 /// `baseline_y` — for a chip sitting in a line of text.
 pub fn center_for_baseline(chip: &Chip, baseline_y: f32) -> f32 {
-    TextBox::new(chip.font, TEXT_SIZE, height()).center_for_baseline(baseline_y)
+    TextBox::new(chip.font, text_size(chip.font), height()).center_for_baseline(baseline_y)
 }
 
 /// Paints `chip` with its left edge at `x`, centred on `center_y`: the chip of
@@ -152,12 +158,13 @@ pub fn paint(
     }
     // Same box as `view`: the line is the chip's height, shifted so the caps
     // sit on the mid-line.
-    let shift = TextBox::new(chip.font, TEXT_SIZE, chip_h).trim_shift();
+    let label_size = text_size(chip.font);
+    let shift = TextBox::new(chip.font, label_size, chip_h).trim_shift();
     crate::typography::paint_line(
         &chip.label,
         text_x,
         top + shift,
-        TEXT_SIZE,
+        label_size,
         chip_h,
         chip.font,
         chip.text_color,
@@ -168,9 +175,9 @@ pub fn paint(
     if let Some((suffix, color)) = &chip.suffix {
         crate::typography::paint_line(
             suffix,
-            text_x + memo.width(&chip.label, TEXT_SIZE, chip.font),
+            text_x + memo.width(&chip.label, label_size, chip.font),
             top + shift,
-            TEXT_SIZE,
+            label_size,
             chip_h,
             chip.font,
             *color,
@@ -189,7 +196,7 @@ pub fn view(chip: &Chip) -> Div {
     // extra leading around the glyphs, and any asymmetry in that distribution
     // shows up as the label riding high or low inside a box this tight. The
     // shift then puts the label's caps, not its line box, on the mid-line.
-    let shift = TextBox::new(chip.font, TEXT_SIZE, chip_h).trim_shift();
+    let shift = TextBox::new(chip.font, text_size(chip.font), chip_h).trim_shift();
     let mut element = div()
         .flex()
         .flex_row()
@@ -221,7 +228,7 @@ pub fn view(chip: &Chip) -> Div {
             .relative()
             .top(px(shift))
             .font(chip.font.gpui())
-            .text_size(px(TEXT_SIZE))
+            .text_size(px(text_size(chip.font)))
             .line_height(px(chip_h))
             .text_color(color)
             .whitespace_nowrap()

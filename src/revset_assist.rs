@@ -22,14 +22,25 @@ use diffui_core::completion::Completion;
 use diffui_core::revset::{RevsetError, RevsetMatch, RevsetQuery};
 
 use crate::cmdline::{apply_completion, cursor_after_edit, cursor_after_key, place_caret};
-use crate::palette::{RESULTS_INSET, ROW_HEIGHT};
 use crate::theme::ThemeSpec;
 use crate::{Diffui, TabId};
 
 /// How long typing must pause before the revset is checked.
 const SETTLE: Duration = Duration::from_millis(300);
 /// Rows the dropdown shows before it scrolls.
-const VISIBLE_ROWS: usize = 8;
+const VISIBLE_ROWS: usize = 10;
+/// A completion row: tighter than the palette's, so a narrow sidebar's
+/// dropdown shows more of them.
+const ROW_HEIGHT: f32 = 28.0;
+/// The list's inset from the card's edges.
+const RESULTS_INSET: f32 = theme::space::XS;
+/// A row's text inset from its wash.
+const ROW_PAD_X: f32 = theme::space::MD;
+/// The card's corner radius: a step under a popover's, for a dropdown
+/// hanging off a field.
+const CARD_RADIUS: f32 = theme::radius::MD;
+/// How far the list's scrollbar stops short of the card's rounded top.
+const BAR_INSET: f32 = CARD_RADIUS / 2.0;
 
 /// The field's completion and error state, per tab.
 #[derive(Debug, Default)]
@@ -390,17 +401,12 @@ pub(crate) fn dropdown(
     }
     let mut list = div().w_full().flex().flex_col().p(px(RESULTS_INSET));
     for (index, completion) in field.completions.iter().enumerate() {
-        let body = crate::cmdline_view::completion_row(ui, theme, completion, window, cx);
+        let selected = index == field.selected;
+        let body = crate::cmdline_view::completion_row(ui, theme, completion, selected, window, cx);
         list = list.child(
             div()
                 .id(("revset-row", index))
-                .child(crate::palette::row_shell(
-                    body,
-                    index == field.selected,
-                    theme,
-                    window,
-                    cx,
-                ))
+                .child(row_shell(body, selected, theme))
                 .on_mouse_move(
                     cx.listener(move |this: &mut Diffui, _: &MouseMoveEvent, _, cx| {
                         if this.active().cmdline.field.selected != index {
@@ -420,22 +426,75 @@ pub(crate) fn dropdown(
     let height = rows as f32 * ROW_HEIGHT + 2.0 * RESULTS_INSET;
     let selected = field.navigated.then_some(field.selected);
     let handle = dropdown_scroll(selected, height, window, cx);
+    // The keys the field answers while the list is open, as the palette's
+    // footer tells its own.
+    let font = ui.config.ui_font;
+    let footer = crate::overlay_kit::footer_strip(theme)
+        .rounded_b(px(CARD_RADIUS - 1.0))
+        .child(crate::overlay_kit::key_hint(
+            &["\u{21e5}"],
+            "Complete",
+            font,
+            theme,
+        ))
+        .child(crate::overlay_kit::key_hint(
+            &["\u{21b5}"],
+            "Apply",
+            font,
+            theme,
+        ))
+        .child(crate::overlay_kit::key_hint(&["esc"], "Close", font, theme));
     Some(
         div()
             .w_full()
             .pt(px(theme::space::XXS))
-            .px(px(crate::field::PANEL_TOGGLE_INSET))
+            .pl(px(crate::field::list_field_insets().0))
+            .pr(px(crate::field::list_field_insets().1))
             .child(
                 theme::popover(div(), theme)
+                    // Firmer than a popover's edge: it hangs over a busy list.
+                    .border_color(crate::overlay_kit::firm_border(theme))
+                    .shadow(vec![
+                        theme::floating_shadow(10.0, 28.0),
+                        theme::floating_shadow(10.0, 28.0),
+                        theme::floating_shadow(2.0, 6.0),
+                    ])
+                    .rounded(px(CARD_RADIUS))
                     .id("revset-dropdown-card")
                     .w_full()
-                    .h(px(height))
+                    .flex()
+                    .flex_col()
                     .overflow_hidden()
                     .occlude()
-                    .child(ui::scrollable_with(DROPDOWN_ID, &handle, list)),
+                    .child(if field.completions.len() > VISIBLE_ROWS {
+                        div().w_full().h(px(height)).child(ui::scrollable_inset(
+                            DROPDOWN_ID,
+                            &handle,
+                            list,
+                            BAR_INSET,
+                        ))
+                    } else {
+                        // All of it fits: nothing to scroll, and no bar.
+                        list
+                    })
+                    .child(footer),
             )
             .into_any_element(),
     )
+}
+
+/// A completion row's box: its wash when highlighted.
+fn row_shell(body: AnyElement, selected: bool, theme: ThemeSpec) -> gpui_kit::Div {
+    div()
+        .w_full()
+        .h(px(ROW_HEIGHT))
+        .flex()
+        .items_center()
+        .px(px(ROW_PAD_X))
+        // Concentric with the card around it.
+        .rounded(px(CARD_RADIUS - RESULTS_INSET))
+        .when(selected, |row| row.bg(theme.selected_file))
+        .child(body)
 }
 
 /// The dropdown's handle, moved just enough to show the row ↑/↓ landed on. Only
@@ -485,7 +544,8 @@ pub(crate) fn error_strip(
     _window: &mut GpuiWindow,
     cx: &mut Cx,
 ) -> Option<AnyElement> {
-    use crate::field::{LEADING_ICON_INSET, LEADING_ICON_SIZE, LEADING_TEXT_X, PANEL_HEADER_LEAD};
+    use crate::field::{LEADING_ICON_INSET, LEADING_ICON_SIZE, LEADING_TEXT_X};
+    let (lead, trail) = crate::field::list_field_insets();
     let error = shown_error(ui)?;
     let value = &ui.active().session.revset;
     let font = ui.config.ui_font;
@@ -524,7 +584,7 @@ pub(crate) fn error_strip(
         .gap(px(theme::space::SM))
         .child(message);
     if let Some(span) = error.span.clone() {
-        let room = ui.sidebar_width - PANEL_HEADER_LEAD - LEADING_TEXT_X - PANEL_HEADER_LEAD;
+        let room = ui.sidebar_width - lead - LEADING_TEXT_X - trail;
         if let Some(echo) = echo(value, span, room, mono, theme) {
             body = body.child(div().pl(px(column_inset)).overflow_hidden().child(echo));
         }
@@ -537,9 +597,9 @@ pub(crate) fn error_strip(
     Some(
         div()
             .w_full()
-            .pr(px(PANEL_HEADER_LEAD))
+            .pr(px(trail))
             .pb(px(theme::space::SM))
-            .pl(px(PANEL_HEADER_LEAD + LEADING_ICON_INSET))
+            .pl(px(lead + LEADING_ICON_INSET))
             .child(body)
             .into_any_element(),
     )

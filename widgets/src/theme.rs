@@ -561,8 +561,34 @@ pub fn raised_button_style(theme: ThemeSpec) -> ButtonStyle {
         active: mix(theme.panel_background_elevated, theme.text, 0.07),
         label: theme.text,
         border: None,
-        shadow: Some(raised_shadow),
+        shadow: Some(raised_button_shadow),
     }
+}
+
+/// A raised button's edge: its ring drawn *inside* its box, as every button's
+/// edge is, so buttons of one size step stand the same height side by side.
+fn raised_button_shadow(theme: ThemeSpec) -> Vec<BoxShadow> {
+    vec![
+        BoxShadow {
+            color: Hsla::from(firm_ring(theme)),
+            offset: point(px(0.0), px(0.0)),
+            blur_radius: px(0.0),
+            spread_radius: px(1.0),
+            inset: true,
+        },
+        BoxShadow {
+            color: Hsla::from(Color { a: 0.05, ..BLACK }),
+            offset: point(px(0.0), px(1.0)),
+            blur_radius: px(1.0),
+            spread_radius: px(0.0),
+            inset: false,
+        },
+    ]
+}
+
+/// The hairline of a raised control, a step firmer than the panes' borders.
+fn firm_ring(theme: ThemeSpec) -> Color {
+    mix(theme.border, theme.subtle_text, 0.25)
 }
 
 /// Primary call-to-action: the accent, with an inverted label, a darker inner
@@ -638,17 +664,19 @@ pub fn floating_shadow(offset_y: f32, blur_radius: f32) -> BoxShadow {
     }
 }
 
-/// The edge of a raised control (the active tab, the active segment): a
-/// hairline ring a step firmer than the panes' borders and a soft drop under
-/// it. Shadows, not a border, so raising a control never moves its content.
+/// The edge of a control raised out of its track (the active tab, the active
+/// segment): a hairline ring a step firmer than the panes' borders and a soft
+/// drop under it. Shadows, not a border, so raising a control never moves its
+/// content; the ring is inset because GPUI grows a spread shadow's box but not
+/// its corner radius, which thickens an outer ring at the corners.
 pub fn raised_shadow(theme: ThemeSpec) -> Vec<BoxShadow> {
     vec![
         BoxShadow {
-            color: Hsla::from(mix(theme.border, theme.subtle_text, 0.25)),
+            color: Hsla::from(firm_ring(theme)),
             offset: point(px(0.0), px(0.0)),
             blur_radius: px(0.0),
             spread_radius: px(1.0),
-            inset: false,
+            inset: true,
         },
         BoxShadow {
             color: Hsla::from(Color { a: 0.10, ..BLACK }),

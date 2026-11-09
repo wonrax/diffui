@@ -18,7 +18,7 @@ use gpui_kit::component::Disableable as _;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, Div, ElementId, SharedString, Stateful, Window, div, px};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::time::Instant;
@@ -1190,8 +1190,6 @@ pub(crate) fn file_filter_banner(
         return None;
     }
     let filter = ui.active().history.file_filter.as_ref()?;
-    // The icon and the close button centre on the text's caps (see
-    // `crate::typography`).
     let title = Prose::from("History of ")
         .path(&filter.path)
         .line(
@@ -1205,41 +1203,44 @@ pub(crate) fn file_filter_banner(
     let close = ui::close_button("file-filter-close", theme.muted_text, theme, cx).on_click(
         Diffui::on_action(Action::History(HistoryAction::ClearFileFilter), cx),
     );
-    let content = typography::baseline_row(
-        [
-            Aligned::glyph(
-                icons::icon(icons::FILE_CLOCK, ui::ICON_SIZE, theme.accent),
-                ui::ICON_SIZE,
-            ),
-            Aligned::text(title, ui.config.ui_font, text_size::UI).fill(),
-            Aligned::glyph(
-                with_tooltip(
-                    "file-filter-close-tip",
-                    close,
-                    "Show the whole graph again",
-                    ui,
-                    theme,
+    // The icon and the title share a line; the close button is a control,
+    // centred in the banner's box with an even inset, not hung off the text.
+    let line = typography::centered(
+        typography::baseline_row(
+            [
+                Aligned::glyph(
+                    icons::icon(icons::FILE_CLOCK, ui::ICON_SIZE, theme.accent),
+                    ui::ICON_SIZE,
                 ),
-                ui::CLOSE_SIDE,
-            ),
-        ],
-        space::SM,
+                Aligned::text(title, ui.config.ui_font, text_size::UI).fill(),
+            ],
+            space::SM,
+        ),
+        ui.config.ui_font,
+        text_size::UI,
     );
     Some(
-        div()
-            .w_full()
-            .flex_none()
-            .px(px(space::MD))
-            .py(px(space::XS))
+        crate::field::panel_strip()
             .child(
                 div()
                     .w_full()
+                    .h(px(crate::theme::control::COMPACT))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(space::SM))
                     .pl(px(space::MD))
                     .pr(px(ui::BANNER_INSET))
-                    .py(px(ui::BANNER_INSET))
                     .bg(chip_background(theme.accent))
                     .rounded(px(radius::CONTROL))
-                    .child(content),
+                    .child(div().flex_1().min_w_0().child(line))
+                    .child(with_tooltip(
+                        "file-filter-close-tip",
+                        close,
+                        "Show the whole graph again",
+                        ui,
+                        theme,
+                    )),
             )
             .into_any_element(),
     )
@@ -1854,14 +1855,31 @@ fn list_column() -> Div {
 
 /// The op log, building only the rows on screen. A page holds hundreds of
 /// operations, and a scroll tick rebuilds the pane holding the list: with every
-/// row built that cost about 15ms a tick, over a 120 Hz frame.
+/// row built that cost about 15ms a tick, over a 120 Hz frame. Each row is
+/// still measured once when it arrives (see [`OpLogList`]), for the scrollbar.
 fn op_log_list(ui: &Diffui, cx: &mut Cx) -> AnyElement {
     let list = &ui.active().history.op_list;
     list.sync(op_log_keys(ui));
     let state = list.state.clone();
     let app = cx.entity();
     let now = now_millis();
-    let wheel = op_log_wheel(&state, &list.wheel);
+    // The panes repaint when the list leaves or reaches its top, for the
+    // header's fade; scrolling otherwise only moves the list.
+    let scrolled = list.scrolled.clone();
+    let app_id = app.entity_id();
+    state.set_scroll_handler({
+        let scrolled = scrolled.clone();
+        move |event, _, cx| note_scrolled(&scrolled, event.is_scrolled, app_id, cx)
+    });
+    let wheel = op_log_wheel(&state, &list.wheel, &scrolled, app_id);
+    let fade = crate::field::scroll_fade(
+        if state.logical_scroll_top() == gpui_kit::ListOffset::default() {
+            0.0
+        } else {
+            1.0
+        },
+        ui.resolved_theme().spec().panel_background,
+    );
     let rows = gpui_kit::list(state.clone(), move |index, window, cx| {
         diffui_widgets::frame_log::time("oplog.row", || {
             app.update(cx, |ui, cx| {
@@ -1892,22 +1910,41 @@ fn op_log_list(ui: &Diffui, cx: &mut Cx) -> AnyElement {
         .size_full()
         .child(wheel)
         .child(rows)
+        .children(fade)
         .vertical_scrollbar(&state)
         .into_any_element()
+}
+
+/// Records whether the op log is off its top, notifying the app when that
+/// changes.
+fn note_scrolled(
+    flag: &Cell<bool>,
+    scrolled: bool,
+    app: gpui_kit::EntityId,
+    cx: &mut gpui_kit::App,
+) {
+    if flag.replace(scrolled) != scrolled {
+        cx.notify(app);
+    }
 }
 
 /// Takes the op log's wheel events from the list and scrolls it evenly over the
 /// frames that follow, as the graph and the diff do (`scroll_resample`). It sits
 /// under the list: laid out first, so a frame's motion lands before the list's
 /// layout, and its capture-phase handler runs before the list's own.
-fn op_log_wheel(state: &gpui_kit::ListState, wheel: &Rc<RefCell<Resampler>>) -> AnyElement {
+fn op_log_wheel(
+    state: &gpui_kit::ListState,
+    wheel: &Rc<RefCell<Resampler>>,
+    scrolled: &Rc<Cell<bool>>,
+    app: gpui_kit::EntityId,
+) -> AnyElement {
     if scroll_resample::delay().is_zero() {
         return div().into_any_element();
     }
-    let (state, wheel) = (state.clone(), wheel.clone());
+    let (state, wheel, scrolled) = (state.clone(), wheel.clone(), scrolled.clone());
     let events = wheel.clone();
     gpui_kit::canvas(
-        move |bounds, window, _| {
+        move |bounds, window, cx| {
             let step = wheel.borrow_mut().take(Instant::now());
             if step != 0.0 {
                 diffui_widgets::frame_log::value("sy", step);
@@ -1917,6 +1954,7 @@ fn op_log_wheel(state: &gpui_kit::ListState, wheel: &Rc<RefCell<Resampler>>) -> 
                 let max = f64::from(state.max_offset_for_scrollbar().y);
                 let top = (top + step).clamp(0.0, max) as f32;
                 state.set_offset_from_scrollbar(gpui_kit::point(px(0.0), px(-top)));
+                note_scrolled(&scrolled, top > 0.0, app, cx);
             }
             if wheel.borrow().pending() {
                 window.request_animation_frame();
@@ -1955,14 +1993,21 @@ struct OpLogList {
     state: gpui_kit::ListState,
     keys: std::cell::RefCell<Vec<OpLogKey>>,
     wheel: Rc<RefCell<Resampler>>,
+    /// Off its top, as the panes last drew it: see [`note_scrolled`].
+    scrolled: Rc<Cell<bool>>,
 }
 
 impl Default for OpLogList {
     fn default() -> Self {
         Self {
-            state: gpui_kit::ListState::new(0, gpui_kit::ListAlignment::Top, px(OP_LOG_OVERDRAW)),
+            // Every row measured once, so the scrollbar is right from the start
+            // instead of shrinking as rows scroll in; a scroll tick still builds
+            // only the rows on screen.
+            state: gpui_kit::ListState::new(0, gpui_kit::ListAlignment::Top, px(OP_LOG_OVERDRAW))
+                .measure_all(),
             keys: Default::default(),
             wheel: Default::default(),
+            scrolled: Default::default(),
         }
     }
 }
@@ -2006,8 +2051,15 @@ impl OpLogList {
             .zip(keys[prefix..].iter().rev())
             .take_while(|(old, new)| old == new)
             .count();
-        self.state
-            .splice(prefix..old.len() - suffix, keys.len() - prefix - suffix);
+        let inserted = keys.len() - prefix - suffix;
+        self.state.splice(prefix..old.len() - suffix, inserted);
+        // GPUI's splice leaves a measure-all list believing it's measured
+        // everything, so the new rows would only be measured as they scroll
+        // in and the scrollbar would shrink as they did. Asking for them again
+        // has the next layout measure just those.
+        if inserted > 0 {
+            self.state.remeasure_items(prefix..prefix + inserted);
+        }
         if at_top {
             self.state.scroll_to(gpui_kit::ListOffset::default());
         }
@@ -3263,6 +3315,51 @@ mod scenes {
         h.wait_for_graph();
         assert!(h.read(file_filter_active));
         h.shot(LANE, "file-history");
+    }
+
+    /// Every row of a page is measured before it scrolls in, so the scrollbar
+    /// knows the whole log from the start instead of shrinking as rows arrive.
+    /// Every row of a page is measured before it scrolls in, so the scrollbar
+    /// knows the whole log from the start instead of shrinking as rows arrive.
+    #[test]
+    fn the_op_log_knows_its_whole_height_before_it_scrolls() {
+        let mut h = history_view();
+        h.act(|ui, _| {
+            let history = &mut ui.active_mut().history;
+            let template = history
+                .ops
+                .iter()
+                .find(|op| !op.is_snapshot && !op.is_current)
+                .expect("an operation")
+                .clone();
+            history.ops = (0..OP_LOG_PAGE)
+                .map(|index| OperationEntry {
+                    id: format!("{index:0128x}"),
+                    is_current: false,
+                    ..template.clone()
+                })
+                .collect();
+        });
+        h.settle();
+        let range = |h: &mut Harness| {
+            h.read(|ui| {
+                f32::from(
+                    ui.active()
+                        .history
+                        .op_list
+                        .state
+                        .max_offset_for_scrollbar()
+                        .y,
+                )
+            })
+        };
+        let before = range(&mut h);
+        assert!(before > 0.0, "a page of operations overflows the pane");
+        for _ in 0..3 {
+            h.act(|ui, _| ui.active().history.op_list.state.scroll_by(px(800.0)));
+            h.settle();
+        }
+        assert_eq!(range(&mut h), before);
     }
 
     /// What a frame of the op log costs: it isn't virtualized, as it wasn't

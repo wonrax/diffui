@@ -922,7 +922,10 @@ fn panel_peek(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> AnyElement {
         .shadow(vec![shadow])
         .occlude()
         .child(watcher)
-        .child(embed(pane))
+        // The pane's own clip, a rectangle wholly inside the rounded edge: the
+        // surface's clip is its square box, which would let a pane drawing
+        // past its inset show at the corners.
+        .child(div().size_full().overflow_hidden().child(embed(pane)))
         .into_any_element()
 }
 

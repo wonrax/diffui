@@ -109,10 +109,8 @@ const AGE_TEXT_SIZE: f32 = 11.5;
 /// The working-copy label on its row's id line: the list's one solid chip.
 const WORKING_COPY_LABEL: &str = "Working copy";
 const WORKING_COPY_TEXT_SIZE: f32 = crate::theme::text_size::CAPTION;
-const WORKING_COPY_DOT: f32 = 6.0;
-const WORKING_COPY_PAD_LEFT: f32 = 5.0;
-const WORKING_COPY_PAD_RIGHT: f32 = 7.0;
-const WORKING_COPY_DOT_GAP: f32 = 4.0;
+/// The label's inset on either side of its text: a chip's.
+const WORKING_COPY_PAD_X: f32 = chip::PAD_X;
 /// Text size for the collapse/expand chevron on the selected revision row. The
 /// Lucide glyph fills its box, so a near-text size reads clearly as a chevron
 /// without dominating the row.
@@ -147,6 +145,9 @@ const REVISION_LANES: LaneGeometry = LaneGeometry {
     first: FIRST_LANE_X,
     spacing: LANE_SPACING,
 };
+/// How far the fade under the header reaches into the list: see
+/// [`RevisionListProps::top_fade`].
+const TOP_FADE: f32 = 28.0;
 /// The working-copy pin shown while its row is scrolled away.
 const PIN_HEIGHT: f32 = 28.0;
 const PIN_TEXT_SIZE: f32 = crate::theme::text_size::UI;
@@ -484,6 +485,9 @@ pub struct RevisionListProps {
     /// away.
     working_copy_flat: Option<usize>,
     file_layout: FileRowLayout,
+    /// The colour the header above the list is: see
+    /// [`RevisionListProps::top_fade`].
+    top_fade: Option<Color>,
 }
 
 impl RevisionListProps {
@@ -520,6 +524,7 @@ impl RevisionListProps {
             multi_selection_count: 0,
             working_copy_flat: None,
             file_layout: FileRowLayout::Classic,
+            top_fade: None,
         }
     }
 
@@ -539,6 +544,15 @@ impl RevisionListProps {
 
     /// Where the working copy's row is, so a pin can bring it back when it's
     /// scrolled out of view.
+    /// Once the list has scrolled off its top, fade its top edge from
+    /// `ground` (the header above it) into nothing, so rows slide under the
+    /// header and the cut says there's more above. Under the working copy's
+    /// pin.
+    pub fn top_fade(mut self, ground: Color) -> Self {
+        self.top_fade = Some(ground);
+        self
+    }
+
     pub fn working_copy(mut self, flat: Option<usize>) -> Self {
         self.working_copy_flat = flat;
         self
@@ -2010,6 +2024,20 @@ impl RevisionList {
                     None => {}
                 }
             }
+            if let Some(ground) = self.props.top_fade.filter(|_| self.vertical_offset > 0.0) {
+                window.paint_quad(fill(
+                    Rectangle {
+                        height: TOP_FADE.min(self.bounds.height),
+                        ..self.bounds
+                    }
+                    .bounds(),
+                    linear_gradient(
+                        180.0,
+                        linear_color_stop(ground, 0.0),
+                        linear_color_stop(Color { a: 0.0, ..ground }, 1.0),
+                    ),
+                ));
+            }
             self.paint_working_copy_pin(window, cx);
         });
     }
@@ -3116,17 +3144,13 @@ pub fn working_copy_label_width(font: Font) -> f32 {
     label_width(&WidthMemo::default(), emphasis_font(font, Weight::SEMIBOLD))
 }
 
-/// Width of the working-copy label: dot, gap, text and padding.
+/// Width of the working-copy label: text and padding.
 fn label_width(widths: &WidthMemo, font: Font) -> f32 {
-    WORKING_COPY_PAD_LEFT
-        + WORKING_COPY_DOT
-        + WORKING_COPY_DOT_GAP
-        + widths.width(WORKING_COPY_LABEL, WORKING_COPY_TEXT_SIZE, font)
-        + WORKING_COPY_PAD_RIGHT
+    widths.width(WORKING_COPY_LABEL, WORKING_COPY_TEXT_SIZE, font) + 2.0 * WORKING_COPY_PAD_X
 }
 
 /// The working copy's "Working copy" label at `x`, its text on `baseline`: an
-/// accent box, chip-high, with a dot ahead of the text.
+/// accent box, chip-high.
 fn paint_working_copy_label(
     x: f32,
     baseline: f32,
@@ -3150,21 +3174,9 @@ fn paint_working_copy_label(
         crate::theme::radius::XS,
         window,
     );
-    let dot_x = x + WORKING_COPY_PAD_LEFT;
-    fill_rounded(
-        Rectangle {
-            x: dot_x,
-            y: top + (height - WORKING_COPY_DOT) / 2.0,
-            width: WORKING_COPY_DOT,
-            height: WORKING_COPY_DOT,
-        },
-        style.accent_foreground,
-        WORKING_COPY_DOT / 2.0,
-        window,
-    );
     paint_centered(
         WORKING_COPY_LABEL,
-        dot_x + WORKING_COPY_DOT + WORKING_COPY_DOT_GAP,
+        x + WORKING_COPY_PAD_X,
         center,
         WORKING_COPY_TEXT_SIZE,
         font,

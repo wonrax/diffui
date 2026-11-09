@@ -7,10 +7,10 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use gpui_kit::prelude::*;
-use gpui_kit::{AnyElement, Bounds, MouseButton, Pixels, Window, canvas, div, px};
+use gpui_kit::{AnyElement, Bounds, Div, MouseButton, Pixels, Window, canvas, div, px};
 
 use crate::theme::{self, ThemeSpec};
-use crate::theme::{Font, Padding};
+use crate::theme::{Color, Font, Padding};
 use crate::{Cx, Diffui, icons, input};
 use crate::{HoverTarget, ToolbarMenu};
 
@@ -44,6 +44,11 @@ const CARET_MARGIN: f32 = 3.0;
 /// A field's leading icon: its inset from the field's left edge, and size.
 pub const LEADING_ICON_INSET: f32 = 9.0;
 pub const LEADING_ICON_SIZE: f32 = 13.0;
+/// The row a medium kit input centres its line in (its `h_8`), whatever box
+/// it's given: the line hangs from the box's top. The field gives the input a
+/// box of exactly this height and centres that in the well, so the line (and
+/// its selection) sits in the middle rather than low.
+const INPUT_ROW: f32 = 32.0;
 /// The text's inset from what precedes it, the field's edge or its icon.
 const TEXT_INSET: f32 = 9.0;
 /// Where the text of a field with a leading icon starts, from the field's
@@ -92,9 +97,11 @@ pub(crate) fn filter_field(
         let on_submit = Diffui::listen(cx, move |this, _: &(), _, cx| on_submit(this, cx));
         field = field.on_submit(move |window, cx| on_submit(&(), window, cx));
     }
+    // No vertical padding: the kit's 8px would push the line off its row.
     let text = input::single_line(field, font, window, cx)
         .appearance(false)
         .px(px(TEXT_INSET))
+        .py(px(0.0))
         .h_full();
 
     // The field's bounds, for the presets menu that anchors edge-to-edge below it.
@@ -127,18 +134,7 @@ pub(crate) fn filter_field(
                 .child(icons::icon(icon, LEADING_ICON_SIZE, theme.subtle_text)),
         );
     }
-    // The caps, not the line box, centre in the well. The input lays its line
-    // out over its whole box and ignores vertical padding, so its wrapper moves.
-    let shift = crate::typography::TextBox::default_line(font, theme::text_size::UI).trim_shift();
-    bar = bar.child(
-        div()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .relative()
-            .top(px(shift))
-            .child(text),
-    );
+    bar = bar.child(div().flex_1().min_w_0().h(px(INPUT_ROW)).child(text));
     if let Some(caret) = spec.caret {
         bar = bar.child(presets_caret(caret, bounds, theme, window, cx));
     }
@@ -190,6 +186,53 @@ fn presets_caret(
         .into_any_element()
 }
 
+/// A side panel's field insets, left and right: the row cards' under it, so
+/// the field and the rows stand the same width.
+pub(crate) fn list_field_insets() -> (f32, f32) {
+    let inset = crate::revision_list::ROW_CARD_INSET_X;
+    (inset + crate::chrome::window_border(), inset)
+}
+
+/// A strip stacked between a side panel's field and its list (a banner, a
+/// notice): the field's width, and the gap the field keeps to the list's
+/// first card above and below it. The header's bottom padding and the
+/// strip's top make one such gap; the strip's bottom and the first card's own
+/// inset make the other.
+pub(crate) fn panel_strip() -> Div {
+    let (lead, trail) = list_field_insets();
+    div()
+        .w_full()
+        .flex_none()
+        .pl(px(lead))
+        .pr(px(trail))
+        .pt(px(crate::revision_list::ROW_CARD_INSET_Y))
+        .pb(px(PANEL_HEADER_PADDING.bottom))
+}
+
+/// How far the fade under a panel's header reaches into its list.
+const SCROLL_FADE: f32 = 28.0;
+
+/// The fade a panel's header casts over its list once the list has scrolled
+/// off its top: the pane's colour into nothing, so rows slide under the
+/// header instead of being cut by it, and the cut says there's more above.
+/// `None` at the top. Hung over the list's box (which is `relative`); it takes
+/// no presses.
+pub(crate) fn scroll_fade(offset: f64, ground: Color) -> Option<Div> {
+    (offset > 0.0).then(|| {
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(px(SCROLL_FADE))
+            .bg(gpui_kit::linear_gradient(
+                180.0,
+                gpui_kit::linear_color_stop(ground, 0.0),
+                gpui_kit::linear_color_stop(Color { a: 0.0, ..ground }, 1.0),
+            ))
+    })
+}
+
 /// A [`filter_field`] alone in a panel header (the source browser's file
 /// search): the same row geometry as the diff sidebar's field + toggle
 /// header, with the lead inset mirrored on the right. No rule under the
@@ -201,12 +244,13 @@ pub(crate) fn sidebar_filter_field(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let (lead, trail) = list_field_insets();
     div()
         .w_full()
         .pt(px(PANEL_HEADER_PADDING.top))
         .pb(px(PANEL_HEADER_PADDING.bottom))
-        .pl(px(PANEL_HEADER_PADDING.left))
-        .pr(px(PANEL_HEADER_LEAD))
+        .pl(px(lead))
+        .pr(px(trail))
         .child(filter_field(theme, font, spec, window, cx))
         .into_any_element()
 }
@@ -221,12 +265,21 @@ pub(crate) fn dialog_input(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    input::single_line(spec, font, window, cx)
+    // The well is drawn here, around the input's own row: see [`INPUT_ROW`].
+    let input = input::single_line(spec, font, window, cx)
+        .appearance(false)
         .text_size(px(theme::text_size::BODY))
+        .py(px(0.0))
+        .h_full();
+    div()
+        .w_full()
         .h(px(DIALOG_FIELD_HEIGHT))
+        .flex()
+        .items_center()
         .bg(theme.panel_background)
+        .border_1()
         .border_color(theme.border)
         .rounded(px(theme::radius::CONTROL))
-        .focus_bordered(false)
+        .child(div().w_full().h(px(INPUT_ROW)).child(input))
         .into_any_element()
 }

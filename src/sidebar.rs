@@ -413,9 +413,11 @@ pub(crate) fn build_sidebar(
         })
         // The revset / revision-range filter sits at the very top of the pane.
         .child(
-            field::PANEL_HEADER_PADDING
-                .apply(div())
-                .pr(px(field::PANEL_HEADER_LEAD))
+            div()
+                .pt(px(field::PANEL_HEADER_PADDING.top))
+                .pb(px(field::PANEL_HEADER_PADDING.bottom))
+                .pl(px(field::list_field_insets().0))
+                .pr(px(field::list_field_insets().1))
                 .w_full()
                 .flex_none()
                 .flex()
@@ -446,7 +448,16 @@ pub(crate) fn build_sidebar(
     }
     let list =
         crate::empty_states::revision_list_placeholder(ui, theme, cx).unwrap_or(revision_list);
-    // The revset field's completions hang over the top of the list.
+    // The revset field's completions hang over the top of the list, which
+    // recedes under a veil of the pane's colour while they're open. The veil
+    // takes no presses: the list stays live.
+    let dropdown = crate::revset_assist::dropdown(ui, theme, window, cx);
+    let veil = dropdown.is_some().then(|| {
+        div().absolute().inset_0().bg(Color {
+            a: DROPDOWN_VEIL,
+            ..theme.panel_background
+        })
+    });
     body = body.child(
         div()
             .relative()
@@ -454,8 +465,9 @@ pub(crate) fn build_sidebar(
             .min_h_0()
             .w_full()
             .child(list)
+            .children(veil)
             .children(
-                crate::revset_assist::dropdown(ui, theme, window, cx)
+                dropdown
                     .map(|dropdown| div().absolute().top_0().left_0().right_0().child(dropdown)),
             ),
     );
@@ -466,6 +478,9 @@ pub(crate) fn build_sidebar(
     }
     body.into_any_element()
 }
+
+/// How much of the list the veil under the revset completions hides.
+const DROPDOWN_VEIL: f32 = 0.65;
 
 /// How a target row of the op bar reads.
 #[derive(Clone, Copy, PartialEq)]
@@ -529,10 +544,11 @@ fn op_target_row(
         .map(|label| div().w(px(52.0)).child(label).into_any_element()),
     ];
     if let Some(key) = key {
+        let size = typography::optical_size(mono_font, text_size::CAPTION);
         content.push(Aligned::chip(
-            typography::line(key, mono_font, text_size::CAPTION, key_color),
+            typography::line(key, mono_font, size, key_color),
             mono_font,
-            text_size::CAPTION,
+            size,
             Padding::from([0.0, 5.0]),
             move |chip| chip.bg(key_bg).rounded(px(crate::theme::radius::XS)),
         ));

@@ -22,7 +22,7 @@
 //!   [`TextBox::baseline_for_center`]).
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 use gpui_kit::prelude::*;
 use gpui_kit::{
@@ -39,6 +39,7 @@ pub struct FontMetrics {
     pub ascent: f32,
     pub descent: f32,
     pub cap_height: f32,
+    pub x_height: f32,
 }
 
 impl FontMetrics {
@@ -47,6 +48,7 @@ impl FontMetrics {
         ascent: 0.95,
         descent: 0.25,
         cap_height: 0.70,
+        x_height: 0.52,
     };
 
     /// The metrics of the face `font` resolves to for Latin text, read once
@@ -83,11 +85,62 @@ fn read_metrics(font: Font) -> Option<FontMetrics> {
     let ascent = f32::from(system.ascent(id, size)) / EM;
     let descent = f32::from(system.descent(id, size)).abs() / EM;
     let cap_height = f32::from(system.cap_height(id, size)) / EM;
+    let x_height = f32::from(system.x_height(id, size)) / EM;
     (ascent.is_finite() && descent.is_finite() && cap_height > 0.0).then_some(FontMetrics {
         ascent,
         descent,
         cap_height,
+        x_height: if x_height > 0.0 {
+            x_height
+        } else {
+            FontMetrics::FALLBACK.x_height
+        },
     })
+}
+
+/// The face body text is set in: what [`optical_size`] matches other faces to.
+static UI_FONT: RwLock<Option<Font>> = RwLock::new(None);
+
+/// Tells the module which face body text is set in. The app calls it when it
+/// loads its config.
+pub fn set_ui_font(font: Font) {
+    if let Ok(mut slot) = UI_FONT.write() {
+        *slot = Some(font);
+    }
+}
+
+/// The size to set `font` at so a label in it reads as large as one in the UI
+/// font does at `size`. How big text looks is both how tall its lowercase
+/// stands and how wide its letters run, and a monospace face usually exceeds a
+/// sans on both at one point size (Menlo against SF: 4% taller, 23% wider), so
+/// a mono chip beside sans ones reads a size up. The factor is the mean of the
+/// two ratios, from the faces' own metrics, so it holds for whatever fonts the
+/// config names. Only ever smaller, and never by more than 15%.
+pub fn optical_size(font: Font, size: f32) -> f32 {
+    let Some(ui) = UI_FONT.read().ok().and_then(|slot| *slot) else {
+        return size;
+    };
+    if font == ui {
+        return size;
+    }
+    static CACHE: OnceLock<Mutex<HashMap<(Font, Font), f32>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let known = cache
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&(ui, font)).copied());
+    let factor = known.unwrap_or_else(|| {
+        const SAMPLE: &str = "divergent conflict hidden 0123456789";
+        let tall = FontMetrics::of(ui).x_height / FontMetrics::of(font).x_height;
+        let wide = crate::measure::line_width(SAMPLE, 100.0, ui)
+            / crate::measure::line_width(SAMPLE, 100.0, font).max(1.0);
+        let factor = (tall * wide).sqrt().clamp(0.85, 1.0);
+        if let Ok(mut cache) = cache.lock() {
+            cache.insert((ui, font), factor);
+        }
+        factor
+    });
+    size * factor
 }
 
 /// One line of text in one font and size, laid out in a line box
@@ -525,12 +578,14 @@ mod tests {
         ascent: 0.95,
         descent: 0.25,
         cap_height: 0.70,
+        x_height: 0.52,
     };
     /// A mono with a deeper descent and shorter caps.
     const MONO: FontMetrics = FontMetrics {
         ascent: 0.80,
         descent: 0.30,
         cap_height: 0.66,
+        x_height: 0.55,
     };
 
     fn close(a: f32, b: f32) {

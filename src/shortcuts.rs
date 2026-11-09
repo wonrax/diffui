@@ -406,10 +406,11 @@ pub(crate) fn keycap(
     _cx: &mut Cx,
 ) -> Aligned {
     let mono = ui.config.mono_font;
+    let size = typography::optical_size(mono, text_size::CAPTION);
     Aligned::chip(
-        typography::line(key, mono, text_size::CAPTION, theme.muted_text),
+        typography::line(key, mono, size, theme.muted_text),
         mono,
-        text_size::CAPTION,
+        size,
         [1.0, 5.0].into(),
         move |chip| {
             chip.bg(theme::chip_background(theme.muted_text))

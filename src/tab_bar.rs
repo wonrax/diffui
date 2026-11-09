@@ -43,9 +43,9 @@ const TAB_TEXT_SIZE: f32 = text_size::UI;
 /// strip's other controls.
 const TAB_HEIGHT: f32 = 28.0;
 
-/// Room around the tabs' row inside its clip, so the active tab's ring and
-/// shadow aren't cut off.
-const TAB_RING_ROOM: f32 = 2.0;
+/// Room around the tabs' row inside its clip, so the active tab's drop
+/// shadow (1px down, 2px of blur) isn't cut off at the strip's bottom.
+const TAB_RING_ROOM: f32 = 4.0;
 
 /// Gap between neighboring tabs, and between the final tab and the add button.
 const TAB_GAP: f32 = 2.0;
@@ -859,12 +859,13 @@ fn tab_badge(source: &crate::TabSource, active: bool, theme: ThemeSpec, mono: Fo
         (theme.muted_text, chip_background(theme.muted_text))
     };
     let font = emphasis_font(mono, Weight::SEMIBOLD);
-    typography::trimmed_padding([1.0, 5.0].into(), font, text_size::BADGE)
+    let size = typography::optical_size(font, text_size::BADGE);
+    typography::trimmed_padding([1.0, 5.0].into(), font, size)
         .apply(div())
         .flex_none()
         .bg(fill)
         .rounded(px(radius::XS))
-        .child(typography::line(label, font, text_size::BADGE, text))
+        .child(typography::line(label, font, size, text))
 }
 
 /// Small ring signalling the working copy (`@`) has changes. A ring in the
@@ -1953,10 +1954,11 @@ fn row_lead(vcs: Option<Vcs>, theme: ThemeSpec, mono: Font) -> Aligned {
                 Vcs::Git => ("git", crate::palette::active_wash(theme), theme.subtle_text),
             };
             let font = emphasis_font(mono, Weight::SEMIBOLD);
+            let size = typography::optical_size(font, text_size::BADGE);
             Aligned::chip(
-                typography::line(label, font, text_size::BADGE, ink),
+                typography::line(label, font, size, ink),
                 font,
-                text_size::BADGE,
+                size,
                 [2.0, 4.0].into(),
                 move |chip| chip.bg(fill).rounded(px(radius::XS)),
             )

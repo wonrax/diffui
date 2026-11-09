@@ -707,10 +707,11 @@ fn browsed_revision_label(ui: &Diffui, theme: ThemeSpec, is_jj: bool) -> impl In
 
     if working_copy {
         let accent = theme.accent;
+        let size = typography::optical_size(mono, text_size::CAPTION);
         label.push(Aligned::chip(
-            typography::line("@ working copy", mono, text_size::CAPTION, accent),
+            typography::line("@ working copy", mono, size, accent),
             mono,
-            text_size::CAPTION,
+            size,
             [1.0, 6.0].into(),
             move |chip| {
                 chip.bg(chip_background(accent))

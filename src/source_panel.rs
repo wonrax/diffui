@@ -462,6 +462,7 @@ pub(crate) fn build_source_sidebar(
     .on_scroll(cx.listener(|this: &mut Diffui, offset: &f64, _, _| {
         this.on_source_tree_scrolled(*offset);
     }))
+    .top_fade(theme.panel_background)
     .restore_scroll(source.tree_scroll_offset, ui.scroll_restore_token)
     .on_file_context_menu(Diffui::listen(
         cx,
@@ -760,10 +761,11 @@ fn build_info_bar(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut C
 
 fn status_chip_text(label: &'static str, color: Color, ui: &Diffui) -> Aligned {
     let mono = ui.config.mono_font;
+    let size = typography::optical_size(mono, text_size::CAPTION);
     Aligned::chip(
-        typography::line(label, mono, text_size::CAPTION, color),
+        typography::line(label, mono, size, color),
         mono,
-        text_size::CAPTION,
+        size,
         Padding::from([1.0, 6.0]),
         move |chip| {
             chip.bg(chip_background(color))

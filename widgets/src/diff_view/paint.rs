@@ -274,11 +274,12 @@ impl Plan {
             );
             text_x += glyph_width + chip::ICON_GAP;
         }
-        let shift = TextBox::new(chip.font, chip::TEXT_SIZE, height).trim_shift();
+        let size = chip::text_size(chip.font);
+        let shift = TextBox::new(chip.font, size, height).trim_shift();
         self.line(
             &chip.label,
             chip.font,
-            chip::TEXT_SIZE,
+            size,
             text_x,
             rect.y + shift,
             height,
@@ -289,8 +290,8 @@ impl Plan {
             self.line(
                 suffix,
                 chip.font,
-                chip::TEXT_SIZE,
-                text_x + measure::line_width(&chip.label, chip::TEXT_SIZE, chip.font),
+                size,
+                text_x + measure::line_width(&chip.label, size, chip.font),
                 rect.y + shift,
                 height,
                 *color,

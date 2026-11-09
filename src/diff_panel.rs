@@ -319,24 +319,25 @@ pub(crate) fn build_file_navigator(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    build_file_navigator_surface(ui, theme, ui.file_nav_width, window, cx)
+    build_file_navigator_surface(ui, theme, Some(ui.file_nav_width), window, cx)
 }
 
-/// The navigator at the width it floats at over the diff while its panel is
-/// hidden (see `root::Panel`).
+/// The navigator floating over the diff while its panel is hidden (see
+/// `root::Panel`): as wide as the card it floats in.
 pub(crate) fn build_file_navigator_peek(
     ui: &Diffui,
     theme: ThemeSpec,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    build_file_navigator_surface(ui, theme, FILE_NAV_PEEK_WIDTH, window, cx)
+    build_file_navigator_surface(ui, theme, None, window, cx)
 }
 
+/// The navigator, `width` wide, or filling its parent.
 fn build_file_navigator_surface(
     ui: &Diffui,
     theme: ThemeSpec,
-    width: f32,
+    width: Option<f32>,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
@@ -368,7 +369,10 @@ fn build_file_navigator_surface(
     div()
         .flex()
         .flex_col()
-        .w(px(width))
+        .map(|column| match width {
+            Some(width) => column.w(px(width)),
+            None => column.w_full(),
+        })
         .h_full()
         .bg(theme.panel_background)
         .child(
@@ -454,6 +458,7 @@ fn file_tree(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) ->
     .on_scroll(cx.listener(|this: &mut Diffui, offset: &f64, _, _| {
         this.on_changed_files_scrolled(*offset);
     }))
+    .top_fade(theme.panel_background)
     .restore_scroll(tab.file_tree_scroll_offset, ui.scroll_restore_token)
     .on_file_context_menu(Diffui::listen(
         cx,
