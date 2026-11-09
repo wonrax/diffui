@@ -1412,3 +1412,83 @@ fn a_drag_onto_a_header_band_stops_at_the_nearest_row() {
         assert_eq!(press_at(hunk_near_below), last);
     }
 }
+
+/// No-wrap sideways extent: each line is held to the text area it is laid out in. A
+/// one-sided file spans the whole area in split mode, so its long line mustn't let the
+/// split files scroll on into nothing, and a line that fits needs no scrolling at all.
+#[test]
+fn the_sideways_extent_holds_each_line_to_its_own_text_area() {
+    let cols = |n: usize| "x".repeat(n);
+    let hunks = |full: usize, split: usize| {
+        vec![
+            vec![DiffHunkView {
+                header: "@@".to_owned(),
+                lines: vec![line(DiffLineKind::Addition, &cols(full), 1)],
+            }],
+            vec![DiffHunkView {
+                header: "@@".to_owned(),
+                lines: vec![
+                    line(DiffLineKind::Deletion, &cols(split), 1),
+                    line(DiffLineKind::Addition, "new", 1),
+                ],
+            }],
+        ]
+    };
+    let width = 1600.0;
+    let extent = |hunks: &[Vec<DiffHunkView>]| {
+        let mut props = test_props(2).side_by_side(true);
+        props.wrap = false;
+        let view = view_of(&props, hunks);
+        let cells = TestCaches::default();
+        view.ensure_height_index(&cells.index, &cells.geometry, width);
+        let index = cells.index.borrow();
+        let cw = view.metrics.char_width;
+        let areas = (
+            view.content_width(width),
+            view.split_layout(width).text_width,
+        );
+        (view.max_horizontal(&index, width), cw, areas)
+    };
+    let fits = |area: f32, cw: f32| (area / cw).floor() as usize - 2;
+
+    // The full-width line is wider than a split column but fits the whole area, and the
+    // split one fits its column: nothing to scroll to.
+    let (_, cw, (full, split)) = extent(&hunks(1, 1));
+    assert!(fits(full, cw) > fits(split, cw));
+    let (max, ..) = extent(&hunks(fits(full, cw), fits(split, cw)));
+    assert_eq!(max, 0.0);
+
+    // Past either area, it scrolls exactly to the line's end (and a breathing column).
+    let long = fits(full, cw) + 10;
+    let (max, ..) = extent(&hunks(long, 1));
+    assert_eq!(max, (long as f32 + 1.0) * cw - full);
+    let long = fits(split, cw) + 10;
+    let (max, ..) = extent(&hunks(1, long));
+    assert_eq!(max, (long as f32 + 1.0) * cw - split);
+}
+
+/// A non-ASCII line's sideways extent is its shaped width, worked out after the
+/// rebuild, not the three-columns-a-char bound the rebuild works with.
+#[test]
+fn a_non_ascii_line_reaches_as_far_as_it_is_drawn() {
+    let content = "日本語のコメント".repeat(20);
+    let hunks = vec![vec![DiffHunkView {
+        header: "@@".to_owned(),
+        lines: vec![line(DiffLineKind::Addition, &content, 1)],
+    }]];
+    let mut props = test_props(1);
+    props.wrap = false;
+    let view = view_of(&props, &hunks);
+    let cells = TestCaches::default();
+    view.ensure_height_index(&cells.index, &cells.geometry, 1200.0);
+    assert!(
+        cells.geometry.borrow().shapes.is_empty(),
+        "the rebuild shaped"
+    );
+    view.settle_extent(&cells.index, &cells.geometry);
+    let shaped = LineShape::of(&content, view.geometry_params(f32::INFINITY)).width()
+        / view.metrics.char_width;
+    let index = cells.index.borrow();
+    assert_eq!(index.max_columns, shaped);
+    assert!(shaped < super::line::column_bound(&content));
+}

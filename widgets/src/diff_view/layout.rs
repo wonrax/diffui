@@ -278,9 +278,17 @@ pub(super) struct HeightIndex {
     /// split mode. A single-sided file (all additions or all deletions) has
     /// nothing to mirror, so splitting it would waste half the pane on padding.
     pub(super) full_width_files: Vec<bool>,
-    /// Widest line of the document in columns: the horizontal extent the no-wrap
-    /// mode can scroll across. Left at zero while wrapping.
+    /// Widest full-width line of the document in columns (every line in unified
+    /// mode; a one-sided file's in split): what the no-wrap mode can scroll across
+    /// the whole text area. Left at zero while wrapping.
     pub(super) max_columns: f32,
+    /// Widest line of a split file in columns, scrolled across one column's text
+    /// area. Left at zero while wrapping or unified.
+    pub(super) max_split_columns: f32,
+    /// Lines whose width the two maxima above don't know yet: non-ASCII ones,
+    /// which [`column_bound`] only bounds. `(bound, in a split file, key)`, shaped
+    /// for real by [`View::settle_extent`] instead of during the rebuild.
+    pub(super) unmeasured_wide: Vec<(f32, bool, GeometryKey)>,
     /// Total content height (revision header + every file).
     pub(super) total_height: f32,
     /// `(file, top, height)` of each image preview block, in document order.
@@ -1373,6 +1381,8 @@ impl<'a> View<'a> {
         index.file_strips.clear();
         index.note_bands.clear();
         index.max_columns = 0.0;
+        index.max_split_columns = 0.0;
+        index.unmeasured_wide.clear();
         index.full_width_files = if props.side_by_side {
             self.hunks
                 .iter()
@@ -1460,7 +1470,11 @@ impl<'a> View<'a> {
                                 .push((line_index as u32, line_index as u32));
                         }
                         if !props.wrap {
-                            index.max_columns = index.max_columns.max(bound);
+                            if line.content.is_ascii() {
+                                index.max_columns = index.max_columns.max(bound);
+                            } else {
+                                index.unmeasured_wide.push((bound, false, key));
+                            }
                         }
                         y += height;
                     }
@@ -1500,6 +1514,7 @@ impl<'a> View<'a> {
             y += height;
         };
         let mut max_columns = 0.0_f32;
+        let mut unmeasured = Vec::new();
         let mut height_of = |line_index: usize, line: &DiffLine| {
             let key = body_geometry_key(
                 file_index,
@@ -1510,7 +1525,11 @@ impl<'a> View<'a> {
             );
             let (height, bound) = self.indexed_row_height(memo, key, line, base, content_width);
             if !self.props.wrap {
-                max_columns = max_columns.max(bound);
+                if line.content.is_ascii() {
+                    max_columns = max_columns.max(bound);
+                } else {
+                    unmeasured.push((bound, true, key));
+                }
             }
             height
         };
@@ -1562,7 +1581,8 @@ impl<'a> View<'a> {
                 );
             }
         }
-        index.max_columns = index.max_columns.max(max_columns);
+        index.max_split_columns = index.max_split_columns.max(max_columns);
+        index.unmeasured_wide.extend(unmeasured);
         y
     }
 
@@ -1677,7 +1697,7 @@ impl<'a> View<'a> {
         LineGeometry::measure(content, self.geometry_params(wrap_width))
     }
 
-    fn geometry_params(&self, wrap_width: f32) -> GeometryParams {
+    pub(super) fn geometry_params(&self, wrap_width: f32) -> GeometryParams {
         GeometryParams {
             size: self.props.typography.size,
             font: self.props.font,
@@ -1761,16 +1781,78 @@ impl<'a> View<'a> {
         (rows as f32 * self.metrics.row_height, bound)
     }
 
-    /// How far the no-wrap mode can scroll sideways: the widest line's extent
-    /// beyond the visible text area (plus one column of breathing room), zero while
-    /// wrapping.
+    /// How far the no-wrap mode can scroll sideways: the furthest any line
+    /// reaches past the text area it is laid out in (plus one column of breathing
+    /// room), zero while wrapping. In split mode a one-sided file spans the whole
+    /// text area and a split one a column's, so each is held to its own.
     pub(super) fn max_horizontal(&self, index: &HeightIndex, viewport_width: f32) -> f32 {
         if self.props.wrap {
             return 0.0;
         }
-        let text_width = self.effective_text_width(viewport_width);
-        let content = (index.max_columns + 1.0) * self.metrics.char_width;
-        (content - text_width).max(0.0)
+        let cw = self.metrics.char_width;
+        let overflow = |columns: f32, text_width: f32| {
+            if columns > 0.0 {
+                (columns + 1.0) * cw - text_width
+            } else {
+                0.0
+            }
+        };
+        let full = overflow(index.max_columns, self.content_width(viewport_width));
+        let split = if self.props.side_by_side {
+            overflow(
+                index.max_split_columns,
+                self.split_layout(viewport_width).text_width,
+            )
+        } else {
+            0.0
+        };
+        full.max(split).max(0.0)
+    }
+
+    /// Folds the non-ASCII lines a rebuild left unmeasured into the sideways
+    /// extent. [`column_bound`] errs high on them (three columns a char), so each is
+    /// shaped for its real width, widest bound first, and only while its bound could
+    /// still beat what's known. Runs once per rebuild, off the rebuild itself: that
+    /// one walks every line on every width change while wrapping and must not shape.
+    pub(super) fn settle_extent(&self, cell: &RefCell<HeightIndex>, memo: &RefCell<GeometryMemo>) {
+        let mut index = cell.borrow_mut();
+        if index.unmeasured_wide.is_empty() {
+            return;
+        }
+        let mut wide = std::mem::take(&mut index.unmeasured_wide);
+        wide.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let cw = self.metrics.char_width.max(1.0);
+        for (bound, split, key) in wide {
+            let widest = if split {
+                index.max_split_columns
+            } else {
+                index.max_columns
+            };
+            if bound <= widest {
+                continue;
+            }
+            let Some(line) = self.line(
+                key.file_index as usize,
+                key.hunk_index as usize,
+                key.line_index as usize,
+            ) else {
+                continue;
+            };
+            let columns = shape_of(
+                memo,
+                key,
+                &line.content,
+                self.geometry_params(f32::INFINITY),
+            )
+            .width()
+                / cw;
+            let slot = if split {
+                &mut index.max_split_columns
+            } else {
+                &mut index.max_columns
+            };
+            *slot = slot.max(columns);
+        }
     }
 
     /// Height of index row `row`: the taller member's in side-by-side. Read off the

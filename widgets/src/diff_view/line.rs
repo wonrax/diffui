@@ -473,6 +473,11 @@ impl LineShape {
     /// glyph's right edge passes the width, the line breaks at the last word start since
     /// the previous break, or, with none, at that glyph. A trailing blank doesn't get to
     /// hang past the width. `geometry_starts_match_the_engine` pins it to the real thing.
+    /// The unwrapped width, px.
+    pub(super) fn width(&self) -> f32 {
+        self.width
+    }
+
     pub(super) fn wrap(&self, wrap_width: f32) -> Vec<usize> {
         let mut starts = vec![0usize];
         if !wrap_width.is_finite() || self.width <= wrap_width {

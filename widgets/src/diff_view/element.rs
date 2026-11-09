@@ -1081,6 +1081,7 @@ impl DiffView {
             crate::frame_log::time("diff.index", || {
                 view.ensure_height_index(&state.height_index, &state.geometry, bounds.width);
             });
+            view.settle_extent(&state.height_index, &state.geometry);
             if state.height_index.borrow().key != key {
                 state.last_index_build = started.elapsed();
             }
