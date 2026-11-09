@@ -38,13 +38,6 @@ pub fn rect(x: f32, center_y: f32) -> Rectangle {
     }
 }
 
-/// The `center_y` that puts the letter's baseline on `baseline_y`, for a badge
-/// sitting in a line of text. The letter's caps are centred in the box, so this
-/// is also where the box goes.
-pub fn center_for_baseline(mono: Font, baseline_y: f32) -> f32 {
-    TextBox::new(font(mono), TEXT_SIZE, SIZE).center_for_baseline(baseline_y)
-}
-
 /// Where the letter's line box goes in `rect`: its top, with the caps centred.
 pub fn letter_top(mono: Font, rect: Rectangle) -> f32 {
     let line = TextBox::new(font(mono), TEXT_SIZE, SIZE);

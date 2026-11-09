@@ -11,9 +11,12 @@ use gpui_kit::component::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_kit::component::scroll::{Scrollable, ScrollableElement as _};
 use gpui_kit::prelude::*;
+use std::cell::Cell;
+use std::rc::Rc;
+
 use gpui_kit::{
-    AnyElement, AnyView, App, Context, Div, ElementId, Entity, MouseButton, ScrollHandle,
-    SharedString, Stateful, Window, div, px,
+    AnyElement, App, Bounds, Context, Div, ElementId, Entity, MouseButton, Pixels, ScrollHandle,
+    SharedString, Stateful, Window, anchored, canvas, div, point, px,
 };
 
 use crate::icons;
@@ -92,12 +95,17 @@ pub fn button(
     theme: ThemeSpec,
     cx: &App,
 ) -> Button {
-    frame(id, style(variant, theme), cx)
+    frame(id, style(variant, theme), theme, cx)
         .h(px(size.height()))
         .px(px(size.pad_x()))
 }
 
-fn frame(id: impl Into<ElementId>, style: theme::ButtonStyle, cx: &App) -> Button {
+fn frame(
+    id: impl Into<ElementId>,
+    style: theme::ButtonStyle,
+    theme: ThemeSpec,
+    cx: &App,
+) -> Button {
     let colors = ButtonCustomVariant::new(cx)
         .color(style.rest.unwrap_or(theme::TRANSPARENT).into())
         .foreground(style.label.into())
@@ -112,6 +120,9 @@ fn frame(id: impl Into<ElementId>, style: theme::ButtonStyle, cx: &App) -> Butto
     if let Some(border) = style.border {
         button = button.border_1().border_color(border);
     }
+    if let Some(shadow) = style.shadow {
+        button = button.shadow(shadow(theme));
+    }
     button
 }
 
@@ -123,6 +134,8 @@ pub fn label(
     size: Size,
     font: Font,
 ) -> Div {
+    // Labels sit a weight over body text, as the prototype's buttons do.
+    let font = theme::emphasis_font(font, Weight::MEDIUM);
     let text = div()
         .font(font.gpui())
         .text_size(px(size.text_size()))
@@ -169,7 +182,7 @@ pub fn primary_button(
     } else {
         theme::disabled_button_style(theme)
     };
-    frame(id, colors, cx)
+    frame(id, colors, theme, cx)
         .h(px(size.height()))
         .px(px(size.pad_x()))
         .disabled(!enabled)
@@ -217,7 +230,7 @@ pub fn icon_button(
     cx: &App,
 ) -> Button {
     let side = px(size.height());
-    frame(id, theme::ghost_button_style(theme), cx)
+    frame(id, theme::ghost_button_style(theme), theme, cx)
         .size(side)
         .p(px(0.0))
         .child(icons::icon(glyph, ICON_SIZE, color))
@@ -227,7 +240,7 @@ pub fn icon_button(
 /// wash, so it sits inside the banner with even insets instead of filling
 /// its height.
 pub fn close_button(id: impl Into<ElementId>, color: Color, theme: ThemeSpec, cx: &App) -> Button {
-    frame(id, theme::ghost_button_style(theme), cx)
+    frame(id, theme::ghost_button_style(theme), theme, cx)
         .size(px(CLOSE_SIDE))
         .p(px(0.0))
         .child(icons::icon(icons::CLOSE, CLOSE_ICON_SIZE, color))
@@ -367,33 +380,68 @@ pub fn gutter() -> Div {
     div().w_full().pr(px(crate::scrollbar::GUTTER))
 }
 
-/// The hover label every chrome control uses, for `.tooltip(ui::tooltip(...))`
-/// on an element with an id.
-pub fn tooltip(
-    label: impl Into<SharedString>,
-    font: Font,
-    theme: ThemeSpec,
-) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
-    let label = label.into();
-    move |_, cx| {
-        let label = label.clone();
-        cx.new(|_| TooltipView { label, font, theme }).into()
+/// Between a control's bottom edge and its tooltip.
+const TOOLTIP_GAP: f32 = 6.0;
+/// The least a tooltip keeps from the window's edges.
+const TOOLTIP_MARGIN: f32 = 6.0;
+
+/// The hover label every chrome control uses: `.tip(label, font, theme)` on an
+/// element with an id. GPUI drops a tooltip at the cursor, over what's under
+/// it; this one hangs from the control's bottom edge instead, left-aligned
+/// with it, and moves up or in to stay in the window.
+pub trait Tip: StatefulInteractiveElement + ParentElement + Sized {
+    fn tip(self, label: impl Into<SharedString>, font: Font, theme: ThemeSpec) -> Self {
+        let anchor: Rc<Cell<Option<Bounds<Pixels>>>> = Rc::default();
+        let recorded = anchor.clone();
+        let label = label.into();
+        // An absolute child sits on its parent's box (taffy positions it
+        // against its own parent), so this reads the control's bounds.
+        self.child(
+            canvas(
+                move |bounds, _, _| recorded.set(Some(bounds)),
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_full(),
+        )
+        .tooltip(move |_, cx| {
+            let label = label.clone();
+            let anchor = anchor.clone();
+            cx.new(|_| TooltipView {
+                label,
+                font,
+                theme,
+                anchor,
+            })
+            .into()
+        })
     }
 }
+
+impl<T: StatefulInteractiveElement + ParentElement + Sized> Tip for T {}
 
 struct TooltipView {
     label: SharedString,
     font: Font,
     theme: ThemeSpec,
+    anchor: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
 
 impl Render for TooltipView {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        theme::tooltip_card(div(), self.theme)
+        let card = theme::tooltip_card(div(), self.theme)
             .px(px(8.0))
             .py(px(4.0))
             .font(self.font.gpui())
             .text_size(px(text_size::UI))
-            .child(self.label.clone())
+            .child(self.label.clone());
+        match self.anchor.get() {
+            Some(control) => anchored()
+                .position(point(control.left(), control.bottom() + px(TOOLTIP_GAP)))
+                .snap_to_window_with_margin(px(TOOLTIP_MARGIN))
+                .child(card)
+                .into_any_element(),
+            None => card.into_any_element(),
+        }
     }
 }

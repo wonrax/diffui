@@ -68,6 +68,7 @@ pub struct ResizeHandle {
     min_width: f32,
     right_reserve: f32,
     hit_padding: f32,
+    grabbable: bool,
     on_resize: OnResize,
 }
 
@@ -85,12 +86,21 @@ impl ResizeHandle {
             min_width,
             right_reserve: MIN_DIFF_PANE_WIDTH,
             hit_padding,
+            grabbable: true,
             on_resize: Rc::new(on_resize),
         }
     }
 
     pub fn right_reserve(mut self, width: f32) -> Self {
         self.right_reserve = width;
+        self
+    }
+
+    /// Whether a press can start a drag here. A collapsed pane's handle keeps
+    /// listening without a band to grab, so a drag that collapsed it can open
+    /// it again before the button comes up.
+    pub fn grabbable(mut self, grabbable: bool) -> Self {
+        self.grabbable = grabbable;
         self
     }
 
@@ -117,20 +127,22 @@ impl ResizeHandle {
                 );
                 on_resize(clamped, window, cx);
             })
-            .child(
-                div()
-                    .id(self.id)
-                    .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .left(px(self.handle_x - self.hit_padding))
-                    .w(px(self.hit_padding * 2.0))
-                    .cursor(CursorStyle::ResizeLeftRight)
-                    .on_drag(drag, |_, _, _, cx| cx.new(|_| NoDragPreview))
-                    .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| {
-                        cx.stop_propagation()
-                    }),
-            )
+            .when(self.grabbable, |overlay| {
+                overlay.child(
+                    div()
+                        .id(self.id)
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(px(self.handle_x - self.hit_padding))
+                        .w(px(self.hit_padding * 2.0))
+                        .cursor(CursorStyle::ResizeLeftRight)
+                        .on_drag(drag, |_, _, _, cx| cx.new(|_| NoDragPreview))
+                        .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| {
+                            cx.stop_propagation()
+                        }),
+                )
+            })
             .into_any_element()
     }
 }

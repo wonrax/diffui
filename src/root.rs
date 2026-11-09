@@ -842,6 +842,11 @@ impl Diffui {
 
 /// The peeked panel, over the panes: the revisions down the window's left edge
 /// at the sidebar's width, the file tree under the control that opened it.
+/// How far a peek's pane sits in from its rounded edges. GPUI clips to the
+/// surface's rectangle, not its rounded corners, so a pane flush to the edge
+/// would square them off: this keeps its corners inside the curve.
+const PEEK_CORNER_INSET: f32 = theme::radius::LG * (1.0 - std::f32::consts::FRAC_1_SQRT_2) + 0.5;
+
 fn panel_peek(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> AnyElement {
     let (Some(peek), Some(panes)) = (ui.panel_peek, ui.panes.as_ref()) else {
         return div().into_any_element();
@@ -858,7 +863,9 @@ fn panel_peek(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> AnyElement {
                 .bottom(px(bottom))
                 .w(px(ui.sidebar_width))
                 .rounded_r(px(theme::radius::LG))
-                .border_r_1(),
+                .border_r_1()
+                .py(px(PEEK_CORNER_INSET))
+                .pr(px(PEEK_CORNER_INSET)),
             &panes.left,
         ),
         Panel::Files => {
@@ -877,7 +884,8 @@ fn panel_peek(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> AnyElement {
                     .w(px(FILES_PEEK_WIDTH))
                     .h(px(height))
                     .rounded(px(theme::radius::LG))
-                    .border_1(),
+                    .border_1()
+                    .p(px(PEEK_CORNER_INSET)),
                 &panes.files,
             )
         }
@@ -1063,8 +1071,9 @@ impl Diffui {
 
         let mut body = div().relative().flex_1().min_h_0().w_full().child(row);
 
-        // The history pane's seam.
-        if history_width > 0.0 {
+        // The history pane's seam. Collapsed, it still hears the drag that
+        // collapsed it, so the same drag can bring the pane back.
+        {
             let reserve = if files_width > 0.0 {
                 files_width + 1.0
             } else {
@@ -1083,11 +1092,12 @@ impl Diffui {
                     move |width, window, cx| on_resize(&width, window, cx),
                 )
                 .right_reserve(reserve)
+                .grabbable(history_width > 0.0)
                 .view(),
             );
         }
-        // The changed files' seam.
-        if files_width > 0.0 {
+        // The changed files' seam, likewise.
+        if self.active().main_view == crate::MainView::Diff {
             let lead = if history_width > 0.0 {
                 history_width + 1.0
             } else {
@@ -1105,6 +1115,7 @@ impl Diffui {
                     move |position, window, cx| on_resize(&position, window, cx),
                 )
                 .right_reserve(1.0 + resize_handle::MIN_DIFF_PANE_WIDTH)
+                .grabbable(files_width > 0.0)
                 .view(),
             );
         }

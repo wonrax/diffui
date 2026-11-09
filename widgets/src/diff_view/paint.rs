@@ -1510,6 +1510,26 @@ impl View<'_> {
                             .map(|(_, slot)| slot),
                     );
                 }
+                HeaderLine::Title { text, placeholder } => {
+                    let font = theme::emphasis_font(self.props.ui_font, theme::Weight::SEMIBOLD);
+                    let height = super::HEADER_TITLE_ROW_HEIGHT;
+                    let line_box = TextBox::new(font, super::HEADER_TITLE_SIZE, height);
+                    let top = line_box.baseline_for_center(y + height / 2.0) - line_box.baseline();
+                    plan.line(
+                        text,
+                        font,
+                        super::HEADER_TITLE_SIZE,
+                        left_x,
+                        top,
+                        height,
+                        if *placeholder {
+                            palette.text_muted
+                        } else {
+                            palette.text
+                        },
+                        clip,
+                    );
+                }
                 HeaderLine::Blank | HeaderLine::Spacer(_) => {}
             }
             y += self.header_line_height(line);

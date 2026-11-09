@@ -16,6 +16,7 @@
 use crate::overlay_kit::{Tone, count_chip, glyph};
 use crate::theme::{self, Color, Font, Padding, Weight, emphasis_font, text_size};
 use crate::typography::{self, Aligned};
+use crate::ui::Tip as _;
 use crate::{Action, Cx, ellipsis, icons, input, ui};
 use gpui_kit::component::Sizable as _;
 use gpui_kit::prelude::*;
@@ -991,7 +992,7 @@ fn activity_row(
         actions = actions.child(
             div()
                 .id(("activity-link-tip", index))
-                .tooltip(ui::tooltip(url.clone(), ui.config.ui_font, theme))
+                .tip(url.clone(), ui.config.ui_font, theme)
                 .child(row_button(
                     ui,
                     theme,
@@ -1343,11 +1344,11 @@ fn clear_button(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> AnyElement {
     div()
         .id("activity-clear-tip")
         .flex_none()
-        .tooltip(ui::tooltip(
+        .tip(
             "Remove finished entries. Running and queued work stays.",
             ui.config.ui_font,
             theme,
-        ))
+        )
         .child(button)
         .into_any_element()
 }

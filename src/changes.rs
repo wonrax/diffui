@@ -30,6 +30,7 @@ use crate::palette::ResultRef;
 use crate::prose::Prose;
 use crate::theme::{self, Color, ThemeSpec, Weight, text_size};
 use crate::typography::{self, Aligned};
+use crate::ui::Tip as _;
 use crate::{
     Action, ConfirmDialog, Cx, Diffui, MainView, PendingMutation, TabState, activity, icons, ui,
 };
@@ -1616,7 +1617,7 @@ pub(crate) fn action_bar(
             .h(px(BAR_BUTTON_HEIGHT))
             .rounded(px(theme::radius::BUTTON))
             .child(content)
-            .tooltip(ui::tooltip(tip, font, theme));
+            .tip(tip, font, theme);
         element = if show_label {
             element.px(px(9.0))
         } else {
@@ -1746,7 +1747,7 @@ pub(crate) fn action_bar(
             .rounded(px(theme::radius::BUTTON))
             .cursor_pointer()
             .hover(move |style| style.bg(hover))
-            .tooltip(ui::tooltip("Clear picks", font, theme))
+            .tip("Clear picks", font, theme)
             .on_click(Diffui::on_action(Action::Changes(ChangesMsg::Clear), cx))
             .child(typography::centered(
                 typography::line("Clear", font, text_size::UI, ink),

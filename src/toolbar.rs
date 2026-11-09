@@ -18,6 +18,7 @@ use crate::theme::{
     well_fill,
 };
 use crate::typography::{self, Aligned};
+use crate::ui::Tip as _;
 use crate::{Action, Cx, Diffui, FetchTarget, MainView, ToolbarMenu, activity, icons, sidebar, ui};
 
 /// Every control in the bar is one [`ui::Size::Compact`] step tall.
@@ -112,7 +113,7 @@ pub(crate) fn caret_hover<E: StatefulInteractiveElement + Styled>(
 ) -> E {
     caret
         .rounded(px(radius))
-        .hover(move |caret| caret.bg(chip_background(theme.muted_text)))
+        .hover(move |caret| caret.bg(theme::hover_wash(theme)))
 }
 
 /// Build the actions toolbar. Empty when no repo is open (the welcome screen owns
@@ -267,7 +268,8 @@ pub(crate) fn build_toolbar(
         .w_full()
         .h(px(HEIGHT))
         .px(px(theme::space::MD))
-        .bg(theme.panel_background_elevated)
+        // The window's chrome, one section with the tab strip above.
+        .bg(well_fill(theme))
         // Too narrow for both, the actions stay whole and the right group runs off
         // the edge.
         .overflow_hidden()
@@ -285,6 +287,7 @@ pub(crate) fn build_toolbar(
         .flex_col()
         .w_full()
         .flex_none()
+        .bg(well_fill(theme))
         .child(bar)
         .child(
             div()
@@ -350,7 +353,7 @@ fn svg_switcher(
 }
 
 /// A segmented control, for switching between views of one thing: a recessed well
-/// (window-background fill) holding the tabs, the active one raised as a bordered
+/// (window-background fill) holding the tabs, the active one raised as a ringed
 /// pill.
 pub(crate) fn segmented(
     segments: Vec<Segment>,
@@ -371,7 +374,11 @@ pub(crate) fn segmented(
         .gap(px(theme::space::XXS))
         .p(px(INSET))
         .rounded(px(radius::BUTTON))
-        .bg(well_fill(theme));
+        // A step into the chrome it sits on.
+        .bg(Color {
+            a: 0.07,
+            ..theme.text
+        });
     for segment in segments {
         let Segment {
             icon,
@@ -408,8 +415,7 @@ pub(crate) fn segmented(
             .rounded(px(radius::BUTTON - INSET))
             .when(active, |tab| {
                 tab.bg(theme.panel_background_elevated)
-                    .border_1()
-                    .border_color(theme.border)
+                    .shadow(theme::raised_shadow(theme))
             })
             .children(icon.map(|icon| icons::icon(icon, ui::ICON_SIZE, icon_color)))
             .child(typography::centered(
@@ -496,7 +502,7 @@ fn toggle_button(
     div()
         .id(ElementId::Name(SharedString::from(format!("{id}-tip"))))
         .flex_none()
-        .tooltip(ui::tooltip(label, font, theme))
+        .tip(label, font, theme)
         .child(button)
         .into_any_element()
 }
@@ -666,11 +672,7 @@ fn push_button(ui: &Diffui, theme: ThemeSpec, font: Font, cx: &mut Cx) -> AnyEle
     div()
         .id("toolbar-push-tip")
         .flex_none()
-        .tooltip(ui::tooltip(
-            with_shortcut(ui, &tip, "repo.push"),
-            font,
-            theme,
-        ))
+        .tip(with_shortcut(ui, &tip, "repo.push"), font, theme)
         .child(button)
         .into_any_element()
 }

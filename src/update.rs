@@ -169,7 +169,6 @@ impl Diffui {
                         .get(&key)
                         .copied()
                         .unwrap_or(false);
-                    state.lane_cap = saved.lane_caps.get(&key).copied();
                     (owner, name, source, state)
                 }
                 BootTarget::Pr(spec) => (
@@ -1251,11 +1250,20 @@ impl Diffui {
         self.revset_field_edited(value, cx);
     }
 
+    /// A drag on the history seam. Down to the minimum it collapses the pane;
+    /// past it again, in the same drag, the pane comes back.
     pub(crate) fn on_sidebar_width_changed(&mut self, width: f32) {
+        let collapsed = self.active().history_panel_collapsed;
         if width <= self.sidebar_min_width + f32::EPSILON {
-            self.active_mut().history_panel_collapsed = true;
-            self.mark_geometry_dirty();
+            if !collapsed {
+                self.active_mut().history_panel_collapsed = true;
+                self.mark_geometry_dirty();
+            }
             return;
+        }
+        if collapsed {
+            self.active_mut().history_panel_collapsed = false;
+            self.mark_geometry_dirty();
         }
         let files_width = self.files_pane_width();
         let files = if files_width > 0.0 {
@@ -1283,10 +1291,17 @@ impl Diffui {
             0.0
         };
         let width = handle_x - lead;
+        let collapsed = self.active().files_panel_collapsed;
         if width <= diff_panel::MIN_FILE_NAV_WIDTH + f32::EPSILON {
-            self.active_mut().files_panel_collapsed = true;
-            self.mark_geometry_dirty();
+            if !collapsed {
+                self.active_mut().files_panel_collapsed = true;
+                self.mark_geometry_dirty();
+            }
             return;
+        }
+        if collapsed {
+            self.active_mut().files_panel_collapsed = false;
+            self.mark_geometry_dirty();
         }
         let available = (self.window_size.width - lead - 1.0).max(diff_panel::MIN_FILE_NAV_WIDTH);
         let clamped = resize_handle::clamp_width(width, diff_panel::MIN_FILE_NAV_WIDTH, available);
@@ -4379,16 +4394,6 @@ impl Diffui {
                 .collect_panel_collapse_state(|state| state.history_panel_collapsed),
             files_panel_collapsed: self
                 .collect_panel_collapse_state(|state| state.files_panel_collapsed),
-            lane_caps: self
-                .tabs
-                .iter()
-                .filter_map(|tab| {
-                    Some((
-                        tab.root()?.to_string_lossy().into_owned(),
-                        tab.state.lane_cap?,
-                    ))
-                })
-                .collect(),
             recent_repos: self.recent_repos.clone(),
         }
     }
@@ -4449,6 +4454,11 @@ mod tests {
 
             assert!(ui.active().history_panel_collapsed);
             assert_eq!(ui.sidebar_width, 340.0);
+
+            // The same drag, back out past the minimum: the pane returns.
+            ui.act(cx, |ui, _| ui.on_sidebar_width_changed(300.0));
+            assert!(!ui.active().history_panel_collapsed);
+            assert_eq!(ui.sidebar_width, 300.0);
         });
     }
 

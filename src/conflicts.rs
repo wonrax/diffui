@@ -11,6 +11,7 @@
 
 use crate::Cx;
 use crate::theme::Font;
+use crate::ui::Tip as _;
 use diffui_core::{
     ConflictFile, ConflictPick, ConflictResolution, DiffFileStatus, JobId, MergeToolInvocation,
     MutationOp, RevisionSelection, hunk_conflict_region,
@@ -1206,7 +1207,7 @@ fn editor_footer(ui: &Diffui, theme: ThemeSpec, editor: &MarkerEditor, cx: &mut 
     let keyed = |id: &'static str, button: AnyElement, key: &'static str| {
         div()
             .id(id)
-            .tooltip(ui::tooltip(key, font, theme))
+            .tip(key, font, theme)
             .child(button)
             .into_any_element()
     };

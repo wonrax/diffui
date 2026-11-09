@@ -10,7 +10,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, Bounds, MouseButton, Pixels, Window, canvas, div, px};
 
 use crate::theme::{self, ThemeSpec};
-use crate::theme::{Font, Padding, chip_background};
+use crate::theme::{Font, Padding};
 use crate::{Cx, Diffui, icons, input};
 use crate::{HoverTarget, ToolbarMenu};
 
@@ -92,13 +92,9 @@ pub(crate) fn filter_field(
         let on_submit = Diffui::listen(cx, move |this, _: &(), _, cx| on_submit(this, cx));
         field = field.on_submit(move |window, cx| on_submit(&(), window, cx));
     }
-    // The caps, not the line box, centre in the well.
-    let trim = crate::typography::trimmed_padding(Padding::ZERO, font, theme::text_size::UI);
     let text = input::single_line(field, font, window, cx)
         .appearance(false)
         .px(px(TEXT_INSET))
-        .pt(px(trim.top))
-        .pb(px(trim.bottom))
         .h_full();
 
     // The field's bounds, for the presets menu that anchors edge-to-edge below it.
@@ -131,7 +127,18 @@ pub(crate) fn filter_field(
                 .child(icons::icon(icon, LEADING_ICON_SIZE, theme.subtle_text)),
         );
     }
-    bar = bar.child(div().flex_1().min_w_0().h_full().child(text));
+    // The caps, not the line box, centre in the well. The input lays its line
+    // out over its whole box and ignores vertical padding, so its wrapper moves.
+    let shift = crate::typography::TextBox::default_line(font, theme::text_size::UI).trim_shift();
+    bar = bar.child(
+        div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .relative()
+            .top(px(shift))
+            .child(text),
+    );
     if let Some(caret) = spec.caret {
         bar = bar.child(presets_caret(caret, bounds, theme, window, cx));
     }
@@ -171,7 +178,7 @@ fn presets_caret(
         .justify_center()
         .rounded(px(theme::radius::CONTROL))
         .cursor_pointer()
-        .when(hovered, |this| this.bg(chip_background(theme.muted_text)))
+        .when(hovered, |this| this.bg(theme::hover_wash(theme)))
         .on_hover(on_hover)
         .on_mouse_down(MouseButton::Left, on_press)
         .child(crate::toolbar::caret_glyph(

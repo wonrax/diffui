@@ -12,7 +12,8 @@ use gpui_kit::{AnyElement, ElementId, Window, div, px};
 use crate::ellipsis::{self, Span};
 use crate::theme::{Color, Font, ThemeSpec, chip_background, space, text_size};
 use crate::typography::{self, Aligned};
-use crate::{Cx, Diffui, icons, ui};
+use crate::ui::Tip as _;
+use crate::{Cx, Diffui, icons};
 
 /// Widest a name gets before it ellipsizes, so a long one can't push the
 /// time off the line.
@@ -289,7 +290,7 @@ fn hover(
             .id(ElementId::Name(id.into()))
             .flex()
             .min_w_0()
-            .tooltip(ui::tooltip(detail, ui.config.ui_font, theme))
+            .tip(detail, ui.config.ui_font, theme)
             .child(content)
             .into_any_element(),
         None => content,

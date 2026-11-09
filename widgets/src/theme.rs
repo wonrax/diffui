@@ -508,6 +508,23 @@ pub fn well_fill(theme: ThemeSpec) -> Color {
     mix(theme.background, BLACK, 0.06)
 }
 
+/// The wash a quiet control takes under the cursor: a faint veil of the
+/// text colour, so it reads on the chrome, the panes and the cards alike.
+pub fn hover_wash(theme: ThemeSpec) -> Color {
+    Color {
+        a: 0.06,
+        ..theme.text
+    }
+}
+
+/// [`hover_wash`] while pressed, or while what it opens is open.
+pub fn press_wash(theme: ThemeSpec) -> Color {
+    Color {
+        a: 0.10,
+        ..theme.text
+    }
+}
+
 /// Colours of a button in each state. Geometry lives in [`crate::ui`].
 #[derive(Debug, Clone, Copy)]
 pub struct ButtonStyle {
@@ -516,47 +533,70 @@ pub struct ButtonStyle {
     pub active: Color,
     pub label: Color,
     pub border: Option<Color>,
+    /// Drawn on the button, under its fill: its edge and lift.
+    pub shadow: Option<fn(ThemeSpec) -> Vec<BoxShadow>>,
 }
 
-/// Ghost button: invisible at rest, translucent wash on hover and press. The
-/// wash is [`chip_background`] of `muted_text`, so it reads the same on panel
-/// and elevated backgrounds. For icon-only and small-label controls embedded
-/// in framed surfaces (tab strip, find card, popover footers); standalone
-/// actions use [`raised_button_style`] so they stay visible at rest.
+/// Ghost button: invisible at rest, [`hover_wash`] on hover and
+/// [`press_wash`] on press, its label a step quieter than body text. For
+/// controls on the chrome and in bars and cards; standalone actions use
+/// [`raised_button_style`] so they stay visible at rest.
 pub fn ghost_button_style(theme: ThemeSpec) -> ButtonStyle {
-    let wash = chip_background(theme.muted_text);
     ButtonStyle {
         rest: None,
-        hover: wash,
-        active: wash,
-        label: theme.text,
+        hover: hover_wash(theme),
+        active: press_wash(theme),
+        label: theme.muted_text,
         border: None,
+        shadow: None,
     }
 }
 
-/// The standard button: a flat fill one step above its surface, a crisp 1px
-/// border. Hover and press deepen the fill without moving the control or
-/// adding elevation.
+/// The standard button: the panes' raised surface with a firm hairline ring
+/// and a faint lift. Hover and press deepen the fill without moving it.
 pub fn raised_button_style(theme: ThemeSpec) -> ButtonStyle {
     ButtonStyle {
-        rest: Some(raised_fill(theme, 0.35)),
-        hover: raised_fill(theme, 0.65),
-        active: raised_fill(theme, 0.9),
+        rest: Some(theme.panel_background_elevated),
+        hover: mix(theme.panel_background_elevated, theme.text, 0.035),
+        active: mix(theme.panel_background_elevated, theme.text, 0.07),
         label: theme.text,
-        border: Some(theme.border),
+        border: None,
+        shadow: Some(raised_shadow),
     }
 }
 
-/// Primary call-to-action: an `info` fill with an inverted label, well away
-/// from the destructive red.
+/// Primary call-to-action: the accent, with an inverted label, a darker inner
+/// ring and a faint lift, well away from the destructive red.
 pub fn primary_button_style(theme: ThemeSpec) -> ButtonStyle {
     ButtonStyle {
-        rest: Some(theme.info),
-        hover: mix(theme.info, theme.text, 0.08),
-        active: mix(theme.info, theme.background, 0.12),
+        rest: Some(theme.accent),
+        hover: mix(theme.accent, theme.text, 0.10),
+        active: mix(theme.accent, theme.text, 0.18),
         label: theme.background,
         border: None,
+        shadow: Some(primary_shadow),
     }
+}
+
+/// A primary button's edge: an inner ring a shade darker than its fill and a
+/// faint drop.
+fn primary_shadow(_theme: ThemeSpec) -> Vec<BoxShadow> {
+    vec![
+        BoxShadow {
+            color: Hsla::from(Color { a: 0.10, ..BLACK }),
+            offset: point(px(0.0), px(0.0)),
+            blur_radius: px(0.0),
+            spread_radius: px(1.0),
+            inset: true,
+        },
+        BoxShadow {
+            color: Hsla::from(Color { a: 0.08, ..BLACK }),
+            offset: point(px(0.0), px(1.0)),
+            blur_radius: px(1.0),
+            spread_radius: px(0.0),
+            inset: false,
+        },
+    ]
 }
 
 /// The primary button while it can't be pressed.
@@ -568,6 +608,7 @@ pub fn disabled_button_style(theme: ThemeSpec) -> ButtonStyle {
         active: fill,
         label: theme.subtle_text,
         border: Some(theme.border),
+        shadow: None,
     }
 }
 
@@ -580,6 +621,7 @@ pub fn destructive_button_style(theme: ThemeSpec) -> ButtonStyle {
         active: theme.removed_text,
         label: theme.background,
         border: None,
+        shadow: Some(primary_shadow),
     }
 }
 
@@ -594,6 +636,28 @@ pub fn floating_shadow(offset_y: f32, blur_radius: f32) -> BoxShadow {
         spread_radius: px(0.0),
         inset: false,
     }
+}
+
+/// The edge of a raised control (the active tab, the active segment): a
+/// hairline ring a step firmer than the panes' borders and a soft drop under
+/// it. Shadows, not a border, so raising a control never moves its content.
+pub fn raised_shadow(theme: ThemeSpec) -> Vec<BoxShadow> {
+    vec![
+        BoxShadow {
+            color: Hsla::from(mix(theme.border, theme.subtle_text, 0.25)),
+            offset: point(px(0.0), px(0.0)),
+            blur_radius: px(0.0),
+            spread_radius: px(1.0),
+            inset: false,
+        },
+        BoxShadow {
+            color: Hsla::from(Color { a: 0.10, ..BLACK }),
+            offset: point(px(0.0), px(1.0)),
+            blur_radius: px(2.0),
+            spread_radius: px(0.0),
+            inset: false,
+        },
+    ]
 }
 
 /// Floating card anchored to a trigger with nothing dimming the content behind

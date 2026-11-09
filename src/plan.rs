@@ -6,6 +6,7 @@
 //! names revisions from the loaded graph and draws the line.
 
 use crate::typography::{self, Aligned};
+use crate::ui::Tip as _;
 use crate::{Action, Cx, icons, ui};
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, Window, div, px};
@@ -208,7 +209,7 @@ fn laid_out(
     };
     let copy = div()
         .id(("copy-command-tip", id))
-        .tooltip(ui::tooltip("Copy command", ui_font, theme))
+        .tip("Copy command", ui_font, theme)
         // Above a row that opens on press, a press here is the button's alone.
         .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| {
             cx.stop_propagation()

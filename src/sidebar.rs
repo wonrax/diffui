@@ -55,9 +55,7 @@ pub fn min_width(config: AppConfig) -> f32 {
         + chip_gap
         + conflict_w;
     let working_copy_row = label_w + id_gap + change_id_w + chip_gap + conflict_w;
-    revision_list::gutter_width(1, revision_list::DEFAULT_LANE_CAP)
-        + row.max(working_copy_row)
-        + REVISION_CONTENT_RIGHT_PAD
+    revision_list::revision_gutter_width(1) + row.max(working_copy_row) + REVISION_CONTENT_RIGHT_PAD
 }
 
 /// Mirrors `revision_list::CONTENT_PADDING` — the right-edge padding

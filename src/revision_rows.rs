@@ -16,8 +16,7 @@ use crate::graph_view::NodeKind;
 use crate::graph_view::RevisionGraphStyle;
 use crate::icons;
 use crate::revision_list::{
-    self, DEFAULT_LANE_CAP, DragHooks, DropSpot, GraphGutter, RevisionListProps, RevisionRowView,
-    RowSelectionKey,
+    self, DragHooks, DropSpot, RevisionListProps, RevisionRowView, RowSelectionKey,
 };
 use crate::sidebar::{
     COMMIT_ID_CHARS, REVISION_ID_CHARS, bookmark_chips_for, commit_description_color,
@@ -66,11 +65,6 @@ pub(crate) fn build_revision_list(
         Rc::new(move |row: usize, cx: &App| revision_row_at(this.read(cx), theme, row))
     };
 
-    // One gutter for every row, from the widest the drawn graph gets. The
-    // working copy's and the selected revision's lanes never fold away.
-    let layout = tab
-        .shown_preview()
-        .map_or(&tab.session.graph, |preview| &preview.layout);
     let working_copy_row = tab
         .session
         .commits
@@ -80,18 +74,6 @@ pub(crate) fn build_revision_list(
         .session
         .selected_commit_index
         .and_then(|index| tab.list_row(index));
-    let pinned = [working_copy_row, selected_list_row]
-        .into_iter()
-        .flatten()
-        .filter(|&row| row < layout.len())
-        .map(|row| layout.frame(row, usize::MAX).node_lane)
-        .collect();
-    let gutter = GraphGutter {
-        lanes: layout.max_lanes(),
-        cap: tab.lane_cap.unwrap_or(DEFAULT_LANE_CAP),
-        pinned,
-    };
-
     let mut props = RevisionListProps::new(row_count, None, list_style)
         .revisions(
             build,
@@ -105,13 +87,6 @@ pub(crate) fn build_revision_list(
             }),
         )
         .at_window_edge()
-        .graph_gutter(
-            gutter,
-            Diffui::listen(cx, |this, cap: &usize, _, _| {
-                this.active_mut().lane_cap = Some(*cap);
-                this.mark_geometry_dirty();
-            }),
-        )
         .working_copy(working_copy_row)
         .multi_selection_count(tab.revision_multi_selection.len())
         .reveal_selected(tab.revision_reveal_token)
@@ -1155,31 +1130,12 @@ pub(crate) mod scenes {
             ui.scroll_restore_token = ui.scroll_restore_token.wrapping_add(1);
         });
         h.settle();
-        click_row(&mut h, 0, Modifiers::default());
+        // The second row: the working copy's pin floats over the first.
+        click_row(&mut h, 1, Modifiers::default());
         assert_eq!(
             h.read(|ui| ui.active().session.selected_commit_index),
-            Some(10),
-            "the row on top is the tenth"
-        );
-    }
-
-    /// Dragging the gutter's edge out shows more lane slots, and the tab
-    /// remembers how many.
-    #[test]
-    fn dragging_the_gutter_edge_widens_the_graph() {
-        let mut h = open("all()");
-        let lanes = h.read(|ui| ui.active().session.graph.max_lanes());
-        assert!(lanes > revision_list::DEFAULT_LANE_CAP, "all() folds");
-        let edge = revision_list::gutter_width(lanes, revision_list::DEFAULT_LANE_CAP);
-        let y = row_at(3).y;
-        h.drag(point(px(edge), y), point(px(edge + 30.0), y));
-        h.settle();
-        let cap = h.read(|ui| ui.active().lane_cap).expect("a dragged cap");
-        assert!(cap > revision_list::DEFAULT_LANE_CAP, "widened to {cap}");
-        // Nothing was selected or dragged on the way.
-        assert_eq!(
-            h.read(|ui| ui.active().session.selected_commit_index),
-            Some(0)
+            Some(11),
+            "the row under the top one is the eleventh"
         );
     }
 
@@ -1195,8 +1151,7 @@ pub(crate) mod scenes {
         });
         h.settle();
         let width = h.read(|ui| ui.sidebar_width);
-        // Under the folded lanes' badge, which all() shows too.
-        h.click_point(point(px(width / 2.0), px(LIST_TOP + 46.0)));
+        h.click_point(point(px(width / 2.0), px(LIST_TOP + 24.0)));
         h.settle();
         assert_eq!(h.read(|ui| ui.active().sidebar_scroll_offset), 0.0);
     }

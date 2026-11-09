@@ -101,6 +101,9 @@ pub const HEADER_VERTICAL_PADDING: f32 = 12.0;
 // Left/right padding inside the header block (between the panel edge and
 // the first character of label/description text).
 pub const HEADER_HORIZONTAL_PADDING: f32 = 16.0;
+/// A [`HeaderLine::Title`]'s text size and the row each of its lines takes.
+pub const HEADER_TITLE_SIZE: f32 = 17.0;
+pub const HEADER_TITLE_ROW_HEIGHT: f32 = 26.0;
 
 // The diff data model lives in `diffui_core`; re-export the types this widget
 // renders so `crate::diff_view::DiffLine` etc. still resolve for callers.
@@ -208,6 +211,10 @@ pub enum HeaderLine {
     /// colors are resolved by the caller (the selected commit's lane color);
     /// remote `name@remote` bookmarks render outlined.
     Bookmarks { label: String, chips: Vec<Chip> },
+    /// One line of the revision's title, in the UI font, a step up and
+    /// semibold. The caller wraps it to the pane. `placeholder` draws it
+    /// receding ("No description").
+    Title { text: String, placeholder: bool },
     /// A line of the description. Leads the header as its title — the "what
     /// is this change" — with the metadata block following below.
     Description(String),
@@ -234,6 +241,7 @@ pub fn header_block_height(
         .iter()
         .map(|line| match line {
             HeaderLine::Spacer(height) => *height,
+            HeaderLine::Title { .. } => HEADER_TITLE_ROW_HEIGHT,
             _ => row_height,
         })
         .sum::<f32>()

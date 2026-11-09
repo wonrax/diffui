@@ -19,9 +19,6 @@ use diffui_core::github::PrSpec;
 
 use crate::{Cx, Diffui, TabSource};
 
-/// Most rows the prompt lists; typing more of the name narrows past them.
-pub(crate) const MAX_SUGGESTIONS: usize = 8;
-
 /// The typed path, split where completion happens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Query {
@@ -60,14 +57,14 @@ impl Query {
         format!("{}{}", self.typed_dir, entry.name)
     }
 
-    /// The listed entries whose names start with the partial, case-insensitively.
-    /// Dot-directories stay hidden until the partial asks for them.
+    /// The listed entries whose names start with the partial, case-insensitively,
+    /// all of them: the list scrolls, so a folder can be browsed for as well as
+    /// typed. Dot-directories stay hidden until the partial asks for them.
     pub(crate) fn matches<'a>(&self, listing: &'a Listing) -> Vec<&'a Entry> {
-        self.all_matches(listing).take(MAX_SUGGESTIONS).collect()
+        self.all_matches(listing).collect()
     }
 
-    /// How many entries match, and how many of those are repositories: the
-    /// list shows [`MAX_SUGGESTIONS`] of them at most.
+    /// How many entries match, and how many of those are repositories.
     pub(crate) fn count(&self, listing: &Listing) -> (usize, usize) {
         self.all_matches(listing)
             .fold((0, 0), |(folders, repos), entry| {

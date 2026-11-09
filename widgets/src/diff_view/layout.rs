@@ -1066,6 +1066,7 @@ impl<'a> View<'a> {
     pub(super) fn header_line_height(&self, line: &HeaderLine) -> f32 {
         match line {
             HeaderLine::Spacer(height) => *height,
+            HeaderLine::Title { .. } => super::HEADER_TITLE_ROW_HEIGHT,
             _ => self.metrics.row_height,
         }
     }
@@ -2136,10 +2137,14 @@ impl<'a> View<'a> {
                 x += CHECK_SIZE + FILE_HEADER_GAP;
                 rect
             });
-        let badge = crate::status_badge::rect(
-            x,
-            crate::status_badge::center_for_baseline(self.props.font, baseline),
+        // Centred on the path's capitals, as the controls beside it are on
+        // the header: its smaller letter on the path's baseline would sit low.
+        let path_line = TextBox::new(
+            self.props.font,
+            self.props.typography.size,
+            self.metrics.row_height,
         );
+        let badge = crate::status_badge::rect(x, path_line.center_for_baseline(baseline));
         x += badge.width + FILE_HEADER_GAP;
         let title_x = x;
 

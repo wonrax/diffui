@@ -152,17 +152,11 @@ have no scene; see src/toolbar.rs and core/src/github.rs for what differs.
 - State: The same list scrolled to the middle: scrollbar thumb, gutter reserved, rows stop short of it.
 - Steps: As graph-all, scroll the list down.
 
-### `graph-wide-fold`
+### `graph-wide`
 
 - Window: 1440x900, light
-- State: Fourteen parallel branches off main: lanes squeeze to 9px, the outer ones fold into one column under a sticky +N badge, the working copy's lane keeps its slot.
+- State: Fourteen parallel branches off main: each row's text starts just past its own lanes, so wide rows trade alignment for room.
 - Steps: Open a repository with many heads off one commit.
-
-### `graph-wide-fold-hover`
-
-- Window: 1440x900, light
-- State: The wide graph with a folded row hovered: its lane comes out of the fold and the other lanes recede.
-- Steps: As graph-wide-fold, hover a row in the folded column.
 
 ### `graph-bookmark-states`
 

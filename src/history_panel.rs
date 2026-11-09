@@ -13,6 +13,7 @@
 //! module owns the per-tab state, routes its own jobs, and builds the panes.
 
 use crate::Cx;
+use crate::ui::Tip as _;
 use gpui_kit::component::Disableable as _;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::prelude::*;
@@ -1173,7 +1174,7 @@ fn with_tooltip(
     div()
         .id(id)
         .flex_none()
-        .tooltip(ui::tooltip(label, ui.config.ui_font, theme))
+        .tip(label, ui.config.ui_font, theme)
         .child(control)
 }
 
@@ -2131,11 +2132,7 @@ fn change_row(
         div()
             .id(SharedString::from(format!("change-open-tip-{index}")))
             .flex_none()
-            .tooltip(ui::tooltip(
-                "Show in the diff view",
-                ui.config.ui_font,
-                theme,
-            ))
+            .tip("Show in the diff view", ui.config.ui_font, theme)
             // The row is a button too: this one mustn't also select it.
             .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| {
                 cx.stop_propagation()

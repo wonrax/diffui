@@ -1,13 +1,13 @@
 //! The commit info block: what a revision is, above its diff.
 //!
-//! Above the diff sits the title, with the change's size and the edit and
-//! fold controls. The rest scrolls with the diff, drawn by the diff view as
-//! its header ([`header_lines`]) so it stays selectable text: the
-//! description's body in mono, then one column of fields: author, date,
-//! change and commit ids in the graph's colours with copy buttons, parents
-//! as links, and the refs as the graph draws them. The History view's diffs
-//! carry the same header. Folded, the block is the title and the shared
-//! [`crate::meta_line`] line, the line the History view's headers use.
+//! Above the diff sits a bar with the revision's ids, the change's size and
+//! the edit and fold controls. The rest scrolls with the diff, drawn by the
+//! diff view as its header ([`header_lines`]): the title, wrapped to the
+//! pane, then the description's body in mono, then one column of fields:
+//! author, date, change and commit ids in the graph's colours with copy
+//! buttons, parents as links, and the refs as the graph draws them. The
+//! History view's diffs carry the same fields. Folded, the header is the
+//! title alone.
 
 use diffui_core::history::{human_timestamp, now_millis, parse_timestamp_millis};
 use diffui_core::{RevisionDetails, SignatureInfo};
@@ -16,18 +16,19 @@ use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, Window, div, px};
 
 use crate::diff_view::{HeaderAction, HeaderField, HeaderLine};
-use crate::meta_line::{self, Badge, Meta};
+use crate::meta_line;
 use crate::sidebar::{COMMIT_ID_CHARS, REVISION_ID_CHARS, revision_id_display_len};
-use crate::theme::{
-    Color, Font, ThemeSpec, Weight, chip_background, emphasis_font, radius, space, text_size,
-};
+use crate::theme::{self, Color, Font, ThemeSpec, Weight, emphasis_font, radius, space, text_size};
 use crate::typography::Aligned;
+use crate::ui::Tip as _;
 use crate::{Action, Cx, Diffui, icons, typography, ui};
 
 /// The header bar's height: a pane header's.
 pub(crate) const BAR_HEIGHT: f32 = 40.0;
 /// The title's step: the revision list's description size.
 const TITLE_SIZE: f32 = text_size::BODY;
+/// Between the header's title and what follows it.
+const TITLE_GAP: f32 = 8.0;
 /// Ids and counts, a step under the title.
 const META_SIZE: f32 = text_size::UI;
 /// The diffstat: this many cells, each this square, this far apart.
@@ -70,20 +71,6 @@ fn stat_cells(additions: usize, deletions: usize) -> (usize, usize) {
     (added, removed)
 }
 
-fn status_badges(row: Option<diffui_core::RowView<'_>>, theme: ThemeSpec) -> Vec<Badge> {
-    match row {
-        Some(row) if row.is_hidden() => vec![Badge {
-            label: "hidden",
-            color: theme.subtle_text,
-        }],
-        Some(row) if row.is_divergent() => vec![Badge {
-            label: "divergent",
-            color: theme.modified_token,
-        }],
-        _ => Vec::new(),
-    }
-}
-
 /// How much of a row's id is its shortest unique prefix: jj's own count,
 /// else the one the graph computed (git hashes), else the default id width.
 fn unique_prefix(ui: &Diffui, row: Option<diffui_core::RowView<'_>>) -> usize {
@@ -114,8 +101,15 @@ pub(crate) fn header_lines(
     foldable: bool,
     pane_width: f32,
 ) -> Vec<HeaderLine> {
+    // The diff pane's bar names the revision by its ids only; the title
+    // leads the header under it. The History view's own headers carry it.
+    let mut lines = if foldable {
+        title_lines(ui, details, pane_width)
+    } else {
+        Vec::new()
+    };
     if foldable && ui.commit_details_collapsed {
-        return Vec::new();
+        return lines;
     }
     let text = details
         .description
@@ -131,7 +125,7 @@ pub(crate) fn header_lines(
             - crate::scrollbar::GUTTER;
         (text_width / char_width.max(1.0)).floor().max(20.0) as usize
     });
-    let mut lines: Vec<HeaderLine> = text
+    let body: Vec<HeaderLine> = text
         .lines()
         .flat_map(|line| match columns {
             Some(columns) => wrap_columns(line, columns),
@@ -140,6 +134,10 @@ pub(crate) fn header_lines(
         .map(|line| HeaderLine::description(&line))
         .collect();
     if !lines.is_empty() {
+        lines.push(HeaderLine::spacer(TITLE_GAP));
+    }
+    if !body.is_empty() {
+        lines.extend(body);
         lines.push(HeaderLine::blank());
     }
 
@@ -368,15 +366,15 @@ pub(crate) fn with_tooltip(
     div()
         .id(id)
         .flex_none()
-        .tooltip(ui::tooltip(label, font, theme))
+        .tip(label, font, theme)
         .child(child)
         .into_any_element()
 }
 
-/// The header bar over the diff: what the revision is (its title and ids),
-/// how big the change is, and what can be done to it. With a panel hidden, the
+/// The header bar over the diff: which revision it is (its ids), how big the
+/// change is, and what can be done to it. With a panel hidden, the
 /// ids and the file count open it over the diff (see [`crate::root`]).
-pub(crate) fn view(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> AnyElement {
+pub(crate) fn view(ui: &Diffui, theme: ThemeSpec, _window: &mut Window, cx: &mut Cx) -> AnyElement {
     let session = &ui.active().session;
     let font = ui.config.ui_font;
     let has_files = !session.document.files.is_empty();
@@ -408,19 +406,7 @@ pub(crate) fn view(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut 
         return block(theme).child(bar(line, Vec::new())).into_any_element();
     };
 
-    let summary = details
-        .description
-        .lines()
-        .find(|line| !line.trim().is_empty());
-    let mut line = vec![title(
-        summary.unwrap_or("No description").to_owned(),
-        if summary.is_some() {
-            theme.text
-        } else {
-            theme.subtle_text
-        },
-    )];
-    line.push(revision_ids(ui, details, theme, cx));
+    let mut line = vec![revision_ids(ui, details, theme, cx)];
     if has_files {
         line.extend(diff_stats(ui, theme, cx));
     }
@@ -476,18 +462,7 @@ pub(crate) fn view(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut 
         actions.push(more);
     }
 
-    block(theme)
-        .child(bar(line, actions))
-        .when(folded, |block| {
-            block.child(
-                div()
-                    .pl(px(BAR_LEAD))
-                    .pr(px(space::LG))
-                    .pb(px(space::SM))
-                    .child(revision_meta(ui, details, theme, window, cx)),
-            )
-        })
-        .into_any_element()
+    block(theme).child(bar(line, actions)).into_any_element()
 }
 
 /// Where the bar's first text starts: the diff header's own inset, so the
@@ -523,6 +498,12 @@ fn bar(line: Vec<Aligned>, actions: Vec<AnyElement>) -> gpui_kit::Div {
                 .flex_1()
                 .min_w_0()
                 .overflow_hidden()
+                // The clip reaches past the line by the triggers' washes, which
+                // spill out of the line box, so they aren't cut top and bottom.
+                .py(px(TRIGGER_PAD[0]))
+                .my(px(-TRIGGER_PAD[0]))
+                .px(px(TRIGGER_PAD[1]))
+                .mx(px(-TRIGGER_PAD[1]))
                 .child(typography::baseline_row(line, space::MD)),
         )
         .children(actions)
@@ -568,11 +549,9 @@ fn panel_trigger(
             .mx(px(-px_))
             .rounded(px(radius::XS))
             .cursor_pointer()
-            .when(open, |trigger| {
-                trigger.bg(chip_background(theme.muted_text))
-            })
-            .hover(move |trigger| trigger.bg(chip_background(theme.muted_text)))
-            .tooltip(ui::tooltip(tooltip, font, theme))
+            .when(open, |trigger| trigger.bg(theme::press_wash(theme)))
+            .hover(move |trigger| trigger.bg(theme::hover_wash(theme)))
+            .tip(tooltip, font, theme)
             .on_click(on_click)
             .child(tracker)
             .child(line)
@@ -772,47 +751,37 @@ fn more_button(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> Option<AnyElement>
     ))
 }
 
-/// The folded block's second line, under the bar that already shows the
-/// ids: the revision's status badges, then the author and a relative date
-/// with the exact one on hover.
-fn revision_meta(
-    ui: &Diffui,
-    details: &RevisionDetails,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    let row_of = ui
-        .active()
-        .session
-        .commits
-        .find_by_commit_id(&details.commit_id);
-    let author = &details.author;
-    let who = if !author.name.is_empty() {
-        Some((author.name.clone(), Some(author.email.clone())))
-    } else if !author.email.is_empty() {
-        Some((author.email.clone(), None))
-    } else {
-        None
+/// The revision's title as header lines, wrapped at spaces to the pane so
+/// a narrow pane shows all of it.
+fn title_lines(ui: &Diffui, details: &RevisionDetails, pane_width: f32) -> Vec<HeaderLine> {
+    let summary = details
+        .description
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty());
+    let font = emphasis_font(ui.config.ui_font, Weight::SEMIBOLD);
+    let room =
+        (pane_width - 2.0 * crate::diff_view::HEADER_HORIZONTAL_PADDING - crate::scrollbar::GUTTER)
+            .max(120.0);
+    let fits = |text: &str| {
+        crate::measure::line_width(text, crate::diff_view::HEADER_TITLE_SIZE, font) <= room
     };
-    let when = author
-        .timestamp
-        .as_ref()
-        .filter(|timestamp| !timestamp.is_empty())
-        .map(|timestamp| (parse_timestamp_millis(timestamp), timestamp.clone()));
-    meta_line::view(
-        Meta {
-            ids: Vec::new(),
-            badges: status_badges(row_of, theme),
-            who,
-            when,
-            operation: None,
-        },
-        ui,
-        theme,
-        window,
-        cx,
-    )
+    let mut rows: Vec<String> = Vec::new();
+    for word in summary.unwrap_or("No description").split(' ') {
+        match rows.last_mut() {
+            Some(row) if fits(&format!("{row} {word}")) => {
+                row.push(' ');
+                row.push_str(word);
+            }
+            _ => rows.push(word.to_owned()),
+        }
+    }
+    rows.into_iter()
+        .map(|text| HeaderLine::Title {
+            text,
+            placeholder: summary.is_none(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -854,6 +823,8 @@ mod tests {
         lines
             .iter()
             .map(|line| match line {
+                HeaderLine::Title { text, .. } => format!("# {text}"),
+                HeaderLine::Spacer(_) => "~".to_owned(),
                 HeaderLine::Description(value) => format!("| {value}"),
                 HeaderLine::Blank => String::new(),
                 HeaderLine::Rich(field) => format!("{}: {}", field.label, field.value),
@@ -871,7 +842,7 @@ mod tests {
     }
 
     #[test]
-    fn the_header_is_the_description_then_one_column_of_fields() {
+    fn the_header_is_the_title_the_description_then_one_column_of_fields() {
         let mut ui = crate::tabs::tests::app();
         crate::tabs::tests::push_tab(&mut ui, "/tmp/diffui-commit-info-test");
         let theme = ui.resolved_theme().spec();
@@ -897,17 +868,19 @@ mod tests {
         let lines = header_lines(&ui, &details, theme, true, 2000.0);
         let rendered = render(&lines);
         assert_eq!(
-            rendered[..4],
+            rendered[..6],
             [
+                "# subject",
+                "~",
                 "| body one",
                 "| body two",
                 "",
                 "Author: Ada Lovelace <ada@example.com>"
             ]
         );
-        assert!(rendered[4].starts_with("Date: Sep 7, 2026, 10:00  "));
+        assert!(rendered[6].starts_with("Date: Sep 7, 2026, 10:00  "));
         assert_eq!(
-            rendered[5..],
+            rendered[7..],
             [
                 "Change: zyxwvutsrqponmlkzyxwvutsrqponmlk",
                 "Commit: abcdef0123456789abcdef0123456789abcdef01",
@@ -916,14 +889,14 @@ mod tests {
             ]
         );
         // The copy buttons copy whole ids; the parent's id opens it.
-        let HeaderLine::Rich(commit) = &lines[6] else {
+        let HeaderLine::Rich(commit) = &lines[8] else {
             panic!("the commit line is a field");
         };
         assert_eq!(
             commit.buttons[0].1,
             HeaderAction::Copy(details.commit_id.clone())
         );
-        let HeaderLine::Rich(parent) = &lines[7] else {
+        let HeaderLine::Rich(parent) = &lines[9] else {
             panic!("the parent line is a field");
         };
         assert_eq!(
@@ -931,12 +904,16 @@ mod tests {
             Some((8, HeaderAction::Open(details.parents[0].commit_id.clone())))
         );
 
-        // Folded, the diff pane's header is gone; the History view's stays.
+        // Folded, the diff pane's header is the title alone; the History
+        // view's, which names the revision itself, keeps the rest.
         ui.commit_details_collapsed = true;
-        assert!(header_lines(&ui, &details, theme, true, 2000.0).is_empty());
+        assert_eq!(
+            render(&header_lines(&ui, &details, theme, true, 2000.0)),
+            ["# subject"]
+        );
         assert_eq!(
             header_lines(&ui, &details, theme, false, 2000.0).len(),
-            lines.len()
+            lines.len() - 2
         );
     }
 }

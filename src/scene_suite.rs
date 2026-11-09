@@ -434,9 +434,7 @@ fn plain_git(repo: &Path) {
     .unwrap();
 }
 
-/// Everything's visible: the revset box says `all()`.
-/// Fourteen heads off `main`, `@` on the twelfth: a graph wider than the
-/// gutter's default cap.
+/// Fourteen heads off `main`, `@` on the twelfth: a wide graph.
 fn wide_graph(repo: &Path) {
     for branch in 1..=14 {
         jj(
@@ -455,9 +453,7 @@ fn wide_graph(repo: &Path) {
     );
 }
 
-/// The middle of a row whose lane is folded in `graph-wide-fold`.
-const WIDE_FOLDED_ROW_Y: f32 = 111.0 + 46.0 * 9.5;
-
+/// Everything's visible: the revset box says `all()`.
 fn all_revs(c: &mut Ctx) {
     c.act(Action::SetRevset("all()".to_owned()));
 }
@@ -570,8 +566,7 @@ fn all() -> Vec<Scene> {
     t.group("Revision list");
     t.add(s("graph-all", "Revset all(): branching graph, merges, the octopus merge, immutable diamonds, conflict marks, bookmarks, tags, remote bookmarks, divergent ids.", "Type all() in the revset field, Enter.", all_revs));
     t.add(s("graph-all-scrolled", "The same list scrolled to the middle: scrollbar thumb, gutter reserved, rows stop short of it.", "As graph-all, scroll the list down.", |c| { all_revs(c); c.scroll(150.0, 500.0, -900.0); }));
-    t.add(s("graph-wide-fold", "Fourteen parallel branches off main: lanes squeeze to 9px, the outer ones fold into one column under a sticky +N badge, the working copy's lane keeps its slot.", "Open a repository with many heads off one commit.", |_c| {}).prepare(wide_graph));
-    t.add(s("graph-wide-fold-hover", "The wide graph with a folded row hovered: its lane comes out of the fold and the other lanes recede.", "As graph-wide-fold, hover a row in the folded column.", |c| { c.hover(150.0, WIDE_FOLDED_ROW_Y); }).prepare(wide_graph));
+    t.add(s("graph-wide", "Fourteen parallel branches off main: each row's text starts just past its own lanes, so wide rows trade alignment for room.", "Open a repository with many heads off one commit.", |_c| {}).prepare(wide_graph));
     t.add(s("graph-bookmark-states", "Bookmark chips in every state: ahead (*), conflicted (??), remote-only, deleted, tracked; a very long bookmark ellipsised.", "Revset 'bookmarks() | remote_bookmarks()'.", |c| { c.act(Action::SetRevset("bookmarks() | remote_bookmarks()".to_owned())); }));
     t.add(s(
         "graph-marked-rows",

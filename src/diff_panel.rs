@@ -7,6 +7,7 @@ use crate::revision_list::{self, FileRowView, RevisionListProps};
 use crate::theme::{
     Color, Font, ThemeSpec, Weight, chip_background, diff_palette, file_status_color, text_size,
 };
+use crate::ui::Tip as _;
 use crate::{Action, Cx, Diffui, LoadStatus, icons, ui};
 use diffui_core::FileTreeRow;
 use gpui_kit::component::Disableable as _;
@@ -584,6 +585,7 @@ fn header_only_view(
         ui.config.code_type,
         ui.config.multi_click_ms,
     )
+    .ui_font(ui.config.ui_font)
     .on_copy(on_copy(cx))
     .on_header_action(on_header_action(cx))
     .content_version(ui.document_version)
@@ -1055,7 +1057,7 @@ fn build_description_editor(
             div()
                 .id(id)
                 .child(button)
-                .tooltip(ui::tooltip(key, ui.config.ui_font, theme))
+                .tip(key, ui.config.ui_font, theme)
                 .into_any_element()
         };
     let actions = ui::button_row(

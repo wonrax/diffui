@@ -11,7 +11,8 @@ use gpui_kit::{AnyElement, Window, div, px};
 use crate::repository::Vcs;
 use crate::theme::{self, Color, ThemeSpec, Weight, emphasis_font};
 use crate::typography::{self, Aligned};
-use crate::{Cx, Diffui, icons, ui};
+use crate::ui::Tip as _;
+use crate::{Cx, Diffui, icons};
 
 /// The bar's height, without the hairline over it.
 pub const HEIGHT: f32 = 26.0;
@@ -95,7 +96,7 @@ pub(crate) fn build_status_bar(
                 bookmark.map(move |bookmark| {
                     div()
                         .id("status-bookmark")
-                        .tooltip(ui::tooltip(upstream, font, theme))
+                        .tip(upstream, font, theme)
                         .child(bookmark)
                         .into_any_element()
                 })

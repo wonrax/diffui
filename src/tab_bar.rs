@@ -31,6 +31,7 @@ use crate::theme::{
     well_fill,
 };
 use crate::typography::{self, Aligned};
+use crate::ui::Tip as _;
 use crate::{Action, Cx, Diffui, HoverTarget, TabId, icons, ui};
 
 /// Focus target id for the open-repository dialog's path field.
@@ -99,7 +100,7 @@ const OPEN_ROW_HEIGHT: f32 = 36.0;
 /// Rows the card's list shows before it scrolls: as many as the folder
 /// suggestions can be, so typing a path and clearing it again keeps the card
 /// the same size once the recents fill it.
-const OPEN_LIST_ROWS: usize = crate::path_browse::MAX_SUGGESTIONS;
+const OPEN_LIST_ROWS: usize = 8;
 /// The column a row's badge or folder glyph is centred in.
 const OPEN_LEAD_BOX: f32 = 22.0;
 const OPEN_GLYPH_GAP: f32 = 10.0;
@@ -741,7 +742,7 @@ fn tab_widget(
         .min_w_0()
         .flex_shrink(1.0)
         .child(label)
-        .tooltip(ui::tooltip(tab_tooltip(tab), font, theme));
+        .tip(tab_tooltip(tab), font, theme);
 
     // The uncommitted-changes dot lives in the close button's slot and gives way
     // to the `×` under the cursor, as in editor tabs: every tab keeps one trailing
@@ -774,7 +775,7 @@ fn tab_widget(
 
     // Inactive tabs stay quiet; hovering one washes it. The label sits in the
     // same box in every state, so nothing shifts on hover or selection.
-    let wash_fill = (!active && (hovered || lifted)).then(|| chip_background(theme.muted_text));
+    let wash_fill = (!active && (hovered || lifted)).then(|| theme::hover_wash(theme));
     let wash = div()
         .flex()
         .flex_row()
@@ -815,9 +816,7 @@ fn tab_widget(
         .rounded(px(radius::BUTTON))
         .when(active, |body| {
             body.bg(theme.panel_background_elevated)
-                .border_1()
-                .border_color(theme.border)
-                .shadow(vec![theme::floating_shadow(1.0, 2.0)])
+                .shadow(theme::raised_shadow(theme))
         })
         // Only the active tab has a fill to hide what it passes over; a background
         // one in the air (its activation was refused) gets a stand-in.
@@ -1244,7 +1243,7 @@ pub(crate) fn open_repo_card(
         band = band.child(
             div()
                 .id("open-repo-folder-tip")
-                .tooltip(ui::tooltip("Choose a folder in Finder", font, theme))
+                .tip("Choose a folder in Finder", font, theme)
                 .child(
                     ui::text_button(
                         "open-repo-folder",
@@ -1268,7 +1267,12 @@ pub(crate) fn open_repo_card(
         .overflow_hidden()
         .child(band)
         .child(crate::root::horizontal_divider(theme));
-    if let Some(status) = &status {
+    // A plain folder needs no telling: browsing through folders is what the
+    // list under the field is for.
+    let told = status
+        .as_ref()
+        .filter(|status| !matches!(status, crate::path_browse::Status::NotRepository { .. }));
+    if let Some(status) = told {
         body = body
             .child(status_line(ui, theme, status))
             .child(crate::root::horizontal_divider(theme));
@@ -1279,7 +1283,9 @@ pub(crate) fn open_repo_card(
         (Some(crate::path_browse::Status::PullRequest(spec)), _) => {
             Some(pull_request_card(ui, theme, spec).into_any_element())
         }
-        (_, Some((query, rows))) => Some(folder_section(ui, theme, dialog, query, rows, cx)),
+        (_, Some((query, rows))) => {
+            Some(folder_section(ui, theme, dialog, query, rows, window, cx))
+        }
         _ if path.is_empty() => recents_section(ui, theme, dialog, cx),
         _ => None,
     };
@@ -1801,6 +1807,7 @@ fn folder_section(
     dialog: &crate::OpenRepoDialog,
     query: crate::path_browse::Query,
     rows: Vec<&crate::path_browse::Entry>,
+    window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
     let (font, mono) = (ui.config.ui_font, ui.config.mono_font);
@@ -1888,16 +1895,53 @@ fn folder_section(
                 theme.subtle_text,
             ))
     };
+    let list = if shown > OPEN_LIST_ROWS {
+        let handle = ui::scroll_handle("open-repo-folders", window, cx)
+            .read(cx)
+            .clone();
+        reveal_selected_folder(dialog.selected, &handle, window, cx);
+        div()
+            .w_full()
+            .h(px(OPEN_LIST_ROWS as f32 * OPEN_ROW_HEIGHT))
+            .child(ui::scrollable_with("open-repo-folder-list", &handle, list))
+            .into_any_element()
+    } else {
+        list.into_any_element()
+    };
     let mut section = div().w_full().flex().flex_col().child(header).child(list);
-    if folders > shown {
-        section = section.child(note(format!(
-            "{} more. Keep typing to narrow.",
-            folders - shown
-        )));
-    } else if listing.is_some_and(|listing| listing.entries.is_empty()) {
+    if listing.is_some_and(|listing| listing.entries.is_empty()) {
         section = section.child(note("This folder has no subfolders.".to_owned()));
     }
     section.into_any_element()
+}
+
+/// Scrolls the folder list so a row the arrow keys moved to is in view. Only on
+/// a move: a list the wheel scrolled stays where the wheel left it.
+fn reveal_selected_folder(
+    selected: Option<usize>,
+    handle: &gpui_kit::ScrollHandle,
+    window: &mut Window,
+    cx: &mut Cx,
+) {
+    let last = window.use_keyed_state("open-repo-folders-revealed", cx, |_, _| None::<usize>);
+    if *last.read(cx) == selected {
+        return;
+    }
+    last.update(cx, |last, _| *last = selected);
+    let Some(selected) = selected else {
+        return;
+    };
+    let view = OPEN_LIST_ROWS as f32 * OPEN_ROW_HEIGHT;
+    let top = selected as f32 * OPEN_ROW_HEIGHT;
+    let scrolled = -f32::from(handle.offset().y);
+    let to = if top < scrolled {
+        top
+    } else if top + OPEN_ROW_HEIGHT > scrolled + view {
+        top + OPEN_ROW_HEIGHT - view
+    } else {
+        return;
+    };
+    handle.set_offset(gpui_kit::point(px(0.0), px(-to)));
 }
 
 /// A row's lead: the jj/git badge of a repository, or a folder.
