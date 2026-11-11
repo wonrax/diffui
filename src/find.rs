@@ -15,7 +15,7 @@ use regex::{Regex, RegexBuilder};
 use std::time::Duration;
 
 use crate::diff_view::FindMatch;
-use crate::theme::{self, ThemeSpec, Weight, text_size};
+use crate::theme::{self, Weight, text_size};
 use crate::ui::Look;
 use crate::{Action, Cx, Diffui, icons};
 use diffui_core::DiffFile;
@@ -211,11 +211,11 @@ const CARD_MAX_WIDTH: f32 = 460.0;
 /// `None`, so it can be unconditionally stacked into the diff panel.
 pub(crate) fn build_overlay(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let look = ui.look(theme);
+    let Look { theme, .. } = look;
     let Some(state) = ui.active().find() else {
         return div().into_any_element();
     };
@@ -240,8 +240,7 @@ pub(crate) fn build_overlay(
         .min_w_0()
         .h(px(CONTROL.height()))
         .child(crate::field::filter_field(
-            theme,
-            ui.config.ui_font,
+            look,
             crate::field::FilterField {
                 id: FIND_INPUT_ID,
                 leading_icon: Some(icons::SEARCH),
@@ -314,11 +313,11 @@ pub(crate) fn build_overlay(
                 .child(crate::typography::centered(
                     crate::typography::line(
                         count_label,
-                        ui.config.ui_font,
+                        look.font,
                         text_size::CAPTION,
                         theme.subtle_text,
                     ),
-                    ui.config.ui_font,
+                    look.font,
                     text_size::CAPTION,
                 )),
         )
@@ -347,7 +346,7 @@ pub(crate) fn build_overlay(
     if let Some(err) = &state.error {
         card = card.child(crate::typography::line(
             format!("Regex error: {err}"),
-            ui.config.ui_font,
+            look.font,
             text_size::CAPTION,
             theme.removed_text,
         ));

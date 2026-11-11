@@ -325,7 +325,7 @@ fn a_hunk_button_reaches_its_hunk() {
     let (mut h, repo) = open_sized(SIZE);
     select(&mut h, &repo, "working-copy");
     let actions = h
-        .act(|ui, cx| crate::changes::hunk_actions(ui, ui.resolved_theme().spec(), cx))
+        .act(|ui, cx| crate::changes::hunk_actions(ui, ui.look(ui.resolved_theme().spec()), cx))
         .expect("the working copy's hunks can be picked");
     let files = h.read(|ui| ui.active().session.document.files.len());
     let file = h

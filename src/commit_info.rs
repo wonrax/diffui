@@ -20,6 +20,7 @@ use crate::meta_line;
 use crate::sidebar::{COMMIT_ID_CHARS, REVISION_ID_CHARS, revision_id_display_len};
 use crate::theme::{self, Color, ThemeSpec, Weight, emphasis_font, radius, space, text_size};
 use crate::typography::Aligned;
+use crate::ui::Look;
 use crate::ui::Tip as _;
 use crate::{Action, Cx, Diffui, icons, typography, ui};
 
@@ -95,10 +96,11 @@ fn unique_prefix(ui: &Diffui, row: Option<diffui_core::RowView<'_>>) -> usize {
 pub(crate) fn header_lines(
     ui: &Diffui,
     details: &RevisionDetails,
-    theme: ThemeSpec,
+    look: Look,
     foldable: bool,
     pane_width: f32,
 ) -> Vec<HeaderLine> {
+    let Look { theme, .. } = look;
     // The diff pane's bar names the revision by its ids only; the title
     // leads the header under it. The History view's own headers carry it.
     let mut lines = if foldable {
@@ -117,7 +119,7 @@ pub(crate) fn header_lines(
         .trim();
     let columns = ui.diff_wrap.then(|| {
         let size = ui.config.code_type.size;
-        let char_width = crate::measure::line_width("0000000000", size, ui.config.mono_font) / 10.0;
+        let char_width = crate::measure::line_width("0000000000", size, look.mono) / 10.0;
         let text_width = pane_width
             - 2.0 * crate::diff_view::HEADER_HORIZONTAL_PADDING
             - crate::scrollbar::GUTTER;
@@ -177,7 +179,7 @@ pub(crate) fn header_lines(
         let mut change = HeaderField::new("Change", value);
         change.runs = vec![(0, theme.accent), (unique, theme.subtle_text)];
         if let Some(row) = row_of {
-            change.chips = crate::sidebar::status_chips_for(row, theme, ui.config);
+            change.chips = crate::sidebar::status_chips_for(row, look);
         }
         change.buttons = vec![(icons::COPY, HeaderAction::Copy(change_id.to_owned()))];
         lines.push(rich(change));
@@ -255,10 +257,8 @@ pub(crate) fn header_lines(
     // The refs as the graph draws them on this revision's row, lane colour
     // and all; a revision off the graph shows its bookmarks in the accent.
     let chips = match row_of {
-        Some(row) => crate::sidebar::graph_ref_chips(session, row.index(), theme, ui.config),
-        None => {
-            crate::sidebar::bookmark_chips_for(&details.bookmarks, theme.accent, theme, ui.config)
-        }
+        Some(row) => crate::sidebar::graph_ref_chips(session, row.index(), look),
+        None => crate::sidebar::bookmark_chips_for(&details.bookmarks, theme.accent, look),
     };
     if !chips.is_empty() {
         lines.push(HeaderLine::Bookmarks {
@@ -356,10 +356,10 @@ fn signature_field(label: &str, signature: &SignatureInfo, theme: ThemeSpec) -> 
 /// The header bar over the diff: which revision it is (its ids), how big the
 /// change is, and what can be done to it. With a panel hidden, the
 /// ids and the file count open it over the diff (see [`crate::root`]).
-pub(crate) fn view(ui: &Diffui, theme: ThemeSpec, _window: &mut Window, cx: &mut Cx) -> AnyElement {
-    let look = ui.look(theme);
+pub(crate) fn view(ui: &Diffui, look: Look, _window: &mut Window, cx: &mut Cx) -> AnyElement {
+    let Look { theme, .. } = look;
     let session = &ui.active().session;
-    let font = ui.config.ui_font;
+    let font = look.font;
     let has_files = !session.document.files.is_empty();
     let title_font = emphasis_font(font, Weight::SEMIBOLD);
     let title = |title: String, color: Color| {
@@ -376,22 +376,22 @@ pub(crate) fn view(ui: &Diffui, theme: ThemeSpec, _window: &mut Window, cx: &mut
     if let Some(range) = crate::range::shown_range(ui) {
         let mut line = vec![title(crate::range::title(range), theme.text)];
         if has_files {
-            line.extend(diff_stats(ui, theme, cx));
+            line.extend(diff_stats(ui, look, cx));
         }
         return block(theme).child(bar(line, Vec::new())).into_any_element();
     }
     let Some(details) = session.revision_details.as_ref() else {
         let line = if has_files {
-            diff_stats(ui, theme, cx)
+            diff_stats(ui, look, cx)
         } else {
             Vec::new()
         };
         return block(theme).child(bar(line, Vec::new())).into_any_element();
     };
 
-    let mut line = vec![revision_ids(ui, details, theme, cx)];
+    let mut line = vec![revision_ids(ui, details, look, cx)];
     if has_files {
-        line.extend(diff_stats(ui, theme, cx));
+        line.extend(diff_stats(ui, look, cx));
     }
 
     let mut actions = Vec::new();
@@ -431,7 +431,7 @@ pub(crate) fn view(ui: &Diffui, theme: ThemeSpec, _window: &mut Window, cx: &mut
         })
         .into_any_element(),
     );
-    if let Some(more) = more_button(ui, theme, cx) {
+    if let Some(more) = more_button(ui, look, cx) {
         actions.push(more);
     }
 
@@ -489,10 +489,10 @@ fn panel_trigger(
     panel: Option<crate::root::Panel>,
     tooltip: &'static str,
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     cx: &mut Cx,
 ) -> Aligned {
-    let look = ui.look(theme);
+    let Look { theme, .. } = look;
     let group = typography::group(content, space::MD);
     let Some(panel) = panel else {
         return group;
@@ -544,8 +544,9 @@ fn hidden(ui: &Diffui, panel: crate::root::Panel) -> Option<crate::root::Panel> 
 /// The change id as jj prints it (its shortest unique prefix bright), then
 /// the commit hash, dimmed; for git the hash alone, as the change id. With
 /// the revisions hidden, they open them.
-fn revision_ids(ui: &Diffui, details: &RevisionDetails, theme: ThemeSpec, cx: &mut Cx) -> Aligned {
-    let mono = ui.config.mono_font;
+fn revision_ids(ui: &Diffui, details: &RevisionDetails, look: Look, cx: &mut Cx) -> Aligned {
+    let Look { theme, .. } = look;
+    let mono = look.mono;
     let row_of = ui
         .active()
         .session
@@ -608,17 +609,18 @@ fn revision_ids(ui: &Diffui, details: &RevisionDetails, theme: ThemeSpec, cx: &m
         hidden(ui, panel),
         "Show revisions",
         ui,
-        theme,
+        look,
         cx,
     )
 }
 
 /// `+N −M`, the five-cell diffstat, and the file count. With the changed
 /// files hidden, the count opens them.
-fn diff_stats(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> Vec<Aligned> {
+fn diff_stats(ui: &Diffui, look: Look, cx: &mut Cx) -> Vec<Aligned> {
+    let Look { theme, .. } = look;
     let document = &ui.active().session.document;
     let (additions, deletions) = (document.total_additions, document.total_deletions);
-    let mono = ui.config.mono_font;
+    let mono = look.mono;
     let count = |value: String, color: Color| {
         Aligned::text(
             typography::line(value, mono, META_SIZE, color),
@@ -660,7 +662,7 @@ fn diff_stats(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> Vec<Aligned> {
     }
 
     let files = document.files.len();
-    let font = ui.config.ui_font;
+    let font = look.font;
     let label = format!("{files} {}", if files == 1 { "file" } else { "files" });
     let panel = crate::root::Panel::Files;
     vec![
@@ -676,7 +678,7 @@ fn diff_stats(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> Vec<Aligned> {
             hidden(ui, panel),
             "Show changed files",
             ui,
-            theme,
+            look,
             cx,
         ),
     ]
@@ -684,8 +686,8 @@ fn diff_stats(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> Vec<Aligned> {
 
 /// ⋯: the revision's context menu, the one its row in the list opens. jj
 /// only, as that menu is.
-fn more_button(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> Option<AnyElement> {
-    let look = ui.look(theme);
+fn more_button(ui: &Diffui, look: Look, cx: &mut Cx) -> Option<AnyElement> {
+    let Look { theme, .. } = look;
     let tab = ui.active();
     if tab.repository.as_ref().map(|r| r.vcs) != Some(crate::repository::Vcs::Jj) {
         return None;
@@ -812,6 +814,7 @@ mod tests {
         let mut ui = crate::tabs::tests::app();
         crate::tabs::tests::push_tab(&mut ui, "/tmp/diffui-commit-info-test");
         let theme = ui.resolved_theme().spec();
+        let look = ui.look(theme);
         let details = RevisionDetails {
             commit_id: "abcdef0123456789abcdef0123456789abcdef01".to_owned(),
             change_id: Some("zyxwvutsrqponmlkzyxwvutsrqponmlk".to_owned()),
@@ -831,7 +834,7 @@ mod tests {
             }],
         };
 
-        let lines = header_lines(&ui, &details, theme, true, 2000.0);
+        let lines = header_lines(&ui, &details, look, true, 2000.0);
         let rendered = render(&lines);
         assert_eq!(
             rendered[..6],
@@ -874,11 +877,11 @@ mod tests {
         // view's, which names the revision itself, keeps the rest.
         ui.commit_details_collapsed = true;
         assert_eq!(
-            render(&header_lines(&ui, &details, theme, true, 2000.0)),
+            render(&header_lines(&ui, &details, look, true, 2000.0)),
             ["# subject"]
         );
         assert_eq!(
-            header_lines(&ui, &details, theme, false, 2000.0).len(),
+            header_lines(&ui, &details, look, false, 2000.0).len(),
             lines.len() - 2
         );
     }

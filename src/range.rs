@@ -15,7 +15,7 @@ use gpui_kit::{AnyElement, Window, div, px};
 use crate::action::Action;
 use crate::diff_view::{HeaderAction, HeaderField, HeaderLine};
 use crate::prose::Prose;
-use crate::theme::{ThemeSpec, Weight, emphasis_font, text_size};
+use crate::theme::{Weight, emphasis_font, text_size};
 use crate::typography::{self, Aligned};
 use crate::ui::Look;
 use crate::{Cx, Diffui, icons, ui};
@@ -187,7 +187,8 @@ pub(crate) fn empty_message(ui: &Diffui, range: &DiffRange) -> &'static str {
 
 /// The commit list that stands in for the commit info: one row per commit,
 /// its id and title as the commit info writes a parent's.
-pub(crate) fn header_lines(ui: &Diffui, range: &DiffRange, theme: ThemeSpec) -> Vec<HeaderLine> {
+pub(crate) fn header_lines(ui: &Diffui, range: &DiffRange, look: Look) -> Vec<HeaderLine> {
+    let Look { theme, .. } = look;
     let session = &ui.active().session;
     let mut lines = Vec::new();
     for (index, hex) in range.commits.iter().take(LISTED_COMMITS).enumerate() {
@@ -254,14 +255,14 @@ pub(crate) fn header_lines(ui: &Diffui, range: &DiffRange, theme: ThemeSpec) -> 
 /// the jj command, and edit and exit. `None` when no range is on.
 pub(crate) fn banner(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     window: &mut Window,
     cx: &mut Cx,
 ) -> Option<AnyElement> {
-    let look = ui.look(theme);
+    let Look { theme, .. } = look;
     let mode = mode(ui)?;
-    let font = ui.config.ui_font;
-    let mono = ui.config.mono_font;
+    let font = look.font;
+    let mono = look.mono;
     let medium = emphasis_font(font, Weight::MEDIUM);
     let refused = refused_span(ui);
     let (glyph, label) = match mode {
@@ -330,7 +331,7 @@ pub(crate) fn banner(
             theme.conflict_marker,
         )
         .into_any_element(),
-        None => crate::plan::caption_command_line(ui, theme, &diff_command(&revset), window, cx),
+        None => crate::plan::caption_command_line(look, &diff_command(&revset), window, cx),
     };
     let sides = div().child(headline).child(subline);
 
@@ -362,13 +363,13 @@ pub(crate) fn banner(
 /// revision it names styled as one.
 pub(crate) fn refused_state(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     error: &diffui_core::RevsetError,
     _window: &mut Window,
     _cx: &mut Cx,
 ) -> AnyElement {
-    let look = ui.look(theme);
-    let font = ui.config.ui_font;
+    let Look { theme, .. } = look;
+    let font = look.font;
     let mut detail = Prose::from("jj diff -r needs the marked revisions to have no gaps.");
     if let Some(hint) = &error.hint {
         detail = detail.text(" ");

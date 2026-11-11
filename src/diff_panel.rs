@@ -8,6 +8,7 @@ use crate::root::PaneSet;
 use crate::theme::{
     Color, ThemeSpec, Weight, chip_background, diff_palette, file_status_color, text_size,
 };
+use crate::ui::Look;
 use crate::{Action, Cx, Diffui, LoadStatus, icons, ui};
 use diffui_core::FileTreeRow;
 use gpui_kit::prelude::*;
@@ -299,33 +300,33 @@ fn description_editor_input_height(ui: &Diffui) -> f32 {
 /// from the revision graph means browsing a change never reflows history.
 pub(crate) fn build_file_navigator(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    build_file_navigator_surface(ui, theme, Some(ui.file_nav_width), window, cx)
+    build_file_navigator_surface(ui, look, Some(ui.file_nav_width), window, cx)
 }
 
 /// The navigator floating over the diff while its panel is hidden (see
 /// `root::Panel`): as wide as the card it floats in.
 pub(crate) fn build_file_navigator_peek(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    build_file_navigator_surface(ui, theme, None, window, cx)
+    build_file_navigator_surface(ui, look, None, window, cx)
 }
 
 /// The navigator, `width` wide, or filling its parent.
 fn build_file_navigator_surface(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     width: Option<f32>,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let look = ui.look(theme);
+    let Look { theme, .. } = look;
     let files = &ui.active().session.document.files;
     if files.is_empty() {
         return div().into_any_element();
@@ -357,14 +358,15 @@ fn build_file_navigator_surface(
             div()
                 .flex_1()
                 .min_h_0()
-                .child(file_tree(ui, theme, window, cx)),
+                .child(file_tree(ui, look, window, cx)),
         )
         .into_any_element()
 }
 
 /// The changed files on the shared list: folding, stat columns, checkboxes, scroll
 /// restore and reveal. Rows are built at paint, for on-screen rows only.
-fn file_tree(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> AnyElement {
+fn file_tree(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyElement {
+    let Look { theme, .. } = look;
     let tab = ui.active();
     let files = &tab.session.document.files;
     let tree_rows = ui.sidebar_file_cache.borrow_mut().tree_rows(
@@ -398,7 +400,7 @@ fn file_tree(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) ->
     let props = RevisionListProps::new(
         0,
         Some((0, row_count)),
-        crate::sidebar::revision_list_style(theme, ui.config),
+        crate::sidebar::revision_list_style(look),
     )
     .file_picking(crate::changes::has_selection(ui))
     .files(
@@ -429,12 +431,11 @@ fn file_tree(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) ->
 
 pub(crate) fn build_diff_panel(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let look = ui.look(theme);
-    let body = build_diff_panel_body(ui, theme, window, cx);
+    let body = build_diff_panel_body(ui, look, window, cx);
     match crate::empty_states::outside_view_banner(ui, look) {
         Some(banner) => div()
             .flex()
@@ -491,11 +492,8 @@ pub(crate) fn find_matches(ui: &Diffui) -> &[diff_view::FindMatch] {
 
 /// The diff view's find overlay, when the find bar is open. All matches wear a soft
 /// wash; the *active* one is the strong fill.
-pub(crate) fn find_overlay(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    cx: &mut Cx,
-) -> Option<diff_view::FindOverlay> {
+pub(crate) fn find_overlay(ui: &Diffui, look: Look, cx: &mut Cx) -> Option<diff_view::FindOverlay> {
+    let Look { theme, .. } = look;
     let find = ui.active().find()?;
     Some(diff_view::FindOverlay {
         matches: Slice::new(cx.entity(), find_matches),
@@ -530,11 +528,12 @@ fn on_copy(cx: &mut Cx) -> impl Fn(&String, &mut Window, &mut gpui_kit::App) + '
 /// selectable the same way.
 fn header_only_view(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     lines: Vec<HeaderLine>,
     window: &mut Window,
     cx: &mut Cx,
 ) -> gpui_kit::Div {
+    let Look { theme, .. } = look;
     let height = diff_view::header_block_height(&lines, ui.config.code_type);
     let props = DiffProps::new(
         Vec::new(),
@@ -542,11 +541,11 @@ fn header_only_view(
         0,
         format!("header:{}", ui.active().session.document_id),
         diff_palette(theme),
-        ui.config.mono_font,
+        look.mono,
         ui.config.code_type,
         ui.config.multi_click_ms,
     )
-    .ui_font(ui.config.ui_font)
+    .ui_font(look.font)
     .on_copy(on_copy(cx))
     .on_header_action(on_header_action(cx))
     .content_version(ui.document_version)
@@ -577,17 +576,12 @@ fn centered_fill() -> gpui_kit::Div {
         .justify_center()
 }
 
-fn build_diff_panel_body(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    let look = ui.look(theme);
+fn build_diff_panel_body(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyElement {
+    let Look { theme, .. } = look;
     let tab = ui.active();
     let session = &tab.session;
     let range = crate::range::shown_range(ui);
-    let compare = crate::compare::build_compare_banner(ui, theme, window, cx);
+    let compare = crate::compare::build_compare_banner(ui, look, window, cx);
     let mut panel = panel_column(theme).children(compare);
 
     if let Some(error) = crate::range::refused_span(ui) {
@@ -598,7 +592,7 @@ fn build_diff_panel_body(
                 div()
                     .flex_1()
                     .min_h_0()
-                    .child(crate::range::refused_state(ui, theme, error, window, cx)),
+                    .child(crate::range::refused_state(ui, look, error, window, cx)),
             )
             .children(crate::mode_hints::strip(ui, look, window, cx))
             .into_any_element();
@@ -615,14 +609,14 @@ fn build_diff_panel_body(
             .child(div().flex_1().min_h_0().child(ui::empty_state(
                 message,
                 ui::Placement::Centered,
-                ui.config.ui_font,
+                look.font,
                 theme.subtle_text,
             )))
             .into_any_element();
     }
 
-    let summary = build_revision_summary(ui, theme, window, cx);
-    let title_font = crate::theme::emphasis_font(ui.config.ui_font, Weight::MEDIUM);
+    let summary = build_revision_summary(ui, look, window, cx);
+    let title_font = crate::theme::emphasis_font(look.font, Weight::MEDIUM);
 
     if session.document.files.is_empty() {
         if let Some(range) = range {
@@ -630,9 +624,9 @@ fn build_diff_panel_body(
             if range.count > 0 {
                 panel = panel.child(div().flex_none().w_full().child(summary));
             }
-            let lines = crate::range::header_lines(ui, range, theme);
+            let lines = crate::range::header_lines(ui, range, look);
             if !lines.is_empty() {
-                panel = panel.child(header_only_view(ui, theme, lines, window, cx));
+                panel = panel.child(header_only_view(ui, look, lines, window, cx));
             }
             return panel
                 .child(div().flex_1().min_h_0().child(ui::empty_state(
@@ -715,21 +709,21 @@ fn build_diff_panel_body(
             .revision_details
             .as_ref()
             .map(|details| {
-                crate::commit_info::header_lines(ui, details, theme, true, diff_pane_width(ui))
+                crate::commit_info::header_lines(ui, details, look, true, diff_pane_width(ui))
             })
             .filter(|lines| !lines.is_empty());
         panel = panel.child(div().flex_none().w_full().child(summary));
         if let Some(lines) = header {
-            panel = panel.child(header_only_view(ui, theme, lines, window, cx));
+            panel = panel.child(header_only_view(ui, look, lines, window, cx));
         }
         return panel.child(empty).into_any_element();
     }
 
     // The marker editor stands in for the diff while it is open.
-    let diff_view: AnyElement = match crate::conflicts::marker_editor(ui, theme, window, cx) {
+    let diff_view: AnyElement = match crate::conflicts::marker_editor(ui, look, window, cx) {
         Some(editor) => editor,
         None => {
-            let props = diff_props(ui, theme, range, cx);
+            let props = diff_props(ui, look, range, cx);
             diff_view::view("diff", props, window, cx)
         }
     };
@@ -742,7 +736,7 @@ fn build_diff_panel_body(
         .w_full()
         .overflow_hidden()
         .child(diff_view)
-        .child(crate::find::build_overlay(ui, theme, window, cx));
+        .child(crate::find::build_overlay(ui, look, window, cx));
     // The active mode's key hints dock under the diff; the picks' bar floats over it
     // (see `crate::changes::action_bar`).
     panel
@@ -811,10 +805,11 @@ impl Diffui {
 
 fn diff_props(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     range: Option<&diffui_core::DiffRange>,
     cx: &mut Cx,
 ) -> DiffProps {
+    let Look { theme, .. } = look;
     let tab = ui.active();
     let session = &tab.session;
     let mut props = DiffProps::new(
@@ -823,7 +818,7 @@ fn diff_props(
         tab.selected_file,
         diff_key(tab),
         diff_palette(theme),
-        ui.config.mono_font,
+        look.mono,
         ui.config.code_type,
         ui.config.multi_click_ms,
     )
@@ -844,7 +839,7 @@ fn diff_props(
     .layout_version(session.document_id)
     .wrap(ui.diff_wrap)
     .side_by_side(split_in_effect(ui))
-    .ui_font(ui.config.ui_font)
+    .ui_font(look.font)
     .on_header_action(on_header_action(cx))
     .folds(
         folded_files(tab),
@@ -859,12 +854,12 @@ fn diff_props(
         },
     ));
     if let Some(range) = range {
-        props = props.with_header(crate::range::header_lines(ui, range, theme));
+        props = props.with_header(crate::range::header_lines(ui, range, look));
     } else if let Some(details) = session.revision_details.as_ref() {
         props = props.with_header(crate::commit_info::header_lines(
             ui,
             details,
-            theme,
+            look,
             true,
             diff_pane_width(ui),
         ));
@@ -896,12 +891,12 @@ fn diff_props(
         }));
     }
 
-    if let Some(marks) = crate::changes::diff_marks(ui, theme, cx) {
+    if let Some(marks) = crate::changes::diff_marks(ui, look, cx) {
         props = props.change_marks(marks);
     }
     let actions = match (
-        crate::conflicts::hunk_actions(ui, theme, cx),
-        crate::changes::hunk_actions(ui, theme, cx),
+        crate::conflicts::hunk_actions(ui, look, cx),
+        crate::changes::hunk_actions(ui, look, cx),
     ) {
         (Some(conflicts), Some(picks)) => Some(conflicts.merge(picks)),
         (conflicts, picks) => conflicts.or(picks),
@@ -909,7 +904,7 @@ fn diff_props(
     if let Some(actions) = actions {
         props = props.hunk_actions(actions);
     }
-    if let Some(find) = find_overlay(ui, theme, cx) {
+    if let Some(find) = find_overlay(ui, look, cx) {
         props = props.with_find(find);
     }
     props
@@ -917,11 +912,11 @@ fn diff_props(
 
 fn build_description_editor(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let look = ui.look(theme);
+    let Look { theme, .. } = look;
     let Some(editor) = ui
         .active()
         .description_editor()
@@ -945,12 +940,11 @@ fn build_description_editor(
         });
         spec = spec.on_input(move |text, window, cx| on_edit(&text, window, cx));
     }
-    let (field, focused) =
-        crate::input::multi_line_with_focus(spec, ui.config.mono_font, window, cx);
+    let (field, focused) = crate::input::multi_line_with_focus(spec, look.mono, window, cx);
     let input = div()
         .w_full()
         .h(px(description_editor_input_height(ui)))
-        .font(ui.config.mono_font.gpui())
+        .font(look.mono.gpui())
         .text_size(px(ui.config.code_type.size))
         .child(
             field
@@ -980,7 +974,7 @@ fn build_description_editor(
         .disabled(!save_enabled)
         .on_click(Diffui::on_action(Action::SaveDescription, cx));
 
-    let font = ui.config.ui_font;
+    let font = look.font;
     let bound = |command: crate::commands::CommandId, label: &'static str| {
         crate::overlay_kit::bound_hint(
             ui,
@@ -1035,21 +1029,16 @@ fn build_description_editor(
 
 /// The commit info block above the diff (see [`crate::commit_info`]), or the description
 /// editor while it is open for this revision.
-fn build_revision_summary(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
+fn build_revision_summary(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyElement {
     let session = &ui.active().session;
     if ui
         .active()
         .description_editor()
         .is_some_and(|editor| editor.target == session.selected_revision)
     {
-        return build_description_editor(ui, theme, window, cx);
+        return build_description_editor(ui, look, window, cx);
     }
-    crate::commit_info::view(ui, theme, window, cx)
+    crate::commit_info::view(ui, look, window, cx)
 }
 
 #[cfg(test)]

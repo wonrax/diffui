@@ -14,7 +14,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, Window, div, px};
 
 use crate::action::Action;
-use crate::theme::{ThemeSpec, Weight, text_size};
+use crate::theme::{Weight, text_size};
 use crate::typography::{self, Aligned};
 use crate::ui::Look;
 use crate::{Cx, Diffui, ellipsis, icons, ui};
@@ -171,12 +171,12 @@ pub(crate) fn banner_strip(
 /// shows a plain revision diff.
 pub(crate) fn build_compare_banner(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     window: &mut Window,
     cx: &mut Cx,
 ) -> Option<AnyElement> {
-    let look = ui.look(theme);
-    if let Some(banner) = crate::range::banner(ui, theme, window, cx) {
+    let Look { theme, .. } = look;
+    if let Some(banner) = crate::range::banner(ui, look, window, cx) {
         return Some(banner);
     }
     let session = &ui.active().session;
@@ -191,8 +191,8 @@ pub(crate) fn build_compare_banner(
     let from = base.revision()?;
     let to = session.diff_pending().unwrap_or(&session.selected_revision);
     let interdiff = matches!(base, DiffBase::Interdiff(_));
-    let font = ui.config.ui_font;
-    let mono = ui.config.mono_font;
+    let font = look.font;
+    let mono = look.mono;
 
     let (from_id, from_title) = revision_label(ui, from);
     let (to_id, to_title) = revision_label(ui, to);

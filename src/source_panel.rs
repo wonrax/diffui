@@ -19,6 +19,7 @@ use crate::revision_list::{
 };
 use crate::theme::{Color, ThemeSpec, chip_background, text_size};
 use crate::typography::{self, Aligned};
+use crate::ui::Look;
 use crate::{Action, Cx, Diffui, SourceState, ellipsis, icons};
 use diffui_core::{
     RevisionSelection, SourceEntry, SourceEntryStatus, SourceTreeRow, source_tree_rows,
@@ -329,15 +330,12 @@ fn format_lines(count: usize) -> String {
 /// same [`crate::field::filter_field`] (caretless variant) so both sidebars'
 /// top bars match. Typing filters the tree into a ranked match list;
 /// Enter opens the best match.
-fn build_source_filter(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
+fn build_source_filter(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyElement {
     crate::field::sidebar_filter_field(
-        theme,
-        ui.config.mono_font,
+        Look {
+            font: look.mono,
+            ..look
+        },
         crate::field::FilterField {
             id: SOURCE_FILTER_INPUT_ID,
             leading_icon: Some(icons::SEARCH),
@@ -356,11 +354,11 @@ fn build_source_filter(
 /// file tree — no revision rows, no revset filter, no branch footer.
 pub(crate) fn build_source_sidebar(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let look = ui.look(theme);
+    let Look { theme, .. } = look;
     let source = &ui.active().source;
     let mut body = div()
         .flex()
@@ -372,7 +370,7 @@ pub(crate) fn build_source_sidebar(
                 .w_full()
                 .flex_none()
                 .min_h(px(crate::field::PANEL_HEADER_HEIGHT))
-                .child(build_source_filter(ui, theme, window, cx)),
+                .child(build_source_filter(ui, look, window, cx)),
         );
 
     if let Some(error) = &source.tree_error {
@@ -382,7 +380,7 @@ pub(crate) fn build_source_sidebar(
                     .icon(icons::ALERT_TRIANGLE)
                     .child(
                         div()
-                            .font(ui.config.ui_font.gpui())
+                            .font(look.font.gpui())
                             .text_color(theme.text)
                             .child(format!("Couldn't list files: {error}")),
                     )
@@ -432,7 +430,7 @@ pub(crate) fn build_source_sidebar(
     let props = RevisionListProps::new(
         0,
         (row_count > 0).then_some((0, row_count)),
-        crate::sidebar::revision_list_style(theme, ui.config),
+        crate::sidebar::revision_list_style(look),
     )
     .files(
         build_file,
@@ -469,7 +467,7 @@ pub(crate) fn build_source_sidebar(
         body = body.child(div().w_full().flex_none().py(px(6.0)).px(px(12.0)).child(
             typography::line(
                 "Listing files…",
-                ui.config.ui_font,
+                look.font,
                 text_size::BODY,
                 theme.subtle_text,
             ),
@@ -483,12 +481,13 @@ pub(crate) fn build_source_sidebar(
 /// plain code view, with the find bar overlaid like the diff panel's.
 pub(crate) fn build_source_panel(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let Look { theme, .. } = look;
     let source = &ui.active().source;
-    let info_bar = build_info_bar(ui, theme, window, cx);
+    let info_bar = build_info_bar(ui, look, window, cx);
 
     let body: AnyElement = if let Some(error) = &source.file_error {
         centered_note(
@@ -513,7 +512,7 @@ pub(crate) fn build_source_panel(
                 theme.subtle_text,
             )
         } else {
-            source_code(ui, view, theme, window, cx)
+            source_code(ui, view, look, window, cx)
         }
     } else if source.loading.is_some() {
         // Content on its way; a blank pane beats a flash of placeholder text.
@@ -540,7 +539,7 @@ pub(crate) fn build_source_panel(
                 .min_h_0()
                 .w_full()
                 .child(body)
-                .child(crate::find::build_overlay(ui, theme, window, cx)),
+                .child(crate::find::build_overlay(ui, look, window, cx)),
         )
         .into_any_element()
 }
@@ -549,10 +548,11 @@ pub(crate) fn build_source_panel(
 fn source_code(
     ui: &Diffui,
     view: &crate::SourceFileView,
-    theme: ThemeSpec,
+    look: Look,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let Look { theme, .. } = look;
     use crate::diff_view::{self, DiffFileView, DiffProps, DocSource};
     let source = &ui.active().source;
     let files = vec![DiffFileView {
@@ -585,7 +585,7 @@ fn source_code(
         0,
         revision_key,
         crate::theme::diff_palette(theme),
-        ui.config.mono_font,
+        look.mono,
         ui.config.code_type,
         ui.config.multi_click_ms,
     )
@@ -605,7 +605,7 @@ fn source_code(
     }
     // Soft wash for every match, strong fill for the active one: the diff
     // panel's find colours.
-    if let Some(find) = crate::diff_panel::find_overlay(ui, theme, cx) {
+    if let Some(find) = crate::diff_panel::find_overlay(ui, look, cx) {
         props = props.with_find(find);
     }
     diff_view::view("source-code", props, window, cx)
@@ -625,13 +625,14 @@ fn centered_note(ui: &Diffui, message: String, color: Color) -> AnyElement {
 /// dimmed, like a diff file header), line/byte counts and an
 /// ignored/untracked marker on the right. The browsed revision is already
 /// in the toolbar, so it isn't repeated here.
-fn build_info_bar(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> AnyElement {
+fn build_info_bar(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyElement {
+    let Look { theme, .. } = look;
     let source = &ui.active().source;
-    let mono = ui.config.mono_font;
+    let mono = look.mono;
 
     // The path (mono), the size and status captions (sans) and the status
     // chip sit on the caps' centre line (see `crate::typography`).
-    let font = ui.config.ui_font;
+    let font = look.font;
     let caption = |value: String, color: Color| {
         Aligned::text(
             typography::line(value, font, text_size::BODY, color),

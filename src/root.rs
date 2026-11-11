@@ -804,8 +804,8 @@ impl Panes {
 fn left_pane(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyElement {
     let Look { theme, .. } = look;
     match ui.active().main_view {
-        MainView::Diff => sidebar::build_sidebar(ui, theme, window, cx),
-        MainView::Source => source_panel::build_source_sidebar(ui, theme, window, cx),
+        MainView::Diff => sidebar::build_sidebar(ui, look, window, cx),
+        MainView::Source => source_panel::build_source_sidebar(ui, look, window, cx),
         MainView::History => history_panel::build_history_sidebar(ui, theme, window, cx),
     }
 }
@@ -813,11 +813,10 @@ fn left_pane(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyEl
 /// The changed files, in the Diff view: the panel, or the narrower tree that
 /// floats over the diff while the panel is hidden.
 fn files_pane(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyElement {
-    let Look { theme, .. } = look;
     if ui.active().files_panel_collapsed {
-        diff_panel::build_file_navigator_peek(ui, theme, window, cx)
+        diff_panel::build_file_navigator_peek(ui, look, window, cx)
     } else {
-        diff_panel::build_file_navigator(ui, theme, window, cx)
+        diff_panel::build_file_navigator(ui, look, window, cx)
     }
 }
 
@@ -825,8 +824,8 @@ fn files_pane(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyE
 fn main_pane(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyElement {
     let Look { theme, .. } = look;
     match ui.active().main_view {
-        MainView::Diff => diff_panel::build_diff_panel(ui, theme, window, cx),
-        MainView::Source => source_panel::build_source_panel(ui, theme, window, cx),
+        MainView::Diff => diff_panel::build_diff_panel(ui, look, window, cx),
+        MainView::Source => source_panel::build_source_panel(ui, look, window, cx),
         MainView::History => history_panel::build_history_panel(ui, theme, window, cx),
     }
 }
@@ -840,14 +839,14 @@ fn floats_pane(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> Any
         .relative()
         .size_full()
         // Under every overlay: the picks' bar floats over the diff, not over them.
-        .child(crate::changes::action_bar(ui, theme, window, cx))
+        .child(crate::changes::action_bar(ui, look, window, cx))
         .child(panel_peek(ui, look, cx))
         .child(palette::build_overlay(ui, theme, window, cx))
         .child(activity::activity_popover(ui, theme, window, cx))
         .child(menu::build_overlay(ui, look, window, cx))
         .child(tab_bar::build_open_repo_dialog(ui, look, window, cx))
         .child(crate::bookmarks::build_name_prompt(ui, theme, window, cx))
-        .child(crate::changes::split_modal(ui, theme, window, cx))
+        .child(crate::changes::split_modal(ui, look, window, cx))
         .child(tab_bar::build_confirm_dialog(ui, look, window, cx))
         .child(crate::cli_output::build_overlay(ui, theme, window, cx))
         .child(crate::credentials::build_overlay(ui, theme, window, cx))

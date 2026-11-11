@@ -19,7 +19,7 @@ use diffui_core::{JjCli, MutationOp, RevisionSelection, Vcs};
 
 use crate::ellipsis;
 use crate::prose::Prose;
-use crate::theme::{ThemeSpec, text_size};
+use crate::theme::text_size;
 use crate::ui::Look;
 use crate::{Diffui, TabState};
 
@@ -137,13 +137,8 @@ fn marked_prose(text: &str, marks: &[highlight::Marked]) -> Prose {
 const CHROME: f32 = GLYPH + 6.0 + 4.0 + GLYPH + 4.0;
 
 /// The command's text, highlighted.
-fn command_text(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    command: &str,
-    size: f32,
-) -> ellipsis::Line<'static> {
-    let look = ui.look(theme);
+fn command_text(look: Look, command: &str, size: f32) -> ellipsis::Line<'static> {
+    let Look { theme, .. } = look;
     command_prose(command).line(
         Look {
             font: look.mono,
@@ -156,14 +151,8 @@ fn command_text(
 
 /// Whether the command fits `width` on one line, glyph and copy button
 /// included.
-pub(crate) fn command_fits(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    command: &str,
-    size: f32,
-    width: f32,
-) -> bool {
-    let line = command_text(ui, theme, command, size);
+pub(crate) fn command_fits(look: Look, command: &str, size: f32, width: f32) -> bool {
+    let line = command_text(look, command, size);
     !line.is_multiline() && line.fits(width - CHROME)
 }
 
@@ -171,8 +160,7 @@ pub(crate) fn command_fits(
 /// with an ellipsis when it doesn't fit) and a copy button, which copies the
 /// whole command.
 pub(crate) fn command_line(
-    ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     command: &str,
     size: f32,
     _window: &mut Window,
@@ -180,34 +168,26 @@ pub(crate) fn command_line(
 ) -> AnyElement {
     // Width-free: the line gives up what its row can't hold, so it fits anywhere it
     // is placed and the copy button stays right behind the text.
-    let text = command_text(ui, theme, command, size).view();
-    laid_out(text, command, size, ui, theme, cx)
+    let text = command_text(look, command, size).view();
+    laid_out(text, command, size, look, cx)
 }
 
 /// The whole command, wrapped to the width it gets, its later lines under the
 /// command's first rather than under the glyph, the copy button after it.
 pub(crate) fn wrapped_command_line(
-    ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     command: &str,
     size: f32,
     _window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let text = command_text(ui, theme, command, size).wrapped();
-    laid_out(text, command, size, ui, theme, cx)
+    let text = command_text(look, command, size).wrapped();
+    laid_out(text, command, size, look, cx)
 }
 
-fn laid_out(
-    text: gpui_kit::Div,
-    command: &str,
-    size: f32,
-    ui: &Diffui,
-    theme: ThemeSpec,
-    cx: &mut Cx,
-) -> AnyElement {
-    let look = ui.look(theme);
-    let mono = ui.config.mono_font;
+fn laid_out(text: gpui_kit::Div, command: &str, size: f32, look: Look, cx: &mut Cx) -> AnyElement {
+    let Look { theme, .. } = look;
+    let mono = look.mono;
     // Commands repeat across a list: the text says which one this is.
     let id = {
         use std::hash::{Hash as _, Hasher as _};
@@ -247,13 +227,12 @@ fn laid_out(
 
 /// [`command_line`] at caption size, the size the logs use.
 pub(crate) fn caption_command_line(
-    ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     command: &str,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    command_line(ui, theme, command, text_size::CAPTION, window, cx)
+    command_line(look, command, text_size::CAPTION, window, cx)
 }
 
 #[cfg(test)]

@@ -1242,7 +1242,7 @@ fn activity_header(
         .map(|result| crate::prose::Prose::from(result).line(look, result_color, text_size::BODY));
     let cut_short = !title.fits(text_width - trailing_width)
         || activity.command.as_deref().is_some_and(|command| {
-            !crate::plan::command_fits(ui, theme, command, text_size::CAPTION, text_width)
+            !crate::plan::command_fits(look, command, text_size::CAPTION, text_width)
         })
         || result
             .as_ref()
@@ -1302,9 +1302,9 @@ fn activity_header(
     }
     if let Some(command) = activity.command.as_deref() {
         header = header.child(indented().child(if open {
-            crate::plan::wrapped_command_line(ui, theme, command, text_size::CAPTION, window, cx)
+            crate::plan::wrapped_command_line(look, command, text_size::CAPTION, window, cx)
         } else {
-            crate::plan::caption_command_line(ui, theme, command, window, cx)
+            crate::plan::caption_command_line(look, command, window, cx)
         }));
     }
     if matches!(activity.status, ActivityStatus::Running) && determinate {

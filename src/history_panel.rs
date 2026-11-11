@@ -1352,15 +1352,7 @@ fn op_row(
     }
     let meta = typography::baseline_row(meta, space::SM);
     let title = title_with_age(
-        meta_line::description(
-            op.summary(),
-            SMALL_TEXT_SIZE,
-            ui.config.ui_font,
-            theme.text,
-            ui,
-            theme,
-        )
-        .view(),
+        meta_line::description(op.summary(), SMALL_TEXT_SIZE, theme.text, look).view(),
         age,
         ui,
         theme,
@@ -2296,7 +2288,7 @@ fn operation_header(
             operation: None,
         },
         ui,
-        theme,
+        look,
         window,
         cx,
     );
@@ -2355,14 +2347,7 @@ fn operation_header(
                 .gap(px(space::SM))
                 // Centred on its caps against the buttons beside it.
                 .child(div().flex_1().min_w_0().child(typography::centered(
-                    meta_line::description(
-                        op.summary(),
-                        DETAIL_TITLE_SIZE,
-                        title_font,
-                        theme.text,
-                        ui,
-                        theme,
-                    )
+                    meta_line::description(op.summary(), DETAIL_TITLE_SIZE, theme.text, Look { font: title_font, ..look })
                     .wrapped(),
                     title_font,
                     DETAIL_TITLE_SIZE,
@@ -2391,8 +2376,7 @@ fn operation_header(
                     )
                 })
                 .child(crate::plan::wrapped_command_line(
-                    ui,
-                    theme,
+                    look,
                     args,
                     text_size::BODY,
                     window,
@@ -2521,7 +2505,7 @@ fn evolog_header(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx
             ..meta_line::Meta::default()
         },
         ui,
-        theme,
+        look,
         window,
         cx,
     );
@@ -2650,6 +2634,7 @@ fn history_diff_view(
 
 /// The selected change's diff.
 fn history_diff(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> AnyElement {
+    let look = ui.look(theme);
     let history = &ui.active().history;
     let Some(diff) = &history.diff else {
         return div().into_any_element();
@@ -2695,9 +2680,8 @@ fn history_diff(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx)
             .with_header(crate::commit_info::header_lines(
                 ui,
                 details,
-                theme,
-                false,
-                // The History view's right pane: the window less its list.
+                look,
+                false, // The History view's right pane: the window less its list.
                 ui.window_size.width - ui.sidebar_width - 1.0,
             ))
             .on_header_action(Diffui::listen(
@@ -3195,8 +3179,9 @@ mod scenes {
         h.wait_for_graph();
         crate::revision_rows::scenes::show_list(&mut h);
         h.show(|ui, theme, window, cx| {
+            let look = ui.look(theme);
             let banner = file_filter_banner(ui, theme, window, cx);
-            let list = crate::revision_rows::build_revision_list(ui, theme, window, cx);
+            let list = crate::revision_rows::build_revision_list(ui, look, window, cx);
             div()
                 .w(px(ui.sidebar_width))
                 .h_full()

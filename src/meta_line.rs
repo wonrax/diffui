@@ -10,8 +10,9 @@ use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, ElementId, Window, div, px};
 
 use crate::ellipsis::{self, Span};
-use crate::theme::{Color, Font, ThemeSpec, space, text_size};
+use crate::theme::{Color, space, text_size};
 use crate::typography::{self, Aligned};
+use crate::ui::Look;
 use crate::ui::Tip as _;
 use crate::{Cx, Diffui, icons};
 
@@ -120,12 +121,11 @@ pub(crate) fn shorten_ids(description: &str) -> String {
 pub(crate) fn description(
     description: &str,
     size: f32,
-    font: Font,
     color: Color,
-    ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
 ) -> ellipsis::Line<'static> {
-    let mono = ui.config.mono_font;
+    let Look { theme, font, .. } = look;
+    let mono = look.mono;
     // One rich text, so the mono ids sit on the prose's baseline. GPUI sizes a line as
     // a whole, so ids stay at the line's size rather than matching its cap height.
     let mut spans = Vec::new();
@@ -144,10 +144,11 @@ pub(crate) fn description(
 pub(crate) fn view(
     meta: Meta,
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let Look { theme, .. } = look;
     // Mono ids, sans names and small badges share one baseline (see
     // `crate::typography`), not one box centre.
     let mut line: Vec<Aligned> = Vec::new();
@@ -162,7 +163,7 @@ pub(crate) fn view(
         line.push(typography::group(ids, space::SM));
     }
     if let Some((name, detail)) = meta.who {
-        let label = labelled(icons::USER, name, ui, theme);
+        let label = labelled(icons::USER, name, look);
         line.push(
             label
                 .map(|label| {
@@ -172,7 +173,7 @@ pub(crate) fn view(
                         .child(label)
                         .into_any_element()
                 })
-                .map(|label| hover("meta-who", label, detail, ui, theme)),
+                .map(|label| hover("meta-who", label, detail, look)),
         );
     }
     if let Some((millis, absolute)) = meta.when {
@@ -184,8 +185,8 @@ pub(crate) fn view(
             None => (absolute, None),
         };
         line.push(
-            labelled(icons::CLOCK, label, ui, theme)
-                .map(|label| hover("meta-when", label, detail, ui, theme)),
+            labelled(icons::CLOCK, label, look)
+                .map(|label| hover("meta-when", label, detail, look)),
         );
     }
     if let Some((id, operation)) = meta.operation {
@@ -199,12 +200,12 @@ pub(crate) fn view(
                 Aligned::text(
                     typography::line(
                         shorten_ids(&operation),
-                        ui.config.ui_font,
+                        look.font,
                         text_size::BODY,
                         theme.muted_text,
                     )
                     .text_ellipsis(),
-                    ui.config.ui_font,
+                    look.font,
                     text_size::BODY,
                 )
                 .shrink(),
@@ -258,8 +259,9 @@ pub(crate) fn id_text(id: Id, ui: &Diffui) -> Aligned {
 }
 
 /// An icon and its label, centred on the label's caps.
-fn labelled(glyph: &'static str, label: String, ui: &Diffui, theme: ThemeSpec) -> Aligned {
-    let font = ui.config.ui_font;
+fn labelled(glyph: &'static str, label: String, look: Look) -> Aligned {
+    let Look { theme, .. } = look;
+    let font = look.font;
     typography::group(
         [
             Aligned::glyph(icons::icon(glyph, ICON_SIZE, theme.subtle_text), ICON_SIZE),
@@ -274,14 +276,7 @@ fn labelled(glyph: &'static str, label: String, ui: &Diffui, theme: ThemeSpec) -
     )
 }
 
-fn hover(
-    id: &'static str,
-    content: AnyElement,
-    detail: Option<String>,
-    ui: &Diffui,
-    theme: ThemeSpec,
-) -> AnyElement {
-    let look = ui.look(theme);
+fn hover(id: &'static str, content: AnyElement, detail: Option<String>, look: Look) -> AnyElement {
     match detail.filter(|detail| !detail.is_empty()) {
         Some(detail) => div()
             .id(ElementId::Name(id.into()))

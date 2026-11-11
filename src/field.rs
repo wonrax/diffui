@@ -10,8 +10,8 @@ use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, Bounds, Div, MouseButton, Pixels, Window, canvas, div, px};
 
 use crate::root::PaneSet;
-use crate::theme::Font;
 use crate::theme::{self, ThemeSpec};
+use crate::ui::Look;
 use crate::{Cx, Diffui, icons, input};
 use crate::{HoverTarget, ToolbarMenu};
 
@@ -65,12 +65,12 @@ pub(crate) struct FilterField<'a> {
 /// The field chrome (well + hairline border) lives on a wrapping element rather
 /// than the input itself so the optional presets caret can sit *inside* the field.
 pub(crate) fn filter_field(
-    theme: ThemeSpec,
-    font: Font,
+    look: Look,
     spec: FilterField,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let Look { theme, font, .. } = look;
     let on_input = spec.on_input;
     let on_input = Diffui::listen(cx, move |this, text: &String, _, cx| {
         on_input(this, text.clone(), cx);
@@ -212,8 +212,7 @@ pub(crate) fn panel_strip() -> Div {
 /// header, with the lead inset mirrored on the right. No rule under the
 /// field; its bordered well already separates it from the list below.
 pub(crate) fn sidebar_filter_field(
-    theme: ThemeSpec,
-    font: Font,
+    look: Look,
     spec: FilterField,
     window: &mut Window,
     cx: &mut Cx,
@@ -222,7 +221,7 @@ pub(crate) fn sidebar_filter_field(
     crate::ui::panel_header()
         .pl(px(lead))
         .pr(px(trail))
-        .child(filter_field(theme, font, spec, window, cx))
+        .child(filter_field(look, spec, window, cx))
         .into_any_element()
 }
 
@@ -244,11 +243,11 @@ pub(crate) fn field_well(focused: bool, theme: ThemeSpec) -> Div {
 /// A dialog's one-line field: the shared well, at the dialog's control height.
 pub(crate) fn dialog_input(
     spec: input::FieldSpec<'_>,
-    font: Font,
-    theme: ThemeSpec,
+    look: Look,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let Look { theme, font, .. } = look;
     // The well is drawn here, around the input's own row: see [`INPUT_ROW`].
     let (input, focused) = input::single_line_with_focus(spec, font, window, cx);
     let input = input

@@ -27,8 +27,9 @@ use crate::diff_view::{
 use crate::modes::{ModeKind, TabMode};
 use crate::palette::ResultRef;
 use crate::prose::Prose;
-use crate::theme::{self, Color, Font, ThemeSpec, Weight, text_size};
+use crate::theme::{self, Color, Font, Weight, text_size};
 use crate::typography::{self, Aligned};
+use crate::ui::Look;
 use crate::ui::Tip as _;
 use crate::{Action, ConfirmDialog, Cx, Diffui, MainView, TabState, icons, ui};
 
@@ -679,7 +680,8 @@ pub(crate) fn command_file_path(ui: &Diffui, arg: &CommandArg) -> Option<String>
 }
 
 /// Checkbox marks for the diff view, or `None` when nothing can be picked.
-pub(crate) fn diff_marks(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> Option<ChangeMarks> {
+pub(crate) fn diff_marks(ui: &Diffui, look: Look, cx: &mut Cx) -> Option<ChangeMarks> {
+    let Look { theme, .. } = look;
     let tab = ui.active();
     if !editable(tab) {
         return None;
@@ -902,14 +904,15 @@ fn write_hunk(out: &mut String, hunk: &DiffHunkView, picked: Option<&[LineRef]>)
 /// A header's buttons are built when it's on screen.
 pub(crate) fn hunk_actions(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     cx: &mut Cx,
 ) -> Option<crate::hunk_actions::HunkActions> {
+    let Look { theme, .. } = look;
     use crate::hunk_actions::{Button, HunkActions, Row, Run, Style, Tone};
     if !editable(ui.active()) {
         return None;
     }
-    let font = ui.config.ui_font;
+    let font = look.font;
     let app = cx.entity();
     let rows = move |file: usize, hunk: usize, cx: &gpui_kit::App| {
         let tab = app.read(cx).active();
@@ -1548,13 +1551,8 @@ fn bar_fits_labels(
 /// The picks' floating bar: what is picked and what can be done with it, over
 /// the diff, in inverted colours. Line-select mode shows it too, with its way
 /// out. Empty when nothing is picked. Mounted once for the window.
-pub(crate) fn action_bar(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    _window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    let look = ui.look(theme);
+pub(crate) fn action_bar(ui: &Diffui, look: Look, _window: &mut Window, cx: &mut Cx) -> AnyElement {
+    let Look { theme, .. } = look;
     use gpui_kit::base::TestSupportExt as _;
     let tab = ui.active();
     let empty = || div().into_any_element();
@@ -1566,7 +1564,7 @@ pub(crate) fn action_bar(
     if selection.is_empty() && !selecting {
         return empty();
     }
-    let font = ui.config.ui_font;
+    let font = look.font;
     let bold = theme::emphasis_font(font, Weight::SEMIBOLD);
     let ink = theme.panel_background;
     let faded = Color { a: 0.7, ..ink };
@@ -1830,17 +1828,12 @@ pub(crate) fn action_bar(
 /// descriptions in the app's editor, and the footer. Empty when closed. A
 /// stray click outside doesn't throw the typed descriptions away; Esc and
 /// Cancel do.
-pub(crate) fn split_modal(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    let look = ui.look(theme);
+pub(crate) fn split_modal(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyElement {
+    let Look { theme, .. } = look;
     let Some(prompt) = split_prompt_shown(ui) else {
         return div().into_any_element();
     };
-    let mono = ui.config.mono_font;
+    let mono = look.mono;
     let label = revision_label(ui.active(), &prompt.revision);
     let size = ui.config.code_type.size;
     let width = SPLIT_WIDTH - 2.0 * crate::overlay_kit::DIALOG_PAD;

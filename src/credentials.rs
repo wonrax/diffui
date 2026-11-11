@@ -20,6 +20,7 @@ use crate::Diffui;
 use crate::modes::{Mode, ModeKind};
 use crate::prose::Prose;
 use crate::theme::ThemeSpec;
+use crate::ui::Look;
 
 const INPUT_ID: &str = "credential-input";
 
@@ -239,7 +240,12 @@ pub(crate) fn build_overlay(
                 .masked(prompt.kind == PromptKind::Secret)
                 .on_input(move |value, window, cx| on_input(&value, window, cx))
                 .on_submit(move |window, cx| on_submit(&(), window, cx));
-            card = card.child(crate::field::dialog_input(spec, mono, theme, window, cx));
+            card = card.child(crate::field::dialog_input(
+                spec,
+                Look { font: mono, ..look },
+                window,
+                cx,
+            ));
             Some("Continue")
         }
         PromptKind::YesNo => {

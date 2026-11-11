@@ -9,6 +9,7 @@ use crate::theme::{
     self, Color, Padding, ThemeSpec, Weight, chip_background, emphasis_font, text_size,
 };
 use crate::typography::{self, Aligned};
+use crate::ui::Look;
 use crate::{Action, Cx, Diffui, HoverTarget, LoadStatus, ToolbarMenu, icons, ui};
 use diffui_core::{DiffFile, FileTreeRow, RowView, file_tree_rows};
 use gpui_kit::base::TestSupportExt as _;
@@ -123,19 +124,18 @@ pub(crate) fn revision_graph_style(theme: ThemeSpec) -> RevisionGraphStyle {
 pub(crate) fn graph_ref_chips(
     session: &diffui_core::Session,
     index: usize,
-    theme: ThemeSpec,
-    config: AppConfig,
+    look: Look,
 ) -> Vec<Chip> {
+    let Look { theme, .. } = look;
     let commit = session.commits.row(index);
     let lane = session.graph.frame(index, usize::MAX).node_lane;
     let mut chips = bookmark_chips_for(
         commit.bookmarks(),
         revision_graph_style(theme).lane_color(lane),
-        theme,
-        config,
+        look,
     );
     if let Some(tags) = session.bookmarks.tags.get(commit.commit_id()) {
-        chips.extend(tag_chips_for(tags, theme, config));
+        chips.extend(tag_chips_for(tags, look));
     }
     chips
 }
@@ -151,12 +151,8 @@ pub(crate) fn graph_ref_chips(
 /// remote bookmark (`main@origin`): outlined, with the remote in subtle text.
 /// A local bookmark that differs from its remote keeps its `*` in the modified
 /// colour, and a conflicted one its `??` in the conflict colour.
-pub(crate) fn bookmark_chips_for(
-    bookmarks: &[String],
-    lane_color: Color,
-    theme: ThemeSpec,
-    config: AppConfig,
-) -> Vec<Chip> {
+pub(crate) fn bookmark_chips_for(bookmarks: &[String], lane_color: Color, look: Look) -> Vec<Chip> {
+    let Look { theme, .. } = look;
     bookmarks
         .iter()
         .map(|bookmark| {
@@ -182,7 +178,7 @@ pub(crate) fn bookmark_chips_for(
             };
             Chip {
                 label,
-                font: config.ui_font,
+                font: look.font,
                 background: if remote_at.is_some() {
                     crate::theme::TRANSPARENT
                 } else {
@@ -212,11 +208,12 @@ pub(crate) fn neutral_chip_background(theme: ThemeSpec) -> Color {
 /// and wearing the tag glyph, so they never read as bookmarks. A remote tag
 /// that differs from the local one (`v1@origin`) is outlined, like a remote
 /// bookmark.
-pub(crate) fn tag_chips_for(tags: &[String], theme: ThemeSpec, config: AppConfig) -> Vec<Chip> {
+pub(crate) fn tag_chips_for(tags: &[String], look: Look) -> Vec<Chip> {
+    let Look { theme, .. } = look;
     tags.iter()
         .map(|tag| Chip {
             label: tag.clone(),
-            font: config.ui_font,
+            font: look.font,
             background: neutral_chip_background(theme),
             text_color: theme.muted_text,
             border_color: tag.contains('@').then_some(theme.border),
@@ -230,12 +227,13 @@ pub(crate) fn tag_chips_for(tags: &[String], theme: ThemeSpec, config: AppConfig
 
 /// Status chips (`empty`, `conflict`, `hidden`/`divergent`) for a commit row.
 /// Shared with the source browser's revision-header row.
-pub(crate) fn status_chips_for(commit: RowView, theme: ThemeSpec, config: AppConfig) -> Vec<Chip> {
+pub(crate) fn status_chips_for(commit: RowView, look: Look) -> Vec<Chip> {
+    let Look { theme, .. } = look;
     let mut status_chips = Vec::new();
     if commit.is_empty() == Some(true) {
         status_chips.push(Chip {
             label: "empty".to_owned(),
-            font: config.mono_font,
+            font: look.mono,
             background: crate::theme::TRANSPARENT,
             text_color: theme.subtle_text,
             border_color: Some(theme.subtle_text),
@@ -248,7 +246,7 @@ pub(crate) fn status_chips_for(commit: RowView, theme: ThemeSpec, config: AppCon
     if commit.has_conflict() {
         status_chips.push(Chip {
             label: "conflict".to_owned(),
-            font: config.mono_font,
+            font: look.mono,
             background: chip_background(theme.conflict_marker),
             text_color: theme.conflict_marker,
             border_color: None,
@@ -264,7 +262,7 @@ pub(crate) fn status_chips_for(commit: RowView, theme: ThemeSpec, config: AppCon
         // precedence over the divergent chip, matching jj's log template.
         status_chips.push(Chip {
             label: "hidden".to_owned(),
-            font: config.mono_font,
+            font: look.mono,
             background: crate::theme::TRANSPARENT,
             text_color: theme.subtle_text,
             border_color: Some(theme.subtle_text),
@@ -279,7 +277,7 @@ pub(crate) fn status_chips_for(commit: RowView, theme: ThemeSpec, config: AppCon
         // warning about identity, not about tree state.
         status_chips.push(Chip {
             label: "divergent".to_owned(),
-            font: config.mono_font,
+            font: look.mono,
             background: chip_background(theme.modified_token),
             text_color: theme.modified_token,
             border_color: None,
@@ -336,7 +334,8 @@ impl SidebarFileCache {
     }
 }
 
-pub(crate) fn revision_list_style(theme: ThemeSpec, config: AppConfig) -> RevisionListStyle {
+pub(crate) fn revision_list_style(look: Look) -> RevisionListStyle {
+    let Look { theme, .. } = look;
     RevisionListStyle {
         graph: revision_graph_style(theme),
         background: theme.panel_background,
@@ -349,8 +348,8 @@ pub(crate) fn revision_list_style(theme: ThemeSpec, config: AppConfig) -> Revisi
         accent_text: theme.accent,
         change_id: theme.change_id,
         accent_foreground: theme.panel_background,
-        primary_font: config.ui_font,
-        mono_font: config.mono_font,
+        primary_font: look.font,
+        mono_font: look.mono,
         floating: theme,
     }
 }
@@ -379,16 +378,16 @@ pub(crate) fn commit_description_color(commit: RowView, theme: ThemeSpec) -> Col
 
 pub(crate) fn build_sidebar(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let look = ui.look(theme);
+    let Look { theme, .. } = look;
     // The "Changes" header is gone; the list starts flush at the top of the
     // pane. Each row carries its own internal vertical padding, so the first
     // row's content isn't cramped against the top edge — adding a panel-colored
     // gap above it instead just reads as a stray strip above the selected row.
-    let revision_list = crate::revision_rows::build_revision_list(ui, theme, window, cx);
+    let revision_list = crate::revision_rows::build_revision_list(ui, look, window, cx);
 
     let draft_active = ui.active().op_draft().is_some();
     let mut body = div()
@@ -411,7 +410,7 @@ pub(crate) fn build_sidebar(
                         .flex_1()
                         .min_w_0()
                         .h(px(field::FIELD_HEIGHT))
-                        .child(build_revset_filter(ui, theme, window, cx)),
+                        .child(build_revset_filter(ui, look, window, cx)),
                 ),
         )
         .children(crate::revset_assist::error_strip(ui, theme, window, cx))
@@ -456,7 +455,7 @@ pub(crate) fn build_sidebar(
     // Target mode: the op bar floats under the list while a rebase/squash
     // draft is picking its destination.
     if draft_active {
-        body = body.child(build_op_bar(ui, theme, window, cx));
+        body = body.child(build_op_bar(ui, look, window, cx));
     }
     body.into_any_element()
 }
@@ -489,11 +488,11 @@ fn op_target_row(
     tone: RowTone,
     description: Option<String>,
     on_press: Option<Action>,
-    ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     cx: &mut Cx,
 ) -> AnyElement {
-    let (ui_font, mono_font) = (ui.config.ui_font, ui.config.mono_font);
+    let Look { theme, .. } = look;
+    let (ui_font, mono_font) = (look.font, look.mono);
     let (label_color, key_color, key_bg, desc_color) = match tone {
         RowTone::Armed => (
             theme.accent,
@@ -569,8 +568,8 @@ fn op_target_row(
 
 /// The target-mode strip: what's being moved, the placement toggle
 /// (rebase only), the live preview line, and the key hints.
-fn build_op_bar(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> AnyElement {
-    let look = ui.look(theme);
+fn build_op_bar(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyElement {
+    let Look { theme, .. } = look;
     use diffui_core::{DraftKind, PlacementKind};
     let Some(draft_ui) = ui.active().op_draft() else {
         return div().into_any_element();
@@ -674,7 +673,7 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx)
     .then_some(("Can't target the revision being moved", theme.removed_text));
     // The verb, the mono names and the suffix share a baseline; the glyph
     // and the close button centre on the caps (see `crate::typography`).
-    let (ui_font, mono_font) = (ui.config.ui_font, ui.config.mono_font);
+    let (ui_font, mono_font) = (look.font, look.mono);
     let verb_font = emphasis_font(ui_font, Weight::SEMIBOLD);
     let names_font = emphasis_font(mono_font, Weight::MEDIUM);
     let mut operation = vec![
@@ -811,8 +810,7 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx)
                     tone(placement),
                     describe(placement),
                     Some(Action::DraftPlacement(placement)),
-                    ui,
-                    theme,
+                    look,
                     cx,
                 ));
             }
@@ -829,8 +827,7 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx)
                     RowTone::Armed,
                     Some(format!("{parent} and {child}")),
                     None,
-                    ui,
-                    theme,
+                    look,
                     cx,
                 ));
             }
@@ -851,8 +848,7 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx)
                 tone,
                 description,
                 None,
-                ui,
-                theme,
+                look,
                 cx,
             ));
         }
@@ -1086,7 +1082,7 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx)
                 .w_full()
                 .overflow_hidden()
                 .child(crate::plan::caption_command_line(
-                    ui, theme, &command, window, cx,
+                    look, &command, window, cx,
                 ))
         }));
 
@@ -1156,19 +1152,16 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx)
 /// The monospace revset (jj) / revision-range (git) input at the top of the
 /// sidebar, with a caret that opens the presets menu. Submitting (Enter) or
 /// picking a preset re-evaluates the log.
-fn build_revset_filter(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
+fn build_revset_filter(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyElement {
     let placeholder = match ui.active().repository.as_ref().map(|r| r.vcs) {
         Some(Vcs::Git) => "Revisions, e.g. --all",
         _ => "Revset, e.g. all()",
     };
     field::filter_field(
-        theme,
-        ui.config.mono_font,
+        Look {
+            font: look.mono,
+            ..look
+        },
         field::FilterField {
             id: REVSET_INPUT_ID,
             leading_icon: Some(icons::GIT_BRANCH),

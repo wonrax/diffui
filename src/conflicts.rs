@@ -10,7 +10,6 @@
 //! ordinary [`MutationOp::ResolveConflict`].
 
 use crate::Cx;
-use crate::theme::Font;
 use diffui_core::{
     ConflictFile, ConflictPick, ConflictResolution, DiffFileStatus, JobId, MergeToolInvocation,
     MutationOp, RevisionSelection, hunk_conflict_region,
@@ -21,7 +20,8 @@ use gpui_kit::{AnyElement, Window, div, px};
 use crate::changes::{ChangesMsg, editable};
 use crate::commands::CommandArg;
 use crate::prose::Prose;
-use crate::theme::{self, ThemeSpec, text_size};
+use crate::theme::{self, text_size};
+use crate::ui::Look;
 use crate::{Action, Diffui, PendingMutation, TabId, TabState, activity, icons, input, typography};
 
 #[derive(Debug, Clone)]
@@ -903,10 +903,9 @@ fn file_label(conflict: &ConflictFile) -> String {
 fn term_runs(
     conflict: &ConflictFile,
     pick: ConflictPick,
-    font: Font,
-    mono: Font,
-    theme: ThemeSpec,
+    look: Look,
 ) -> Vec<crate::hunk_actions::Run> {
+    let Look { theme, font, mono } = look;
     use crate::hunk_actions::Run;
     let run = |text: String, font, color| Run { text, font, color };
     match pick {
@@ -927,11 +926,11 @@ fn file_strip(
     ui: &Diffui,
     file: usize,
     conflict: &ConflictFile,
-    theme: ThemeSpec,
+    look: Look,
 ) -> (crate::hunk_actions::FileStrip, Vec<FileButton>) {
+    let Look { theme, .. } = look;
     use crate::hunk_actions::{Button, FileStrip, Row, Run, Tool};
-    let font = ui.config.ui_font;
-    let mono = ui.config.mono_font;
+    let font = look.font;
     let path = conflict.path.as_str();
     let tool = |icon: &str, label: &str, enabled: bool| Tool {
         runs: vec![
@@ -978,7 +977,7 @@ fn file_strip(
         }
         for pick in picks(conflict) {
             takes.push(Button {
-                runs: term_runs(conflict, pick, font, mono, theme),
+                runs: term_runs(conflict, pick, look),
                 tone: crate::hunk_actions::Tone::Raised,
             });
             buttons.push(FileButton::Take(pick));
@@ -1008,9 +1007,10 @@ fn file_strip(
 /// and take-a-side buttons on every conflict region's hunk header.
 pub(crate) fn hunk_actions(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     cx: &mut Cx,
 ) -> Option<crate::hunk_actions::HunkActions> {
+    let Look { theme, .. } = look;
     use crate::hunk_actions::{Button, Row, Run};
     let tab = ui.active();
     if !editable(tab) || editor_shown(ui).is_some() {
@@ -1021,7 +1021,7 @@ pub(crate) fn hunk_actions(
     let mut file_targets = Vec::new();
     for (index, file) in tab.session.document.files.iter().enumerate() {
         if let Some(conflict) = conflicts.iter().find(|conflict| conflict.path == file.path) {
-            let (strip, buttons) = file_strip(ui, index, conflict, theme);
+            let (strip, buttons) = file_strip(ui, index, conflict, look);
             files.push(strip);
             file_targets.push((conflict.path.clone(), buttons));
         }
@@ -1030,8 +1030,7 @@ pub(crate) fn hunk_actions(
     if all.is_empty() && files.is_empty() {
         return None;
     }
-    let font = ui.config.ui_font;
-    let mono = ui.config.mono_font;
+    let font = look.font;
     let focus = focused(tab, &all);
     let mut rows = Vec::with_capacity(all.len());
     let mut targets = Vec::with_capacity(all.len());
@@ -1041,7 +1040,7 @@ pub(crate) fn hunk_actions(
         let buttons = picks(conflict)
             .into_iter()
             .map(|pick| Button {
-                runs: term_runs(conflict, pick, font, mono, theme),
+                runs: term_runs(conflict, pick, look),
                 tone: crate::hunk_actions::Tone::Raised,
             })
             .collect();
@@ -1140,17 +1139,17 @@ pub(crate) fn hunk_actions(
 /// left in it.
 pub(crate) fn marker_editor(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     window: &mut Window,
     cx: &mut Cx,
 ) -> Option<AnyElement> {
-    let look = ui.look(theme);
+    let Look { theme, .. } = look;
     const GAP: f32 = 8.0;
     let editor = editor_shown(ui)?;
     let saving = editor.saving.is_some();
-    let mono = ui.config.mono_font;
+    let mono = look.mono;
     let size = ui.config.code_type.size;
-    let font = ui.config.ui_font;
+    let font = look.font;
     let title = div()
         .h(px(theme::control::COMPACT))
         .flex_none()
@@ -1200,16 +1199,16 @@ pub(crate) fn marker_editor(
                     .flex()
                     .flex_col()
                     .child(field)
-                    .child(editor_footer(ui, theme, editor, cx)),
+                    .child(editor_footer(ui, look, editor, cx)),
             )
             .into_any_element(),
     )
 }
 
 /// How many conflicts the edit still holds, Cancel and Save.
-fn editor_footer(ui: &Diffui, theme: ThemeSpec, editor: &MarkerEditor, cx: &mut Cx) -> AnyElement {
-    let look = ui.look(theme);
-    let font = ui.config.ui_font;
+fn editor_footer(ui: &Diffui, look: Look, editor: &MarkerEditor, cx: &mut Cx) -> AnyElement {
+    let Look { theme, .. } = look;
+    let font = look.font;
     let saving = editor.saving.is_some();
     let hint = match markers_left(&editor.content, editor.marker_len) {
         0 => "No conflict markers left: saving resolves the file".to_owned(),

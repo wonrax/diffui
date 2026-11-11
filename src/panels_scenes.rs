@@ -156,13 +156,14 @@ fn commit_header_actions_reach_the_clipboard_and_the_graph() {
     let id = select(&mut h, CLAMP);
     let lines = h.read(|ui| {
         let theme = ui.resolved_theme().spec();
+        let look = ui.look(theme);
         let details = ui
             .active()
             .session
             .revision_details
             .clone()
             .expect("details");
-        crate::commit_info::header_lines(ui, &details, theme, true, 900.0)
+        crate::commit_info::header_lines(ui, &details, look, true, 900.0)
     });
     let copy = lines.iter().find_map(|line| match line {
         HeaderLine::Rich(field) if field.label == "Commit" => Some(field.buttons[0].1.clone()),

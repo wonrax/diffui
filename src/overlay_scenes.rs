@@ -15,6 +15,7 @@ use crate::field::{FilterField, filter_field};
 use crate::harness::{Harness, at, fixture_repo};
 use crate::prose::Prose;
 use crate::theme::ThemePreference;
+use crate::ui::Look;
 
 const LANE: &str = "overlays";
 
@@ -467,7 +468,8 @@ fn conflict_on(mut h: Harness) {
         crate::conflicts::editor_shown(ui).is_some()
     });
     h.show(|ui, theme, window, cx| {
-        crate::conflicts::marker_editor(ui, theme, window, cx)
+        let look = ui.look(theme);
+        crate::conflicts::marker_editor(ui, look, window, cx)
             .unwrap_or_else(|| div().into_any_element())
     });
     h.shot(LANE, "conflict-marker-editor");
@@ -476,9 +478,12 @@ fn conflict_on(mut h: Harness) {
 /// The revset field alone: the panels lane places it in the sidebar.
 fn field_scene(h: &mut Harness) {
     h.show(|ui, theme, window, cx| {
+        let look = ui.look(theme);
         let field = filter_field(
-            theme,
-            ui.config.mono_font,
+            Look {
+                font: ui.config.mono_font,
+                ..look
+            },
             FilterField {
                 id: crate::sidebar::REVSET_INPUT_ID,
                 leading_icon: Some(crate::icons::SEARCH),

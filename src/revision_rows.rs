@@ -23,16 +23,17 @@ use crate::sidebar::{
     draft_panel_background, revision_graph_style, revision_id_display_len, revision_list_style,
     status_chips_for, tag_chips_for, truncate_end,
 };
-use crate::theme::ThemeSpec;
+use crate::ui::Look;
 use crate::{Cx, Diffui};
 
 /// The revision list of the sidebar, filling what it's given.
 pub(crate) fn build_revision_list(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let Look { theme, .. } = look;
     let tab = ui.active();
 
     let reveal_target = tab
@@ -49,7 +50,7 @@ pub(crate) fn build_revision_list(
 
     // The list fills its own background, so the target-mode wash has to reach
     // it too: a tinted container alone would be painted over.
-    let mut list_style = revision_list_style(theme, ui.config);
+    let mut list_style = revision_list_style(look);
     if tab.op_draft().is_some() {
         list_style.background = draft_panel_background(theme);
         // The rings that cut nodes out of their strokes are the pane's colour.
@@ -62,7 +63,7 @@ pub(crate) fn build_revision_list(
     let this = cx.entity();
     let build = {
         let this = this.clone();
-        Rc::new(move |row: usize, cx: &App| revision_row_at(this.read(cx), theme, row))
+        Rc::new(move |row: usize, cx: &App| revision_row_at(this.read(cx), look, row))
     };
 
     let working_copy_row = tab
@@ -168,7 +169,8 @@ pub(crate) fn build_revision_list(
 
 /// The view of list row `row`, whatever is drawn at the moment: the loaded
 /// graph, or the post-op graph while a draft is previewed.
-fn revision_row_at(ui: &Diffui, theme: ThemeSpec, row: usize) -> RevisionRowView {
+fn revision_row_at(ui: &Diffui, look: Look, row: usize) -> RevisionRowView {
+    let Look { theme, .. } = look;
     let tab = ui.active();
     let config = ui.config;
     let commits = &tab.session.commits;
@@ -213,7 +215,7 @@ fn revision_row_at(ui: &Diffui, theme: ThemeSpec, row: usize) -> RevisionRowView
     let commit_id = slot.commit.commit_id();
     let mut view = build_revision_row(
         slot,
-        theme,
+        look,
         config,
         &graph_style,
         &tab.revision_multi_selection,
@@ -246,8 +248,7 @@ fn revision_row_at(ui: &Diffui, theme: ThemeSpec, row: usize) -> RevisionRowView
     }
     // Tags trail the bookmarks, so the rail's `+N` overflow sheds them first.
     if !ghost && let Some(tags) = tab.session.bookmarks.tags.get(commit_id) {
-        view.bookmark_chips
-            .extend(tag_chips_for(tags, theme, config));
+        view.bookmark_chips.extend(tag_chips_for(tags, look));
     }
     view
 }
@@ -270,12 +271,13 @@ struct RowSlot<'a> {
 /// store. Called only for on-screen rows.
 fn build_revision_row(
     slot: RowSlot<'_>,
-    theme: ThemeSpec,
+    look: Look,
     config: AppConfig,
     graph_style: &RevisionGraphStyle,
     multi_selection: &[String],
     draft: Option<&crate::DraftUi>,
 ) -> RevisionRowView {
+    let Look { theme, .. } = look;
     let RowSlot {
         commit,
         layout: graph,
@@ -330,11 +332,11 @@ fn build_revision_row(
     };
 
     let lane_color = graph_style.lane_color(lane_frame.node_lane);
-    let bookmark_chips = bookmark_chips_for(bookmarks, lane_color, theme, config);
+    let bookmark_chips = bookmark_chips_for(bookmarks, lane_color, look);
     let mut status_chips = if ghost {
         Vec::new()
     } else {
-        status_chips_for(commit, theme, config)
+        status_chips_for(commit, look)
     };
     // A conflict the operation would cause wears the outlined (forecast)
     // form of the conflict chip.
@@ -579,7 +581,8 @@ pub(crate) mod scenes {
     /// around it is the panels lane's.
     pub(crate) fn show_list(h: &mut Harness) {
         h.show(|ui, theme, window, cx| {
-            let list = build_revision_list(ui, theme, window, cx);
+            let look = ui.look(theme);
+            let list = build_revision_list(ui, look, window, cx);
             div()
                 .size_full()
                 .flex()
@@ -1028,7 +1031,8 @@ pub(crate) mod scenes {
         let mut h = open("");
         let seen = log.clone();
         h.show(move |ui, theme, window, cx| {
-            let style = revision_list_style(theme, ui.config);
+            let look = ui.look(theme);
+            let style = revision_list_style(look);
             let added = theme.added_text;
             let build = Rc::new(move |row: usize, _: &App| FileRowView {
                 primary: if row == 0 {

@@ -18,6 +18,7 @@ use crate::modes::{Mode, ModeKind};
 use crate::mutations::MutationOp;
 use crate::prose::Prose;
 use crate::theme::{self, ThemeSpec};
+use crate::ui::Look;
 use crate::{ConfirmDialog, Diffui, PendingMutation, TabState, activity};
 
 pub(crate) const NAME_PROMPT_INPUT_ID: &str = "bookmark-name-input";
@@ -756,8 +757,12 @@ pub(crate) fn build_name_prompt(
         .placeholder("bookmark name")
         .on_input(move |value, window, cx| on_input(&value, window, cx))
         .on_submit(move |window, cx| on_submit(&(), window, cx));
-    let mut card = crate::overlay_kit::Dialog::new(&title, look)
-        .child(crate::field::dialog_input(spec, mono, theme, window, cx));
+    let mut card = crate::overlay_kit::Dialog::new(&title, look).child(crate::field::dialog_input(
+        spec,
+        Look { font: mono, ..look },
+        window,
+        cx,
+    ));
     if !note.is_empty() {
         let color = if error {
             theme.removed_text
