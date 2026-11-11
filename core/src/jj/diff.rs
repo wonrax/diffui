@@ -413,8 +413,16 @@ pub(crate) async fn diff_trees_with_copies(
             }));
         }
         // Past the caps a file keeps its counts but gets no rows (see
-        // `large_diff`); one the user already expanded is exempt.
-        let collapse = if binary || expanded {
+        // `large_diff`); one the user already expanded is exempt. A file can't
+        // change more lines than its two sides hold, so when that already fits
+        // the budget the hunks below are built straight away and charged for
+        // what they hold; only a file that might not fit is line-diffed first
+        // to count it.
+        let surely_fits = !binary
+            && !expanded
+            && budget
+                .fits(large_diff::line_count(before_bytes) + large_diff::line_count(after_bytes));
+        let collapse = if binary || expanded || surely_fits {
             None
         } else {
             let (additions, deletions) = large_diff::count_changed_lines(before_bytes, after_bytes);
@@ -507,6 +515,10 @@ pub(crate) async fn diff_trees_with_copies(
                     header: format_hunk_header(&hunk.left_line_range, &hunk.right_line_range),
                     lines: rows,
                 });
+            }
+            if surely_fits {
+                // Within the bound `surely_fits` checked, so this admits.
+                let _ = budget.admit(file.additions + file.deletions);
             }
             if after_conflicted {
                 file.hunks = split_conflict_regions(std::mem::take(&mut file.hunks));
