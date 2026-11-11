@@ -407,11 +407,24 @@ pub(crate) fn dropdown(
     if !field.open || field.completions.is_empty() {
         return None;
     }
-    let mut list = div().w_full().flex().flex_col().p(px(RESULTS_INSET));
-    for (index, completion) in field.completions.iter().enumerate() {
-        let selected = index == field.selected;
-        let body = crate::cmdline_view::completion_row(ui, theme, completion, selected, window, cx);
-        list = list.child(
+    let rows = field.completions.len().min(VISIBLE_ROWS);
+    let height = rows as f32 * ROW_HEIGHT + 2.0 * RESULTS_INSET;
+    let selected = field.navigated.then_some(field.selected);
+    let handle = dropdown_scroll(selected, height, window, cx);
+    let items = crate::palette::visible_results(
+        field
+            .completions
+            .iter()
+            .map(|_| None::<std::convert::Infallible>),
+        &handle,
+        height,
+        ROW_HEIGHT,
+        |no_heading| match no_heading {},
+        |index| {
+            let completion = &field.completions[index];
+            let selected = index == field.selected;
+            let body =
+                crate::cmdline_view::completion_row(ui, theme, completion, selected, window, cx);
             div()
                 .id(("revset-row", index))
                 .child(row_shell(body, selected, theme))
@@ -429,13 +442,16 @@ pub(crate) fn dropdown(
                     Diffui::listen(cx, move |this, _, _, cx| {
                         this.accept_revset_field(index, cx);
                     }),
-                ),
-        );
-    }
-    let rows = field.completions.len().min(VISIBLE_ROWS);
-    let height = rows as f32 * ROW_HEIGHT + 2.0 * RESULTS_INSET;
-    let selected = field.navigated.then_some(field.selected);
-    let handle = dropdown_scroll(selected, height, window, cx);
+                )
+                .into_any_element()
+        },
+    );
+    let list = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .p(px(RESULTS_INSET))
+        .children(items);
     // The keys the field answers while the list is open, as the palette's
     // footer tells its own.
     let font = ui.config.ui_font;

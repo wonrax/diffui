@@ -417,17 +417,21 @@ pub(crate) fn results(
         palette::empty_results(ui, theme, label.to_owned()).into_any_element()
     } else {
         let font = ui.config.ui_font;
-        let mut list = div().w_full().flex().flex_col().p(px(RESULTS_INSET));
-        let mut group = None;
-        for (index, completion) in command.completions.iter().enumerate() {
-            let heading = completion_group(completion.kind);
-            if group != Some(heading) {
-                group = Some(heading);
-                list = list.child(palette::group_heading(heading, font, theme));
-            }
-            let selected = index == command.selected;
-            let body = candidate_row(ui, theme, completion, selected, window, cx);
-            list = list.child(
+        let handle =
+            palette::list_scroll("command-results-scroll", command.scroll_y, 0, window, cx);
+        let items = palette::visible_results(
+            command
+                .completions
+                .iter()
+                .map(|completion| Some(completion_group(completion.kind))),
+            &handle,
+            palette::RESULTS_VIEWPORT_HEIGHT,
+            palette::ROW_HEIGHT,
+            |heading| palette::group_heading(heading, font, theme).into_any_element(),
+            |index| {
+                let completion = &command.completions[index];
+                let selected = index == command.selected;
+                let body = candidate_row(ui, theme, completion, selected, window, cx);
                 div()
                     .id(("command-row", index))
                     .child(palette::row_shell(body, selected, theme, window, cx))
@@ -448,11 +452,16 @@ pub(crate) fn results(
                         Diffui::listen(cx, move |this, _, _, cx| {
                             this.palette_on_accept_index(0, index, cx);
                         }),
-                    ),
-            );
-        }
-        let handle =
-            palette::list_scroll("command-results-scroll", command.scroll_y, 0, window, cx);
+                    )
+                    .into_any_element()
+            },
+        );
+        let list = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .p(px(RESULTS_INSET))
+            .children(items);
         ui::scrollable_with("command-results", &handle, list).into_any_element()
     };
     div()

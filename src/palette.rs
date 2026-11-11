@@ -48,7 +48,7 @@ pub fn results_scrollable_id(depth: usize) -> String {
 /// an extra scroll-to that doesn't move the offset, which is invisible to
 /// the user. Computed as: column height − input band − rule − scope tabs −
 /// rule − results-pane padding (top + bottom) − rule − footer.
-const RESULTS_VIEWPORT_HEIGHT: f32 = COLUMN_HEIGHT
+pub(crate) const RESULTS_VIEWPORT_HEIGHT: f32 = COLUMN_HEIGHT
     - INPUT_BAND
     - 1.0
     - SCOPES_HEIGHT
@@ -1581,17 +1581,28 @@ fn build_results(
 
     let font = ui.config.ui_font;
     let root = matches!(column.source, ColumnSource::Root);
-    let mut list = div().w_full().flex().flex_col().p(px(RESULTS_INSET));
-    let mut group = None;
-    for (index, row) in column.matches.iter().enumerate() {
-        let heading = group_of(&row.item);
-        if group != Some(heading) {
-            group = Some(heading);
-            list = list.child(group_heading(heading, font, theme));
-        }
-        let selected = index == column.selected;
-        let body = result_row_body(ui, theme, row, root, selected, window, cx);
-        list = list.child(
+    // The bar floats over the rows' right inset like the graph's does; the rows'
+    // text padding keeps every label and hint clear of it.
+    let id = results_scrollable_id(depth);
+    let handle = list_scroll(
+        ElementId::Name(format!("{id}-scroll").into()),
+        column.scroll_y,
+        // The wheel moves the list without touching `scroll_y`, so a target of 0
+        // can be no change at all: every new query goes back to it regardless.
+        column.query_version,
+        window,
+        cx,
+    );
+    let items = visible_results(
+        column.matches.iter().map(|row| Some(group_of(&row.item))),
+        &handle,
+        RESULTS_VIEWPORT_HEIGHT,
+        ROW_HEIGHT,
+        |heading| group_heading(heading, font, theme).into_any_element(),
+        |index| {
+            let row = &column.matches[index];
+            let selected = index == column.selected;
+            let body = result_row_body(ui, theme, row, root, selected, window, cx);
             div()
                 .id(("palette-row", index))
                 .child(row_shell(body, selected, theme, window, cx))
@@ -1613,22 +1624,78 @@ fn build_results(
                     Diffui::listen(cx, move |this, _, _, cx| {
                         this.palette_on_accept_index(depth, index, cx);
                     }),
-                ),
-        );
-    }
-    // The bar floats over the rows' right inset like the graph's does; the rows'
-    // text padding keeps every label and hint clear of it.
-    let id = results_scrollable_id(depth);
-    let handle = list_scroll(
-        ElementId::Name(format!("{id}-scroll").into()),
-        column.scroll_y,
-        // The wheel moves the list without touching `scroll_y`, so a target of 0
-        // can be no change at all: every new query goes back to it regardless.
-        column.query_version,
-        window,
-        cx,
+                )
+                .into_any_element()
+        },
     );
+    let list = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .p(px(RESULTS_INSET))
+        .children(items);
     ui::scrollable_with(ElementId::Name(id.into()), &handle, list).into_any_element()
+}
+
+/// A results list's group headings and rows, in order, built only near the
+/// `viewport` tall window `handle` is scrolled to: a list holds up to a couple
+/// of hundred rows and shows about ten, and it is rebuilt on every keystroke
+/// and hover. Headings and rows (`row_height`) are fixed heights, so spacers
+/// hold the rest's place and the list keeps its length. `groups` is each row's heading, if it
+/// has one; a heading opens where it changes.
+pub(crate) fn visible_results<G: PartialEq + Copy>(
+    groups: impl IntoIterator<Item = Option<G>>,
+    handle: &ScrollHandle,
+    viewport: f32,
+    row_height: f32,
+    mut heading: impl FnMut(G) -> AnyElement,
+    mut row: impl FnMut(usize) -> AnyElement,
+) -> Vec<AnyElement> {
+    enum Item<G> {
+        Heading(G),
+        Row(usize),
+    }
+    let mut items = Vec::new();
+    let mut open = None;
+    for (index, group) in groups.into_iter().enumerate() {
+        if let Some(group) = group
+            && open != Some(group)
+        {
+            open = Some(group);
+            items.push(Item::Heading(group));
+        }
+        items.push(Item::Row(index));
+    }
+    // Half a viewport either side: the wheel and the bar move the list before
+    // the render that follows them.
+    let top = -f32::from(handle.offset().y);
+    let (from, to) = (top - viewport / 2.0, top + 1.5 * viewport);
+    let spacer = |height: f32| div().w_full().flex_none().h(px(height)).into_any_element();
+    let mut built = Vec::new();
+    let (mut y, mut skipped) = (0.0, 0.0);
+    for item in items {
+        let height = match item {
+            Item::Heading(_) => crate::overlay_kit::GROUP_HEIGHT,
+            Item::Row(_) => row_height,
+        };
+        if y + height < from || y > to {
+            skipped += height;
+        } else {
+            if skipped > 0.0 {
+                built.push(spacer(skipped));
+                skipped = 0.0;
+            }
+            built.push(match item {
+                Item::Heading(group) => heading(group),
+                Item::Row(index) => row(index),
+            });
+        }
+        y += height;
+    }
+    if skipped > 0.0 {
+        built.push(spacer(skipped));
+    }
+    built
 }
 
 /// A group's heading in a results list, its label on the rows' text edge.
@@ -2100,6 +2167,48 @@ mod tests {
             assert_eq!(changes.len(), 2, "{changes:?}");
             assert!(!changes.contains(&"llllllll"));
         });
+    }
+
+    /// A long results list builds the rows near its view, wherever it's
+    /// scrolled, and the headings over them.
+    #[test]
+    fn a_results_list_builds_only_the_rows_near_its_view() {
+        let groups: Vec<Option<&str>> = (0..200)
+            .map(|index| Some(if index < 100 { "A" } else { "B" }))
+            .collect();
+        let handle = ScrollHandle::default();
+        let built = |handle: &ScrollHandle| {
+            let rows = std::cell::RefCell::new(Vec::new());
+            let headings = std::cell::RefCell::new(Vec::new());
+            visible_results(
+                groups.iter().copied(),
+                handle,
+                RESULTS_VIEWPORT_HEIGHT,
+                ROW_HEIGHT,
+                |group| {
+                    headings.borrow_mut().push(group);
+                    div().into_any_element()
+                },
+                |index| {
+                    rows.borrow_mut().push(index);
+                    div().into_any_element()
+                },
+            );
+            (rows.into_inner(), headings.into_inner())
+        };
+        let (rows, headings) = built(&handle);
+        assert_eq!(headings, ["A"]);
+        assert_eq!(rows.first(), Some(&0));
+        assert!(rows.len() < 30, "{rows:?}");
+
+        // Scrolled to the second group's heading.
+        let heading = crate::overlay_kit::GROUP_HEIGHT;
+        handle.set_offset(point(px(0.0), px(-(100.0 * ROW_HEIGHT + heading))));
+        let (rows, headings) = built(&handle);
+        assert_eq!(headings, ["B"]);
+        assert!(rows.contains(&100) && rows.contains(&105), "{rows:?}");
+        assert!(rows.windows(2).all(|pair| pair[1] == pair[0] + 1));
+        assert!(rows.len() < 30, "{rows:?}");
     }
 
     /// The pre-registry names in a recents file written by an older build all
