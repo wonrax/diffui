@@ -289,6 +289,8 @@ pub struct Session {
     snapshot_job: Option<(JobId, RefreshOrigin)>,
     /// The sweep in flight, with the graph job whose rows it addresses.
     empty_status_job: Option<(JobId, JobId)>,
+    /// The rows the sweep has yet to ask about, sent a chunk at a time.
+    empty_status_queue: Vec<(usize, String)>,
     /// The job of the graph currently on screen — the identity a background
     /// per-row result is checked against.
     graph_version: Option<JobId>,
@@ -449,7 +451,9 @@ impl Session {
             self.selected_commit_index = self.find_selected_commit_index();
             // An instant swap lands no event, so the follow-ups a `DiffLoaded`
             // would have produced are issued here.
-            return vec![Effect::RepaintDocument, Effect::RevealSelection];
+            let mut effects = self.drop_expand_jobs();
+            effects.extend([Effect::RepaintDocument, Effect::RevealSelection]);
+            return effects;
         }
         let mut effects = Vec::new();
         if let Some((job, ..)) = self.diff_job.take() {
@@ -497,6 +501,16 @@ impl Session {
             base: self.document_base.clone(),
             path: path.to_owned(),
         })]
+    }
+
+    /// Cancel the expands asked of the document being replaced. Their files
+    /// belong to another revision, and one landing on the new document would
+    /// be spliced in at the same path (a lockfile changes in most commits).
+    fn drop_expand_jobs(&mut self) -> Vec<Effect> {
+        self.expand_jobs
+            .drain(..)
+            .map(|(job, _)| Effect::Send(Command::Cancel { job }))
+            .collect()
     }
 
     fn on_file_expanded(
@@ -1008,8 +1022,7 @@ impl Session {
     }
 
     fn on_graph_loaded(&mut self, job: JobId, tail: crate::repo::GraphTail) -> Vec<Effect> {
-        let Some(load) = self.graph_job.take().filter(|load| load.id == job) else {
-            // Not ours: put back whatever was there.
+        let Some(load) = self.graph_job.take_if(|load| load.id == job) else {
             return Vec::new();
         };
         let swapped = load.staging.is_some();
@@ -1036,13 +1049,13 @@ impl Session {
         if tail.root_commit_id.is_some() {
             self.root_commit_id = tail.root_commit_id;
         }
+        // Not cached: the walk works these out again every time, and the
+        // cache only answers for the rows a walk leaves unknown.
         for (index, empty) in tail.empty_updates {
             // A shorter store must never be indexed past its end.
             if index >= self.commits.len() {
                 continue;
             }
-            let commit_id = self.commits.row(index).commit_id().to_owned();
-            self.empty_cache.insert(commit_id, empty);
             self.commits.set_is_empty(index, empty);
         }
         // The stream ended: the graph is what it is, even when it held no rows
@@ -1100,6 +1113,10 @@ impl Session {
         if !self.capabilities.graph {
             self.park_displayed_document();
         }
+        let mut effects = Vec::new();
+        if revision != self.selected_revision || base != self.document_base {
+            effects.extend(self.drop_expand_jobs());
+        }
         // Every backend's document lands here, so this is the one place that
         // makes file order mean the same thing to the diff view, the tree and
         // next/previous file.
@@ -1119,7 +1136,7 @@ impl Session {
             self.repaint_version = self.repaint_version.wrapping_add(1);
         }
 
-        let mut effects = vec![Effect::RepaintDocument];
+        effects.push(Effect::RepaintDocument);
         effects.extend(self.drain_pending_refresh());
         effects
     }
@@ -1244,8 +1261,13 @@ impl Session {
         };
         self.empty_status_job = None;
         // The graph these row indices address has since been replaced.
-        if Some(graph) != self.graph_version || updates.is_empty() {
+        if Some(graph) != self.graph_version {
+            self.empty_status_queue.clear();
             return Vec::new();
+        }
+        let next = self.next_empty_status_chunk();
+        if updates.is_empty() {
+            return next.into_iter().collect();
         }
         for &(index, empty) in &updates {
             if index >= self.commits.len() {
@@ -1256,7 +1278,7 @@ impl Session {
             self.commits.set_is_empty(index, empty);
         }
         self.repaint_version = self.repaint_version.wrapping_add(1);
-        Vec::new()
+        next.into_iter().collect()
     }
 
     fn on_op_head(&mut self, fingerprint: &str) -> Vec<Effect> {
@@ -1349,6 +1371,7 @@ impl Session {
         }
         if self.empty_status_job.is_some_and(|(id, _)| id == job) {
             self.empty_status_job = None;
+            self.empty_status_queue.clear();
         }
         if self.mutation_job == Some(job) {
             self.mutation_job = None;
@@ -1552,25 +1575,34 @@ impl Session {
         if had_cached {
             self.repaint_version = self.repaint_version.wrapping_add(1);
         }
-        if targets.is_empty() {
-            return Vec::new();
-        }
+        self.empty_status_queue = targets;
+        let mut effects = Vec::new();
         if let Some((job, _)) = self.empty_status_job.take() {
-            return vec![
-                Effect::Send(Command::Cancel { job }),
-                self.start_empty_status(targets),
-            ];
+            effects.push(Effect::Send(Command::Cancel { job }));
         }
-        vec![self.start_empty_status(targets)]
+        effects.extend(self.next_empty_status_chunk());
+        effects
     }
 
-    fn start_empty_status(&mut self, targets: Vec<(usize, String)>) -> Effect {
+    /// Ask about the next few queued rows. A sweep goes out a chunk per
+    /// command, so a diff or a load asked for meanwhile waits behind one
+    /// chunk rather than behind thousands of parent-tree merges.
+    fn next_empty_status_chunk(&mut self) -> Option<Effect> {
+        const CHUNK: usize = 64;
+
+        if self.empty_status_queue.is_empty() {
+            return None;
+        }
+        let rest = self
+            .empty_status_queue
+            .split_off(CHUNK.min(self.empty_status_queue.len()));
+        let targets = std::mem::replace(&mut self.empty_status_queue, rest);
         let job = self.next_job();
         let graph = self
             .graph_version
             .expect("empty status is only resolved for a graph that finished loading");
         self.empty_status_job = Some((job, graph));
-        Effect::Send(Command::EmptyStatus { job, targets })
+        Some(Effect::Send(Command::EmptyStatus { job, targets }))
     }
 }
 
@@ -1666,6 +1698,60 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The empty-status sweep goes out a chunk at a time, the next chunk on
+    /// each answer, so whatever the user asks for meanwhile waits behind one
+    /// chunk rather than the whole sweep.
+    #[test]
+    fn the_empty_status_sweep_goes_out_in_chunks() {
+        let repo = crate::repo::repo_id(&crate::repo::OpenSpec::Local {
+            root: "/tmp/sweep".into(),
+            scope: Default::default(),
+        });
+        let mut session = Session::unloaded(String::new());
+        session.capabilities.graph = true;
+        let job = session
+            .load_graph(true)
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::Send(Command::LoadGraph { job, .. }) => Some(*job),
+                _ => None,
+            })
+            .expect("a graph load");
+        session.apply(Event::new(
+            repo.clone(),
+            Payload::Batch {
+                job,
+                rows: (0..150).map(row).collect(),
+            },
+        ));
+        let mut effects = session.apply(Event::new(
+            repo.clone(),
+            Payload::GraphLoaded {
+                job,
+                tail: crate::repo::GraphTail::default(),
+            },
+        ));
+        let mut sizes = Vec::new();
+        while let Some((job, targets)) = effects.iter().find_map(|effect| match effect {
+            Effect::Send(Command::EmptyStatus { job, targets }) => Some((*job, targets.clone())),
+            _ => None,
+        }) {
+            sizes.push(targets.len());
+            let updates = targets.iter().map(|(index, _)| (*index, false)).collect();
+            effects = session.apply(Event::new(
+                repo.clone(),
+                Payload::EmptyStatus { job, updates },
+            ));
+        }
+        assert_eq!(sizes, [64, 64, 22]);
+        assert!(
+            session
+                .commits
+                .iter()
+                .all(|row| row.is_empty() == Some(false))
+        );
     }
 
     /// The diff view walks `document.files` and the changed-files tree lists
@@ -2457,6 +2543,62 @@ mod tests {
             Some(Vec::new()),
             "another revision starts collapsed"
         );
+    }
+
+    /// An expand asked of one revision must not land on the next one's
+    /// document, where the same path is another file's diff.
+    #[test]
+    fn an_expand_outlived_by_its_document_is_dropped() {
+        let mut session = compare_session();
+        let repo = crate::repo::repo_id(&crate::repo::OpenSpec::Local {
+            root: "/tmp/caps".into(),
+            scope: Default::default(),
+        });
+        let land = |session: &mut Session, revision: &str| {
+            let effects = session.load_diff(commit(revision));
+            let (job, ..) = sent_diff(&effects).expect("a diff load");
+            session.apply(Event::new(
+                repo.clone(),
+                Payload::DiffLoaded {
+                    job,
+                    revision: commit(revision),
+                    document: DiffDocument {
+                        files: vec![collapsed_file("Cargo.lock")],
+                        total_additions: 5_000,
+                        total_deletions: 0,
+                        range: None,
+                    },
+                    details: None,
+                },
+            ))
+        };
+        land(&mut session, "aaa");
+        let effects = session.expand_file("Cargo.lock");
+        let [Effect::Send(Command::ExpandFile { job: expand, .. })] = effects.as_slice() else {
+            panic!("expected an ExpandFile, got {effects:?}");
+        };
+        let expand = *expand;
+
+        let effects = land(&mut session, "bbb");
+        assert!(
+            effects.iter().any(
+                |effect| matches!(effect, Effect::Send(Command::Cancel { job }) if *job == expand)
+            ),
+            "{effects:?}"
+        );
+        assert!(!session.owns_job(expand));
+        let mut aaa = collapsed_file("Cargo.lock");
+        aaa.collapsed = None;
+        let effects = session.apply(Event::new(
+            repo,
+            Payload::FileExpanded {
+                job: expand,
+                path: "Cargo.lock".to_owned(),
+                file: Some(aaa),
+            },
+        ));
+        assert!(effects.is_empty());
+        assert!(session.document.files[0].collapsed.is_some());
     }
 
     #[test]
