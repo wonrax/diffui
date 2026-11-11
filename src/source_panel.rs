@@ -452,8 +452,8 @@ pub(crate) fn build_source_sidebar(
     .files(
         build_file,
         selected_entry,
-        Diffui::listen(cx, |this, row: &usize, _, _| {
-            this.on_source_sidebar_row(*row);
+        Diffui::listen(cx, |this, row: &usize, _, cx| {
+            this.on_source_sidebar_row(*row, cx);
         }),
     )
     .at_window_edge()

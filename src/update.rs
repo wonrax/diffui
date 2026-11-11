@@ -363,7 +363,7 @@ impl Diffui {
             self.open_pending_description_edit(tab, cx);
         }
         if relist_source {
-            self.refresh_source_if_working_copy(tab);
+            self.refresh_source_if_working_copy(tab, cx);
         }
         self.drain_queued_mutation(tab);
     }
@@ -1341,7 +1341,7 @@ impl Diffui {
         }
     }
 
-    pub(crate) fn on_source_sidebar_row(&mut self, display_index: usize) {
+    pub(crate) fn on_source_sidebar_row(&mut self, display_index: usize, cx: &mut Cx) {
         let (entries, rows) = self.source_entries_and_rows();
         match rows.get(display_index).cloned() {
             Some(diffui_core::SourceTreeRow::Dir { path, unlisted, .. }) => {
@@ -1353,7 +1353,7 @@ impl Diffui {
                         return;
                     };
                     self.active_mut().source.expanded.insert(path.clone());
-                    return self.list_ignored_dir(tab, path);
+                    return self.list_ignored_dir(tab, path, cx);
                 }
                 let expanded = &mut self.active_mut().source.expanded;
                 if !expanded.remove(&path) {
@@ -3287,7 +3287,7 @@ impl Diffui {
     /// Re-list + re-read `tab`'s browser when it's showing the working copy —
     /// called when a snapshot lands, so the browsed "directory" tracks the
     /// disk.
-    fn refresh_source_if_working_copy(&mut self, tab: TabId) {
+    fn refresh_source_if_working_copy(&mut self, tab: TabId, cx: &mut Cx) {
         let Some(target) = self.tab_mut(tab) else {
             return;
         };
@@ -3305,7 +3305,7 @@ impl Diffui {
             self.kick_source_file_load(tab);
         }
         for dir in dirs {
-            self.list_ignored_dir(tab, dir);
+            self.list_ignored_dir(tab, dir, cx);
         }
     }
 
@@ -3336,15 +3336,45 @@ impl Diffui {
 
     /// List one level of an unenumerated ignored directory. Ignored content
     /// exists only on disk, so this reads the filesystem directly rather than
-    /// going through the actor's tree.
-    fn list_ignored_dir(&mut self, tab: TabId, dir: String) {
+    /// going through the actor's tree, off the UI thread: a slow volume
+    /// mustn't stall a frame.
+    fn list_ignored_dir(&mut self, tab: TabId, dir: String, cx: &mut Cx) {
+        let Some(repository) = self.tab(tab).and_then(|target| target.repository.clone()) else {
+            return;
+        };
+        Self::run_async(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let listed = diffui_core::list_ignored_dir(&repository, &dir)
+                        .map_err(|error| format!("{error:#}"));
+                    (dir, listed)
+                })
+                .await
+            },
+            cx,
+            move |this, listed, _| {
+                if let Ok((dir, listed)) = listed {
+                    this.ignored_dir_listed(tab, dir, listed);
+                }
+            },
+        );
+    }
+
+    fn ignored_dir_listed(
+        &mut self,
+        tab: TabId,
+        dir: String,
+        listed: Result<Vec<diffui_core::SourceEntry>, String>,
+    ) {
         let Some(target) = self.tab_mut(tab) else {
             return;
         };
-        let Some(repository) = target.repository.clone() else {
+        // Collapsed before its first listing landed: nothing wants it.
+        let source = &target.source;
+        if !source.expanded.contains(&dir) && !source.dir_children.contains_key(&dir) {
             return;
-        };
-        match diffui_core::list_ignored_dir(&repository, &dir) {
+        }
+        match listed {
             Ok(entries) => {
                 target.source.dir_children.insert(dir, entries);
                 target.source.tree_epoch = target.source.tree_epoch.wrapping_add(1);
@@ -3353,7 +3383,7 @@ impl Diffui {
             // unlisted so the click can retry.
             Err(error) => {
                 target.source.expanded.remove(&dir);
-                target.source.tree_error = Some(format!("{error:#}"));
+                target.source.tree_error = Some(error);
             }
         }
     }
