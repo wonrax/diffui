@@ -26,6 +26,7 @@ use crate::chrome;
 use crate::input;
 use crate::measure;
 use crate::repository::Vcs;
+use crate::root::PaneSet;
 use crate::theme::{
     self, Color, Font, ThemeSpec, Weight, chip_background, emphasis_font, radius, text_size,
     well_fill,
@@ -559,14 +560,18 @@ pub(crate) fn build_tab_bar(
     // A drag has to keep tracking the cursor after it leaves the tab that started
     // it, so these listen to the whole window. They are registered in every frame
     // rather than only during a drag: a press and release can land between frames.
-    let on_move = Diffui::listen(cx, |this, event: &MouseMoveEvent, _, cx| {
-        if event.pressed_button == Some(MouseButton::Left) {
-            this.on_tab_drag_moved(f32::from(event.position.x), cx);
-        } else {
-            // A release we never saw: it landed outside the app's event stream.
-            this.on_tab_drag_released(cx);
-        }
-    });
+    let on_move = Diffui::listen_on(
+        cx,
+        PaneSet::TAB_BAR,
+        |this, event: &MouseMoveEvent, _, cx| {
+            if event.pressed_button == Some(MouseButton::Left) {
+                this.on_tab_drag_moved(f32::from(event.position.x), cx);
+            } else {
+                // A release we never saw: it landed outside the app's event stream.
+                this.on_tab_drag_released(cx);
+            }
+        },
+    );
     let on_up = Diffui::listen(cx, |this, _: &MouseUpEvent, _, cx| {
         this.on_tab_drag_released(cx);
     });
@@ -798,11 +803,11 @@ fn tab_widget(
     let on_hover = cx.listener(move |this: &mut Diffui, entered: &bool, _, cx| {
         if *entered {
             this.hovered = Some(HoverTarget::Tab(id));
-            cx.notify();
+            this.notify_panes(cx, PaneSet::TAB_BAR);
         // Crossing between neighbours can report the new tab first.
         } else if this.hovered == Some(HoverTarget::Tab(id)) {
             this.hovered = None;
-            cx.notify();
+            this.notify_panes(cx, PaneSet::TAB_BAR);
         }
     });
     let on_press = Diffui::listen(cx, move |this, event: &gpui_kit::MouseDownEvent, _, cx| {

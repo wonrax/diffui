@@ -3,6 +3,7 @@
 //! error, pointed at), the completion list in the palette's own rows, and a
 //! footer that says what Enter will do.
 
+use crate::root::PaneSet;
 use crate::theme::{self, Color, Font, Padding, Weight, text_size};
 use crate::typography::{self, Aligned};
 use crate::{Cx, input, palette, ui};
@@ -436,7 +437,9 @@ pub(crate) fn results(
                                 .command_line()
                                 .is_some_and(|command| command.selected != index)
                             {
-                                this.act(cx, |this, _| this.palette_on_select_index(0, index));
+                                this.act_on(cx, PaneSet::FLOATS, |this, _| {
+                                    this.palette_on_select_index(0, index)
+                                });
                             }
                         },
                     ))

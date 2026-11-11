@@ -192,6 +192,32 @@ fn a_diff_scroll_leaves_the_other_panes_alone() {
     assert!(h.read(|ui| ui.active().diff_scroll_offset) > 500.0);
 }
 
+/// Scrolling the diff into the next file moves the file tree's mark, and only
+/// the tree and the diff redraw for it.
+#[test]
+fn crossing_a_file_redraws_the_tree_and_the_diff_alone() {
+    let (mut h, repo) = open();
+    select(&mut h, &repo, "kitchen-sink");
+    h.frames();
+    let before = renders(&mut h);
+    for _ in 0..200 {
+        h.wheel(at(IN_DIFF.0, IN_DIFF.1), -60.0);
+        if h.read(|ui| ui.active().selected_file) > 0 {
+            break;
+        }
+    }
+    assert!(h.read(|ui| ui.active().selected_file) > 0, "crossed a file");
+    h.frames();
+    let delta = renders(&mut h) - before;
+    assert!(delta.files > 0, "the tree redrew: {delta:?}");
+    assert_eq!(
+        (delta.tab_bar, delta.toolbar, delta.left, delta.floats),
+        (0, 0, 0, 0),
+        "{delta:?}"
+    );
+    h.same_after_a_refresh().unwrap();
+}
+
 /// A wheel tick or a hover over the list draws the list's pane alone, with no echo on
 /// the next frame even though that pane holds a retained view whose props it just set.
 #[test]

@@ -102,11 +102,18 @@ fn init_keys(cx: &mut App) {
             window.blur(cx);
             consumed = true;
         }
+        let escape = key == keys::Key::Named(keys::Named::Escape);
         let taken = app.update(cx, |app, cx| {
             app.modifiers = modifiers;
-            app.act(cx, |app, cx| {
+            let taken = app.act_on(cx, PaneSet::NONE, |app, cx| {
                 app.on_key_pressed(&key, modifiers, consumed, cx)
-            })
+            });
+            // A key the keymap passes on changed nothing, so it rebuilds
+            // nothing; Esc may have dropped a tab drag on the way.
+            if taken || escape {
+                app.notify_panes(cx, PaneSet::ALL);
+            }
+            taken
         });
         // A field with a selection of its own copies that; otherwise a live diff
         // selection copies, whichever element holds focus by now.
@@ -226,45 +233,46 @@ pub(crate) fn build_root(
 }
 
 impl Diffui {
-    /// Runs a state change, then [`Diffui::reconcile`], then notifies. See the
-    /// module docs.
+    /// Runs a state change, then [`Diffui::reconcile`], then redraws the
+    /// whole window. See the module docs.
     pub(crate) fn act<R>(
         &mut self,
         cx: &mut Cx,
         change: impl FnOnce(&mut Self, &mut Cx) -> R,
     ) -> R {
-        frame_log::time(std::any::type_name_of_val(&change), || {
-            let out = change(self, cx);
-            self.reconcile(cx);
-            cx.notify();
-            out
-        })
+        self.act_on(cx, PaneSet::ALL, change)
     }
 
-    /// [`Diffui::act`] for a change that only the main pane shows, such as a
-    /// file's text or highlighting arriving for the diff: the other panes keep
-    /// their last frame. Rebuilding all of them costs several milliseconds in a
-    /// real window, and these changes land while the diff scrolls. Anything
-    /// another pane reads must go through [`Diffui::act`] instead, or that pane
-    /// goes stale.
-    pub(crate) fn act_on_main<R>(
+    /// [`Diffui::act`] for a change only `panes` show, such as a file's text
+    /// arriving for the diff or a hover in an overlay: the other panes keep
+    /// their last frame. Rebuilding all of them costs several milliseconds in
+    /// a real window. Anything another pane reads must name that pane too, or
+    /// it goes stale.
+    pub(crate) fn act_on<R>(
         &mut self,
         cx: &mut Cx,
+        panes: PaneSet,
         change: impl FnOnce(&mut Self, &mut Cx) -> R,
     ) -> R {
         frame_log::time(std::any::type_name_of_val(&change), || {
             let out = change(self, cx);
             self.reconcile(cx);
-            self.notify_panes(cx, |panes| &panes.main);
+            self.notify_panes(cx, panes);
             out
         })
     }
 
-    /// Redraws one pane, or the whole window before the panes exist.
-    pub(crate) fn notify_panes(&self, cx: &mut Cx, pane: impl Fn(&Panes) -> &Entity<Pane>) {
+    /// Redraws `panes`: the whole window for [`PaneSet::ALL`], or before the
+    /// panes exist.
+    pub(crate) fn notify_panes(&self, cx: &mut Cx, set: PaneSet) {
         match &self.panes {
-            Some(panes) => pane(panes).update(cx, |_, cx| cx.notify()),
-            None => cx.notify(),
+            Some(panes) if set != PaneSet::ALL => {
+                for pane in panes.select(set) {
+                    pane.update(cx, |_, cx| cx.notify());
+                }
+            }
+            _ if set.is_empty() => {}
+            _ => cx.notify(),
         }
     }
 
@@ -273,12 +281,17 @@ impl Diffui {
         cx: &mut Cx,
         change: impl Fn(&mut Diffui, &E, &mut Window, &mut Cx) + 'static,
     ) -> impl Fn(&E, &mut Window, &mut App) + 'static {
+        Self::listen_on(cx, PaneSet::ALL, change)
+    }
+
+    /// A listener that runs `change` inside [`Diffui::act_on`] `panes`.
+    pub(crate) fn listen_on<E: 'static>(
+        cx: &mut Cx,
+        panes: PaneSet,
+        change: impl Fn(&mut Diffui, &E, &mut Window, &mut Cx) + 'static,
+    ) -> impl Fn(&E, &mut Window, &mut App) + 'static {
         cx.listener(move |this: &mut Diffui, event: &E, window, cx| {
-            frame_log::time(std::any::type_name_of_val(&change), || {
-                change(this, event, window, cx);
-                this.reconcile(cx);
-                cx.notify();
-            });
+            this.act_on(cx, panes, |this, cx| change(this, event, window, cx));
         })
     }
 
@@ -345,10 +358,7 @@ impl Diffui {
             work_in_flight,
             Duration::from_millis(120),
             cx,
-            |this, cx| {
-                this.notify_panes(cx, |panes| &panes.toolbar);
-                this.notify_panes(cx, |panes| &panes.floats);
-            },
+            |this, cx| this.notify_panes(cx, PaneSet::TOOLBAR | PaneSet::FLOATS),
         );
 
         // The overlay menu's fixed clock: the trajectory apex and the sweep stall.
@@ -367,7 +377,7 @@ impl Diffui {
             self.toasts.iter().any(|toast| !toast.sticky),
             Duration::from_millis(500),
             cx,
-            |this, cx| this.act(cx, |this, _| this.on_toast_tick()),
+            |this, cx| this.act_on(cx, PaneSet::FLOATS, |this, _| this.on_toast_tick()),
         );
 
         // Drives the debounced geometry save. Active only while a change is
@@ -491,17 +501,17 @@ fn repository_loop(spec: OpenSpec, cx: &mut Cx) -> Task<()> {
                     diffui_core::repo::Payload::FilePairRead { .. }
                 )
             });
+            let panes = if main_only {
+                PaneSet::MAIN
+            } else {
+                PaneSet::ALL
+            };
             let updated = this.update(cx, |this, cx| {
-                let apply = |this: &mut Diffui, cx: &mut Cx| {
+                this.act_on(cx, panes, |this, cx| {
                     for event in batch {
                         this.on_repo_event(event, cx);
                     }
-                };
-                if main_only {
-                    this.act_on_main(cx, apply);
-                } else {
-                    this.act(cx, apply);
-                }
+                });
             });
             if updated.is_err() {
                 return;
@@ -687,6 +697,38 @@ impl Render for Pane {
     }
 }
 
+/// A set of [`Panes`]: the ones a change redraws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PaneSet(u8);
+
+impl PaneSet {
+    pub(crate) const NONE: Self = Self(0);
+    pub(crate) const TAB_BAR: Self = Self(1);
+    pub(crate) const TOOLBAR: Self = Self(1 << 1);
+    pub(crate) const LEFT: Self = Self(1 << 2);
+    pub(crate) const FILES: Self = Self(1 << 3);
+    pub(crate) const MAIN: Self = Self(1 << 4);
+    pub(crate) const STATUS: Self = Self(1 << 5);
+    pub(crate) const FLOATS: Self = Self(1 << 6);
+    pub(crate) const ALL: Self = Self((1 << 7) - 1);
+
+    fn is_empty(self) -> bool {
+        self == Self::NONE
+    }
+
+    fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
+impl std::ops::BitOr for PaneSet {
+    type Output = Self;
+
+    fn bitor(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
 /// The window's regions.
 #[derive(Clone)]
 pub(crate) struct Panes {
@@ -706,6 +748,21 @@ impl std::fmt::Debug for Panes {
 }
 
 impl Panes {
+    fn select(&self, set: PaneSet) -> impl Iterator<Item = &Entity<Pane>> {
+        [
+            (PaneSet::TAB_BAR, &self.tab_bar),
+            (PaneSet::TOOLBAR, &self.toolbar),
+            (PaneSet::LEFT, &self.left),
+            (PaneSet::FILES, &self.files),
+            (PaneSet::MAIN, &self.main),
+            (PaneSet::STATUS, &self.status),
+            (PaneSet::FLOATS, &self.floats),
+        ]
+        .into_iter()
+        .filter(move |(member, _)| set.contains(*member))
+        .map(|(_, pane)| pane)
+    }
+
     fn new(app: Entity<Diffui>, cx: &mut App) -> Self {
         Self {
             tab_bar: Pane::new(app.clone(), "tab_bar", tab_bar::build_tab_bar, cx),

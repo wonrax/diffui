@@ -5,6 +5,7 @@
 
 use crate::Cx;
 use crate::keys::{self as keyboard, Named};
+use crate::root::PaneSet;
 use crate::theme::{self, Font, text_size};
 use crate::typography::{self, Aligned};
 use crate::{icons, ui};
@@ -410,7 +411,9 @@ pub(crate) fn dropdown(
                 .on_mouse_move(
                     cx.listener(move |this: &mut Diffui, _: &MouseMoveEvent, _, cx| {
                         if this.active().cmdline.field.selected != index {
-                            this.act(cx, |this, _| this.cmd_on_field_select(index));
+                            this.act_on(cx, PaneSet::LEFT, |this, _| {
+                                this.cmd_on_field_select(index)
+                            });
                         }
                     }),
                 )

@@ -9,6 +9,7 @@ use std::rc::Rc;
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, Bounds, Div, MouseButton, Pixels, Window, canvas, div, px};
 
+use crate::root::PaneSet;
 use crate::theme::{self, ThemeSpec};
 use crate::theme::{Color, Font, Padding};
 use crate::{Cx, Diffui, icons, input};
@@ -162,7 +163,7 @@ fn presets_caret(
     } = caret;
     let on_hover = cx.listener(move |this: &mut Diffui, hovering: &bool, _, cx| {
         this.on_set_hover(hovering.then_some(target));
-        cx.notify();
+        this.notify_panes(cx, PaneSet::LEFT);
     });
     let on_press = Diffui::listen(cx, move |this, _: &gpui_kit::MouseDownEvent, _, cx| {
         cx.stop_propagation();

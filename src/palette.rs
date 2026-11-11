@@ -14,6 +14,7 @@
 //! the user has recently jumped to / commands they recently ran. Recents
 //! are kept in-memory in `Recents` and persisted to the XDG data dir.
 
+use crate::root::PaneSet;
 use crate::theme::{Color, Font, Weight, text_size};
 use crate::{Action, Cx, icons, input, ui};
 use gpui_kit::prelude::*;
@@ -1592,7 +1593,9 @@ fn build_results(
                             .and_then(|state| state.stack.get(depth))
                             .is_some_and(|column| column.selected == index);
                         if !selected {
-                            this.act(cx, |this, _| this.palette_on_select_index(depth, index));
+                            this.act_on(cx, PaneSet::FLOATS, |this, _| {
+                                this.palette_on_select_index(depth, index)
+                            });
                         }
                     }),
                 )

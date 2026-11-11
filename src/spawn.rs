@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use tokio::runtime::Runtime;
 
+use crate::root::PaneSet;
 use crate::{Cx, Diffui};
 
 /// The runtime behind [`Diffui::run_async`].
@@ -36,22 +37,14 @@ impl Diffui {
         cx: &mut Cx,
         done: impl FnOnce(&mut Diffui, T, &mut Cx) + 'static,
     ) {
-        Self::run_async_in(future, false, cx, done);
+        Self::run_async_on(future, PaneSet::ALL, cx, done);
     }
 
-    /// [`Diffui::run_async`] for a result only the main pane shows: `done` runs
-    /// in [`Diffui::act_on_main`].
-    pub(crate) fn run_async_on_main<T: Send + 'static>(
+    /// [`Diffui::run_async`] for a result only `panes` show: `done` runs in
+    /// [`Diffui::act_on`].
+    pub(crate) fn run_async_on<T: Send + 'static>(
         future: impl Future<Output = T> + Send + 'static,
-        cx: &mut Cx,
-        done: impl FnOnce(&mut Diffui, T, &mut Cx) + 'static,
-    ) {
-        Self::run_async_in(future, true, cx, done);
-    }
-
-    fn run_async_in<T: Send + 'static>(
-        future: impl Future<Output = T> + Send + 'static,
-        main_only: bool,
+        panes: PaneSet,
         cx: &mut Cx,
         done: impl FnOnce(&mut Diffui, T, &mut Cx) + 'static,
     ) {
@@ -61,12 +54,7 @@ impl Diffui {
                 return;
             };
             let _ = this.update(cx, |this, cx| {
-                let done = |this: &mut Diffui, cx: &mut Cx| done(this, output, cx);
-                if main_only {
-                    this.act_on_main(cx, done);
-                } else {
-                    this.act(cx, done);
-                }
+                this.act_on(cx, panes, |this, cx| done(this, output, cx));
             });
         })
         .detach();

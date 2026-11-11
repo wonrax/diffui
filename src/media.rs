@@ -7,6 +7,7 @@
 //! side at a time, for the documents the active tab shows.
 
 use crate::Cx;
+use crate::root::PaneSet;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -255,7 +256,9 @@ fn decode(jobs: Vec<(String, BlobKind, Arc<[u8]>)>, cx: &mut Cx) {
                     use futures::StreamExt as _;
                     while let Some(decoded) = receiver.next().await {
                         let updated = this.update(cx, |this, cx| {
-                            this.act(cx, |this, _| this.on_media_decoded(decoded));
+                            this.act_on(cx, PaneSet::MAIN, |this, _| {
+                                this.on_media_decoded(decoded)
+                            });
                         });
                         if updated.is_err() {
                             return;

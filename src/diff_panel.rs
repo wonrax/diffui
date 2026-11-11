@@ -4,6 +4,7 @@ use crate::diff_view::{
 };
 use crate::geometry::{Point, Rectangle};
 use crate::revision_list::{self, FileRowView, RevisionListProps};
+use crate::root::PaneSet;
 use crate::theme::{
     Color, Font, ThemeSpec, Weight, chip_background, diff_palette, file_status_color, text_size,
 };
@@ -886,9 +887,12 @@ fn diff_props(
         ui.config.code_type,
         ui.config.multi_click_ms,
     )
-    .on_selected_file_changed(Diffui::listen(cx, |this, index: &usize, _, cx| {
-        this.perform(Action::SelectFile(*index), cx);
-    }))
+    // The scroll spy: only the file tree marks the file in view.
+    .on_selected_file_changed(Diffui::listen_on(
+        cx,
+        PaneSet::FILES | PaneSet::MAIN,
+        |this, index: &usize, _, cx| this.perform(Action::SelectFile(*index), cx),
+    ))
     .on_copy(on_copy(cx))
     // Every scroll tick: store the offset, and leave the app out of it.
     .on_scroll(cx.listener(|this: &mut Diffui, offset: &f32, _, _| {

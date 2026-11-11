@@ -2757,7 +2757,7 @@ impl Diffui {
         // Tens of milliseconds on a large file, plus mapping every span back
         // to its diff line: too long for the UI thread, and the actor's has
         // commands to serve.
-        Self::run_async_on_main(
+        Self::run_async_on(
             async move {
                 tokio::task::spawn_blocking(move || {
                     diffui_core::syntax::highlight_file(file, old.as_deref(), new.as_deref())
@@ -2765,6 +2765,7 @@ impl Diffui {
                 .await
                 .unwrap_or_default()
             },
+            crate::root::PaneSet::MAIN,
             cx,
             move |this, spans, _| this.on_file_highlighted(document_id, file_index, spans),
         );
