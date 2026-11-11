@@ -2214,6 +2214,45 @@ fn log_rows_carry_the_immutable_flag() {
     );
 }
 
+/// The graph's change-id prefixes are unique within
+/// `revsets.short-prefixes` first, as `jj log` shortens them, not across the
+/// whole repo.
+#[test]
+fn change_id_prefixes_are_unique_within_short_prefixes() {
+    let root = scratch_repo("short-prefixes");
+    snapshot(&root);
+    let base = commit_id(&root, "@-");
+    // More changes than the 16 one-letter prefixes, so some need two.
+    harness::new_chain(&root, &base, 20);
+    let load = || {
+        block_on(load_jj_commits(
+            root.clone(),
+            "all()".to_owned(),
+            LoadProgress::default(),
+        ))
+        .expect("load commits")
+        .0
+    };
+    let store = load();
+    let long = store
+        .iter()
+        .find(|row| row.shortest_change_id_len().is_some_and(|len| len > 1))
+        .expect("a change whose prefix needs two letters");
+    let (commit, change) = (long.commit_id().to_owned(), long.change_id().to_owned());
+
+    std::fs::write(
+        root.join(".jj/repo/config.toml"),
+        format!("[revsets]\nshort-prefixes = '{commit}'\n"),
+    )
+    .expect("write repo config");
+    let store = load();
+    let row = store
+        .iter()
+        .find(|row| row.change_id() == change)
+        .expect("the change is still in the graph");
+    assert_eq!(row.shortest_change_id_len(), Some(1));
+}
+
 /// Rows descending from `trunk()` are flagged, and the trunk's id rides
 /// along with the bookmarks; with no trunk bookmark, `trunk()` is the root
 /// commit, which counts as no trunk at all.

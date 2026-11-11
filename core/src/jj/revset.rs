@@ -75,7 +75,8 @@ impl RevsetScope<'_> {
         src: &str,
         expression: &Arc<UserRevsetExpression>,
     ) -> Result<Arc<ResolvedRevsetExpression>, RevsetError> {
-        let id_prefixes = self.id_prefix_context();
+        let id_prefixes =
+            id_prefix_context(self.repo_root, self.repo.settings(), self.workspace_name);
         let resolver = SymbolResolver::new(
             self.repo,
             &[] as &[Box<dyn jj_lib::revset::SymbolResolverExtension>],
@@ -84,31 +85,6 @@ impl RevsetScope<'_> {
         expression
             .resolve_user_expression(self.repo, &resolver)
             .map_err(|error| resolution_error(src, error))
-    }
-
-    /// jj-cli's id prefix context: change and commit id prefixes are
-    /// disambiguated within `revsets.short-prefixes` (else `revsets.log`)
-    /// first, so a prefix `jj log` shows as unique resolves here too. A
-    /// setting that doesn't parse disambiguates over the whole repo, where
-    /// jj would refuse to run.
-    fn id_prefix_context(&self) -> IdPrefixContext {
-        let context = IdPrefixContext::new(Arc::default());
-        let settings = self.repo.settings();
-        let text = settings
-            .get_string("revsets.short-prefixes")
-            .optional()
-            .transpose()
-            .unwrap_or_else(|| settings.get_string("revsets.log"));
-        let Ok(text) = text else {
-            return context;
-        };
-        if text.trim().is_empty() {
-            return context;
-        }
-        match parse_revset_raw(self.repo_root, settings, self.workspace_name, &text) {
-            Ok(Ok(expression)) => context.disambiguate_within(expression),
-            _ => context,
-        }
     }
 
     /// The commit ids `expression` evaluates to, newest first.
@@ -384,6 +360,34 @@ pub(crate) struct ResolvedRange {
     pub from: MergedTree,
     pub to: MergedTree,
     pub info: DiffRange,
+}
+
+/// jj-cli's id prefix context: change and commit id prefixes are
+/// disambiguated within `revsets.short-prefixes` (else `revsets.log`) first,
+/// so a prefix `jj log` shows as unique is the one shown and resolved here
+/// too. A setting that doesn't parse disambiguates over the whole repo, where
+/// jj would refuse to run.
+pub(super) fn id_prefix_context(
+    repo_root: &Path,
+    settings: &UserSettings,
+    workspace_name: &WorkspaceName,
+) -> IdPrefixContext {
+    let context = IdPrefixContext::new(Arc::default());
+    let text = settings
+        .get_string("revsets.short-prefixes")
+        .optional()
+        .transpose()
+        .unwrap_or_else(|| settings.get_string("revsets.log"));
+    let Ok(text) = text else {
+        return context;
+    };
+    if text.trim().is_empty() {
+        return context;
+    }
+    match parse_revset_raw(repo_root, settings, workspace_name, &text) {
+        Ok(Ok(expression)) => context.disambiguate_within(expression),
+        _ => context,
+    }
 }
 
 /// jj-cli's `resolve_single_rev` wording.

@@ -7,6 +7,7 @@ use jj_lib::{
     backend::{ChangeId, CommitId},
     commit::Commit,
     graph::{GraphEdge, GraphEdgeType, TopoGroupedGraph},
+    id_prefix::IdPrefixIndex,
     object_id::ObjectId,
     ref_name::WorkspaceName,
     repo::{ReadonlyRepo, Repo},
@@ -680,6 +681,11 @@ async fn post_op_graph(
         })
         .ok();
     let is_immutable = immutable.as_ref().map(|set| set.containing_fn());
+    // Prefixes as the graph walk shortens them.
+    let id_prefixes = super::revset::id_prefix_context(root, base.settings(), name);
+    let id_prefix_index = id_prefixes
+        .populate(repo)
+        .unwrap_or_else(|_| IdPrefixIndex::empty());
 
     let mut missing: HashMap<CommitId, usize> = HashMap::new();
     let mut rows: Vec<PostOpRow> = Vec::with_capacity(nodes.len());
@@ -717,7 +723,16 @@ async fn post_op_graph(
                     new_conflict: commit.has_conflict()
                         && !pred.is_some_and(|pred| pred.has_conflict()),
                     summary: Some(
-                        summary_of(repo, &commit, origin.hex(), labels, is_wc, immutable).await,
+                        summary_of(
+                            repo,
+                            &id_prefix_index,
+                            &commit,
+                            origin.hex(),
+                            labels,
+                            is_wc,
+                            immutable,
+                        )
+                        .await,
                     ),
                 }
             }
@@ -730,7 +745,18 @@ async fn post_op_graph(
                     None
                 } else {
                     let commit = load_commit(repo, id).await?;
-                    Some(summary_of(repo, &commit, id.hex(), labels, is_wc, immutable).await)
+                    Some(
+                        summary_of(
+                            repo,
+                            &id_prefix_index,
+                            &commit,
+                            id.hex(),
+                            labels,
+                            is_wc,
+                            immutable,
+                        )
+                        .await,
+                    )
                 };
                 PostOpRow {
                     origin: Some(id.hex()),
@@ -754,6 +780,7 @@ async fn post_op_graph(
 /// draft sources keep matching it.
 async fn summary_of(
     repo: &dyn Repo,
+    id_prefixes: &IdPrefixIndex<'_>,
     commit: &Commit,
     commit_id: String,
     bookmarks: Vec<String>,
@@ -775,8 +802,8 @@ async fn summary_of(
     CommitSummary {
         change_id: commit.change_id().to_string(),
         commit_id,
-        shortest_change_id_len: repo
-            .shortest_unique_change_id_prefix_len(commit.change_id())
+        shortest_change_id_len: id_prefixes
+            .shortest_change_prefix_len(repo, commit.change_id())
             .await
             .ok(),
         description: if description.is_empty() {

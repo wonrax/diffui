@@ -11,6 +11,7 @@ use jj_lib::{
     backend::{CommitId, TreeId},
     git::REMOTE_NAME_FOR_LOCAL_GIT_REPO,
     graph::TopoGroupedGraph,
+    id_prefix::IdPrefixIndex,
     merge::Merge,
     object_id::ObjectId,
     op_store::LocalRemoteRefTarget,
@@ -316,6 +317,15 @@ pub async fn walk_jj_with_repo(
     };
     let on_trunk_fn = on_trunk_revset.as_ref().map(|rs| rs.containing_fn());
 
+    // Change-id prefixes as short as `jj log` shows them: unique within
+    // `revsets.short-prefixes` first. Best-effort: an index that won't load
+    // falls back to whole-repo uniqueness.
+    let id_prefixes = super::revset::id_prefix_context(repo_root, repo.settings(), workspace_name);
+    let id_prefix_index = id_prefixes.populate(repo).unwrap_or_else(|error| {
+        tracing::warn!("revsets.short-prefixes unavailable: {error}");
+        IdPrefixIndex::empty()
+    });
+
     let mut lane_assigner = LaneAssigner::new();
     let mut tree_ids: HashMap<CommitId, Merge<TreeId>> = HashMap::new();
     let mut ids: Vec<CommitId> = Vec::new();
@@ -354,8 +364,8 @@ pub async fn walk_jj_with_repo(
             });
 
             let description = commit.description().lines().next().unwrap_or("").trim();
-            let shortest_change_id_len = repo
-                .shortest_unique_change_id_prefix_len(commit.change_id())
+            let shortest_change_id_len = id_prefix_index
+                .shortest_change_prefix_len(repo, commit.change_id())
                 .await
                 .with_context(|| {
                     format!(
