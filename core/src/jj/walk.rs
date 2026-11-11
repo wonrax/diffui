@@ -685,11 +685,13 @@ pub(super) fn compute_bookmarks_info(
     }
 }
 
-/// The bookmarks a plain `jj git push --remote <remote>` would send, picked
-/// as the push's tracked mode picks them (`jj::push`): tracked bookmarks whose
-/// local target sits in `remote_bookmarks(remote=<remote>)..@`. Each carries
-/// how many commits it is ahead of the remote's copy. Conflicted bookmarks,
-/// and ones the remote no longer has, are left out, as the push skips them.
+/// The bookmarks and tags a plain `jj git push --remote <remote>` would send,
+/// picked as the push's tracked mode picks them (`jj::push`): tracked refs
+/// whose local target sits in `remote_bookmarks(remote=<remote>)..@`. Each
+/// carries how many commits it is ahead of the remote's copy. Conflicted
+/// refs, and bookmarks the remote no longer has, are left out, as the push
+/// skips them. A tracked tag the remote doesn't have yet goes, as it does in
+/// the push, counted from the remote's bookmarks.
 /// Best-effort, like the branch summary: a failure leaves the list empty.
 pub(super) async fn compute_tracked_push(
     repo: &ReadonlyRepo,
@@ -716,7 +718,7 @@ async fn tracked_push_inner(
         .flat_map(|(_, remote_ref)| remote_ref.target.added_ids())
         .cloned()
         .collect();
-    let in_range: HashSet<CommitId> = RevsetExpression::commits(remote_heads)
+    let in_range: HashSet<CommitId> = RevsetExpression::commits(remote_heads.clone())
         .range(&RevsetExpression::commit(wc_commit_id.clone()))
         .evaluate(repo)
         .context("failed to evaluate the default push range")?
@@ -738,19 +740,46 @@ async fn tracked_push_inner(
         if !in_range.contains(local) {
             continue;
         }
-        let ahead = RevsetExpression::commit(theirs.clone())
-            .range(&RevsetExpression::commit(local.clone()))
-            .evaluate(repo)
-            .context("failed to count a bookmark's unpushed commits")?
-            .stream()
-            .count()
-            .await;
         candidates.push(PushCandidate {
             name: name.as_str().to_owned(),
-            ahead,
+            tag: false,
+            ahead: count_ahead(repo, vec![theirs.clone()], local).await?,
+        });
+    }
+    for (name, targets) in view.local_remote_tags(remote) {
+        if !targets.remote_ref.is_tracked() {
+            continue;
+        }
+        let Some(local) = targets.local_target.as_normal() else {
+            continue;
+        };
+        if !in_range.contains(local) {
+            continue;
+        }
+        let base = match targets.remote_ref.target.as_normal() {
+            Some(theirs) if theirs == local => continue,
+            Some(theirs) => vec![theirs.clone()],
+            None if targets.remote_ref.target.is_absent() => remote_heads.clone(),
+            None => continue,
+        };
+        candidates.push(PushCandidate {
+            name: name.as_str().to_owned(),
+            tag: true,
+            ahead: count_ahead(repo, base, local).await?,
         });
     }
     Ok(candidates)
+}
+
+/// How many commits `base..local` holds: what a push of `local` adds.
+async fn count_ahead(repo: &ReadonlyRepo, base: Vec<CommitId>, local: &CommitId) -> Result<usize> {
+    Ok(RevsetExpression::commits(base)
+        .range(&RevsetExpression::commit(local.clone()))
+        .evaluate(repo)
+        .context("failed to count a ref's unpushed commits")?
+        .stream()
+        .count()
+        .await)
 }
 
 /// Compute the working-copy's branch summary: the nearest local bookmark at or

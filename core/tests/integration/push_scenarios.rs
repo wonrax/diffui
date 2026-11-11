@@ -592,6 +592,7 @@ fn tracked_push_sends_tracked_bookmarks_that_moved() {
         bookmarks(&mut repo).tracked_push,
         vec![PushCandidate {
             name: "main".to_owned(),
+            tag: false,
             ahead: 1,
         }]
     );
@@ -647,6 +648,16 @@ fn tracked_push_sends_tracked_tags_too() {
         tx.commit("test: tags").await.expect("commit the tags");
     });
 
+    // The toolbar's Push offers the tag alone, since no bookmark moved.
+    assert_eq!(
+        bookmarks(&mut repo).tracked_push,
+        vec![PushCandidate {
+            name: "v1".to_owned(),
+            tag: true,
+            ahead: 1,
+        }]
+    );
+
     let outcome = repo
         .mutate(push("origin", vec![PushTarget::Tracked]))
         .expect("plain push");
@@ -664,6 +675,7 @@ fn tracked_push_sends_tracked_tags_too() {
     };
     assert_eq!(tag("v1"), Some(second));
     assert_eq!(tag("v2"), None);
+    assert!(bookmarks(&mut repo).tracked_push.is_empty());
 }
 
 #[test]

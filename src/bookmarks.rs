@@ -594,12 +594,35 @@ pub(crate) fn working_copy_push_warning() -> Prose {
         .text(" instead.")
 }
 
-/// A push confirmation's title: how many bookmarks go to which remote.
+/// What a push sends, by kind: "bookmark", "tag", or "bookmarks and tags"
+/// when both go; plural when `plural`.
+pub(crate) fn ref_noun(tags: usize, total: usize, plural: bool) -> &'static str {
+    match (tags, plural) {
+        (0, false) => "bookmark",
+        (0, true) => "bookmarks",
+        (t, false) if t == total => "tag",
+        (t, true) if t == total => "tags",
+        _ => "bookmarks and tags",
+    }
+}
+
+/// "1 tag", "2 bookmarks", "3 bookmarks and tags".
+pub(crate) fn ref_count(tags: usize, total: usize) -> String {
+    format!("{total} {}", ref_noun(tags, total, total != 1))
+}
+
+/// [`ref_noun`] for a push's moves.
+fn moves_noun<'a>(moves: impl IntoIterator<Item = &'a diffui_core::BookmarkMove>) -> &'static str {
+    let (tags, total) = moves
+        .into_iter()
+        .fold((0, 0), |(tags, total), m| (tags + usize::from(m.tag), total + 1));
+    ref_noun(tags, total, total > 1)
+}
+
+/// A push confirmation's title: how many bookmarks and tags go to which
+/// remote.
 pub(crate) fn push_title(moves: &[diffui_core::BookmarkMove], remote: &str) -> Prose {
-    let count = match moves.len() {
-        1 => "1 bookmark".to_owned(),
-        n => format!("{n} bookmarks"),
-    };
+    let count = ref_count(moves.iter().filter(|m| m.tag).count(), moves.len());
     Prose::from(format!("Push {count} to "))
         .remote(remote)
         .text("?")
@@ -609,35 +632,28 @@ pub(crate) fn push_title(moves: &[diffui_core::BookmarkMove], remote: &str) -> P
 /// is lost.
 pub(crate) fn push_explanation(moves: &[diffui_core::BookmarkMove], remote: &str) -> Prose {
     use diffui_core::MoveKind;
-    let several = moves.len() > 1;
-    if moves
+    let noun = moves_noun(moves);
+    let rewinds = moves
         .iter()
-        .any(|m| matches!(m.kind, MoveKind::Backward | MoveKind::Sideways))
-    {
+        .filter(|m| matches!(m.kind, MoveKind::Backward | MoveKind::Sideways));
+    if rewinds.clone().next().is_some() {
         return Prose::from("Not a fast-forward: revisions only ")
             .remote(remote)
-            .text(" has are dropped from its bookmark.");
+            .text(format!(" has are dropped from its {}.", moves_noun(rewinds)));
     }
     if moves.iter().any(|m| m.kind == MoveKind::Delete) {
         return Prose::from("Deletes the bookmark on ")
             .remote(remote)
             .text(". The revisions stay here.");
     }
+    let verb = if moves.len() > 1 { "are" } else { "is" };
     if moves.iter().all(|m| m.kind == MoveKind::Add) {
-        return Prose::from(if several {
-            "The bookmarks are new on "
-        } else {
-            "The bookmark is new on "
-        })
-        .remote(remote)
-        .text(", and tracked from here on.");
+        return Prose::from(format!("The {noun} {verb} new on "))
+            .remote(remote)
+            .text(", and tracked from here on.");
     }
-    Prose::from(if several {
-        "This moves the remote bookmarks forward. "
-    } else {
-        "This moves the remote bookmark forward. "
-    })
-    .text("Nobody else's work is overwritten.")
+    Prose::from(format!("This moves the remote {noun} forward. "))
+        .text("Nobody else's work is overwritten.")
 }
 
 /// Activity label for a push.

@@ -525,14 +525,18 @@ fn panel_toggles(ui: &Diffui, theme: ThemeSpec, font: Font, cx: &mut Cx) -> impl
         ))
 }
 
-/// Push, saying what it pushes: the bookmark a plain `jj git push` would send
-/// and how far it is ahead of the remote, or how many bookmarks go. Plain
+/// Push, saying what it pushes: the bookmark or tag a plain `jj git push`
+/// would send and how far it is ahead of the remote, or how many go. Plain
 /// "Push" when nothing would.
 fn push_button(ui: &Diffui, theme: ThemeSpec, font: Font, cx: &mut Cx) -> AnyElement {
     let session = &ui.active().session;
     let bookmarks = &session.bookmarks;
     let remote = bookmarks.default_push_remote();
     let candidates = &bookmarks.tracked_push;
+    let count = crate::bookmarks::ref_count(
+        candidates.iter().filter(|candidate| candidate.tag).count(),
+        candidates.len(),
+    );
 
     let tip = match (remote, candidates.as_slice()) {
         (None, _) => "Push needs a remote: several are set up, and no git.push".to_owned(),
@@ -548,8 +552,7 @@ fn push_button(ui: &Diffui, theme: ThemeSpec, font: Font, cx: &mut Cx) -> AnyEle
             }
         ),
         (Some(remote), many) => format!(
-            "Push {} bookmarks to {remote}: {}",
-            many.len(),
+            "Push {count} to {remote}: {}",
             many.iter()
                 .map(|candidate| candidate.name.as_str())
                 .collect::<Vec<_>>()
@@ -568,6 +571,7 @@ fn push_button(ui: &Diffui, theme: ThemeSpec, font: Font, cx: &mut Cx) -> AnyEle
     ];
     let target = match candidates.as_slice() {
         [] => None,
+        [one] if one.tag => Some((icons::TAG, one.name.clone(), Some(one.ahead), theme.lanes[0])),
         [one] => {
             let lane = session
                 .commits
@@ -577,18 +581,18 @@ fn push_button(ui: &Diffui, theme: ThemeSpec, font: Font, cx: &mut Cx) -> AnyEle
                     sidebar::revision_graph_style(theme).lane_color(lane)
                 })
                 .unwrap_or(theme.lanes[0]);
-            Some((one.name.clone(), Some(one.ahead), lane))
+            Some((icons::BOOKMARK, one.name.clone(), Some(one.ahead), lane))
         }
-        many => Some((format!("{} bookmarks", many.len()), None, theme.lanes[0])),
+        _ => Some((icons::BOOKMARK, count, None, theme.lanes[0])),
     };
-    if let Some((name, ahead, lane)) = target {
+    if let Some((icon, name, ahead, lane)) = target {
         let counts = emphasis_font(font, Weight::SEMIBOLD);
         let content = div()
             .flex()
             .flex_row()
             .items_center()
             .gap(px(PUSH_CHIP_GAP))
-            .child(icons::icon(icons::BOOKMARK, crate::chip::ICON_SIZE, lane))
+            .child(icons::icon(icon, crate::chip::ICON_SIZE, lane))
             .child(
                 div()
                     .max_w(px(PUSH_TARGET_MAX_WIDTH))
