@@ -376,18 +376,25 @@ impl Actor {
     /// The op head is read afresh so the watcher's next signal dedups against
     /// *our* write. Leaving it stale made every mutation and fetch look like
     /// an external operation, which cost a second lock-and-snapshot that could
-    /// only report "already up to date". The cached repo stays only when the
-    /// head didn't move (the work committed nothing).
-    async fn adopt_written_op(&mut self, repository: &Repository) {
+    /// only report "already up to date". `written` is the repo the work left
+    /// at head, kept when the head is still its operation; otherwise the
+    /// cached repo stays only when the head didn't move.
+    async fn adopt_written_op(
+        &mut self,
+        repository: &Repository,
+        written: Option<Arc<ReadonlyRepo>>,
+    ) {
         let Ok(slot) = self.slot(repository) else {
             self.repo = None;
             self.op_head = None;
             return;
         };
         self.op_head = jj::read_op_heads(slot.workspace.repo_loader()).await.ok();
-        if self.repo.as_ref().map(|repo| repo.op_id().hex()) != self.op_head {
-            self.repo = None;
-        }
+        let at_head = |repo: &Arc<ReadonlyRepo>| Some(repo.op_id().hex()) == self.op_head;
+        self.repo = match written.filter(at_head) {
+            Some(repo) => Some(repo),
+            None => self.repo.take().filter(at_head),
+        };
     }
 
     /// After a CLI run: it may have written operations (or edited the jj
@@ -397,7 +404,7 @@ impl Actor {
     async fn notice_cli_writes(&mut self, repository: &Repository) {
         let before = self.op_head.clone();
         self.reload_settings_if_changed(repository);
-        self.adopt_written_op(repository).await;
+        self.adopt_written_op(repository, None).await;
         if self.op_head != before
             && let Some(fingerprint) = self.op_head.clone()
         {
@@ -515,7 +522,7 @@ impl Actor {
                 self.reload_settings_if_changed(repository);
                 let (progress, _relay) = self.relay_progress(job);
                 let slot = self.slot_for_lock(repository)?;
-                let outcome = {
+                let (outcome, written) = {
                     let WorkspaceSlot {
                         workspace,
                         settings,
@@ -524,7 +531,7 @@ impl Actor {
                     } = slot;
                     jj::fetch_jj(workspace, settings, snapshot, &target, &progress).await?
                 };
-                self.adopt_written_op(repository).await;
+                self.adopt_written_op(repository, Some(written)).await;
                 self.emit(Payload::FetchDone { job, outcome });
                 Ok(())
             }
@@ -868,7 +875,7 @@ impl Actor {
         self.reload_settings_if_changed(repository);
         let (progress, _relay) = self.relay_progress(job);
         let slot = self.slot_for_lock(repository)?;
-        let (outcome, recovered_stale) = {
+        let (outcome, recovered_stale, written) = {
             let WorkspaceSlot {
                 workspace,
                 settings,
@@ -888,7 +895,7 @@ impl Actor {
             )
             .await?
         };
-        self.adopt_written_op(repository).await;
+        self.adopt_written_op(repository, Some(written)).await;
         if recovered_stale {
             self.emit(Payload::StaleWorkingCopyRecovered);
         }

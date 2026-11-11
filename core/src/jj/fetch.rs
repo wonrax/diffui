@@ -18,6 +18,8 @@
 //!   `rebase_mutable_descendants` and `finish_transaction`
 //!   (`cli/src/cli_util.rs`).
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result, bail};
 use jj_cli::{
     revset_util::{
@@ -35,7 +37,7 @@ use jj_lib::{
     object_id::ObjectId,
     op_store::RemoteRefState,
     ref_name::{RefName, RemoteName, RemoteNameBuf},
-    repo::Repo,
+    repo::{ReadonlyRepo, Repo},
     rewrite::RebaseOptions,
     settings::UserSettings,
     store::Store,
@@ -59,13 +61,16 @@ use crate::repository::{FetchOutcome, FetchTarget};
 ///
 /// jj-lib's [`GitFetch`] spawns `git fetch`, so authentication reuses the
 /// user's git credential setup, plus diffui's credential prompt.
+///
+/// Also returns the repo at the operation the fetch left at head, for the
+/// caller to keep instead of loading it again.
 pub(crate) async fn fetch_jj(
     workspace: &mut Workspace,
     settings: &UserSettings,
     context: &SnapshotContext,
     target: &FetchTarget,
     progress: &LoadProgress,
-) -> Result<FetchOutcome> {
+) -> Result<(FetchOutcome, Arc<ReadonlyRepo>)> {
     let workspace_name = workspace.workspace_name().to_owned();
     let workspace_root = workspace.workspace_root().to_owned();
     let repo_loader = workspace.repo_loader().clone();
@@ -99,7 +104,7 @@ async fn fetch_locked(
     place: &Place<'_>,
     target: &FetchTarget,
     progress: &LoadProgress,
-) -> Result<FetchOutcome> {
+) -> Result<(FetchOutcome, Arc<ReadonlyRepo>)> {
     let ui = Ui::null();
     let settings = place.settings;
     let repo = locked.repo.clone();
@@ -254,7 +259,7 @@ async fn fetch_locked(
         outcome.output.push("Nothing changed.".to_owned());
         outcome.output.extend(git_output);
         locked.finish(repo.op_id().clone()).await?;
-        return Ok(outcome);
+        return Ok((outcome, repo));
     }
     outcome.changed = true;
 
@@ -311,7 +316,7 @@ async fn fetch_locked(
     locked.finish(new_repo.op_id().clone()).await?;
 
     outcome.output.extend(git_output);
-    Ok(outcome)
+    Ok((outcome, new_repo))
 }
 
 /// `get_default_fetch_remotes`: `git.fetch` (a name, a pattern or a list of

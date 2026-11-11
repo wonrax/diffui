@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, bail};
@@ -112,29 +113,27 @@ pub(crate) async fn apply_mutation(
     allow_immutable: bool,
     seen_op: Option<&str>,
     seen_wc: Option<&str>,
-) -> Result<(MutationOutcome, bool)> {
+) -> Result<(MutationOutcome, bool, Arc<ReadonlyRepo>)> {
     if is_view_only(op) {
-        return Ok((
-            apply_view_only(
-                workspace,
-                settings,
-                context,
-                &repository.root,
-                op,
-                progress,
-                seen_op,
-                seen_wc,
-            )
-            .await?,
-            false,
-        ));
+        let (outcome, repo) = apply_view_only(
+            workspace,
+            settings,
+            context,
+            &repository.root,
+            op,
+            progress,
+            seen_op,
+            seen_wc,
+        )
+        .await?;
+        return Ok((outcome, false, repo));
     }
     // Recovering a stale checkout finishes the lock session the mutation needs,
     // so the attempt reports back without mutating and the retry runs against
     // the recovered `@`. A second stale report means something outside is still
     // rewriting this workspace's `@`; refuse rather than keep taking the lock.
     for attempt in 0..2 {
-        if let Some(outcome) = apply_mutation_attempt(
+        if let Some((outcome, repo)) = apply_mutation_attempt(
             workspace,
             settings,
             context,
@@ -147,7 +146,7 @@ pub(crate) async fn apply_mutation(
         )
         .await?
         {
-            return Ok((outcome, attempt > 0));
+            return Ok((outcome, attempt > 0, repo));
         }
     }
     bail!("jj working copy kept going stale while applying the mutation")
@@ -188,7 +187,7 @@ async fn apply_view_only(
     progress: &LoadProgress,
     seen_op: Option<&str>,
     seen_wc: Option<&str>,
-) -> Result<MutationOutcome> {
+) -> Result<(MutationOutcome, Arc<ReadonlyRepo>)> {
     let workspace_name = workspace.workspace_name().to_owned();
     let mut signed: Option<Signed> = None;
     loop {
@@ -281,13 +280,14 @@ async fn apply_view_only(
             return Err(super::push::PushFailed(failure).into());
         }
 
-        return Ok(MutationOutcome {
+        let outcome = MutationOutcome {
             message,
             moved_working_copy: false,
             rewritten_commit: None,
             output,
             operation_id: Some(new_repo.op_id().hex()),
-        });
+        };
+        return Ok((outcome, new_repo));
     }
 }
 
@@ -562,7 +562,7 @@ async fn apply_mutation_attempt(
     allow_immutable: bool,
     seen_op: Option<&str>,
     seen_wc: Option<&str>,
-) -> Result<Option<MutationOutcome>> {
+) -> Result<Option<(MutationOutcome, Arc<ReadonlyRepo>)>> {
     let workspace_name = workspace.workspace_name().to_owned();
     let repo_loader = workspace.repo_loader().clone();
 
@@ -586,7 +586,7 @@ async fn apply_mutation_attempt(
     )
     .await;
     match result {
-        Ok(outcome) => Ok(Some(outcome)),
+        Ok(applied) => Ok(Some(applied)),
         Err(error) => {
             // Nothing landed, so there is nothing to persist — say so, rather
             // than letting the lock fall out of scope unfinished, which leaves
@@ -612,7 +612,7 @@ async fn mutate_locked(
     allow_immutable: bool,
     seen_op: Option<&str>,
     seen_wc: Option<&str>,
-) -> Result<MutationOutcome> {
+) -> Result<(MutationOutcome, Arc<ReadonlyRepo>)> {
     let base_repo = locked.repo.clone();
     let workspace_name = workspace_name.to_owned();
     let args = super::op_args::op_args(
@@ -1359,7 +1359,7 @@ async fn mutate_locked(
     locked.check_out(&new_wc_commit).await?;
     locked.finish(new_repo.op_id().clone()).await?;
 
-    Ok(mutation_outcome(
+    let outcome = mutation_outcome(
         op,
         message,
         output,
@@ -1367,7 +1367,8 @@ async fn mutate_locked(
         &current_wc_change,
         new_wc_commit.change_id(),
         new_repo.op_id(),
-    ))
+    );
+    Ok((outcome, new_repo))
 }
 
 /// The operation a revert targets, resolved before anything has been written.
