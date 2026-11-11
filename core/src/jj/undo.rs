@@ -39,6 +39,7 @@ use jj_lib::{
 };
 
 use super::history::restored_view;
+use super::workspace::{Place, fold_into_working_copy};
 
 /// jj-cli's `UNDO_OP_DESC_PREFIX` (`cli/src/commands/undo.rs`).
 pub(crate) const UNDO_OP_DESC_PREFIX: &str = "undo: restore to operation ";
@@ -50,6 +51,9 @@ pub(crate) const REDO_OP_DESC_PREFIX: &str = "redo: restore to operation ";
 /// has to happen before the pre-op working-copy fold is committed.
 pub(crate) struct OpRestorePlan {
     kind: PlanKind,
+    /// The operation taken back is a push: jj-cli warns that undoing one
+    /// often leaves conflicted bookmarks, and diffui asks first.
+    pub(crate) undoes_push: Option<String>,
     /// The operation description jj would write.
     pub(crate) op_description: String,
     /// What the activity row says.
@@ -94,6 +98,7 @@ pub(crate) async fn plan_undo(loader: &RepoLoader, head: &Operation) -> Result<O
     Ok(OpRestorePlan {
         op_description: format!("{UNDO_OP_DESC_PREFIX}{}", parent.id().hex()),
         message: format!("Undid: {}", summary(&target)),
+        undoes_push: is_push_operation(&target).then(|| summary(&target)),
         kind: PlanKind::Restore {
             restore: parent,
             latest_real,
@@ -128,6 +133,7 @@ pub(crate) async fn plan_redo(loader: &RepoLoader, head: &Operation) -> Result<O
     Ok(OpRestorePlan {
         op_description: format!("{REDO_OP_DESC_PREFIX}{}", parent.id().hex()),
         message: format!("Redid: {}", summary(&redone)),
+        undoes_push: None,
         kind: PlanKind::Restore {
             restore: parent,
             latest_real,
@@ -144,6 +150,7 @@ pub(crate) async fn plan_revert(
 ) -> Result<OpRestorePlan> {
     let target = super::mutate::resolve_undo_target(loader, base_repo, Some(hex)).await?;
     Ok(OpRestorePlan {
+        undoes_push: is_push_operation(&target.operation).then(|| summary(&target.operation)),
         op_description: format!("revert operation {}", target.operation.id().hex()),
         message: format!(
             "Reverted: {}",
@@ -166,8 +173,9 @@ impl OpRestorePlan {
         &self,
         tx: &mut Transaction,
         loader: &RepoLoader,
-        workspace_name: &WorkspaceName,
+        place: &Place<'_>,
     ) -> Result<()> {
+        let workspace_name = place.workspace_name;
         let current = tx.base_repo().view().store_view().clone();
         match &self.kind {
             PlanKind::Revert { operation, parent } => {
@@ -199,7 +207,7 @@ impl OpRestorePlan {
                     .context("failed to read the view to restore")?;
                 tx.repo_mut()
                     .set_view(restored_view(restored.store_view(), &current));
-                carry_snapshotted_edits(tx, loader, workspace_name, latest_real).await?;
+                carry_snapshotted_edits(tx, loader, place, latest_real).await?;
             }
         }
         Ok(())
@@ -209,13 +217,15 @@ impl OpRestorePlan {
 /// Re-apply the file edits that snapshots recorded after `latest_real` onto
 /// the `@` the restored view names, as a three-way merge (`restored @` +
 /// `head @` − `@ at latest_real`). A no-op when no snapshot came in between,
-/// which keeps a plain undo identical to the CLI's.
+/// which keeps a plain undo identical to the CLI's. A restored `@` that is
+/// immutable keeps its content; the edits land in a new commit on top.
 async fn carry_snapshotted_edits(
     tx: &mut Transaction,
     loader: &RepoLoader,
-    workspace_name: &WorkspaceName,
+    place: &Place<'_>,
     latest_real: &Operation,
 ) -> Result<()> {
+    let workspace_name = place.workspace_name;
     let head = tx.base_repo().clone();
     if head.op_id() == latest_real.id() {
         return Ok(());
@@ -249,16 +259,9 @@ async fn carry_snapshotted_edits(
     ]))
     .await
     .context("failed to carry the working-copy edits over")?;
-    let carried = tx
-        .repo_mut()
-        .rewrite_commit(&target)
-        .set_tree(tree)
-        .write()
+    fold_into_working_copy(place, tx.repo_mut(), &target, tree)
         .await
         .context("failed to write the working copy with the carried edits")?;
-    tx.repo_mut()
-        .set_wc_commit(workspace_name.to_owned(), carried.id().clone())
-        .context("failed to update the working-copy pointer")?;
     Ok(())
 }
 
@@ -292,6 +295,34 @@ async fn skip_snapshots(mut operation: Operation) -> Result<Operation> {
     }
     Ok(operation)
 }
+
+/// Whether an operation with this description pushed: jj-cli's own (its
+/// `is_push_operation`, `push ` prefixed) or diffui's (`diffui: Pushed …`,
+/// alone or after a bookmark move).
+pub fn is_push_description(description: &str) -> bool {
+    description.starts_with("push ")
+        || description
+            .strip_prefix("diffui: ")
+            .is_some_and(|rest| rest.starts_with("Pushed ") || rest.contains(" \u{b7} Pushed "))
+}
+
+fn is_push_operation(operation: &Operation) -> bool {
+    is_push_description(&operation.metadata().description)
+}
+
+/// An undo or revert of a push, refused until the user confirms it.
+#[derive(Debug)]
+pub(crate) struct UndoesPush {
+    pub(crate) summary: String,
+}
+
+impl std::fmt::Display for UndoesPush {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "undoing \u{201c}{}\u{201d} undoes a push", self.summary)
+    }
+}
+
+impl std::error::Error for UndoesPush {}
 
 /// The operation an undo/redo operation's description names, if `operation`
 /// is one of those (`prefix` picks which stack).
@@ -331,5 +362,23 @@ fn summary(operation: &Operation) -> String {
         "operation".to_owned()
     } else {
         line.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_push_description;
+
+    #[test]
+    fn push_operations_are_recognised_from_either_cli() {
+        assert!(is_push_description(
+            "push bookmark main to git remote origin"
+        ));
+        assert!(is_push_description("diffui: Pushed main to origin"));
+        assert!(is_push_description(
+            "diffui: Moved bookmark main to kxyz \u{b7} Pushed main to origin"
+        ));
+        assert!(!is_push_description("diffui: sign commits before push"));
+        assert!(!is_push_description("diffui: Moved bookmark main to kxyz"));
     }
 }

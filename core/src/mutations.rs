@@ -235,6 +235,21 @@ pub enum MutationOp {
     RevertOperation { operation_id: String },
 }
 
+impl MutationOp {
+    /// Undo, redo and the op-log restores: they put back views and rewrite
+    /// nothing the immutable guard covers. Their `allow_immutable` is the
+    /// confirmation of undoing a push instead, never `--ignore-immutable`.
+    pub fn restores_operation(&self) -> bool {
+        matches!(
+            self,
+            Self::Undo { .. }
+                | Self::Redo
+                | Self::RestoreOperation { .. }
+                | Self::RevertOperation { .. }
+        )
+    }
+}
+
 /// User-facing summary of a successful mutation — becomes the status message.
 #[derive(Debug, Clone)]
 pub struct MutationOutcome {

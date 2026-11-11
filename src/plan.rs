@@ -33,7 +33,7 @@ pub(crate) fn op_command(ui: &Diffui, op: &MutationOp, allow_immutable: bool) ->
         return None;
     }
     let equivalent = op.cli_equivalent(&tab.session.commits);
-    let equivalent = if allow_immutable {
+    let equivalent = if allow_immutable && !op.restores_operation() {
         plan::ignoring_immutable(equivalent)
     } else {
         equivalent

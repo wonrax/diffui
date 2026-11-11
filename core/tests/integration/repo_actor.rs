@@ -963,3 +963,73 @@ fn a_cli_run_announces_the_operation_it_wrote() {
     };
     assert_eq!(fingerprint, harness::operation_log(&root)[0].1);
 }
+
+/// jj-cli imports a colocated repo's git `HEAD` and refs before every
+/// command. After a plain `git commit` and `git branch`, diffui has to show
+/// the commit under `@` and the new bookmark, not the old graph with the
+/// committed changes still inside `@`.
+#[test]
+fn a_colocated_checkout_takes_in_what_git_did() {
+    if !harness::git_available() {
+        eprintln!("skipping: the git CLI is not on PATH");
+        return;
+    }
+    let root = harness::scratch_colocated_repo("colocated-import");
+    let mut repo = TestRepo::open(&root);
+    repo.snapshot();
+    commit_file(&mut repo, "a.txt", "one\n", "first");
+
+    write(&root, "b.txt", "two\n");
+    harness::run_git(&root, &["add", "b.txt"]);
+    harness::run_git(
+        &root,
+        &[
+            "-c",
+            "user.name=Scenario Test",
+            "-c",
+            "user.email=scenario@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "from git",
+        ],
+    );
+    harness::run_git(&root, &["branch", "topic"]);
+    let git_commit = harness::run_git(&root, &["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+
+    repo.snapshot();
+    let parent = repo.graph("@-");
+    assert_eq!(parent.len(), 1);
+    assert_eq!(parent[0].summary.commit_id, git_commit);
+    assert!(
+        repo.diff(RevisionSelection::WorkingCopy).files.is_empty(),
+        "what git committed is no longer inside @"
+    );
+    assert_eq!(repo.graph("topic").len(), 1, "git's branch is a bookmark");
+    assert_eq!(git_head(&root), Some(git_commit), "git's HEAD stays put");
+}
+
+/// Bookmarks are exported to git after an operation only when the working
+/// copy is git's, as in jj-cli. A repo backed by a git repo elsewhere keeps
+/// that repo's branches until a push or `jj git export`.
+#[test]
+fn bookmarks_stay_out_of_a_backing_git_repo_that_is_not_colocated() {
+    let root = scratch_repo("no-export");
+    let mut repo = TestRepo::open(&root);
+    repo.snapshot();
+    commit_file(&mut repo, "a.txt", "one\n", "first");
+    repo.mutate(MutationOp::CreateBookmark {
+        name: "feature".to_owned(),
+        to: RevisionSelection::WorkingCopy,
+    })
+    .expect("create bookmark");
+
+    let git_dir = harness::repo_dir(&root).join("store").join("git");
+    assert!(!git_dir.join("refs/heads/feature").exists());
+    let packed = std::fs::read_to_string(git_dir.join("packed-refs")).unwrap_or_default();
+    assert!(!packed.contains("refs/heads/feature"), "{packed}");
+}

@@ -29,6 +29,7 @@ pub(crate) mod walk;
 pub(crate) mod workspace;
 
 pub use push::validate_bookmark_name;
+pub use undo::is_push_description;
 pub use walk::jj_log_revset;
 /// Driving the walk from outside the actor, against a workspace it opens
 /// itself, is only ever the `track-alloc` memory profile: everything in the app

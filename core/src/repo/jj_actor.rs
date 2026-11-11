@@ -1021,6 +1021,11 @@ pub(super) fn classify(error: anyhow::Error) -> RepoError {
             short_id: immutable.short_id.clone(),
         };
     }
+    if let Some(undo) = error.downcast_ref::<jj::undo::UndoesPush>() {
+        return RepoError::UndoesPush {
+            summary: undo.summary.clone(),
+        };
+    }
     if let Some(rejection) = error.downcast_ref::<crate::push::PushRejection>() {
         return RepoError::PushRejected(Box::new(rejection.clone()));
     }

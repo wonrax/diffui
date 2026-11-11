@@ -3,23 +3,29 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use jj_cli::ui::Ui;
 use jj_lib::{
     backend::CommitId,
     commit::Commit,
     default_backend_factories::{default_backend_factories, default_working_copy_factories},
+    git::{GitSettings, import_head, import_refs},
     gitignore::GitIgnoreFile,
+    lock::FileLock,
     matchers::{Matcher, NothingMatcher},
     merged_tree::MergedTree,
     object_id::ObjectId,
     op_store::OperationId,
     ref_name::WorkspaceName,
-    repo::{ReadonlyRepo, Repo, RepoLoader},
+    repo::{MutableRepo, ReadonlyRepo, Repo, RepoLoader},
+    revset::{ResolvedRevsetExpression, RevsetExpression, SymbolResolver, SymbolResolverExtension},
+    rewrite::RebaseOptions,
     settings::{HumanByteSize, UserSettings},
     working_copy::{SnapshotOptions, SnapshotStats, UntrackedReason, WorkingCopyFreshness},
     workspace::{LockedWorkspace, Workspace},
 };
 
 use super::settings::*;
+use super::walk::parse_user_revset;
 use crate::model::RevisionSelection;
 use crate::repository::{Repository, RepositorySnapshot};
 
@@ -47,6 +53,9 @@ pub(crate) enum LockOutcome<'a> {
 /// already moved past, which jj then reports as a divergent `@`.
 pub(crate) struct LockedWorkingCopy<'a> {
     locked_ws: Option<LockedWorkspace<'a>>,
+    /// jj-cli's git import/export lock, held for the whole session in a
+    /// colocated workspace so another jj can't import or export in between.
+    _git_lock: Option<FileLock>,
     pub(crate) repo: Arc<ReadonlyRepo>,
     pub(crate) wc_commit: Commit,
     pub(crate) tree: MergedTree,
@@ -130,6 +139,26 @@ pub(crate) async fn lock_working_copy<'a>(
     // the stale op — lands as a sibling of the cli's op. Both ops touch the
     // same change_id with different commit_ids, which jj's concurrent-op
     // resolver presents as a divergent change.
+    let workspace_root = workspace.workspace_root().to_owned();
+    // A colocated checkout first takes in what git did since the last look —
+    // a `git commit`, a checkout, a pull — as jj-cli does before every
+    // command, under its git import/export lock. Without it the graph shows
+    // the old state and the next mutation resets git's index under a `HEAD`
+    // that moved, so a plain `git commit` would commit a revert.
+    let git_lock = if super::colocate::is_colocated(repo_loader.store(), &workspace_root)? {
+        let git_lock = FileLock::lock(workspace.repo_path().join("git_import_export.lock"))
+            .context("failed to take the git import/export lock")?;
+        let place = Place {
+            settings: repo_loader.settings(),
+            workspace_name,
+            workspace_root: &workspace_root,
+        };
+        import_git_head(workspace, repo_loader, &place).await?;
+        import_git_refs(workspace, repo_loader, &place, snapshot_options).await?;
+        Some(git_lock)
+    } else {
+        None
+    };
     let mut locked_ws = workspace
         .start_working_copy_mutation()
         .await
@@ -235,18 +264,16 @@ pub(crate) async fn lock_working_copy<'a>(
                 .await
                 .context("failed to snapshot the stale jj working copy")?;
             if disk_tree.tree_ids_and_labels() != old_wc_commit.tree().tree_ids_and_labels() {
+                let place = Place {
+                    settings: repo_loader.settings(),
+                    workspace_name,
+                    workspace_root: &workspace_root,
+                };
                 let mut tx = old_repo.start_transaction();
                 tx.set_is_snapshot(true);
-                let new_commit = tx
-                    .repo_mut()
-                    .rewrite_commit(&old_wc_commit)
-                    .set_tree(disk_tree)
-                    .write()
+                fold_into_working_copy(&place, tx.repo_mut(), &old_wc_commit, disk_tree)
                     .await
                     .context("failed to preserve stale jj working-copy edits")?;
-                tx.repo_mut()
-                    .set_wc_commit(workspace_name.to_owned(), new_commit.id().clone())
-                    .context("failed to update jj working-copy pointer")?;
                 tx.repo_mut()
                     .rebase_descendants()
                     .await
@@ -301,11 +328,199 @@ pub(crate) async fn lock_working_copy<'a>(
 
     Ok(LockOutcome::Locked(LockedWorkingCopy {
         locked_ws: Some(locked_ws),
+        _git_lock: git_lock,
         repo: base_repo,
         wc_commit,
         tree,
         warnings: untracked_warnings(&stats),
     }))
+}
+
+/// The working copy as the repo at head has it, with the lock held, when the
+/// checkout is fresh. Anything else is left to [`lock_working_copy`]'s own
+/// stale handling.
+async fn fresh_working_copy(
+    locked_ws: &mut LockedWorkspace<'_>,
+    repo_loader: &RepoLoader,
+    workspace_name: &WorkspaceName,
+) -> Result<Option<(Arc<ReadonlyRepo>, Commit)>> {
+    let repo = repo_loader
+        .load_at_head()
+        .await
+        .context("failed to load jj repo")?;
+    let Some(wc_id) = repo.view().get_wc_commit_id(workspace_name).cloned() else {
+        return Ok(None);
+    };
+    let wc_commit = repo
+        .store()
+        .get_commit_async(&wc_id)
+        .await
+        .with_context(|| format!("failed to load jj working-copy commit {}", wc_id.hex()))?;
+    let fresh = matches!(
+        WorkingCopyFreshness::check_stale(locked_ws.locked_wc(), &wc_commit, &repo).await,
+        Ok(WorkingCopyFreshness::Fresh)
+    );
+    Ok(fresh.then_some((repo, wc_commit)))
+}
+
+/// jj-cli's `import_git_head`: when git's `HEAD` moved, start `@` on top of
+/// the new `HEAD` (abandoning the old `@` if it was discardable) and record
+/// that the files on disk already match it — git put them there.
+async fn import_git_head(
+    workspace: &mut Workspace,
+    repo_loader: &RepoLoader,
+    place: &Place<'_>,
+) -> Result<()> {
+    let mut locked_ws = workspace
+        .start_working_copy_mutation()
+        .await
+        .context("failed to lock jj working copy")?;
+    let Some((repo, _)) =
+        fresh_working_copy(&mut locked_ws, repo_loader, place.workspace_name).await?
+    else {
+        return Ok(());
+    };
+    let mut tx = repo.start_transaction();
+    import_head(tx.repo_mut(), place.workspace_name, place.workspace_root)
+        .await
+        .context("failed to import the colocated git HEAD")?;
+    if !tx.repo().has_changes() {
+        return Ok(());
+    }
+    let new_head = tx.repo().view().git_head(place.workspace_name).clone();
+    let wc_commit = match new_head.as_normal() {
+        Some(head_id) => {
+            let head = tx
+                .repo()
+                .store()
+                .get_commit_async(head_id)
+                .await
+                .context("failed to load the colocated git HEAD commit")?;
+            let wc_commit = tx
+                .repo_mut()
+                .check_out(place.workspace_name.to_owned(), &head)
+                .await
+                .context("failed to start a working-copy commit on git HEAD")?;
+            locked_ws
+                .locked_wc()
+                .reset(&wc_commit)
+                .await
+                .context("failed to reset the working copy to git HEAD")?;
+            Some(wc_commit)
+        }
+        // `HEAD` deleted under git: nothing to check out.
+        None => None,
+    };
+    tx.repo_mut()
+        .rebase_descendants()
+        .await
+        .context("failed to rebase descendants after importing git HEAD")?;
+    let new_repo = tx
+        .commit("import git head")
+        .await
+        .context("failed to commit the git HEAD import")?;
+    if wc_commit.is_some() {
+        locked_ws
+            .finish(new_repo.op_id().clone())
+            .await
+            .context("failed to finish the git HEAD import")?;
+    }
+    Ok(())
+}
+
+/// jj-cli's `import_git_refs`, which it runs right after its snapshot: take in
+/// branches and tags git moved, abandon what they no longer reach, and rebase
+/// mutable descendants. Only when the import changes something is the disk
+/// folded into `@` first (the CLI's snapshot op, here in the same operation)
+/// and the resulting `@` checked out.
+async fn import_git_refs(
+    workspace: &mut Workspace,
+    repo_loader: &RepoLoader,
+    place: &Place<'_>,
+    snapshot_options: &SnapshotOptions<'_>,
+) -> Result<()> {
+    let git_settings =
+        GitSettings::from_settings(place.settings).context("failed to read git settings")?;
+    let remote_settings = place
+        .settings
+        .remote_settings()
+        .context("failed to read remotes.* settings")?;
+    let import_options =
+        jj_cli::git_util::load_git_import_options(&Ui::null(), &git_settings, &remote_settings)
+            .map_err(cli_error)?;
+    let mut locked_ws = workspace
+        .start_working_copy_mutation()
+        .await
+        .context("failed to lock jj working copy")?;
+    let Some((repo, wc_commit)) =
+        fresh_working_copy(&mut locked_ws, repo_loader, place.workspace_name).await?
+    else {
+        return Ok(());
+    };
+    // A dry run first: almost always git moved nothing, and then neither the
+    // disk nor the op log is touched.
+    let mut probe = repo.start_transaction();
+    import_refs(probe.repo_mut(), &import_options)
+        .await
+        .context("failed to import git refs")?;
+    if !probe.repo().has_changes() {
+        return Ok(());
+    }
+    drop(probe);
+
+    let (tree, _stats) = locked_ws
+        .locked_wc()
+        .snapshot(snapshot_options)
+        .await
+        .context("failed to snapshot jj working copy")?;
+    let mut tx = repo.start_transaction();
+    if tree.tree_ids_and_labels() != wc_commit.tree().tree_ids_and_labels() {
+        fold_into_working_copy(place, tx.repo_mut(), &wc_commit, tree).await?;
+        tx.repo_mut()
+            .rebase_descendants()
+            .await
+            .context("failed to rebase descendants after jj snapshot")?;
+    }
+    import_refs(tx.repo_mut(), &import_options)
+        .await
+        .context("failed to import git refs")?;
+    // jj-cli's `rebase_mutable_descendants`: commits git rewrote can be
+    // immutable; their immutable descendants stay put.
+    let immutable = place.immutable(tx.base_repo().as_ref())?;
+    tx.repo_mut()
+        .rebase_descendants_with_options(&immutable, &RebaseOptions::default(), |_, _| {})
+        .await
+        .context("failed to rebase descendants after importing git refs")?;
+    renew_immutable_working_copy(place, tx.repo_mut()).await?;
+    super::colocate::sync_git_after_transaction(
+        tx.repo_mut(),
+        place.workspace_name,
+        place.workspace_root,
+    )
+    .await?;
+    let new_repo = tx
+        .commit("import git refs")
+        .await
+        .context("failed to commit the git refs import")?;
+    let wc_id = new_repo
+        .view()
+        .get_wc_commit_id(place.workspace_name)
+        .context("jj workspace has no working-copy commit")?;
+    let new_wc = new_repo
+        .store()
+        .get_commit_async(wc_id)
+        .await
+        .with_context(|| format!("failed to load jj working-copy commit {}", wc_id.hex()))?;
+    locked_ws
+        .locked_wc()
+        .check_out(&new_wc)
+        .await
+        .context("failed to check out the working copy after importing git refs")?;
+    locked_ws
+        .finish(new_repo.op_id().clone())
+        .await
+        .context("failed to finish the git refs import")?;
+    Ok(())
 }
 
 /// One line per path the snapshot refused to track, worded like jj's own
@@ -325,6 +540,109 @@ fn untracked_warnings(stats: &SnapshotStats) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+/// Where a transaction's working copy lives: what `immutable()` and the
+/// working-copy helpers below resolve against.
+pub(crate) struct Place<'a> {
+    pub(crate) settings: &'a UserSettings,
+    pub(crate) workspace_name: &'a WorkspaceName,
+    pub(crate) workspace_root: &'a Path,
+}
+
+/// jj-cli's warning when a snapshot finds `@` immutable (`snapshot_working_copy`).
+pub(crate) const WC_IMMUTABLE_NOTE: &str =
+    "The working-copy commit is immutable; a new commit has been created on top of it.";
+/// jj-cli's warning when a transaction made `@` immutable (`finish_transaction`).
+pub(crate) const WC_BECAME_IMMUTABLE_NOTE: &str =
+    "The working-copy commit became immutable; a new commit has been created on top of it.";
+
+impl Place<'_> {
+    /// `immutable()` as jj resolves it for a transaction.
+    pub(crate) fn immutable(&self, repo: &dyn Repo) -> Result<Arc<ResolvedRevsetExpression>> {
+        parse_user_revset(
+            self.workspace_root,
+            self.settings,
+            self.workspace_name,
+            "immutable()",
+        )?
+        .resolve_user_expression(
+            repo,
+            &SymbolResolver::new(repo, &[] as &[Box<dyn SymbolResolverExtension>]),
+        )
+        .context("failed to resolve immutable()")
+    }
+
+    fn is_immutable(&self, repo: &dyn Repo, id: &CommitId) -> Result<bool> {
+        self.immutable(repo)?
+            .intersection(&RevsetExpression::commit(id.clone()))
+            .evaluate(repo)
+            .context("failed to check whether the working-copy commit is immutable")?
+            .is_empty()
+            .map(|empty| !empty)
+            .context("failed to check whether the working-copy commit is immutable")
+    }
+}
+
+/// A disk tree folded into `@`.
+pub(crate) struct FoldedWorkingCopy {
+    pub(crate) commit: Commit,
+    /// `@` was immutable, so the tree went into a new commit on top of it
+    /// instead ([`WC_IMMUTABLE_NOTE`]).
+    pub(crate) on_top: bool,
+}
+
+/// Fold `tree` into the working-copy commit `wc_commit` and point `@` at the
+/// result, as jj-cli's snapshot does: an immutable `@` is never amended, the
+/// tree goes into a new commit on top of it. `--ignore-immutable` doesn't
+/// change this in the CLI either. The caller rebases descendants.
+pub(crate) async fn fold_into_working_copy(
+    place: &Place<'_>,
+    repo: &mut MutableRepo,
+    wc_commit: &Commit,
+    tree: MergedTree,
+) -> Result<FoldedWorkingCopy> {
+    let on_top = place.is_immutable(repo, wc_commit.id())?;
+    let commit = if on_top {
+        repo.new_commit(vec![wc_commit.id().clone()], tree)
+            .write()
+            .await
+    } else {
+        repo.rewrite_commit(wc_commit).set_tree(tree).write().await
+    }
+    .context("failed to fold the working-copy changes into a commit")?;
+    repo.set_wc_commit(place.workspace_name.to_owned(), commit.id().clone())
+        .context("failed to update jj working-copy pointer")?;
+    Ok(FoldedWorkingCopy { commit, on_top })
+}
+
+/// The step every jj-cli transaction ends with (`finish_transaction`): when
+/// the transaction made `@` immutable (a bookmark moved onto it, a push, an
+/// undo that landed on shared history), start a new commit on top so the next
+/// snapshot doesn't amend it. Returns whether it did.
+pub(crate) async fn renew_immutable_working_copy(
+    place: &Place<'_>,
+    repo: &mut MutableRepo,
+) -> Result<bool> {
+    let Some(wc_id) = repo.view().get_wc_commit_id(place.workspace_name).cloned() else {
+        return Ok(false);
+    };
+    if !place.is_immutable(repo, &wc_id)? {
+        return Ok(false);
+    }
+    let wc_commit = repo
+        .store()
+        .get_commit_async(&wc_id)
+        .await
+        .context("failed to load the working-copy commit")?;
+    let fresh = repo
+        .new_commit(vec![wc_id], wc_commit.tree())
+        .write()
+        .await
+        .context("failed to write a new working-copy commit")?;
+    repo.set_wc_commit(place.workspace_name.to_owned(), fresh.id().clone())
+        .context("failed to move the working copy")?;
+    Ok(true)
 }
 
 /// Resolve a [`RevisionSelection`] against the repo at head.
@@ -579,7 +897,7 @@ async fn absorb_snapshot(
     workspace_name: &WorkspaceName,
     workspace_root: &Path,
 ) -> Result<SnapshotOutcome> {
-    let warnings = std::mem::take(&mut locked.warnings);
+    let mut warnings = std::mem::take(&mut locked.warnings);
     if !locked.tree_changed() {
         // No file changes: nothing to write to the op log (the common case on
         // idle ticks, and it keeps `jj op log` clean), but still finish at the
@@ -606,18 +924,22 @@ async fn absorb_snapshot(
     // the op its graph reflects to spot external ops (see
     // `RepositorySnapshot::parent_fingerprint`).
     let base_op_id = locked.repo.op_id().hex();
-    let mut tx = locked.repo.start_transaction();
+    let base_repo = locked.repo.clone();
+    let place = Place {
+        settings: base_repo.settings(),
+        workspace_name,
+        workspace_root,
+    };
+    let mut tx = base_repo.start_transaction();
     tx.set_is_snapshot(true);
-    let new_commit = tx
-        .repo_mut()
-        .rewrite_commit(&locked.wc_commit)
-        .set_tree(locked.tree.clone())
-        .write()
-        .await
-        .context("failed to rewrite jj working-copy commit with new tree")?;
-    tx.repo_mut()
-        .set_wc_commit(workspace_name.to_owned(), new_commit.id().clone())
-        .context("failed to update jj working-copy pointer")?;
+    let folded = fold_into_working_copy(
+        &place,
+        tx.repo_mut(),
+        &locked.wc_commit,
+        locked.tree.clone(),
+    )
+    .await?;
+    let new_commit = folded.commit;
     // `rewrite_commit` records a rewrite that the transaction insists on
     // resolving before commit, even when the wc commit has no descendants.
     // When it has some (the user is editing a commit mid-stack), every one of
@@ -629,15 +951,22 @@ async fn absorb_snapshot(
         .context("failed to rebase descendants after jj snapshot")?;
     // Best-effort, unlike the CLI: this runs on every save, and an IDE
     // holding git's index lock for a moment must not make the save fail to
-    // land. The next mutation resets the index anyway.
-    if let Err(error) = super::colocate::sync_git_after_snapshot(
-        tx.repo_mut(),
-        workspace_root,
-        &locked.wc_commit.tree(),
-        &locked.tree,
-    )
-    .await
-    {
+    // land. The next mutation resets the index anyway. A new `@` on top
+    // moves git's `HEAD` as well, as the CLI's snapshot does then.
+    let synced = if folded.on_top {
+        warnings.push(WC_IMMUTABLE_NOTE.to_owned());
+        super::colocate::sync_git_after_transaction(tx.repo_mut(), workspace_name, workspace_root)
+            .await
+    } else {
+        super::colocate::sync_git_after_snapshot(
+            tx.repo_mut(),
+            workspace_root,
+            &locked.wc_commit.tree(),
+            &locked.tree,
+        )
+        .await
+    };
+    if let Err(error) = synced {
         tracing::warn!(
             error = format!("{error:#}"),
             "failed to sync the colocated git index after a snapshot"

@@ -2832,6 +2832,9 @@ impl Diffui {
             Err(diffui_core::RepoError::PushRejected(rejection)) => {
                 self.push_rejected(pending, *rejection)
             }
+            Err(diffui_core::RepoError::UndoesPush { summary }) => {
+                self.confirm_push_undo(pending, &summary)
+            }
             Err(error) => {
                 let error = error.to_string();
                 if description_save
@@ -4201,7 +4204,7 @@ impl Diffui {
         };
         body = body.text(" (usually pushed or shared).");
         if matches!(pending.op, MutationOp::Edit { .. }) {
-            body = body.text(" Later working-copy changes amend it in place.");
+            body = body.text(" Your edits go into a new change on top of it.");
         }
         // Stacking rather than replacing: a second guarded mutation raised
         // while a dialog is open (a background tab's op being refused) waits
@@ -4211,6 +4214,23 @@ impl Diffui {
             title: format!("{verb} immutable {noun}?").into(),
             body,
             confirm_label: confirm_label.to_owned(),
+            look: Default::default(),
+            pending,
+        }));
+    }
+
+    /// The actor refused to undo a push until the user says so. Undoing one
+    /// rolls back only this repository's record of the remote; the remote
+    /// keeps the commits, which is what the copy has to say.
+    fn confirm_push_undo(&mut self, mut pending: PendingMutation, summary: &str) {
+        if let Some(log) = self.activity_log_for(pending.tab_id) {
+            log.set_status(pending.activity_id, activity::ActivityStatus::Queued);
+        }
+        pending.allow_immutable = true;
+        self.push_mode(Mode::Confirm(ConfirmDialog {
+            title: "Undo a push?".into(),
+            body: push_undo_body(summary),
+            confirm_label: "Undo anyway".to_owned(),
             look: Default::default(),
             pending,
         }));
@@ -4435,6 +4455,15 @@ impl Diffui {
     pub(crate) fn resolved_theme(&self) -> ResolvedTheme {
         self.selected_theme.active(self.system_theme)
     }
+}
+
+/// What undoing the push named `summary` does, for its confirm dialog.
+pub(crate) fn push_undo_body(summary: &str) -> Prose {
+    Prose::from(format!(
+        "Undoing \u{201c}{summary}\u{201d} rolls back only this repository's record of the \
+         remote. The remote keeps the pushed commits, so pushing these bookmarks again fails \
+         until you fetch, which can leave them conflicted."
+    ))
 }
 
 #[cfg(test)]

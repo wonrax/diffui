@@ -106,6 +106,12 @@ pub enum RepoError {
     /// `jj git push`'s commit checks refused the push; the rejection lists
     /// each commit and carries the request for a rerun with allowances.
     PushRejected(Box<crate::push::PushRejection>),
+    /// An undo or revert would take back a push, which jj-cli warns about:
+    /// only the local record of the remote rolls back. `summary` names the
+    /// push, so the frontend can confirm and rerun with the guard off.
+    UndoesPush {
+        summary: String,
+    },
     /// The actor panicked while running the command. It dropped whatever it
     /// had loaded and keeps serving, so the next command starts clean.
     Crashed(String),
@@ -124,6 +130,9 @@ impl fmt::Display for RepoError {
             Self::Unsupported => f.write_str("this repository does not support that operation"),
             Self::Other(message) => write!(f, "{message}"),
             Self::PushRejected(rejection) => write!(f, "{rejection}"),
+            Self::UndoesPush { summary } => {
+                write!(f, "undoing \u{201c}{summary}\u{201d} undoes a push")
+            }
             Self::Crashed(message) => write!(
                 f,
                 "This repository's worker crashed: {message}. See the log \

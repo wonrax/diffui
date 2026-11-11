@@ -504,14 +504,14 @@ impl Diffui {
             return;
         }
         let short = &id[..id.len().min(12)];
-        let summary = self
-            .active()
-            .history
-            .ops
-            .iter()
-            .find(|op| op.id == id)
+        let entry = self.active().history.ops.iter().find(|op| op.id == id);
+        let summary = entry
             .map(|op| meta_line::shorten_ids(op.summary()))
             .unwrap_or_default();
+        // A revert of a push is confirmed here with the push spelled out, so
+        // the actor's own push guard doesn't ask a second time.
+        let is_push = !restore
+            && entry.is_some_and(|op| diffui_core::jj::is_push_description(&op.description));
         let (title, body, confirm_label, label, op) = if restore {
             (
                 Prose::from("Restore to operation ").op(short).text("?"),
@@ -522,6 +522,16 @@ impl Diffui {
                 "Restore",
                 Prose::from("Restore to ").op(short),
                 MutationOp::RestoreOperation {
+                    operation_id: id.clone(),
+                },
+            )
+        } else if is_push {
+            (
+                Prose::from("Revert push ").op(short).text("?"),
+                crate::update::push_undo_body(&summary),
+                "Revert anyway",
+                Prose::from("Revert ").op(short),
+                MutationOp::RevertOperation {
                     operation_id: id.clone(),
                 },
             )
@@ -551,7 +561,7 @@ impl Diffui {
                 op,
                 tab_id: tab,
                 activity_id,
-                allow_immutable: false,
+                allow_immutable: is_push,
             },
         }));
     }

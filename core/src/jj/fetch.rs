@@ -34,9 +34,8 @@ use jj_lib::{
     },
     object_id::ObjectId,
     op_store::RemoteRefState,
-    ref_name::{RefName, RemoteName, RemoteNameBuf, WorkspaceName},
+    ref_name::{RefName, RemoteName, RemoteNameBuf},
     repo::Repo,
-    revset::{ResolvedRevsetExpression, RevsetExpression, SymbolResolver},
     rewrite::RebaseOptions,
     settings::UserSettings,
     store::Store,
@@ -46,8 +45,10 @@ use jj_lib::{
 
 use super::remote::CollectingCallback;
 use super::settings::cli_error;
-use super::walk::parse_user_revset;
-use super::workspace::{LockOutcome, LockedWorkingCopy, SnapshotContext, lock_working_copy};
+use super::workspace::{
+    LockOutcome, LockedWorkingCopy, Place, SnapshotContext, WC_BECAME_IMMUTABLE_NOTE,
+    fold_into_working_copy, lock_working_copy, renew_immutable_working_copy,
+};
 use crate::model::LoadProgress;
 use crate::repository::{FetchOutcome, FetchTarget};
 
@@ -90,12 +91,6 @@ pub(crate) async fn fetch_jj(
             Err(error)
         }
     }
-}
-
-struct Place<'a> {
-    settings: &'a UserSettings,
-    workspace_name: &'a WorkspaceName,
-    workspace_root: &'a std::path::Path,
 }
 
 /// `cmd_git_fetch`, with the lock held. Split out so [`fetch_jj`] has exactly
@@ -155,16 +150,9 @@ async fn fetch_locked(
     // operation carries them instead of stranding them behind an op that
     // rewrote the view. (jj snapshots into an operation of its own first.)
     if locked.tree_changed() {
-        let rewritten = tx
-            .repo_mut()
-            .rewrite_commit(&locked.wc_commit)
-            .set_tree(locked.tree.clone())
-            .write()
+        fold_into_working_copy(place, tx.repo_mut(), &locked.wc_commit, locked.tree.clone())
             .await
             .context("failed to fold working-copy changes before fetch")?;
-        tx.repo_mut()
-            .set_wc_commit(place.workspace_name.to_owned(), rewritten.id().clone())
-            .context("failed to update working-copy pointer before fetch")?;
         tx.repo_mut()
             .rebase_descendants()
             .await
@@ -270,7 +258,7 @@ async fn fetch_locked(
 
     // Fetching can move immutable commits to match the remote; their
     // immutable descendants stay put.
-    let immutable = immutable_set(place, tx.base_repo().as_ref())?;
+    let immutable = place.immutable(tx.base_repo().as_ref())?;
     let mut rebased = 0usize;
     tx.repo_mut()
         .rebase_descendants_with_options(&immutable, &RebaseOptions::default(), |_, _| rebased += 1)
@@ -283,54 +271,18 @@ async fn fetch_locked(
     }
 
     // A working-copy commit the fetch made immutable gets a fresh one on top.
-    if let Some(wc_id) = tx
-        .repo()
-        .view()
-        .get_wc_commit_id(place.workspace_name)
-        .cloned()
-    {
-        let immutable_now = immutable_set(place, tx.repo())?;
-        let is_immutable = immutable_now
-            .intersection(&RevsetExpression::commit(wc_id.clone()))
-            .evaluate(tx.repo())
-            .context("failed to check the working-copy commit")?
-            .is_empty()
-            .map(|empty| !empty)
-            .context("failed to check the working-copy commit")?;
-        if is_immutable {
-            let wc_commit = tx
-                .repo()
-                .store()
-                .get_commit_async(&wc_id)
-                .await
-                .context("failed to load the working-copy commit")?;
-            let fresh = tx
-                .repo_mut()
-                .new_commit(vec![wc_id], wc_commit.tree())
-                .write()
-                .await
-                .context("failed to write a new working-copy commit")?;
-            tx.repo_mut()
-                .set_wc_commit(place.workspace_name.to_owned(), fresh.id().clone())
-                .context("failed to move the working copy")?;
-            outcome.warnings.push(
-                "The working-copy commit became immutable; a new commit has been created on top \
-                 of it."
-                    .to_owned(),
-            );
-        }
+    if renew_immutable_working_copy(place, tx.repo_mut()).await? {
+        outcome.warnings.push(WC_BECAME_IMMUTABLE_NOTE.to_owned());
     }
 
     // Only a colocated workspace exports to git here, as in jj-cli; elsewhere
     // the fetched refs stay jj's until a push or `jj git export`.
-    if super::colocate::is_colocated(tx.repo().store(), place.workspace_root)? {
-        super::colocate::sync_git_after_transaction(
-            tx.repo_mut(),
-            place.workspace_name,
-            place.workspace_root,
-        )
-        .await?;
-    }
+    super::colocate::sync_git_after_transaction(
+        tx.repo_mut(),
+        place.workspace_name,
+        place.workspace_root,
+    )
+    .await?;
     let remotes = matching_remotes
         .iter()
         .map(|remote| remote.as_symbol().to_string())
@@ -394,27 +346,6 @@ fn default_fetch_remotes(
         }
         None => StringExpression::exact(DEFAULT_REMOTE),
     })
-}
-
-/// `immutable()` as jj resolves it for the transaction tail.
-fn immutable_set(
-    place: &Place<'_>,
-    repo: &dyn Repo,
-) -> Result<std::sync::Arc<ResolvedRevsetExpression>> {
-    parse_user_revset(
-        place.workspace_root,
-        place.settings,
-        place.workspace_name,
-        "immutable()",
-    )?
-    .resolve_user_expression(
-        repo,
-        &SymbolResolver::new(
-            repo,
-            &[] as &[Box<dyn jj_lib::revset::SymbolResolverExtension>],
-        ),
-    )
-    .context("failed to resolve immutable()")
 }
 
 fn warn_ignored_refspecs(

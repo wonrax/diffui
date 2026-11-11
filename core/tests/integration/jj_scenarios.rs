@@ -589,7 +589,11 @@ fn describe_mutation_replaces_the_full_message_without_moving_working_copy() {
     assert_eq!(change_id(&root, "@"), working_copy_change);
     let rewritten = outcome.rewritten_commit.expect("rewritten commit id");
     assert_ne!(rewritten, target, "describe rewrites the commit");
-    assert_eq!(harness::full_description(&root, &rewritten), description);
+    // Newline-terminated, as `jj describe -m` stores it.
+    assert_eq!(
+        harness::full_description(&root, &rewritten),
+        format!("{description}\n")
+    );
 }
 
 /// diffui's operations carry the `args` tag jj-cli would have written for
@@ -786,7 +790,7 @@ fn stale_workspace_mutation_recovers_instead_of_reverting_the_rebase() {
     );
     assert_eq!(
         harness::full_description(&root, &working_copy),
-        "described merge",
+        "described merge\n",
         "the mutation applies after the recovery, not instead of it"
     );
     assert!(
@@ -1830,7 +1834,145 @@ fn immutable_guard_covers_describe_and_honors_override() {
     describe(true).expect("override rewrites the immutable commit");
     assert_eq!(
         harness::full_description(&root, &commit_id(&root, "description(glob:\"renamed*\")")),
-        "renamed anyway"
+        "renamed anyway\n"
+    );
+}
+
+/// A working copy on an immutable commit is never amended. jj-cli's snapshot
+/// puts the disk into a new commit on top instead, and so must every place
+/// that folds the disk into `@`: published history rewritten on a file save
+/// diverges from its remote copy.
+#[test]
+fn edits_on_an_immutable_working_copy_go_into_a_new_commit_on_top() {
+    let root = scratch_repo("immutable-wc-fold");
+    write(&root, "a.txt", "one\n");
+    run(
+        &root,
+        MutationOp::Describe {
+            target: RevisionSelection::WorkingCopy,
+            description: "protected wc\n".to_owned(),
+        },
+    );
+    std::fs::write(
+        root.join(".jj/repo/config.toml"),
+        "[revset-aliases]\n'immutable_heads()' = 'description(glob:\"protected*\")'\n",
+    )
+    .expect("write repo config");
+    let protected = commit_id(&root, "description(glob:\"protected*\")");
+
+    // The refresh path.
+    write(&root, "a.txt", "two\n");
+    snapshot(&root);
+    let wc = commit_id(&root, "@");
+    assert_ne!(wc, protected, "the save starts a new commit");
+    assert_eq!(parent_ids(&root, "@"), vec![protected.clone()]);
+    assert_eq!(harness::file_at(&root, &protected, "a.txt"), "one\n");
+    assert_eq!(harness::file_at(&root, &wc, "a.txt"), "two\n");
+
+    // The mutation path: `@` made immutable behind diffui's back, an edit,
+    // then a mutation that folds the disk before it runs.
+    harness::describe(&root, OpBase::Head, &wc, "protected too\n");
+    let protected_too = commit_id(&root, "description(glob:\"protected too*\")");
+    write(&root, "a.txt", "three\n");
+    run(
+        &root,
+        MutationOp::New {
+            parent: RevisionSelection::Commit(protected.clone()),
+        },
+    );
+    assert_eq!(harness::file_at(&root, &protected_too, "a.txt"), "two\n");
+    let folded = commit_ids(&root, &format!("children({protected_too})"));
+    assert_eq!(folded.len(), 1, "the edit went into a commit on top");
+    assert_eq!(harness::file_at(&root, &folded[0], "a.txt"), "three\n");
+
+    // Edit anyway: jj-cli's transaction tail starts a new `@` on top.
+    let edited = block_on(run_mutation(
+        repository(&root),
+        MutationOp::Edit {
+            target: RevisionSelection::Commit(protected.clone()),
+        },
+        LoadProgress::default(),
+        true,
+    ))
+    .expect("edit the immutable commit anyway");
+    assert!(
+        edited
+            .output
+            .iter()
+            .any(|line| line.contains("became immutable")),
+        "{:?}",
+        edited.output
+    );
+    assert_eq!(parent_ids(&root, "@"), vec![protected.clone()]);
+    assert_eq!(harness::file_at(&root, &protected, "a.txt"), "one\n");
+}
+
+/// A bookmark moved onto `@` can make it immutable. jj-cli ends every
+/// transaction by starting a new `@` on top of one that became immutable, so
+/// the next save can't rewrite what was just published.
+#[test]
+fn a_working_copy_that_becomes_immutable_gets_a_new_commit_on_top() {
+    let root = scratch_repo("immutable-wc-tail");
+    write(&root, "a.txt", "one\n");
+    snapshot(&root);
+    std::fs::write(
+        root.join(".jj/repo/config.toml"),
+        "[revset-aliases]\n'immutable_heads()' = 'present(main)'\n",
+    )
+    .expect("write repo config");
+    let before = commit_id(&root, "@");
+
+    let moved = run(
+        &root,
+        MutationOp::MoveBookmark {
+            name: "main".to_owned(),
+            to: RevisionSelection::WorkingCopy,
+            push_remote: None,
+        },
+    );
+    assert!(
+        moved
+            .output
+            .iter()
+            .any(|line| line.contains("became immutable")),
+        "{:?}",
+        moved.output
+    );
+    assert_eq!(commit_id(&root, "main"), before);
+    assert_eq!(parent_ids(&root, "@"), vec![before.clone()]);
+
+    write(&root, "a.txt", "two\n");
+    snapshot(&root);
+    assert_eq!(commit_id(&root, "main"), before, "main is never rewritten");
+    assert_eq!(harness::file_at(&root, &before, "a.txt"), "one\n");
+}
+
+/// `jj abandon` deletes the bookmarks on the commits it abandons. Sliding
+/// them to the parent instead made the next push move the remote bookmark
+/// backwards rather than delete it.
+#[test]
+fn abandon_deletes_the_bookmarks_on_what_it_abandons() {
+    let root = scratch_repo("abandon-bookmarks");
+    write(&root, "a.txt", "base\n");
+    commit(&root, "base");
+    write(&root, "a.txt", "feature\n");
+    commit(&root, "feature tip");
+    let tip = commit_id(&root, "description(glob:\"feature tip*\")");
+    harness::set_bookmark(&root, OpBase::Head, "feature", &tip);
+
+    run(
+        &root,
+        MutationOp::Abandon {
+            targets: vec![RevisionSelection::Commit(tip.clone())],
+        },
+    );
+    assert!(
+        commit_ids(&root, "description(glob:\"feature tip*\")").is_empty(),
+        "the tip is abandoned"
+    );
+    assert!(
+        !is_present(&root, "feature"),
+        "the bookmark goes with it instead of sliding to the parent"
     );
 }
 

@@ -888,13 +888,20 @@ fn sign_on_push_skips_immutable_commits_with_a_warning() {
         "push-sign-immutable",
         "keep",
         false,
-        "[revset-aliases]\n'immutable_heads()' = 'description(glob:\"frozen*\")'\n",
+        // A bookmark rather than a description: describing `@` into
+        // `immutable()` would start a new `@` on top of it, as jj-cli does.
+        "[revset-aliases]\n'immutable_heads()' = 'present(frozen)'\n",
     );
     let Some((mut repo, remote)) = setup_with_config("push-sign-immutable", Some(&config)) else {
         return;
     };
     let frozen = commit(&mut repo, "a.txt", "frozen");
     let frozen_change = repo.graph("@-")[0].summary.change_id.clone();
+    repo.mutate(MutationOp::CreateBookmark {
+        name: "frozen".to_owned(),
+        to: at(&frozen),
+    })
+    .expect("freeze the first commit");
     let next = commit(&mut repo, "b.txt", "next");
     repo.mutate(MutationOp::CreateBookmark {
         name: "feature".to_owned(),
@@ -949,4 +956,48 @@ fn a_signing_failure_pushes_nothing_and_rewrites_nothing() {
     assert_eq!(one(&mut repo, "feature"), first);
     assert_eq!(one(&mut repo, "@"), wc);
     assert_eq!(harness::operation_log(&repo.root).len(), ops);
+}
+
+/// Undoing a push rolls back only the local record of the remote; jj-cli
+/// warns that it often leaves conflicted bookmarks. The undo is refused until
+/// the user confirms it, and the confirmed rerun is still a plain `jj undo`.
+#[test]
+fn undoing_a_push_asks_first() {
+    let Some((mut repo, remote)) = setup("push-undo") else {
+        return;
+    };
+    let first = commit(&mut repo, "a.txt", "first");
+    repo.mutate(MutationOp::CreateBookmark {
+        name: "feature".to_owned(),
+        to: at(&first),
+    })
+    .expect("create bookmark");
+    repo.mutate(push("origin", vec![PushTarget::Bookmark("feature".into())]))
+        .expect("push");
+
+    let undo = MutationOp::Undo { operation_id: None };
+    match repo.mutate(undo.clone()) {
+        Err(RepoError::UndoesPush { summary }) => {
+            assert!(summary.contains("Pushed feature"), "{summary}")
+        }
+        other => panic!("expected the push guard, got {other:?}"),
+    }
+
+    let events = repo.run(|job| Command::Mutate {
+        job,
+        op: undo,
+        allow_immutable: true,
+        seen_op: None,
+    });
+    assert!(
+        matches!(events.last(), Some(Payload::MutationDone { .. })),
+        "{events:?}"
+    );
+    let args = harness::head_operation_args(&repo.root).unwrap_or_default();
+    assert!(!args.contains("--ignore-immutable"), "{args}");
+    assert_eq!(
+        remote_ref(&remote, "feature"),
+        Some(first),
+        "the remote keeps what was pushed"
+    );
 }
