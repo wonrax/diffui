@@ -350,6 +350,26 @@ impl Diffui {
         let Some(target) = self.tab_mut(tab) else {
             return;
         };
+        // A browsed working copy re-lists when a snapshot lands that moved it,
+        // or one a refresh asked for: ignored files never move it, and an
+        // open `target/` should still track the disk.
+        let relist_source = match &event.payload {
+            Payload::SnapshotDone {
+                job,
+                origin,
+                snapshot,
+                ..
+            } => {
+                target.session.owns_job(*job)
+                    && (matches!(origin, RefreshOrigin::Focus)
+                        || target
+                            .session
+                            .repository_snapshot
+                            .as_ref()
+                            .is_none_or(|known| known.fingerprint != snapshot.fingerprint))
+            }
+            _ => false,
+        };
         let effects = target.session.apply(event);
         let replaced = effects
             .iter()
@@ -360,6 +380,9 @@ impl Diffui {
         }
         if diff_landed {
             self.open_pending_description_edit(tab, cx);
+        }
+        if relist_source {
+            self.refresh_source_if_working_copy(tab);
         }
         self.drain_queued_mutation(tab);
     }
@@ -3276,8 +3299,8 @@ impl Diffui {
     }
 
     /// Re-list + re-read `tab`'s browser when it's showing the working copy —
-    /// called wherever the repo refreshes (watcher edits, focus regain, the
-    /// post-mutation reload), so the browsed "directory" tracks the disk.
+    /// called when a snapshot lands, so the browsed "directory" tracks the
+    /// disk.
     fn refresh_source_if_working_copy(&mut self, tab: TabId) {
         let Some(target) = self.tab_mut(tab) else {
             return;
@@ -3612,16 +3635,10 @@ impl Diffui {
             .retain(|dir| !path.starts_with(&format!("{dir}/")));
     }
 
-    /// Start a working-copy snapshot for `tab`. Every refresh path funnels
-    /// through here (watcher edits, focus regain, tab activation, the
-    /// post-mutation reload), so it's also where a working-copy source browse
-    /// re-syncs with the disk. Those loads are read-only and version-guarded,
-    /// so they ride alongside the snapshot without contending for jj's wc lock.
     /// Fold `tab`'s working copy into `@`. The projection decides whether to
-    /// run now or coalesce behind work already in flight; the browser re-lists
-    /// alongside it so a browsed working copy tracks the disk.
+    /// run now or coalesce behind work already in flight; a browsed working
+    /// copy re-lists when the snapshot lands (see [`Self::on_repo_event`]).
     pub(crate) fn start_repository_snapshot(&mut self, tab: TabId, origin: RefreshOrigin) {
-        self.refresh_source_if_working_copy(tab);
         let effects = match self.tab_mut(tab) {
             Some(target) => target.session.snapshot(origin),
             None => Vec::new(),
@@ -4728,6 +4745,54 @@ mod tests {
             assert!(state.queued_mutations.is_empty(), "nothing was queued");
             assert!(ui.confirm().is_none());
             assert!(!ui.active().activities.any_running());
+        });
+    }
+
+    /// A watcher edit that moves `@` re-lists a source view browsing it; one
+    /// that changes nothing doesn't.
+    #[test]
+    fn the_source_view_on_the_working_copy_follows_edits() {
+        crate::tabs::tests::with_cx(|cx| {
+            let mut relists = |known: &str, landed: &str| {
+                let mut ui = app();
+                let tab = push_tab(&mut ui, "/tmp/repo");
+                let repo = ui.tabs[0].repo_id().unwrap();
+                let state = ui.tab_mut(tab).unwrap();
+                state.session.capabilities.graph = true;
+                state.session.capabilities.browse = true;
+                state.session.repository_snapshot = Some(diffui_core::RepositorySnapshot {
+                    fingerprint: known.to_owned(),
+                    ..Default::default()
+                });
+                state.main_view = MainView::Source;
+                state.source.revision = Some(RevisionSelection::WorkingCopy);
+                let job = match state.session.snapshot(RefreshOrigin::Watcher).as_slice() {
+                    [diffui_core::Effect::Send(diffui_core::Command::Snapshot { job, .. })] => *job,
+                    other => panic!("a snapshot: {other:?}"),
+                };
+                ui.on_repo_event(
+                    diffui_core::Event::new(
+                        repo,
+                        diffui_core::Payload::SnapshotDone {
+                            job,
+                            origin: RefreshOrigin::Watcher,
+                            snapshot: diffui_core::RepositorySnapshot {
+                                fingerprint: landed.to_owned(),
+                                ..Default::default()
+                            },
+                            warnings: Vec::new(),
+                        },
+                    ),
+                    cx,
+                );
+                ui.tab(tab)
+                    .unwrap()
+                    .jobs
+                    .find(|pending| matches!(pending, Pending::Tree(_)))
+                    .is_some()
+            };
+            assert!(relists("op-1", "op-2"), "the edit re-lists the tree");
+            assert!(!relists("op-1", "op-1"), "nothing moved, nothing re-listed");
         });
     }
 
