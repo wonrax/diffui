@@ -732,7 +732,7 @@ pub(crate) fn activity_popover(
     // The card carries no padding of its own so the divider can run edge to
     // edge. The list scrolls out to the card's right edge, where the bar sits
     // as in every scroll view; the rows' own padding keeps their text clear.
-    let card = theme::popover(div(), theme)
+    let card = theme::surface(div(), theme::Elevation::Popover, theme)
         .id("activity-popover-card")
         .w(px(POPOVER_WIDTH))
         .flex()
@@ -854,7 +854,7 @@ pub(crate) fn toast_layer(
                 theme,
             ));
         cards = cards.child(
-            theme::popover(div(), theme)
+            theme::surface(div(), theme::Elevation::Popover, theme)
                 .w_full()
                 .flex()
                 .flex_col()

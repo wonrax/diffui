@@ -337,7 +337,7 @@ pub(crate) fn build_overlay(
     // Floating rounded card hovering over the diff's top-right corner: shares the popover
     // elevation language so it reads as a transient control, not as pane chrome. A regex
     // error joins inside the card.
-    let mut card = theme::popover(div(), theme)
+    let mut card = theme::surface(div(), theme::Elevation::Popover, theme)
         .id("find-bar")
         .flex()
         .flex_col()

@@ -1167,14 +1167,20 @@ fn build_column(
     } else {
         theme.border
     };
-    let card = theme::modal_card_outlined(div(), theme, edge)
-        .id(("palette-column", depth))
-        .w(px(COLUMN_WIDTH))
-        .h(px(COLUMN_HEIGHT))
-        .flex()
-        .flex_col()
-        .overflow_hidden()
-        .occlude();
+    let card = theme::surface_with(
+        div(),
+        theme::Elevation::Modal,
+        theme::Elevation::Modal.radius(),
+        edge,
+        theme,
+    )
+    .id(("palette-column", depth))
+    .w(px(COLUMN_WIDTH))
+    .h(px(COLUMN_HEIGHT))
+    .flex()
+    .flex_col()
+    .overflow_hidden()
+    .occlude();
     let body = |slot: AnyElement| div().flex_1().min_h_0().w_full().child(slot);
     let rule = || crate::root::horizontal_divider(theme);
     if let Some(command) = column.command.as_deref() {

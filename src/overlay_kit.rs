@@ -473,7 +473,7 @@ impl Dialog {
         });
         let footer =
             footer_with_buttons(Density::Dialog, MODAL_FOOT, self.hints, self.buttons, theme);
-        theme::modal_card(div(), theme)
+        theme::surface(div(), theme::Elevation::Modal, theme)
             .w(px(self.width))
             .when_some(self.height, |card, height| card.h(px(height)))
             .flex()

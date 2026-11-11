@@ -1808,10 +1808,7 @@ pub(crate) fn action_bar(
         .max_w_full()
         .overflow_hidden()
         .map(|bar| theme::squircle(bar, theme::radius::LG, Some(theme.text), None))
-        .shadow(vec![
-            theme::floating_shadow(18.0, 40.0),
-            theme::floating_shadow(8.0, 16.0),
-        ])
+        .shadow(vec![theme::Elevation::Popover.shadow(theme)])
         .children(items);
     div()
         .absolute()

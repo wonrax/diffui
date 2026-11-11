@@ -490,16 +490,12 @@ pub(crate) fn dropdown(
             .pr(px(crate::field::list_field_insets().1))
             .child(
                 // Firmer than a popover's edge: it hangs over a busy list.
-                theme::floating_card(
+                theme::surface_with(
                     div(),
-                    theme,
+                    theme::Elevation::Popover,
                     CARD_RADIUS,
                     theme::firm_ring(theme),
-                    vec![
-                        theme::floating_shadow(10.0, 28.0),
-                        theme::floating_shadow(10.0, 28.0),
-                        theme::floating_shadow(2.0, 6.0),
-                    ],
+                    theme,
                 )
                 .id("revset-dropdown-card")
                 .w_full()

@@ -106,12 +106,6 @@ const WORKING_COPY_PAD_X: f32 = chip::PAD_X;
 const CHEVRON_TEXT_SIZE: f32 = 15.0;
 
 pub const FILE_ROW_GAP: f32 = 6.0;
-const TOOLTIP_RADIUS: f32 = crate::theme::radius::POPOVER;
-// Wider horizontally than vertically: the POPOVER radius eats into the
-// card's left/right ends, so the text needs extra x inset to read centered.
-const TOOLTIP_PADDING_X: f32 = 9.0;
-const TOOLTIP_PADDING_Y: f32 = 6.0;
-const TOOLTIP_GAP: f32 = 8.0;
 /// How much of a ghost row's text shows through (see
 /// [`RevisionRowView::ghost`]).
 const GHOST_TEXT_ALPHA: f32 = 0.4;
@@ -165,9 +159,9 @@ pub struct RevisionListStyle {
     pub primary_font: Font,
     pub mono_font: Font,
     pub file_badge_width: f32,
-    pub tooltip_background: Color,
-    pub tooltip_text: Color,
-    pub tooltip_border: Color,
+    /// The palette of what floats over the list: the hover tooltip and the
+    /// drag chip.
+    pub floating: crate::theme::ThemeSpec,
 }
 
 /// Key the widget reports back so the parent can map it to its own
@@ -1724,96 +1718,59 @@ impl RevisionList {
         // Lane tooltip wins over the file path tooltip when both could fire at
         // the same time: the cursor is in the gutter, which is mutually
         // exclusive with the content area anyway.
-        let (text, anchor_x, row_y, row_height) =
-            if let Some((item_idx, lane, _half)) = self.hovered_lane {
-                if item_idx >= props.row_count() {
-                    return None;
-                }
-                let item = self.props.item_at(item_idx, cx)?;
-                let labels = item_lane_labels(&item, lane);
-                if labels.is_empty() {
-                    return None;
-                }
-                (
-                    labels.join(", "),
-                    // Anchor just past the gutter so the tip sits next to the
-                    // stroke rather than at the far right edge.
-                    bounds.x + self.gutter_width(&item),
-                    self.row_screen_y(item_idx),
-                    row_height_of(props.row_kind(item_idx)),
-                )
-            } else {
-                let item_idx = self.hovered_file_item?;
-                if item_idx >= props.row_count() {
-                    return None;
-                }
-                let item = props.item_at(item_idx, cx)?;
-                let gutter_total = self.gutter_width(&item);
-                let Item::File(file) = item else {
-                    return None;
-                };
-                // Only show the path tooltip when the name is actually
-                // ellipsized: same column math as painting it.
-                let path_w = props
-                    .file_row_columns(bounds.x, bounds.width, gutter_total, &file)
-                    .path_w;
-                let name_width =
-                    self.widths
-                        .width(&file.primary, FILE_NAME_TEXT_SIZE, style.primary_font);
-                if name_width <= path_w {
-                    return None;
-                }
-                (
-                    file.raw_path,
-                    bounds.x + bounds.width,
-                    self.row_screen_y(item_idx),
-                    FILE_ROW_HEIGHT,
-                )
+        let (text, target) = if let Some((item_idx, lane, _half)) = self.hovered_lane {
+            if item_idx >= props.row_count() {
+                return None;
+            }
+            let item = self.props.item_at(item_idx, cx)?;
+            let labels = item_lane_labels(&item, lane);
+            if labels.is_empty() {
+                return None;
+            }
+            (
+                labels.join(", "),
+                // The stroke under the cursor, on its row.
+                Rectangle {
+                    x: cursor.x,
+                    y: self.row_screen_y(item_idx),
+                    width: 0.0,
+                    height: row_height_of(props.row_kind(item_idx)),
+                },
+            )
+        } else {
+            let item_idx = self.hovered_file_item?;
+            if item_idx >= props.row_count() {
+                return None;
+            }
+            let item = props.item_at(item_idx, cx)?;
+            let gutter_total = self.gutter_width(&item);
+            let Item::File(file) = item else {
+                return None;
             };
+            // Only show the path tooltip when the name is actually
+            // ellipsized: same column math as painting it.
+            let columns = props.file_row_columns(bounds.x, bounds.width, gutter_total, &file);
+            let path_w = columns.path_w;
+            let name_width =
+                self.widths
+                    .width(&file.primary, FILE_NAME_TEXT_SIZE, style.primary_font);
+            if name_width <= path_w {
+                return None;
+            }
+            (
+                file.raw_path,
+                Rectangle {
+                    x: columns.path_x,
+                    y: self.row_screen_y(item_idx),
+                    width: path_w,
+                    height: FILE_ROW_HEIGHT,
+                },
+            )
+        };
 
-        let viewport = window.viewport_size();
-        let text_w = self
-            .widths
-            .width(&text, CAPTION_TEXT_SIZE, style.primary_font);
-        let box_w = text_w + TOOLTIP_PADDING_X * 2.0 + 2.0;
-        let box_h = CAPTION_TEXT_SIZE * LINE_HEIGHT_MULTIPLIER + TOOLTIP_PADDING_Y * 2.0;
-        // Anchor to the right of the row at its vertical center, shifted by the
-        // gap. Snap into the viewport if it would clip.
-        let mut x = anchor_x + TOOLTIP_GAP;
-        let mut y = row_y + (row_height - box_h) / 2.0;
-        if x + box_w > f32::from(viewport.width) {
-            // Fall back to following the cursor on the left.
-            x = (cursor.x - box_w - TOOLTIP_GAP).max(4.0);
-        }
-        if y + box_h > f32::from(viewport.height) {
-            y = (f32::from(viewport.height) - box_h - 4.0).max(0.0);
-        }
-        if y < 0.0 {
-            y = 4.0;
-        }
-        Some((
-            div()
-                .w(px(box_w))
-                .h(px(box_h))
-                .flex()
-                .items_center()
-                .px(px(TOOLTIP_PADDING_X))
-                .bg(style.tooltip_background)
-                .border_1()
-                .border_color(style.tooltip_border)
-                .rounded(px(TOOLTIP_RADIUS))
-                // Same soft lift every other floating surface carries: shadowless,
-                // the card sank into the busy rows behind it.
-                .shadow(vec![crate::theme::floating_shadow(3.0, 10.0)])
-                .font(style.primary_font.gpui())
-                .text_size(px(CAPTION_TEXT_SIZE))
-                .line_height(relative(LINE_HEIGHT_MULTIPLIER))
-                .text_color(style.tooltip_text)
-                .whitespace_nowrap()
-                .child(text)
-                .into_any_element(),
-            point(px(x), px(y)),
-        ))
+        let (card, at) =
+            crate::ui::placed_tooltip(text, target, style.primary_font, style.floating, window);
+        Some((card.into_any_element(), at))
     }
 
     /// The chip trailing the cursor during a drag: the dragged revision's
@@ -1842,14 +1799,16 @@ impl RevisionList {
                     crate::theme::squircle(
                         label,
                         crate::theme::radius::CONTROL,
-                        Some(style.tooltip_background),
+                        Some(style.floating.panel_background_elevated),
                         Some(Color {
                             a: 0.6,
                             ..style.accent
                         }),
                     )
                 })
-                .shadow(vec![crate::theme::floating_shadow(3.0, 10.0)])
+                .shadow(vec![
+                    crate::theme::Elevation::Tooltip.shadow(style.floating),
+                ])
                 .font(style.mono_font.gpui())
                 .text_size(px(CAPTION_TEXT_SIZE))
                 .text_color(style.accent)
@@ -2940,9 +2899,7 @@ fn placeholder_style() -> RevisionListStyle {
         primary_font: Font::DEFAULT,
         mono_font: Font::MONOSPACE,
         file_badge_width: 0.0,
-        tooltip_background: color,
-        tooltip_text: color,
-        tooltip_border: color,
+        floating: crate::theme::ResolvedTheme::Dark.spec(),
     }
 }
 

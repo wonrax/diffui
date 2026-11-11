@@ -356,9 +356,7 @@ pub(crate) fn revision_list_style(
         primary_font: config.ui_font,
         mono_font: config.mono_font,
         file_badge_width,
-        tooltip_background: theme.panel_background_elevated,
-        tooltip_text: theme.text,
-        tooltip_border: theme.border,
+        floating: theme,
     }
 }
 

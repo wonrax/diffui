@@ -707,7 +707,7 @@ fn build_card(
     let scrolls = content_h + MENU_CARD_PAD * 2.0 > menu_max_height(ui);
     // The card swallows presses (either button) so a click inside it never reaches
     // the dismiss backdrop; rows carry their own hover/release handlers.
-    let card = theme::popover(div(), theme)
+    let card = theme::surface(div(), theme::Elevation::Popover, theme)
         .absolute()
         .left(px(rect.x))
         .top(px(rect.y))

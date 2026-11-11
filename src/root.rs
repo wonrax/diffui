@@ -910,7 +910,7 @@ fn panel_peek(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> AnyElement {
     };
     let top = toolbar::chrome_bottom();
     let bottom = crate::status_bar::TOTAL_HEIGHT;
-    let shadow = theme::floating_shadow(8.0, 16.0);
+    let shadow = theme::Elevation::Popover.shadow(theme);
     // The floating files peek is a squircle; the revisions peek, flush with the
     // window's left edge and edged on its right only, keeps its plain corners.
     let (surface, pane, squircle) = match peek.panel {

@@ -1074,15 +1074,86 @@ pub fn scroll_handle(
     window.use_keyed_state(id, cx, |_, _| ScrollHandle::default())
 }
 
-/// Between a control's bottom edge and its tooltip.
-const TOOLTIP_GAP: f32 = 6.0;
+/// Between the described element's edge and its tooltip.
+const TOOLTIP_GAP: f32 = 4.0;
 /// The least a tooltip keeps from the window's edges.
 const TOOLTIP_MARGIN: f32 = 6.0;
+const TOOLTIP_TEXT_SIZE: f32 = text_size::CAPTION;
+const TOOLTIP_PAD_X: f32 = 8.0;
+const TOOLTIP_PAD_Y: f32 = 3.0;
+
+/// The hover label every tooltip in the app shows: an 11px caption on a small
+/// card, like a macOS help tag. One line, never wrapped.
+pub fn tooltip_card(label: impl Into<SharedString>, font: Font, theme: ThemeSpec) -> Div {
+    let label = label.into();
+    let (width, height) = tooltip_size(&label, font);
+    theme::surface(div(), theme::Elevation::Tooltip, theme)
+        .w(px(width))
+        .h(px(height))
+        .flex()
+        .items_center()
+        .px(px(TOOLTIP_PAD_X))
+        .font(font.gpui())
+        .text_size(px(TOOLTIP_TEXT_SIZE))
+        .line_height(px(TOOLTIP_TEXT_SIZE * typography::DEFAULT_LINE_HEIGHT))
+        .text_color(theme.text)
+        .whitespace_nowrap()
+        .child(label)
+}
+
+/// The outer size of [`tooltip_card`] holding `label`, its 1px edge included.
+fn tooltip_size(label: &str, font: Font) -> (f32, f32) {
+    let edge = 2.0;
+    let width = crate::measure::line_width(label, TOOLTIP_TEXT_SIZE, font) + 2.0 * TOOLTIP_PAD_X;
+    let height = TOOLTIP_TEXT_SIZE * typography::DEFAULT_LINE_HEIGHT + 2.0 * TOOLTIP_PAD_Y;
+    (width.ceil() + edge, height.ceil() + edge)
+}
+
+/// Where a `size` tooltip goes for an element at `target` in a `viewport`
+/// window: centred under it, a few px off; above it when there's no room
+/// below; slid along to stay `TOOLTIP_MARGIN` inside the window.
+pub fn tooltip_origin(
+    target: crate::geometry::Rectangle,
+    size: (f32, f32),
+    viewport: (f32, f32),
+) -> (f32, f32) {
+    let (width, height) = size;
+    let centre = target.x + target.width / 2.0;
+    let x = (centre - width / 2.0)
+        .min(viewport.0 - TOOLTIP_MARGIN - width)
+        .max(TOOLTIP_MARGIN);
+    let below = target.y + target.height + TOOLTIP_GAP;
+    let above = target.y - TOOLTIP_GAP - height;
+    let y = if below + height <= viewport.1 - TOOLTIP_MARGIN || above < TOOLTIP_MARGIN {
+        below
+    } else {
+        above
+    };
+    (x, y)
+}
+
+/// [`tooltip_card`] for `label`, placed by [`tooltip_origin`]: the card and
+/// its window position.
+pub fn placed_tooltip(
+    label: impl Into<SharedString>,
+    target: crate::geometry::Rectangle,
+    font: Font,
+    theme: ThemeSpec,
+    window: &Window,
+) -> (Div, gpui_kit::Point<Pixels>) {
+    let label = label.into();
+    let viewport = window.viewport_size();
+    let (x, y) = tooltip_origin(
+        target,
+        tooltip_size(&label, font),
+        (f32::from(viewport.width), f32::from(viewport.height)),
+    );
+    (tooltip_card(label, font, theme), point(px(x), px(y)))
+}
 
 /// The hover label every chrome control uses: `.tip(label, font, theme)` on an
 /// element with an id. GPUI drops a tooltip at the cursor, over what's under
-/// it; this one hangs from the control's bottom edge instead, left-aligned
-/// with it, and moves up or in to stay in the window.
+/// it; this one is centred under the control instead (see [`tooltip_origin`]).
 pub trait Tip: StatefulInteractiveElement + ParentElement + Sized {
     fn tip(self, label: impl Into<SharedString>, font: Font, theme: ThemeSpec) -> Self {
         let anchor: Rc<Cell<Option<Bounds<Pixels>>>> = Rc::default();
@@ -1122,20 +1193,61 @@ struct TooltipView {
 }
 
 impl Render for TooltipView {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        let card = theme::tooltip_card(div(), self.theme)
-            .px(px(8.0))
-            .py(px(4.0))
-            .font(self.font.gpui())
-            .text_size(px(text_size::BODY))
-            .child(self.label.clone());
+    fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         match self.anchor.get() {
-            Some(control) => anchored()
-                .position(point(control.left(), control.bottom() + px(TOOLTIP_GAP)))
-                .snap_to_window_with_margin(px(TOOLTIP_MARGIN))
-                .child(card)
-                .into_any_element(),
-            None => card.into_any_element(),
+            Some(control) => {
+                let (card, at) = placed_tooltip(
+                    self.label.clone(),
+                    control.into(),
+                    self.font,
+                    self.theme,
+                    window,
+                );
+                anchored()
+                    .position(at)
+                    .snap_to_window_with_margin(px(TOOLTIP_MARGIN))
+                    .child(card)
+                    .into_any_element()
+            }
+            None => tooltip_card(self.label.clone(), self.font, self.theme).into_any_element(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geometry::Rectangle;
+
+    const VIEWPORT: (f32, f32) = (800.0, 600.0);
+
+    fn rect(x: f32, y: f32, width: f32, height: f32) -> Rectangle {
+        Rectangle {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn a_tooltip_hangs_centred_just_under_its_element() {
+        let (x, y) = tooltip_origin(rect(300.0, 100.0, 28.0, 28.0), (80.0, 20.0), VIEWPORT);
+        assert_eq!(x, 314.0 - 40.0);
+        assert_eq!(y, 128.0 + TOOLTIP_GAP);
+    }
+
+    #[test]
+    fn a_tooltip_without_room_below_goes_above() {
+        let (_, y) = tooltip_origin(rect(300.0, 570.0, 28.0, 28.0), (80.0, 20.0), VIEWPORT);
+        assert_eq!(y, 570.0 - TOOLTIP_GAP - 20.0);
+    }
+
+    #[test]
+    fn a_tooltip_stays_inside_the_window() {
+        let (x, _) = tooltip_origin(rect(0.0, 100.0, 20.0, 20.0), (80.0, 20.0), VIEWPORT);
+        assert_eq!(x, TOOLTIP_MARGIN);
+        let (x, _) = tooltip_origin(rect(790.0, 100.0, 10.0, 20.0), (80.0, 20.0), VIEWPORT);
+        assert_eq!(x, 800.0 - TOOLTIP_MARGIN - 80.0);
     }
 }

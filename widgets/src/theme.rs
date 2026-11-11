@@ -728,19 +728,6 @@ pub fn destructive_button_style(theme: ThemeSpec) -> ButtonStyle {
     }
 }
 
-/// The drop shadow every floating surface shares: same tint and alpha
-/// everywhere, geometry scaled to the surface (popovers are bigger than
-/// tooltips).
-pub fn floating_shadow(offset_y: f32, blur_radius: f32) -> BoxShadow {
-    BoxShadow {
-        color: Hsla::from(Color { a: 0.05, ..BLACK }),
-        offset: point(px(0.0), px(offset_y)),
-        blur_radius: px(blur_radius),
-        spread_radius: px(0.0),
-        inset: false,
-    }
-}
-
 /// The soft drop under a control raised out of its track (the active tab, the
 /// active segment). Its edge is the squircle's ring, in [`firm_ring`].
 pub fn raised_lift() -> BoxShadow {
@@ -788,77 +775,89 @@ pub fn raised<E: Styled + gpui_kit::ParentElement>(element: E, radius: f32, them
         ))
 }
 
-/// Floating card anchored to a trigger with nothing dimming the content behind
-/// it (dropdown menus, the activity popover). The heavy drop shadow is what
-/// separates it from the busy panel underneath. Add its content after this:
-/// its squircle is the card's first child.
-pub fn popover<E: Styled + gpui_kit::ParentElement>(element: E, theme: ThemeSpec) -> E {
-    floating(
-        element,
-        theme,
-        radius::POPOVER,
-        theme.border,
-        floating_shadow(8.0, 16.0),
-    )
+/// How far a floating surface stands off what's under it. Each step owns its
+/// corner, edge and drop shadow, so every surface at a step reads the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Elevation {
+    /// Hover labels.
+    Tooltip,
+    /// Cards anchored to a trigger with nothing dimming what's behind them:
+    /// menus, popovers, the find bar, toasts.
+    Popover,
+    /// Cards over the scrim: dialogs, the palette.
+    Modal,
 }
 
-/// Centered card over a scrim (confirm dialog, open-repo dialog, command
-/// palette). The scrim already darkens what's behind the modal, so a heavy
-/// shadow would just look like double dimming: soft, just enough to suggest
-/// the card is lifted.
-pub fn modal_card<E: Styled + gpui_kit::ParentElement>(element: E, theme: ThemeSpec) -> E {
-    modal_card_outlined(element, theme, theme.border)
+impl Elevation {
+    pub fn radius(self) -> f32 {
+        match self {
+            Elevation::Tooltip => radius::XS,
+            Elevation::Popover => radius::POPOVER,
+            Elevation::Modal => radius::MODAL,
+        }
+    }
+
+    /// The drop under a surface at this step. Black on a dark canvas needs
+    /// far more alpha than on a light one to show at all.
+    pub fn shadow(self, theme: ThemeSpec) -> BoxShadow {
+        let dark = is_dark(theme);
+        let (offset_y, blur, light_alpha, dark_alpha) = match self {
+            Elevation::Tooltip => (2.0, 8.0, 0.14, 0.40),
+            Elevation::Popover => (8.0, 24.0, 0.20, 0.55),
+            Elevation::Modal => (12.0, 32.0, 0.28, 0.70),
+        };
+        BoxShadow {
+            color: Hsla::from(Color {
+                a: if dark { dark_alpha } else { light_alpha },
+                ..BLACK
+            }),
+            offset: point(px(0.0), px(offset_y)),
+            blur_radius: px(blur),
+            spread_radius: px(0.0),
+            inset: false,
+        }
+    }
 }
 
-/// [`modal_card`] with its edge in `border`: the palette rings the column
-/// that has the keyboard.
-pub fn modal_card_outlined<E: Styled + gpui_kit::ParentElement>(
+/// Whether `theme` draws light ink on a dark canvas.
+fn is_dark(theme: ThemeSpec) -> bool {
+    let canvas = theme.background;
+    canvas.r + canvas.g + canvas.b < 1.5
+}
+
+/// A floating surface at `elevation`: the raised fill and the border's edge in
+/// a squircle, and the step's drop shadow. Add its content after this: its
+/// squircle is the card's first child.
+pub fn surface<E: Styled + gpui_kit::ParentElement>(
     element: E,
+    elevation: Elevation,
     theme: ThemeSpec,
-    border: Color,
 ) -> E {
-    floating(
-        element,
-        theme,
-        radius::XL,
-        border,
-        floating_shadow(4.0, 12.0),
-    )
+    surface_with(element, elevation, elevation.radius(), theme.border, theme)
 }
 
-/// A floating card: its fill and edge are a squircle, and its drop shadow
-/// keeps the circular corner GPUI shadows have, which the blur hides.
-fn floating<E: Styled + gpui_kit::ParentElement>(
+/// [`surface`] with its own corner and edge: the palette rings the column that
+/// has the keyboard, the revset dropdown is a compact card with a firmer edge.
+pub fn surface_with<E: Styled + gpui_kit::ParentElement>(
     element: E,
-    theme: ThemeSpec,
+    elevation: Elevation,
     radius: f32,
-    border: Color,
-    shadow: BoxShadow,
-) -> E {
-    floating_card(element, theme, radius, border, vec![shadow])
-}
-
-/// [`popover`] with its own corner, edge and shadows: a card that needs to
-/// stand further off what it hangs over.
-pub fn floating_card<E: Styled + gpui_kit::ParentElement>(
-    element: E,
+    edge: Color,
     theme: ThemeSpec,
-    radius: f32,
-    border: Color,
-    shadows: Vec<BoxShadow>,
 ) -> E {
     use crate::squircle::{Corners, Fill, background};
     // The transparent border keeps the card's layout and lets an
-    // overflow-hidden card clip to its whole box, edge included.
+    // overflow-hidden card clip to its whole box, edge included. The shadow
+    // keeps the circular corner GPUI shadows have, which the blur hides.
     element
         .border_1()
         .border_color(TRANSPARENT)
         .rounded(px(radius))
-        .shadow(shadows)
+        .shadow(vec![elevation.shadow(theme)])
         .child(background(
             Fill::new(Corners::all(radius))
                 .background(theme.panel_background_elevated)
-                .border(1.0, border),
+                .border(1.0, edge),
             1.0,
         ))
 }
@@ -874,16 +873,6 @@ pub fn input_selection(theme: ThemeSpec) -> Color {
         a: 0.25,
         ..theme.accent
     }
-}
-
-/// Hover tooltip card.
-pub fn tooltip_card<E: Styled>(element: E, theme: ThemeSpec) -> E {
-    element
-        .bg(theme.panel_background_elevated)
-        .text_color(theme.text)
-        .border_1()
-        .border_color(theme.border)
-        .rounded(px(radius::SM))
 }
 
 /// Makes kit's theme speak diffui's palette, so a stock kit component (a

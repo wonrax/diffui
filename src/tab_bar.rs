@@ -1204,7 +1204,7 @@ pub(crate) fn open_repo_card(
         );
     }
 
-    let mut body = theme::modal_card(div(), theme)
+    let mut body = theme::surface(div(), theme::Elevation::Modal, theme)
         .w(px(OPEN_DIALOG_WIDTH))
         .flex()
         .flex_col()
