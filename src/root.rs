@@ -833,7 +833,6 @@ fn main_pane(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyEl
 /// Everything that floats above the shell. Each is empty when inactive, so they can
 /// always be stacked.
 fn floats_pane(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyElement {
-    let Look { theme, .. } = look;
     request_overlay_frames(ui, window);
     div()
         .relative()
@@ -841,17 +840,17 @@ fn floats_pane(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> Any
         // Under every overlay: the picks' bar floats over the diff, not over them.
         .child(crate::changes::action_bar(ui, look, window, cx))
         .child(panel_peek(ui, look, cx))
-        .child(palette::build_overlay(ui, theme, window, cx))
-        .child(activity::activity_popover(ui, theme, window, cx))
+        .child(palette::build_overlay(ui, look, window, cx))
+        .child(activity::activity_popover(ui, look, window, cx))
         .child(menu::build_overlay(ui, look, window, cx))
         .child(tab_bar::build_open_repo_dialog(ui, look, window, cx))
-        .child(crate::bookmarks::build_name_prompt(ui, theme, window, cx))
+        .child(crate::bookmarks::build_name_prompt(ui, look, window, cx))
         .child(crate::changes::split_modal(ui, look, window, cx))
         .child(tab_bar::build_confirm_dialog(ui, look, window, cx))
-        .child(crate::cli_output::build_overlay(ui, theme, window, cx))
-        .child(crate::credentials::build_overlay(ui, theme, window, cx))
+        .child(crate::cli_output::build_overlay(ui, look, window, cx))
+        .child(crate::credentials::build_overlay(ui, look, window, cx))
         .child(crate::shortcuts::build_overlay(ui, look, window, cx))
-        .child(activity::toast_layer(ui, theme, window, cx))
+        .child(activity::toast_layer(ui, look, window, cx))
         .into_any_element()
 }
 

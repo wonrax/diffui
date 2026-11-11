@@ -4,7 +4,7 @@
 //! footer that says what Enter will do.
 
 use crate::root::PaneSet;
-use crate::theme::{self, Color, Font, Weight, text_size};
+use crate::theme::{self, Color, Weight, text_size};
 use crate::typography::{self, Aligned};
 use crate::{Cx, input, palette, ui};
 use gpui_kit::component::Sizable as _;
@@ -190,14 +190,15 @@ fn enter_label(kind: Option<CommandKind>) -> &'static str {
 /// selection can never drift apart.
 pub(crate) fn input(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     query: &str,
     command: &CommandLine,
     focused: bool,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let mono = ui.config.mono_font;
+    let Look { theme, .. } = look;
+    let mono = look.mono;
     // The field holds what follows the `jj ` the chip stands for; offsets into
     // the line move by its length.
     let shown = query.strip_prefix(PREFIX).unwrap_or(query);
@@ -221,7 +222,7 @@ pub(crate) fn input(
             .on_edit(move |line, cursor, window, cx| on_edit(&(line, cursor), window, cx))
             .on_submit(move |window, cx| on_submit(&(), window, cx));
     }
-    let look = input::StyledLook {
+    let styled = input::StyledLook {
         submit_on_enter: true,
         colors,
         ..Default::default()
@@ -236,7 +237,7 @@ pub(crate) fn input(
         .items_center()
         .px(px(CONTENT_X))
         .font(mono.gpui())
-        .child(prefix_chip(mono, theme))
+        .child(prefix_chip(look))
         .child(
             div()
                 .flex_1()
@@ -244,7 +245,7 @@ pub(crate) fn input(
                 // The editor keeps its own margin before the text.
                 .ml(px(GLYPH_GAP - EDITOR_MARGIN))
                 .child(
-                    input::styled_text(spec, look, mono, text_size::BODY_LG, window, cx)
+                    input::styled_text(spec, styled, mono, text_size::BODY_LG, window, cx)
                         .with_size(gpui_kit::component::Size::XSmall)
                         .line_height(px(line_height))
                         .h(px(line_height)),
@@ -262,7 +263,8 @@ pub(crate) fn input(
 }
 
 /// The solid `jj` the command line starts with.
-fn prefix_chip(mono: Font, theme: ThemeSpec) -> impl IntoElement {
+fn prefix_chip(look: Look) -> impl IntoElement {
+    let Look { theme, mono, .. } = look;
     let mono = theme::emphasis_font(mono, Weight::SEMIBOLD);
     div()
         .flex_none()
@@ -288,15 +290,15 @@ fn prefix_chip(mono: Font, theme: ThemeSpec) -> impl IntoElement {
 /// error. Nothing when there's neither.
 pub(crate) fn args_strip(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     line: &str,
     command: &CommandLine,
     _window: &mut Window,
     _cx: &mut Cx,
 ) -> Option<AnyElement> {
-    let look = ui.look(theme);
-    let font = ui.config.ui_font;
-    let mono = ui.config.mono_font;
+    let Look { theme, .. } = look;
+    let font = look.font;
+    let mono = look.mono;
     let plan = ui.plan(command);
     let blocked = match &plan.state {
         PlanState::Blocked { reason, span } if command.error_visible(line, span.as_ref()) => {
@@ -388,14 +390,14 @@ pub(crate) fn args_strip(
 /// the palette's row style, grouped by kind. With none, a hint.
 pub(crate) fn results(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     line: &str,
     command: &CommandLine,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let look = ui.look(theme);
-    let preview = preview(ui, theme, line, command);
+    let Look { theme, .. } = look;
+    let preview = preview(ui, look, line, command);
     let list = if command.completions.is_empty() {
         let label = if line.trim_end() != "jj" {
             "No suggestions here"
@@ -404,7 +406,7 @@ pub(crate) fn results(
         } else {
             "Type a jj command, or \u{2191} for recent ones"
         };
-        palette::empty_results(ui, theme, label.to_owned()).into_any_element()
+        palette::empty_results(look, label.to_owned()).into_any_element()
     } else {
         let id = "command-results";
         let handle = ui::scroll_handle("command-results-scroll", window, cx)
@@ -440,7 +442,7 @@ pub(crate) fn results(
             |index| {
                 let completion = &command.completions[index];
                 let selected = index == command.selected;
-                let body = candidate_row(ui, theme, completion, selected, window, cx);
+                let body = candidate_row(ui, look, completion, selected, window, cx);
                 div()
                     .id(("command-row", index))
                     .child(palette::row_shell(body, selected, theme, window, cx))
@@ -497,14 +499,13 @@ pub(crate) fn completion_group(kind: CompletionKind) -> &'static str {
 /// highlighted candidate ghosted in where it would go, what kind of command it
 /// is, and what it will do in words. Nothing on a bare `jj ` with nothing to
 /// offer.
-fn preview(ui: &Diffui, theme: ThemeSpec, line: &str, command: &CommandLine) -> Option<AnyElement> {
-    let look = ui.look(theme);
+fn preview(ui: &Diffui, look: Look, line: &str, command: &CommandLine) -> Option<AnyElement> {
+    let Look { theme, .. } = look;
     let completion = command.completions.get(command.selected);
     if line.trim_end() == "jj" && completion.is_none() {
         return None;
     }
-    let font = ui.config.ui_font;
-    let mono = ui.config.mono_font;
+    let mono = look.mono;
     let plan = ui.plan(command);
     let line = line.trim_end_matches(['\n', '\r']);
     let mut spans: Vec<crate::ellipsis::Span<'_>> = Vec::new();
@@ -537,7 +538,7 @@ fn preview(ui: &Diffui, theme: ThemeSpec, line: &str, command: &CommandLine) -> 
     }
     let mut head: Vec<Aligned> = Vec::new();
     if let Some(kind) = plan.kind.filter(|_| !ghosted) {
-        head.push(badge(kind, font, theme));
+        head.push(badge(kind, look));
         head.push(Aligned::gap(theme::space::MD));
     }
     head.push(
@@ -588,27 +589,27 @@ fn preview(ui: &Diffui, theme: ThemeSpec, line: &str, command: &CommandLine) -> 
 /// One candidate: a glyph for its kind, the text it inserts, and its help.
 pub(crate) fn completion_row(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     completion: &Completion,
     selected: bool,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    candidate_row(ui, theme, completion, selected, window, cx)
+    candidate_row(ui, look, completion, selected, window, cx)
 }
 
 /// [`completion_row`], the highlighted one showing the key that takes it.
 fn candidate_row(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     completion: &Completion,
     selected: bool,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let look = ui.look(theme);
-    let mono = ui.config.mono_font;
-    let font = ui.config.ui_font;
+    let Look { theme, .. } = look;
+    let mono = look.mono;
+    let font = look.font;
     let (glyph, _) = completion_glyph(completion.kind, theme);
     let label_color = match completion.kind {
         CompletionKind::Revision => theme.accent,
@@ -667,12 +668,12 @@ fn candidate_row(
 /// The footer: the keys of the command line, and where what runs ends up.
 pub(crate) fn footer(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     command: &CommandLine,
     _window: &mut Window,
     _cx: &mut Cx,
 ) -> AnyElement {
-    let look = ui.look(theme);
+    let Look { theme, .. } = look;
     let plan = ui.plan(command);
     let enter = match &plan.state {
         PlanState::Pending => "Resolving\u{2026}",
@@ -724,7 +725,8 @@ fn sentence(words: &crate::prose::Prose, color: Color, look: Look) -> Aligned {
 }
 
 /// The kind badge: View, Preview, Opens editor, CLI.
-pub(crate) fn badge(kind: CommandKind, font: Font, theme: ThemeSpec) -> Aligned {
+pub(crate) fn badge(kind: CommandKind, look: Look) -> Aligned {
+    let Look { theme, font, .. } = look;
     let color = match kind {
         CommandKind::View => theme.info,
         CommandKind::Mutation => theme.accent,

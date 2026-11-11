@@ -8,7 +8,7 @@
 //! user doing anything.
 
 use crate::overlay_kit::Dialog;
-use crate::theme::{self, Font, text_size};
+use crate::theme::{self, text_size};
 use crate::{Action, Cx, input, ui};
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, Window, div, px};
@@ -19,7 +19,6 @@ use diffui_core::askpass::{self, AskpassEvent, PromptKind, PromptRequest};
 use crate::Diffui;
 use crate::modes::{Mode, ModeKind};
 use crate::prose::Prose;
-use crate::theme::ThemeSpec;
 use crate::ui::Look;
 
 const INPUT_ID: &str = "credential-input";
@@ -213,15 +212,14 @@ fn title(request: &PromptRequest) -> Prose {
 /// The modal card. Empty when no prompt is open.
 pub(crate) fn build_overlay(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let look = ui.look(theme);
     let Some(dialog) = ui.credential_dialog() else {
         return div().into_any_element();
     };
-    let mono = ui.config.mono_font;
+    let mono = look.mono;
     let prompt = &dialog.current.prompt;
 
     let mut card = Dialog::new(&title(&dialog.current), look);
@@ -253,7 +251,7 @@ pub(crate) fn build_overlay(
                 "First connection to this host. Check its fingerprint.",
             ));
             if let Some(detail) = &prompt.detail {
-                card = card.child(fingerprint(detail, mono, theme));
+                card = card.child(fingerprint(detail, look));
             }
             Some("Trust")
         }
@@ -320,7 +318,8 @@ pub(crate) fn build_overlay(
 
 /// A host key's fingerprint in a quiet well, wrapping at any character so the
 /// long hash never runs off the card.
-fn fingerprint(detail: &str, mono: Font, theme: ThemeSpec) -> gpui_kit::Div {
+fn fingerprint(detail: &str, look: Look) -> gpui_kit::Div {
+    let Look { theme, mono, .. } = look;
     div()
         .w_full()
         .px(px(theme::space::LG))

@@ -413,7 +413,7 @@ pub(crate) fn build_sidebar(
                         .child(build_revset_filter(ui, look, window, cx)),
                 ),
         )
-        .children(crate::revset_assist::error_strip(ui, theme, window, cx))
+        .children(crate::revset_assist::error_strip(ui, look, window, cx))
         .children(crate::history_panel::file_filter_banner(
             ui, theme, window, cx,
         ));
@@ -432,7 +432,7 @@ pub(crate) fn build_sidebar(
     // The revset field's completions hang over the top of the list, which
     // recedes under a veil of the pane's colour while they're open. The veil
     // takes no presses: the list stays live.
-    let dropdown = crate::revset_assist::dropdown(ui, theme, window, cx);
+    let dropdown = crate::revset_assist::dropdown(ui, look, window, cx);
     let veil = dropdown.is_some().then(|| {
         div().absolute().inset_0().bg(Color {
             a: DROPDOWN_VEIL,

@@ -6,7 +6,7 @@
 use crate::Cx;
 use crate::keys::{self as keyboard, Named};
 use crate::root::PaneSet;
-use crate::theme::{self, Font, text_size};
+use crate::theme::{self, text_size};
 use crate::{icons, ui};
 use gpui_kit::Window as GpuiWindow;
 use gpui_kit::prelude::*;
@@ -22,6 +22,7 @@ use diffui_core::revset::{RevsetError, RevsetMatch, RevsetQuery};
 
 use crate::cmdline::{apply_completion, cursor_after_edit, cursor_after_key, place_caret};
 use crate::theme::ThemeSpec;
+use crate::ui::Look;
 use crate::{Diffui, TabId};
 
 /// How long typing must pause before the revset is checked.
@@ -397,11 +398,11 @@ fn window(text: &str, span: Range<usize>, room: f32, width: impl Fn(&str) -> f32
 /// highlight stays in sight as ↑/↓ walk past the fold.
 pub(crate) fn dropdown(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     window: &mut GpuiWindow,
     cx: &mut Cx,
 ) -> Option<AnyElement> {
-    let look = ui.look(theme);
+    let Look { theme, .. } = look;
     let field = &ui.active().cmdline.field;
     if !field.open || field.completions.is_empty() {
         return None;
@@ -438,7 +439,7 @@ pub(crate) fn dropdown(
             let completion = &field.completions[index];
             let selected = index == field.selected;
             let body =
-                crate::cmdline_view::completion_row(ui, theme, completion, selected, window, cx);
+                crate::cmdline_view::completion_row(ui, look, completion, selected, window, cx);
             div()
                 .id(("revset-row", index))
                 .child(row_shell(body, selected, theme))
@@ -542,15 +543,14 @@ fn row_shell(body: AnyElement, selected: bool, theme: ThemeSpec) -> gpui_kit::Di
 /// revset with the bad part underlined, and the way back to the default.
 pub(crate) fn error_strip(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     _window: &mut GpuiWindow,
     cx: &mut Cx,
 ) -> Option<AnyElement> {
-    let look = ui.look(theme);
+    let Look { theme, .. } = look;
     let (lead, trail) = crate::field::list_field_insets();
     let error = shown_error(ui)?;
     let value = &ui.active().session.revset;
-    let mono = ui.config.mono_font;
     let message = div().w_full().text_size(px(text_size::BODY)).child(
         crate::prose::Prose::from_backticks(&crate::cmdline::sentence(
             &error.message,
@@ -564,7 +564,7 @@ pub(crate) fn error_strip(
     if let Some(span) = error.span.clone() {
         let room =
             ui::Banner::message_width(ui::BannerShape::Card, ui.sidebar_width - lead - trail);
-        if let Some(echo) = echo(value, span, room, mono, theme) {
+        if let Some(echo) = echo(value, span, room, look) {
             banner = banner.child(div().overflow_hidden().child(echo));
         }
     }
@@ -586,13 +586,8 @@ pub(crate) fn error_strip(
 
 /// The revset on one line, `span` underlined (or a caret where something is
 /// missing), cut to what fits in `room` around it.
-fn echo(
-    value: &str,
-    span: Range<usize>,
-    room: f32,
-    mono: Font,
-    theme: ThemeSpec,
-) -> Option<AnyElement> {
+fn echo(value: &str, span: Range<usize>, room: f32, look: Look) -> Option<AnyElement> {
+    let Look { theme, mono, .. } = look;
     let start = span.start.min(value.len());
     let end = span.end.min(value.len()).max(start);
     if !value.is_char_boundary(start) || !value.is_char_boundary(end) {

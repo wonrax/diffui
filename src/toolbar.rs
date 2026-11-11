@@ -268,7 +268,7 @@ pub(crate) fn build_toolbar(
         .child(
             div()
                 .flex_none()
-                .child(activity::activity_indicator(ui, theme, window, cx)),
+                .child(activity::activity_indicator(ui, look, window, cx)),
         )
         .child(toggles);
 
@@ -284,7 +284,7 @@ pub(crate) fn build_toolbar(
                 .w_full()
                 .h(px(activity::PROGRESS_LINE_HEIGHT))
                 .overflow_hidden()
-                .child(activity::activity_progress_line(ui, theme, window, cx)),
+                .child(activity::activity_progress_line(ui, look, window, cx)),
         )
         .into_any_element()
 }

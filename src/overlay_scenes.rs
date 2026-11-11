@@ -413,15 +413,16 @@ fn toolbar_running_activity() {
     // Past the delay that keeps short work from flashing.
     std::thread::sleep(std::time::Duration::from_millis(200));
     h.show(|ui, theme, window, cx| {
+        let look = ui.look(theme);
         div()
             .size_full()
             .flex()
             .flex_col()
             .items_end()
             .p_4()
-            .child(crate::activity::activity_indicator(ui, theme, window, cx))
+            .child(crate::activity::activity_indicator(ui, look, window, cx))
             .child(crate::activity::activity_progress_line(
-                ui, theme, window, cx,
+                ui, look, window, cx,
             ))
             .into_any_element()
     });
@@ -501,8 +502,8 @@ fn field_scene(h: &mut Harness) {
             .flex()
             .flex_col()
             .child(div().p_1().pl_3().child(field))
-            .children(crate::revset_assist::error_strip(ui, theme, window, cx))
-            .children(crate::revset_assist::dropdown(ui, theme, window, cx))
+            .children(crate::revset_assist::error_strip(ui, look, window, cx))
+            .children(crate::revset_assist::dropdown(ui, look, window, cx))
             .into_any_element()
     });
 }

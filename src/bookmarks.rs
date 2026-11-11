@@ -17,7 +17,7 @@ use crate::menu::MenuEntry;
 use crate::modes::{Mode, ModeKind};
 use crate::mutations::MutationOp;
 use crate::prose::Prose;
-use crate::theme::{self, ThemeSpec};
+use crate::theme::{self};
 use crate::ui::Look;
 use crate::{ConfirmDialog, Diffui, PendingMutation, TabState, activity};
 
@@ -698,15 +698,15 @@ pub(crate) fn local_bookmark_label(label: &str) -> Option<&str> {
 /// it can't), and the buttons. Empty when closed.
 pub(crate) fn build_name_prompt(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let look = ui.look(theme);
+    let Look { theme, .. } = look;
     let Some(prompt) = ui.name_prompt() else {
         return div().into_any_element();
     };
-    let mono = ui.config.mono_font;
+    let mono = look.mono;
     let cancel = Action::Bookmark(BookmarkAction::PromptCancel);
     let submit = Action::Bookmark(BookmarkAction::PromptSubmit);
 

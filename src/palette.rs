@@ -1041,7 +1041,7 @@ pub fn change_id_for_recents(item: &ResultRef, ui: &Diffui) -> Option<String> {
 /// pop it starts at `-(COL+GAP)` and the remaining columns slide right back.
 pub(crate) fn build_overlay(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
@@ -1079,7 +1079,7 @@ pub(crate) fn build_overlay(
                 .top(px(crate::toolbar::modal_top()))
                 .child(build_column(
                     ui,
-                    theme,
+                    look,
                     column,
                     depth,
                     focused,
@@ -1095,15 +1095,15 @@ pub(crate) fn build_overlay(
 #[allow(clippy::too_many_arguments)]
 fn build_column(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     column: &PaletteColumn,
     depth: usize,
-    focused: bool,
-    // Only worth marking when there are columns to tell apart.
+    focused: bool, // Only worth marking when there are columns to tell apart.
     outline_focus: bool,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let Look { theme, .. } = look;
     let edge = if outline_focus {
         theme.accent
     } else {
@@ -1127,27 +1127,27 @@ fn build_column(
     let rule = || crate::root::horizontal_divider(theme);
     if let Some(command) = column.command.as_deref() {
         let input =
-            crate::cmdline_view::input(ui, theme, &column.query, command, focused, window, cx);
-        let strip = crate::cmdline_view::args_strip(ui, theme, &column.query, command, window, cx);
-        let results = crate::cmdline_view::results(ui, theme, &column.query, command, window, cx);
-        let footer = crate::cmdline_view::footer(ui, theme, command, window, cx);
+            crate::cmdline_view::input(ui, look, &column.query, command, focused, window, cx);
+        let strip = crate::cmdline_view::args_strip(ui, look, &column.query, command, window, cx);
+        let results = crate::cmdline_view::results(ui, look, &column.query, command, window, cx);
+        let footer = crate::cmdline_view::footer(ui, look, command, window, cx);
         card.child(input)
             .children(strip)
             .child(rule())
-            .child(scope_tabs(ui, theme, column, cx))
+            .child(scope_tabs(look, column, cx))
             .child(rule())
             .child(body(results))
             .child(footer)
             .into_any_element()
     } else {
         let root = matches!(column.source, ColumnSource::Root);
-        let input = build_input(ui, theme, column, focused, window, cx);
-        let results = build_results(ui, theme, column, depth, window, cx);
-        let footer = column_footer(ui, theme, column);
+        let input = build_input(ui, look, column, focused, window, cx);
+        let results = build_results(ui, look, column, depth, window, cx);
+        let footer = column_footer(ui, look, column);
         card.child(input)
             .child(rule())
             .when(root, |card| {
-                card.child(scope_tabs(ui, theme, column, cx)).child(rule())
+                card.child(scope_tabs(look, column, cx)).child(rule())
             })
             .child(body(results))
             .child(footer)
@@ -1159,8 +1159,8 @@ fn build_column(
 /// each with how many results it holds, then, past a rule, the tab that turns
 /// the input into a jj command line. The scopes are the query prefixes
 /// (`>`, `@`, `:`), so typing one presses its tab too.
-fn scope_tabs(ui: &Diffui, theme: ThemeSpec, column: &PaletteColumn, cx: &mut Cx) -> AnyElement {
-    let look = ui.look(theme);
+fn scope_tabs(look: Look, column: &PaletteColumn, cx: &mut Cx) -> AnyElement {
+    let Look { theme, .. } = look;
     let command = column.command.is_some();
     let (mode, needle) = parse_query(&column.query);
     let needle = if command { "" } else { needle };
@@ -1259,9 +1259,9 @@ fn segment(
 /// The strip under the results: the keys that act on the highlight, and on
 /// the root column how to reach the command line; on an actions column, what
 /// the actions are for.
-fn column_footer(ui: &Diffui, theme: ThemeSpec, column: &PaletteColumn) -> AnyElement {
-    let look = ui.look(theme);
-    let font = ui.config.ui_font;
+fn column_footer(ui: &Diffui, look: Look, column: &PaletteColumn) -> AnyElement {
+    let Look { theme, .. } = look;
+    let font = look.font;
     let hint = |keys: &[&str], label: &'static str| crate::overlay_kit::key_hint(keys, label, look);
     let bound = |commands: &[crate::commands::CommandId], label: &'static str| {
         crate::overlay_kit::bound_hint(ui, crate::commands::Context::Palette, commands, label, look)
@@ -1330,18 +1330,18 @@ fn column_footer(ui: &Diffui, theme: ThemeSpec, column: &PaletteColumn) -> AnyEl
 
 fn build_input(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     column: &PaletteColumn,
     focused: bool,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let look = ui.look(theme);
+    let Look { theme, .. } = look;
     let placeholder = match &column.source {
         ColumnSource::Root => "Run a command, or find a file, bookmark or revision",
         ColumnSource::Actions(_) => "Filter actions\u{2026}",
     };
-    let font = ui.config.ui_font;
+    let font = look.font;
     let band = div()
         .w_full()
         .flex_none()
@@ -1421,13 +1421,13 @@ impl Diffui {
 
 fn build_results(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     column: &PaletteColumn,
     depth: usize,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let look = ui.look(theme);
+    let Look { theme, .. } = look;
     // `:` commit-search defers the all-commits scan to ⏎: show a prompt until it
     // runs, instead of an empty "No matches".
     let revision_prompt = revision_mode_needle(&column.query)
@@ -1448,7 +1448,7 @@ fn build_results(
                 "No matches".to_owned()
             }
         });
-        return empty_results(ui, theme, label).into_any_element();
+        return empty_results(look, label).into_any_element();
     }
 
     let root = matches!(column.source, ColumnSource::Root);
@@ -1484,7 +1484,7 @@ fn build_results(
         |index| {
             let row = &column.matches[index];
             let selected = index == column.selected;
-            let body = result_row_body(ui, theme, row, root, selected, window, cx);
+            let body = result_row_body(ui, look, row, root, selected, window, cx);
             div()
                 .id(("palette-row", index))
                 .child(row_shell(body, selected, theme, window, cx))
@@ -1596,15 +1596,11 @@ pub(crate) fn group_heading(label: &'static str, look: Look) -> Div {
 }
 
 /// What a results list says when it has no rows.
-pub(crate) fn empty_results(ui: &Diffui, theme: ThemeSpec, label: String) -> Div {
-    ui::empty_state(
-        label,
-        ui::Placement::Top,
-        ui.config.ui_font,
-        theme.subtle_text,
-    )
-    .size_full()
-    .bg(theme.panel_background_elevated)
+pub(crate) fn empty_results(look: Look, label: String) -> Div {
+    let Look { theme, .. } = look;
+    ui::empty_state(label, ui::Placement::Top, look.font, theme.subtle_text)
+        .size_full()
+        .bg(theme.panel_background_elevated)
 }
 
 /// A result row's cell: fixed height, the label inset on the content edge,
@@ -1636,18 +1632,18 @@ pub(crate) fn glyph_ink(selected: bool, theme: ThemeSpec) -> Color {
 
 fn result_row_body(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     row: &PaletteMatch,
     root: bool,
     selected: bool,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let look = ui.look(theme);
+    let Look { theme, .. } = look;
     let primary = theme.text;
     let muted = theme.subtle_text;
-    let font = ui.config.ui_font;
-    let mono = ui.config.mono_font;
+    let font = look.font;
+    let mono = look.mono;
     let ink = glyph_ink(selected, theme);
     let indices = row.indices.as_slice();
 
@@ -1676,7 +1672,7 @@ fn result_row_body(
                     text_size::BODY,
                 )
                 .map(glyph_box),
-                highlighted(ui, "Working copy", &[], font, primary, theme),
+                highlighted("Working copy", &[], primary, look),
                 None,
                 Vec::new(),
             ),
@@ -1700,8 +1696,8 @@ fn result_row_body(
                     .unwrap_or_default();
                 let author = commit.map(|c| c.author().to_owned()).unwrap_or_default();
                 (
-                    change_id_label(&prefix, unique, mono, theme),
-                    highlighted(ui, &description, &[], font, primary, theme),
+                    change_id_label(&prefix, unique, look),
+                    highlighted(&description, &[], primary, look),
                     hint(author),
                     Vec::new(),
                 )
@@ -1722,14 +1718,14 @@ fn result_row_body(
                     .unwrap_or_default();
                 (
                     glyph_icon(crate::overlay_kit::glyph::BOOKMARK, ink, window, cx),
-                    highlighted(ui, name, indices, mono, primary, theme),
+                    highlighted(name, indices, primary, Look { font: mono, ..look }),
                     hint(destination),
                     Vec::new(),
                 )
             }
             ResultRef::File(path) => (
                 glyph_icon(icons::FILE, ink, window, cx),
-                highlighted(ui, path, indices, mono, primary, theme),
+                highlighted(path, indices, primary, Look { font: mono, ..look }),
                 // The glyph already says "file".
                 None,
                 Vec::new(),
@@ -1737,16 +1733,16 @@ fn result_row_body(
             // A command that can't run: greyed, with the reason as its hint.
             ResultRef::Command(id) if let Some(reason) = row.disabled => (
                 glyph_icon(command_icon(id), muted, window, cx),
-                highlighted(ui, &command_label(id), indices, font, muted, theme),
+                highlighted(&command_label(id), indices, muted, look),
                 hint(reason.to_owned()),
                 Vec::new(),
             ),
             ResultRef::Command(id) => (
                 glyph_icon(command_icon(id), ink, window, cx),
                 if root && is_revision_verb(id) {
-                    verb_label(ui, theme, id, indices)
+                    verb_label(ui, look, id, indices)
                 } else {
-                    highlighted(ui, &command_label(id), indices, font, primary, theme)
+                    highlighted(&command_label(id), indices, primary, look)
                 },
                 None,
                 // The shortcut, where there is one: what the palette teaches.
@@ -1779,7 +1775,8 @@ fn result_row_body(
 
 /// A change id as jj prints it: the shortest unique prefix in the id colour,
 /// the rest quiet.
-fn change_id_label(prefix: &str, unique: usize, mono: Font, theme: ThemeSpec) -> Aligned {
+fn change_id_label(prefix: &str, unique: usize, look: Look) -> Aligned {
+    let Look { theme, mono, .. } = look;
     let split = prefix
         .char_indices()
         .nth(unique)
@@ -1800,15 +1797,9 @@ fn change_id_label(prefix: &str, unique: usize, mono: Font, theme: ThemeSpec) ->
 /// One line of `label` whose chars at `indices` (what the query matched) are
 /// picked out in the accent, semibold. Takes the room it needs and gives way
 /// with an ellipsis.
-fn highlighted(
-    ui: &Diffui,
-    label: &str,
-    indices: &[u32],
-    font: Font,
-    color: Color,
-    theme: ThemeSpec,
-) -> Aligned {
-    let size = if font == ui.config.mono_font {
+fn highlighted(label: &str, indices: &[u32], color: Color, look: Look) -> Aligned {
+    let Look { font, .. } = look;
+    let size = if font == look.mono {
         // Mono faces run wide and tall: at the same size a path reads louder
         // than the sans labels around it.
         text_size::BODY
@@ -1822,13 +1813,13 @@ fn highlighted(
     for (at, ch) in label.chars().enumerate() {
         let matched = indices.binary_search(&(at as u32)).is_ok();
         if matched != run_matched && !run.is_empty() {
-            spans.push(span(std::mem::take(&mut run), run_matched, strong, theme));
+            spans.push(span(std::mem::take(&mut run), run_matched, strong, look));
         }
         run_matched = matched;
         run.push(ch);
     }
     if !run.is_empty() {
-        spans.push(span(run, run_matched, strong, theme));
+        spans.push(span(run, run_matched, strong, look));
     }
     Aligned::text(
         crate::overlay_kit::rich_line(font, size, color)
@@ -1841,12 +1832,8 @@ fn highlighted(
     .shrink()
 }
 
-fn span(
-    text: String,
-    matched: bool,
-    strong: Font,
-    theme: ThemeSpec,
-) -> crate::ellipsis::Span<'static> {
+fn span(text: String, matched: bool, strong: Font, look: Look) -> crate::ellipsis::Span<'static> {
+    let Look { theme, .. } = look;
     let span = crate::ellipsis::Span::new(text);
     if matched {
         span.font(strong).color(theme.accent)
@@ -1922,7 +1909,8 @@ fn command_icon(id: CommandId) -> &'static str {
 
 /// A top-level revision verb's label: the verb, then the revision it will act
 /// on (the selected one) so a pick never lands somewhere unexpected.
-fn verb_label(ui: &Diffui, theme: ThemeSpec, id: CommandId, indices: &[u32]) -> Aligned {
+fn verb_label(ui: &Diffui, look: Look, id: CommandId, indices: &[u32]) -> Aligned {
+    let Look { theme, .. } = look;
     let selection = &ui.active().session.selected_revision;
     let commits = &ui.active().session.commits;
     let (target, summary) = match commits.find(selection) {
@@ -1937,11 +1925,11 @@ fn verb_label(ui: &Diffui, theme: ThemeSpec, id: CommandId, indices: &[u32]) -> 
         }
         None => (ui.active().revision_short_label(selection), String::new()),
     };
-    let font = ui.config.ui_font;
-    let mono = ui.config.mono_font;
+    let font = look.font;
+    let mono = look.mono;
     typography::group(
         [
-            highlighted(ui, &command_label(id), indices, font, theme.text, theme),
+            highlighted(&command_label(id), indices, theme.text, look),
             Aligned::text(
                 typography::line(target, mono, text_size::BODY, theme.accent),
                 mono,

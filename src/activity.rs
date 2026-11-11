@@ -26,7 +26,6 @@ use std::time::{Duration, Instant};
 use crate::Diffui;
 use crate::geometry::Rectangle;
 use crate::prose::Prose;
-use crate::theme::ThemeSpec;
 use crate::ui::Look;
 use diffui_core::LoadProgress;
 
@@ -467,13 +466,13 @@ fn round_badge(label: String, fill: Color, ink: Color, font: Font) -> Aligned {
 /// either way. Click → open/close the popover.
 pub(crate) fn activity_indicator(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     _window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let look = ui.look(theme);
-    let mono = ui.config.mono_font;
-    let font = ui.config.ui_font;
+    let Look { theme, .. } = look;
+    let mono = look.mono;
+    let font = look.font;
     let activities = &ui.active().activities;
     let running = activities.running_count();
     let queued = activities.queued_count();
@@ -600,10 +599,11 @@ const INDICATOR_LABEL_MAX: f32 = 200.0;
 /// from shifting when idle.
 pub(crate) fn activity_progress_line(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     _window: &mut Window,
     _cx: &mut Cx,
 ) -> AnyElement {
+    let Look { theme, .. } = look;
     let line = div().w_full().flex_none().h(px(PROGRESS_LINE_HEIGHT));
     // Both visuals are held back until the work has run past the display delay,
     // so short ops don't flash. `loading_since` times the (un-logged)
@@ -653,15 +653,15 @@ pub(crate) fn activity_progress_line(
 /// progress pinned over what has finished. Empty when closed.
 pub(crate) fn activity_popover(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let look = ui.look(theme);
+    let Look { theme, .. } = look;
     if !ui.activity_popover_open() {
         return div().into_any_element();
     }
-    let font = ui.config.ui_font;
+    let font = look.font;
     let log = &ui.active().activities;
     let title_font = emphasis_font(font, Weight::SEMIBOLD);
     let mut title = vec![Aligned::text(
@@ -701,7 +701,7 @@ pub(crate) fn activity_popover(
         .pl(px(theme::space::XL))
         .pr(px(10.0))
         .child(typography::baseline_row(title, 0.0).flex_1().min_w_0())
-        .child(clear_button(ui, theme, cx));
+        .child(clear_button(ui, look, cx));
 
     let (live, past): (Vec<&Activity>, Vec<&Activity>) =
         log.activities.iter().partition(|activity| {
@@ -733,14 +733,14 @@ pub(crate) fn activity_popover(
         // In the order they run.
         list = list.child(heading("In progress"));
         for activity in live {
-            list = list.child(activity_row(ui, theme, activity, window, cx));
+            list = list.child(activity_row(ui, look, activity, window, cx));
         }
     }
     if !past.is_empty() {
         // Newest first, so the latest result is on top.
         list = list.child(heading("Finished"));
         for activity in past.into_iter().rev() {
-            list = list.child(activity_row(ui, theme, activity, window, cx));
+            list = list.child(activity_row(ui, look, activity, window, cx));
         }
     }
 
@@ -812,15 +812,15 @@ pub(crate) fn activity_popover(
 /// to dismiss; a slow tick prunes the rest after [`crate::TOAST_TTL`].
 pub(crate) fn toast_layer(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     _window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let look = ui.look(theme);
+    let Look { theme, .. } = look;
     if ui.toasts.is_empty() {
         return div().into_any_element();
     }
-    let title_font = emphasis_font(ui.config.ui_font, Weight::SEMIBOLD);
+    let title_font = emphasis_font(look.font, Weight::SEMIBOLD);
     // Only the stack occludes: it owns the cursor and wheel over its area, while
     // the rest of the window keeps working.
     let mut cards = div()
@@ -897,10 +897,8 @@ pub(crate) fn toast_layer(
 
 /// A small button on a row: the title line's Revert and Output, the output's
 /// links and Copy.
-#[allow(clippy::too_many_arguments)]
 fn row_button(
-    ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     id: (&'static str, u64),
     glyph: Option<&'static str>,
     label: impl Into<gpui_kit::SharedString>,
@@ -908,8 +906,8 @@ fn row_button(
     on_press: Action,
     cx: &mut Cx,
 ) -> Div {
-    let look = ui.look(theme);
-    let font = ui.config.ui_font;
+    let Look { theme, .. } = look;
+    let font = look.font;
     let ink = theme.muted_text;
     let size = ui::Size::Small;
     let mut line = Vec::new();
@@ -983,15 +981,15 @@ fn link_label(activity: &Activity, url: &str) -> &'static str {
 
 fn activity_row(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     activity: &Activity,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let look = ui.look(theme);
+    let Look { theme, .. } = look;
     let group: gpui_kit::SharedString = format!("activity-row-{}", activity.id.0).into();
     let error = matches!(activity.status, ActivityStatus::Error);
-    let header = activity_header(ui, theme, activity, ROW_WIDTH, &group, window, cx);
+    let header = activity_header(ui, look, activity, ROW_WIDTH, &group, window, cx);
     let row = div()
         .id(("activity-row", activity.id.0 as usize))
         .group(group)
@@ -1029,7 +1027,7 @@ fn activity_row(
     else {
         return row.into_any_element();
     };
-    let mono = ui.config.mono_font;
+    let mono = look.mono;
     let inner = ROW_WIDTH - 2.0 * ROW_PAD_X - TITLE_INDENT - 2.0 * WELL_PAD_X - 2.0;
     let line_height = (text_size::CAPTION * 1.6).ceil();
     let lines =
@@ -1068,8 +1066,7 @@ fn activity_row(
                 .id(("activity-link-tip", index))
                 .tip(url.clone(), look)
                 .child(row_button(
-                    ui,
-                    theme,
+                    look,
                     ("activity-link", activity.id.0 * 64 + index as u64),
                     Some(glyph::EXTERNAL_LINK),
                     link_label(activity, url),
@@ -1080,8 +1077,7 @@ fn activity_row(
         );
     }
     actions = actions.child(row_button(
-        ui,
-        theme,
+        look,
         ("activity-copy", activity.id.0),
         Some(icons::COPY),
         "Copy output",
@@ -1111,16 +1107,16 @@ fn activity_row(
 /// collapse the row.
 fn activity_header(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     activity: &Activity,
     width: f32,
     group: &gpui_kit::SharedString,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let look = ui.look(theme);
-    let mono = ui.config.mono_font;
-    let ui_font = ui.config.ui_font;
+    let Look { theme, .. } = look;
+    let mono = look.mono;
+    let ui_font = look.font;
     let (loaded, total, determinate) = activity.progress_snapshot();
 
     // What sits right of the title: a count, the Revert and Output buttons, the
@@ -1166,8 +1162,7 @@ fn activity_header(
                 && let Some(operation_id) = activity.undo_op.clone()
             {
                 let revert = row_button(
-                    ui,
-                    theme,
+                    look,
                     ("activity-revert", activity.id.0),
                     Some(icons::UNDO),
                     "Revert",
@@ -1193,8 +1188,7 @@ fn activity_header(
                 trailing.push((
                     Aligned::glyph(
                         row_button(
-                            ui,
-                            theme,
+                            look,
                             ("activity-output", activity.id.0),
                             None,
                             "Output",
@@ -1263,7 +1257,7 @@ fn activity_header(
         title.cut(text_width - trailing_width - chevron_width)
     };
     let mut head: Vec<Aligned> = vec![
-        Aligned::glyph(status_icon(activity, theme, mono), STATUS_ICON_BOX),
+        Aligned::glyph(status_icon(activity, look), STATUS_ICON_BOX),
         Aligned::gap(10.0),
         Aligned::text(title, ui_font, text_size::BODY).fill(),
     ];
@@ -1349,7 +1343,8 @@ fn activity_header(
 }
 
 /// Status glyph centered in the fixed [`STATUS_ICON_BOX`] square.
-fn status_icon(activity: &Activity, theme: ThemeSpec, mono: Font) -> AnyElement {
+fn status_icon(activity: &Activity, look: Look) -> AnyElement {
+    let Look { theme, mono, .. } = look;
     let icon = |glyph: &'static str, color: Color| {
         div()
             .size(px(STATUS_ICON_BOX))
@@ -1385,8 +1380,7 @@ fn mono_glyph(glyph: &'static str, mono: Font, color: Color) -> AnyElement {
 }
 
 /// "Clear finished": drops what's done, keeps what runs or waits.
-fn clear_button(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> AnyElement {
-    let look = ui.look(theme);
+fn clear_button(ui: &Diffui, look: Look, cx: &mut Cx) -> AnyElement {
     let enabled = ui.active().activities.activities.iter().any(|a| {
         matches!(
             a.status,

@@ -6,7 +6,7 @@
 //! panel follows it live; the run's activity row reopens the panel later.
 
 use crate::cmdline::CmdAction;
-use crate::theme::{self, Font, text_size};
+use crate::theme::{self, text_size};
 use crate::{Action, Cx, icons, input, typography, ui};
 use gpui_kit::component::Sizable as _;
 use gpui_kit::prelude::*;
@@ -20,7 +20,7 @@ use diffui_core::cli::{CliInvocation, CliLine, CliStream};
 use crate::activity::{ActivityId, ActivityStatus};
 use crate::modes::{Mode, ModeKind};
 use crate::prose::Prose;
-use crate::theme::ThemeSpec;
+use crate::ui::Look;
 use crate::{Diffui, TabId};
 
 /// Lines a run keeps; older ones fall off the front.
@@ -299,16 +299,15 @@ const OUTPUT_WIDTH: f32 = 680.0;
 /// and ⌘C copies the sweep; with nothing selected ⌘C copies all of it.
 pub(crate) fn build_overlay(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let look = ui.look(theme);
+    let Look { theme, .. } = look;
     let Some(run) = ui.shown_cli_run() else {
         return div().into_any_element();
     };
-    let font = ui.config.ui_font;
-    let mono = ui.config.mono_font;
+    let font = look.font;
 
     let content = if run.lines.is_empty() && run.dropped == 0 {
         div()
@@ -325,7 +324,7 @@ pub(crate) fn build_overlay(
             ))
             .into_any_element()
     } else {
-        output_text(run, theme, mono, window, cx)
+        output_text(run, look, window, cx)
     };
     let output = crate::field::field_well(false, theme)
         .overflow_hidden()
@@ -404,13 +403,8 @@ fn send<E: 'static>(
 /// The lines as one text, each stream in its colour. stderr carries a rule in the
 /// gutter, so the two streams read apart even where jj's informational stderr
 /// looks like output.
-fn output_text(
-    run: &CliRun,
-    theme: ThemeSpec,
-    mono: Font,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
+fn output_text(run: &CliRun, look: Look, window: &mut Window, cx: &mut Cx) -> AnyElement {
+    let Look { theme, mono, .. } = look;
     let mut text = String::new();
     let mut colors = Vec::new();
     let mut marks = Vec::new();
