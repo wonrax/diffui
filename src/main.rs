@@ -6,6 +6,7 @@ use std::{
 
 mod action;
 mod activity;
+mod app_files;
 mod app_menu;
 mod bookmarks;
 mod changes;

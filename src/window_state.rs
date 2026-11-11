@@ -178,26 +178,12 @@ impl WindowState {
     /// Best-effort: errors are dropped.
     pub fn save(&self) {
         let Some(path) = state_path() else { return };
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         let Ok(raw) = toml::to_string(self) else {
             return;
         };
-        // Write beside the file and rename over it rather than truncating in
-        // place: a save that dies part-way (a quit mid-write, a full disk)
-        // would otherwise leave a truncated file, and since the session lives
-        // here that costs the user their open tabs, not just the geometry.
-        // Rename is atomic on the platforms we ship, so a reader sees either
-        // the whole old file or the whole new one.
-        let temp = path.with_extension("toml.new");
-        if std::fs::write(&temp, raw).is_err() {
-            let _ = std::fs::remove_file(&temp);
-            return;
-        }
-        if std::fs::rename(&temp, &path).is_err() {
-            let _ = std::fs::remove_file(&temp);
-        }
+        // Atomic: the session lives here, so a torn write would cost the user
+        // their open tabs, not just the geometry.
+        let _ = crate::app_files::write_atomic(&path, raw.as_bytes());
     }
 
     /// Validated logical size, or `None` if absent or implausible (a corrupt
@@ -252,29 +238,8 @@ pub fn default_window_size(visible: Option<(f32, f32)>) -> Option<(f32, f32)> {
     ))
 }
 
-/// Resolve the per-platform state file path. Uses runtime `cfg!` branches
-/// (not `#[cfg]`) so every platform's path logic is type-checked in every
-/// build; the untaken branches are dead but harmless.
 fn state_path() -> Option<PathBuf> {
-    use std::env;
-
-    let dir = if cfg!(windows) {
-        // Per-machine, non-roaming state: window coordinates shouldn't roam to
-        // a machine with a different monitor layout. Fall back to roaming.
-        env::var_os("LOCALAPPDATA")
-            .or_else(|| env::var_os("APPDATA"))
-            .map(PathBuf::from)?
-    } else if cfg!(target_os = "macos") {
-        PathBuf::from(env::var_os("HOME")?).join("Library/Application Support")
-    } else {
-        // Linux / other unixes: the XDG state dir, else its spec'd default.
-        env::var_os("XDG_STATE_HOME")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?
-    };
-
-    Some(dir.join("diffui").join("window.toml"))
+    crate::app_files::app_file(crate::app_files::AppDir::State, "window.toml")
 }
 
 #[cfg(test)]

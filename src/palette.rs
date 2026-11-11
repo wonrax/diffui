@@ -354,12 +354,9 @@ impl Recents {
     /// directory if needed. Best-effort: errors are dropped.
     pub fn save(&self) {
         let Some(path) = recents_path() else { return };
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         let persisted = PersistedRecents::from(self);
         if let Ok(raw) = toml::to_string(&persisted) {
-            let _ = std::fs::write(&path, raw);
+            let _ = crate::app_files::write_atomic(&path, raw.as_bytes());
         }
     }
 
@@ -455,22 +452,8 @@ impl From<&Recents> for PersistedRecents {
     }
 }
 
-/// Path to the persisted recents file. Mirrors `config.rs`'s XDG handling
-/// but resolves the *data* dir (`$XDG_DATA_HOME` → `$HOME/.local/share`).
 fn recents_path() -> Option<std::path::PathBuf> {
-    use std::env;
-    use std::path::PathBuf;
-
-    let base = if let Ok(xdg) = env::var("XDG_DATA_HOME")
-        && !xdg.is_empty()
-    {
-        PathBuf::from(xdg)
-    } else {
-        PathBuf::from(env::var("HOME").ok()?)
-            .join(".local")
-            .join("share")
-    };
-    Some(base.join("diffui").join("recents.toml"))
+    crate::app_files::app_file(crate::app_files::AppDir::Data, "recents.toml")
 }
 
 fn rank_bonus(rank: usize) -> u32 {

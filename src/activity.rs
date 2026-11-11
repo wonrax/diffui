@@ -166,6 +166,10 @@ impl Activity {
 /// go and the row says how many.
 const MAX_OUTPUT_LINES: usize = 500;
 
+/// Most finished rows a log keeps; the oldest go first. Running and queued
+/// rows always stay.
+const MAX_FINISHED: usize = 200;
+
 /// The per-tab activity list; one lives in every tab's [`crate::TabState`].
 #[derive(Debug, Clone, Default)]
 pub struct ActivityLog {
@@ -201,7 +205,31 @@ impl ActivityLog {
             undo_op: None,
             command: None,
         });
+        self.trim();
         progress
+    }
+
+    /// Drop the oldest finished rows past [`MAX_FINISHED`].
+    fn trim(&mut self) {
+        let unfinished = |activity: &Activity| {
+            matches!(
+                activity.status,
+                ActivityStatus::Running | ActivityStatus::Queued
+            )
+        };
+        let mut excess = self
+            .activities
+            .iter()
+            .filter(|activity| !unfinished(activity))
+            .count()
+            .saturating_sub(MAX_FINISHED);
+        self.activities.retain(|activity| {
+            if excess == 0 || unfinished(activity) {
+                return true;
+            }
+            excess -= 1;
+            false
+        });
     }
 
     /// Record a standalone note — a warning the backend surfaced in passing
@@ -236,6 +264,7 @@ impl ActivityLog {
             undo_op: None,
             command: None,
         });
+        self.trim();
     }
 
     pub fn append_output(&mut self, id: ActivityId, line: impl Into<String>) {
@@ -1396,6 +1425,21 @@ impl ActivityLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_log_keeps_running_rows_and_the_newest_finished_ones() {
+        let mut log = ActivityLog::default();
+        log.start(ActivityId(0), "Push", false);
+        for id in 1..=MAX_FINISHED as u64 + 5 {
+            log.start(ActivityId(id), "Fetch", false);
+            log.finish(ActivityId(id), ActivityStatus::Done, None);
+        }
+        log.start(ActivityId(1000), "Fetch", false);
+        assert!(log.label(ActivityId(0)).is_some(), "a running row stays");
+        assert!(log.label(ActivityId(5)).is_none(), "the oldest finished go");
+        assert!(log.label(ActivityId(6)).is_some());
+        assert_eq!(log.activities.len(), MAX_FINISHED + 2);
+    }
 
     #[test]
     fn start_run_finish_lifecycle() {

@@ -220,14 +220,7 @@ fn display_path(path: &std::path::Path) -> String {
 }
 
 pub(crate) fn config_path() -> Option<PathBuf> {
-    let base = if let Ok(xdg) = env::var("XDG_CONFIG_HOME")
-        && !xdg.is_empty()
-    {
-        PathBuf::from(xdg)
-    } else {
-        PathBuf::from(env::var("HOME").ok()?).join(".config")
-    };
-    Some(base.join("diffui").join("config.toml"))
+    crate::app_files::app_file(crate::app_files::AppDir::Config, "config.toml")
 }
 
 fn font_from_name(name: &str) -> Font {

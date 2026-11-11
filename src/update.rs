@@ -2585,6 +2585,12 @@ impl Diffui {
         {
             self.pop_mode(ModeKind::CliOutput);
         }
+        // A confirmation for a closed tab has nothing left to run.
+        let tabs = &self.tabs;
+        self.modes.retain(|mode| match mode {
+            Mode::Confirm(dialog) => tabs.iter().any(|tab| tab.id == dialog.pending.tab_id),
+            _ => true,
+        });
         let stale = {
             let tab = self.active();
             tab.description_editor().is_some_and(|editor| {
@@ -4780,6 +4786,36 @@ mod tests {
             };
             assert!(relists("op-1", "op-2"), "the edit re-lists the tree");
             assert!(!relists("op-1", "op-1"), "nothing moved, nothing re-listed");
+        });
+    }
+
+    /// Closing a tab takes its pending confirmation with it: the accept would
+    /// have nothing to run.
+    #[test]
+    fn a_confirmation_closes_with_its_tab() {
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            push_tab(&mut ui, "/tmp/first");
+            let second = push_tab(&mut ui, "/tmp/second");
+            let (activity_id, _) = ui.begin_activity(second, "Abandon", false);
+            ui.push_mode(Mode::Confirm(crate::ConfirmDialog {
+                title: "Abandon?".into(),
+                body: Prose::new(),
+                confirm_label: "Abandon".to_owned(),
+                look: Default::default(),
+                pending: PendingMutation {
+                    op: mutations::MutationOp::Abandon {
+                        targets: vec![RevisionSelection::WorkingCopy],
+                    },
+                    tab_id: second,
+                    activity_id,
+                    allow_immutable: false,
+                },
+            }));
+
+            ui.act(cx, |ui, cx| ui.close_tab(second, cx));
+
+            assert!(ui.confirm().is_none());
         });
     }
 
