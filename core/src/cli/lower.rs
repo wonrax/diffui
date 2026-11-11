@@ -332,8 +332,12 @@ pub fn lower(
                 .iter()
                 .map(|name| PushTarget::Bookmark(name.value.clone()))
                 .collect();
-            for revision in r.union(changes)? {
-                targets.push(PushTarget::Change(revision));
+            // jj refuses a `-c` that resolves to nothing ("Empty revision
+            // set") rather than falling back to the default push.
+            if !changes.is_empty() {
+                for revision in r.non_empty(changes)? {
+                    targets.push(PushTarget::Change(revision));
+                }
             }
             if targets.is_empty() {
                 targets.push(PushTarget::Tracked);
@@ -439,6 +443,10 @@ mod tests {
         assert!(matches!(
             lower_line("jj git push"),
             Err(LowerError::NoPushRemote)
+        ));
+        assert!(matches!(
+            lower_line("jj git push --remote origin -c 'none()'"),
+            Err(LowerError::NotSingle { count: 0, .. })
         ));
         // Several parents make a merge.
         assert!(matches!(
