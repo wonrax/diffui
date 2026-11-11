@@ -142,6 +142,48 @@ fn corner(radius: f32, smoothing: f32, budget: f32) -> Corner {
     }
 }
 
+/// The rounded corners of a box of `size`, clockwise from the top right.
+fn corner_shapes(size: (f32, f32), corners: Corners, smoothing: f32) -> [Option<Corner>; 4] {
+    let (width, height) = size;
+    // A corner may take half of an edge, or all of it when the corner at the
+    // edge's other end is square.
+    let budget = |radius: f32, along_x: f32, along_y: f32| {
+        let x = if along_x > 0.0 { width / 2.0 } else { width };
+        let y = if along_y > 0.0 { height / 2.0 } else { height };
+        (radius > 0.0).then(|| corner(radius, smoothing, x.min(y)))
+    };
+    [
+        budget(corners.top_right, corners.top_left, corners.bottom_right),
+        budget(corners.bottom_right, corners.bottom_left, corners.top_right),
+        budget(corners.bottom_left, corners.bottom_right, corners.top_left),
+        budget(corners.top_left, corners.top_right, corners.bottom_left),
+    ]
+}
+
+/// `corners` as the circular radii a quad draws, when no corner eases off its
+/// circle by more than one of [`MIN_RADIUS`] does: a small control, or one too
+/// short to keep its smoothing. A quad is drawn with the rest; a path costs the
+/// frame a pass of its own.
+fn circular(size: (f32, f32), corners: Corners) -> Option<Corners> {
+    let shapes = corner_shapes(size, corners, SMOOTHING);
+    let eased = |shape: &Corner| shape.p - shape.radius;
+    if shapes
+        .iter()
+        .flatten()
+        .any(|shape| eased(shape) + 1e-3 >= SMOOTHING * MIN_RADIUS)
+    {
+        return None;
+    }
+    let [top_right, bottom_right, bottom_left, top_left] =
+        shapes.map(|shape| shape.map_or(0.0, |shape| shape.radius));
+    Some(Corners {
+        top_left,
+        top_right,
+        bottom_right,
+        bottom_left,
+    })
+}
+
 /// The outline of a box at `origin` of `size` with `corners`, clockwise from
 /// the top edge.
 pub(crate) fn outline(
@@ -153,40 +195,14 @@ pub(crate) fn outline(
     let (width, height) = size;
     let (left, top) = (origin.x, origin.y);
     let (right, bottom) = (left + width, top + height);
-    // A corner may take half of an edge, or all of it when the corner at the
-    // edge's other end is square.
-    let budget = |radius: f32, along_x: f32, along_y: f32| {
-        let x = if along_x > 0.0 { width / 2.0 } else { width };
-        let y = if along_y > 0.0 { height / 2.0 } else { height };
-        (radius > 0.0).then(|| corner(radius, smoothing, x.min(y)))
-    };
+    let [top_right, bottom_right, bottom_left, top_left] = corner_shapes(size, corners, smoothing);
     // Each corner with its point and its frame: `u` runs along the edge into
     // the corner, `v` along the edge out of it.
     let shapes = [
-        (
-            budget(corners.top_right, corners.top_left, corners.bottom_right),
-            point(right, top),
-            (1.0, 0.0),
-            (0.0, 1.0),
-        ),
-        (
-            budget(corners.bottom_right, corners.bottom_left, corners.top_right),
-            point(right, bottom),
-            (0.0, 1.0),
-            (-1.0, 0.0),
-        ),
-        (
-            budget(corners.bottom_left, corners.bottom_right, corners.top_left),
-            point(left, bottom),
-            (-1.0, 0.0),
-            (0.0, -1.0),
-        ),
-        (
-            budget(corners.top_left, corners.top_right, corners.bottom_left),
-            point(left, top),
-            (0.0, -1.0),
-            (1.0, 0.0),
-        ),
+        (top_right, point(right, top), (1.0, 0.0), (0.0, 1.0)),
+        (bottom_right, point(right, bottom), (0.0, 1.0), (-1.0, 0.0)),
+        (bottom_left, point(left, bottom), (-1.0, 0.0), (0.0, -1.0)),
+        (top_left, point(left, top), (0.0, -1.0), (1.0, 0.0)),
     ];
 
     let mut segments = Vec::with_capacity(17);
@@ -318,32 +334,41 @@ pub fn stroke_path(bounds: Bounds<Pixels>, corners: Corners, width: f32) -> Opti
     builder.build().ok()
 }
 
-/// Paints `fill` over `bounds`.
+/// Paints `fill` over `bounds`: as a quad when its corners are as good as
+/// circular (see [`circular`]), else as paths.
 pub fn paint(bounds: Bounds<Pixels>, fill: Fill, window: &mut Window) {
-    if frame(bounds).is_none() {
+    let Some((_, size)) = frame(bounds) else {
+        return;
+    };
+    if fill.background.is_none() && fill.border.is_none() {
         return;
     }
-    let square = fill.corners == Corners::default();
-    if let Some(color) = fill.background {
-        if square {
-            window.paint_quad(gpui_kit::fill(bounds, color));
-        } else if let Some(path) = fill_path(bounds, fill.corners) {
-            window.paint_path(path, color);
-        }
+    if let Some(radii) = circular(size, fill.corners) {
+        let (width, color) = fill.border.unwrap_or((0.0, crate::theme::TRANSPARENT));
+        window.paint_quad(gpui_kit::quad(
+            bounds,
+            gpui_kit::Corners {
+                top_left: px(radii.top_left),
+                top_right: px(radii.top_right),
+                bottom_right: px(radii.bottom_right),
+                bottom_left: px(radii.bottom_left),
+            },
+            fill.background.unwrap_or(crate::theme::TRANSPARENT),
+            px(width),
+            color,
+            BorderStyle::Solid,
+        ));
+        return;
     }
-    if let Some((width, color)) = fill.border {
-        if square {
-            window.paint_quad(gpui_kit::quad(
-                bounds,
-                px(0.0),
-                crate::theme::TRANSPARENT,
-                px(width),
-                color,
-                BorderStyle::Solid,
-            ));
-        } else if let Some(path) = stroke_path(bounds, fill.corners, width) {
-            window.paint_path(path, color);
-        }
+    if let Some(color) = fill.background
+        && let Some(path) = fill_path(bounds, fill.corners)
+    {
+        window.paint_path(path, color);
+    }
+    if let Some((width, color)) = fill.border
+        && let Some(path) = stroke_path(bounds, fill.corners, width)
+    {
+        window.paint_path(path, color);
     }
 }
 
@@ -511,6 +536,32 @@ mod tests {
         // A pill keeps its full radius and no smoothing.
         let pill = corner(30.0, SMOOTHING, 12.0);
         assert!((pill.radius - 12.0).abs() < 1e-4 && (pill.p - 12.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn small_controls_draw_circular_corners() {
+        // A 24 px button with a 6 px radius, and one too short for its 10 px.
+        assert_eq!(
+            circular((80.0, 24.0), Corners::all(6.0)),
+            Some(Corners::all(6.0))
+        );
+        assert_eq!(
+            circular((80.0, 24.0), Corners::all(10.0)),
+            Some(Corners::all(10.0))
+        );
+        // A pill keeps the radius it has room for.
+        assert_eq!(
+            circular((80.0, 24.0), Corners::all(30.0)),
+            Some(Corners::all(12.0))
+        );
+        assert_eq!(
+            circular((80.0, 24.0), Corners::default()),
+            Some(Corners::default())
+        );
+        // A surface keeps its squircle, and so does a box with one large corner.
+        assert_eq!(circular((400.0, 300.0), Corners::all(12.0)), None);
+        assert_eq!(circular((400.0, 300.0), Corners::all(MIN_RADIUS)), None);
+        assert_eq!(circular((400.0, 300.0), Corners::right(12.0)), None);
     }
 
     #[test]
