@@ -730,7 +730,7 @@ fn more_button(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> Option<AnyElement>
     let open = Diffui::listen(cx, move |this, _: &gpui_kit::ClickEvent, _, cx| {
         let rect = anchor.get();
         let cursor = crate::geometry::Point::new(rect.x, rect.y + rect.height);
-        this.on_revision_context_menu(key.clone(), rect, cursor, cx);
+        this.open_revision_menu(key.clone(), rect, cursor, cx);
     });
     Some(with_tooltip(
         "commit-more-tip",

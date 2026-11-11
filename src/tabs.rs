@@ -1,7 +1,7 @@
 //! Multi-repo tab lifecycle for [`Diffui`]: the accessors that resolve a tab's
 //! state, activating and closing tabs, and opening a repository as a new tab.
-//! Split out of `update.rs` to keep that module focused on the message-handling
-//! core.
+//! Split out of `update.rs` to keep that module focused on handling state
+//! changes.
 
 use super::*;
 use crate::Cx;

@@ -489,14 +489,6 @@ impl Diffui {
         }
     }
 
-    pub(crate) fn cmd_on_field_select(&mut self, index: usize) {
-        self.revset_field_select(index);
-    }
-
-    pub(crate) fn cmd_on_field_accept(&mut self, index: usize, cx: &mut Cx) {
-        self.accept_revset_field(index, cx);
-    }
-
     /// The jj grammar and aliases for the active tab's repository, loaded
     /// once per tab.
     pub(crate) fn command_line_cli(&mut self) -> JjCli {

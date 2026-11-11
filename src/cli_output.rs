@@ -13,9 +13,9 @@ use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, ClickEvent, Window, div, px};
 use std::time::Instant;
 
+use diffui_core::JobId;
 use diffui_core::cli::tokenize::shell_quote;
 use diffui_core::cli::{CliInvocation, CliLine, CliStream};
-use diffui_core::{JobId, RepoError};
 
 use crate::activity::{ActivityId, ActivityStatus};
 use crate::modes::{Mode, ModeKind};
@@ -255,16 +255,6 @@ impl Diffui {
         });
         run.exit = Some(exit);
         state.activities.finish(activity, status, summary);
-    }
-
-    pub(crate) fn fail_cli_run(
-        &mut self,
-        tab: TabId,
-        job: JobId,
-        activity: ActivityId,
-        error: RepoError,
-    ) {
-        self.finish_cli_run(tab, job, activity, Exit::Failed(error.to_string()))
     }
 
     pub(crate) fn on_output_action(&mut self, action: OutputAction, cx: &mut Cx) {

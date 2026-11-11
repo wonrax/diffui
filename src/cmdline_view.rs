@@ -214,9 +214,9 @@ pub(crate) fn input(
         input::FieldSpec::new(COMMAND_INPUT_ID, shown).placeholder("Subcommand and arguments");
     if focused {
         let on_edit = Diffui::listen(cx, |this, (line, cursor): &(String, usize), _, cx| {
-            this.palette_on_command_edit(format!("{PREFIX}{line}"), cursor + PREFIX.len(), cx);
+            this.command_line_edit(format!("{PREFIX}{line}"), cursor + PREFIX.len(), cx);
         });
-        let on_submit = Diffui::listen(cx, |this, _: &(), _, cx| this.palette_on_accept(cx));
+        let on_submit = Diffui::listen(cx, |this, _: &(), _, cx| this.palette_submit(cx));
         spec = spec
             .on_edit(move |line, cursor, window, cx| on_edit(&(line, cursor), window, cx))
             .on_submit(move |window, cx| on_submit(&(), window, cx));

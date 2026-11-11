@@ -2,14 +2,12 @@
 //!
 //! Every producer — the keyboard (through [`crate::keymap`]), the command
 //! palette, the menus, toolbar buttons, drag & drop — ends up emitting an
-//! [`Action`], and `Message::Action` is the single arm that performs it. That
-//! is what keeps a fix in one place: before this existed the same intent was
-//! spelled three ways (a `MenuAction`, a palette `CommandId`, a key match) and
-//! a bug fixed in one spelling stayed alive in the other two.
+//! [`Action`], and [`crate::Diffui::perform`] is the one place that carries it
+//! out, so a fix lands once for every way of asking.
 //!
 //! An `Action` is *what the user asked for*, not how a widget said it. Widget
-//! plumbing (scroll offsets, hover, debounce ticks) stays out — see
-//! [`crate::message::UiEvent`].
+//! plumbing (scroll offsets, hover, debounce ticks) stays out: those are
+//! listeners that change state directly.
 
 use diffui_core::{FetchTarget, RevisionSelection};
 

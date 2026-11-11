@@ -100,13 +100,13 @@ pub(crate) fn build_revision_list(
         .on_context_menu(Diffui::listen(
             cx,
             |this, (key, rect, point): &(RowSelectionKey, Rectangle, Point), _, cx| {
-                this.on_revision_context_menu(key.clone(), *rect, *point, cx);
+                this.open_revision_menu(key.clone(), *rect, *point, cx);
             },
         ))
         .on_file_context_menu(Diffui::listen(
             cx,
             |this, (row, rect, point): &(usize, Rectangle, Point), _, cx| {
-                this.on_sidebar_file_context_menu(*row, *rect, *point, cx);
+                this.open_file_context_menu(*row, *rect, *point, cx);
             },
         ));
 

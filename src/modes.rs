@@ -1,15 +1,12 @@
 //! The mode stack: what owns the keyboard, and what is on screen because of
 //! it.
 //!
-//! An overlay used to be a field of its own — `palette: Option<…>`,
-//! `confirm: Option<…>`, `find: Option<…>` — and "who owns the keyboard" was a
-//! tuple of eight booleans read in a hardcoded order inside `subscription`.
-//! Every bug that model produced was the same bug: a flag that was set while
-//! its overlay wasn't visible (the description editor eating keys after a view
-//! switch), or one that wasn't checked at all (the popup menu letting keys fall
-//! through to file navigation).
+//! A mode is on screen exactly while it is on a stack, so nothing can hold
+//! the keyboard for an overlay that isn't showing (the description editor
+//! eating keys after a view switch) or let keys fall through one that is (the
+//! popup menu passing them to file navigation).
 //!
-//! Now there are two stacks and the top of them decides. Global overlays live
+//! There are two stacks and the top of them decides. Global overlays live
 //! on [`crate::Diffui`]; the ones bound to one tab's document live on
 //! [`crate::TabState`], and the keyboard reads the *active* tab's — so a tab
 //! switch can never leave an off-screen mode holding the keys.

@@ -17,8 +17,7 @@ use std::rc::Rc;
 
 const EMPTY_STATE_TEXT_SIZE: f32 = text_size::BODY_LG;
 pub(crate) const DESCRIPTION_EDITOR_ID: &str = "revision-description-editor";
-// 12 over iced's 236: CoreText sets 13pt SF as AppKit does, about 12% wider than
-// iced's shaper did, and the stat columns measure wider with it.
+// Wide enough for the stat columns at CoreText's 13pt SF.
 pub const DEFAULT_FILE_NAV_WIDTH: f32 = 248.0;
 pub const MIN_FILE_NAV_WIDTH: f32 = 168.0;
 pub const FILE_NAV_PEEK_WIDTH: f32 = 300.0;
@@ -461,7 +460,7 @@ fn file_tree(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) ->
     .on_file_context_menu(Diffui::listen(
         cx,
         |this, (row, rect, point): &(usize, Rectangle, Point), _, cx| {
-            this.on_sidebar_file_context_menu(*row, *rect, *point, cx);
+            this.open_file_context_menu(*row, *rect, *point, cx);
         },
     ))
     .on_file_check(Diffui::listen(cx, |this, row: &usize, _, cx| {

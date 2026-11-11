@@ -1207,7 +1207,7 @@ fn build_revset_filter(
             leading_icon: Some(icons::GIT_BRANCH),
             placeholder,
             value: &ui.active().session.revset,
-            on_input: |this, value, cx| this.on_revset_changed(value, cx),
+            on_input: |this, value, cx| this.revset_field_edited(value, cx),
             on_submit: Some(|this, cx| this.perform(Action::SubmitRevset, cx)),
             caret: Some(field::FilterCaret {
                 hovered: ui.hovered == Some(HoverTarget::RevsetCaret),

@@ -1,7 +1,6 @@
-//! `impl Diffui` — the application reducer (`update`), lifecycle (`new`,
-//! `view`, `subscription`, `theme`), and all the orchestration/menu/tab helper
-//! methods. Split out of `main.rs`; the type defs + free fns it calls stay at
-//! the crate root and are reached via `super::*` / `crate::`.
+//! `impl Diffui`: construction, [`Diffui::perform`], the repository event
+//! router, and the orchestration helpers they share. The types and free
+//! functions it uses stay at the crate root, reached via `super::*`.
 
 use super::*;
 use crate::Cx;
@@ -610,7 +609,10 @@ impl Diffui {
                 let refused = Err(diffui_core::RevsetError::new(error.to_string()));
                 self.revset_field_resolved(tab, &revset, refused)
             }
-            Pending::Cli(activity) => self.fail_cli_run(tab, job, activity, error),
+            Pending::Cli(activity) => {
+                let exit = crate::cli_output::Exit::Failed(error.to_string());
+                self.finish_cli_run(tab, job, activity, exit)
+            }
             // Copy what the graph knows instead.
             Pending::DetailCopy(_, fallback) => crate::write_clipboard(fallback, cx),
         }
@@ -653,8 +655,7 @@ impl Diffui {
     }
 
     /// Carry out what the projection asked for. Commands go straight down the
-    /// actor's channel — the answer comes back through the subscription — so
-    /// most effects produce no `Task` at all.
+    /// actor's channel; the answer comes back through the repository loop.
     pub(crate) fn run_effects(&mut self, tab: TabId, effects: Vec<diffui_core::Effect>) {
         use diffui_core::{Effect, session::Activity};
 
@@ -732,9 +733,9 @@ impl Diffui {
 
     /// Carry out one user intent, whichever producer resolved it.
     ///
-    /// This is the only place an intent is executed. Nothing in here re-enters
-    /// `update` or re-emits a `Message` at itself: a handler that needs another
-    /// intent's work calls the helper both of them share, so a fix lands once.
+    /// This is the only place an intent is executed. A handler that needs
+    /// another intent's work calls the helper both of them share, so a fix
+    /// lands once.
     pub(crate) fn perform(&mut self, action: Action, cx: &mut Cx) {
         match action {
             // ── Revisions ───────────────────────────────────────────────
@@ -1218,26 +1219,6 @@ impl Diffui {
             .retain(|toast| toast.sticky || toast.born.elapsed() < TOAST_TTL);
     }
 
-    pub(crate) fn on_revision_context_menu(
-        &mut self,
-        key: revision_list::RowSelectionKey,
-        row_rect: Rectangle,
-        cursor: Point,
-        cx: &mut Cx,
-    ) {
-        self.open_revision_menu(key, row_rect, cursor, cx);
-    }
-
-    pub(crate) fn on_sidebar_file_context_menu(
-        &mut self,
-        display_index: usize,
-        row_rect: Rectangle,
-        cursor: Point,
-        cx: &mut Cx,
-    ) {
-        self.open_file_context_menu(display_index, row_rect, cursor, cx);
-    }
-
     pub(crate) fn on_open_toolbar_menu(
         &mut self,
         which: ToolbarMenu,
@@ -1274,10 +1255,6 @@ impl Diffui {
                 dialog.listed_query = Some(query);
             }
         }
-    }
-
-    pub(crate) fn on_revset_changed(&mut self, value: String, cx: &mut Cx) {
-        self.revset_field_edited(value, cx);
     }
 
     /// A drag on the history seam. Down to the minimum it collapses the pane;
@@ -1744,14 +1721,6 @@ impl Diffui {
         }
     }
 
-    pub(crate) fn palette_on_accept(&mut self, cx: &mut Cx) {
-        self.palette_submit(cx);
-    }
-
-    pub(crate) fn palette_on_command_edit(&mut self, line: String, cursor: usize, cx: &mut Cx) {
-        self.command_line_edit(line, cursor, cx);
-    }
-
     pub(crate) fn palette_on_accept_index(&mut self, depth: usize, index: usize, cx: &mut Cx) {
         if self.command_line().is_some() {
             self.command_line_accept_index(index, cx);
@@ -2132,7 +2101,7 @@ impl Diffui {
 
     /// Right-click on a revision row: retarget the marks if needed, then pop
     /// the context menu.
-    fn open_revision_menu(
+    pub(crate) fn open_revision_menu(
         &mut self,
         key: revision_list::RowSelectionKey,
         row_rect: Rectangle,
@@ -2602,10 +2571,6 @@ impl Diffui {
         }
     }
 
-    /// Open (or re-focus) the source browser at `revision`, optionally jumped
-    /// to `jump` — the entry point behind the toolbar switcher, the revision
-    /// context menu, file-tree right-clicks, and the diff view's per-file
-    /// browse button. Repo tabs only; a PR tab has no tree to browse.
     /// Fold a finished draft simulation into the active draft.
     fn apply_draft_preview(
         &mut self,
@@ -3051,6 +3016,10 @@ impl Diffui {
         }
     }
 
+    /// Open (or re-focus) the source browser at `revision`, optionally jumped
+    /// to `jump` — the entry point behind the toolbar switcher, the revision
+    /// context menu, file-tree right-clicks, and the diff view's per-file
+    /// browse button. Repo tabs only; a PR tab has no tree to browse.
     pub(crate) fn open_source_browser(
         &mut self,
         revision: RevisionSelection,
@@ -3309,9 +3278,7 @@ impl Diffui {
         }
     }
 
-    /// Hand one command to `tab`'s actor. Returns a `Task` only so call sites
-    /// read like the other kickers; commands travel down the channel, not
-    /// through the runtime.
+    /// Hand one command to `tab`'s actor, down its channel.
     pub(crate) fn send(&mut self, tab: TabId, command: diffui_core::Command) {
         if let Some(handle) = self.tab_mut(tab).and_then(|target| target.handle.clone()) {
             handle.send(command);
@@ -3521,9 +3488,8 @@ impl Diffui {
         self.push_mode(Mode::Palette(state));
     }
 
-    /// Execute the highlighted result in the rightmost column. Returns the
-    /// `Task` chain that performs the corresponding action plus any
-    /// followup state (closing the palette, focusing input, etc.).
+    /// Execute the highlighted result in the rightmost column, with its
+    /// follow-up state (closing the palette, focusing input, etc.).
     pub(crate) fn palette_accept_current(&mut self, cx: &mut Cx) {
         self.palette_recompute_if_dirty();
         let Some(state) = self.palette() else {
@@ -3706,10 +3672,6 @@ impl Diffui {
             .collect()
     }
 
-    /// (Re)start the initial load for the active tab's repository — a streaming
-    /// cold load for jj, a one-shot load for git. Resets the per-repo view
-    /// fields first, so a re-kick (after returning to a tab whose load was
-    /// abandoned while it sat in the background) starts from a clean slate.
     /// Hand out the next document identity (monotonic across every tab).
     pub(crate) fn allocate_document_id(&mut self) -> u64 {
         self.next_document_id = self.next_document_id.wrapping_add(1);

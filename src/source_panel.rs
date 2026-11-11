@@ -29,8 +29,8 @@ const EMPTY_STATE_TEXT_SIZE: f32 = text_size::BODY_LG;
 const BAR_TEXT_SIZE: f32 = text_size::BODY;
 
 /// View-time memo for the source tree, mirroring
-/// [`sidebar::SidebarFileCache`]'s rationale: `view()` rebuilds on every
-/// message, and re-composing + re-flattening a whole-repo listing (tens of
+/// [`sidebar::SidebarFileCache`]'s rationale: the pane renders on every
+/// change it shows, and re-composing + re-flattening a whole-repo listing (tens of
 /// thousands of entries) each time would dominate frame cost. Two layers:
 /// the *composed entries* (the base listing + every lazily-listed ignored
 /// dir's children) rebuild only when the tree data changes; the flattened
@@ -467,7 +467,7 @@ pub(crate) fn build_source_sidebar(
     .on_file_context_menu(Diffui::listen(
         cx,
         |this, (row, rect, point): &(usize, Rectangle, Point), _, cx| {
-            this.on_sidebar_file_context_menu(*row, *rect, *point, cx);
+            this.open_file_context_menu(*row, *rect, *point, cx);
         },
     ));
 

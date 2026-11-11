@@ -419,7 +419,7 @@ pub(crate) fn dropdown(
                     cx.listener(move |this: &mut Diffui, _: &MouseMoveEvent, _, cx| {
                         if this.active().cmdline.field.selected != index {
                             this.act_on(cx, PaneSet::LEFT, |this, _| {
-                                this.cmd_on_field_select(index)
+                                this.revset_field_select(index)
                             });
                         }
                     }),
@@ -427,7 +427,7 @@ pub(crate) fn dropdown(
                 .on_mouse_down(
                     MouseButton::Left,
                     Diffui::listen(cx, move |this, _, _, cx| {
-                        this.cmd_on_field_accept(index, cx);
+                        this.accept_revset_field(index, cx);
                     }),
                 ),
         );

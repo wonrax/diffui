@@ -128,8 +128,8 @@ pub struct PaletteState {
     /// right) and slides into place. On pop, we initialize to
     /// `-(COL + GAP)` so the remaining columns start shifted right of
     /// their final position and slide left to fill the now-vacant
-    /// rightmost slot. Animation is driven by a `PaletteTick`
-    /// subscription that only runs while `is_animating()` is true.
+    /// rightmost slot. The floats pane asks for animation frames while
+    /// `is_animating()` is true.
     pub shift_anim: SlideAnimation,
 }
 
@@ -620,8 +620,8 @@ impl PaletteState {
         }
     }
 
-    /// Whether the column-push/pop animation is still mid-transition.
-    /// Drives the per-frame redraw subscription from `main.rs`.
+    /// Whether the column-push/pop animation is still mid-transition: the
+    /// floats pane asks for frames while it is.
     pub fn is_animating(&self, at: Instant) -> bool {
         self.shift_anim.is_animating(at)
     }
@@ -1490,7 +1490,7 @@ fn build_input(
             this.palette_on_query_changed(query.clone(), cx);
         }
     });
-    let on_submit = Diffui::listen(cx, |this, _: &(), _, cx| this.palette_on_accept(cx));
+    let on_submit = Diffui::listen(cx, |this, _: &(), _, cx| this.palette_submit(cx));
     let spec = input::FieldSpec::new(PALETTE_INPUT_ID, &column.query)
         .placeholder(placeholder)
         .on_input(move |query, window, cx| on_input(&query, window, cx))

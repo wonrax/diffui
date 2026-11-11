@@ -29,9 +29,8 @@ use crate::theme::ThemeSpec;
 use diffui_core::LoadProgress;
 
 /// Frames for the running spinner. Braille-dot frames read as a smooth orbit
-/// at small sizes (the cargo/npm convention) where the old `|/-\` ASCII set
-/// looked like a teletype; advanced off the activity's elapsed time (the
-/// toolbar tick keeps `view()` re-running while anything is in flight).
+/// at small sizes (the cargo/npm convention); advanced off the activity's
+/// elapsed time (the toolbar tick redraws while anything is in flight).
 /// Falls back to `.notdef` boxes only if the mono font lacks Braille — every
 /// bundled/system mono we target ships it.
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];

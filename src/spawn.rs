@@ -30,9 +30,8 @@ pub(crate) fn runtime() -> &'static Runtime {
 
 impl Diffui {
     /// Runs `future` off the UI thread, then `done` with its output, inside
-    /// `act`. Detached: it finishes even if nothing is waiting. A slot that must
-    /// not outlive a superseded request checks a version in `done`, as
-    /// `Task::perform` callers always did.
+    /// `act`. Detached: it finishes even if nothing is waiting, so a slot that
+    /// must not outlive a superseded request checks for that in `done`.
     pub(crate) fn run_async<T: Send + 'static>(
         future: impl Future<Output = T> + Send + 'static,
         cx: &mut Cx,
@@ -72,9 +71,9 @@ impl Diffui {
         Self::run_async(wait, cx, move |this, (), cx| run(this, cx));
     }
 
-    /// `run` once the current update has returned, inside its own `act`. This
-    /// is what `Task::done` did: the work happens after the `update` that asked
-    /// for it (and that update's reconcile), not in the middle of it.
+    /// `run` once the current update has returned, inside its own `act`: the
+    /// work happens after the update that asked for it (and its reconcile),
+    /// not in the middle of it.
     pub(crate) fn later(cx: &mut Cx, run: impl FnOnce(&mut Diffui, &mut Cx) + 'static) {
         let this = cx.weak_entity();
         cx.defer(move |cx| {

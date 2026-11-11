@@ -298,10 +298,9 @@ pub(crate) struct Diffui {
     /// Decoded image and SVG previews, by blob id (see [`media`]).
     pub(crate) media: media::MediaCache,
     /// View-time memo for the file list's stat-column widths and flattened file
-    /// tree, keyed on document identity. Without it, the sidebar re-shaped ~5·N
-    /// strings on every diff-scroll file-boundary crossing
-    /// (each crossing publishes `SelectFile`, which forces a full rebuild) and tanked the frame rate on large PRs. Interior-mutable because
-    /// `view()` only has `&self`; global rather than per-tab since every cache
+    /// tree, keyed on document identity, so a file-boundary crossing in the
+    /// diff doesn't re-shape ~5·N strings. Interior-mutable because a render
+    /// only has `&self`; global rather than per-tab since every cache
     /// key carries `document_id`, which is unique across tabs — a switch is
     /// already a miss.
     /// See [`sidebar::SidebarFileCache`].
@@ -309,8 +308,8 @@ pub(crate) struct Diffui {
     /// Cached result of `sidebar::min_width(config)`. The min width is
     /// purely a function of `config.ui_font` + `config.mono_font` glyph
     /// advances at `CAPTION_TEXT_SIZE`, which are stable for the life of
-    /// the app — caching avoids re-shaping six strings on every `view()`
-    /// rebuild and on every drag tick of the resize handle.
+    /// the app — caching avoids re-shaping six strings on every render and on
+    /// every drag tick of the resize handle.
     pub(crate) sidebar_min_width: f32,
     /// Last window geometry seen from the compositor: inner (client) size and
     /// outer top-left position. Updated on `Opened`/`Resized`/`Moved` and
@@ -371,7 +370,7 @@ pub(crate) struct Diffui {
     pub(crate) active: usize,
     /// The state reached by [`Diffui::active`] when no tab is open at all (a
     /// launch with nothing to restore, or after the last tab is closed). Its
-    /// `Session::empty` is `Loaded`, so `view()` renders the welcome screen
+    /// `Session::empty` is `Loaded`, so the window shows the welcome screen
     /// rather than a spinner, and handlers that fire with no tab open write
     /// here harmlessly instead of forcing an `Option` on every call site.
     pub(crate) no_tab: TabState,
@@ -827,7 +826,7 @@ impl TabState {
     }
 
     /// The state shown when no repository is open at all. `Session::empty` is
-    /// `Loaded` so `view()` shows the empty state rather than a loading
+    /// `Loaded` so the window shows the empty state rather than a loading
     /// indicator.
     pub(crate) fn empty() -> Self {
         Self {
@@ -870,10 +869,6 @@ impl TabState {
     }
 }
 
-/// The default revset for a freshly-opened repo of `vcs`, before any persisted
-/// value is applied: jj shows `all()` (every visible head's ancestry — the
-/// current hardcoded behavior); git falls back to its `git log` default (the
-/// current branch's history), expressed as an empty range.
 /// The revset a freshly-opened repo starts on when nothing is persisted for it.
 /// jj mirrors `jj log` (the user's `revsets.log`, or jj's default); git keeps
 /// its empty default (the backend's own "current branch" view).
