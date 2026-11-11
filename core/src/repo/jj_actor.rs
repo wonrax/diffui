@@ -87,6 +87,7 @@ pub(super) fn spawn(
                         workspace: None,
                         repo: None,
                         op_head: None,
+                        sides: None,
                         jobs,
                         stale_notice: None,
                     }
@@ -109,27 +110,30 @@ struct Actor {
     /// The repo at head, reloaded only when the operation head actually moves.
     repo: Option<Arc<ReadonlyRepo>>,
     op_head: Option<String>,
+    /// The trees the last diff compared, for the reads that follow it (each
+    /// file's full sources for highlighting, a file expanded in full). Keyed
+    /// by operation, so anything written since misses it.
+    sides: Option<(SidesKey, jj::DiffSides)>,
     jobs: Jobs,
     /// The stale-checkout notice last reported, so a refresh on every save
     /// doesn't raise it again until it changes or the checkout is updated.
     stale_notice: Option<String>,
 }
 
+/// Stops [`Actor::relay_progress`]'s thread when dropped.
+struct ProgressRelay(CancelFlag);
+
+impl Drop for ProgressRelay {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// What [`Actor::sides`] was resolved for: an operation id, a revision and a
+/// base.
+type SidesKey = (String, RevisionSelection, DiffBase);
+
 impl Actor {
-    /// Start `job`, picking up a cancel that arrived before its turn came.
-    fn begin(&self, job: JobId) -> CancelFlag {
-        match self.jobs.lock() {
-            Ok(mut jobs) => jobs.begin(job),
-            Err(_) => CancelFlag::default(),
-        }
-    }
-
-    fn finish(&self, job: JobId) {
-        if let Ok(mut jobs) = self.jobs.lock() {
-            jobs.finish(job);
-        }
-    }
-
     async fn run(&mut self, mut commands: mpsc::UnboundedReceiver<Envelope>) {
         while let Some(envelope) = commands.recv().await {
             match envelope {
@@ -369,7 +373,7 @@ impl Actor {
                 base,
                 expand,
             } => {
-                self.load_diff(repository, job, revision, base, &expand)
+                self.load_diff(repository, job, revision, base, &expand, cancel)
                     .await
             }
             Command::ExpandFile {
@@ -378,24 +382,21 @@ impl Actor {
                 base,
                 path,
             } => {
-                let repo = self.repo_at_head(repository).await?;
-                let name = self.slot(repository)?.name.clone();
+                let (repo, sides) = self.diff_sides(repository, &revision, &base).await?;
                 let expand = [path.clone()];
                 let options = jj::DiffOptions {
                     limits: jj::large_diff::DiffLimits::unlimited(),
                     expand: &expand,
                     only: Some(&path),
                 };
-                let document = if let DiffBase::Range(revset) = &base {
-                    let range = revset_scope(&repo, &name, repository).range(revset).await?;
-                    jj::diff_jj_range(repo.as_ref(), range, repository, &options).await?
-                } else {
-                    let commit_id = jj::resolve_revision(repo.as_ref(), &name, &revision).await?;
-                    let base = jj::resolve_base(repo.as_ref(), &name, &base).await?;
-                    jj::diff_jj_with_repo(repo.as_ref(), &commit_id, &base, repository, &options)
-                        .await?
-                        .0
-                };
+                let document =
+                    match jj::diff_jj(repo.as_ref(), &sides, repository, &options, cancel).await {
+                        Err(_) if cancel.is_cancelled() => {
+                            self.emit(Payload::Cancelled { job });
+                            return Ok(());
+                        }
+                        document => document?,
+                    };
                 let file = document.files.into_iter().find(|file| file.path == path);
                 self.emit(Payload::FileExpanded { job, path, file });
                 Ok(())
@@ -540,18 +541,9 @@ impl Actor {
                 old_path,
                 base,
             } => {
-                let repo = self.repo_at_head(repository).await?;
-                let name = self.slot(repository)?.name.clone();
-                let (old, new) = jj::read_jj_file_pair_inner(
-                    repo.as_ref(),
-                    &name,
-                    &repository.root,
-                    &revision,
-                    &base,
-                    &path,
-                    old_path.as_deref(),
-                )
-                .await?;
+                let (repo, sides) = self.diff_sides(repository, &revision, &base).await?;
+                let (old, new) =
+                    jj::read_jj_file_pair(repo.as_ref(), &sides, &path, old_path.as_deref()).await;
                 self.emit(Payload::FilePairRead {
                     job,
                     path,
@@ -748,18 +740,24 @@ impl Actor {
         revision: RevisionSelection,
         base: DiffBase,
         expand: &[String],
+        cancel: &CancelFlag,
     ) -> Result<()> {
-        let repo = self.repo_at_head(repository).await?;
-        let name = self.slot(repository)?.name.clone();
+        let (repo, sides) = self.diff_sides(repository, &revision, &base).await?;
         let options = jj::DiffOptions {
             expand,
             ..Default::default()
         };
-        if let DiffBase::Range(revset) = &base {
-            // The revset names both sides; the selected revision rides along
-            // untouched as the graph's cursor.
-            let range = revset_scope(&repo, &name, repository).range(revset).await?;
-            let document = jj::diff_jj_range(repo.as_ref(), range, repository, &options).await?;
+        let document = match jj::diff_jj(repo.as_ref(), &sides, repository, &options, cancel).await
+        {
+            Err(_) if cancel.is_cancelled() => {
+                self.emit(Payload::Cancelled { job });
+                return Ok(());
+            }
+            document => document?,
+        };
+        // A range's revset names both sides, and the selected revision rides
+        // along untouched as the graph's cursor.
+        let Some(commit) = &sides.commit else {
             self.emit(Payload::DiffLoaded {
                 job,
                 revision,
@@ -767,17 +765,14 @@ impl Actor {
                 details: None,
             });
             return Ok(());
-        }
-        let commit_id = jj::resolve_revision(repo.as_ref(), &name, &revision).await?;
-        let base = jj::resolve_base(repo.as_ref(), &name, &base).await?;
-        let (document, details) =
-            jj::diff_jj_with_repo(repo.as_ref(), &commit_id, &base, repository, &options).await?;
+        };
+        let details = jj::jj_revision_details(repo.as_ref(), commit).await;
         // A commit rewritten since the caller read its id resolved to its
         // successor; answer under the id that was actually loaded, so the
         // selection follows the change instead of naming a hidden commit.
         let revision = match revision {
-            RevisionSelection::Commit(hex) if hex != commit_id.hex() => {
-                RevisionSelection::Commit(commit_id.hex())
+            RevisionSelection::Commit(hex) if hex != commit.id().hex() => {
+                RevisionSelection::Commit(commit.id().hex())
             }
             revision => revision,
         };
@@ -785,9 +780,31 @@ impl Actor {
             job,
             revision,
             document,
-            details,
+            details: Some(details),
         });
         Ok(())
+    }
+
+    /// The trees a diff of `revision` against `base` compares, resolved once
+    /// per operation and shared by the load and the reads that follow it.
+    async fn diff_sides(
+        &mut self,
+        repository: &Repository,
+        revision: &RevisionSelection,
+        base: &DiffBase,
+    ) -> Result<(Arc<ReadonlyRepo>, jj::DiffSides)> {
+        let repo = self.repo_at_head(repository).await?;
+        let key = (repo.op_id().hex(), revision.clone(), base.clone());
+        if let Some((cached, sides)) = &self.sides
+            && *cached == key
+        {
+            return Ok((repo, sides.clone()));
+        }
+        let name = self.slot(repository)?.name.clone();
+        let sides =
+            jj::DiffSides::resolve(repo.as_ref(), &name, &repository.root, revision, base).await?;
+        self.sides = Some((key, sides.clone()));
+        Ok((repo, sides))
     }
 
     async fn mutate(

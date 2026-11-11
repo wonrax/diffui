@@ -27,39 +27,19 @@ use crate::model::{DiffFileStatus, RevisionSelection};
 use crate::repository::Repository;
 use crate::source_browse::{SourceEntry, SourceEntryStatus, SourceFileData};
 
-/// Read the full old/new contents of one file at `revision`, for full-context
-/// syntax highlighting (the old side comes from the first parent — matching
-/// what the diff was computed against). Best-effort by design: absent, binary,
-/// conflicted or oversized sides come back `None` and the caller falls back to
-/// diff-only reconstruction. Read-only: no snapshot, no lock.
-pub(crate) async fn read_jj_file_pair_inner(
+/// Read the full old/new contents of one file of a diff, for full-context
+/// syntax highlighting, off the trees the diff compared. Best-effort by
+/// design: absent, binary, conflicted or oversized sides come back `None` and
+/// the caller falls back to diff-only reconstruction.
+pub(crate) async fn read_jj_file_pair(
     repo: &ReadonlyRepo,
-    workspace_name: &WorkspaceName,
-    repo_root: &std::path::Path,
-    revision: &RevisionSelection,
-    base: &crate::model::DiffBase,
+    sides: &super::diff::DiffSides,
     path: &str,
     old_path: Option<&str>,
-) -> Result<(Option<String>, Option<String>)> {
-    if let crate::model::DiffBase::Range(revset) = base {
-        let scope = super::revset::RevsetScope {
-            repo,
-            workspace_name,
-            repo_root,
-        };
-        let range = scope.range(revset).await?;
-        let new = read_jj_tree_file(repo, &range.to, path).await;
-        let old = read_jj_tree_file(repo, &range.from, old_path.unwrap_or(path)).await;
-        return Ok((old, new));
-    }
-    let commit = resolve_browse_commit(repo, workspace_name, revision).await?;
-    let new_tree = commit.tree();
-    let base = super::diff::resolve_base(repo, workspace_name, base).await?;
-    let old_tree = super::diff::base_tree(repo, &commit, &base).await?;
-
-    let new = read_jj_tree_file(repo, &new_tree, path).await;
-    let old = read_jj_tree_file(repo, &old_tree, old_path.unwrap_or(path)).await;
-    Ok((old, new))
+) -> (Option<String>, Option<String>) {
+    let new = read_jj_tree_file(repo, &sides.new, path).await;
+    let old = read_jj_tree_file(repo, &sides.old, old_path.unwrap_or(path)).await;
+    (old, new)
 }
 
 /// Materialize one tree entry as text, `None` for anything full-context
