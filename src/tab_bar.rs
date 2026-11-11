@@ -1005,6 +1005,9 @@ pub(crate) fn build_confirm_dialog(
             theme,
         ));
     }
+    if dialog.look.routine {
+        card = card.hint(&["\u{21b5}"], dialog.confirm_label.clone());
+    }
     let card = card
         .hint(&["esc"], "Cancel")
         .buttons([cancel.into_any_element(), accept.into_any_element()])

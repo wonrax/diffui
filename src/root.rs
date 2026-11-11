@@ -519,6 +519,23 @@ fn repository_loop(spec: OpenSpec, cx: &mut Cx) -> Task<()> {
     })
 }
 
+impl Diffui {
+    /// Notes what has the keyboard as the first window-level mode (a dialog,
+    /// the palette, a popover) opens, before its field takes focus on its
+    /// first draw, and gives it back once the last mode has closed.
+    fn restore_focus_after_modes(&mut self, window: &mut Window, cx: &mut App) {
+        match (self.modes.is_empty(), self.focus_before_modes.is_some()) {
+            (false, false) => self.focus_before_modes = Some(window.focused(cx)),
+            (true, true) => {
+                if let Some(Some(handle)) = self.focus_before_modes.take() {
+                    window.focus(&handle, cx);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 impl Render for Diffui {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(test)]
@@ -527,6 +544,7 @@ impl Render for Diffui {
         }
         frame_log::begin();
         self.media.release(window);
+        self.restore_focus_after_modes(window, cx);
         let theme = self.resolved_theme().spec();
 
         #[cfg(test)]

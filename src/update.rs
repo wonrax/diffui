@@ -216,6 +216,7 @@ impl Diffui {
             config,
             keymap,
             modes: Vec::new(),
+            focus_before_modes: None,
             recents: Recents::load(),
             sidebar_file_reveal_token: 0,
             scroll_restore_token: 0,
@@ -4931,6 +4932,39 @@ mod tests {
             ui.resolve_chord(context, &esc, false),
             Some("confirm.cancel")
         );
+    }
+
+    /// Enter accepts a routine confirm (a push); one that destroys or
+    /// overrides something stays click-only.
+    #[test]
+    fn enter_accepts_only_a_routine_confirmation() {
+        for routine in [true, false] {
+            let mut ui = app();
+            ui.push_mode(Mode::Confirm(ConfirmDialog {
+                title: "Push?".into(),
+                body: Prose::new(),
+                confirm_label: "Push".to_owned(),
+                look: crate::ConfirmLook {
+                    routine,
+                    ..Default::default()
+                },
+                pending: PendingMutation {
+                    op: mutations::MutationOp::Undo { operation_id: None },
+                    tab_id: TabId(0),
+                    activity_id: activity::ActivityId(0),
+                    allow_immutable: false,
+                },
+            }));
+            let enter = Chord::parse("enter").expect("a parsable chord");
+            let id = ui.resolve_chord(Context::Confirm, &enter, false);
+            assert_eq!(id, Some("confirm.accept"));
+            let command = commands::command("confirm.accept").expect("a command");
+            assert_eq!(
+                (command.enabled)(&ui, &CommandArg::None).is_ok(),
+                routine,
+                "routine: {routine}"
+            );
+        }
     }
 
     /// The base context's plain keys belong to whatever has focus — the revset

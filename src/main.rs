@@ -334,6 +334,9 @@ pub(crate) struct Diffui {
     /// is empty, the top of the active tab's) owns the keyboard — see
     /// [`crate::modes`].
     pub(crate) modes: Vec<Mode>,
+    /// What had the keyboard when the first window-level mode opened, given
+    /// back when the last one closes: `Some` while a mode is open.
+    pub(crate) focus_before_modes: Option<Option<gpui_kit::FocusHandle>>,
     /// In-session recents (revisions + commands) used to score palette
     /// matches. Persisted to the XDG data dir between sessions.
     pub(crate) recents: Recents,

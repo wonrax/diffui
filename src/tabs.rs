@@ -443,6 +443,7 @@ pub(crate) mod tests {
             },
             keymap: Keymap::build(&Default::default()).0,
             modes: Vec::new(),
+            focus_before_modes: None,
             recents: Recents::default(),
             sidebar_file_reveal_token: 0,
             scroll_restore_token: 0,

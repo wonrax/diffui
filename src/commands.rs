@@ -2099,12 +2099,18 @@ pub(crate) static REGISTRY: &[Command] = &[
         id: "confirm.accept",
         label: "Confirm",
         hint: "Run the mutation the dialog is holding",
-        // Deliberately chordless: the dialog gates an operation the jj CLI
-        // itself refuses, so it takes a click rather than a stray Enter.
+        // Enter for a routine confirm (a push). One that destroys or
+        // overrides something the jj CLI refuses takes a click, not a stray
+        // Enter.
         contexts: &[Context::Confirm],
-        chords: &[],
+        chords: &["enter"],
         mac_chords: &[],
-        enabled: always,
+        enabled: |ui, _arg| {
+            require(
+                ui.confirm().is_some_and(|dialog| dialog.look.routine),
+                "Click to confirm a destructive change",
+            )
+        },
         build: |_ui, _arg| Some(Action::ConfirmAccept),
         palette: PaletteScope::Hidden,
     },
