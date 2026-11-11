@@ -481,7 +481,7 @@ pub(crate) fn dropdown(
                     div(),
                     theme,
                     CARD_RADIUS,
-                    crate::overlay_kit::firm_border(theme),
+                    theme::firm_ring(theme),
                     vec![
                         theme::floating_shadow(10.0, 28.0),
                         theme::floating_shadow(10.0, 28.0),
@@ -596,7 +596,7 @@ pub(crate) fn error_strip(
             ),
             Aligned::gap(LEADING_TEXT_X - LEADING_ICON_INSET - LEADING_ICON_SIZE),
             Aligned::text(
-                div().w_full().text_size(px(text_size::UI)).child(
+                div().w_full().text_size(px(text_size::BODY)).child(
                     crate::prose::Prose::from_backticks(&crate::cmdline::sentence(
                         &error.message,
                         error.hint.as_deref(),
@@ -604,7 +604,7 @@ pub(crate) fn error_strip(
                     .view(font, mono, theme.removed_text, theme),
                 ),
                 font,
-                text_size::UI,
+                text_size::BODY,
             )
             .fill(),
         ],
@@ -664,7 +664,7 @@ fn echo(
         (value.to_owned(), start..end)
     };
     let shown = window(&line, span.clone(), room, |text| {
-        crate::measure::line_width(text, text_size::UI, mono)
+        crate::measure::line_width(text, text_size::BODY, mono)
     });
     let bad = span.start.max(shown.range.start)..span.end.min(shown.range.end);
     let mut text = String::new();
@@ -703,7 +703,7 @@ fn echo(
         div()
             .whitespace_nowrap()
             .font(mono.gpui())
-            .text_size(px(text_size::UI))
+            .text_size(px(text_size::BODY))
             .child(StyledText::new(text).with_highlights(runs))
             .into_any_element(),
     )

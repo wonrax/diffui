@@ -117,7 +117,7 @@ pub(crate) fn filter_field(
         .map(|bar| {
             theme::squircle(
                 bar,
-                theme::radius::PUSH,
+                theme::radius::CARD,
                 Some(theme.panel_background),
                 Some(theme.border),
             )
@@ -220,9 +220,6 @@ pub(crate) fn panel_strip() -> Div {
         .pb(px(PANEL_HEADER_PADDING.bottom))
 }
 
-/// How far the fade under a panel's header reaches into its list.
-const SCROLL_FADE: f32 = 28.0;
-
 /// The fade a panel's header casts over its list once the list has scrolled
 /// off its top: the pane's colour into nothing, so rows slide under the
 /// header instead of being cut by it, and the cut says there's more above.
@@ -235,7 +232,7 @@ pub(crate) fn scroll_fade(offset: f64, ground: Color) -> Option<Div> {
             .top_0()
             .left_0()
             .right_0()
-            .h(px(SCROLL_FADE))
+            .h(px(crate::revision_list::TOP_FADE))
             .bg(gpui_kit::linear_gradient(
                 180.0,
                 gpui_kit::linear_color_stop(ground, 0.0),

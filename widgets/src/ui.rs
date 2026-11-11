@@ -51,7 +51,7 @@ impl Size {
 
     pub fn text_size(self) -> f32 {
         match self {
-            Size::Compact => text_size::UI,
+            Size::Compact => text_size::BODY,
             Size::Standard => text_size::BODY,
         }
     }
@@ -114,12 +114,12 @@ fn frame(id: impl Into<ElementId>, style: theme::ButtonStyle, cx: &App) -> Butto
         .custom(colors)
         .bg(theme::TRANSPARENT)
         // The lift's shape: a shadow's blur hides its circular corner.
-        .rounded(px(theme::radius::BUTTON));
+        .rounded(px(theme::radius::CONTROL));
     if let Some(lift) = style.lift {
         inner = inner.shadow(vec![lift]);
     }
     let fill = |color: Option<Color>| {
-        let mut fill = squircle::Fill::new(squircle::Corners::all(theme::radius::BUTTON));
+        let mut fill = squircle::Fill::new(squircle::Corners::all(theme::radius::CONTROL));
         if let Some(color) = color {
             fill = fill.background(color);
         }
@@ -186,7 +186,7 @@ impl Button {
         self
     }
 
-    /// Rounds the button by `radius` in place of [`theme::radius::BUTTON`]: a
+    /// Rounds the button by `radius` in place of [`theme::radius::CONTROL`]: a
     /// smaller control.
     pub fn corner_radius(mut self, radius: f32) -> Self {
         let corners = squircle::Corners::all(radius);
@@ -402,7 +402,7 @@ pub fn modal(
 /// kit's bar, which [`theme::apply_to_kit`] colours like the hand-drawn bar of
 /// the graph and the diff. Like there, the content runs under the bar: row
 /// washes may reach the edge, but text keeps [`crate::scrollbar::GUTTER`] clear
-/// on the right ([`gutter`]).
+/// on the right.
 pub fn scrollable(
     id: impl Into<ElementId>,
     content: impl IntoElement,
@@ -472,11 +472,6 @@ pub fn scroll_handle(
     window.use_keyed_state(id, cx, |_, _| ScrollHandle::default())
 }
 
-/// A scroll view's text column: its content keeps the bar's footprint clear.
-pub fn gutter() -> Div {
-    div().w_full().pr(px(crate::scrollbar::GUTTER))
-}
-
 /// Between a control's bottom edge and its tooltip.
 const TOOLTIP_GAP: f32 = 6.0;
 /// The least a tooltip keeps from the window's edges.
@@ -530,7 +525,7 @@ impl Render for TooltipView {
             .px(px(8.0))
             .py(px(4.0))
             .font(self.font.gpui())
-            .text_size(px(text_size::UI))
+            .text_size(px(text_size::BODY))
             .child(self.label.clone());
         match self.anchor.get() {
             Some(control) => anchored()

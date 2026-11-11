@@ -1524,7 +1524,7 @@ fn bar_fits_labels(
     selecting: bool,
     font: Font,
 ) -> bool {
-    let width = |text: &str, font: Font| crate::measure::line_width(text, text_size::UI, font);
+    let width = |text: &str, font: Font| crate::measure::line_width(text, text_size::BODY, font);
     // The bar's padding, the summary's own and the side margins around the bar.
     let mut needed = 2.0 * 5.0 + 8.0 + 10.0 + 2.0 * 16.0;
     needed += width(title, theme::emphasis_font(font, Weight::SEMIBOLD))
@@ -1588,15 +1588,15 @@ pub(crate) fn action_bar(
     let label = typography::baseline_row(
         vec![
             Aligned::text(
-                typography::line(title, bold, text_size::UI, ink),
+                typography::line(title, bold, text_size::BODY, ink),
                 bold,
-                text_size::UI,
+                text_size::BODY,
             ),
             Aligned::gap(theme::space::SM),
             Aligned::text(
-                typography::line(detail, font, text_size::UI, faded),
+                typography::line(detail, font, text_size::BODY, faded),
                 font,
-                text_size::UI,
+                text_size::BODY,
             ),
         ],
         0.0,
@@ -1630,9 +1630,9 @@ pub(crate) fn action_bar(
         }
         if show_label {
             content = content.child(typography::centered(
-                typography::line(text, font, text_size::UI, ink),
+                typography::line(text, font, text_size::BODY, ink),
                 font,
-                text_size::UI,
+                text_size::BODY,
             ));
         }
         let mut element = div()
@@ -1647,7 +1647,7 @@ pub(crate) fn action_bar(
             .when(enabled, |element| {
                 element.child(crate::squircle::hover_background(
                     crate::squircle::Fill::new(crate::squircle::Corners::all(
-                        theme::radius::BUTTON,
+                        theme::radius::CONTROL,
                     ))
                     .background(hover),
                     0.0,
@@ -1781,7 +1781,7 @@ pub(crate) fn action_bar(
             .h(px(BAR_BUTTON_HEIGHT))
             .px(px(9.0))
             .child(crate::squircle::hover_background(
-                crate::squircle::Fill::new(crate::squircle::Corners::all(theme::radius::BUTTON))
+                crate::squircle::Fill::new(crate::squircle::Corners::all(theme::radius::CONTROL))
                     .background(hover),
                 0.0,
             ))
@@ -1789,9 +1789,9 @@ pub(crate) fn action_bar(
             .tip("Clear picks", font, theme)
             .on_click(Diffui::on_action(Action::Changes(ChangesMsg::Clear), cx))
             .child(typography::centered(
-                typography::line("Clear", font, text_size::UI, ink),
+                typography::line("Clear", font, text_size::BODY, ink),
                 font,
-                text_size::UI,
+                text_size::BODY,
             ))
             .child(keycap);
         items.push(clear.into_any_element());
@@ -1863,7 +1863,7 @@ pub(crate) fn split_modal(
             .flex()
             .flex_col()
             .gap(px(theme::space::SM))
-            .child(div().text_size(px(text_size::UI)).child(caption.view(
+            .child(div().text_size(px(text_size::BODY)).child(caption.view(
                 font,
                 mono,
                 theme.muted_text,

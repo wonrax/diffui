@@ -13,8 +13,8 @@ use gpui_kit::{AnyElement, ElementId, MouseButton, MouseDownEvent, SharedString,
 
 use crate::repository::Vcs;
 use crate::theme::{
-    self, Color, Font, ThemeSpec, Weight, chip_background, emphasis_font, radius, text_size,
-    well_fill,
+    self, Color, Font, ThemeSpec, Weight, chip_background, chrome_fill, emphasis_font, radius,
+    text_size,
 };
 use crate::typography::{self, Aligned};
 use crate::ui::Tip as _;
@@ -30,7 +30,7 @@ pub const HEIGHT: f32 = theme::control::COMPACT + 2.0 * theme::space::SM;
 /// the panels begin — what floating surfaces anchored under the toolbar hang
 /// from.
 pub fn chrome_bottom() -> f32 {
-    crate::tab_bar::height() + HEIGHT + activity::PROGRESS_LINE_HEIGHT + 1.0
+    crate::tab_bar::height() + HEIGHT + activity::PROGRESS_LINE_HEIGHT + theme::HAIRLINE
 }
 
 /// Where every modal surface (command palette, open-repo and confirm
@@ -266,7 +266,7 @@ pub(crate) fn build_toolbar(
         .h(px(HEIGHT))
         .px(px(theme::space::MD))
         // The window's chrome, one section with the tab strip above.
-        .bg(well_fill(theme))
+        .bg(chrome_fill(theme))
         // Too narrow for both, the actions stay whole and the right group runs off
         // the edge.
         .overflow_hidden()
@@ -284,7 +284,7 @@ pub(crate) fn build_toolbar(
         .flex_col()
         .w_full()
         .flex_none()
-        .bg(well_fill(theme))
+        .bg(chrome_fill(theme))
         .child(bar)
         .child(
             div()
@@ -372,12 +372,8 @@ pub(crate) fn segmented(
         .p(px(INSET))
         // A step into the chrome it sits on.
         .child(crate::squircle::background(
-            crate::squircle::Fill::new(crate::squircle::Corners::all(radius::BUTTON)).background(
-                Color {
-                    a: 0.07,
-                    ..theme.text
-                },
-            ),
+            crate::squircle::Fill::new(crate::squircle::Corners::all(radius::CONTROL))
+                .background(theme::well_wash(theme)),
             0.0,
         ));
     for segment in segments {
@@ -414,13 +410,13 @@ pub(crate) fn segmented(
             .h(px(SEGMENT_HEIGHT))
             .px(px(10.0 - INSET))
             .when(active, |tab| {
-                theme::raised(tab, radius::BUTTON - INSET, theme)
+                theme::raised(tab, radius::CONTROL - INSET, theme)
             })
             .children(icon.map(|icon| icons::icon(icon, ui::ICON_SIZE, icon_color)))
             .child(typography::centered(
-                typography::line(label, font, text_size::UI, text_color),
+                typography::line(label, font, text_size::BODY, text_color),
                 font,
-                text_size::UI,
+                text_size::BODY,
             ));
         if let Some(action) = on_press {
             tab = tab.cursor_pointer().on_click(Diffui::on_action(action, cx));
@@ -791,7 +787,7 @@ fn fetch_split_button(
     let caret = caret_hover(
         div().id("toolbar-fetch-caret").test_support().flex_none(),
         theme,
-        radius::BUTTON,
+        radius::CONTROL,
     )
     .flex()
     .justify_center()

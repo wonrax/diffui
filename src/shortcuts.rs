@@ -339,17 +339,17 @@ fn binding_row(
     let mut line = match disabled {
         None => vec![
             Aligned::text(
-                typography::line(label, font, text_size::UI, theme.text).text_ellipsis(),
+                typography::line(label, font, text_size::BODY, theme.text).text_ellipsis(),
                 font,
-                text_size::UI,
+                text_size::BODY,
             )
             .fill(),
         ],
         Some(reason) => vec![
             Aligned::text(
-                typography::line(label, font, text_size::UI, theme.subtle_text).text_ellipsis(),
+                typography::line(label, font, text_size::BODY, theme.subtle_text).text_ellipsis(),
                 font,
-                text_size::UI,
+                text_size::BODY,
             ),
             Aligned::gap(theme::space::SM),
             Aligned::text(
@@ -410,7 +410,7 @@ pub(crate) fn keycap(
                 .justify_center()
                 .bg(theme.panel_background_elevated)
                 .border_1()
-                .border_color(crate::overlay_kit::firm_border(theme))
+                .border_color(crate::theme::firm_ring(theme))
                 .rounded(px(theme::radius::XS))
         },
     )
@@ -437,9 +437,9 @@ pub(crate) fn welcome_hints(
             line.push(keycap(ui, theme, key, window, cx));
         }
         line.push(Aligned::text(
-            typography::line(what, font, text_size::UI, theme.subtle_text),
+            typography::line(what, font, text_size::BODY, theme.subtle_text),
             font,
-            text_size::UI,
+            text_size::BODY,
         ));
         typography::baseline_row(line, theme::space::SM)
     };
@@ -463,7 +463,7 @@ pub(crate) fn welcome_hints(
     .child(typography::line(
         "Keyboard shortcuts",
         font,
-        text_size::UI,
+        text_size::BODY,
         theme.muted_text,
     ))
     .on_click(Diffui::on_action(Action::ToggleShortcuts, cx));
@@ -482,7 +482,7 @@ pub(crate) fn welcome_hints(
         .child(typography::line(
             "Right-click a revision for its actions  \u{b7}  drag a revision or marked set onto another to rebase",
             font,
-            text_size::UI,
+            text_size::BODY,
             theme.subtle_text,
         ))
         .child(all)

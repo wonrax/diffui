@@ -45,7 +45,7 @@ const MENU_ITEM_PAD_X: f32 = 8.0;
 /// Row text runs one step above the chrome default so menus read as content,
 /// not controls. Width measurement ([`card_width`]) keys off the same sizes.
 const MENU_LABEL_SIZE: f32 = text_size::BODY;
-const MENU_DETAIL_SIZE: f32 = text_size::UI;
+const MENU_DETAIL_SIZE: f32 = text_size::BODY;
 /// Sub-pixel cushion so a row sized to exactly its measured width doesn't
 /// ellipsize from float rounding.
 const MENU_TEXT_SLACK: f32 = 2.0;
@@ -61,10 +61,10 @@ const MENU_ANCHOR_GAP: f32 = 4.0;
 /// two read as one connected surface rather than two cards touching.
 const MENU_FLYOUT_OVERLAP: f32 = 4.0;
 /// Hover highlight rounding. Strict concentricity with the card's
-/// [`theme::radius::SURFACE`] would be `SURFACE - border - MENU_CARD_PAD`,
+/// [`theme::radius::POPOVER`] would be `POPOVER - border - MENU_CARD_PAD`,
 /// but that small a radius reads sharper than the card's; a step up looks
 /// matched.
-const MENU_ROW_RADIUS: f32 = theme::radius::BUTTON;
+const MENU_ROW_RADIUS: f32 = theme::radius::CONTROL;
 /// Radians/second for the right-click glow pulse (~1.2 s period).
 const GLOW_PULSE_SPEED: f32 = 5.0;
 

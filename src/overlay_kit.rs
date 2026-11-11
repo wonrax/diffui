@@ -38,12 +38,6 @@ pub(crate) const FOOTER_HEIGHT: f32 = 36.0;
 /// Height of a group heading in a list, its label sitting on the bottom.
 pub(crate) const GROUP_HEIGHT: f32 = 28.0;
 
-/// The hairline a keycap and a raised control draw: a step firmer than the
-/// panes' own borders, so a key reads as a thing to press.
-pub(crate) fn firm_border(theme: ThemeSpec) -> Color {
-    theme::mix(theme.border, theme.subtle_text, 0.18)
-}
-
 /// The fill of a card's footer strip and of quiet wells inside a card: a step
 /// off the card itself.
 pub(crate) fn inset_fill(theme: ThemeSpec) -> Color {
@@ -76,7 +70,7 @@ pub(crate) fn keycap(key: impl Into<SharedString>, font: Font, theme: ThemeSpec)
         .rounded(px(radius::XS))
         .bg(theme.panel_background_elevated)
         .border_1()
-        .border_color(firm_border(theme))
+        .border_color(theme::firm_ring(theme))
         .child(typography::centered(
             typography::line(key, font, text_size::BADGE, theme.subtle_text),
             font,
@@ -210,7 +204,7 @@ pub(crate) fn group_heading(label: impl Into<SharedString>, font: Font, theme: T
         .child(typography::line(
             label,
             font,
-            text_size::UI,
+            text_size::BODY,
             theme.muted_text,
         ))
 }
@@ -242,7 +236,7 @@ pub(crate) fn count_chip(
         Tone::Neutral => (
             theme::TRANSPARENT,
             theme.subtle_text,
-            Some(firm_border(theme)),
+            Some(theme::firm_ring(theme)),
         ),
     };
     typography::Aligned::chip(
@@ -270,15 +264,15 @@ pub(crate) fn callout(
     mono: Font,
     theme: ThemeSpec,
 ) -> Div {
-    let line = typography::TextBox::default_line(font, text_size::UI);
+    let line = typography::TextBox::default_line(font, text_size::BODY);
     // The glyph centres on the first line's caps.
     let glyph_top = ((line.cap_top() + line.baseline()) / 2.0 - CALLOUT_ICON / 2.0).max(0.0);
     let mut text = div()
         .flex_1()
         .min_w_0()
         .font(font.gpui())
-        .text_size(px(text_size::UI))
-        .line_height(px(text_size::UI * typography::DEFAULT_LINE_HEIGHT))
+        .text_size(px(text_size::BODY))
+        .line_height(px(text_size::BODY * typography::DEFAULT_LINE_HEIGHT))
         .child(lead.view(font, mono, theme.note_text, theme));
     if let Some(detail) = detail {
         text = text.child(detail.view(font, mono, theme.muted_text, theme));

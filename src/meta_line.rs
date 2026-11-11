@@ -200,12 +200,12 @@ pub(crate) fn view(
                     typography::line(
                         shorten_ids(&operation),
                         ui.config.ui_font,
-                        text_size::UI,
+                        text_size::BODY,
                         theme.muted_text,
                     )
                     .text_ellipsis(),
                     ui.config.ui_font,
-                    text_size::UI,
+                    text_size::BODY,
                 )
                 .shrink(),
             ],
@@ -253,11 +253,11 @@ pub(crate) fn id_text(id: Id, ui: &Diffui) -> Aligned {
     ];
     Aligned::text(
         div()
-            .text_size(px(text_size::UI))
+            .text_size(px(text_size::BODY))
             .whitespace_nowrap()
             .child(ellipsis::rich_text(&spans, mono, id.color)),
         mono,
-        text_size::UI,
+        text_size::BODY,
     )
 }
 
@@ -268,9 +268,9 @@ fn labelled(glyph: &'static str, label: String, ui: &Diffui, theme: ThemeSpec) -
         [
             Aligned::glyph(icons::icon(glyph, ICON_SIZE, theme.subtle_text), ICON_SIZE),
             Aligned::text(
-                typography::line(label, font, text_size::UI, theme.muted_text).text_ellipsis(),
+                typography::line(label, font, text_size::BODY, theme.muted_text).text_ellipsis(),
                 font,
-                text_size::UI,
+                text_size::BODY,
             )
             .shrink(),
         ],

@@ -105,11 +105,6 @@ impl From<[f32; 2]> for Padding {
     }
 }
 
-/// Geometry of the scrollbar pill. Mirrors `crate::scrollbar` (a 12px
-/// footprint, 2px clear of every edge → an 8px pill).
-pub const SCROLLBAR_WIDTH: f32 = 8.0;
-pub const SCROLLBAR_MARGIN: f32 = 2.0;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThemePreference {
     System,
@@ -427,10 +422,9 @@ pub mod text_size {
     /// Secondary metadata beside a body run: shortcut hints, timestamps,
     /// result summaries.
     pub const CAPTION: f32 = 11.0;
-    /// Chrome controls: buttons, tabs, menu rows, footer, dialog body.
-    /// macOS's regular control size (`NSFont.systemFontSize`).
-    pub const UI: f32 = 13.0;
-    /// Primary content runs: ids, chips, list rows, inputs.
+    /// Chrome controls and content runs: buttons, tabs, menu and list rows,
+    /// inputs, ids, dialog body. macOS's regular control size
+    /// (`NSFont.systemFontSize`).
     pub const BODY: f32 = 13.0;
     /// Emphasized content: revision descriptions, empty states.
     pub const BODY_LG: f32 = 14.0;
@@ -447,42 +441,71 @@ pub mod space {
     pub const XS: f32 = 4.0;
     pub const SM: f32 = 6.0;
     pub const MD: f32 = 8.0;
+    /// A row's and a button's text inset.
+    pub const MD_LG: f32 = 10.0;
     pub const LG: f32 = 12.0;
     pub const XL: f32 = 16.0;
+    /// A dialog's inset around its content.
+    pub const XL_XXL: f32 = 20.0;
     pub const XXL: f32 = 24.0;
 }
+
+/// The 1px line that divides panes, bars and sections. Layout that sums
+/// heights counts it with this.
+pub const HAIRLINE: f32 = 1.0;
 
 /// App-wide control geometry. Fixed heights keep adjacent controls aligned
 /// even when their labels use different fonts.
 pub mod control {
+    /// Close and clear buttons, small toggles inside a row.
+    pub const SMALL: f32 = 22.0;
     pub const COMPACT: f32 = 28.0;
     pub const STANDARD: f32 = 32.0;
 }
+
+/// Glyph sizes. Lucide's 24px grid carries about 2px of padding, so a glyph
+/// reads a step smaller than text of the same size.
+pub mod icon {
+    /// Chevrons, carets and glyphs inside small controls.
+    pub const SM: f32 = 12.0;
+    /// A glyph leading a label or filling an icon button.
+    pub const MD: f32 = 14.0;
+    /// Empty states and standalone marks.
+    pub const LG: f32 = 16.0;
+}
+
+/// Height of every pane header: the side panes' field rows, the History
+/// lists' title rows and the commit bar over the diff. The toolbar's height
+/// too, so the panes' first lines meet the chrome on one rhythm.
+pub const PANE_HEADER_HEIGHT: f32 = 40.0;
 
 /// Corner radii. One scale for the whole app: pick the step by the size of
 /// the thing being rounded, so a 20px chip and a 400px card read as the same
 /// family. The named roles below are the steps the chrome reaches for.
 pub mod radius {
-    /// Chips, badges, keycaps, small icon buttons.
     pub const XS: f32 = 6.0;
-    /// Buttons, inputs, tree and menu rows.
     pub const SM: f32 = 10.0;
-    /// Revision rows, inner cards and wells.
     pub const MD: f32 = 12.0;
-    /// Popovers.
     pub const LG: f32 = 16.0;
-    /// Modals: dialogs, the palette.
     pub const XL: f32 = 20.0;
 
-    /// Inputs, hover washes, list/menu rows.
+    /// Chips, badges, keycaps, small icon buttons, short list rows.
+    pub const CHIP: f32 = XS;
+    /// Buttons, inputs, hover washes, list and menu rows, segmented wells.
     pub const CONTROL: f32 = SM;
-    /// Every button-shaped control (ghost, raised, primary, dialog) and
-    /// the toolbar's segmented well.
-    pub const BUTTON: f32 = SM;
-    /// Inset row cards (revision/file selection).
-    pub const PUSH: f32 = MD;
+    /// Revision and history rows, inner cards and dropdowns.
+    pub const CARD: f32 = MD;
     /// Floating cards anchored to a trigger: popovers, menus.
-    pub const SURFACE: f32 = LG;
+    pub const POPOVER: f32 = LG;
+    /// Modals: dialogs, the palette.
+    pub const MODAL: f32 = XL;
+
+    /// The radius of a box `inset` px inside one rounded by `outer`, so the
+    /// two corners stay concentric.
+    pub const fn inner(outer: f32, inset: f32) -> f32 {
+        let radius = outer - inset;
+        if radius > 0.0 { radius } else { 0.0 }
+    }
 }
 
 /// Blend `a` toward `b` by `t` (0..=1), ignoring alpha. Used to derive the
@@ -501,19 +524,28 @@ fn raised_fill(theme: ThemeSpec, t: f32) -> Color {
     mix(theme.panel_background_elevated, theme.selected_file, t)
 }
 
-/// Fill for recessed wells (the toolbar's Diff/Source switcher): the
-/// window canvas pushed a step darker, so the well clearly sinks below
-/// both the canvas and the elevated bar it sits on — recessed surfaces
-/// deepen in both dark and light themes.
-pub fn well_fill(theme: ThemeSpec) -> Color {
+/// The window chrome's one fill: the tab strip, the toolbar and the status
+/// bar. The window canvas a step darker, so the panes read as raised above it.
+pub fn chrome_fill(theme: ThemeSpec) -> Color {
     mix(theme.background, BLACK, 0.06)
 }
 
-/// The wash a quiet control takes under the cursor: a faint veil of the
-/// text colour, so it reads on the chrome, the panes and the cards alike.
+/// The wash a quiet control takes under the cursor, and a row's hover: a
+/// faint veil of the text colour, so it reads on the chrome, the panes and
+/// the cards alike.
 pub fn hover_wash(theme: ThemeSpec) -> Color {
     Color {
         a: 0.06,
+        ..theme.text
+    }
+}
+
+/// A recessed well inside a surface (the segmented controls' track, a
+/// progress track) and a neutral badge's fill: a step under
+/// [`press_wash`], so a pressed control in it still reads.
+pub fn well_wash(theme: ThemeSpec) -> Color {
+    Color {
+        a: 0.08,
         ..theme.text
     }
 }
@@ -704,7 +736,7 @@ pub fn popover<E: Styled + gpui_kit::ParentElement>(element: E, theme: ThemeSpec
     floating(
         element,
         theme,
-        radius::SURFACE,
+        radius::POPOVER,
         theme.border,
         floating_shadow(8.0, 16.0),
     )

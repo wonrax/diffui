@@ -28,8 +28,8 @@ use crate::measure;
 use crate::repository::Vcs;
 use crate::root::PaneSet;
 use crate::theme::{
-    self, Color, Font, ThemeSpec, Weight, chip_background, emphasis_font, radius, text_size,
-    well_fill,
+    self, Color, Font, ThemeSpec, Weight, chip_background, chrome_fill, emphasis_font, radius,
+    text_size,
 };
 use crate::typography::{self, Aligned};
 use crate::ui::Tip as _;
@@ -38,7 +38,7 @@ use crate::{Action, Cx, Diffui, HoverTarget, TabId, icons, ui};
 /// Focus target id for the open-repository dialog's path field.
 pub const OPEN_REPO_INPUT_ID: &str = "open-repo-input";
 
-const TAB_TEXT_SIZE: f32 = text_size::UI;
+const TAB_TEXT_SIZE: f32 = text_size::BODY;
 
 /// A tab's height: a floating rounded tab, centred in the strip like the
 /// strip's other controls.
@@ -638,7 +638,7 @@ pub(crate) fn build_tab_bar(
         .w_full()
         .h(px(height()))
         .flex_none()
-        .bg(well_fill(theme))
+        .bg(chrome_fill(theme))
         .child(listeners)
         .child(row);
     let bar = if dragging {
@@ -792,7 +792,7 @@ fn tab_widget(
         .pr(px(LABEL_PAD_X - 3.0))
         .when_some(wash_fill, |wash, fill| {
             wash.child(crate::squircle::background(
-                crate::squircle::Fill::new(crate::squircle::Corners::all(radius::BUTTON))
+                crate::squircle::Fill::new(crate::squircle::Corners::all(radius::CONTROL))
                     .background(fill),
                 0.0,
             ))
@@ -823,13 +823,13 @@ fn tab_widget(
         .left(px(offset))
         .w_full()
         .h(px(TAB_HEIGHT))
-        .when(active, |body| theme::raised(body, radius::BUTTON, theme))
+        .when(active, |body| theme::raised(body, radius::CONTROL, theme))
         // Only the active tab has a fill to hide what it passes over; a background
         // one in the air (its activation was refused) gets a stand-in.
         .when(lifted && !active, |body| {
             body.child(crate::squircle::background(
-                crate::squircle::Fill::new(crate::squircle::Corners::all(radius::BUTTON))
-                    .background(well_fill(theme)),
+                crate::squircle::Fill::new(crate::squircle::Corners::all(radius::CONTROL))
+                    .background(chrome_fill(theme)),
                 0.0,
             ))
         })
@@ -917,7 +917,7 @@ fn palette_hint(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> impl IntoElement 
         .child(typography::line(
             "Search revisions, files, commands",
             font,
-            text_size::UI,
+            text_size::BODY,
             theme.subtle_text,
         ));
     let keys = crate::overlay_kit::keycaps(
@@ -941,15 +941,15 @@ fn palette_hint(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> impl IntoElement 
         .map(|field| {
             theme::squircle(
                 field,
-                radius::BUTTON,
+                radius::CONTROL,
                 Some(theme.panel_background_elevated),
                 Some(theme.border),
             )
         })
         // Its edge firms up under the pointer.
         .child(crate::squircle::hover_background(
-            crate::squircle::Fill::new(crate::squircle::Corners::all(radius::BUTTON))
-                .border(1.0, crate::overlay_kit::firm_border(theme)),
+            crate::squircle::Fill::new(crate::squircle::Corners::all(radius::CONTROL))
+                .border(1.0, crate::theme::firm_ring(theme)),
             1.0,
         ))
         .cursor_pointer()
@@ -1042,9 +1042,9 @@ fn push_row(
     let name_font = emphasis_font(font, Weight::SEMIBOLD);
     let hash = |text: &str, color: Color| {
         Aligned::text(
-            typography::line(text.to_owned(), mono, text_size::UI, color),
+            typography::line(text.to_owned(), mono, text_size::BODY, color),
             mono,
-            text_size::UI,
+            text_size::BODY,
         )
     };
     let none = "\u{2014}";
@@ -1053,9 +1053,9 @@ fn push_row(
             hash(bookmark.from.as_deref().unwrap_or(none), theme.subtle_text),
             Aligned::gap(theme::space::MD),
             Aligned::text(
-                typography::line("\u{2192}", font, text_size::UI, theme.subtle_text),
+                typography::line("\u{2192}", font, text_size::BODY, theme.subtle_text),
                 font,
-                text_size::UI,
+                text_size::BODY,
             ),
             Aligned::gap(theme::space::MD),
             hash(bookmark.to.as_deref().unwrap_or(none), theme.text),
@@ -1128,7 +1128,7 @@ fn push_row(
                 .child(
                     div()
                         .w_full()
-                        .text_size(px(text_size::UI))
+                        .text_size(px(text_size::BODY))
                         .child(why.view(font, mono, ink, theme)),
                 ),
         )
@@ -1427,11 +1427,7 @@ fn kind_box(status: Option<&crate::path_browse::Status>, theme: ThemeSpec) -> im
             chip_background(theme.added_text),
             theme.added_text,
         ),
-        _ => (
-            icons::FOLDER,
-            crate::palette::active_wash(theme),
-            theme.muted_text,
-        ),
+        _ => (icons::FOLDER, theme::well_wash(theme), theme.muted_text),
     };
     div()
         .flex_none()
@@ -1472,7 +1468,7 @@ fn status_line(ui: &Diffui, theme: ThemeSpec, status: &crate::path_browse::Statu
                     .flex_1()
                     .min_w_0()
                     .font(font.gpui())
-                    .text_size(px(text_size::UI))
+                    .text_size(px(text_size::BODY))
                     .text_color(theme.removed_text)
                     .child(error.clone()),
             );
@@ -1485,8 +1481,8 @@ fn status_line(ui: &Diffui, theme: ThemeSpec, status: &crate::path_browse::Statu
     for run in runs {
         let code = matches!(run, Run::Code(_));
         let (text, run_font, size, color) = match run {
-            Run::Plain(text) => (text, font, text_size::UI, theme.muted_text),
-            Run::Strong(text) => (text, strong_font, text_size::UI, theme.text),
+            Run::Plain(text) => (text, font, text_size::BODY, theme.muted_text),
+            Run::Strong(text) => (text, strong_font, text_size::BODY, theme.text),
             Run::Code(text) => (text, mono, text_size::CAPTION, theme.text),
         };
         let item = Aligned::text(
@@ -1590,8 +1586,8 @@ fn pull_request_card(ui: &Diffui, theme: ThemeSpec, spec: &diffui_core::github::
                 .child(
                     div()
                         .w_full()
-                        .text_size(px(text_size::UI))
-                        .line_height(px(text_size::UI * 1.5))
+                        .text_size(px(text_size::BODY))
+                        .line_height(px(text_size::BODY * 1.5))
                         .child(words.view(font, mono, theme.muted_text, theme)),
                 ),
         )
@@ -1687,7 +1683,7 @@ fn recents_section(
                 .child(typography::line(
                     "Nothing opened yet. Type a path to browse folders.",
                     font,
-                    text_size::UI,
+                    text_size::BODY,
                     theme.subtle_text,
                 ))
                 .into_any_element(),
@@ -1784,7 +1780,7 @@ fn folder_section(
                 .px(px(3.0))
                 .rounded(px(radius::XS))
                 .cursor_pointer()
-                .hover(|crumb| crumb.bg(crate::palette::active_wash(theme)))
+                .hover(|crumb| crumb.bg(theme::hover_wash(theme)))
                 .child(typography::line(
                     segment,
                     mono,
@@ -1851,7 +1847,7 @@ fn folder_section(
             .child(typography::line(
                 text,
                 font,
-                text_size::UI,
+                text_size::BODY,
                 theme.subtle_text,
             ))
     };
@@ -1910,7 +1906,7 @@ fn row_lead(vcs: Option<Vcs>, theme: ThemeSpec, mono: Font) -> Aligned {
         Some(vcs) => {
             let (label, fill, ink) = match vcs {
                 Vcs::Jj => ("jj", chip_background(theme.accent), theme.accent),
-                Vcs::Git => ("git", crate::palette::active_wash(theme), theme.subtle_text),
+                Vcs::Git => ("git", theme::well_wash(theme), theme.subtle_text),
             };
             let font = emphasis_font(mono, Weight::SEMIBOLD);
             let size = typography::optical_size(font, text_size::BADGE);
@@ -1964,7 +1960,7 @@ fn list_row(
         .when(!selected, |row| {
             row.child(crate::squircle::hover_background(
                 crate::squircle::Fill::new(crate::squircle::Corners::all(radius::CONTROL))
-                    .background(crate::palette::active_wash(theme)),
+                    .background(theme::hover_wash(theme)),
                 0.0,
             ))
         })

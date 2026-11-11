@@ -319,7 +319,7 @@ pub(crate) fn build_overlay(
                     "No output"
                 },
                 font,
-                text_size::UI,
+                text_size::BODY,
                 theme.subtle_text,
             ))
             .into_any_element()
@@ -452,8 +452,9 @@ fn output_text(
     }
     let inner =
         OUTPUT_WIDTH - 2.0 * crate::overlay_kit::DIALOG_PAD - 2.0 - OUTPUT_INSET * 2.0 - RULE_ROOM;
-    let line_height = (text_size::UI * typography::DEFAULT_LINE_HEIGHT).ceil();
-    let lines = crate::measure::wrapped_line_count(&text, text_size::UI, mono, line_height, inner);
+    let line_height = (text_size::BODY * typography::DEFAULT_LINE_HEIGHT).ceil();
+    let lines =
+        crate::measure::wrapped_line_count(&text, text_size::BODY, mono, line_height, inner);
     let height = (lines as f32 * line_height + 2.0 * OUTPUT_INSET).min(OUTPUT_MAX_HEIGHT);
     let look = input::StyledLook {
         wrap: true,
@@ -464,7 +465,7 @@ fn output_text(
         ..Default::default()
     };
     let spec = input::FieldSpec::new(OUTPUT_TEXT_ID, &text);
-    input::styled_text(spec, look, mono, text_size::UI, window, cx)
+    input::styled_text(spec, look, mono, text_size::BODY, window, cx)
         .with_size(gpui_kit::component::Size::XSmall)
         .line_height(px(line_height))
         .h(px(height))

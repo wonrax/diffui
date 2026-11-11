@@ -348,11 +348,11 @@ fn build_file_navigator_surface(
         crate::typography::line(
             format!("Changed files ({})", files.len()),
             title_font,
-            text_size::UI,
+            text_size::BODY,
             theme.subtle_text,
         ),
         title_font,
-        text_size::UI,
+        text_size::BODY,
     );
     // One control step tall, so the label sits on the same line as the other
     // panels' headers. The toolbar's toggle hides the panel.
@@ -752,7 +752,7 @@ fn build_diff_panel_body(
                         .map(|badge| {
                             crate::theme::squircle(
                                 badge,
-                                crate::theme::radius::SURFACE,
+                                crate::theme::radius::POPOVER,
                                 Some(chip_background(theme.added_text)),
                                 None,
                             )

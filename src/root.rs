@@ -1099,7 +1099,7 @@ impl Diffui {
         [self.left_pane_width(), self.files_pane_width()]
             .into_iter()
             .filter(|width| *width > 0.0)
-            .map(|width| width + 1.0)
+            .map(|width| width + theme::HAIRLINE)
             .sum()
     }
 
@@ -1143,10 +1143,10 @@ impl Diffui {
         // collapsed it, so the same drag can bring the pane back.
         {
             let reserve = if files_width > 0.0 {
-                files_width + 1.0
+                files_width + theme::HAIRLINE
             } else {
                 0.0
-            } + 1.0
+            } + theme::HAIRLINE
                 + resize_handle::MIN_DIFF_PANE_WIDTH;
             let on_resize = cx.listener(|this: &mut Diffui, width: &f32, _, cx| {
                 this.act(cx, |this, _| this.on_sidebar_width_changed(*width));
@@ -1167,7 +1167,7 @@ impl Diffui {
         // The changed files' seam, likewise.
         if self.active().main_view == crate::MainView::Diff {
             let lead = if history_width > 0.0 {
-                history_width + 1.0
+                history_width + theme::HAIRLINE
             } else {
                 0.0
             };
@@ -1182,7 +1182,7 @@ impl Diffui {
                     sidebar::RESIZE_HIT_PADDING,
                     move |position, window, cx| on_resize(&position, window, cx),
                 )
-                .right_reserve(1.0 + resize_handle::MIN_DIFF_PANE_WIDTH)
+                .right_reserve(theme::HAIRLINE + resize_handle::MIN_DIFF_PANE_WIDTH)
                 .grabbable(files_width > 0.0)
                 .view(),
             );

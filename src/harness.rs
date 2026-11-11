@@ -887,7 +887,7 @@ mod scenes {
                         ellipsis::Line::new(
                             vec![ellipsis::Span::new("A title that doesn't fit")],
                             font,
-                            theme::text_size::UI,
+                            theme::text_size::BODY,
                             theme.text,
                         )
                         .view(),

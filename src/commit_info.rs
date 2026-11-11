@@ -30,7 +30,7 @@ const TITLE_SIZE: f32 = text_size::BODY;
 /// Between the header's title and what follows it.
 const TITLE_GAP: f32 = 8.0;
 /// Ids and counts, a step under the title.
-const META_SIZE: f32 = text_size::UI;
+const META_SIZE: f32 = text_size::BODY;
 /// The diffstat: this many cells, each this square, this far apart.
 const STAT_CELLS: usize = 5;
 const STAT_CELL: f32 = 6.0;

@@ -18,7 +18,7 @@ use crate::{Cx, Diffui, icons};
 pub const HEIGHT: f32 = 26.0;
 
 /// What the bar takes from the window's height: the bar and its hairline.
-pub const TOTAL_HEIGHT: f32 = HEIGHT + 1.0;
+pub const TOTAL_HEIGHT: f32 = HEIGHT + theme::HAIRLINE;
 
 const TEXT_SIZE: f32 = 11.5;
 const ICON_SIZE: f32 = 13.0;

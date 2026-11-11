@@ -747,7 +747,7 @@ pub(crate) fn build_name_prompt(
         card = card.child(
             div()
                 .w_full()
-                .text_size(px(theme::text_size::UI))
+                .text_size(px(theme::text_size::BODY))
                 .child(note.view(font, mono, color, theme)),
         );
     }

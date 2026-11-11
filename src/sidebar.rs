@@ -537,9 +537,9 @@ fn op_target_row(
     let label_font = emphasis_font(ui_font, Weight::SEMIBOLD);
     let mut content = vec![
         Aligned::text(
-            typography::line(label, label_font, text_size::UI, label_color),
+            typography::line(label, label_font, text_size::BODY, label_color),
             label_font,
-            text_size::UI,
+            text_size::BODY,
         )
         .map(|label| div().w(px(52.0)).child(label).into_any_element()),
     ];
@@ -555,9 +555,9 @@ fn op_target_row(
     }
     if let Some(description) = description {
         content.push(Aligned::text(
-            typography::line(description, ui_font, text_size::UI, desc_color),
+            typography::line(description, ui_font, text_size::BODY, desc_color),
             ui_font,
-            text_size::UI,
+            text_size::BODY,
         ));
     }
     let hover = chip_background(theme.subtle_text);
@@ -1029,9 +1029,9 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx)
         ));
     }
     verdict.push(Aligned::text(
-        typography::line(status_text, ui_font, text_size::UI, status_color),
+        typography::line(status_text, ui_font, text_size::BODY, status_color),
         ui_font,
-        text_size::UI,
+        text_size::BODY,
     ));
     let summary = div()
         .flex_1()
@@ -1042,7 +1042,8 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx)
         .gap(px(2.0))
         .child(typography::baseline_row(verdict, 6.0))
         .children(
-            counts.map(|counts| typography::line(counts, ui_font, text_size::UI, theme.muted_text)),
+            counts
+                .map(|counts| typography::line(counts, ui_font, text_size::BODY, theme.muted_text)),
         );
 
     // Merge can be complete from its selected parents alone; other drafts
@@ -1111,7 +1112,7 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx)
         .children(sentence.map(|sentence| {
             div()
                 .w_full()
-                .text_size(px(text_size::UI))
+                .text_size(px(text_size::BODY))
                 .child(sentence.view(ui_font, mono_font, theme.text, theme))
         }))
         .children(command.map(|command| {

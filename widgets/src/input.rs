@@ -411,7 +411,7 @@ pub fn single_line_with_focus(
     let input = Input::new(&state)
         .id(id)
         .font(font.gpui())
-        .text_size(px(crate::theme::text_size::UI));
+        .text_size(px(crate::theme::text_size::BODY));
     (input, focused)
 }
 
@@ -505,7 +505,7 @@ pub fn multi_line_with_focus(
     let textarea = Textarea::new(&state)
         .readonly(readonly)
         .font(font.gpui())
-        .text_size(px(crate::theme::text_size::UI));
+        .text_size(px(crate::theme::text_size::BODY));
     (textarea, focused)
 }
 

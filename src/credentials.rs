@@ -344,8 +344,8 @@ fn fingerprint(detail: &str, mono: Font, theme: ThemeSpec) -> gpui_kit::Div {
             )
         })
         .font(mono.gpui())
-        .text_size(px(text_size::UI))
-        .line_height(px(text_size::UI * 1.5))
+        .text_size(px(text_size::BODY))
+        .line_height(px(text_size::BODY * 1.5))
         .text_color(theme.text)
         .child(detail.to_owned())
 }

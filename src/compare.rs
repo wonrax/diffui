@@ -222,9 +222,9 @@ pub(crate) fn build_compare_banner(
     let (to_id, to_title) = revision_label(ui, to);
     let id = |id: String| {
         Aligned::text(
-            typography::line(id, mono, text_size::UI, theme.accent),
+            typography::line(id, mono, text_size::BODY, theme.accent),
             mono,
-            text_size::UI,
+            text_size::BODY,
         )
     };
     let glyph = |glyph: &'static str, color| {
@@ -238,9 +238,9 @@ pub(crate) fn build_compare_banner(
         [
             glyph(icons::GIT_COMPARE, theme.accent),
             Aligned::text(
-                typography::line(label, medium, text_size::UI, theme.text),
+                typography::line(label, medium, text_size::BODY, theme.text),
                 medium,
-                text_size::UI,
+                text_size::BODY,
             ),
             id(from_id),
             glyph(icons::ARROW_RIGHT, theme.muted_text),

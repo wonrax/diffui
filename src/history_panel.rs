@@ -1008,8 +1008,8 @@ enum OpRow<'a> {
 
 /// Width of the chevron column in a snapshot run's row.
 const RUN_CHEVRON: f32 = 12.0;
-/// An operation's age on its row's title line.
-const AGE_TEXT_SIZE: f32 = 11.5;
+/// An operation's age on its row's title line: a revision's.
+use crate::revision_list::AGE_TEXT_SIZE;
 /// The op detail's title.
 const DETAIL_TITLE_SIZE: f32 = 18.0;
 /// A section label: "Changed revisions 1".
@@ -1216,7 +1216,7 @@ pub(crate) fn file_filter_banner(
             ui.config.mono_font,
             theme.text,
             theme,
-            text_size::UI,
+            text_size::BODY,
         )
         .view();
     let close = ui::close_button("file-filter-close", theme.muted_text, theme, cx).on_click(
@@ -1231,12 +1231,12 @@ pub(crate) fn file_filter_banner(
                     icons::icon(icons::FILE_CLOCK, ui::ICON_SIZE, theme.accent),
                     ui::ICON_SIZE,
                 ),
-                Aligned::text(title, ui.config.ui_font, text_size::UI).fill(),
+                Aligned::text(title, ui.config.ui_font, text_size::BODY).fill(),
             ],
             space::SM,
         ),
         ui.config.ui_font,
-        text_size::UI,
+        text_size::BODY,
     );
     Some(
         crate::field::panel_strip()
@@ -1740,7 +1740,7 @@ fn note(message: impl Into<SharedString>, color: Color, ui: &Diffui) -> Div {
         .px(px(space::LG))
         .py(px(space::SM))
         .font(ui.config.ui_font.gpui())
-        .text_size(px(text_size::UI))
+        .text_size(px(text_size::BODY))
         .text_color(color)
         .child(message.into())
 }
@@ -1788,9 +1788,9 @@ pub(crate) fn build_history_sidebar(
                     theme.subtle_text,
                 ))
                 .child(div().flex_1().child(typography::centered(
-                    typography::line("Operations", title_font, text_size::UI, theme.text),
+                    typography::line("Operations", title_font, text_size::BODY, theme.text),
                     title_font,
-                    text_size::UI,
+                    text_size::BODY,
                 )))
                 .child(reload);
             (header, op_log_list(ui, cx))
@@ -1827,11 +1827,11 @@ pub(crate) fn build_history_sidebar(
                             typography::line(
                                 "Evolution of ",
                                 title_font,
-                                text_size::UI,
+                                text_size::BODY,
                                 theme.text,
                             ),
                             title_font,
-                            text_size::UI,
+                            text_size::BODY,
                         ),
                         mono_on_line(label.clone(), theme.accent, ui),
                     ],
@@ -2218,9 +2218,9 @@ fn commit_line(
         line.push(meta_line::badge("empty", theme.subtle_text, ui, window, cx));
     }
     line.push(fill_on_line(
-        summary_line(commit, text_size::UI, ui.config.ui_font, theme),
+        summary_line(commit, text_size::BODY, ui.config.ui_font, theme),
         ui.config.ui_font,
-        text_size::UI,
+        text_size::BODY,
     ));
     line
 }
@@ -2562,7 +2562,7 @@ fn operation_header(
                     ui,
                     theme,
                     args,
-                    text_size::UI,
+                    text_size::BODY,
                     window,
                     cx,
                 )),

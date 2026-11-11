@@ -1065,14 +1065,14 @@ pub(crate) fn hunk_actions(
     Some(crate::hunk_actions::HunkActions {
         rows,
         style: crate::hunk_actions::Style {
-            size: crate::theme::text_size::UI,
+            size: crate::theme::text_size::BODY,
             fill: raised.rest.unwrap_or(theme.panel_background),
             hover_fill: raised.hover,
             ghost_hover_fill: crate::theme::ghost_button_style(theme).hover,
             border: theme.border,
             focus: theme.accent,
             on_fill: theme.accent,
-            radius: crate::theme::radius::BUTTON,
+            radius: crate::theme::radius::CONTROL,
         },
         on_press: std::rc::Rc::new(Diffui::listen(
             cx,
@@ -1144,7 +1144,7 @@ pub(crate) fn marker_editor(
         .child(typography::centered(
             div()
                 .whitespace_nowrap()
-                .text_size(px(text_size::UI))
+                .text_size(px(text_size::BODY))
                 .child(
                     Prose::new()
                         .text("Editing ")
@@ -1152,7 +1152,7 @@ pub(crate) fn marker_editor(
                         .view(font, mono, theme.text, theme),
                 ),
             font,
-            text_size::UI,
+            text_size::BODY,
         ));
     let mut spec = input::FieldSpec::new(MARKER_EDITOR_ID, &editor.content);
     if !saving {

@@ -60,7 +60,7 @@ pub const ROW_CARD_INSET_X: f32 = 2.0 * ROW_CARD_INSET_Y;
 pub const ROW_CARD_INSET_Y: f32 = 1.0;
 /// Corner radius of a row's card — and of the highlight a context menu puts
 /// over it, which must sit exactly on the card.
-pub const ROW_CARD_RADIUS: f32 = crate::theme::radius::PUSH;
+pub const ROW_CARD_RADIUS: f32 = crate::theme::radius::CARD;
 /// The same for a file row's shorter card, which `ROW_CARD_RADIUS` would turn
 /// into a capsule.
 pub const FILE_ROW_CARD_RADIUS: f32 = crate::theme::radius::XS;
@@ -107,7 +107,7 @@ pub const CAPTION_TEXT_SIZE: f32 = crate::theme::text_size::CAPTION;
 /// Gap between a revision row's description and its id line.
 pub const ROW_LINE_GAP: f32 = 7.0;
 /// The commit's age, right-aligned on a revision row's title line.
-const AGE_TEXT_SIZE: f32 = 11.5;
+pub const AGE_TEXT_SIZE: f32 = 11.5;
 /// The working-copy label on its row's id line: the list's one solid chip.
 const WORKING_COPY_LABEL: &str = "Working copy";
 const WORKING_COPY_TEXT_SIZE: f32 = crate::theme::text_size::CAPTION;
@@ -120,7 +120,7 @@ const CHEVRON_TEXT_SIZE: f32 = 15.0;
 
 pub const FILE_ROW_GAP: f32 = 6.0;
 pub const FILE_ROW_RIGHT_PAD: f32 = crate::scrollbar::GUTTER;
-const TOOLTIP_RADIUS: f32 = crate::theme::radius::SURFACE;
+const TOOLTIP_RADIUS: f32 = crate::theme::radius::POPOVER;
 // Wider horizontally than vertically: the SURFACE radius eats into the
 // card's left/right ends, so the text needs extra x inset to read centered.
 const TOOLTIP_PADDING_X: f32 = 9.0;
@@ -149,10 +149,10 @@ const REVISION_LANES: LaneGeometry = LaneGeometry {
 };
 /// How far the fade under the header reaches into the list: see
 /// [`RevisionListProps::top_fade`].
-const TOP_FADE: f32 = 28.0;
+pub const TOP_FADE: f32 = 28.0;
 /// The working-copy pin shown while its row is scrolled away.
 const PIN_HEIGHT: f32 = 28.0;
-const PIN_TEXT_SIZE: f32 = crate::theme::text_size::UI;
+const PIN_TEXT_SIZE: f32 = crate::theme::text_size::BODY;
 const PIN_PAD_LEFT: f32 = 12.0;
 const PIN_PAD_RIGHT: f32 = 10.0;
 const PIN_GAP: f32 = 8.0;

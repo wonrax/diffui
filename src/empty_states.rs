@@ -55,7 +55,7 @@ pub(crate) fn revision_list_placeholder(
         LoadStatus::Loading => div().child(typography::line(
             "Loading revisions\u{2026}",
             ui_font,
-            text_size::UI,
+            text_size::BODY,
             theme.subtle_text,
         )),
         LoadStatus::Loaded => {
@@ -78,7 +78,7 @@ pub(crate) fn revision_list_placeholder(
                         .w_full()
                         .text_center()
                         .font(mono.gpui())
-                        .text_size(px(text_size::UI))
+                        .text_size(px(text_size::BODY))
                         .text_color(theme.accent)
                         .child(revset.to_owned()),
                 )
@@ -169,9 +169,9 @@ pub(crate) fn load_error(ui: &Diffui, theme: ThemeSpec, error: &str, cx: &mut Cx
                     ui::ICON_SIZE,
                 ),
                 Aligned::text(
-                    typography::line(title, title_font, text_size::UI, theme.removed_text),
+                    typography::line(title, title_font, text_size::BODY, theme.removed_text),
                     title_font,
-                    text_size::UI,
+                    text_size::BODY,
                 ),
             ],
             theme::space::SM,
@@ -240,10 +240,10 @@ pub(crate) fn outside_view_banner(ui: &Diffui, theme: ThemeSpec) -> Option<AnyEl
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .text_ellipsis()
-                            .text_size(px(text_size::UI))
+                            .text_size(px(text_size::BODY))
                             .child(sentence),
                         ui.config.ui_font,
-                        text_size::UI,
+                        text_size::BODY,
                     ),
                 ],
                 theme::space::MD,
@@ -284,7 +284,7 @@ pub(crate) fn welcome(
         body = body.child(typography::line(
             format!("Couldn't open repository: {error}"),
             font,
-            text_size::UI,
+            text_size::BODY,
             theme.removed_text,
         ));
     }

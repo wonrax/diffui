@@ -269,11 +269,11 @@ fn prefix_chip(mono: Font, theme: ThemeSpec) -> impl IntoElement {
             typography::line(
                 "jj",
                 mono,
-                text_size::UI,
+                text_size::BODY,
                 theme::primary_button_style(theme).label,
             ),
             mono,
-            text_size::UI,
+            text_size::BODY,
         ))
 }
 
@@ -329,9 +329,9 @@ pub(crate) fn args_strip(
             let flag = crate::cmdline::typed_flag(line, slot);
             if !flag.is_empty() {
                 parts.push(Aligned::text(
-                    typography::line(flag.to_owned(), mono, text_size::UI, theme.subtle_text),
+                    typography::line(flag.to_owned(), mono, text_size::BODY, theme.subtle_text),
                     mono,
-                    text_size::UI,
+                    text_size::BODY,
                 ));
                 parts.push(Aligned::gap(theme::space::XS));
             }
@@ -347,9 +347,9 @@ pub(crate) fn args_strip(
                 theme.muted_text
             };
             parts.push(Aligned::text(
-                typography::line(shown, mono, text_size::UI, color),
+                typography::line(shown, mono, text_size::BODY, color),
                 mono,
-                text_size::UI,
+                text_size::BODY,
             ));
             parts.push(Aligned::gap(theme::space::SM));
             let (label, color) = match command.resolution(&slot.revset).map(|r| &r.result) {
@@ -541,13 +541,13 @@ fn preview(ui: &Diffui, theme: ThemeSpec, line: &str, command: &CommandLine) -> 
     }
     head.push(
         Aligned::text(
-            crate::overlay_kit::rich_line(mono, text_size::UI, theme.text)
+            crate::overlay_kit::rich_line(mono, text_size::BODY, theme.text)
                 .w_full()
                 .overflow_hidden()
                 .text_ellipsis()
                 .child(crate::ellipsis::rich_text(&spans, mono, theme.text)),
             mono,
-            text_size::UI,
+            text_size::BODY,
         )
         .fill(),
     );
@@ -618,11 +618,11 @@ fn candidate_row(
             palette::glyph_icon(glyph, palette::glyph_ink(selected, theme), window, cx),
             Aligned::gap(GLYPH_GAP),
             Aligned::text(
-                typography::line(completion.label.clone(), mono, text_size::UI, label_color)
+                typography::line(completion.label.clone(), mono, text_size::BODY, label_color)
                     .overflow_hidden()
                     .text_ellipsis(),
                 mono,
-                text_size::UI,
+                text_size::BODY,
             )
             .shrink(),
             Aligned::gap(theme::space::MD),
@@ -630,11 +630,11 @@ fn candidate_row(
                 palette::filling(
                     completion.detail.clone(),
                     font,
-                    text_size::UI,
+                    text_size::BODY,
                     theme.subtle_text,
                 ),
                 font,
-                text_size::UI,
+                text_size::BODY,
             )
             .fill(),
         ],
@@ -694,7 +694,7 @@ fn sentence(
     color: Color,
     theme: ThemeSpec,
 ) -> Aligned {
-    typography::group(words.runs(font, mono, color, theme, text_size::UI), 0.0)
+    typography::group(words.runs(font, mono, color, theme, text_size::BODY), 0.0)
         .map(|line| {
             div()
                 .w_full()

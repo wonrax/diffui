@@ -1213,14 +1213,6 @@ fn build_column(
     }
 }
 
-/// The wash a pressed or hovered control takes on a card: the ink, faint.
-pub(crate) fn active_wash(theme: ThemeSpec) -> Color {
-    Color {
-        a: 0.08,
-        ..theme.text
-    }
-}
-
 /// The row of scope tabs under the input: All / Commands / Files / Revisions,
 /// each with how many results it holds, then, past a rule, the tab that turns
 /// the input into a jj command line. The scopes are the query prefixes
@@ -1297,7 +1289,7 @@ fn scope_tabs(ui: &Diffui, theme: ThemeSpec, column: &PaletteColumn, cx: &mut Cx
                 .w(px(1.0))
                 .h(px(18.0))
                 .mx(px(theme::space::XS))
-                .bg(crate::overlay_kit::firm_border(theme)),
+                .bg(crate::theme::firm_ring(theme)),
         )
         .child(jj)
         .into_any_element()
@@ -1311,7 +1303,7 @@ fn segment_well(theme: ThemeSpec) -> Div {
         .flex_none()
         .p(px(SEGMENT_WELL_PAD))
         .gap(px(SEGMENT_WELL_PAD))
-        .map(|well| theme::squircle(well, theme::radius::MD, Some(active_wash(theme)), None))
+        .map(|well| theme::squircle(well, theme::radius::MD, Some(theme::well_wash(theme)), None))
 }
 
 /// One segmented tab: an optional glyph, its label and an optional count,
@@ -1773,12 +1765,12 @@ fn result_row_body(
     let hint = |value: String| -> Option<Aligned> {
         (!value.is_empty()).then(|| {
             Aligned::text(
-                typography::line(value, font, text_size::UI, muted)
+                typography::line(value, font, text_size::BODY, muted)
                     .max_w(px(TAIL_MAX_WIDTH))
                     .overflow_hidden()
                     .text_ellipsis(),
                 font,
-                text_size::UI,
+                text_size::BODY,
             )
             .shrink()
         })
@@ -1927,7 +1919,7 @@ fn highlighted(
     let size = if font == ui.config.mono_font {
         // Mono faces run wide and tall: at the same size a path reads louder
         // than the sans labels around it.
-        text_size::UI
+        text_size::BODY
     } else {
         text_size::BODY
     };
@@ -2059,14 +2051,14 @@ fn verb_label(ui: &Diffui, theme: ThemeSpec, id: CommandId, indices: &[u32]) -> 
         [
             highlighted(ui, &command_label(id), indices, font, theme.text, theme),
             Aligned::text(
-                typography::line(target, mono, text_size::UI, theme.accent),
+                typography::line(target, mono, text_size::BODY, theme.accent),
                 mono,
-                text_size::UI,
+                text_size::BODY,
             ),
             Aligned::text(
-                filling(summary, font, text_size::UI, theme.subtle_text),
+                filling(summary, font, text_size::BODY, theme.subtle_text),
                 font,
-                text_size::UI,
+                text_size::BODY,
             )
             .fill(),
         ],

@@ -495,11 +495,11 @@ pub(crate) fn activity_indicator(
                 typography::line(
                     spinner_glyph(active.started),
                     mono,
-                    text_size::UI,
+                    text_size::BODY,
                     theme.accent,
                 ),
                 mono,
-                text_size::UI,
+                text_size::BODY,
             ),
             Aligned::text(
                 div()
@@ -507,17 +507,17 @@ pub(crate) fn activity_indicator(
                     .overflow_hidden()
                     .text_ellipsis()
                     .whitespace_nowrap()
-                    .text_size(px(text_size::UI))
+                    .text_size(px(text_size::BODY))
                     .child(active.label.view(font, mono, theme.muted_text, theme)),
                 font,
-                text_size::UI,
+                text_size::BODY,
             )
             .shrink(),
         ];
         if running > 1 {
             items.push(round_badge(
                 format!("+{}", running - 1),
-                crate::palette::active_wash(theme),
+                theme::well_wash(theme),
                 theme.subtle_text,
                 font,
             ));
@@ -525,7 +525,7 @@ pub(crate) fn activity_indicator(
         if queued > 0 {
             items.push(round_badge(
                 format!("{queued} queued"),
-                crate::palette::active_wash(theme),
+                theme::well_wash(theme),
                 theme.subtle_text,
                 font,
             ));
@@ -545,11 +545,11 @@ pub(crate) fn activity_indicator(
                     typography::line(
                         format!("{failed} failed"),
                         font,
-                        text_size::UI,
+                        text_size::BODY,
                         theme.muted_text,
                     ),
                     font,
-                    text_size::UI,
+                    text_size::BODY,
                 ),
             ],
             6.0,
@@ -562,9 +562,9 @@ pub(crate) fn activity_indicator(
                     ui::ICON_SIZE,
                 ),
                 Aligned::text(
-                    typography::line("Up to date", font, text_size::UI, theme.muted_text),
+                    typography::line("Up to date", font, text_size::BODY, theme.muted_text),
                     font,
-                    text_size::UI,
+                    text_size::BODY,
                 ),
             ],
             6.0,
@@ -579,7 +579,7 @@ pub(crate) fn activity_indicator(
         cx,
     )
     .when(ui.activity_popover_open(), |button| {
-        button.resting(crate::palette::active_wash(theme), None)
+        button.resting(theme::press_wash(theme), None)
     })
     .child(body)
     .on_click(Diffui::on_action(Action::ToggleActivityPopover, cx))
@@ -706,7 +706,7 @@ pub(crate) fn activity_popover(
                 .child(typography::line(
                     "Nothing has run in this tab yet. Fetches, pushes and edits show up here.",
                     font,
-                    text_size::UI,
+                    text_size::BODY,
                     theme.subtle_text,
                 )),
         );
@@ -845,7 +845,7 @@ pub(crate) fn toast_layer(
         );
         let detail = div()
             .w_full()
-            .text_size(px(text_size::UI))
+            .text_size(px(text_size::BODY))
             .child(toast.detail.view(
                 ui.config.ui_font,
                 ui.config.mono_font,
@@ -1211,7 +1211,7 @@ fn activity_header(
         theme.muted_text
     };
     let result = activity.result.as_deref().map(|result| {
-        crate::prose::Prose::from(result).line(ui_font, mono, result_color, theme, text_size::UI)
+        crate::prose::Prose::from(result).line(ui_font, mono, result_color, theme, text_size::BODY)
     });
     let cut_short = !title.fits(text_width - trailing_width)
         || activity.command.as_deref().is_some_and(|command| {
@@ -1294,7 +1294,7 @@ fn activity_header(
                         .flex_1()
                         .h(px(4.0))
                         .rounded(px(2.0))
-                        .bg(crate::palette::active_wash(theme))
+                        .bg(theme::well_wash(theme))
                         .child(
                             div()
                                 .h_full()
@@ -1380,9 +1380,9 @@ fn clear_button(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> AnyElement {
     .h(px(24.0))
     .px(px(theme::space::MD))
     .child(typography::centered(
-        typography::line("Clear finished", ui.config.ui_font, text_size::UI, color),
+        typography::line("Clear finished", ui.config.ui_font, text_size::BODY, color),
         ui.config.ui_font,
-        text_size::UI,
+        text_size::BODY,
     ));
     if enabled {
         button = button.on_click(Diffui::on_action(Action::ClearActivities, cx));

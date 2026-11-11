@@ -53,7 +53,7 @@ const PICK_BAR_WIDTH: f32 = 3.0;
 const BROWSE_ICON_SIZE: f32 = 13.0;
 const HEADER_BUTTON_ICON_SIZE: f32 = 12.0;
 const HEADER_EDIT_ICON_SIZE: f32 = 13.0;
-const HEADER_EDIT_LABEL_SIZE: f32 = crate::theme::text_size::UI;
+const HEADER_EDIT_LABEL_SIZE: f32 = crate::theme::text_size::BODY;
 const HEADER_EDIT_CONTENT_GAP: f32 = 5.0;
 /// Spacing of the hatch on a padded split column.
 const HATCH_STEP: f32 = 6.0;
@@ -1496,7 +1496,7 @@ impl View<'_> {
                     {
                         plan.rounded(
                             button,
-                            theme::radius::BUTTON,
+                            theme::radius::CONTROL,
                             Color {
                                 a: 0.12,
                                 ..palette.text_muted
@@ -2162,7 +2162,7 @@ impl View<'_> {
         if let (Some(rect), Some(label)) = (button, note.action.as_deref()) {
             plan.boxed(
                 rect,
-                theme::radius::BUTTON,
+                theme::radius::CONTROL,
                 if button_hovered {
                     palette.hunk_header
                 } else {

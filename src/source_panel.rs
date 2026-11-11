@@ -485,7 +485,7 @@ pub(crate) fn build_source_sidebar(
             typography::line(
                 "Listing files…",
                 ui.config.ui_font,
-                text_size::UI,
+                text_size::BODY,
                 theme.subtle_text,
             ),
         ));
@@ -654,9 +654,9 @@ fn build_info_bar(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut C
     let font = ui.config.ui_font;
     let caption = |value: String, color: Color| {
         Aligned::text(
-            typography::line(value, font, text_size::UI, color),
+            typography::line(value, font, text_size::BODY, color),
             font,
-            text_size::UI,
+            text_size::BODY,
         )
     };
 

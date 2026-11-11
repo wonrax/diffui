@@ -278,9 +278,9 @@ pub(crate) fn banner(
             ui::ICON_SIZE,
         ),
         Aligned::text(
-            typography::line(label, medium, text_size::UI, theme.text),
+            typography::line(label, medium, text_size::BODY, theme.text),
             medium,
-            text_size::UI,
+            text_size::BODY,
         ),
     ];
     match (mode, refused) {
@@ -288,11 +288,11 @@ pub(crate) fn banner(
             typography::line(
                 format!("{} revisions", span.count),
                 font,
-                text_size::UI,
+                text_size::BODY,
                 theme.muted_text,
             ),
             font,
-            text_size::UI,
+            text_size::BODY,
         )),
         _ => {
             // What the pane leaves the revset: it ellipsises before the controls.
@@ -301,14 +301,14 @@ pub(crate) fn banner(
                 - BANNER_CONTROLS_WIDTH
                 - ui::ICON_SIZE
                 - 16.0
-                - crate::measure::line_width(label, text_size::UI, medium))
+                - crate::measure::line_width(label, text_size::BODY, medium))
             .max(0.0);
             line.push(Aligned::text(
                 crate::plan::revset_prose(&revset)
-                    .line(mono, mono, theme.text, theme, text_size::UI)
+                    .line(mono, mono, theme.text, theme, text_size::BODY)
                     .cut(room),
                 mono,
-                text_size::UI,
+                text_size::BODY,
             ));
         }
     }
@@ -421,7 +421,7 @@ pub(crate) fn refused_state(
                     div()
                         .w_full()
                         .text_center()
-                        .text_size(px(text_size::UI))
+                        .text_size(px(text_size::BODY))
                         .child(detail.view(font, mono, theme.muted_text, theme)),
                 ),
         )
