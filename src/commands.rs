@@ -33,80 +33,62 @@ use crate::{DetailField, Diffui, MainView, mutations};
 /// in the persisted palette recents without a hand-written mapping table.
 pub(crate) type CommandId = &'static str;
 
-/// Where a command's keys are live. The mode stack decides which context the
-/// keyboard is in; a command only resolves in the contexts it lists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) enum Context {
+/// Declares [`Context`] once: each variant with the name it goes by in
+/// `config.toml`'s `[keys.<name>]`, and [`Context::ALL`] from the same list.
+macro_rules! contexts {
+    ($( $(#[$meta:meta])* $Variant:ident = $name:literal, )*) => {
+        /// Where a command's keys are live. The mode stack decides which
+        /// context the keyboard is in; a command only resolves in the
+        /// contexts it lists.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        pub(crate) enum Context {
+            $( $(#[$meta])* $Variant, )*
+        }
+
+        impl Context {
+            /// Every context, for iteration in tests and config parsing.
+            pub(crate) const ALL: &'static [Context] = &[$( Context::$Variant, )*];
+
+            /// The name this context goes by in `config.toml`'s
+            /// `[keys.<name>]`.
+            pub(crate) fn name(self) -> &'static str {
+                match self {
+                    $( Context::$Variant => $name, )*
+                }
+            }
+        }
+    };
+}
+
+contexts! {
     /// No overlay: the graph, the diff, the tabs.
-    Base,
-    Palette,
-    Find,
-    Confirm,
-    Description,
+    Base = "base",
+    Palette = "palette",
+    Find = "find",
+    Confirm = "confirm",
+    Description = "description",
     /// Target mode — picking a rebase/squash/merge destination.
-    Draft,
-    Menu,
-    OpenRepo,
-    ActivityPopover,
+    Draft = "draft",
+    Menu = "menu",
+    OpenRepo = "open-repo",
+    ActivityPopover = "activity",
     /// The bookmark-name prompt.
-    Prompt,
+    Prompt = "prompt",
     /// The keyboard-shortcut cheat sheet.
-    Shortcuts,
+    Shortcuts = "shortcuts",
     /// Line-select mode in the diff pane.
-    Lines,
+    Lines = "lines",
     /// The split prompt's two description editors.
-    Split,
+    Split = "split",
     /// The credential prompt git or ssh raised.
-    Credential,
+    Credential = "credential",
     /// A jj CLI run's output panel.
-    Output,
+    Output = "output",
     /// The conflict marker editor.
-    ConflictEdit,
+    ConflictEdit = "conflict-edit",
 }
 
 impl Context {
-    /// Every context, for iteration in tests and config parsing.
-    pub(crate) const ALL: &'static [Context] = &[
-        Context::Base,
-        Context::Palette,
-        Context::Find,
-        Context::Confirm,
-        Context::Description,
-        Context::Draft,
-        Context::Menu,
-        Context::OpenRepo,
-        Context::ActivityPopover,
-        Context::Prompt,
-        Context::Shortcuts,
-        Context::Lines,
-        Context::Split,
-        Context::Credential,
-        Context::Output,
-        Context::ConflictEdit,
-    ];
-
-    /// The name this context goes by in `config.toml`'s `[keys.<name>]`.
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            Context::Base => "base",
-            Context::Palette => "palette",
-            Context::Find => "find",
-            Context::Confirm => "confirm",
-            Context::Description => "description",
-            Context::Draft => "draft",
-            Context::Menu => "menu",
-            Context::OpenRepo => "open-repo",
-            Context::ActivityPopover => "activity",
-            Context::Prompt => "prompt",
-            Context::Shortcuts => "shortcuts",
-            Context::Lines => "lines",
-            Context::Split => "split",
-            Context::Credential => "credential",
-            Context::Output => "output",
-            Context::ConflictEdit => "conflict-edit",
-        }
-    }
-
     pub(crate) fn parse(name: &str) -> Option<Self> {
         Context::ALL
             .iter()

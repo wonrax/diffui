@@ -26,109 +26,109 @@ use crate::menu::OverlayMenu;
 use crate::palette::PaletteState;
 use crate::{ConfirmDialog, DescriptionEditor, Diffui, DraftUi, OpenRepoDialog, TabState};
 
-/// A window-level mode. These sit above every tab, so they live on the app.
-#[derive(Debug)]
-pub(crate) enum Mode {
-    Palette(PaletteState),
-    /// A popup menu (toolbar dropdown or right-click). Non-macOS only; macOS
-    /// pops a native `NSMenu`, which owns the keyboard itself while it runs,
-    /// so nothing there constructs this variant and the dead-code lint would
-    /// otherwise fail a macOS build with warnings denied.
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
-    Menu(OverlayMenu),
-    Confirm(ConfirmDialog),
-    OpenRepo(OpenRepoDialog),
-    ActivityPopover,
-    /// The bookmark-name prompt (create / rename).
-    NamePrompt(crate::bookmarks::NamePrompt),
-    /// The keyboard-shortcut cheat sheet.
-    Shortcuts,
-    /// git or ssh asking for a credential.
-    Credential(crate::credentials::CredentialDialog),
-    /// A jj CLI run's output.
-    CliOutput(crate::cli_output::OutputView),
-}
-
-/// A mode bound to one tab: it names rows, files, or text that belong to that
-/// tab's document and would point at the wrong thing anywhere else.
-#[derive(Debug)]
-pub(crate) enum TabMode {
-    Find(FindState),
-    Description(DescriptionEditor),
-    /// Target mode — an in-progress rebase/squash/merge destination pick.
-    Draft(DraftUi),
-    /// Line-select mode: the diff's changed lines are pickable one by one.
-    Lines(crate::changes::LineSelect),
-}
-
-/// What a mode is, independent of what it holds. Used to decide whether a push
-/// replaces an existing mode or stacks on top of it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ModeKind {
-    Palette,
-    Menu,
-    Confirm,
-    OpenRepo,
-    ActivityPopover,
-    Shortcuts,
-    Find,
-    Description,
-    Draft,
-    NamePrompt,
-    Lines,
-    Credential,
-    CliOutput,
-}
-
-impl Mode {
-    pub(crate) fn kind(&self) -> ModeKind {
-        match self {
-            Mode::Palette(_) => ModeKind::Palette,
-            Mode::Menu(_) => ModeKind::Menu,
-            Mode::Confirm(_) => ModeKind::Confirm,
-            Mode::OpenRepo(_) => ModeKind::OpenRepo,
-            Mode::ActivityPopover => ModeKind::ActivityPopover,
-            Mode::NamePrompt(_) => ModeKind::NamePrompt,
-            Mode::Shortcuts => ModeKind::Shortcuts,
-            Mode::Credential(_) => ModeKind::Credential,
-            Mode::CliOutput(_) => ModeKind::CliOutput,
+/// The modes, declared once: each variant, the keyboard context it puts the
+/// keys in, and its accessors (`get` and `get_mut` on the stack's owner).
+/// Generates [`Mode`], [`TabMode`], [`ModeKind`] and their `kind` and
+/// `context`.
+macro_rules! modes {
+    ($(
+        $(#[$enum_meta:meta])*
+        $Enum:ident on $Owner:ty {
+            $(
+                $(#[$meta:meta])*
+                $Variant:ident $(($Payload:ty $(; $get:ident $(, $get_mut:ident)?)?))? => $Context:ident,
+            )*
         }
+    )*) => {
+        $(
+            $(#[$enum_meta])*
+            #[derive(Debug)]
+            pub(crate) enum $Enum {
+                $( $(#[$meta])* $Variant $(($Payload))?, )*
+            }
+
+            impl $Enum {
+                pub(crate) fn kind(&self) -> ModeKind {
+                    match self {
+                        $( Self::$Variant { .. } => ModeKind::$Variant, )*
+                    }
+                }
+
+                pub(crate) fn context(&self) -> Context {
+                    match self {
+                        $( Self::$Variant { .. } => Context::$Context, )*
+                    }
+                }
+            }
+
+            impl $Owner {
+                $($($(
+                    pub(crate) fn $get(&self) -> Option<&$Payload> {
+                        match self.mode(ModeKind::$Variant) {
+                            Some($Enum::$Variant(state)) => Some(state),
+                            _ => None,
+                        }
+                    }
+                    $(
+                        pub(crate) fn $get_mut(&mut self) -> Option<&mut $Payload> {
+                            match self.mode_mut(ModeKind::$Variant) {
+                                Some($Enum::$Variant(state)) => Some(state),
+                                _ => None,
+                            }
+                        }
+                    )?
+                )?)?)*
+            }
+        )*
+
+        /// What a mode is, independent of what it holds. Used to decide whether
+        /// a push replaces an existing mode or stacks on top of it.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub(crate) enum ModeKind {
+            $($( $Variant, )*)*
+        }
+    };
+}
+
+modes! {
+    /// A window-level mode. These sit above every tab, so they live on the
+    /// app, and each floats above the whole shell.
+    Mode on Diffui {
+        Palette(PaletteState; palette, palette_mut) => Palette,
+        /// A popup menu (toolbar dropdown or right-click). Non-macOS only;
+        /// macOS pops a native `NSMenu`, which owns the keyboard itself while
+        /// it runs, so nothing there constructs this variant and the dead-code
+        /// lint would otherwise fail a macOS build with warnings denied.
+        #[cfg_attr(target_os = "macos", allow(dead_code))]
+        Menu(OverlayMenu; menu, menu_mut) => Menu,
+        /// A guarded mutation's confirmation. These stack: `confirm` is the
+        /// one on top, and the ones under it surface as it resolves.
+        Confirm(ConfirmDialog; confirm) => Confirm,
+        OpenRepo(OpenRepoDialog; open_repo_dialog, open_repo_dialog_mut) => OpenRepo,
+        ActivityPopover => ActivityPopover,
+        /// The bookmark-name prompt (create / rename).
+        NamePrompt(crate::bookmarks::NamePrompt) => Prompt,
+        /// The keyboard-shortcut cheat sheet.
+        Shortcuts => Shortcuts,
+        /// git or ssh asking for a credential.
+        Credential(crate::credentials::CredentialDialog) => Credential,
+        /// A jj CLI run's output.
+        CliOutput(crate::cli_output::OutputView) => Output,
     }
 
-    pub(crate) fn context(&self) -> Context {
-        match self {
-            Mode::Palette(_) => Context::Palette,
-            Mode::Menu(_) => Context::Menu,
-            Mode::Confirm(_) => Context::Confirm,
-            Mode::OpenRepo(_) => Context::OpenRepo,
-            Mode::ActivityPopover => Context::ActivityPopover,
-            Mode::NamePrompt(_) => Context::Prompt,
-            Mode::Shortcuts => Context::Shortcuts,
-            Mode::Credential(_) => Context::Credential,
-            Mode::CliOutput(_) => Context::Output,
-        }
+    /// A mode bound to one tab: it names rows, files, or text that belong to
+    /// that tab's document and would point at the wrong thing anywhere else.
+    TabMode on TabState {
+        Find(FindState; find, find_mut) => Find,
+        Description(DescriptionEditor; description_editor, description_editor_mut) => Description,
+        /// Target mode — an in-progress rebase/squash/merge destination pick.
+        Draft(DraftUi; op_draft, op_draft_mut) => Draft,
+        /// Line-select mode: the diff's changed lines are pickable one by one.
+        Lines(crate::changes::LineSelect; line_select) => Lines,
     }
 }
 
 impl TabMode {
-    pub(crate) fn kind(&self) -> ModeKind {
-        match self {
-            TabMode::Find(_) => ModeKind::Find,
-            TabMode::Description(_) => ModeKind::Description,
-            TabMode::Draft(_) => ModeKind::Draft,
-            TabMode::Lines(_) => ModeKind::Lines,
-        }
-    }
-
-    pub(crate) fn context(&self) -> Context {
-        match self {
-            TabMode::Find(_) => Context::Find,
-            TabMode::Description(_) => Context::Description,
-            TabMode::Draft(_) => Context::Draft,
-            TabMode::Lines(_) => Context::Lines,
-        }
-    }
-
     /// Where this mode sits in the tab's stack, regardless of the order the
     /// two were opened in.
     ///
@@ -274,57 +274,6 @@ impl Diffui {
         self.modes.iter_mut().rev().find(|mode| mode.kind() == kind)
     }
 
-    pub(crate) fn palette(&self) -> Option<&PaletteState> {
-        match self.mode(ModeKind::Palette) {
-            Some(Mode::Palette(state)) => Some(state),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn palette_mut(&mut self) -> Option<&mut PaletteState> {
-        match self.mode_mut(ModeKind::Palette) {
-            Some(Mode::Palette(state)) => Some(state),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn menu(&self) -> Option<&OverlayMenu> {
-        match self.mode(ModeKind::Menu) {
-            Some(Mode::Menu(menu)) => Some(menu),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn menu_mut(&mut self) -> Option<&mut OverlayMenu> {
-        match self.mode_mut(ModeKind::Menu) {
-            Some(Mode::Menu(menu)) => Some(menu),
-            _ => None,
-        }
-    }
-
-    /// The confirmation on top. A second one raised while this is open sits
-    /// under it and surfaces when it resolves.
-    pub(crate) fn confirm(&self) -> Option<&ConfirmDialog> {
-        match self.mode(ModeKind::Confirm) {
-            Some(Mode::Confirm(dialog)) => Some(dialog),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn open_repo_dialog(&self) -> Option<&OpenRepoDialog> {
-        match self.mode(ModeKind::OpenRepo) {
-            Some(Mode::OpenRepo(dialog)) => Some(dialog),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn open_repo_dialog_mut(&mut self) -> Option<&mut OpenRepoDialog> {
-        match self.mode_mut(ModeKind::OpenRepo) {
-            Some(Mode::OpenRepo(dialog)) => Some(dialog),
-            _ => None,
-        }
-    }
-
     pub(crate) fn activity_popover_open(&self) -> bool {
         self.mode(ModeKind::ActivityPopover).is_some()
     }
@@ -355,55 +304,6 @@ impl TabState {
 
     fn mode_mut(&mut self, kind: ModeKind) -> Option<&mut TabMode> {
         self.modes.iter_mut().rev().find(|mode| mode.kind() == kind)
-    }
-
-    pub(crate) fn find(&self) -> Option<&FindState> {
-        match self.mode(ModeKind::Find) {
-            Some(TabMode::Find(state)) => Some(state),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn find_mut(&mut self) -> Option<&mut FindState> {
-        match self.mode_mut(ModeKind::Find) {
-            Some(TabMode::Find(state)) => Some(state),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn description_editor(&self) -> Option<&DescriptionEditor> {
-        match self.mode(ModeKind::Description) {
-            Some(TabMode::Description(editor)) => Some(editor),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn description_editor_mut(&mut self) -> Option<&mut DescriptionEditor> {
-        match self.mode_mut(ModeKind::Description) {
-            Some(TabMode::Description(editor)) => Some(editor),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn op_draft(&self) -> Option<&DraftUi> {
-        match self.mode(ModeKind::Draft) {
-            Some(TabMode::Draft(draft)) => Some(draft),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn line_select(&self) -> Option<&crate::changes::LineSelect> {
-        match self.mode(ModeKind::Lines) {
-            Some(TabMode::Lines(mode)) => Some(mode),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn op_draft_mut(&mut self) -> Option<&mut DraftUi> {
-        match self.mode_mut(ModeKind::Draft) {
-            Some(TabMode::Draft(draft)) => Some(draft),
-            _ => None,
-        }
     }
 }
 

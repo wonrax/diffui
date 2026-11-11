@@ -22,7 +22,6 @@ use gpui_kit::{
 };
 
 use crate::keys;
-use crate::modes::ModeKind;
 use crate::theme::{self, ThemeSpec};
 use crate::{
     Action, Cli, Cx, Diffui, MainView, WINDOW_STATE_DEBOUNCE, activity, chrome, diff_panel,
@@ -1021,20 +1020,8 @@ impl Diffui {
     /// The whole window with a tab open: the skeleton, cheap enough to run on every
     /// frame, with the regions in it as cached [`Pane`]s.
     fn shell(&self, panes: &Panes, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> Div {
-        let modal_open = [
-            ModeKind::ActivityPopover,
-            ModeKind::Palette,
-            ModeKind::Menu,
-            ModeKind::OpenRepo,
-            ModeKind::Confirm,
-            ModeKind::NamePrompt,
-            ModeKind::Credential,
-            ModeKind::CliOutput,
-            ModeKind::Shortcuts,
-        ]
-        .into_iter()
-        .any(|kind| self.mode(kind).is_some())
-            || crate::changes::split_shown(self);
+        // Every window-level mode floats above the shell.
+        let modal_open = !self.modes.is_empty() || crate::changes::split_shown(self);
 
         let mut shell = div()
             .flex()
