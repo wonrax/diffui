@@ -90,7 +90,7 @@ pub(crate) fn build_revision_list(
         .working_copy(working_copy_row)
         .multi_selection_count(tab.revision_multi_selection.len())
         .reveal_selected(tab.revision_reveal_token)
-        .reveal_file(ui.sidebar_file_reveal_token, reveal_target)
+        .reveal_file(tab.candidate_reveal_token, reveal_target)
         // Every tick of a scroll lands here: stored, not acted on.
         .on_scroll(cx.listener(|this: &mut Diffui, offset: &f64, _, _| {
             this.active_mut().sidebar_scroll_offset = *offset;

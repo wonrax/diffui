@@ -2371,9 +2371,8 @@ impl Diffui {
             draft.draft.candidate = Some(found);
             draft.hover_spot = None;
         }
-        // Reveal the candidate row (the sidebar routes the file-reveal
-        // token at a draft candidate while target mode is active).
-        self.sidebar_file_reveal_token = self.sidebar_file_reveal_token.wrapping_add(1);
+        let tab = self.active_mut();
+        tab.candidate_reveal_token = tab.candidate_reveal_token.wrapping_add(1);
         self.kick_draft_preview(cx)
     }
 

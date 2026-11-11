@@ -698,6 +698,9 @@ pub(crate) struct TabState {
     /// `RevisionList` watches this and scrolls the matching row into view on
     /// disagreement.
     pub(crate) revision_reveal_token: u64,
+    /// Bumped when the keyboard moves the draft's destination candidate: the
+    /// revision list scrolls that row into view.
+    pub(crate) candidate_reveal_token: u64,
     /// True while a palette-initiated revision load is in flight. We can't bump
     /// `revision_reveal_token` at the moment the user accepts the result — at
     /// that point `selected_revision` is still the old value, so the sidebar
@@ -784,6 +787,7 @@ impl TabState {
             folded_files: (String::new(), HashSet::new()),
             selected_file: 0,
             revision_reveal_token: 0,
+            candidate_reveal_token: 0,
             pending_revision_reveal: false,
             sidebar_scroll_offset: 0.0,
             file_tree_scroll_offset: 0.0,
