@@ -13,7 +13,7 @@ use crate::prose::Prose;
 
 impl Diffui {
     pub(crate) fn new(cli: Cli, saved: WindowState, cx: &mut Cx) -> Self {
-        let (config, raw_keys, config_error) = AppConfig::load();
+        let (config, raw_keys, config_files) = AppConfig::load();
         crate::typography::set_ui_font(config.ui_font);
         // A keymap problem is never fatal: a config written against another
         // build still opens the app, having said once what it had to skip.
@@ -214,6 +214,7 @@ impl Diffui {
             window_display,
             geometry_dirty_since: None,
             config,
+            config_files,
             keymap,
             modes: Vec::new(),
             focus_before_modes: None,
@@ -245,7 +246,10 @@ impl Diffui {
             renders: 0,
         };
 
-        if let Some(error) = config_error {
+        if let Some(error) = app.config_files.settings_error.clone() {
+            app.push_sticky_toast("settings.toml ignored".to_owned(), &error);
+        }
+        if let Some(error) = app.config_files.config_error.clone() {
             app.push_sticky_toast("config.toml ignored, using defaults".to_owned(), &error);
         } else if let Some(first) = problems.first() {
             let more = match problems.len() {
@@ -1091,8 +1095,12 @@ impl Diffui {
             Action::SetTheme(theme) => {
                 self.selected_theme = theme;
                 self.apply_theme(cx);
+                self.persist_setting(config::Setting::Theme(theme));
             }
-            Action::SetRefreshMode(mode) => self.set_refresh_mode(mode),
+            Action::SetRefreshMode(mode) => {
+                self.set_refresh_mode(mode);
+                self.persist_setting(config::Setting::Refresh(mode));
+            }
             Action::SetMainView(mode) => self.set_main_view(mode, cx),
 
             // ── Tabs ────────────────────────────────────────────────────

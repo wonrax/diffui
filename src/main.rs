@@ -63,6 +63,7 @@ mod revset_assist;
 mod root;
 #[cfg(test)]
 mod scene_suite;
+mod settings;
 mod shortcuts;
 mod sidebar;
 mod source_panel;
@@ -307,9 +308,9 @@ pub(crate) struct Diffui {
     pub(crate) sidebar_file_cache: std::cell::RefCell<sidebar::SidebarFileCache>,
     /// Cached result of `sidebar::min_width(config)`. The min width is
     /// purely a function of `config.ui_font` + `config.mono_font` glyph
-    /// advances at `CAPTION_TEXT_SIZE`, which are stable for the life of
-    /// the app — caching avoids re-shaping six strings on every render and on
-    /// every drag tick of the resize handle.
+    /// advances at `CAPTION_TEXT_SIZE`, which only change when the settings
+    /// dialog changes a font — caching avoids re-shaping six strings on every
+    /// render and on every drag tick of the resize handle.
     pub(crate) sidebar_min_width: f32,
     /// Last window geometry seen from the compositor: inner (client) size and
     /// outer top-left position. Updated on `Opened`/`Resized`/`Moved` and
@@ -327,6 +328,8 @@ pub(crate) struct Diffui {
     /// changes settle. `None` when nothing is pending.
     pub(crate) geometry_dirty_since: Option<Instant>,
     pub(crate) config: AppConfig,
+    /// Where `config` came from, and the one way to save a setting.
+    pub(crate) config_files: config::ConfigFiles,
     /// Chord → command id per context, built from the registry's defaults
     /// with the `[keys]` section of `config.toml` layered on top.
     pub(crate) keymap: Keymap,

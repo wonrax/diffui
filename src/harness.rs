@@ -218,12 +218,26 @@ impl Harness {
 
     pub(crate) fn open_sized(repo: Option<&Path>, size: (f32, f32)) -> Self {
         let turn = turn();
+        // What an earlier harness's theme or refresh change saved there would
+        // otherwise carry into this one.
+        let settings = scratch_home().join(".config/diffui/settings.toml");
+        if let Err(error) = std::fs::remove_file(&settings)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("clear {}: {error}", settings.display());
+        }
         Self::start(turn, repo, size)
     }
 
-    /// [`Self::open_sized`] on a `HOME` with no saved session or recents and `config`
-    /// as its config file, as a first launch would see it.
-    pub(crate) fn open_fresh(repo: Option<&Path>, size: (f32, f32), config: &str) -> Self {
+    /// [`Self::open_sized`] on a `HOME` with no saved session or recents, and
+    /// `config` and `settings` as its `config.toml` and `settings.toml`, as a
+    /// first launch would see it.
+    pub(crate) fn open_fresh(
+        repo: Option<&Path>,
+        size: (f32, f32),
+        config: &str,
+        settings: &str,
+    ) -> Self {
         let turn = turn();
         let home = scratch_home();
         for entry in std::fs::read_dir(home).expect("list the scratch home") {
@@ -243,6 +257,7 @@ impl Harness {
         let dir = home.join(".config/diffui");
         std::fs::create_dir_all(&dir).expect("make the config directory");
         std::fs::write(dir.join("config.toml"), config).expect("write the config");
+        std::fs::write(dir.join("settings.toml"), settings).expect("write the settings");
         Self::start(turn, repo, size)
     }
 

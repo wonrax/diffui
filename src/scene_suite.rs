@@ -34,6 +34,8 @@ pub(crate) struct Scene {
     size: (f32, f32),
     theme: &'static str,
     config: &'static str,
+    /// Appended to the `settings.toml` that sets the theme.
+    settings: &'static str,
     open_repo: bool,
     /// Mid-flight: no settling after the steps, and no stale check.
     raw: bool,
@@ -103,6 +105,7 @@ fn s(id: &'static str, _state: &'static str, _steps: &'static str, steps: fn(&mu
         size: (W, H),
         theme: "Light",
         config: "",
+        settings: "",
         open_repo: true,
         raw: false,
         cold: false,
@@ -2470,8 +2473,10 @@ fn run(scene: &Scene) -> Result<(), String> {
     // `<id>-dark.png`.
     let theme_override = std::env::var("DIFFUI_SCENE_THEME").ok();
     let theme = theme_override.as_deref().unwrap_or(scene.theme);
-    let config = format!("theme = \"{theme}\"\n{}", scene.config);
-    let h = Harness::open_fresh(open.as_deref(), scene.size, &config);
+    // In `settings.toml`, where the dialog would put it, so a scene's
+    // `config.toml` holds only what the scene sets.
+    let settings = format!("theme = \"{theme}\"\n{}", scene.settings);
+    let h = Harness::open_fresh(open.as_deref(), scene.size, scene.config, &settings);
     let mut c = Ctx {
         h,
         manifest,
