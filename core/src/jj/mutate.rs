@@ -308,11 +308,18 @@ async fn stage_view_only(
         } => {
             let commit = resolve_mutation_target(repo, push_context.targets, to).await?;
             let short = short_change_id(&commit);
-            repo.set_local_bookmark_target(
-                RefName::new(name),
-                RefTarget::normal(commit.id().clone()),
-            );
-            let moved = format!("Moved bookmark {name} to {short}");
+            let ref_name = RefName::new(name);
+            // `jj bookmark set` on a name with no local target and nothing
+            // tracked creates it, auto-tracking included; else it moves.
+            let moved = if repo.view().get_local_bookmark(ref_name).is_absent()
+                && !jj_cli::cli_util::has_tracked_remote_bookmarks(repo, ref_name)
+            {
+                create_bookmark(settings, repo, name, &commit).await?;
+                format!("Created bookmark {name} at {short}")
+            } else {
+                repo.set_local_bookmark_target(ref_name, RefTarget::normal(commit.id().clone()));
+                format!("Moved bookmark {name} to {short}")
+            };
             match push_remote {
                 // The push reads the bookmark's target back out of this
                 // transaction's view, so it pushes the position set above —
@@ -344,6 +351,17 @@ async fn stage_view_only(
         },
         MutationOp::Push(request) => request,
         MutationOp::DeleteBookmark { name } => {
+            // jj warns and writes no operation for a name that isn't there.
+            if repo
+                .view()
+                .get_local_bookmark(RefName::new(name))
+                .is_absent()
+            {
+                bail!(
+                    "No matching bookmarks for names: {}",
+                    jj_lib::revset::format_symbol(name)
+                );
+            }
             repo.set_local_bookmark_target(RefName::new(name), RefTarget::absent());
             return Ok((Some(format!("Deleted bookmark {name}")), None));
         }

@@ -1100,6 +1100,33 @@ fn rebase_between_inserts_into_the_gap() {
     );
 }
 
+/// `jj bookmark delete` of a name that isn't there changes nothing.
+#[test]
+fn deleting_a_missing_bookmark_is_refused() {
+    let root = scratch_repo("delete-missing-bookmark");
+    snapshot(&root);
+    let before = block_on(read_jj_op_head(repository(&root))).expect("op head");
+    let error = block_on(run_mutation(
+        repository(&root),
+        MutationOp::DeleteBookmark {
+            name: "nope".to_owned(),
+        },
+        LoadProgress::default(),
+        false,
+    ))
+    .expect_err("nothing to delete");
+    assert!(
+        error
+            .to_string()
+            .contains("No matching bookmarks for names: nope"),
+        "{error}"
+    );
+    assert_eq!(
+        block_on(read_jj_op_head(repository(&root))).expect("op head"),
+        before
+    );
+}
+
 /// `jj rebase -s`: the picked revision moves together with its descendants.
 #[test]
 fn rebase_with_descendants_moves_the_subtree() {

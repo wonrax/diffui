@@ -18,6 +18,10 @@ pub trait LowerContext {
     /// op addresses `@` the way the GUI's ops do.
     fn resolve(&self, revset: &str) -> Result<Vec<RevisionSelection>, String>;
 
+    /// Whether local bookmark `name` exists: `jj bookmark move` only moves
+    /// one that does.
+    fn has_local_bookmark(&self, name: &str) -> bool;
+
     /// `git.push`, or the only remote, or `origin`: where a `jj git push`
     /// without `--remote` goes.
     fn default_push_remote(&self) -> Option<String> {
@@ -300,6 +304,24 @@ pub fn lower(
             to: r.single(to)?,
             push_remote: None,
         },
+        MutationCommand::BookmarkMove { name, to, .. } => {
+            if !context.has_local_bookmark(&name.value) {
+                // jj's warning; it then moves nothing.
+                return Err(LowerError::Resolve {
+                    text: name.value.clone(),
+                    span: Some(name.span.clone()),
+                    message: format!(
+                        "No matching bookmarks for names: {}",
+                        jj_lib::revset::format_symbol(&name.value)
+                    ),
+                });
+            }
+            MutationOp::MoveBookmark {
+                name: name.value.clone(),
+                to: r.single(to)?,
+                push_remote: None,
+            }
+        }
         MutationCommand::BookmarkDelete { name } => MutationOp::DeleteBookmark {
             name: name.value.clone(),
         },
@@ -417,8 +439,13 @@ mod tests {
                 match revset {
                     "none()" => Ok(Vec::new()),
                     "@" => Ok(vec![RevisionSelection::WorkingCopy]),
+                    "one" => Ok(vec![commit('a')]),
                     _ => Ok(vec![commit('a'), commit('b')]),
                 }
+            }
+
+            fn has_local_bookmark(&self, name: &str) -> bool {
+                name == "main"
             }
         }
         let lower_line = |line: &str| {
@@ -447,6 +474,18 @@ mod tests {
         assert!(matches!(
             lower_line("jj git push --remote origin -c 'none()'"),
             Err(LowerError::NotSingle { count: 0, .. })
+        ));
+        // `move` never creates; `set` does.
+        let error = lower_line("jj bookmark move mian --to one").unwrap_err();
+        assert_eq!(error.to_string(), "No matching bookmarks for names: mian");
+        assert_eq!(error.span(), Some(17..21));
+        assert!(matches!(
+            lower_line("jj bookmark move main --to one"),
+            Ok(NativeAction::Mutate(MutationOp::MoveBookmark { .. }))
+        ));
+        assert!(matches!(
+            lower_line("jj bookmark set mian -r one"),
+            Ok(NativeAction::Mutate(MutationOp::MoveBookmark { .. }))
         ));
         // Several parents make a merge.
         assert!(matches!(

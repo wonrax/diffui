@@ -1053,6 +1053,9 @@ impl Diffui {
             MutationCommand::BookmarkSet {
                 allow_backwards: true,
                 ..
+            } | MutationCommand::BookmarkMove {
+                allow_backwards: true,
+                ..
             }
         );
         self.start_mutation(op, allow_backwards)

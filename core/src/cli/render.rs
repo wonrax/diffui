@@ -193,13 +193,14 @@ fn strings<const N: usize>(words: [&str; N]) -> Vec<String> {
     words.iter().map(|w| (*w).to_owned()).collect()
 }
 
-/// A bookmark name as a string pattern: plain unless it has glob
-/// characters, which `exact:` neutralises.
+/// A bookmark name as a string pattern: a symbol (quoted when it isn't a
+/// bare word) unless it has glob characters, which `exact:` neutralises.
 fn bookmark_pattern(name: &str) -> String {
-    if name.contains(['*', '?', '[', ']']) || name.contains(':') {
-        format!("exact:{name}")
+    let symbol = jj_lib::revset::format_symbol(name);
+    if name.contains(['*', '?', '[', ']']) {
+        format!("exact:{symbol}")
     } else {
-        name.to_owned()
+        symbol
     }
 }
 
@@ -328,7 +329,7 @@ impl MutationOp {
                 let set = vec![
                     "bookmark".into(),
                     "set".into(),
-                    bookmark_pattern(name),
+                    jj_lib::revset::format_symbol(name),
                     "-r".into(),
                     r.rev(to),
                 ];
@@ -358,12 +359,12 @@ impl MutationOp {
             Self::TrackBookmark { name, remote } => CliEquivalent::one(vec![
                 "bookmark".into(),
                 "track".into(),
-                format!("{name}@{remote}"),
+                jj_lib::revset::format_remote_symbol(name, remote),
             ]),
             Self::UntrackBookmark { name, remote } => CliEquivalent::one(vec![
                 "bookmark".into(),
                 "untrack".into(),
-                format!("{name}@{remote}"),
+                jj_lib::revset::format_remote_symbol(name, remote),
             ]),
             Self::PushBookmark { name, remote } => CliEquivalent::one(vec![
                 "git".into(),
@@ -383,15 +384,15 @@ impl MutationOp {
             Self::CreateBookmark { name, to } => CliEquivalent::one(vec![
                 "bookmark".into(),
                 "create".into(),
-                bookmark_pattern(name),
+                jj_lib::revset::format_symbol(name),
                 "-r".into(),
                 r.rev(to),
             ]),
             Self::RenameBookmark { old, new } => CliEquivalent::one(vec![
                 "bookmark".into(),
                 "rename".into(),
-                old.clone(),
-                new.clone(),
+                jj_lib::revset::format_symbol(old),
+                jj_lib::revset::format_symbol(new),
             ]),
             Self::ForgetBookmark { name } => CliEquivalent::one(vec![
                 "bookmark".into(),
@@ -418,7 +419,7 @@ impl MutationOp {
                             before.push(vec![
                                 "bookmark".into(),
                                 "set".into(),
-                                bookmark_pattern(name),
+                                jj_lib::revset::format_symbol(name),
                                 "-r".into(),
                                 r.rev(to),
                             ]);
@@ -716,6 +717,10 @@ mod tests {
                 }
             }
             Err(format!("Revision `{revset}` doesn't exist"))
+        }
+
+        fn has_local_bookmark(&self, name: &str) -> bool {
+            name == "main"
         }
 
         fn default_push_remote(&self) -> Option<String> {

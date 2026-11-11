@@ -223,10 +223,17 @@ pub enum MutationCommand {
         name: Spanned<String>,
         to: RevsetArg,
     },
-    /// `jj bookmark set NAME -r REVSET` and `jj bookmark move NAME --to
-    /// REVSET`. Without `allow_backwards` jj refuses a backwards or sideways
-    /// move; run [`crate::Command::BookmarkCheck`] first to honour that.
+    /// `jj bookmark set NAME -r REVSET`, which creates NAME if needed.
+    /// Without `allow_backwards` jj refuses a backwards or sideways move; run
+    /// [`crate::Command::BookmarkCheck`] first to honour that.
     BookmarkSet {
+        name: Spanned<String>,
+        to: RevsetArg,
+        allow_backwards: bool,
+    },
+    /// `jj bookmark move NAME --to REVSET`: [`Self::BookmarkSet`] for a
+    /// bookmark that already exists, never a new one.
+    BookmarkMove {
         name: Spanned<String>,
         to: RevsetArg,
         allow_backwards: bool,
