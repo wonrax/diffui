@@ -5,14 +5,14 @@
 //! a confirmation names the changes that would end up conflicted.
 
 use diffui_core::{
-    Destination, DraftSimulation, JobId, PreviewRequest, RebaseSourceMode, RevisionSelection,
+    Destination, DraftSimulation, PreviewRequest, RebaseSourceMode, RevisionSelection,
 };
 
 use crate::commands::{self, CommandArg};
 use crate::modes::Mode;
 use crate::mutations::MutationOp;
 use crate::prose::Prose;
-use crate::{ConfirmDialog, Diffui, PendingMutation, activity};
+use crate::{ConfirmDialog, Diffui, Pending, PendingMutation, activity};
 
 /// Why X's branch can't be rebased onto trunk, or `None` when it can.
 pub(crate) fn blocker(ui: &Diffui, arg: &CommandArg) -> Option<&'static str> {
@@ -71,17 +71,16 @@ impl Diffui {
             return;
         };
         let mut effects = Vec::new();
-        if let Some((previous, _)) = state.jobs.trunk_rebase.take() {
-            effects.push(diffui_core::Effect::Send(diffui_core::Command::Cancel {
-                job: previous,
-            }));
-        }
         let (job, preview) = state.session.preview(PreviewRequest::Rebase {
             mode: RebaseSourceMode::Branch,
             sources,
             destination: Destination::Onto(RevisionSelection::Commit(trunk)),
         });
-        state.jobs.trunk_rebase = Some((job, op));
+        if let Some(previous) = state.jobs.issue(job, Pending::TrunkRebase(op)) {
+            effects.push(diffui_core::Effect::Send(diffui_core::Command::Cancel {
+                job: previous,
+            }));
+        }
         effects.extend(preview);
         self.run_effects(tab, effects)
     }
@@ -91,15 +90,9 @@ impl Diffui {
     pub(crate) fn finish_trunk_preview(
         &mut self,
         tab: crate::TabId,
-        job: JobId,
+        op: MutationOp,
         simulation: Result<&DraftSimulation, String>,
     ) {
-        let Some(state) = self.tab_mut(tab) else {
-            return;
-        };
-        let Some((_, op)) = state.jobs.trunk_rebase.take_if(|(id, _)| *id == job) else {
-            return;
-        };
         let conflicts = match simulation {
             Ok(DraftSimulation::Rebase(preview)) => preview.new_conflicts.clone(),
             Ok(_) => Vec::new(),
@@ -272,18 +265,16 @@ mod tests {
             let asked = ui.active_tab_id().unwrap();
             let other = push_tab(&mut ui, "/tmp/other");
             ui.tab_mut(other).unwrap().session.capabilities.mutate = true;
-            let job = JobId::next();
             let op = rebase_op(
                 vec![RevisionSelection::Commit("f".repeat(8))],
                 "t".repeat(8),
             );
-            ui.tab_mut(asked).unwrap().jobs.trunk_rebase = Some((job, op));
             ui.active = 1;
 
-            ui.finish_trunk_preview(asked, job, Err("no forecast".to_owned()));
+            ui.finish_trunk_preview(asked, op, Err("no forecast".to_owned()));
 
-            assert!(ui.tab(asked).unwrap().jobs.mutation.is_some());
-            assert!(ui.tab(other).unwrap().jobs.mutation.is_none());
+            assert!(ui.tab(asked).unwrap().jobs.mutation().is_some());
+            assert!(ui.tab(other).unwrap().jobs.mutation().is_none());
         });
     }
 }

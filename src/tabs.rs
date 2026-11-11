@@ -798,12 +798,12 @@ pub(crate) mod tests {
                 })
             };
             describe(&mut ui, "first", cx);
-            let first_job = ui.tab_mut(tab).unwrap().jobs.mutation.as_ref().unwrap().0;
+            let first_job = ui.tab_mut(tab).unwrap().jobs.mutation().unwrap();
             describe(&mut ui, "second", cx);
 
             let state = ui.tab_mut(tab).unwrap();
             assert_eq!(
-                state.jobs.mutation.as_ref().map(|(job, _)| *job),
+                state.jobs.mutation(),
                 Some(first_job),
                 "the first mutation still owns the slot"
             );
@@ -833,11 +833,7 @@ pub(crate) mod tests {
             let state = ui.tab_mut(tab).unwrap();
             assert!(state.queued_mutations.is_empty(), "the queue drained");
             assert!(
-                state
-                    .jobs
-                    .mutation
-                    .as_ref()
-                    .is_some_and(|(job, _)| *job != first_job),
+                state.jobs.mutation().is_some_and(|job| job != first_job),
                 "the second mutation is now in flight"
             );
         });

@@ -336,10 +336,11 @@ impl Diffui {
         if self.history_event(tab, &event, cx).is_some() {
             return;
         }
-        // A job can be both the frontend's and the projection's — a mutation
-        // owns an activity row *and* a slot — so the two run in order rather
-        // than one short-circuiting the other.
-        self.take_own_job(tab, &event, cx);
+        // A mutation is both the frontend's and the projection's — it owns an
+        // activity row *and* a slot — so its event comes back for the second.
+        let Some(event) = self.take_own_job(tab, event, cx) else {
+            return;
+        };
         // Read the draft's destination off the store this event is about to
         // replace, so it can be re-found by commit id afterwards.
         let candidate = self.draft_candidate_commit(tab);
@@ -454,195 +455,195 @@ impl Diffui {
         }
     }
 
-    /// Handle the results the projection has no state to fold: previews, the
-    /// source browser, fetches, mutations and file pairs. Returns `None` when
-    /// the event isn't one of those, so the caller hands it to `Session::apply`.
-    fn take_own_job(&mut self, tab: TabId, event: &diffui_core::Event, cx: &mut Cx) -> Option<()> {
+    /// Finish a job the tab issued itself: previews, the source browser,
+    /// fetches, mutations and file pairs. Hands the event back when the
+    /// projection must see it too: when it isn't one of these, and for a
+    /// mutation, whose slot the projection also holds.
+    fn take_own_job(
+        &mut self,
+        tab: TabId,
+        event: diffui_core::Event,
+        cx: &mut Cx,
+    ) -> Option<diffui_core::Event> {
         use diffui_core::Payload;
 
-        let job = event.job()?;
-        let target = self.tab_mut(tab)?;
-        let owns = target.jobs.owns(job)
-            || target
-                .pending_detail_copy
-                .as_ref()
-                .is_some_and(|(id, ..)| *id == job);
-        if !owns {
-            return None;
-        }
-        let _: () = match &event.payload {
-            Payload::PreviewDone { simulation, .. }
-                if target
-                    .jobs
-                    .trunk_rebase
-                    .as_ref()
-                    .is_some_and(|(id, _)| *id == job) =>
-            {
-                self.finish_trunk_preview(tab, job, Ok(simulation))
-            }
-            Payload::PreviewDone {
-                simulation, graph, ..
-            } => {
-                self.tab_mut(tab)?.jobs.preview = None;
-                self.apply_draft_preview(tab, Ok((simulation.clone(), graph.clone())))
-            }
-            Payload::TreeListed {
-                revision, entries, ..
-            } => self.apply_source_tree(tab, revision.clone(), Ok(entries.clone())),
-            Payload::FileRead { path, file, .. } => {
-                self.apply_source_file(tab, path.clone(), Ok(file.clone()))
-            }
-            Payload::FetchDone { outcome, .. } => self.finish_fetch(tab, Ok(outcome.clone())),
-            Payload::MutationDone { outcome, .. } => self.finish_mutation(tab, Ok(outcome.clone())),
-            Payload::BookmarkChecked { backwards, .. } => {
-                self.apply_bookmark_check(tab, Ok(*backwards))
-            }
-            Payload::FilePairRead { old, new, .. } => {
-                self.apply_file_pair(tab, job, old.clone(), new.clone(), cx)
-            }
-            Payload::RevsetResolved { revset, result, .. }
-                if self.tab_mut(tab)?.jobs.revset_field == Some(job) =>
-            {
-                self.revset_field_resolved(tab, revset, result.clone())
-            }
-            Payload::RevsetResolved { revset, result, .. } => {
-                self.command_revset_resolved(tab, job, revset, result.clone(), cx)
-            }
-            Payload::CliOutput { lines, .. } => {
-                self.cli_output(tab, job, lines);
-            }
-            Payload::CliExited { code, .. } => {
-                self.finish_cli_run(tab, job, crate::cli_output::Exit::Code(*code))
-            }
-            Payload::DetailsLoaded { details, .. } => {
-                let field = self
-                    .tab_mut(tab)
-                    .and_then(|state| state.pending_detail_copy.take());
-                if let Some((_, field, fallback)) = field {
-                    crate::write_clipboard(format_detail(details, field).unwrap_or(fallback), cx)
-                }
-            }
-            Payload::Failed { error, .. } => self.fail_own_job(tab, job, error.clone()),
-            Payload::Cancelled { .. } => {
-                // Resolve whatever row was showing the job before releasing
-                // its slot: a cancelled fetch or mutation left "Running" spins
-                // in the log forever, and calling it "Done" would claim work
-                // that never happened.
-                let activity = self.tab_mut(tab).and_then(|state| {
-                    let jobs = &state.jobs;
-                    jobs.fetch
-                        .as_ref()
-                        .filter(|(id, ..)| *id == job)
-                        .map(|(_, activity, _)| *activity)
-                        .or_else(|| {
-                            jobs.mutation
-                                .as_ref()
-                                .filter(|(id, _)| *id == job)
-                                .map(|(_, pending)| pending.activity_id)
-                        })
-                        .or_else(|| {
-                            jobs.bookmark_check
-                                .as_ref()
-                                .filter(|(id, _)| *id == job)
-                                .map(|(_, pending)| pending.activity_id)
-                        })
-                });
-                if self.tab_mut(tab)?.jobs.cli.contains_key(&job) {
-                    return {
-                        self.finish_cli_run(tab, job, crate::cli_output::Exit::Cancelled);
-                        Some(())
-                    };
-                }
-                if let Some(activity_id) = activity
-                    && let Some(log) = self.activity_log_for(tab)
-                {
-                    log.finish(
-                        activity_id,
-                        activity::ActivityStatus::Cancelled,
-                        Some("Canceled".to_owned()),
-                    );
-                }
-                self.tab_mut(tab)?.jobs.clear(job);
-            }
-            Payload::Progress { loaded, total, .. } => {
-                let jobs = &self.tab_mut(tab)?.jobs;
-                let activity = jobs
-                    .fetch
-                    .as_ref()
-                    .filter(|(id, ..)| *id == job)
-                    .map(|(_, activity, _)| *activity)
-                    .or_else(|| {
-                        jobs.mutation
-                            .as_ref()
-                            .filter(|(id, _)| *id == job)
-                            .map(|(_, pending)| pending.activity_id)
-                    });
-                if let Some(activity) = activity
-                    && let Some(log) = self.activity_log_for(tab)
-                {
-                    log.set_progress(activity, *loaded, *total);
-                }
-            }
-            // A job this tab owns can't produce anything else.
-            _ => {}
+        let Some(job) = event.job() else {
+            return Some(event);
         };
-        Some(())
+        let Some(pending) = self.tab_mut(tab).and_then(|state| state.jobs.take(job)) else {
+            return Some(event);
+        };
+        let handed_back = matches!(pending, Pending::Mutation(_)).then(|| event.clone());
+        match event.payload {
+            Payload::Failed { error, .. } => self.fail_own_job(tab, job, pending, error, cx),
+            Payload::Cancelled { .. } => self.cancel_own_job(tab, job, pending),
+            payload => self.finish_own_job(tab, job, pending, payload, cx),
+        }
+        handed_back
     }
 
-    /// A frontend-routed job failed. Each kind has its own recovery — an
+    /// A job the tab issued answered. An answer of another shape than the job
+    /// asked for can't happen; it is dropped with the job.
+    fn finish_own_job(
+        &mut self,
+        tab: TabId,
+        job: diffui_core::JobId,
+        pending: Pending,
+        payload: diffui_core::Payload,
+        cx: &mut Cx,
+    ) {
+        use diffui_core::Payload;
+
+        match (pending, payload) {
+            (
+                Pending::Preview,
+                Payload::PreviewDone {
+                    simulation, graph, ..
+                },
+            ) => self.apply_draft_preview(tab, Ok((simulation, graph))),
+            (Pending::TrunkRebase(op), Payload::PreviewDone { simulation, .. }) => {
+                self.finish_trunk_preview(tab, op, Ok(&simulation))
+            }
+            (
+                Pending::Tree(_),
+                Payload::TreeListed {
+                    revision, entries, ..
+                },
+            ) => self.apply_source_tree(tab, revision, Ok(entries)),
+            (Pending::File(_), Payload::FileRead { path, file, .. }) => {
+                self.apply_source_file(tab, path, Ok(file))
+            }
+            (Pending::Fetch(activity, target), Payload::FetchDone { outcome, .. }) => {
+                self.finish_fetch(tab, activity, target, Ok(outcome))
+            }
+            (Pending::Mutation(pending), Payload::MutationDone { outcome, .. }) => {
+                self.finish_mutation(tab, pending, Ok(outcome))
+            }
+            (Pending::BookmarkCheck(pending), Payload::BookmarkChecked { backwards, .. }) => {
+                self.apply_bookmark_check(tab, pending, Ok(backwards))
+            }
+            (
+                Pending::FilePair(document_id, file_index),
+                Payload::FilePairRead { old, new, .. },
+            ) => self.apply_file_pair(tab, document_id, file_index, old, new, cx),
+            (Pending::CommandRevset(_), Payload::RevsetResolved { revset, result, .. }) => {
+                self.command_revset_resolved(tab, job, &revset, result, cx)
+            }
+            (Pending::RevsetField(_), Payload::RevsetResolved { revset, result, .. }) => {
+                self.revset_field_resolved(tab, &revset, result)
+            }
+            (Pending::Cli(activity), Payload::CliOutput { lines, .. }) => {
+                if let Some(state) = self.tab_mut(tab) {
+                    state.jobs.issue(job, Pending::Cli(activity));
+                }
+                self.cli_output(tab, job, &lines);
+            }
+            (Pending::Cli(activity), Payload::CliExited { code, .. }) => {
+                self.finish_cli_run(tab, job, activity, crate::cli_output::Exit::Code(code))
+            }
+            (Pending::DetailCopy(field, fallback), Payload::DetailsLoaded { details, .. }) => {
+                crate::write_clipboard(format_detail(&details, field).unwrap_or(fallback), cx)
+            }
+            // A fetch or mutation reporting how far it got: the job runs on.
+            (Pending::Fetch(activity, target), Payload::Progress { loaded, total, .. }) => {
+                if let Some(state) = self.tab_mut(tab) {
+                    state.jobs.issue(job, Pending::Fetch(activity, target));
+                }
+                if let Some(log) = self.activity_log_for(tab) {
+                    log.set_progress(activity, loaded, total);
+                }
+            }
+            (Pending::Mutation(pending), Payload::Progress { loaded, total, .. }) => {
+                let activity = pending.activity_id;
+                if let Some(state) = self.tab_mut(tab) {
+                    state.jobs.issue(job, Pending::Mutation(pending));
+                }
+                if let Some(log) = self.activity_log_for(tab) {
+                    log.set_progress(activity, loaded, total);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A job the tab issued failed. Each kind has its own recovery — an
     /// immutable rejection re-raises the confirmation, a preview just vanishes
     /// — so they can't share the projection's generic failure path.
-    fn fail_own_job(&mut self, tab: TabId, job: diffui_core::JobId, error: diffui_core::RepoError) {
-        let Some(target) = self.tab_mut(tab) else {
-            return;
-        };
-        let jobs = &mut target.jobs;
-        if jobs.trunk_rebase.as_ref().is_some_and(|(id, _)| *id == job) {
-            return self.finish_trunk_preview(tab, job, Err(error.to_string()));
-        }
-        if jobs.cli.contains_key(&job) {
-            return self.fail_cli_run(tab, job, error);
-        }
-        if jobs.cmdline.remove(&job) || jobs.revset_field.take_if(|id| *id == job).is_some() {
-            return;
-        }
-        if jobs.preview == Some(job) {
-            jobs.preview = None;
-            return self.apply_draft_preview(tab, Err(error.to_string()));
-        }
-        if jobs.tree.as_ref().is_some_and(|(id, _)| *id == job) {
-            let revision = jobs.tree.take().map(|(_, revision)| revision);
-            return if let Some(revision) = revision {
+    fn fail_own_job(
+        &mut self,
+        tab: TabId,
+        job: diffui_core::JobId,
+        pending: Pending,
+        error: diffui_core::RepoError,
+        cx: &mut Cx,
+    ) {
+        match pending {
+            Pending::Preview => self.apply_draft_preview(tab, Err(error.to_string())),
+            Pending::TrunkRebase(op) => self.finish_trunk_preview(tab, op, Err(error.to_string())),
+            Pending::Tree(revision) => {
                 self.apply_source_tree(tab, revision, Err(error.to_string()))
-            };
-        }
-        if jobs.file.as_ref().is_some_and(|(id, _)| *id == job) {
-            let path = jobs.file.take().map(|(_, path)| path);
-            return if let Some(path) = path {
-                self.apply_source_file(tab, path, Err(error.to_string()))
-            };
-        }
-        if jobs.fetch.as_ref().is_some_and(|(id, ..)| *id == job) {
-            return self.finish_fetch(tab, Err(error.to_string()));
-        }
-        if jobs
-            .bookmark_check
-            .as_ref()
-            .is_some_and(|(id, _)| *id == job)
-        {
+            }
+            Pending::File(path) => self.apply_source_file(tab, path, Err(error.to_string())),
+            Pending::Fetch(activity, target) => {
+                self.finish_fetch(tab, activity, target, Err(error.to_string()))
+            }
+            Pending::Mutation(pending) => self.finish_mutation(tab, pending, Err(error)),
             // The ancestry check failed, so we can't tell a backwards move from
             // a fast-forward; `apply_bookmark_check` refuses the move.
-            return self.apply_bookmark_check(tab, Err(error.to_string()));
+            Pending::BookmarkCheck(pending) => {
+                self.apply_bookmark_check(tab, pending, Err(error.to_string()))
+            }
+            // A file-pair read that failed leaves its file unhighlighted, but the
+            // queue must still advance — otherwise two failures wedge it at the
+            // concurrency limit and nothing else is ever highlighted.
+            Pending::FilePair(document_id, _) => self.release_file_pair(tab, document_id),
+            // Settled as a refusal, so an Enter waiting on it doesn't wait forever.
+            Pending::CommandRevset(revset) => {
+                let refused = Err(diffui_core::RevsetError::new(error.to_string()));
+                self.command_revset_resolved(tab, job, &revset, refused, cx)
+            }
+            Pending::RevsetField(revset) => {
+                let refused = Err(diffui_core::RevsetError::new(error.to_string()));
+                self.revset_field_resolved(tab, &revset, refused)
+            }
+            Pending::Cli(activity) => self.fail_cli_run(tab, job, activity, error),
+            // Copy what the graph knows instead.
+            Pending::DetailCopy(_, fallback) => crate::write_clipboard(fallback, cx),
         }
-        if jobs.mutation.as_ref().is_some_and(|(id, _)| *id == job) {
-            return self.finish_mutation(tab, Err(error));
+    }
+
+    /// A job the tab issued was cancelled: resolve whatever row was showing
+    /// it. A cancelled fetch or mutation left "Running" spins in the log
+    /// forever, and calling it "Done" would claim work that never happened.
+    fn cancel_own_job(&mut self, tab: TabId, job: diffui_core::JobId, pending: Pending) {
+        let activity = match pending {
+            Pending::Fetch(activity, _) => activity,
+            Pending::Mutation(pending) | Pending::BookmarkCheck(pending) => pending.activity_id,
+            Pending::Cli(activity) => {
+                return self.finish_cli_run(tab, job, activity, crate::cli_output::Exit::Cancelled);
+            }
+            Pending::Preview
+            | Pending::FilePair(..)
+            | Pending::TrunkRebase(_)
+            | Pending::Tree(_)
+            | Pending::File(_)
+            | Pending::CommandRevset(_)
+            | Pending::RevsetField(_)
+            | Pending::DetailCopy(..) => return,
+        };
+        if let Some(log) = self.activity_log_for(tab) {
+            log.finish(
+                activity,
+                activity::ActivityStatus::Cancelled,
+                Some("Canceled".to_owned()),
+            );
         }
-        // A file-pair read that failed leaves its file unhighlighted, but the
-        // queue must still advance — otherwise two failures wedge it at the
-        // concurrency limit and nothing else is ever highlighted.
-        if let Some((document_id, _)) = jobs.file_pairs.remove(&job) {
-            target.session.highlight_in_flight =
-                target.session.highlight_in_flight.saturating_sub(1);
+    }
+
+    /// A highlight job ended without sources: free its place in the queue.
+    fn release_file_pair(&mut self, tab: TabId, document_id: u64) {
+        if let Some(state) = self.tab_mut(tab) {
+            state.session.highlight_in_flight = state.session.highlight_in_flight.saturating_sub(1);
             self.spawn_highlights(document_id);
         }
     }
@@ -1120,7 +1121,7 @@ impl Diffui {
                     return crate::write_clipboard(fallback, cx);
                 }
                 let job = state.session.next_job();
-                state.pending_detail_copy = Some((job, field, fallback));
+                state.jobs.issue(job, Pending::DetailCopy(field, fallback));
                 self.send(tab, diffui_core::Command::RevisionDetails { job, revision })
             }
             Action::CopyFileDiff => {
@@ -2506,13 +2507,12 @@ impl Diffui {
         // A superseded simulation is cancelled rather than left to
         // finish against a candidate the user has already left.
         let mut effects = Vec::new();
-        if let Some(previous) = state.jobs.preview.take() {
+        let (job, preview) = state.session.preview(draft);
+        if let Some(previous) = state.jobs.issue(job, Pending::Preview) {
             effects.push(diffui_core::Effect::Send(diffui_core::Command::Cancel {
                 job: previous,
             }));
         }
-        let (job, preview) = state.session.preview(draft);
-        state.jobs.preview = Some(job);
         effects.extend(preview);
         self.run_effects(tab, effects)
     }
@@ -2663,10 +2663,8 @@ impl Diffui {
         };
         // A listing for a revision the browser has since left is stale.
         if source_panel::browsed_revision(&target.source) != revision {
-            target.jobs.tree = None;
             return;
         }
-        target.jobs.tree = None;
         let state = &mut target.source;
         match result {
             Ok(entries) => {
@@ -2701,7 +2699,6 @@ impl Diffui {
         let Some(target) = self.tab_mut(tab) else {
             return;
         };
-        target.jobs.file = None;
         let state = &mut target.source;
         // A selection that has since moved on drops the result.
         if state.selected.as_deref() != Some(path.as_str()) {
@@ -2736,15 +2733,13 @@ impl Diffui {
     fn apply_file_pair(
         &mut self,
         tab: TabId,
-        job: diffui_core::JobId,
+        document_id: u64,
+        file_index: usize,
         old: Option<String>,
         new: Option<String>,
         cx: &mut Cx,
     ) {
         let Some(target) = self.tab_mut(tab) else {
-            return;
-        };
-        let Some((document_id, file_index)) = target.jobs.file_pairs.remove(&job) else {
             return;
         };
         if target.session.document_id != document_id {
@@ -2775,12 +2770,13 @@ impl Diffui {
     /// ellipsized, the subtitle shows it in full). jj's first warning rides
     /// along in the summary; every line of jj's and git's output goes to the
     /// row's expanded output, warnings first.
-    fn finish_fetch(&mut self, tab: TabId, result: Result<diffui_core::FetchOutcome, String>) {
-        let Some((_, activity_id, target)) =
-            self.tab_mut(tab).and_then(|state| state.jobs.fetch.take())
-        else {
-            return;
-        };
+    fn finish_fetch(
+        &mut self,
+        tab: TabId,
+        activity_id: activity::ActivityId,
+        target: FetchTarget,
+        result: Result<diffui_core::FetchOutcome, String>,
+    ) {
         let summary = result.as_ref().ok().map(|outcome| {
             let mut summary = if !outcome.changed {
                 "Fetched \u{b7} up to date".to_owned()
@@ -2832,14 +2828,9 @@ impl Diffui {
     fn finish_mutation(
         &mut self,
         tab: TabId,
+        pending: PendingMutation,
         result: Result<mutations::MutationOutcome, diffui_core::RepoError>,
     ) {
-        let Some((_, pending)) = self
-            .tab_mut(tab)
-            .and_then(|state| state.jobs.mutation.take())
-        else {
-            return;
-        };
         let activity_id = pending.activity_id;
         let description_save = self.tab_mut(tab).is_some_and(|target| {
             target
@@ -2898,7 +2889,7 @@ impl Diffui {
         let Some(state) = self.tab_mut(tab) else {
             return;
         };
-        if state.jobs.mutation.is_some() || state.session.mutation_in_flight() {
+        if state.jobs.mutation().is_some() || state.session.mutation_in_flight() {
             return;
         }
         if let Some(next) = state.queued_mutations.pop_front() {
@@ -2908,13 +2899,12 @@ impl Diffui {
 
     /// The backwards-bookmark-move check resolved: run the move, or raise the
     /// confirmation the jj CLI's `--allow-backwards` stands for.
-    fn apply_bookmark_check(&mut self, tab: TabId, result: Result<bool, String>) {
-        let Some((_, pending)) = self
-            .tab_mut(tab)
-            .and_then(|state| state.jobs.bookmark_check.take())
-        else {
-            return;
-        };
+    fn apply_bookmark_check(
+        &mut self,
+        tab: TabId,
+        pending: PendingMutation,
+        result: Result<bool, String>,
+    ) {
         // A check that failed can't tell a backwards move from a fast-forward,
         // and running it anyway would let a backwards move-and-push rewrite
         // the remote with no confirmation. Fail closed: report, don't move.
@@ -3256,7 +3246,7 @@ impl Diffui {
         }
         let revision = source_panel::browsed_revision(&target.source);
         let job = target.session.next_job();
-        target.jobs.tree = Some((job, revision.clone()));
+        target.jobs.issue(job, Pending::Tree(revision.clone()));
         self.send(tab, diffui_core::Command::ListTree { job, revision })
     }
 
@@ -3274,7 +3264,7 @@ impl Diffui {
         target.source.loading = Some(path.clone());
         let revision = source_panel::browsed_revision(&target.source);
         let job = target.session.next_job();
-        target.jobs.file = Some((job, path.clone()));
+        target.jobs.issue(job, Pending::File(path.clone()));
         self.send(
             tab,
             diffui_core::Command::ReadFile {
@@ -3724,8 +3714,7 @@ impl Diffui {
             let job = target.session.next_job();
             target
                 .jobs
-                .file_pairs
-                .insert(job, (document_id, file_index));
+                .issue(job, Pending::FilePair(document_id, file_index));
             commands.push(diffui_core::Command::FilePair {
                 job,
                 revision: revision.clone(),
@@ -4135,7 +4124,7 @@ impl Diffui {
         // one visible, which is what the activity log shows.
         if self
             .tab_mut(tab)
-            .is_some_and(|state| state.jobs.mutation.is_some())
+            .is_some_and(|state| state.jobs.mutation().is_some())
         {
             if let Some(log) = self.activity_log_for(tab) {
                 log.set_status(pending.activity_id, activity::ActivityStatus::Queued);
@@ -4164,7 +4153,7 @@ impl Diffui {
         // The projection owns the job; the frontend keeps its twin so the
         // activity row and an immutable retry can find their way back to the op
         // that started them.
-        state.jobs.mutation = Some((job, pending));
+        state.jobs.issue(job, Pending::Mutation(pending));
         self.run_effects(tab, effects)
     }
 
@@ -4280,7 +4269,7 @@ impl Diffui {
             return;
         };
         let (job, effects) = state.session.fetch(target.clone());
-        state.jobs.fetch = Some((job, activity_id, target));
+        state.jobs.issue(job, Pending::Fetch(activity_id, target));
         self.run_effects(tab, effects)
     }
 
@@ -4721,30 +4710,54 @@ mod tests {
             let mut ui = app();
             let tab = push_tab(&mut ui, "/tmp/repo");
             let (activity_id, _) = ui.begin_activity(tab, "Move main + push", false);
-            let state = ui.tab_mut(tab).unwrap();
-            let job = state.session.next_job();
-            state.jobs.bookmark_check = Some((
-                job,
-                PendingMutation {
-                    op: mutations::MutationOp::MoveBookmark {
-                        name: "main".to_owned(),
-                        to: RevisionSelection::WorkingCopy,
-                        push_remote: Some("origin".to_owned()),
-                    },
-                    tab_id: tab,
-                    activity_id,
-                    allow_immutable: false,
+            let pending = PendingMutation {
+                op: mutations::MutationOp::MoveBookmark {
+                    name: "main".to_owned(),
+                    to: RevisionSelection::WorkingCopy,
+                    push_remote: Some("origin".to_owned()),
                 },
-            ));
+                tab_id: tab,
+                activity_id,
+                allow_immutable: false,
+            };
 
-            ui.apply_bookmark_check(tab, Err("index unavailable".to_owned()));
+            ui.apply_bookmark_check(tab, pending, Err("index unavailable".to_owned()));
 
             let state = ui.tab_mut(tab).unwrap();
-            assert!(state.jobs.bookmark_check.is_none());
-            assert!(state.jobs.mutation.is_none(), "nothing was sent");
+            assert!(state.jobs.mutation().is_none(), "nothing was sent");
             assert!(state.queued_mutations.is_empty(), "nothing was queued");
             assert!(ui.confirm().is_none());
             assert!(!ui.active().activities.any_running());
+        });
+    }
+
+    /// A detail copy whose header read failed still copies: what the graph
+    /// knows, rather than nothing.
+    #[test]
+    fn a_failed_detail_copy_copies_what_the_graph_knows() {
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            let tab = push_tab(&mut ui, "/tmp/repo");
+            let state = ui.tab_mut(tab).unwrap();
+            let job = state.session.next_job();
+            state.jobs.issue(
+                job,
+                Pending::DetailCopy(crate::DetailField::Author, "Ann <ann@x>".to_owned()),
+            );
+            let repo = ui.tabs[0].repo_id().unwrap();
+            ui.on_repo_event(
+                diffui_core::Event::new(
+                    repo,
+                    diffui_core::Payload::Failed {
+                        job,
+                        error: diffui_core::RepoError::Other("gone".to_owned()),
+                    },
+                ),
+                cx,
+            );
+            assert!(!ui.tab(tab).unwrap().jobs.owns(job));
+            let copied = cx.read_from_clipboard().and_then(|item| item.text());
+            assert_eq!(copied.as_deref(), Some("Ann <ann@x>"));
         });
     }
 
@@ -4763,15 +4776,19 @@ mod tests {
             };
 
             ui.start_mutation_on(tab, op(), false);
+            let check = |pending: &Pending| matches!(pending, Pending::BookmarkCheck(_));
             let state = ui.tab_mut(tab).unwrap();
-            assert!(state.jobs.bookmark_check.is_some());
-            assert!(state.jobs.mutation.is_none());
-            state.jobs.bookmark_check = None;
+            assert!(state.jobs.find(check).is_some());
+            assert!(state.jobs.mutation().is_none());
+            state.jobs.take_where(check);
 
             ui.start_mutation_on(tab, op(), true);
             let state = ui.tab_mut(tab).unwrap();
-            assert!(state.jobs.bookmark_check.is_none());
-            assert!(state.jobs.mutation.is_some(), "the move runs straight away");
+            assert!(state.jobs.find(check).is_none());
+            assert!(
+                state.jobs.mutation().is_some(),
+                "the move runs straight away"
+            );
         });
     }
 

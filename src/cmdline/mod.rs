@@ -673,14 +673,16 @@ impl Diffui {
         let mut tasks = Vec::new();
         if let Some(state) = self.tab_mut(tab) {
             for job in &stale {
-                state.jobs.cmdline.remove(job);
+                state.jobs.take(*job);
                 if let Some(handle) = &state.handle {
                     handle.send(diffui_core::Command::Cancel { job: *job });
                 }
             }
             for revset in missing {
                 let (job, effects) = state.session.resolve_revset(RevsetQuery::new(&revset));
-                state.jobs.cmdline.insert(job);
+                state
+                    .jobs
+                    .issue(job, crate::Pending::CommandRevset(revset.clone()));
                 sent.push((job, revset));
                 tasks.push(effects);
             }
@@ -708,9 +710,6 @@ impl Diffui {
         result: Result<RevsetMatch, RevsetError>,
         cx: &mut Cx,
     ) {
-        if let Some(state) = self.tab_mut(tab) {
-            state.jobs.cmdline.remove(&job);
-        }
         if !self.is_active(tab) {
             return;
         }
@@ -740,7 +739,7 @@ impl Diffui {
         };
         if let Some(state) = self.tab_mut(tab) {
             for (job, _) in &command.in_flight {
-                state.jobs.cmdline.remove(job);
+                state.jobs.take(*job);
                 if let Some(handle) = &state.handle {
                     handle.send(diffui_core::Command::Cancel { job: *job });
                 }

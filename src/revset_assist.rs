@@ -125,7 +125,7 @@ impl Diffui {
         }
         let (job, effects) = state.session.resolve_revset(RevsetQuery::new(&value));
         state.cmdline.field.job = Some(job);
-        state.jobs.revset_field = Some(job);
+        state.jobs.issue(job, crate::Pending::RevsetField(value));
         self.run_effects(tab, effects)
     }
 
@@ -138,7 +138,6 @@ impl Diffui {
         let Some(state) = self.tab_mut(tab) else {
             return;
         };
-        state.jobs.revset_field = None;
         state.cmdline.field.job = None;
         if state.session.revset != revset {
             return;

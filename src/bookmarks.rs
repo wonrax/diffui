@@ -973,7 +973,7 @@ mod tests {
             let held = pending(&mut ui, tab, wc_push);
             ui.run_mutation_checking_wc_push(held);
             assert!(ui.confirm().is_some());
-            assert!(ui.tab_mut(tab).unwrap().jobs.mutation.is_none());
+            assert!(ui.tab_mut(tab).unwrap().jobs.mutation().is_none());
         });
     }
 

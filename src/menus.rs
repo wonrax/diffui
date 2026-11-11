@@ -597,7 +597,7 @@ impl Diffui {
                 return;
             };
             let (job, effects) = state.session.bookmark_check(name, to);
-            state.jobs.bookmark_check = Some((job, pending));
+            state.jobs.issue(job, Pending::BookmarkCheck(pending));
             return self.run_effects(tab_id, effects);
         }
         self.run_mutation_checking_wc_push(pending)

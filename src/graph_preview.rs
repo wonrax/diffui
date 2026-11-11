@@ -119,7 +119,10 @@ impl Diffui {
             if wanted {
                 continue;
             }
-            let Some(job) = tab.jobs.preview.take() else {
+            let Some((job, _)) = tab
+                .jobs
+                .take_where(|pending| matches!(pending, crate::Pending::Preview))
+            else {
                 continue;
             };
             self.run_effects(

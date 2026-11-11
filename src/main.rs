@@ -674,8 +674,8 @@ pub(crate) struct TabState {
     pub(crate) handle: Option<RepoHandle>,
     /// Jobs this tab issued whose results it routes itself, because the
     /// projection has no state to fold them into.
-    pub(crate) jobs: PendingJobs,
-    /// Mutations waiting for [`PendingJobs::mutation`] to free up. The actor
+    pub(crate) jobs: JobTable,
+    /// Mutations waiting for [`JobTable::mutation`] to free up. The actor
     /// serializes the work; this keeps the ones behind it addressable, so each
     /// completion still finds the activity row that started it.
     pub(crate) queued_mutations: VecDeque<PendingMutation>,
@@ -738,9 +738,6 @@ pub(crate) struct TabState {
     /// `WorkingCopy` matches every tab, so a global one opened the editor on
     /// whichever tab produced the next `@` diff.
     pub(crate) pending_description_edit: Option<RevisionSelection>,
-    /// A `Copy → Author / Committer / Description` waiting on the revision
-    /// header it reads from. Per tab, like every other routed job.
-    pub(crate) pending_detail_copy: Option<(JobId, DetailField, String)>,
     /// Commit ids marked via ⌘-click / ⇧-click for a batch action (the context
     /// menu's "Abandon N revisions"), in mark order. A separate axis from
     /// `session.selected_revision` — marking never changes which diff is shown.
@@ -777,7 +774,7 @@ impl TabState {
             session: Session::unloaded(revset),
             repository,
             handle: None,
-            jobs: PendingJobs::default(),
+            jobs: JobTable::default(),
             queued_mutations: VecDeque::new(),
             default_revset,
             modes: Vec::new(),
@@ -797,7 +794,6 @@ impl TabState {
             source: SourceState::default(),
             source_tree_cache: Default::default(),
             pending_description_edit: None,
-            pending_detail_copy: None,
             revision_multi_selection: Vec::new(),
             pending_commit: false,
             changes: Default::default(),
@@ -960,74 +956,105 @@ impl Tab {
     }
 }
 
-/// The jobs a tab issued whose results it routes itself. The projection owns
-/// the graph/diff/snapshot/mutation slots; these are the ones with nowhere in
-/// the session to fold into — a preview, a source-browser read, a fetch. Each
-/// is one slot, so a superseded result is dropped by the same comparison.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct PendingJobs {
-    /// The draft simulation in flight, if any.
-    pub(crate) preview: Option<JobId>,
-    /// The source browser's tree listing, and which revision it lists.
-    pub(crate) tree: Option<(JobId, RevisionSelection)>,
-    /// The source browser's file read, and which path it reads.
-    pub(crate) file: Option<(JobId, String)>,
+/// What a tab waits on a job for, holding what it needs to finish it. The
+/// projection owns the graph/diff/snapshot/mutation slots; these are the jobs
+/// with nowhere in the session to fold into.
+#[derive(Debug, Clone)]
+pub(crate) enum Pending {
+    /// The draft simulation.
+    Preview,
+    /// The forecast a rebase onto trunk waits on, holding that rebase.
+    TrunkRebase(mutations::MutationOp),
+    /// The source browser's tree listing, of this revision.
+    Tree(RevisionSelection),
+    /// The source browser's file read, of this path.
+    File(String),
     /// A fetch, with the activity row showing it and the target it names.
-    pub(crate) fetch: Option<(JobId, activity::ActivityId, FetchTarget)>,
+    Fetch(activity::ActivityId, FetchTarget),
     /// The mutation the actor is running, with everything the frontend must
     /// remember to finish (or retry) it.
-    pub(crate) mutation: Option<(JobId, PendingMutation)>,
+    Mutation(PendingMutation),
     /// A backwards-bookmark-move check, holding the mutation it gates.
-    pub(crate) bookmark_check: Option<(JobId, PendingMutation)>,
-    /// The forecast a rebase onto trunk waits on, holding that rebase.
-    pub(crate) trunk_rebase: Option<(JobId, mutations::MutationOp)>,
-    /// Full file sources requested for background syntax highlighting, keyed
-    /// by job: `(document id, file index)`.
-    pub(crate) file_pairs: HashMap<JobId, (u64, usize)>,
-    /// The command line's revset resolutions in flight.
-    pub(crate) cmdline: HashSet<JobId>,
-    /// The revset field's check in flight.
-    pub(crate) revset_field: Option<JobId>,
-    /// Passthrough jj CLI runs, with their activity rows.
-    pub(crate) cli: HashMap<JobId, activity::ActivityId>,
+    BookmarkCheck(PendingMutation),
+    /// A file's full sources for background syntax highlighting: the
+    /// document id and the file's index in it.
+    FilePair(u64, usize),
+    /// One of the command line's revsets.
+    CommandRevset(String),
+    /// The revset field's check of this revset.
+    RevsetField(String),
+    /// A passthrough jj CLI run, with its activity row. Its output streams,
+    /// so each batch puts it back.
+    Cli(activity::ActivityId),
+    /// A `Copy → Author / Committer / Description` waiting on the revision
+    /// header, with the in-memory value to copy if that never comes.
+    DetailCopy(DetailField, String),
 }
 
-impl PendingJobs {
-    /// Whether one of these slots is waiting on `job`.
-    pub(crate) fn owns(&self, job: JobId) -> bool {
-        self.preview == Some(job)
-            || self.tree.as_ref().is_some_and(|(id, _)| *id == job)
-            || self.file.as_ref().is_some_and(|(id, _)| *id == job)
-            || self.fetch.as_ref().is_some_and(|(id, ..)| *id == job)
-            || self.mutation.as_ref().is_some_and(|(id, _)| *id == job)
-            || self
-                .bookmark_check
-                .as_ref()
-                .is_some_and(|(id, _)| *id == job)
-            || self.trunk_rebase.as_ref().is_some_and(|(id, _)| *id == job)
-            || self.file_pairs.contains_key(&job)
-            || self.cmdline.contains(&job)
-            || self.revset_field == Some(job)
-            || self.cli.contains_key(&job)
+impl Pending {
+    /// Whether the tab waits on one job of this kind at a time, so a new one
+    /// supersedes the last.
+    fn is_slot(&self) -> bool {
+        !matches!(
+            self,
+            Self::FilePair(..) | Self::CommandRevset(_) | Self::Cli(_)
+        )
+    }
+}
+
+/// The jobs a tab issued whose results it routes itself, by job.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct JobTable(HashMap<JobId, Pending>);
+
+impl JobTable {
+    /// Wait on `job` for `pending`. Returns the job this one supersedes: the
+    /// one of the same kind, for a kind held one at a time. Its result is
+    /// dropped when it lands, and the caller may cancel it.
+    pub(crate) fn issue(&mut self, job: JobId, pending: Pending) -> Option<JobId> {
+        let superseded = pending
+            .is_slot()
+            .then(|| self.find(|held| same_kind(held, &pending)))
+            .flatten();
+        if let Some(old) = superseded {
+            self.0.remove(&old);
+        }
+        self.0.insert(job, pending);
+        superseded
     }
 
-    /// Release whichever slot `job` holds — the cancelled-job path, where
-    /// there is no result to apply but the slot must not stay stuck.
-    pub(crate) fn clear(&mut self, job: JobId) {
-        if self.preview == Some(job) {
-            self.preview = None;
-        }
-        self.tree.take_if(|(id, _)| *id == job);
-        self.file.take_if(|(id, _)| *id == job);
-        self.fetch.take_if(|(id, ..)| *id == job);
-        self.mutation.take_if(|(id, _)| *id == job);
-        self.bookmark_check.take_if(|(id, _)| *id == job);
-        self.trunk_rebase.take_if(|(id, _)| *id == job);
-        self.file_pairs.remove(&job);
-        self.cmdline.remove(&job);
-        self.revset_field.take_if(|id| *id == job);
-        self.cli.remove(&job);
+    /// Stop waiting on `job`, handing back what it was for.
+    pub(crate) fn take(&mut self, job: JobId) -> Option<Pending> {
+        self.0.remove(&job)
     }
+
+    pub(crate) fn owns(&self, job: JobId) -> bool {
+        self.0.contains_key(&job)
+    }
+
+    /// A job held for something `wanted` picks.
+    pub(crate) fn find(&self, wanted: impl Fn(&Pending) -> bool) -> Option<JobId> {
+        self.0
+            .iter()
+            .find_map(|(job, pending)| wanted(pending).then_some(*job))
+    }
+
+    /// Stop waiting on whichever job `wanted` picks, handing it back.
+    pub(crate) fn take_where(
+        &mut self,
+        wanted: impl Fn(&Pending) -> bool,
+    ) -> Option<(JobId, Pending)> {
+        let job = self.find(wanted)?;
+        self.take(job).map(|pending| (job, pending))
+    }
+
+    /// The mutation the actor is running: one at a time per tab.
+    pub(crate) fn mutation(&self) -> Option<JobId> {
+        self.find(|pending| matches!(pending, Pending::Mutation(_)))
+    }
+}
+
+fn same_kind(a: &Pending, b: &Pending) -> bool {
+    std::mem::discriminant(a) == std::mem::discriminant(b)
 }
 
 /// Transient state of the open-repository path dialog.

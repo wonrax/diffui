@@ -150,7 +150,7 @@ impl Diffui {
         let Some(handle) = state.handle.clone() else {
             return;
         };
-        state.jobs.cli.insert(job, activity);
+        state.jobs.issue(job, crate::Pending::Cli(activity));
         let runs = &mut state.cmdline.runs;
         if runs.len() >= MAX_RUNS
             && let Some(oldest) = runs.iter().position(|run| run.exit.is_some())
@@ -211,11 +211,14 @@ impl Diffui {
     }
 
     /// The run ended: settle its row and its panel.
-    pub(crate) fn finish_cli_run(&mut self, tab: TabId, job: JobId, exit: Exit) {
+    pub(crate) fn finish_cli_run(
+        &mut self,
+        tab: TabId,
+        job: JobId,
+        activity: ActivityId,
+        exit: Exit,
+    ) {
         let Some(state) = self.tab_mut(tab) else {
-            return;
-        };
-        let Some(activity) = state.jobs.cli.remove(&job) else {
             return;
         };
         let Some(run) = state.cmdline.runs.iter_mut().find(|run| run.job == job) else {
@@ -254,8 +257,14 @@ impl Diffui {
         state.activities.finish(activity, status, summary);
     }
 
-    pub(crate) fn fail_cli_run(&mut self, tab: TabId, job: JobId, error: RepoError) {
-        self.finish_cli_run(tab, job, Exit::Failed(error.to_string()))
+    pub(crate) fn fail_cli_run(
+        &mut self,
+        tab: TabId,
+        job: JobId,
+        activity: ActivityId,
+        error: RepoError,
+    ) {
+        self.finish_cli_run(tab, job, activity, Exit::Failed(error.to_string()))
     }
 
     pub(crate) fn on_output_action(&mut self, action: OutputAction, cx: &mut Cx) {
