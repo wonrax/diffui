@@ -102,7 +102,7 @@ impl Diffui {
             }
         };
         if conflicts.is_empty() || !self.is_active(tab) {
-            return self.start_mutation_on(tab, op, false);
+            return self.start_mutation_on(tab, op, false, false);
         }
         let MutationOp::Rebase { sources, .. } = &op else {
             return;

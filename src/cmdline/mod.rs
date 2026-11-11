@@ -990,7 +990,11 @@ impl Diffui {
         }
         match run {
             Run::View(view) => self.run_view(view, cx),
-            Run::Native { action, command } => self.run_native(action, command, cx),
+            Run::Native {
+                action,
+                command,
+                ignore_immutable,
+            } => self.run_native(action, command, ignore_immutable, cx),
             Run::Ui { command, target } => self.run_ui(command, target, cx),
             Run::Cli { args } => self.start_cli_run(args),
         }
@@ -1048,12 +1052,21 @@ impl Diffui {
         }
     }
 
-    fn run_native(&mut self, action: NativeAction, command: MutationCommand, cx: &mut Cx) {
+    fn run_native(
+        &mut self,
+        action: NativeAction,
+        command: MutationCommand,
+        ignore_immutable: bool,
+        cx: &mut Cx,
+    ) {
         let op = match action {
             NativeAction::Fetch(target) => return self.start_fetch(target),
             NativeAction::Mutate(op) => op,
         };
-        if let Some((kind, placement)) = command.draft_kind()
+        // `--ignore-immutable` runs as typed: a draft's Enter would ask about
+        // immutable commits again.
+        if !ignore_immutable
+            && let Some((kind, placement)) = command.draft_kind()
             && self.draft_from_op(kind, placement, &op, cx).is_some()
         {
             return;
@@ -1069,7 +1082,7 @@ impl Diffui {
             }
         );
         if let Some(tab) = self.active_tab_id() {
-            self.start_mutation_on(tab, op, allow_backwards);
+            self.start_mutation_on(tab, op, allow_backwards, ignore_immutable);
         }
     }
 

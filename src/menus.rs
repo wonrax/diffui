@@ -455,7 +455,7 @@ impl Diffui {
     /// starts.
     pub(crate) fn start_mutation_op(&mut self, op: mutations::MutationOp) {
         if let Some(tab) = self.active_tab_id() {
-            self.start_mutation_on(tab, op, false);
+            self.start_mutation_on(tab, op, false, false);
         }
     }
 
@@ -463,12 +463,14 @@ impl Diffui {
     /// Every mutation entry point — context menu, target-mode confirm, drag &
     /// drop — funnels through here so labels and guards can't drift apart.
     /// `allow_backwards` is a typed `--allow-backwards`: a bookmark move then
-    /// runs without asking first.
+    /// runs without asking first. `allow_immutable` is a typed
+    /// `--ignore-immutable`: the immutable-commit guard is off.
     pub(crate) fn start_mutation_on(
         &mut self,
         tab_id: TabId,
         op: mutations::MutationOp,
         allow_backwards: bool,
+        allow_immutable: bool,
     ) {
         use mutations::MutationOp;
         let Some(tab) = self.tab(tab_id) else {
@@ -581,7 +583,7 @@ impl Diffui {
             op,
             tab_id,
             activity_id,
-            allow_immutable: false,
+            allow_immutable,
         };
         // jj CLI parity: `jj bookmark set` refuses a backwards/sideways move
         // without `--allow-backwards`. Check ancestry first — the result either

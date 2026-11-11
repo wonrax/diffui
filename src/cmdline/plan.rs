@@ -152,6 +152,7 @@ impl Diffui {
                         state: PlanState::Ready(Run::Native {
                             action,
                             command: mutation.clone(),
+                            ignore_immutable: parsed.ignore_immutable,
                         }),
                     },
                     Err(LowerError::NeedsCli(reason)) => cli_plan(Some(reason)),
@@ -231,6 +232,8 @@ pub(crate) enum Run {
     Native {
         action: NativeAction,
         command: MutationCommand,
+        /// `--ignore-immutable`: run without the immutable-commit guard.
+        ignore_immutable: bool,
     },
     Ui {
         command: UiCommand,
@@ -665,6 +668,24 @@ mod tests {
         let plan = ui.plan(&command);
         let words = plan.words.to_string();
         (plan, words)
+    }
+
+    #[test]
+    fn ignore_immutable_rides_into_the_run() {
+        let a = "a".repeat(40);
+        for (line, expected) in [
+            ("jj abandon x", false),
+            ("jj --ignore-immutable abandon x", true),
+        ] {
+            let (plan, _) = plan_for(line, &[("x", Ok(vec![&a]))]);
+            let PlanState::Ready(Run::Native {
+                ignore_immutable, ..
+            }) = plan.state
+            else {
+                panic!("{line} runs natively");
+            };
+            assert_eq!(ignore_immutable, expected, "{line}");
+        }
     }
 
     #[test]

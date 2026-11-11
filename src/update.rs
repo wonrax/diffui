@@ -4890,14 +4890,14 @@ mod tests {
                 push_remote: None,
             };
 
-            ui.start_mutation_on(tab, op(), false);
+            ui.start_mutation_on(tab, op(), false, false);
             let check = |pending: &Pending| matches!(pending, Pending::BookmarkCheck(_));
             let state = ui.tab_mut(tab).unwrap();
             assert!(state.jobs.find(check).is_some());
             assert!(state.jobs.mutation().is_none());
             state.jobs.take_where(check);
 
-            ui.start_mutation_on(tab, op(), true);
+            ui.start_mutation_on(tab, op(), true, false);
             let state = ui.tab_mut(tab).unwrap();
             assert!(state.jobs.find(check).is_none());
             assert!(
