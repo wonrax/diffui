@@ -198,6 +198,10 @@ pub(crate) struct CommandLine {
     pub(crate) insisted: bool,
     pub(crate) version: u64,
     pub(crate) resolved: HashMap<String, Resolution>,
+    /// The repository operation `resolved` answers for. jj evaluates a
+    /// revset when the command runs, so answers from before a save, fetch or
+    /// CLI run are asked again.
+    resolved_at: Option<String>,
     pub(crate) in_flight: Vec<(JobId, String)>,
     pub(crate) history: Option<HistoryWalk>,
     /// Enter came while a revset was still resolving: run once it lands.
@@ -220,6 +224,7 @@ impl CommandLine {
             insisted: false,
             version: 0,
             resolved: HashMap::new(),
+            resolved_at: None,
             in_flight: Vec::new(),
             history: None,
             run_when_ready: false,
@@ -628,17 +633,26 @@ impl Diffui {
         Self::after(SETTLE, cx, move |this, _| this.settle_command_line(version));
     }
 
-    /// Typing paused: show errors, and resolve the revsets nobody has yet.
+    /// The operation the active tab's repository is at, as far as it knows.
+    fn repository_op(&self) -> Option<String> {
+        let snapshot = self.active().session.repository_snapshot.as_ref()?;
+        Some(snapshot.fingerprint.clone())
+    }
+
+    /// Typing paused: show errors, and resolve the revsets nobody has yet
+    /// (all of them again if the repository moved since).
     pub(crate) fn settle_command_line(&mut self, version: u64) {
         let Some(tab) = self.active_tab_id() else {
             return;
         };
+        let op = self.repository_op();
         let Some(command) = self.command_line() else {
             return;
         };
         if command.version != version {
             return;
         }
+        let moved = command.resolved_at != op;
         let wanted: Vec<String> = command.slots().iter().map(|slot| slot.revset.clone()).fold(
             Vec::new(),
             |mut kept, revset| {
@@ -651,14 +665,15 @@ impl Diffui {
         let stale: Vec<JobId> = command
             .in_flight
             .iter()
-            .filter(|(_, revset)| !wanted.contains(revset))
+            .filter(|(_, revset)| moved || !wanted.contains(revset))
             .map(|(job, _)| *job)
             .collect();
         let missing: Vec<String> = wanted
             .into_iter()
             .filter(|revset| {
-                !command.resolved.contains_key(revset)
-                    && !command.in_flight.iter().any(|(_, r)| r == revset)
+                moved
+                    || (!command.resolved.contains_key(revset)
+                        && !command.in_flight.iter().any(|(_, r)| r == revset))
             })
             .collect();
         let mut sent = Vec::new();
@@ -682,6 +697,10 @@ impl Diffui {
         }
         if let Some(command) = self.command_line_mut() {
             command.settled = true;
+            if moved {
+                command.resolved.clear();
+                command.resolved_at = op;
+            }
             command.in_flight.retain(|(job, _)| !stale.contains(job));
             command.in_flight.extend(sent);
         }
@@ -933,6 +952,14 @@ impl Diffui {
         // Errors show at once on Enter, settled or not.
         let pending_settle = !command.settled;
         let version = command.version;
+        // The repository moved since the revsets resolved: ask again and run
+        // on the new answers, as jj would evaluate them now.
+        if !command.slots().is_empty() && command.resolved_at != self.repository_op() {
+            if let Some(command) = self.command_line_mut() {
+                command.run_when_ready = true;
+            }
+            return self.settle_command_line(version);
+        }
         let plan = self.plan(command);
         match plan.state {
             PlanState::Blocked { .. } => {
@@ -1360,5 +1387,57 @@ mod tests {
         assert_eq!(found[0].replace, 0..6);
         // Not with the caret mid-line.
         assert!(history_candidates("jj reb", 4, &history).is_empty());
+    }
+
+    /// A revset resolved before the repository moved is asked again, as jj
+    /// evaluates it when the command runs.
+    #[test]
+    fn resolutions_from_an_older_operation_are_asked_again() {
+        let mut ui = crate::tabs::tests::app();
+        crate::tabs::tests::push_tab(&mut ui, "/tmp/stale-revsets");
+        ui.active = 0;
+        let at = |ui: &mut Diffui, op: &str| {
+            ui.active_mut().session.repository_snapshot = Some(diffui_core::RepositorySnapshot {
+                fingerprint: op.to_owned(),
+                ..Default::default()
+            });
+        };
+        at(&mut ui, "op1");
+        let mut state = palette::PaletteState::open(&ui);
+        let column = state.top_mut().unwrap();
+        column.query = "jj abandon x".to_owned();
+        let end = column.query.len();
+        ui.refresh_command_line(column, end);
+        ui.push_mode(crate::modes::Mode::Palette(state));
+        let settle = |ui: &mut Diffui| {
+            let version = ui.command_line().unwrap().version;
+            ui.settle_command_line(version);
+            let command = ui.command_line().unwrap();
+            command
+                .in_flight
+                .iter()
+                .map(|(job, _)| *job)
+                .collect::<Vec<_>>()
+        };
+
+        let first = settle(&mut ui);
+        assert_eq!(first.len(), 1);
+        // The answer lands; the line at the same operation keeps it.
+        let command = ui.command_line_mut().unwrap();
+        command.in_flight.clear();
+        command.resolved.insert(
+            "x".to_owned(),
+            Resolution {
+                result: Ok(RevsetMatch::default()),
+                set: HashSet::new(),
+            },
+        );
+        assert!(settle(&mut ui).is_empty());
+        assert!(ui.command_line().unwrap().resolved.contains_key("x"));
+
+        // A save lands: the old answer goes and `x` is asked again.
+        at(&mut ui, "op2");
+        assert_eq!(settle(&mut ui).len(), 1);
+        assert!(ui.command_line().unwrap().resolved.is_empty());
     }
 }
