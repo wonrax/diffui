@@ -7,7 +7,9 @@ use std::ops::Range;
 
 use super::command::{MutationCommand, RevsetArg, RevsetDestination, Spanned};
 use crate::model::RevisionSelection;
-use crate::mutations::{Destination, DraftKind, MutationOp, PlacementKind, SquashTarget};
+use crate::mutations::{
+    Destination, DraftKind, MutationOp, PlacementKind, RebaseSourceMode, SquashTarget,
+};
 use crate::push::{PushRequest, PushTarget};
 use crate::repository::FetchTarget;
 
@@ -246,11 +248,22 @@ pub fn lower(
             mode,
             sources,
             destination,
-        } => MutationOp::Rebase {
-            mode: *mode,
-            sources: r.non_empty(sources)?,
-            destination: r.destination(destination)?,
-        },
+        } => {
+            let sources = r.non_empty(sources)?;
+            // jj puts every `-s` revision directly on the destination, even
+            // one inside another's subtree; diffui's op moves the set's
+            // roots and keeps a stack intact.
+            if *mode == RebaseSourceMode::WithDescendants && sources.len() > 1 {
+                return Err(LowerError::NeedsCli(
+                    "several -s revisions; diffui moves one subtree".to_owned(),
+                ));
+            }
+            MutationOp::Rebase {
+                mode: *mode,
+                sources,
+                destination: r.destination(destination)?,
+            }
+        }
         MutationCommand::Squash { from, into: None } => {
             let [from] = from.as_slice() else {
                 return Err(LowerError::NeedsCli(
@@ -474,6 +487,19 @@ mod tests {
         assert!(matches!(
             lower_line("jj git push --remote origin -c 'none()'"),
             Err(LowerError::NotSingle { count: 0, .. })
+        ));
+        // Several `-s` are jj's to place; one moves natively.
+        assert!(matches!(
+            lower_line("jj rebase -s x -o one"),
+            Err(LowerError::NeedsCli(_))
+        ));
+        assert!(matches!(
+            lower_line("jj rebase -s one -o one"),
+            Ok(NativeAction::Mutate(MutationOp::Rebase { .. }))
+        ));
+        assert!(matches!(
+            lower_line("jj rebase -r x -o one"),
+            Ok(NativeAction::Mutate(MutationOp::Rebase { .. }))
         ));
         // `move` never creates; `set` does.
         let error = lower_line("jj bookmark move mian --to one").unwrap_err();

@@ -275,7 +275,14 @@ impl MutationOp {
                     }
                 }
                 args.extend(r.destination(destination));
-                CliEquivalent::one(args)
+                let equivalent = CliEquivalent::one(args);
+                // jj puts each `-s` on the destination, so several are only
+                // this op when none is inside another's subtree.
+                if *mode == RebaseSourceMode::WithDescendants && sources.len() > 1 {
+                    equivalent.approximate()
+                } else {
+                    equivalent
+                }
             }
             Self::Squash {
                 from,
@@ -908,9 +915,14 @@ mod tests {
                     child: wc.clone(),
                 },
             ] {
+                // Several `-s` lower through the CLI (see `lower`).
+                let sources = match mode {
+                    WithDescendants => vec![c('a')],
+                    _ => vec![c('a'), c('b')],
+                };
                 ops.push(MutationOp::Rebase {
                     mode,
-                    sources: vec![c('a'), c('b')],
+                    sources,
                     destination,
                 });
             }
