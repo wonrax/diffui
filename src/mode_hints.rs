@@ -146,8 +146,8 @@ fn keys(ui: &Diffui, context: Context, commands: &[CommandId]) -> Vec<String> {
 pub(crate) fn strip(
     ui: &Diffui,
     theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
+    _window: &mut Window,
+    _cx: &mut Cx,
 ) -> Option<AnyElement> {
     let (context, hints) = active_hints(ui)?;
     let font = ui.config.ui_font;
@@ -168,11 +168,8 @@ pub(crate) fn strip(
         }
         let gesture = keys.is_empty();
         any_key |= !gesture;
-        for (index, key) in keys.into_iter().enumerate() {
-            if index > 0 {
-                line.push(Aligned::gap(theme::space::XS));
-            }
-            line.push(crate::shortcuts::keycap(ui, theme, key, window, cx));
+        if !gesture {
+            line.push(crate::ui::chord_aligned(keys, ui.config.ui_font, theme));
         }
         if !gesture {
             line.push(Aligned::gap(theme::space::SM));

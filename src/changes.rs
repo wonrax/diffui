@@ -1763,13 +1763,9 @@ pub(crate) fn action_bar(
         ));
     }
     if !selection.is_empty() {
-        let keycap = div()
-            .flex_none()
-            .px(px(5.0))
-            .rounded(px(theme::radius::XS))
-            .border_1()
-            .border_color(Color { a: 0.6, ..ink })
-            .child(typography::line("esc", font, text_size::CAPTION, faded));
+        let keycap = ui::keycap("esc", font, theme)
+            .colors(faded, theme::TRANSPARENT, Color { a: 0.6, ..ink })
+            .view();
         let clear = div()
             .id("picks-clear")
             .test_support()

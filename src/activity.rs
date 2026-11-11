@@ -675,7 +675,7 @@ pub(crate) fn activity_popover(
             );
             // Waiting work is neutral: an outline, no wash.
             let chip = match tone {
-                ui::Tone::Muted => chip.outlined(crate::overlay_kit::firm_border(theme)),
+                ui::Tone::Muted => chip.outlined(crate::theme::firm_ring(theme)),
                 _ => chip,
             };
             title.push(chip.aligned());

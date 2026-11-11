@@ -29,10 +29,6 @@ pub(crate) mod glyph {
     pub(crate) const GIT_COMMIT: &str = "\u{e0e3}"; // git-commit-horizontal
 }
 
-/// Side of a keycap: the box a single key sits in.
-pub(crate) const KEYCAP: f32 = 18.0;
-/// Gap between the keys of one chord.
-const KEYCAP_GAP: f32 = 3.0;
 /// Height of a card's footer strip of key hints.
 pub(crate) const FOOTER_HEIGHT: f32 = 36.0;
 /// Height of a group heading in a list, its label sitting on the bottom.
@@ -54,46 +50,6 @@ pub(crate) fn rich_line(font: Font, size: f32, color: Color) -> Div {
         .line_height(px(size * typography::DEFAULT_LINE_HEIGHT))
         .text_color(color)
         .whitespace_nowrap()
-}
-
-/// One key, in its own small box.
-pub(crate) fn keycap(key: impl Into<SharedString>, font: Font, theme: ThemeSpec) -> Div {
-    let font = theme::emphasis_font(font, Weight::MEDIUM);
-    div()
-        .flex_none()
-        .h(px(KEYCAP))
-        .min_w(px(KEYCAP))
-        .px(px(5.0))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(radius::XS))
-        .bg(theme.panel_background_elevated)
-        .border_1()
-        .border_color(theme::firm_ring(theme))
-        .child(typography::centered(
-            typography::line(key, font, text_size::BADGE, theme.subtle_text),
-            font,
-            text_size::BADGE,
-        ))
-}
-
-/// A chord as one keycap per key.
-pub(crate) fn keycaps<S: Into<SharedString>>(
-    keys: impl IntoIterator<Item = S>,
-    font: Font,
-    theme: ThemeSpec,
-) -> Div {
-    let mut row = div()
-        .flex()
-        .flex_row()
-        .flex_none()
-        .items_center()
-        .gap(px(KEYCAP_GAP));
-    for key in keys {
-        row = row.child(keycap(key, font, theme));
-    }
-    row
 }
 
 /// The keys of a chord as the keymap spells it (`⌘⇧K`, `Ctrl+Shift+K`), one
@@ -140,7 +96,7 @@ pub(crate) fn key_hint(
         .flex_none()
         .items_center()
         .gap(px(theme::space::SM))
-        .child(keycaps(keys.iter().copied(), font, theme))
+        .child(crate::ui::chord(keys.iter().copied(), font, theme))
         .child(typography::centered(
             typography::line(label, font, text_size::CAPTION, theme.subtle_text),
             font,

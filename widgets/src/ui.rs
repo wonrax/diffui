@@ -1028,6 +1028,109 @@ impl Tag {
     }
 }
 
+// ── Keycaps ─────────────────────────────────────────────────────────────
+
+/// Side of a keycap: the box a single key sits in.
+pub const KEYCAP: f32 = 18.0;
+/// Gap between the keys of one chord.
+pub const KEYCAP_GAP: f32 = 3.0;
+const KEYCAP_PAD_X: f32 = 5.0;
+
+/// One key in its own small box, raised a step off the card with a firm
+/// hairline. Set in the UI font, whatever surrounds it.
+pub struct Keycap {
+    key: SharedString,
+    font: Font,
+    ink: Color,
+    fill: Color,
+    edge: Color,
+}
+
+pub fn keycap(key: impl Into<SharedString>, font: Font, theme: ThemeSpec) -> Keycap {
+    Keycap {
+        key: key.into(),
+        font: theme::emphasis_font(font, Weight::MEDIUM),
+        ink: theme.subtle_text,
+        fill: theme.panel_background_elevated,
+        edge: theme::firm_ring(theme),
+    }
+}
+
+impl Keycap {
+    /// Its ink, fill and edge in place of the card's: a cap on an inverted bar.
+    pub fn colors(mut self, ink: Color, fill: Color, edge: Color) -> Self {
+        self.ink = ink;
+        self.fill = fill;
+        self.edge = edge;
+        self
+    }
+
+    fn parts(self) -> (Div, theme::Padding, Font, f32) {
+        let size = text_size::BADGE;
+        let line = typography::TextBox::default_line(self.font, size).line_height();
+        // The edge is a border, inside the cap's height.
+        let pad_y = (KEYCAP - 2.0 - line) / 2.0;
+        let padding =
+            typography::trimmed_padding([pad_y, KEYCAP_PAD_X - 1.0].into(), self.font, size);
+        let cap = padding
+            .apply(div())
+            .flex_none()
+            .flex()
+            .justify_center()
+            .min_w(px(KEYCAP))
+            .rounded(px(theme::radius::XS))
+            .bg(self.fill)
+            .border_1()
+            .border_color(self.edge)
+            .child(typography::line(self.key, self.font, size, self.ink));
+        let padding = theme::Padding {
+            top: padding.top + 1.0,
+            bottom: padding.bottom + 1.0,
+            ..padding
+        };
+        (cap, padding, self.font, size)
+    }
+
+    /// The cap on its text's baseline, for a [`typography::baseline_row`].
+    pub fn aligned(self) -> typography::Aligned {
+        let (cap, padding, font, size) = self.parts();
+        typography::Aligned::boxed(cap, padding, typography::TextBox::default_line(font, size))
+    }
+
+    /// The cap's box, for a parent that centres it.
+    pub fn view(self) -> Div {
+        self.parts().0
+    }
+}
+
+/// A chord as one keycap per key.
+pub fn chord<S: Into<SharedString>>(
+    keys: impl IntoIterator<Item = S>,
+    font: Font,
+    theme: ThemeSpec,
+) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_center()
+        .gap(px(KEYCAP_GAP))
+        .children(keys.into_iter().map(|key| keycap(key, font, theme).view()))
+}
+
+/// [`chord`] on its text's baseline.
+pub fn chord_aligned<S: Into<SharedString>>(
+    keys: impl IntoIterator<Item = S>,
+    font: Font,
+    theme: ThemeSpec,
+) -> typography::Aligned {
+    typography::group(
+        keys.into_iter()
+            .map(|key| keycap(key, font, theme).aligned()),
+        KEYCAP_GAP,
+    )
+}
+
 // ── Modals ──────────────────────────────────────────────────────────────
 
 /// A card over the scrim, hung `top` px below the window's top edge. A press

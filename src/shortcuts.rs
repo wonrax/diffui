@@ -332,8 +332,8 @@ fn binding_row(
     label: String,
     keys: Vec<String>,
     disabled: Option<commands::Reason>,
-    window: &mut Window,
-    cx: &mut Cx,
+    _window: &mut Window,
+    _cx: &mut Cx,
 ) -> AnyElement {
     let font = ui.config.ui_font;
     // The label and the mono keycaps share a baseline (see `crate::typography`). A
@@ -375,12 +375,7 @@ fn binding_row(
         } else {
             crate::overlay_kit::chord_keys(&chord)
         };
-        for (at, key) in caps.into_iter().enumerate() {
-            if at > 0 {
-                line.push(Aligned::gap(3.0));
-            }
-            line.push(keycap(ui, theme, key, window, cx));
-        }
+        line.push(ui::chord_aligned(caps, ui.config.ui_font, theme));
     }
     div()
         .flex()
@@ -391,40 +386,13 @@ fn binding_row(
         .into_any_element()
 }
 
-/// One key in its own cap, the overlays' [`crate::overlay_kit::keycap`] on a
-/// baseline: a step raised off the card, a firm hairline.
-pub(crate) fn keycap(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    key: String,
-    _window: &mut Window,
-    _cx: &mut Cx,
-) -> Aligned {
-    let font = emphasis_font(ui.config.ui_font, Weight::MEDIUM);
-    let size = text_size::BADGE;
-    Aligned::chip(
-        typography::line(key, font, size, theme.subtle_text),
-        font,
-        size,
-        [3.0, 5.0].into(),
-        move |chip| {
-            chip.min_w(px(crate::overlay_kit::KEYCAP))
-                .justify_center()
-                .bg(theme.panel_background_elevated)
-                .border_1()
-                .border_color(crate::theme::firm_ring(theme))
-                .rounded(px(theme::radius::XS))
-        },
-    )
-}
-
 /// The welcome screen's tips: the few keys and gestures that make the rest
 /// discoverable, under the open prompt. Chords come from the keymap so an override
 /// shows up here too.
 pub(crate) fn welcome_hints(
     ui: &Diffui,
     theme: ThemeSpec,
-    window: &mut Window,
+    _window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
     let font = ui.config.ui_font;
@@ -433,10 +401,10 @@ pub(crate) fn welcome_hints(
             .chord_for(Context::Base, id)
             .map(|chord| chord.display())
     };
-    let mut tip = |key: Option<String>, what: &'static str| {
+    let tip = |key: Option<String>, what: &'static str| {
         let mut line = Vec::new();
         if let Some(key) = key {
-            line.push(keycap(ui, theme, key, window, cx));
+            line.push(ui::keycap(key, ui.config.ui_font, theme).aligned());
         }
         line.push(Aligned::text(
             typography::line(what, font, text_size::BODY, theme.subtle_text),

@@ -1365,7 +1365,7 @@ fn column_footer(ui: &Diffui, theme: ThemeSpec, column: &PaletteColumn) -> AnyEl
                         .items_center()
                         .gap(px(theme::space::SM))
                         .child(crate::overlay_kit::footer_note("Type", font, theme))
-                        .child(crate::overlay_kit::keycap("jj", font, theme))
+                        .child(ui::keycap("jj", font, theme).view())
                         .child(crate::overlay_kit::footer_note(
                             "for a jj command",
                             font,
@@ -1431,7 +1431,7 @@ fn build_input(
         .child(glyph_box(
             icons::icon(icons::SEARCH, 16.0, theme.subtle_text).into_any_element(),
         ));
-    let esc = crate::overlay_kit::keycap("esc", font, theme);
+    let esc = ui::keycap("esc", font, theme).view();
     if !focused {
         // Older (left-of-center) columns are read-only previews. Only the rightmost
         // holds the input: a field's state is keyed by its id.
@@ -1846,7 +1846,7 @@ fn result_row_body(
         .gap(px(theme::space::LG))
         .child(text);
     if !keys.is_empty() {
-        row = row.child(crate::overlay_kit::keycaps(keys, font, theme));
+        row = row.child(ui::chord(keys, font, theme));
     }
     row.into_any_element()
 }

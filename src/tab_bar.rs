@@ -910,9 +910,9 @@ fn palette_hint(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> impl IntoElement 
             text_size::BODY,
             theme.subtle_text,
         ));
-    let keys = crate::overlay_kit::keycaps(
+    let keys = ui::chord(
         crate::overlay_kit::chord_keys(&chrome::cmd_label("K")),
-        ui.config.mono_font,
+        ui.config.ui_font,
         theme,
     );
     div()
@@ -1566,7 +1566,7 @@ fn open_repo_footer(
     dialog: &crate::OpenRepoDialog,
     status: Option<&crate::path_browse::Status>,
 ) -> Div {
-    use crate::overlay_kit::{Density, MODAL_FOOT, footer, footer_note, key_hint, keycap};
+    use crate::overlay_kit::{Density, MODAL_FOOT, footer, footer_note, key_hint};
     let font = ui.config.ui_font;
     let mono = ui.config.mono_font;
     let path = dialog.path.trim();
@@ -1608,9 +1608,9 @@ fn open_repo_footer(
             .child(
                 end()
                     .child(footer_note("Type", font, theme))
-                    .child(keycap("/", font, theme))
+                    .child(ui::keycap("/", font, theme).view())
                     .child(footer_note("or", font, theme))
-                    .child(keycap("~", font, theme))
+                    .child(ui::keycap("~", font, theme).view())
                     .child(footer_note("to browse, or", font, theme))
                     .child(footer_note("owner/repo#123", mono, theme)),
             );
@@ -1629,7 +1629,7 @@ fn open_repo_footer(
             .child(
                 end()
                     .child(footer_note("Hidden folders: type", font, theme))
-                    .child(keycap(".", font, theme)),
+                    .child(ui::keycap(".", font, theme).view()),
             );
     }
     strip
@@ -2020,7 +2020,7 @@ fn folder_row(
         .when(open, |end| end.child(open_chip(font, theme)))
         .when(selected, |end| {
             end.child(row_hint(hint, font, theme))
-                .child(crate::overlay_kit::keycap(key, font, theme))
+                .child(ui::keycap(key, font, theme).view())
         });
     list_row(
         ("open-repo-folder-row", index).into(),

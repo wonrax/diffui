@@ -250,7 +250,7 @@ pub(crate) fn input(
                         .h(px(line_height)),
                 ),
         )
-        .child(crate::overlay_kit::keycap("esc", font, theme))
+        .child(ui::keycap("esc", font, theme).view())
         .into_any_element()
 }
 
@@ -634,7 +634,7 @@ fn candidate_row(
         .gap(px(theme::space::LG))
         .child(text)
         .when(selected, |row| {
-            row.child(crate::overlay_kit::keycap("\u{21e5}", font, theme))
+            row.child(ui::keycap("\u{21e5}", font, theme).view())
         })
         .into_any_element()
 }
