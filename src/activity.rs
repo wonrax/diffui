@@ -24,6 +24,7 @@ use gpui_kit::{AnyElement, Div, MouseButton, Window, div, px, relative};
 use std::time::{Duration, Instant};
 
 use crate::Diffui;
+use crate::geometry::Rectangle;
 use crate::prose::Prose;
 use crate::theme::ThemeSpec;
 use diffui_core::LoadProgress;
@@ -578,8 +579,19 @@ pub(crate) fn activity_indicator(
         button.resting(theme::press_wash(theme), None)
     })
     .child(body)
+    .child(
+        gpui_kit::canvas(|bounds, _, _| INDICATOR.set(bounds.into()), |_, _, _, _| {})
+            .absolute()
+            .size_full(),
+    )
     .on_click(Diffui::on_action(Action::ToggleActivityPopover, cx))
     .into_any_element()
+}
+
+thread_local! {
+    /// The indicator's box in the window as last painted: a press on it is
+    /// the indicator's to toggle the popover, not an outside press closing it.
+    static INDICATOR: std::cell::Cell<Rectangle> = std::cell::Cell::default();
 }
 
 /// The most the indicator's running label takes before it ellipsises.
@@ -764,24 +776,37 @@ pub(crate) fn activity_popover(
                 )),
         );
 
+    // A press anywhere but the card and the indicator closes it and still does
+    // what it would have, as a macOS popover does.
+    let bounds = std::rc::Rc::new(std::cell::Cell::new(Rectangle::default()));
+    let recorded = bounds.clone();
+    let close = Diffui::on_action::<gpui_kit::MouseDownEvent>(Action::CloseActivityPopover, cx);
+    let watcher = gpui_kit::canvas(
+        move |rect, _, _| recorded.set(rect.into()),
+        move |_, _, window, _| {
+            window.on_mouse_event(move |event: &gpui_kit::MouseDownEvent, phase, window, cx| {
+                let at = crate::geometry::Point::from(event.position);
+                if phase == gpui_kit::DispatchPhase::Capture
+                    && !bounds.get().contains(at)
+                    && !INDICATOR.get().contains(at)
+                {
+                    close(event, window, cx);
+                }
+            });
+        },
+    )
+    .absolute()
+    .size_full();
     // Hang just under the toolbar, its right edge on the toolbar's own edge inset
-    // so the card lines up under the controls that opened it. `occlude` keeps the
-    // wheel and the cursor from reaching the shell underneath.
+    // so the card lines up under the controls that opened it. The card's
+    // `occlude` keeps the wheel and the cursor from reaching the shell under it.
     div()
-        .id("activity-popover")
         .absolute()
-        .inset_0()
-        .occlude()
-        .on_mouse_down(
-            MouseButton::Left,
-            Diffui::on_action(Action::ToggleActivityPopover, cx),
-        )
+        .top(px(crate::toolbar::chrome_bottom() + theme::space::XS))
+        .right(px(theme::space::MD))
         .child(
-            div()
-                .absolute()
-                .top(px(crate::toolbar::chrome_bottom() + theme::space::XS))
-                .right(px(theme::space::MD))
-                .child(card.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())),
+            card.child(watcher)
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
         )
         .into_any_element()
 }

@@ -1163,6 +1163,12 @@ pub fn modal(
         )
 }
 
+/// [`modal`] for a dialog holding typed input: a stray press on the scrim
+/// mustn't throw the typing away, so only Esc and Cancel close it.
+pub fn input_modal(id: impl Into<ElementId>, card: impl IntoElement, top: f32) -> Stateful<Div> {
+    modal(id, card, top, |_, _| {})
+}
+
 /// Every plain scroll view in the app: `content` scrolling vertically under
 /// kit's bar, which [`theme::apply_to_kit`] colours like the hand-drawn bar of
 /// the graph and the diff. Like there, the content runs under the bar: row

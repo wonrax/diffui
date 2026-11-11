@@ -319,13 +319,7 @@ pub(crate) fn build_overlay(
     }
     let card = card.buttons(buttons).build();
     // A stray click on the scrim must not cancel a push.
-    ui::modal(
-        "credential-modal",
-        card,
-        crate::toolbar::modal_top(),
-        |_, _| {},
-    )
-    .into_any_element()
+    ui::input_modal("credential-modal", card, crate::toolbar::modal_top()).into_any_element()
 }
 
 /// A host key's fingerprint in a quiet well, wrapping at any character so the

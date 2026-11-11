@@ -767,21 +767,14 @@ pub(crate) fn build_name_prompt(
     }
     let cancel_button =
         ui::cancel_button("name-prompt-cancel", ui::Size::Standard, font, theme, cx)
-            .on_click(Diffui::on_action(cancel.clone(), cx));
+            .on_click(Diffui::on_action(cancel, cx));
 
     let card = card
         .hint(&["\u{21b5}"], verb)
         .hint(&["esc"], "Cancel")
         .buttons([cancel_button.into_any_element(), accept.into_any_element()])
         .build();
-    let dismiss = Diffui::on_action(cancel, cx);
-    ui::modal(
-        "name-prompt-modal",
-        card,
-        crate::toolbar::modal_top(),
-        move |window, cx| dismiss(&(), window, cx),
-    )
-    .into_any_element()
+    ui::input_modal("name-prompt-modal", card, crate::toolbar::modal_top()).into_any_element()
 }
 
 #[cfg(test)]

@@ -1917,7 +1917,7 @@ pub(crate) fn split_modal(
             .hint(&["esc"], "Cancel")
             .buttons([cancel.into_any_element(), split.into_any_element()])
             .build();
-    ui::modal("split-modal", card, crate::toolbar::modal_top(), |_, _| {}).into_any_element()
+    ui::input_modal("split-modal", card, crate::toolbar::modal_top()).into_any_element()
 }
 
 #[cfg(test)]
