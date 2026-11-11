@@ -121,13 +121,30 @@ pub(crate) async fn diff_jj_with_repo(
     let details = jj_revision_details(repo, &commit).await;
     let old_tree = base_tree(repo, &commit, base).await?;
     let matcher = diff_matcher(repository, options)?;
+    // Renames as `jj diff` finds them: against each parent, or the `--from`
+    // revision. `jj interdiff` has none yet (a TODO in jj-cli too).
+    let copy_records = match base {
+        ResolvedBase::Parents => {
+            let head = std::slice::from_ref(commit.id());
+            copy_records(repo, commit.parent_ids(), head, matcher.as_ref()).await?
+        }
+        ResolvedBase::Tree(from) => {
+            let (from, head) = (
+                std::slice::from_ref(from),
+                std::slice::from_ref(commit.id()),
+            );
+            copy_records(repo, from, head, matcher.as_ref()).await?
+        }
+        ResolvedBase::Interdiff(_) => CopyRecords::default(),
+    };
     // A comparison shows only what differs between its two sides, like
     // `jj diff --from`, so only a diff against the parents lists conflicts.
-    let document = diff_trees(
+    let document = diff_trees_with_copies(
         repo,
         &old_tree,
         &commit.tree(),
         matcher.as_ref(),
+        &copy_records,
         options,
         *base == ResolvedBase::Parents,
     )
@@ -145,11 +162,21 @@ pub(crate) async fn diff_jj_range(
     options: &DiffOptions<'_>,
 ) -> Result<DiffDocument> {
     let matcher = diff_matcher(repository, options)?;
-    let mut document = diff_trees(
+    // `jj diff -r`'s records: every base parent against every head.
+    let ids = |hexes: &[String]| -> Result<Vec<CommitId>> {
+        hexes
+            .iter()
+            .map(|hex| CommitId::try_from_hex(hex).with_context(|| format!("bad commit id {hex}")))
+            .collect()
+    };
+    let (base, heads) = (ids(&range.info.base)?, ids(&range.info.heads)?);
+    let records = copy_records(repo, &base, &heads, matcher.as_ref()).await?;
+    let mut document = diff_trees_with_copies(
         repo,
         &range.from,
         &range.to,
         matcher.as_ref(),
+        &records,
         options,
         true,
     )
@@ -180,10 +207,30 @@ pub(super) fn conflict_merge_options() -> MergeOptions {
     }
 }
 
-/// Diff two trees into a [`DiffDocument`], within `options`' caps, and —
-/// with `surface_conflicts` — list the new side's conflicts. Shared by the
-/// revision diff and the history views' interdiffs, which compare trees that
-/// aren't a commit and its parents.
+/// The renames and copies the backend records from each of `roots` to each
+/// of `heads`, those whose target `matcher` takes (jj-cli's
+/// `get_copy_records`).
+pub(super) async fn copy_records(
+    repo: &dyn Repo,
+    roots: &[CommitId],
+    heads: &[CommitId],
+    matcher: &dyn Matcher,
+) -> Result<CopyRecords> {
+    let mut records = CopyRecords::default();
+    for root in roots {
+        for head in heads {
+            records.add_records(
+                jj_cli::diff_util::get_copy_records(repo.store(), root, head, matcher)
+                    .await
+                    .context("failed to read jj copy records")?,
+            );
+        }
+    }
+    Ok(records)
+}
+
+/// [`diff_trees_with_copies`] without renames: the history views'
+/// interdiffs, which compare trees that aren't a commit and its parents.
 pub(crate) async fn diff_trees(
     repo: &ReadonlyRepo,
     old_tree: &MergedTree,
@@ -192,9 +239,32 @@ pub(crate) async fn diff_trees(
     options: &DiffOptions<'_>,
     surface_conflicts: bool,
 ) -> Result<DiffDocument> {
+    diff_trees_with_copies(
+        repo,
+        old_tree,
+        new_tree,
+        matcher,
+        &CopyRecords::default(),
+        options,
+        surface_conflicts,
+    )
+    .await
+}
+
+/// Diff two trees into a [`DiffDocument`], within `options`' caps, a file
+/// `copy_records` names as copied or renamed shown under both its paths,
+/// and — with `surface_conflicts` — list the new side's conflicts.
+pub(crate) async fn diff_trees_with_copies(
+    repo: &ReadonlyRepo,
+    old_tree: &MergedTree,
+    new_tree: &MergedTree,
+    matcher: &dyn Matcher,
+    copy_records: &CopyRecords,
+    options: &DiffOptions<'_>,
+    surface_conflicts: bool,
+) -> Result<DiffDocument> {
     let mut budget = RowBudget::new(options.limits);
-    let copy_records = CopyRecords::default();
-    let tree_diff = old_tree.diff_stream_with_copies(new_tree, matcher, &copy_records);
+    let tree_diff = old_tree.diff_stream_with_copies(new_tree, matcher, copy_records);
     let labels = Diff::new(old_tree.labels(), new_tree.labels());
     let mut stream = materialized_diff_stream(repo.store(), tree_diff, labels);
     let materialize_options = ConflictMaterializeOptions {

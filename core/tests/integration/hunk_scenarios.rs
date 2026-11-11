@@ -10,9 +10,9 @@ use crate::harness;
 
 use diffui_core::repo::{Command, Payload};
 use diffui_core::{
-    ConflictFile, ConflictPick, ConflictResolution, Destination, DiffSelection, FileSelection,
-    HunkPick, HunkRef, LineRef, MergeToolInvocation, MutationOp, RebaseSourceMode, RepoError,
-    RevisionSelection, SquashTarget, hunk_conflict_region,
+    ConflictFile, ConflictPick, ConflictResolution, Destination, DiffFileStatus, DiffSelection,
+    FileSelection, HunkPick, HunkRef, LineRef, MergeToolInvocation, MutationOp, RebaseSourceMode,
+    RepoError, RevisionSelection, SquashTarget, hunk_conflict_region,
 };
 use harness::{TestRepo, file_at, file_at_or_absent, full_description, scratch_repo, write};
 
@@ -505,6 +505,91 @@ fn a_selection_made_against_an_older_diff_is_refused() {
         })
         .is_err()
     );
+}
+
+/// base: a.txt (20 lines) → `@` "move": a.txt renamed to moved.txt with
+/// line 2 edited, b.txt added.
+fn renamed_child(name: &str) -> TestRepo {
+    let root = scratch_repo(name);
+    let mut repo = TestRepo::open(&root);
+    write(&root, "a.txt", &numbered(&[]));
+    commit(&mut repo, "base");
+    std::fs::remove_file(root.join("a.txt")).unwrap();
+    write(&root, "moved.txt", &numbered(&[(2, "two")]));
+    write(&root, "b.txt", "bee\n");
+    describe_wc(&mut repo, "move");
+    repo
+}
+
+#[test]
+fn a_rename_shows_as_one_file_and_splits_off_whole() {
+    let mut repo = renamed_child("rename-split");
+    let document = repo.diff(RevisionSelection::WorkingCopy);
+    let files: Vec<_> = document
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), file.old_path.as_deref(), file.status))
+        .collect();
+    assert_eq!(
+        files,
+        vec![
+            ("b.txt", None, DiffFileStatus::Added),
+            ("moved.txt", Some("a.txt"), DiffFileStatus::Renamed),
+        ]
+    );
+
+    // Splitting off the renamed file takes its old path along.
+    let selection = select(
+        &mut repo,
+        &RevisionSelection::WorkingCopy,
+        &[("moved.txt", &[])],
+    );
+    repo.mutate(MutationOp::Split {
+        target: RevisionSelection::WorkingCopy,
+        selection,
+        first_description: None,
+        second_description: "rest\n".to_owned(),
+    })
+    .expect("split");
+    let first = commit_of(&mut repo, "@-");
+    assert_eq!(file_at_or_absent(&repo.root, &first, "a.txt"), "");
+    assert_eq!(
+        file_at(&repo.root, &first, "moved.txt"),
+        numbered(&[(2, "two")])
+    );
+    assert_eq!(file_at_or_absent(&repo.root, &first, "b.txt"), "");
+}
+
+#[test]
+fn restoring_a_rename_brings_the_old_path_back_and_hunks_are_refused() {
+    let mut repo = renamed_child("rename-restore");
+    let hunk = select(
+        &mut repo,
+        &RevisionSelection::WorkingCopy,
+        &[("moved.txt", &[0])],
+    );
+    let error = repo
+        .mutate(MutationOp::RestoreChanges {
+            target: RevisionSelection::WorkingCopy,
+            selection: hunk,
+        })
+        .expect_err("a hunk of a renamed file is refused");
+    assert!(error.to_string().contains("came from a.txt"), "{error}");
+
+    let whole = select(
+        &mut repo,
+        &RevisionSelection::WorkingCopy,
+        &[("moved.txt", &[])],
+    );
+    repo.mutate(MutationOp::RestoreChanges {
+        target: RevisionSelection::WorkingCopy,
+        selection: whole,
+    })
+    .expect("restore");
+    let wc = commit_of(&mut repo, "@");
+    assert_eq!(file_at(&repo.root, &wc, "a.txt"), numbered(&[]));
+    assert_eq!(file_at_or_absent(&repo.root, &wc, "moved.txt"), "");
+    assert_eq!(file_at(&repo.root, &wc, "b.txt"), "bee\n");
 }
 
 // ── Conflicts ────────────────────────────────────────────────────────────
