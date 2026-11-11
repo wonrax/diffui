@@ -1100,6 +1100,39 @@ fn rebase_between_inserts_into_the_gap() {
     );
 }
 
+/// `jj rebase -A mid -B base` with `base` below `mid`: jj refuses the loop
+/// before jj-lib sees it.
+#[test]
+fn rebase_between_refuses_a_loop() {
+    let root = scratch_repo("rebase-between-loop");
+    write(&root, "file.txt", "base\n");
+    commit(&root, "base");
+    let base = commit_id(&root, "description(exact:\"base\\n\")");
+    write(&root, "file.txt", "base\nmid\n");
+    commit(&root, "mid");
+    let mid = commit_id(&root, "description(exact:\"mid\\n\")");
+    let leaf = new_leaf(&root, std::slice::from_ref(&base), "leaf");
+
+    let error = block_on(run_mutation(
+        repository(&root),
+        MutationOp::Rebase {
+            mode: RebaseSourceMode::Revisions,
+            sources: vec![RevisionSelection::Commit(leaf)],
+            destination: Destination::Between {
+                parent: RevisionSelection::Commit(mid),
+                child: RevisionSelection::Commit(base),
+            },
+        },
+        LoadProgress::default(),
+        false,
+    ))
+    .expect_err("a loop is refused");
+    assert!(
+        error.to_string().contains("Refusing to create a loop"),
+        "{error}"
+    );
+}
+
 /// `jj bookmark delete` of a name that isn't there changes nothing.
 #[test]
 fn deleting_a_missing_bookmark_is_refused() {

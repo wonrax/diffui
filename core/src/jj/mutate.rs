@@ -1481,7 +1481,7 @@ pub(super) async fn resolve_rebase_location(
     context: &TargetContext,
     destination: &Destination,
 ) -> Result<(Vec<CommitId>, Vec<CommitId>, Commit)> {
-    Ok(match destination {
+    let (parents, children, anchor) = match destination {
         Destination::Onto(target) => {
             let anchor = resolve_mutation_target(repo, context, target).await?;
             (vec![anchor.id().clone()], Vec::new(), anchor)
@@ -1511,7 +1511,26 @@ pub(super) async fn resolve_rebase_location(
             let child = resolve_mutation_target(repo, context, child).await?;
             (vec![parent.id().clone()], vec![child.id().clone()], parent)
         }
-    })
+    };
+    // jj-cli's `ensure_no_commit_loop`: `-A x -B y` with `y` an ancestor of
+    // `x` would make the moved commits both, which jj-lib can't rewrite.
+    if !children.is_empty()
+        && let Some(id) = RevsetExpression::commits(children.clone())
+            .dag_range_to(&RevsetExpression::commits(parents.clone()))
+            .evaluate(repo)
+            .context("failed to check the destination for a loop")?
+            .stream()
+            .next()
+            .await
+    {
+        let id = id.context("failed to check the destination for a loop")?;
+        bail!(
+            "Refusing to create a loop: commit {} would be both an ancestor and a descendant of \
+             the moved commits",
+            jj_cli::cli_util::short_commit_hash(&id)
+        );
+    }
+    Ok((parents, children, anchor))
 }
 
 /// The ids in the reverse-topological order (children first) that
