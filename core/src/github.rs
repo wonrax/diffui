@@ -16,6 +16,8 @@ use jj_lib::graph::GraphEdge;
 
 use crate::diff_parse::DiffStreamParser;
 use crate::graph::assign_lanes;
+use crate::process::NETWORK_TIMEOUT;
+use crate::repo::CancelFlag;
 
 use crate::model::{
     CommitSummary, DiffDocument, DiffFile, DiffFileStatus, RevisionDetails, SignatureInfo,
@@ -183,7 +185,6 @@ impl PrSpec {
         if let Some(host) = &self.host {
             command.env("GH_HOST", host);
         }
-        command.stdin(Stdio::null());
         command
     }
 
@@ -339,19 +340,36 @@ fn gh_failure(
 }
 
 /// Run `gh` against `spec`'s host with `args` and return its stdout. `what`
-/// names the invocation in the error (e.g. "gh pr view").
-async fn run_gh(spec: &PrSpec, args: &[&str], what: &str) -> Result<Vec<u8>> {
-    let output = spec
-        .gh()
-        .args(args)
-        .output()
+/// names the invocation in the error (e.g. "gh pr view"). One request, so it
+/// gets [`NETWORK_TIMEOUT`] to answer.
+async fn run_gh(
+    spec: &PrSpec,
+    args: &[&str],
+    what: &str,
+    cancel: Option<&CancelFlag>,
+) -> Result<Vec<u8>> {
+    let output = crate::process::run(spec.gh().args(args), Some(NETWORK_TIMEOUT), cancel)
         .await
-        .map_err(gh_spawn_error)?;
+        .map_err(|error| gh_wait_error(spec, what, error))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(gh_failure(spec, what, output.status, &stderr));
     }
     Ok(output.stdout)
+}
+
+/// What to tell the user when `gh` couldn't be started, or stopped answering.
+fn gh_wait_error(spec: &PrSpec, what: &str, error: std::io::Error) -> anyhow::Error {
+    if error.kind() == std::io::ErrorKind::TimedOut {
+        anyhow::anyhow!(
+            "{what} got no answer from {} within {} seconds. Check the network (and the VPN, \
+             for an Enterprise host), then reopen the tab.",
+            spec.host_label(),
+            NETWORK_TIMEOUT.as_secs()
+        )
+    } else {
+        gh_spawn_error(error)
+    }
 }
 
 /// PR header metadata from `gh pr view`.
@@ -389,6 +407,7 @@ pub async fn fetch_pr_info(spec: &PrSpec) -> Result<PrInfo> {
             JQ,
         ],
         "gh pr view",
+        None,
     )
     .await?;
 
@@ -437,6 +456,7 @@ pub async fn fetch_pr_commits(spec: &PrSpec) -> Result<Vec<PrCommit>> {
             JQ,
         ],
         "gh pr view --json commits",
+        None,
     )
     .await?;
 
@@ -571,8 +591,9 @@ struct ApiCommitSignature {
 pub async fn load_pr_commit_diff(
     spec: &PrSpec,
     oid: &str,
+    cancel: &CancelFlag,
 ) -> Result<(DiffDocument, Option<RevisionDetails>), String> {
-    fetch_pr_commit_diff(spec, oid)
+    fetch_pr_commit_diff(spec, oid, cancel)
         .await
         .map_err(|error| format!("{error:#}"))
 }
@@ -580,6 +601,7 @@ pub async fn load_pr_commit_diff(
 async fn fetch_pr_commit_diff(
     spec: &PrSpec,
     oid: &str,
+    cancel: &CancelFlag,
 ) -> Result<(DiffDocument, Option<RevisionDetails>)> {
     let mut files = Vec::new();
     let mut details: Option<RevisionDetails> = None;
@@ -590,7 +612,7 @@ async fn fetch_pr_commit_diff(
             "repos/{}/commits/{oid}?per_page={GITHUB_API_PAGE_SIZE}&page={page}",
             spec.slug()
         );
-        let stdout = run_gh(spec, &["api", &path], "gh api commit diff").await?;
+        let stdout = run_gh(spec, &["api", &path], "gh api commit diff", Some(cancel)).await?;
         let commit: ApiCommit =
             serde_json::from_slice(&stdout).context("failed to parse the commit API response")?;
         if details.is_none() {
@@ -676,9 +698,16 @@ pub fn pr_revision_details(info: &PrInfo) -> RevisionDetails {
 /// REST files endpoint, which serves per-file patches up to GitHub's
 /// 3,000-file listing cap (the app surfaces any shortfall against
 /// `changedFiles` in the activity log).
-pub async fn stream_pr_diff(spec: &PrSpec, mut on_file: impl FnMut(DiffFile)) -> Result<()> {
+///
+/// A raised `cancel` stops the download (the `gh` child is killed) and fails
+/// the stream with an [`std::io::ErrorKind::Interrupted`] error.
+pub async fn stream_pr_diff(
+    spec: &PrSpec,
+    cancel: &CancelFlag,
+    mut on_file: impl FnMut(DiffFile),
+) -> Result<()> {
     let mut emitted = 0usize;
-    let result = stream_pr_diff_gh(spec, |file| {
+    let result = stream_pr_diff_gh(spec, cancel, |file| {
         emitted += 1;
         on_file(file);
     })
@@ -689,7 +718,7 @@ pub async fn stream_pr_diff(spec: &PrSpec, mut on_file: impl FnMut(DiffFile)) ->
         // `emitted == 0` because the 406 arrives before any diff bytes; if
         // files already streamed, rerouting would duplicate them.
         Err(error) if emitted == 0 && is_diff_too_large(&error) => {
-            stream_pr_files_api(spec, on_file).await
+            stream_pr_files_api(spec, cancel, on_file).await
         }
         other => other,
     }
@@ -720,7 +749,11 @@ struct ApiPrFile {
 
 /// Page through `GET /repos/{owner}/{repo}/pulls/{n}/files`, lowering each
 /// entry to a [`DiffFile`]. Streams page-by-page (100 files per request).
-async fn stream_pr_files_api(spec: &PrSpec, mut on_file: impl FnMut(DiffFile)) -> Result<()> {
+async fn stream_pr_files_api(
+    spec: &PrSpec,
+    cancel: &CancelFlag,
+    mut on_file: impl FnMut(DiffFile),
+) -> Result<()> {
     let mut page = 1usize;
     loop {
         let path = format!(
@@ -728,7 +761,13 @@ async fn stream_pr_files_api(spec: &PrSpec, mut on_file: impl FnMut(DiffFile)) -
             spec.slug(),
             spec.number
         );
-        let stdout = run_gh(spec, &["api", &path], "gh api pull-request files").await?;
+        let stdout = run_gh(
+            spec,
+            &["api", &path],
+            "gh api pull-request files",
+            Some(cancel),
+        )
+        .await?;
         let files: Vec<ApiPrFile> = serde_json::from_slice(&stdout)
             .context("failed to parse the pull-request files API response")?;
         // A short (or empty) page is the last one; GitHub also simply stops
@@ -792,7 +831,13 @@ fn api_file_to_diff_file(file: ApiPrFile) -> DiffFile {
 
 /// The `gh pr diff` path: one process, unified diff streamed off its stdout.
 /// Returns once the stream ends; a non-zero exit fails with captured stderr.
-async fn stream_pr_diff_gh(spec: &PrSpec, mut on_file: impl FnMut(DiffFile)) -> Result<()> {
+/// A stream that sends nothing for [`NETWORK_TIMEOUT`], or whose `cancel` is
+/// raised, fails, and dropping the child kills it.
+async fn stream_pr_diff_gh(
+    spec: &PrSpec,
+    cancel: &CancelFlag,
+    mut on_file: impl FnMut(DiffFile),
+) -> Result<()> {
     let mut child = spec
         .gh()
         .args([
@@ -802,6 +847,8 @@ async fn stream_pr_diff_gh(spec: &PrSpec, mut on_file: impl FnMut(DiffFile)) -> 
             "--repo",
             &spec.repo_arg(),
         ])
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -823,10 +870,11 @@ async fn stream_pr_diff_gh(spec: &PrSpec, mut on_file: impl FnMut(DiffFile)) -> 
     // latin-1 file. The trailing `\r` is dropped the way `str::lines` does it,
     // so a CRLF diff parses like any other.
     let mut lines = BufReader::with_capacity(256 * 1024, stdout).split(b'\n');
-    while let Some(raw) = lines
-        .next_segment()
-        .await
-        .context("failed to read gh pr diff output")?
+    while let Some(raw) =
+        crate::process::bounded(lines.next_segment(), Some(NETWORK_TIMEOUT), Some(cancel))
+            .await
+            .map_err(|error| gh_wait_error(spec, "gh pr diff", error))?
+            .context("failed to read gh pr diff output")?
     {
         let raw = raw.strip_suffix(b"\r").unwrap_or(&raw);
         if let Some(file) = parser.push_line(&String::from_utf8_lossy(raw)) {

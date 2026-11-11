@@ -3,7 +3,6 @@ use std::{
     ffi::OsString,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
-    process::Stdio,
 };
 
 use anyhow::{Context, Result, bail};
@@ -469,9 +468,30 @@ pub async fn fetch_git(repository: &Repository, target: &FetchTarget) -> Result<
         ],
     };
     let askpass = crate::askpass::Scope::new();
-    run_command_lines(&repository.root, "git", args, askpass.environment())
+    let mut env = askpass.environment();
+    env.extend(stall_limit_env());
+    run_command_lines(&repository.root, "git", args, env)
         .await
         .map_err(|error| askpass.explain(error))
+}
+
+/// The longest a `git fetch` may run before it's killed. Generous, because a
+/// first fetch of a big repository is legitimately slow; a transfer that
+/// stalls is caught much sooner by [`stall_limit_env`].
+const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// git's own stall detection for HTTP remotes: abort a transfer that moves
+/// less than 1 KB/s for a minute (`http.lowSpeedLimit` / `lowSpeedTime`).
+/// Left alone when the environment already sets either. SSH remotes have no
+/// equivalent short of overriding the user's ssh command, so they rely on
+/// [`FETCH_TIMEOUT`] alone.
+pub(crate) fn stall_limit_env() -> Vec<(OsString, OsString)> {
+    const LIMIT: &str = "GIT_HTTP_LOW_SPEED_LIMIT";
+    const TIME: &str = "GIT_HTTP_LOW_SPEED_TIME";
+    if std::env::var_os(LIMIT).is_some() || std::env::var_os(TIME).is_some() {
+        return Vec::new();
+    }
+    vec![(LIMIT.into(), "1000".into()), (TIME.into(), "60".into())]
 }
 
 /// Run a command and return its combined stdout+stderr split into non-empty
@@ -484,14 +504,16 @@ async fn run_command_lines(
     args: Vec<OsString>,
     env: std::collections::HashMap<OsString, OsString>,
 ) -> Result<Vec<String>> {
-    let output = Command::new(program)
-        .args(args)
-        .envs(env)
-        .current_dir(current_dir)
-        .stdin(Stdio::null())
-        .output()
-        .await
-        .with_context(|| format!("failed to execute {program}"))?;
+    let output = crate::process::run(
+        Command::new(program)
+            .args(args)
+            .envs(env)
+            .current_dir(current_dir),
+        Some(FETCH_TIMEOUT),
+        None,
+    )
+    .await
+    .with_context(|| format!("failed to execute {program}"))?;
 
     let mut lines = Vec::new();
     for chunk in [&output.stdout, &output.stderr] {
@@ -518,13 +540,13 @@ async fn run_command_bytes(
     program: &str,
     args: Vec<OsString>,
 ) -> Result<Vec<u8>> {
-    let output = Command::new(program)
-        .args(args)
-        .current_dir(current_dir)
-        .stdin(Stdio::null())
-        .output()
-        .await
-        .with_context(|| format!("failed to execute {program}"))?;
+    let output = crate::process::run(
+        Command::new(program).args(args).current_dir(current_dir),
+        None,
+        None,
+    )
+    .await
+    .with_context(|| format!("failed to execute {program}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

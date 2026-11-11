@@ -220,6 +220,9 @@ async fn fetch_locked(
         let askpass = crate::askpass::Scope::new();
         let mut subprocess_options = git_settings.to_subprocess_options();
         subprocess_options.environment.extend(askpass.environment());
+        subprocess_options
+            .environment
+            .extend(crate::git::stall_limit_env());
         let mut fetcher = GitFetch::new(tx.repo_mut(), subprocess_options, &import_options)
             .context("failed to start git fetch")?;
         let mut callback = CollectingCallback::new(progress.clone());
