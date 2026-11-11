@@ -461,7 +461,12 @@ pub(crate) async fn diff_trees_with_copies(
             file.deletions = deletions;
             file.collapsed = Some(reason);
         } else {
-            let hunks = large_diff::hunks(before_bytes, after_bytes, 3, budget.limits());
+            let hunks = large_diff::hunks(
+                before_bytes,
+                after_bytes,
+                crate::partial::HUNK_CONTEXT,
+                budget.limits(),
+            );
             for hunk in hunks {
                 let mut rows = Vec::new();
                 let mut old_line = hunk.left_line_range.start + 1;
