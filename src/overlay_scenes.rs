@@ -330,6 +330,19 @@ fn activity_popover() {
     h.shot(LANE, "activity-popover");
 }
 
+/// A press outside the popover closes it and still lands, as a macOS
+/// popover's does; one on the card keeps it open.
+#[test]
+fn a_press_outside_the_activity_popover_closes_it() {
+    let mut h = app();
+    logged(&mut h);
+    h.perform(Action::ToggleActivityPopover);
+    h.settle();
+    h.click_point(at(180.0, 240.0));
+    h.settle();
+    assert!(!h.read(|ui| ui.activity_popover_open()));
+}
+
 #[test]
 fn activity_popover_dark() {
     let mut h = app();
