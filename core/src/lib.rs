@@ -64,7 +64,7 @@ pub use revset::{
     RevsetCompleter, RevsetError, RevsetExpect, RevsetMatch, RevsetQuery, RevsetSymbols,
 };
 pub use session::{
-    ColdBatchFold, ColdCursor, DiffSpan, Effect, LoadStatus, RefreshOrigin, Session,
+    ColdBatchFold, ColdCursor, DiffSpan, Effect, LoadStatus, RefreshMode, RefreshOrigin, Session,
     coalesce_refresh, fold_cold_batch,
 };
 pub use source_browse::{

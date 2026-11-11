@@ -1086,6 +1086,7 @@ impl Diffui {
                 self.selected_theme = theme;
                 self.apply_theme(cx);
             }
+            Action::SetRefreshMode(mode) => self.config.refresh = mode,
             Action::SetMainView(mode) => self.set_main_view(mode, cx),
 
             // ── Tabs ────────────────────────────────────────────────────

@@ -46,6 +46,18 @@ pub struct CachedDiff {
 /// Files with more diff rows than this are left uncoloured.
 pub const HIGHLIGHT_MAX_ROWS: usize = 10_000;
 
+/// How a repository keeps up with the disk. `Auto` folds every edit into `@`
+/// as it lands and brings a stale checkout up to date on its own; `Manual`
+/// writes nothing in the background, only noticing that the disk has edits
+/// `@` doesn't hold or that the checkout went stale, and leaves both to the
+/// refresh button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RefreshMode {
+    #[default]
+    Auto,
+    Manual,
+}
+
 /// What triggered a repository refresh — decides how much we reload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefreshOrigin {

@@ -143,6 +143,8 @@ pub(crate) enum Action {
     /// Collapse or restore the changed-files pane.
     ToggleFilesPanel,
     SetTheme(ThemePreference),
+    /// Keep up with the disk on its own, or only when Refresh is pressed.
+    SetRefreshMode(diffui_core::RefreshMode),
     SetMainView(MainView),
 
     // ── Tabs ────────────────────────────────────────────────────────────

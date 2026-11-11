@@ -440,6 +440,7 @@ pub(crate) mod tests {
                 multi_click_ms: 350,
                 theme: ThemePreference::System,
                 code_type: CodeTypography::default(),
+                refresh: diffui_core::RefreshMode::Auto,
             },
             keymap: Keymap::build(&Default::default()).0,
             modes: Vec::new(),

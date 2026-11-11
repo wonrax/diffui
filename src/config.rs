@@ -18,6 +18,10 @@
 //!                          of `code_font_size`. Defaults to 1.85.
 //!   code_baseline_offset — px nudge of code text within its row; positive
 //!                          moves it down. Defaults to 0.
+//!   refresh              — Auto | Manual. Auto folds edits into `@` as they
+//!                          land and updates a stale checkout on its own;
+//!                          Manual leaves both to the Refresh button, which
+//!                          shows when either is due. Defaults to Auto.
 //!
 //! Keyboard bindings live in a `[keys]` section; see [`crate::keymap`] for the
 //! chord syntax and the per-context tables. Example:
@@ -56,6 +60,7 @@
 //! control today.
 
 use crate::theme::Font;
+use diffui_core::RefreshMode;
 use serde::Deserialize;
 use std::{env, path::PathBuf, sync::OnceLock};
 
@@ -70,6 +75,7 @@ pub struct AppConfig {
     pub multi_click_ms: u64,
     pub theme: ThemePreference,
     pub code_type: CodeTypography,
+    pub refresh: RefreshMode,
 }
 
 impl AppConfig {
@@ -104,6 +110,11 @@ impl AppConfig {
                 .as_deref()
                 .and_then(theme_from_name)
                 .unwrap_or(ThemePreference::System),
+            refresh: raw
+                .refresh
+                .as_deref()
+                .and_then(refresh_from_name)
+                .unwrap_or_default(),
             // Clamped to keep a fat-fingered config renderable rather than
             // degenerate (zero-height rows, text nudged out of its row).
             code_type: CodeTypography {
@@ -155,6 +166,7 @@ struct RawConfig {
     code_font_size: Option<f32>,
     code_line_height: Option<f32>,
     code_baseline_offset: Option<f32>,
+    refresh: Option<String>,
     #[serde(default)]
     keys: RawKeys,
     revset_presets: Option<Vec<RevsetPreset>>,
@@ -169,6 +181,16 @@ fn theme_from_name(name: &str) -> Option<ThemePreference> {
         "light" => Some(ThemePreference::Light),
         "dark" => Some(ThemePreference::Dark),
         "contrast" | "highcontrast" | "high-contrast" => Some(ThemePreference::HighContrast),
+        _ => None,
+    }
+}
+
+/// Parse a config `refresh` value, case-insensitively. Unknown values fall
+/// back to `Auto` (via the `None` the caller unwraps).
+fn refresh_from_name(name: &str) -> Option<RefreshMode> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "auto" => Some(RefreshMode::Auto),
+        "manual" => Some(RefreshMode::Manual),
         _ => None,
     }
 }
