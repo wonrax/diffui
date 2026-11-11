@@ -265,12 +265,9 @@ impl Diffui {
     /// allowances; otherwise it's an error with the list.
     pub(crate) fn push_rejected(&mut self, pending: PendingMutation, rejection: PushRejection) {
         if rejection.is_confirmation() {
-            if let Some(log) = self.activity_log_for(pending.tab_id) {
-                log.set_status(pending.activity_id, activity::ActivityStatus::Queued);
-            }
             let mut request = rejection.request;
             request.confirm = false;
-            self.push_mode(Mode::Confirm(ConfirmDialog {
+            self.ask(ConfirmDialog {
                 title: push_title(&rejection.moves, &request.remote),
                 body: push_explanation(&rejection.moves, &request.remote),
                 confirm_label: "Push".to_owned(),
@@ -283,7 +280,7 @@ impl Diffui {
                     op: MutationOp::Push(request),
                     ..pending
                 },
-            }));
+            });
             return;
         }
         let lines = rejection.lines();
@@ -296,7 +293,6 @@ impl Diffui {
         };
         if let Some(log) = self.activity_log_for(pending.tab_id) {
             log.extend_output(pending.activity_id, lines);
-            log.set_status(pending.activity_id, activity::ActivityStatus::Queued);
         }
         let count = rejection.commits.len();
         let commits = if count == 1 && !rejection.truncated {
@@ -343,7 +339,7 @@ impl Diffui {
         let mut request = rejection.request;
         request.allow = allow;
         request.confirm = false;
-        self.push_mode(Mode::Confirm(ConfirmDialog {
+        self.ask(ConfirmDialog {
             title: Prose::from("Push to ")
                 .remote(&request.remote)
                 .text(" anyway?"),
@@ -358,7 +354,7 @@ impl Diffui {
                 op: MutationOp::Push(request),
                 ..pending
             },
-        }));
+        });
     }
 
     fn finish_mutation_error(&mut self, pending: PendingMutation, error: String) {
@@ -393,10 +389,7 @@ impl Diffui {
         if !publishes {
             return self.run_mutation(pending);
         }
-        if let Some(log) = self.activity_log_for(pending.tab_id) {
-            log.set_status(pending.activity_id, activity::ActivityStatus::Queued);
-        }
-        self.push_mode(Mode::Confirm(ConfirmDialog {
+        self.ask(ConfirmDialog {
             title: Prose::from("Push the working-copy commit?"),
             body: Prose::from("This puts ")
                 .rev("@")
@@ -411,7 +404,7 @@ impl Diffui {
                 )],
             },
             pending,
-        }));
+        });
     }
 
     // ── Revision context menu ───────────────────────────────────────────

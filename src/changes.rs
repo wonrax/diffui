@@ -30,9 +30,7 @@ use crate::prose::Prose;
 use crate::theme::{self, Color, Font, ThemeSpec, Weight, text_size};
 use crate::typography::{self, Aligned};
 use crate::ui::Tip as _;
-use crate::{
-    Action, ConfirmDialog, Cx, Diffui, MainView, PendingMutation, TabState, activity, icons, ui,
-};
+use crate::{Action, ConfirmDialog, Cx, Diffui, MainView, TabState, icons, ui};
 
 /// A change-selection intent or event.
 #[derive(Debug, Clone)]
@@ -1392,33 +1390,26 @@ impl Diffui {
             return;
         };
         let label = revision_label(self.active(), &revision);
-        let (activity_id, _) = self.begin_activity(
+        let title = Prose::from("Discard ")
+            .then(selection_prose(&selection))
+            .text("?");
+        let pending = self.begin_mutation(
             tab_id,
             Prose::from("Discard ").then(selection_prose(&selection)),
-            false,
+            MutationOp::RestoreChanges {
+                target: revision,
+                selection,
+            },
         );
-        if let Some(log) = self.activity_log_for(tab_id) {
-            log.set_status(activity_id, activity::ActivityStatus::Queued);
-        }
-        self.push_mode(crate::modes::Mode::Confirm(ConfirmDialog {
-            title: Prose::from("Discard ")
-                .then(selection_prose(&selection))
-                .text("?"),
+        self.ask(ConfirmDialog {
+            title,
             body: Prose::from("The changes leave ")
                 .rev(label)
                 .text(". Undo brings them back."),
             confirm_label: "Discard".to_owned(),
             look: Default::default(),
-            pending: PendingMutation {
-                op: MutationOp::RestoreChanges {
-                    target: revision,
-                    selection,
-                },
-                tab_id,
-                activity_id,
-                allow_immutable: false,
-            },
-        }));
+            pending,
+        });
     }
 
     /// The picks' "more" menu: what the bar has no room for.

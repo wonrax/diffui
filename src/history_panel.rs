@@ -44,10 +44,7 @@ use crate::theme::{
     text_size,
 };
 use crate::typography::{self, Aligned};
-use crate::{
-    Action, ConfirmDialog, Diffui, MainView, PendingMutation, TabId, activity, icons, meta_line,
-    modes::Mode, ui,
-};
+use crate::{Action, ConfirmDialog, Diffui, MainView, TabId, icons, meta_line, ui};
 
 /// Operations read per page of the op log.
 const OP_LOG_PAGE: usize = 300;
@@ -548,22 +545,15 @@ impl Diffui {
                 },
             )
         };
-        let (activity_id, _) = self.begin_activity(tab, label, false);
-        if let Some(log) = self.activity_log_for(tab) {
-            log.set_status(activity_id, activity::ActivityStatus::Queued);
-        }
-        self.push_mode(Mode::Confirm(ConfirmDialog {
+        let mut pending = self.begin_mutation(tab, label, op);
+        pending.allow_immutable = is_push;
+        self.ask(ConfirmDialog {
             title,
             body,
             confirm_label: confirm_label.to_owned(),
             look: Default::default(),
-            pending: PendingMutation {
-                op,
-                tab_id: tab,
-                activity_id,
-                allow_immutable: is_push,
-            },
-        }));
+            pending,
+        });
     }
 
     fn show_file_history(&mut self, revision: RevisionSelection, path: String, cx: &mut Cx) {

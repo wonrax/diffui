@@ -2999,13 +2999,13 @@ impl Diffui {
                 .text(" ")
                 .then(crate::bookmarks::working_copy_push_warning());
         }
-        self.push_mode(Mode::Confirm(ConfirmDialog {
+        self.ask(ConfirmDialog {
             title,
             body,
             confirm_label,
             look: Default::default(),
             pending,
-        }));
+        });
     }
 
     /// Record an operation's result on `tab`'s log, toasting a failure so it is
@@ -4160,6 +4160,37 @@ impl Diffui {
         self.run_effects(tab, effects)
     }
 
+    /// Open `label`'s activity row on `tab` for `op`, which a confirmation
+    /// will hold before it runs.
+    pub(crate) fn begin_mutation(
+        &mut self,
+        tab: TabId,
+        label: impl Into<Prose>,
+        op: mutations::MutationOp,
+    ) -> PendingMutation {
+        let (activity_id, _) = self.begin_activity(tab, label, false);
+        PendingMutation {
+            op,
+            tab_id: tab,
+            activity_id,
+            allow_immutable: false,
+        }
+    }
+
+    /// Hold `dialog`'s mutation behind it. Its row waits as queued meanwhile:
+    /// accepting runs it, cancelling resolves the row. Stacking rather than
+    /// replacing: a second guarded mutation raised while a dialog is open (a
+    /// background tab's op being refused) waits under it and surfaces when
+    /// that one resolves, instead of taking over the buttons the user was
+    /// about to press.
+    pub(crate) fn ask(&mut self, dialog: ConfirmDialog) {
+        let pending = &dialog.pending;
+        if let Some(log) = self.activity_log_for(pending.tab_id) {
+            log.set_status(pending.activity_id, activity::ActivityStatus::Queued);
+        }
+        self.push_mode(Mode::Confirm(dialog));
+    }
+
     /// Park `pending` behind the immutable-rewrite confirmation dialog, its
     /// override armed for the accept. `after_rejection` marks the fallback
     /// path — the backend already refused once (a computed-set member was
@@ -4171,11 +4202,6 @@ impl Diffui {
         after_rejection: bool,
     ) {
         use mutations::MutationOp;
-        // Hold the activity visibly while the dialog decides; cancel resolves
-        // it (ConfirmCancel), accept re-dispatches it.
-        if let Some(log) = self.activity_log_for(pending.tab_id) {
-            log.set_status(pending.activity_id, activity::ActivityStatus::Queued);
-        }
         pending.allow_immutable = true;
 
         let (verb, confirm_label) = match &pending.op {
@@ -4209,34 +4235,27 @@ impl Diffui {
         if matches!(pending.op, MutationOp::Edit { .. }) {
             body = body.text(" Your edits go into a new change on top of it.");
         }
-        // Stacking rather than replacing: a second guarded mutation raised
-        // while a dialog is open (a background tab's op being refused) waits
-        // under it and surfaces when that one resolves, instead of silently
-        // taking over the buttons the user was about to press.
-        self.push_mode(Mode::Confirm(ConfirmDialog {
+        self.ask(ConfirmDialog {
             title: format!("{verb} immutable {noun}?").into(),
             body,
             confirm_label: confirm_label.to_owned(),
             look: Default::default(),
             pending,
-        }));
+        });
     }
 
     /// The actor refused to undo a push until the user says so. Undoing one
     /// rolls back only this repository's record of the remote; the remote
     /// keeps the commits, which is what the copy has to say.
     fn confirm_push_undo(&mut self, mut pending: PendingMutation, summary: &str) {
-        if let Some(log) = self.activity_log_for(pending.tab_id) {
-            log.set_status(pending.activity_id, activity::ActivityStatus::Queued);
-        }
         pending.allow_immutable = true;
-        self.push_mode(Mode::Confirm(ConfirmDialog {
+        self.ask(ConfirmDialog {
             title: "Undo a push?".into(),
             body: push_undo_body(summary),
             confirm_label: "Undo anyway".to_owned(),
             look: Default::default(),
             pending,
-        }));
+        });
     }
 
     /// The activity log for `tab_id`, or `None` if the tab has since closed.

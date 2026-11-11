@@ -9,10 +9,9 @@ use diffui_core::{
 };
 
 use crate::commands::{self, CommandArg};
-use crate::modes::Mode;
 use crate::mutations::MutationOp;
 use crate::prose::Prose;
-use crate::{ConfirmDialog, Diffui, Pending, PendingMutation, activity};
+use crate::{ConfirmDialog, Diffui, Pending};
 
 /// Why X's branch can't be rebased onto trunk, or `None` when it can.
 pub(crate) fn blocker(ui: &Diffui, arg: &CommandArg) -> Option<&'static str> {
@@ -132,22 +131,14 @@ impl Diffui {
             body = body.text(" conflicted");
         }
         body = body.text(". Undo takes it back.");
-        let (activity_id, _) = self.begin_activity(tab, "Rebase onto trunk", false);
-        if let Some(log) = self.activity_log_for(tab) {
-            log.set_status(activity_id, activity::ActivityStatus::Queued);
-        }
-        self.push_mode(Mode::Confirm(ConfirmDialog {
+        let pending = self.begin_mutation(tab, "Rebase onto trunk", op);
+        self.ask(ConfirmDialog {
             title,
             body,
             confirm_label: "Rebase".to_owned(),
             look: Default::default(),
-            pending: PendingMutation {
-                op,
-                tab_id: tab,
-                activity_id,
-                allow_immutable: false,
-            },
-        }));
+            pending,
+        });
     }
 }
 

@@ -634,23 +634,14 @@ impl Diffui {
                  Undo brings them back.",
             ),
         };
-        let body = Prose::from(body);
-        let (activity_id, _) = self.begin_activity(tab_id, label, false);
-        if let Some(log) = self.activity_log_for(tab_id) {
-            log.set_status(activity_id, activity::ActivityStatus::Queued);
-        }
-        self.push_mode(Mode::Confirm(ConfirmDialog {
+        let pending = self.begin_mutation(tab_id, label, op);
+        self.ask(ConfirmDialog {
             title,
-            body,
+            body: Prose::from(body),
             confirm_label: "Abandon".to_owned(),
             look: Default::default(),
-            pending: PendingMutation {
-                op,
-                tab_id,
-                activity_id,
-                allow_immutable: false,
-            },
-        }));
+            pending,
+        });
     }
 
     /// Context-menu tree for a file-tree row (`display_index` into the
