@@ -605,6 +605,67 @@ fn tracked_push_sends_tracked_bookmarks_that_moved() {
     assert!(bookmarks(&mut repo).tracked_push.is_empty());
 }
 
+/// `jj git push` with no targets carries tracked tags pointing into the
+/// default range along with the bookmarks; an untracked tag stays home.
+#[test]
+fn tracked_push_sends_tracked_tags_too() {
+    let Some((mut repo, remote)) = setup("push-tracked-tags") else {
+        return;
+    };
+    let first = commit(&mut repo, "a.txt", "first");
+    repo.mutate(MutationOp::CreateBookmark {
+        name: "main".to_owned(),
+        to: at(&first),
+    })
+    .expect("create bookmark");
+    repo.mutate(push("origin", vec![PushTarget::Bookmark("main".into())]))
+        .expect("push");
+    let second = commit(&mut repo, "b.txt", "second");
+    harness::block_on(async {
+        let workspace = harness::load_workspace(&repo.root);
+        let base = workspace
+            .repo_loader()
+            .load_at_head()
+            .await
+            .expect("load repo");
+        let mut tx = base.start_transaction();
+        let id = jj_lib::backend::CommitId::try_from_hex(&second).expect("commit id");
+        for (name, tracked) in [("v1", true), ("v2", false)] {
+            let name = jj_lib::ref_name::RefName::new(name);
+            tx.repo_mut()
+                .set_local_tag_target(name, jj_lib::op_store::RefTarget::normal(id.clone()));
+            if tracked {
+                tx.repo_mut().set_remote_tag(
+                    name.to_remote_symbol(jj_lib::ref_name::RemoteName::new("origin")),
+                    jj_lib::op_store::RemoteRef {
+                        target: jj_lib::op_store::RefTarget::absent(),
+                        state: jj_lib::op_store::RemoteRefState::Tracked,
+                    },
+                );
+            }
+        }
+        tx.commit("test: tags").await.expect("commit the tags");
+    });
+
+    let outcome = repo
+        .mutate(push("origin", vec![PushTarget::Tracked]))
+        .expect("plain push");
+    assert_eq!(outcome.message, "Pushed v1 to origin");
+    let tag = |name: &str| {
+        let out = harness::run_git(
+            &remote,
+            &[
+                "for-each-ref",
+                "--format=%(objectname)",
+                &format!("refs/tags/{name}"),
+            ],
+        );
+        Some(out.trim().to_owned()).filter(|out| !out.is_empty())
+    };
+    assert_eq!(tag("v1"), Some(second));
+    assert_eq!(tag("v2"), None);
+}
+
 #[test]
 fn tags_reach_the_graph_as_read_only_labels() {
     let Some((mut repo, _remote)) = setup("push-tags") else {

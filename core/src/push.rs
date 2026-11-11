@@ -22,8 +22,9 @@ pub enum PushTarget {
     /// `-c <revision>`: create the bookmark `templates.git_push_bookmark`
     /// names for the revision and push it.
     Change(RevisionSelection),
-    /// No target flags at all: the tracked bookmarks whose local target sits
-    /// in `remote_bookmarks(remote=<remote>)..@` and differs from the remote.
+    /// No target flags at all: the tracked bookmarks and tags whose local
+    /// target sits in `remote_bookmarks(remote=<remote>)..@` and differs from
+    /// the remote.
     Tracked,
 }
 
@@ -127,10 +128,12 @@ impl MoveKind {
     }
 }
 
-/// One bookmark a push would change on the remote.
+/// One bookmark (or tag) a push would change on the remote.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BookmarkMove {
     pub bookmark: String,
+    /// `bookmark` names a tag: a tracked tag the default push carries along.
+    pub tag: bool,
     /// Short hash of where the remote has it; `None` when it's new there.
     pub from: Option<String>,
     /// Short hash of where it goes; `None` when it's deleted there.
@@ -148,7 +151,7 @@ impl BookmarkMove {
     pub const LISTED: usize = 3;
 
     /// The move as the CLI prints it before pushing:
-    /// `bookmark: main [move forward from … to …]`.
+    /// `bookmark: main [move forward from … to …]` (`tag: v1 […]` for a tag).
     pub fn line(&self) -> String {
         let from = self.from.as_deref().unwrap_or_default();
         let to = self.to.as_deref().unwrap_or_default();
@@ -159,7 +162,8 @@ impl BookmarkMove {
             MoveKind::Backward => format!("move backward from {from} to {to}"),
             MoveKind::Sideways => format!("move sideways from {from} to {to}"),
         };
-        format!("bookmark: {} [{what}]", self.bookmark)
+        let kind = if self.tag { "tag" } else { "bookmark" };
+        format!("{kind}: {} [{what}]", self.bookmark)
     }
 }
 

@@ -854,6 +854,7 @@ mod tests {
             },
             moves: vec![diffui_core::BookmarkMove {
                 bookmark: "main".to_owned(),
+                tag: false,
                 from: None,
                 to: Some("aaaaaaaaaaaa".to_owned()),
                 kind: diffui_core::MoveKind::Add,
