@@ -746,7 +746,7 @@ pub fn empty_state(
 
 /// What a [`Banner`] says about its message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tone {
+pub enum BannerTone {
     /// A mode or a scope the view is in: a comparison, a file's history.
     Info,
     /// Worth knowing before going on, but nothing stops it.
@@ -755,7 +755,7 @@ pub enum Tone {
     Danger,
 }
 
-impl Tone {
+impl BannerTone {
     /// The tone's ink (its glyph, a title) and its wash.
     pub fn colors(self, theme: ThemeSpec) -> (Color, Color) {
         match self {
@@ -791,7 +791,7 @@ pub enum BannerShape {
 /// controls at the end. Every banner and callout in the app is one, so they
 /// stack with one inset and one strength.
 pub struct Banner {
-    tone: Tone,
+    tone: BannerTone,
     shape: BannerShape,
     icon: Option<&'static str>,
     body: Vec<gpui_kit::AnyElement>,
@@ -799,7 +799,7 @@ pub struct Banner {
 }
 
 impl Banner {
-    pub fn new(tone: Tone) -> Self {
+    pub fn new(tone: BannerTone) -> Self {
         Self {
             tone,
             shape: BannerShape::Card,
@@ -898,6 +898,133 @@ impl Banner {
                     .children(self.end),
             )
         }
+    }
+}
+
+// ── Tags ────────────────────────────────────────────────────────────────
+
+/// What a status word or count says, by colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Accent,
+    Muted,
+    Ok,
+    Warn,
+    Danger,
+}
+
+impl Tone {
+    pub fn ink(self, theme: ThemeSpec) -> Color {
+        match self {
+            Tone::Accent => theme.accent,
+            Tone::Muted => theme.subtle_text,
+            Tone::Ok => theme.added_text,
+            Tone::Warn => theme.note_text,
+            Tone::Danger => theme.removed_text,
+        }
+    }
+}
+
+/// A [`tag`]'s step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagSize {
+    /// 10px: a kind badge (`jj`, `git`), a marker beside a title.
+    Small,
+    /// 11px: a count or a state ("1 running", "untracked").
+    Regular,
+}
+
+impl TagSize {
+    fn text_size(self) -> f32 {
+        match self {
+            TagSize::Small => text_size::BADGE,
+            TagSize::Regular => text_size::CAPTION,
+        }
+    }
+
+    /// `[vertical, horizontal]` around the text's line box.
+    fn padding(self) -> [f32; 2] {
+        match self {
+            TagSize::Small => [1.0, 5.0],
+            TagSize::Regular => [2.0, 6.0],
+        }
+    }
+}
+
+/// A short label in a tinted box, the chrome's chips and badges. Painted rows
+/// draw theirs with [`crate::chip`].
+pub struct Tag {
+    label: SharedString,
+    ink: Color,
+    fill: Color,
+    edge: Option<Color>,
+    size: TagSize,
+    font: Font,
+    optical: bool,
+}
+
+/// `label` in `ink` on a wash of it, at `size` in `font`.
+pub fn tag(label: impl Into<SharedString>, ink: Color, size: TagSize, font: Font) -> Tag {
+    Tag {
+        label: label.into(),
+        ink,
+        fill: theme::chip_background(ink),
+        edge: None,
+        size,
+        font,
+        optical: false,
+    }
+}
+
+impl Tag {
+    /// Set in `mono`, sized to match the UI font beside it.
+    pub fn mono(mut self, mono: Font) -> Self {
+        self.font = mono;
+        self.optical = true;
+        self
+    }
+
+    /// The box's fill in place of the ink's wash.
+    pub fn fill(mut self, fill: Color) -> Self {
+        self.fill = fill;
+        self
+    }
+
+    /// No fill, a 1px `edge` inside the box instead.
+    pub fn outlined(mut self, edge: Color) -> Self {
+        self.fill = theme::TRANSPARENT;
+        self.edge = Some(edge);
+        self
+    }
+
+    fn parts(self) -> (Div, theme::Padding, Font, f32) {
+        let size = if self.optical {
+            typography::optical_size(self.font, self.size.text_size())
+        } else {
+            self.size.text_size()
+        };
+        let padding = typography::trimmed_padding(self.size.padding().into(), self.font, size);
+        let mut chip = padding
+            .apply(div())
+            .flex_none()
+            .bg(self.fill)
+            .rounded(px(crate::chip::RADIUS));
+        if let Some(edge) = self.edge {
+            chip = chip.shadow(vec![theme::inset_ring(edge)]);
+        }
+        let chip = chip.child(typography::line(self.label, self.font, size, self.ink));
+        (chip, padding, self.font, size)
+    }
+
+    /// The tag on its text's baseline, for a [`typography::baseline_row`].
+    pub fn aligned(self) -> typography::Aligned {
+        let (chip, padding, font, size) = self.parts();
+        typography::Aligned::boxed(chip, padding, typography::TextBox::default_line(font, size))
+    }
+
+    /// The tag's box, for a parent that centres it.
+    pub fn view(self) -> Div {
+        self.parts().0
     }
 }
 

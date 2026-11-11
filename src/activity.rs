@@ -13,8 +13,8 @@
 //! Entries are **persistent**: running and finished alike stay until the user
 //! clears them or the app restarts — nothing auto-dismisses.
 
-use crate::overlay_kit::{Tone, count_chip, glyph};
-use crate::theme::{self, Color, Font, Padding, Weight, emphasis_font, text_size};
+use crate::overlay_kit::glyph;
+use crate::theme::{self, Color, Font, Weight, emphasis_font, text_size};
 use crate::typography::{self, Aligned};
 use crate::ui::Tip as _;
 use crate::{Action, Cx, ellipsis, icons, input, ui};
@@ -451,16 +451,12 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
-/// A round count badge on the indicator.
+/// A count badge on the indicator.
 fn round_badge(label: String, fill: Color, ink: Color, font: Font) -> Aligned {
     let font = emphasis_font(font, Weight::SEMIBOLD);
-    Aligned::chip(
-        typography::line(label, font, text_size::BADGE, ink),
-        font,
-        text_size::BADGE,
-        Padding::from([2.0, 5.0]),
-        move |chip| chip.bg(fill).rounded(px(theme::radius::SM)),
-    )
+    ui::tag(label, ink, ui::TagSize::Small, font)
+        .fill(fill)
+        .aligned()
 }
 
 /// The right-edge toolbar control. While work is in flight: a spinner, the
@@ -665,13 +661,24 @@ pub(crate) fn activity_popover(
         text_size::BODY,
     )];
     for (count, what, tone) in [
-        (log.running_count(), "running", Tone::Accent),
-        (log.queued_count(), "queued", Tone::Neutral),
-        (log.failed_count(), "failed", Tone::Danger),
+        (log.running_count(), "running", ui::Tone::Accent),
+        (log.queued_count(), "queued", ui::Tone::Muted),
+        (log.failed_count(), "failed", ui::Tone::Danger),
     ] {
         if count > 0 {
             title.push(Aligned::gap(if title.len() == 1 { 10.0 } else { 4.0 }));
-            title.push(count_chip(format!("{count} {what}"), tone, font, theme));
+            let chip = ui::tag(
+                format!("{count} {what}"),
+                tone.ink(theme),
+                ui::TagSize::Regular,
+                emphasis_font(font, Weight::MEDIUM),
+            );
+            // Waiting work is neutral: an outline, no wash.
+            let chip = match tone {
+                ui::Tone::Muted => chip.outlined(crate::overlay_kit::firm_border(theme)),
+                _ => chip,
+            };
+            title.push(chip.aligned());
         }
     }
     let header = div()

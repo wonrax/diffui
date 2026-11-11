@@ -32,7 +32,7 @@ use crate::theme::{
     text_size,
 };
 use crate::typography::{self, Aligned};
-use crate::ui::Tip as _;
+use crate::ui::{Tip as _, Tone};
 use crate::{Action, Cx, Diffui, HoverTarget, TabId, icons, ui};
 
 /// Focus target id for the open-repository dialog's path field.
@@ -856,19 +856,18 @@ fn tab_badge(source: &crate::TabSource, active: bool, theme: ThemeSpec, mono: Fo
         crate::TabSource::Repo { vcs: Vcs::Git, .. } => "git",
         crate::TabSource::GitHubPr(_) => "pr",
     };
-    let (text, fill) = if active {
-        (theme.accent, chip_background(theme.accent))
+    let ink = if active {
+        theme.accent
     } else {
-        (theme.muted_text, chip_background(theme.muted_text))
+        theme.muted_text
     };
-    let font = emphasis_font(mono, Weight::SEMIBOLD);
-    let size = typography::optical_size(font, text_size::BADGE);
-    typography::trimmed_padding([1.0, 5.0].into(), font, size)
-        .apply(div())
-        .flex_none()
-        .bg(fill)
-        .rounded(px(radius::XS))
-        .child(typography::line(label, font, size, text))
+    vcs_badge(label, ink, mono).view()
+}
+
+/// `jj`, `git` or `pr` in a small mono tag.
+fn vcs_badge(label: &'static str, ink: Color, mono: Font) -> ui::Tag {
+    let mono = emphasis_font(mono, Weight::SEMIBOLD);
+    ui::tag(label, ink, ui::TagSize::Small, mono).mono(mono)
 }
 
 /// Small ring signalling the working copy (`@`) has changes. A ring in the
@@ -1246,16 +1245,6 @@ pub(crate) fn open_repo_card(
         .into_any_element()
 }
 
-/// How a status line is tinted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tone {
-    Ok,
-    Info,
-    Muted,
-    Warn,
-    Danger,
-}
-
 /// A stretch of a status line.
 enum Run {
     Plain(String),
@@ -1299,7 +1288,7 @@ fn status_parts(
                 runs.extend([plain(" on "), code(host.clone())]);
             }
             (
-                Tone::Info,
+                Tone::Accent,
                 glyph::PULL_REQUEST,
                 runs,
                 Some("Open in a new tab"),
@@ -1322,7 +1311,7 @@ fn status_parts(
         Status::Repository {
             name, open: true, ..
         } => (
-            Tone::Info,
+            Tone::Accent,
             glyph::CHECK_CIRCLE,
             vec![strong(name.clone()), plain(" is already open.")],
             Some("Switch to its tab"),
@@ -1389,16 +1378,6 @@ fn status_parts(
     }
 }
 
-fn tone_ink(tone: Tone, theme: ThemeSpec) -> Color {
-    match tone {
-        Tone::Ok => theme.added_text,
-        Tone::Info => theme.accent,
-        Tone::Muted => theme.subtle_text,
-        Tone::Warn => theme.note_text,
-        Tone::Danger => theme.removed_text,
-    }
-}
-
 /// The square at the band's start: what kind of thing the input names. Green
 /// once the path resolves to a repository, the accent for a pull request.
 fn kind_box(status: Option<&crate::path_browse::Status>, theme: ThemeSpec) -> impl IntoElement {
@@ -1431,7 +1410,7 @@ fn kind_box(status: Option<&crate::path_browse::Status>, theme: ThemeSpec) -> im
 fn status_line(ui: &Diffui, theme: ThemeSpec, status: &crate::path_browse::Status) -> Div {
     let (font, mono) = (ui.config.ui_font, ui.config.mono_font);
     let (tone, glyph, runs, enter) = status_parts(status);
-    let ink = tone_ink(tone, theme);
+    let ink = tone.ink(theme);
     let line = div()
         .w_full()
         .min_h(px(OPEN_STATUS_HEIGHT))
@@ -1915,20 +1894,11 @@ fn folder_section(
 fn row_lead(vcs: Option<Vcs>, theme: ThemeSpec, mono: Font) -> Aligned {
     match vcs {
         Some(vcs) => {
-            let (label, fill, ink) = match vcs {
-                Vcs::Jj => ("jj", chip_background(theme.accent), theme.accent),
-                Vcs::Git => ("git", theme::well_wash(theme), theme.subtle_text),
+            let badge = match vcs {
+                Vcs::Jj => vcs_badge("jj", theme.accent, mono),
+                Vcs::Git => vcs_badge("git", theme.subtle_text, mono).fill(theme::well_wash(theme)),
             };
-            let font = emphasis_font(mono, Weight::SEMIBOLD);
-            let size = typography::optical_size(font, text_size::BADGE);
-            Aligned::chip(
-                typography::line(label, font, size, ink),
-                font,
-                size,
-                [2.0, 4.0].into(),
-                move |chip| chip.bg(fill).rounded(px(radius::XS)),
-            )
-            .map(|badge| {
+            badge.aligned().map(|badge| {
                 div()
                     .w(px(OPEN_LEAD_BOX))
                     .flex()
@@ -1968,19 +1938,7 @@ fn list_row(
 /// The "Open" chip of a repository a tab has open.
 fn open_chip(font: Font, theme: ThemeSpec) -> impl IntoElement {
     let font = emphasis_font(font, Weight::MEDIUM);
-    div()
-        .flex_none()
-        .h(px(18.0))
-        .px(px(6.0))
-        .flex()
-        .items_center()
-        .rounded(px(radius::XS))
-        .bg(chip_background(theme.accent))
-        .child(typography::centered(
-            typography::line("Open", font, text_size::CAPTION, theme.accent),
-            font,
-            text_size::CAPTION,
-        ))
+    ui::tag("Open", theme.accent, ui::TagSize::Regular, font).view()
 }
 
 /// What a row's pick does, said on the highlighted row.

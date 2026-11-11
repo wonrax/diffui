@@ -4,7 +4,7 @@
 //! footer that says what Enter will do.
 
 use crate::root::PaneSet;
-use crate::theme::{self, Color, Font, Padding, Weight, text_size};
+use crate::theme::{self, Color, Font, Weight, text_size};
 use crate::typography::{self, Aligned};
 use crate::{Cx, input, palette, ui};
 use gpui_kit::component::Sizable as _;
@@ -361,7 +361,7 @@ pub(crate) fn args_strip(
                 Some(Err(_)) => ("no match".to_owned(), theme.removed_text),
                 None => ("\u{2026}".to_owned(), theme.subtle_text),
             };
-            parts.push(count_chip(label, font, text_size::CAPTION, color));
+            parts.push(crate::ui::tag(label, color, crate::ui::TagSize::Regular, font).aligned());
         }
         typography::baseline_row(parts, 0.0)
     };
@@ -376,26 +376,6 @@ pub(crate) fn args_strip(
             .overflow_hidden()
             .child(content)
             .into_any_element(),
-    )
-}
-
-/// The little tinted count or kind beside a word.
-fn count_chip(
-    label: impl Into<gpui_kit::SharedString>,
-    font: Font,
-    size: f32,
-    color: Color,
-) -> Aligned {
-    let size = typography::optical_size(font, size);
-    Aligned::chip(
-        typography::line(label, font, size, color),
-        font,
-        size,
-        Padding::from([1.0, 6.0]),
-        move |chip| {
-            chip.bg(theme::chip_background(color))
-                .rounded(px(theme::radius::XS))
-        },
     )
 }
 
@@ -727,10 +707,11 @@ pub(crate) fn badge(kind: CommandKind, font: Font, theme: ThemeSpec) -> Aligned 
         CommandKind::OpensUi => theme.modified_token,
         CommandKind::Passthrough => theme.muted_text,
     };
-    count_chip(
+    crate::ui::tag(
         kind.label(),
-        theme::emphasis_font(font, Weight::MEDIUM),
-        text_size::CAPTION,
         color,
+        crate::ui::TagSize::Regular,
+        theme::emphasis_font(font, Weight::MEDIUM),
     )
+    .aligned()
 }

@@ -10,7 +10,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, ElementId, Window, div, px};
 
 use crate::ellipsis::{self, Span};
-use crate::theme::{Color, Font, ThemeSpec, chip_background, space, text_size};
+use crate::theme::{Color, Font, ThemeSpec, space, text_size};
 use crate::typography::{self, Aligned};
 use crate::ui::Tip as _;
 use crate::{Cx, Diffui, icons};
@@ -224,17 +224,13 @@ pub(crate) fn badge(
     _window: &mut Window,
     _cx: &mut Cx,
 ) -> Aligned {
-    let font = ui.config.ui_font;
-    Aligned::chip(
-        typography::line(label.to_owned(), font, text_size::BADGE, color),
-        font,
-        text_size::BADGE,
-        [0.0, 5.0].into(),
-        move |chip| {
-            chip.bg(chip_background(color))
-                .rounded(px(crate::chip::RADIUS))
-        },
+    crate::ui::tag(
+        label.to_owned(),
+        color,
+        crate::ui::TagSize::Small,
+        ui.config.ui_font,
     )
+    .aligned()
 }
 
 /// An id in mono, its bright prefix and the rest as one rich text, so the two

@@ -650,18 +650,16 @@ fn browsed_revision_label(ui: &Diffui, theme: ThemeSpec, is_jj: bool) -> impl In
     let mut label: Vec<Aligned> = Vec::new();
 
     if working_copy {
-        let accent = theme.accent;
-        let size = typography::optical_size(mono, text_size::CAPTION);
-        label.push(Aligned::chip(
-            typography::line("@ working copy", mono, size, accent),
-            mono,
-            size,
-            [1.0, 6.0].into(),
-            move |chip| {
-                chip.bg(chip_background(accent))
-                    .rounded(px(crate::chip::RADIUS))
-            },
-        ));
+        label.push(
+            ui::tag(
+                "@ working copy",
+                theme.accent,
+                ui::TagSize::Regular,
+                ui.config.ui_font,
+            )
+            .mono(mono)
+            .aligned(),
+        );
     } else {
         let id = match (&revision, commit) {
             (_, Some(row)) if is_jj => {

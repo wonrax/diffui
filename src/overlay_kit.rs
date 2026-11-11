@@ -274,51 +274,6 @@ pub(crate) fn group_heading(label: impl Into<SharedString>, font: Font, theme: T
         ))
 }
 
-/// How a [`count_chip`] is tinted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Tone {
-    Accent,
-    Neutral,
-    Danger,
-}
-
-/// A small tinted chip with a count or a state in it ("1 running"), placed on
-/// its text's baseline.
-pub(crate) fn count_chip(
-    label: impl Into<SharedString>,
-    tone: Tone,
-    font: Font,
-    theme: ThemeSpec,
-) -> typography::Aligned {
-    let font = theme::emphasis_font(font, Weight::MEDIUM);
-    let (fill, ink, outline) = match tone {
-        Tone::Accent => (theme::chip_background(theme.accent), theme.accent, None),
-        Tone::Danger => (
-            theme::chip_background(theme.removed_text),
-            theme.removed_text,
-            None,
-        ),
-        Tone::Neutral => (
-            theme::TRANSPARENT,
-            theme.subtle_text,
-            Some(theme::firm_ring(theme)),
-        ),
-    };
-    typography::Aligned::chip(
-        typography::line(label, font, text_size::CAPTION, ink),
-        font,
-        text_size::CAPTION,
-        [3.0, 7.0].into(),
-        move |chip| {
-            let chip = chip.bg(fill).rounded(px(radius::XS));
-            match outline {
-                Some(color) => chip.shadow(vec![theme::inset_ring(color)]),
-                None => chip,
-            }
-        },
-    )
-}
-
 /// A warning card with an alert glyph: something the reader should know
 /// before they confirm, that doesn't stop them. `lead` takes the warning's
 /// ink, `detail` (the consequence, in plain words) the body's.
@@ -335,7 +290,7 @@ pub(crate) fn callout(
             .line_height(px(text_size::BODY * typography::DEFAULT_LINE_HEIGHT))
             .child(prose.view(font, mono, color, theme))
     };
-    let mut banner = crate::ui::Banner::new(crate::ui::Tone::Warning)
+    let mut banner = crate::ui::Banner::new(crate::ui::BannerTone::Warning)
         .icon(icons::ALERT_TRIANGLE)
         .child(text(lead, theme.note_text));
     if let Some(detail) = detail {

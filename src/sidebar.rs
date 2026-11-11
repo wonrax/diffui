@@ -530,14 +530,12 @@ fn op_target_row(
         .map(|label| div().w(px(52.0)).child(label).into_any_element()),
     ];
     if let Some(key) = key {
-        let size = typography::optical_size(mono_font, text_size::CAPTION);
-        content.push(Aligned::chip(
-            typography::line(key, mono_font, size, key_color),
-            mono_font,
-            size,
-            Padding::from([0.0, 5.0]),
-            move |chip| chip.bg(key_bg).rounded(px(crate::theme::radius::XS)),
-        ));
+        content.push(
+            crate::ui::tag(key, key_color, crate::ui::TagSize::Regular, ui_font)
+                .mono(mono_font)
+                .fill(key_bg)
+                .aligned(),
+        );
     }
     if let Some(description) = description {
         // A long description ellipsises rather than running off the strip.

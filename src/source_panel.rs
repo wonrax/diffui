@@ -17,7 +17,7 @@ use crate::geometry::{Point, Rectangle};
 use crate::revision_list::{
     self, FileRowView, RevisionListProps, RevisionRowView, RowSelectionKey,
 };
-use crate::theme::{Color, Padding, ThemeSpec, chip_background, text_size};
+use crate::theme::{Color, ThemeSpec, chip_background, text_size};
 use crate::typography::{self, Aligned};
 use crate::{Action, Cx, Diffui, SourceState, ellipsis, icons};
 use diffui_core::{
@@ -386,7 +386,7 @@ pub(crate) fn build_source_sidebar(
     if let Some(error) = &source.tree_error {
         body = body.child(
             crate::field::panel_strip().child(
-                crate::ui::Banner::new(crate::ui::Tone::Danger)
+                crate::ui::Banner::new(crate::ui::BannerTone::Danger)
                     .icon(icons::ALERT_TRIANGLE)
                     .child(
                         div()
@@ -750,16 +750,7 @@ fn build_info_bar(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut C
 }
 
 fn status_chip_text(label: &'static str, color: Color, ui: &Diffui) -> Aligned {
-    let mono = ui.config.mono_font;
-    let size = typography::optical_size(mono, text_size::CAPTION);
-    Aligned::chip(
-        typography::line(label, mono, size, color),
-        mono,
-        size,
-        Padding::from([1.0, 6.0]),
-        move |chip| {
-            chip.bg(chip_background(color))
-                .rounded(px(crate::chip::RADIUS))
-        },
-    )
+    crate::ui::tag(label, color, crate::ui::TagSize::Regular, ui.config.ui_font)
+        .mono(ui.config.mono_font)
+        .aligned()
 }

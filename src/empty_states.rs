@@ -147,7 +147,7 @@ pub(crate) fn load_error(ui: &Diffui, theme: ThemeSpec, error: &str, cx: &mut Cx
         ("Couldn't load the history", error)
     };
     let title_font = emphasis_font(ui.config.ui_font, Weight::MEDIUM);
-    let card = ui::Banner::new(ui::Tone::Danger)
+    let card = ui::Banner::new(ui::BannerTone::Danger)
         .icon(icons::ALERT_TRIANGLE)
         .child(typography::line(
             title,
@@ -200,7 +200,7 @@ pub(crate) fn outside_view_banner(ui: &Diffui, theme: ThemeSpec) -> Option<AnyEl
         theme,
     );
     Some(
-        ui::Banner::new(ui::Tone::Info)
+        ui::Banner::new(ui::BannerTone::Info)
             .shape(ui::BannerShape::Strip)
             .icon(icons::ALERT_TRIANGLE)
             .child(
